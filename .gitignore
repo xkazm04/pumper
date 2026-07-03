@@ -1,0 +1,22 @@
+# Build artifacts
+/target
+
+# Local runtime data: SQLite DB, scraped artifacts, browser profile (login cookies)
+/data
+
+# Claude Code session logs and local settings
+.claude/
+
+# Secrets / local environment overrides
+.env
+*.local
+
+# Editor / IDE
+.idea/
+.vscode/
+*.swp
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

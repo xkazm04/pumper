@@ -1,0 +1,35 @@
+[package]
+name = "pumper-server"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "pumper"
+path = "src/main.rs"
+
+[dependencies]
+pumper-core.workspace = true
+pumper-engine-http.workspace = true
+pumper-engine-browser.workspace = true
+pumper-engine-claude.workspace = true
+app-hackernews.workspace = true
+app-research.workspace = true
+app-readable.workspace = true
+
+axum.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+reqwest.workspace = true
+futures.workspace = true
+async-stream.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hmac.workspace = true
+hex.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+cron.workspace = true

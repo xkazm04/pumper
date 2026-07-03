@@ -1,0 +1,81 @@
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use async_trait::async_trait;
+use serde_json::Value;
+use uuid::Uuid;
+
+use crate::datasets::{ChangeKind, Datasets, UpsertSummary};
+use crate::engine::EngineSet;
+use crate::{Error, Result};
+
+/// Everything a job run gets from the runtime: its params, the engines, the
+/// dataset store (dedup + change detection), and a per-job artifacts directory
+/// for raw dumps (HTML, JSON, screenshots, ...).
+pub struct AppContext {
+    pub job_id: Uuid,
+    /// Name of the running app; scopes dataset records.
+    pub app: String,
+    pub params: Value,
+    pub engines: Arc<EngineSet>,
+    pub datasets: Arc<Datasets>,
+    pub artifacts_dir: PathBuf,
+}
+
+impl AppContext {
+    /// Writes a file under `data/artifacts/<app>/<job_id>/` and returns its path.
+    pub async fn save_artifact(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+        tokio::fs::create_dir_all(&self.artifacts_dir).await?;
+        let path = self.artifacts_dir.join(name);
+        tokio::fs::write(&path, bytes).await?;
+        Ok(path)
+    }
+
+    pub fn require_str(&self, key: &str) -> Result<&str> {
+        self.params
+            .get(key)
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::App(format!("missing required string param '{key}'")))
+    }
+
+    /// Upserts one record into `<this app>/<dataset>`, reporting new/changed/unchanged.
+    pub async fn upsert(&self, dataset: &str, key: &str, value: &Value) -> Result<ChangeKind> {
+        self.datasets.upsert(&self.app, dataset, key, value).await
+    }
+
+    /// Upserts a batch and returns a new/changed/unchanged summary — the primary
+    /// dedup + change-detection entry point for periodic scrapes.
+    pub async fn upsert_many(
+        &self,
+        dataset: &str,
+        items: &[(String, Value)],
+    ) -> Result<UpsertSummary> {
+        self.datasets.upsert_many(&self.app, dataset, items).await
+    }
+}
+
+/// One scraping use case. Implement this in a crate under `crates/apps/` and
+/// register it in the server's `registry.rs` — that is the whole integration.
+#[async_trait]
+pub trait ScrapeApp: Send + Sync {
+    /// Unique name; becomes the API path segment (`POST /apps/<name>/jobs`).
+    fn name(&self) -> &'static str;
+
+    fn description(&self) -> &'static str {
+        ""
+    }
+
+    /// Recurring schedule as a cron expression with seconds
+    /// (`"0 0 */6 * * *"` = every 6 hours). `None` = manual runs only.
+    fn schedule(&self) -> Option<&'static str> {
+        None
+    }
+
+    /// Params used for scheduled runs and for API calls without a body.
+    fn default_params(&self) -> Value {
+        Value::Object(Default::default())
+    }
+
+    /// Executes one job. The returned JSON is stored as the job result.
+    async fn run(&self, ctx: AppContext) -> Result<Value>;
+}

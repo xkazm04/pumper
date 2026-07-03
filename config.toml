@@ -1,0 +1,64 @@
+# Pumper — local scraping service configuration.
+# Every key is optional; defaults are baked into the binary (see crates/core/src/config.rs).
+
+[server]
+host = "127.0.0.1"
+port = 8088
+
+[worker]
+concurrency = 4              # max jobs running at once, across all apps
+job_timeout_secs = 900
+poll_interval_secs = 2
+default_app_concurrency = 0  # per-app cap for fairness (0 = unlimited)
+schedule_tick_secs = 15      # how often the scheduler checks cron schedules
+# [worker.app_concurrency]   # per-app overrides
+# research = 1               # only one research (Claude) job at a time
+
+[storage]
+database_path = "data/pumper.db"
+artifacts_dir = "data/artifacts"
+
+[http]
+user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
+timeout_secs = 30
+retries = 3
+
+# Per-domain politeness governor — spaces out requests to the same host.
+[governor]
+enabled = true
+default_rps = 2.0            # requests/sec per host (0 = unlimited)
+jitter_ms = 250             # random extra delay to de-sync bursts
+# [governor.per_domain]     # per-host overrides
+# "news.ycombinator.com" = 1.0
+
+# Content-addressed HTTP response cache with TTL.
+[cache]
+enabled = true
+ttl_secs = 3600
+
+[browser]
+chrome_executable = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
+headless = true
+# Persistent profile: log in to sites once (headless = false), scrape behind logins forever after.
+user_data_dir = "data/browser-profile"
+default_wait_ms = 1000
+nav_timeout_secs = 30
+
+[claude]
+binary = "claude"
+timeout_secs = 600
+# effort = "high"            # global default reasoning effort
+# max_budget_usd = 2.0       # global hard spend ceiling per run
+bare = false                 # pass --bare for faster CLI startup
+# Local power mode: the CLI runs with permission prompts disabled.
+skip_permissions = true
+allowed_tools = ["WebSearch", "WebFetch"]
+
+# Model/effort presets apps select by name (3rd-party apps can override per job).
+[claude.roles.research]
+model = "claude-sonnet-5"    # latest Sonnet for research gathering
+effort = "high"              # normal reasoning
+
+[claude.roles.compose]
+model = "claude-opus-4-8"    # Opus for composing research output
+effort = "xhigh"             # maximum practical reasoning

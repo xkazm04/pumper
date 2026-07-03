@@ -1,0 +1,11 @@
+[package]
+name = "pumper-engine-http"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pumper-core.workspace = true
+reqwest.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
