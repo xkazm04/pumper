@@ -11,6 +11,13 @@ pub fn apps() -> Vec<Arc<dyn ScrapeApp>> {
         Arc::new(app_hackernews::HackerNews),
         Arc::new(app_research::Research),
         Arc::new(app_readable::Readable),
+        Arc::new(app_grants_gov::GrantsGov),
         Arc::new(app_cms_fee_schedule::CmsFeeSchedule),
+        Arc::new(app_census_density::CensusDensity),
+        Arc::new(app_ca_grants::CaGrants),
+        Arc::new(app_eu_sedia::EuSedia),
+        Arc::new(app_extractor::Extractor),
+        Arc::new(app_plugin::Plugin),
+        Arc::new(app_crawl::Crawl),
     ]
 }

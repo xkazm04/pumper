@@ -16,6 +16,8 @@ pub struct Config {
     pub claude: ClaudeConfig,
     pub governor: GovernorConfig,
     pub cache: CacheConfig,
+    pub plugins: PluginConfig,
+    pub search: SearchConfig,
 }
 
 impl Config {
@@ -238,5 +240,42 @@ pub struct CacheConfig {
 impl Default for CacheConfig {
     fn default() -> Self {
         Self { enabled: true, ttl_secs: 3600 }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct PluginConfig {
+    pub enabled: bool,
+    /// Directory scanned for `.wasm` plugin modules.
+    pub dir: PathBuf,
+    /// Per-call CPU instruction budget (fuel). Bounds runaway plugins.
+    pub fuel: u64,
+    /// Hard cap on a plugin instance's linear memory.
+    pub max_memory_mb: usize,
+}
+
+impl Default for PluginConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            dir: "data/plugins".into(),
+            fuel: 200_000_000,
+            max_memory_mb: 64,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct SearchConfig {
+    pub enabled: bool,
+    /// Directory for the embedded Tantivy index.
+    pub dir: PathBuf,
+}
+
+impl Default for SearchConfig {
+    fn default() -> Self {
+        Self { enabled: true, dir: "data/search-index".into() }
     }
 }

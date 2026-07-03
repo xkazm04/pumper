@@ -2,9 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pumper_core::{AppContext, Job, JobStatus};
+use pumper_core::{AppContext, Job, JobStatus, SearchDoc};
+use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{error, info, warn};
+use uuid::Uuid;
 
 use crate::events::JobEvent;
 use crate::state::AppState;
@@ -106,6 +108,7 @@ async fn execute(state: AppState, job: Job) {
         params: job.params.clone(),
         engines: state.engines.clone(),
         datasets: state.datasets.clone(),
+        plugins: state.plugins.clone(),
         artifacts_dir: state
             .storage
             .artifacts_dir
@@ -116,6 +119,11 @@ async fn execute(state: AppState, job: Job) {
     let timeout = Duration::from_secs(state.config.worker.job_timeout_secs);
     match tokio::time::timeout(timeout, app.run(ctx)).await {
         Ok(Ok(result)) => {
+            // Index the result into full-text search before persisting it.
+            let docs = search_docs(&job.app, job.id, &result);
+            if let Err(e) = state.search.index(docs).await {
+                warn!(job = %job.id, "search index failed: {e}");
+            }
             if let Err(e) = state.storage.complete(job.id, result).await {
                 error!(job = %job.id, "failed to persist result: {e}");
             } else {
@@ -167,4 +175,54 @@ async fn finalize(state: &AppState, id: uuid::Uuid) {
 fn publish(state: &AppState, event: JobEvent) {
     // Ignore send errors: no subscribers is fine.
     let _ = state.events.send(event);
+}
+
+/// Builds full-text search documents from a job's result: each element of a
+/// `records`/`stories`/`items` array, or the whole result as one document.
+fn search_docs(app: &str, job_id: Uuid, result: &Value) -> Vec<SearchDoc> {
+    let mut docs = Vec::new();
+    for key in ["records", "stories", "items"] {
+        if let Some(arr) = result.get(key).and_then(Value::as_array) {
+            for (i, rec) in arr.iter().enumerate() {
+                docs.push(record_doc(app, job_id, i, rec));
+            }
+        }
+    }
+    if docs.is_empty() {
+        docs.push(SearchDoc {
+            id: format!("{app}:{job_id}"),
+            app: app.to_string(),
+            dataset: app.to_string(),
+            url: String::new(),
+            title: app.to_string(),
+            body: result.to_string(),
+        });
+    }
+    docs
+}
+
+fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
+    let url = ["_url", "url"]
+        .iter()
+        .find_map(|k| rec.get(*k).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    let title = ["title", "name", "headline", "full_name"]
+        .iter()
+        .find_map(|k| rec.get(*k).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    let id = if url.is_empty() {
+        format!("{app}:{job_id}:{i}")
+    } else {
+        format!("{app}:{url}")
+    };
+    SearchDoc {
+        id,
+        app: app.to_string(),
+        dataset: app.to_string(),
+        url,
+        title,
+        body: rec.to_string(),
+    }
 }

@@ -62,3 +62,15 @@ effort = "high"              # normal reasoning
 [claude.roles.compose]
 model = "claude-opus-4-8"    # Opus for composing research output
 effort = "xhigh"             # maximum practical reasoning
+
+# Sandboxed WASM plugin host — runs untrusted .wasm extractors with hard limits.
+[plugins]
+enabled = true
+dir = "data/plugins"         # .wasm modules loaded at boot; hot-swap via POST /plugins/reload
+fuel = 200000000            # per-call CPU instruction budget (traps runaway plugins)
+max_memory_mb = 64          # hard linear-memory cap per call
+
+# Embedded full-text search (Tantivy) — in-process, no external service.
+[search]
+enabled = true
+dir = "data/search-index"

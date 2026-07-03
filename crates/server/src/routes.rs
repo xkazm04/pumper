@@ -31,6 +31,10 @@ pub fn router(state: AppState) -> Router {
         .route("/schedules/{id}/enabled", post(set_schedule_enabled))
         .route("/datasets/{app}/{dataset}", get(list_records))
         .route("/datasets/{app}/{dataset}/export", get(export_records))
+        .route("/datasets/{app}/{dataset}/duplicates", get(dataset_duplicates))
+        .route("/plugins", get(list_plugins))
+        .route("/plugins/reload", post(reload_plugins))
+        .route("/search", get(search))
         .layer(tower_http::trace::TraceLayer::new_for_http())
         // Local power mode: any localhost web app may call this API directly.
         .layer(tower_http::cors::CorsLayer::permissive())
@@ -363,4 +367,67 @@ async fn export_records(
         "count": records.len(),
         "records": records,
     })))
+}
+
+#[derive(Deserialize)]
+struct DupQuery {
+    #[serde(default = "default_distance")]
+    distance: u32,
+}
+
+fn default_distance() -> u32 {
+    3
+}
+
+/// Near-duplicate record pairs (SimHash Hamming distance ≤ `distance`).
+async fn dataset_duplicates(
+    State(state): State<AppState>,
+    Path((app, dataset)): Path<(String, String)>,
+    Query(query): Query<DupQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let distance = query.distance.min(20);
+    let pairs = state.datasets.duplicate_pairs(&app, &dataset, distance).await?;
+    Ok(Json(json!({
+        "app": app,
+        "dataset": dataset,
+        "max_distance": distance,
+        "pairs": pairs,
+    })))
+}
+
+// ---- Full-text search -----------------------------------------------------
+
+#[derive(Deserialize)]
+struct SearchQuery {
+    q: String,
+    #[serde(default = "default_search_limit")]
+    limit: usize,
+}
+
+fn default_search_limit() -> usize {
+    20
+}
+
+/// Full-text search across everything indexed from job results (BM25 ranked).
+async fn search(
+    State(state): State<AppState>,
+    Query(query): Query<SearchQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if query.q.trim().is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "query 'q' is required".into()));
+    }
+    let hits = state.search.query(&query.q, query.limit.clamp(1, 100)).await?;
+    Ok(Json(json!({ "query": query.q, "count": hits.len(), "hits": hits })))
+}
+
+// ---- WASM plugins ---------------------------------------------------------
+
+async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
+    Json(json!({ "plugins": state.plugins.list() }))
+}
+
+/// Hot-swap: rescan the plugin directory and reload every `.wasm` module.
+async fn reload_plugins(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let loaded = state.plugins.reload().await?;
+    Ok(Json(json!({ "loaded": loaded })))
 }

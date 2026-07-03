@@ -50,6 +50,15 @@ over HTTP and poll for results.
 - **Dynamic cron schedules** in the DB — create/enable/disable/delete via API.
 - **Result webhooks** — POST the finished job to a caller URL (HMAC-signed).
 - **Observability** — `/metrics` (Prometheus text) and SSE live job streams.
+- **Multi-core SIMD extraction** — declarative rule sets (CSS/regex/JSON-pointer)
+  run over document batches across all cores (`core::extract`, `extractor` app).
+- **Sandboxed WASM plugins** — untrusted `.wasm` extractors run in-process with
+  a CPU-fuel budget + memory cap (`engine-wasm`, `plugin` app; `/plugins`).
+- **Embedded full-text search** (Tantivy, in-process) auto-indexed from job
+  results (`/search`), plus **SimHash near-duplicate detection** over datasets
+  (`/datasets/{app}/{ds}/duplicates`).
+- **High-concurrency broad crawler** — bounded frontier, robots.txt, near-dup
+  dropping, bodies streamed to disk (`core::crawl`, `crawl` app).
 - Per-job artifact directory for raw dumps (HTML, JSON, screenshots).
 - Claude runs report cost / turns / session id back in the job result.
 
@@ -145,6 +154,10 @@ Start it (from this directory): `cargo run -p pumper-server` → listens on
 | `GET /apps/{name}/datasets`| List an app's dataset names.                                 |
 | `GET /datasets/{app}/{dataset}?limit=` | Query stored records (change-detected).         |
 | `GET /datasets/{app}/{dataset}/export` | Export the whole dataset as JSON.               |
+| `GET /datasets/{app}/{dataset}/duplicates?distance=` | Near-duplicate record pairs (SimHash). |
+| `GET /search?q=&limit=`    | Full-text search (BM25) over indexed job results.            |
+| `GET /plugins`             | List loaded WASM plugins.                                     |
+| `POST /plugins/reload`     | Hot-swap: rescan `data/plugins` for `.wasm` modules.         |
 
 **Enqueue body** (all fields optional):
 
@@ -249,8 +262,13 @@ impl ScrapeApp for MyApp {
 - `ctx.upsert(dataset, key, &value).await` → `ChangeKind` and
   `ctx.upsert_many(dataset, &items).await` → `UpsertSummary{new,changed,unchanged}`
   — dedup + change detection, scoped to this app.
+- `ctx.plugins.run(name, doc).await` → JSON — run a sandboxed WASM plugin.
 - `ctx.save_artifact(name, bytes).await` — writes under this job's artifact dir.
 - `ctx.app` (this app's name) and `ctx.job_id` (UUID) for correlation.
+
+Free functions in `core` for the Rust-leverage features: `extract_batch(&compiled,
+&docs)` (multi-core extraction — call inside `spawn_blocking`), `crawl(http, cfg,
+out_dir)` (broad crawler), `simhash`/`hamming` (near-dup), `html_to_markdown`.
 
 ### Step 3 — Register the crate in the workspace + server
 
@@ -285,6 +303,14 @@ appears in `GET /apps`, enqueue a job, verify the result.
 `sec min hour day month weekday`. `"0 0 */6 * * *"` = every 6 hours. Scheduled
 runs use `default_params()`, so make sure those params are sufficient (e.g. the
 `research` app needs a `query` and therefore should not be scheduled without one).
+
+### Step 5 — add a catalog entry (required, not optional)
+
+Append a `[[source]]` block to `catalog/data-sources.toml` describing what this app
+scrapes — its market, data category, engine, cadence, access, and confidence. The
+catalog is how any human or agent assesses the data-pipeline state without reading
+every app; an app that isn't catalogued is invisible to that overview. Schema and
+how-to live in `catalog/README.md` and [§10](#10-data-source-catalog).
 
 ---
 
@@ -438,3 +464,30 @@ within the contracts above. You are encouraged to:
 
 The bar is simple: **the codebase should be a little more capable and no less
 correct after you touch it than before.** Build accordingly.
+
+---
+
+## 10. Data source catalog
+
+`catalog/data-sources.toml` is the machine-readable registry of **every data
+pipeline on this machine** — one `[[source]]` per source. It answers, at a glance
+and without reading any app: which **markets** we cover, by what **mechanism**
+(web `http`/`browser` vs `claude` LLM vs `bulk` download), how **often** (one-time /
+on-demand vs a cron), how **fresh**, and how **trustworthy** (a 1–5 confidence).
+Both humans and other agents read it to assess the state of the data pipelines;
+`catalog/README.md` is the schema plus a rendered overview table.
+
+**Rule (part of the Path B contract):** adding or changing a scraping app **must**
+add or update its `[[source]]` entry in the same change. A source you have only
+researched (no app yet) still gets an entry with `status = "planned"` and
+`app = ""` — so the catalog doubles as the roadmap, and "live vs planned" stays honest.
+
+**Standardized fields** (defined in the `data-sources.toml` header and
+`catalog/README.md`): `id, app, market, name, url, category, engine, access,
+cadence, cron, status, confidence, dataset, notes`. The three `category` values —
+`open-calls` · `awarded-history` · `registry` — encode the core data-strategy
+insight that open-call feeds are the scarce, decisive resource.
+
+The format is deliberately **app-agnostic**: any other app on this machine can copy
+the schema and keep its own `data-sources.toml`, so "what data do we have, how
+fresh, by what mechanism" has one uniform, greppable answer everywhere.

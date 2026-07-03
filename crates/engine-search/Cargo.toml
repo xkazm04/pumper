@@ -1,0 +1,12 @@
+[package]
+name = "pumper-engine-search"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pumper-core.workspace = true
+tantivy.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true

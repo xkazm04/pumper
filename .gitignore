@@ -1,5 +1,8 @@
 # Build artifacts
 /target
+# Example WASM plugins build in their own (detached) workspaces
+plugins-src/*/target/
+plugins-src/*/Cargo.lock
 
 # Local runtime data: SQLite DB, scraped artifacts, browser profile (login cookies)
 /data

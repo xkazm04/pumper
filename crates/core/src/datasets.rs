@@ -36,6 +36,14 @@ pub struct Record {
     pub updated_at: DateTime<Utc>,
 }
 
+/// A near-duplicate record pair and their SimHash Hamming distance.
+#[derive(Debug, Clone, Serialize)]
+pub struct DupPair {
+    pub a: String,
+    pub b: String,
+    pub distance: u32,
+}
+
 /// Outcome of upserting a batch: the fresh records, plus a count of unchanged.
 #[derive(Debug, Default, Serialize)]
 pub struct UpsertSummary {
@@ -69,6 +77,7 @@ impl Datasets {
         value: &Value,
     ) -> Result<ChangeKind> {
         let hash = hash_value(value);
+        let sim = crate::simhash::simhash_value(value) as i64;
         let now = Utc::now();
         let existing: Option<String> = sqlx::query_scalar(
             "SELECT hash FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3",
@@ -94,14 +103,15 @@ impl Datasets {
             }
             Some(_) => {
                 sqlx::query(
-                    "UPDATE records SET hash = ?4, data = ?5, last_seen = ?6, updated_at = ?6 \
-                     WHERE app = ?1 AND dataset = ?2 AND key = ?3",
+                    "UPDATE records SET hash = ?4, data = ?5, simhash = ?6, last_seen = ?7, \
+                     updated_at = ?7 WHERE app = ?1 AND dataset = ?2 AND key = ?3",
                 )
                 .bind(app)
                 .bind(dataset)
                 .bind(key)
                 .bind(&hash)
                 .bind(value.to_string())
+                .bind(sim)
                 .bind(ts(now))
                 .execute(&self.pool)
                 .await?;
@@ -109,14 +119,15 @@ impl Datasets {
             }
             None => {
                 sqlx::query(
-                    "INSERT INTO records (app, dataset, key, hash, data, first_seen, last_seen, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?6, ?6)",
+                    "INSERT INTO records (app, dataset, key, hash, data, simhash, first_seen, last_seen, updated_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7)",
                 )
                 .bind(app)
                 .bind(dataset)
                 .bind(key)
                 .bind(&hash)
                 .bind(value.to_string())
+                .bind(sim)
                 .bind(ts(now))
                 .execute(&self.pool)
                 .await?;
@@ -141,6 +152,45 @@ impl Datasets {
             }
         }
         Ok(summary)
+    }
+
+    /// Finds near-duplicate record pairs within a dataset using SimHash Hamming
+    /// distance (semantic dedup — catches near-identical content, not just exact
+    /// matches). O(n²) scan, fine for local datasets. Records with no textual
+    /// content (simhash 0) are skipped.
+    pub async fn duplicate_pairs(
+        &self,
+        app: &str,
+        dataset: &str,
+        max_distance: u32,
+    ) -> Result<Vec<DupPair>> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT key, simhash FROM records WHERE app = ?1 AND dataset = ?2")
+                .bind(app)
+                .bind(dataset)
+                .fetch_all(&self.pool)
+                .await?;
+        let mut pairs = Vec::new();
+        for i in 0..rows.len() {
+            if rows[i].1 == 0 {
+                continue;
+            }
+            for j in (i + 1)..rows.len() {
+                if rows[j].1 == 0 {
+                    continue;
+                }
+                let distance = crate::simhash::hamming(rows[i].1 as u64, rows[j].1 as u64);
+                if distance <= max_distance {
+                    pairs.push(DupPair {
+                        a: rows[i].0.clone(),
+                        b: rows[j].0.clone(),
+                        distance,
+                    });
+                }
+            }
+        }
+        pairs.sort_by_key(|p| p.distance);
+        Ok(pairs)
     }
 
     /// Dedup helper: true if this key has been recorded before.

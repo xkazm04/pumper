@@ -7,11 +7,12 @@ use uuid::Uuid;
 
 use crate::datasets::{ChangeKind, Datasets, UpsertSummary};
 use crate::engine::EngineSet;
+use crate::plugin::Plugins;
 use crate::{Error, Result};
 
 /// Everything a job run gets from the runtime: its params, the engines, the
-/// dataset store (dedup + change detection), and a per-job artifacts directory
-/// for raw dumps (HTML, JSON, screenshots, ...).
+/// dataset store (dedup + change detection), the sandboxed WASM plugin host,
+/// and a per-job artifacts directory for raw dumps (HTML, JSON, screenshots).
 pub struct AppContext {
     pub job_id: Uuid,
     /// Name of the running app; scopes dataset records.
@@ -19,6 +20,8 @@ pub struct AppContext {
     pub params: Value,
     pub engines: Arc<EngineSet>,
     pub datasets: Arc<Datasets>,
+    /// Sandboxed WASM plugin host (fuel + memory limited).
+    pub plugins: Arc<dyn Plugins>,
     pub artifacts_dir: PathBuf,
 }
 

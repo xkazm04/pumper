@@ -1,0 +1,303 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Pumper Data-Source Catalog
+#
+# The single source of truth for WHAT this machine scrapes and HOW. One
+# `[[source]]` entry per data pipeline. Both humans and LLMs read this to assess
+# the state of the data pipelines at a glance. The schema is documented in
+# `catalog/README.md`; keep this file in sync with the registered apps.
+#
+# Every field (copy this block when adding a source):
+#   id          stable kebab-case slug; == the Pumper app `name()` when 1:1
+#   app         Pumper app crate serving it (crates/apps/<app>); "" if not built yet
+#   market      jurisdiction id (app's scheme): us, us-ca (California), eu, au,
+#               gb, cz, ca (Canada), ...  NB: us-ca = California, ca = Canada
+#   name        human name of the source
+#   url         primary endpoint / portal
+#   category    open-calls | awarded-history | registry
+#   engine      http | browser | claude | bulk        (http/browser = web, claude = llm, bulk = file download)
+#   access      key-free | api-key | bulk | scrape
+#   cadence     one-time | on-demand | daily | weekly | monthly | quarterly | annual
+#   cron        exact 6-field expr (sec min hour dom mon dow) when on the scheduler; "" otherwise
+#   status      live | planned | blocked
+#   confidence  1-5  output-validity confidence (from data-source research)
+#   dataset     Datasets dataset name it writes (ctx.upsert); "" if n/a
+#   notes       freeform flags / gotchas
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── US federal backbone — one build serves every US org ──────────────────────
+
+[[source]]
+id = "grants-gov"
+app = "grants-gov"
+market = "us"
+name = "Grants.gov Search2 API"
+url = "https://api.grants.gov/v1/api/search2"
+category = "open-calls"
+engine = "http"
+access = "key-free"
+cadence = "daily"
+cron = "0 0 9 * * *"
+status = "live"
+confidence = 5
+dataset = "opportunities"
+notes = "POST-only (bare GET = 403). Verified live: 1366 posted opps, dedup confirmed."
+
+[[source]]
+id = "grants-gov-xml"
+app = ""
+market = "us"
+name = "Grants.gov daily DB extract (XML)"
+url = "https://prod-grants-gov-chatbot.s3.amazonaws.com/extracts/"
+category = "open-calls"
+engine = "bulk"
+access = "bulk"
+cadence = "daily"
+cron = ""
+status = "planned"
+confidence = 5
+dataset = "opportunities"
+notes = "Nightly full-DB companion to grants-gov (regenerated ~4:40am ET). Use for full re-sync."
+
+[[source]]
+id = "irs-eo-bmf"
+app = ""
+market = "us"
+name = "IRS Exempt-Org Business Master File + Pub 78"
+url = "https://www.irs.gov/charities-non-profits/tax-exempt-organization-search-bulk-data-downloads"
+category = "registry"
+engine = "bulk"
+access = "bulk"
+cadence = "monthly"
+cron = ""
+status = "planned"
+confidence = 5
+dataset = "orgs"
+notes = "The eligibility ground-truth: EIN valid, 501(c)(3), deductibility, auto-revocation. Monthly (2nd Tue)."
+
+[[source]]
+id = "propublica-nonprofits"
+app = ""
+market = "us"
+name = "ProPublica Nonprofit Explorer API"
+url = "https://projects.propublica.org/nonprofits/api/v2/"
+category = "registry"
+engine = "http"
+access = "key-free"
+cadence = "on-demand"
+cron = ""
+status = "planned"
+confidence = 4
+dataset = ""
+notes = "Fast EIN->name/NTEE/financials lookup at onboarding. Derivative of IRS data; verify hard gate vs BMF."
+
+[[source]]
+id = "usaspending"
+app = ""
+market = "us"
+name = "USAspending.gov API"
+url = "https://api.usaspending.gov/api/v2/"
+category = "awarded-history"
+engine = "http"
+access = "key-free"
+cadence = "monthly"
+cron = ""
+status = "planned"
+confidence = 4
+dataset = "awards"
+notes = "Funder intelligence: who each agency funded. Awarded, not open calls."
+
+# ── US states (data-richness order; CA is the only one with an open-call API) ─
+
+[[source]]
+id = "ca-grants"
+app = "ca-grants"
+market = "us-ca"
+name = "California grants.ca.gov (data.ca.gov CKAN)"
+url = "https://data.ca.gov/api/3/action/datastore_search?resource_id=111c8c88-21f6-453c-ae2c-b4785a0624f5"
+category = "open-calls"
+engine = "http"
+access = "key-free"
+cadence = "daily"
+cron = ""
+status = "live"
+confidence = 5
+dataset = "opportunities"
+notes = "The only US state with a true open-call API (CKAN, 37 fields, refreshed daily 8:45pm). Verified live end-to-end: 164 active grants, keyed by PortalID, dedup confirmed."
+
+[[source]]
+id = "ny-grants"
+app = ""
+market = "us-ny"
+name = "NY Grants Gateway / SFS Vendor Portal"
+url = "https://grantsmanagement.ny.gov/search-funding-sfs"
+category = "open-calls"
+engine = "browser"
+access = "scrape"
+cadence = "daily"
+cron = ""
+status = "planned"
+confidence = 4
+dataset = "opportunities"
+notes = "Stable enterprise portal, scrape-only (data.ny.gov Socrata is awards only)."
+
+[[source]]
+id = "tx-grants"
+app = ""
+market = "us-tx"
+name = "Texas eGrants + ESBD"
+url = "https://egrants.gov.texas.gov/fundingopp"
+category = "open-calls"
+engine = "browser"
+access = "scrape"
+cadence = "daily"
+cron = ""
+status = "planned"
+confidence = 4
+dataset = "opportunities"
+notes = "Modern per-opportunity pages, scrape-only."
+
+[[source]]
+id = "il-grants"
+app = ""
+market = "us-il"
+name = "Illinois GATA CSFA catalog"
+url = "https://omb.illinois.gov/public/gata/csfa/OpportunityList.aspx"
+category = "open-calls"
+engine = "browser"
+access = "scrape"
+cadence = "weekly"
+cron = ""
+status = "planned"
+confidence = 3
+dataset = "opportunities"
+notes = "Statewide GATA mandate; older ASPX but comprehensive."
+
+[[source]]
+id = "oh-grants"
+app = ""
+market = "us-oh"
+name = "Ohio Grants Partnership portal"
+url = "https://grantsportal.ohio.gov/Public/FundingOpportunities"
+category = "open-calls"
+engine = "browser"
+access = "scrape"
+cadence = "weekly"
+cron = ""
+status = "planned"
+confidence = 3
+dataset = "opportunities"
+notes = "OBM-mandated single portal; no documented API."
+
+# ── Non-US markets ───────────────────────────────────────────────────────────
+
+[[source]]
+id = "au-grantconnect"
+app = ""
+market = "au"
+name = "GrantConnect (forecast + current + awarded)"
+url = "https://www.grants.gov.au"
+category = "open-calls"
+engine = "browser"
+access = "scrape"
+cadence = "weekly"
+cron = ""
+status = "planned"
+confidence = 5
+dataset = "opportunities"
+notes = "Rare true national open-call export (weekly, Sun). Cloudflare-fronted; needs realistic UA / browser."
+
+[[source]]
+id = "au-acnc"
+app = ""
+market = "au"
+name = "ACNC Charity Register"
+url = "https://data.gov.au/data/dataset/acnc-register"
+category = "registry"
+engine = "bulk"
+access = "key-free"
+cadence = "monthly"
+cron = ""
+status = "planned"
+confidence = 5
+dataset = "orgs"
+notes = "Identity AND financials (AIS). Bulk CSV/CKAN, ~64k charities."
+
+[[source]]
+id = "eu-sedia"
+app = "eu-sedia"
+market = "eu"
+name = "EU Funding & Tenders Portal (SEDIA Search API)"
+url = "https://api.tech.ec.europa.eu/search-api/prod/rest/search?apiKey=SEDIA"
+category = "open-calls"
+engine = "http"
+access = "key-free"
+cadence = "daily"
+cron = ""
+status = "live"
+confidence = 5
+dataset = "opportunities"
+notes = "POST multipart (query+languages). apiKey=SEDIA static. Filter type in {1,2}, status=31094502. Shared source attached to every EU member-state profile. Verified live end-to-end: 601 open topics, keyed by identifier, dedup confirmed. See grant-writing app docs/eu-market-deep-dive."
+
+[[source]]
+id = "uk-360giving"
+app = ""
+market = "gb"
+name = "360Giving GrantNav (bulk)"
+url = "https://grantnav.threesixtygiving.org/api/grants.json"
+category = "awarded-history"
+engine = "bulk"
+access = "key-free"
+cadence = "daily"
+cron = ""
+status = "planned"
+confidence = 5
+dataset = "awards"
+notes = "World-class funder intelligence: 1.47M grants, daily bulk JSON/CSV. Awarded, not open calls."
+
+[[source]]
+id = "uk-charity-commission"
+app = ""
+market = "gb"
+name = "Charity Commission for England & Wales API"
+url = "https://api-portal.charitycommission.gov.uk"
+category = "registry"
+engine = "http"
+access = "api-key"
+cadence = "on-demand"
+cron = ""
+status = "planned"
+confidence = 5
+dataset = ""
+notes = "Applicant identity + financials (~170k E&W charities). Free key. Companies House + OSCR complement it."
+
+[[source]]
+id = "cz-eufunds"
+app = ""
+market = "cz"
+name = "MS2021+ EU structural funds (výzvy XML)"
+url = "https://ms21opendata.mssf.cz/SeznamVyzev_21_27.xml"
+category = "open-calls"
+engine = "http"
+access = "key-free"
+cadence = "weekly"
+cron = ""
+status = "planned"
+confidence = 4
+dataset = "opportunities"
+notes = "Already implemented in the grant-writing app (cz-eufunds ingest); candidate to migrate onto Pumper."
+
+[[source]]
+id = "cra-charities"
+app = ""
+market = "ca"
+name = "CRA List of Charities (T3010)"
+url = "https://open.canada.ca/data/en/dataset/05b3abd0-e70f-4b3b-a9c5-acc436bd15b6"
+category = "registry"
+engine = "bulk"
+access = "bulk"
+cadence = "annual"
+cron = ""
+status = "planned"
+confidence = 5
+dataset = "orgs"
+notes = "Canada's clean national registry (~86k charities, 24 T3010 CSVs). Canada has NO open-calls API — opps are scrape/LLM."

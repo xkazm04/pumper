@@ -5,6 +5,8 @@ members = [
     "crates/engine-http",
     "crates/engine-browser",
     "crates/engine-claude",
+    "crates/engine-wasm",
+    "crates/engine-search",
     "crates/server",
     "crates/apps/*",
 ]
@@ -19,10 +21,19 @@ pumper-core = { path = "crates/core" }
 pumper-engine-http = { path = "crates/engine-http" }
 pumper-engine-browser = { path = "crates/engine-browser" }
 pumper-engine-claude = { path = "crates/engine-claude" }
+pumper-engine-wasm = { path = "crates/engine-wasm" }
+pumper-engine-search = { path = "crates/engine-search" }
 app-hackernews = { path = "crates/apps/hackernews" }
 app-research = { path = "crates/apps/research" }
 app-readable = { path = "crates/apps/readable" }
+app-grants-gov = { path = "crates/apps/grants-gov" }
 app-cms-fee-schedule = { path = "crates/apps/cms-fee-schedule" }
+app-census-density = { path = "crates/apps/census-density" }
+app-ca-grants = { path = "crates/apps/ca-grants" }
+app-eu-sedia = { path = "crates/apps/eu-sedia" }
+app-extractor = { path = "crates/apps/extractor" }
+app-plugin = { path = "crates/apps/plugin" }
+app-crawl = { path = "crates/apps/crawl" }
 
 # async runtime + web
 tokio = { version = "1", features = ["full"] }
@@ -38,6 +49,18 @@ scraper = "0.23"
 ego-tree = "0.10"
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
 futures = "0.3"
+
+# high-throughput extraction (no-GIL parallelism + SIMD)
+regex = "1"
+rayon = "1"
+simd-json = "0.14"
+url = "2"
+
+# sandboxed WASM plugin runtime
+wasmtime = "46"
+
+# embedded full-text search (in-process, no external service)
+tantivy = "0.26"
 
 # shared
 async-trait = "0.1"

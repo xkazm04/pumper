@@ -2,10 +2,15 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pumper_core::{Config, Datasets, EngineSet, Fetcher, Governor, HttpCache, ScrapeApp, Storage};
+use pumper_core::{
+    Config, Datasets, EngineSet, Fetcher, Governor, HttpCache, NoPlugins, NoSearch, Plugins,
+    ScrapeApp, Search, Storage,
+};
 use pumper_engine_browser::BrowserEngine;
 use pumper_engine_claude::ClaudeEngine;
 use pumper_engine_http::HttpEngine;
+use pumper_engine_search::TantivyIndex;
+use pumper_engine_wasm::WasmPluginHost;
 use tokio::sync::{broadcast, Notify};
 
 use crate::events::JobEvent;
@@ -17,6 +22,10 @@ pub struct AppState {
     pub datasets: Arc<Datasets>,
     pub cache: Arc<HttpCache>,
     pub engines: Arc<EngineSet>,
+    /// Sandboxed WASM plugin host.
+    pub plugins: Arc<dyn Plugins>,
+    /// Embedded full-text search index.
+    pub search: Arc<dyn Search>,
     pub registry: Arc<HashMap<String, Arc<dyn ScrapeApp>>>,
     /// Pinged on enqueue so the worker picks up work without waiting a poll tick.
     pub notify: Arc<Notify>,
@@ -39,6 +48,17 @@ impl AppState {
         let fetch = Fetcher::new(http.clone(), browser.clone(), claude.clone());
         let engines = EngineSet { http, browser, claude, fetch };
 
+        let plugins: Arc<dyn Plugins> = if config.plugins.enabled {
+            Arc::new(WasmPluginHost::new(&config.plugins)?)
+        } else {
+            Arc::new(NoPlugins)
+        };
+        let search: Arc<dyn Search> = if config.search.enabled {
+            Arc::new(TantivyIndex::new(&config.search)?)
+        } else {
+            Arc::new(NoSearch)
+        };
+
         let registry: HashMap<String, Arc<dyn ScrapeApp>> = crate::registry::apps()
             .into_iter()
             .map(|app| (app.name().to_string(), app))
@@ -59,6 +79,8 @@ impl AppState {
             datasets,
             cache,
             engines: Arc::new(engines),
+            plugins,
+            search,
             registry: Arc::new(registry),
             notify: Arc::new(Notify::new()),
             webhook_client,
