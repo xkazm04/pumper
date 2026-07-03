@@ -20,6 +20,7 @@ app-readable.workspace = true
 app-grants-gov.workspace = true
 app-cms-fee-schedule.workspace = true
 app-census-density.workspace = true
+app-census-nonemp.workspace = true
 app-ca-grants.workspace = true
 app-eu-sedia.workspace = true
 app-extractor.workspace = true

@@ -93,6 +93,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-census-nonemp"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pumper-core",
+ "serde_json",
+]
+
+[[package]]
 name = "app-cms-fee-schedule"
 version = "0.1.0"
 dependencies = [
@@ -2729,6 +2738,7 @@ dependencies = [
  "anyhow",
  "app-ca-grants",
  "app-census-density",
+ "app-census-nonemp",
  "app-cms-fee-schedule",
  "app-crawl",
  "app-eu-sedia",
