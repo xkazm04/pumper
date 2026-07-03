@@ -30,6 +30,7 @@ app-grants-gov = { path = "crates/apps/grants-gov" }
 app-cms-fee-schedule = { path = "crates/apps/cms-fee-schedule" }
 app-census-density = { path = "crates/apps/census-density" }
 app-census-nonemp = { path = "crates/apps/census-nonemp" }
+app-homewyse-pricing = { path = "crates/apps/homewyse-pricing" }
 app-ca-grants = { path = "crates/apps/ca-grants" }
 app-eu-sedia = { path = "crates/apps/eu-sedia" }
 app-extractor = { path = "crates/apps/extractor" }
