@@ -13,6 +13,8 @@ use crate::state::AppState;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    load_dotenv();
+
     tracing_subscriber::fmt()
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
@@ -44,6 +46,30 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("pumper listening on http://{addr}");
     axum::serve(listener, routes::router(state)).await?;
     Ok(())
+}
+
+/// Best-effort load of `KEY=VALUE` lines from a local `.env` into the process
+/// environment, so keyed apps (e.g. census-density's `CENSUS_API_KEY`) work from
+/// a plain `cargo run` without exporting the key by hand. Existing env vars win;
+/// a missing or blank `.env` is ignored. Runs once at startup, before anything
+/// reads the environment.
+fn load_dotenv() {
+    let Ok(contents) = std::fs::read_to_string(".env") else {
+        return;
+    };
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some((key, val)) = line.split_once('=') {
+            let key = key.trim();
+            let val = val.trim().trim_matches('"').trim_matches('\'');
+            if !key.is_empty() && std::env::var_os(key).is_none() {
+                std::env::set_var(key, val);
+            }
+        }
+    }
 }
 
 /// Evicts expired cache entries hourly so the on-disk cache doesn't grow forever.
