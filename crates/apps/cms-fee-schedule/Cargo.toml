@@ -1,0 +1,9 @@
+[package]
+name = "app-cms-fee-schedule"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pumper-core.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true

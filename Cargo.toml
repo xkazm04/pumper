@@ -22,6 +22,7 @@ pumper-engine-claude = { path = "crates/engine-claude" }
 app-hackernews = { path = "crates/apps/hackernews" }
 app-research = { path = "crates/apps/research" }
 app-readable = { path = "crates/apps/readable" }
+app-cms-fee-schedule = { path = "crates/apps/cms-fee-schedule" }
 
 # async runtime + web
 tokio = { version = "1", features = ["full"] }
