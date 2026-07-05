@@ -165,6 +165,10 @@ fn normalize(hit: &Value) -> (String, Value) {
         "reference": reference,
         "title": first(&m, "title"),
         "summary": hit.get("summary").and_then(Value::as_str),
+        // The REAL topic description (Expected Outcome / Scope / Specific challenge)
+        // as HTML — the search `summary` is just a title echo, so this is what carries
+        // the substance. Downstream normalizers strip the HTML. (data-hygiene P6b)
+        "descriptionByte": first(&m, "descriptionByte"),
         "url": hit.get("url").and_then(Value::as_str),
         "status": first(&m, "status"),
         "type": first(&m, "type"),
