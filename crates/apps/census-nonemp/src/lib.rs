@@ -120,12 +120,21 @@ impl ScrapeApp for CensusNonemp {
             format!("for=state:{states}")
         };
 
+        // The NAICS classification vintage is year-dependent: NES 2017–2021 expose the
+        // trade codes under the NAICS2017 predicate, but the 2022 vintage switched to
+        // the 2022 classification, so the 2022 endpoint rejects NAICS2017 with HTTP 400
+        // "unknown predicate variable". Pick the variable from the requested year.
+        let naics_var = match year.parse::<u32>() {
+            Ok(y) if y >= 2022 => "NAICS2022",
+            _ => "NAICS2017",
+        };
+
         let mut all_records: Vec<(String, Value)> = Vec::new();
         let mut trade_summaries: Vec<Value> = Vec::new();
 
         for (naics, label) in &trades {
             let url = format!(
-                "https://api.census.gov/data/{year}/nonemp?get=NAME,NESTAB,NRCPTOT&{for_clause}&NAICS2017={naics}&key={api_key}"
+                "https://api.census.gov/data/{year}/nonemp?get=NAME,NESTAB,NRCPTOT&{for_clause}&{naics_var}={naics}&key={api_key}"
             );
             let resp = ctx.engines.http.fetch(HttpRequest::get(url)).await?;
             // 204 No Content (fully suppressed) or a non-JSON body → record a note,
