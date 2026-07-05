@@ -206,6 +206,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-trade-wages"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pumper-core",
+ "serde_json",
+]
+
+[[package]]
 name = "app-valuation-multiples"
 version = "0.1.0"
 dependencies = [
@@ -2777,6 +2786,7 @@ dependencies = [
  "app-readable",
  "app-research",
  "app-state-tax",
+ "app-trade-wages",
  "app-valuation-multiples",
  "async-stream",
  "axum",

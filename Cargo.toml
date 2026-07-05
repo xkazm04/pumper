@@ -33,6 +33,7 @@ app-census-nonemp = { path = "crates/apps/census-nonemp" }
 app-homewyse-pricing = { path = "crates/apps/homewyse-pricing" }
 app-state-tax = { path = "crates/apps/state-tax" }
 app-valuation-multiples = { path = "crates/apps/valuation-multiples" }
+app-trade-wages = { path = "crates/apps/trade-wages" }
 app-ca-grants = { path = "crates/apps/ca-grants" }
 app-eu-sedia = { path = "crates/apps/eu-sedia" }
 app-extractor = { path = "crates/apps/extractor" }

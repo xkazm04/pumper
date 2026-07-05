@@ -24,6 +24,7 @@ app-census-nonemp.workspace = true
 app-homewyse-pricing.workspace = true
 app-state-tax.workspace = true
 app-valuation-multiples.workspace = true
+app-trade-wages.workspace = true
 app-ca-grants.workspace = true
 app-eu-sedia.workspace = true
 app-extractor.workspace = true
