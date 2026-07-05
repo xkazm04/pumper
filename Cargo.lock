@@ -169,6 +169,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-mpsv-ispv"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pumper-core",
+ "serde_json",
+]
+
+[[package]]
+name = "app-mpsv-vpm"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "pumper-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "app-plugin"
 version = "0.1.0"
 dependencies = [
@@ -2782,6 +2802,8 @@ dependencies = [
  "app-grants-gov",
  "app-hackernews",
  "app-homewyse-pricing",
+ "app-mpsv-ispv",
+ "app-mpsv-vpm",
  "app-plugin",
  "app-readable",
  "app-research",

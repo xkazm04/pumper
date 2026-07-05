@@ -21,6 +21,8 @@ pub fn apps() -> Vec<Arc<dyn ScrapeApp>> {
         Arc::new(app_trade_wages::TradeWages),
         Arc::new(app_ca_grants::CaGrants),
         Arc::new(app_eu_sedia::EuSedia),
+        Arc::new(app_mpsv_vpm::MpsvVpm),
+        Arc::new(app_mpsv_ispv::MpsvIspv),
         Arc::new(app_extractor::Extractor),
         Arc::new(app_plugin::Plugin),
         Arc::new(app_crawl::Crawl),

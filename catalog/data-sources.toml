@@ -13,7 +13,9 @@
 #               gb, cz, ca (Canada), ...  NB: us-ca = California, ca = Canada
 #   name        human name of the source
 #   url         primary endpoint / portal
-#   category    open-calls | awarded-history | registry
+#   category    open-calls | awarded-history | registry | labor-market
+#               (labor-market = job postings + wage benchmarks; a separate domain
+#                from the grant/nonprofit categories above)
 #   engine      http | browser | claude | bulk        (http/browser = web, claude = llm, bulk = file download)
 #   access      key-free | api-key | bulk | scrape
 #   cadence     one-time | on-demand | daily | weekly | monthly | quarterly | annual
@@ -301,3 +303,104 @@ status = "planned"
 confidence = 5
 dataset = "orgs"
 notes = "Canada's clean national registry (~86k charities, 24 T3010 CSVs). Canada has NO open-calls API — opps are scrape/LLM."
+
+# ── Czech labor market (job postings + wage benchmarks) ──────────────────────
+# A distinct domain from the grant pipelines above: reference salaries, JD
+# references, and trending/fading roles for the `kp` app. Official MPSV open data
+# is the backbone; commercial boards are ToS-risky and kept planned/blocked.
+
+[[source]]
+id = "mpsv-vpm"
+app = "mpsv-vpm"
+market = "cz"
+name = "MPSV / ÚP ČR – Volná místa za celou ČR (national vacancy register)"
+url = "https://data.mpsv.cz/od/soubory/volna-mista/volna-mista.json"
+category = "labor-market"
+engine = "http"
+access = "key-free"
+cadence = "daily"
+cron = "0 0 6 * * *"
+status = "live"
+confidence = 5
+dataset = "role_region_agg"
+notes = "~188 MB single JSON {polozky:[]}, replaced daily, CC BY 4.0. Per posting: monthly salary min/max CZK, profeseCzIsco, employer IČO, kraj/okres/obec, public/agency flags. Parsed to a typed subset and aggregated in-memory (CZ-ISCO×kraj×orgType) → role_region_agg (+ national kraj=ALL cell) and vacancy_samples; a full per-posting upsert is avoided (upsert_many is per-row). Needs the raised [http] timeout_secs. Verified live 2026-07-05."
+
+[[source]]
+id = "mpsv-ispv"
+app = "mpsv-ispv"
+market = "cz"
+name = "MPSV – ISPV average earnings by CZ-ISCO (wage benchmarks)"
+url = "https://data.mpsv.cz/od/soubory/ispv-zamestnani/ispv-zamestnani.json"
+category = "labor-market"
+engine = "http"
+access = "key-free"
+cadence = "quarterly"
+cron = "0 0 7 1 */3 *"
+status = "live"
+confidence = 5
+dataset = "wages"
+notes = "~320 KB {polozky:[]}, CC BY 4.0. Median/mean + monthly deciles D1/Q1/Q3/D9 per czIsco|sfera (MZDOVA wage vs PLATOVA salary sphere). The salary-calibration anchor joined to mpsv-vpm on czIsco. Verified live 2026-07-05."
+
+[[source]]
+id = "mpsv-vpm-prirustky"
+app = ""
+market = "cz"
+name = "MPSV – Přírůstky volných míst (daily vacancy increments)"
+url = "https://data.mpsv.cz/web/data/prirustky-volnych-mist-za-celou-cr"
+category = "labor-market"
+engine = "http"
+access = "key-free"
+cadence = "daily"
+cron = ""
+status = "planned"
+confidence = 5
+dataset = "role_region_agg"
+notes = "Lighter daily-delta companion to the full feed; exact /od/soubory distribution URL still TBD (guessed slugs 404). Wire as the scheduled pump to avoid re-downloading the 188 MB full file daily."
+
+[[source]]
+id = "jooble-cz"
+app = ""
+market = "cz"
+name = "Jooble aggregator (CZ)"
+url = "https://jooble.org/api/about"
+category = "labor-market"
+engine = "http"
+access = "api-key"
+cadence = "on-demand"
+cron = ""
+status = "planned"
+confidence = 4
+dataset = "role_region_agg"
+notes = "Official free partner REST API (GUID key on request, no card). Commercial/IT/startup breadth the official feed under-weights; salary sparse/optional. POST https://jooble.org/api/{KEY}. Scaffold when a key is provided."
+
+[[source]]
+id = "startupjobs-cz"
+app = ""
+market = "cz"
+name = "StartupJobs.cz public API"
+url = "https://api.startupjobs.cz/company/offers"
+category = "labor-market"
+engine = "http"
+access = "api-key"
+cadence = "on-demand"
+cron = ""
+status = "planned"
+confidence = 3
+dataset = "role_region_agg"
+notes = "Partner-gated Bearer token (email support@startupjobs.com). Clean CZK startup salary ranges. Sitemap fallback (robots Allow:/) at lower confidence if no token is granted."
+
+[[source]]
+id = "jobs-cz"
+app = ""
+market = "cz"
+name = "jobs.cz / prace.cz (LMC / Alma Career), Indeed CZ, volnamista.cz"
+url = "https://www.jobs.cz/prace/"
+category = "labor-market"
+engine = "browser"
+access = "scrape"
+cadence = "on-demand"
+cron = ""
+status = "blocked"
+confidence = 2
+dataset = ""
+notes = "No public read API; JS SPA; LMC ToS is the binding constraint (robots allows /prace/ but the ToS does not). Indeed CZ's public job API is deprecated; volnamista.cz is ingest-only XML. High legal risk — deliberately NOT ingested in v1."

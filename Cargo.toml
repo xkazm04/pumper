@@ -36,6 +36,8 @@ app-valuation-multiples = { path = "crates/apps/valuation-multiples" }
 app-trade-wages = { path = "crates/apps/trade-wages" }
 app-ca-grants = { path = "crates/apps/ca-grants" }
 app-eu-sedia = { path = "crates/apps/eu-sedia" }
+app-mpsv-vpm = { path = "crates/apps/mpsv-vpm" }
+app-mpsv-ispv = { path = "crates/apps/mpsv-ispv" }
 app-extractor = { path = "crates/apps/extractor" }
 app-plugin = { path = "crates/apps/plugin" }
 app-crawl = { path = "crates/apps/crawl" }

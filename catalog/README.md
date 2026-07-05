@@ -21,7 +21,7 @@ Every `[[source]]` has these fields:
 | `market` | string | jurisdiction id in the app's scheme — `us`, `us-ca` (California), `eu`, `au`, `gb`, `cz`, `ca` (Canada)… **`us-ca` = California, `ca` = Canada** |
 | `name` | string | human name of the source |
 | `url` | string | primary endpoint / portal |
-| `category` | enum | **`open-calls`** (opportunities + deadlines) · **`awarded-history`** (who funded whom) · **`registry`** (org identity/eligibility) |
+| `category` | enum | **`open-calls`** (opportunities + deadlines) · **`awarded-history`** (who funded whom) · **`registry`** (org identity/eligibility) · **`labor-market`** (job postings + wage benchmarks — a separate domain, for the `kp` app) |
 | `engine` | enum | **`http`** · **`browser`** · **`claude`** · **`bulk`** — the import mechanism (`http`/`browser` = web, `claude` = LLM, `bulk` = file download) |
 | `access` | enum | `key-free` · `api-key` · `bulk` · `scrape` |
 | `cadence` | enum | `one-time` · `on-demand` · `daily` · `weekly` · `monthly` · `quarterly` · `annual` |
@@ -58,8 +58,14 @@ feeds are scarce**, awarded-history and registry data are abundant. A market is
 | uk-charity-commission | gb | registry | http (api-key) | on-demand | planned | 5 |
 | cz-eufunds | cz | open-calls | http | weekly | planned | 4 |
 | cra-charities | ca | registry | bulk | annual | planned | 5 |
+| **mpsv-vpm** | cz | labor-market | http | daily | **live** | 5 |
+| **mpsv-ispv** | cz | labor-market | http | quarterly | **live** | 5 |
+| mpsv-vpm-prirustky | cz | labor-market | http | daily | planned | 5 |
+| jooble-cz | cz | labor-market | http (api-key) | on-demand | planned | 4 |
+| startupjobs-cz | cz | labor-market | http (api-key) | on-demand | planned | 3 |
+| jobs-cz | cz | labor-market | browser | on-demand | blocked | 2 |
 
-**State:** 3 live · 14 planned. Build order follows the market research
+**State:** 5 live · 17 planned · 1 blocked. Build order follows the market research
 (`grant-writing-nonprofits/docs/data-source-market-map.md`): US federal → CA →
 Australia → EU SEDIA → UK, then the browser/LLM scrapers.
 
