@@ -16,6 +16,8 @@ pub fn apps() -> Vec<Arc<dyn ScrapeApp>> {
         Arc::new(app_census_density::CensusDensity),
         Arc::new(app_census_nonemp::CensusNonemp),
         Arc::new(app_homewyse_pricing::HomewysePricing),
+        Arc::new(app_state_tax::StateTax),
+        Arc::new(app_valuation_multiples::ValuationMultiples),
         Arc::new(app_ca_grants::CaGrants),
         Arc::new(app_eu_sedia::EuSedia),
         Arc::new(app_extractor::Extractor),

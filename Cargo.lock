@@ -197,6 +197,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-state-tax"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pumper-core",
+ "serde_json",
+]
+
+[[package]]
+name = "app-valuation-multiples"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pumper-core",
+ "serde_json",
+]
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2758,6 +2776,8 @@ dependencies = [
  "app-plugin",
  "app-readable",
  "app-research",
+ "app-state-tax",
+ "app-valuation-multiples",
  "async-stream",
  "axum",
  "chrono",
