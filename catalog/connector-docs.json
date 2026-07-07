@@ -1,0 +1,860 @@
+{
+  "version": 1,
+  "note": "Watch list for the pumper connector-api-watch app. Generated from scripts/connectors/builtin/*.json (connectors with a public docs_url). Copy into pumper/catalog/connector-docs.json. Do not hand-edit; regenerate with node scripts/events/generate-connector-events.mjs.",
+  "connectors": [
+    {
+      "slug": "airtable",
+      "label": "Airtable",
+      "docs_url": "https://airtable.com/create/tokens",
+      "icon": "/icons/connectors/airtable.svg",
+      "color": "#18BFFF"
+    },
+    {
+      "slug": "alpha_vantage",
+      "label": "Alpha Vantage",
+      "docs_url": "https://www.alphavantage.co/documentation/",
+      "icon": "/icons/connectors/alpha-vantage.svg",
+      "color": "#222832"
+    },
+    {
+      "slug": "apify",
+      "label": "Apify",
+      "docs_url": "https://docs.apify.com/api/v2",
+      "icon": "/icons/connectors/apify.svg",
+      "color": "#246DFF"
+    },
+    {
+      "slug": "arcade",
+      "label": "Arcade",
+      "docs_url": "https://docs.arcade.dev/",
+      "icon": "/icons/connectors/arcade.svg",
+      "color": "#F97316"
+    },
+    {
+      "slug": "arxiv",
+      "label": "arXiv",
+      "docs_url": "https://info.arxiv.org/help/api/index.html",
+      "icon": "/icons/connectors/arxiv.svg",
+      "color": "#B31B1B"
+    },
+    {
+      "slug": "asana",
+      "label": "Asana",
+      "docs_url": "https://developers.asana.com/docs/personal-access-token",
+      "icon": "/icons/connectors/asana.svg",
+      "color": "#F06A6A"
+    },
+    {
+      "slug": "attio",
+      "label": "Attio",
+      "docs_url": "https://developers.attio.com/reference",
+      "icon": "/icons/connectors/attio.svg",
+      "color": "#4F46E5"
+    },
+    {
+      "slug": "aws_cloud",
+      "label": "Amazon Web Services",
+      "docs_url": "https://docs.aws.amazon.com/IAM/latest/UserGuide/id_credentials_access-keys.html",
+      "icon": "/icons/connectors/aws-s3.svg",
+      "color": "#FF9900"
+    },
+    {
+      "slug": "aws_s3",
+      "label": "AWS S3",
+      "docs_url": "https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html",
+      "icon": "/icons/connectors/aws-s3.svg",
+      "color": "#569A31"
+    },
+    {
+      "slug": "azure_cloud",
+      "label": "Microsoft Azure",
+      "docs_url": "https://learn.microsoft.com/en-us/azure/active-directory/develop/quickstart-register-app",
+      "icon": "/icons/connectors/azure-devops.svg",
+      "color": "#0078D4"
+    },
+    {
+      "slug": "azure_devops_org",
+      "label": "Azure DevOps (org-aware)",
+      "docs_url": "https://learn.microsoft.com/en-us/rest/api/azure/devops/",
+      "icon": "/icons/connectors/azure-devops.svg",
+      "color": "#0078D7"
+    },
+    {
+      "slug": "azure_devops",
+      "label": "Azure DevOps",
+      "docs_url": "https://learn.microsoft.com/en-us/rest/api/azure/devops/",
+      "icon": "/icons/connectors/azure-devops.svg",
+      "color": "#0078D7"
+    },
+    {
+      "slug": "backblaze_b2",
+      "label": "Backblaze B2",
+      "docs_url": "https://www.backblaze.com/docs/cloud-storage",
+      "icon": "/icons/connectors/backblaze-b2.svg",
+      "color": "#E21E29"
+    },
+    {
+      "slug": "betterstack",
+      "label": "Better Stack",
+      "docs_url": "https://betterstack.com/docs/uptime/api/getting-started-with-uptime-api/",
+      "icon": "/icons/connectors/betterstack.svg",
+      "color": "#E5484D"
+    },
+    {
+      "slug": "bright_data",
+      "label": "Bright Data",
+      "docs_url": "https://docs.brightdata.com",
+      "icon": "/icons/connectors/bright_data.svg",
+      "color": "#00B6FF"
+    },
+    {
+      "slug": "buffer",
+      "label": "Buffer",
+      "docs_url": "https://buffer.com/developers/api",
+      "icon": "/icons/connectors/buffer.svg",
+      "color": "#168EEA"
+    },
+    {
+      "slug": "cal_com",
+      "label": "Cal.com",
+      "docs_url": "https://cal.com/docs/api-reference/v2/introduction",
+      "icon": "/icons/connectors/cal-com.svg",
+      "color": "#292929"
+    },
+    {
+      "slug": "calendly",
+      "label": "Calendly",
+      "docs_url": "https://developer.calendly.com/api-docs/",
+      "icon": "/icons/connectors/calendly.svg",
+      "color": "#006BFF"
+    },
+    {
+      "slug": "canva",
+      "label": "Canva",
+      "docs_url": "https://www.canva.dev/docs/connect/",
+      "icon": "/icons/connectors/canva.svg",
+      "color": "#00C4CC"
+    },
+    {
+      "slug": "circleci",
+      "label": "CircleCI",
+      "docs_url": "https://circleci.com/docs/managing-api-tokens/",
+      "icon": "/icons/connectors/circleci.svg",
+      "color": "#343434"
+    },
+    {
+      "slug": "clickup",
+      "label": "ClickUp",
+      "docs_url": "https://clickup.com/api/developer-portal/authentication",
+      "icon": "/icons/connectors/clickup.svg",
+      "color": "#7B68EE"
+    },
+    {
+      "slug": "clockify",
+      "label": "Clockify",
+      "docs_url": "https://docs.clockify.me/",
+      "icon": "https://cdn.simpleicons.org/clockify/03A9F4",
+      "color": "#03A9F4"
+    },
+    {
+      "slug": "cloudflare_r2",
+      "label": "Cloudflare R2",
+      "docs_url": "https://developers.cloudflare.com/r2/api/",
+      "icon": "/icons/connectors/cloudflare-r2.svg",
+      "color": "#F38020"
+    },
+    {
+      "slug": "cloudflare",
+      "label": "Cloudflare",
+      "docs_url": "https://dash.cloudflare.com/profile/api-tokens",
+      "icon": "/icons/connectors/cloudflare.svg",
+      "color": "#F38020"
+    },
+    {
+      "slug": "confluence",
+      "label": "Confluence",
+      "docs_url": "https://id.atlassian.com/manage-profile/security/api-tokens",
+      "icon": "/icons/connectors/confluence.svg",
+      "color": "#172B4D"
+    },
+    {
+      "slug": "convex",
+      "label": "Convex",
+      "docs_url": "https://docs.convex.dev/http-api/",
+      "icon": "/icons/connectors/convex.svg",
+      "color": "#F97316"
+    },
+    {
+      "slug": "crisp",
+      "label": "Crisp",
+      "docs_url": "https://docs.crisp.chat/references/rest-api/v1/",
+      "icon": "/icons/connectors/crisp.svg",
+      "color": "#4B60F5"
+    },
+    {
+      "slug": "deepgram",
+      "label": "Deepgram",
+      "docs_url": "https://developers.deepgram.com/reference",
+      "icon": "/icons/connectors/deepgram.svg",
+      "color": "#13EF93"
+    },
+    {
+      "slug": "desktop_docker",
+      "label": "Docker",
+      "docs_url": "https://docs.docker.com/reference/cli/docker/",
+      "icon": "/icons/connectors/docker.svg",
+      "color": "#2496ED"
+    },
+    {
+      "slug": "desktop_obsidian",
+      "label": "Obsidian",
+      "docs_url": "https://obsidian.md/",
+      "icon": "/icons/connectors/obsidian.svg",
+      "color": "#7C3AED"
+    },
+    {
+      "slug": "digitalocean",
+      "label": "DigitalOcean",
+      "docs_url": "https://docs.digitalocean.com/reference/api/",
+      "icon": "/icons/connectors/digitalocean.svg",
+      "color": "#0080FF"
+    },
+    {
+      "slug": "discord_webhook",
+      "label": "Discord (channel webhook)",
+      "docs_url": "https://support.discord.com/hc/en-us/articles/228383668",
+      "icon": "/icons/connectors/discord.svg",
+      "color": "#5865F2"
+    },
+    {
+      "slug": "discord",
+      "label": "Discord",
+      "docs_url": "https://discord.com/developers/applications",
+      "icon": "/icons/connectors/discord.svg",
+      "color": "#5865F2"
+    },
+    {
+      "slug": "dropbox",
+      "label": "Dropbox",
+      "docs_url": "https://www.dropbox.com/developers/apps",
+      "icon": "/icons/connectors/dropbox.svg",
+      "color": "#0061FF"
+    },
+    {
+      "slug": "duckdb",
+      "label": "DuckDB",
+      "docs_url": "https://duckdb.org/docs/connect/overview",
+      "icon": "/icons/connectors/duckdb.svg",
+      "color": "#FFC107"
+    },
+    {
+      "slug": "elevenlabs",
+      "label": "ElevenLabs",
+      "docs_url": "https://elevenlabs.io/docs/api-reference",
+      "icon": "/icons/connectors/elevenlabs.svg",
+      "color": "#000000"
+    },
+    {
+      "slug": "figma",
+      "label": "Figma",
+      "docs_url": "https://www.figma.com/developers/api",
+      "icon": "/icons/connectors/figma.svg",
+      "color": "#F24E1E"
+    },
+    {
+      "slug": "firecrawl",
+      "label": "Firecrawl",
+      "docs_url": "https://docs.firecrawl.dev/introduction",
+      "icon": "/icons/connectors/firecrawl.svg",
+      "color": "#F97316"
+    },
+    {
+      "slug": "fly_io",
+      "label": "Fly.io",
+      "docs_url": "https://fly.io/docs/reference/",
+      "icon": "/icons/connectors/fly-io.svg",
+      "color": "#7B3FE4"
+    },
+    {
+      "slug": "formbricks",
+      "label": "Formbricks",
+      "docs_url": "https://formbricks.com/docs/api/overview",
+      "icon": "/icons/connectors/formbricks.svg",
+      "color": "#00C4B8"
+    },
+    {
+      "slug": "gcp_cloud",
+      "label": "Google Cloud Platform",
+      "docs_url": "https://cloud.google.com/iam/docs/service-account-overview",
+      "icon": "/icons/connectors/google.svg",
+      "color": "#4285F4"
+    },
+    {
+      "slug": "gemini_vision",
+      "label": "Gemini Vision",
+      "docs_url": "https://ai.google.dev/gemini-api/docs",
+      "icon": "/icons/connectors/gemini-vision.svg",
+      "color": "#4285F4"
+    },
+    {
+      "slug": "generic_webhook",
+      "label": "Generic JSON webhook",
+      "docs_url": "https://docs.personas.app/docs/notifications",
+      "icon": "/icons/connectors/webhook.svg",
+      "color": "#6B7280"
+    },
+    {
+      "slug": "github_actions",
+      "label": "GitHub Actions",
+      "docs_url": "https://github.com/settings/tokens",
+      "icon": "/icons/connectors/github.svg",
+      "color": "#2088FF"
+    },
+    {
+      "slug": "github",
+      "label": "GitHub",
+      "docs_url": "https://github.com/settings/tokens",
+      "icon": "/icons/connectors/github.svg",
+      "color": "#1F2937"
+    },
+    {
+      "slug": "gitlab",
+      "label": "GitLab",
+      "docs_url": "https://docs.gitlab.com/ee/api/rest/",
+      "icon": "/icons/connectors/gitlab.svg",
+      "color": "#FC6D26"
+    },
+    {
+      "slug": "gmail",
+      "label": "Gmail",
+      "docs_url": "https://developers.google.com/workspace/gmail/api/reference/rest",
+      "icon": "/icons/connectors/gmail.svg",
+      "color": "#EA4335"
+    },
+    {
+      "slug": "google_ads",
+      "label": "Google Ads",
+      "docs_url": "https://developers.google.com/google-ads/api/rest/overview",
+      "icon": "/icons/connectors/google-ads.svg",
+      "color": "#4285F4"
+    },
+    {
+      "slug": "google_calendar",
+      "label": "Google Calendar",
+      "docs_url": "https://developers.google.com/calendar/api/v3/reference",
+      "icon": "/icons/connectors/google-calendar.svg",
+      "color": "#4285F4"
+    },
+    {
+      "slug": "google_drive",
+      "label": "Google Drive",
+      "docs_url": "https://developers.google.com/drive/api/guides/about-sdk",
+      "icon": "/icons/connectors/google-drive.svg",
+      "color": "#1FA463"
+    },
+    {
+      "slug": "google_gemini",
+      "label": "Google Gemini",
+      "docs_url": "https://ai.google.dev/gemini-api/docs",
+      "icon": "/icons/connectors/google-gemini.svg",
+      "color": "#4285F4"
+    },
+    {
+      "slug": "google_sheets",
+      "label": "Google Sheets",
+      "docs_url": "https://developers.google.com/workspace/sheets/api/reference/rest",
+      "icon": "/icons/connectors/google-sheets.svg",
+      "color": "#34A853"
+    },
+    {
+      "slug": "google_workspace_oauth_template",
+      "label": "Google Workspace",
+      "docs_url": "https://console.cloud.google.com/apis/credentials",
+      "icon": "/icons/connectors/google.svg",
+      "color": "#4285F4"
+    },
+    {
+      "slug": "granola",
+      "label": "Granola",
+      "docs_url": "https://docs.granola.ai/introduction",
+      "icon": "/icons/connectors/granola.svg",
+      "color": "#C49A6C"
+    },
+    {
+      "slug": "harvest",
+      "label": "Harvest",
+      "docs_url": "https://help.getharvest.com/api-v2/",
+      "icon": "/icons/connectors/harvest.svg",
+      "color": "#FA5D00"
+    },
+    {
+      "slug": "helicone",
+      "label": "Helicone",
+      "docs_url": "https://docs.helicone.ai/rest/request/post-v1requestquery",
+      "icon": "/icons/connectors/helicone.svg",
+      "color": "#F1A208"
+    },
+    {
+      "slug": "higgsfield",
+      "label": "Higgsfield",
+      "docs_url": "https://github.com/higgsfield-ai/higgsfield-js",
+      "icon": "/icons/connectors/higgsfield.svg",
+      "color": "#5B5FFF"
+    },
+    {
+      "slug": "hubspot",
+      "label": "HubSpot",
+      "docs_url": "https://developers.hubspot.com/docs/api/private-apps",
+      "icon": "/icons/connectors/hubspot.svg",
+      "color": "#FF7A59"
+    },
+    {
+      "slug": "humbalytics",
+      "label": "Humbalytics",
+      "docs_url": "https://humbalytics.com/docs/api",
+      "icon": "/icons/connectors/humbalytics.svg",
+      "color": "#7C3AED"
+    },
+    {
+      "slug": "jira",
+      "label": "Jira",
+      "docs_url": "https://id.atlassian.com/manage-profile/security/api-tokens",
+      "icon": "/icons/connectors/jira.svg",
+      "color": "#0052CC"
+    },
+    {
+      "slug": "kalshi",
+      "label": "Kalshi",
+      "docs_url": "https://docs.kalshi.com",
+      "icon": "/icons/connectors/kalshi.svg",
+      "color": "#4DE4B2"
+    },
+    {
+      "slug": "knock",
+      "label": "Knock",
+      "docs_url": "https://docs.knock.app/reference",
+      "icon": "/icons/connectors/knock.svg",
+      "color": "#6C47FF"
+    },
+    {
+      "slug": "kubernetes",
+      "label": "Kubernetes",
+      "docs_url": "https://kubernetes.io/docs/reference/kubernetes-api/",
+      "icon": "/icons/connectors/kubernetes.svg",
+      "color": "#326CE5"
+    },
+    {
+      "slug": "langfuse",
+      "label": "Langfuse",
+      "docs_url": "https://langfuse.com/docs/api",
+      "icon": "/icons/connectors/langfuse.svg",
+      "color": "#0A60FF"
+    },
+    {
+      "slug": "langsmith",
+      "label": "LangSmith",
+      "docs_url": "https://docs.smith.langchain.com/reference/api",
+      "icon": "/icons/connectors/langsmith.svg",
+      "color": "#1C3C3C"
+    },
+    {
+      "slug": "lemonsqueezy",
+      "label": "Lemon Squeezy",
+      "docs_url": "https://docs.lemonsqueezy.com/api",
+      "icon": "/icons/connectors/lemonsqueezy.svg",
+      "color": "#FFC233"
+    },
+    {
+      "slug": "leonardo_ai",
+      "label": "Leonardo AI",
+      "docs_url": "https://docs.leonardo.ai/docs/getting-started",
+      "icon": "/icons/connectors/leonardo-ai.svg",
+      "color": "#6C3AEF"
+    },
+    {
+      "slug": "linear",
+      "label": "Linear",
+      "docs_url": "https://linear.app/settings/api",
+      "icon": "/icons/connectors/linear.svg",
+      "color": "#5E6AD2"
+    },
+    {
+      "slug": "linkedin_ads",
+      "label": "LinkedIn Ads",
+      "docs_url": "https://learn.microsoft.com/en-us/linkedin/marketing/integrations/ads-reporting/ads-reporting",
+      "icon": "/icons/connectors/linkedin-ads.svg",
+      "color": "#0A66C2"
+    },
+    {
+      "slug": "linkedin",
+      "label": "LinkedIn",
+      "docs_url": "https://learn.microsoft.com/en-us/linkedin/shared/authentication/authorization-code-flow",
+      "icon": "/icons/connectors/linkedin.svg",
+      "color": "#0A66C2"
+    },
+    {
+      "slug": "mcp_gateway",
+      "label": "MCP Gateway",
+      "docs_url": "https://modelcontextprotocol.io/",
+      "icon": "/icons/connectors/mcp_gateway.svg",
+      "color": "#6366F1"
+    },
+    {
+      "slug": "meta_ads",
+      "label": "Meta Ads",
+      "docs_url": "https://developers.facebook.com/docs/marketing-api/overview",
+      "icon": "/icons/connectors/meta-ads.svg",
+      "color": "#1877F2"
+    },
+    {
+      "slug": "metabase",
+      "label": "Metabase",
+      "docs_url": "https://www.metabase.com/docs/latest/api",
+      "icon": "/icons/connectors/metabase.svg",
+      "color": "#509EE3"
+    },
+    {
+      "slug": "microsoft_calendar",
+      "label": "Microsoft Outlook Calendar",
+      "docs_url": "https://learn.microsoft.com/en-us/graph/api/resources/calendar",
+      "icon": "/icons/connectors/microsoft-calendar.svg",
+      "color": "#0078D4"
+    },
+    {
+      "slug": "microsoft_excel",
+      "label": "Microsoft Excel",
+      "docs_url": "https://learn.microsoft.com/en-us/graph/api/resources/excel",
+      "icon": "/icons/connectors/microsoft-excel.svg",
+      "color": "#217346"
+    },
+    {
+      "slug": "microsoft_outlook",
+      "label": "Microsoft Outlook",
+      "docs_url": "https://learn.microsoft.com/en-us/graph/api/resources/mail-api-overview",
+      "icon": "/icons/connectors/microsoft-outlook.svg",
+      "color": "#0078D4"
+    },
+    {
+      "slug": "microsoft_teams",
+      "label": "Microsoft Teams",
+      "docs_url": "https://learn.microsoft.com/en-us/graph/api/resources/teams-api-overview",
+      "icon": "/icons/connectors/microsoft-teams.svg",
+      "color": "#6264A7"
+    },
+    {
+      "slug": "mixpanel",
+      "label": "Mixpanel",
+      "docs_url": "https://developer.mixpanel.com/reference/project-secret",
+      "icon": "/icons/connectors/mixpanel.svg",
+      "color": "#7856FF"
+    },
+    {
+      "slug": "monday",
+      "label": "Monday.com",
+      "docs_url": "https://developer.monday.com/api-reference/docs/authentication",
+      "icon": "/icons/connectors/monday.svg",
+      "color": "#FF3D57"
+    },
+    {
+      "slug": "mongodb",
+      "label": "MongoDB",
+      "docs_url": "https://www.mongodb.com/docs/manual/reference/connection-string/",
+      "icon": "/icons/connectors/mongodb.svg",
+      "color": "#47A248"
+    },
+    {
+      "slug": "n8n",
+      "label": "n8n",
+      "docs_url": "https://docs.n8n.io/api/",
+      "icon": "/icons/connectors/n8n.svg",
+      "color": "#EA4B71"
+    },
+    {
+      "slug": "neon",
+      "label": "Neon",
+      "docs_url": "https://neon.tech/docs/manage/api-keys",
+      "icon": "/icons/connectors/neon.svg",
+      "color": "#00E699"
+    },
+    {
+      "slug": "netlify",
+      "label": "Netlify",
+      "docs_url": "https://app.netlify.com/user/applications#personal-access-tokens",
+      "icon": "/icons/connectors/netlify.svg",
+      "color": "#00C7B7"
+    },
+    {
+      "slug": "news_api",
+      "label": "News API",
+      "docs_url": "https://newsapi.org/docs",
+      "icon": "/icons/connectors/news-api.svg",
+      "color": "#CF212B"
+    },
+    {
+      "slug": "notion",
+      "label": "Notion",
+      "docs_url": "https://www.notion.so/my-integrations",
+      "icon": "/icons/connectors/notion.svg",
+      "color": "#000000"
+    },
+    {
+      "slug": "novu",
+      "label": "Novu",
+      "docs_url": "https://docs.novu.co/api-reference/overview",
+      "icon": "/icons/connectors/novu.svg",
+      "color": "#FF4981"
+    },
+    {
+      "slug": "ntfy",
+      "label": "ntfy",
+      "docs_url": "https://docs.ntfy.sh/",
+      "icon": "/icons/connectors/ntfy.svg",
+      "color": "#317F6E"
+    },
+    {
+      "slug": "obsidian",
+      "label": "Obsidian",
+      "docs_url": "https://coddingtonbear.github.io/obsidian-local-rest-api/",
+      "icon": "/icons/connectors/obsidian.svg",
+      "color": "#7C3AED"
+    },
+    {
+      "slug": "onedrive",
+      "label": "OneDrive",
+      "docs_url": "https://learn.microsoft.com/en-us/graph/api/resources/onedrive",
+      "icon": "/icons/connectors/onedrive.svg",
+      "color": "#0078D4"
+    },
+    {
+      "slug": "penpot",
+      "label": "Penpot",
+      "docs_url": "https://penpot.app/developers",
+      "icon": "/icons/connectors/penpot.svg",
+      "color": "#0D1117"
+    },
+    {
+      "slug": "pipedrive",
+      "label": "Pipedrive",
+      "docs_url": "https://developers.pipedrive.com/docs/api/v1",
+      "icon": "/icons/connectors/pipedrive.svg",
+      "color": "#017737"
+    },
+    {
+      "slug": "planetscale",
+      "label": "PlanetScale",
+      "docs_url": "https://planetscale.com/docs/concepts/service-tokens",
+      "icon": "/icons/connectors/planetscale.svg",
+      "color": "#000000"
+    },
+    {
+      "slug": "postgres",
+      "label": "PostgreSQL",
+      "docs_url": "https://www.postgresql.org/docs/current/libpq-connect.html",
+      "icon": "/icons/connectors/postgres.svg",
+      "color": "#336791"
+    },
+    {
+      "slug": "posthog",
+      "label": "PostHog",
+      "docs_url": "https://posthog.com/docs/api",
+      "icon": "/icons/connectors/posthog.svg",
+      "color": "#F9BD2B"
+    },
+    {
+      "slug": "pubmed",
+      "label": "PubMed",
+      "docs_url": "https://www.ncbi.nlm.nih.gov/books/NBK25501/",
+      "icon": "/icons/connectors/pubmed.svg",
+      "color": "#326599"
+    },
+    {
+      "slug": "railway",
+      "label": "Railway",
+      "docs_url": "https://docs.railway.com/reference/public-api",
+      "icon": "/icons/connectors/railway.svg",
+      "color": "#0B0D0E"
+    },
+    {
+      "slug": "ramp",
+      "label": "Ramp",
+      "docs_url": "https://docs.ramp.com/developer-api/v1",
+      "icon": "/icons/connectors/ramp.svg",
+      "color": "#FFCD1C"
+    },
+    {
+      "slug": "redash",
+      "label": "Redash",
+      "docs_url": "https://redash.io/help/user-guide/integrations-and-api/api",
+      "icon": "/icons/connectors/redash.svg",
+      "color": "#FF7964"
+    },
+    {
+      "slug": "reddit",
+      "label": "Reddit",
+      "docs_url": "https://www.reddit.com/dev/api",
+      "icon": "/icons/connectors/reddit.svg",
+      "color": "#FF4500"
+    },
+    {
+      "slug": "redis",
+      "label": "Redis",
+      "docs_url": "https://redis.io/docs/latest/develop/connect/",
+      "icon": "/icons/connectors/redis.svg",
+      "color": "#DC382D"
+    },
+    {
+      "slug": "resend",
+      "label": "Resend",
+      "docs_url": "https://resend.com/docs/api-reference/introduction",
+      "icon": "/icons/connectors/resend.svg",
+      "color": "#000000"
+    },
+    {
+      "slug": "semantic_scholar",
+      "label": "Semantic Scholar",
+      "docs_url": "https://api.semanticscholar.org/",
+      "icon": "/icons/connectors/semantic-scholar.svg",
+      "color": "#1857B6"
+    },
+    {
+      "slug": "sendgrid",
+      "label": "SendGrid",
+      "docs_url": "https://docs.sendgrid.com/ui/account-and-settings/api-keys",
+      "icon": "/icons/connectors/sendgrid.svg",
+      "color": "#1A82E2"
+    },
+    {
+      "slug": "sentry",
+      "label": "Sentry",
+      "docs_url": "https://docs.sentry.io/api/guides/create-auth-token/",
+      "icon": "/icons/connectors/sentry.svg",
+      "color": "#362D59"
+    },
+    {
+      "slug": "sharepoint",
+      "label": "SharePoint",
+      "docs_url": "https://learn.microsoft.com/en-us/graph/api/resources/sharepoint",
+      "icon": "/icons/connectors/sharepoint.svg",
+      "color": "#038387"
+    },
+    {
+      "slug": "slack_webhook",
+      "label": "Slack (incoming webhook)",
+      "docs_url": "https://api.slack.com/messaging/webhooks",
+      "icon": "/icons/connectors/slack.svg",
+      "color": "#4A154B"
+    },
+    {
+      "slug": "slack",
+      "label": "Slack",
+      "docs_url": "https://api.slack.com/authentication/token-types",
+      "icon": "/icons/connectors/slack.svg",
+      "color": "#4A154B"
+    },
+    {
+      "slug": "stripe",
+      "label": "Stripe",
+      "docs_url": "https://stripe.com/docs/api",
+      "icon": "/icons/connectors/stripe.svg",
+      "color": "#635BFF"
+    },
+    {
+      "slug": "supabase",
+      "label": "Supabase",
+      "docs_url": "https://supabase.com/dashboard/project/_/settings/api",
+      "icon": "/icons/connectors/supabase.svg",
+      "color": "#3ECF8E"
+    },
+    {
+      "slug": "tally",
+      "label": "Tally",
+      "docs_url": "https://tally.so/help/developer-resources",
+      "icon": "/icons/connectors/tally.svg",
+      "color": "#3CCF91"
+    },
+    {
+      "slug": "teams_webhook",
+      "label": "Microsoft Teams (incoming webhook)",
+      "docs_url": "https://learn.microsoft.com/en-us/microsoftteams/platform/webhooks-and-connectors/how-to/add-incoming-webhook",
+      "icon": "/icons/connectors/microsoft-teams.svg",
+      "color": "#4B53BC"
+    },
+    {
+      "slug": "telegram",
+      "label": "Telegram",
+      "docs_url": "https://core.telegram.org/bots/api",
+      "icon": "/icons/connectors/telegram.svg",
+      "color": "#26A5E4"
+    },
+    {
+      "slug": "toggl",
+      "label": "Toggl Track",
+      "docs_url": "https://engineering.toggl.com/docs/",
+      "icon": "https://cdn.simpleicons.org/toggltrack/E57CD8",
+      "color": "#E57CD8"
+    },
+    {
+      "slug": "tracklight",
+      "label": "LightTrack",
+      "docs_url": "https://github.com/xkazm04/tracklight",
+      "icon": "/icons/connectors/tracklight.svg",
+      "color": "#0EA5E9"
+    },
+    {
+      "slug": "twilio_segment",
+      "label": "Twilio Segment",
+      "docs_url": "https://segment.com/docs/connections/sources/catalog/",
+      "icon": "/icons/connectors/twilio.svg",
+      "color": "#52BD94"
+    },
+    {
+      "slug": "twilio_sms",
+      "label": "Twilio",
+      "docs_url": "https://www.twilio.com/docs/usage/api",
+      "icon": "/icons/connectors/twilio.svg",
+      "color": "#F22F46"
+    },
+    {
+      "slug": "upstash",
+      "label": "Upstash",
+      "docs_url": "https://upstash.com/docs/redis/features/restapi",
+      "icon": "/icons/connectors/upstash.svg",
+      "color": "#00E9A3"
+    },
+    {
+      "slug": "vercel",
+      "label": "Vercel",
+      "docs_url": "https://vercel.com/account/tokens",
+      "icon": "/icons/connectors/vercel.svg",
+      "color": "#000000"
+    },
+    {
+      "slug": "woocommerce",
+      "label": "WooCommerce",
+      "docs_url": "https://woocommerce.github.io/woocommerce-rest-api-docs/",
+      "icon": "/icons/connectors/woocommerce.svg",
+      "color": "#96588A"
+    },
+    {
+      "slug": "x_twitter",
+      "label": "X (Twitter)",
+      "docs_url": "https://docs.x.com/x-api",
+      "icon": "/icons/connectors/x-twitter.svg",
+      "color": "#000000"
+    },
+    {
+      "slug": "youtube_data",
+      "label": "YouTube Data API",
+      "docs_url": "https://developers.google.com/youtube/v3/docs",
+      "icon": "/icons/connectors/youtube-data.svg",
+      "color": "#FF0000"
+    },
+    {
+      "slug": "zapier",
+      "label": "Zapier",
+      "docs_url": "https://platform.zapier.com/reference/introduction",
+      "icon": "/icons/connectors/zapier.svg",
+      "color": "#FF4A00"
+    }
+  ]
+}

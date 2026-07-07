@@ -23,6 +23,7 @@ pumper-engine-browser = { path = "crates/engine-browser" }
 pumper-engine-claude = { path = "crates/engine-claude" }
 pumper-engine-wasm = { path = "crates/engine-wasm" }
 pumper-engine-search = { path = "crates/engine-search" }
+app-connector-api-watch = { path = "crates/apps/connector-api-watch" }
 app-hackernews = { path = "crates/apps/hackernews" }
 app-research = { path = "crates/apps/research" }
 app-readable = { path = "crates/apps/readable" }

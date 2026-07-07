@@ -14,6 +14,7 @@ pumper-engine-browser.workspace = true
 pumper-engine-claude.workspace = true
 pumper-engine-wasm.workspace = true
 pumper-engine-search.workspace = true
+app-connector-api-watch.workspace = true
 app-hackernews.workspace = true
 app-research.workspace = true
 app-readable.workspace = true
