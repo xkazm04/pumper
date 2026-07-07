@@ -1,8 +1,18 @@
+// SQLite-backed modules (sqlx) — gated behind `storage` (default-on). The
+// AppContext/ScrapeApp runtime lives here too because AppContext owns the
+// Datasets store. Embedders that only need the engines + Fetcher build with
+// `default-features = false` and get everything below the `storage` line.
+#[cfg(feature = "storage")]
 pub mod app;
+#[cfg(feature = "storage")]
 pub mod cache;
+#[cfg(feature = "storage")]
+pub mod datasets;
+#[cfg(feature = "storage")]
+pub mod storage;
+
 pub mod config;
 pub mod crawl;
-pub mod datasets;
 pub mod engine;
 pub mod error;
 pub mod extract;
@@ -13,13 +23,18 @@ pub mod markdown;
 pub mod plugin;
 pub mod search;
 pub mod simhash;
-pub mod storage;
 
+#[cfg(feature = "storage")]
 pub use app::{AppContext, ScrapeApp};
+#[cfg(feature = "storage")]
 pub use cache::HttpCache;
+#[cfg(feature = "storage")]
+pub use datasets::{ChangeKind, Datasets, DupPair, Record, UpsertSummary};
+#[cfg(feature = "storage")]
+pub use storage::{EnqueueOptions, Schedule, Storage};
+
 pub use config::Config;
 pub use crawl::{crawl, CrawlConfig, CrawlPage, CrawlStats};
-pub use datasets::{ChangeKind, Datasets, DupPair, Record, UpsertSummary};
 pub use simhash::{hamming, simhash, simhash_value};
 pub use extract::{extract_batch, extract_one, CompiledRuleSet, Rule, RuleSet};
 pub use engine::{
@@ -33,4 +48,3 @@ pub use job::{Job, JobStatus};
 pub use markdown::html_to_markdown;
 pub use plugin::{NoPlugins, Plugins};
 pub use search::{NoSearch, Search, SearchDoc, SearchHit};
-pub use storage::{EnqueueOptions, Schedule, Storage};

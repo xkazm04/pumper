@@ -3,9 +3,18 @@ name = "pumper-core"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# `storage` pulls sqlx + the SQLite-backed modules (Storage/Datasets/HttpCache +
+# the AppContext/ScrapeApp runtime). Default-on for the Pumper server + apps.
+# Downstream embedders that only want the engine traits + Fetcher + Markdown
+# (e.g. Personas) depend with `default-features = false` to drop sqlx entirely
+# (avoids a duplicate libsqlite3 link against a bundled rusqlite).
+default = ["storage"]
+storage = ["dep:sqlx"]
+
 [dependencies]
 tokio.workspace = true
-sqlx.workspace = true
+sqlx = { workspace = true, optional = true }
 scraper.workspace = true
 ego-tree.workspace = true
 regex.workspace = true

@@ -6,6 +6,7 @@ pub enum Error {
     Browser(String),
     #[error("claude engine: {0}")]
     Claude(String),
+    #[cfg(feature = "storage")]
     #[error("storage: {0}")]
     Storage(#[from] sqlx::Error),
     #[error("parse: {0}")]
