@@ -12,6 +12,8 @@ pub mod costs;
 pub mod datasets;
 #[cfg(feature = "storage")]
 pub mod storage;
+#[cfg(feature = "storage")]
+pub mod tiers;
 
 pub mod config;
 pub mod crawl;
@@ -38,6 +40,8 @@ pub use datasets::{diff_values, ChangeKind, Datasets, DupPair, Record, Revision,
 pub use storage::{
     Delivery, EnqueueOptions, NewTrigger, SavedSearch, Schedule, Storage, Trigger, Watch,
 };
+#[cfg(feature = "storage")]
+pub use tiers::TierMemory;
 
 pub use config::Config;
 pub use crawl::{crawl, CrawlConfig, CrawlPage, CrawlStats};

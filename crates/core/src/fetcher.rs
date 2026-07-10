@@ -47,6 +47,11 @@ pub struct FetchRequest {
     /// Spend ceiling for the Claude tier of this fetch (`--max-budget-usd`).
     #[serde(default)]
     pub max_budget_usd: Option<f64>,
+    /// Skip the HTTP tier and start at the browser (set by the learned tier
+    /// router for hosts where HTTP persistently fails/thins out). Ignored for
+    /// the explicit `Http` strategy.
+    #[serde(default)]
+    pub skip_http: bool,
     /// Also produce clean Markdown alongside the raw HTML.
     #[serde(default)]
     pub to_markdown: bool,
@@ -61,6 +66,7 @@ impl FetchRequest {
             min_content_chars: None,
             research_prompt: None,
             max_budget_usd: None,
+            skip_http: false,
             to_markdown: false,
         }
     }
@@ -104,8 +110,12 @@ impl Fetcher {
         let min_chars = req.min_content_chars.unwrap_or(DEFAULT_MIN_CONTENT_CHARS);
         let mut escalations: Vec<String> = Vec::new();
 
-        // --- HTTP tier ---
-        if matches!(req.strategy, FetchStrategy::Http | FetchStrategy::Auto | FetchStrategy::AutoWithResearch) {
+        // --- HTTP tier --- (skip_http only applies to escalating strategies;
+        // an explicit Http strategy is the caller's call.)
+        let try_http = req.strategy == FetchStrategy::Http
+            || (!req.skip_http
+                && matches!(req.strategy, FetchStrategy::Auto | FetchStrategy::AutoWithResearch));
+        if try_http {
             match self.http.fetch(HttpRequest::get(&req.url)).await {
                 Ok(resp) => {
                     let markdown = html_to_markdown(&resp.body);
