@@ -3,6 +3,7 @@ mod registry;
 mod routes;
 mod scheduler;
 mod state;
+mod triggers;
 mod webhook;
 mod worker;
 

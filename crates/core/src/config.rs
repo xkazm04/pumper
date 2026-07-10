@@ -18,6 +18,23 @@ pub struct Config {
     pub cache: CacheConfig,
     pub plugins: PluginConfig,
     pub search: SearchConfig,
+    pub triggers: TriggersConfig,
+}
+
+/// Reactive-pipeline trigger evaluation limits.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct TriggersConfig {
+    /// Max reactive chain depth; hops past this are skipped (warn-logged).
+    pub max_depth: u32,
+    /// Max keys inlined into `params._trigger.keys` (`count` stays exact).
+    pub key_cap: usize,
+}
+
+impl Default for TriggersConfig {
+    fn default() -> Self {
+        Self { max_depth: 8, key_cap: 200 }
+    }
 }
 
 impl Config {
