@@ -35,14 +35,52 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+/// A full-text query with optional app/dataset scoping.
+#[derive(Debug, Clone, Default)]
+pub struct SearchRequest {
+    pub q: String,
+    pub limit: usize,
+    /// Restrict hits to one app.
+    pub app: Option<String>,
+    /// Restrict hits to one dataset.
+    pub dataset: Option<String>,
+}
+
+impl SearchRequest {
+    pub fn new(q: impl Into<String>, limit: usize) -> Self {
+        Self { q: q.into(), limit, ..Default::default() }
+    }
+}
+
+/// One facet bucket: a field value and how many matching docs carry it.
+#[derive(Debug, Clone, Serialize)]
+pub struct FacetCount {
+    pub value: String,
+    pub count: u64,
+}
+
+/// Facet breakdowns over the matching documents (sampled on large result sets).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SearchFacets {
+    pub apps: Vec<FacetCount>,
+    pub datasets: Vec<FacetCount>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct SearchResponse {
+    pub hits: Vec<SearchHit>,
+    pub facets: SearchFacets,
+}
+
 #[async_trait]
 pub trait Search: Send + Sync {
     /// Indexes a batch of documents (re-indexing an existing `id` replaces it)
     /// and commits so the results are immediately queryable.
     async fn index(&self, docs: Vec<SearchDoc>) -> Result<()>;
 
-    /// Runs a full-text query, returning up to `limit` ranked hits.
-    async fn query(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>>;
+    /// Runs a full-text query, returning ranked hits plus app/dataset facets
+    /// over the matching set.
+    async fn query(&self, req: SearchRequest) -> Result<SearchResponse>;
 }
 
 /// Fallback used when search is disabled.
@@ -53,7 +91,7 @@ impl Search for NoSearch {
     async fn index(&self, _docs: Vec<SearchDoc>) -> Result<()> {
         Ok(())
     }
-    async fn query(&self, _query: &str, _limit: usize) -> Result<Vec<SearchHit>> {
-        Ok(Vec::new())
+    async fn query(&self, _req: SearchRequest) -> Result<SearchResponse> {
+        Ok(SearchResponse::default())
     }
 }

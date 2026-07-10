@@ -7,11 +7,18 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use pumper_core::config::SearchConfig;
-use pumper_core::{Error, Result, Search, SearchDoc, SearchHit};
+use pumper_core::{
+    Error, FacetCount, Result, Search, SearchDoc, SearchFacets, SearchHit, SearchRequest,
+    SearchResponse,
+};
 use tantivy::collector::TopDocs;
-use tantivy::query::QueryParser;
-use tantivy::schema::{Field, Schema, STORED, STRING, TEXT};
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
+use tantivy::schema::{Field, IndexRecordOption, Schema, STORED, STRING, TEXT};
 use tantivy::{doc, Document, Index, IndexReader, IndexWriter, TantivyDocument, Term};
+
+/// Facet counts are computed over at most this many top-ranked matches — an
+/// honest sample that stays cheap on large result sets.
+const FACET_SAMPLE: usize = 1_000;
 
 #[derive(Clone, Copy)]
 struct Fields {
@@ -136,34 +143,60 @@ impl Search for TantivyIndex {
         .map_err(|e| Error::App(format!("index task panicked: {e}")))?
     }
 
-    async fn query(&self, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+    async fn query(&self, req: SearchRequest) -> Result<SearchResponse> {
         let index = self.index.clone();
         let reader = self.reader.clone();
         let schema = self.schema.clone();
         let f = self.fields;
-        let query = query.to_string();
-        tokio::task::spawn_blocking(move || -> Result<Vec<SearchHit>> {
+        tokio::task::spawn_blocking(move || -> Result<SearchResponse> {
             let searcher = reader.searcher();
             let parser = QueryParser::for_index(&index, vec![f.title, f.body]);
             let parsed = parser
-                .parse_query(&query)
+                .parse_query(&req.q)
                 .map_err(|e| Error::App(format!("bad search query: {e}")))?;
+
+            // Scope by app/dataset via exact term filters.
+            let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, parsed)];
+            if let Some(app) = &req.app {
+                clauses.push((
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(f.app, app),
+                        IndexRecordOption::Basic,
+                    )),
+                ));
+            }
+            if let Some(dataset) = &req.dataset {
+                clauses.push((
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(f.dataset, dataset),
+                        IndexRecordOption::Basic,
+                    )),
+                ));
+            }
+            let query: Box<dyn Query> = if clauses.len() == 1 {
+                clauses.pop().unwrap().1
+            } else {
+                Box::new(BooleanQuery::new(clauses))
+            };
+
+            let sample_size = req.limit.max(FACET_SAMPLE);
             let top = searcher
-                .search(&parsed, &TopDocs::with_limit(limit).order_by_score())
+                .search(&query, &TopDocs::with_limit(sample_size).order_by_score())
                 .map_err(|e| Error::App(format!("search: {e}")))?;
 
             // Highlighted body fragments; best-effort (empty on failure).
-            let snippets = tantivy::snippet::SnippetGenerator::create(&searcher, &parsed, f.body).ok();
+            let snippets =
+                tantivy::snippet::SnippetGenerator::create(&searcher, &*query, f.body).ok();
 
-            let mut hits = Vec::with_capacity(top.len());
-            for (score, address) in top {
+            let mut hits = Vec::with_capacity(req.limit.min(top.len()));
+            let mut app_counts: std::collections::BTreeMap<String, u64> = Default::default();
+            let mut dataset_counts: std::collections::BTreeMap<String, u64> = Default::default();
+            for (i, (score, address)) in top.iter().enumerate() {
                 let doc: TantivyDocument = searcher
-                    .doc(address)
+                    .doc(*address)
                     .map_err(|e| Error::App(format!("fetch doc: {e}")))?;
-                let snippet = snippets
-                    .as_ref()
-                    .map(|g| g.snippet_from_doc(&doc).to_html())
-                    .unwrap_or_default();
                 // Stored fields serialize as {"field": ["value"], ...}.
                 let json: serde_json::Value =
                     serde_json::from_str(&doc.to_json(&schema)).unwrap_or(serde_json::Value::Null);
@@ -174,17 +207,40 @@ impl Search for TantivyIndex {
                         .unwrap_or("")
                         .to_string()
                 };
-                hits.push(SearchHit {
-                    id: get("id"),
-                    app: get("app"),
-                    dataset: get("dataset"),
-                    url: get("url"),
-                    title: get("title"),
-                    score,
-                    snippet,
-                });
+                let (app, dataset) = (get("app"), get("dataset"));
+                *app_counts.entry(app.clone()).or_insert(0) += 1;
+                *dataset_counts.entry(dataset.clone()).or_insert(0) += 1;
+                if i < req.limit {
+                    let snippet = snippets
+                        .as_ref()
+                        .map(|g| g.snippet_from_doc(&doc).to_html())
+                        .unwrap_or_default();
+                    hits.push(SearchHit {
+                        id: get("id"),
+                        app,
+                        dataset,
+                        url: get("url"),
+                        title: get("title"),
+                        score: *score,
+                        snippet,
+                    });
+                }
             }
-            Ok(hits)
+            let to_facets = |counts: std::collections::BTreeMap<String, u64>| {
+                let mut list: Vec<FacetCount> = counts
+                    .into_iter()
+                    .map(|(value, count)| FacetCount { value, count })
+                    .collect();
+                list.sort_by(|a, b| b.count.cmp(&a.count));
+                list
+            };
+            Ok(SearchResponse {
+                hits,
+                facets: SearchFacets {
+                    apps: to_facets(app_counts),
+                    datasets: to_facets(dataset_counts),
+                },
+            })
         })
         .await
         .map_err(|e| Error::App(format!("query task panicked: {e}")))?

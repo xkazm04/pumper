@@ -833,13 +833,18 @@ struct SearchQuery {
     q: String,
     #[serde(default = "default_search_limit")]
     limit: usize,
+    /// Restrict hits to one app.
+    app: Option<String>,
+    /// Restrict hits to one dataset.
+    dataset: Option<String>,
 }
 
 fn default_search_limit() -> usize {
     20
 }
 
-/// Full-text search across everything indexed from job results (BM25 ranked).
+/// Full-text search across everything indexed from job results (BM25 ranked),
+/// with highlighted snippets and app/dataset facets over the matching set.
 async fn search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
@@ -847,8 +852,19 @@ async fn search(
     if query.q.trim().is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "query 'q' is required".into()));
     }
-    let hits = state.search.query(&query.q, query.limit.clamp(1, 100)).await?;
-    Ok(Json(json!({ "query": query.q, "count": hits.len(), "hits": hits })))
+    let req = pumper_core::SearchRequest {
+        q: query.q.clone(),
+        limit: query.limit.clamp(1, 100),
+        app: query.app,
+        dataset: query.dataset,
+    };
+    let results = state.search.query(req).await?;
+    Ok(Json(json!({
+        "query": query.q,
+        "count": results.hits.len(),
+        "hits": results.hits,
+        "facets": results.facets,
+    })))
 }
 
 // ---- WASM plugins ---------------------------------------------------------

@@ -51,4 +51,7 @@ pub use governor::Governor;
 pub use job::{Job, JobStatus};
 pub use markdown::html_to_markdown;
 pub use plugin::{NoPlugins, Plugins};
-pub use search::{NoSearch, Search, SearchDoc, SearchHit};
+pub use search::{
+    FacetCount, NoSearch, Search, SearchDoc, SearchFacets, SearchHit, SearchRequest,
+    SearchResponse,
+};
