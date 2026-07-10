@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use futures::stream::{FuturesUnordered, StreamExt};
 use scraper::{Html, Selector};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use url::Url;
 
 use crate::engine::{HttpClient, HttpRequest};
@@ -42,6 +42,10 @@ pub struct CrawlConfig {
     /// Expand seeds from each seed host's sitemaps (robots.txt `Sitemap:`
     /// directives, falling back to /sitemap.xml).
     pub sitemap_seeds: bool,
+    /// Persist frontier state here (JSON): loaded at start when present, saved
+    /// periodically and at the end — so an interrupted or page-capped crawl
+    /// resumes where it left off instead of refetching everything.
+    pub checkpoint: Option<PathBuf>,
 }
 
 /// Compiled include/exclude filter.
@@ -95,6 +99,8 @@ pub struct CrawlStats {
     pub skipped_filtered: usize,
     /// URLs seeded into the frontier from sitemaps.
     pub sitemap_seeded: usize,
+    /// True when this run restored frontier state from a checkpoint.
+    pub resumed: bool,
     pub hosts: usize,
     pub frontier_remaining: usize,
     pub pages: Vec<CrawlPage>,
@@ -146,6 +152,20 @@ pub async fn crawl(
     let concurrency = cfg.concurrency.clamp(1, 256);
     let filter = UrlFilter::compile(&cfg)?;
     let mut frontier = Frontier::new();
+    let mut kept_hashes: Vec<u64> = Vec::new();
+    let mut resumed = false;
+
+    // Restore a prior run's frontier + dedup state before seeding, so already
+    // -seen URLs (including the seeds) aren't re-enqueued.
+    if let Some(path) = &cfg.checkpoint {
+        if let Some(cp) = Checkpoint::load(path).await {
+            frontier.queue = cp.queue.into_iter().collect();
+            frontier.seen = cp.seen.into_iter().collect();
+            kept_hashes = cp.kept_hashes;
+            resumed = true;
+        }
+    }
+
     let mut seed_hosts: HashSet<String> = HashSet::new();
     for seed in &cfg.seeds {
         if let Some(host) = host_of(seed) {
@@ -158,9 +178,9 @@ pub async fn crawl(
     }
 
     let mut robots: HashMap<String, RobotRules> = HashMap::new();
-    let mut kept_hashes: Vec<u64> = Vec::new();
     let mut hosts: HashSet<String> = HashSet::new();
     let mut stats = CrawlStats::default();
+    stats.resumed = resumed;
     let mut in_flight = FuturesUnordered::new();
     // Per-host earliest-next-fetch, driven by robots.txt Crawl-delay.
     let mut next_allowed: HashMap<String, tokio::time::Instant> = HashMap::new();
@@ -242,6 +262,12 @@ pub async fn crawl(
                 let file = dir.join(format!("page-{:04}.html", stats.kept));
                 let _ = tokio::fs::write(file, &fetched.body).await;
             }
+            // Periodic checkpoint so a killed process loses at most one stride.
+            if stats.kept % CHECKPOINT_STRIDE == 0 {
+                if let Some(path) = &cfg.checkpoint {
+                    Checkpoint::save(path, &frontier, &kept_hashes).await;
+                }
+            }
             // Enqueue newly discovered links within the depth budget.
             if fetched.depth < cfg.max_depth {
                 for link in &fetched.links {
@@ -270,7 +296,46 @@ pub async fn crawl(
 
     stats.hosts = hosts.len();
     stats.frontier_remaining = frontier.queue.len();
+    if let Some(path) = &cfg.checkpoint {
+        Checkpoint::save(path, &frontier, &kept_hashes).await;
+    }
     Ok(stats)
+}
+
+const CHECKPOINT_STRIDE: usize = 25;
+
+/// Persisted frontier state: what is still queued, what has been seen, and the
+/// SimHash fingerprints of kept pages (so dedup survives the resume too).
+#[derive(Serialize, Deserialize)]
+struct Checkpoint {
+    queue: Vec<(String, u32)>,
+    seen: Vec<String>,
+    kept_hashes: Vec<u64>,
+}
+
+impl Checkpoint {
+    async fn load(path: &PathBuf) -> Option<Self> {
+        let bytes = tokio::fs::read(path).await.ok()?;
+        serde_json::from_slice(&bytes).ok()
+    }
+
+    /// Best-effort save; checkpointing must never fail the crawl.
+    async fn save(path: &PathBuf, frontier: &Frontier, kept_hashes: &[u64]) {
+        let cp = Checkpoint {
+            queue: frontier.queue.iter().cloned().collect(),
+            seen: frontier.seen.iter().cloned().collect(),
+            kept_hashes: kept_hashes.to_vec(),
+        };
+        let Ok(bytes) = serde_json::to_vec(&cp) else { return };
+        if let Some(parent) = path.parent() {
+            tokio::fs::create_dir_all(parent).await.ok();
+        }
+        // Write-then-rename so a crash mid-write can't corrupt the checkpoint.
+        let tmp = path.with_extension("json.tmp");
+        if tokio::fs::write(&tmp, bytes).await.is_ok() {
+            tokio::fs::rename(&tmp, path).await.ok();
+        }
+    }
 }
 
 async fn fetch_one(
@@ -525,6 +590,7 @@ mod tests {
             include_patterns: vec!["/blog/".into()],
             exclude_patterns: vec!["\\.pdf$".into()],
             sitemap_seeds: false,
+            checkpoint: None,
         };
         let f = UrlFilter::compile(&cfg).unwrap();
         assert!(f.allows("https://x.com/blog/post"));

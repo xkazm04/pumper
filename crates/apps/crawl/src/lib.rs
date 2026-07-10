@@ -19,7 +19,8 @@ impl ScrapeApp for Crawl {
         "High-concurrency broad crawler. Params: {\"seeds\": [..], \"max_pages\": 50, \
          \"max_depth\": 2, \"concurrency\": 16, \"same_domain\": true, \
          \"dedup_distance\": 3, \"respect_robots\": true, \
-         \"include_patterns\": [\"regex\", ..], \"exclude_patterns\": [\"regex\", ..]}"
+         \"include_patterns\": [\"regex\", ..], \"exclude_patterns\": [\"regex\", ..], \
+         \"sitemap_seeds\": false, \"checkpoint\": \"name\" (resumable frontier)}"
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -56,6 +57,23 @@ impl ScrapeApp for Crawl {
             include_patterns: str_array("include_patterns"),
             exclude_patterns: str_array("exclude_patterns"),
             sitemap_seeds: bool_param("sitemap_seeds", false),
+            // Named checkpoints live beside (not inside) the per-job artifacts
+            // dir, so a later job with the same name resumes the crawl.
+            checkpoint: ctx
+                .params
+                .get("checkpoint")
+                .and_then(Value::as_str)
+                .map(|name| {
+                    let safe: String = name
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                        .collect();
+                    ctx.artifacts_dir
+                        .parent()
+                        .unwrap_or(&ctx.artifacts_dir)
+                        .join("checkpoints")
+                        .join(format!("{safe}.json"))
+                }),
         };
 
         let stats = crawl(ctx.engines.http.clone(), cfg, Some(ctx.artifacts_dir.clone())).await?;
@@ -66,6 +84,7 @@ impl ScrapeApp for Crawl {
             "skipped_robots": stats.skipped_robots,
             "skipped_filtered": stats.skipped_filtered,
             "sitemap_seeded": stats.sitemap_seeded,
+            "resumed": stats.resumed,
             "hosts": stats.hosts,
             "frontier_remaining": stats.frontier_remaining,
             "pages": stats.pages,
