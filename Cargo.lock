@@ -258,6 +258,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-watch"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pumper-core",
+ "serde_json",
+ "sha2",
+]
+
+[[package]]
 name = "arbitrary"
 version = "1.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2825,6 +2835,7 @@ dependencies = [
  "app-state-tax",
  "app-trade-wages",
  "app-valuation-multiples",
+ "app-watch",
  "async-stream",
  "axum",
  "chrono",

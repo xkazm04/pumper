@@ -12,6 +12,7 @@ pub fn apps() -> Vec<Arc<dyn ScrapeApp>> {
         Arc::new(app_research::Research),
         Arc::new(app_connector_api_watch::ConnectorApiWatch),
         Arc::new(app_readable::Readable),
+        Arc::new(app_watch::Watch),
         Arc::new(app_grants_gov::GrantsGov),
         Arc::new(app_cms_fee_schedule::CmsFeeSchedule),
         Arc::new(app_census_density::CensusDensity),
