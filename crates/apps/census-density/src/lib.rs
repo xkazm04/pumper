@@ -25,7 +25,7 @@
 //! CENSUS_API_KEY. CBP vintages from 2017 use the `NAICS2017` predicate variable
 //! (override via params.naics_var for other vintages).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
 use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
@@ -370,6 +370,15 @@ impl ScrapeApp for CensusDensity {
             json!({ "skipped": "normalize=false" })
         };
 
+        // Blend the employer counts just upserted with census-nonemp's solo
+        // counts into the shared `census/market_blend` dataset. Degrades
+        // gracefully — a blend failure (or the other app never having run)
+        // must not fail an otherwise-good CBP scrape.
+        let market_blend = match sync_market_blend(&ctx).await {
+            Ok(v) => v,
+            Err(e) => json!({ "skipped": format!("{e}") }),
+        };
+
         Ok(json!({
             "source": format!("census/cbp/{year}"),
             "geo": geo,
@@ -378,12 +387,192 @@ impl ScrapeApp for CensusDensity {
             "top_places_overall": top_overall,
             "top_places_by_saturation": saturation,
             "normalization": normalization,
+            "market_blend": market_blend,
             "records": all_records.len(),
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
         }))
     }
+}
+
+// ---------------------------------------------------------------------------
+// Blended employer + solo total-market view.
+//
+// census-density counts EMPLOYER businesses (CBP, 6-digit NAICS) and
+// census-nonemp counts SOLO operators (Nonemployer Statistics, 4-digit NAICS —
+// 6-digit is disclosure-suppressed). Neither alone is the market: a state can
+// look "thin" on employer firms while teeming with one-person shops. The blend
+// gives the TRUE total per trade group × state.
+//
+// Honest join grain: (4-digit NAICS prefix × state FIPS). NES is state-only and
+// 4-digit-only, so CBP's 6-digit state rows are rolled UP to their 4-digit
+// prefix (238220+238210 → 2382) and county rows are excluded — anything finer
+// would fabricate solo counts we don't have. Vintages differ (CBP lags ~1y,
+// NES ~2y), so each side's year is carried on the record instead of pretending
+// they match.
+//
+// The result lives under the virtual shared app namespace `census` (the
+// grants-common `grants/unified` pattern): both real apps re-derive it after
+// their own upserts, so the blend stays fresh regardless of which annual run
+// happens last.
+// ---------------------------------------------------------------------------
+
+/// Virtual app namespace holding the cross-app blended dataset.
+pub const MARKET_APP: &str = "census";
+pub const MARKET_BLEND_DATASET: &str = "market_blend";
+
+/// Well over the worst case (4 trades × 52 states employer-side; NES is
+/// smaller), while still bounding a runaway county-mode dataset read.
+const BLEND_READ_LIMIT: i64 = 50_000;
+
+/// Reads both apps' live records, blends them, and upserts
+/// `census/market_blend`. Returns a compact summary for the job result. If
+/// either side has no data yet (the other app may never have run), reports
+/// `blended: 0` with a note instead of writing half-truths.
+pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
+    let live = |recs: Vec<pumper_core::Record>| -> Vec<Value> {
+        recs.into_iter()
+            .filter(|r| r.removed_at.is_none())
+            .map(|r| r.data)
+            .collect()
+    };
+    let employers = live(
+        ctx.datasets
+            .list("census-density", "establishments", BLEND_READ_LIMIT)
+            .await?,
+    );
+    let solos = live(
+        ctx.datasets
+            .list("census-nonemp", "nonemployers", BLEND_READ_LIMIT)
+            .await?,
+    );
+    if employers.is_empty() || solos.is_empty() {
+        let missing = if employers.is_empty() { "census-density" } else { "census-nonemp" };
+        return Ok(json!({
+            "blended": 0,
+            "note": format!("no live records from {missing} yet — run it to enable the blend"),
+        }));
+    }
+
+    let items = blend_market(&employers, &solos);
+    let count = |cov: &str| {
+        items
+            .iter()
+            .filter(|(_, v)| v["coverage"] == cov)
+            .count()
+    };
+    let (both, employer_only, solo_only) =
+        (count("both"), count("employer_only"), count("solo_only"));
+    let summary = ctx
+        .datasets
+        .upsert_many(MARKET_APP, MARKET_BLEND_DATASET, &items)
+        .await?;
+    Ok(json!({
+        "dataset": format!("{MARKET_APP}/{MARKET_BLEND_DATASET}"),
+        "blended": items.len(),
+        "matched_both": both,
+        "employer_only": employer_only,
+        "solo_only": solo_only,
+        "new": summary.new.len(),
+        "changed": summary.changed.len(),
+        "unchanged": summary.unchanged,
+    }))
+}
+
+/// Pure blend: employer state rows (6-digit NAICS, from `establishments`) +
+/// solo state rows (4-digit NAICS, from `nonemployers`) → one record per
+/// (4-digit NAICS group × state FIPS), keyed `{naics4}:{state_fips}`.
+///
+/// Employer county rows are skipped (NES has no county grain); a group present
+/// on only one side is still emitted — with 0 on the missing side and a
+/// `coverage` marker — so the dataset shows WHERE the blend is partial rather
+/// than hiding it.
+pub fn blend_market(employers: &[Value], solos: &[Value]) -> Vec<(String, Value)> {
+    // (naics4, state_fips) → accumulating blend halves.
+    #[derive(Default)]
+    struct Cell {
+        state: Option<String>,
+        trade: Option<String>,
+        employer_estab: Option<i64>,
+        employer_naics: BTreeSet<String>,
+        employer_year: Option<String>,
+        solo_estab: Option<i64>,
+        solo_year: Option<String>,
+    }
+    let str_field = |v: &Value, f: &str| v.get(f).and_then(Value::as_str).map(str::to_string);
+    let num_field = |v: &Value, f: &str| v.get(f).and_then(Value::as_i64).unwrap_or(0);
+
+    let mut cells: BTreeMap<(String, String), Cell> = BTreeMap::new();
+
+    for e in employers {
+        // Only state rows: the solo side has no county grain to join against.
+        if e.get("geo").and_then(Value::as_str) != Some("state") {
+            continue;
+        }
+        let (Some(naics), Some(st)) = (str_field(e, "naics"), str_field(e, "state_fips")) else {
+            continue;
+        };
+        // 6-digit → 4-digit trade group (codes shorter than 4 pass through).
+        let naics4: String = naics.chars().take(4).collect();
+        let cell = cells.entry((naics4, st)).or_default();
+        *cell.employer_estab.get_or_insert(0) += num_field(e, "establishments");
+        cell.employer_naics.insert(naics);
+        cell.employer_year = cell.employer_year.take().or_else(|| str_field(e, "year"));
+        cell.state.get_or_insert_with(|| {
+            str_field(e, "place").unwrap_or_default()
+        });
+    }
+
+    for s in solos {
+        let (Some(naics4), Some(st)) = (str_field(s, "naics"), str_field(s, "state_fips")) else {
+            continue;
+        };
+        let cell = cells.entry((naics4, st)).or_default();
+        *cell.solo_estab.get_or_insert(0) += num_field(s, "nonemployers");
+        cell.solo_year = cell.solo_year.take().or_else(|| str_field(s, "year"));
+        if let Some(state) = str_field(s, "state") {
+            cell.state.get_or_insert(state);
+        }
+        // The 4-digit group label lives on the solo side; keep it.
+        if let Some(trade) = str_field(s, "trade") {
+            cell.trade.get_or_insert(trade);
+        }
+    }
+
+    cells
+        .into_iter()
+        .map(|((naics4, st_fips), c)| {
+            let coverage = match (c.employer_estab.is_some(), c.solo_estab.is_some()) {
+                (true, true) => "both",
+                (true, false) => "employer_only",
+                _ => "solo_only",
+            };
+            let employer = c.employer_estab.unwrap_or(0);
+            let solo = c.solo_estab.unwrap_or(0);
+            let total = employer + solo;
+            let solo_share = if total > 0 {
+                Value::from(((solo as f64 / total as f64) * 10_000.0).round() / 10_000.0)
+            } else {
+                Value::Null
+            };
+            let value = json!({
+                "naics4": naics4,
+                "trade": c.trade,
+                "state": c.state,
+                "state_fips": st_fips,
+                "employer_establishments": employer,
+                "employer_naics": c.employer_naics.into_iter().collect::<Vec<_>>(),
+                "employer_year": c.employer_year,
+                "solo_operators": solo,
+                "solo_year": c.solo_year,
+                "total_market": total,
+                "solo_share": solo_share,
+                "coverage": coverage,
+            });
+            (format!("{naics4}:{st_fips}"), value)
+        })
+        .collect()
 }
 
 /// Build a CBP API query. State mode returns all states (or a FIPS subset); county
@@ -501,6 +690,89 @@ async fn fetch_denominator(
         );
     }
     Ok(map)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn emp(naics: &str, geo: &str, place: &str, st: &str, estab: i64) -> Value {
+        json!({
+            "naics": naics, "geo": geo, "place": place, "state_fips": st,
+            "establishments": estab, "year": "2022",
+        })
+    }
+
+    fn solo(naics4: &str, state: &str, st: &str, nonemp: i64) -> Value {
+        json!({
+            "naics": naics4, "trade": "Building equipment contractors",
+            "state": state, "state_fips": st, "nonemployers": nonemp, "year": "2021",
+        })
+    }
+
+    #[test]
+    fn rolls_six_digit_employers_into_four_digit_group_and_joins_solo() {
+        // 238220 + 238210 both belong to trade group 2382.
+        let employers = vec![
+            emp("238220", "state", "CA", "06", 100),
+            emp("238210", "state", "CA", "06", 50),
+        ];
+        let solos = vec![solo("2382", "CA", "06", 300)];
+        let items = blend_market(&employers, &solos);
+        assert_eq!(items.len(), 1);
+        let (key, v) = &items[0];
+        assert_eq!(key, "2382:06");
+        assert_eq!(v["employer_establishments"], 150);
+        assert_eq!(v["employer_naics"], json!(["238210", "238220"]));
+        assert_eq!(v["solo_operators"], 300);
+        assert_eq!(v["total_market"], 450);
+        assert_eq!(v["solo_share"], json!(0.6667)); // 300/450 rounded to 4dp
+        assert_eq!(v["coverage"], "both");
+        assert_eq!(v["employer_year"], "2022");
+        assert_eq!(v["solo_year"], "2021");
+        assert_eq!(v["state"], "CA");
+        assert_eq!(v["trade"], "Building equipment contractors");
+    }
+
+    #[test]
+    fn county_employer_rows_are_excluded_from_the_state_grain_blend() {
+        let employers = vec![
+            emp("238220", "county", "CA·037", "06", 40),
+            emp("238220", "state", "CA", "06", 100),
+        ];
+        let solos = vec![solo("2382", "CA", "06", 10)];
+        let items = blend_market(&employers, &solos);
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].1["employer_establishments"], 100);
+    }
+
+    #[test]
+    fn one_sided_groups_are_emitted_with_coverage_markers() {
+        let employers = vec![emp("561730", "state", "TX", "48", 80)];
+        let solos = vec![solo("2382", "FL", "12", 25)];
+        let items = blend_market(&employers, &solos);
+        assert_eq!(items.len(), 2);
+        let by_key: BTreeMap<_, _> = items.into_iter().collect();
+        let e = &by_key["5617:48"];
+        assert_eq!(e["coverage"], "employer_only");
+        assert_eq!(e["solo_operators"], 0);
+        assert_eq!(e["total_market"], 80);
+        assert_eq!(e["solo_share"], json!(0.0));
+        let s = &by_key["2382:12"];
+        assert_eq!(s["coverage"], "solo_only");
+        assert_eq!(s["employer_establishments"], 0);
+        assert_eq!(s["solo_share"], json!(1.0));
+        assert_eq!(s["state"], "FL");
+    }
+
+    #[test]
+    fn zero_totals_yield_null_share_not_a_division_artifact() {
+        let employers = vec![emp("238220", "state", "AK", "02", 0)];
+        let solos = vec![solo("2382", "AK", "02", 0)];
+        let items = blend_market(&employers, &solos);
+        assert_eq!(items[0].1["solo_share"], Value::Null);
+        assert_eq!(items[0].1["total_market"], 0);
+    }
 }
 
 /// 2-digit state FIPS → USPS abbreviation (50 states + DC + PR). Unknown codes

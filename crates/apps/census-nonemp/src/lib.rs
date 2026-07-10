@@ -240,10 +240,22 @@ impl ScrapeApp for CensusNonemp {
 
         let summary = ctx.upsert_many("nonemployers", &all_records).await?;
 
+        // Re-derive the blended employer+solo `census/market_blend` dataset
+        // (shared logic lives in app-census-density). BOTH Census apps trigger
+        // the blend after their own upserts because they run annually and
+        // independently — whichever refreshes last would otherwise leave the
+        // blend stale until the other's next run. Degrades gracefully (a note,
+        // not a failure) when census-density has never run.
+        let market_blend = match app_census_density::sync_market_blend(&ctx).await {
+            Ok(v) => v,
+            Err(e) => json!({ "skipped": format!("{e}") }),
+        };
+
         Ok(json!({
             "source": format!("census/nonemp/{year}"),
             "year": year,
             "trades": trade_summaries,
+            "market_blend": market_blend,
             "records": all_records.len(),
             "new": summary.new.len(),
             "changed": summary.changed.len(),
