@@ -26,7 +26,11 @@
 - Migrate remaining apps to metered `ctx.fetch`/`ctx.research` (agentic apps first: state-tax, trade-wages, valuation-multiples, homewyse — they spend Claude money unmetered).
 - `research_cache` purge job (mirror `HttpCache::purge_expired`).
 - Vibeman-side bug observed during scans: `/api/ideas/claude` sometimes returns a different group's prompt than the requested `groupId` (agents self-corrected via `/api/contexts?groupId=`); also idea `category` rejects values outside functionality/performance/maintenance/ui/code_quality/user_benefit.
-- Remaining INDEX themes: T4 search, T7 API hardening, T9 domain products, T10 platform (T6 crawler + T5 extraction basics closed in wave 3; T5 LLM-assisted items — NL→RuleSet, self-healing selectors, schema-less extraction — remain).
+- Remaining INDEX themes: T4 search, T9 domain products, T10 platform (T7 API hardening closed in wave 4 except deferred: API-key auth [needs product decision], OpenAPI, SSE Last-Event-ID, misfire policy, hot-reload; T5 LLM-assisted extraction items remain).
+
+## Structural facts (Wave 4 additions)
+- **2026-07-10** — All outbound webhooks flow through `crates/server/src/webhook.rs::deliver` and are logged to `webhook_deliveries` (migration 0010); replay via `POST /webhooks/deliveries/{id}/replay`. Jobs table now also carries `idempotency_key` (0011, partial unique idx) and `schedule_id` (0012, overlap guard).
+- **2026-07-10** — Pagination convention: `cursor=` param (even empty) switches list endpoints to `{items, next_cursor}`; cursors are `<stored-ts>|<id-or-key>` keysets. Follow this for any new list endpoint.
 
 ## Structural facts (Wave 3 additions)
 - **2026-07-10** — Extraction rules: `RuleSet.fields` maps to `FieldRule {rule, transforms}` (serde-flattened; old plain-rule JSON still parses). Rule types: css/regex/json/xpath/const. XPath via `skyscraper` crate (pure Rust, HTML-native; heavy grammar crate, ~1min cold-build cost).
