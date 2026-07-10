@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use pumper_core::{
     Config, CostLedger, Datasets, EngineSet, Fetcher, Governor, HttpCache, NoPlugins, NoSearch,
-    Plugins, ScrapeApp, Search, Storage,
+    Plugins, ResearchCache, ScrapeApp, Search, Storage,
 };
 use pumper_engine_browser::BrowserEngine;
 use pumper_engine_claude::ClaudeEngine;
@@ -22,6 +22,7 @@ pub struct AppState {
     pub datasets: Arc<Datasets>,
     pub costs: Arc<CostLedger>,
     pub cache: Arc<HttpCache>,
+    pub research_cache: Arc<ResearchCache>,
     pub engines: Arc<EngineSet>,
     /// Sandboxed WASM plugin host.
     pub plugins: Arc<dyn Plugins>,
@@ -42,6 +43,10 @@ impl AppState {
         let datasets = Arc::new(Datasets::new(storage.pool()));
         let costs = Arc::new(CostLedger::new(storage.pool()));
         let cache = Arc::new(HttpCache::new(storage.pool(), &config.cache));
+        let research_cache = Arc::new(ResearchCache::new(
+            storage.pool(),
+            config.claude.research_cache_ttl_secs,
+        ));
         let governor = Arc::new(Governor::new(&config.governor));
 
         let http = Arc::new(HttpEngine::new(&config.http, governor, cache.clone())?);
@@ -81,6 +86,7 @@ impl AppState {
             datasets,
             costs,
             cache,
+            research_cache,
             engines: Arc::new(engines),
             plugins,
             search,

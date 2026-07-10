@@ -5,6 +5,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::cache::ResearchCache;
 use crate::costs::CostLedger;
 use crate::datasets::{ChangeKind, Datasets, UpsertSummary};
 use crate::engine::{EngineSet, ResearchOutput, ResearchRequest};
@@ -26,6 +27,8 @@ pub struct AppContext {
     pub costs: Arc<CostLedger>,
     /// Spend ceiling for the whole job (from enqueue); None = unlimited.
     pub budget_usd: Option<f64>,
+    /// Cost-aware cache for Claude research runs (TTL-bound, key = request).
+    pub research_cache: Arc<ResearchCache>,
     /// Sandboxed WASM plugin host (fuel + memory limited).
     pub plugins: Arc<dyn Plugins>,
     pub artifacts_dir: PathBuf,
@@ -109,10 +112,32 @@ impl AppContext {
     }
 
     /// Metered Claude research: same as `engines.claude.research(...)` but
-    /// records the run's actual `total_cost_usd` against this job, refuses to
-    /// start once the job budget is exhausted, and clamps the per-call ceiling
-    /// to the remaining headroom.
+    /// cache-aware and budget-governed. Identical requests within the cache
+    /// TTL are served from disk at zero cost (recorded as a `cache_hit`
+    /// event); misses refuse to start once the job budget is exhausted, clamp
+    /// the per-call ceiling to the remaining headroom, and store their output
+    /// for the next caller. `resume_session` requests bypass the cache.
     pub async fn research(&self, mut req: ResearchRequest) -> Result<ResearchOutput> {
+        let cacheable = req.resume_session.is_none() && self.research_cache.enabled();
+        let key = cacheable.then(|| ResearchCache::key(&req));
+        if let Some(key) = &key {
+            if let Some(mut hit) = self.research_cache.get(key).await? {
+                let saved = hit.cost_usd.take();
+                let detail = saved.map_or("cache_hit".to_string(), |c| {
+                    format!("cache_hit (saved ~${c:.4})")
+                });
+                if let Err(e) = self
+                    .costs
+                    .record(self.job_id, &self.app, "claude", None, 0.0, Some(&detail))
+                    .await
+                {
+                    tracing::warn!(job = %self.job_id, "cost event write failed: {e}");
+                }
+                hit.cost_usd = Some(0.0);
+                return Ok(hit);
+            }
+        }
+
         if let Some(remaining) = self.require_budget().await? {
             req.max_budget_usd = Some(req.max_budget_usd.map_or(remaining, |b| b.min(remaining)));
         }
@@ -123,6 +148,11 @@ impl AppContext {
             .await
         {
             tracing::warn!(job = %self.job_id, "cost event write failed: {e}");
+        }
+        if let Some(key) = &key {
+            if let Err(e) = self.research_cache.put(key, &out).await {
+                tracing::warn!(job = %self.job_id, "research cache write failed: {e}");
+            }
         }
         Ok(out)
     }
