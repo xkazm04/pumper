@@ -26,7 +26,11 @@
 - Migrate remaining apps to metered `ctx.fetch`/`ctx.research` (agentic apps first: state-tax, trade-wages, valuation-multiples, homewyse — they spend Claude money unmetered).
 - `research_cache` purge job (mirror `HttpCache::purge_expired`).
 - Vibeman-side bug observed during scans: `/api/ideas/claude` sometimes returns a different group's prompt than the requested `groupId` (agents self-corrected via `/api/contexts?groupId=`); also idea `category` rejects values outside functionality/performance/maintenance/ui/code_quality/user_benefit.
-- Remaining INDEX themes: T4 search, T9 domain products, T10 platform (T7 API hardening closed in wave 4 except deferred: API-key auth [needs product decision], OpenAPI, SSE Last-Event-ID, misfire policy, hot-reload; T5 LLM-assisted extraction items remain).
+- Remaining INDEX themes: T9 domain products, T10 platform (T4 search fundamentals closed in wave 5; deferred T4 tail: answer-engine RAG, hybrid semantic [3 dup ideas], multilingual, LTR, autocomplete. T7 deferred: API-key auth [product decision], OpenAPI, SSE Last-Event-ID, misfire, hot-reload. T5 LLM-assisted extraction items remain).
+
+## Structural facts (Wave 5 additions)
+- **2026-07-10** — `Search::query` takes `SearchRequest` and returns `SearchResponse` (hits+facets); trait also has `delete_ids`/`delete_dataset`. Tantivy body field is STORED (snippet support); old indexes auto-rebuild empty on open. Saved searches (`saved_searches`/`saved_search_seen`, migration 0013) alert via the logged webhook path with exactly-once claim_unseen dedup.
+- **2026-07-10** — Any new webhook event kind should go through `webhook::dispatch_event` (logged, signed, replayable) — never hand-roll a reqwest send.
 
 ## Structural facts (Wave 4 additions)
 - **2026-07-10** — All outbound webhooks flow through `crates/server/src/webhook.rs::deliver` and are logged to `webhook_deliveries` (migration 0010); replay via `POST /webhooks/deliveries/{id}/replay`. Jobs table now also carries `idempotency_key` (0011, partial unique idx) and `schedule_id` (0012, overlap guard).
