@@ -39,6 +39,13 @@ pub enum Rule {
     },
     /// JSON Pointer (RFC 6901, e.g. `/data/0/name`) into a JSON body.
     Json { pointer: String },
+    /// XPath expression over the HTML document (e.g. `//div[@id='x']//a/@href`);
+    /// `all` collects every match.
+    Xpath {
+        xpath: String,
+        #[serde(default)]
+        all: bool,
+    },
     /// A literal value.
     Const { value: Value },
 }
@@ -107,6 +114,11 @@ impl RuleSet {
                     CompiledRule::Regex { re, group: *group }
                 }
                 Rule::Json { pointer } => CompiledRule::Json { pointer: pointer.clone() },
+                Rule::Xpath { xpath, all } => {
+                    let parsed = skyscraper::xpath::parse(xpath)
+                        .map_err(|e| Error::Parse(format!("bad xpath '{xpath}': {e}")))?;
+                    CompiledRule::Xpath { xpath: parsed, all: *all }
+                }
                 Rule::Const { value } => CompiledRule::Const { value: value.clone() },
             };
             let transforms = field
@@ -124,6 +136,7 @@ enum CompiledRule {
     Css { selector: Selector, attr: Option<String>, all: bool },
     Regex { re: Regex, group: usize },
     Json { pointer: String },
+    Xpath { xpath: skyscraper::xpath::Xpath, all: bool },
     Const { value: Value },
 }
 
@@ -251,6 +264,10 @@ impl CompiledRuleSet {
     fn needs_json(&self) -> bool {
         self.fields.iter().any(|(_, r, _)| matches!(r, CompiledRule::Json { .. }))
     }
+
+    fn needs_xpath(&self) -> bool {
+        self.fields.iter().any(|(_, r, _)| matches!(r, CompiledRule::Xpath { .. }))
+    }
 }
 
 /// Extracts one document into a JSON object. HTML is parsed at most once (only
@@ -261,6 +278,11 @@ pub fn extract_one(rules: &CompiledRuleSet, doc: &str) -> Value {
     let json = if rules.needs_json() {
         let mut bytes = doc.as_bytes().to_vec();
         simd_json::serde::from_slice::<Value>(&mut bytes).ok()
+    } else {
+        None
+    };
+    let xpath_tree = if rules.needs_xpath() {
+        skyscraper::html::parse(doc).ok()
     } else {
         None
     };
@@ -280,6 +302,10 @@ pub fn extract_one(rules: &CompiledRuleSet, doc: &str) -> Value {
                 .as_ref()
                 .and_then(|j| j.pointer(pointer).cloned())
                 .unwrap_or(Value::Null),
+            CompiledRule::Xpath { xpath, all } => xpath_tree
+                .as_ref()
+                .map(|tree| xpath_extract(tree, xpath, *all))
+                .unwrap_or(Value::Null),
             CompiledRule::Const { value } => value.clone(),
         };
         for t in transforms {
@@ -293,6 +319,40 @@ pub fn extract_one(rules: &CompiledRuleSet, doc: &str) -> Value {
 /// Extracts a whole batch in parallel across all cores.
 pub fn extract_batch(rules: &CompiledRuleSet, docs: &[String]) -> Vec<Value> {
     docs.par_iter().map(|doc| extract_one(rules, doc)).collect()
+}
+
+fn xpath_extract(
+    tree: &skyscraper::xpath::XpathItemTree,
+    xpath: &skyscraper::xpath::Xpath,
+    all: bool,
+) -> Value {
+    let Ok(items) = xpath.apply(tree) else {
+        return Value::Null;
+    };
+    let mut values = items.iter().map(|item| xpath_item_value(item, tree));
+    if all {
+        Value::Array(values.collect())
+    } else {
+        values.next().unwrap_or(Value::Null)
+    }
+}
+
+/// One XPath result as JSON: attribute nodes yield their value, text nodes
+/// their content, elements their recursive text; atomics render as strings.
+fn xpath_item_value(
+    item: &skyscraper::xpath::grammar::data_model::XpathItem,
+    tree: &skyscraper::xpath::XpathItemTree,
+) -> Value {
+    use skyscraper::xpath::grammar::data_model::XpathItem;
+    use skyscraper::xpath::grammar::XpathItemTreeNode;
+    match item {
+        XpathItem::Node(node) => match node {
+            XpathItemTreeNode::AttributeNode(a) => Value::String(a.value.clone()),
+            XpathItemTreeNode::TextNode(t) => Value::String(t.content.trim().to_string()),
+            n => Value::String(n.text_content(tree).trim().to_string()),
+        },
+        other => Value::String(format!("{other:?}")),
+    }
 }
 
 fn css_extract(html: &Html, selector: &Selector, attr: Option<&str>, all: bool) -> Value {
@@ -351,6 +411,31 @@ mod tests {
         let out = &extract_batch(&rules, std::slice::from_ref(&doc))[0];
         assert_eq!(out["name"], json!("Ada"));
         assert_eq!(out["n"], json!(2));
+    }
+
+    #[test]
+    fn xpath_text_attribute_and_all() {
+        let rules = ruleset(json!({
+            "title": {"type": "xpath", "xpath": "//div[@class='main']/h2"},
+            "href":  {"type": "xpath", "xpath": "//a/@href"},
+            "items": {"type": "xpath", "xpath": "//li", "all": true},
+            "none":  {"type": "xpath", "xpath": "//article"}
+        }));
+        let doc = r#"<html><body><div class="main"><h2> Deep Title </h2></div>
+                     <a href="/next">n</a><ul><li>a</li><li>b</li></ul></body></html>"#
+            .to_string();
+        let out = &extract_batch(&rules, std::slice::from_ref(&doc))[0];
+        assert_eq!(out["title"], json!("Deep Title"));
+        assert_eq!(out["href"], json!("/next"));
+        assert_eq!(out["items"], json!(["a", "b"]));
+        assert_eq!(out["none"], json!(null));
+        // Invalid XPath fails at compile time, not silently at extraction.
+        assert!(serde_json::from_value::<RuleSet>(
+            json!({ "x": {"type": "xpath", "xpath": "///"} })
+        )
+        .unwrap()
+        .compile()
+        .is_err());
     }
 
     #[test]
