@@ -310,7 +310,10 @@ async fn finalize(state: &AppState, id: uuid::Uuid) {
     event.result = job.result.clone();
     event.error = job.error.clone();
     publish(state, event);
-    webhook::dispatch(state.webhook_client.clone(), state.storage.clone(), job);
+    webhook::dispatch(state.webhook_client.clone(), state.storage.clone(), job.clone());
+    // Terminal-job triggers: the job's final status is an event other apps can
+    // chain on (e.g. "when crawl succeeds, run extract").
+    crate::triggers::fire_terminal_triggers(state, &job).await;
 }
 
 fn publish(state: &AppState, event: JobEvent) {
