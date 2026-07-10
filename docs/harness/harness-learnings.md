@@ -28,6 +28,10 @@
 - Vibeman-side bug observed during scans: `/api/ideas/claude` sometimes returns a different group's prompt than the requested `groupId` (agents self-corrected via `/api/contexts?groupId=`); also idea `category` rejects values outside functionality/performance/maintenance/ui/code_quality/user_benefit.
 - Remaining INDEX themes: T9 domain products, T10 platform (T4 search fundamentals closed in wave 5; deferred T4 tail: answer-engine RAG, hybrid semantic [3 dup ideas], multilingual, LTR, autocomplete. T7 deferred: API-key auth [product decision], OpenAPI, SSE Last-Event-ID, misfire, hot-reload. T5 LLM-assisted extraction items remain).
 
+## Structural facts (Wave 6 additions)
+- **2026-07-10** — Cross-source grant layer: `grants-common` crate normalizes grants-gov + ca-grants into the virtual `grants` app namespace (`unified` + `duplicate_links` datasets, keys `<source>:<id>`). New grant sources should implement a `normalize_*` there and call `sync_unified` + `link_duplicates`.
+- **2026-07-10** — mpsv-vpm `role_trends` derives from `role_region_agg` revision history — deleting revisions breaks the trend window.
+
 ## Structural facts (Wave 5 additions)
 - **2026-07-10** — `Search::query` takes `SearchRequest` and returns `SearchResponse` (hits+facets); trait also has `delete_ids`/`delete_dataset`. Tantivy body field is STORED (snippet support); old indexes auto-rebuild empty on open. Saved searches (`saved_searches`/`saved_search_seen`, migration 0013) alert via the logged webhook path with exactly-once claim_unseen dedup.
 - **2026-07-10** — Any new webhook event kind should go through `webhook::dispatch_event` (logged, signed, replayable) — never hand-roll a reqwest send.
