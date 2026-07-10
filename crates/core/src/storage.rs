@@ -280,6 +280,33 @@ impl Storage {
         rows.into_iter().map(Job::try_from).collect()
     }
 
+    /// Keyset page of jobs ordered (created_at DESC, id DESC). `after` is the
+    /// previous page's last (created_at-as-stored, id); None starts at the top.
+    pub async fn list_page(
+        &self,
+        app: Option<&str>,
+        status: Option<JobStatus>,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<Job>> {
+        let (after_ts, after_id) = after.map(|(t, i)| (Some(t), Some(i))).unwrap_or((None, None));
+        let sql = format!(
+            "SELECT {JOB_COLUMNS} FROM jobs \
+             WHERE (?1 IS NULL OR app = ?1) AND (?2 IS NULL OR status = ?2) \
+             AND (?3 IS NULL OR created_at < ?3 OR (created_at = ?3 AND id < ?4)) \
+             ORDER BY created_at DESC, id DESC LIMIT ?5"
+        );
+        let rows: Vec<JobRow> = sqlx::query_as(&sql)
+            .bind(app)
+            .bind(status.map(JobStatus::as_str))
+            .bind(after_ts)
+            .bind(after_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(Job::try_from).collect()
+    }
+
     /// Counts jobs grouped by status — for the metrics endpoint.
     pub async fn status_counts(&self) -> Result<Vec<(String, i64)>> {
         let rows: Vec<(String, i64)> =

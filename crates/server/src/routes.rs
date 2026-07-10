@@ -6,7 +6,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use pumper_core::{EnqueueOptions, Job, JobStatus, Record, Schedule};
+use pumper_core::{EnqueueOptions, Job, JobStatus, Schedule};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
@@ -244,16 +244,28 @@ struct ListQuery {
     status: Option<String>,
     #[serde(default = "default_limit")]
     limit: i64,
+    /// Opaque keyset cursor. Presence (even empty, for page 1) switches the
+    /// response to `{items, next_cursor}`; absent keeps the legacy bare array.
+    cursor: Option<String>,
 }
 
 fn default_limit() -> i64 {
     50
 }
 
+/// Cursors are `<sort-timestamp>|<tiebreak-id>` — decode back to the pair.
+fn parse_cursor(cursor: &str) -> Option<(String, String)> {
+    let trimmed = cursor.trim();
+    if trimmed.is_empty() {
+        return None; // first page
+    }
+    trimmed.split_once('|').map(|(t, k)| (t.to_string(), k.to_string()))
+}
+
 async fn list_jobs(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
-) -> Result<Json<Vec<Job>>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let status = query
         .status
         .as_deref()
@@ -262,11 +274,21 @@ async fn list_jobs(
                 .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, format!("invalid status '{s}'")))
         })
         .transpose()?;
+    let limit = query.limit.clamp(1, 500);
+    let Some(cursor) = &query.cursor else {
+        let jobs = state.storage.list(query.app.as_deref(), status, limit).await?;
+        return Ok(Json(json!(jobs)));
+    };
+    let after = parse_cursor(cursor);
     let jobs = state
         .storage
-        .list(query.app.as_deref(), status, query.limit.clamp(1, 500))
+        .list_page(query.app.as_deref(), status, after, limit)
         .await?;
-    Ok(Json(jobs))
+    let next_cursor = ((jobs.len() as i64) == limit)
+        .then(|| jobs.last())
+        .flatten()
+        .map(|j| format!("{}|{}", pumper_core::datasets::ts(j.created_at), j.id));
+    Ok(Json(json!({ "items": jobs, "next_cursor": next_cursor })))
 }
 
 async fn get_job(
@@ -459,18 +481,27 @@ async fn list_datasets(
 struct RecordsQuery {
     #[serde(default = "default_limit")]
     limit: i64,
+    /// Opaque keyset cursor; presence switches to `{items, next_cursor}`.
+    cursor: Option<String>,
 }
 
 async fn list_records(
     State(state): State<AppState>,
     Path((app, dataset)): Path<(String, String)>,
     Query(query): Query<RecordsQuery>,
-) -> Result<Json<Vec<Record>>, ApiError> {
-    let records = state
-        .datasets
-        .list(&app, &dataset, query.limit.clamp(1, 1000))
-        .await?;
-    Ok(Json(records))
+) -> Result<Json<Value>, ApiError> {
+    let limit = query.limit.clamp(1, 1000);
+    let Some(cursor) = &query.cursor else {
+        let records = state.datasets.list(&app, &dataset, limit).await?;
+        return Ok(Json(json!(records)));
+    };
+    let after = parse_cursor(cursor);
+    let records = state.datasets.list_page(&app, &dataset, after, limit).await?;
+    let next_cursor = ((records.len() as i64) == limit)
+        .then(|| records.last())
+        .flatten()
+        .map(|r| format!("{}|{}", pumper_core::datasets::ts(r.updated_at), r.key));
+    Ok(Json(json!({ "items": records, "next_cursor": next_cursor })))
 }
 
 #[derive(Deserialize)]
