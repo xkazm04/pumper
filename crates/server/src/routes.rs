@@ -26,6 +26,8 @@ pub fn router(state: AppState) -> Router {
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", get(get_job).delete(cancel_job))
         .route("/jobs/{id}/stream", get(stream_job))
+        .route("/jobs/{id}/costs", get(job_costs))
+        .route("/costs", get(cost_summary))
         .route("/schedules", get(list_schedules).post(create_schedule))
         .route("/schedules/{id}", axum::routing::delete(delete_schedule))
         .route("/schedules/{id}/enabled", post(set_schedule_enabled))
@@ -75,6 +77,13 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
     for status in ["queued", "running", "succeeded", "failed", "cancelled"] {
         let n = counts.iter().find(|(s, _)| s == status).map_or(0, |(_, n)| *n);
         out.push_str(&format!("pumper_jobs{{status=\"{status}\"}} {n}\n"));
+    }
+    out.push_str("# HELP pumper_cost_usd Total engine spend by app\n# TYPE pumper_cost_usd gauge\n");
+    for entry in state.costs.summary(None, None).await? {
+        out.push_str(&format!(
+            "pumper_cost_usd{{app=\"{}\",engine=\"{}\"}} {}\n",
+            entry.app, entry.engine, entry.cost_usd
+        ));
     }
     out.push_str("# HELP pumper_apps Registered apps\n# TYPE pumper_apps gauge\n");
     out.push_str(&format!("pumper_apps {}\n", state.registry.len()));
@@ -264,6 +273,64 @@ async fn cancel_job(
             "job not found or not in 'queued' state".into(),
         ))
     }
+}
+
+// ---- Costs ------------------------------------------------------------------
+
+/// A job's cost events + total, with cost-per-fresh-record yield when the
+/// job's result exposes new/changed counts (the upsert-summary convention).
+async fn job_costs(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(job) = state.storage.get(id).await? else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "job not found".into()));
+    };
+    let events = state.costs.job_events(id).await?;
+    let total: f64 = events.iter().map(|e| e.cost_usd).sum();
+    let fresh = job.result.as_ref().map(|r| {
+        r.get("new").and_then(Value::as_u64).unwrap_or(0)
+            + r.get("changed").and_then(Value::as_u64).unwrap_or(0)
+    });
+    let cost_per_fresh_record = match fresh {
+        Some(n) if n > 0 => Some(total / n as f64),
+        _ => None,
+    };
+    Ok(Json(json!({
+        "job_id": id,
+        "app": job.app,
+        "total_usd": total,
+        "calls": events.len(),
+        "fresh_records": fresh,
+        "cost_per_fresh_record_usd": cost_per_fresh_record,
+        "events": events,
+    })))
+}
+
+#[derive(Deserialize)]
+struct CostSummaryQuery {
+    app: Option<String>,
+    /// RFC 3339 lower bound for the window.
+    since: Option<String>,
+}
+
+/// Spend grouped by (app, engine) — the ROI overview.
+async fn cost_summary(
+    State(state): State<AppState>,
+    Query(query): Query<CostSummaryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let since = query
+        .since
+        .as_deref()
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid 'since': {e}")))
+        })
+        .transpose()?;
+    let summary = state.costs.summary(query.app.as_deref(), since).await?;
+    let total: f64 = summary.iter().map(|s| s.cost_usd).sum();
+    Ok(Json(json!({ "total_usd": total, "by_app_engine": summary })))
 }
 
 // ---- Schedules ------------------------------------------------------------
