@@ -81,6 +81,13 @@ pub trait Search: Send + Sync {
     /// Runs a full-text query, returning ranked hits plus app/dataset facets
     /// over the matching set.
     async fn query(&self, req: SearchRequest) -> Result<SearchResponse>;
+
+    /// Removes documents by id and commits.
+    async fn delete_ids(&self, ids: &[String]) -> Result<()>;
+
+    /// Removes every document of one app's dataset and commits — the cleanup
+    /// path when a dataset is retired or re-imported from scratch.
+    async fn delete_dataset(&self, app: &str, dataset: &str) -> Result<()>;
 }
 
 /// Fallback used when search is disabled.
@@ -93,5 +100,11 @@ impl Search for NoSearch {
     }
     async fn query(&self, _req: SearchRequest) -> Result<SearchResponse> {
         Ok(SearchResponse::default())
+    }
+    async fn delete_ids(&self, _ids: &[String]) -> Result<()> {
+        Ok(())
+    }
+    async fn delete_dataset(&self, _app: &str, _dataset: &str) -> Result<()> {
+        Ok(())
     }
 }

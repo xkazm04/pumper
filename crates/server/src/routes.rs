@@ -46,6 +46,11 @@ pub fn router(state: AppState) -> Router {
         .route("/plugins", get(list_plugins))
         .route("/plugins/reload", post(reload_plugins))
         .route("/search", get(search))
+        .route("/search/docs", axum::routing::delete(delete_search_docs))
+        .route(
+            "/search/datasets/{app}/{dataset}",
+            axum::routing::delete(delete_search_dataset),
+        )
         .layer(tower_http::trace::TraceLayer::new_for_http())
         // Local power mode: any localhost web app may call this API directly.
         .layer(tower_http::cors::CorsLayer::permissive())
@@ -865,6 +870,33 @@ async fn search(
         "hits": results.hits,
         "facets": results.facets,
     })))
+}
+
+#[derive(Deserialize)]
+struct DeleteDocsBody {
+    ids: Vec<String>,
+}
+
+/// Removes specific documents from the search index by id.
+async fn delete_search_docs(
+    State(state): State<AppState>,
+    Json(body): Json<DeleteDocsBody>,
+) -> Result<Json<Value>, ApiError> {
+    if body.ids.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "'ids' must be non-empty".into()));
+    }
+    let count = body.ids.len();
+    state.search.delete_ids(&body.ids).await?;
+    Ok(Json(json!({ "deleted": count })))
+}
+
+/// Removes every indexed document of one app's dataset.
+async fn delete_search_dataset(
+    State(state): State<AppState>,
+    Path((app, dataset)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    state.search.delete_dataset(&app, &dataset).await?;
+    Ok(Json(json!({ "app": app, "dataset": dataset, "deleted": true })))
 }
 
 // ---- WASM plugins ---------------------------------------------------------

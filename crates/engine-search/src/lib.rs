@@ -143,6 +143,62 @@ impl Search for TantivyIndex {
         .map_err(|e| Error::App(format!("index task panicked: {e}")))?
     }
 
+    async fn delete_ids(&self, ids: &[String]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+        let writer = self.writer.clone();
+        let reader = self.reader.clone();
+        let f = self.fields;
+        let ids = ids.to_vec();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut w = writer.lock().unwrap();
+            for id in &ids {
+                w.delete_term(Term::from_field_text(f.id, id));
+            }
+            w.commit().map_err(|e| Error::App(format!("commit: {e}")))?;
+            reader.reload().map_err(|e| Error::App(format!("reader reload: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::App(format!("delete task panicked: {e}")))?
+    }
+
+    async fn delete_dataset(&self, app: &str, dataset: &str) -> Result<()> {
+        let writer = self.writer.clone();
+        let reader = self.reader.clone();
+        let f = self.fields;
+        let (app, dataset) = (app.to_string(), dataset.to_string());
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            // Dataset names may repeat across apps — delete the conjunction,
+            // not the bare dataset term.
+            let query = BooleanQuery::new(vec![
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(f.app, &app),
+                        IndexRecordOption::Basic,
+                    )) as Box<dyn Query>,
+                ),
+                (
+                    Occur::Must,
+                    Box::new(TermQuery::new(
+                        Term::from_field_text(f.dataset, &dataset),
+                        IndexRecordOption::Basic,
+                    )),
+                ),
+            ]);
+            let mut w = writer.lock().unwrap();
+            w.delete_query(Box::new(query))
+                .map_err(|e| Error::App(format!("delete_query: {e}")))?;
+            w.commit().map_err(|e| Error::App(format!("commit: {e}")))?;
+            reader.reload().map_err(|e| Error::App(format!("reader reload: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::App(format!("delete task panicked: {e}")))?
+    }
+
     async fn query(&self, req: SearchRequest) -> Result<SearchResponse> {
         let index = self.index.clone();
         let reader = self.reader.clone();
