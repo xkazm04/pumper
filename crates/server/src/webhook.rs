@@ -69,6 +69,37 @@ pub fn dispatch_change(
     );
 }
 
+/// Spawns a best-effort, logged delivery of an arbitrary event — the generic
+/// entry point for new event kinds (e.g. saved-search matches).
+pub fn dispatch_event(
+    client: reqwest::Client,
+    storage: Arc<Storage>,
+    kind: &str,
+    ref_id: &str,
+    url: &str,
+    event: &str,
+    payload: serde_json::Value,
+    secret: Option<String>,
+) {
+    let body = match serde_json::to_vec(&payload) {
+        Ok(body) => body,
+        Err(e) => {
+            warn!(kind = %kind, ref_id = %ref_id, "webhook serialize failed: {e}");
+            return;
+        }
+    };
+    spawn_logged(
+        client,
+        storage,
+        kind.to_string(),
+        ref_id.to_string(),
+        url.to_string(),
+        event.to_string(),
+        body,
+        secret,
+    );
+}
+
 /// Re-sends a logged delivery (the dead-letter replay path). The caller has
 /// already resolved the signing secret from the delivery's source.
 pub fn replay(

@@ -133,6 +133,7 @@ async fn execute(state: AppState, job: Job) {
                 info!(job = %job.id, "job succeeded");
             }
             notify_watches(&state, &job).await;
+            notify_saved_searches(&state, &job).await;
         }
         Ok(Err(e)) => {
             warn!(job = %job.id, error = %e, "job failed");
@@ -213,6 +214,72 @@ async fn notify_watches(state: &AppState, job: &Job) {
                 payload,
             );
         }
+    }
+}
+
+/// Runs enabled saved searches after a job's results were indexed, alerting
+/// each NEW match exactly once (`saved_search_seen` dedup). Scoped to searches
+/// whose app filter is empty or matches the finished job's app.
+async fn notify_saved_searches(state: &AppState, job: &Job) {
+    let searches = match state.storage.list_saved_searches(true).await {
+        Ok(list) if !list.is_empty() => list,
+        Ok(_) => return,
+        Err(e) => {
+            warn!(job = %job.id, "failed to load saved searches: {e}");
+            return;
+        }
+    };
+    for search in searches {
+        if search.app.as_deref().is_some_and(|app| app != job.app) {
+            continue;
+        }
+        let req = pumper_core::SearchRequest {
+            q: search.query.clone(),
+            limit: 50,
+            app: search.app.clone(),
+            dataset: search.dataset.clone(),
+            fuzzy: false,
+        };
+        let results = match state.search.query(req).await {
+            Ok(results) => results,
+            Err(e) => {
+                warn!(search = %search.id, "saved search query failed: {e}");
+                continue;
+            }
+        };
+        let ids: Vec<String> = results.hits.iter().map(|h| h.id.clone()).collect();
+        let unseen = match state.storage.claim_unseen(&search.id, &ids).await {
+            Ok(unseen) if !unseen.is_empty() => unseen,
+            Ok(_) => continue,
+            Err(e) => {
+                warn!(search = %search.id, "saved search dedup failed: {e}");
+                continue;
+            }
+        };
+        let matches: Vec<_> = results
+            .hits
+            .iter()
+            .filter(|h| unseen.contains(&h.id))
+            .collect();
+        let payload = serde_json::json!({
+            "event": "search.matched",
+            "search_id": search.id,
+            "query": search.query,
+            "job_id": job.id,
+            "app": job.app,
+            "count": matches.len(),
+            "matches": matches,
+        });
+        webhook::dispatch_event(
+            state.webhook_client.clone(),
+            state.storage.clone(),
+            "search",
+            &search.id,
+            &search.url,
+            "search.matched",
+            payload,
+            search.secret.clone(),
+        );
     }
 }
 

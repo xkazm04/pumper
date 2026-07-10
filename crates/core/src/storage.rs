@@ -544,6 +544,100 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
+    // ---- Saved searches -----------------------------------------------------
+
+    pub async fn create_saved_search(
+        &self,
+        query: &str,
+        app: Option<&str>,
+        dataset: Option<&str>,
+        url: &str,
+        secret: Option<&str>,
+    ) -> Result<SavedSearch> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO saved_searches (id, query, app, dataset, url, secret, enabled, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+        )
+        .bind(&id)
+        .bind(query)
+        .bind(app)
+        .bind(dataset)
+        .bind(url)
+        .bind(secret)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_saved_search(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_saved_search(&self, id: &str) -> Result<Option<SavedSearch>> {
+        let row: Option<SavedSearchRow> = sqlx::query_as(
+            "SELECT id, query, app, dataset, url, secret, enabled, created_at \
+             FROM saved_searches WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(SavedSearch::try_from).transpose()
+    }
+
+    pub async fn list_saved_searches(&self, enabled_only: bool) -> Result<Vec<SavedSearch>> {
+        let rows: Vec<SavedSearchRow> = sqlx::query_as(
+            "SELECT id, query, app, dataset, url, secret, enabled, created_at \
+             FROM saved_searches WHERE (?1 = 0 OR enabled = 1) ORDER BY created_at",
+        )
+        .bind(enabled_only as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(SavedSearch::try_from).collect()
+    }
+
+    pub async fn set_saved_search_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE saved_searches SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_saved_search(&self, id: &str) -> Result<bool> {
+        sqlx::query("DELETE FROM saved_search_seen WHERE search_id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        let result = sqlx::query("DELETE FROM saved_searches WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// The subset of `doc_ids` this search has never alerted on, marked seen
+    /// atomically-enough for the single-writer worker: insert-or-ignore, then
+    /// report which inserts landed.
+    pub async fn claim_unseen(&self, search_id: &str, doc_ids: &[String]) -> Result<Vec<String>> {
+        let mut unseen = Vec::new();
+        for doc_id in doc_ids {
+            let result = sqlx::query(
+                "INSERT OR IGNORE INTO saved_search_seen (search_id, doc_id, created_at) \
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(search_id)
+            .bind(doc_id)
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+            if result.rows_affected() > 0 {
+                unseen.push(doc_id.clone());
+            }
+        }
+        Ok(unseen)
+    }
+
     // ---- Webhook delivery log ----------------------------------------------
 
     /// Records an outbound delivery as pending; returns its id.
@@ -672,6 +766,49 @@ impl TryFrom<JobRow> for Job {
             available_at: parse_ts(&r.available_at)?,
             started_at: r.started_at.as_deref().map(parse_ts).transpose()?,
             finished_at: r.finished_at.as_deref().map(parse_ts).transpose()?,
+        })
+    }
+}
+
+/// A standing full-text query that webhooks NEW matches exactly once each.
+#[derive(Debug, Clone, Serialize)]
+pub struct SavedSearch {
+    pub id: String,
+    pub query: String,
+    pub app: Option<String>,
+    pub dataset: Option<String>,
+    pub url: String,
+    #[serde(skip_serializing)]
+    pub secret: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SavedSearchRow {
+    id: String,
+    query: String,
+    app: Option<String>,
+    dataset: Option<String>,
+    url: String,
+    secret: Option<String>,
+    enabled: i64,
+    created_at: String,
+}
+
+impl TryFrom<SavedSearchRow> for SavedSearch {
+    type Error = Error;
+
+    fn try_from(r: SavedSearchRow) -> Result<SavedSearch> {
+        Ok(SavedSearch {
+            id: r.id,
+            query: r.query,
+            app: r.app,
+            dataset: r.dataset,
+            url: r.url,
+            secret: r.secret,
+            enabled: r.enabled != 0,
+            created_at: parse_ts(&r.created_at)?,
         })
     }
 }

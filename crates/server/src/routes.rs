@@ -47,6 +47,9 @@ pub fn router(state: AppState) -> Router {
         .route("/plugins/reload", post(reload_plugins))
         .route("/search", get(search))
         .route("/search/docs", axum::routing::delete(delete_search_docs))
+        .route("/searches", get(list_saved_searches).post(create_saved_search))
+        .route("/searches/{id}", axum::routing::delete(delete_saved_search))
+        .route("/searches/{id}/enabled", post(set_saved_search_enabled))
         .route(
             "/search/datasets/{app}/{dataset}",
             axum::routing::delete(delete_search_dataset),
@@ -874,6 +877,72 @@ async fn search(
         "hits": results.hits,
         "facets": results.facets,
     })))
+}
+
+// ---- Saved searches (standing alerts) ---------------------------------------
+
+async fn list_saved_searches(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let searches = state.storage.list_saved_searches(false).await?;
+    Ok(Json(json!({ "searches": searches })))
+}
+
+#[derive(Deserialize)]
+struct CreateSavedSearchBody {
+    /// Full-text query (same syntax as GET /search).
+    query: String,
+    /// Optional scope: only this app / dataset.
+    app: Option<String>,
+    dataset: Option<String>,
+    /// Webhook that receives `search.matched` events for NEW matches.
+    url: String,
+    /// If set, delivery bodies are HMAC-SHA256 signed with this secret.
+    secret: Option<String>,
+}
+
+async fn create_saved_search(
+    State(state): State<AppState>,
+    Json(body): Json<CreateSavedSearchBody>,
+) -> Result<(StatusCode, Json<pumper_core::SavedSearch>), ApiError> {
+    if body.query.trim().is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "'query' is required".into()));
+    }
+    if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "url must be http(s)".into()));
+    }
+    let search = state
+        .storage
+        .create_saved_search(
+            body.query.trim(),
+            body.app.as_deref(),
+            body.dataset.as_deref(),
+            &body.url,
+            body.secret.as_deref(),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(search)))
+}
+
+async fn delete_saved_search(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if state.storage.delete_saved_search(&id).await? {
+        Ok(Json(json!({ "deleted": true })))
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "saved search not found".into()))
+    }
+}
+
+async fn set_saved_search_enabled(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<EnabledBody>,
+) -> Result<Json<Value>, ApiError> {
+    if state.storage.set_saved_search_enabled(&id, body.enabled).await? {
+        Ok(Json(json!({ "id": id, "enabled": body.enabled })))
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "saved search not found".into()))
+    }
 }
 
 #[derive(Deserialize)]
