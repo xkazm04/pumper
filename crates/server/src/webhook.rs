@@ -55,6 +55,47 @@ pub fn dispatch(client: reqwest::Client, job: Job) {
     });
 }
 
+/// Spawns a best-effort delivery of a `dataset.changed` event to one watch.
+/// Same retry/signing contract as job webhooks: 3 attempts, HMAC-SHA256 body
+/// signature in `X-Pumper-Signature` when the watch has a secret.
+pub fn dispatch_change(client: reqwest::Client, watch: pumper_core::Watch, payload: serde_json::Value) {
+    tokio::spawn(async move {
+        let body = match serde_json::to_vec(&payload) {
+            Ok(body) => body,
+            Err(e) => {
+                warn!(watch = %watch.id, "change webhook serialize failed: {e}");
+                return;
+            }
+        };
+        let signature = watch.secret.as_ref().map(|s| sign(s.as_bytes(), &body));
+
+        for attempt in 0..3 {
+            if attempt > 0 {
+                tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
+            }
+            let mut req = client
+                .post(&watch.url)
+                .header("content-type", "application/json")
+                .header("x-pumper-event", "dataset.changed")
+                .body(body.clone());
+            if let Some(sig) = &signature {
+                req = req.header("x-pumper-signature", format!("sha256={sig}"));
+            }
+            match req.send().await {
+                Ok(resp) if resp.status().is_success() => {
+                    debug!(watch = %watch.id, url = %watch.url, "change webhook delivered");
+                    return;
+                }
+                Ok(resp) => {
+                    warn!(watch = %watch.id, status = %resp.status(), "change webhook non-2xx")
+                }
+                Err(e) => warn!(watch = %watch.id, "change webhook send error: {e}"),
+            }
+        }
+        warn!(watch = %watch.id, url = %watch.url, "change webhook gave up after retries");
+    });
+}
+
 fn sign(secret: &[u8], body: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret).expect("hmac accepts any key length");
     mac.update(body);

@@ -129,6 +129,7 @@ async fn execute(state: AppState, job: Job) {
             } else {
                 info!(job = %job.id, "job succeeded");
             }
+            notify_watches(&state, &job).await;
         }
         Ok(Err(e)) => {
             warn!(job = %job.id, error = %e, "job failed");
@@ -158,6 +159,53 @@ async fn execute(state: AppState, job: Job) {
         }
     }
     finalize(&state, job.id).await;
+}
+
+/// Fires `dataset.changed` webhooks at every enabled watch whose dataset saw
+/// new/changed/removed revisions during this job run. Best-effort: delivery
+/// failures never affect the job outcome.
+async fn notify_watches(state: &AppState, job: &Job) {
+    let watches = match state.storage.enabled_watches(&job.app).await {
+        Ok(w) if !w.is_empty() => w,
+        Ok(_) => return,
+        Err(e) => {
+            warn!(job = %job.id, "failed to load watches: {e}");
+            return;
+        }
+    };
+    // Everything this run wrote: revisions after the attempt's start.
+    let changes = match state
+        .datasets
+        .changes_since(&job.app, None, job.started_at, 1000)
+        .await
+    {
+        Ok(c) if !c.is_empty() => c,
+        Ok(_) => return,
+        Err(e) => {
+            warn!(job = %job.id, "failed to load changes for watches: {e}");
+            return;
+        }
+    };
+
+    let mut by_dataset: HashMap<&str, Vec<&pumper_core::Revision>> = HashMap::new();
+    for rev in &changes {
+        by_dataset.entry(rev.dataset.as_str()).or_default().push(rev);
+    }
+
+    for (dataset, revs) in by_dataset {
+        for watch in watches.iter().filter(|w| w.covers(dataset)) {
+            let payload = serde_json::json!({
+                "event": "dataset.changed",
+                "watch_id": watch.id,
+                "job_id": job.id,
+                "app": job.app,
+                "dataset": dataset,
+                "count": revs.len(),
+                "changes": revs,
+            });
+            webhook::dispatch_change(state.webhook_client.clone(), watch.clone(), payload);
+        }
+    }
 }
 
 /// Emits the terminal event and fires the result webhook, if configured.

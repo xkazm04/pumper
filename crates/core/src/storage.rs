@@ -27,6 +27,28 @@ pub struct EnqueueOptions {
     pub callback_secret: Option<String>,
 }
 
+/// A standing subscription: POST a webhook whenever a job leaves fresh
+/// revisions in the watched dataset (`"*"` = all datasets of the app).
+#[derive(Debug, Clone, Serialize)]
+pub struct Watch {
+    pub id: String,
+    pub app: String,
+    pub dataset: String,
+    pub url: String,
+    /// HMAC-SHA256 signing secret for delivery bodies (never serialized).
+    #[serde(skip_serializing)]
+    pub secret: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Watch {
+    /// True when this watch covers `dataset`.
+    pub fn covers(&self, dataset: &str) -> bool {
+        self.dataset == "*" || self.dataset == dataset
+    }
+}
+
 /// A recurring schedule that fires an app on a cron cadence.
 #[derive(Debug, Clone, Serialize)]
 pub struct Schedule {
@@ -343,6 +365,84 @@ impl Storage {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    // ---- Dataset watches ---------------------------------------------------
+
+    pub async fn create_watch(
+        &self,
+        app: &str,
+        dataset: &str,
+        url: &str,
+        secret: Option<&str>,
+    ) -> Result<Watch> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO watches (id, app, dataset, url, secret, enabled, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+        )
+        .bind(&id)
+        .bind(app)
+        .bind(dataset)
+        .bind(url)
+        .bind(secret)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_watch(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_watch(&self, id: &str) -> Result<Option<Watch>> {
+        let row: Option<WatchRow> = sqlx::query_as(
+            "SELECT id, app, dataset, url, secret, enabled, created_at FROM watches WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Watch::try_from).transpose()
+    }
+
+    /// Watches for an app (all watches when `app` is None).
+    pub async fn list_watches(&self, app: Option<&str>) -> Result<Vec<Watch>> {
+        let rows: Vec<WatchRow> = sqlx::query_as(
+            "SELECT id, app, dataset, url, secret, enabled, created_at FROM watches \
+             WHERE (?1 IS NULL OR app = ?1) ORDER BY app, dataset",
+        )
+        .bind(app)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Watch::try_from).collect()
+    }
+
+    /// Enabled watches for an app — the delivery set for change webhooks.
+    pub async fn enabled_watches(&self, app: &str) -> Result<Vec<Watch>> {
+        let rows: Vec<WatchRow> = sqlx::query_as(
+            "SELECT id, app, dataset, url, secret, enabled, created_at FROM watches \
+             WHERE app = ?1 AND enabled = 1",
+        )
+        .bind(app)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Watch::try_from).collect()
+    }
+
+    pub async fn set_watch_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE watches SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_watch(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM watches WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -388,6 +488,33 @@ impl TryFrom<JobRow> for Job {
             available_at: parse_ts(&r.available_at)?,
             started_at: r.started_at.as_deref().map(parse_ts).transpose()?,
             finished_at: r.finished_at.as_deref().map(parse_ts).transpose()?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct WatchRow {
+    id: String,
+    app: String,
+    dataset: String,
+    url: String,
+    secret: Option<String>,
+    enabled: i64,
+    created_at: String,
+}
+
+impl TryFrom<WatchRow> for Watch {
+    type Error = Error;
+
+    fn try_from(r: WatchRow) -> Result<Watch> {
+        Ok(Watch {
+            id: r.id,
+            app: r.app,
+            dataset: r.dataset,
+            url: r.url,
+            secret: r.secret,
+            enabled: r.enabled != 0,
+            created_at: parse_ts(&r.created_at)?,
         })
     }
 }
