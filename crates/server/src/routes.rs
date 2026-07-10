@@ -40,6 +40,11 @@ pub fn router(state: AppState) -> Router {
         .route("/watches", get(list_watches).post(create_watch))
         .route("/watches/{id}", axum::routing::delete(delete_watch))
         .route("/watches/{id}/enabled", post(set_watch_enabled))
+        .route("/triggers", get(list_triggers).post(create_trigger))
+        .route("/triggers/{id}", axum::routing::delete(delete_trigger))
+        .route("/triggers/{id}/enabled", post(set_trigger_enabled))
+        .route("/triggers/{id}/test", post(test_trigger))
+        .route("/triggers/{id}/runs", get(trigger_runs))
         .route("/webhooks/deliveries", get(list_deliveries))
         .route("/webhooks/deliveries/{id}", get(get_delivery))
         .route("/webhooks/deliveries/{id}/replay", post(replay_delivery))
@@ -236,6 +241,7 @@ async fn enqueue_job(
         budget_usd: body.budget_usd.filter(|b| *b > 0.0),
         idempotency_key,
         schedule_id: None,
+        trigger_id: None,
     };
     let (job, created) = state.storage.enqueue_dedup(&name, opts).await?;
     if created {
@@ -766,6 +772,231 @@ async fn set_watch_enabled(
     } else {
         Err(ApiError(StatusCode::NOT_FOUND, "watch not found".into()))
     }
+}
+
+// ---- Reactive triggers -------------------------------------------------------
+
+#[derive(Deserialize)]
+struct TriggersQuery {
+    app: Option<String>,
+}
+
+async fn list_triggers(
+    State(state): State<AppState>,
+    Query(query): Query<TriggersQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let triggers = state.storage.list_triggers(query.app.as_deref()).await?;
+    Ok(Json(json!({ "triggers": triggers })))
+}
+
+#[derive(Deserialize)]
+struct CreateTriggerBody {
+    name: Option<String>,
+    /// 'dataset' (change-feed events) | 'job' (terminal events).
+    source_kind: String,
+    source_app: String,
+    /// Dataset kind only: dataset name or '*' (default).
+    source_dataset: Option<String>,
+    /// Dataset kind only: new|changed|removed|fresh|any (default fresh).
+    on_change: Option<String>,
+    /// Job kind only: succeeded|failed|any (default succeeded).
+    on_status: Option<String>,
+    target_app: String,
+    /// Static params template; `_trigger` is merged over it at fire time.
+    params: Option<Value>,
+    /// The TARGET's spend ceiling (never inherited from the source).
+    budget_usd: Option<f64>,
+    priority: Option<i64>,
+    max_attempts: Option<i64>,
+}
+
+async fn create_trigger(
+    State(state): State<AppState>,
+    Json(body): Json<CreateTriggerBody>,
+) -> Result<(StatusCode, Json<pumper_core::Trigger>), ApiError> {
+    let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, msg);
+    if !state.registry.contains_key(&body.target_app) {
+        return Err(ApiError(StatusCode::NOT_FOUND, format!("unknown target app '{}'", body.target_app)));
+    }
+    // source_app may be a virtual namespace (e.g. cross-source 'grants'), so
+    // only the target is required to be a registered app.
+    let (source_dataset, on_change, on_status) = match body.source_kind.as_str() {
+        "dataset" => {
+            let on_change = body.on_change.as_deref().unwrap_or("fresh");
+            if !matches!(on_change, "new" | "changed" | "removed" | "fresh" | "any") {
+                return Err(bad(format!("invalid on_change '{on_change}'")));
+            }
+            if body.on_status.is_some() {
+                return Err(bad("on_status is only valid for source_kind 'job'".into()));
+            }
+            (
+                Some(body.source_dataset.as_deref().unwrap_or("*")),
+                Some(on_change),
+                None,
+            )
+        }
+        "job" => {
+            let on_status = body.on_status.as_deref().unwrap_or("succeeded");
+            if !matches!(on_status, "succeeded" | "failed" | "any") {
+                return Err(bad(format!("invalid on_status '{on_status}'")));
+            }
+            if body.source_dataset.is_some() || body.on_change.is_some() {
+                return Err(bad("source_dataset/on_change are only valid for source_kind 'dataset'".into()));
+            }
+            (None, None, Some(on_status))
+        }
+        other => return Err(bad(format!("invalid source_kind '{other}' (dataset | job)"))),
+    };
+    let params = body.params.unwrap_or_else(|| json!({}));
+    let trigger = state
+        .storage
+        .create_trigger(&pumper_core::NewTrigger {
+            name: body.name.as_deref(),
+            source_kind: &body.source_kind,
+            source_app: &body.source_app,
+            source_dataset,
+            on_change,
+            on_status,
+            target_app: &body.target_app,
+            params: &params,
+            budget_usd: body.budget_usd.filter(|b| *b > 0.0),
+            priority: body.priority.unwrap_or(0),
+            max_attempts: body.max_attempts.unwrap_or(1),
+        })
+        .await?;
+    Ok((StatusCode::CREATED, Json(trigger)))
+}
+
+async fn delete_trigger(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    if state.storage.delete_trigger(&id).await? {
+        Ok(Json(json!({ "deleted": true })))
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "trigger not found".into()))
+    }
+}
+
+async fn set_trigger_enabled(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<EnabledBody>,
+) -> Result<Json<Value>, ApiError> {
+    if state.storage.set_trigger_enabled(&id, body.enabled).await? {
+        Ok(Json(json!({ "id": id, "enabled": body.enabled })))
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "trigger not found".into()))
+    }
+}
+
+#[derive(Deserialize)]
+struct TestTriggerQuery {
+    /// When true, actually enqueue the resolved hop (repeatable — the
+    /// idempotency key is bypassed for testing). Default: dry-run only.
+    #[serde(default)]
+    fire: bool,
+}
+
+/// Dry-runs a trigger against its most recent matching source job: shows
+/// whether it would fire, the resolved target params, and why not otherwise.
+/// `?fire=true` enqueues the hop for real.
+async fn test_trigger(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<TestTriggerQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(trigger) = state.storage.get_trigger(&id).await? else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "trigger not found".into()));
+    };
+    let no_fire = |reason: &str| json!({ "would_fire": false, "reason": reason });
+
+    // Most recent source job of the trigger's source app.
+    let Some(source) = state
+        .storage
+        .list(Some(&trigger.source_app), None, 1)
+        .await?
+        .into_iter()
+        .next()
+    else {
+        return Ok(Json(no_fire("no source job of that app exists yet")));
+    };
+
+    let decision = crate::triggers::decide(&trigger.id, &source.params, &state.config.triggers);
+    let (depth, chain) = match decision {
+        crate::triggers::FireDecision::Fire { depth, chain } => (depth, chain),
+        crate::triggers::FireDecision::SkipCycle => {
+            return Ok(Json(no_fire("cycle: trigger already in the source job's chain")))
+        }
+        crate::triggers::FireDecision::SkipDepth => {
+            return Ok(Json(no_fire("max chain depth reached")))
+        }
+    };
+
+    let obj = if trigger.source_kind == "dataset" {
+        let changes = state
+            .datasets
+            .changes_since(&trigger.source_app, None, source.started_at, 1000)
+            .await?;
+        let matching: Vec<&pumper_core::Revision> = changes
+            .iter()
+            .filter(|r| trigger.covers_dataset(&r.dataset))
+            .filter(|r| crate::triggers::change_matches(trigger.on_change.as_deref(), &r.change))
+            .collect();
+        if matching.is_empty() {
+            return Ok(Json(no_fire("latest source run produced no matching changes")));
+        }
+        let dataset = matching[0].dataset.clone();
+        crate::triggers::dataset_trigger_obj(
+            &trigger, &source, &dataset, &matching, depth, &chain, &state.config.triggers,
+        )
+    } else {
+        if !crate::triggers::status_matches(trigger.on_status.as_deref(), source.status.as_str()) {
+            return Ok(Json(no_fire("latest source job's status does not match on_status")));
+        }
+        crate::triggers::terminal_trigger_obj(&trigger, &source, depth, &chain)
+    };
+    let resolved_params = crate::triggers::merged_params(&trigger.params, obj);
+
+    if !query.fire {
+        return Ok(Json(json!({
+            "would_fire": true,
+            "target_app": trigger.target_app,
+            "source_job_id": source.id,
+            "resolved_params": resolved_params,
+        })));
+    }
+    // Real fire: no idempotency key so tests are repeatable.
+    let opts = EnqueueOptions {
+        params: resolved_params,
+        max_attempts: trigger.max_attempts,
+        priority: trigger.priority,
+        budget_usd: trigger.budget_usd,
+        trigger_id: Some(trigger.id.clone()),
+        ..Default::default()
+    };
+    let job = state.storage.enqueue(&trigger.target_app, opts).await?;
+    state.notify.notify_one();
+    Ok(Json(json!({ "fired": true, "job": job })))
+}
+
+#[derive(Deserialize)]
+struct RunsQuery {
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+/// Jobs this trigger fired, newest first — the lineage view.
+async fn trigger_runs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<RunsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let jobs = state
+        .storage
+        .jobs_by_trigger(&id, query.limit.clamp(1, 500))
+        .await?;
+    Ok(Json(json!({ "trigger_id": id, "count": jobs.len(), "runs": jobs })))
 }
 
 // ---- Webhook delivery log ----------------------------------------------------

@@ -13,8 +13,8 @@ use crate::job::{Job, JobStatus};
 use crate::{Error, Result};
 
 const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, priority, \
-                           callback_url, callback_secret, budget_usd, schedule_id, result, error, \
-                           created_at, available_at, started_at, finished_at";
+                           callback_url, callback_secret, budget_usd, schedule_id, trigger_id, \
+                           result, error, created_at, available_at, started_at, finished_at";
 
 /// Options for enqueuing a job. Defaults: 1 attempt, no delay, priority 0.
 #[derive(Debug, Clone, Default)]
@@ -32,6 +32,8 @@ pub struct EnqueueOptions {
     pub idempotency_key: Option<String>,
     /// Set by the scheduler so overlapping runs of one schedule can be skipped.
     pub schedule_id: Option<String>,
+    /// Set by trigger evaluation: which trigger fired this job (lineage).
+    pub trigger_id: Option<String>,
 }
 
 /// A standing subscription: POST a webhook whenever a job leaves fresh
@@ -124,8 +126,8 @@ impl Storage {
         let insert = sqlx::query(
             "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
              callback_url, callback_secret, budget_usd, idempotency_key, schedule_id, \
-             created_at, available_at) \
-             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             trigger_id, created_at, available_at) \
+             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         )
         .bind(id.to_string())
         .bind(app)
@@ -137,6 +139,7 @@ impl Storage {
         .bind(opts.budget_usd)
         .bind(&opts.idempotency_key)
         .bind(&opts.schedule_id)
+        .bind(&opts.trigger_id)
         .bind(ts(created))
         .bind(ts(available))
         .execute(&self.pool)
@@ -544,6 +547,102 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
+    // ---- Reactive triggers ---------------------------------------------------
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_trigger(&self, t: &NewTrigger<'_>) -> Result<Trigger> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO triggers (id, name, source_kind, source_app, source_dataset, on_change, \
+             on_status, target_app, params, budget_usd, priority, max_attempts, enabled, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13)",
+        )
+        .bind(&id)
+        .bind(t.name)
+        .bind(t.source_kind)
+        .bind(t.source_app)
+        .bind(t.source_dataset)
+        .bind(t.on_change)
+        .bind(t.on_status)
+        .bind(t.target_app)
+        .bind(t.params.to_string())
+        .bind(t.budget_usd)
+        .bind(t.priority)
+        .bind(t.max_attempts.max(1))
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_trigger(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_trigger(&self, id: &str) -> Result<Option<Trigger>> {
+        let row: Option<TriggerRow> = sqlx::query_as(&format!(
+            "SELECT {TRIGGER_COLUMNS} FROM triggers WHERE id = ?1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Trigger::try_from).transpose()
+    }
+
+    /// All triggers, optionally filtered by source app.
+    pub async fn list_triggers(&self, source_app: Option<&str>) -> Result<Vec<Trigger>> {
+        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+            "SELECT {TRIGGER_COLUMNS} FROM triggers \
+             WHERE (?1 IS NULL OR source_app = ?1) ORDER BY created_at"
+        ))
+        .bind(source_app)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Trigger::try_from).collect()
+    }
+
+    /// Enabled triggers of one source kind for an app — the evaluation set.
+    pub async fn enabled_triggers(&self, source_kind: &str, source_app: &str) -> Result<Vec<Trigger>> {
+        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+            "SELECT {TRIGGER_COLUMNS} FROM triggers \
+             WHERE source_kind = ?1 AND source_app = ?2 AND enabled = 1"
+        ))
+        .bind(source_kind)
+        .bind(source_app)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Trigger::try_from).collect()
+    }
+
+    pub async fn set_trigger_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE triggers SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_trigger(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM triggers WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Jobs a trigger fired, newest first (the lineage view).
+    pub async fn jobs_by_trigger(&self, trigger_id: &str, limit: i64) -> Result<Vec<Job>> {
+        let sql = format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE trigger_id = ?1 \
+             ORDER BY created_at DESC LIMIT ?2"
+        );
+        let rows: Vec<JobRow> = sqlx::query_as(&sql)
+            .bind(trigger_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(Job::try_from).collect()
+    }
+
     // ---- Saved searches -----------------------------------------------------
 
     pub async fn create_saved_search(
@@ -732,6 +831,7 @@ struct JobRow {
     callback_secret: Option<String>,
     budget_usd: Option<f64>,
     schedule_id: Option<String>,
+    trigger_id: Option<String>,
     result: Option<String>,
     error: Option<String>,
     created_at: String,
@@ -757,6 +857,7 @@ impl TryFrom<JobRow> for Job {
             callback_secret: r.callback_secret,
             budget_usd: r.budget_usd,
             schedule_id: r.schedule_id,
+            trigger_id: r.trigger_id,
             result: r
                 .result
                 .as_deref()
@@ -766,6 +867,99 @@ impl TryFrom<JobRow> for Job {
             available_at: parse_ts(&r.available_at)?,
             started_at: r.started_at.as_deref().map(parse_ts).transpose()?,
             finished_at: r.finished_at.as_deref().map(parse_ts).transpose()?,
+        })
+    }
+}
+
+const TRIGGER_COLUMNS: &str = "id, name, source_kind, source_app, source_dataset, on_change, \
+                               on_status, target_app, params, budget_usd, priority, \
+                               max_attempts, enabled, created_at";
+
+/// A reactive-pipeline edge: (source event) → (enqueue target app). The set of
+/// triggers is the pipeline DAG.
+#[derive(Debug, Clone, Serialize)]
+pub struct Trigger {
+    pub id: String,
+    pub name: Option<String>,
+    /// 'dataset' | 'job'
+    pub source_kind: String,
+    pub source_app: String,
+    /// '*' or dataset name (dataset kind only).
+    pub source_dataset: Option<String>,
+    /// 'new'|'changed'|'removed'|'fresh'|'any' (dataset kind only).
+    pub on_change: Option<String>,
+    /// 'succeeded'|'failed'|'any' (job kind only).
+    pub on_status: Option<String>,
+    pub target_app: String,
+    /// Static params template; `_trigger` is merged over it at fire time.
+    pub params: Value,
+    pub budget_usd: Option<f64>,
+    pub priority: i64,
+    pub max_attempts: i64,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Trigger {
+    /// True when this dataset trigger covers `dataset` (`'*'` = all).
+    pub fn covers_dataset(&self, dataset: &str) -> bool {
+        matches!(self.source_dataset.as_deref(), Some("*") | None)
+            || self.source_dataset.as_deref() == Some(dataset)
+    }
+}
+
+/// Create-time fields for a trigger (borrowed; storage assigns id/enabled/time).
+pub struct NewTrigger<'a> {
+    pub name: Option<&'a str>,
+    pub source_kind: &'a str,
+    pub source_app: &'a str,
+    pub source_dataset: Option<&'a str>,
+    pub on_change: Option<&'a str>,
+    pub on_status: Option<&'a str>,
+    pub target_app: &'a str,
+    pub params: &'a Value,
+    pub budget_usd: Option<f64>,
+    pub priority: i64,
+    pub max_attempts: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct TriggerRow {
+    id: String,
+    name: Option<String>,
+    source_kind: String,
+    source_app: String,
+    source_dataset: Option<String>,
+    on_change: Option<String>,
+    on_status: Option<String>,
+    target_app: String,
+    params: String,
+    budget_usd: Option<f64>,
+    priority: i64,
+    max_attempts: i64,
+    enabled: i64,
+    created_at: String,
+}
+
+impl TryFrom<TriggerRow> for Trigger {
+    type Error = Error;
+
+    fn try_from(r: TriggerRow) -> Result<Trigger> {
+        Ok(Trigger {
+            id: r.id,
+            name: r.name,
+            source_kind: r.source_kind,
+            source_app: r.source_app,
+            source_dataset: r.source_dataset,
+            on_change: r.on_change,
+            on_status: r.on_status,
+            target_app: r.target_app,
+            params: serde_json::from_str(&r.params).unwrap_or(Value::Null),
+            budget_usd: r.budget_usd,
+            priority: r.priority,
+            max_attempts: r.max_attempts,
+            enabled: r.enabled != 0,
+            created_at: parse_ts(&r.created_at)?,
         })
     }
 }

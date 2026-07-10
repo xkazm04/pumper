@@ -54,6 +54,8 @@ pub struct Job {
     pub budget_usd: Option<f64>,
     /// The schedule that fired this job, when it was a scheduled run.
     pub schedule_id: Option<String>,
+    /// The trigger that fired this job, when it was a reactive-pipeline hop.
+    pub trigger_id: Option<String>,
     pub result: Option<Value>,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,
