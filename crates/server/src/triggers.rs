@@ -210,3 +210,133 @@ mod tests {
         assert_ne!(idempotency_key("T1", "J1"), idempotency_key("T2", "J1"));
     }
 }
+
+// ── worker hooks (IO around the pure helpers) ────────────────────────────────
+
+use std::collections::HashMap;
+
+use pumper_core::EnqueueOptions;
+use tracing::{info, warn};
+
+use crate::state::AppState;
+
+/// Fires enabled dataset triggers matching this run's revision batch. One
+/// target job per trigger per source run (idempotency-keyed), carrying the
+/// capped key batch in `params._trigger`. Fail-open: evaluation errors are
+/// logged and never affect the source job.
+pub async fn fire_dataset_triggers(
+    state: &AppState,
+    job: &Job,
+    by_dataset: &HashMap<&str, Vec<&Revision>>,
+) {
+    let trigs = match state.storage.enabled_triggers("dataset", &job.app).await {
+        Ok(t) if !t.is_empty() => t,
+        Ok(_) => return,
+        Err(e) => {
+            warn!(job = %job.id, "failed to load dataset triggers: {e}");
+            return;
+        }
+    };
+    let mut fired = 0;
+    for (dataset, revs) in by_dataset {
+        for trigger in trigs.iter().filter(|t| t.covers_dataset(dataset)) {
+            let matching: Vec<&Revision> = revs
+                .iter()
+                .copied()
+                .filter(|r| change_matches(trigger.on_change.as_deref(), &r.change))
+                .collect();
+            if matching.is_empty() {
+                continue;
+            }
+            let (depth, chain) = match decide(&trigger.id, &job.params, &state.config.triggers) {
+                FireDecision::Fire { depth, chain } => (depth, chain),
+                FireDecision::SkipCycle => {
+                    warn!(trigger = %trigger.id, job = %job.id,
+                          "trigger skipped: cycle detected in provenance chain");
+                    continue;
+                }
+                FireDecision::SkipDepth => {
+                    warn!(trigger = %trigger.id, job = %job.id,
+                          max_depth = state.config.triggers.max_depth,
+                          "trigger skipped: max chain depth reached");
+                    continue;
+                }
+            };
+            let obj = dataset_trigger_obj(
+                trigger, job, dataset, &matching, depth, &chain, &state.config.triggers,
+            );
+            fired += enqueue_hop(state, trigger, job, obj).await;
+        }
+    }
+    if fired > 0 {
+        state.notify.notify_one();
+    }
+}
+
+/// Fires enabled terminal-job triggers matching this job's final status.
+pub async fn fire_terminal_triggers(state: &AppState, job: &Job) {
+    let trigs = match state.storage.enabled_triggers("job", &job.app).await {
+        Ok(t) if !t.is_empty() => t,
+        Ok(_) => return,
+        Err(e) => {
+            warn!(job = %job.id, "failed to load job triggers: {e}");
+            return;
+        }
+    };
+    let mut fired = 0;
+    for trigger in &trigs {
+        if !status_matches(trigger.on_status.as_deref(), job.status.as_str()) {
+            continue;
+        }
+        let (depth, chain) = match decide(&trigger.id, &job.params, &state.config.triggers) {
+            FireDecision::Fire { depth, chain } => (depth, chain),
+            FireDecision::SkipCycle => {
+                warn!(trigger = %trigger.id, job = %job.id,
+                      "trigger skipped: cycle detected in provenance chain");
+                continue;
+            }
+            FireDecision::SkipDepth => {
+                warn!(trigger = %trigger.id, job = %job.id,
+                      max_depth = state.config.triggers.max_depth,
+                      "trigger skipped: max chain depth reached");
+                continue;
+            }
+        };
+        let obj = terminal_trigger_obj(trigger, job, depth, &chain);
+        fired += enqueue_hop(state, trigger, job, obj).await;
+    }
+    if fired > 0 {
+        state.notify.notify_one();
+    }
+}
+
+/// Enqueues one triggered hop (dedup-guarded). Returns 1 when a job was
+/// actually created, 0 when skipped/deduped/failed.
+async fn enqueue_hop(state: &AppState, trigger: &Trigger, source: &Job, obj: Value) -> usize {
+    if !state.registry.contains_key(&trigger.target_app) {
+        warn!(trigger = %trigger.id, app = %trigger.target_app,
+              "trigger skipped: target app not registered");
+        return 0;
+    }
+    let opts = EnqueueOptions {
+        params: merged_params(&trigger.params, obj),
+        max_attempts: trigger.max_attempts,
+        priority: trigger.priority,
+        budget_usd: trigger.budget_usd,
+        idempotency_key: Some(idempotency_key(&trigger.id, &source.id.to_string())),
+        trigger_id: Some(trigger.id.clone()),
+        ..Default::default()
+    };
+    match state.storage.enqueue_dedup(&trigger.target_app, opts).await {
+        Ok((hop, true)) => {
+            info!(trigger = %trigger.id, source = %source.id, target = %hop.id,
+                  app = %trigger.target_app, "trigger fired");
+            1
+        }
+        Ok((_, false)) => 0, // already fired for this source run
+        Err(e) => {
+            warn!(trigger = %trigger.id, source = %source.id, "trigger enqueue failed: {e}");
+            0
+        }
+    }
+}

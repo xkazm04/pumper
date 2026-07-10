@@ -132,7 +132,13 @@ async fn execute(state: AppState, job: Job) {
             } else {
                 info!(job = %job.id, "job succeeded");
             }
-            notify_watches(&state, &job).await;
+            // One revision batch for this run, shared by watches + triggers.
+            let changes = load_run_changes(&state, &job).await;
+            if !changes.is_empty() {
+                let by_dataset = group_by_dataset(&changes);
+                notify_watches(&state, &job, &by_dataset).await;
+                crate::triggers::fire_dataset_triggers(&state, &job, &by_dataset).await;
+            }
             notify_saved_searches(&state, &job).await;
         }
         Ok(Err(e)) => {
@@ -165,10 +171,40 @@ async fn execute(state: AppState, job: Job) {
     finalize(&state, job.id).await;
 }
 
+/// Everything this run wrote: revisions after the attempt's start. Fail-open
+/// (empty on error) — side effects never block the job outcome.
+async fn load_run_changes(state: &AppState, job: &Job) -> Vec<pumper_core::Revision> {
+    match state
+        .datasets
+        .changes_since(&job.app, None, job.started_at, 1000)
+        .await
+    {
+        Ok(changes) => changes,
+        Err(e) => {
+            warn!(job = %job.id, "failed to load run changes: {e}");
+            Vec::new()
+        }
+    }
+}
+
+fn group_by_dataset(
+    changes: &[pumper_core::Revision],
+) -> HashMap<&str, Vec<&pumper_core::Revision>> {
+    let mut by_dataset: HashMap<&str, Vec<&pumper_core::Revision>> = HashMap::new();
+    for rev in changes {
+        by_dataset.entry(rev.dataset.as_str()).or_default().push(rev);
+    }
+    by_dataset
+}
+
 /// Fires `dataset.changed` webhooks at every enabled watch whose dataset saw
 /// new/changed/removed revisions during this job run. Best-effort: delivery
 /// failures never affect the job outcome.
-async fn notify_watches(state: &AppState, job: &Job) {
+async fn notify_watches(
+    state: &AppState,
+    job: &Job,
+    by_dataset: &HashMap<&str, Vec<&pumper_core::Revision>>,
+) {
     let watches = match state.storage.enabled_watches(&job.app).await {
         Ok(w) if !w.is_empty() => w,
         Ok(_) => return,
@@ -177,24 +213,6 @@ async fn notify_watches(state: &AppState, job: &Job) {
             return;
         }
     };
-    // Everything this run wrote: revisions after the attempt's start.
-    let changes = match state
-        .datasets
-        .changes_since(&job.app, None, job.started_at, 1000)
-        .await
-    {
-        Ok(c) if !c.is_empty() => c,
-        Ok(_) => return,
-        Err(e) => {
-            warn!(job = %job.id, "failed to load changes for watches: {e}");
-            return;
-        }
-    };
-
-    let mut by_dataset: HashMap<&str, Vec<&pumper_core::Revision>> = HashMap::new();
-    for rev in &changes {
-        by_dataset.entry(rev.dataset.as_str()).or_default().push(rev);
-    }
 
     for (dataset, revs) in by_dataset {
         for watch in watches.iter().filter(|w| w.covers(dataset)) {
