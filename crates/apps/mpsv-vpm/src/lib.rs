@@ -52,6 +52,15 @@ const ISPV_DATASET: &str = "wages";
 const GAP_APP: &str = "cz-labour";
 const GAP_DATASET: &str = "salary_gap";
 
+/// ARES business register — key-free JSON REST lookup of one economic subject
+/// by IČO. Enriches the employers behind this run's vacancy samples.
+const ARES_URL: &str = "https://ares.gov.cz/ekonomicke-subjekty-v-be/rest/ekonomicke-subjekty";
+/// Per-run cap on NEW ARES lookups — this is enrichment, not a crawl; the
+/// backlog drains across daily runs (already-enriched IČOs are skipped).
+const ARES_MAX_LOOKUPS_DEFAULT: u64 = 50;
+/// Cap on CZ-NACE activity codes kept per employer record.
+const ARES_NACE_CAP: usize = 12;
+
 #[async_trait]
 impl ScrapeApp for MpsvVpm {
     fn name(&self) -> &'static str {
@@ -63,12 +72,15 @@ impl ScrapeApp for MpsvVpm {
          Aggregates the ~300k live postings into `role_region_agg` (CZ-ISCO × kraj × orgType: \
          count + monthly-salary distribution; kraj `ALL` = national) and `vacancy_samples` \
          (JD references). Also joins posted salaries against mpsv-ispv official ISPV \
-         statistics into `cz-labour/salary_gap` (per CZ-ISCO unit group × sphere). \
+         statistics into `cz-labour/salary_gap` (per CZ-ISCO unit group × sphere), \
+         and enriches sampled employers from the key-free ARES business register \
+         into `employers` (keyed by IČO: name, legal form, founded, kraj, CZ-NACE). \
          Drops stale relics: postings first posted more than \
          `maxPostedAgeDays` before the feed date are excluded (0 = keep all). \
          Params: {\"url\": endpoint override, \"maxRecords\": 0=all, \
          \"minCount\": 3 (min postings per aggregate cell), \"samplesPerGroup\": 4, \
-         \"maxPostedAgeDays\": 730 (0 = keep all ages)}"
+         \"maxPostedAgeDays\": 730 (0 = keep all ages), \
+         \"aresMaxLookups\": 50 (new ARES lookups per run, 0 = disable)}"
     }
 
     /// Daily full sync at 06:00 UTC. Change detection makes the output meaningful
@@ -78,7 +90,13 @@ impl ScrapeApp for MpsvVpm {
     }
 
     fn default_params(&self) -> Value {
-        json!({ "maxRecords": 0, "minCount": 3, "samplesPerGroup": 4, "maxPostedAgeDays": 730 })
+        json!({
+            "maxRecords": 0,
+            "minCount": 3,
+            "samplesPerGroup": 4,
+            "maxPostedAgeDays": 730,
+            "aresMaxLookups": ARES_MAX_LOOKUPS_DEFAULT,
+        })
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -381,6 +399,82 @@ impl ScrapeApp for MpsvVpm {
             })
         };
 
+        // ── ARES employer enrichment ────────────────────────────────────────
+        // The persisted vacancy samples carry the employer IČO; look the new
+        // ones up in the key-free ARES business register and persist a compact
+        // `employers` record (keyed by IČO). Capped per run — enrichment, not
+        // a crawl; the engine's politeness governor + TTL cache handle
+        // rate/duplication, and the backlog drains across daily runs. A
+        // malformed/404 response skips that IČO with a warn, never fails the run.
+        let ares_max = ctx
+            .params
+            .get("aresMaxLookups")
+            .and_then(Value::as_u64)
+            .unwrap_or(ARES_MAX_LOOKUPS_DEFAULT)
+            .min(500) as usize;
+        let icos = distinct_icos(sample_items.iter().map(|(_, v)| v));
+        let mut employer_items: Vec<(String, Value)> = Vec::new();
+        let mut ares_skipped = 0usize; // already enriched in a prior run
+        let mut ares_failed = 0usize; // transport / 404 / malformed
+        let mut ares_capped = 0usize; // left for a later run (per-run cap)
+        let mut ares_looked_up = 0usize;
+        for ico in &icos {
+            // already in the employers dataset → nothing to fetch
+            if ctx.datasets.get(&ctx.app, "employers", ico).await?.is_some() {
+                ares_skipped += 1;
+                continue;
+            }
+            if ares_looked_up >= ares_max {
+                ares_capped += 1;
+                continue;
+            }
+            ares_looked_up += 1;
+            let ares_url = format!("{ARES_URL}/{ico}");
+            let resp = match ctx.engines.http.fetch(HttpRequest::get(&ares_url)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("mpsv-vpm: ARES fetch failed for IČO {ico}: {e}");
+                    ares_failed += 1;
+                    continue;
+                }
+            };
+            if !resp.is_success() {
+                tracing::warn!(
+                    "mpsv-vpm: ARES returned status {} for IČO {ico} — skipping",
+                    resp.status
+                );
+                ares_failed += 1;
+                continue;
+            }
+            let subject: Value = match serde_json::from_str(&resp.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("mpsv-vpm: ARES body for IČO {ico} was not JSON: {e}");
+                    ares_failed += 1;
+                    continue;
+                }
+            };
+            match normalize_ares_employer(ico, &subject) {
+                Some(rec) => employer_items.push((ico.clone(), rec)),
+                None => {
+                    tracing::warn!("mpsv-vpm: ARES subject for IČO {ico} had no usable name");
+                    ares_failed += 1;
+                }
+            }
+        }
+        let employers = ctx.upsert_many("employers", &employer_items).await?;
+        let employer_summary = json!({
+            "distinctIcos": icos.len(),
+            "enriched": employer_items.len(),
+            "new": employers.new.len(),
+            "changed": employers.changed.len(),
+            "unchanged": employers.unchanged,
+            "skippedExisting": ares_skipped,
+            "capped": ares_capped,
+            "failed": ares_failed,
+            "maxLookups": ares_max,
+        });
+
         let out = json!({
             "source": "data.mpsv.cz/volna-mista",
             "feedRecords": total,
@@ -402,6 +496,7 @@ impl ScrapeApp for MpsvVpm {
             "trendingTop": trending_top,
             "fadingTop": fading_top,
             "salaryGap": salary_gap,
+            "employers": employer_summary,
             "freshness": freshness,
         });
         ctx.save_artifact("summary.json", &serde_json::to_vec_pretty(&out)?)
@@ -500,6 +595,82 @@ fn compute_salary_gaps(
     }
     items.sort_by(|a, b| a.0.cmp(&b.0));
     items
+}
+
+/// Distinct valid employer IČOs from this run's persisted vacancy samples,
+/// zero-padded to the canonical 8 digits (ARES's path format), in first-seen
+/// order for deterministic capping.
+fn distinct_icos<'a>(samples: impl Iterator<Item = &'a Value>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut icos = Vec::new();
+    for v in samples {
+        let Some(raw) = v.get("employerIco").and_then(Value::as_str) else { continue };
+        let raw = raw.trim();
+        if raw.is_empty() || raw.len() > 8 || !raw.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let ico = format!("{raw:0>8}");
+        if seen.insert(ico.clone()) {
+            icos.push(ico);
+        }
+    }
+    icos
+}
+
+/// Non-empty trimmed string or number rendered as a string — ARES codes drift
+/// between the two (e.g. `pravniForma: "121"` vs `kodKraje: 19`).
+fn json_scalar_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => {
+            let s = s.trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// CZ-NACE activity codes from an ARES subject, defensively: an array of
+/// strings/numbers, or of objects carrying the code under a known key.
+/// Returns (codes capped at [`ARES_NACE_CAP`], total present).
+fn ares_nace_codes(v: &Value) -> (Vec<String>, usize) {
+    let Some(arr) = v.get("czNace").and_then(Value::as_array) else {
+        return (Vec::new(), 0);
+    };
+    let codes: Vec<String> = arr
+        .iter()
+        .filter_map(|n| match n {
+            Value::Object(_) => ["kodNace", "kod", "id", "value"]
+                .iter()
+                .find_map(|k| n.get(k).and_then(json_scalar_string)),
+            scalar => json_scalar_string(scalar),
+        })
+        .take(ARES_NACE_CAP)
+        .collect();
+    (codes, arr.len())
+}
+
+/// Compact normalized employer record from one ARES economic-subject response.
+/// Inspects the payload defensively (the exact shape may drift); returns `None`
+/// when there is no usable business name — nothing honest to persist.
+fn normalize_ares_employer(ico: &str, v: &Value) -> Option<Value> {
+    let name = v
+        .get("obchodniJmeno")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let sidlo = v.get("sidlo");
+    let (nace, nace_total) = ares_nace_codes(v);
+    Some(json!({
+        "ico": ico,
+        "name": name,
+        "legalForm": v.get("pravniForma").and_then(json_scalar_string),
+        "founded": v.get("datumVzniku").and_then(Value::as_str),
+        "krajId": sidlo.and_then(|s| s.get("kodKraje")).and_then(json_scalar_string),
+        "krajName": sidlo.and_then(|s| s.get("nazevKraje")).and_then(Value::as_str),
+        "nace": nace,
+        "naceCount": nace_total,
+    }))
 }
 
 // ── typed subset of the feed (unknown fields are ignored, bounding memory) ──
@@ -673,7 +844,7 @@ impl Posting {
             .map(|v| v.iter().filter_map(|r| r.id.clone()).collect())
             .unwrap_or_default();
         let employer = self.zamestnavatel.as_ref().and_then(|z| z.nazev.clone());
-        // IČO → the join key for a future ARES org-size enrichment (startup vs corporate).
+        // IČO → the join key for the ARES enrichment into the `employers` dataset.
         let employer_ico = self.zamestnavatel.as_ref().and_then(|z| z.ico.clone());
         let education = self.minPozadovaneVzdelani.as_ref().and_then(|e| e.id.clone());
         // richer postings (salary + skills + a descriptive title) make better refs
@@ -887,5 +1058,80 @@ mod tests {
     fn unit_group_truncates_to_four_digits() {
         assert_eq!(unit_group("CzIsco/93291"), "9329");
         assert_eq!(unit_group("CzIsco/1120"), "1120");
+    }
+
+    #[test]
+    fn ares_normalize_extracts_compact_employer_record() {
+        // realistic ARES economic-subject shape (subset; extra fields ignored)
+        let subject = json!({
+            "ico": "27074358",
+            "obchodniJmeno": "Alza.cz a.s.",
+            "pravniForma": "121",
+            "datumVzniku": "2003-08-26",
+            "financniUrad": "007",
+            "sidlo": {
+                "kodStatu": "CZ",
+                "kodKraje": 19,
+                "nazevKraje": "Hlavní město Praha",
+                "textovaAdresa": "Jankovcova 1522/53, Holešovice, 17000 Praha 7"
+            },
+            "czNace": ["46900", "620", "471"]
+        });
+        let rec = normalize_ares_employer("27074358", &subject).expect("record");
+        assert_eq!(rec["ico"], "27074358");
+        assert_eq!(rec["name"], "Alza.cz a.s.");
+        assert_eq!(rec["legalForm"], "121");
+        assert_eq!(rec["founded"], "2003-08-26");
+        assert_eq!(rec["krajId"], "19"); // numeric kodKraje → string
+        assert_eq!(rec["krajName"], "Hlavní město Praha");
+        assert_eq!(rec["nace"], json!(["46900", "620", "471"]));
+        assert_eq!(rec["naceCount"], 3);
+    }
+
+    #[test]
+    fn ares_normalize_rejects_nameless_and_tolerates_drifted_shapes() {
+        // no usable name → nothing honest to persist
+        assert!(normalize_ares_employer("123", &json!({"ico": "123"})).is_none());
+        assert!(normalize_ares_employer("123", &json!({"obchodniJmeno": "  "})).is_none());
+        // NACE as objects, string kodKraje, missing sidlo/dates still normalize
+        let subject = json!({
+            "obchodniJmeno": "Obec Horní Lhota",
+            "sidlo": {"kodKraje": "141"},
+            "czNace": [{"kodNace": "84110"}, {"kod": "0161"}, {"nazev": "codeless"}]
+        });
+        let rec = normalize_ares_employer("00000001", &subject).expect("record");
+        assert_eq!(rec["krajId"], "141");
+        assert_eq!(rec["krajName"], Value::Null);
+        assert_eq!(rec["legalForm"], Value::Null);
+        assert_eq!(rec["founded"], Value::Null);
+        assert_eq!(rec["nace"], json!(["84110", "0161"]));
+        assert_eq!(rec["naceCount"], 3); // total present, codeless entry included
+    }
+
+    #[test]
+    fn ares_nace_list_is_capped() {
+        let many: Vec<String> = (0..30).map(|i| format!("{i:05}")).collect();
+        let subject = json!({"obchodniJmeno": "Big s.r.o.", "czNace": many});
+        let rec = normalize_ares_employer("00000002", &subject).expect("record");
+        assert_eq!(rec["nace"].as_array().unwrap().len(), ARES_NACE_CAP);
+        assert_eq!(rec["naceCount"], 30);
+    }
+
+    #[test]
+    fn distinct_icos_dedupes_pads_and_drops_invalid() {
+        let samples = vec![
+            json!({"employerIco": "27074358"}),
+            json!({"employerIco": "27074358"}),  // duplicate
+            json!({"employerIco": "45274649 "}), // trimmed
+            json!({"employerIco": "1234567"}),   // 7 digits → zero-padded
+            json!({"employerIco": "12a45678"}),  // non-numeric → dropped
+            json!({"employerIco": "123456789"}), // too long → dropped
+            json!({"employerIco": ""}),          // empty → dropped
+            json!({"title": "no ico"}),          // absent → dropped
+        ];
+        assert_eq!(
+            distinct_icos(samples.iter()),
+            vec!["27074358", "45274649", "01234567"]
+        );
     }
 }
