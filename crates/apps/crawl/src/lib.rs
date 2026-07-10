@@ -18,16 +18,19 @@ impl ScrapeApp for Crawl {
     fn description(&self) -> &'static str {
         "High-concurrency broad crawler. Params: {\"seeds\": [..], \"max_pages\": 50, \
          \"max_depth\": 2, \"concurrency\": 16, \"same_domain\": true, \
-         \"dedup_distance\": 3, \"respect_robots\": true}"
+         \"dedup_distance\": 3, \"respect_robots\": true, \
+         \"include_patterns\": [\"regex\", ..], \"exclude_patterns\": [\"regex\", ..]}"
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
-        let seeds: Vec<String> = ctx
-            .params
-            .get("seeds")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
+        let str_array = |key: &str| -> Vec<String> {
+            ctx.params
+                .get(key)
+                .and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .unwrap_or_default()
+        };
+        let seeds = str_array("seeds");
         if seeds.is_empty() {
             return Err(Error::App("param 'seeds' must be a non-empty array".into()));
         }
@@ -50,6 +53,8 @@ impl ScrapeApp for Crawl {
             same_domain: bool_param("same_domain", true),
             dedup_distance: u32_param("dedup_distance", 3),
             respect_robots: bool_param("respect_robots", true),
+            include_patterns: str_array("include_patterns"),
+            exclude_patterns: str_array("exclude_patterns"),
         };
 
         let stats = crawl(ctx.engines.http.clone(), cfg, Some(ctx.artifacts_dir.clone())).await?;
@@ -58,6 +63,7 @@ impl ScrapeApp for Crawl {
             "kept": stats.kept,
             "skipped_duplicates": stats.skipped_duplicates,
             "skipped_robots": stats.skipped_robots,
+            "skipped_filtered": stats.skipped_filtered,
             "hosts": stats.hosts,
             "frontier_remaining": stats.frontier_remaining,
             "pages": stats.pages,

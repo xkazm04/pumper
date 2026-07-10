@@ -34,6 +34,42 @@ pub struct CrawlConfig {
     /// Drop pages within this SimHash distance of one already kept (0 disables).
     pub dedup_distance: u32,
     pub respect_robots: bool,
+    /// Regexes a discovered URL must match (any of) to be enqueued. Empty =
+    /// everything allowed. Seeds are exempt — the user asked for them.
+    pub include_patterns: Vec<String>,
+    /// Regexes that drop a discovered URL (any match). Applied after include.
+    pub exclude_patterns: Vec<String>,
+}
+
+/// Compiled include/exclude filter.
+struct UrlFilter {
+    include: Vec<regex::Regex>,
+    exclude: Vec<regex::Regex>,
+}
+
+impl UrlFilter {
+    fn compile(cfg: &CrawlConfig) -> Result<Self> {
+        let compile = |patterns: &[String]| -> Result<Vec<regex::Regex>> {
+            patterns
+                .iter()
+                .map(|p| {
+                    regex::Regex::new(p)
+                        .map_err(|e| crate::Error::Parse(format!("bad url pattern '{p}': {e}")))
+                })
+                .collect()
+        };
+        Ok(Self {
+            include: compile(&cfg.include_patterns)?,
+            exclude: compile(&cfg.exclude_patterns)?,
+        })
+    }
+
+    fn allows(&self, url: &str) -> bool {
+        if !self.include.is_empty() && !self.include.iter().any(|re| re.is_match(url)) {
+            return false;
+        }
+        !self.exclude.iter().any(|re| re.is_match(url))
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -52,6 +88,8 @@ pub struct CrawlStats {
     pub kept: usize,
     pub skipped_duplicates: usize,
     pub skipped_robots: usize,
+    /// Discovered links dropped by include/exclude URL patterns.
+    pub skipped_filtered: usize,
     pub hosts: usize,
     pub frontier_remaining: usize,
     pub pages: Vec<CrawlPage>,
@@ -94,6 +132,7 @@ pub async fn crawl(
     output_dir: Option<PathBuf>,
 ) -> Result<CrawlStats> {
     let concurrency = cfg.concurrency.clamp(1, 256);
+    let filter = UrlFilter::compile(&cfg)?;
     let mut frontier = Frontier::new();
     let mut seed_hosts: HashSet<String> = HashSet::new();
     for seed in &cfg.seeds {
@@ -154,6 +193,10 @@ pub async fn crawl(
             // Enqueue newly discovered links within the depth budget.
             if fetched.depth < cfg.max_depth {
                 for link in &fetched.links {
+                    if !filter.allows(link) {
+                        stats.skipped_filtered += 1;
+                        continue;
+                    }
                     frontier.push(link.clone(), fetched.depth + 1);
                 }
             }
@@ -312,6 +355,27 @@ impl RobotRules {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn url_filter_include_then_exclude() {
+        let cfg = CrawlConfig {
+            seeds: vec![],
+            max_pages: 1,
+            max_depth: 1,
+            concurrency: 1,
+            same_domain: true,
+            dedup_distance: 0,
+            respect_robots: false,
+            include_patterns: vec!["/blog/".into()],
+            exclude_patterns: vec!["\\.pdf$".into()],
+        };
+        let f = UrlFilter::compile(&cfg).unwrap();
+        assert!(f.allows("https://x.com/blog/post"));
+        assert!(!f.allows("https://x.com/shop/item"));
+        assert!(!f.allows("https://x.com/blog/file.pdf"));
+        assert!(UrlFilter::compile(&CrawlConfig { include_patterns: vec!["(".into()], ..cfg })
+            .is_err());
+    }
 
     #[test]
     fn canonicalize_drops_tracking_sorts_query_and_trims_slash() {
