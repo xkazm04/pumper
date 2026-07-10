@@ -25,6 +25,7 @@ pub fn router(state: AppState) -> Router {
         .route("/apps/{name}/datasets", get(list_datasets))
         .route("/jobs", get(list_jobs))
         .route("/jobs/{id}", get(get_job).delete(cancel_job))
+        .route("/jobs/{id}/retry", post(retry_job))
         .route("/jobs/{id}/stream", get(stream_job))
         .route("/jobs/{id}/costs", get(job_costs))
         .route("/costs", get(cost_summary))
@@ -278,6 +279,27 @@ async fn get_job(
         .await?
         .map(Json)
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "job not found".into()))
+}
+
+/// Re-queues a failed or cancelled job with one more attempt.
+async fn retry_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<(StatusCode, Json<Job>), ApiError> {
+    match state.storage.retry(id).await? {
+        Some(job) => {
+            state
+                .events
+                .send(JobEvent::new(job.id, job.app.clone(), "queued"))
+                .ok();
+            state.notify.notify_one();
+            Ok((StatusCode::ACCEPTED, Json(job)))
+        }
+        None => Err(ApiError(
+            StatusCode::CONFLICT,
+            "job not found or not in a retryable state (failed/cancelled)".into(),
+        )),
+    }
 }
 
 async fn cancel_job(

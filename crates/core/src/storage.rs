@@ -289,6 +289,25 @@ impl Storage {
         Ok(rows)
     }
 
+    /// Manually re-queues a failed or cancelled job: clears the terminal state
+    /// and grants one more attempt. Returns the refreshed job, or None when the
+    /// job doesn't exist or isn't in a retryable state.
+    pub async fn retry(&self, id: Uuid) -> Result<Option<Job>> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'queued', error = NULL, finished_at = NULL, \
+             available_at = ?2, max_attempts = MAX(max_attempts, attempts + 1) \
+             WHERE id = ?1 AND status IN ('failed', 'cancelled')",
+        )
+        .bind(id.to_string())
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get(id).await
+    }
+
     /// Re-queues jobs left in `running` by a previous crash/shutdown.
     pub async fn recover_stuck(&self) -> Result<u64> {
         let result =
