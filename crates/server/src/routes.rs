@@ -190,6 +190,8 @@ struct EnqueueBody {
     callback_url: Option<String>,
     /// If set, the callback body is HMAC-SHA256 signed with this secret.
     callback_secret: Option<String>,
+    /// Spend ceiling for the whole job; metered Claude calls abort past it.
+    budget_usd: Option<f64>,
 }
 
 async fn enqueue_job(
@@ -208,6 +210,7 @@ async fn enqueue_job(
         priority: body.priority.unwrap_or(0),
         callback_url: body.callback_url,
         callback_secret: body.callback_secret,
+        budget_usd: body.budget_usd.filter(|b| *b > 0.0),
     };
     let job = state.storage.enqueue(&name, opts).await?;
     state.notify.notify_one();

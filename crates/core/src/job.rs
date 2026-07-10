@@ -50,6 +50,8 @@ pub struct Job {
     pub callback_url: Option<String>,
     #[serde(skip_serializing)]
     pub callback_secret: Option<String>,
+    /// Spend ceiling for the whole job; metered Claude calls abort past it.
+    pub budget_usd: Option<f64>,
     pub result: Option<Value>,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,

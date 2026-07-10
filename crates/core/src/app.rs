@@ -24,6 +24,8 @@ pub struct AppContext {
     pub datasets: Arc<Datasets>,
     /// Cost ledger: every metered engine call is attributed to this job.
     pub costs: Arc<CostLedger>,
+    /// Spend ceiling for the whole job (from enqueue); None = unlimited.
+    pub budget_usd: Option<f64>,
     /// Sandboxed WASM plugin host (fuel + memory limited).
     pub plugins: Arc<dyn Plugins>,
     pub artifacts_dir: PathBuf,
@@ -38,10 +40,39 @@ impl AppContext {
         Ok(path)
     }
 
+    /// USD this job still may spend under its ceiling. None = unlimited.
+    pub async fn remaining_budget_usd(&self) -> Result<Option<f64>> {
+        let Some(budget) = self.budget_usd else {
+            return Ok(None);
+        };
+        let spent = self.costs.job_total(self.job_id).await?;
+        Ok(Some((budget - spent).max(0.0)))
+    }
+
+    /// Errors when the job's spend ceiling is already reached — the abort
+    /// switch for metered Claude calls. Returns the remaining headroom.
+    async fn require_budget(&self) -> Result<Option<f64>> {
+        match self.remaining_budget_usd().await? {
+            Some(remaining) if remaining <= 0.0 => Err(Error::App(format!(
+                "job budget of ${:.2} exhausted — aborting before further metered spend",
+                self.budget_usd.unwrap_or(0.0)
+            ))),
+            other => Ok(other),
+        }
+    }
+
     /// Metered tiered fetch: same as `engines.fetch.fetch(...)` but records a
     /// cost event (tier used, escalation trail, Claude spend) against this job.
     /// Prefer this over calling the fetcher directly.
-    pub async fn fetch(&self, req: FetchRequest) -> Result<FetchOutcome> {
+    pub async fn fetch(&self, mut req: FetchRequest) -> Result<FetchOutcome> {
+        // Only the Claude tier spends money; gate and clamp when it is in play.
+        if matches!(req.strategy, crate::fetcher::FetchStrategy::AutoWithResearch) {
+            if let Some(remaining) = self.require_budget().await? {
+                req.max_budget_usd = Some(
+                    req.max_budget_usd.map_or(remaining, |b| b.min(remaining)),
+                );
+            }
+        }
         let url = req.url.clone();
         let outcome = self.engines.fetch.fetch(req).await?;
         let detail = (!outcome.escalations.is_empty()).then(|| outcome.escalations.join("; "));
@@ -63,8 +94,13 @@ impl AppContext {
     }
 
     /// Metered Claude research: same as `engines.claude.research(...)` but
-    /// records the run's actual `total_cost_usd` against this job.
-    pub async fn research(&self, req: ResearchRequest) -> Result<ResearchOutput> {
+    /// records the run's actual `total_cost_usd` against this job, refuses to
+    /// start once the job budget is exhausted, and clamps the per-call ceiling
+    /// to the remaining headroom.
+    pub async fn research(&self, mut req: ResearchRequest) -> Result<ResearchOutput> {
+        if let Some(remaining) = self.require_budget().await? {
+            req.max_budget_usd = Some(req.max_budget_usd.map_or(remaining, |b| b.min(remaining)));
+        }
         let out = self.engines.claude.research(req).await?;
         if let Err(e) = self
             .costs

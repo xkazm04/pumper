@@ -13,7 +13,7 @@ use crate::job::{Job, JobStatus};
 use crate::{Error, Result};
 
 const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, priority, \
-                           callback_url, callback_secret, result, error, created_at, \
+                           callback_url, callback_secret, budget_usd, result, error, created_at, \
                            available_at, started_at, finished_at";
 
 /// Options for enqueuing a job. Defaults: 1 attempt, no delay, priority 0.
@@ -25,6 +25,8 @@ pub struct EnqueueOptions {
     pub priority: i64,
     pub callback_url: Option<String>,
     pub callback_secret: Option<String>,
+    /// Spend ceiling for the whole job (metered Claude calls abort past it).
+    pub budget_usd: Option<f64>,
 }
 
 /// A standing subscription: POST a webhook whenever a job leaves fresh
@@ -105,8 +107,8 @@ impl Storage {
         let available = created + chrono::Duration::seconds(opts.delay_secs as i64);
         sqlx::query(
             "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
-             callback_url, callback_secret, created_at, available_at) \
-             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9)",
+             callback_url, callback_secret, budget_usd, created_at, available_at) \
+             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
         .bind(id.to_string())
         .bind(app)
@@ -115,6 +117,7 @@ impl Storage {
         .bind(opts.priority)
         .bind(opts.callback_url)
         .bind(opts.callback_secret)
+        .bind(opts.budget_usd)
         .bind(ts(created))
         .bind(ts(available))
         .execute(&self.pool)
@@ -456,6 +459,7 @@ struct JobRow {
     priority: i64,
     callback_url: Option<String>,
     callback_secret: Option<String>,
+    budget_usd: Option<f64>,
     result: Option<String>,
     error: Option<String>,
     created_at: String,
@@ -479,6 +483,7 @@ impl TryFrom<JobRow> for Job {
             priority: r.priority,
             callback_url: r.callback_url,
             callback_secret: r.callback_secret,
+            budget_usd: r.budget_usd,
             result: r
                 .result
                 .as_deref()
