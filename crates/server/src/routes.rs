@@ -195,17 +195,28 @@ struct EnqueueBody {
     callback_secret: Option<String>,
     /// Spend ceiling for the whole job; metered Claude calls abort past it.
     budget_usd: Option<f64>,
+    /// Dedup key: retrying an enqueue with the same key returns the original
+    /// job (200) instead of creating a duplicate. The `Idempotency-Key`
+    /// header takes precedence over this field.
+    idempotency_key: Option<String>,
 }
 
 async fn enqueue_job(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Option<Json<EnqueueBody>>,
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
     let Some(app) = state.registry.get(&name) else {
         return Err(ApiError(StatusCode::NOT_FOUND, format!("unknown app '{name}'")));
     };
     let body = body.map(|Json(b)| b).unwrap_or_default();
+    let idempotency_key = headers
+        .get("idempotency-key")
+        .and_then(|v| v.to_str().ok())
+        .map(String::from)
+        .or(body.idempotency_key)
+        .filter(|k| !k.trim().is_empty());
     let opts = EnqueueOptions {
         params: body.params.unwrap_or_else(|| app.default_params()),
         max_attempts: body.max_attempts.unwrap_or(1),
@@ -214,10 +225,16 @@ async fn enqueue_job(
         callback_url: body.callback_url,
         callback_secret: body.callback_secret,
         budget_usd: body.budget_usd.filter(|b| *b > 0.0),
+        idempotency_key,
     };
-    let job = state.storage.enqueue(&name, opts).await?;
-    state.notify.notify_one();
-    Ok((StatusCode::ACCEPTED, Json(job)))
+    let (job, created) = state.storage.enqueue_dedup(&name, opts).await?;
+    if created {
+        state.notify.notify_one();
+        Ok((StatusCode::ACCEPTED, Json(job)))
+    } else {
+        // Replayed request: the original job, not a new one.
+        Ok((StatusCode::OK, Json(job)))
+    }
 }
 
 #[derive(Deserialize)]

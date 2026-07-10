@@ -27,6 +27,9 @@ pub struct EnqueueOptions {
     pub callback_secret: Option<String>,
     /// Spend ceiling for the whole job (metered Claude calls abort past it).
     pub budget_usd: Option<f64>,
+    /// Client-supplied dedup key: an enqueue with a key that already exists
+    /// returns the original job instead of creating a duplicate.
+    pub idempotency_key: Option<String>,
 }
 
 /// A standing subscription: POST a webhook whenever a job leaves fresh
@@ -102,13 +105,24 @@ impl Storage {
     }
 
     pub async fn enqueue(&self, app: &str, opts: EnqueueOptions) -> Result<Job> {
+        self.enqueue_dedup(app, opts).await.map(|(job, _)| job)
+    }
+
+    /// Enqueues a job; when `opts.idempotency_key` matches an existing job, the
+    /// original is returned instead. The bool reports whether a job was created.
+    pub async fn enqueue_dedup(&self, app: &str, opts: EnqueueOptions) -> Result<(Job, bool)> {
+        if let Some(key) = &opts.idempotency_key {
+            if let Some(existing) = self.get_by_idempotency_key(key).await? {
+                return Ok((existing, false));
+            }
+        }
         let id = Uuid::new_v4();
         let created = Utc::now();
         let available = created + chrono::Duration::seconds(opts.delay_secs as i64);
-        sqlx::query(
+        let insert = sqlx::query(
             "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
-             callback_url, callback_secret, budget_usd, created_at, available_at) \
-             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             callback_url, callback_secret, budget_usd, idempotency_key, created_at, available_at) \
+             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         )
         .bind(id.to_string())
         .bind(app)
@@ -118,13 +132,34 @@ impl Storage {
         .bind(opts.callback_url)
         .bind(opts.callback_secret)
         .bind(opts.budget_usd)
+        .bind(&opts.idempotency_key)
         .bind(ts(created))
         .bind(ts(available))
         .execute(&self.pool)
-        .await?;
-        self.get(id)
+        .await;
+        if let Err(e) = insert {
+            // Lost a concurrent race on the unique key — return the winner.
+            if let Some(key) = &opts.idempotency_key {
+                if let Some(existing) = self.get_by_idempotency_key(key).await? {
+                    return Ok((existing, false));
+                }
+            }
+            return Err(e.into());
+        }
+        let job = self
+            .get(id)
             .await?
-            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))?;
+        Ok((job, true))
+    }
+
+    async fn get_by_idempotency_key(&self, key: &str) -> Result<Option<Job>> {
+        let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE idempotency_key = ?1");
+        let row: Option<JobRow> = sqlx::query_as(&sql)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(Job::try_from).transpose()
     }
 
     /// Atomically claims the highest-priority due job and flips it to `running`.
