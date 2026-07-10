@@ -29,7 +29,7 @@ pub use app::{AppContext, ScrapeApp};
 #[cfg(feature = "storage")]
 pub use cache::HttpCache;
 #[cfg(feature = "storage")]
-pub use datasets::{ChangeKind, Datasets, DupPair, Record, UpsertSummary};
+pub use datasets::{diff_values, ChangeKind, Datasets, DupPair, Record, Revision, UpsertSummary};
 #[cfg(feature = "storage")]
 pub use storage::{EnqueueOptions, Schedule, Storage};
 

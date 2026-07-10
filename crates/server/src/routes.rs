@@ -32,6 +32,8 @@ pub fn router(state: AppState) -> Router {
         .route("/datasets/{app}/{dataset}", get(list_records))
         .route("/datasets/{app}/{dataset}/export", get(export_records))
         .route("/datasets/{app}/{dataset}/duplicates", get(dataset_duplicates))
+        .route("/datasets/{app}/{dataset}/changes", get(dataset_changes))
+        .route("/datasets/{app}/{dataset}/history", get(record_history))
         .route("/plugins", get(list_plugins))
         .route("/plugins/reload", post(reload_plugins))
         .route("/search", get(search))
@@ -392,6 +394,71 @@ async fn dataset_duplicates(
         "dataset": dataset,
         "max_distance": distance,
         "pairs": pairs,
+    })))
+}
+
+// ---- Change intelligence ---------------------------------------------------
+
+#[derive(Deserialize)]
+struct ChangesQuery {
+    /// RFC 3339 lower bound; only revisions after this instant are returned.
+    since: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+/// Change feed for a dataset: new/changed/removed revisions, newest first,
+/// each carrying the field-level diff versus its previous revision.
+async fn dataset_changes(
+    State(state): State<AppState>,
+    Path((app, dataset)): Path<(String, String)>,
+    Query(query): Query<ChangesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let since = query
+        .since
+        .as_deref()
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid 'since': {e}")))
+        })
+        .transpose()?;
+    let changes = state
+        .datasets
+        .changes_since(&app, Some(&dataset), since, query.limit.clamp(1, 1000))
+        .await?;
+    Ok(Json(json!({
+        "app": app,
+        "dataset": dataset,
+        "count": changes.len(),
+        "changes": changes,
+    })))
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    /// Record key (query param, since keys may contain URL-hostile characters).
+    key: String,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+/// A single record's revision history, newest first.
+async fn record_history(
+    State(state): State<AppState>,
+    Path((app, dataset)): Path<(String, String)>,
+    Query(query): Query<HistoryQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let revisions = state
+        .datasets
+        .history(&app, &dataset, &query.key, query.limit.clamp(1, 500))
+        .await?;
+    Ok(Json(json!({
+        "app": app,
+        "dataset": dataset,
+        "key": query.key,
+        "count": revisions.len(),
+        "revisions": revisions,
     })))
 }
 

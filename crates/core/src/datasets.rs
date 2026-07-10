@@ -34,6 +34,25 @@ pub struct Record {
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    /// Set when a full-snapshot sync no longer contained this key.
+    pub removed_at: Option<DateTime<Utc>>,
+}
+
+/// One entry in a record's revision history: what changed, when, and the
+/// field-level diff versus the previous revision.
+#[derive(Debug, Clone, Serialize)]
+pub struct Revision {
+    pub app: String,
+    pub dataset: String,
+    pub key: String,
+    pub revision: i64,
+    /// 'new' | 'changed' | 'removed'
+    pub change: String,
+    /// Full record snapshot at this revision (None for 'removed').
+    pub data: Option<Value>,
+    /// Field-level diff vs the previous revision: `{ "path": {"from": .., "to": ..} }`.
+    pub diff: Option<Value>,
+    pub created_at: DateTime<Utc>,
 }
 
 /// A near-duplicate record pair and their SimHash Hamming distance.
@@ -45,11 +64,14 @@ pub struct DupPair {
 }
 
 /// Outcome of upserting a batch: the fresh records, plus a count of unchanged.
+/// `removed` is only populated by full-snapshot syncs (see
+/// `AppContext::sync_many` / `Datasets::detect_removed`).
 #[derive(Debug, Default, Serialize)]
 pub struct UpsertSummary {
     pub new: Vec<String>,
     pub changed: Vec<String>,
     pub unchanged: usize,
+    pub removed: Vec<String>,
 }
 
 impl UpsertSummary {
@@ -69,6 +91,9 @@ impl Datasets {
     }
 
     /// Upserts one record; returns whether it was new, changed, or unchanged.
+    /// New and Changed upserts also append a revision (with a field-level diff
+    /// for changes). A previously-removed record that reappears is revived and
+    /// reported as Changed even if its content matches the old snapshot.
     pub async fn upsert(
         &self,
         app: &str,
@@ -79,8 +104,8 @@ impl Datasets {
         let hash = hash_value(value);
         let sim = crate::simhash::simhash_value(value) as i64;
         let now = Utc::now();
-        let existing: Option<String> = sqlx::query_scalar(
-            "SELECT hash FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3",
+        let existing: Option<(String, String, Option<String>)> = sqlx::query_as(
+            "SELECT hash, data, removed_at FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3",
         )
         .bind(app)
         .bind(dataset)
@@ -89,7 +114,7 @@ impl Datasets {
         .await?;
 
         match existing {
-            Some(prev) if prev == hash => {
+            Some((prev, _, removed_at)) if prev == hash && removed_at.is_none() => {
                 sqlx::query(
                     "UPDATE records SET last_seen = ?4 WHERE app = ?1 AND dataset = ?2 AND key = ?3",
                 )
@@ -101,10 +126,10 @@ impl Datasets {
                 .await?;
                 Ok(ChangeKind::Unchanged)
             }
-            Some(_) => {
+            Some((_, old_data, _)) => {
                 sqlx::query(
                     "UPDATE records SET hash = ?4, data = ?5, simhash = ?6, last_seen = ?7, \
-                     updated_at = ?7 WHERE app = ?1 AND dataset = ?2 AND key = ?3",
+                     updated_at = ?7, removed_at = NULL WHERE app = ?1 AND dataset = ?2 AND key = ?3",
                 )
                 .bind(app)
                 .bind(dataset)
@@ -115,6 +140,10 @@ impl Datasets {
                 .bind(ts(now))
                 .execute(&self.pool)
                 .await?;
+                let old: Value = serde_json::from_str(&old_data).unwrap_or(Value::Null);
+                let diff = diff_values(&old, value);
+                self.add_revision(app, dataset, key, "changed", Some(value), Some(&diff), now)
+                    .await?;
                 Ok(ChangeKind::Changed)
             }
             None => {
@@ -131,9 +160,129 @@ impl Datasets {
                 .bind(ts(now))
                 .execute(&self.pool)
                 .await?;
+                self.add_revision(app, dataset, key, "new", Some(value), None, now)
+                    .await?;
                 Ok(ChangeKind::New)
             }
         }
+    }
+
+    /// Appends the next revision for a record (revision numbers are per-key,
+    /// starting at 1).
+    async fn add_revision(
+        &self,
+        app: &str,
+        dataset: &str,
+        key: &str,
+        change: &str,
+        data: Option<&Value>,
+        diff: Option<&Value>,
+        when: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO record_revisions (app, dataset, key, revision, change, data, diff, created_at) \
+             VALUES (?1, ?2, ?3, \
+                     (SELECT COALESCE(MAX(revision), 0) + 1 FROM record_revisions \
+                      WHERE app = ?1 AND dataset = ?2 AND key = ?3), \
+                     ?4, ?5, ?6, ?7)",
+        )
+        .bind(app)
+        .bind(dataset)
+        .bind(key)
+        .bind(change)
+        .bind(data.map(Value::to_string))
+        .bind(diff.map(Value::to_string))
+        .bind(ts(when))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// A record's revision history, newest first.
+    pub async fn history(
+        &self,
+        app: &str,
+        dataset: &str,
+        key: &str,
+        limit: i64,
+    ) -> Result<Vec<Revision>> {
+        let rows: Vec<RevisionRow> = sqlx::query_as(
+            "SELECT app, dataset, key, revision, change, data, diff, created_at \
+             FROM record_revisions WHERE app = ?1 AND dataset = ?2 AND key = ?3 \
+             ORDER BY revision DESC LIMIT ?4",
+        )
+        .bind(app)
+        .bind(dataset)
+        .bind(key)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Revision::try_from).collect()
+    }
+
+    /// Change feed: revisions across a dataset (or all of an app's datasets when
+    /// `dataset` is None), newest first, optionally only those after `since`.
+    pub async fn changes_since(
+        &self,
+        app: &str,
+        dataset: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        limit: i64,
+    ) -> Result<Vec<Revision>> {
+        let rows: Vec<RevisionRow> = sqlx::query_as(
+            "SELECT app, dataset, key, revision, change, data, diff, created_at \
+             FROM record_revisions \
+             WHERE app = ?1 AND (?2 IS NULL OR dataset = ?2) AND (?3 IS NULL OR created_at > ?3) \
+             ORDER BY created_at DESC LIMIT ?4",
+        )
+        .bind(app)
+        .bind(dataset)
+        .bind(since.map(ts))
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Revision::try_from).collect()
+    }
+
+    /// Full-snapshot removal detection: marks live records whose key is absent
+    /// from `present` as removed (sets `removed_at` and appends a 'removed'
+    /// revision). Returns the removed keys. Call after upserting a batch that
+    /// represents the complete current state of the dataset.
+    pub async fn detect_removed(
+        &self,
+        app: &str,
+        dataset: &str,
+        present: &[String],
+    ) -> Result<Vec<String>> {
+        let live: Vec<String> = sqlx::query_scalar(
+            "SELECT key FROM records WHERE app = ?1 AND dataset = ?2 AND removed_at IS NULL",
+        )
+        .bind(app)
+        .bind(dataset)
+        .fetch_all(&self.pool)
+        .await?;
+        let present: std::collections::HashSet<&str> =
+            present.iter().map(String::as_str).collect();
+        let now = Utc::now();
+        let mut removed = Vec::new();
+        for key in live {
+            if present.contains(key.as_str()) {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE records SET removed_at = ?4 WHERE app = ?1 AND dataset = ?2 AND key = ?3",
+            )
+            .bind(app)
+            .bind(dataset)
+            .bind(&key)
+            .bind(ts(now))
+            .execute(&self.pool)
+            .await?;
+            self.add_revision(app, dataset, &key, "removed", None, None, now)
+                .await?;
+            removed.push(key);
+        }
+        Ok(removed)
     }
 
     /// Upserts many records, returning a summary of new/changed/unchanged.
@@ -208,7 +357,7 @@ impl Datasets {
 
     pub async fn get(&self, app: &str, dataset: &str, key: &str) -> Result<Option<Record>> {
         let row: Option<RecordRow> = sqlx::query_as(
-            "SELECT key, data, first_seen, last_seen, updated_at \
+            "SELECT key, data, first_seen, last_seen, updated_at, removed_at \
              FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3",
         )
         .bind(app)
@@ -219,10 +368,12 @@ impl Datasets {
         row.map(Record::try_from).transpose()
     }
 
-    /// Lists records in a dataset, most-recently-updated first.
+    /// Lists records in a dataset, most-recently-updated first. Removed records
+    /// are included (with `removed_at` set) so exports stay complete; filter on
+    /// `removed_at` for the live view.
     pub async fn list(&self, app: &str, dataset: &str, limit: i64) -> Result<Vec<Record>> {
         let rows: Vec<RecordRow> = sqlx::query_as(
-            "SELECT key, data, first_seen, last_seen, updated_at \
+            "SELECT key, data, first_seen, last_seen, updated_at, removed_at \
              FROM records WHERE app = ?1 AND dataset = ?2 ORDER BY updated_at DESC LIMIT ?3",
         )
         .bind(app)
@@ -251,6 +402,7 @@ struct RecordRow {
     first_seen: String,
     last_seen: String,
     updated_at: String,
+    removed_at: Option<String>,
 }
 
 impl TryFrom<RecordRow> for Record {
@@ -263,7 +415,72 @@ impl TryFrom<RecordRow> for Record {
             first_seen: parse_ts(&r.first_seen)?,
             last_seen: parse_ts(&r.last_seen)?,
             updated_at: parse_ts(&r.updated_at)?,
+            removed_at: r.removed_at.as_deref().map(parse_ts).transpose()?,
         })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct RevisionRow {
+    app: String,
+    dataset: String,
+    key: String,
+    revision: i64,
+    change: String,
+    data: Option<String>,
+    diff: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<RevisionRow> for Revision {
+    type Error = Error;
+
+    fn try_from(r: RevisionRow) -> Result<Revision> {
+        Ok(Revision {
+            app: r.app,
+            dataset: r.dataset,
+            key: r.key,
+            revision: r.revision,
+            change: r.change,
+            data: r.data.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+            diff: r.diff.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+/// Field-level diff between two JSON values. Nested objects are flattened to
+/// dot-notation paths; arrays and scalars are compared wholesale at their
+/// path. Each entry is `"path": {"from": old, "to": new}`; fields only present
+/// on one side diff against `null`. The root path is `$`.
+pub fn diff_values(old: &Value, new: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    diff_into("", old, new, &mut out);
+    Value::Object(out)
+}
+
+fn diff_into(path: &str, old: &Value, new: &Value, out: &mut serde_json::Map<String, Value>) {
+    match (old, new) {
+        (Value::Object(a), Value::Object(b)) => {
+            let keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
+            for k in keys {
+                let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                diff_into(
+                    &p,
+                    a.get(k).unwrap_or(&Value::Null),
+                    b.get(k).unwrap_or(&Value::Null),
+                    out,
+                );
+            }
+        }
+        (a, b) if a == b => {}
+        (a, b) => {
+            let p = if path.is_empty() { "$" } else { path };
+            out.insert(
+                p.to_string(),
+                serde_json::json!({ "from": a, "to": b }),
+            );
+        }
     }
 }
 
@@ -283,4 +500,38 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| Error::Parse(format!("bad timestamp '{s}': {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn diff_reports_changed_added_and_dropped_fields() {
+        let old = json!({ "title": "A", "close": "2026-01-01", "amount": 100 });
+        let new = json!({ "title": "A", "close": "2026-02-01", "status": "open" });
+        let diff = diff_values(&old, &new);
+        assert_eq!(diff["close"], json!({ "from": "2026-01-01", "to": "2026-02-01" }));
+        assert_eq!(diff["amount"], json!({ "from": 100, "to": null }));
+        assert_eq!(diff["status"], json!({ "from": null, "to": "open" }));
+        assert!(diff.get("title").is_none(), "unchanged fields are omitted");
+    }
+
+    #[test]
+    fn diff_flattens_nested_objects_to_dot_paths() {
+        let old = json!({ "meta": { "agency": "DOE", "codes": [1, 2] } });
+        let new = json!({ "meta": { "agency": "DOD", "codes": [1, 2] } });
+        let diff = diff_values(&old, &new);
+        assert_eq!(diff["meta.agency"], json!({ "from": "DOE", "to": "DOD" }));
+        assert!(diff.get("meta.codes").is_none());
+    }
+
+    #[test]
+    fn diff_compares_arrays_and_scalars_wholesale() {
+        let diff = diff_values(&json!([1, 2]), &json!([1, 3]));
+        assert_eq!(diff["$"], json!({ "from": [1, 2], "to": [1, 3] }));
+        let same = diff_values(&json!("x"), &json!("x"));
+        assert_eq!(same, json!({}));
+    }
 }
