@@ -97,6 +97,7 @@ dependencies = [
 name = "app-census-nonemp"
 version = "0.1.0"
 dependencies = [
+ "app-census-density",
  "async-trait",
  "pumper-core",
  "serde_json",
@@ -203,6 +204,7 @@ dependencies = [
  "pumper-core",
  "serde",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

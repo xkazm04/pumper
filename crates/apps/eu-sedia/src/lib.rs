@@ -18,7 +18,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, HttpMethod, HttpRequest, Result, ScrapeApp};
+use pumper_core::{html_to_markdown, AppContext, Error, HttpMethod, HttpRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
 
 pub struct EuSedia;
@@ -78,6 +78,7 @@ impl ScrapeApp for EuSedia {
         let body = multipart_body(&query, &languages);
 
         let mut records: Vec<(String, Value)> = Vec::new();
+        let mut enriched: u64 = 0;
         let mut total: u64 = 0;
         let mut page: u64 = 1;
         let mut pages_fetched: u64 = 0;
@@ -111,6 +112,9 @@ impl ScrapeApp for EuSedia {
             let got = hits.len() as u64;
             for hit in &hits {
                 let (key, record) = normalize(hit);
+                if record.get("description_text").is_some_and(|v| !v.is_null()) {
+                    enriched += 1;
+                }
                 records.push((key, record));
             }
             pages_fetched += 1;
@@ -130,6 +134,7 @@ impl ScrapeApp for EuSedia {
             "statuses": statuses,
             "totalResults": total,
             "fetched": records.len(),
+            "enriched": enriched,
             "pages": pages_fetched,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
@@ -163,17 +168,22 @@ fn normalize(hit: &Value) -> (String, Value) {
     let record = json!({
         "identifier": identifier,
         "reference": reference,
-        "title": first(&m, "title"),
+        // Titles come back entity-escaped (&amp;, &#8211;, …) — store the decoded
+        // human-readable form; raw HTML lives only in descriptionByte anyway.
+        "title": first(&m, "title").map(clean_inline),
         "summary": hit.get("summary").and_then(Value::as_str),
         // The REAL topic description (Expected Outcome / Scope / Specific challenge)
         // as HTML — the search `summary` is just a title echo, so this is what carries
-        // the substance. Downstream normalizers strip the HTML. (data-hygiene P6b)
+        // the substance. Kept raw for fidelity... (data-hygiene P6b)
         "descriptionByte": first(&m, "descriptionByte"),
+        // ...and enriched as capped plain text so stored records are readable and
+        // search indexing isn't polluted by tag soup (idea 5c873722).
+        "description_text": first(&m, "descriptionByte").and_then(clean_text),
         "url": hit.get("url").and_then(Value::as_str),
         "status": first(&m, "status"),
         "type": first(&m, "type"),
         "callIdentifier": first(&m, "callIdentifier"),
-        "callTitle": first(&m, "callTitle"),
+        "callTitle": first(&m, "callTitle").map(clean_inline),
         "frameworkProgramme": first(&m, "frameworkProgramme"),
         "programmePeriod": first(&m, "programmePeriod"),
         "typesOfAction": first(&m, "typesOfAction"),
@@ -190,6 +200,46 @@ fn first<'a>(metadata: &'a Value, key: &str) -> Option<&'a str> {
     metadata.get(key)?.as_array()?.first()?.as_str()
 }
 
+/// Cap for `description_text` — enough for a full Expected Outcome / Scope intro
+/// without bloating records (full HTML stays in `descriptionByte`).
+const DESCRIPTION_TEXT_CAP: usize = 2000;
+
+/// SEDIA `descriptionByte` HTML -> capped plain text. Reuses core's
+/// `html_to_markdown` (entity decode + tag strip + whitespace collapse), then
+/// drops the residual Markdown decoration so the field is genuinely plain.
+fn clean_text(html: &str) -> Option<String> {
+    let text = strip_md(&html_to_markdown(html));
+    if text.is_empty() {
+        return None;
+    }
+    // Truncate on a char boundary; mark the cut so consumers know it's partial.
+    if text.chars().count() > DESCRIPTION_TEXT_CAP {
+        let cut: String = text.chars().take(DESCRIPTION_TEXT_CAP).collect();
+        Some(format!("{}…", cut.trim_end()))
+    } else {
+        Some(text)
+    }
+}
+
+/// Single-line variant for titles: entity-escaped fragments -> decoded text
+/// with all whitespace collapsed to single spaces.
+fn clean_inline(s: &str) -> String {
+    strip_md(&html_to_markdown(s)).split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Removes the Markdown decoration `html_to_markdown` emits (headings `#`,
+/// bold `**`, italics `_`, code ticks); list dashes are kept — they read fine
+/// as plain text. Dropping `_` is safe here: SEDIA identifiers are hyphenated
+/// (HORIZON-CL4-…), so prose underscores don't occur.
+fn strip_md(md: &str) -> String {
+    md.lines()
+        .map(|l| l.trim_start_matches('#').trim_start().replace(['*', '`', '_'], ""))
+        .collect::<Vec<_>>()
+        .join("\n")
+        .trim()
+        .to_string()
+}
+
 fn multipart_body(query: &str, languages: &str) -> String {
     let mut s = String::new();
     for (name, val) in [("query", query), ("languages", languages)] {
@@ -201,6 +251,76 @@ fn multipart_body(query: &str, languages: &str) -> String {
     }
     s.push_str(&format!("--{BOUNDARY}--\r\n"));
     s
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{clean_inline, clean_text, normalize, DESCRIPTION_TEXT_CAP};
+    use serde_json::json;
+
+    /// Realistic SEDIA descriptionByte shape: entities, nested tags, boilerplate
+    /// whitespace, list markup.
+    const SEDIA_HTML: &str = "<p><strong>Expected Outcome:</strong>&nbsp;Projects are expected to \
+         contribute to the following outcomes:</p>\n\n<ul>\n<li>Improved R&amp;I capacity \
+         &#8211; including <em>SMEs</em>;</li>\n<li>Uptake of &lt;trustworthy&gt; AI \
+         across the EU&rsquo;s single market.</li>\n</ul>\n<p>  Scope:   proposals should \
+         address\u{a0}interoperability.</p>";
+
+    #[test]
+    fn cleans_sedia_html_to_plain_text() {
+        let text = clean_text(SEDIA_HTML).expect("non-empty");
+        // Entities decoded, tags gone, markdown decoration stripped.
+        assert!(text.contains("Expected Outcome: Projects are expected"), "{text}");
+        assert!(text.contains("Improved R&I capacity – including SMEs;"), "{text}");
+        assert!(text.contains("Uptake of <trustworthy> AI across the EU’s single market."), "{text}");
+        assert!(text.contains("Scope: proposals should address interoperability."), "{text}");
+        assert!(!text.contains('<') || text.contains("<trustworthy>"), "tag soup leaked: {text}");
+        assert!(!text.contains("**") && !text.contains("&amp;"), "{text}");
+    }
+
+    #[test]
+    fn caps_long_descriptions() {
+        let html = format!("<p>{}</p>", "grant ".repeat(1000));
+        let text = clean_text(&html).expect("non-empty");
+        assert!(text.chars().count() <= DESCRIPTION_TEXT_CAP + 1, "len {}", text.chars().count());
+        assert!(text.ends_with('…'), "missing truncation marker: {text}");
+        assert!(clean_text("  <p> </p> ").is_none(), "blank HTML should yield None");
+    }
+
+    #[test]
+    fn normalize_enriches_and_keeps_raw() {
+        let hit = json!({
+            "reference": "REF-1",
+            "url": "https://ec.europa.eu/x",
+            "summary": "echo",
+            "metadata": {
+                "identifier": ["HORIZON-CL4-2026-DATA-01"],
+                "title": ["AI &amp; Robotics &#8211; Phase II"],
+                "callTitle": ["Digital &amp; Industry"],
+                "descriptionByte": [SEDIA_HTML],
+            }
+        });
+        let (key, rec) = normalize(&hit);
+        assert_eq!(key, "HORIZON-CL4-2026-DATA-01");
+        // Raw HTML preserved, clean text added alongside.
+        assert_eq!(rec["descriptionByte"].as_str().unwrap(), SEDIA_HTML);
+        assert!(rec["description_text"].as_str().unwrap().contains("Improved R&I capacity"));
+        // Entity-escaped titles normalized.
+        assert_eq!(rec["title"], "AI & Robotics – Phase II");
+        assert_eq!(rec["callTitle"], "Digital & Industry");
+        assert_eq!(clean_inline("Plain title"), "Plain title");
+    }
+
+    #[test]
+    fn normalize_without_description_leaves_null() {
+        let hit = json!({
+            "reference": "REF-2",
+            "metadata": { "identifier": ["ID-2"], "title": ["T"] }
+        });
+        let (_, rec) = normalize(&hit);
+        assert!(rec["description_text"].is_null());
+        assert!(rec["descriptionByte"].is_null());
+    }
 }
 
 fn sedia_request(url: String, body: String) -> HttpRequest {

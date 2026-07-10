@@ -44,6 +44,23 @@ const FULL_URL: &str = "https://data.mpsv.cz/od/soubory/volna-mista/volna-mista.
 const SALARY_MIN: f64 = 5_000.0;
 const SALARY_MAX: f64 = 2_000_000.0;
 
+/// Official ISPV salary statistics — read cross-app from the store.
+const ISPV_APP: &str = "mpsv-ispv";
+const ISPV_DATASET: &str = "wages";
+/// Virtual shared namespace for the posted-vs-official join (grants-common
+/// pattern: cross-source products live in a namespace no single app owns).
+const GAP_APP: &str = "cz-labour";
+const GAP_DATASET: &str = "salary_gap";
+
+/// ARES business register — key-free JSON REST lookup of one economic subject
+/// by IČO. Enriches the employers behind this run's vacancy samples.
+const ARES_URL: &str = "https://ares.gov.cz/ekonomicke-subjekty-v-be/rest/ekonomicke-subjekty";
+/// Per-run cap on NEW ARES lookups — this is enrichment, not a crawl; the
+/// backlog drains across daily runs (already-enriched IČOs are skipped).
+const ARES_MAX_LOOKUPS_DEFAULT: u64 = 50;
+/// Cap on CZ-NACE activity codes kept per employer record.
+const ARES_NACE_CAP: usize = 12;
+
 #[async_trait]
 impl ScrapeApp for MpsvVpm {
     fn name(&self) -> &'static str {
@@ -54,11 +71,16 @@ impl ScrapeApp for MpsvVpm {
         "Czech national job-vacancy register (MPSV / ÚP ČR open data, key-free, CC BY 4.0). \
          Aggregates the ~300k live postings into `role_region_agg` (CZ-ISCO × kraj × orgType: \
          count + monthly-salary distribution; kraj `ALL` = national) and `vacancy_samples` \
-         (JD references). Drops stale relics: postings first posted more than \
+         (JD references). Also joins posted salaries against mpsv-ispv official ISPV \
+         statistics into `cz-labour/salary_gap` (per CZ-ISCO unit group × sphere), \
+         and enriches sampled employers from the key-free ARES business register \
+         into `employers` (keyed by IČO: name, legal form, founded, kraj, CZ-NACE). \
+         Drops stale relics: postings first posted more than \
          `maxPostedAgeDays` before the feed date are excluded (0 = keep all). \
          Params: {\"url\": endpoint override, \"maxRecords\": 0=all, \
          \"minCount\": 3 (min postings per aggregate cell), \"samplesPerGroup\": 4, \
-         \"maxPostedAgeDays\": 730 (0 = keep all ages)}"
+         \"maxPostedAgeDays\": 730 (0 = keep all ages), \
+         \"aresMaxLookups\": 50 (new ARES lookups per run, 0 = disable)}"
     }
 
     /// Daily full sync at 06:00 UTC. Change detection makes the output meaningful
@@ -68,7 +90,13 @@ impl ScrapeApp for MpsvVpm {
     }
 
     fn default_params(&self) -> Value {
-        json!({ "maxRecords": 0, "minCount": 3, "samplesPerGroup": 4, "maxPostedAgeDays": 730 })
+        json!({
+            "maxRecords": 0,
+            "minCount": 3,
+            "samplesPerGroup": 4,
+            "maxPostedAgeDays": 730,
+            "aresMaxLookups": ARES_MAX_LOOKUPS_DEFAULT,
+        })
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -138,6 +166,11 @@ impl ScrapeApp for MpsvVpm {
         // regional salary distribution powering the locality map headline.
         let mut regions: HashMap<(String, String), Cell> = HashMap::new();
         let mut groups: HashMap<String, Vec<Sample>> = HashMap::new();
+        // posted-salary distribution per (CZ-ISCO unit group × ISPV sphere) —
+        // the join side for the posted-vs-official gap benchmark. ISPV publishes
+        // at the 4-digit unit-group level only, so posted salaries are pooled
+        // there from the raw points (medians can't be recombined from finer cells).
+        let mut gap_cells: HashMap<(String, String), Cell> = HashMap::new();
         // gather a few extra candidates per group, then keep only the richest N
         let gather_cap = samples_per_group.saturating_mul(6).max(samples_per_group);
 
@@ -185,6 +218,12 @@ impl ScrapeApp for MpsvVpm {
             regions.entry(("ALL".to_string(), org.clone())).or_default().add(salary);
             regions
                 .entry(("ALL".to_string(), "all".to_string()))
+                .or_default()
+                .add(salary);
+
+            // gap-benchmark pool: unit group × sphere (only rows with a salary count)
+            gap_cells
+                .entry((unit_group(&czisco), sphere_for_org(&org).to_string()))
                 .or_default()
                 .add(salary);
 
@@ -299,6 +338,143 @@ impl ScrapeApp for MpsvVpm {
         let trending_top = top(1);
         let fading_top = top(-1);
 
+        // ── Posted-vs-official salary gap benchmark ─────────────────────────
+        // Joins this run's POSTED distribution against mpsv-ispv's OFFICIAL
+        // (ISPV) `wages` dataset, read cross-app from the store. Computed HERE
+        // (not in mpsv-ispv) because this app runs daily with the raw posted
+        // salary points in memory — the honest unit-group median needs them —
+        // while ISPV refreshes only quarterly and its rows persist in the
+        // store between runs. Output goes to the virtual shared namespace
+        // `cz-labour` (grants-common pattern) so neither app owns the join.
+        let official_rows = ctx.datasets.list(ISPV_APP, ISPV_DATASET, 5_000).await?;
+        let official = official_wage_index(official_rows.iter().map(|r| &r.data));
+        let salary_gap = if official.is_empty() {
+            json!({ "skipped": "no official ISPV wages in store (run mpsv-ispv first)" })
+        } else {
+            let gap_items = compute_salary_gaps(&gap_cells, &official, min_count);
+            let matched_groups: std::collections::HashSet<&str> =
+                gap_items.iter().map(|(k, _)| k.as_str()).collect();
+            let unmatched_posted = gap_cells
+                .iter()
+                .filter(|((g, s), c)| {
+                    c.salaries.len() >= min_count
+                        && !matched_groups.contains(format!("{g}|{s}").as_str())
+                })
+                .count();
+            let gap_sum = ctx
+                .datasets
+                .upsert_many(GAP_APP, GAP_DATASET, &gap_items)
+                .await?;
+            let top_gaps = |dir: f64| -> Vec<Value> {
+                let mut v: Vec<&(String, Value)> = gap_items
+                    .iter()
+                    .filter(|(_, r)| r["gapPct"].as_f64().unwrap_or(0.0) * dir > 0.0)
+                    .collect();
+                v.sort_by(|a, b| {
+                    let f = |r: &Value| r["gapPct"].as_f64().unwrap_or(0.0) * dir;
+                    f(&b.1).total_cmp(&f(&a.1))
+                });
+                v.into_iter()
+                    .take(10)
+                    .map(|(_, r)| {
+                        json!({
+                            "czIscoGroup": r["czIscoGroup"],
+                            "sfera": r["sfera"],
+                            "postedMedian": r["postedMedian"],
+                            "officialMedian": r["officialMedian"],
+                            "gapPct": r["gapPct"],
+                        })
+                    })
+                    .collect()
+            };
+            json!({
+                "cells": gap_items.len(),
+                "new": gap_sum.new.len(),
+                "changed": gap_sum.changed.len(),
+                "unchanged": gap_sum.unchanged,
+                "officialRows": official.len(),
+                "unmatchedPostedGroups": unmatched_posted,
+                "topPostedAboveOfficial": top_gaps(1.0),
+                "topPostedBelowOfficial": top_gaps(-1.0),
+            })
+        };
+
+        // ── ARES employer enrichment ────────────────────────────────────────
+        // The persisted vacancy samples carry the employer IČO; look the new
+        // ones up in the key-free ARES business register and persist a compact
+        // `employers` record (keyed by IČO). Capped per run — enrichment, not
+        // a crawl; the engine's politeness governor + TTL cache handle
+        // rate/duplication, and the backlog drains across daily runs. A
+        // malformed/404 response skips that IČO with a warn, never fails the run.
+        let ares_max = ctx
+            .params
+            .get("aresMaxLookups")
+            .and_then(Value::as_u64)
+            .unwrap_or(ARES_MAX_LOOKUPS_DEFAULT)
+            .min(500) as usize;
+        let icos = distinct_icos(sample_items.iter().map(|(_, v)| v));
+        let mut employer_items: Vec<(String, Value)> = Vec::new();
+        let mut ares_skipped = 0usize; // already enriched in a prior run
+        let mut ares_failed = 0usize; // transport / 404 / malformed
+        let mut ares_capped = 0usize; // left for a later run (per-run cap)
+        let mut ares_looked_up = 0usize;
+        for ico in &icos {
+            // already in the employers dataset → nothing to fetch
+            if ctx.datasets.get(&ctx.app, "employers", ico).await?.is_some() {
+                ares_skipped += 1;
+                continue;
+            }
+            if ares_looked_up >= ares_max {
+                ares_capped += 1;
+                continue;
+            }
+            ares_looked_up += 1;
+            let ares_url = format!("{ARES_URL}/{ico}");
+            let resp = match ctx.engines.http.fetch(HttpRequest::get(&ares_url)).await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("mpsv-vpm: ARES fetch failed for IČO {ico}: {e}");
+                    ares_failed += 1;
+                    continue;
+                }
+            };
+            if !resp.is_success() {
+                tracing::warn!(
+                    "mpsv-vpm: ARES returned status {} for IČO {ico} — skipping",
+                    resp.status
+                );
+                ares_failed += 1;
+                continue;
+            }
+            let subject: Value = match serde_json::from_str(&resp.body) {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("mpsv-vpm: ARES body for IČO {ico} was not JSON: {e}");
+                    ares_failed += 1;
+                    continue;
+                }
+            };
+            match normalize_ares_employer(ico, &subject) {
+                Some(rec) => employer_items.push((ico.clone(), rec)),
+                None => {
+                    tracing::warn!("mpsv-vpm: ARES subject for IČO {ico} had no usable name");
+                    ares_failed += 1;
+                }
+            }
+        }
+        let employers = ctx.upsert_many("employers", &employer_items).await?;
+        let employer_summary = json!({
+            "distinctIcos": icos.len(),
+            "enriched": employer_items.len(),
+            "new": employers.new.len(),
+            "changed": employers.changed.len(),
+            "unchanged": employers.unchanged,
+            "skippedExisting": ares_skipped,
+            "capped": ares_capped,
+            "failed": ares_failed,
+            "maxLookups": ares_max,
+        });
+
         let out = json!({
             "source": "data.mpsv.cz/volna-mista",
             "feedRecords": total,
@@ -319,6 +495,8 @@ impl ScrapeApp for MpsvVpm {
             "trendsChanged": trends.new.len() + trends.changed.len(),
             "trendingTop": trending_top,
             "fadingTop": fading_top,
+            "salaryGap": salary_gap,
+            "employers": employer_summary,
             "freshness": freshness,
         });
         ctx.save_artifact("summary.json", &serde_json::to_vec_pretty(&out)?)
@@ -337,6 +515,162 @@ fn unit_group(czisco: &str) -> String {
     } else {
         digits
     }
+}
+
+/// ISPV sphere for a posted org type: public administration reports into the
+/// salary (PLATOVA) sphere; private employers and temp agencies into the wage
+/// (MZDOVA) sphere.
+fn sphere_for_org(org: &str) -> &'static str {
+    if org == "public" {
+        "PLATOVA"
+    } else {
+        "MZDOVA"
+    }
+}
+
+/// Index of official ISPV rows: (CZ-ISCO unit group, sfera) → (medianMzda,
+/// mzdaPrumer). Rows without a positive monthly median are dropped — no
+/// benchmark can honestly be computed against them.
+fn official_wage_index<'a>(
+    rows: impl Iterator<Item = &'a Value>,
+) -> HashMap<(String, String), (f64, Option<f64>)> {
+    let mut index = HashMap::new();
+    for r in rows {
+        let Some(czisco) = r.get("czIsco").and_then(Value::as_str) else { continue };
+        let sfera = r.get("sfera").and_then(Value::as_str).unwrap_or("").to_string();
+        let Some(median) = r.get("medianMzda").and_then(Value::as_f64).filter(|m| *m > 0.0)
+        else {
+            continue;
+        };
+        let mean = r.get("mzdaPrumer").and_then(Value::as_f64).filter(|m| *m > 0.0);
+        index.insert((unit_group(czisco), sfera), (median, mean));
+    }
+    index
+}
+
+/// Joins posted salary pools against the official ISPV index at their shared
+/// granularity — (CZ-ISCO 4-digit unit group × sphere), the finest level ISPV
+/// publishes — and computes the gap. Posted cells need `min_salaries` actual
+/// salary points to be statistically usable; occupations absent from either
+/// side are skipped, never estimated. Keys are `{unitGroup}|{sfera}`, sorted
+/// for deterministic upserts.
+fn compute_salary_gaps(
+    posted: &HashMap<(String, String), Cell>,
+    official: &HashMap<(String, String), (f64, Option<f64>)>,
+    min_salaries: usize,
+) -> Vec<(String, Value)> {
+    let mut items: Vec<(String, Value)> = Vec::new();
+    for ((group, sfera), cell) in posted {
+        if cell.salaries.len() < min_salaries.max(1) {
+            continue;
+        }
+        let Some((official_median, official_mean)) = official.get(&(group.clone(), sfera.clone()))
+        else {
+            continue; // no official row at this granularity — skip, don't fabricate
+        };
+        let (_, pct) = cell.stats();
+        let Some(posted_median) = pct(0.5) else { continue };
+        let gap = |official: f64| -> (i64, f64) {
+            let abs = posted_median as f64 - official;
+            (abs.round() as i64, (abs / official * 100.0 * 10.0).round() / 10.0)
+        };
+        let (gap_abs, gap_pct) = gap(*official_median);
+        let vs_mean = official_mean.map(gap);
+        items.push((
+            format!("{group}|{sfera}"),
+            json!({
+                "czIscoGroup": group,
+                "sfera": sfera,
+                "postedMedian": posted_median,
+                "postedSalaryCount": cell.salaries.len(),
+                "postedCount": cell.count,
+                "officialMedian": official_median.round() as i64,
+                "officialMean": official_mean.map(|m| m.round() as i64),
+                "gapAbs": gap_abs,
+                "gapPct": gap_pct,
+                "gapVsMeanAbs": vs_mean.map(|(a, _)| a),
+                "gapVsMeanPct": vs_mean.map(|(_, p)| p),
+            }),
+        ));
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+}
+
+/// Distinct valid employer IČOs from this run's persisted vacancy samples,
+/// zero-padded to the canonical 8 digits (ARES's path format), in first-seen
+/// order for deterministic capping.
+fn distinct_icos<'a>(samples: impl Iterator<Item = &'a Value>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut icos = Vec::new();
+    for v in samples {
+        let Some(raw) = v.get("employerIco").and_then(Value::as_str) else { continue };
+        let raw = raw.trim();
+        if raw.is_empty() || raw.len() > 8 || !raw.chars().all(|c| c.is_ascii_digit()) {
+            continue;
+        }
+        let ico = format!("{raw:0>8}");
+        if seen.insert(ico.clone()) {
+            icos.push(ico);
+        }
+    }
+    icos
+}
+
+/// Non-empty trimmed string or number rendered as a string — ARES codes drift
+/// between the two (e.g. `pravniForma: "121"` vs `kodKraje: 19`).
+fn json_scalar_string(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => {
+            let s = s.trim();
+            (!s.is_empty()).then(|| s.to_string())
+        }
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// CZ-NACE activity codes from an ARES subject, defensively: an array of
+/// strings/numbers, or of objects carrying the code under a known key.
+/// Returns (codes capped at [`ARES_NACE_CAP`], total present).
+fn ares_nace_codes(v: &Value) -> (Vec<String>, usize) {
+    let Some(arr) = v.get("czNace").and_then(Value::as_array) else {
+        return (Vec::new(), 0);
+    };
+    let codes: Vec<String> = arr
+        .iter()
+        .filter_map(|n| match n {
+            Value::Object(_) => ["kodNace", "kod", "id", "value"]
+                .iter()
+                .find_map(|k| n.get(k).and_then(json_scalar_string)),
+            scalar => json_scalar_string(scalar),
+        })
+        .take(ARES_NACE_CAP)
+        .collect();
+    (codes, arr.len())
+}
+
+/// Compact normalized employer record from one ARES economic-subject response.
+/// Inspects the payload defensively (the exact shape may drift); returns `None`
+/// when there is no usable business name — nothing honest to persist.
+fn normalize_ares_employer(ico: &str, v: &Value) -> Option<Value> {
+    let name = v
+        .get("obchodniJmeno")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())?;
+    let sidlo = v.get("sidlo");
+    let (nace, nace_total) = ares_nace_codes(v);
+    Some(json!({
+        "ico": ico,
+        "name": name,
+        "legalForm": v.get("pravniForma").and_then(json_scalar_string),
+        "founded": v.get("datumVzniku").and_then(Value::as_str),
+        "krajId": sidlo.and_then(|s| s.get("kodKraje")).and_then(json_scalar_string),
+        "krajName": sidlo.and_then(|s| s.get("nazevKraje")).and_then(Value::as_str),
+        "nace": nace,
+        "naceCount": nace_total,
+    }))
 }
 
 // ── typed subset of the feed (unknown fields are ignored, bounding memory) ──
@@ -510,7 +844,7 @@ impl Posting {
             .map(|v| v.iter().filter_map(|r| r.id.clone()).collect())
             .unwrap_or_default();
         let employer = self.zamestnavatel.as_ref().and_then(|z| z.nazev.clone());
-        // IČO → the join key for a future ARES org-size enrichment (startup vs corporate).
+        // IČO → the join key for the ARES enrichment into the `employers` dataset.
         let employer_ico = self.zamestnavatel.as_ref().and_then(|z| z.ico.clone());
         let education = self.minPozadovaneVzdelani.as_ref().and_then(|e| e.id.clone());
         // richer postings (salary + skills + a descriptive title) make better refs
@@ -605,4 +939,199 @@ struct Sample {
     /// `YYYY-MM-DD` posting date (for recency-preferring sample selection).
     posted: Option<String>,
     value: Value,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cell(salaries: &[f64]) -> Cell {
+        let mut c = Cell::default();
+        for &s in salaries {
+            c.add(Some(s));
+        }
+        c
+    }
+
+    fn posted_map(entries: Vec<((&str, &str), Cell)>) -> HashMap<(String, String), Cell> {
+        entries
+            .into_iter()
+            .map(|((g, s), c)| ((g.to_string(), s.to_string()), c))
+            .collect()
+    }
+
+    #[test]
+    fn sphere_mapping_public_vs_rest() {
+        assert_eq!(sphere_for_org("public"), "PLATOVA");
+        assert_eq!(sphere_for_org("private"), "MZDOVA");
+        assert_eq!(sphere_for_org("agency"), "MZDOVA");
+    }
+
+    #[test]
+    fn official_index_keys_by_unit_group_and_drops_medianless_rows() {
+        let rows = vec![
+            json!({"czIsco": "CzIsco/1120", "sfera": "MZDOVA", "medianMzda": 111959.0, "mzdaPrumer": 190185.0}),
+            json!({"czIsco": "CzIsco/2433", "sfera": "PLATOVA"}), // no median → dropped
+            json!({"sfera": "MZDOVA", "medianMzda": 40000.0}),    // no code → dropped
+            json!({"czIsco": "CzIsco/5223", "sfera": "MZDOVA", "medianMzda": 0.0}), // zero → dropped
+        ];
+        let idx = official_wage_index(rows.iter());
+        assert_eq!(idx.len(), 1);
+        let (median, mean) = idx[&("1120".to_string(), "MZDOVA".to_string())];
+        assert_eq!(median, 111959.0);
+        assert_eq!(mean, Some(190185.0));
+    }
+
+    #[test]
+    fn gap_joins_at_unit_group_and_computes_abs_and_pct() {
+        // posted median of [40k, 50k, 60k] = 50k vs official 40k → +10k = +25%
+        let posted = posted_map(vec![(("5223", "MZDOVA"), cell(&[40_000.0, 50_000.0, 60_000.0]))]);
+        let mut official = HashMap::new();
+        official.insert(
+            ("5223".to_string(), "MZDOVA".to_string()),
+            (40_000.0, Some(44_000.0)),
+        );
+        let items = compute_salary_gaps(&posted, &official, 3);
+        assert_eq!(items.len(), 1);
+        let (key, v) = &items[0];
+        assert_eq!(key, "5223|MZDOVA");
+        assert_eq!(v["postedMedian"], 50_000);
+        assert_eq!(v["officialMedian"], 40_000);
+        assert_eq!(v["gapAbs"], 10_000);
+        assert_eq!(v["gapPct"], 25.0);
+        assert_eq!(v["gapVsMeanAbs"], 6_000);
+        // 6000/44000 = 13.636…% → 13.6 at one decimal
+        assert_eq!(v["gapVsMeanPct"], 13.6);
+        assert_eq!(v["postedSalaryCount"], 3);
+    }
+
+    #[test]
+    fn gap_skips_unmatched_and_thin_cells_never_fabricates() {
+        let posted = posted_map(vec![
+            // no official row for this (group, sphere) → skipped
+            (("9999", "MZDOVA"), cell(&[30_000.0, 32_000.0, 34_000.0])),
+            // sphere mismatch: official only has PLATOVA → skipped
+            (("2433", "MZDOVA"), cell(&[50_000.0, 52_000.0, 54_000.0])),
+            // matched but only 2 salary points < min 3 → skipped
+            (("5223", "MZDOVA"), cell(&[40_000.0, 42_000.0])),
+        ]);
+        let mut official = HashMap::new();
+        official.insert(("2433".to_string(), "PLATOVA".to_string()), (45_000.0, None));
+        official.insert(("5223".to_string(), "MZDOVA".to_string()), (40_000.0, None));
+        assert!(compute_salary_gaps(&posted, &official, 3).is_empty());
+    }
+
+    #[test]
+    fn gap_handles_negative_gap_and_missing_official_mean() {
+        let posted = posted_map(vec![(("5223", "PLATOVA"), cell(&[30_000.0, 30_000.0, 30_000.0]))]);
+        let mut official = HashMap::new();
+        official.insert(("5223".to_string(), "PLATOVA".to_string()), (40_000.0, None));
+        let items = compute_salary_gaps(&posted, &official, 1);
+        assert_eq!(items.len(), 1);
+        let v = &items[0].1;
+        assert_eq!(v["gapAbs"], -10_000);
+        assert_eq!(v["gapPct"], -25.0);
+        assert_eq!(v["officialMean"], Value::Null);
+        assert_eq!(v["gapVsMeanAbs"], Value::Null);
+        assert_eq!(v["gapVsMeanPct"], Value::Null);
+    }
+
+    #[test]
+    fn gap_output_is_sorted_by_key_for_deterministic_upserts() {
+        let posted = posted_map(vec![
+            (("9329", "MZDOVA"), cell(&[30_000.0])),
+            (("1120", "MZDOVA"), cell(&[100_000.0])),
+            (("5223", "MZDOVA"), cell(&[40_000.0])),
+        ]);
+        let mut official = HashMap::new();
+        for g in ["9329", "1120", "5223"] {
+            official.insert((g.to_string(), "MZDOVA".to_string()), (35_000.0, None));
+        }
+        let keys: Vec<String> = compute_salary_gaps(&posted, &official, 1)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, vec!["1120|MZDOVA", "5223|MZDOVA", "9329|MZDOVA"]);
+    }
+
+    #[test]
+    fn unit_group_truncates_to_four_digits() {
+        assert_eq!(unit_group("CzIsco/93291"), "9329");
+        assert_eq!(unit_group("CzIsco/1120"), "1120");
+    }
+
+    #[test]
+    fn ares_normalize_extracts_compact_employer_record() {
+        // realistic ARES economic-subject shape (subset; extra fields ignored)
+        let subject = json!({
+            "ico": "27074358",
+            "obchodniJmeno": "Alza.cz a.s.",
+            "pravniForma": "121",
+            "datumVzniku": "2003-08-26",
+            "financniUrad": "007",
+            "sidlo": {
+                "kodStatu": "CZ",
+                "kodKraje": 19,
+                "nazevKraje": "Hlavní město Praha",
+                "textovaAdresa": "Jankovcova 1522/53, Holešovice, 17000 Praha 7"
+            },
+            "czNace": ["46900", "620", "471"]
+        });
+        let rec = normalize_ares_employer("27074358", &subject).expect("record");
+        assert_eq!(rec["ico"], "27074358");
+        assert_eq!(rec["name"], "Alza.cz a.s.");
+        assert_eq!(rec["legalForm"], "121");
+        assert_eq!(rec["founded"], "2003-08-26");
+        assert_eq!(rec["krajId"], "19"); // numeric kodKraje → string
+        assert_eq!(rec["krajName"], "Hlavní město Praha");
+        assert_eq!(rec["nace"], json!(["46900", "620", "471"]));
+        assert_eq!(rec["naceCount"], 3);
+    }
+
+    #[test]
+    fn ares_normalize_rejects_nameless_and_tolerates_drifted_shapes() {
+        // no usable name → nothing honest to persist
+        assert!(normalize_ares_employer("123", &json!({"ico": "123"})).is_none());
+        assert!(normalize_ares_employer("123", &json!({"obchodniJmeno": "  "})).is_none());
+        // NACE as objects, string kodKraje, missing sidlo/dates still normalize
+        let subject = json!({
+            "obchodniJmeno": "Obec Horní Lhota",
+            "sidlo": {"kodKraje": "141"},
+            "czNace": [{"kodNace": "84110"}, {"kod": "0161"}, {"nazev": "codeless"}]
+        });
+        let rec = normalize_ares_employer("00000001", &subject).expect("record");
+        assert_eq!(rec["krajId"], "141");
+        assert_eq!(rec["krajName"], Value::Null);
+        assert_eq!(rec["legalForm"], Value::Null);
+        assert_eq!(rec["founded"], Value::Null);
+        assert_eq!(rec["nace"], json!(["84110", "0161"]));
+        assert_eq!(rec["naceCount"], 3); // total present, codeless entry included
+    }
+
+    #[test]
+    fn ares_nace_list_is_capped() {
+        let many: Vec<String> = (0..30).map(|i| format!("{i:05}")).collect();
+        let subject = json!({"obchodniJmeno": "Big s.r.o.", "czNace": many});
+        let rec = normalize_ares_employer("00000002", &subject).expect("record");
+        assert_eq!(rec["nace"].as_array().unwrap().len(), ARES_NACE_CAP);
+        assert_eq!(rec["naceCount"], 30);
+    }
+
+    #[test]
+    fn distinct_icos_dedupes_pads_and_drops_invalid() {
+        let samples = vec![
+            json!({"employerIco": "27074358"}),
+            json!({"employerIco": "27074358"}),  // duplicate
+            json!({"employerIco": "45274649 "}), // trimmed
+            json!({"employerIco": "1234567"}),   // 7 digits → zero-padded
+            json!({"employerIco": "12a45678"}),  // non-numeric → dropped
+            json!({"employerIco": "123456789"}), // too long → dropped
+            json!({"employerIco": ""}),          // empty → dropped
+            json!({"title": "no ico"}),          // absent → dropped
+        ];
+        assert_eq!(
+            distinct_icos(samples.iter()),
+            vec!["27074358", "45274649", "01234567"]
+        );
+    }
 }
