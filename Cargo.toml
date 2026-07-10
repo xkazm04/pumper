@@ -29,6 +29,7 @@ app-research = { path = "crates/apps/research" }
 app-readable = { path = "crates/apps/readable" }
 app-watch = { path = "crates/apps/watch" }
 app-grants-gov = { path = "crates/apps/grants-gov" }
+grants-common = { path = "crates/apps/grants-common" }
 app-cms-fee-schedule = { path = "crates/apps/cms-fee-schedule" }
 app-census-density = { path = "crates/apps/census-density" }
 app-census-nonemp = { path = "crates/apps/census-nonemp" }

@@ -79,6 +79,7 @@ name = "app-ca-grants"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "grants-common",
  "pumper-core",
  "serde_json",
 ]
@@ -159,6 +160,7 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "chrono",
+ "grants-common",
  "pumper-core",
  "serde_json",
 ]
@@ -1591,6 +1593,15 @@ dependencies = [
  "hashbrown 0.16.1",
  "indexmap",
  "stable_deref_trait",
+]
+
+[[package]]
+name = "grants-common"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "pumper-core",
+ "serde_json",
 ]
 
 [[package]]

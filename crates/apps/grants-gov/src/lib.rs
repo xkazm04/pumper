@@ -160,6 +160,15 @@ impl ScrapeApp for GrantsGov {
 
         let summary = ctx.upsert_many("opportunities", &items).await?;
 
+        // Cross-source layer: normalize into grants/unified and link SimHash
+        // near-duplicates syndicated across portals.
+        let unified_items: Vec<(String, Value)> = hits
+            .iter()
+            .filter_map(grants_common::normalize_grants_gov)
+            .collect();
+        let unified = grants_common::sync_unified(&ctx, &unified_items).await?;
+        let cross_source_dups = grants_common::link_duplicates(&ctx, 3).await?;
+
         // Closing-soon digest: posted opportunities whose closeDate falls within
         // the next `digestDays` days, soonest first — the deadline-alert surface
         // this dataset was always meant to feed.
@@ -185,6 +194,8 @@ impl ScrapeApp for GrantsGov {
             "digestDays": digest_days,
             "closingSoonCount": closing_soon.len(),
             "closingSoon": closing_soon.iter().take(25).collect::<Vec<_>>(),
+            "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
+            "crossSourceDups": cross_source_dups,
         }))
     }
 }
