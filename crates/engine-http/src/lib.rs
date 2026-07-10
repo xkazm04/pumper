@@ -74,6 +74,16 @@ impl HttpEngine {
             match self.build(req).send().await {
                 Ok(response) => {
                     let status = response.status().as_u16();
+                    // Adaptive politeness: rate-limit/overload responses teach
+                    // the governor a longer per-host spacing; anything else
+                    // (even a 404) decays a learned penalty back down.
+                    if let Some(host) = &host {
+                        if matches!(status, 429 | 503) {
+                            self.governor.penalize(host, retry_after(&response)).await;
+                        } else {
+                            self.governor.reward(host).await;
+                        }
+                    }
                     if RETRYABLE_STATUS.contains(&status) && attempt < self.retries {
                         warn!(url = %req.url, status, "retryable status");
                         last_error = format!("status {status}");
@@ -104,6 +114,20 @@ impl HttpEngine {
             self.retries + 1
         )))
     }
+}
+
+/// Seconds-form `Retry-After` header (the HTTP-date form is rare on rate
+/// limiters and simply falls back to the doubling policy).
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
+    response
+        .headers()
+        .get("retry-after")?
+        .to_str()
+        .ok()?
+        .trim()
+        .parse::<u64>()
+        .ok()
+        .map(|secs| Duration::from_secs(secs.min(600)))
 }
 
 #[async_trait]
