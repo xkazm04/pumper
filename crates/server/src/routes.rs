@@ -842,6 +842,9 @@ struct SearchQuery {
     app: Option<String>,
     /// Restrict hits to one dataset.
     dataset: Option<String>,
+    /// Typo tolerance (edit distance 1). Quoted phrases stay exact.
+    #[serde(default)]
+    fuzzy: bool,
 }
 
 fn default_search_limit() -> usize {
@@ -862,6 +865,7 @@ async fn search(
         limit: query.limit.clamp(1, 100),
         app: query.app,
         dataset: query.dataset,
+        fuzzy: query.fuzzy,
     };
     let results = state.search.query(req).await?;
     Ok(Json(json!({

@@ -44,6 +44,9 @@ pub struct SearchRequest {
     pub app: Option<String>,
     /// Restrict hits to one dataset.
     pub dataset: Option<String>,
+    /// Typo tolerance: match terms within edit distance 1. Quoted phrases
+    /// (`"exact phrase"`) work in either mode via the query syntax.
+    pub fuzzy: bool,
 }
 
 impl SearchRequest {

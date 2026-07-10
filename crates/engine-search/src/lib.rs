@@ -206,7 +206,14 @@ impl Search for TantivyIndex {
         let f = self.fields;
         tokio::task::spawn_blocking(move || -> Result<SearchResponse> {
             let searcher = reader.searcher();
-            let parser = QueryParser::for_index(&index, vec![f.title, f.body]);
+            let mut parser = QueryParser::for_index(&index, vec![f.title, f.body]);
+            if req.fuzzy {
+                // Edit-distance-1 matching with transposition counted as one
+                // edit — catches the common single-typo case. Quoted phrases
+                // still parse as exact phrase queries.
+                parser.set_field_fuzzy(f.title, false, 1, true);
+                parser.set_field_fuzzy(f.body, false, 1, true);
+            }
             let parsed = parser
                 .parse_query(&req.q)
                 .map_err(|e| Error::App(format!("bad search query: {e}")))?;
