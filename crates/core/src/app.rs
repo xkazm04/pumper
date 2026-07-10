@@ -65,16 +65,31 @@ impl AppContext {
     /// cost event (tier used, escalation trail, Claude spend) against this job.
     /// Prefer this over calling the fetcher directly.
     pub async fn fetch(&self, mut req: FetchRequest) -> Result<FetchOutcome> {
-        // Only the Claude tier spends money; gate and clamp when it is in play.
+        // Budget-governed escalation: only the Claude tier spends money. With
+        // headroom, clamp the tier's per-call ceiling to what's left; with none,
+        // downgrade to the free tiers instead of failing the whole fetch.
+        let mut budget_note = None;
         if matches!(req.strategy, crate::fetcher::FetchStrategy::AutoWithResearch) {
-            if let Some(remaining) = self.require_budget().await? {
-                req.max_budget_usd = Some(
-                    req.max_budget_usd.map_or(remaining, |b| b.min(remaining)),
-                );
+            match self.remaining_budget_usd().await? {
+                Some(remaining) if remaining <= 0.0 => {
+                    req.strategy = crate::fetcher::FetchStrategy::Auto;
+                    budget_note = Some(format!(
+                        "claude tier skipped: job budget of ${:.2} exhausted",
+                        self.budget_usd.unwrap_or(0.0)
+                    ));
+                }
+                Some(remaining) => {
+                    req.max_budget_usd =
+                        Some(req.max_budget_usd.map_or(remaining, |b| b.min(remaining)));
+                }
+                None => {}
             }
         }
         let url = req.url.clone();
-        let outcome = self.engines.fetch.fetch(req).await?;
+        let mut outcome = self.engines.fetch.fetch(req).await?;
+        if let Some(note) = budget_note {
+            outcome.escalations.push(note);
+        }
         let detail = (!outcome.escalations.is_empty()).then(|| outcome.escalations.join("; "));
         if let Err(e) = self
             .costs
