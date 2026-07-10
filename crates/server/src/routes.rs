@@ -473,17 +473,97 @@ async fn list_records(
     Ok(Json(records))
 }
 
+#[derive(Deserialize)]
+struct ExportQuery {
+    /// 'json' (default, buffered) | 'ndjson' | 'csv' (both streamed).
+    format: Option<String>,
+}
+
 async fn export_records(
     State(state): State<AppState>,
     Path((app, dataset)): Path<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    let records = state.datasets.list(&app, &dataset, 100_000).await?;
-    Ok(Json(json!({
-        "app": app,
-        "dataset": dataset,
-        "count": records.len(),
-        "records": records,
-    })))
+    Query(query): Query<ExportQuery>,
+) -> Result<Response, ApiError> {
+    match query.format.as_deref().unwrap_or("json") {
+        "json" => {
+            let records = state.datasets.list(&app, &dataset, 100_000).await?;
+            Ok(Json(json!({
+                "app": app,
+                "dataset": dataset,
+                "count": records.len(),
+                "records": records,
+            }))
+            .into_response())
+        }
+        format @ ("ndjson" | "csv") => Ok(stream_export(state, app, dataset, format == "csv")),
+        other => Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown format '{other}' (json | ndjson | csv)"),
+        )),
+    }
+}
+
+/// Streams the whole dataset in keyset-paged batches — constant memory
+/// regardless of dataset size, unlike the buffered JSON export.
+fn stream_export(state: AppState, app: String, dataset: String, csv: bool) -> Response {
+    const BATCH: i64 = 1_000;
+    let filename = format!("attachment; filename=\"{dataset}.{}\"", if csv { "csv" } else { "ndjson" });
+    let stream = async_stream::stream! {
+        if csv {
+            yield Ok::<_, Infallible>(axum::body::Bytes::from_static(
+                b"key,first_seen,last_seen,updated_at,removed_at,data\n",
+            ));
+        }
+        let mut after: Option<(String, String)> = None;
+        loop {
+            let batch = match state.datasets.list_page(&app, &dataset, after.clone(), BATCH).await {
+                Ok(batch) => batch,
+                Err(e) => {
+                    tracing::warn!(app = %app, dataset = %dataset, "export stream aborted: {e}");
+                    break;
+                }
+            };
+            let Some(last) = batch.last() else { break };
+            after = Some((pumper_core::datasets::ts(last.updated_at), last.key.clone()));
+            let short = (batch.len() as i64) < BATCH;
+            let mut chunk = String::new();
+            for record in &batch {
+                if csv {
+                    csv_row(&mut chunk, record);
+                } else if let Ok(line) = serde_json::to_string(record) {
+                    chunk.push_str(&line);
+                    chunk.push('\n');
+                }
+            }
+            yield Ok(axum::body::Bytes::from(chunk));
+            if short {
+                break;
+            }
+        }
+    };
+    let content_type = if csv { "text/csv; charset=utf-8" } else { "application/x-ndjson" };
+    (
+        [
+            ("content-type", content_type.to_string()),
+            ("content-disposition", filename),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+/// Appends one CSV row: fixed columns, RFC-4180 quoting for key and data.
+fn csv_row(out: &mut String, record: &pumper_core::Record) {
+    let quote = |s: &str| format!("\"{}\"", s.replace('"', "\"\""));
+    out.push_str(&format!(
+        "{},{},{},{},{},{}\n",
+        quote(&record.key),
+        record.first_seen.to_rfc3339(),
+        record.last_seen.to_rfc3339(),
+        record.updated_at.to_rfc3339(),
+        record.removed_at.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        quote(&record.data.to_string()),
+    ));
 }
 
 #[derive(Deserialize)]

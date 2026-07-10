@@ -384,6 +384,33 @@ impl Datasets {
         rows.into_iter().map(Record::try_from).collect()
     }
 
+    /// Keyset page of records ordered (updated_at DESC, key DESC). `after` is
+    /// the previous page's last (updated_at-as-stored, key); None starts from
+    /// the top. Stable under concurrent writes, unlike OFFSET.
+    pub async fn list_page(
+        &self,
+        app: &str,
+        dataset: &str,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<Record>> {
+        let (after_ts, after_key) = after.map(|(t, k)| (Some(t), Some(k))).unwrap_or((None, None));
+        let rows: Vec<RecordRow> = sqlx::query_as(
+            "SELECT key, data, first_seen, last_seen, updated_at, removed_at \
+             FROM records WHERE app = ?1 AND dataset = ?2 \
+             AND (?3 IS NULL OR updated_at < ?3 OR (updated_at = ?3 AND key < ?4)) \
+             ORDER BY updated_at DESC, key DESC LIMIT ?5",
+        )
+        .bind(app)
+        .bind(dataset)
+        .bind(after_ts)
+        .bind(after_key)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Record::try_from).collect()
+    }
+
     /// Distinct dataset names for an app.
     pub async fn datasets(&self, app: &str) -> Result<Vec<String>> {
         let names: Vec<String> =
@@ -492,7 +519,9 @@ fn hash_value(value: &Value) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn ts(dt: DateTime<Utc>) -> String {
+/// Fixed-width RFC 3339 UTC micros — the stored timestamp format. Public so
+/// keyset cursors built from a `Record` round-trip to the exact stored string.
+pub fn ts(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
