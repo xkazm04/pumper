@@ -5,8 +5,10 @@ use async_trait::async_trait;
 use serde_json::Value;
 use uuid::Uuid;
 
+use crate::costs::CostLedger;
 use crate::datasets::{ChangeKind, Datasets, UpsertSummary};
-use crate::engine::EngineSet;
+use crate::engine::{EngineSet, ResearchOutput, ResearchRequest};
+use crate::fetcher::{FetchOutcome, FetchRequest};
 use crate::plugin::Plugins;
 use crate::{Error, Result};
 
@@ -20,6 +22,8 @@ pub struct AppContext {
     pub params: Value,
     pub engines: Arc<EngineSet>,
     pub datasets: Arc<Datasets>,
+    /// Cost ledger: every metered engine call is attributed to this job.
+    pub costs: Arc<CostLedger>,
     /// Sandboxed WASM plugin host (fuel + memory limited).
     pub plugins: Arc<dyn Plugins>,
     pub artifacts_dir: PathBuf,
@@ -32,6 +36,44 @@ impl AppContext {
         let path = self.artifacts_dir.join(name);
         tokio::fs::write(&path, bytes).await?;
         Ok(path)
+    }
+
+    /// Metered tiered fetch: same as `engines.fetch.fetch(...)` but records a
+    /// cost event (tier used, escalation trail, Claude spend) against this job.
+    /// Prefer this over calling the fetcher directly.
+    pub async fn fetch(&self, req: FetchRequest) -> Result<FetchOutcome> {
+        let url = req.url.clone();
+        let outcome = self.engines.fetch.fetch(req).await?;
+        let detail = (!outcome.escalations.is_empty()).then(|| outcome.escalations.join("; "));
+        if let Err(e) = self
+            .costs
+            .record(
+                self.job_id,
+                &self.app,
+                outcome.engine,
+                Some(&url),
+                outcome.cost_usd.unwrap_or(0.0),
+                detail.as_deref(),
+            )
+            .await
+        {
+            tracing::warn!(job = %self.job_id, "cost event write failed: {e}");
+        }
+        Ok(outcome)
+    }
+
+    /// Metered Claude research: same as `engines.claude.research(...)` but
+    /// records the run's actual `total_cost_usd` against this job.
+    pub async fn research(&self, req: ResearchRequest) -> Result<ResearchOutput> {
+        let out = self.engines.claude.research(req).await?;
+        if let Err(e) = self
+            .costs
+            .record(self.job_id, &self.app, "claude", None, out.cost_usd.unwrap_or(0.0), None)
+            .await
+        {
+            tracing::warn!(job = %self.job_id, "cost event write failed: {e}");
+        }
+        Ok(out)
     }
 
     pub fn require_str(&self, key: &str) -> Result<&str> {

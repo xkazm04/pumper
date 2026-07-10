@@ -7,6 +7,8 @@ pub mod app;
 #[cfg(feature = "storage")]
 pub mod cache;
 #[cfg(feature = "storage")]
+pub mod costs;
+#[cfg(feature = "storage")]
 pub mod datasets;
 #[cfg(feature = "storage")]
 pub mod storage;
@@ -28,6 +30,8 @@ pub mod simhash;
 pub use app::{AppContext, ScrapeApp};
 #[cfg(feature = "storage")]
 pub use cache::HttpCache;
+#[cfg(feature = "storage")]
+pub use costs::{CostEvent, CostLedger, CostSummary};
 #[cfg(feature = "storage")]
 pub use datasets::{diff_values, ChangeKind, Datasets, DupPair, Record, Revision, UpsertSummary};
 #[cfg(feature = "storage")]

@@ -52,7 +52,7 @@ impl ScrapeApp for Research {
         request.max_turns = max_turns;
         request.model = model;
         request.effort = effort;
-        let output = ctx.engines.claude.research(request).await?;
+        let output = ctx.research(request).await?;
 
         let report = output
             .json

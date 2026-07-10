@@ -56,7 +56,7 @@ impl ScrapeApp for Watch {
             .and_then(Value::as_u64)
             .map(|n| n as usize);
 
-        let outcome = ctx.engines.fetch.fetch(req).await?;
+        let outcome = ctx.fetch(req).await?;
         let markdown = outcome
             .markdown
             .clone()

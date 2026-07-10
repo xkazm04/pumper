@@ -108,6 +108,7 @@ async fn execute(state: AppState, job: Job) {
         params: job.params.clone(),
         engines: state.engines.clone(),
         datasets: state.datasets.clone(),
+        costs: state.costs.clone(),
         plugins: state.plugins.clone(),
         artifacts_dir: state
             .storage
