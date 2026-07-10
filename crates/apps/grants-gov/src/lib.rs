@@ -160,6 +160,19 @@ impl ScrapeApp for GrantsGov {
 
         let summary = ctx.upsert_many("opportunities", &items).await?;
 
+        // Closing-soon digest: posted opportunities whose closeDate falls within
+        // the next `digestDays` days, soonest first — the deadline-alert surface
+        // this dataset was always meant to feed.
+        let digest_days = ctx
+            .params
+            .get("digestDays")
+            .and_then(Value::as_u64)
+            .unwrap_or(14)
+            .clamp(1, 365) as i64;
+        let closing_soon = closing_soon_digest(&hits, digest_days);
+        ctx.save_artifact("closing_soon.json", &serde_json::to_vec_pretty(&closing_soon)?)
+            .await?;
+
         Ok(json!({
             "source": "grants.gov/search2",
             "oppStatuses": statuses,
@@ -169,8 +182,54 @@ impl ScrapeApp for GrantsGov {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            "digestDays": digest_days,
+            "closingSoonCount": closing_soon.len(),
+            "closingSoon": closing_soon.iter().take(25).collect::<Vec<_>>(),
         }))
     }
+}
+
+/// Posted opportunities closing within `days` days, sorted soonest-first.
+/// Each entry keeps just what an alert needs: id, number, title, agency,
+/// close date, and days left.
+fn closing_soon_digest(hits: &[Value], days: i64) -> Vec<Value> {
+    let today = chrono::Utc::now().date_naive();
+    let mut digest: Vec<(i64, Value)> = hits
+        .iter()
+        .filter(|h| {
+            h.get("oppStatus")
+                .and_then(Value::as_str)
+                .map_or(true, |s| s.eq_ignore_ascii_case("posted"))
+        })
+        .filter_map(|h| {
+            let close = h.get("closeDate").and_then(Value::as_str)?;
+            let close = parse_close_date(close)?;
+            let days_left = (close - today).num_days();
+            (0..=days).contains(&days_left).then(|| {
+                (
+                    days_left,
+                    json!({
+                        "id": h.get("id"),
+                        "number": h.get("number"),
+                        "title": h.get("title"),
+                        "agency": h.get("agency").or_else(|| h.get("agencyCode")),
+                        "closeDate": close.to_string(),
+                        "daysLeft": days_left,
+                    }),
+                )
+            })
+        })
+        .collect();
+    digest.sort_by_key(|(days_left, _)| *days_left);
+    digest.into_iter().map(|(_, v)| v).collect()
+}
+
+/// Grants.gov emits US-style `MM/DD/YYYY`; tolerate ISO `YYYY-MM-DD` too so a
+/// schema drift doesn't silently empty the digest.
+fn parse_close_date(s: &str) -> Option<chrono::NaiveDate> {
+    chrono::NaiveDate::parse_from_str(s, "%m/%d/%Y")
+        .or_else(|_| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d"))
+        .ok()
 }
 
 /// A POST request to the Search2 endpoint carrying a JSON body. The API is
@@ -185,5 +244,47 @@ fn search2_request(body: String) -> HttpRequest {
         headers,
         body: Some(body),
         no_cache: false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn digest_keeps_only_posted_opps_closing_within_window() {
+        let today = chrono::Utc::now().date_naive();
+        let soon = (today + chrono::Duration::days(3)).format("%m/%d/%Y").to_string();
+        let far = (today + chrono::Duration::days(90)).format("%m/%d/%Y").to_string();
+        let past = (today - chrono::Duration::days(1)).format("%m/%d/%Y").to_string();
+        let hits = vec![
+            json!({ "id": "1", "title": "in window", "oppStatus": "posted", "closeDate": soon }),
+            json!({ "id": "2", "title": "too far", "oppStatus": "posted", "closeDate": far }),
+            json!({ "id": "3", "title": "already closed", "oppStatus": "posted", "closeDate": past }),
+            json!({ "id": "4", "title": "forecasted", "oppStatus": "forecasted", "closeDate": soon }),
+            json!({ "id": "5", "title": "no close date", "oppStatus": "posted" }),
+        ];
+        let digest = closing_soon_digest(&hits, 14);
+        assert_eq!(digest.len(), 1);
+        assert_eq!(digest[0]["id"], "1");
+        assert_eq!(digest[0]["daysLeft"], 3);
+    }
+
+    #[test]
+    fn digest_sorts_soonest_first_and_tolerates_iso_dates() {
+        let today = chrono::Utc::now().date_naive();
+        let d = |n: i64, iso: bool| {
+            let date = today + chrono::Duration::days(n);
+            if iso { date.format("%Y-%m-%d").to_string() } else { date.format("%m/%d/%Y").to_string() }
+        };
+        let hits = vec![
+            json!({ "id": "a", "closeDate": d(10, false) }),
+            json!({ "id": "b", "closeDate": d(2, true) }),
+            json!({ "id": "c", "closeDate": d(5, false) }),
+        ];
+        let digest = closing_soon_digest(&hits, 14);
+        let ids: Vec<&str> = digest.iter().map(|e| e["id"].as_str().unwrap()).collect();
+        assert_eq!(ids, vec!["b", "c", "a"]);
     }
 }

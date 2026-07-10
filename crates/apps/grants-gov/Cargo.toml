@@ -7,3 +7,4 @@ edition.workspace = true
 pumper-core.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
+chrono.workspace = true
