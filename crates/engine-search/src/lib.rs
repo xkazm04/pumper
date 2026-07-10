@@ -31,6 +31,15 @@ pub struct TantivyIndex {
     reader: IndexReader,
 }
 
+/// True when the opened index already stores the body field (snippet-capable).
+fn body_is_stored(index: &Index) -> bool {
+    index
+        .schema()
+        .get_field("body")
+        .map(|f| index.schema().get_field_entry(f).is_stored())
+        .unwrap_or(false)
+}
+
 impl TantivyIndex {
     pub fn new(cfg: &SearchConfig) -> Result<Self> {
         let mut builder = Schema::builder();
@@ -40,12 +49,25 @@ impl TantivyIndex {
         builder.add_text_field("dataset", STRING | STORED);
         builder.add_text_field("url", STRING | STORED);
         builder.add_text_field("title", TEXT | STORED);
-        builder.add_text_field("body", TEXT);
+        // Body is stored so hits can carry highlighted snippets.
+        builder.add_text_field("body", TEXT | STORED);
         let schema = builder.build();
 
         std::fs::create_dir_all(&cfg.dir)?;
         let index = match Index::open_in_dir(&cfg.dir) {
-            Ok(index) => index,
+            Ok(index) if body_is_stored(&index) => index,
+            Ok(_) => {
+                // Pre-snippet index (body not stored): rebuild. The index is a
+                // derived artifact — it refills as jobs run.
+                tracing::warn!(
+                    dir = %cfg.dir.display(),
+                    "search index schema outdated (body not stored); rebuilding empty"
+                );
+                std::fs::remove_dir_all(&cfg.dir)?;
+                std::fs::create_dir_all(&cfg.dir)?;
+                Index::create_in_dir(&cfg.dir, schema.clone())
+                    .map_err(|e| Error::App(format!("recreate search index: {e}")))?
+            }
             Err(_) => Index::create_in_dir(&cfg.dir, schema.clone())
                 .map_err(|e| Error::App(format!("create search index: {e}")))?,
         };
@@ -130,11 +152,18 @@ impl Search for TantivyIndex {
                 .search(&parsed, &TopDocs::with_limit(limit).order_by_score())
                 .map_err(|e| Error::App(format!("search: {e}")))?;
 
+            // Highlighted body fragments; best-effort (empty on failure).
+            let snippets = tantivy::snippet::SnippetGenerator::create(&searcher, &parsed, f.body).ok();
+
             let mut hits = Vec::with_capacity(top.len());
             for (score, address) in top {
                 let doc: TantivyDocument = searcher
                     .doc(address)
                     .map_err(|e| Error::App(format!("fetch doc: {e}")))?;
+                let snippet = snippets
+                    .as_ref()
+                    .map(|g| g.snippet_from_doc(&doc).to_html())
+                    .unwrap_or_default();
                 // Stored fields serialize as {"field": ["value"], ...}.
                 let json: serde_json::Value =
                     serde_json::from_str(&doc.to_json(&schema)).unwrap_or(serde_json::Value::Null);
@@ -152,6 +181,7 @@ impl Search for TantivyIndex {
                     url: get("url"),
                     title: get("title"),
                     score,
+                    snippet,
                 });
             }
             Ok(hits)

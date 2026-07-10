@@ -30,6 +30,9 @@ pub struct SearchHit {
     pub url: String,
     pub title: String,
     pub score: f32,
+    /// Highlighted body fragment for this hit — matched terms wrapped in
+    /// `<b>` tags. Empty when the document predates body storage.
+    pub snippet: String,
 }
 
 #[async_trait]
