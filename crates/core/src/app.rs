@@ -55,6 +55,25 @@ impl AppContext {
     ) -> Result<UpsertSummary> {
         self.datasets.upsert_many(&self.app, dataset, items).await
     }
+
+    /// Full-snapshot sync: upserts the batch, then marks previously-seen keys
+    /// that are absent from it as removed. Use instead of `upsert_many` when
+    /// `items` is the complete current state of the dataset (e.g. a full API
+    /// listing) — the summary's `removed` keys are the disappeared-record
+    /// signal (delisted grants, closed vacancies, removed listings).
+    pub async fn sync_many(
+        &self,
+        dataset: &str,
+        items: &[(String, Value)],
+    ) -> Result<UpsertSummary> {
+        let mut summary = self.datasets.upsert_many(&self.app, dataset, items).await?;
+        let present: Vec<String> = items.iter().map(|(k, _)| k.clone()).collect();
+        summary.removed = self
+            .datasets
+            .detect_removed(&self.app, dataset, &present)
+            .await?;
+        Ok(summary)
+    }
 }
 
 /// One scraping use case. Implement this in a crate under `crates/apps/` and
