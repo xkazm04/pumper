@@ -26,4 +26,8 @@
 - Migrate remaining apps to metered `ctx.fetch`/`ctx.research` (agentic apps first: state-tax, trade-wages, valuation-multiples, homewyse — they spend Claude money unmetered).
 - `research_cache` purge job (mirror `HttpCache::purge_expired`).
 - Vibeman-side bug observed during scans: `/api/ideas/claude` sometimes returns a different group's prompt than the requested `groupId` (agents self-corrected via `/api/contexts?groupId=`); also idea `category` rejects values outside functionality/performance/maintenance/ui/code_quality/user_benefit.
-- Remaining INDEX themes: T4 search, T6 crawler, T7 API hardening, T5 AI extraction, T9 domain products, T10 platform.
+- Remaining INDEX themes: T4 search, T7 API hardening, T9 domain products, T10 platform (T6 crawler + T5 extraction basics closed in wave 3; T5 LLM-assisted items — NL→RuleSet, self-healing selectors, schema-less extraction — remain).
+
+## Structural facts (Wave 3 additions)
+- **2026-07-10** — Extraction rules: `RuleSet.fields` maps to `FieldRule {rule, transforms}` (serde-flattened; old plain-rule JSON still parses). Rule types: css/regex/json/xpath/const. XPath via `skyscraper` crate (pure Rust, HTML-native; heavy grammar crate, ~1min cold-build cost).
+- **2026-07-10** — Crawler checkpoints live at `data/artifacts/<app>/checkpoints/<name>.json` (beside per-job dirs, not inside them) so cross-job resume works.
