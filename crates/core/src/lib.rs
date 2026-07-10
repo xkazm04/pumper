@@ -40,7 +40,7 @@ pub use storage::{EnqueueOptions, Schedule, Storage, Watch};
 pub use config::Config;
 pub use crawl::{crawl, CrawlConfig, CrawlPage, CrawlStats};
 pub use simhash::{hamming, simhash, simhash_value};
-pub use extract::{extract_batch, extract_one, CompiledRuleSet, Rule, RuleSet};
+pub use extract::{extract_batch, extract_one, CompiledRuleSet, FieldRule, Rule, RuleSet, Transform};
 pub use engine::{
     Browser, EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, RenderRequest,
     RenderedPage, Researcher, ResearchOutput, ResearchRequest,
