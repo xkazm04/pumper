@@ -7,8 +7,12 @@ plugins-src/*/Cargo.lock
 # Local runtime data: SQLite DB, scraped artifacts, browser profile (login cookies)
 /data
 
-# Claude Code session logs and local settings
-.claude/
+# Claude Code session logs and local settings — but the shared session
+# contract (CLAUDE.md) and the doc-sync Stop hook (settings.json) are
+# versioned so every checkout gets the same enforcement.
+.claude/*
+!.claude/CLAUDE.md
+!.claude/settings.json
 
 # Secrets / local environment overrides
 .env

@@ -1,0 +1,76 @@
+{
+  "_comment": "Source -> feature-doc map used by scripts/docs/check-doc-sync.mjs (Stop hook). Each entry: `doc` (path under docs/features/, required) + `sourceGlobs` (repo-relative globs). When a turn edits matching source without touching docs/features/*, the hook exits 2 with a reminder. Add an entry here in the same change that adds a new feature area. Skip patterns (tests, docs, catalog, scripts) live inside the script.",
+  "entries": [
+    {
+      "doc": "docs/features/runtime.md",
+      "sourceGlobs": [
+        "crates/core/src/app.rs",
+        "crates/core/src/job.rs",
+        "crates/core/src/storage.rs",
+        "crates/core/src/config.rs",
+        "crates/core/src/costs.rs",
+        "crates/server/src/worker.rs",
+        "crates/server/src/scheduler.rs",
+        "crates/server/src/state.rs",
+        "crates/server/src/main.rs",
+        "crates/server/src/registry.rs"
+      ]
+    },
+    {
+      "doc": "docs/features/datasets.md",
+      "sourceGlobs": [
+        "crates/core/src/datasets.rs",
+        "crates/core/src/simhash.rs",
+        "crates/core/migrations/**"
+      ]
+    },
+    {
+      "doc": "docs/features/fetching.md",
+      "sourceGlobs": [
+        "crates/core/src/fetcher.rs",
+        "crates/core/src/engine.rs",
+        "crates/core/src/governor.rs",
+        "crates/core/src/cache.rs",
+        "crates/core/src/tiers.rs",
+        "crates/engine-http/**",
+        "crates/engine-browser/**",
+        "crates/engine-claude/**"
+      ]
+    },
+    {
+      "doc": "docs/features/crawling.md",
+      "sourceGlobs": ["crates/core/src/crawl.rs", "crates/apps/crawl/**"]
+    },
+    {
+      "doc": "docs/features/extraction.md",
+      "sourceGlobs": [
+        "crates/core/src/extract.rs",
+        "crates/core/src/markdown.rs",
+        "crates/core/src/plugin.rs",
+        "crates/engine-wasm/**",
+        "crates/apps/extractor/**",
+        "crates/apps/plugin/**"
+      ]
+    },
+    {
+      "doc": "docs/features/search.md",
+      "sourceGlobs": ["crates/core/src/search.rs", "crates/engine-search/**"]
+    },
+    {
+      "doc": "docs/features/events-webhooks.md",
+      "sourceGlobs": ["crates/server/src/webhook.rs", "crates/server/src/events.rs"]
+    },
+    {
+      "doc": "docs/features/triggers.md",
+      "sourceGlobs": ["crates/server/src/triggers.rs"]
+    },
+    {
+      "doc": "docs/features/http-api.md",
+      "sourceGlobs": ["crates/server/src/routes.rs"]
+    },
+    {
+      "doc": "docs/features/apps.md",
+      "sourceGlobs": ["crates/apps/**"]
+    }
+  ]
+}
