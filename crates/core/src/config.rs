@@ -162,6 +162,9 @@ pub struct ClaudeConfig {
     /// reasoning) vs "compose" (Opus, xhigh reasoning). Any field a request
     /// sets explicitly overrides the role.
     pub roles: HashMap<String, ClaudeRole>,
+    /// TTL for cached research outputs (identical prompts served from disk
+    /// instead of re-spending). 0 disables the research cache.
+    pub research_cache_ttl_secs: u64,
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -201,6 +204,7 @@ impl Default for ClaudeConfig {
             skip_permissions: true,
             allowed_tools: vec!["WebSearch".into(), "WebFetch".into()],
             roles,
+            research_cache_ttl_secs: 24 * 3600,
         }
     }
 }

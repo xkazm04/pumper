@@ -134,6 +134,15 @@ impl ScrapeApp for CaGrants {
 
         let summary = ctx.upsert_many("opportunities", &items).await?;
 
+        // Cross-source layer: normalize into grants/unified and link SimHash
+        // near-duplicates syndicated across portals.
+        let unified_items: Vec<(String, Value)> = records
+            .iter()
+            .filter_map(grants_common::normalize_ca_grants)
+            .collect();
+        let unified = grants_common::sync_unified(&ctx, &unified_items).await?;
+        let cross_source_dups = grants_common::link_duplicates(&ctx, 3).await?;
+
         Ok(json!({
             "source": "data.ca.gov/california-grants-portal",
             "status": status,
@@ -143,6 +152,8 @@ impl ScrapeApp for CaGrants {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
+            "crossSourceDups": cross_source_dups,
         }))
     }
 }

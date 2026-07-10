@@ -1,5 +1,5 @@
 [package]
-name = "app-grants-gov"
+name = "app-watch"
 version.workspace = true
 edition.workspace = true
 
@@ -7,5 +7,4 @@ edition.workspace = true
 pumper-core.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
-chrono.workspace = true
-grants-common.workspace = true
+sha2.workspace = true

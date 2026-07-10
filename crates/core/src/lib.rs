@@ -7,6 +7,8 @@ pub mod app;
 #[cfg(feature = "storage")]
 pub mod cache;
 #[cfg(feature = "storage")]
+pub mod costs;
+#[cfg(feature = "storage")]
 pub mod datasets;
 #[cfg(feature = "storage")]
 pub mod storage;
@@ -27,16 +29,18 @@ pub mod simhash;
 #[cfg(feature = "storage")]
 pub use app::{AppContext, ScrapeApp};
 #[cfg(feature = "storage")]
-pub use cache::HttpCache;
+pub use cache::{HttpCache, ResearchCache};
 #[cfg(feature = "storage")]
-pub use datasets::{ChangeKind, Datasets, DupPair, Record, UpsertSummary};
+pub use costs::{CostEvent, CostLedger, CostSummary};
 #[cfg(feature = "storage")]
-pub use storage::{EnqueueOptions, Schedule, Storage};
+pub use datasets::{diff_values, ChangeKind, Datasets, DupPair, Record, Revision, UpsertSummary};
+#[cfg(feature = "storage")]
+pub use storage::{Delivery, EnqueueOptions, SavedSearch, Schedule, Storage, Watch};
 
 pub use config::Config;
 pub use crawl::{crawl, CrawlConfig, CrawlPage, CrawlStats};
 pub use simhash::{hamming, simhash, simhash_value};
-pub use extract::{extract_batch, extract_one, CompiledRuleSet, Rule, RuleSet};
+pub use extract::{extract_batch, extract_one, CompiledRuleSet, FieldRule, Rule, RuleSet, Transform};
 pub use engine::{
     Browser, EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, RenderRequest,
     RenderedPage, Researcher, ResearchOutput, ResearchRequest,
@@ -47,4 +51,7 @@ pub use governor::Governor;
 pub use job::{Job, JobStatus};
 pub use markdown::html_to_markdown;
 pub use plugin::{NoPlugins, Plugins};
-pub use search::{NoSearch, Search, SearchDoc, SearchHit};
+pub use search::{
+    FacetCount, NoSearch, Search, SearchDoc, SearchFacets, SearchHit, SearchRequest,
+    SearchResponse,
+};

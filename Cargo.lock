@@ -79,6 +79,7 @@ name = "app-ca-grants"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "grants-common",
  "pumper-core",
  "serde_json",
 ]
@@ -158,6 +159,8 @@ name = "app-grants-gov"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
+ "grants-common",
  "pumper-core",
  "serde_json",
 ]
@@ -255,6 +258,16 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+]
+
+[[package]]
+name = "app-watch"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pumper-core",
+ "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -1201,6 +1214,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "enum-extract-error"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "42af18e5daffa0cf759908eb3d13fee16c5811044fe557c6479f5fc0bff14737"
+dependencies = [
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "enum-extract-macro"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c5d96b65abfa4396768e2a3089ae302e350019a7ed7db14ce54a82633c12310a"
+dependencies = [
+ "enum-extract-error",
+ "heck 0.4.1",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "equivalent"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1558,6 +1593,15 @@ dependencies = [
  "hashbrown 0.16.1",
  "indexmap",
  "stable_deref_trait",
+]
+
+[[package]]
+name = "grants-common"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "pumper-core",
+ "serde_json",
 ]
 
 [[package]]
@@ -1976,6 +2020,30 @@ dependencies = [
  "hashbrown 0.17.1",
  "serde",
  "serde_core",
+]
+
+[[package]]
+name = "indextree"
+version = "4.8.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5cee462cd93b03891663339b59a21246cc5fc2cc95060d0bb5059e25cd50edc4"
+dependencies = [
+ "indextree-macros",
+]
+
+[[package]]
+name = "indextree-macros"
+version = "0.1.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f85dac6c239acc85fd61934c572292d93adfd2de459d9c032aa22b553506e915"
+dependencies = [
+ "either",
+ "itertools",
+ "proc-macro2",
+ "quote",
+ "strum",
+ "syn",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -2456,6 +2524,15 @@ dependencies = [
 
 [[package]]
 name = "ordered-float"
+version = "4.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7bb71e1b3fa6ca1c61f383464aaf2bb0e2f8e772a1f01d486832464de363b951"
+dependencies = [
+ "num-traits",
+]
+
+[[package]]
+name = "ordered-float"
 version = "5.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b7d950ca161dc355eaf28f82b11345ed76c6e1f6eb1f4f4479e0323b9e2fbd0e"
@@ -2733,6 +2810,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "simd-json",
+ "skyscraper",
  "sqlx",
  "thiserror 2.0.18",
  "tokio",
@@ -2825,6 +2903,7 @@ dependencies = [
  "app-state-tax",
  "app-trade-wages",
  "app-valuation-multiples",
+ "app-watch",
  "async-stream",
  "axum",
  "chrono",
@@ -3457,6 +3536,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "skyscraper"
+version = "0.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0bfd8ea363ee4acd12b93570c6b83e617f3dd2526bf07531b1eacfe979c6ce9e"
+dependencies = [
+ "enum-extract-error",
+ "enum-extract-macro",
+ "indexmap",
+ "indextree",
+ "log",
+ "nom",
+ "ordered-float 4.6.0",
+ "regex",
+ "thiserror 1.0.69",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "slab"
 version = "0.4.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3737,6 +3834,27 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7da8b5736845d9f2fcb837ea5d9e2628564b3b043a70948a3f0b778838c5fb4f"
 
 [[package]]
+name = "strum"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "af23d6f6c1a224baef9d3f61e287d2761385a5b88fdab4eb4c6f11aeb54c4bcf"
+dependencies = [
+ "strum_macros",
+]
+
+[[package]]
+name = "strum_macros"
+version = "0.27.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7695ce3845ea4b33927c055a39dc438a45b059f7c1b3d91d38d10355fb8cbca7"
+dependencies = [
+ "heck 0.5.0",
+ "proc-macro2",
+ "quote",
+ "syn",
+]
+
+[[package]]
 name = "subtle"
 version = "2.6.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3904,7 +4022,7 @@ checksum = "dfadb8526b6da90704feb293b0701a6aae62ea14983143344be2dc5ce30f1d82"
 dependencies = [
  "fnv",
  "nom",
- "ordered-float",
+ "ordered-float 5.3.0",
  "serde",
  "serde_json",
 ]

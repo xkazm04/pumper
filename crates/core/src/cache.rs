@@ -10,7 +10,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use crate::config::CacheConfig;
-use crate::engine::{HttpRequest, HttpResponse};
+use crate::engine::{HttpRequest, HttpResponse, ResearchOutput, ResearchRequest};
 use crate::Result;
 
 pub struct HttpCache {
@@ -111,4 +111,92 @@ impl HttpCache {
 
 fn ts(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+/// Cost-aware cache for Claude research runs. Research spends real money, so
+/// identical requests within the TTL are served from disk. Keyed by every
+/// answer-shaping field of the request; `resume_session` requests bypass the
+/// cache entirely (they are stateful by design). TTL 0 disables.
+pub struct ResearchCache {
+    pool: SqlitePool,
+    ttl: Duration,
+}
+
+impl ResearchCache {
+    pub fn new(pool: SqlitePool, ttl_secs: u64) -> Self {
+        Self { pool, ttl: Duration::from_secs(ttl_secs) }
+    }
+
+    pub fn enabled(&self) -> bool {
+        !self.ttl.is_zero()
+    }
+
+    /// Stable cache key over the fields that shape the answer.
+    pub fn key(req: &ResearchRequest) -> String {
+        let mut hasher = Sha256::new();
+        for part in [
+            req.prompt.as_str(),
+            req.append_system_prompt.as_deref().unwrap_or(""),
+            req.role.as_deref().unwrap_or(""),
+            req.model.as_deref().unwrap_or(""),
+            req.effort.as_deref().unwrap_or(""),
+        ] {
+            hasher.update(part.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update(req.max_turns.map(|t| t.to_string()).unwrap_or_default().as_bytes());
+        hasher.update([0]);
+        if let Some(schema) = &req.json_schema {
+            hasher.update(schema.to_string().as_bytes());
+        }
+        format!("{:x}", hasher.finalize())
+    }
+
+    /// Fresh cached output, if any. The returned `cost_usd` is the ORIGINAL
+    /// run's spend (what the hit saved), not this run's.
+    pub async fn get(&self, key: &str) -> Result<Option<ResearchOutput>> {
+        if !self.enabled() {
+            return Ok(None);
+        }
+        let row: Option<(String, Option<String>, Option<f64>)> = sqlx::query_as(
+            "SELECT text, json, cost_usd FROM research_cache WHERE key = ?1 AND expires_at > ?2",
+        )
+        .bind(key)
+        .bind(ts(Utc::now()))
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(text, json, cost_usd)| ResearchOutput {
+            text,
+            json: json.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+            cost_usd,
+            duration_ms: None,
+            num_turns: None,
+            session_id: None,
+        }))
+    }
+
+    pub async fn put(&self, key: &str, out: &ResearchOutput) -> Result<()> {
+        if !self.enabled() || out.text.is_empty() {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let expires =
+            now + chrono::Duration::from_std(self.ttl).unwrap_or(chrono::Duration::hours(24));
+        sqlx::query(
+            "INSERT INTO research_cache (key, text, json, cost_usd, created_at, expires_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6) \
+             ON CONFLICT(key) DO UPDATE SET text = excluded.text, json = excluded.json, \
+             cost_usd = excluded.cost_usd, created_at = excluded.created_at, \
+             expires_at = excluded.expires_at",
+        )
+        .bind(key)
+        .bind(&out.text)
+        .bind(out.json.as_ref().map(|j| j.to_string()))
+        .bind(out.cost_usd)
+        .bind(ts(now))
+        .bind(ts(expires))
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
 }

@@ -13,8 +13,8 @@ use crate::job::{Job, JobStatus};
 use crate::{Error, Result};
 
 const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, priority, \
-                           callback_url, callback_secret, result, error, created_at, \
-                           available_at, started_at, finished_at";
+                           callback_url, callback_secret, budget_usd, schedule_id, result, error, \
+                           created_at, available_at, started_at, finished_at";
 
 /// Options for enqueuing a job. Defaults: 1 attempt, no delay, priority 0.
 #[derive(Debug, Clone, Default)]
@@ -25,6 +25,35 @@ pub struct EnqueueOptions {
     pub priority: i64,
     pub callback_url: Option<String>,
     pub callback_secret: Option<String>,
+    /// Spend ceiling for the whole job (metered Claude calls abort past it).
+    pub budget_usd: Option<f64>,
+    /// Client-supplied dedup key: an enqueue with a key that already exists
+    /// returns the original job instead of creating a duplicate.
+    pub idempotency_key: Option<String>,
+    /// Set by the scheduler so overlapping runs of one schedule can be skipped.
+    pub schedule_id: Option<String>,
+}
+
+/// A standing subscription: POST a webhook whenever a job leaves fresh
+/// revisions in the watched dataset (`"*"` = all datasets of the app).
+#[derive(Debug, Clone, Serialize)]
+pub struct Watch {
+    pub id: String,
+    pub app: String,
+    pub dataset: String,
+    pub url: String,
+    /// HMAC-SHA256 signing secret for delivery bodies (never serialized).
+    #[serde(skip_serializing)]
+    pub secret: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+impl Watch {
+    /// True when this watch covers `dataset`.
+    pub fn covers(&self, dataset: &str) -> bool {
+        self.dataset == "*" || self.dataset == dataset
+    }
 }
 
 /// A recurring schedule that fires an app on a cron cadence.
@@ -78,13 +107,25 @@ impl Storage {
     }
 
     pub async fn enqueue(&self, app: &str, opts: EnqueueOptions) -> Result<Job> {
+        self.enqueue_dedup(app, opts).await.map(|(job, _)| job)
+    }
+
+    /// Enqueues a job; when `opts.idempotency_key` matches an existing job, the
+    /// original is returned instead. The bool reports whether a job was created.
+    pub async fn enqueue_dedup(&self, app: &str, opts: EnqueueOptions) -> Result<(Job, bool)> {
+        if let Some(key) = &opts.idempotency_key {
+            if let Some(existing) = self.get_by_idempotency_key(key).await? {
+                return Ok((existing, false));
+            }
+        }
         let id = Uuid::new_v4();
         let created = Utc::now();
         let available = created + chrono::Duration::seconds(opts.delay_secs as i64);
-        sqlx::query(
+        let insert = sqlx::query(
             "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
-             callback_url, callback_secret, created_at, available_at) \
-             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9)",
+             callback_url, callback_secret, budget_usd, idempotency_key, schedule_id, \
+             created_at, available_at) \
+             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(id.to_string())
         .bind(app)
@@ -93,13 +134,36 @@ impl Storage {
         .bind(opts.priority)
         .bind(opts.callback_url)
         .bind(opts.callback_secret)
+        .bind(opts.budget_usd)
+        .bind(&opts.idempotency_key)
+        .bind(&opts.schedule_id)
         .bind(ts(created))
         .bind(ts(available))
         .execute(&self.pool)
-        .await?;
-        self.get(id)
+        .await;
+        if let Err(e) = insert {
+            // Lost a concurrent race on the unique key — return the winner.
+            if let Some(key) = &opts.idempotency_key {
+                if let Some(existing) = self.get_by_idempotency_key(key).await? {
+                    return Ok((existing, false));
+                }
+            }
+            return Err(e.into());
+        }
+        let job = self
+            .get(id)
             .await?
-            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))?;
+        Ok((job, true))
+    }
+
+    async fn get_by_idempotency_key(&self, key: &str) -> Result<Option<Job>> {
+        let sql = format!("SELECT {JOB_COLUMNS} FROM jobs WHERE idempotency_key = ?1");
+        let row: Option<JobRow> = sqlx::query_as(&sql)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(Job::try_from).transpose()
     }
 
     /// Atomically claims the highest-priority due job and flips it to `running`.
@@ -220,6 +284,33 @@ impl Storage {
         rows.into_iter().map(Job::try_from).collect()
     }
 
+    /// Keyset page of jobs ordered (created_at DESC, id DESC). `after` is the
+    /// previous page's last (created_at-as-stored, id); None starts at the top.
+    pub async fn list_page(
+        &self,
+        app: Option<&str>,
+        status: Option<JobStatus>,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<Job>> {
+        let (after_ts, after_id) = after.map(|(t, i)| (Some(t), Some(i))).unwrap_or((None, None));
+        let sql = format!(
+            "SELECT {JOB_COLUMNS} FROM jobs \
+             WHERE (?1 IS NULL OR app = ?1) AND (?2 IS NULL OR status = ?2) \
+             AND (?3 IS NULL OR created_at < ?3 OR (created_at = ?3 AND id < ?4)) \
+             ORDER BY created_at DESC, id DESC LIMIT ?5"
+        );
+        let rows: Vec<JobRow> = sqlx::query_as(&sql)
+            .bind(app)
+            .bind(status.map(JobStatus::as_str))
+            .bind(after_ts)
+            .bind(after_id)
+            .bind(limit)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(Job::try_from).collect()
+    }
+
     /// Counts jobs grouped by status — for the metrics endpoint.
     pub async fn status_counts(&self) -> Result<Vec<(String, i64)>> {
         let rows: Vec<(String, i64)> =
@@ -227,6 +318,37 @@ impl Storage {
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows)
+    }
+
+    /// True when a schedule already has a job queued or running — the overlap
+    /// guard the scheduler consults before firing.
+    pub async fn schedule_has_active_job(&self, schedule_id: &str) -> Result<bool> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM jobs WHERE schedule_id = ?1 AND status IN ('queued', 'running') LIMIT 1",
+        )
+        .bind(schedule_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
+    }
+
+    /// Manually re-queues a failed or cancelled job: clears the terminal state
+    /// and grants one more attempt. Returns the refreshed job, or None when the
+    /// job doesn't exist or isn't in a retryable state.
+    pub async fn retry(&self, id: Uuid) -> Result<Option<Job>> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'queued', error = NULL, finished_at = NULL, \
+             available_at = ?2, max_attempts = MAX(max_attempts, attempts + 1) \
+             WHERE id = ?1 AND status IN ('failed', 'cancelled')",
+        )
+        .bind(id.to_string())
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get(id).await
     }
 
     /// Re-queues jobs left in `running` by a previous crash/shutdown.
@@ -343,6 +465,258 @@ impl Storage {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    // ---- Dataset watches ---------------------------------------------------
+
+    pub async fn create_watch(
+        &self,
+        app: &str,
+        dataset: &str,
+        url: &str,
+        secret: Option<&str>,
+    ) -> Result<Watch> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO watches (id, app, dataset, url, secret, enabled, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+        )
+        .bind(&id)
+        .bind(app)
+        .bind(dataset)
+        .bind(url)
+        .bind(secret)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_watch(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_watch(&self, id: &str) -> Result<Option<Watch>> {
+        let row: Option<WatchRow> = sqlx::query_as(
+            "SELECT id, app, dataset, url, secret, enabled, created_at FROM watches WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Watch::try_from).transpose()
+    }
+
+    /// Watches for an app (all watches when `app` is None).
+    pub async fn list_watches(&self, app: Option<&str>) -> Result<Vec<Watch>> {
+        let rows: Vec<WatchRow> = sqlx::query_as(
+            "SELECT id, app, dataset, url, secret, enabled, created_at FROM watches \
+             WHERE (?1 IS NULL OR app = ?1) ORDER BY app, dataset",
+        )
+        .bind(app)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Watch::try_from).collect()
+    }
+
+    /// Enabled watches for an app — the delivery set for change webhooks.
+    pub async fn enabled_watches(&self, app: &str) -> Result<Vec<Watch>> {
+        let rows: Vec<WatchRow> = sqlx::query_as(
+            "SELECT id, app, dataset, url, secret, enabled, created_at FROM watches \
+             WHERE app = ?1 AND enabled = 1",
+        )
+        .bind(app)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Watch::try_from).collect()
+    }
+
+    pub async fn set_watch_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE watches SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_watch(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM watches WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    // ---- Saved searches -----------------------------------------------------
+
+    pub async fn create_saved_search(
+        &self,
+        query: &str,
+        app: Option<&str>,
+        dataset: Option<&str>,
+        url: &str,
+        secret: Option<&str>,
+    ) -> Result<SavedSearch> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO saved_searches (id, query, app, dataset, url, secret, enabled, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+        )
+        .bind(&id)
+        .bind(query)
+        .bind(app)
+        .bind(dataset)
+        .bind(url)
+        .bind(secret)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_saved_search(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_saved_search(&self, id: &str) -> Result<Option<SavedSearch>> {
+        let row: Option<SavedSearchRow> = sqlx::query_as(
+            "SELECT id, query, app, dataset, url, secret, enabled, created_at \
+             FROM saved_searches WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(SavedSearch::try_from).transpose()
+    }
+
+    pub async fn list_saved_searches(&self, enabled_only: bool) -> Result<Vec<SavedSearch>> {
+        let rows: Vec<SavedSearchRow> = sqlx::query_as(
+            "SELECT id, query, app, dataset, url, secret, enabled, created_at \
+             FROM saved_searches WHERE (?1 = 0 OR enabled = 1) ORDER BY created_at",
+        )
+        .bind(enabled_only as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(SavedSearch::try_from).collect()
+    }
+
+    pub async fn set_saved_search_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE saved_searches SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_saved_search(&self, id: &str) -> Result<bool> {
+        sqlx::query("DELETE FROM saved_search_seen WHERE search_id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        let result = sqlx::query("DELETE FROM saved_searches WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// The subset of `doc_ids` this search has never alerted on, marked seen
+    /// atomically-enough for the single-writer worker: insert-or-ignore, then
+    /// report which inserts landed.
+    pub async fn claim_unseen(&self, search_id: &str, doc_ids: &[String]) -> Result<Vec<String>> {
+        let mut unseen = Vec::new();
+        for doc_id in doc_ids {
+            let result = sqlx::query(
+                "INSERT OR IGNORE INTO saved_search_seen (search_id, doc_id, created_at) \
+                 VALUES (?1, ?2, ?3)",
+            )
+            .bind(search_id)
+            .bind(doc_id)
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+            if result.rows_affected() > 0 {
+                unseen.push(doc_id.clone());
+            }
+        }
+        Ok(unseen)
+    }
+
+    // ---- Webhook delivery log ----------------------------------------------
+
+    /// Records an outbound delivery as pending; returns its id.
+    pub async fn create_delivery(
+        &self,
+        kind: &str,
+        ref_id: &str,
+        url: &str,
+        event: &str,
+        body: &str,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, kind, ref_id, url, event, body, status, \
+             attempts, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, ?7)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(ref_id)
+        .bind(url)
+        .bind(event)
+        .bind(body)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Marks a delivery's outcome after the retry loop finishes.
+    pub async fn finish_delivery(
+        &self,
+        id: &str,
+        delivered: bool,
+        attempts: i64,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE webhook_deliveries SET status = ?2, attempts = attempts + ?3, \
+             last_error = ?4, updated_at = ?5 WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(if delivered { "delivered" } else { "failed" })
+        .bind(attempts)
+        .bind(last_error)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Deliveries, newest first, optionally filtered by status (`failed` is the
+    /// dead-letter view). Bodies excluded — fetch one by id for the payload.
+    pub async fn list_deliveries(
+        &self,
+        status: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Delivery>> {
+        let rows: Vec<DeliveryRow> = sqlx::query_as(
+            "SELECT id, kind, ref_id, url, event, '' AS body, status, attempts, last_error, \
+             created_at, updated_at FROM webhook_deliveries \
+             WHERE (?1 IS NULL OR status = ?1) ORDER BY created_at DESC LIMIT ?2",
+        )
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Delivery::try_from).collect()
+    }
+
+    pub async fn get_delivery(&self, id: &str) -> Result<Option<Delivery>> {
+        let row: Option<DeliveryRow> = sqlx::query_as(
+            "SELECT id, kind, ref_id, url, event, body, status, attempts, last_error, \
+             created_at, updated_at FROM webhook_deliveries WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Delivery::try_from).transpose()
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -356,6 +730,8 @@ struct JobRow {
     priority: i64,
     callback_url: Option<String>,
     callback_secret: Option<String>,
+    budget_usd: Option<f64>,
+    schedule_id: Option<String>,
     result: Option<String>,
     error: Option<String>,
     created_at: String,
@@ -379,6 +755,8 @@ impl TryFrom<JobRow> for Job {
             priority: r.priority,
             callback_url: r.callback_url,
             callback_secret: r.callback_secret,
+            budget_usd: r.budget_usd,
+            schedule_id: r.schedule_id,
             result: r
                 .result
                 .as_deref()
@@ -388,6 +766,128 @@ impl TryFrom<JobRow> for Job {
             available_at: parse_ts(&r.available_at)?,
             started_at: r.started_at.as_deref().map(parse_ts).transpose()?,
             finished_at: r.finished_at.as_deref().map(parse_ts).transpose()?,
+        })
+    }
+}
+
+/// A standing full-text query that webhooks NEW matches exactly once each.
+#[derive(Debug, Clone, Serialize)]
+pub struct SavedSearch {
+    pub id: String,
+    pub query: String,
+    pub app: Option<String>,
+    pub dataset: Option<String>,
+    pub url: String,
+    #[serde(skip_serializing)]
+    pub secret: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct SavedSearchRow {
+    id: String,
+    query: String,
+    app: Option<String>,
+    dataset: Option<String>,
+    url: String,
+    secret: Option<String>,
+    enabled: i64,
+    created_at: String,
+}
+
+impl TryFrom<SavedSearchRow> for SavedSearch {
+    type Error = Error;
+
+    fn try_from(r: SavedSearchRow) -> Result<SavedSearch> {
+        Ok(SavedSearch {
+            id: r.id,
+            query: r.query,
+            app: r.app,
+            dataset: r.dataset,
+            url: r.url,
+            secret: r.secret,
+            enabled: r.enabled != 0,
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+/// One logged webhook delivery. `body` is only populated by `get_delivery`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Delivery {
+    pub id: String,
+    pub kind: String,
+    pub ref_id: String,
+    pub url: String,
+    pub event: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    pub status: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct DeliveryRow {
+    id: String,
+    kind: String,
+    ref_id: String,
+    url: String,
+    event: String,
+    body: String,
+    status: String,
+    attempts: i64,
+    last_error: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl TryFrom<DeliveryRow> for Delivery {
+    type Error = Error;
+
+    fn try_from(r: DeliveryRow) -> Result<Delivery> {
+        Ok(Delivery {
+            id: r.id,
+            kind: r.kind,
+            ref_id: r.ref_id,
+            url: r.url,
+            event: r.event,
+            body: r.body,
+            status: r.status,
+            attempts: r.attempts,
+            last_error: r.last_error,
+            created_at: parse_ts(&r.created_at)?,
+            updated_at: parse_ts(&r.updated_at)?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct WatchRow {
+    id: String,
+    app: String,
+    dataset: String,
+    url: String,
+    secret: Option<String>,
+    enabled: i64,
+    created_at: String,
+}
+
+impl TryFrom<WatchRow> for Watch {
+    type Error = Error;
+
+    fn try_from(r: WatchRow) -> Result<Watch> {
+        Ok(Watch {
+            id: r.id,
+            app: r.app,
+            dataset: r.dataset,
+            url: r.url,
+            secret: r.secret,
+            enabled: r.enabled != 0,
+            created_at: parse_ts(&r.created_at)?,
         })
     }
 }

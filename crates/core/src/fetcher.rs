@@ -44,6 +44,9 @@ pub struct FetchRequest {
     /// Claude tier prompt; defaults to a fetch-and-extract instruction.
     #[serde(default)]
     pub research_prompt: Option<String>,
+    /// Spend ceiling for the Claude tier of this fetch (`--max-budget-usd`).
+    #[serde(default)]
+    pub max_budget_usd: Option<f64>,
     /// Also produce clean Markdown alongside the raw HTML.
     #[serde(default)]
     pub to_markdown: bool,
@@ -57,6 +60,7 @@ impl FetchRequest {
             wait_for_selector: None,
             min_content_chars: None,
             research_prompt: None,
+            max_budget_usd: None,
             to_markdown: false,
         }
     }
@@ -74,6 +78,8 @@ pub struct FetchOutcome {
     pub text: Option<String>,
     /// One line per escalation explaining why the previous tier was rejected.
     pub escalations: Vec<String>,
+    /// Real money spent on this fetch (Claude tier only; None elsewhere).
+    pub cost_usd: Option<f64>,
 }
 
 /// Holds clones of the three engines and orchestrates escalation. Cheap to
@@ -148,7 +154,9 @@ impl Fetcher {
                     req.url
                 )
             });
-            let out = self.claude.research(ResearchRequest::new(prompt)).await?;
+            let mut research = ResearchRequest::new(prompt);
+            research.max_budget_usd = req.max_budget_usd;
+            let out = self.claude.research(research).await?;
             return Ok(FetchOutcome {
                 url: req.url,
                 engine: "claude",
@@ -157,6 +165,7 @@ impl Fetcher {
                 markdown: req.to_markdown.then(|| out.text.clone()),
                 text: Some(out.text),
                 escalations,
+                cost_usd: out.cost_usd,
             });
         }
 
@@ -184,5 +193,6 @@ fn outcome(
         text: None,
         html: Some(html),
         escalations,
+        cost_usd: None,
     }
 }

@@ -18,6 +18,7 @@ app-connector-api-watch.workspace = true
 app-hackernews.workspace = true
 app-research.workspace = true
 app-readable.workspace = true
+app-watch.workspace = true
 app-grants-gov.workspace = true
 app-cms-fee-schedule.workspace = true
 app-census-density.workspace = true

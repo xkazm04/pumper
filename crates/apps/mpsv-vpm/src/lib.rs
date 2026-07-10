@@ -250,6 +250,55 @@ impl ScrapeApp for MpsvVpm {
         let samples = ctx.upsert_many("vacancy_samples", &sample_items).await?;
         ctx.upsert("freshness", "current", &freshness).await?;
 
+        // Trending vs fading roles: national posting-count trajectories from
+        // role_region_agg's revision history (the change-intelligence
+        // substrate). Window = the cell's last 10 revisions, i.e. roughly its
+        // last 10 *changed* days; unchanged days write no revision.
+        let mut trend_items: Vec<(String, Value)> = Vec::new();
+        for (key, _) in agg_items.iter().filter(|(k, _)| k.contains("|ALL|")) {
+            let revs = ctx.datasets.history(&ctx.app, "role_region_agg", key, 10).await?;
+            let count_of = |rev: &pumper_core::Revision| {
+                rev.data.as_ref().and_then(|d| d.get("count")).and_then(Value::as_i64)
+            };
+            let Some(latest) = revs.first().and_then(count_of) else { continue };
+            // Oldest snapshot within the window; None = the cell is brand new.
+            let prev = revs.iter().skip(1).filter_map(count_of).next_back();
+            let (prev_count, delta, trend) = match prev {
+                Some(p) if latest > p => (p, latest - p, "rising"),
+                Some(p) if latest < p => (p, latest - p, "falling"),
+                Some(p) => (p, 0, "flat"),
+                None => (0, latest, "new"),
+            };
+            let mut parts = key.split('|');
+            let czisco = parts.next().unwrap_or_default();
+            let org = parts.nth(1).unwrap_or_default();
+            trend_items.push((
+                format!("{czisco}|{org}"),
+                json!({
+                    "czIsco": czisco,
+                    "orgType": org,
+                    "count": latest,
+                    "prevCount": prev_count,
+                    "delta": delta,
+                    "pctChange": (prev_count > 0)
+                        .then(|| (delta as f64 / prev_count as f64 * 100.0).round()),
+                    "revisions": revs.len(),
+                    "trend": trend,
+                }),
+            ));
+        }
+        let trends = ctx.upsert_many("role_trends", &trend_items).await?;
+        let top = |dir: i64| -> Vec<&Value> {
+            let mut movers: Vec<&(String, Value)> = trend_items
+                .iter()
+                .filter(|(_, v)| v["delta"].as_i64().unwrap_or(0) * dir > 0)
+                .collect();
+            movers.sort_by_key(|(_, v)| -(v["delta"].as_i64().unwrap_or(0) * dir));
+            movers.into_iter().take(15).map(|(_, v)| v).collect()
+        };
+        let trending_top = top(1);
+        let fading_top = top(-1);
+
         let out = json!({
             "source": "data.mpsv.cz/volna-mista",
             "feedRecords": total,
@@ -266,6 +315,10 @@ impl ScrapeApp for MpsvVpm {
             "samples": sample_items.len(),
             "samplesNew": samples.new.len(),
             "samplesChanged": samples.changed.len(),
+            "trendCells": trend_items.len(),
+            "trendsChanged": trends.new.len() + trends.changed.len(),
+            "trendingTop": trending_top,
+            "fadingTop": fading_top,
             "freshness": freshness,
         });
         ctx.save_artifact("summary.json", &serde_json::to_vec_pretty(&out)?)

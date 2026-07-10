@@ -39,15 +39,60 @@ pub enum Rule {
     },
     /// JSON Pointer (RFC 6901, e.g. `/data/0/name`) into a JSON body.
     Json { pointer: String },
+    /// XPath expression over the HTML document (e.g. `//div[@id='x']//a/@href`);
+    /// `all` collects every match.
+    Xpath {
+        xpath: String,
+        #[serde(default)]
+        all: bool,
+    },
     /// A literal value.
     Const { value: Value },
+}
+
+/// A field's extraction rule plus an optional post-processing pipeline, e.g.
+/// `{"type": "regex", "pattern": "\\$([0-9.]+)", "group": 1,
+///   "transforms": [{"op": "to_number"}]}`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldRule {
+    #[serde(flatten)]
+    pub rule: Rule,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transforms: Vec<Transform>,
+}
+
+/// One post-extraction transform. Applied in order; element-wise over arrays
+/// (except `default`, which replaces a null result wholesale).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "op", rename_all = "snake_case")]
+pub enum Transform {
+    /// Trim surrounding whitespace from strings.
+    Trim,
+    Lowercase,
+    Uppercase,
+    /// Parse strings to a number, tolerating `$ € £ % ,` and whitespace.
+    ToNumber,
+    /// Like `to_number` but truncated to an integer.
+    ToInt,
+    /// `true/yes/y/1` → true, `false/no/n/0` → false (case-insensitive).
+    ToBool,
+    /// Regex find/replace over string values ($1-style capture references).
+    RegexReplace { pattern: String, replacement: String },
+    /// Split a string by `sep`; `index` picks one part (else keeps the array).
+    Split {
+        sep: String,
+        #[serde(default)]
+        index: Option<usize>,
+    },
+    /// Replace a null result with this value.
+    Default { value: Value },
 }
 
 /// A set of fields to extract from each document.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct RuleSet {
-    pub fields: BTreeMap<String, Rule>,
+    pub fields: BTreeMap<String, FieldRule>,
 }
 
 impl RuleSet {
@@ -55,8 +100,8 @@ impl RuleSet {
     /// whole batch.
     pub fn compile(&self) -> Result<CompiledRuleSet> {
         let mut fields = Vec::with_capacity(self.fields.len());
-        for (name, rule) in &self.fields {
-            let compiled = match rule {
+        for (name, field) in &self.fields {
+            let compiled = match &field.rule {
                 Rule::Css { selector, attr, all } => {
                     let sel = Selector::parse(selector).map_err(|e| {
                         Error::Parse(format!("bad css selector '{selector}': {e:?}"))
@@ -69,9 +114,19 @@ impl RuleSet {
                     CompiledRule::Regex { re, group: *group }
                 }
                 Rule::Json { pointer } => CompiledRule::Json { pointer: pointer.clone() },
+                Rule::Xpath { xpath, all } => {
+                    let parsed = skyscraper::xpath::parse(xpath)
+                        .map_err(|e| Error::Parse(format!("bad xpath '{xpath}': {e}")))?;
+                    CompiledRule::Xpath { xpath: parsed, all: *all }
+                }
                 Rule::Const { value } => CompiledRule::Const { value: value.clone() },
             };
-            fields.push((name.clone(), compiled));
+            let transforms = field
+                .transforms
+                .iter()
+                .map(|t| CompiledTransform::compile(t.clone()))
+                .collect::<Result<Vec<_>>>()?;
+            fields.push((name.clone(), compiled, transforms));
         }
         Ok(CompiledRuleSet { fields })
     }
@@ -81,22 +136,137 @@ enum CompiledRule {
     Css { selector: Selector, attr: Option<String>, all: bool },
     Regex { re: Regex, group: usize },
     Json { pointer: String },
+    Xpath { xpath: skyscraper::xpath::Xpath, all: bool },
     Const { value: Value },
+}
+
+/// A transform with its regex pre-compiled.
+enum CompiledTransform {
+    Trim,
+    Lowercase,
+    Uppercase,
+    ToNumber,
+    ToInt,
+    ToBool,
+    RegexReplace { re: Regex, replacement: String },
+    Split { sep: String, index: Option<usize> },
+    Default { value: Value },
+}
+
+impl CompiledTransform {
+    fn compile(t: Transform) -> Result<Self> {
+        Ok(match t {
+            Transform::Trim => Self::Trim,
+            Transform::Lowercase => Self::Lowercase,
+            Transform::Uppercase => Self::Uppercase,
+            Transform::ToNumber => Self::ToNumber,
+            Transform::ToInt => Self::ToInt,
+            Transform::ToBool => Self::ToBool,
+            Transform::RegexReplace { pattern, replacement } => Self::RegexReplace {
+                re: Regex::new(&pattern)
+                    .map_err(|e| Error::Parse(format!("bad transform regex '{pattern}': {e}")))?,
+                replacement,
+            },
+            Transform::Split { sep, index } => Self::Split { sep, index },
+            Transform::Default { value } => Self::Default { value },
+        })
+    }
+
+    /// Applies to one value; arrays are mapped element-wise (except `default`).
+    fn apply(&self, value: Value) -> Value {
+        match (self, value) {
+            (Self::Default { value: d }, Value::Null) => d.clone(),
+            (Self::Default { .. }, v) => v,
+            (t, Value::Array(items)) => {
+                Value::Array(items.into_iter().map(|v| t.apply_scalar(v)).collect())
+            }
+            (t, v) => t.apply_scalar(v),
+        }
+    }
+
+    fn apply_scalar(&self, value: Value) -> Value {
+        match self {
+            Self::Trim => map_str(value, |s| Value::String(s.trim().to_string())),
+            Self::Lowercase => map_str(value, |s| Value::String(s.to_lowercase())),
+            Self::Uppercase => map_str(value, |s| Value::String(s.to_uppercase())),
+            Self::ToNumber => coerce_number(value, false),
+            Self::ToInt => coerce_number(value, true),
+            Self::ToBool => match value {
+                Value::Bool(b) => Value::Bool(b),
+                Value::String(s) => match s.trim().to_ascii_lowercase().as_str() {
+                    "true" | "yes" | "y" | "1" => Value::Bool(true),
+                    "false" | "no" | "n" | "0" => Value::Bool(false),
+                    _ => Value::Null,
+                },
+                Value::Number(n) => Value::Bool(n.as_f64() != Some(0.0)),
+                _ => Value::Null,
+            },
+            Self::RegexReplace { re, replacement } => map_str(value, |s| {
+                Value::String(re.replace_all(s, replacement.as_str()).into_owned())
+            }),
+            Self::Split { sep, index } => map_str(value, |s| {
+                let parts: Vec<&str> = s.split(sep.as_str()).collect();
+                match index {
+                    Some(i) => parts
+                        .get(*i)
+                        .map(|p| Value::String(p.trim().to_string()))
+                        .unwrap_or(Value::Null),
+                    None => Value::Array(
+                        parts.into_iter().map(|p| Value::String(p.trim().to_string())).collect(),
+                    ),
+                }
+            }),
+            Self::Default { .. } => value, // handled in apply()
+        }
+    }
+}
+
+/// Applies `f` when the value is a string; passes anything else through.
+fn map_str(value: Value, f: impl Fn(&str) -> Value) -> Value {
+    match value {
+        Value::String(s) => f(&s),
+        v => v,
+    }
+}
+
+/// Parses strings to numbers, tolerating currency symbols, thousands
+/// separators, and `%`. Numbers pass through; anything else becomes null.
+fn coerce_number(value: Value, int: bool) -> Value {
+    let num = match &value {
+        Value::Number(n) => n.as_f64(),
+        Value::String(s) => {
+            let cleaned: String = s
+                .chars()
+                .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
+                .collect();
+            cleaned.parse::<f64>().ok()
+        }
+        _ => None,
+    };
+    match num {
+        Some(n) if int => Value::from(n.trunc() as i64),
+        Some(n) => serde_json::Number::from_f64(n).map(Value::Number).unwrap_or(Value::Null),
+        None => Value::Null,
+    }
 }
 
 /// Compiled, thread-shareable rule set. `Send + Sync` so a `&CompiledRuleSet`
 /// can drive every rayon worker in parallel.
 pub struct CompiledRuleSet {
-    fields: Vec<(String, CompiledRule)>,
+    fields: Vec<(String, CompiledRule, Vec<CompiledTransform>)>,
 }
 
 impl CompiledRuleSet {
     fn needs_html(&self) -> bool {
-        self.fields.iter().any(|(_, r)| matches!(r, CompiledRule::Css { .. }))
+        self.fields.iter().any(|(_, r, _)| matches!(r, CompiledRule::Css { .. }))
     }
 
     fn needs_json(&self) -> bool {
-        self.fields.iter().any(|(_, r)| matches!(r, CompiledRule::Json { .. }))
+        self.fields.iter().any(|(_, r, _)| matches!(r, CompiledRule::Json { .. }))
+    }
+
+    fn needs_xpath(&self) -> bool {
+        self.fields.iter().any(|(_, r, _)| matches!(r, CompiledRule::Xpath { .. }))
     }
 }
 
@@ -111,10 +281,15 @@ pub fn extract_one(rules: &CompiledRuleSet, doc: &str) -> Value {
     } else {
         None
     };
+    let xpath_tree = if rules.needs_xpath() {
+        skyscraper::html::parse(doc).ok()
+    } else {
+        None
+    };
 
     let mut obj = Map::with_capacity(rules.fields.len());
-    for (name, rule) in &rules.fields {
-        let value = match rule {
+    for (name, rule, transforms) in &rules.fields {
+        let mut value = match rule {
             CompiledRule::Css { selector, attr, all } => {
                 css_extract(html.as_ref().unwrap(), selector, attr.as_deref(), *all)
             }
@@ -127,8 +302,15 @@ pub fn extract_one(rules: &CompiledRuleSet, doc: &str) -> Value {
                 .as_ref()
                 .and_then(|j| j.pointer(pointer).cloned())
                 .unwrap_or(Value::Null),
+            CompiledRule::Xpath { xpath, all } => xpath_tree
+                .as_ref()
+                .map(|tree| xpath_extract(tree, xpath, *all))
+                .unwrap_or(Value::Null),
             CompiledRule::Const { value } => value.clone(),
         };
+        for t in transforms {
+            value = t.apply(value);
+        }
         obj.insert(name.clone(), value);
     }
     Value::Object(obj)
@@ -137,6 +319,40 @@ pub fn extract_one(rules: &CompiledRuleSet, doc: &str) -> Value {
 /// Extracts a whole batch in parallel across all cores.
 pub fn extract_batch(rules: &CompiledRuleSet, docs: &[String]) -> Vec<Value> {
     docs.par_iter().map(|doc| extract_one(rules, doc)).collect()
+}
+
+fn xpath_extract(
+    tree: &skyscraper::xpath::XpathItemTree,
+    xpath: &skyscraper::xpath::Xpath,
+    all: bool,
+) -> Value {
+    let Ok(items) = xpath.apply(tree) else {
+        return Value::Null;
+    };
+    let mut values = items.iter().map(|item| xpath_item_value(item, tree));
+    if all {
+        Value::Array(values.collect())
+    } else {
+        values.next().unwrap_or(Value::Null)
+    }
+}
+
+/// One XPath result as JSON: attribute nodes yield their value, text nodes
+/// their content, elements their recursive text; atomics render as strings.
+fn xpath_item_value(
+    item: &skyscraper::xpath::grammar::data_model::XpathItem,
+    tree: &skyscraper::xpath::XpathItemTree,
+) -> Value {
+    use skyscraper::xpath::grammar::data_model::XpathItem;
+    use skyscraper::xpath::grammar::XpathItemTreeNode;
+    match item {
+        XpathItem::Node(node) => match node {
+            XpathItemTreeNode::AttributeNode(a) => Value::String(a.value.clone()),
+            XpathItemTreeNode::TextNode(t) => Value::String(t.content.trim().to_string()),
+            n => Value::String(n.text_content(tree).trim().to_string()),
+        },
+        other => Value::String(format!("{other:?}")),
+    }
 }
 
 fn css_extract(html: &Html, selector: &Selector, attr: Option<&str>, all: bool) -> Value {
@@ -195,6 +411,56 @@ mod tests {
         let out = &extract_batch(&rules, std::slice::from_ref(&doc))[0];
         assert_eq!(out["name"], json!("Ada"));
         assert_eq!(out["n"], json!(2));
+    }
+
+    #[test]
+    fn xpath_text_attribute_and_all() {
+        let rules = ruleset(json!({
+            "title": {"type": "xpath", "xpath": "//div[@class='main']/h2"},
+            "href":  {"type": "xpath", "xpath": "//a/@href"},
+            "items": {"type": "xpath", "xpath": "//li", "all": true},
+            "none":  {"type": "xpath", "xpath": "//article"}
+        }));
+        let doc = r#"<html><body><div class="main"><h2> Deep Title </h2></div>
+                     <a href="/next">n</a><ul><li>a</li><li>b</li></ul></body></html>"#
+            .to_string();
+        let out = &extract_batch(&rules, std::slice::from_ref(&doc))[0];
+        assert_eq!(out["title"], json!("Deep Title"));
+        assert_eq!(out["href"], json!("/next"));
+        assert_eq!(out["items"], json!(["a", "b"]));
+        assert_eq!(out["none"], json!(null));
+        // Invalid XPath fails at compile time, not silently at extraction.
+        assert!(serde_json::from_value::<RuleSet>(
+            json!({ "x": {"type": "xpath", "xpath": "///"} })
+        )
+        .unwrap()
+        .compile()
+        .is_err());
+    }
+
+    #[test]
+    fn transforms_coerce_and_chain() {
+        let rules = ruleset(json!({
+            "price": {"type": "regex", "pattern": "costs (\\$[0-9,.]+)", "group": 1,
+                      "transforms": [{"op": "to_number"}]},
+            "tags":  {"type": "css", "selector": "li", "all": true,
+                      "transforms": [{"op": "lowercase"}, {"op": "trim"}]},
+            "year":  {"type": "css", "selector": ".date",
+                      "transforms": [{"op": "split", "sep": "-", "index": 0}, {"op": "to_int"}]},
+            "missing": {"type": "css", "selector": ".nope",
+                        "transforms": [{"op": "default", "value": "n/a"}]},
+            "active": {"type": "css", "selector": ".flag",
+                       "transforms": [{"op": "to_bool"}]}
+        }));
+        let doc = "<ul><li> Rust </li><li>WEB</li></ul><span class=\"date\">2026-07-10</span>\
+                   <i class=\"flag\">Yes</i> costs $1,234.50"
+            .to_string();
+        let out = &extract_batch(&rules, std::slice::from_ref(&doc))[0];
+        assert_eq!(out["price"], json!(1234.5));
+        assert_eq!(out["tags"], json!(["rust", "web"]));
+        assert_eq!(out["year"], json!(2026));
+        assert_eq!(out["missing"], json!("n/a"));
+        assert_eq!(out["active"], json!(true));
     }
 
     #[test]

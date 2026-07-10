@@ -32,3 +32,4 @@ anyhow.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+skyscraper = "0.7"
