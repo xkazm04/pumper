@@ -100,7 +100,7 @@ pub async fn crawl(
         if let Some(host) = host_of(seed) {
             seed_hosts.insert(host);
         }
-        frontier.push(seed.clone(), 0);
+        frontier.push(canonicalize_str(seed), 0);
     }
     if let Some(dir) = &output_dir {
         tokio::fs::create_dir_all(dir).await.ok();
@@ -199,17 +199,56 @@ fn extract_links(html: &str, base: &str, same_domain: bool) -> Vec<String> {
     let mut out = Vec::new();
     for el in doc.select(&selector) {
         let Some(href) = el.value().attr("href") else { continue };
-        let Ok(mut joined) = base_url.join(href) else { continue };
+        let Ok(joined) = base_url.join(href) else { continue };
         if !matches!(joined.scheme(), "http" | "https") {
             continue;
         }
         if same_domain && joined.host_str().map(str::to_owned) != base_host {
             continue;
         }
-        joined.set_fragment(None);
-        out.push(joined.to_string());
+        out.push(canonicalize(joined));
     }
     out
+}
+
+/// Query parameters that never change page content — dropped so the frontier's
+/// seen-set doesn't treat `?utm_source=x` variants as distinct pages.
+const TRACKING_PARAMS: &[&str] = &[
+    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
+    "gclid", "fbclid", "msclkid", "mc_cid", "mc_eid", "ref", "ref_src",
+];
+
+/// Canonical form of a URL for frontier dedup: fragment stripped, tracking
+/// params dropped, remaining query pairs sorted, trailing slash trimmed off
+/// non-root paths. `Url` itself already lowercases scheme/host and drops
+/// default ports.
+fn canonicalize(mut url: Url) -> String {
+    url.set_fragment(None);
+    let mut pairs: Vec<(String, String)> = url
+        .query_pairs()
+        .filter(|(k, _)| !TRACKING_PARAMS.contains(&k.as_ref()))
+        .map(|(k, v)| (k.into_owned(), v.into_owned()))
+        .collect();
+    pairs.sort();
+    if pairs.is_empty() {
+        url.set_query(None);
+    } else {
+        let query: Vec<String> = pairs
+            .into_iter()
+            .map(|(k, v)| if v.is_empty() { k } else { format!("{k}={v}") })
+            .collect();
+        url.set_query(Some(&query.join("&")));
+    }
+    if url.path().len() > 1 && url.path().ends_with('/') {
+        let trimmed = url.path().trim_end_matches('/').to_string();
+        url.set_path(&trimmed);
+    }
+    url.to_string()
+}
+
+/// Canonicalizes a raw URL string; passes through unparseable input unchanged.
+fn canonicalize_str(url: &str) -> String {
+    Url::parse(url).map(canonicalize).unwrap_or_else(|_| url.to_string())
 }
 
 fn host_of(url: &str) -> Option<String> {
@@ -267,5 +306,21 @@ impl RobotRules {
             .map(|u| u.path().to_string())
             .unwrap_or_else(|| "/".to_string());
         !self.disallows.iter().any(|d| path.starts_with(d))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn canonicalize_drops_tracking_sorts_query_and_trims_slash() {
+        assert_eq!(
+            canonicalize_str("https://x.com/a/?b=2&utm_source=tw&a=1#frag"),
+            "https://x.com/a?a=1&b=2"
+        );
+        assert_eq!(canonicalize_str("https://x.com/"), "https://x.com/");
+        assert_eq!(canonicalize_str("https://x.com/p/?fbclid=abc"), "https://x.com/p");
+        assert_eq!(canonicalize_str("not a url"), "not a url");
     }
 }
