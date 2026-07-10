@@ -29,6 +29,8 @@ pub struct AppContext {
     pub budget_usd: Option<f64>,
     /// Cost-aware cache for Claude research runs (TTL-bound, key = request).
     pub research_cache: Arc<ResearchCache>,
+    /// Learned per-host tier routing (skip the HTTP tier where it never wins).
+    pub tiers: Arc<crate::tiers::TierMemory>,
     /// Sandboxed WASM plugin host (fuel + memory limited).
     pub plugins: Arc<dyn Plugins>,
     pub artifacts_dir: PathBuf,
@@ -68,6 +70,35 @@ impl AppContext {
     /// cost event (tier used, escalation trail, Claude spend) against this job.
     /// Prefer this over calling the fetcher directly.
     pub async fn fetch(&self, mut req: FetchRequest) -> Result<FetchOutcome> {
+        let host = url::Url::parse(&req.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_lowercase));
+
+        // Learned tier routing: hosts where the HTTP tier persistently loses
+        // start straight at the browser (escalating strategies only).
+        let mut tier_note = None;
+        if let Some(host) = &host {
+            if !req.skip_http
+                && matches!(
+                    req.strategy,
+                    crate::fetcher::FetchStrategy::Auto
+                        | crate::fetcher::FetchStrategy::AutoWithResearch
+                )
+            {
+                match self.tiers.preferred(host).await {
+                    Ok(Some(pref)) if pref == "browser" => {
+                        req.skip_http = true;
+                        tier_note = Some(
+                            "http tier skipped: learned host preference (persistent http losses)"
+                                .to_string(),
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => tracing::warn!(job = %self.job_id, "tier memory read failed: {e}"),
+                }
+            }
+        }
+
         // Budget-governed escalation: only the Claude tier spends money. With
         // headroom, clamp the tier's per-call ceiling to what's left; with none,
         // downgrade to the free tiers instead of failing the whole fetch.
@@ -90,8 +121,19 @@ impl AppContext {
         }
         let url = req.url.clone();
         let mut outcome = self.engines.fetch.fetch(req).await?;
+        if let Some(note) = tier_note {
+            outcome.escalations.push(note);
+        }
         if let Some(note) = budget_note {
             outcome.escalations.push(note);
+        }
+        // Teach the router: an HTTP win resets the host, an HTTP loss (the
+        // trail shows the tier failed/thin) adds a strike.
+        if let Some(host) = &host {
+            let http_lost = outcome.escalations.iter().any(|e| e.starts_with("http tier"));
+            if let Err(e) = self.tiers.record(host, outcome.engine, http_lost).await {
+                tracing::warn!(job = %self.job_id, "tier memory write failed: {e}");
+            }
         }
         let detail = (!outcome.escalations.is_empty()).then(|| outcome.escalations.join("; "));
         if let Err(e) = self

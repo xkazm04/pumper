@@ -111,6 +111,7 @@ async fn execute(state: AppState, job: Job) {
         costs: state.costs.clone(),
         budget_usd: job.budget_usd,
         research_cache: state.research_cache.clone(),
+        tiers: state.tiers.clone(),
         plugins: state.plugins.clone(),
         artifacts_dir: state
             .storage
