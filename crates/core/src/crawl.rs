@@ -39,6 +39,9 @@ pub struct CrawlConfig {
     pub include_patterns: Vec<String>,
     /// Regexes that drop a discovered URL (any match). Applied after include.
     pub exclude_patterns: Vec<String>,
+    /// Expand seeds from each seed host's sitemaps (robots.txt `Sitemap:`
+    /// directives, falling back to /sitemap.xml).
+    pub sitemap_seeds: bool,
 }
 
 /// Compiled include/exclude filter.
@@ -90,6 +93,8 @@ pub struct CrawlStats {
     pub skipped_robots: usize,
     /// Discovered links dropped by include/exclude URL patterns.
     pub skipped_filtered: usize,
+    /// URLs seeded into the frontier from sitemaps.
+    pub sitemap_seeded: usize,
     pub hosts: usize,
     pub frontier_remaining: usize,
     pub pages: Vec<CrawlPage>,
@@ -114,6 +119,13 @@ impl Frontier {
     }
     fn pop(&mut self) -> Option<(String, u32)> {
         self.queue.pop_front()
+    }
+    /// Puts an already-seen URL back at the tail (crawl-delay rotation).
+    fn requeue(&mut self, url: String, depth: u32) {
+        self.queue.push_back((url, depth));
+    }
+    fn len(&self) -> usize {
+        self.queue.len()
     }
 }
 
@@ -150,18 +162,50 @@ pub async fn crawl(
     let mut hosts: HashSet<String> = HashSet::new();
     let mut stats = CrawlStats::default();
     let mut in_flight = FuturesUnordered::new();
+    // Per-host earliest-next-fetch, driven by robots.txt Crawl-delay.
+    let mut next_allowed: HashMap<String, tokio::time::Instant> = HashMap::new();
+
+    // Expand seeds from each seed host's sitemaps before crawling.
+    if cfg.sitemap_seeds {
+        let hosts: Vec<String> = seed_hosts.iter().cloned().collect();
+        for host in hosts {
+            let declared = robots_for(&mut robots, &http, &host).await.sitemaps.clone();
+            let budget = MAX_SITEMAP_SEEDS.saturating_sub(stats.sitemap_seeded);
+            if budget == 0 {
+                break;
+            }
+            stats.sitemap_seeded +=
+                seed_from_sitemaps(&http, &host, &declared, &mut frontier, &filter, budget).await;
+        }
+    }
 
     loop {
-        // Top up in-flight fetches from the frontier.
-        while in_flight.len() < concurrency {
+        // Top up in-flight fetches from the frontier. `rotations` guards the
+        // crawl-delay requeue path against spinning through a queue where
+        // every remaining URL is still inside its host's delay window.
+        let mut rotations = 0;
+        while in_flight.len() < concurrency && rotations <= frontier.len() {
             let Some((url, depth)) = frontier.pop() else { break };
             let host = host_of(&url).unwrap_or_default();
+            let mut crawl_delay = None;
             if cfg.respect_robots && !host.is_empty() {
                 let rules = robots_for(&mut robots, &http, &host).await;
                 if !rules.allowed(&url) {
                     stats.skipped_robots += 1;
                     continue;
                 }
+                crawl_delay = rules.crawl_delay;
+            }
+            if let Some(delay) = crawl_delay {
+                let now = tokio::time::Instant::now();
+                if next_allowed.get(&host).is_some_and(|&t| now < t) {
+                    frontier.requeue(url, depth);
+                    rotations += 1;
+                    continue;
+                }
+                // Cap silly delays; a 3600s crawl-delay would stall the run.
+                let delay = std::time::Duration::from_secs_f64(delay.min(30.0));
+                next_allowed.insert(host.clone(), now + delay);
             }
             hosts.insert(host);
             let http = http.clone();
@@ -169,8 +213,16 @@ pub async fn crawl(
             in_flight.push(async move { fetch_one(http, url, depth, same_domain).await });
         }
 
+        if in_flight.is_empty() {
+            if frontier.len() == 0 {
+                break; // frontier drained and nothing in flight
+            }
+            // Everything left is crawl-delayed; wait out the shortest window.
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            continue;
+        }
         let Some(result) = in_flight.next().await else {
-            break; // frontier drained and nothing in flight
+            break;
         };
         let Some(fetched) = result else {
             continue; // fetch failed; skip
@@ -314,33 +366,46 @@ async fn robots_for<'a>(
     cache.get(host).unwrap()
 }
 
-/// Minimal robots.txt rules for the `*` user-agent (Disallow-prefix matching).
+/// Minimal robots.txt rules for the `*` user-agent: Disallow-prefix matching,
+/// plus the `Crawl-delay` for that group and the (group-independent)
+/// `Sitemap:` directives.
 struct RobotRules {
     disallows: Vec<String>,
+    crawl_delay: Option<f64>,
+    sitemaps: Vec<String>,
 }
 
 impl RobotRules {
     fn allow_all() -> Self {
-        Self { disallows: Vec::new() }
+        Self { disallows: Vec::new(), crawl_delay: None, sitemaps: Vec::new() }
     }
 
     fn parse(text: &str) -> Self {
-        let mut disallows = Vec::new();
+        let mut rules = Self::allow_all();
         let mut in_star_group = false;
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
             let Some((key, value)) = line.split_once(':') else { continue };
             let key = key.trim().to_ascii_lowercase();
-            let value = value.trim();
+            // `Sitemap:` values are absolute URLs — re-join the split colon.
+            let value = if key == "sitemap" {
+                line.splitn(2, ':').nth(1).unwrap_or("").trim()
+            } else {
+                value.trim()
+            };
             match key.as_str() {
                 "user-agent" => in_star_group = value == "*",
                 "disallow" if in_star_group && !value.is_empty() => {
-                    disallows.push(value.to_string());
+                    rules.disallows.push(value.to_string());
                 }
+                "crawl-delay" if in_star_group => {
+                    rules.crawl_delay = value.parse::<f64>().ok().filter(|d| *d > 0.0);
+                }
+                "sitemap" if !value.is_empty() => rules.sitemaps.push(value.to_string()),
                 _ => {}
             }
         }
-        Self { disallows }
+        rules
     }
 
     fn allowed(&self, url: &str) -> bool {
@@ -352,9 +417,100 @@ impl RobotRules {
     }
 }
 
+/// Hard caps for sitemap seeding: nested sitemaps followed per index, and total
+/// URLs pushed — a big site's sitemap must not replace the crawl itself.
+const MAX_SITEMAPS_PER_HOST: usize = 10;
+const MAX_SITEMAP_SEEDS: usize = 2_000;
+
+/// `<loc>` values from a sitemap or sitemap-index document.
+fn parse_sitemap_locs(xml: &str) -> Vec<String> {
+    let re = regex::Regex::new(r"<loc>\s*([^<]+?)\s*</loc>").expect("valid regex");
+    re.captures_iter(xml)
+        .map(|c| c[1].replace("&amp;", "&"))
+        .collect()
+}
+
+/// Seeds the frontier from a host's sitemaps (robots `Sitemap:` directives,
+/// falling back to `/sitemap.xml`). Sitemap-index files are followed one level
+/// deep. Returns how many URLs were pushed.
+async fn seed_from_sitemaps(
+    http: &Arc<dyn HttpClient>,
+    host: &str,
+    declared: &[String],
+    frontier: &mut Frontier,
+    filter: &UrlFilter,
+    budget: usize,
+) -> usize {
+    let roots: Vec<String> = if declared.is_empty() {
+        vec![format!("https://{host}/sitemap.xml")]
+    } else {
+        declared.iter().take(MAX_SITEMAPS_PER_HOST).cloned().collect()
+    };
+    let mut pushed = 0;
+    for root in roots {
+        let Ok(resp) = http.fetch(HttpRequest::get(&root)).await else { continue };
+        if !resp.is_success() {
+            continue;
+        }
+        let locs = parse_sitemap_locs(&resp.body);
+        // A sitemap index lists further sitemaps; follow one level.
+        let nested: Vec<String> = if resp.body.contains("<sitemapindex") {
+            locs.into_iter().take(MAX_SITEMAPS_PER_HOST).collect()
+        } else {
+            for loc in locs {
+                if pushed >= budget {
+                    return pushed;
+                }
+                if filter.allows(&loc) {
+                    frontier.push(canonicalize_str(&loc), 0);
+                    pushed += 1;
+                }
+            }
+            continue;
+        };
+        for sm in nested {
+            let Ok(resp) = http.fetch(HttpRequest::get(&sm)).await else { continue };
+            if !resp.is_success() {
+                continue;
+            }
+            for loc in parse_sitemap_locs(&resp.body) {
+                if pushed >= budget {
+                    return pushed;
+                }
+                if filter.allows(&loc) {
+                    frontier.push(canonicalize_str(&loc), 0);
+                    pushed += 1;
+                }
+            }
+        }
+    }
+    pushed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn robots_parses_crawl_delay_and_sitemaps() {
+        let rules = RobotRules::parse(
+            "User-agent: googlebot\nCrawl-delay: 9\n\nUser-agent: *\nDisallow: /admin\n\
+             Crawl-delay: 2.5\nSitemap: https://x.com/sitemap.xml\nSitemap: https://x.com/news.xml",
+        );
+        assert_eq!(rules.crawl_delay, Some(2.5));
+        assert_eq!(rules.sitemaps.len(), 2);
+        assert_eq!(rules.sitemaps[0], "https://x.com/sitemap.xml");
+        assert!(!rules.allowed("https://x.com/admin/x"));
+        assert!(rules.allowed("https://x.com/pub"));
+    }
+
+    #[test]
+    fn sitemap_locs_parse_and_unescape() {
+        let xml = "<urlset><url><loc> https://x.com/a </loc></url>\
+                   <url><loc>https://x.com/b?x=1&amp;y=2</loc></url></urlset>";
+        let locs = parse_sitemap_locs(xml);
+        assert_eq!(locs, vec!["https://x.com/a", "https://x.com/b?x=1&y=2"]);
+    }
 
     #[test]
     fn url_filter_include_then_exclude() {
@@ -368,6 +524,7 @@ mod tests {
             respect_robots: false,
             include_patterns: vec!["/blog/".into()],
             exclude_patterns: vec!["\\.pdf$".into()],
+            sitemap_seeds: false,
         };
         let f = UrlFilter::compile(&cfg).unwrap();
         assert!(f.allows("https://x.com/blog/post"));

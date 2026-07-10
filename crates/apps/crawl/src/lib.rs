@@ -55,6 +55,7 @@ impl ScrapeApp for Crawl {
             respect_robots: bool_param("respect_robots", true),
             include_patterns: str_array("include_patterns"),
             exclude_patterns: str_array("exclude_patterns"),
+            sitemap_seeds: bool_param("sitemap_seeds", false),
         };
 
         let stats = crawl(ctx.engines.http.clone(), cfg, Some(ctx.artifacts_dir.clone())).await?;
@@ -64,6 +65,7 @@ impl ScrapeApp for Crawl {
             "skipped_duplicates": stats.skipped_duplicates,
             "skipped_robots": stats.skipped_robots,
             "skipped_filtered": stats.skipped_filtered,
+            "sitemap_seeded": stats.sitemap_seeded,
             "hosts": stats.hosts,
             "frontier_remaining": stats.frontier_remaining,
             "pages": stats.pages,
