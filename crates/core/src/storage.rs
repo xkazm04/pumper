@@ -13,8 +13,8 @@ use crate::job::{Job, JobStatus};
 use crate::{Error, Result};
 
 const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, priority, \
-                           callback_url, callback_secret, budget_usd, result, error, created_at, \
-                           available_at, started_at, finished_at";
+                           callback_url, callback_secret, budget_usd, schedule_id, result, error, \
+                           created_at, available_at, started_at, finished_at";
 
 /// Options for enqueuing a job. Defaults: 1 attempt, no delay, priority 0.
 #[derive(Debug, Clone, Default)]
@@ -30,6 +30,8 @@ pub struct EnqueueOptions {
     /// Client-supplied dedup key: an enqueue with a key that already exists
     /// returns the original job instead of creating a duplicate.
     pub idempotency_key: Option<String>,
+    /// Set by the scheduler so overlapping runs of one schedule can be skipped.
+    pub schedule_id: Option<String>,
 }
 
 /// A standing subscription: POST a webhook whenever a job leaves fresh
@@ -121,8 +123,9 @@ impl Storage {
         let available = created + chrono::Duration::seconds(opts.delay_secs as i64);
         let insert = sqlx::query(
             "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
-             callback_url, callback_secret, budget_usd, idempotency_key, created_at, available_at) \
-             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+             callback_url, callback_secret, budget_usd, idempotency_key, schedule_id, \
+             created_at, available_at) \
+             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(id.to_string())
         .bind(app)
@@ -133,6 +136,7 @@ impl Storage {
         .bind(opts.callback_secret)
         .bind(opts.budget_usd)
         .bind(&opts.idempotency_key)
+        .bind(&opts.schedule_id)
         .bind(ts(created))
         .bind(ts(available))
         .execute(&self.pool)
@@ -314,6 +318,18 @@ impl Storage {
                 .fetch_all(&self.pool)
                 .await?;
         Ok(rows)
+    }
+
+    /// True when a schedule already has a job queued or running — the overlap
+    /// guard the scheduler consults before firing.
+    pub async fn schedule_has_active_job(&self, schedule_id: &str) -> Result<bool> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM jobs WHERE schedule_id = ?1 AND status IN ('queued', 'running') LIMIT 1",
+        )
+        .bind(schedule_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
     }
 
     /// Manually re-queues a failed or cancelled job: clears the terminal state
@@ -621,6 +637,7 @@ struct JobRow {
     callback_url: Option<String>,
     callback_secret: Option<String>,
     budget_usd: Option<f64>,
+    schedule_id: Option<String>,
     result: Option<String>,
     error: Option<String>,
     created_at: String,
@@ -645,6 +662,7 @@ impl TryFrom<JobRow> for Job {
             callback_url: r.callback_url,
             callback_secret: r.callback_secret,
             budget_usd: r.budget_usd,
+            schedule_id: r.schedule_id,
             result: r
                 .result
                 .as_deref()

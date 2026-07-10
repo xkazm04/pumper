@@ -52,6 +52,8 @@ pub struct Job {
     pub callback_secret: Option<String>,
     /// Spend ceiling for the whole job; metered Claude calls abort past it.
     pub budget_usd: Option<f64>,
+    /// The schedule that fired this job, when it was a scheduled run.
+    pub schedule_id: Option<String>,
     pub result: Option<Value>,
     pub error: Option<String>,
     pub created_at: DateTime<Utc>,

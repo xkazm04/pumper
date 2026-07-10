@@ -227,6 +227,7 @@ async fn enqueue_job(
         callback_secret: body.callback_secret,
         budget_usd: body.budget_usd.filter(|b| *b > 0.0),
         idempotency_key,
+        schedule_id: None,
     };
     let (job, created) = state.storage.enqueue_dedup(&name, opts).await?;
     if created {

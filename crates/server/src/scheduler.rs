@@ -54,11 +54,20 @@ async fn reconcile(state: &AppState) -> anyhow::Result<()> {
             continue;
         }
 
+        // Overlap guard: don't stack a second run while the previous one is
+        // still queued/running. last_run is NOT touched, so the missed firing
+        // stays due and fires on the first tick after the active run finishes.
+        if state.storage.schedule_has_active_job(&schedule.id).await? {
+            info!(id = %schedule.id, app = %schedule.app, "previous scheduled run still active; skipping tick");
+            continue;
+        }
+
         let params = resolve_params(state, &schedule);
         let opts = EnqueueOptions {
             params,
             max_attempts: 1,
             priority: schedule.priority,
+            schedule_id: Some(schedule.id.clone()),
             ..Default::default()
         };
         match state.storage.enqueue(&schedule.app, opts).await {
