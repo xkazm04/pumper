@@ -39,6 +39,9 @@ pub fn router(state: AppState) -> Router {
         .route("/watches", get(list_watches).post(create_watch))
         .route("/watches/{id}", axum::routing::delete(delete_watch))
         .route("/watches/{id}/enabled", post(set_watch_enabled))
+        .route("/webhooks/deliveries", get(list_deliveries))
+        .route("/webhooks/deliveries/{id}", get(get_delivery))
+        .route("/webhooks/deliveries/{id}/replay", post(replay_delivery))
         .route("/plugins", get(list_plugins))
         .route("/plugins/reload", post(reload_plugins))
         .route("/search", get(search))
@@ -604,6 +607,72 @@ async fn set_watch_enabled(
     } else {
         Err(ApiError(StatusCode::NOT_FOUND, "watch not found".into()))
     }
+}
+
+// ---- Webhook delivery log ----------------------------------------------------
+
+#[derive(Deserialize)]
+struct DeliveriesQuery {
+    /// 'pending' | 'delivered' | 'failed' — `failed` is the dead-letter view.
+    status: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+async fn list_deliveries(
+    State(state): State<AppState>,
+    Query(query): Query<DeliveriesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let deliveries = state
+        .storage
+        .list_deliveries(query.status.as_deref(), query.limit.clamp(1, 500))
+        .await?;
+    Ok(Json(json!({ "count": deliveries.len(), "deliveries": deliveries })))
+}
+
+async fn get_delivery(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<pumper_core::Delivery>, ApiError> {
+    state
+        .storage
+        .get_delivery(&id)
+        .await?
+        .map(Json)
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "delivery not found".into()))
+}
+
+/// Re-sends a logged delivery, re-signing with the source's current secret
+/// (job callback secret or watch secret) when it still exists.
+async fn replay_delivery(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<(StatusCode, Json<Value>), ApiError> {
+    let Some(delivery) = state.storage.get_delivery(&id).await? else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "delivery not found".into()));
+    };
+    let secret = match delivery.kind.as_str() {
+        "job" => {
+            let job_id = Uuid::parse_str(&delivery.ref_id)
+                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
+            state.storage.get(job_id).await?.and_then(|j| j.callback_secret)
+        }
+        _ => state
+            .storage
+            .get_watch(&delivery.ref_id)
+            .await?
+            .and_then(|w| w.secret),
+    };
+    crate::webhook::replay(
+        state.webhook_client.clone(),
+        state.storage.clone(),
+        delivery.id.clone(),
+        delivery.url.clone(),
+        delivery.event.clone(),
+        delivery.body.into_bytes(),
+        secret,
+    );
+    Ok((StatusCode::ACCEPTED, Json(json!({ "id": id, "replaying": true }))))
 }
 
 // ---- Full-text search -----------------------------------------------------

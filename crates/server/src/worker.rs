@@ -206,7 +206,12 @@ async fn notify_watches(state: &AppState, job: &Job) {
                 "count": revs.len(),
                 "changes": revs,
             });
-            webhook::dispatch_change(state.webhook_client.clone(), watch.clone(), payload);
+            webhook::dispatch_change(
+                state.webhook_client.clone(),
+                state.storage.clone(),
+                watch.clone(),
+                payload,
+            );
         }
     }
 }
@@ -220,7 +225,7 @@ async fn finalize(state: &AppState, id: uuid::Uuid) {
     event.result = job.result.clone();
     event.error = job.error.clone();
     publish(state, event);
-    webhook::dispatch(state.webhook_client.clone(), job);
+    webhook::dispatch(state.webhook_client.clone(), state.storage.clone(), job);
 }
 
 fn publish(state: &AppState, event: JobEvent) {

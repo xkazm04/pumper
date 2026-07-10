@@ -35,7 +35,7 @@ pub use costs::{CostEvent, CostLedger, CostSummary};
 #[cfg(feature = "storage")]
 pub use datasets::{diff_values, ChangeKind, Datasets, DupPair, Record, Revision, UpsertSummary};
 #[cfg(feature = "storage")]
-pub use storage::{EnqueueOptions, Schedule, Storage, Watch};
+pub use storage::{Delivery, EnqueueOptions, Schedule, Storage, Watch};
 
 pub use config::Config;
 pub use crawl::{crawl, CrawlConfig, CrawlPage, CrawlStats};

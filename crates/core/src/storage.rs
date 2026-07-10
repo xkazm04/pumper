@@ -446,6 +446,86 @@ impl Storage {
             .await?;
         Ok(result.rows_affected() > 0)
     }
+
+    // ---- Webhook delivery log ----------------------------------------------
+
+    /// Records an outbound delivery as pending; returns its id.
+    pub async fn create_delivery(
+        &self,
+        kind: &str,
+        ref_id: &str,
+        url: &str,
+        event: &str,
+        body: &str,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, kind, ref_id, url, event, body, status, \
+             attempts, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', 0, ?7, ?7)",
+        )
+        .bind(&id)
+        .bind(kind)
+        .bind(ref_id)
+        .bind(url)
+        .bind(event)
+        .bind(body)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Marks a delivery's outcome after the retry loop finishes.
+    pub async fn finish_delivery(
+        &self,
+        id: &str,
+        delivered: bool,
+        attempts: i64,
+        last_error: Option<&str>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE webhook_deliveries SET status = ?2, attempts = attempts + ?3, \
+             last_error = ?4, updated_at = ?5 WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(if delivered { "delivered" } else { "failed" })
+        .bind(attempts)
+        .bind(last_error)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Deliveries, newest first, optionally filtered by status (`failed` is the
+    /// dead-letter view). Bodies excluded — fetch one by id for the payload.
+    pub async fn list_deliveries(
+        &self,
+        status: Option<&str>,
+        limit: i64,
+    ) -> Result<Vec<Delivery>> {
+        let rows: Vec<DeliveryRow> = sqlx::query_as(
+            "SELECT id, kind, ref_id, url, event, '' AS body, status, attempts, last_error, \
+             created_at, updated_at FROM webhook_deliveries \
+             WHERE (?1 IS NULL OR status = ?1) ORDER BY created_at DESC LIMIT ?2",
+        )
+        .bind(status)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Delivery::try_from).collect()
+    }
+
+    pub async fn get_delivery(&self, id: &str) -> Result<Option<Delivery>> {
+        let row: Option<DeliveryRow> = sqlx::query_as(
+            "SELECT id, kind, ref_id, url, event, body, status, attempts, last_error, \
+             created_at, updated_at FROM webhook_deliveries WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(Delivery::try_from).transpose()
+    }
 }
 
 #[derive(sqlx::FromRow)]
@@ -493,6 +573,58 @@ impl TryFrom<JobRow> for Job {
             available_at: parse_ts(&r.available_at)?,
             started_at: r.started_at.as_deref().map(parse_ts).transpose()?,
             finished_at: r.finished_at.as_deref().map(parse_ts).transpose()?,
+        })
+    }
+}
+
+/// One logged webhook delivery. `body` is only populated by `get_delivery`.
+#[derive(Debug, Clone, Serialize)]
+pub struct Delivery {
+    pub id: String,
+    pub kind: String,
+    pub ref_id: String,
+    pub url: String,
+    pub event: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub body: String,
+    pub status: String,
+    pub attempts: i64,
+    pub last_error: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct DeliveryRow {
+    id: String,
+    kind: String,
+    ref_id: String,
+    url: String,
+    event: String,
+    body: String,
+    status: String,
+    attempts: i64,
+    last_error: Option<String>,
+    created_at: String,
+    updated_at: String,
+}
+
+impl TryFrom<DeliveryRow> for Delivery {
+    type Error = Error;
+
+    fn try_from(r: DeliveryRow) -> Result<Delivery> {
+        Ok(Delivery {
+            id: r.id,
+            kind: r.kind,
+            ref_id: r.ref_id,
+            url: r.url,
+            event: r.event,
+            body: r.body,
+            status: r.status,
+            attempts: r.attempts,
+            last_error: r.last_error,
+            created_at: parse_ts(&r.created_at)?,
+            updated_at: parse_ts(&r.updated_at)?,
         })
     }
 }
