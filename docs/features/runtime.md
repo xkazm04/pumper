@@ -29,6 +29,12 @@ A long-running app reports compact progress snapshots through `AppContext::progr
 
 DB-backed cron (6-field, with seconds) reconciled every `schedule_tick_secs`. Apps can declare a static schedule (`ScrapeApp::schedule`, seeded idempotently); runtime CRUD via `GET/POST /schedules`, `DELETE /schedules/{id}`, `POST /schedules/{id}/enabled`. **Overlap guard:** a schedule whose previous job is still queued/running skips the tick without touching `last_run`, so exactly one catch-up run fires when it frees up.
 
+Each schedule carries three cron-maturity fields (`schedules` table cols `timezone`, `misfire_policy`, `max_attempts`; all set at `POST /schedules` and returned by `GET /schedules`):
+
+- **`timezone`** — IANA name (chrono-tz), e.g. `"America/New_York"`; `null` = UTC. The cron expression is evaluated in this zone, so DST transitions are honoured: a firing at a wall-clock time that doesn't exist (inside a spring-forward gap) is skipped to the next valid one. An unknown name is rejected at create time with `400 bad_request`.
+- **`misfire_policy`** — how firings missed while the scheduler was down are handled once it's back. `"fire_once"` (default) runs a single catch-up job (collapsing the whole backlog into one run — the historical behaviour, now explicit); `"skip"` runs none and just advances `last_run` past the missed firings (the count is logged). A firing more than two `schedule_tick_secs` late is treated as missed; a firing detected on-time within that grace window always runs under both policies.
+- **`max_attempts`** — attempt budget for jobs this schedule enqueues; `null` = server default (**3**), so scheduled runs retry transient failures with backoff exactly like a manual job (previously cron runs were hardcoded to a single attempt).
+
 ## Budgets & the cost ledger
 
 - Every metered engine call (`AppContext::fetch` / `AppContext::research`) writes a `cost_events` row (job, app, engine tier, url, `cost_usd` — Claude actual, free tiers 0.0, detail incl. escalation trail / `cache_hit`).
@@ -47,4 +53,3 @@ DB-backed cron (6-field, with seconds) reconciled every `schedule_tick_secs`. Ap
 ## Known gaps
 
 - No auth on the HTTP API (deliberate local power mode; API-key auth is a parked product decision).
-- Schedule misfire/catch-up policy beyond the single-run overlap guard is not implemented.

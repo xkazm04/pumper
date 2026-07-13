@@ -4,17 +4,34 @@
 //! the database, apps and callers can add, disable, or remove them at runtime
 //! via the API without restarting the service. Paired with each app's dataset
 //! dedup, this delivers periodic scrapes that only surface what changed.
+//!
+//! Each schedule's cron is evaluated in its own timezone (`schedules.timezone`,
+//! chrono-tz; `NULL` = UTC), so DST transitions are honoured. When the scheduler
+//! was down across one or more firings, `misfire_policy` decides the catch-up:
+//! `fire_once` runs a single job (the historical behaviour), `skip` runs none
+//! and simply advances past the missed firings.
 
 use std::str::FromStr;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use chrono_tz::Tz;
 use cron::Schedule as CronSchedule;
 use pumper_core::{EnqueueOptions, Schedule};
 use serde_json::Value;
 use tracing::{error, info, warn};
 
 use crate::state::AppState;
+
+/// Attempt budget for scheduled jobs whose schedule leaves `max_attempts` unset.
+/// Cron runs then retry transient failures with backoff exactly like a manual
+/// job, instead of the historical single hardcoded attempt.
+const DEFAULT_SCHEDULE_MAX_ATTEMPTS: i64 = 3;
+
+/// Cap on how many missed firings are enumerated per schedule per tick when
+/// sizing a backlog, so a frequent schedule that fell far behind can't spin.
+/// Reported "missed"/"collapsed" counts saturate at this bound.
+const MAX_MISFIRE_SCAN: usize = 10_000;
 
 pub async fn run(state: AppState) {
     let tick = Duration::from_secs(state.config.worker.schedule_tick_secs.max(1));
@@ -41,6 +58,11 @@ pub async fn run(state: AppState) {
 
 async fn reconcile(state: &AppState) -> anyhow::Result<()> {
     let now = Utc::now();
+    // A firing more than two ticks late was missed while the scheduler was down
+    // (a healthy tick catches a due firing within one interval). This is the
+    // grace window that separates an on-time run from a backlog misfire.
+    let grace =
+        chrono::Duration::seconds(state.config.worker.schedule_tick_secs.max(1) as i64 * 2);
     for schedule in state.storage.list_schedules().await? {
         if !schedule.enabled {
             continue;
@@ -52,46 +74,121 @@ async fn reconcile(state: &AppState) -> anyhow::Result<()> {
                 continue;
             }
         };
+        let tz = parse_tz(schedule.timezone.as_deref());
         // Next firing after the last run (or after creation for a fresh schedule).
         let reference = schedule.last_run.unwrap_or(schedule.created_at);
-        let Some(next) = cron.after(&reference).next() else {
-            continue;
-        };
-        if next > now {
-            continue; // not due yet
-        }
+        let misfire_skip = schedule.misfire_policy == "skip";
 
-        if !state.registry.contains_key(&schedule.app) {
-            warn!(app = %schedule.app, "schedule references unregistered app; skipping");
-            continue;
-        }
-
-        // Overlap guard: don't stack a second run while the previous one is
-        // still queued/running. last_run is NOT touched, so the missed firing
-        // stays due and fires on the first tick after the active run finishes.
-        if state.storage.schedule_has_active_job(&schedule.id).await? {
-            info!(id = %schedule.id, app = %schedule.app, "previous scheduled run still active; skipping tick");
-            continue;
-        }
-
-        let params = resolve_params(state, &schedule);
-        let opts = EnqueueOptions {
-            params,
-            max_attempts: 1,
-            priority: schedule.priority,
-            schedule_id: Some(schedule.id.clone()),
-            ..Default::default()
-        };
-        match state.storage.enqueue(&schedule.app, opts).await {
-            Ok(job) => {
-                info!(id = %schedule.id, app = %schedule.app, job = %job.id, "scheduled run fired");
+        match decide(&cron, tz, reference, now, misfire_skip, grace) {
+            Action::Idle => continue,
+            Action::Skip { missed } => {
+                info!(
+                    id = %schedule.id, app = %schedule.app, missed,
+                    "misfire policy 'skip': advancing past missed firings without enqueuing"
+                );
                 state.storage.touch_schedule(&schedule.id, now).await?;
-                state.notify.notify_one();
             }
-            Err(e) => error!(id = %schedule.id, "failed to enqueue scheduled job: {e}"),
+            Action::Fire { collapsed } => {
+                if !state.registry.contains_key(&schedule.app) {
+                    warn!(app = %schedule.app, "schedule references unregistered app; skipping");
+                    continue;
+                }
+                // Overlap guard: don't stack a second run while the previous one
+                // is still queued/running. last_run is NOT touched, so the missed
+                // firing stays due and fires on the first tick after it finishes.
+                if state.storage.schedule_has_active_job(&schedule.id).await? {
+                    info!(id = %schedule.id, app = %schedule.app, "previous scheduled run still active; skipping tick");
+                    continue;
+                }
+
+                let params = resolve_params(state, &schedule);
+                let max_attempts = schedule.max_attempts.unwrap_or(DEFAULT_SCHEDULE_MAX_ATTEMPTS);
+                let opts = EnqueueOptions {
+                    params,
+                    max_attempts,
+                    priority: schedule.priority,
+                    schedule_id: Some(schedule.id.clone()),
+                    ..Default::default()
+                };
+                match state.storage.enqueue(&schedule.app, opts).await {
+                    Ok(job) => {
+                        if collapsed > 0 {
+                            info!(id = %schedule.id, app = %schedule.app, job = %job.id, collapsed, "scheduled run fired (missed firings collapsed into one)");
+                        } else {
+                            info!(id = %schedule.id, app = %schedule.app, job = %job.id, "scheduled run fired");
+                        }
+                        state.storage.touch_schedule(&schedule.id, now).await?;
+                        state.notify.notify_one();
+                    }
+                    Err(e) => error!(id = %schedule.id, "failed to enqueue scheduled job: {e}"),
+                }
+            }
         }
     }
     Ok(())
+}
+
+/// What a tick should do with one schedule.
+#[derive(Debug, PartialEq, Eq)]
+enum Action {
+    /// Nothing due yet.
+    Idle,
+    /// Enqueue one run. `collapsed` = extra missed firings folded into this run
+    /// (0 when on-time) — for logging only.
+    Fire { collapsed: usize },
+    /// `misfire_policy = skip`: advance past `missed` firings without enqueuing.
+    Skip { missed: usize },
+}
+
+/// Parses an IANA timezone name; unknown/absent names fall back to UTC. The API
+/// validates the name at create time, so this only defends against manual edits.
+fn parse_tz(name: Option<&str>) -> Tz {
+    name.and_then(|n| n.parse().ok()).unwrap_or(Tz::UTC)
+}
+
+/// Decides a schedule's action this tick — pure (no I/O), so it is unit-testable
+/// against simulated downtime and DST boundaries.
+///
+/// The cron is evaluated in `tz` (a firing at a nonexistent local wall-clock time
+/// — e.g. inside a spring-forward gap — is skipped by the cron iterator). `grace`
+/// is how late the oldest pending firing may be and still count as on-time; older
+/// than that means it was missed while the scheduler was down (a misfire).
+fn decide(
+    cron: &CronSchedule,
+    tz: Tz,
+    reference: DateTime<Utc>,
+    now: DateTime<Utc>,
+    misfire_skip: bool,
+    grace: chrono::Duration,
+) -> Action {
+    let reference_tz = reference.with_timezone(&tz);
+    let now_tz = now.with_timezone(&tz);
+
+    // Enumerate firings in (reference, now], capped.
+    let mut count = 0usize;
+    let mut earliest: Option<DateTime<Tz>> = None;
+    for fire in cron.after(&reference_tz) {
+        if fire > now_tz {
+            break;
+        }
+        earliest.get_or_insert(fire);
+        count += 1;
+        if count >= MAX_MISFIRE_SCAN {
+            break;
+        }
+    }
+    let Some(earliest) = earliest else {
+        return Action::Idle;
+    };
+
+    // Misfire = the oldest pending firing is more than `grace` behind now.
+    let missed = now_tz.signed_duration_since(earliest) > grace;
+    if missed && misfire_skip {
+        Action::Skip { missed: count }
+    } else {
+        // fire_once, or skip-but-on-time: one run; any extras are collapsed.
+        Action::Fire { collapsed: count.saturating_sub(1) }
+    }
 }
 
 /// Uses the schedule's own params, falling back to the app's defaults when none
@@ -107,5 +204,95 @@ fn resolve_params(state: &AppState, schedule: &Schedule) -> Value {
             .unwrap_or(Value::Null)
     } else {
         schedule.params.clone()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn cron(expr: &str) -> CronSchedule {
+        CronSchedule::from_str(expr).unwrap()
+    }
+
+    /// Top of every hour.
+    const HOURLY: &str = "0 0 * * * *";
+    const GRACE: chrono::Duration = chrono::Duration::seconds(30);
+
+    #[test]
+    fn idle_when_next_firing_is_in_the_future() {
+        let reference = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 30).unwrap();
+        // Next hourly firing after 12:00 is 13:00 — not yet due.
+        assert_eq!(decide(&cron(HOURLY), Tz::UTC, reference, now, false, GRACE), Action::Idle);
+    }
+
+    #[test]
+    fn on_time_firing_runs_under_both_policies() {
+        // Firing at 12:00:00 detected 30s later — within grace, so on-time.
+        let reference = Utc.with_ymd_and_hms(2026, 7, 13, 11, 30, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 30).unwrap();
+        let grace = chrono::Duration::seconds(60);
+        assert_eq!(
+            decide(&cron(HOURLY), Tz::UTC, reference, now, false, grace),
+            Action::Fire { collapsed: 0 }
+        );
+        // skip only skips *missed* firings; an on-time one still runs.
+        assert_eq!(
+            decide(&cron(HOURLY), Tz::UTC, reference, now, true, grace),
+            Action::Fire { collapsed: 0 }
+        );
+    }
+
+    #[test]
+    fn fire_once_collapses_a_downtime_backlog_into_one_run() {
+        // Simulated downtime: last run 08:00, back at 12:00:30 — 09/10/11/12 missed.
+        let reference = Utc.with_ymd_and_hms(2026, 7, 13, 8, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 30).unwrap();
+        assert_eq!(
+            decide(&cron(HOURLY), Tz::UTC, reference, now, false, GRACE),
+            Action::Fire { collapsed: 3 }
+        );
+    }
+
+    #[test]
+    fn skip_advances_past_a_downtime_backlog_without_running() {
+        let reference = Utc.with_ymd_and_hms(2026, 7, 13, 8, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 30).unwrap();
+        assert_eq!(
+            decide(&cron(HOURLY), Tz::UTC, reference, now, true, GRACE),
+            Action::Skip { missed: 4 }
+        );
+    }
+
+    #[test]
+    fn cron_is_evaluated_in_the_schedule_timezone_across_dst() {
+        // US spring-forward 2026: DST begins Sun Mar 8 02:00 -> 03:00 (EST->EDT).
+        let tz: Tz = "America/New_York".parse().unwrap();
+        // Daily noon local. Reference just after Mar 7 noon (EST, UTC-5 => 17:00Z).
+        let reference = Utc.with_ymd_and_hms(2026, 3, 7, 18, 0, 0).unwrap();
+        let next = cron("0 0 12 * * *")
+            .after(&reference.with_timezone(&tz))
+            .next()
+            .unwrap()
+            .with_timezone(&Utc);
+        // Mar 8 is already on EDT (UTC-4), so local noon = 16:00Z — NOT the 17:00Z
+        // a naive-UTC evaluation would produce.
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 3, 8, 16, 0, 0).unwrap());
+    }
+
+    #[test]
+    fn firing_inside_a_spring_forward_gap_is_skipped() {
+        // 02:30 local does not exist on Mar 8 2026 (clocks jump 02:00 -> 03:00).
+        let tz: Tz = "America/New_York".parse().unwrap();
+        let reference = Utc.with_ymd_and_hms(2026, 3, 8, 5, 0, 0).unwrap(); // Mar 8 00:00 EST
+        let next = cron("0 30 2 * * *")
+            .after(&reference.with_timezone(&tz))
+            .next()
+            .unwrap()
+            .with_timezone(&Utc);
+        // The nonexistent Mar 8 02:30 is skipped; next is Mar 9 02:30 EDT = 06:30Z.
+        assert_eq!(next, Utc.with_ymd_and_hms(2026, 3, 9, 6, 30, 0).unwrap());
     }
 }

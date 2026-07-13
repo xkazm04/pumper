@@ -928,6 +928,14 @@ struct CreateScheduleBody {
     cron: String,
     params: Option<Value>,
     priority: Option<i64>,
+    /// IANA timezone the cron is evaluated in (e.g. "America/New_York"); omitted
+    /// = UTC. An unknown name is rejected with 400 `bad_request`.
+    timezone: Option<String>,
+    /// Catch-up policy for firings missed while the scheduler was down:
+    /// "fire_once" (default) runs a single job; "skip" runs none.
+    misfire_policy: Option<String>,
+    /// Attempt budget for jobs this schedule enqueues; omitted = server default (3).
+    max_attempts: Option<i64>,
 }
 
 #[utoipa::path(
@@ -937,7 +945,7 @@ struct CreateScheduleBody {
     request_body = CreateScheduleBody,
     responses(
         (status = 201, description = "Created schedule", body = Object),
-        (status = 400, description = "Invalid cron expression", body = Object),
+        (status = 400, description = "Invalid cron, timezone, or misfire_policy", body = Object),
         (status = 404, description = "Unknown app", body = Object),
     )
 )]
@@ -953,14 +961,32 @@ async fn create_schedule(
     cron::Schedule::from_str(&body.cron)
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid cron: {e}")))?;
 
+    // Validate the timezone against the chrono-tz database.
+    if let Some(tz) = &body.timezone {
+        chrono_tz::Tz::from_str(tz)
+            .map_err(|_| ApiError(StatusCode::BAD_REQUEST, format!("unknown timezone '{tz}'")))?;
+    }
+
+    // Validate the misfire policy.
+    let misfire_policy = body.misfire_policy.as_deref().unwrap_or("fire_once");
+    if !matches!(misfire_policy, "fire_once" | "skip") {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("unknown misfire_policy '{misfire_policy}' (expected 'fire_once' or 'skip')"),
+        ));
+    }
+
     let schedule = state
         .storage
-        .create_schedule(
-            &body.app,
-            &body.cron,
-            body.params.unwrap_or(Value::Null),
-            body.priority.unwrap_or(0),
-        )
+        .create_schedule(pumper_core::NewSchedule {
+            app: &body.app,
+            cron: &body.cron,
+            params: body.params.unwrap_or(Value::Null),
+            priority: body.priority.unwrap_or(0),
+            timezone: body.timezone.as_deref(),
+            misfire_policy,
+            max_attempts: body.max_attempts,
+        })
         .await?;
     Ok((StatusCode::CREATED, Json(schedule)))
 }

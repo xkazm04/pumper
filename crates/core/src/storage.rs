@@ -67,8 +67,36 @@ pub struct Schedule {
     pub params: Value,
     pub enabled: bool,
     pub priority: i64,
+    /// IANA timezone name (chrono-tz) the cron expression is evaluated in;
+    /// `None` = UTC.
+    pub timezone: Option<String>,
+    /// How firings missed while the scheduler was down are handled:
+    /// `"fire_once"` (default) runs one catch-up; `"skip"` runs none.
+    pub misfire_policy: String,
+    /// Attempt budget for jobs this schedule enqueues; `None` = server default.
+    pub max_attempts: Option<i64>,
     pub last_run: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Column list shared by every `schedules` SELECT (kept in sync with `ScheduleRow`).
+const SCHEDULE_COLUMNS: &str =
+    "id, app, cron, params, enabled, priority, timezone, misfire_policy, max_attempts, \
+     last_run, created_at";
+
+/// Create-time fields for a schedule (borrowed; storage assigns id/enabled/time).
+#[derive(Debug, Clone)]
+pub struct NewSchedule<'a> {
+    pub app: &'a str,
+    pub cron: &'a str,
+    pub params: Value,
+    pub priority: i64,
+    /// IANA timezone name (chrono-tz); `None` = UTC.
+    pub timezone: Option<&'a str>,
+    /// `"fire_once"` | `"skip"`.
+    pub misfire_policy: &'a str,
+    /// `None` = server default attempt budget.
+    pub max_attempts: Option<i64>,
 }
 
 /// Durable job store on SQLite (WAL). Jobs survive restarts; `recover_stuck`
@@ -536,15 +564,9 @@ impl Storage {
 
     // ---- Schedules --------------------------------------------------------
 
-    pub async fn create_schedule(
-        &self,
-        app: &str,
-        cron: &str,
-        params: Value,
-        priority: i64,
-    ) -> Result<Schedule> {
+    pub async fn create_schedule(&self, s: NewSchedule<'_>) -> Result<Schedule> {
         let id = Uuid::new_v4().to_string();
-        self.insert_schedule(&id, app, cron, params, priority, true).await?;
+        self.insert_schedule(&id, &s).await?;
         self.get_schedule(&id)
             .await?
             .ok_or(Error::Storage(sqlx::Error::RowNotFound))
@@ -567,25 +589,20 @@ impl Storage {
         Ok(())
     }
 
-    async fn insert_schedule(
-        &self,
-        id: &str,
-        app: &str,
-        cron: &str,
-        params: Value,
-        priority: i64,
-        enabled: bool,
-    ) -> Result<()> {
+    async fn insert_schedule(&self, id: &str, s: &NewSchedule<'_>) -> Result<()> {
         sqlx::query(
-            "INSERT INTO schedules (id, app, cron, params, enabled, priority, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            "INSERT INTO schedules \
+             (id, app, cron, params, enabled, priority, timezone, misfire_policy, max_attempts, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9)",
         )
         .bind(id)
-        .bind(app)
-        .bind(cron)
-        .bind(params.to_string())
-        .bind(enabled as i64)
-        .bind(priority)
+        .bind(s.app)
+        .bind(s.cron)
+        .bind(s.params.to_string())
+        .bind(s.priority)
+        .bind(s.timezone)
+        .bind(s.misfire_policy)
+        .bind(s.max_attempts)
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -593,10 +610,9 @@ impl Storage {
     }
 
     pub async fn list_schedules(&self) -> Result<Vec<Schedule>> {
-        let rows: Vec<ScheduleRow> = sqlx::query_as(
-            "SELECT id, app, cron, params, enabled, priority, last_run, created_at \
-             FROM schedules ORDER BY app",
-        )
+        let rows: Vec<ScheduleRow> = sqlx::query_as(&format!(
+            "SELECT {SCHEDULE_COLUMNS} FROM schedules ORDER BY app"
+        ))
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Schedule::try_from).collect()
@@ -610,12 +626,11 @@ impl Storage {
         limit: i64,
     ) -> Result<Vec<Schedule>> {
         let (after_ts, after_id) = split_after(after);
-        let rows: Vec<ScheduleRow> = sqlx::query_as(
-            "SELECT id, app, cron, params, enabled, priority, last_run, created_at \
-             FROM schedules \
+        let rows: Vec<ScheduleRow> = sqlx::query_as(&format!(
+            "SELECT {SCHEDULE_COLUMNS} FROM schedules \
              WHERE (?1 IS NULL OR created_at < ?1 OR (created_at = ?1 AND id < ?2)) \
-             ORDER BY created_at DESC, id DESC LIMIT ?3",
-        )
+             ORDER BY created_at DESC, id DESC LIMIT ?3"
+        ))
         .bind(after_ts)
         .bind(after_id)
         .bind(limit)
@@ -625,10 +640,9 @@ impl Storage {
     }
 
     pub async fn get_schedule(&self, id: &str) -> Result<Option<Schedule>> {
-        let row: Option<ScheduleRow> = sqlx::query_as(
-            "SELECT id, app, cron, params, enabled, priority, last_run, created_at \
-             FROM schedules WHERE id = ?1",
-        )
+        let row: Option<ScheduleRow> = sqlx::query_as(&format!(
+            "SELECT {SCHEDULE_COLUMNS} FROM schedules WHERE id = ?1"
+        ))
         .bind(id)
         .fetch_optional(&self.pool)
         .await?;
@@ -1397,6 +1411,9 @@ struct ScheduleRow {
     params: String,
     enabled: i64,
     priority: i64,
+    timezone: Option<String>,
+    misfire_policy: String,
+    max_attempts: Option<i64>,
     last_run: Option<String>,
     created_at: String,
 }
@@ -1412,6 +1429,9 @@ impl TryFrom<ScheduleRow> for Schedule {
             params: serde_json::from_str(&r.params).unwrap_or(Value::Null),
             enabled: r.enabled != 0,
             priority: r.priority,
+            timezone: r.timezone,
+            misfire_policy: r.misfire_policy,
+            max_attempts: r.max_attempts,
             last_run: r.last_run.as_deref().map(parse_ts).transpose()?,
             created_at: parse_ts(&r.created_at)?,
         })

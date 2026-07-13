@@ -40,7 +40,8 @@ pub use datasets::{
 };
 #[cfg(feature = "storage")]
 pub use storage::{
-    Delivery, EnqueueOptions, JobTimingStats, NewTrigger, SavedSearch, Schedule, Storage, Trigger,
+    Delivery, EnqueueOptions, JobTimingStats, NewSchedule, NewTrigger, SavedSearch, Schedule,
+    Storage, Trigger,
     Watch,
 };
 #[cfg(feature = "storage")]

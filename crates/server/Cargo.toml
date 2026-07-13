@@ -54,4 +54,5 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 uuid.workspace = true
 chrono.workspace = true
+chrono-tz.workspace = true
 cron.workspace = true
