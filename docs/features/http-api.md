@@ -22,6 +22,7 @@ Axum server (default port 8088, `[server]` config). **Local power mode: no auth,
 | Events | `GET /events` (SSE all jobs; monotonic ids + `Last-Event-ID` resume — see [events-webhooks.md](events-webhooks.md)) |
 | Hosts | `GET /hosts?limit=&cursor=` (learned tier memory + politeness per host) · `GET /hosts/{host}` (404 unknown) · `DELETE /hosts/{host}/memory` (reset strikes+pin+penalty; 404 unknown) |
 | Plugins | `GET /plugins` · `POST /plugins/reload` |
+| Extraction | `POST /extract/preview` (dry-run a RuleSet against one document; see below) |
 | Meta | `GET /openapi.json` (OpenAPI 3.1 spec for all routes) |
 
 Conventions: enable/disable is always `POST …/{id}/enabled {"enabled": bool}`; every list endpoint is dual-mode — without `cursor=` it returns its legacy shape (bare array or `{watches|triggers|searches|changes|revisions|deliveries: [...]}`, unbounded except where a legacy `limit` already applied), and with `cursor=` present (even empty, for page 1) it returns `{items, next_cursor}` and pages by keyset. Cursors are opaque `<stored-ts>|<tiebreak>` tokens (`next_cursor` is `null` on the last page); pass the previous response's `next_cursor` back as `cursor=`. The `changes`/`history` feeds page the full revision set — the legacy no-cursor shapes still clamp at 1000/500 rows, but `cursor=` reaches everything past that. Details of each area live in the sibling feature docs.
@@ -36,6 +37,14 @@ Conventions: enable/disable is always `POST …/{id}/enabled {"enabled": bool}`;
 All three send `content-disposition: attachment; filename="{ds}.{ext}"`.
 
 `GET /datasets/{app}/{ds}/duplicates` runs an in-memory O(n²) pairwise SimHash sweep, so it is bounded: datasets over **10,000 records** return `413 too_large` (the message carries the actual count and the cap) rather than pinning a core. Narrow the dataset or run the scan offline.
+
+## RuleSet preview (`POST /extract/preview`)
+
+Dry-run a declarative `RuleSet` against one document without enqueuing a job — the authoring loop for selectors. Body `{rules, html}` **or** `{rules, url}` (exactly one of `html`/`url`; both or neither → `400 bad_request`). `rules` is a bare `{field: rule}` map (same shape apps take).
+
+Rules compile **field-by-field**, so a bad set returns `400 bad_request` with a per-field `fields: [{field, error}]` list naming **every** bad field (deserialize errors like an unknown rule `type`, and compile errors like a bad CSS selector / regex / XPath) — not just the first. A non-object `rules` is `400`.
+
+`url` mode fetches through the **HTTP tier only** (no browser, never the paid Claude tier), bounded by a 15s timeout (exceeded → `400`) and an 8 MiB body cap (over → `413 too_large`); a non-`http(s)` url or fetch failure is `400`. Success (`200`) returns `{values, report, fields_matched, fields_total}` — extracted values plus the per-field match report (each field `matched`|`empty`|`error`; see [extraction.md](extraction.md)). No job, dataset write, or cost is incurred. Full detail in [extraction.md](extraction.md).
 
 ## Host profiles (`/hosts`)
 

@@ -48,6 +48,15 @@ Both modes share the extraction + quality-report path and report aggregate quali
 
 **Artifact-retention caveat**: source mode depends on the origin job's bodies still being on disk. Crawl bodies live in per-job dirs (`data/artifacts/<app>/<job_id>/`) and there is **no retention/GC policy** — bodies persist until manually removed, and once removed those keys land in `missing_keys` on the next extract.
 
+## RuleSet preview (`POST /extract/preview`)
+
+Test a `RuleSet` against one document **without enqueuing a job** — the fast feedback loop for authoring selectors, so a typo is caught before a job fetches everything. Body: `{rules, html}` **or** `{rules, url}` (exactly one of `html`/`url`; both or neither → `400 bad_request`).
+
+- `rules` — a bare `{field: rule}` map (the same shape apps take), e.g. `{"title": {"type":"css","selector":"h1"}}`. Rules are compiled **field-by-field** (each as a single-field `RuleSet`), so **every** bad field is reported at once, not just the first. On any failure the response is `400 bad_request` with a per-field `fields: [{field, error}]` list covering deserialize errors (unknown rule `type`, missing keys) and compile errors (bad CSS selector / regex / XPath). A non-object `rules` is `400`.
+- `url` mode fetches through the shared **HTTP tier only** (`FetchStrategy::Http` — no browser render, and never the paid Claude tier), under a modest budget: a 15s fetch timeout (exceeded → `400`) and an 8 MiB body cap (over → `413 too_large`). A non-`http(s)` url or a fetch failure is `400`.
+
+On success (`200`): `{values, report, fields_matched, fields_total}` — the extracted values plus the per-field match report (`DocReport`: each field `matched`|`empty`|`error`, see above), so a selector that silently matches nothing is visible immediately. `fields_matched`/`fields_total` are the matched-over-attempted counts.
+
 ## HTML → Markdown
 
 `pumper_core::html_to_markdown` — boilerplate-skipping converter used by the fetcher (`to_markdown`), `readable`/`watch` apps, and SEDIA clean-text enrichment.

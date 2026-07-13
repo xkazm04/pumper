@@ -39,6 +39,7 @@ use crate::state::AppState;
         (name = "triggers", description = "Reactive pipelines"),
         (name = "webhooks", description = "Outbound delivery log"),
         (name = "search", description = "Full-text search and saved searches"),
+        (name = "extract", description = "Declarative RuleSet preview / dry-run"),
         (name = "plugins", description = "WASM plugin host"),
         (name = "events", description = "Server-sent event streams"),
         (name = "hosts", description = "Learned per-host tier memory and politeness"),
@@ -97,6 +98,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(delete_saved_search))
         .routes(routes!(set_saved_search_enabled))
         .routes(routes!(delete_search_dataset))
+        .routes(routes!(extract_preview))
         .routes(routes!(openapi_json))
 }
 
@@ -2318,6 +2320,165 @@ async fn reload_plugins(State(state): State<AppState>) -> Result<Json<Value>, Ap
     Ok(Json(json!({ "loaded": loaded })))
 }
 
+// ---- Declarative extraction preview -----------------------------------------
+
+/// Time budget for a preview `url` fetch. A preview must stay interactive, so a
+/// slow origin is abandoned rather than blocking the request.
+const PREVIEW_FETCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Body budget for a preview `url` fetch. Past this the document is rejected
+/// (413) instead of parsed — previews validate rules, they are not a bulk pull.
+const PREVIEW_MAX_BODY_BYTES: usize = 8 * 1024 * 1024;
+
+#[derive(Deserialize, ToSchema)]
+struct PreviewBody {
+    /// A `RuleSet`: a bare `{field: rule}` map (the same shape apps take), e.g.
+    /// `{"title": {"type": "css", "selector": "h1"}}`.
+    #[schema(value_type = Object)]
+    rules: Value,
+    /// Inline document to run the rules against. Provide exactly one of
+    /// `html` or `url`.
+    html: Option<String>,
+    /// URL to fetch (HTTP tier only — no browser/Claude escalation) and run the
+    /// rules against. Provide exactly one of `html` or `url`.
+    url: Option<String>,
+}
+
+/// Compiles a `RuleSet` and runs it against one document without enqueuing a
+/// job — the fast feedback loop for authoring selectors. Rules are compiled
+/// field-by-field so every bad field is reported at once (not just the first);
+/// the response pairs the extracted values with the per-field match report
+/// (matched | empty | error), so a selector that silently matches nothing is
+/// visible before a job fetches anything.
+///
+/// `url` mode fetches through the shared HTTP tier only (`FetchStrategy::Http`):
+/// a preview never spends money on the Claude tier or waits on a browser render,
+/// and is bounded by a modest time and body budget.
+#[utoipa::path(
+    post,
+    path = "/extract/preview",
+    tag = "extract",
+    request_body = PreviewBody,
+    responses(
+        (status = 200, description = "`{values, report, fields_matched, fields_total}` — extracted values plus the per-field match report (each field `matched`|`empty`|`error`)."),
+        (status = 400, description = "Bad request: not exactly one of html|url, non-object `rules`, non-http(s) url, fetch failure/timeout, or rule compile errors — the body then carries a `fields: [{field, error}]` list covering every bad field.", body = Object),
+        (status = 413, description = "Fetched body over the preview size budget", body = Object),
+    )
+)]
+async fn extract_preview(
+    State(state): State<AppState>,
+    Json(body): Json<PreviewBody>,
+) -> Result<Response, ApiError> {
+    // Exactly one document source.
+    let doc = match (body.html, body.url) {
+        (Some(_), Some(_)) => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "provide exactly one of 'html' or 'url', not both".into(),
+            ))
+        }
+        (None, None) => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "provide exactly one of 'html' or 'url'".into(),
+            ))
+        }
+        (Some(html), None) => html,
+        (None, Some(url)) => fetch_preview_doc(&state, &url).await?,
+    };
+
+    // Compile field-by-field so ALL bad fields are reported, not just the first.
+    // `rules` must be an object mapping field -> rule; each value is deserialized
+    // into a `FieldRule` and then compiled on its own (as a single-field
+    // `RuleSet`), collecting both deserialize and compile-time errors per field.
+    let Value::Object(map) = body.rules else {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "'rules' must be a JSON object mapping field -> rule".into(),
+        ));
+    };
+    let mut fields: std::collections::BTreeMap<String, pumper_core::FieldRule> =
+        std::collections::BTreeMap::new();
+    let mut errors: Vec<Value> = Vec::new();
+    for (name, rule_val) in map {
+        match serde_json::from_value::<pumper_core::FieldRule>(rule_val) {
+            Ok(field_rule) => {
+                let one = std::collections::BTreeMap::from([(name.clone(), field_rule.clone())]);
+                match (pumper_core::RuleSet { fields: one }).compile() {
+                    Ok(_) => {
+                        fields.insert(name, field_rule);
+                    }
+                    Err(e) => errors.push(json!({ "field": name, "error": e.to_string() })),
+                }
+            }
+            Err(e) => errors.push(json!({ "field": name, "error": e.to_string() })),
+        }
+    }
+    if !errors.is_empty() {
+        // Structured compile diagnostics: the same `{error, code}` envelope as
+        // ApiError, plus a per-field list so every bad selector is fixed at once.
+        return Ok((
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "rule compilation failed",
+                "code": error_code(StatusCode::BAD_REQUEST),
+                "fields": errors,
+            })),
+        )
+            .into_response());
+    }
+
+    // Every field compiled on its own, so the combined compile cannot fail.
+    let compiled = (pumper_core::RuleSet { fields })
+        .compile()
+        .map_err(ApiError::from)?;
+    let (values, report) = pumper_core::extract_one_with_report(&compiled, &doc);
+    let fields_total = report.fields.len();
+    let fields_matched = report
+        .fields
+        .values()
+        .filter(|s| matches!(s, pumper_core::FieldStatus::Matched))
+        .count();
+    Ok(Json(json!({
+        "values": values,
+        "report": report,
+        "fields_matched": fields_matched,
+        "fields_total": fields_total,
+    }))
+    .into_response())
+}
+
+/// Fetches a preview document through the shared HTTP tier only, under a modest
+/// time and size budget. No browser/Claude escalation — a preview must stay
+/// cheap and never spend money.
+async fn fetch_preview_doc(state: &AppState, url: &str) -> Result<String, ApiError> {
+    if !url.starts_with("http://") && !url.starts_with("https://") {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "'url' must be http(s)".into()));
+    }
+    let mut req = pumper_core::FetchRequest::new(url);
+    req.strategy = pumper_core::FetchStrategy::Http;
+    let outcome = tokio::time::timeout(PREVIEW_FETCH_TIMEOUT, state.engines.fetch.fetch(req))
+        .await
+        .map_err(|_| {
+            ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("fetch exceeded the {}s preview budget", PREVIEW_FETCH_TIMEOUT.as_secs()),
+            )
+        })?
+        .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("failed to fetch url: {e}")))?;
+    let html = outcome.html.unwrap_or_default();
+    if html.len() > PREVIEW_MAX_BODY_BYTES {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "fetched body is {} bytes; the preview budget is {PREVIEW_MAX_BODY_BYTES} bytes",
+                html.len()
+            ),
+        ));
+    }
+    Ok(html)
+}
+
 #[cfg(test)]
 mod api_spec_tests {
     use std::collections::BTreeSet;
@@ -2377,6 +2538,7 @@ mod api_spec_tests {
         "DELETE /searches/{id}",
         "POST /searches/{id}/enabled",
         "DELETE /search/datasets/{app}/{dataset}",
+        "POST /extract/preview",
         "GET /openapi.json",
     ];
 
