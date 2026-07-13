@@ -55,7 +55,9 @@ pub use engine::{
     RenderedPage, Researcher, ResearchOutput, ResearchRequest,
 };
 pub use error::{Error, Result};
-pub use fetcher::{FetchOutcome, FetchRequest, FetchStrategy, Fetcher};
+pub use fetcher::{
+    FetchOutcome, FetchRequest, FetchStrategy, FetchTier, Fetcher, TierTrace, TierVerdict,
+};
 pub use governor::Governor;
 pub use job::{Job, JobStatus};
 pub use markdown::html_to_markdown;

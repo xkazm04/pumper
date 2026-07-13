@@ -102,7 +102,7 @@ impl HttpEngine {
                     // Non-2xx bodies are returned, not raised — scrapers often
                     // want to inspect 404/403 pages; apps decide via is_success().
                     let body = response.text().await.map_err(|e| Error::Http(e.to_string()))?;
-                    return Ok(HttpResponse { status, headers, body, final_url });
+                    return Ok(HttpResponse { status, headers, body, final_url, cache_hit: false });
                 }
                 Err(e) => {
                     last_error = e.to_string();

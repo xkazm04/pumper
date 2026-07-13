@@ -121,16 +121,47 @@ impl AppContext {
         }
         let url = req.url.clone();
         let mut outcome = self.engines.fetch.fetch(req).await?;
+        // Router-level skips are recorded as structured `skipped_by_router`
+        // trace entries and kept as human trail lines alongside.
         if let Some(note) = tier_note {
+            outcome.trace.push(crate::fetcher::TierTrace {
+                tier: crate::fetcher::FetchTier::Http,
+                verdict: crate::fetcher::TierVerdict::SkippedByRouter,
+                http_status: None,
+                content_chars: None,
+                cache_hit: None,
+                latency_ms: 0,
+                cost_usd: None,
+                detail: Some("learned host preference (persistent http losses)".to_string()),
+            });
             outcome.escalations.push(note);
         }
         if let Some(note) = budget_note {
+            outcome.trace.push(crate::fetcher::TierTrace {
+                tier: crate::fetcher::FetchTier::Claude,
+                verdict: crate::fetcher::TierVerdict::SkippedByRouter,
+                http_status: None,
+                content_chars: None,
+                cache_hit: None,
+                latency_ms: 0,
+                cost_usd: None,
+                detail: Some("job budget exhausted".to_string()),
+            });
             outcome.escalations.push(note);
         }
         // Teach the router: an HTTP win resets the host, an HTTP loss (the
-        // trail shows the tier failed/thin) adds a strike.
+        // http tier's trace verdict is thin/blocked/error) adds a strike. Keyed
+        // on the structured verdict enum, not the free-text trail.
         if let Some(host) = &host {
-            let http_lost = outcome.escalations.iter().any(|e| e.starts_with("http tier"));
+            let http_lost = outcome.trace.iter().any(|t| {
+                t.tier == crate::fetcher::FetchTier::Http
+                    && matches!(
+                        t.verdict,
+                        crate::fetcher::TierVerdict::Thin
+                            | crate::fetcher::TierVerdict::Blocked
+                            | crate::fetcher::TierVerdict::Error
+                    )
+            });
             if let Err(e) = self.tiers.record(host, outcome.engine, http_lost).await {
                 tracing::warn!(job = %self.job_id, "tier memory write failed: {e}");
             }

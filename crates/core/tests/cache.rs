@@ -14,6 +14,7 @@ fn resp() -> HttpResponse {
         headers: HashMap::new(),
         body: "hello world".into(),
         final_url: "https://example.com/".into(),
+        cache_hit: false,
     }
 }
 

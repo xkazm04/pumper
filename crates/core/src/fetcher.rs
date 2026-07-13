@@ -7,6 +7,7 @@
 //! succeeded, plus a trail of why each escalation happened.
 
 use std::sync::Arc;
+use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
@@ -102,6 +103,78 @@ impl FetchRequest {
     }
 }
 
+/// The three fetch tiers, cheapest first. Serializes to `http`/`browser`/`claude`
+/// — the same strings the winning `FetchOutcome.engine` uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FetchTier {
+    Http,
+    Browser,
+    Claude,
+}
+
+impl FetchTier {
+    /// The `&'static str` tier name (matches `FetchOutcome.engine`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FetchTier::Http => "http",
+            FetchTier::Browser => "browser",
+            FetchTier::Claude => "claude",
+        }
+    }
+}
+
+/// Why a tier's attempt ended — the structured replacement for string-matching
+/// the free-text escalation trail. Consumers branch on this instead of parsing
+/// prose; the tier router keys on it to detect HTTP losses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TierVerdict {
+    /// This tier produced the returned result (the winner).
+    Ok,
+    /// Too little content to trust — escalated to the next tier.
+    Thin,
+    /// A bot-wall / challenge / block (status 403/429/503 or a challenge
+    /// marker) — escalated.
+    Blocked,
+    /// The tier itself errored (network/render/research failure) — escalated.
+    Error,
+    /// The router skipped this tier before attempting it (learned `skip_http`
+    /// preference, or the Claude tier dropped because the job budget is spent).
+    SkippedByRouter,
+}
+
+/// One tier's contribution to a fetch: what it did, why it ended, and its cost
+/// in latency and money. Every attempted tier (including the winner) gets an
+/// entry; the human-readable `FetchOutcome.escalations` lines are kept alongside.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TierTrace {
+    pub tier: FetchTier,
+    pub verdict: TierVerdict,
+    /// HTTP status (http tier only; the browser/claude tiers have none).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    /// Extracted-text length in chars when it was measured (escalation
+    /// decisions and the claude answer measure it; a straight `Http`-strategy
+    /// return that skips counting leaves it `None`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content_chars: Option<usize>,
+    /// http tier only: whether the response was served from the HTTP cache.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_hit: Option<bool>,
+    /// Wall-clock time this tier took. Zero for a `skipped_by_router` entry
+    /// (nothing ran).
+    pub latency_ms: u64,
+    /// Real money spent (claude tier only; `None` for the free tiers).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cost_usd: Option<f64>,
+    /// Short human reason (challenge marker, error text, skip cause). `None`
+    /// when the tier + verdict already say everything (e.g. a thin http tier,
+    /// whose status and char count are their own explanation).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct FetchOutcome {
     pub url: String,
@@ -113,7 +186,14 @@ pub struct FetchOutcome {
     /// Extracted plain text (Claude tier stores its answer here).
     pub text: Option<String>,
     /// One line per escalation explaining why the previous tier was rejected.
+    /// Preserved for existing consumers and cost-event detail; the structured
+    /// equivalent (and the winning tier's entry) lives in `trace`.
     pub escalations: Vec<String>,
+    /// Structured, serde-serializable per-tier trace: one entry per attempted
+    /// tier (incl. the winner), with verdict, per-tier latency, http status,
+    /// content size, cache hit, and Claude spend. Consumers branch on
+    /// `verdict` rather than parsing `escalations`.
+    pub trace: Vec<TierTrace>,
     /// Real money spent on this fetch (Claude tier only; None elsewhere).
     pub cost_usd: Option<f64>,
 }
@@ -143,6 +223,7 @@ impl Fetcher {
     pub async fn fetch(&self, req: FetchRequest) -> Result<FetchOutcome> {
         let min_chars = req.min_content_chars.unwrap_or(self.min_content_chars);
         let mut escalations: Vec<String> = Vec::new();
+        let mut trace: Vec<TierTrace> = Vec::new();
 
         // --- HTTP tier --- (skip_http only applies to escalating strategies;
         // an explicit Http strategy is the caller's call.)
@@ -153,8 +234,10 @@ impl Fetcher {
             let mut http_req = HttpRequest::get(&req.url);
             http_req.no_cache = req.no_cache;
             http_req.ttl_override = req.ttl_override;
+            let started = Instant::now();
             match self.http.fetch(http_req).await {
                 Ok(resp) => {
+                    let latency_ms = elapsed_ms(started);
                     // Convert to Markdown at most once, and only when a decision
                     // (escalation) or the caller (to_markdown) actually needs it.
                     // The `Http` strategy returns regardless, so it skips the
@@ -172,26 +255,73 @@ impl Fetcher {
                     let markdown =
                         (req.to_markdown || needs_count).then(|| html_to_markdown(&resp.body));
                     let text_len = markdown.as_ref().map(|m| m.chars().count());
+                    let cache_hit = Some(resp.cache_hit);
                     let enough = wall.is_none()
                         && resp.is_success()
                         && text_len.map_or(true, |n| n >= min_chars);
                     if enough || req.strategy == FetchStrategy::Http {
-                        return Ok(outcome("http", &req, Some(resp.status), resp.body, markdown, escalations));
+                        trace.push(TierTrace {
+                            tier: FetchTier::Http,
+                            verdict: TierVerdict::Ok,
+                            http_status: Some(resp.status),
+                            content_chars: text_len,
+                            cache_hit,
+                            latency_ms,
+                            cost_usd: None,
+                            detail: None,
+                        });
+                        return Ok(outcome(
+                            "http",
+                            &req,
+                            Some(resp.status),
+                            resp.body,
+                            markdown,
+                            escalations,
+                            trace,
+                        ));
                     }
-                    match wall {
-                        Some(reason) => escalations.push(format!(
-                            "http tier blocked: {reason} (status {})",
-                            resp.status
-                        )),
-                        None => escalations.push(format!(
-                            "http tier thin: status {}, {} chars of text",
-                            resp.status,
-                            text_len.unwrap_or(0)
-                        )),
-                    }
+                    let (verdict, detail) = match wall {
+                        Some(reason) => {
+                            escalations.push(format!(
+                                "http tier blocked: {reason} (status {})",
+                                resp.status
+                            ));
+                            (TierVerdict::Blocked, Some(reason))
+                        }
+                        None => {
+                            escalations.push(format!(
+                                "http tier thin: status {}, {} chars of text",
+                                resp.status,
+                                text_len.unwrap_or(0)
+                            ));
+                            (TierVerdict::Thin, None)
+                        }
+                    };
+                    trace.push(TierTrace {
+                        tier: FetchTier::Http,
+                        verdict,
+                        http_status: Some(resp.status),
+                        content_chars: text_len,
+                        cache_hit,
+                        latency_ms,
+                        cost_usd: None,
+                        detail,
+                    });
                 }
                 Err(e) if req.strategy == FetchStrategy::Http => return Err(e),
-                Err(e) => escalations.push(format!("http tier failed: {e}")),
+                Err(e) => {
+                    escalations.push(format!("http tier failed: {e}"));
+                    trace.push(TierTrace {
+                        tier: FetchTier::Http,
+                        verdict: TierVerdict::Error,
+                        http_status: None,
+                        content_chars: None,
+                        cache_hit: None,
+                        latency_ms: elapsed_ms(started),
+                        cost_usd: None,
+                        detail: Some(e.to_string()),
+                    });
+                }
             }
         }
 
@@ -199,8 +329,10 @@ impl Fetcher {
         if matches!(req.strategy, FetchStrategy::Browser | FetchStrategy::Auto | FetchStrategy::AutoWithResearch) {
             let mut render = RenderRequest::new(&req.url);
             render.wait_for_selector = req.wait_for_selector.clone();
+            let started = Instant::now();
             match self.browser.render(render).await {
                 Ok(page) => {
+                    let latency_ms = elapsed_ms(started);
                     // Only AutoWithResearch escalates past the browser, so the
                     // char count only decides anything there; every other
                     // strategy returns the render as-is. Convert once, and only
@@ -215,20 +347,64 @@ impl Fetcher {
                     let text_len = markdown.as_ref().map(|m| m.chars().count());
                     let enough = wall.is_none() && text_len.map_or(true, |n| n >= min_chars);
                     if enough || req.strategy != FetchStrategy::AutoWithResearch {
-                        return Ok(outcome("browser", &req, None, page.html, markdown, escalations));
+                        trace.push(TierTrace {
+                            tier: FetchTier::Browser,
+                            verdict: TierVerdict::Ok,
+                            http_status: None,
+                            content_chars: text_len,
+                            cache_hit: None,
+                            latency_ms,
+                            cost_usd: None,
+                            detail: None,
+                        });
+                        return Ok(outcome(
+                            "browser",
+                            &req,
+                            None,
+                            page.html,
+                            markdown,
+                            escalations,
+                            trace,
+                        ));
                     }
-                    match wall {
+                    let (verdict, detail) = match wall {
                         Some(reason) => {
-                            escalations.push(format!("browser tier blocked: {reason}"))
+                            escalations.push(format!("browser tier blocked: {reason}"));
+                            (TierVerdict::Blocked, Some(reason))
                         }
-                        None => escalations.push(format!(
-                            "browser tier thin: {} chars of text",
-                            text_len.unwrap_or(0)
-                        )),
-                    }
+                        None => {
+                            escalations.push(format!(
+                                "browser tier thin: {} chars of text",
+                                text_len.unwrap_or(0)
+                            ));
+                            (TierVerdict::Thin, None)
+                        }
+                    };
+                    trace.push(TierTrace {
+                        tier: FetchTier::Browser,
+                        verdict,
+                        http_status: None,
+                        content_chars: text_len,
+                        cache_hit: None,
+                        latency_ms,
+                        cost_usd: None,
+                        detail,
+                    });
                 }
                 Err(e) if req.strategy == FetchStrategy::Browser => return Err(e),
-                Err(e) => escalations.push(format!("browser tier failed: {e}")),
+                Err(e) => {
+                    escalations.push(format!("browser tier failed: {e}"));
+                    trace.push(TierTrace {
+                        tier: FetchTier::Browser,
+                        verdict: TierVerdict::Error,
+                        http_status: None,
+                        content_chars: None,
+                        cache_hit: None,
+                        latency_ms: elapsed_ms(started),
+                        cost_usd: None,
+                        detail: Some(e.to_string()),
+                    });
+                }
             }
         }
 
@@ -243,7 +419,18 @@ impl Fetcher {
             });
             let mut research = ResearchRequest::new(prompt);
             research.max_budget_usd = req.max_budget_usd;
+            let started = Instant::now();
             let out = self.claude.research(research).await?;
+            trace.push(TierTrace {
+                tier: FetchTier::Claude,
+                verdict: TierVerdict::Ok,
+                http_status: None,
+                content_chars: Some(out.text.chars().count()),
+                cache_hit: None,
+                latency_ms: elapsed_ms(started),
+                cost_usd: out.cost_usd,
+                detail: None,
+            });
             return Ok(FetchOutcome {
                 url: req.url,
                 engine: "claude",
@@ -252,6 +439,7 @@ impl Fetcher {
                 markdown: req.to_markdown.then(|| out.text.clone()),
                 text: Some(out.text),
                 escalations,
+                trace,
                 cost_usd: out.cost_usd,
             });
         }
@@ -264,6 +452,12 @@ impl Fetcher {
     }
 }
 
+/// Milliseconds since `started`, saturating into a `u64` for the trace.
+fn elapsed_ms(started: Instant) -> u64 {
+    started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+#[allow(clippy::too_many_arguments)]
 fn outcome(
     engine: &'static str,
     req: &FetchRequest,
@@ -271,6 +465,7 @@ fn outcome(
     html: String,
     markdown: Option<String>,
     escalations: Vec<String>,
+    trace: Vec<TierTrace>,
 ) -> FetchOutcome {
     FetchOutcome {
         url: req.url.clone(),
@@ -281,6 +476,7 @@ fn outcome(
         text: None,
         html: Some(html),
         escalations,
+        trace,
         cost_usd: None,
     }
 }
@@ -355,6 +551,45 @@ mod tests {
         let mut body = "x".repeat(CHALLENGE_SCAN_CHARS + 10);
         body.push_str("enable javascript");
         assert!(challenge_marker(&body).is_none());
+    }
+
+    #[test]
+    fn verdict_and_tier_serialize_to_stable_snake_case() {
+        // The trace is a serialized API contract: verdicts are snake_case
+        // strings and a tier's name matches the winning `engine` string.
+        assert_eq!(
+            serde_json::to_string(&TierVerdict::SkippedByRouter).unwrap(),
+            "\"skipped_by_router\""
+        );
+        assert_eq!(serde_json::to_string(&TierVerdict::Ok).unwrap(), "\"ok\"");
+        assert_eq!(serde_json::to_string(&FetchTier::Claude).unwrap(), "\"claude\"");
+        assert_eq!(FetchTier::Http.as_str(), "http");
+        assert_eq!(FetchTier::Browser.as_str(), "browser");
+        assert_eq!(FetchTier::Claude.as_str(), "claude");
+    }
+
+    #[test]
+    fn trace_entry_omits_empty_optionals_but_keeps_latency() {
+        // Optional fields drop out when None; latency_ms is always present.
+        let t = TierTrace {
+            tier: FetchTier::Http,
+            verdict: TierVerdict::Thin,
+            http_status: Some(200),
+            content_chars: Some(12),
+            cache_hit: Some(false),
+            latency_ms: 7,
+            cost_usd: None,
+            detail: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&t).unwrap();
+        assert_eq!(v["tier"], "http");
+        assert_eq!(v["verdict"], "thin");
+        assert_eq!(v["http_status"], 200);
+        assert_eq!(v["content_chars"], 12);
+        assert_eq!(v["cache_hit"], false);
+        assert_eq!(v["latency_ms"], 7);
+        assert!(v.get("cost_usd").is_none(), "None cost_usd is omitted");
+        assert!(v.get("detail").is_none(), "None detail is omitted");
     }
 
     #[test]

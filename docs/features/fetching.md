@@ -4,9 +4,28 @@ One `Fetcher` escalates across three engines by cost: **http → browser → cla
 
 ## FetchRequest / FetchOutcome
 
-`FetchRequest`: `url`, `strategy` (`http | browser | auto | auto_with_research`), `wait_for_selector`, `min_content_chars`, `research_prompt`, `max_budget_usd` (Claude tier ceiling), `skip_http` (set by the tier router), `to_markdown`, `no_cache` (bypass the HTTP cache — always hit the network), `ttl_override` (per-fetch cache TTL in seconds; caps staleness without a full bypass). `FetchOutcome`: winning `engine`, status, html/markdown/text, `escalations` trail (one line per tier rejection + router/budget notes), `cost_usd` (Claude tier actual).
+`FetchRequest`: `url`, `strategy` (`http | browser | auto | auto_with_research`), `wait_for_selector`, `min_content_chars`, `research_prompt`, `max_budget_usd` (Claude tier ceiling), `skip_http` (set by the tier router), `to_markdown`, `no_cache` (bypass the HTTP cache — always hit the network), `ttl_override` (per-fetch cache TTL in seconds; caps staleness without a full bypass). `FetchOutcome`: winning `engine`, status, html/markdown/text, `escalations` trail (one line per tier rejection + router/budget notes), structured `trace` (see below), `cost_usd` (Claude tier actual).
 
 Always prefer the metered **`AppContext::fetch`** over `ctx.engines.fetch` — it adds cost attribution, budget governance, and tier routing.
+
+### Structured fetch trace
+
+`FetchOutcome.trace` is a typed, serde-serializable list — **one entry per attempted tier, including the winner** — so consumers branch on *why* a fetch escalated (or the cache/latency/cost of each tier) instead of string-matching the `escalations` prose. The human-readable `escalations` lines are still populated (kept alongside, not replaced), and cost-event `detail` still embeds them.
+
+Each `TierTrace` entry:
+
+| field | type | notes |
+| --- | --- | --- |
+| `tier` | `http \| browser \| claude` | matches the winning `engine` string |
+| `verdict` | enum: `ok \| thin \| blocked \| error \| skipped_by_router` | `ok` = this tier produced the result; `thin`/`blocked`/`error` = escalated; `skipped_by_router` = never attempted (learned `skip_http`, or Claude dropped because the job budget is spent) |
+| `http_status` | `u16?` | http tier only; omitted elsewhere |
+| `content_chars` | `usize?` | extracted-text length when measured (escalation decisions + the Claude answer); omitted when not counted |
+| `cache_hit` | `bool?` | http tier only: served from the `http_cache` vs the network |
+| `latency_ms` | `u64` | wall-clock time for this tier; `0` for a `skipped_by_router` entry |
+| `cost_usd` | `f64?` | Claude tier only |
+| `detail` | `string?` | short reason (challenge marker, error text, skip cause); omitted when the tier + verdict already say everything (e.g. a thin http tier) |
+
+Optional fields (`http_status`, `content_chars`, `cache_hit`, `cost_usd`, `detail`) are omitted from JSON when absent; `tier`, `verdict`, and `latency_ms` are always present. The learned tier router keys on the http tier's **`verdict`** (`thin`/`blocked`/`error` = an HTTP loss) rather than the trail wording.
 
 ## Engines
 

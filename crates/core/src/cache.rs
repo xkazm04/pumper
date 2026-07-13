@@ -68,6 +68,7 @@ impl HttpCache {
             headers: serde_json::from_str(&headers).unwrap_or_default(),
             body,
             final_url,
+            cache_hit: true,
         }))
     }
 

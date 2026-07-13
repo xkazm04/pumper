@@ -57,6 +57,12 @@ pub struct HttpResponse {
     pub headers: HashMap<String, String>,
     pub body: String,
     pub final_url: String,
+    /// Whether this response was served from the HTTP cache rather than the
+    /// network. Set by the engine; surfaced in the tiered-fetch trace so callers
+    /// can distinguish a cache hit from a live fetch. `#[serde(default)]` keeps
+    /// older serialized responses (which predate the field) deserializable.
+    #[serde(default)]
+    pub cache_hit: bool,
 }
 
 impl HttpResponse {
