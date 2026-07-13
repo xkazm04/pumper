@@ -61,6 +61,10 @@ sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
 
 # scraping engines
 reqwest = { version = "0.12", features = ["json", "cookies", "gzip", "brotli", "socks"] }
+# Serializable cookie jar behind reqwest's `cookie_provider` (session vault).
+# Already in the tree as reqwest's own cookie store — this is a direct edge, not
+# a new dependency.
+cookie_store = "0.22"
 scraper = "0.23"
 ego-tree = "0.10"
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }

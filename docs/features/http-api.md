@@ -21,6 +21,7 @@ Axum server (default port 8088, `[server]` config). **Local power mode: no auth,
 | Saved searches | `GET /searches?limit=&cursor=` · `POST /searches` · `DELETE /searches/{id}` · `POST /searches/{id}/enabled` |
 | Events | `GET /events` (SSE all jobs; monotonic ids + `Last-Event-ID` resume — see [events-webhooks.md](events-webhooks.md)) |
 | Hosts | `GET /hosts?limit=&cursor=` (learned tier memory + politeness per host) · `GET /hosts/{host}` (404 unknown) · `DELETE /hosts/{host}/memory` (reset strikes+pin+penalty; 404 unknown) |
+| Profiles | `GET /profiles` (session vault: named login profiles; see below) |
 | Plugins | `GET /plugins` · `POST /plugins/reload` |
 | Extraction | `POST /extract/preview` (dry-run a RuleSet against one document; see below) |
 | Grants | `GET /grants?status=&agency=&source=&closing_before=&closing_after=&min_award=&limit=&cursor=` · `GET /grants/closing-soon?days=` (see below) |
@@ -80,6 +81,14 @@ Diagnostics over the tiered fetcher's learned per-host state (see [fetching.md](
 - `GET /hosts` — dual-mode list, most-recently-active first: no `cursor=` ⇒ `{hosts: [...]}`; `cursor=` present ⇒ `{items, next_cursor}` keyset-paged by `<updated_at>|<host>`.
 - `GET /hosts/{host}` — one host's profile; `404 not_found` when the host has no learned state. A host with only a live (not-yet-snapshotted) penalty is still returned.
 - `DELETE /hosts/{host}/memory` — resets the host: drops strikes + browser pin + persisted penalty **and** clears the live governor penalty; `{host, reset: true}` on success, `404 not_found` when unknown.
+
+## Session profiles (`/profiles`)
+
+Read-only view of the session vault — the named login profiles a fetch can run under (`profile` on `FetchRequest`/`HttpRequest`/`RenderRequest`; full semantics in [fetching.md](fetching.md)).
+
+- `GET /profiles` — `{profiles: [{name, has_cookies, has_browser_dir, last_used}]}`, alphabetical by `name`. `has_cookies` = a persistent HTTP jar (`cookies.json`) exists; `has_browser_dir` = a Chrome user-data-dir (`browser/`) exists; `last_used` = newest mtime across the profile dir and those two artifacts (RFC 3339, `null` if unreadable). An absent vault dir returns an **empty list, not an error** — it is created by the first profiled fetch. Entries whose names aren't valid profiles (or aren't directories) are ignored.
+
+Profiles are created implicitly by the first fetch that names them; there is **no create/delete API** in phase 1 (delete = remove the directory under `[fetcher] profiles_dir`, default `data/profiles`). A request naming an invalid profile fails with a typed profile error (`500 internal` at the API boundary — names are validated in the engines, not at the route).
 
 ## Known gaps
 

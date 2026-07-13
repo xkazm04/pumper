@@ -44,6 +44,7 @@ use crate::state::AppState;
         (name = "plugins", description = "WASM plugin host"),
         (name = "events", description = "Server-sent event streams"),
         (name = "hosts", description = "Learned per-host tier memory and politeness"),
+        (name = "profiles", description = "Session vault: named login profiles"),
         (name = "meta", description = "The OpenAPI document itself"),
     )
 )]
@@ -91,6 +92,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_hosts))
         .routes(routes!(get_host))
         .routes(routes!(delete_host_memory))
+        .routes(routes!(list_profiles))
         .routes(routes!(list_plugins))
         .routes(routes!(reload_plugins))
         .routes(routes!(search))
@@ -2299,6 +2301,89 @@ async fn delete_host_memory(
     }
 }
 
+// ---- Session profiles -----------------------------------------------------
+
+/// One profile of the session vault (`[fetcher] profiles_dir`), as it exists on
+/// disk. Profiles are created implicitly by the first fetch that names them —
+/// there is no create/delete API in phase 1.
+#[derive(serde::Serialize, ToSchema)]
+struct ProfileInfo {
+    /// Directory name — exactly the string a request's `profile` field takes.
+    name: String,
+    /// A persistent HTTP cookie jar exists (`cookies.json`).
+    has_cookies: bool,
+    /// A Chrome user-data-dir exists (`browser/`).
+    has_browser_dir: bool,
+    /// Most recent mtime across the profile dir, its jar, and its browser dir
+    /// (RFC 3339). `None` when no mtime is readable.
+    last_used: Option<String>,
+}
+
+/// Lists the profiles in the session vault — see [fetching.md]. Read-only
+/// diagnostics: it reports what is on disk, it does not create anything.
+#[utoipa::path(
+    get,
+    path = "/profiles",
+    tag = "profiles",
+    responses((
+        status = 200,
+        description = "`{profiles: [{name, has_cookies, has_browser_dir, last_used}]}`, \
+                       alphabetical. Empty (not an error) when the vault dir does not exist yet.",
+        body = Object,
+    ))
+)]
+async fn list_profiles(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let root = state.config.fetcher.profiles_dir.clone();
+    let mut entries = match tokio::fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        // No vault dir yet simply means no profiles — it is created on the first
+        // profiled fetch, so this is an empty list, not a failure.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(Json(json!({ "profiles": [] })));
+        }
+        Err(e) => {
+            return Err(ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("reading {}: {e}", root.display()),
+            ))
+        }
+    };
+
+    let mut profiles: Vec<ProfileInfo> = Vec::new();
+    while let Some(entry) = entries.next_entry().await.map_err(|e| {
+        ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("reading {}: {e}", root.display()))
+    })? {
+        let Ok(name) = entry.file_name().into_string() else { continue };
+        // Only directories whose names are valid profiles — anything else in the
+        // vault dir isn't ours and can't be named by a request anyway.
+        if pumper_core::validate_profile_name(&name).is_err() {
+            continue;
+        }
+        if !entry.file_type().await.map(|t| t.is_dir()).unwrap_or(false) {
+            continue;
+        }
+        let dir = entry.path();
+        let cookies = dir.join(pumper_core::PROFILE_COOKIES_FILE);
+        let browser = dir.join(pumper_core::PROFILE_BROWSER_DIR);
+        let has_cookies = tokio::fs::metadata(&cookies).await.map(|m| m.is_file()).unwrap_or(false);
+        let has_browser_dir =
+            tokio::fs::metadata(&browser).await.map(|m| m.is_dir()).unwrap_or(false);
+        // Last use ≈ the newest mtime among the profile dir and its artifacts:
+        // the jar is rewritten after cookie-setting responses, and Chrome churns
+        // its user-data-dir on every render.
+        let mut newest: Option<std::time::SystemTime> = None;
+        for path in [&dir, &cookies, &browser] {
+            if let Ok(mtime) = tokio::fs::metadata(path).await.and_then(|m| m.modified()) {
+                newest = Some(newest.map_or(mtime, |cur: std::time::SystemTime| cur.max(mtime)));
+            }
+        }
+        let last_used = newest.map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
+        profiles.push(ProfileInfo { name, has_cookies, has_browser_dir, last_used });
+    }
+    profiles.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(Json(json!({ "profiles": profiles })))
+}
+
 // ---- WASM plugins ---------------------------------------------------------
 
 #[utoipa::path(
@@ -2723,6 +2808,7 @@ mod api_spec_tests {
         "GET /hosts",
         "GET /hosts/{host}",
         "DELETE /hosts/{host}/memory",
+        "GET /profiles",
         "GET /plugins",
         "POST /plugins/reload",
         "GET /search",

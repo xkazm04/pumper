@@ -211,5 +211,6 @@ fn post_json(url: &str, body: String) -> HttpRequest {
         max_body_bytes: None,
         timeout_secs: None,
         proxy: None,
+        profile: None,
     }
 }

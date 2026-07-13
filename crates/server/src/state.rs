@@ -116,8 +116,16 @@ impl AppState {
             });
         }
 
-        let http = Arc::new(HttpEngine::new(&config.http, governor.clone(), cache.clone())?);
-        let browser = Arc::new(BrowserEngine::new(&config.browser));
+        // Session vault: both tiers resolve named profiles under the same root
+        // (`[fetcher] profiles_dir`) — cookies.json for HTTP, browser/ for Chrome.
+        let profiles_dir = config.fetcher.profiles_dir.clone();
+        let http = Arc::new(HttpEngine::new(
+            &config.http,
+            governor.clone(),
+            cache.clone(),
+            profiles_dir.clone(),
+        )?);
+        let browser = Arc::new(BrowserEngine::new(&config.browser, profiles_dir));
         let claude = Arc::new(ClaudeEngine::new(&config.claude));
         let fetch = Fetcher::new(http.clone(), browser.clone(), claude.clone(), &config.fetcher);
         let engines = EngineSet { http, browser, claude, fetch };

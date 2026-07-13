@@ -58,8 +58,10 @@ pub use extract::{
     CompiledRuleSet, DocReport, FieldRule, FieldStatus, Rule, RuleSet, Transform,
 };
 pub use engine::{
-    Browser, EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, RenderRequest,
-    RenderedPage, Researcher, ResearchOutput, ResearchRequest,
+    profile_browser_dir, profile_cookies_path, profile_dir, validate_profile_name, Browser,
+    EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, RenderRequest, RenderedPage,
+    Researcher, ResearchOutput, ResearchRequest, PROFILE_BROWSER_DIR, PROFILE_COOKIES_FILE,
+    PROFILE_NAME_MAX_LEN,
 };
 pub use error::{Error, Result};
 pub use fetcher::{

@@ -6,7 +6,12 @@ edition.workspace = true
 [dependencies]
 pumper-core.workspace = true
 reqwest.workspace = true
+cookie_store.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
 tracing.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+# Local cookie-setting server for the session-vault persistence test.
+axum.workspace = true

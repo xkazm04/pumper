@@ -1,18 +1,36 @@
-//! Traditional HTTP scraping engine: reqwest with a shared cookie jar,
-//! browser-like User-Agent, and retries with exponential backoff. Fronted by
-//! a content-addressed TTL cache and a per-domain politeness governor.
+//! Traditional HTTP scraping engine: reqwest with a cookie jar, browser-like
+//! User-Agent, and retries with exponential backoff. Fronted by a
+//! content-addressed TTL cache and a per-domain politeness governor.
+//!
+//! ## Clients, proxies and session profiles
+//!
+//! reqwest binds both its proxy and its cookie jar at **client-build** time, so
+//! a request that overrides either needs its own client. One bounded LRU pool
+//! ([`ClientPool`]) serves both dimensions: it is keyed by the
+//! `(proxy, profile)` pair the client was built with.
+//!
+//! A `profile` (session vault, phase 1) swaps reqwest's in-memory jar — which
+//! dies with the process — for a [`ProfileJar`]: a serializable jar loaded from
+//! and written back to `<profiles_dir>/<name>/cookies.json`, so a logged-in
+//! session survives a restart. See `docs/features/fetching.md`.
 
 use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
+use std::io::BufReader;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
+use cookie_store::{CookieStore, RawCookie};
 use pumper_core::config::HttpConfig;
 use pumper_core::{
-    Error, Governor, HttpCache, HttpClient, HttpMethod, HttpRequest, HttpResponse, Result,
+    profile_cookies_path, Error, Governor, HttpCache, HttpClient, HttpMethod, HttpRequest,
+    HttpResponse, Result,
 };
+use reqwest::header::HeaderValue;
 use tracing::{debug, warn};
 
 /// Base of the exponential retry backoff (attempt 1 waits this, then doubles).
@@ -20,23 +38,165 @@ const RETRY_BASE_MS: u64 = 500;
 /// Retry jitter is up to this fraction of the (post-max) delay, spread with a
 /// deterministic hash — no `rand` dependency (mirrors the governor's approach).
 const RETRY_JITTER_FRAC: f64 = 0.25;
-/// Max distinct per-request-proxy clients cached. reqwest binds a proxy at
-/// client-build time, so a per-request proxy override needs its own client; we
-/// pool them (LRU, this cap) rather than rebuild per request. Cost: each pooled
-/// client has its **own** cookie jar (proxied requests don't share cookies with
-/// the default client), and up to this many idle keep-alive pools may linger.
-const MAX_PROXY_CLIENTS: usize = 8;
+/// Max distinct pooled clients (LRU). A client is built per `(proxy, profile)`
+/// pair, so this bounds the combined fan-out of per-request proxy overrides and
+/// session profiles. Cost: up to this many idle keep-alive pools may linger.
+/// Evicting a client never loses cookies — the profile's [`ProfileJar`] is owned
+/// by the engine's jar map, not by the client.
+const MAX_POOLED_CLIENTS: usize = 8;
+/// Debounce for writing a profile's cookie jar back to disk. Cookies set by a
+/// response are flushed at most this long afterwards (trailing-edge: the last
+/// response in a burst is always written). Crash-loss window: a hard kill within
+/// this window of a Set-Cookie loses that cookie on disk (it was still applied
+/// in-process). One write per profile per window bounds the write rate under a
+/// profiled crawl.
+const COOKIE_FLUSH_DEBOUNCE: Duration = Duration::from_secs(1);
 
-/// Small LRU pool of proxy-bound clients keyed by proxy URL. Guarded by a
-/// std `Mutex`: the critical section (lookup / build / insert) is fully sync —
-/// building a reqwest client does not await — so no async lock is needed.
-struct ProxyPool {
+/// A persistent, serializable cookie jar for one named profile. Installed as
+/// reqwest's `cookie_provider`, so reqwest reads/writes it exactly like its own
+/// in-memory jar — but it is loaded from disk on first use and written back
+/// (atomically: tmp file + rename) on a trailing debounce after responses.
+///
+/// Persisted with cookie_store's JSON format **including session (non-persistent)
+/// cookies** — a login that sets only a session cookie is the whole point of the
+/// vault — while expired cookies are dropped at load time.
+pub(crate) struct ProfileJar {
+    name: String,
+    path: PathBuf,
+    /// std `Mutex`: reqwest's `CookieStore` trait methods are sync and the
+    /// critical sections (match cookies / store Set-Cookie / serialize) never
+    /// await.
+    store: Mutex<CookieStore>,
+    /// Set when a response may have changed the jar; cleared by the flusher.
+    dirty: AtomicBool,
+    /// Whether a flusher task is currently armed (at most one per jar).
+    flushing: AtomicBool,
+}
+
+impl ProfileJar {
+    /// Loads `<profiles_dir>/<name>/cookies.json`, creating the profile dir on
+    /// first use. A missing file starts an empty jar; an unreadable/corrupt one
+    /// is warned about and also starts empty (a bad jar must not wedge fetches).
+    fn load(name: &str, path: PathBuf) -> Result<Self> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let store = match std::fs::File::open(&path) {
+            Ok(file) => cookie_store::serde::json::load(BufReader::new(file)).unwrap_or_else(|e| {
+                warn!(profile = %name, "cookie jar {} unreadable ({e}); starting empty", path.display());
+                CookieStore::default()
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => CookieStore::default(),
+            Err(e) => {
+                return Err(Error::Profile(format!("opening {}: {e}", path.display())));
+            }
+        };
+        Ok(Self {
+            name: name.to_string(),
+            path,
+            store: Mutex::new(store),
+            dirty: AtomicBool::new(false),
+            flushing: AtomicBool::new(false),
+        })
+    }
+
+    /// Serializes the jar and replaces the file atomically (write tmp + rename),
+    /// so a crash mid-write can never leave a truncated jar behind.
+    fn save(&self) -> Result<()> {
+        let mut buf: Vec<u8> = Vec::new();
+        {
+            let store = self.store.lock().expect("cookie jar mutex poisoned");
+            // `_incl_expired_and_nonpersistent` keeps **session** cookies, which
+            // is exactly what a login profile needs; `load` drops expired ones.
+            cookie_store::serde::json::save_incl_expired_and_nonpersistent(&store, &mut buf)
+                .map_err(|e| {
+                    Error::Profile(format!("serializing jar for profile '{}': {e}", self.name))
+                })?;
+        }
+        let tmp = self.path.with_extension("json.tmp");
+        std::fs::write(&tmp, &buf)?;
+        std::fs::rename(&tmp, &self.path)?;
+        debug!(profile = %self.name, "cookie jar saved");
+        Ok(())
+    }
+
+    /// Marks the jar dirty after a response and arms the (single) flusher task.
+    fn touch(self: &Arc<Self>) {
+        self.dirty.store(true, Ordering::SeqCst);
+        if self.flushing.swap(true, Ordering::SeqCst) {
+            return; // a flusher is already armed; it will pick this up.
+        }
+        let jar = self.clone();
+        tokio::spawn(jar.flush_loop());
+    }
+
+    /// Write-behind loop: sleeps the debounce, writes if dirty, and retires once
+    /// the jar is clean. The re-arm check closes the race where a `touch` lands
+    /// between the clean observation and retiring the flag.
+    async fn flush_loop(self: Arc<Self>) {
+        loop {
+            tokio::time::sleep(COOKIE_FLUSH_DEBOUNCE).await;
+            if self.dirty.swap(false, Ordering::SeqCst) {
+                if let Err(e) = self.save() {
+                    warn!(profile = %self.name, "saving cookie jar: {e}");
+                }
+                continue;
+            }
+            self.flushing.store(false, Ordering::SeqCst);
+            if self.dirty.load(Ordering::SeqCst) && !self.flushing.swap(true, Ordering::SeqCst) {
+                continue; // a touch raced in and saw `flushing`; keep going.
+            }
+            return;
+        }
+    }
+}
+
+impl reqwest::cookie::CookieStore for ProfileJar {
+    fn set_cookies(
+        &self,
+        cookie_headers: &mut dyn Iterator<Item = &HeaderValue>,
+        url: &reqwest::Url,
+    ) {
+        let cookies = cookie_headers.filter_map(|value| {
+            std::str::from_utf8(value.as_bytes())
+                .ok()
+                .and_then(|raw| RawCookie::parse(raw.to_owned()).ok())
+        });
+        let mut store = self.store.lock().expect("cookie jar mutex poisoned");
+        store.store_response_cookies(cookies, url);
+    }
+
+    fn cookies(&self, url: &reqwest::Url) -> Option<HeaderValue> {
+        let store = self.store.lock().expect("cookie jar mutex poisoned");
+        let header = store
+            .get_request_values(url)
+            .map(|(name, value)| format!("{name}={value}"))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if header.is_empty() {
+            return None;
+        }
+        HeaderValue::from_str(&header).ok()
+    }
+}
+
+/// Pool key: a client is uniquely determined by what it was **built** with — its
+/// proxy and its cookie jar (profile). The unit separator can appear in neither,
+/// so the two fields can never collide.
+fn pool_key(proxy: Option<&str>, profile: Option<&str>) -> String {
+    format!("{}\u{1f}{}", proxy.unwrap_or(""), profile.unwrap_or(""))
+}
+
+/// Small LRU pool of clients keyed by [`pool_key`]. Guarded by a std `Mutex`:
+/// the critical section (lookup / build / insert) is fully sync — building a
+/// reqwest client does not await — so no async lock is needed.
+struct ClientPool {
     clients: HashMap<String, reqwest::Client>,
-    /// Front = least-recently-used, back = most-recent. Bounded by MAX_PROXY_CLIENTS.
+    /// Front = least-recently-used, back = most-recent. Bounded by MAX_POOLED_CLIENTS.
     order: VecDeque<String>,
 }
 
-impl ProxyPool {
+impl ClientPool {
     fn new() -> Self {
         Self { clients: HashMap::new(), order: VecDeque::new() }
     }
@@ -64,25 +224,43 @@ impl ProxyPool {
 }
 
 pub struct HttpEngine {
-    /// Client for requests with no per-request proxy override (carries
-    /// `[http] proxy` when configured).
+    /// Client for profile-less requests with no per-request proxy override
+    /// (carries `[http] proxy` when configured, and reqwest's in-memory jar).
     client: reqwest::Client,
-    /// Kept to rebuild proxy-bound clients on demand.
+    /// Kept to rebuild pooled clients on demand.
     cfg: HttpConfig,
+    /// Root of the session vault (`[fetcher] profiles_dir`).
+    profiles_dir: PathBuf,
     governor: Arc<Governor>,
     cache: Arc<HttpCache>,
-    proxy_pool: Mutex<ProxyPool>,
+    /// LRU pool of clients keyed by `(proxy, profile)`.
+    clients: Mutex<ClientPool>,
+    /// One jar per profile, keyed by name. Deliberately **not** LRU-evicted: a
+    /// jar holds the live copy of a profile's cookies, so dropping it when its
+    /// client is evicted could lose cookies set since the last flush. Jars are
+    /// a few KB each and only exist for profiles this process actually used.
+    jars: Mutex<HashMap<String, Arc<ProfileJar>>>,
 }
 
-/// Builds a reqwest client mirroring the base settings, optionally proxied.
-fn build_client(cfg: &HttpConfig, proxy: Option<&str>) -> Result<reqwest::Client> {
+/// Builds a reqwest client mirroring the base settings, optionally proxied and
+/// optionally bound to a profile's persistent cookie jar.
+fn build_client(
+    cfg: &HttpConfig,
+    proxy: Option<&str>,
+    jar: Option<Arc<ProfileJar>>,
+) -> Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
         .user_agent(&cfg.user_agent)
         .timeout(Duration::from_secs(cfg.timeout_secs))
-        .cookie_store(true)
         .gzip(true)
         .brotli(true)
         .redirect(reqwest::redirect::Policy::limited(cfg.redirect_limit));
+    builder = match jar {
+        // Profiled: a persistent jar, shared by every client of this profile.
+        Some(jar) => builder.cookie_provider(jar),
+        // Default: reqwest's own in-memory jar (dies with the process).
+        None => builder.cookie_store(true),
+    };
     if let Some(url) = proxy {
         // `Proxy::all` covers http/https/socks5 and honors `user:pass@` auth in
         // the URL. socks5 support comes from reqwest's `socks` feature.
@@ -94,35 +272,67 @@ fn build_client(cfg: &HttpConfig, proxy: Option<&str>) -> Result<reqwest::Client
 }
 
 impl HttpEngine {
-    pub fn new(cfg: &HttpConfig, governor: Arc<Governor>, cache: Arc<HttpCache>) -> Result<Self> {
-        let client = build_client(cfg, cfg.proxy.as_deref())?;
+    pub fn new(
+        cfg: &HttpConfig,
+        governor: Arc<Governor>,
+        cache: Arc<HttpCache>,
+        profiles_dir: impl Into<PathBuf>,
+    ) -> Result<Self> {
+        let client = build_client(cfg, cfg.proxy.as_deref(), None)?;
         Ok(Self {
             client,
             cfg: cfg.clone(),
+            profiles_dir: profiles_dir.into(),
             governor,
             cache,
-            proxy_pool: Mutex::new(ProxyPool::new()),
+            clients: Mutex::new(ClientPool::new()),
+            jars: Mutex::new(HashMap::new()),
         })
     }
 
-    /// Selects the client for a request: the base client unless the request
-    /// carries a `proxy` override, in which case a pooled proxy-bound client.
-    fn client_for(&self, req: &HttpRequest) -> Result<reqwest::Client> {
-        let Some(proxy) = req.proxy.as_deref() else {
-            return Ok(self.client.clone());
+    /// The persistent jar for `name`, loading it from disk (and creating the
+    /// profile dir) on first use. Validates the name — a bad one is a typed
+    /// [`Error::Profile`] and never touches the filesystem.
+    fn jar_for(&self, name: &str) -> Result<Arc<ProfileJar>> {
+        let mut jars = self.jars.lock().expect("jar map mutex poisoned");
+        if let Some(jar) = jars.get(name) {
+            return Ok(jar.clone());
+        }
+        let path = profile_cookies_path(&self.profiles_dir, name)?;
+        let jar = Arc::new(ProfileJar::load(name, path)?);
+        debug!(profile = %name, "opened session profile");
+        jars.insert(name.to_string(), jar.clone());
+        Ok(jar)
+    }
+
+    /// Selects the client for a request. The base client serves the common case
+    /// (no profile, no proxy override beyond the configured one); anything that
+    /// changes what the client is *built* with — a proxy override, a profile, or
+    /// both — comes from the LRU pool keyed by that pair. Returns the profile's
+    /// jar alongside so the caller can flush it after a response.
+    fn client_for(&self, req: &HttpRequest) -> Result<(reqwest::Client, Option<Arc<ProfileJar>>)> {
+        // Effective proxy: the per-request override, else the configured one.
+        let proxy = req.proxy.as_deref().or(self.cfg.proxy.as_deref());
+        let jar = match req.profile.as_deref() {
+            Some(name) => Some(self.jar_for(name)?),
+            None => {
+                // No profile: if the effective proxy is the configured one, the
+                // base client already carries it — reuse it (and its jar) rather
+                // than pooling a duplicate.
+                if proxy == self.cfg.proxy.as_deref() {
+                    return Ok((self.client.clone(), None));
+                }
+                None
+            }
         };
-        // If the override equals the configured proxy, the base client already
-        // carries it — reuse it (and its cookie jar) rather than pooling a dup.
-        if self.cfg.proxy.as_deref() == Some(proxy) {
-            return Ok(self.client.clone());
+        let key = pool_key(proxy, req.profile.as_deref());
+        let mut pool = self.clients.lock().expect("client pool mutex poisoned");
+        if let Some(existing) = pool.get(&key) {
+            return Ok((existing, jar));
         }
-        let mut pool = self.proxy_pool.lock().expect("proxy pool mutex poisoned");
-        if let Some(existing) = pool.get(proxy) {
-            return Ok(existing);
-        }
-        let client = build_client(&self.cfg, Some(proxy))?;
-        pool.insert(proxy, client.clone(), MAX_PROXY_CLIENTS);
-        Ok(client)
+        let client = build_client(&self.cfg, proxy, jar.clone())?;
+        pool.insert(&key, client.clone(), MAX_POOLED_CLIENTS);
+        Ok((client, jar))
     }
 
     fn build(&self, client: &reqwest::Client, req: &HttpRequest) -> reqwest::RequestBuilder {
@@ -152,16 +362,22 @@ impl HttpEngine {
         builder
     }
 
-    /// Only idempotent, bodyless GETs are cacheable.
+    /// Only idempotent, bodyless GETs are cacheable — and never a **profiled**
+    /// request: the shared `http_cache` is keyed by method+url+body only, so
+    /// caching a logged-in body would serve it to anonymous callers (and vice
+    /// versa). Profiled fetches always hit the network.
     fn cacheable(req: &HttpRequest) -> bool {
-        req.method == HttpMethod::Get && req.body.is_none() && !req.no_cache
+        req.method == HttpMethod::Get
+            && req.body.is_none()
+            && !req.no_cache
+            && req.profile.is_none()
     }
 
     async fn send(&self, req: &HttpRequest) -> Result<HttpResponse> {
         let host = reqwest::Url::parse(&req.url)
             .ok()
             .and_then(|u| u.host_str().map(str::to_owned));
-        let client = self.client_for(req)?;
+        let (client, jar) = self.client_for(req)?;
         let retries = self.cfg.retries;
         let cap = req.max_body_bytes.unwrap_or(self.cfg.max_body_bytes);
 
@@ -182,6 +398,12 @@ impl HttpEngine {
             }
             match self.build(&client, req).send().await {
                 Ok(response) => {
+                    // reqwest has already applied any Set-Cookie (including on
+                    // redirect hops) to the profile's jar by now — schedule the
+                    // debounced write-back, whatever the status.
+                    if let Some(jar) = &jar {
+                        jar.touch();
+                    }
                     let status = response.status().as_u16();
                     // Adaptive politeness: rate-limit/overload responses teach
                     // the governor a longer per-host spacing; only a genuinely
@@ -462,32 +684,111 @@ mod tests {
         let mut cfg = HttpConfig::default();
         cfg.proxy = Some("http://gw:8080".into());
         // build_client must accept a valid proxy URL.
-        assert!(build_client(&cfg, cfg.proxy.as_deref()).is_ok());
+        assert!(build_client(&cfg, cfg.proxy.as_deref(), None).is_ok());
     }
 
     #[test]
     fn build_client_rejects_invalid_proxy() {
         let cfg = HttpConfig::default();
         // A syntactically invalid proxy URL surfaces a typed Http error.
-        let err = build_client(&cfg, Some("::not a url::")).unwrap_err();
+        let err = build_client(&cfg, Some("::not a url::"), None).unwrap_err();
         assert!(matches!(err, Error::Http(_)));
     }
 
     #[test]
-    fn proxy_pool_is_lru_bounded() {
+    fn client_pool_is_lru_bounded() {
         // Dummy clients (no network) exercise the pool's LRU + eviction directly.
-        let mut pool = ProxyPool::new();
-        for i in 0..MAX_PROXY_CLIENTS {
-            pool.insert(&format!("p{i}"), reqwest::Client::new(), MAX_PROXY_CLIENTS);
+        let mut pool = ClientPool::new();
+        for i in 0..MAX_POOLED_CLIENTS {
+            pool.insert(&format!("p{i}"), reqwest::Client::new(), MAX_POOLED_CLIENTS);
         }
-        assert_eq!(pool.clients.len(), MAX_PROXY_CLIENTS);
+        assert_eq!(pool.clients.len(), MAX_POOLED_CLIENTS);
         // Touch p0 so it's most-recent; p1 becomes the LRU victim.
         assert!(pool.get("p0").is_some());
         // Insert one over cap -> evicts the least-recently-used (p1), keeps p0.
-        pool.insert("pN", reqwest::Client::new(), MAX_PROXY_CLIENTS);
-        assert_eq!(pool.clients.len(), MAX_PROXY_CLIENTS);
+        pool.insert("pN", reqwest::Client::new(), MAX_POOLED_CLIENTS);
+        assert_eq!(pool.clients.len(), MAX_POOLED_CLIENTS);
         assert!(pool.get("p0").is_some(), "recently-touched entry retained");
         assert!(pool.clients.get("p1").is_none(), "LRU entry evicted");
         assert!(pool.get("pN").is_some(), "newest entry present");
+    }
+
+    #[test]
+    fn pool_key_separates_proxy_and_profile_dimensions() {
+        // The same proxy under two profiles => two clients; the same profile
+        // behind two proxies => two clients; and no cross-field collision.
+        assert_ne!(pool_key(Some("http://gw"), None), pool_key(Some("http://gw"), Some("a")));
+        assert_ne!(pool_key(None, Some("a")), pool_key(Some("http://gw"), Some("a")));
+        assert_ne!(pool_key(Some("a"), Some("b")), pool_key(Some("ab"), None));
+        assert_ne!(pool_key(None, None), pool_key(None, Some("a")));
+        // Stable for the same pair (a pooled client is actually reused).
+        assert_eq!(pool_key(Some("p"), Some("a")), pool_key(Some("p"), Some("a")));
+    }
+
+    #[test]
+    fn profiled_requests_never_touch_the_shared_cache() {
+        // The http_cache key ignores `profile`, so a logged-in body must never be
+        // cached (it would be served to anonymous callers).
+        let mut req = HttpRequest::get("https://example.com/");
+        assert!(HttpEngine::cacheable(&req));
+        req.profile = Some("acme".into());
+        assert!(!HttpEngine::cacheable(&req), "profiled fetches must bypass the cache");
+    }
+
+    /// The jar round-trips through disk: a cookie stored from a response is
+    /// written to `cookies.json` and comes back on the next process (a fresh
+    /// `ProfileJar::load` of the same path), which is the whole point of the
+    /// vault. Uses the reqwest `CookieStore` trait exactly like reqwest does.
+    #[test]
+    fn cookie_jar_round_trips_through_disk() {
+        use reqwest::cookie::CookieStore as _;
+
+        let dir = std::env::temp_dir().join(format!(
+            "pumper-jar-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = profile_cookies_path(&dir, "acme").expect("valid name");
+        let url: reqwest::Url = "https://example.com/app".parse().unwrap();
+
+        let jar = ProfileJar::load("acme", path.clone()).expect("fresh jar");
+        // A session cookie (no Expires/Max-Age) — the login case.
+        let set = HeaderValue::from_static("sid=secret-123; Path=/");
+        jar.set_cookies(&mut [&set].into_iter(), &url);
+        assert_eq!(
+            jar.cookies(&url).unwrap().to_str().unwrap(),
+            "sid=secret-123",
+            "the live jar replays the cookie"
+        );
+        jar.save().expect("jar saves");
+        assert!(path.exists(), "cookies.json written at {}", path.display());
+
+        // A second process: load the same file, cookie must still be there.
+        let reloaded = ProfileJar::load("acme", path.clone()).expect("reload");
+        assert_eq!(
+            reloaded.cookies(&url).unwrap().to_str().unwrap(),
+            "sid=secret-123",
+            "session cookie survived the round-trip"
+        );
+        // Cookies are scoped to their origin — another host gets nothing.
+        let other: reqwest::Url = "https://other.test/".parse().unwrap();
+        assert!(reloaded.cookies(&other).is_none());
+
+        // A separate profile has a separate jar (no cross-profile bleed).
+        let other_path = profile_cookies_path(&dir, "beta").expect("valid name");
+        let beta = ProfileJar::load("beta", other_path).expect("fresh jar");
+        assert!(beta.cookies(&url).is_none(), "profiles do not share cookies");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn jar_load_rejects_an_unsafe_profile_name() {
+        // Validation happens before any path is built (typed Profile error).
+        let err = profile_cookies_path(std::path::Path::new("data/profiles"), "../etc")
+            .unwrap_err();
+        assert!(matches!(err, Error::Profile(_)));
     }
 }

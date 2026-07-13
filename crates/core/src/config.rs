@@ -356,6 +356,11 @@ pub struct FetcherConfig {
     /// snapshotted to the DB so they survive a restart (restored on boot).
     /// `0` disables persistence (penalties stay purely in-memory). Default: 60s.
     pub host_penalty_persist_secs: u64,
+    /// Root of the session vault: each named login profile lives in
+    /// `<profiles_dir>/<name>/` — `cookies.json` (the HTTP tier's persistent
+    /// cookie jar) and `browser/` (that profile's Chrome user-data-dir). Created
+    /// on first use. Default: `data/profiles`.
+    pub profiles_dir: PathBuf,
 }
 
 impl Default for FetcherConfig {
@@ -364,6 +369,7 @@ impl Default for FetcherConfig {
             min_content_chars: 250,
             host_memory_ttl_secs: 7 * 24 * 3600,
             host_penalty_persist_secs: 60,
+            profiles_dir: "data/profiles".into(),
         }
     }
 }
@@ -499,6 +505,21 @@ mod tests {
         assert!(cfg.browser.proxy.is_none(), "not yet normalized");
         cfg.normalize();
         assert_eq!(cfg.browser.proxy.as_deref(), Some("http://gw:8080"));
+    }
+
+    #[test]
+    fn fetcher_profiles_dir_defaults_and_overrides() {
+        assert_eq!(FetcherConfig::default().profiles_dir, PathBuf::from("data/profiles"));
+        let cfg: Config = toml::from_str(
+            r#"
+            [fetcher]
+            profiles_dir = "/var/lib/pumper/profiles"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.fetcher.profiles_dir, PathBuf::from("/var/lib/pumper/profiles"));
+        // Untouched sibling keys keep their defaults.
+        assert_eq!(cfg.fetcher.min_content_chars, 250);
     }
 
     #[test]

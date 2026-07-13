@@ -9,6 +9,11 @@ pub enum Error {
     #[cfg(feature = "storage")]
     #[error("storage: {0}")]
     Storage(#[from] sqlx::Error),
+    /// A session-vault profile problem: an unsafe/unusable profile name, or a
+    /// profile dir that can't be prepared. Typed so a bad `profile` on a request
+    /// is distinguishable from a transport failure.
+    #[error("profile: {0}")]
+    Profile(String),
     #[error("parse: {0}")]
     Parse(String),
     #[error("config: {0}")]

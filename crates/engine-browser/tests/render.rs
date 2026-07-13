@@ -19,9 +19,17 @@ fn test_cfg(profile: &str) -> BrowserConfig {
     cfg
 }
 
+/// A private session-vault root for a test (profiles land in `<root>/<name>/browser`).
+fn vault(name: &str) -> std::path::PathBuf {
+    std::env::temp_dir().join(name)
+}
+
 #[tokio::test]
 async fn renders_example_dot_com() {
-    let engine = BrowserEngine::new(&test_cfg("pumper-browser-test-profile"));
+    let engine = BrowserEngine::new(
+        &test_cfg("pumper-browser-test-profile"),
+        vault("pumper-vault-basic"),
+    );
     let mut request = RenderRequest::new("https://example.com");
     request.evaluate = Some("document.title".into());
 
@@ -47,7 +55,10 @@ async fn renders_example_dot_com() {
 /// `load_all_resources` opts a single render back into loading everything.
 #[tokio::test]
 async fn blocks_heavy_resources_and_opt_out_loads_them() {
-    let engine = BrowserEngine::new(&test_cfg("pumper-browser-test-blocking"));
+    let engine = BrowserEngine::new(
+        &test_cfg("pumper-browser-test-blocking"),
+        vault("pumper-vault-blocking"),
+    );
     // A page with real images/fonts so interception has something to drop.
     let url = "https://en.wikipedia.org/wiki/Main_Page";
 
@@ -77,7 +88,10 @@ async fn blocks_heavy_resources_and_opt_out_loads_them() {
 /// (the shared-instance path) — two renders on one engine both succeed.
 #[tokio::test]
 async fn reuses_browser_across_renders() {
-    let engine = BrowserEngine::new(&test_cfg("pumper-browser-test-reuse"));
+    let engine = BrowserEngine::new(
+        &test_cfg("pumper-browser-test-reuse"),
+        vault("pumper-vault-reuse"),
+    );
     for _ in 0..2 {
         let page = engine
             .render(RenderRequest::new("https://example.com"))
@@ -85,4 +99,37 @@ async fn reuses_browser_across_renders() {
             .expect("render should succeed on a reused holder");
         assert!(page.html.contains("Example Domain"));
     }
+}
+
+/// Session vault: two named profiles each get their own Chrome (bound to their
+/// own user-data-dir under the vault), both render, and interleaving them does
+/// not thrash — the per-profile holders stay live. Also asserts the on-disk
+/// layout the `/profiles` endpoint reports (`<vault>/<name>/browser`).
+#[tokio::test]
+async fn renders_under_named_profiles_with_separate_user_data_dirs() {
+    let root = vault("pumper-vault-profiles");
+    let _ = std::fs::remove_dir_all(&root);
+    let engine = BrowserEngine::new(&test_cfg("pumper-browser-test-vault"), root.clone());
+
+    // Interleave the two profiles: A, B, A — with per-profile holders, the
+    // second A render reuses A's Chrome instead of relaunching.
+    for name in ["alpha", "beta", "alpha"] {
+        let mut req = RenderRequest::new("https://example.com");
+        req.profile = Some(name.to_string());
+        let page = engine
+            .render(req)
+            .await
+            .unwrap_or_else(|e| panic!("render under profile {name} failed: {e}"));
+        assert!(page.html.contains("Example Domain"), "profile {name} rendered the page");
+    }
+
+    for name in ["alpha", "beta"] {
+        let dir = root.join(name).join("browser");
+        assert!(dir.is_dir(), "profile chrome dir missing: {}", dir.display());
+    }
+
+    // An unsafe profile name is rejected before Chrome is ever launched.
+    let mut bad = RenderRequest::new("https://example.com");
+    bad.profile = Some("../escape".into());
+    assert!(engine.render(bad).await.is_err(), "unsafe profile name must be rejected");
 }

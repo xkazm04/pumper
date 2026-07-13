@@ -84,6 +84,12 @@ pub struct FetchRequest {
     /// without a full cache bypass. Only affects the HTTP tier.
     #[serde(default)]
     pub ttl_override: Option<u64>,
+    /// Session-vault profile this fetch runs under, threaded to **both** tiers:
+    /// the HTTP tier uses that profile's persistent cookie jar, the browser tier
+    /// a Chrome bound to that profile's user-data-dir. `None` = today's behavior
+    /// (in-memory jar + the shared default browser profile).
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl FetchRequest {
@@ -99,6 +105,7 @@ impl FetchRequest {
             to_markdown: false,
             no_cache: false,
             ttl_override: None,
+            profile: None,
         }
     }
 }
@@ -234,6 +241,7 @@ impl Fetcher {
             let mut http_req = HttpRequest::get(&req.url);
             http_req.no_cache = req.no_cache;
             http_req.ttl_override = req.ttl_override;
+            http_req.profile = req.profile.clone();
             let started = Instant::now();
             match self.http.fetch(http_req).await {
                 Ok(resp) => {
@@ -329,6 +337,7 @@ impl Fetcher {
         if matches!(req.strategy, FetchStrategy::Browser | FetchStrategy::Auto | FetchStrategy::AutoWithResearch) {
             let mut render = RenderRequest::new(&req.url);
             render.wait_for_selector = req.wait_for_selector.clone();
+            render.profile = req.profile.clone();
             let started = Instant::now();
             match self.browser.render(render).await {
                 Ok(page) => {
@@ -590,6 +599,24 @@ mod tests {
         assert_eq!(v["latency_ms"], 7);
         assert!(v.get("cost_usd").is_none(), "None cost_usd is omitted");
         assert!(v.get("detail").is_none(), "None detail is omitted");
+    }
+
+    #[test]
+    fn fetch_request_profile_is_serde_defaulted_and_threads_to_both_tiers() {
+        // Omitted => None => today's behavior.
+        let req: FetchRequest = serde_json::from_str(r#"{"url":"https://x/"}"#).unwrap();
+        assert!(req.profile.is_none());
+        assert!(FetchRequest::new("https://x/").profile.is_none());
+
+        // Present => both tier requests carry it (mirrors what `fetch` builds).
+        let req: FetchRequest =
+            serde_json::from_str(r#"{"url":"https://x/","profile":"acme"}"#).unwrap();
+        let mut http_req = HttpRequest::get(&req.url);
+        http_req.profile = req.profile.clone();
+        let mut render = RenderRequest::new(&req.url);
+        render.profile = req.profile.clone();
+        assert_eq!(http_req.profile.as_deref(), Some("acme"));
+        assert_eq!(render.profile.as_deref(), Some("acme"));
     }
 
     #[test]

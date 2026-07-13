@@ -44,6 +44,11 @@ host_memory_ttl_secs = 604800   # 7 days
 # How often the governor's learned per-host penalties are snapshotted to the DB
 # so they survive a restart (0 = in-memory only).
 host_penalty_persist_secs = 60
+# Session vault: named login profiles a fetch can run under (`profile` on a
+# request). Each lives in <profiles_dir>/<name>/ — cookies.json (persistent HTTP
+# cookie jar) + browser/ (that profile's Chrome user-data-dir), created on first
+# use. Session state only: no credential management, no encryption at rest.
+profiles_dir = "data/profiles"
 
 # Content-addressed HTTP response cache with TTL.
 [cache]

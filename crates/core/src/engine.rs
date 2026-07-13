@@ -3,13 +3,74 @@
 //! server wires everything together into an [`EngineSet`].
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::Result;
+use crate::{Error, Result};
+
+// ---- Session vault: named login profiles (phase 1) -------------------------
+//
+// A *profile* is a named, persistent identity a fetch can run under. It lives in
+// its own directory under `[fetcher] profiles_dir` (default `data/profiles`),
+// created on first use:
+//
+//   data/profiles/<name>/cookies.json   persistent HTTP cookie jar (engine-http)
+//   data/profiles/<name>/browser/       Chrome user-data-dir      (engine-browser)
+//
+// The name is the only untrusted input in that path, so it is validated to a
+// path-safe alphabet before it is ever joined onto a directory. Phase 1 stores
+// session state only — there is no credential management or at-rest encryption.
+
+/// Cookie-jar file inside a profile dir.
+pub const PROFILE_COOKIES_FILE: &str = "cookies.json";
+/// Chrome user-data-dir inside a profile dir.
+pub const PROFILE_BROWSER_DIR: &str = "browser";
+/// Max profile-name length (keeps paths sane on every platform).
+pub const PROFILE_NAME_MAX_LEN: usize = 64;
+
+/// Accepts only path-safe profile names: 1..=64 chars of ASCII alphanumerics,
+/// `-`, or `_`. Everything else — separators, `.`/`..`, drive letters, spaces,
+/// non-ASCII — is rejected with a typed [`Error::Profile`], so a name can never
+/// escape `profiles_dir`.
+pub fn validate_profile_name(name: &str) -> Result<()> {
+    if name.is_empty() {
+        return Err(Error::Profile("name must not be empty".into()));
+    }
+    if name.len() > PROFILE_NAME_MAX_LEN {
+        return Err(Error::Profile(format!(
+            "name '{name}' is longer than {PROFILE_NAME_MAX_LEN} chars"
+        )));
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| !(c.is_ascii_alphanumeric() || *c == '-' || *c == '_'))
+    {
+        return Err(Error::Profile(format!(
+            "name '{name}' contains {bad:?}; only ASCII letters, digits, '-' and '_' are allowed"
+        )));
+    }
+    Ok(())
+}
+
+/// `<profiles_dir>/<name>` for a validated name.
+pub fn profile_dir(profiles_dir: &Path, name: &str) -> Result<PathBuf> {
+    validate_profile_name(name)?;
+    Ok(profiles_dir.join(name))
+}
+
+/// `<profiles_dir>/<name>/cookies.json` — the HTTP tier's persistent jar.
+pub fn profile_cookies_path(profiles_dir: &Path, name: &str) -> Result<PathBuf> {
+    Ok(profile_dir(profiles_dir, name)?.join(PROFILE_COOKIES_FILE))
+}
+
+/// `<profiles_dir>/<name>/browser` — the browser tier's Chrome user-data-dir.
+pub fn profile_browser_dir(profiles_dir: &Path, name: &str) -> Result<PathBuf> {
+    Ok(profile_dir(profiles_dir, name)?.join(PROFILE_BROWSER_DIR))
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -66,6 +127,13 @@ pub struct HttpRequest {
     /// default (or no proxy).
     #[serde(default)]
     pub proxy: Option<String>,
+    /// Session-vault profile to run this request under: it is served by a client
+    /// bound to `<profiles_dir>/<name>/cookies.json`, a **persistent** cookie jar
+    /// that survives restarts (the default client's jar is in-memory and dies
+    /// with the process). `None` = exactly the previous behavior. An invalid name
+    /// yields a typed [`Error::Profile`].
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl HttpRequest {
@@ -82,6 +150,7 @@ impl HttpRequest {
             max_body_bytes: None,
             timeout_secs: None,
             proxy: None,
+            profile: None,
         }
     }
 }
@@ -123,6 +192,12 @@ pub struct RenderRequest {
     /// load images/fonts/media too. Ignored when blocking is disabled globally.
     #[serde(default)]
     pub load_all_resources: bool,
+    /// Session-vault profile to render under: Chrome is acquired with
+    /// `<profiles_dir>/<name>/browser` as its user-data-dir, so that profile's
+    /// logins/cookies are in effect. `None` renders on the shared default
+    /// instance (`[browser] user_data_dir`) — exactly the previous behavior.
+    #[serde(default)]
+    pub profile: Option<String>,
 }
 
 impl RenderRequest {
@@ -133,6 +208,7 @@ impl RenderRequest {
             extra_wait_ms: None,
             evaluate: None,
             load_all_resources: false,
+            profile: None,
         }
     }
 }
@@ -258,5 +334,55 @@ mod tests {
         assert_eq!(req2.if_modified_since.as_deref(), Some("Wed, 21 Oct 2025 07:28:00 GMT"));
         // The convenience constructor leaves them unset.
         assert!(HttpRequest::get("https://x/").etag.is_none());
+    }
+
+    #[test]
+    fn profile_is_serde_defaulted_on_every_request_type() {
+        // None = today's behavior; omitted from older payloads.
+        let h: HttpRequest = serde_json::from_str(r#"{"url":"https://x/"}"#).unwrap();
+        assert!(h.profile.is_none());
+        let r: RenderRequest = serde_json::from_str(r#"{"url":"https://x/"}"#).unwrap();
+        assert!(r.profile.is_none());
+        // Present => round-trips.
+        let h2: HttpRequest =
+            serde_json::from_str(r#"{"url":"https://x/","profile":"acme_login"}"#).unwrap();
+        assert_eq!(h2.profile.as_deref(), Some("acme_login"));
+        let r2: RenderRequest =
+            serde_json::from_str(r#"{"url":"https://x/","profile":"acme_login"}"#).unwrap();
+        assert_eq!(r2.profile.as_deref(), Some("acme_login"));
+        assert!(HttpRequest::get("https://x/").profile.is_none());
+        assert!(RenderRequest::new("https://x/").profile.is_none());
+    }
+
+    #[test]
+    fn profile_names_accept_only_the_path_safe_alphabet() {
+        for ok in ["a", "acme", "acme-login", "acme_login_2", "A1", &"x".repeat(64)] {
+            assert!(validate_profile_name(ok).is_ok(), "{ok:?} should be accepted");
+        }
+        // Traversal, separators, and anything else are typed errors.
+        for bad in [
+            "", "..", ".", "a/b", "a\\b", "a.b", "C:", "a b", "naïve", "a:b", "-*-",
+            &"x".repeat(65),
+        ] {
+            let err = validate_profile_name(bad).unwrap_err();
+            assert!(matches!(err, Error::Profile(_)), "{bad:?} => {err:?}");
+        }
+    }
+
+    #[test]
+    fn profile_paths_stay_inside_the_profiles_dir() {
+        let root = Path::new("data/profiles");
+        assert_eq!(profile_dir(root, "acme").unwrap(), root.join("acme"));
+        assert_eq!(
+            profile_cookies_path(root, "acme").unwrap(),
+            root.join("acme").join("cookies.json")
+        );
+        assert_eq!(
+            profile_browser_dir(root, "acme").unwrap(),
+            root.join("acme").join("browser")
+        );
+        // A traversal attempt never produces a path at all.
+        assert!(profile_cookies_path(root, "../../etc").is_err());
+        assert!(profile_browser_dir(root, "..").is_err());
     }
 }
