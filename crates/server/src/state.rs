@@ -36,6 +36,9 @@ pub struct AppState {
     pub webhook_client: reqwest::Client,
     /// Fan-out of job status transitions to SSE subscribers.
     pub events: broadcast::Sender<JobEvent>,
+    /// Short-TTL cache of the fully-rendered `/metrics` body, so a burst of
+    /// Prometheus scrapes doesn't re-run the aggregate queries every time.
+    pub metrics_cache: Arc<tokio::sync::Mutex<Option<(std::time::Instant, String)>>>,
 }
 
 impl AppState {
@@ -97,6 +100,7 @@ impl AppState {
             notify: Arc::new(Notify::new()),
             webhook_client,
             events,
+            metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
 }

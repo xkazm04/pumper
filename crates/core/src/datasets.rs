@@ -427,6 +427,18 @@ impl Datasets {
         Ok(pairs)
     }
 
+    /// Number of records in a dataset (removed rows included) — the bound the
+    /// duplicate scan checks before its O(n²) pairwise SimHash comparison.
+    pub async fn record_count(&self, app: &str, dataset: &str) -> Result<i64> {
+        let n: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE app = ?1 AND dataset = ?2")
+                .bind(app)
+                .bind(dataset)
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(n)
+    }
+
     /// Dedup helper: true if this key has been recorded before.
     pub async fn seen(&self, app: &str, dataset: &str, key: &str) -> Result<bool> {
         let found: Option<i64> = sqlx::query_scalar(

@@ -40,7 +40,8 @@ pub use datasets::{
 };
 #[cfg(feature = "storage")]
 pub use storage::{
-    Delivery, EnqueueOptions, NewTrigger, SavedSearch, Schedule, Storage, Trigger, Watch,
+    Delivery, EnqueueOptions, JobTimingStats, NewTrigger, SavedSearch, Schedule, Storage, Trigger,
+    Watch,
 };
 #[cfg(feature = "storage")]
 pub use tiers::TierMemory;

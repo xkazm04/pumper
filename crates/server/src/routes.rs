@@ -104,9 +104,29 @@ async fn health() -> Json<Value> {
 
 // ---- Observability --------------------------------------------------------
 
-/// Prometheus-style text exposition of queue + platform gauges.
+/// How long a rendered `/metrics` body is served from cache before the aggregate
+/// queries are re-run. Short enough that a scrape is never meaningfully stale.
+const METRICS_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn metrics_response(body: String) -> Response {
+    ([("content-type", "text/plain; version=0.0.4")], body).into_response()
+}
+
+/// Prometheus-style text exposition of queue + platform gauges. Cached for
+/// `METRICS_TTL` so a burst of scrapes doesn't re-run the aggregate queries each
+/// time (the render touches jobs, costs, schedules, and timing in one pass).
 async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
+    {
+        let cached = state.metrics_cache.lock().await;
+        if let Some((at, body)) = cached.as_ref() {
+            if at.elapsed() < METRICS_TTL {
+                return Ok(metrics_response(body.clone()));
+            }
+        }
+    }
+
     let counts = state.storage.status_counts().await?;
+    let timing = state.storage.job_timing_stats().await?;
     let schedules = state.storage.list_schedules().await?;
     let mut out = String::new();
     out.push_str("# HELP pumper_jobs Jobs by status\n# TYPE pumper_jobs gauge\n");
@@ -114,6 +134,32 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
         let n = counts.iter().find(|(s, _)| s == status).map_or(0, |(_, n)| *n);
         out.push_str(&format!("pumper_jobs{{status=\"{status}\"}} {n}\n"));
     }
+    out.push_str(
+        "# HELP pumper_job_duration_seconds Job execution time (started -> finished)\n\
+         # TYPE pumper_job_duration_seconds summary\n",
+    );
+    out.push_str(&format!(
+        "pumper_job_duration_seconds_sum {}\npumper_job_duration_seconds_count {}\n",
+        timing.duration_sum, timing.duration_count
+    ));
+    out.push_str(
+        "# HELP pumper_job_duration_seconds_max Longest job execution time\n\
+         # TYPE pumper_job_duration_seconds_max gauge\n",
+    );
+    out.push_str(&format!("pumper_job_duration_seconds_max {}\n", timing.duration_max));
+    out.push_str(
+        "# HELP pumper_job_queue_wait_seconds Queue wait (created -> started)\n\
+         # TYPE pumper_job_queue_wait_seconds summary\n",
+    );
+    out.push_str(&format!(
+        "pumper_job_queue_wait_seconds_sum {}\npumper_job_queue_wait_seconds_count {}\n",
+        timing.wait_sum, timing.wait_count
+    ));
+    out.push_str(
+        "# HELP pumper_job_queue_wait_seconds_max Longest queue wait\n\
+         # TYPE pumper_job_queue_wait_seconds_max gauge\n",
+    );
+    out.push_str(&format!("pumper_job_queue_wait_seconds_max {}\n", timing.wait_max));
     out.push_str("# HELP pumper_cost_usd Total engine spend by app\n# TYPE pumper_cost_usd gauge\n");
     for entry in state.costs.summary(None, None).await? {
         out.push_str(&format!(
@@ -130,7 +176,9 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
         "pumper_schedules{{enabled=\"false\"}} {}\n",
         schedules.len() - enabled
     ));
-    Ok(([("content-type", "text/plain; version=0.0.4")], out).into_response())
+
+    *state.metrics_cache.lock().await = Some((std::time::Instant::now(), out.clone()));
+    Ok(metrics_response(out))
 }
 
 /// SSE stream of all job status transitions.
@@ -586,8 +634,36 @@ async fn list_records(
 
 #[derive(Deserialize)]
 struct ExportQuery {
-    /// 'json' (default, buffered) | 'ndjson' | 'csv' (both streamed).
+    /// 'json' (default) | 'ndjson' | 'csv'. All three stream in constant memory.
     format: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+enum ExportFormat {
+    /// A single streamed JSON array — `[{record},{record},...]`.
+    Json,
+    /// One JSON object per line.
+    Ndjson,
+    /// RFC-4180 rows with a fixed header.
+    Csv,
+}
+
+impl ExportFormat {
+    fn extension(self) -> &'static str {
+        match self {
+            ExportFormat::Json => "json",
+            ExportFormat::Ndjson => "ndjson",
+            ExportFormat::Csv => "csv",
+        }
+    }
+
+    fn content_type(self) -> &'static str {
+        match self {
+            ExportFormat::Json => "application/json",
+            ExportFormat::Ndjson => "application/x-ndjson",
+            ExportFormat::Csv => "text/csv; charset=utf-8",
+        }
+    }
 }
 
 async fn export_records(
@@ -595,37 +671,38 @@ async fn export_records(
     Path((app, dataset)): Path<(String, String)>,
     Query(query): Query<ExportQuery>,
 ) -> Result<Response, ApiError> {
-    match query.format.as_deref().unwrap_or("json") {
-        "json" => {
-            let records = state.datasets.list(&app, &dataset, 100_000).await?;
-            Ok(Json(json!({
-                "app": app,
-                "dataset": dataset,
-                "count": records.len(),
-                "records": records,
-            }))
-            .into_response())
+    let format = match query.format.as_deref().unwrap_or("json") {
+        "json" => ExportFormat::Json,
+        "ndjson" => ExportFormat::Ndjson,
+        "csv" => ExportFormat::Csv,
+        other => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("unknown format '{other}' (json | ndjson | csv)"),
+            ))
         }
-        format @ ("ndjson" | "csv") => Ok(stream_export(state, app, dataset, format == "csv")),
-        other => Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            format!("unknown format '{other}' (json | ndjson | csv)"),
-        )),
-    }
+    };
+    Ok(stream_export(state, app, dataset, format))
 }
 
 /// Streams the whole dataset in keyset-paged batches — constant memory
-/// regardless of dataset size, unlike the buffered JSON export.
-fn stream_export(state: AppState, app: String, dataset: String, csv: bool) -> Response {
+/// regardless of dataset size, with no row cap or silent truncation. `json`
+/// frames the batches as one array (`[`, comma-separated records, `]`); `ndjson`
+/// and `csv` stream line-oriented output.
+fn stream_export(state: AppState, app: String, dataset: String, format: ExportFormat) -> Response {
     const BATCH: i64 = 1_000;
-    let filename = format!("attachment; filename=\"{dataset}.{}\"", if csv { "csv" } else { "ndjson" });
+    let filename = format!("attachment; filename=\"{dataset}.{}\"", format.extension());
+    let content_type = format.content_type();
     let stream = async_stream::stream! {
-        if csv {
-            yield Ok::<_, Infallible>(axum::body::Bytes::from_static(
+        match format {
+            ExportFormat::Csv => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(
                 b"key,first_seen,last_seen,updated_at,removed_at,data\n",
-            ));
+            )),
+            ExportFormat::Json => yield Ok(axum::body::Bytes::from_static(b"[")),
+            ExportFormat::Ndjson => {}
         }
         let mut after: Option<(String, String)> = None;
+        let mut first = true;
         loop {
             let batch = match state.datasets.list_page(&app, &dataset, after.clone(), BATCH).await {
                 Ok(batch) => batch,
@@ -639,11 +716,23 @@ fn stream_export(state: AppState, app: String, dataset: String, csv: bool) -> Re
             let short = (batch.len() as i64) < BATCH;
             let mut chunk = String::new();
             for record in &batch {
-                if csv {
-                    csv_row(&mut chunk, record);
-                } else if let Ok(line) = serde_json::to_string(record) {
-                    chunk.push_str(&line);
-                    chunk.push('\n');
+                match format {
+                    ExportFormat::Csv => csv_row(&mut chunk, record),
+                    ExportFormat::Ndjson => {
+                        if let Ok(line) = serde_json::to_string(record) {
+                            chunk.push_str(&line);
+                            chunk.push('\n');
+                        }
+                    }
+                    ExportFormat::Json => {
+                        if let Ok(line) = serde_json::to_string(record) {
+                            if !first {
+                                chunk.push(',');
+                            }
+                            first = false;
+                            chunk.push_str(&line);
+                        }
+                    }
                 }
             }
             yield Ok(axum::body::Bytes::from(chunk));
@@ -651,8 +740,10 @@ fn stream_export(state: AppState, app: String, dataset: String, csv: bool) -> Re
                 break;
             }
         }
+        if let ExportFormat::Json = format {
+            yield Ok(axum::body::Bytes::from_static(b"]"));
+        }
     };
-    let content_type = if csv { "text/csv; charset=utf-8" } else { "application/x-ndjson" };
     (
         [
             ("content-type", content_type.to_string()),
@@ -687,12 +778,28 @@ fn default_distance() -> u32 {
     3
 }
 
+/// Upper bound on dataset size for the duplicate scan. The comparison is an
+/// O(n²) pairwise SimHash sweep held in memory, so a dataset past this size is
+/// rejected (413) rather than pinning a core; page or narrow the dataset, or run
+/// the scan offline. 10k rows ≈ 50M Hamming comparisons — sub-second, bounded.
+const DUP_SCAN_MAX: i64 = 10_000;
+
 /// Near-duplicate record pairs (SimHash Hamming distance ≤ `distance`).
 async fn dataset_duplicates(
     State(state): State<AppState>,
     Path((app, dataset)): Path<(String, String)>,
     Query(query): Query<DupQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let count = state.datasets.record_count(&app, &dataset).await?;
+    if count > DUP_SCAN_MAX {
+        return Err(ApiError(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "dataset has {count} records; the duplicate scan is O(n²) and capped at \
+                 {DUP_SCAN_MAX}. Narrow the dataset or run the scan offline."
+            ),
+        ));
+    }
     let distance = query.distance.min(20);
     let pairs = state.datasets.duplicate_pairs(&app, &dataset, distance).await?;
     Ok(Json(json!({

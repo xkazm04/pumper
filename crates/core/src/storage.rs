@@ -323,6 +323,30 @@ impl Storage {
         Ok(rows)
     }
 
+    /// Execution-duration (started→finished) and queue-wait (created→started)
+    /// aggregates for the metrics endpoint, computed in one pass. Durations come
+    /// from `julianday` deltas over the fixed-width RFC-3339 timestamps (× 86400
+    /// → seconds). Rows missing an endpoint are excluded from that aggregate.
+    pub async fn job_timing_stats(&self) -> Result<JobTimingStats> {
+        let row: JobTimingStats = sqlx::query_as(
+            "SELECT \
+               COALESCE(SUM(CASE WHEN started_at IS NOT NULL AND finished_at IS NOT NULL \
+                 THEN (julianday(finished_at) - julianday(started_at)) * 86400.0 END), 0.0) AS duration_sum, \
+               COUNT(CASE WHEN started_at IS NOT NULL AND finished_at IS NOT NULL THEN 1 END) AS duration_count, \
+               COALESCE(MAX(CASE WHEN started_at IS NOT NULL AND finished_at IS NOT NULL \
+                 THEN (julianday(finished_at) - julianday(started_at)) * 86400.0 END), 0.0) AS duration_max, \
+               COALESCE(SUM(CASE WHEN started_at IS NOT NULL \
+                 THEN (julianday(started_at) - julianday(created_at)) * 86400.0 END), 0.0) AS wait_sum, \
+               COUNT(CASE WHEN started_at IS NOT NULL THEN 1 END) AS wait_count, \
+               COALESCE(MAX(CASE WHEN started_at IS NOT NULL \
+                 THEN (julianday(started_at) - julianday(created_at)) * 86400.0 END), 0.0) AS wait_max \
+             FROM jobs",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     /// True when a schedule already has a job queued or running — the overlap
     /// guard the scheduler consults before firing.
     pub async fn schedule_has_active_job(&self, schedule_id: &str) -> Result<bool> {
@@ -936,6 +960,19 @@ impl Storage {
         .await?;
         row.map(Delivery::try_from).transpose()
     }
+}
+
+/// Job timing aggregates (seconds) for the metrics endpoint: execution duration
+/// (started→finished) and queue wait (created→started), each as sum/count/max so
+/// callers can expose Prometheus summaries and derive averages.
+#[derive(Debug, Clone, Default, sqlx::FromRow)]
+pub struct JobTimingStats {
+    pub duration_sum: f64,
+    pub duration_count: i64,
+    pub duration_max: f64,
+    pub wait_sum: f64,
+    pub wait_count: i64,
+    pub wait_max: f64,
 }
 
 #[derive(sqlx::FromRow)]
