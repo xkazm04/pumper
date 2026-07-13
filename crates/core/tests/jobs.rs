@@ -5,7 +5,8 @@
 
 use chrono::{Duration, SecondsFormat, Utc};
 use pumper_core::config::StorageConfig;
-use pumper_core::Storage;
+use pumper_core::{EnqueueOptions, JobStatus, Storage};
+use serde_json::json;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
@@ -109,6 +110,115 @@ async fn equal_priority_claims_fifo() {
     assert_eq!(second.id, middle);
     let third = storage.claim_next(&[], 900.0).await.unwrap().unwrap();
     assert_eq!(third.id, newest);
+
+    drop(storage);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// Inserts a job already in a terminal `failed` state.
+async fn insert_failed(pool: &SqlitePool, app: &str) -> Uuid {
+    let id = Uuid::new_v4();
+    let ts = Utc::now().to_rfc3339_opts(SecondsFormat::Micros, true);
+    sqlx::query(
+        "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
+         error, created_at, available_at, started_at, finished_at) \
+         VALUES (?1, ?2, '{}', 'failed', 1, 1, 0, 'boom', ?3, ?3, ?3, ?3)",
+    )
+    .bind(id.to_string())
+    .bind(app)
+    .bind(&ts)
+    .execute(pool)
+    .await
+    .expect("insert failed job");
+    id
+}
+
+#[tokio::test]
+async fn reset_requeues_running_and_fences_stale_completion() {
+    let (storage, dir) = fresh_db("reset").await;
+
+    let job = storage
+        .enqueue("a", EnqueueOptions { max_attempts: 3, ..Default::default() })
+        .await
+        .unwrap();
+
+    // Reset only applies to running jobs.
+    assert!(storage.reset(job.id).await.unwrap().is_none(), "queued job is not resettable");
+
+    // Claim -> running, attempts = 1.
+    let claimed = storage.claim_next(&[], 0.0).await.unwrap().unwrap();
+    assert_eq!(claimed.id, job.id);
+    assert_eq!(claimed.attempts, 1);
+
+    // Reset re-queues it (the orphaned task still holds attempt 1).
+    let after = storage.reset(job.id).await.unwrap().unwrap();
+    assert_eq!(after.status, JobStatus::Queued);
+    assert_eq!(after.attempts, 1);
+
+    // Stale attempt-1 completion is discarded: the row is queued, not running.
+    assert!(!storage.complete(job.id, 1, json!({"stale": true})).await.unwrap());
+
+    // Re-claim -> attempts = 2 (fence advances past the orphan).
+    let reclaimed = storage.claim_next(&[], 0.0).await.unwrap().unwrap();
+    assert_eq!(reclaimed.attempts, 2);
+
+    // Orphan's attempt-1 write still discarded; the live attempt-2 write lands.
+    assert!(!storage.complete(job.id, 1, json!({"stale": true})).await.unwrap());
+    assert!(storage.complete(job.id, 2, json!({"ok": true})).await.unwrap());
+
+    let done = storage.get(job.id).await.unwrap().unwrap();
+    assert_eq!(done.status, JobStatus::Succeeded);
+    assert_eq!(done.result, Some(json!({"ok": true})));
+
+    drop(storage);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn cancel_running_is_attempt_guarded() {
+    let (storage, dir) = fresh_db("cancel-running").await;
+    let job = storage.enqueue("a", EnqueueOptions::default()).await.unwrap();
+    let claimed = storage.claim_next(&[], 0.0).await.unwrap().unwrap();
+    assert_eq!(claimed.attempts, 1);
+
+    // Wrong attempt / not-running -> no-op.
+    assert!(!storage.cancel_running(job.id, 2).await.unwrap());
+    // Correct attempt cancels the in-flight job.
+    assert!(storage.cancel_running(job.id, 1).await.unwrap());
+    assert_eq!(storage.get(job.id).await.unwrap().unwrap().status, JobStatus::Cancelled);
+    // Idempotent: already terminal.
+    assert!(!storage.cancel_running(job.id, 1).await.unwrap());
+
+    drop(storage);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn retry_bulk_requeues_filtered_batch() {
+    let (storage, dir) = fresh_db("bulk").await;
+    let pool = storage.pool();
+
+    let a1 = insert_failed(&pool, "a").await;
+    let a2 = insert_failed(&pool, "a").await;
+    let b1 = insert_failed(&pool, "b").await;
+
+    // Scoped to app "a": only its two failed jobs re-queue.
+    let ids = storage.retry_bulk(JobStatus::Failed, Some("a"), 500).await.unwrap();
+    assert_eq!(ids.len(), 2);
+    assert!(ids.contains(&a1) && ids.contains(&a2));
+    for id in [a1, a2] {
+        let j = storage.get(id).await.unwrap().unwrap();
+        assert_eq!(j.status, JobStatus::Queued);
+        assert_eq!(j.max_attempts, 2, "one more attempt granted");
+    }
+    // app "b" untouched.
+    assert_eq!(storage.get(b1).await.unwrap().unwrap().status, JobStatus::Failed);
+
+    // Cap is respected.
+    insert_failed(&pool, "c").await;
+    insert_failed(&pool, "c").await;
+    let capped = storage.retry_bulk(JobStatus::Failed, None, 1).await.unwrap();
+    assert_eq!(capped.len(), 1);
 
     drop(storage);
     std::fs::remove_dir_all(&dir).ok();

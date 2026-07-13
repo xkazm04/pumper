@@ -46,8 +46,24 @@ pub async fn run(state: AppState) {
                 let state = state.clone();
                 let running = running.clone();
                 tokio::spawn(async move {
+                    // Register a cancellation token so `DELETE /jobs/{id}` can
+                    // abort this in-flight run. Keyed by attempt so an
+                    // overlapping re-claim (after a reset/reap) doesn't clobber
+                    // or get clobbered by this task's registry entry.
+                    let cancel = tokio_util::sync::CancellationToken::new();
+                    state
+                        .job_cancels
+                        .lock()
+                        .unwrap()
+                        .insert(job.id, (job.attempts, cancel.clone()));
                     publish(&state, JobEvent::new(job.id, job.app.clone(), "running"));
-                    execute(state.clone(), job.clone()).await;
+                    execute(state.clone(), job.clone(), cancel).await;
+                    {
+                        let mut m = state.job_cancels.lock().unwrap();
+                        if m.get(&job.id).map(|(a, _)| *a) == Some(job.attempts) {
+                            m.remove(&job.id);
+                        }
+                    }
                     {
                         let mut counts = running.lock().await;
                         if let Some(n) = counts.get_mut(&job.app) {
@@ -121,12 +137,20 @@ fn app_limit(state: &AppState, app: &str) -> usize {
         .unwrap_or(state.config.worker.default_app_concurrency)
 }
 
-async fn execute(state: AppState, job: Job) {
+/// How a run left the queue: the app finished (Ok/Err), the wall-clock timeout
+/// tripped, or a cancellation token fired mid-run.
+enum Outcome {
+    Finished(pumper_core::Result<Value>),
+    TimedOut,
+    Cancelled,
+}
+
+async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::CancellationToken) {
     let Some(app) = state.registry.get(&job.app).cloned() else {
         warn!(app = %job.app, job = %job.id, "job references unregistered app");
         let _ = state
             .storage
-            .fail_permanently(job.id, "app not registered")
+            .fail_permanently(job.id, job.attempts, "app not registered")
             .await;
         finalize(&state, job.id).await;
         return;
@@ -152,17 +176,50 @@ async fn execute(state: AppState, job: Job) {
     };
 
     let timeout = Duration::from_secs(state.config.worker.job_timeout_secs);
-    match tokio::time::timeout(timeout, app.run(ctx)).await {
-        Ok(Ok(result)) => {
+    let run = app.run(ctx);
+    tokio::pin!(run);
+    let sleep = tokio::time::sleep(timeout);
+    tokio::pin!(sleep);
+    // Race the app future against the wall-clock timeout and the cancel token.
+    let outcome = tokio::select! {
+        biased;
+        _ = cancel.cancelled() => Outcome::Cancelled,
+        _ = &mut sleep => Outcome::TimedOut,
+        res = &mut run => Outcome::Finished(res),
+    };
+
+    match outcome {
+        Outcome::Cancelled => {
+            // Cooperative cancel of a running job: mark it cancelled (not failed)
+            // and emit the terminal event, mirroring the queued-cancel path
+            // (event only, no result webhook). Guarded, so a job that raced to a
+            // terminal state or was reset first is left untouched.
+            match state.storage.cancel_running(job.id, job.attempts).await {
+                Ok(true) => {
+                    warn!(job = %job.id, "running job cancelled");
+                    publish(&state, JobEvent::new(job.id, job.app.clone(), "cancelled"));
+                }
+                Ok(false) => {}
+                Err(e) => error!(job = %job.id, "failed to persist cancellation: {e}"),
+            }
+            return;
+        }
+        Outcome::Finished(Ok(result)) => {
             // Index the result into full-text search before persisting it.
             let docs = search_docs(&job.app, job.id, &result);
             if let Err(e) = state.search.index(docs).await {
                 warn!(job = %job.id, "search index failed: {e}");
             }
-            if let Err(e) = state.storage.complete(job.id, result).await {
-                error!(job = %job.id, "failed to persist result: {e}");
-            } else {
-                info!(job = %job.id, "job succeeded");
+            match state.storage.complete(job.id, job.attempts, result).await {
+                Ok(true) => info!(job = %job.id, "job succeeded"),
+                Ok(false) => {
+                    // The job was reset/reaped mid-run and re-claimed elsewhere;
+                    // this run's result is stale. Drop it (no side effects, no
+                    // finalize) so the live attempt owns the outcome.
+                    warn!(job = %job.id, "completion discarded: job was reset or reaped mid-run");
+                    return;
+                }
+                Err(e) => error!(job = %job.id, "failed to persist result: {e}"),
             }
             // One revision batch for this run, shared by watches + triggers.
             let changes = load_run_changes(&state, &job).await;
@@ -173,29 +230,32 @@ async fn execute(state: AppState, job: Job) {
             }
             notify_saved_searches(&state, &job).await;
         }
-        Ok(Err(e)) => {
+        Outcome::Finished(Err(e)) => {
             warn!(job = %job.id, error = %e, "job failed");
-            match state.storage.fail(job.id, &e.to_string()).await {
-                Ok(JobStatus::Queued) => {
+            match state.storage.fail(job.id, job.attempts, &e.to_string()).await {
+                Ok(Some(JobStatus::Queued)) => {
                     // Not terminal — retry pending; wake the worker and return.
                     state.notify.notify_one();
                     return;
                 }
-                Ok(_) => {}
+                // Stale (job reset/reaped mid-run): the live attempt owns it.
+                Ok(None) => return,
+                Ok(Some(_)) => {}
                 Err(pe) => error!(job = %job.id, "failed to persist failure: {pe}"),
             }
         }
-        Err(_) => {
+        Outcome::TimedOut => {
             warn!(job = %job.id, timeout_secs = timeout.as_secs(), "job timed out");
             match state
                 .storage
-                .fail(job.id, &format!("timed out after {}s", timeout.as_secs()))
+                .fail(job.id, job.attempts, &format!("timed out after {}s", timeout.as_secs()))
                 .await
             {
-                Ok(JobStatus::Queued) => {
+                Ok(Some(JobStatus::Queued)) => {
                     state.notify.notify_one();
                     return;
                 }
+                Ok(None) => return,
                 _ => {}
             }
         }

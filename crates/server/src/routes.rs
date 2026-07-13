@@ -62,6 +62,8 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_jobs))
         .routes(routes!(get_job, cancel_job))
         .routes(routes!(retry_job))
+        .routes(routes!(bulk_retry_jobs))
+        .routes(routes!(reset_job))
         .routes(routes!(stream_job))
         .routes(routes!(job_costs))
         .routes(routes!(cost_summary))
@@ -676,6 +678,83 @@ async fn retry_job(
     }
 }
 
+#[derive(Deserialize, ToSchema, Default)]
+struct BulkRetryBody {
+    /// Terminal state to resurrect: `failed` (default) or `cancelled`.
+    status: Option<String>,
+    /// Restrict the batch to one app.
+    app: Option<String>,
+    /// Max jobs to re-queue (clamped 1..=500, default 500).
+    limit: Option<i64>,
+}
+
+/// Bulk re-queue: re-queues every job in the given terminal state (default
+/// `failed`), optionally scoped to one app, up to a cap — each with one more
+/// attempt. Returns the count and the ids re-queued.
+#[utoipa::path(
+    post,
+    path = "/jobs/retry",
+    tag = "jobs",
+    request_body = BulkRetryBody,
+    responses(
+        (status = 200, description = "`{retried: <count>, ids: [uuid]}`"),
+        (status = 400, description = "status must be failed|cancelled", body = Object),
+    )
+)]
+async fn bulk_retry_jobs(
+    State(state): State<AppState>,
+    body: Option<Json<BulkRetryBody>>,
+) -> Result<Json<Value>, ApiError> {
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let status = match body.status.as_deref().unwrap_or("failed") {
+        "failed" => JobStatus::Failed,
+        "cancelled" => JobStatus::Cancelled,
+        other => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("status must be failed|cancelled, got '{other}'"),
+            ))
+        }
+    };
+    let cap = body.limit.unwrap_or(500).clamp(1, 500);
+    let ids = state.storage.retry_bulk(status, body.app.as_deref(), cap).await?;
+    for id in &ids {
+        state.events.emit(JobEvent::new(*id, "", "queued"));
+    }
+    if !ids.is_empty() {
+        state.notify.notify_one();
+    }
+    Ok(Json(json!({ "retried": ids.len(), "ids": ids })))
+}
+
+/// Re-queues a `running` job (e.g. one stuck on a hung task) with a fresh
+/// attempt budget. The orphaned task's late completion is discarded by the
+/// `(status, attempts)` fence on the worker's finish/fail writes.
+#[utoipa::path(
+    post,
+    path = "/jobs/{id}/reset",
+    tag = "jobs",
+    params(("id" = Uuid, Path, description = "Job id")),
+    responses(
+        (status = 202, description = "Re-queued job", body = Object),
+        (status = 404, description = "Job not found", body = Object),
+        (status = 409, description = "Job not in `running` state", body = Object),
+    )
+)]
+async fn reset_job(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Result<(StatusCode, Json<Job>), ApiError> {
+    match state.storage.reset(id).await? {
+        Some(job) => {
+            state.events.emit(JobEvent::new(job.id, job.app.clone(), "queued"));
+            state.notify.notify_one();
+            Ok((StatusCode::ACCEPTED, Json(job)))
+        }
+        None => Err(job_state_error(&state, id, "job is not in 'running' state").await),
+    }
+}
+
 /// Distinguishes a missing job (404) from a job in the wrong state (409) after a
 /// state-guarded mutation reported no rows changed — one extra lookup to give the
 /// caller an actionable status instead of a blanket conflict.
@@ -687,27 +766,44 @@ async fn job_state_error(state: &AppState, id: Uuid, wrong_state: &str) -> ApiEr
     }
 }
 
+/// Cancels a job. A `queued` job is cancelled synchronously; a `running` job
+/// has its cancellation token fired so the worker aborts the app future and
+/// marks it `cancelled` (the response reports `running: true`). A terminal job
+/// is `409`, an unknown one `404`.
 #[utoipa::path(
     delete,
     path = "/jobs/{id}",
     tag = "jobs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 200, description = "Cancelled (`{cancelled: true}`)"),
+        (status = 200, description = "Cancelled (`{cancelled: true}`; `running: true` when it was in-flight)"),
         (status = 404, description = "Job not found", body = Object),
-        (status = 409, description = "Job not in `queued` state", body = Object),
+        (status = 409, description = "Job already terminal (succeeded/failed/cancelled)", body = Object),
     )
 )]
 async fn cancel_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
+    // Queued job: cancel synchronously.
     if state.storage.cancel(id).await? {
         state.events.emit(JobEvent::new(id, "", "cancelled"));
-        Ok(Json(json!({ "cancelled": true })))
-    } else {
-        Err(job_state_error(&state, id, "job is not in 'queued' state (already running or terminal)").await)
+        return Ok(Json(json!({ "cancelled": true })));
     }
+    // Otherwise it may be running here: fire its cancellation token. The worker
+    // task races it against the app future and persists `cancelled` + emits the
+    // terminal event, so we don't touch storage or emit from the request path.
+    let token = state
+        .job_cancels
+        .lock()
+        .unwrap()
+        .get(&id)
+        .map(|(_, t)| t.clone());
+    if let Some(token) = token {
+        token.cancel();
+        return Ok(Json(json!({ "cancelled": true, "running": true })));
+    }
+    Err(job_state_error(&state, id, "job is already terminal (succeeded/failed/cancelled)").await)
 }
 
 // ---- Costs ------------------------------------------------------------------
@@ -2199,6 +2295,8 @@ mod api_spec_tests {
         "GET /jobs/{id}",
         "DELETE /jobs/{id}",
         "POST /jobs/{id}/retry",
+        "POST /jobs/retry",
+        "POST /jobs/{id}/reset",
         "GET /jobs/{id}/stream",
         "GET /jobs/{id}/costs",
         "GET /costs",

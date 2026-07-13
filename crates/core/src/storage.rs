@@ -211,56 +211,73 @@ impl Storage {
         row.map(Job::try_from).transpose()
     }
 
-    pub async fn complete(&self, id: Uuid, result: Value) -> Result<()> {
-        sqlx::query(
+    /// Marks a running job succeeded. Guarded on `(status, attempts)`: only the
+    /// worker task that currently owns the running row may complete it, so a
+    /// stale task whose job was reset/reaped and re-claimed (advancing the
+    /// attempt number) can't overwrite the live row. Returns whether the write
+    /// landed (`false` = discarded as stale).
+    pub async fn complete(&self, id: Uuid, attempt: i64, result: Value) -> Result<bool> {
+        let r = sqlx::query(
             "UPDATE jobs SET status = 'succeeded', result = ?2, error = NULL, finished_at = ?3 \
-             WHERE id = ?1",
+             WHERE id = ?1 AND status = 'running' AND attempts = ?4",
         )
         .bind(id.to_string())
         .bind(result.to_string())
         .bind(now())
+        .bind(attempt)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(r.rows_affected() > 0)
     }
 
-    /// Marks failed, or re-queues with exponential backoff while attempts
-    /// remain. Returns the status the job ended up in.
-    pub async fn fail(&self, id: Uuid, error: &str) -> Result<JobStatus> {
-        let job = self
-            .get(id)
-            .await?
-            .ok_or(Error::Storage(sqlx::Error::RowNotFound))?;
+    /// Records a running job's failure, guarded on `(status, attempts)` like
+    /// `complete`. Re-queues with exponential backoff while attempts remain,
+    /// else fails permanently. Returns the resulting status, or `None` when the
+    /// write was discarded as stale (the job had already moved on).
+    pub async fn fail(&self, id: Uuid, attempt: i64, error: &str) -> Result<Option<JobStatus>> {
+        let Some(job) = self.get(id).await? else {
+            return Ok(None);
+        };
+        // Fence: only fail the row this task is still running.
+        if job.status != JobStatus::Running || job.attempts != attempt {
+            return Ok(None);
+        }
         if job.attempts < job.max_attempts {
             let backoff_secs = 10u64
                 .saturating_mul(2u64.saturating_pow(job.attempts.max(0) as u32))
                 .min(3600);
             let available = Utc::now() + chrono::Duration::seconds(backoff_secs as i64);
-            sqlx::query(
-                "UPDATE jobs SET status = 'queued', error = ?2, available_at = ?3 WHERE id = ?1",
+            let r = sqlx::query(
+                "UPDATE jobs SET status = 'queued', error = ?2, available_at = ?3 \
+                 WHERE id = ?1 AND status = 'running' AND attempts = ?4",
             )
             .bind(id.to_string())
             .bind(error)
             .bind(ts(available))
+            .bind(attempt)
             .execute(&self.pool)
             .await?;
-            Ok(JobStatus::Queued)
+            Ok((r.rows_affected() > 0).then_some(JobStatus::Queued))
         } else {
-            self.fail_permanently(id, error).await?;
-            Ok(JobStatus::Failed)
+            let ok = self.fail_permanently(id, attempt, error).await?;
+            Ok(ok.then_some(JobStatus::Failed))
         }
     }
 
-    pub async fn fail_permanently(&self, id: Uuid, error: &str) -> Result<()> {
-        sqlx::query(
-            "UPDATE jobs SET status = 'failed', error = ?2, finished_at = ?3 WHERE id = ?1",
+    /// Marks a running job permanently failed, guarded on `(status, attempts)`.
+    /// Returns whether the write landed (`false` = stale, discarded).
+    pub async fn fail_permanently(&self, id: Uuid, attempt: i64, error: &str) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE jobs SET status = 'failed', error = ?2, finished_at = ?3 \
+             WHERE id = ?1 AND status = 'running' AND attempts = ?4",
         )
         .bind(id.to_string())
         .bind(error)
         .bind(now())
+        .bind(attempt)
         .execute(&self.pool)
         .await?;
-        Ok(())
+        Ok(r.rows_affected() > 0)
     }
 
     /// Cancels a job that has not started yet.
@@ -274,6 +291,72 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         Ok(result.rows_affected() > 0)
+    }
+
+    /// Marks a `running` job cancelled, guarded on `(status, attempts)`. The
+    /// worker calls this when a per-job cancellation token fires for an in-flight
+    /// job (`DELETE /jobs/{id}` on a running job). Returns whether it landed.
+    pub async fn cancel_running(&self, id: Uuid, attempt: i64) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'cancelled', finished_at = ?2 \
+             WHERE id = ?1 AND status = 'running' AND attempts = ?3",
+        )
+        .bind(id.to_string())
+        .bind(now())
+        .bind(attempt)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Re-queues a `running` job (e.g. hung/stuck) with a fresh attempt budget.
+    /// The orphaned worker task's late completion is discarded by the
+    /// `(status, attempts)` fence on `complete`/`fail`: once this row is
+    /// re-claimed its attempt advances past what the stale task holds, so the
+    /// stale write matches no row. Returns the refreshed job, or None when the
+    /// job doesn't exist or isn't running.
+    pub async fn reset(&self, id: Uuid) -> Result<Option<Job>> {
+        let r = sqlx::query(
+            "UPDATE jobs SET status = 'queued', error = NULL, finished_at = NULL, \
+             available_at = ?2, max_attempts = MAX(max_attempts, attempts + 1) \
+             WHERE id = ?1 AND status = 'running'",
+        )
+        .bind(id.to_string())
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        if r.rows_affected() == 0 {
+            return Ok(None);
+        }
+        self.get(id).await
+    }
+
+    /// Bulk re-queue: re-queues up to `cap` jobs in the given terminal state
+    /// (`Failed` | `Cancelled`), optionally scoped to one app, each granted one
+    /// more attempt — the per-job `retry` semantics applied to a filtered batch,
+    /// oldest first. Returns the ids re-queued.
+    pub async fn retry_bulk(
+        &self,
+        status: JobStatus,
+        app: Option<&str>,
+        cap: i64,
+    ) -> Result<Vec<Uuid>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "UPDATE jobs SET status = 'queued', error = NULL, finished_at = NULL, \
+             available_at = ?1, max_attempts = MAX(max_attempts, attempts + 1) \
+             WHERE id IN (SELECT id FROM jobs WHERE status = ?2 AND (?3 IS NULL OR app = ?3) \
+                          ORDER BY created_at LIMIT ?4) \
+             RETURNING id",
+        )
+        .bind(now())
+        .bind(status.as_str())
+        .bind(app)
+        .bind(cap.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|(s,)| Uuid::parse_str(&s).map_err(|e| Error::Parse(format!("job id: {e}"))))
+            .collect()
     }
 
     pub async fn get(&self, id: Uuid) -> Result<Option<Job>> {

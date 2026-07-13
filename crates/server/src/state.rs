@@ -50,6 +50,13 @@ pub struct AppState {
     /// Cancelled on SIGTERM/Ctrl-C to drive graceful shutdown: the worker stops
     /// claiming, in-flight jobs drain, and `axum::serve` stops accepting.
     pub shutdown: CancellationToken,
+    /// Per-job cancellation tokens for jobs the worker is currently running,
+    /// keyed by job id with the attempt number that owns the entry. `DELETE
+    /// /jobs/{id}` on a running job fires its token; the owning worker task
+    /// removes its entry on finish (attempt-matched so an overlapping re-claim's
+    /// token is never clobbered). std Mutex — only quick insert/get/remove, no
+    /// await held.
+    pub job_cancels: Arc<std::sync::Mutex<HashMap<uuid::Uuid, (i64, CancellationToken)>>>,
     /// Short-TTL cache of the fully-rendered `/metrics` body, so a burst of
     /// Prometheus scrapes doesn't re-run the aggregate queries every time.
     pub metrics_cache: Arc<tokio::sync::Mutex<Option<(std::time::Instant, String)>>>,
@@ -153,6 +160,7 @@ impl AppState {
             webhook_client,
             events,
             shutdown: CancellationToken::new(),
+            job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
