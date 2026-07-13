@@ -154,6 +154,9 @@ impl ScrapeApp for CaGrants {
             "unchanged": summary.unchanged,
             "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
             "crossSourceDups": cross_source_dups,
+            // Per-opportunity search docs come from the unified dataset (compact
+            // result, one indexed doc per grant) — see worker `dataset_search_docs`.
+            "index_datasets": [{ "app": grants_common::UNIFIED_APP, "dataset": grants_common::UNIFIED_DATASET }],
         }))
     }
 }

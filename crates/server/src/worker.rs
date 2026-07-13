@@ -224,8 +224,12 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             return;
         }
         Outcome::Finished(Ok(result)) => {
-            // Index the result into full-text search before persisting it.
-            let docs = search_docs(&job.app, job.id, &result);
+            // Index the result into full-text search before persisting it. Apps
+            // whose result stays compact (counts, not arrays) can additionally
+            // name datasets to index per-record via `index_datasets` — see
+            // `dataset_search_docs`.
+            let mut docs = search_docs(&job.app, job.id, &result);
+            docs.extend(dataset_search_docs(&state, &result).await);
             if let Err(e) = state.search.index(docs).await {
                 warn!(job = %job.id, "search index failed: {e}");
             }
@@ -515,6 +519,62 @@ fn search_docs(app: &str, job_id: Uuid, result: &Value) -> Vec<SearchDoc> {
         });
     }
     docs
+}
+
+/// Per-record search docs for datasets the result names in `index_datasets`
+/// (`[{ "app", "dataset" }]`). Lets an app with a large record set keep its job
+/// result compact (counts, not arrays) yet still get one search document per
+/// live record. Doc ids are `<app>:<dataset>:<key>`, so a re-run replaces rather
+/// than duplicates. Removed records are skipped. Failures are logged, not fatal
+/// — search is a derived artifact and must never fail a completed job.
+async fn dataset_search_docs(state: &AppState, result: &Value) -> Vec<SearchDoc> {
+    let Some(specs) = result.get("index_datasets").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut docs = Vec::new();
+    for spec in specs {
+        let (Some(app), Some(dataset)) = (
+            spec.get("app").and_then(Value::as_str),
+            spec.get("dataset").and_then(Value::as_str),
+        ) else {
+            continue;
+        };
+        match state.datasets.list(app, dataset, 100_000).await {
+            Ok(records) => {
+                for rec in records {
+                    if rec.removed_at.is_some() {
+                        continue;
+                    }
+                    docs.push(dataset_doc(app, dataset, &rec.key, &rec.data));
+                }
+            }
+            Err(e) => warn!("index_datasets: failed to load {app}/{dataset}: {e}"),
+        }
+    }
+    docs
+}
+
+/// One search document for a stored dataset record (stable id, app+dataset
+/// preserved for facets). Mirrors `record_doc`'s title/url field picking.
+fn dataset_doc(app: &str, dataset: &str, key: &str, rec: &Value) -> SearchDoc {
+    let url = ["_url", "url"]
+        .iter()
+        .find_map(|k| rec.get(*k).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    let title = ["title", "name", "headline", "full_name"]
+        .iter()
+        .find_map(|k| rec.get(*k).and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+    SearchDoc {
+        id: format!("{app}:{dataset}:{key}"),
+        app: app.to_string(),
+        dataset: dataset.to_string(),
+        url,
+        title,
+        body: rec.to_string(),
+    }
 }
 
 fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {

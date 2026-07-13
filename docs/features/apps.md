@@ -19,7 +19,7 @@ Apps are `ScrapeApp` implementations under `crates/apps/*`, registered in `crate
 
 | App(s) | Datasets produced |
 | --- | --- |
-| `grants-gov` (daily 09:00), `ca-grants` (daily 09:30) | own `opportunities` + **`grants/unified`** (canonical schema via `grants-common`: normalized status/dates/money, keys `<source>:<id>`) + **`grants/duplicate_links`** (cross-source SimHash pairs). grants-gov also emits a `closingSoon` digest (`digestDays`, default 14) |
+| `grants-gov` (daily 09:00), `ca-grants` (daily 09:30) | own `opportunities` + **`grants/unified`** (canonical schema via `grants-common`: normalized status/dates/money, keys `<source>:<id>`) + **`grants/duplicate_links`** (cross-source SimHash pairs). grants-gov also emits a `closingSoon` digest (`digestDays`, default 14). Each run names `grants/unified` in its result `index_datasets`, so every opportunity is an individual full-text search doc (title/agency/status/url) that saved searches can alert on — see [search.md](search.md) |
 | `eu-sedia` | EU SEDIA calls; records enriched with `description_text` (clean plain text beside raw HTML) |
 | `cms-fee-schedule` | CMS fee-schedule release watcher |
 | `mpsv-vpm` (daily) | CZ vacancies → `role_region_agg` (czisco×kraj×org salary cells), `region_agg`, `vacancy_samples`, `freshness`, **`role_trends`** (rising/falling from revision history), **`cz-labour/salary_gap`** (posted vs ISPV official, isco4×sphere), **`employers`** (ARES registry enrichment per IČO, capped 50 lookups/run) |
