@@ -83,6 +83,10 @@ pub struct WorkerConfig {
     pub app_concurrency: HashMap<String, usize>,
     /// How often the scheduler re-checks cron schedules for due firings.
     pub schedule_tick_secs: u64,
+    /// Grace period on graceful shutdown: how long to wait for in-flight jobs to
+    /// finish before re-queuing whatever is still running (mirrors
+    /// `recover_stuck`) and exiting.
+    pub shutdown_drain_secs: u64,
 }
 
 impl Default for WorkerConfig {
@@ -94,6 +98,7 @@ impl Default for WorkerConfig {
             default_app_concurrency: 0,
             app_concurrency: HashMap::new(),
             schedule_tick_secs: 15,
+            shutdown_drain_secs: 25,
         }
     }
 }

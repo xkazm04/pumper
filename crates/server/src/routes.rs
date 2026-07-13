@@ -185,13 +185,38 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
 }
 
 /// SSE stream of all job status transitions.
-async fn stream_events(State(state): State<AppState>) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+///
+/// Every event carries a monotonic id. A client reconnecting with a
+/// `Last-Event-ID` header is replayed the events it missed from the in-memory
+/// ring; if the gap is older than the ring retains, a single `reset` event is
+/// emitted first so the client knows to resync its view. Live subscribers that
+/// fall behind the broadcast buffer recover the same way instead of dropping
+/// events silently.
+async fn stream_events(
+    State(state): State<AppState>,
+    headers: axum::http::HeaderMap,
+) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let after = last_event_id(&headers);
     let mut rx = state.events.subscribe();
+    let (initial, mut last_seq) = resume(&state, after, |_| true);
     let stream = async_stream::stream! {
+        for ev in initial {
+            yield Ok(ev);
+        }
         loop {
             match rx.recv().await {
-                Ok(event) => yield Ok(sse_event(&event)),
-                Err(RecvError::Lagged(_)) => continue,
+                Ok((seq, event)) => {
+                    if seq <= last_seq {
+                        continue; // already replayed (overlap window)
+                    }
+                    last_seq = seq;
+                    yield Ok(sse_event(seq, &event));
+                }
+                Err(RecvError::Lagged(_)) => {
+                    for ev in recover(&state, &mut last_seq, |_| true) {
+                        yield Ok(ev);
+                    }
+                }
                 Err(RecvError::Closed) => break,
             }
         }
@@ -200,34 +225,57 @@ async fn stream_events(State(state): State<AppState>) -> Sse<impl futures::Strea
 }
 
 /// SSE stream scoped to one job; closes once the job reaches a terminal state.
+/// Supports the same `Last-Event-ID` resume as `/events`, filtered to this job.
 async fn stream_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
+    headers: axum::http::HeaderMap,
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
+    let after = last_event_id(&headers);
     // Subscribe before snapshotting so no transition slips through the gap.
     let mut rx = state.events.subscribe();
-    let snapshot = state.storage.get(id).await.ok().flatten();
+    // A fresh connect (no resume point) gets the current state up front; a
+    // resuming client already has it and only wants the gap.
+    let snapshot = if after.is_none() {
+        state.storage.get(id).await.ok().flatten()
+    } else {
+        None
+    };
+    let (replayed, mut last_seq) = resume(&state, after, move |ev| ev.job_id == id);
     let stream = async_stream::stream! {
+        for ev in replayed {
+            yield Ok(ev);
+        }
         if let Some(job) = snapshot {
             let mut event = JobEvent::new(job.id, job.app.clone(), job.status.as_str());
             event.result = job.result.clone();
             event.error = job.error.clone();
-            yield Ok(sse_event(&event));
+            yield Ok(snapshot_event(&event));
             if is_terminal(job.status) {
                 return;
             }
         }
         loop {
             match rx.recv().await {
-                Ok(event) if event.job_id == id => {
+                Ok((seq, event)) => {
+                    if seq <= last_seq {
+                        continue;
+                    }
+                    last_seq = seq;
+                    if event.job_id != id {
+                        continue;
+                    }
                     let done = matches!(event.status.as_str(), "succeeded" | "failed" | "cancelled");
-                    yield Ok(sse_event(&event));
+                    yield Ok(sse_event(seq, &event));
                     if done {
                         break;
                     }
                 }
-                Ok(_) => continue,
-                Err(RecvError::Lagged(_)) => continue,
+                Err(RecvError::Lagged(_)) => {
+                    for ev in recover(&state, &mut last_seq, |ev| ev.job_id == id) {
+                        yield Ok(ev);
+                    }
+                }
                 Err(RecvError::Closed) => break,
             }
         }
@@ -235,11 +283,93 @@ async fn stream_job(
     Sse::new(stream).keep_alive(KeepAlive::default())
 }
 
-fn sse_event(event: &JobEvent) -> Event {
+/// Parses a `Last-Event-ID` header into the sequence id the client last saw.
+fn last_event_id(headers: &axum::http::HeaderMap) -> Option<u64> {
+    headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// Builds the connect-time replay for a resuming client: the buffered events it
+/// missed (filtered by `keep`), preceded by a `reset` marker when the gap is too
+/// old. Returns the events plus the highest sequence id now delivered, which the
+/// live loop uses to dedup the broadcast overlap window.
+fn resume(
+    state: &AppState,
+    after: Option<u64>,
+    keep: impl Fn(&JobEvent) -> bool,
+) -> (Vec<Event>, u64) {
+    let Some(after) = after else {
+        return (Vec::new(), 0);
+    };
+    match state.events.replay(after) {
+        crate::events::Replay::Reset => {
+            let latest = state.events.latest_seq();
+            (vec![reset_event(latest)], latest)
+        }
+        crate::events::Replay::Events(events) => {
+            let mut last = after;
+            let mut out = Vec::new();
+            for (seq, event) in events {
+                last = seq;
+                if keep(&event) {
+                    out.push(sse_event(seq, &event));
+                }
+            }
+            (out, last)
+        }
+    }
+}
+
+/// Recovers a live subscriber that lagged past the broadcast buffer: replays the
+/// ring past `last_seq`, advancing it, or emits a single `reset` when the gap is
+/// unrecoverable.
+fn recover(state: &AppState, last_seq: &mut u64, keep: impl Fn(&JobEvent) -> bool) -> Vec<Event> {
+    match state.events.replay(*last_seq) {
+        crate::events::Replay::Reset => {
+            let latest = state.events.latest_seq();
+            *last_seq = latest;
+            vec![reset_event(latest)]
+        }
+        crate::events::Replay::Events(events) => {
+            let mut out = Vec::new();
+            for (seq, event) in events {
+                *last_seq = seq;
+                if keep(&event) {
+                    out.push(sse_event(seq, &event));
+                }
+            }
+            out
+        }
+    }
+}
+
+fn sse_event(seq: u64, event: &JobEvent) -> Event {
+    Event::default()
+        .id(seq.to_string())
+        .event("job")
+        .json_data(event)
+        .unwrap_or_else(|_| Event::default().comment("serialize error"))
+}
+
+/// Connect-time snapshot of a job's current state (no sequence id — it is a
+/// synthesized view, not a buffered transition).
+fn snapshot_event(event: &JobEvent) -> Event {
     Event::default()
         .event("job")
         .json_data(event)
         .unwrap_or_else(|_| Event::default().comment("serialize error"))
+}
+
+/// Signals a resuming client that its requested id fell out of the replay ring;
+/// it should discard assumptions and resync. Carries the latest id so the client
+/// can advance its `Last-Event-ID` pointer.
+fn reset_event(latest: u64) -> Event {
+    Event::default()
+        .id(latest.to_string())
+        .event("reset")
+        .data("replay gap: reconnect point too old, resync state")
 }
 
 fn is_terminal(status: JobStatus) -> bool {
@@ -411,10 +541,7 @@ async fn retry_job(
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
     match state.storage.retry(id).await? {
         Some(job) => {
-            state
-                .events
-                .send(JobEvent::new(job.id, job.app.clone(), "queued"))
-                .ok();
+            state.events.emit(JobEvent::new(job.id, job.app.clone(), "queued"));
             state.notify.notify_one();
             Ok((StatusCode::ACCEPTED, Json(job)))
         }
@@ -443,10 +570,7 @@ async fn cancel_job(
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
     if state.storage.cancel(id).await? {
-        state
-            .events
-            .send(JobEvent::new(id, "", "cancelled"))
-            .ok();
+        state.events.emit(JobEvent::new(id, "", "cancelled"));
         Ok(Json(json!({ "cancelled": true })))
     } else {
         Err(job_state_error(&state, id, "job is not in 'queued' state (already running or terminal)").await)

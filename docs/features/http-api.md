@@ -17,7 +17,7 @@ Axum server (default port 8088, `[server]` config). **Local power mode: no auth,
 | Triggers | `GET /triggers?app=&limit=&cursor=` · `POST /triggers` · `DELETE /triggers/{id}` · `POST /triggers/{id}/enabled` · `POST /triggers/{id}/test?fire=` · `GET /triggers/{id}/runs` |
 | Search | `GET /search?q=&limit=&app=&dataset=&fuzzy=` · `DELETE /search/docs` · `DELETE /search/datasets/{app}/{ds}` |
 | Saved searches | `GET /searches?limit=&cursor=` · `POST /searches` · `DELETE /searches/{id}` · `POST /searches/{id}/enabled` |
-| Events | `GET /events` (SSE all jobs) |
+| Events | `GET /events` (SSE all jobs; monotonic ids + `Last-Event-ID` resume — see [events-webhooks.md](events-webhooks.md)) |
 | Hosts | `GET /hosts?limit=&cursor=` (learned tier memory + politeness per host) · `GET /hosts/{host}` (404 unknown) · `DELETE /hosts/{host}/memory` (reset strikes+pin+penalty; 404 unknown) |
 | Plugins | `GET /plugins` · `POST /plugins/reload` |
 

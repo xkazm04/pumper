@@ -23,11 +23,17 @@ pub async fn run(state: AppState) {
     info!(concurrency, "job worker started");
 
     loop {
-        let permit = semaphore
-            .clone()
-            .acquire_owned()
-            .await
-            .expect("semaphore closed");
+        // Stop claiming new work the moment shutdown is signalled — jobs already
+        // running keep their permits and are drained below.
+        let permit = tokio::select! {
+            biased;
+            _ = state.shutdown.cancelled() => break,
+            permit = semaphore.clone().acquire_owned() => permit.expect("semaphore closed"),
+        };
+        if state.shutdown.is_cancelled() {
+            drop(permit);
+            break;
+        }
 
         let blocked = blocked_apps(&state, &running).await;
         match state.storage.claim_next(&blocked).await {
@@ -55,6 +61,7 @@ pub async fn run(state: AppState) {
             Ok(None) => {
                 drop(permit);
                 tokio::select! {
+                    _ = state.shutdown.cancelled() => break,
                     _ = state.notify.notified() => {}
                     _ = tokio::time::sleep(poll) => {}
                 }
@@ -62,9 +69,32 @@ pub async fn run(state: AppState) {
             Err(e) => {
                 drop(permit);
                 error!("failed to claim job: {e}");
-                tokio::time::sleep(poll).await;
+                tokio::select! {
+                    _ = state.shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(poll) => {}
+                }
             }
         }
+    }
+
+    drain(&state, &semaphore, concurrency).await;
+}
+
+/// Graceful-shutdown drain: waits up to `shutdown_drain_secs` for in-flight jobs
+/// to finish (each holds a semaphore permit, so reacquiring all of them means the
+/// queue is idle). Jobs still running when the deadline passes are re-queued —
+/// mirroring `recover_stuck` — so a slow job resumes cleanly on the next boot
+/// instead of being stranded in `running`.
+async fn drain(state: &AppState, semaphore: &Arc<Semaphore>, concurrency: usize) {
+    let deadline = Duration::from_secs(state.config.worker.shutdown_drain_secs);
+    info!(deadline_secs = deadline.as_secs(), "worker draining in-flight jobs");
+    let acquire = semaphore.clone().acquire_many_owned(concurrency as u32);
+    match tokio::time::timeout(deadline, acquire).await {
+        Ok(_) => info!("worker drained cleanly; no jobs left running"),
+        Err(_) => match state.storage.recover_stuck().await {
+            Ok(n) => warn!(requeued = n, "drain deadline reached; re-queued still-running jobs"),
+            Err(e) => error!("drain re-queue failed: {e}"),
+        },
     }
 }
 
@@ -318,8 +348,8 @@ async fn finalize(state: &AppState, id: uuid::Uuid) {
 }
 
 fn publish(state: &AppState, event: JobEvent) {
-    // Ignore send errors: no subscribers is fine.
-    let _ = state.events.send(event);
+    // Stamps the event with its sequence id and buffers it for replay.
+    state.events.emit(event);
 }
 
 /// Builds full-text search documents from a job's result: each element of a

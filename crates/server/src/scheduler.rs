@@ -20,11 +20,19 @@ pub async fn run(state: AppState) {
     let tick = Duration::from_secs(state.config.worker.schedule_tick_secs.max(1));
     info!(tick_secs = tick.as_secs(), "scheduler started");
     loop {
+        if state.shutdown.is_cancelled() {
+            break;
+        }
         if let Err(e) = reconcile(&state).await {
             error!("scheduler reconcile failed: {e}");
         }
-        tokio::time::sleep(tick).await;
+        // Stop enqueuing new scheduled work as soon as shutdown is signalled.
+        tokio::select! {
+            _ = state.shutdown.cancelled() => break,
+            _ = tokio::time::sleep(tick) => {}
+        }
     }
+    info!("scheduler stopped");
 }
 
 async fn reconcile(state: &AppState) -> anyhow::Result<()> {

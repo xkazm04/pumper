@@ -11,9 +11,16 @@ use pumper_engine_claude::ClaudeEngine;
 use pumper_engine_http::HttpEngine;
 use pumper_engine_search::TantivyIndex;
 use pumper_engine_wasm::WasmPluginHost;
-use tokio::sync::{broadcast, Notify};
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
-use crate::events::JobEvent;
+use crate::events::EventBus;
+
+/// Capacity of the broadcast channel fanning live events to SSE subscribers.
+const EVENT_BROADCAST_CAPACITY: usize = 512;
+/// How many recent events the replay ring retains for `Last-Event-ID` resume
+/// and broadcast-lag recovery. Older events fall out and trigger a `reset`.
+const EVENT_RING_CAPACITY: usize = 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -37,8 +44,12 @@ pub struct AppState {
     pub notify: Arc<Notify>,
     /// Dedicated client for firing result webhooks.
     pub webhook_client: reqwest::Client,
-    /// Fan-out of job status transitions to SSE subscribers.
-    pub events: broadcast::Sender<JobEvent>,
+    /// Fan-out of job status transitions to SSE subscribers, with a bounded
+    /// replay ring backing `Last-Event-ID` resume.
+    pub events: Arc<EventBus>,
+    /// Cancelled on SIGTERM/Ctrl-C to drive graceful shutdown: the worker stops
+    /// claiming, in-flight jobs drain, and `axum::serve` stops accepting.
+    pub shutdown: CancellationToken,
     /// Short-TTL cache of the fully-rendered `/metrics` body, so a burst of
     /// Prometheus scrapes doesn't re-run the aggregate queries every time.
     pub metrics_cache: Arc<tokio::sync::Mutex<Option<(std::time::Instant, String)>>>,
@@ -123,7 +134,7 @@ impl AppState {
         let webhook_client = reqwest::Client::builder()
             .timeout(Duration::from_secs(15))
             .build()?;
-        let (events, _) = broadcast::channel(512);
+        let events = Arc::new(EventBus::new(EVENT_BROADCAST_CAPACITY, EVENT_RING_CAPACITY));
 
         Ok(Self {
             config: Arc::new(config),
@@ -141,6 +152,7 @@ impl AppState {
             notify: Arc::new(Notify::new()),
             webhook_client,
             events,
+            shutdown: CancellationToken::new(),
             metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
         })
     }
