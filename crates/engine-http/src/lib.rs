@@ -2,7 +2,9 @@
 //! browser-like User-Agent, and retries with exponential backoff. Fronted by
 //! a content-addressed TTL cache and a per-domain politeness governor.
 
+use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -13,34 +15,47 @@ use pumper_core::{
 };
 use tracing::{debug, warn};
 
-const RETRYABLE_STATUS: [u16; 4] = [429, 502, 503, 504];
+/// Base of the exponential retry backoff (attempt 1 waits this, then doubles).
+const RETRY_BASE_MS: u64 = 500;
+/// Retry jitter is up to this fraction of the (post-max) delay, spread with a
+/// deterministic hash — no `rand` dependency (mirrors the governor's approach).
+const RETRY_JITTER_FRAC: f64 = 0.25;
 
 pub struct HttpEngine {
     client: reqwest::Client,
-    retries: u32,
+    cfg: HttpConfig,
     governor: Arc<Governor>,
     cache: Arc<HttpCache>,
 }
 
+/// Builds a reqwest client from the HTTP config.
+fn build_client(cfg: &HttpConfig) -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .user_agent(&cfg.user_agent)
+        .timeout(Duration::from_secs(cfg.timeout_secs))
+        .cookie_store(true)
+        .gzip(true)
+        .brotli(true)
+        .redirect(reqwest::redirect::Policy::limited(cfg.redirect_limit))
+        .build()
+        .map_err(|e| Error::Http(e.to_string()))
+}
+
 impl HttpEngine {
     pub fn new(cfg: &HttpConfig, governor: Arc<Governor>, cache: Arc<HttpCache>) -> Result<Self> {
-        let client = reqwest::Client::builder()
-            .user_agent(&cfg.user_agent)
-            .timeout(Duration::from_secs(cfg.timeout_secs))
-            .cookie_store(true)
-            .gzip(true)
-            .brotli(true)
-            .redirect(reqwest::redirect::Policy::limited(10))
-            .build()
-            .map_err(|e| Error::Http(e.to_string()))?;
-        Ok(Self { client, retries: cfg.retries, governor, cache })
+        let client = build_client(cfg)?;
+        Ok(Self { client, cfg: cfg.clone(), governor, cache })
     }
 
-    fn build(&self, req: &HttpRequest) -> reqwest::RequestBuilder {
+    fn build(&self, client: &reqwest::Client, req: &HttpRequest) -> reqwest::RequestBuilder {
         let mut builder = match req.method {
-            HttpMethod::Get => self.client.get(&req.url),
-            HttpMethod::Post => self.client.post(&req.url),
+            HttpMethod::Get => client.get(&req.url),
+            HttpMethod::Post => client.post(&req.url),
         };
+        if let Some(secs) = req.timeout_secs {
+            // Per-attempt override of the client-global timeout.
+            builder = builder.timeout(Duration::from_secs(secs));
+        }
         for (key, value) in &req.headers {
             builder = builder.header(key, value);
         }
@@ -68,19 +83,26 @@ impl HttpEngine {
         let host = reqwest::Url::parse(&req.url)
             .ok()
             .and_then(|u| u.host_str().map(str::to_owned));
+        let client = self.client.clone();
+        let retries = self.cfg.retries;
+        let cap = req.max_body_bytes.unwrap_or(self.cfg.max_body_bytes);
 
         let mut last_error = String::new();
-        for attempt in 0..=self.retries {
+        // Retry-After from the previous retryable response, so the next sleep can
+        // honor the server's requested delay instead of a blind doubling.
+        let mut last_retry_after: Option<Duration> = None;
+        for attempt in 0..=retries {
             if attempt > 0 {
-                let backoff = Duration::from_millis(500 * 2u64.pow(attempt - 1));
-                debug!(url = %req.url, attempt, "retrying in {backoff:?} ({last_error})");
-                tokio::time::sleep(backoff).await;
+                let seed = jitter_seed(&req.url, attempt);
+                let delay = retry_delay(attempt, last_retry_after, RETRY_BASE_MS, seed);
+                debug!(url = %req.url, attempt, "retrying in {delay:?} ({last_error})");
+                tokio::time::sleep(delay).await;
             }
             // Politeness spacing is applied per attempt so retries also wait.
             if let Some(host) = &host {
                 self.governor.acquire(host).await;
             }
-            match self.build(req).send().await {
+            match self.build(&client, req).send().await {
                 Ok(response) => {
                     let status = response.status().as_u16();
                     // Adaptive politeness: rate-limit/overload responses teach
@@ -88,16 +110,18 @@ impl HttpEngine {
                     // healthy (2xx) response decays a learned penalty. A 4xx
                     // (e.g. 404/403) is NOT health — it must not reward the host
                     // with faster spacing — and other 5xx are left neutral.
+                    let ra = retry_after(&response);
                     if let Some(host) = &host {
                         if matches!(status, 429 | 503) {
-                            self.governor.penalize(host, retry_after(&response)).await;
+                            self.governor.penalize(host, ra).await;
                         } else if (200..300).contains(&status) {
                             self.governor.reward(host).await;
                         }
                     }
-                    if RETRYABLE_STATUS.contains(&status) && attempt < self.retries {
+                    if self.cfg.retryable_statuses.contains(&status) && attempt < retries {
                         warn!(url = %req.url, status, "retryable status");
                         last_error = format!("status {status}");
+                        last_retry_after = ra;
                         continue;
                     }
                     let final_url = response.url().to_string();
@@ -110,7 +134,9 @@ impl HttpEngine {
                         .collect::<HashMap<_, _>>();
                     // Non-2xx bodies are returned, not raised — scrapers often
                     // want to inspect 404/403 pages; apps decide via is_success().
-                    let body = response.text().await.map_err(|e| Error::Http(e.to_string()))?;
+                    // Streamed with a hard size cap so one huge/hostile body can't
+                    // balloon memory (over-limit => a typed error naming cap + URL).
+                    let body = read_body_capped(response, cap, &req.url).await?;
                     return Ok(HttpResponse { status, headers, body, final_url, cache_hit: false });
                 }
                 Err(e) => {
@@ -122,9 +148,59 @@ impl HttpEngine {
         Err(Error::Http(format!(
             "{} failed after {} attempts: {last_error}",
             req.url,
-            self.retries + 1
+            retries + 1
         )))
     }
+}
+
+/// Reads a response body in streamed chunks, aborting the instant the cumulative
+/// size would exceed `cap`. Returns a typed error naming the cap and URL on
+/// overflow. Decoded lossily as UTF-8 (matches the prior `.text()` fallback for
+/// non-UTF-8 bytes; charset-from-header detection is not performed).
+async fn read_body_capped(mut response: reqwest::Response, cap: u64, url: &str) -> Result<String> {
+    let mut buf: Vec<u8> = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| Error::Http(e.to_string()))? {
+        if would_exceed_cap(buf.len() as u64, chunk.len() as u64, cap) {
+            return Err(Error::Http(format!(
+                "response body from {url} exceeds max_body_bytes cap of {cap} bytes"
+            )));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// Whether appending `chunk_len` bytes to a `current_len`-byte buffer would
+/// exceed `cap`. Split out for unit testing the streaming cap decision without a
+/// live server (the cap check `read_body_capped` performs per chunk).
+fn would_exceed_cap(current_len: u64, chunk_len: u64, cap: u64) -> bool {
+    current_len + chunk_len > cap
+}
+
+/// Deterministic per-retry jitter seed from the URL and attempt number — same
+/// URL+attempt always jitters identically (reproducible), distinct URLs spread.
+fn jitter_seed(url: &str, attempt: u32) -> u64 {
+    let mut h = DefaultHasher::new();
+    url.hash(&mut h);
+    attempt.hash(&mut h);
+    h.finish()
+}
+
+/// Retry sleep policy (pure, deterministic for testing): the larger of the
+/// exponential backoff (`base_ms * 2^(attempt-1)`) and any server `Retry-After`,
+/// plus hash-based jitter up to `RETRY_JITTER_FRAC` of that floor. `attempt` is
+/// 1-based (the first retry). No `rand` dependency — jitter is derived from
+/// `seed` exactly like the governor.
+fn retry_delay(attempt: u32, retry_after: Option<Duration>, base_ms: u64, seed: u64) -> Duration {
+    let exp = attempt.saturating_sub(1).min(20); // cap the shift; 2^20 ms ≈ 17min
+    let backoff = Duration::from_millis(base_ms.saturating_mul(2u64.saturating_pow(exp)));
+    let floor = backoff.max(retry_after.unwrap_or(Duration::ZERO));
+    // Deterministic LCG scramble of the seed -> fraction in [0,1).
+    let scrambled = seed
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1442695040888963407);
+    let frac = (scrambled >> 33) as f64 / (1u64 << 31) as f64;
+    floor + floor.mul_f64(RETRY_JITTER_FRAC * frac.min(1.0))
 }
 
 /// Parses a `Retry-After` header. Both RFC 7231 forms are honored: delta
@@ -245,5 +321,58 @@ mod tests {
     fn retry_after_malformed_is_none() {
         let now = chrono::Utc::now();
         assert_eq!(retry_after_value("not-a-date", now), None);
+    }
+
+    #[test]
+    fn body_cap_decision() {
+        // Under cap: fits.
+        assert!(!would_exceed_cap(0, 100, 100));
+        assert!(!would_exceed_cap(50, 50, 100));
+        // Exactly at cap is allowed; one over trips.
+        assert!(would_exceed_cap(50, 51, 100));
+        assert!(would_exceed_cap(100, 1, 100));
+        // A single oversized first chunk trips immediately.
+        assert!(would_exceed_cap(0, 101, 100));
+    }
+
+    #[test]
+    fn retry_delay_backoff_doubles_per_attempt() {
+        // Zero jitter (seed chosen so frac≈0 is not guaranteed) — instead assert
+        // the delay is within [floor, floor*1.25]. floor = base * 2^(attempt-1).
+        let base = 500;
+        for (attempt, floor_ms) in [(1u32, 500u64), (2, 1000), (3, 2000), (4, 4000)] {
+            let d = retry_delay(attempt, None, base, jitter_seed("https://x/", attempt));
+            let floor = Duration::from_millis(floor_ms);
+            assert!(d >= floor, "attempt {attempt}: {d:?} < floor {floor:?}");
+            assert!(
+                d <= floor.mul_f64(1.0 + RETRY_JITTER_FRAC),
+                "attempt {attempt}: {d:?} exceeds floor+jitter"
+            );
+        }
+    }
+
+    #[test]
+    fn retry_delay_honors_retry_after_over_backoff() {
+        // Attempt 1 backoff floor is 500ms; a 5s Retry-After must win.
+        let d = retry_delay(1, Some(Duration::from_secs(5)), 500, 12345);
+        assert!(d >= Duration::from_secs(5), "Retry-After should dominate: {d:?}");
+        assert!(d <= Duration::from_millis(5000).mul_f64(1.0 + RETRY_JITTER_FRAC));
+        // When backoff exceeds a tiny Retry-After, backoff wins.
+        let d2 = retry_delay(4, Some(Duration::from_millis(10)), 500, 12345);
+        assert!(d2 >= Duration::from_millis(4000));
+    }
+
+    #[test]
+    fn retry_delay_is_deterministic_for_same_inputs() {
+        let a = retry_delay(2, None, 500, 999);
+        let b = retry_delay(2, None, 500, 999);
+        assert_eq!(a, b, "same seed/inputs must yield identical delay");
+    }
+
+    #[test]
+    fn jitter_seed_varies_by_url_and_attempt() {
+        assert_ne!(jitter_seed("https://a/", 1), jitter_seed("https://b/", 1));
+        assert_ne!(jitter_seed("https://a/", 1), jitter_seed("https://a/", 2));
+        assert_eq!(jitter_seed("https://a/", 1), jitter_seed("https://a/", 1));
     }
 }

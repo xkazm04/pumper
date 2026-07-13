@@ -167,7 +167,25 @@ pub struct HttpConfig {
     pub user_agent: String,
     pub timeout_secs: u64,
     pub retries: u32,
+    /// Hard cap on a single response body (bytes). The engine streams the body in
+    /// chunks and aborts with a typed error the moment the cumulative size would
+    /// exceed this, so one huge/hostile URL can't balloon memory. Per-request
+    /// `HttpRequest.max_body_bytes` overrides it. Default 16 MiB — comfortably
+    /// above the largest real HTML/JSON pages we fetch (SEDIA clean-text and
+    /// census blobs land in the low single-digit MiB), while still bounding a
+    /// multi-GB response.
+    pub max_body_bytes: u64,
+    /// Max redirects a single request will follow before erroring. Was a
+    /// hardcoded 10; now tunable for hosts with deep redirect chains.
+    pub redirect_limit: usize,
+    /// HTTP status codes that trigger a retry (with backoff). Was hardcoded
+    /// `[429, 502, 503, 504]`; overridable so operators can add/remove codes
+    /// (e.g. drop 502 for a flaky-but-not-retryable upstream).
+    pub retryable_statuses: Vec<u16>,
 }
+
+/// Default response-body cap: 16 MiB. See `HttpConfig::max_body_bytes`.
+pub const DEFAULT_MAX_BODY_BYTES: u64 = 16 * 1024 * 1024;
 
 impl Default for HttpConfig {
     fn default() -> Self {
@@ -177,6 +195,9 @@ impl Default for HttpConfig {
                 .into(),
             timeout_secs: 30,
             retries: 3,
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            redirect_limit: 10,
+            retryable_statuses: vec![429, 502, 503, 504],
         }
     }
 }
@@ -406,5 +427,35 @@ pub struct SearchConfig {
 impl Default for SearchConfig {
     fn default() -> Self {
         Self { enabled: true, dir: "data/search-index".into() }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_defaults_match_prior_hardcoded_values() {
+        let h = HttpConfig::default();
+        assert_eq!(h.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
+        assert_eq!(h.max_body_bytes, 16 * 1024 * 1024);
+        assert_eq!(h.redirect_limit, 10);
+        assert_eq!(h.retryable_statuses, vec![429, 502, 503, 504]);
+    }
+
+    #[test]
+    fn http_caps_parse_from_toml() {
+        let cfg: Config = toml::from_str(
+            r#"
+            [http]
+            max_body_bytes = 1048576
+            redirect_limit = 3
+            retryable_statuses = [429, 503]
+            "#,
+        )
+        .unwrap();
+        assert_eq!(cfg.http.max_body_bytes, 1_048_576);
+        assert_eq!(cfg.http.redirect_limit, 3);
+        assert_eq!(cfg.http.retryable_statuses, vec![429, 503]);
     }
 }

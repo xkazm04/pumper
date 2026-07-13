@@ -270,6 +270,8 @@ fn search2_request(body: String) -> HttpRequest {
         ttl_override: None,
         etag: None,
         if_modified_since: None,
+        max_body_bytes: None,
+        timeout_secs: None,
     }
 }
 

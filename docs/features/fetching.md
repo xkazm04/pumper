@@ -29,7 +29,14 @@ Optional fields (`http_status`, `content_chars`, `cache_hit`, `cost_usd`, `detai
 
 ## Engines
 
-- **http** (`engine-http`): reqwest + cookie jar, retries w/ backoff (`RETRYABLE_STATUS` 429/502/503/504), fronted by the content-addressed TTL `http_cache` (GET-only; `HttpRequest.no_cache` bypasses) and the governor. **Conditional GET:** `HttpRequest.etag` / `HttpRequest.if_modified_since` (serde-defaulted) are sent as `If-None-Match` / `If-Modified-Since` (explicit `headers` still win); a `304 Not Modified` is passed through with its status intact and is **never** written to the cache over the prior full response (powers the crawler's revisit mode — [crawling.md](crawling.md)).
+- **http** (`engine-http`): reqwest + cookie jar, retries w/ backoff, fronted by the content-addressed TTL `http_cache` (GET-only; `HttpRequest.no_cache` bypasses) and the governor. **Conditional GET:** `HttpRequest.etag` / `HttpRequest.if_modified_since` (serde-defaulted) are sent as `If-None-Match` / `If-Modified-Since` (explicit `headers` still win); a `304 Not Modified` is passed through with its status intact and is **never** written to the cache over the prior full response (powers the crawler's revisit mode — [crawling.md](crawling.md)).
+
+#### HTTP request controls (body cap, timeout, retry policy)
+
+- **Body size cap.** The response body is read in streamed chunks and aborted the instant the cumulative size would exceed the cap — one huge/hostile URL can't balloon memory. Over-limit yields a typed `Error::Http` naming the cap and URL. Cap = `HttpRequest.max_body_bytes` (per-request `Option<u64>`) else `[http] max_body_bytes` (default **16 MiB** — comfortably above the largest real pages we fetch, e.g. SEDIA clean-text / census blobs in the low single-digit MiB). Bodies are decoded lossily as UTF-8 (charset-from-header detection is not performed).
+- **Per-request timeout.** `HttpRequest.timeout_secs` (`Option<u64>`) overrides the client-global `[http] timeout_secs` for that request, applied per attempt.
+- **Retry policy.** Retryable statuses are configurable via `[http] retryable_statuses` (default `[429, 502, 503, 504]`); the redirect-follow limit is `[http] redirect_limit` (default 10). The retry sleep is `max(exponential backoff, server Retry-After) + jitter`: backoff is `500ms · 2^(attempt-1)`, a `Retry-After` (both delta-seconds and HTTP-date forms) on the prior response raises the floor, and up to 25% deterministic hash-based jitter (seeded from URL+attempt, no `rand` dep) de-syncs retry bursts. The governor still learns from `Retry-After` on 429/503 as before.
+
 - **browser** (`engine-browser`): headless Chrome render (chromiumoxide/CDP), `wait_for_selector`. One shared Chrome instance behind a relaunchable holder — details below.
 
 #### Browser engine: resilience, concurrency & cheap renders

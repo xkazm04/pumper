@@ -48,6 +48,17 @@ pub struct HttpRequest {
     /// as `etag`.
     #[serde(default)]
     pub if_modified_since: Option<String>,
+    /// Per-request response body cap (bytes). Overrides `[http] max_body_bytes`.
+    /// A response whose streamed body exceeds this is rejected with a typed error
+    /// naming the cap and URL (guards against unbounded/hostile bodies). `None`
+    /// uses the configured default.
+    #[serde(default)]
+    pub max_body_bytes: Option<u64>,
+    /// Per-request timeout (seconds) applied to each attempt. Overrides the
+    /// client-global `[http] timeout_secs` for this request only. `None` uses the
+    /// global timeout.
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
 }
 
 impl HttpRequest {
@@ -61,6 +72,8 @@ impl HttpRequest {
             ttl_override: None,
             etag: None,
             if_modified_since: None,
+            max_body_bytes: None,
+            timeout_secs: None,
         }
     }
 }

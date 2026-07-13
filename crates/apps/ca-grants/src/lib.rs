@@ -208,5 +208,7 @@ fn post_json(url: &str, body: String) -> HttpRequest {
         ttl_override: None,
         etag: None,
         if_modified_since: None,
+        max_body_bytes: None,
+        timeout_secs: None,
     }
 }
