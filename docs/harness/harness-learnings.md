@@ -23,7 +23,7 @@
 ## Open follow-ups (from Waves 1–2, 2026-07-10)
 - `FetchRequest.no_cache` flag for monitors (watch app currently sees TTL-cached bodies).
 - Line-level text diff for watch-app excerpts.
-- Migrate remaining apps to metered `ctx.fetch`/`ctx.research` (agentic apps first: state-tax, trade-wages, valuation-multiples, homewyse — they spend Claude money unmetered).
+- ~~Migrate remaining apps to metered `ctx.fetch`/`ctx.research` (agentic apps first: state-tax, trade-wages, valuation-multiples, homewyse — they spend Claude money unmetered).~~ **Done 2026-07-13** — all four trades apps now call `ctx.research` (cost-attributed, budget-governed, research-cached). Remaining unmetered `ctx.fetch` callers only.
 - `research_cache` purge job (mirror `HttpCache::purge_expired`).
 - Vibeman-side bug observed during scans: `/api/ideas/claude` sometimes returns a different group's prompt than the requested `groupId` (agents self-corrected via `/api/contexts?groupId=`); also idea `category` rejects values outside functionality/performance/maintenance/ui/code_quality/user_benefit.
 - Remaining INDEX themes: T9 domain products, T10 platform (T4 search fundamentals closed in wave 5; deferred T4 tail: answer-engine RAG, hybrid semantic [3 dup ideas], multilingual, LTR, autocomplete. T7 deferred: API-key auth [product decision], OpenAPI, SSE Last-Event-ID, misfire, hot-reload. T5 LLM-assisted extraction items remain).

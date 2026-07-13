@@ -92,7 +92,9 @@ impl ScrapeApp for HomewysePricing {
         // that failed ~1/3 of runs (e.g. a dropped key, `"low":150,"300,"high":500`). The
         // salvage_json fallback below still catches anything the schema path misses.
         request.json_schema = Some(pricing_schema());
-        let output = ctx.engines.claude.research(request).await?;
+        // Metered seam: records a cost event against the job, honors budget_usd,
+        // and serves identical re-runs from the research cache (see core/app.rs).
+        let output = ctx.research(request).await?;
 
         let artifact = match &output.json {
             Some(j) => serde_json::to_vec_pretty(j)?,

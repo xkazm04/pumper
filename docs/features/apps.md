@@ -25,7 +25,7 @@ Apps are `ScrapeApp` implementations under `crates/apps/*`, registered in `crate
 | `mpsv-vpm` (daily) | CZ vacancies → `role_region_agg` (czisco×kraj×org salary cells), `region_agg`, `vacancy_samples`, `freshness`, **`role_trends`** (rising/falling from revision history), **`cz-labour/salary_gap`** (posted vs ISPV official, isco4×sphere), **`employers`** (ARES registry enrichment per IČO, capped 50 lookups/run) |
 | `mpsv-ispv` | Official CZ salary statistics (quarterly `wages`) |
 | `census-density`, `census-nonemp` | CBP employer + NES solo aggregates → **`census/market_blend`** (naics4×state: total market, solo_share, coverage; both apps re-derive) |
-| `homewyse-pricing`, `state-tax`, `trade-wages`, `valuation-multiples` | Agentic (Claude-engine) US trades reference datasets |
+| `homewyse-pricing`, `state-tax`, `trade-wages`, `valuation-multiples` | Agentic (Claude-engine) US trades reference datasets. All four call the metered `ctx.research` seam: each run records a `claude` cost event, is refused/clamped against the job's `budget_usd`, and serves an identical re-run from the research cache at zero cost. Cache escape hatch: config `[claude].research_cache_ttl_secs = 0` disables it (default 86400s / 24h); `resume_session` requests also bypass it |
 
 ## Conventions for new apps
 

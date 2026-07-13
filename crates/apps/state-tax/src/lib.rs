@@ -85,7 +85,9 @@ impl ScrapeApp for StateTax {
         request.max_turns = max_turns;
         request.model = ctx.params.get("model").and_then(Value::as_str).map(String::from);
         request.effort = ctx.params.get("effort").and_then(Value::as_str).map(String::from);
-        let output = ctx.engines.claude.research(request).await?;
+        // Metered seam: records a cost event against the job, honors budget_usd,
+        // and serves identical re-runs from the research cache (see core/app.rs).
+        let output = ctx.research(request).await?;
 
         let artifact = match &output.json {
             Some(j) => serde_json::to_vec_pretty(j)?,
