@@ -3,9 +3,9 @@
 //! a content-addressed TTL cache and a per-domain politeness governor.
 
 use std::collections::hash_map::DefaultHasher;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -20,31 +20,109 @@ const RETRY_BASE_MS: u64 = 500;
 /// Retry jitter is up to this fraction of the (post-max) delay, spread with a
 /// deterministic hash — no `rand` dependency (mirrors the governor's approach).
 const RETRY_JITTER_FRAC: f64 = 0.25;
+/// Max distinct per-request-proxy clients cached. reqwest binds a proxy at
+/// client-build time, so a per-request proxy override needs its own client; we
+/// pool them (LRU, this cap) rather than rebuild per request. Cost: each pooled
+/// client has its **own** cookie jar (proxied requests don't share cookies with
+/// the default client), and up to this many idle keep-alive pools may linger.
+const MAX_PROXY_CLIENTS: usize = 8;
+
+/// Small LRU pool of proxy-bound clients keyed by proxy URL. Guarded by a
+/// std `Mutex`: the critical section (lookup / build / insert) is fully sync —
+/// building a reqwest client does not await — so no async lock is needed.
+struct ProxyPool {
+    clients: HashMap<String, reqwest::Client>,
+    /// Front = least-recently-used, back = most-recent. Bounded by MAX_PROXY_CLIENTS.
+    order: VecDeque<String>,
+}
+
+impl ProxyPool {
+    fn new() -> Self {
+        Self { clients: HashMap::new(), order: VecDeque::new() }
+    }
+
+    /// LRU lookup: returns a cached client for `key`, touching it as most-recent.
+    fn get(&mut self, key: &str) -> Option<reqwest::Client> {
+        let client = self.clients.get(key).cloned()?;
+        self.order.retain(|k| k != key);
+        self.order.push_back(key.to_string());
+        Some(client)
+    }
+
+    /// Insert a freshly built client as most-recent, evicting the least-recently
+    /// used entries until the pool is within `cap`.
+    fn insert(&mut self, key: &str, client: reqwest::Client, cap: usize) {
+        self.clients.insert(key.to_string(), client);
+        self.order.retain(|k| k != key);
+        self.order.push_back(key.to_string());
+        while self.order.len() > cap {
+            if let Some(evict) = self.order.pop_front() {
+                self.clients.remove(&evict);
+            }
+        }
+    }
+}
 
 pub struct HttpEngine {
+    /// Client for requests with no per-request proxy override (carries
+    /// `[http] proxy` when configured).
     client: reqwest::Client,
+    /// Kept to rebuild proxy-bound clients on demand.
     cfg: HttpConfig,
     governor: Arc<Governor>,
     cache: Arc<HttpCache>,
+    proxy_pool: Mutex<ProxyPool>,
 }
 
-/// Builds a reqwest client from the HTTP config.
-fn build_client(cfg: &HttpConfig) -> Result<reqwest::Client> {
-    reqwest::Client::builder()
+/// Builds a reqwest client mirroring the base settings, optionally proxied.
+fn build_client(cfg: &HttpConfig, proxy: Option<&str>) -> Result<reqwest::Client> {
+    let mut builder = reqwest::Client::builder()
         .user_agent(&cfg.user_agent)
         .timeout(Duration::from_secs(cfg.timeout_secs))
         .cookie_store(true)
         .gzip(true)
         .brotli(true)
-        .redirect(reqwest::redirect::Policy::limited(cfg.redirect_limit))
-        .build()
-        .map_err(|e| Error::Http(e.to_string()))
+        .redirect(reqwest::redirect::Policy::limited(cfg.redirect_limit));
+    if let Some(url) = proxy {
+        // `Proxy::all` covers http/https/socks5 and honors `user:pass@` auth in
+        // the URL. socks5 support comes from reqwest's `socks` feature.
+        let p = reqwest::Proxy::all(url)
+            .map_err(|e| Error::Http(format!("invalid proxy '{url}': {e}")))?;
+        builder = builder.proxy(p);
+    }
+    builder.build().map_err(|e| Error::Http(e.to_string()))
 }
 
 impl HttpEngine {
     pub fn new(cfg: &HttpConfig, governor: Arc<Governor>, cache: Arc<HttpCache>) -> Result<Self> {
-        let client = build_client(cfg)?;
-        Ok(Self { client, cfg: cfg.clone(), governor, cache })
+        let client = build_client(cfg, cfg.proxy.as_deref())?;
+        Ok(Self {
+            client,
+            cfg: cfg.clone(),
+            governor,
+            cache,
+            proxy_pool: Mutex::new(ProxyPool::new()),
+        })
+    }
+
+    /// Selects the client for a request: the base client unless the request
+    /// carries a `proxy` override, in which case a pooled proxy-bound client.
+    fn client_for(&self, req: &HttpRequest) -> Result<reqwest::Client> {
+        let Some(proxy) = req.proxy.as_deref() else {
+            return Ok(self.client.clone());
+        };
+        // If the override equals the configured proxy, the base client already
+        // carries it — reuse it (and its cookie jar) rather than pooling a dup.
+        if self.cfg.proxy.as_deref() == Some(proxy) {
+            return Ok(self.client.clone());
+        }
+        let mut pool = self.proxy_pool.lock().expect("proxy pool mutex poisoned");
+        if let Some(existing) = pool.get(proxy) {
+            return Ok(existing);
+        }
+        let client = build_client(&self.cfg, Some(proxy))?;
+        pool.insert(proxy, client.clone(), MAX_PROXY_CLIENTS);
+        Ok(client)
     }
 
     fn build(&self, client: &reqwest::Client, req: &HttpRequest) -> reqwest::RequestBuilder {
@@ -83,7 +161,7 @@ impl HttpEngine {
         let host = reqwest::Url::parse(&req.url)
             .ok()
             .and_then(|u| u.host_str().map(str::to_owned));
-        let client = self.client.clone();
+        let client = self.client_for(req)?;
         let retries = self.cfg.retries;
         let cap = req.max_body_bytes.unwrap_or(self.cfg.max_body_bytes);
 
@@ -374,5 +452,42 @@ mod tests {
         assert_ne!(jitter_seed("https://a/", 1), jitter_seed("https://b/", 1));
         assert_ne!(jitter_seed("https://a/", 1), jitter_seed("https://a/", 2));
         assert_eq!(jitter_seed("https://a/", 1), jitter_seed("https://a/", 1));
+    }
+
+    #[test]
+    fn proxy_client_reused_when_matching_configured_proxy() {
+        // A per-request proxy equal to the configured [http] proxy reuses the
+        // base client rather than pooling a duplicate (no live network needed —
+        // build_client just constructs a client).
+        let mut cfg = HttpConfig::default();
+        cfg.proxy = Some("http://gw:8080".into());
+        // build_client must accept a valid proxy URL.
+        assert!(build_client(&cfg, cfg.proxy.as_deref()).is_ok());
+    }
+
+    #[test]
+    fn build_client_rejects_invalid_proxy() {
+        let cfg = HttpConfig::default();
+        // A syntactically invalid proxy URL surfaces a typed Http error.
+        let err = build_client(&cfg, Some("::not a url::")).unwrap_err();
+        assert!(matches!(err, Error::Http(_)));
+    }
+
+    #[test]
+    fn proxy_pool_is_lru_bounded() {
+        // Dummy clients (no network) exercise the pool's LRU + eviction directly.
+        let mut pool = ProxyPool::new();
+        for i in 0..MAX_PROXY_CLIENTS {
+            pool.insert(&format!("p{i}"), reqwest::Client::new(), MAX_PROXY_CLIENTS);
+        }
+        assert_eq!(pool.clients.len(), MAX_PROXY_CLIENTS);
+        // Touch p0 so it's most-recent; p1 becomes the LRU victim.
+        assert!(pool.get("p0").is_some());
+        // Insert one over cap -> evicts the least-recently-used (p1), keeps p0.
+        pool.insert("pN", reqwest::Client::new(), MAX_PROXY_CLIENTS);
+        assert_eq!(pool.clients.len(), MAX_PROXY_CLIENTS);
+        assert!(pool.get("p0").is_some(), "recently-touched entry retained");
+        assert!(pool.clients.get("p1").is_none(), "LRU entry evicted");
+        assert!(pool.get("pN").is_some(), "newest entry present");
     }
 }

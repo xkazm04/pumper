@@ -96,6 +96,13 @@ impl BrowserEngine {
             .arg("--disable-dev-shm-usage")
             // Bound V8 heap so one heavy page can't OOM the shared instance.
             .arg(format!("--js-flags=--max-old-space-size={JS_HEAP_CAP_MB}"));
+        if let Some(proxy) = &self.cfg.proxy {
+            // Route the browser through the configured proxy. Falls back to
+            // `[http] proxy` at config load. Chrome's --proxy-server takes no
+            // in-URL auth (an authenticated proxy would prompt), so auth is
+            // unsupported on the browser tier.
+            builder = builder.arg(format!("--proxy-server={proxy}"));
+        }
         if self.cfg.block_resources {
             // Enable the Fetch domain so per-page drainers can drop subresources.
             // (This also auto-disables Chrome's HTTP cache; cookies are separate

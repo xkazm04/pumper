@@ -61,10 +61,22 @@ impl Config {
         );
         if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
-            toml::from_str(&raw).map_err(|e| Error::Config(format!("{}: {e}", path.display())))
+            let mut cfg: Config =
+                toml::from_str(&raw).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+            cfg.normalize();
+            Ok(cfg)
         } else {
             tracing::warn!("config file {} not found, using defaults", path.display());
             Ok(Config::default())
+        }
+    }
+
+    /// Cross-section fixups applied after parsing. Currently: the browser proxy
+    /// falls back to `[http] proxy` when unset, so a single `[http] proxy` knob
+    /// routes both the HTTP and browser tiers.
+    fn normalize(&mut self) {
+        if self.browser.proxy.is_none() {
+            self.browser.proxy = self.http.proxy.clone();
         }
     }
 }
@@ -182,6 +194,11 @@ pub struct HttpConfig {
     /// `[429, 502, 503, 504]`; overridable so operators can add/remove codes
     /// (e.g. drop 502 for a flaky-but-not-retryable upstream).
     pub retryable_statuses: Vec<u16>,
+    /// Outbound proxy for all HTTP requests: an `http`/`https`/`socks5` URL with
+    /// optional `user:pass@` auth (e.g. `http://user:pass@proxy:8080`,
+    /// `socks5://127.0.0.1:1080`). Applied at client-build time. Per-request
+    /// `HttpRequest.proxy` overrides it via a small client pool. `None` = direct.
+    pub proxy: Option<String>,
 }
 
 /// Default response-body cap: 16 MiB. See `HttpConfig::max_body_bytes`.
@@ -198,6 +215,7 @@ impl Default for HttpConfig {
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             redirect_limit: 10,
             retryable_statuses: vec![429, 502, 503, 504],
+            proxy: None,
         }
     }
 }
@@ -227,6 +245,13 @@ pub struct BrowserConfig {
     /// accumulated memory/leaked tabs. `0` disables periodic recycling (Chrome
     /// still relaunches on crash).
     pub recycle_after_renders: u64,
+    /// Proxy for the headless browser, passed as Chrome's `--proxy-server` launch
+    /// arg (`http`/`https`/`socks5` URL). When unset it falls back to
+    /// `[http] proxy` at config load, so one knob usually serves both engines.
+    /// Note: Chrome's `--proxy-server` does not accept `user:pass@` auth in the
+    /// URL — an authenticated proxy prompts interactively, so browser-tier proxy
+    /// auth is unsupported (a known gap).
+    pub proxy: Option<String>,
 }
 
 impl Default for BrowserConfig {
@@ -240,6 +265,7 @@ impl Default for BrowserConfig {
             max_concurrent_renders: 4,
             block_resources: true,
             recycle_after_renders: 200,
+            proxy: None,
         }
     }
 }
@@ -441,21 +467,50 @@ mod tests {
         assert_eq!(h.max_body_bytes, 16 * 1024 * 1024);
         assert_eq!(h.redirect_limit, 10);
         assert_eq!(h.retryable_statuses, vec![429, 502, 503, 504]);
+        assert!(h.proxy.is_none());
     }
 
     #[test]
-    fn http_caps_parse_from_toml() {
+    fn http_proxy_and_caps_parse_from_toml() {
         let cfg: Config = toml::from_str(
             r#"
             [http]
+            proxy = "socks5://127.0.0.1:1080"
             max_body_bytes = 1048576
             redirect_limit = 3
             retryable_statuses = [429, 503]
             "#,
         )
         .unwrap();
+        assert_eq!(cfg.http.proxy.as_deref(), Some("socks5://127.0.0.1:1080"));
         assert_eq!(cfg.http.max_body_bytes, 1_048_576);
         assert_eq!(cfg.http.redirect_limit, 3);
         assert_eq!(cfg.http.retryable_statuses, vec![429, 503]);
+    }
+
+    #[test]
+    fn browser_proxy_falls_back_to_http_proxy_on_normalize() {
+        // Unset browser proxy inherits [http] proxy.
+        let mut cfg: Config = toml::from_str(r#"
+            [http]
+            proxy = "http://gw:8080"
+        "#)
+        .unwrap();
+        assert!(cfg.browser.proxy.is_none(), "not yet normalized");
+        cfg.normalize();
+        assert_eq!(cfg.browser.proxy.as_deref(), Some("http://gw:8080"));
+    }
+
+    #[test]
+    fn explicit_browser_proxy_wins_over_http_proxy() {
+        let mut cfg: Config = toml::from_str(r#"
+            [http]
+            proxy = "http://gw:8080"
+            [browser]
+            proxy = "http://browser-gw:9090"
+        "#)
+        .unwrap();
+        cfg.normalize();
+        assert_eq!(cfg.browser.proxy.as_deref(), Some("http://browser-gw:9090"));
     }
 }

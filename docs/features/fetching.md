@@ -37,6 +37,11 @@ Optional fields (`http_status`, `content_chars`, `cache_hit`, `cost_usd`, `detai
 - **Per-request timeout.** `HttpRequest.timeout_secs` (`Option<u64>`) overrides the client-global `[http] timeout_secs` for that request, applied per attempt.
 - **Retry policy.** Retryable statuses are configurable via `[http] retryable_statuses` (default `[429, 502, 503, 504]`); the redirect-follow limit is `[http] redirect_limit` (default 10). The retry sleep is `max(exponential backoff, server Retry-After) + jitter`: backoff is `500ms · 2^(attempt-1)`, a `Retry-After` (both delta-seconds and HTTP-date forms) on the prior response raises the floor, and up to 25% deterministic hash-based jitter (seeded from URL+attempt, no `rand` dep) de-syncs retry bursts. The governor still learns from `Retry-After` on 429/503 as before.
 
+#### Proxy support
+
+- **HTTP tier.** `[http] proxy` (`Option<String>`) routes all HTTP requests through an `http`/`https`/`socks5` proxy, applied at client-build time via `reqwest::Proxy::all`. Auth in the URL (`http://user:pass@host:port`) is honored; socks5 support comes from reqwest's `socks` feature. Per-request `HttpRequest.proxy` overrides it. Because reqwest binds a proxy at client-build time, a per-request override is served from a small **bounded client pool** keyed by proxy URL (LRU, ≤8 cached clients, oldest evicted). Costs: each pooled client carries its **own cookie jar** (proxied requests don't share cookies with the default client), and up to 8 idle keep-alive pools may linger. An override equal to the configured `[http] proxy` reuses the base client (no duplicate). An invalid proxy URL surfaces a typed `Error::Http`.
+- **Browser tier.** `[browser] proxy` (`Option<String>`) is passed to Chrome as `--proxy-server`. When unset it **falls back to `[http] proxy`** at config load (`Config::normalize`), so a single `[http] proxy` knob usually serves both engines; an explicit `[browser] proxy` wins. Note: Chrome's `--proxy-server` does not accept `user:pass@` auth in the URL (an authenticated proxy prompts interactively), so browser-tier proxy auth is unsupported.
+
 - **browser** (`engine-browser`): headless Chrome render (chromiumoxide/CDP), `wait_for_selector`. One shared Chrome instance behind a relaunchable holder — details below.
 
 #### Browser engine: resilience, concurrency & cheap renders
@@ -53,7 +58,7 @@ A single Chrome instance is shared across renders (persistent `[browser] user_da
 
 **`RenderedPage`** fields: `html`, `final_url`, `evaluated`, plus honest wait/cost signals — `nav_timed_out: bool` (the navigation-wait deadline elapsed and the DOM was captured mid-load, so HTML may be partial), `selector_found: Option<bool>` (`Some(true)`/`Some(false)` for a requested `wait_for_selector` that did/didn't appear before the deadline; `None` when none was requested), `blocked_resources: usize` (count of subresources dropped by interception this render). All three are serde-defaulted.
 
-Config keys (`[browser]`): `chrome_executable`, `headless` (true), `user_data_dir` (`data/browser-profile`), `default_wait_ms` (1000), `nav_timeout_secs` (30), `max_concurrent_renders` (4), `block_resources` (true), `recycle_after_renders` (200).
+Config keys (`[browser]`): `chrome_executable`, `headless` (true), `user_data_dir` (`data/browser-profile`), `default_wait_ms` (1000), `nav_timeout_secs` (30), `max_concurrent_renders` (4), `block_resources` (true), `recycle_after_renders` (200), `proxy` (none; falls back to `[http] proxy`).
 
 ### Honest tier verdicts (bot-wall detection)
 
@@ -78,5 +83,5 @@ Config keys (`[fetcher]`): `min_content_chars` (250), `host_memory_ttl_secs` (60
 
 ## Known gaps
 
-- No proxy pool / stealth tier (backlog moonshots).
+- Single static proxy per tier (`[http] proxy` / `[browser] proxy`, per-request override on the HTTP tier). No proxy **pool / rotation** and no stealth tier (backlog moonshots). Browser-tier proxy auth (`user:pass@`) is unsupported (Chrome `--proxy-server` limitation).
 - Aging is time-based only; there is no success-rate / half-life model of host reliability.

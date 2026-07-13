@@ -272,6 +272,7 @@ fn search2_request(body: String) -> HttpRequest {
         if_modified_since: None,
         max_body_bytes: None,
         timeout_secs: None,
+        proxy: None,
     }
 }
 

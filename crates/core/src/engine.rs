@@ -59,6 +59,13 @@ pub struct HttpRequest {
     /// global timeout.
     #[serde(default)]
     pub timeout_secs: Option<u64>,
+    /// Per-request proxy override (`http`/`https`/`socks5` URL, optional
+    /// `user:pass@` auth). Routes just this request through the given proxy
+    /// instead of `[http] proxy`. Served from a small bounded client pool since
+    /// reqwest binds a proxy at client-build time. `None` uses the configured
+    /// default (or no proxy).
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 impl HttpRequest {
@@ -74,6 +81,7 @@ impl HttpRequest {
             if_modified_since: None,
             max_body_bytes: None,
             timeout_secs: None,
+            proxy: None,
         }
     }
 }
