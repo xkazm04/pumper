@@ -3,11 +3,74 @@
 //! governor, dropping near-duplicate pages, and streaming page bodies to the
 //! job's artifact directory.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+
 use async_trait::async_trait;
-use pumper_core::{crawl, AppContext, CrawlConfig, Error, Result, ScrapeApp};
+use pumper_core::{
+    crawl, AppContext, CrawlConfig, CrawlPageRecord, Datasets, Error, PageSink, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 
 pub struct Crawl;
+
+/// Running new/changed/unchanged tallies shared between the [`DatasetPageSink`]
+/// (which adds to them as batches upsert) and the app (which reads them into the
+/// job result once the crawl returns). Atomics avoid holding a lock across the
+/// sink's `.await`.
+#[derive(Default)]
+struct PageCounts {
+    new: AtomicUsize,
+    changed: AtomicUsize,
+    unchanged: AtomicUsize,
+}
+
+/// [`PageSink`] that upserts each batch of kept-page fingerprints into the
+/// `pages` dataset (key = canonical URL). Uses `upsert_many` — partial-batch
+/// semantics, never `sync_many` (a crawl is a partial view, not a full snapshot,
+/// so absent keys must NOT be marked removed). Errors are logged, never fatal:
+/// dataset side-effects must not fail the crawl.
+struct DatasetPageSink {
+    datasets: Arc<Datasets>,
+    app: String,
+    job_id: String,
+    counts: Arc<PageCounts>,
+}
+
+#[async_trait]
+impl PageSink for DatasetPageSink {
+    async fn emit(&mut self, batch: Vec<CrawlPageRecord>) {
+        let items: Vec<(String, Value)> = batch
+            .into_iter()
+            .map(|p| {
+                (
+                    p.url.clone(),
+                    json!({
+                        "url": p.url,
+                        "title": p.title,
+                        "status": p.status,
+                        "content_chars": p.content_chars,
+                        "simhash": p.simhash,
+                        "excerpt": p.excerpt,
+                        "artifact_path": p.artifact_path,
+                        "depth": p.depth,
+                        "job_id": self.job_id,
+                    }),
+                )
+            })
+            .collect();
+        match self.datasets.upsert_many(&self.app, "pages", &items).await {
+            Ok(summary) => {
+                self.counts.new.fetch_add(summary.new.len(), Ordering::Relaxed);
+                self.counts.changed.fetch_add(summary.changed.len(), Ordering::Relaxed);
+                self.counts.unchanged.fetch_add(summary.unchanged, Ordering::Relaxed);
+            }
+            Err(e) => {
+                tracing::warn!(job = %self.job_id, "crawl pages upsert failed: {e}");
+            }
+        }
+    }
+}
 
 #[async_trait]
 impl ScrapeApp for Crawl {
@@ -76,7 +139,24 @@ impl ScrapeApp for Crawl {
                 }),
         };
 
-        let stats = crawl(ctx.engines.http.clone(), cfg, Some(ctx.artifacts_dir.clone())).await?;
+        // Per-page fingerprints stream into the `pages` dataset as the crawl
+        // runs (key = canonical URL), so crawled pages become queryable/diffable
+        // and dataset triggers + watches fire per-page.
+        let counts = Arc::new(PageCounts::default());
+        let sink: Box<dyn PageSink> = Box::new(DatasetPageSink {
+            datasets: ctx.datasets.clone(),
+            app: ctx.app.clone(),
+            job_id: ctx.job_id.to_string(),
+            counts: counts.clone(),
+        });
+
+        let stats =
+            crawl(ctx.engines.http.clone(), cfg, Some(ctx.artifacts_dir.clone()), Some(sink))
+                .await?;
+
+        let pages_new = counts.new.load(Ordering::Relaxed);
+        let pages_changed = counts.changed.load(Ordering::Relaxed);
+        let pages_unchanged = counts.unchanged.load(Ordering::Relaxed);
         Ok(json!({
             "crawled": stats.crawled,
             "kept": stats.kept,
@@ -87,6 +167,10 @@ impl ScrapeApp for Crawl {
             "resumed": stats.resumed,
             "hosts": stats.hosts,
             "frontier_remaining": stats.frontier_remaining,
+            // Dataset write outcome for the `pages` dataset.
+            "pages_new": pages_new,
+            "pages_changed": pages_changed,
+            "pages_unchanged": pages_unchanged,
             "pages": stats.pages,
         }))
     }

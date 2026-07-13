@@ -12,6 +12,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use async_trait::async_trait;
 use futures::stream::{FuturesUnordered, StreamExt};
 use scraper::{Html, Selector};
 use serde::{Deserialize, Serialize};
@@ -22,6 +23,46 @@ use crate::simhash::{hamming, simhash};
 use crate::Result;
 
 const MAX_FRONTIER: usize = 100_000;
+
+/// Characters of extracted page text kept as the record excerpt.
+const EXCERPT_CHARS: usize = 300;
+
+/// Kept pages are flushed to the [`PageSink`] in batches of this size during the
+/// crawl (not one giant batch at the end) so dataset writes stay incremental and
+/// per-page metadata never accumulates in memory.
+const PAGE_SINK_STRIDE: usize = 50;
+
+/// Compact, queryable fingerprint of one KEPT page — the unit the crawl streams
+/// to a [`PageSink`] (e.g. the app's dataset writer). Bodies are artifacts
+/// (`artifact_path`), never stored here; this carries only what supports
+/// query/diff/trigger. Keyed downstream by `url` (canonical).
+#[derive(Debug, Clone, Serialize)]
+pub struct CrawlPageRecord {
+    /// Canonical URL — the stable external id / dataset key.
+    pub url: String,
+    /// `<title>` text, when present.
+    pub title: Option<String>,
+    pub status: u16,
+    /// Visible-text character count (script/style excluded).
+    pub content_chars: usize,
+    /// SimHash of the body (same fingerprint used for near-dup detection).
+    pub simhash: u64,
+    /// First ~300 chars of extracted text.
+    pub excerpt: String,
+    /// Basename of the page body written under the job's artifacts dir
+    /// (`page-NNNN.html`), or empty when bodies aren't being written.
+    pub artifact_path: String,
+    pub depth: u32,
+}
+
+/// A streaming consumer of KEPT-page fingerprints, called in batches during the
+/// crawl. The app layer implements this over `ctx.datasets` (upsert to the
+/// `pages` dataset); core stays storage-agnostic. Implementations must not fail
+/// the crawl — swallow and log their own errors.
+#[async_trait]
+pub trait PageSink: Send {
+    async fn emit(&mut self, batch: Vec<CrawlPageRecord>);
+}
 
 #[derive(Debug, Clone)]
 pub struct CrawlConfig {
@@ -141,15 +182,25 @@ struct Fetched {
     status: u16,
     body: String,
     links: Vec<String>,
+    title: Option<String>,
+    content_chars: usize,
+    excerpt: String,
 }
 
 /// Crawls from the seeds, writing kept page bodies under `output_dir` (if set).
+///
+/// `sink`, when provided, receives batches of [`CrawlPageRecord`] for KEPT pages
+/// during the crawl — the seam the app layer uses to upsert per-page
+/// fingerprints into the `pages` dataset without core knowing about storage.
 pub async fn crawl(
     http: Arc<dyn HttpClient>,
     cfg: CrawlConfig,
     output_dir: Option<PathBuf>,
+    mut sink: Option<Box<dyn PageSink>>,
 ) -> Result<CrawlStats> {
     let concurrency = cfg.concurrency.clamp(1, 256);
+    // Buffer of kept-page fingerprints awaiting the next batched sink flush.
+    let mut sink_buf: Vec<CrawlPageRecord> = Vec::new();
     let filter = UrlFilter::compile(&cfg)?;
     let mut frontier = Frontier::new();
     let mut kept_hashes: Vec<u64> = Vec::new();
@@ -258,9 +309,32 @@ pub async fn crawl(
         } else {
             kept_hashes.push(hash);
             stats.kept += 1;
+            let artifact_name = format!("page-{:04}.html", stats.kept);
             if let Some(dir) = &output_dir {
-                let file = dir.join(format!("page-{:04}.html", stats.kept));
+                let file = dir.join(&artifact_name);
                 let _ = tokio::fs::write(file, &fetched.body).await;
+            }
+            // Stream this kept page's compact fingerprint to the sink (batched).
+            if sink.is_some() {
+                sink_buf.push(CrawlPageRecord {
+                    url: fetched.url.clone(),
+                    title: fetched.title.clone(),
+                    status: fetched.status,
+                    content_chars: fetched.content_chars,
+                    simhash: hash,
+                    excerpt: fetched.excerpt.clone(),
+                    artifact_path: if output_dir.is_some() {
+                        artifact_name
+                    } else {
+                        String::new()
+                    },
+                    depth: fetched.depth,
+                });
+                if sink_buf.len() >= PAGE_SINK_STRIDE {
+                    if let Some(s) = sink.as_mut() {
+                        s.emit(std::mem::take(&mut sink_buf)).await;
+                    }
+                }
             }
             // Periodic checkpoint so a killed process loses at most one stride.
             if stats.kept % CHECKPOINT_STRIDE == 0 {
@@ -291,6 +365,13 @@ pub async fn crawl(
 
         if stats.kept >= cfg.max_pages {
             break;
+        }
+    }
+
+    // Flush any kept pages still buffered below the batch stride.
+    if let Some(s) = sink.as_mut() {
+        if !sink_buf.is_empty() {
+            s.emit(std::mem::take(&mut sink_buf)).await;
         }
     }
 
@@ -345,16 +426,44 @@ async fn fetch_one(
     same_domain: bool,
 ) -> Option<Fetched> {
     let resp = http.fetch(HttpRequest::get(&url)).await.ok()?;
-    let links = extract_links(&resp.body, &url, same_domain);
-    Some(Fetched { url, depth, status: resp.status, body: resp.body, links })
+    let parsed = parse_page(&resp.body, &url, same_domain);
+    Some(Fetched {
+        url,
+        depth,
+        status: resp.status,
+        body: resp.body,
+        links: parsed.links,
+        title: parsed.title,
+        content_chars: parsed.content_chars,
+        excerpt: parsed.excerpt,
+    })
 }
 
-fn extract_links(html: &str, base: &str, same_domain: bool) -> Vec<String> {
+/// Everything derived from one parse of a page body: outbound links plus a
+/// compact content fingerprint (title / visible-text chars / excerpt). Parsed
+/// once, off the main loop, inside the concurrent fetch task.
+struct ParsedPage {
+    links: Vec<String>,
+    title: Option<String>,
+    content_chars: usize,
+    excerpt: String,
+}
+
+fn parse_page(html: &str, base: &str, same_domain: bool) -> ParsedPage {
+    let doc = Html::parse_document(html);
+    let links = extract_links(&doc, base, same_domain);
+    let title = extract_title(&doc);
+    let text = extract_text(&doc);
+    let content_chars = text.chars().count();
+    let excerpt: String = text.chars().take(EXCERPT_CHARS).collect();
+    ParsedPage { links, title, content_chars, excerpt }
+}
+
+fn extract_links(doc: &Html, base: &str, same_domain: bool) -> Vec<String> {
     let Ok(base_url) = Url::parse(base) else {
         return Vec::new();
     };
     let base_host = base_url.host_str().map(str::to_owned);
-    let doc = Html::parse_document(html);
     let selector = Selector::parse("a[href]").expect("valid selector");
     let mut out = Vec::new();
     for el in doc.select(&selector) {
@@ -367,6 +476,41 @@ fn extract_links(html: &str, base: &str, same_domain: bool) -> Vec<String> {
             continue;
         }
         out.push(canonicalize(joined));
+    }
+    out
+}
+
+/// `<title>` text (whitespace-collapsed), or `None` when absent/empty.
+fn extract_title(doc: &Html) -> Option<String> {
+    let selector = Selector::parse("title").expect("valid selector");
+    let raw: String = doc.select(&selector).next()?.text().collect();
+    let title: String = raw.split_whitespace().collect::<Vec<_>>().join(" ");
+    (!title.is_empty()).then_some(title)
+}
+
+/// Visible page text, script/style/noscript excluded, whitespace-collapsed. Used
+/// only for compact fingerprints (char count + excerpt), so approximate is fine.
+fn extract_text(doc: &Html) -> String {
+    let mut out = String::new();
+    for node in doc.tree.nodes() {
+        let Some(text) = node.value().as_text() else { continue };
+        let in_non_content = node.ancestors().any(|a| {
+            a.value().as_element().is_some_and(|e| {
+                matches!(
+                    e.name(),
+                    "script" | "style" | "noscript" | "template" | "head" | "title"
+                )
+            })
+        });
+        if in_non_content {
+            continue;
+        }
+        for word in text.split_whitespace() {
+            if !out.is_empty() {
+                out.push(' ');
+            }
+            out.push_str(word);
+        }
     }
     out
 }
@@ -555,6 +699,92 @@ async fn seed_from_sitemaps(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::HttpResponse;
+    use std::sync::Mutex as SyncMutex;
+
+    /// Serves canned `(status, body)` per URL; unknown URLs → 404 empty.
+    struct MockHttp {
+        pages: HashMap<String, (u16, String)>,
+    }
+
+    #[async_trait]
+    impl HttpClient for MockHttp {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            let (status, body) =
+                self.pages.get(&req.url).cloned().unwrap_or((404, String::new()));
+            Ok(HttpResponse {
+                status,
+                headers: HashMap::new(),
+                body,
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    /// A [`PageSink`] that accumulates every emitted record for assertions.
+    struct CollectSink {
+        records: Arc<SyncMutex<Vec<CrawlPageRecord>>>,
+    }
+
+    #[async_trait]
+    impl PageSink for CollectSink {
+        async fn emit(&mut self, batch: Vec<CrawlPageRecord>) {
+            self.records.lock().unwrap().extend(batch);
+        }
+    }
+
+    /// Minimal config for tests: robots + sitemaps off, single-threaded, no dedup.
+    fn test_cfg(seeds: &[&str]) -> CrawlConfig {
+        CrawlConfig {
+            seeds: seeds.iter().map(|s| s.to_string()).collect(),
+            max_pages: 50,
+            max_depth: 3,
+            concurrency: 4,
+            same_domain: true,
+            dedup_distance: 0,
+            respect_robots: false,
+            include_patterns: vec![],
+            exclude_patterns: vec![],
+            sitemap_seeds: false,
+            checkpoint: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn crawl_streams_kept_pages_to_sink() {
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://ex.com/".to_string(),
+            (200, "<html><head><title>Home</title></head><body><h1>Hi</h1>\
+                   <a href=\"/about\">about</a></body></html>"
+                .to_string()),
+        );
+        pages.insert(
+            "https://ex.com/about".to_string(),
+            (200, "<html><head><title>About</title></head><body>\
+                   <p>About us page content.</p></body></html>"
+                .to_string()),
+        );
+        let http = Arc::new(MockHttp { pages });
+        let records = Arc::new(SyncMutex::new(Vec::new()));
+        let sink = Box::new(CollectSink { records: records.clone() });
+
+        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, Some(sink))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.kept, 2, "both distinct pages kept");
+        let recs = records.lock().unwrap();
+        assert_eq!(recs.len(), 2, "each kept page streamed to the sink exactly once");
+        let home = recs.iter().find(|r| r.url == "https://ex.com/").unwrap();
+        assert_eq!(home.title.as_deref(), Some("Home"));
+        assert_eq!(home.status, 200);
+        assert!(home.content_chars > 0);
+        assert_ne!(home.simhash, 0, "body simhash recorded");
+        assert!(recs.iter().any(|r| r.url == "https://ex.com/about"
+            && r.title.as_deref() == Some("About")));
+    }
 
     #[test]
     fn robots_parses_crawl_delay_and_sitemaps() {
@@ -598,6 +828,32 @@ mod tests {
         assert!(!f.allows("https://x.com/blog/file.pdf"));
         assert!(UrlFilter::compile(&CrawlConfig { include_patterns: vec!["(".into()], ..cfg })
             .is_err());
+    }
+
+    #[test]
+    fn parse_page_extracts_title_text_and_excerpt() {
+        let html = "<html><head><title>  Weekly  Report </title>\
+            <style>.a{color:red}</style></head><body>\
+            <script>var x = 'ignore me';</script>\
+            <h1>Revenue</h1><p>Sales rose sharply this quarter.</p>\
+            <noscript>enable javascript</noscript></body></html>";
+        let parsed = parse_page(html, "https://x.com/", true);
+        assert_eq!(parsed.title.as_deref(), Some("Weekly Report"));
+        // script/style/noscript text is excluded; visible text is collapsed.
+        assert_eq!(parsed.excerpt, "Revenue Sales rose sharply this quarter.");
+        assert_eq!(parsed.content_chars, parsed.excerpt.chars().count());
+        assert!(!parsed.excerpt.contains("ignore me"));
+        assert!(!parsed.excerpt.contains("enable javascript"));
+    }
+
+    #[test]
+    fn parse_page_excerpt_is_capped() {
+        let body = "word ".repeat(400);
+        let html = format!("<html><body><p>{body}</p></body></html>");
+        let parsed = parse_page(&html, "https://x.com/", true);
+        assert_eq!(parsed.excerpt.chars().count(), EXCERPT_CHARS);
+        assert!(parsed.content_chars > EXCERPT_CHARS);
+        assert!(parsed.title.is_none());
     }
 
     #[test]
