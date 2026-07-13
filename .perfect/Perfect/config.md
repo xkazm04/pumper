@@ -25,6 +25,17 @@ git worktree add .claude/worktrees/perfect-<ctx> -b worktree-perfect-<ctx>
 - direction size: ≲15 files, one builder session, no cross-context schema breaks
 - cooldown: 2 proposal rounds per context
 
+## Model policy (builders)
+
+Default **sonnet**; escalate a whole brief to **opus** if any direction in it trips a trigger (full list in the skill, Phase B step 1): sized L · concurrency/correctness-critical (locking, fencing, cancellation, cache coherence, crash recovery) · new public seam other contexts build on · an acceptance criterion that hands over a *design decision* rather than a spec · schema/migration other contexts read, or an algorithmic rewrite needing a correctness proof · a redo after a rejected diff (never re-run the same brief on the same model).
+
+**Retrospective calibration (rounds 1–3, all 35 shipped on Opus).** Classified against the triggers, roughly a third would have needed Opus and two thirds would have been fine on Sonnet:
+- **Opus-worthy (trigger fired):** job-control-surface + stuck-job-reaper (attempt fencing, cancellation, crash recovery); structured-fetch-trace + governor-hot-path (new public seam; sharded locking); crawl-memory-bounds (banded-SimHash equivalence proof); crawl-pages-dataset + extract-from-stored-pages (new PageSink/source seams); session-vault (client-pool generalization + the cache-bypass correctness catch); sse-resume-graceful-shutdown (drain/requeue correctness); trades-common-unified (new crate + taxonomy other apps key on); extraction-quality-signal (new public report type).
+- **Sonnet-shaped (spec, not design):** trades-meter-research, trades-output-guards, fetch-no-cache-ttl, api-pagination-errors, api-streaming-bounded, openapi-spec, priority-aging, cron-maturity, job-failed-webhooks, crawl-honest-errors, crawl-live-progress, browser-cheap-renders, http-request-controls, proxy-support, markdown-tables-tonumber, ruleset-preview-endpoint, and all four grants directions.
+- Watch item: `grants-schema-enrichment` looked Sonnet-shaped but its real value came from the builder *disbelieving the brief* and checking the live API. If a Sonnet builder ever accepts a wrong brief claim uncritically, that's a trigger to add ("brief rests on unverified external-source facts → opus").
+
+(Log every escalation, mid-flight upgrade, or rejected-diff here with the trigger that should have caught it — this is how the list gets sharper.)
+
 ## User taste
 - 2026-07-13: In the trades context the user rejected the consumer-facing directions (provenance fields, exit-readiness endpoint) and kept substrate/data-correctness ones — weight future slates toward engine/data quality until steered otherwise. Exception: for the API context they took everything EXCEPT auth, including the wildcard (OpenAPI) — infra polish is welcome.
 - 2026-07-13 (round 3): rules:"auto" (LLM drafts RuleSet) rejected — third LLM-feature rejection. Pattern: deterministic engine work ≫ LLM-driven features. Stop slating T5 LLM directions unless the user asks.
