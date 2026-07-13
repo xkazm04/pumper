@@ -4,8 +4,8 @@ repo: pumper
 updated: 2026-07-13
 pool: 0
 pool_target: 10
-shipped_total: 22
-cursor: "Fetch Engines (HTTP / Browser / Claude)"
+shipped_total: 35
+cursor: "Dataset Store & Change Detection"
 last_session: "[[sessions/2026-07-13]]"
 ---
 
@@ -13,7 +13,13 @@ last_session: "[[sessions/2026-07-13]]"
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **0/10** · phase: **Propose (round 3)** · cursor: **Fetch Engines (HTTP / Browser / Claude)** — FRESH scout brief + Director direction-seeds cached in its context note (do not re-scout). Rounds 1+2: **22/22 accepted directions shipped**, zero failed/dropped. On cooldown after round 2: Worker/Scheduler, Broad Crawler (plus round-1 contexts entering their final cooldown round).
+**State**: pool **0/10** · phase: **Propose (round 4)** · cursor: **Dataset Store & Change Detection** (no cached brief — scout fresh). Rounds 1–3: **35/35 accepted directions shipped**, zero failed/dropped. On cooldown: Fetch Engines, Extraction, Grants (round 3); Worker/Scheduler, Broad Crawler (round 2). Round-1 contexts (Tiered Fetcher, US Trades, HTTP API) are OFF cooldown and eligible again.
+
+**Strong round-4 seeds already banked** (from round-3 builder findings, no scout needed):
+- Saved-search app-scoping bug: worker scopes alerts by JOB app, but `index_datasets` docs carry the virtual app (`grants`) — alerts scoped by app are silently skipped. Worker-side fix. (Job Server context.)
+- `index_datasets` re-indexes the FULL dataset every run — needs incremental indexing before large datasets adopt the seam. (Job Server / Search.)
+- grants: sweep_closed O(n) + link_duplicates O(n²) run on every run of both apps over the whole corpus — real scaling cliff. (Grants, after cooldown.)
+- No artifact retention/GC policy anywhere — bodies accumulate in per-job dirs forever; source-mode extraction depends on them. (Dataset Store / Runtime.)
 
 ## Queue (opportunity-ranked, 2026-07-13 init scoring)
 
@@ -43,18 +49,23 @@ Score = consumer reach × headroom (post waves 1–9) × strategic fit. Refined 
 | 20 | US Trades Business Density | Economic & Labor | 4 | census blend shipped w9 |
 | 21 | App Registry | Job Server & API | 3 | hot-reload deferred by choice; thin surface |
 
-## Accepted pool — round 2 (5/10)
+## Accepted pool — round 3 (5/10)
 
-1. [[job-control-surface]] — Worker/Scheduler · feature · M
-2. [[stuck-job-reaper]] — Worker/Scheduler · robustness · M
-3. [[cron-maturity]] — Worker/Scheduler · api-ux · M
-4. [[priority-aging]] — Worker/Scheduler · optimization · S
-5. [[job-failed-webhooks]] — Worker/Scheduler · wildcard · S
-6. [[crawl-pages-dataset]] — Broad Crawler · feature · M
-7. [[crawl-live-progress]] — Broad Crawler · api-ux · M
-8. [[crawl-honest-errors]] — Broad Crawler · robustness · M
-9. [[crawl-memory-bounds]] — Broad Crawler · optimization · S
-10. [[crawl-incremental-recrawl]] — Broad Crawler · wildcard · M
+1. [[browser-resilience]] — Fetch Engines · robustness · M
+2. [[browser-cheap-renders]] — Fetch Engines · optimization · M
+3. [[proxy-support]] — Fetch Engines · feature · M
+4. [[http-request-controls]] — Fetch Engines · api-ux · M
+5. [[session-vault]] — Fetch Engines · wildcard · M
+6. [[extract-from-stored-pages]] — Extraction · feature · M
+7. [[ruleset-preview-endpoint]] — Extraction · api-ux · M
+8. [[extraction-quality-signal]] — Extraction · robustness · M
+9. [[markdown-tables-tonumber]] — Extraction · optimization · S
+10. [[grants-searchable-alerts]] — Grants · feature · S
+11. [[grants-lifecycle-honesty]] — Grants · robustness · M
+12. [[grants-query-surface]] — Grants · api-ux · M
+13. [[grants-schema-enrichment]] — Grants · optimization · M
+
+(Round-1 and round-2 pools: all shipped — see ledger.)
 
 ## Round-1 pool (all shipped)
 
@@ -82,3 +93,4 @@ Score = consumer reach × headroom (post waves 1–9) × strategic fit. Refined 
 - 2026-07-13 · Worker wave 1 (round 2): 49e133c (priority aging), 5a6258a (bulk retry / reset / cancel-running, attempt-fenced writes, live-verified), f04e2a8 (heartbeat reaper, migration 0017, live-verified) — gates green, 51 core + 11 server tests.
 - 2026-07-13 · Crawler wave 2 (round 2): 78ad7da (live progress seam + SSE), 1c3fe35 (incremental recrawl / sentinel mode, live-E2E-verified) — gates green, 55 core + 13 server tests. Crawler context COMPLETE: 5/5.
 - 2026-07-13 · Worker wave 2 (round 2): c544db2 (cron tz + misfire policy + scheduled retries, migration 0018, live-verified misfire counts), 041055b (job.failed webhooks + failure metric, live-verified HMAC delivery) — gates green, 55 core + 19 server tests. Worker context COMPLETE: 5/5. **Round 2 total: 10/10. Cumulative: 22/22.**
+- 2026-07-13 · **Round 3 (13/13)** — Fetch Engines 5/5: a57ee1c (browser relaunch/semaphore/honest waits), 8d3eda5 (resource blocking + recycle, live-proven), 709e84b (body cap + timeout + Retry-After retries), 9d2044f (proxy http/https/socks5), 50e03ba (session vault + cache-bypass correctness catch). Extraction 4/4: 70221c1 (per-field quality signal), ebe5f89 (markdown tables + number parsing), 66b063f (stored-pages source mode, no-double-fetch proven), 387a509 (POST /extract/preview). Grants 4/4: 94940a9 (per-record search via generic index_datasets seam + live search.matched webhook), 9d18132 (close-date sweep + drift guard), d59b307 (taxonomies + real money parsing — builder corrected the scout's guessed CA columns against the live API), c526d9f (GET /grants filters + closing-soon, verified vs SQL over 1,988 live records). Merged-server smoke test green (49 OpenAPI paths). **Cumulative: 35/35.**

@@ -4,9 +4,9 @@ type: perfect/context
 group: "Scraping Engines"
 category: lib
 opportunity: 7
-last_proposed: never
+last_proposed: 2026-07-13
 cooldown_until: —
-directions: []
+directions: ["[[browser-resilience]]", "[[browser-cheap-renders]]", "[[proxy-support]]", "[[http-request-controls]]", "[[session-vault]]"]
 ---
 
 ## Current state (scout brief digest, 2026-07-13 — FRESH, reuse next round, do not re-scout)
@@ -26,7 +26,12 @@ directions: []
 - Claude guards: default max-turns, cost-missing warning.
 
 ## Direction history
-(never proposed)
+- 2026-07-13 (round 3): 5 proposed, **5 accepted** (browser resilience, cheap renders, proxy, HTTP request controls, session vault). Claude-engine guards (default max-turns, cost-missing warning) deliberately unslated — small, future ride-along.
 
 ## Shipped
-(none)
+- [[browser-resilience]] → a57ee1c — Mutex<Option<LiveBrowser>> holder, alive-flag crash detection (CDP handler-drain completion), relaunch on acquire, render semaphore (max_concurrent_renders default 4), RenderedPage.nav_timed_out + selector_found. Kill-recovery unit-tested (live Chrome-kill impractical — would kill user's Chrome).
+- [[browser-cheap-renders]] → 8d3eda5 — CDP interception blocks image/font/media (NOT stylesheets), block_resources default true + per-request load_all_resources opt-out, blocked_resources count on RenderedPage (live-proven vs Wikipedia), --disable-dev-shm-usage + 512MB JS heap cap, recycle_after_renders (200). Caveat: interception disables Chrome's HTTP cache while on (chromiumoxide coupling).
+- [[http-request-controls]] → 709e84b — [http] max_body_bytes (16 MiB) streamed cap + per-request override, HttpRequest.timeout_secs, retry sleep = max(backoff, Retry-After) + hash jitter (no rand), config redirect_limit + retryable_statuses. Caveat: capped path uses from_utf8_lossy (drops charset-from-header vs .text()).
+- [[proxy-support]] → 9d2044f — [http]/[browser] proxy (http/https/socks5, user:pass@), Config::normalize browser→http fallback, HttpRequest.proxy override via bounded LRU client pool (≤8). Caveats: pooled clients have own cookie jars; browser proxy auth unsupported (Chrome prompts). Pool key generalized to (proxy, profile) by session-vault.
+- [[session-vault]] → 50e03ba — data/profiles/<name>/{cookies.json, browser/}; profile on Http/Render/FetchRequest; ClientPool keyed (proxy, profile) — pool GENERALIZED not duplicated; jars owned by engine (eviction can't lose cookies), atomic tmp+rename write on ~1s trailing debounce; browser holders keyed by profile (≤4 live Chromes, LRU-evict). **Builder caught a real correctness trap unprompted: profiled requests now BYPASS the shared http_cache** (key is method+url+body only — a logged-in body would otherwise be served to anonymous callers). Live-verified: two profiles, no cross-bleed, cookies survive engine restart; interleaved Chrome profiles on real browser. Caveats: ~1s crash-loss window; plaintext on disk (no encryption/credential mgmt — phase 1); HTTP jar and Chrome profile are separate stores.
+Context COMPLETE: 5/5 shipped.
