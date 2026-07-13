@@ -72,6 +72,79 @@ pub async fn sync_unified(
     ctx.datasets.upsert_many(UNIFIED_APP, UNIFIED_DATASET, items).await
 }
 
+/// Lifecycle sweep for the upsert-only unified dataset: these sources only
+/// report currently-listed opportunities, so a grant that closes or is delisted
+/// is simply absent from the next fetch — its `open`/`forecasted` row would
+/// otherwise persist forever. After sync, mark every live unified row whose
+/// status is `open`/`forecasted` and whose `close_date` is strictly before
+/// today as `closed`. Written through the normal upsert path, so each transition
+/// records a `changed` revision (the delisting signal `removed_at` can't give on
+/// a partial-view source). Returns the number of rows swept to `closed`.
+pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
+    let today = chrono::Utc::now().date_naive();
+    // Local datasets are small (both sources cap well under this); one read.
+    let rows = ctx.datasets.list(UNIFIED_APP, UNIFIED_DATASET, 1_000_000).await?;
+    let mut updates: Vec<(String, Value)> = Vec::new();
+    for rec in rows {
+        if rec.removed_at.is_some() {
+            continue;
+        }
+        let status = rec.data.get("status").and_then(Value::as_str);
+        if !matches!(status, Some("open") | Some("forecasted")) {
+            continue;
+        }
+        let past_due = rec
+            .data
+            .get("close_date")
+            .and_then(Value::as_str)
+            .and_then(parse_date)
+            .is_some_and(|d| d < today);
+        if !past_due {
+            continue;
+        }
+        let mut updated = rec.data.clone();
+        updated["status"] = Value::String("closed".to_string());
+        updates.push((rec.key, updated));
+    }
+    if !updates.is_empty() {
+        ctx.datasets.upsert_many(UNIFIED_APP, UNIFIED_DATASET, &updates).await?;
+    }
+    Ok(updates.len())
+}
+
+/// Fraction of a run's normalized opportunities missing their `title` above
+/// which schema drift is likely (a renamed/dropped title column). Titles are
+/// essentially always present, so a majority-null run is the signal; picked at
+/// 0.5 to stay quiet on the odd genuinely-untitled record while catching a
+/// wholesale column rename. `close_date`-null is intentionally NOT a drift
+/// signal — forecasted grants legitimately have no close date.
+pub const TITLE_NULL_DRIFT_THRESHOLD: f64 = 0.5;
+
+/// Non-fatal schema-drift warnings over a run's normalized unified items. Empty
+/// when nothing looks wrong; otherwise human-readable strings for the result's
+/// `warnings` array. (The hard drift case — a positive server hitCount with zero
+/// fetched rows — is a job failure, handled in each app.)
+pub fn drift_warnings(items: &[(String, Value)]) -> Vec<String> {
+    let mut warnings = Vec::new();
+    let total = items.len();
+    if total == 0 {
+        return warnings;
+    }
+    let null_titles = items
+        .iter()
+        .filter(|(_, v)| v.get("title").and_then(Value::as_str).is_none())
+        .count();
+    let rate = null_titles as f64 / total as f64;
+    if rate > TITLE_NULL_DRIFT_THRESHOLD {
+        warnings.push(format!(
+            "possible schema drift: {null_titles}/{total} ({:.0}%) normalized opportunities \
+             have a null title — check the source's title field",
+            rate * 100.0
+        ));
+    }
+    warnings
+}
+
 /// Links cross-source near-duplicates (SimHash Hamming ≤ `max_distance`) into
 /// `grants/duplicate_links`, keyed `a|b`. Same-source pairs are skipped — the
 /// interesting signal is one grant syndicated on two portals.
@@ -133,9 +206,13 @@ fn money_of(rec: &Value, fields: &[&str]) -> Value {
     Value::Null
 }
 
-/// Normalizes dates to `YYYY-MM-DD`; tolerates US `MM/DD/YYYY`, ISO, and ISO
-/// datetime prefixes.
-fn norm_date(s: &str) -> Option<String> {
+/// The one date parser for the grant sources — used by normalization, the
+/// close-date sweep, and the closing-soon digest so they can never diverge.
+/// Tolerates the formats observed across grants.gov and the CA portal:
+/// US `MM/DD/YYYY` (non-zero-padded ok, e.g. `7/1/2027`), ISO `YYYY-MM-DD`, and
+/// ISO/space datetimes (`2026-11-02 23:59:00`, `2026-11-02T23:59:00Z`) whose
+/// date prefix is taken. Empty/whitespace and unrecognized text yield `None`.
+pub fn parse_date(s: &str) -> Option<chrono::NaiveDate> {
     let s = s.trim();
     if s.is_empty() {
         return None;
@@ -144,7 +221,11 @@ fn norm_date(s: &str) -> Option<String> {
         .or_else(|_| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d"))
         .or_else(|_| chrono::NaiveDate::parse_from_str(&s[..s.len().min(10)], "%Y-%m-%d"))
         .ok()
-        .map(|d| d.to_string())
+}
+
+/// Normalizes a date string to canonical `YYYY-MM-DD`, or `None` if unparseable.
+fn norm_date(s: &str) -> Option<String> {
+    parse_date(s).map(|d| d.to_string())
 }
 
 /// Canonical status vocabulary: open | forecasted | closed (unknowns lowercase
@@ -199,5 +280,36 @@ mod tests {
     fn unmappable_rows_are_skipped_not_fabricated() {
         assert!(normalize_ca_grants(&json!({ "Title": "no id" })).is_none());
         assert!(normalize_grants_gov(&json!({})).is_none());
+    }
+
+    #[test]
+    fn parse_date_handles_all_observed_formats() {
+        // US MM/DD/YYYY (grants.gov), zero-padded and not.
+        assert_eq!(parse_date("08/15/2026").unwrap().to_string(), "2026-08-15");
+        assert_eq!(parse_date("7/1/2027").unwrap().to_string(), "2027-07-01");
+        // ISO date.
+        assert_eq!(parse_date("2026-09-30").unwrap().to_string(), "2026-09-30");
+        // CA portal space-separated datetime + ISO 'T' datetime → date prefix.
+        assert_eq!(parse_date("2026-11-02 23:59:00").unwrap().to_string(), "2026-11-02");
+        assert_eq!(parse_date("2026-11-02T23:59:00Z").unwrap().to_string(), "2026-11-02");
+        // Empty / unparseable → None.
+        assert!(parse_date("").is_none());
+        assert!(parse_date("   ").is_none());
+        assert!(parse_date("not a date").is_none());
+    }
+
+    #[test]
+    fn drift_warnings_fire_only_on_majority_null_titles() {
+        let with_title = |t: Option<&str>| {
+            ("k".to_string(), json!({ "title": t }))
+        };
+        // Mostly-present titles: no warning.
+        let ok = vec![with_title(Some("A")), with_title(Some("B")), with_title(None)];
+        assert!(drift_warnings(&ok).is_empty());
+        // Majority null: warning.
+        let bad = vec![with_title(None), with_title(None), with_title(Some("C"))];
+        assert_eq!(drift_warnings(&bad).len(), 1);
+        // Empty input: no warning (no data is not drift).
+        assert!(drift_warnings(&[]).is_empty());
     }
 }

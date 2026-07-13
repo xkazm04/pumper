@@ -141,6 +141,17 @@ impl ScrapeApp for GrantsGov {
             }
         }
 
+        // Drift guard: the server reported a positive hitCount but we parsed zero
+        // opportunities out of `data.oppHits` — the array was renamed/moved and
+        // `unwrap_or_default` silently emptied it. Fail loudly instead of
+        // reporting a successful empty run.
+        if hit_count > 0 && hits.is_empty() {
+            return Err(Error::App(format!(
+                "grants.gov schema drift: hitCount={hit_count} but parsed 0 oppHits \
+                 (data.oppHits missing or not an array)"
+            )));
+        }
+
         // Dedup + change detection: key each opportunity by its stable id (falling
         // back to the opportunity number, then row index). A scheduled run reports
         // only new/changed opportunities — the substrate for deadline alerts.
@@ -167,7 +178,11 @@ impl ScrapeApp for GrantsGov {
             .filter_map(grants_common::normalize_grants_gov)
             .collect();
         let unified = grants_common::sync_unified(&ctx, &unified_items).await?;
+        // Lifecycle: flip past-due open/forecasted unified rows to closed (this
+        // upsert-only source never sees a delisting otherwise).
+        let swept = grants_common::sweep_closed(&ctx).await?;
         let cross_source_dups = grants_common::link_duplicates(&ctx, 3).await?;
+        let warnings = grants_common::drift_warnings(&unified_items);
 
         // Closing-soon digest: posted opportunities whose closeDate falls within
         // the next `digestDays` days, soonest first — the deadline-alert surface
@@ -195,6 +210,8 @@ impl ScrapeApp for GrantsGov {
             "closingSoonCount": closing_soon.len(),
             "closingSoon": closing_soon.iter().take(25).collect::<Vec<_>>(),
             "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
+            "swept": swept,
+            "warnings": warnings,
             "crossSourceDups": cross_source_dups,
             // Per-opportunity search docs come from the unified dataset (compact
             // result, one indexed doc per grant) — see worker `dataset_search_docs`.
@@ -217,7 +234,7 @@ fn closing_soon_digest(hits: &[Value], days: i64) -> Vec<Value> {
         })
         .filter_map(|h| {
             let close = h.get("closeDate").and_then(Value::as_str)?;
-            let close = parse_close_date(close)?;
+            let close = grants_common::parse_date(close)?;
             let days_left = (close - today).num_days();
             (0..=days).contains(&days_left).then(|| {
                 (
@@ -236,14 +253,6 @@ fn closing_soon_digest(hits: &[Value], days: i64) -> Vec<Value> {
         .collect();
     digest.sort_by_key(|(days_left, _)| *days_left);
     digest.into_iter().map(|(_, v)| v).collect()
-}
-
-/// Grants.gov emits US-style `MM/DD/YYYY`; tolerate ISO `YYYY-MM-DD` too so a
-/// schema drift doesn't silently empty the digest.
-fn parse_close_date(s: &str) -> Option<chrono::NaiveDate> {
-    chrono::NaiveDate::parse_from_str(s, "%m/%d/%Y")
-        .or_else(|_| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d"))
-        .ok()
 }
 
 /// A POST request to the Search2 endpoint carrying a JSON body. The API is

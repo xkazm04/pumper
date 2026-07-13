@@ -124,6 +124,17 @@ impl ScrapeApp for CaGrants {
             }
         }
 
+        // Drift guard: CKAN reported a positive `result.total` but we parsed zero
+        // records — the `result.records` array was renamed/moved and
+        // `unwrap_or_default` silently emptied it. Fail loudly instead of
+        // reporting a successful empty run.
+        if total > 0 && records.is_empty() {
+            return Err(Error::App(format!(
+                "ca-grants schema drift: result.total={total} but parsed 0 records \
+                 (result.records missing or not an array)"
+            )));
+        }
+
         // Key by the portal's stable grant id (PortalID); the CKAN `_id` is a row
         // number that renumbers on dataset reload, so it must NOT be the key.
         let items: Vec<(String, Value)> = records
@@ -141,7 +152,11 @@ impl ScrapeApp for CaGrants {
             .filter_map(grants_common::normalize_ca_grants)
             .collect();
         let unified = grants_common::sync_unified(&ctx, &unified_items).await?;
+        // Lifecycle: flip past-due open/forecasted unified rows to closed (this
+        // upsert-only source never sees a delisting otherwise).
+        let swept = grants_common::sweep_closed(&ctx).await?;
         let cross_source_dups = grants_common::link_duplicates(&ctx, 3).await?;
+        let warnings = grants_common::drift_warnings(&unified_items);
 
         Ok(json!({
             "source": "data.ca.gov/california-grants-portal",
@@ -153,6 +168,8 @@ impl ScrapeApp for CaGrants {
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
             "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
+            "swept": swept,
+            "warnings": warnings,
             "crossSourceDups": cross_source_dups,
             // Per-opportunity search docs come from the unified dataset (compact
             // result, one indexed doc per grant) — see worker `dataset_search_docs`.
