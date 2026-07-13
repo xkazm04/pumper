@@ -106,11 +106,21 @@ impl RenderRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 pub struct RenderedPage {
     pub html: String,
     pub final_url: Option<String>,
     pub evaluated: Option<Value>,
+    /// `true` when the navigation-wait deadline elapsed and the DOM was captured
+    /// mid-load — the HTML may be partial. Distinguishes an honest timeout from a
+    /// clean load. Serde-defaulted so older payloads deserialize.
+    #[serde(default)]
+    pub nav_timed_out: bool,
+    /// Outcome of a `wait_for_selector`: `Some(true)` the selector appeared,
+    /// `Some(false)` it never did before the deadline, `None` no selector was
+    /// requested. Serde-defaulted for compatibility.
+    #[serde(default)]
+    pub selector_found: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

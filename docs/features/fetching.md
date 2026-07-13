@@ -30,7 +30,20 @@ Optional fields (`http_status`, `content_chars`, `cache_hit`, `cost_usd`, `detai
 ## Engines
 
 - **http** (`engine-http`): reqwest + cookie jar, retries w/ backoff (`RETRYABLE_STATUS` 429/502/503/504), fronted by the content-addressed TTL `http_cache` (GET-only; `HttpRequest.no_cache` bypasses) and the governor. **Conditional GET:** `HttpRequest.etag` / `HttpRequest.if_modified_since` (serde-defaulted) are sent as `If-None-Match` / `If-Modified-Since` (explicit `headers` still win); a `304 Not Modified` is passed through with its status intact and is **never** written to the cache over the prior full response (powers the crawler's revisit mode — [crawling.md](crawling.md)).
-- **browser** (`engine-browser`): headless render, `wait_for_selector`.
+- **browser** (`engine-browser`): headless Chrome render (chromiumoxide/CDP), `wait_for_selector`. One shared Chrome instance behind a relaunchable holder — details below.
+
+#### Browser engine: resilience & concurrency
+
+A single Chrome instance is shared across renders (persistent `[browser] user_data_dir`, so logins/cookies survive restarts). It is managed by a relaunchable holder:
+
+- **Relaunch on crash.** A background task drives the CDP handler loop and flips a liveness flag when Chrome's connection ends (crash or exit). The next render's acquire sees the dead flag and relaunches — a crash no longer wedges every future render until a server restart.
+- **Render concurrency cap.** `[browser] max_concurrent_renders` (default 4; `0` = unlimited) is a semaphore bounding simultaneous tabs, so N concurrent callers can't spawn N unbounded tabs.
+
+**`RenderRequest`** fields: `url`, `wait_for_selector`, `extra_wait_ms` (settle time; falls back to `[browser] default_wait_ms`), `evaluate` (JS expression; JSON result lands in `RenderedPage.evaluated`).
+
+**`RenderedPage`** fields: `html`, `final_url`, `evaluated`, plus honest wait signals — `nav_timed_out: bool` (the navigation-wait deadline elapsed and the DOM was captured mid-load, so HTML may be partial) and `selector_found: Option<bool>` (`Some(true)`/`Some(false)` for a requested `wait_for_selector` that did/didn't appear before the deadline; `None` when none was requested). Both are serde-defaulted.
+
+Config keys (`[browser]`): `chrome_executable`, `headless` (true), `user_data_dir` (`data/browser-profile`), `default_wait_ms` (1000), `nav_timeout_secs` (30), `max_concurrent_renders` (4).
 
 ### Honest tier verdicts (bot-wall detection)
 

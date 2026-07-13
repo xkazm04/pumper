@@ -192,6 +192,10 @@ pub struct BrowserConfig {
     /// Settle time after navigation before the DOM is captured.
     pub default_wait_ms: u64,
     pub nav_timeout_secs: u64,
+    /// Max renders (tabs) running at once against the shared Chrome instance.
+    /// Each render opens a page/tab; without a cap N concurrent renders spawn N
+    /// unbounded tabs. `0` = unlimited.
+    pub max_concurrent_renders: usize,
 }
 
 impl Default for BrowserConfig {
@@ -202,6 +206,7 @@ impl Default for BrowserConfig {
             user_data_dir: "data/browser-profile".into(),
             default_wait_ms: 1000,
             nav_timeout_secs: 30,
+            max_concurrent_renders: 4,
         }
     }
 }
