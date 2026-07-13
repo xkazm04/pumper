@@ -52,6 +52,10 @@ tokio-util = "0.7"
 axum = "0.8"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 
+# OpenAPI spec generation (machine-readable route surface at /openapi.json)
+utoipa = { version = "5", features = ["axum_extras", "uuid", "chrono"] }
+utoipa-axum = "0.2"
+
 # storage
 sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate"] }
 

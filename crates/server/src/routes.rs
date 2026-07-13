@@ -4,68 +4,119 @@ use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
 use axum::{Json, Router};
 use pumper_core::{EnqueueOptions, HostProfile, Job, JobStatus, Schedule};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
+use utoipa::{IntoParams, OpenApi, ToSchema};
+use utoipa_axum::router::OpenApiRouter;
+use utoipa_axum::routes;
 use uuid::Uuid;
 
 use crate::events::JobEvent;
 use crate::state::AppState;
 
+/// Top-level metadata for the generated OpenAPI document. Route operations are
+/// collected from each `#[utoipa::path]` handler by `OpenApiRouter` (see
+/// `openapi_router`), so this only carries document-level info and tags.
+#[derive(OpenApi)]
+#[openapi(
+    info(
+        title = "pumper HTTP API",
+        description = "Local scraping / data-product service. Machine-readable surface \
+                       for the routes documented in docs/features/http-api.md.",
+        version = "0.1.0",
+    ),
+    tags(
+        (name = "health", description = "Liveness and Prometheus metrics"),
+        (name = "apps", description = "Registered scraping apps and enqueue"),
+        (name = "jobs", description = "Job queue lifecycle"),
+        (name = "costs", description = "Engine spend ledger"),
+        (name = "schedules", description = "Cron schedules"),
+        (name = "datasets", description = "Change-detected dataset records, export, history"),
+        (name = "watches", description = "Dataset change webhooks"),
+        (name = "triggers", description = "Reactive pipelines"),
+        (name = "webhooks", description = "Outbound delivery log"),
+        (name = "search", description = "Full-text search and saved searches"),
+        (name = "plugins", description = "WASM plugin host"),
+        (name = "events", description = "Server-sent event streams"),
+        (name = "hosts", description = "Learned per-host tier memory and politeness"),
+        (name = "meta", description = "The OpenAPI document itself"),
+    )
+)]
+struct ApiDoc;
+
+/// Builds the router with every route registered through its `#[utoipa::path]`
+/// annotation, so the axum routing table and the OpenAPI document are generated
+/// from a single source and cannot drift. Registering a route without an
+/// annotation fails to compile; the path-coverage test guards the inverse.
+fn openapi_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::with_openapi(ApiDoc::openapi())
+        .routes(routes!(health))
+        .routes(routes!(metrics))
+        .routes(routes!(stream_events))
+        .routes(routes!(list_apps))
+        .routes(routes!(enqueue_job))
+        .routes(routes!(list_datasets))
+        .routes(routes!(list_jobs))
+        .routes(routes!(get_job, cancel_job))
+        .routes(routes!(retry_job))
+        .routes(routes!(stream_job))
+        .routes(routes!(job_costs))
+        .routes(routes!(cost_summary))
+        .routes(routes!(list_schedules, create_schedule))
+        .routes(routes!(delete_schedule))
+        .routes(routes!(set_schedule_enabled))
+        .routes(routes!(list_records))
+        .routes(routes!(export_records))
+        .routes(routes!(dataset_duplicates))
+        .routes(routes!(dataset_changes))
+        .routes(routes!(record_history))
+        .routes(routes!(list_watches, create_watch))
+        .routes(routes!(delete_watch))
+        .routes(routes!(set_watch_enabled))
+        .routes(routes!(list_triggers, create_trigger))
+        .routes(routes!(delete_trigger))
+        .routes(routes!(set_trigger_enabled))
+        .routes(routes!(test_trigger))
+        .routes(routes!(trigger_runs))
+        .routes(routes!(list_deliveries))
+        .routes(routes!(get_delivery))
+        .routes(routes!(replay_delivery))
+        .routes(routes!(list_hosts))
+        .routes(routes!(get_host))
+        .routes(routes!(delete_host_memory))
+        .routes(routes!(list_plugins))
+        .routes(routes!(reload_plugins))
+        .routes(routes!(search))
+        .routes(routes!(delete_search_docs))
+        .routes(routes!(list_saved_searches, create_saved_search))
+        .routes(routes!(delete_saved_search))
+        .routes(routes!(set_saved_search_enabled))
+        .routes(routes!(delete_search_dataset))
+        .routes(routes!(openapi_json))
+}
+
 pub fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/health", get(health))
-        .route("/metrics", get(metrics))
-        .route("/events", get(stream_events))
-        .route("/apps", get(list_apps))
-        .route("/apps/{name}/jobs", post(enqueue_job))
-        .route("/apps/{name}/datasets", get(list_datasets))
-        .route("/jobs", get(list_jobs))
-        .route("/jobs/{id}", get(get_job).delete(cancel_job))
-        .route("/jobs/{id}/retry", post(retry_job))
-        .route("/jobs/{id}/stream", get(stream_job))
-        .route("/jobs/{id}/costs", get(job_costs))
-        .route("/costs", get(cost_summary))
-        .route("/schedules", get(list_schedules).post(create_schedule))
-        .route("/schedules/{id}", axum::routing::delete(delete_schedule))
-        .route("/schedules/{id}/enabled", post(set_schedule_enabled))
-        .route("/datasets/{app}/{dataset}", get(list_records))
-        .route("/datasets/{app}/{dataset}/export", get(export_records))
-        .route("/datasets/{app}/{dataset}/duplicates", get(dataset_duplicates))
-        .route("/datasets/{app}/{dataset}/changes", get(dataset_changes))
-        .route("/datasets/{app}/{dataset}/history", get(record_history))
-        .route("/watches", get(list_watches).post(create_watch))
-        .route("/watches/{id}", axum::routing::delete(delete_watch))
-        .route("/watches/{id}/enabled", post(set_watch_enabled))
-        .route("/triggers", get(list_triggers).post(create_trigger))
-        .route("/triggers/{id}", axum::routing::delete(delete_trigger))
-        .route("/triggers/{id}/enabled", post(set_trigger_enabled))
-        .route("/triggers/{id}/test", post(test_trigger))
-        .route("/triggers/{id}/runs", get(trigger_runs))
-        .route("/webhooks/deliveries", get(list_deliveries))
-        .route("/webhooks/deliveries/{id}", get(get_delivery))
-        .route("/webhooks/deliveries/{id}/replay", post(replay_delivery))
-        .route("/hosts", get(list_hosts))
-        .route("/hosts/{host}", get(get_host))
-        .route("/hosts/{host}/memory", axum::routing::delete(delete_host_memory))
-        .route("/plugins", get(list_plugins))
-        .route("/plugins/reload", post(reload_plugins))
-        .route("/search", get(search))
-        .route("/search/docs", axum::routing::delete(delete_search_docs))
-        .route("/searches", get(list_saved_searches).post(create_saved_search))
-        .route("/searches/{id}", axum::routing::delete(delete_saved_search))
-        .route("/searches/{id}/enabled", post(set_saved_search_enabled))
-        .route(
-            "/search/datasets/{app}/{dataset}",
-            axum::routing::delete(delete_search_dataset),
-        )
+    let (router, _api) = openapi_router().split_for_parts();
+    router
         .layer(tower_http::trace::TraceLayer::new_for_http())
         // Local power mode: any localhost web app may call this API directly.
         .layer(tower_http::cors::CorsLayer::permissive())
         .with_state(state)
+}
+
+/// Serves the generated OpenAPI 3.1 document. The spec is rebuilt from the same
+/// route registration used by `router`, so it always matches what is served.
+#[utoipa::path(
+    get,
+    path = "/openapi.json",
+    tag = "meta",
+    responses((status = 200, description = "OpenAPI 3.1 document for this API"))
+)]
+async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
+    Json(openapi_router().split_for_parts().1)
 }
 
 struct ApiError(StatusCode, String);
@@ -101,6 +152,12 @@ impl From<pumper_core::Error> for ApiError {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/health",
+    tag = "health",
+    responses((status = 200, description = "Service is up (`{\"status\":\"ok\"}`)"))
+)]
 async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
@@ -118,6 +175,12 @@ fn metrics_response(body: String) -> Response {
 /// Prometheus-style text exposition of queue + platform gauges. Cached for
 /// `METRICS_TTL` so a burst of scrapes doesn't re-run the aggregate queries each
 /// time (the render touches jobs, costs, schedules, and timing in one pass).
+#[utoipa::path(
+    get,
+    path = "/metrics",
+    tag = "health",
+    responses((status = 200, description = "Prometheus text exposition (content-type text/plain; version=0.0.4)", content_type = "text/plain"))
+)]
 async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
     {
         let cached = state.metrics_cache.lock().await;
@@ -192,6 +255,12 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
 /// emitted first so the client knows to resync its view. Live subscribers that
 /// fall behind the broadcast buffer recover the same way instead of dropping
 /// events silently.
+#[utoipa::path(
+    get,
+    path = "/events",
+    tag = "events",
+    responses((status = 200, description = "SSE stream of job status transitions. Each event carries a monotonic `id`; reconnect with a `Last-Event-ID` header to replay the missed gap (or receive a `reset` event when it is too old).", content_type = "text/event-stream"))
+)]
 async fn stream_events(
     State(state): State<AppState>,
     headers: axum::http::HeaderMap,
@@ -226,6 +295,13 @@ async fn stream_events(
 
 /// SSE stream scoped to one job; closes once the job reaches a terminal state.
 /// Supports the same `Last-Event-ID` resume as `/events`, filtered to this job.
+#[utoipa::path(
+    get,
+    path = "/jobs/{id}/stream",
+    tag = "events",
+    params(("id" = Uuid, Path, description = "Job id")),
+    responses((status = 200, description = "SSE stream scoped to one job; replays current state on connect, closes at terminal. Same `Last-Event-ID` resume as `/events`.", content_type = "text/event-stream"))
+)]
 async fn stream_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -381,6 +457,12 @@ fn is_terminal(status: JobStatus) -> bool {
 
 // ---- Apps & jobs ----------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/apps",
+    tag = "apps",
+    responses((status = 200, description = "`{apps: [{name, description, schedule}]}`"))
+)]
 async fn list_apps(State(state): State<AppState>) -> Json<Value> {
     let mut apps: Vec<_> = state.registry.values().collect();
     apps.sort_by_key(|app| app.name());
@@ -397,7 +479,7 @@ async fn list_apps(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "apps": apps }))
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Default, ToSchema)]
 struct EnqueueBody {
     params: Option<Value>,
     max_attempts: Option<i64>,
@@ -415,6 +497,18 @@ struct EnqueueBody {
     idempotency_key: Option<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/apps/{name}/jobs",
+    tag = "apps",
+    params(("name" = String, Path, description = "App name")),
+    request_body = EnqueueBody,
+    responses(
+        (status = 202, description = "Job enqueued", body = Object),
+        (status = 200, description = "Idempotency-Key replay: the original job", body = Object),
+        (status = 404, description = "Unknown app", body = Object),
+    )
+)]
 async fn enqueue_job(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -453,7 +547,7 @@ async fn enqueue_job(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct ListQuery {
     app: Option<String>,
     status: Option<String>,
@@ -493,6 +587,13 @@ fn keyset_cursor<T>(items: &[T], limit: i64, encode: impl Fn(&T) -> String) -> O
         .map(encode)
 }
 
+#[utoipa::path(
+    get,
+    path = "/jobs",
+    tag = "jobs",
+    params(ListQuery),
+    responses((status = 200, description = "Dual-mode: without `cursor` a bare `[Job]` array; with `cursor` present (even empty) `{items: [Job], next_cursor}` paged by keyset."))
+)]
 async fn list_jobs(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
@@ -522,6 +623,16 @@ async fn list_jobs(
     Ok(Json(json!({ "items": jobs, "next_cursor": next_cursor })))
 }
 
+#[utoipa::path(
+    get,
+    path = "/jobs/{id}",
+    tag = "jobs",
+    params(("id" = Uuid, Path, description = "Job id")),
+    responses(
+        (status = 200, description = "The job", body = Object),
+        (status = 404, description = "Job not found", body = Object),
+    )
+)]
 async fn get_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -535,6 +646,17 @@ async fn get_job(
 }
 
 /// Re-queues a failed or cancelled job with one more attempt.
+#[utoipa::path(
+    post,
+    path = "/jobs/{id}/retry",
+    tag = "jobs",
+    params(("id" = Uuid, Path, description = "Job id")),
+    responses(
+        (status = 202, description = "Re-queued job", body = Object),
+        (status = 404, description = "Job not found", body = Object),
+        (status = 409, description = "Job not in a retryable (failed/cancelled) state", body = Object),
+    )
+)]
 async fn retry_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -565,6 +687,17 @@ async fn job_state_error(state: &AppState, id: Uuid, wrong_state: &str) -> ApiEr
     }
 }
 
+#[utoipa::path(
+    delete,
+    path = "/jobs/{id}",
+    tag = "jobs",
+    params(("id" = Uuid, Path, description = "Job id")),
+    responses(
+        (status = 200, description = "Cancelled (`{cancelled: true}`)"),
+        (status = 404, description = "Job not found", body = Object),
+        (status = 409, description = "Job not in `queued` state", body = Object),
+    )
+)]
 async fn cancel_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -581,6 +714,16 @@ async fn cancel_job(
 
 /// A job's cost events + total, with cost-per-fresh-record yield when the
 /// job's result exposes new/changed counts (the upsert-summary convention).
+#[utoipa::path(
+    get,
+    path = "/jobs/{id}/costs",
+    tag = "costs",
+    params(("id" = Uuid, Path, description = "Job id")),
+    responses(
+        (status = 200, description = "`{job_id, app, total_usd, calls, fresh_records, cost_per_fresh_record_usd, events}`"),
+        (status = 404, description = "Job not found", body = Object),
+    )
+)]
 async fn job_costs(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -609,7 +752,7 @@ async fn job_costs(
     })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct CostSummaryQuery {
     app: Option<String>,
     /// RFC 3339 lower bound for the window.
@@ -617,6 +760,13 @@ struct CostSummaryQuery {
 }
 
 /// Spend grouped by (app, engine) — the ROI overview.
+#[utoipa::path(
+    get,
+    path = "/costs",
+    tag = "costs",
+    params(CostSummaryQuery),
+    responses((status = 200, description = "`{total_usd, by_app_engine: [{app, engine, cost_usd}]}`"))
+)]
 async fn cost_summary(
     State(state): State<AppState>,
     Query(query): Query<CostSummaryQuery>,
@@ -637,7 +787,7 @@ async fn cost_summary(
 
 // ---- Schedules ------------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct SchedulesQuery {
     #[serde(default = "default_limit")]
     limit: i64,
@@ -645,6 +795,13 @@ struct SchedulesQuery {
     cursor: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/schedules",
+    tag = "schedules",
+    params(SchedulesQuery),
+    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present."))
+)]
 async fn list_schedules(
     State(state): State<AppState>,
     Query(query): Query<SchedulesQuery>,
@@ -661,7 +818,7 @@ async fn list_schedules(
     Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct CreateScheduleBody {
     app: String,
     /// 6-field cron with seconds: "sec min hour day month weekday".
@@ -670,6 +827,17 @@ struct CreateScheduleBody {
     priority: Option<i64>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/schedules",
+    tag = "schedules",
+    request_body = CreateScheduleBody,
+    responses(
+        (status = 201, description = "Created schedule", body = Object),
+        (status = 400, description = "Invalid cron expression", body = Object),
+        (status = 404, description = "Unknown app", body = Object),
+    )
+)]
 async fn create_schedule(
     State(state): State<AppState>,
     Json(body): Json<CreateScheduleBody>,
@@ -694,6 +862,16 @@ async fn create_schedule(
     Ok((StatusCode::CREATED, Json(schedule)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/schedules/{id}",
+    tag = "schedules",
+    params(("id" = String, Path, description = "Schedule id")),
+    responses(
+        (status = 200, description = "Deleted (`{deleted: true}`)"),
+        (status = 404, description = "Schedule not found", body = Object),
+    )
+)]
 async fn delete_schedule(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -705,11 +883,22 @@ async fn delete_schedule(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct EnabledBody {
     enabled: bool,
 }
 
+#[utoipa::path(
+    post,
+    path = "/schedules/{id}/enabled",
+    tag = "schedules",
+    params(("id" = String, Path, description = "Schedule id")),
+    request_body = EnabledBody,
+    responses(
+        (status = 200, description = "`{id, enabled}`"),
+        (status = 404, description = "Schedule not found", body = Object),
+    )
+)]
 async fn set_schedule_enabled(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -724,6 +913,13 @@ async fn set_schedule_enabled(
 
 // ---- Datasets -------------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/apps/{name}/datasets",
+    tag = "apps",
+    params(("name" = String, Path, description = "App name")),
+    responses((status = 200, description = "`{app, datasets: [name]}`"))
+)]
 async fn list_datasets(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -732,7 +928,7 @@ async fn list_datasets(
     Ok(Json(json!({ "app": name, "datasets": names })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct RecordsQuery {
     #[serde(default = "default_limit")]
     limit: i64,
@@ -740,6 +936,17 @@ struct RecordsQuery {
     cursor: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/datasets/{app}/{dataset}",
+    tag = "datasets",
+    params(
+        ("app" = String, Path, description = "App name"),
+        ("dataset" = String, Path, description = "Dataset name"),
+        RecordsQuery,
+    ),
+    responses((status = 200, description = "Dual-mode: bare `[Record]` array, or `{items, next_cursor}` when `cursor` is present."))
+)]
 async fn list_records(
     State(state): State<AppState>,
     Path((app, dataset)): Path<(String, String)>,
@@ -759,7 +966,7 @@ async fn list_records(
     Ok(Json(json!({ "items": records, "next_cursor": next_cursor })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct ExportQuery {
     /// 'json' (default) | 'ndjson' | 'csv'. All three stream in constant memory.
     format: Option<String>,
@@ -793,6 +1000,20 @@ impl ExportFormat {
     }
 }
 
+#[utoipa::path(
+    get,
+    path = "/datasets/{app}/{dataset}/export",
+    tag = "datasets",
+    params(
+        ("app" = String, Path, description = "App name"),
+        ("dataset" = String, Path, description = "Dataset name"),
+        ExportQuery,
+    ),
+    responses(
+        (status = 200, description = "Streamed export as a JSON array, NDJSON, or CSV (per `format`); constant memory, no row cap. `content-disposition: attachment`."),
+        (status = 400, description = "Unknown format", body = Object),
+    )
+)]
 async fn export_records(
     State(state): State<AppState>,
     Path((app, dataset)): Path<(String, String)>,
@@ -895,7 +1116,7 @@ fn csv_row(out: &mut String, record: &pumper_core::Record) {
     ));
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct DupQuery {
     #[serde(default = "default_distance")]
     distance: u32,
@@ -912,6 +1133,20 @@ fn default_distance() -> u32 {
 const DUP_SCAN_MAX: i64 = 10_000;
 
 /// Near-duplicate record pairs (SimHash Hamming distance ≤ `distance`).
+#[utoipa::path(
+    get,
+    path = "/datasets/{app}/{dataset}/duplicates",
+    tag = "datasets",
+    params(
+        ("app" = String, Path, description = "App name"),
+        ("dataset" = String, Path, description = "Dataset name"),
+        DupQuery,
+    ),
+    responses(
+        (status = 200, description = "`{app, dataset, max_distance, pairs}`"),
+        (status = 413, description = "Dataset over the 10k O(n^2) scan cap", body = Object),
+    )
+)]
 async fn dataset_duplicates(
     State(state): State<AppState>,
     Path((app, dataset)): Path<(String, String)>,
@@ -939,7 +1174,7 @@ async fn dataset_duplicates(
 
 // ---- Change intelligence ---------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct ChangesQuery {
     /// RFC 3339 lower bound; only revisions after this instant are returned.
     since: Option<String>,
@@ -952,6 +1187,17 @@ struct ChangesQuery {
 
 /// Change feed for a dataset: new/changed/removed revisions, newest first,
 /// each carrying the field-level diff versus its previous revision.
+#[utoipa::path(
+    get,
+    path = "/datasets/{app}/{dataset}/changes",
+    tag = "datasets",
+    params(
+        ("app" = String, Path, description = "App name"),
+        ("dataset" = String, Path, description = "Dataset name"),
+        ChangesQuery,
+    ),
+    responses((status = 200, description = "Dual-mode: `{app, dataset, count, changes}` (clamped 1000), or `{items, next_cursor}` when `cursor` is present (pages the full feed)."))
+)]
 async fn dataset_changes(
     State(state): State<AppState>,
     Path((app, dataset)): Path<(String, String)>,
@@ -986,7 +1232,7 @@ async fn dataset_changes(
     Ok(Json(json!({ "items": page.items, "next_cursor": page.next_cursor })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct HistoryQuery {
     /// Record key (query param, since keys may contain URL-hostile characters).
     key: String,
@@ -998,6 +1244,17 @@ struct HistoryQuery {
 }
 
 /// A single record's revision history, newest first.
+#[utoipa::path(
+    get,
+    path = "/datasets/{app}/{dataset}/history",
+    tag = "datasets",
+    params(
+        ("app" = String, Path, description = "App name"),
+        ("dataset" = String, Path, description = "Dataset name"),
+        HistoryQuery,
+    ),
+    responses((status = 200, description = "Dual-mode: `{app, dataset, key, count, revisions}` (clamped 500), or `{items, next_cursor}` when `cursor` is present."))
+)]
 async fn record_history(
     State(state): State<AppState>,
     Path((app, dataset)): Path<(String, String)>,
@@ -1026,7 +1283,7 @@ async fn record_history(
 
 // ---- Dataset watches --------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct WatchesQuery {
     app: Option<String>,
     #[serde(default = "default_limit")]
@@ -1035,6 +1292,13 @@ struct WatchesQuery {
     cursor: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/watches",
+    tag = "watches",
+    params(WatchesQuery),
+    responses((status = 200, description = "Dual-mode: `{watches: [Watch]}`, or `{items, next_cursor}` when `cursor` is present."))
+)]
 async fn list_watches(
     State(state): State<AppState>,
     Query(query): Query<WatchesQuery>,
@@ -1055,7 +1319,7 @@ async fn list_watches(
     Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct CreateWatchBody {
     app: String,
     /// Dataset to watch; "*" (default) watches every dataset of the app.
@@ -1066,6 +1330,17 @@ struct CreateWatchBody {
     secret: Option<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/watches",
+    tag = "watches",
+    request_body = CreateWatchBody,
+    responses(
+        (status = 201, description = "Created watch", body = Object),
+        (status = 400, description = "url must be http(s)", body = Object),
+        (status = 404, description = "Unknown app", body = Object),
+    )
+)]
 async fn create_watch(
     State(state): State<AppState>,
     Json(body): Json<CreateWatchBody>,
@@ -1088,6 +1363,16 @@ async fn create_watch(
     Ok((StatusCode::CREATED, Json(watch)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/watches/{id}",
+    tag = "watches",
+    params(("id" = String, Path, description = "Watch id")),
+    responses(
+        (status = 200, description = "Deleted (`{deleted: true}`)"),
+        (status = 404, description = "Watch not found", body = Object),
+    )
+)]
 async fn delete_watch(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1099,6 +1384,17 @@ async fn delete_watch(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/watches/{id}/enabled",
+    tag = "watches",
+    params(("id" = String, Path, description = "Watch id")),
+    request_body = EnabledBody,
+    responses(
+        (status = 200, description = "`{id, enabled}`"),
+        (status = 404, description = "Watch not found", body = Object),
+    )
+)]
 async fn set_watch_enabled(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1113,7 +1409,7 @@ async fn set_watch_enabled(
 
 // ---- Reactive triggers -------------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct TriggersQuery {
     app: Option<String>,
     #[serde(default = "default_limit")]
@@ -1122,6 +1418,13 @@ struct TriggersQuery {
     cursor: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/triggers",
+    tag = "triggers",
+    params(TriggersQuery),
+    responses((status = 200, description = "Dual-mode: `{triggers: [Trigger]}`, or `{items, next_cursor}` when `cursor` is present."))
+)]
 async fn list_triggers(
     State(state): State<AppState>,
     Query(query): Query<TriggersQuery>,
@@ -1142,7 +1445,7 @@ async fn list_triggers(
     Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct CreateTriggerBody {
     name: Option<String>,
     /// 'dataset' (change-feed events) | 'job' (terminal events).
@@ -1163,6 +1466,17 @@ struct CreateTriggerBody {
     max_attempts: Option<i64>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/triggers",
+    tag = "triggers",
+    request_body = CreateTriggerBody,
+    responses(
+        (status = 201, description = "Created trigger", body = Object),
+        (status = 400, description = "Invalid source_kind/on_change/on_status", body = Object),
+        (status = 404, description = "Unknown target app", body = Object),
+    )
+)]
 async fn create_trigger(
     State(state): State<AppState>,
     Json(body): Json<CreateTriggerBody>,
@@ -1220,6 +1534,16 @@ async fn create_trigger(
     Ok((StatusCode::CREATED, Json(trigger)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/triggers/{id}",
+    tag = "triggers",
+    params(("id" = String, Path, description = "Trigger id")),
+    responses(
+        (status = 200, description = "Deleted (`{deleted: true}`)"),
+        (status = 404, description = "Trigger not found", body = Object),
+    )
+)]
 async fn delete_trigger(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1231,6 +1555,17 @@ async fn delete_trigger(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/triggers/{id}/enabled",
+    tag = "triggers",
+    params(("id" = String, Path, description = "Trigger id")),
+    request_body = EnabledBody,
+    responses(
+        (status = 200, description = "`{id, enabled}`"),
+        (status = 404, description = "Trigger not found", body = Object),
+    )
+)]
 async fn set_trigger_enabled(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1243,7 +1578,7 @@ async fn set_trigger_enabled(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct TestTriggerQuery {
     /// When true, actually enqueue the resolved hop (repeatable — the
     /// idempotency key is bypassed for testing). Default: dry-run only.
@@ -1254,6 +1589,16 @@ struct TestTriggerQuery {
 /// Dry-runs a trigger against its most recent matching source job: shows
 /// whether it would fire, the resolved target params, and why not otherwise.
 /// `?fire=true` enqueues the hop for real.
+#[utoipa::path(
+    post,
+    path = "/triggers/{id}/test",
+    tag = "triggers",
+    params(("id" = String, Path, description = "Trigger id"), TestTriggerQuery),
+    responses(
+        (status = 200, description = "Dry-run decision `{would_fire, ...}` or, with `?fire=true`, `{fired, job}`"),
+        (status = 404, description = "Trigger not found", body = Object),
+    )
+)]
 async fn test_trigger(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1333,13 +1678,20 @@ async fn test_trigger(
     Ok(Json(json!({ "fired": true, "job": job })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct RunsQuery {
     #[serde(default = "default_limit")]
     limit: i64,
 }
 
 /// Jobs this trigger fired, newest first — the lineage view.
+#[utoipa::path(
+    get,
+    path = "/triggers/{id}/runs",
+    tag = "triggers",
+    params(("id" = String, Path, description = "Trigger id"), RunsQuery),
+    responses((status = 200, description = "`{trigger_id, count, runs: [Job]}`"))
+)]
 async fn trigger_runs(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1354,7 +1706,7 @@ async fn trigger_runs(
 
 // ---- Webhook delivery log ----------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct DeliveriesQuery {
     /// 'pending' | 'delivered' | 'failed' — `failed` is the dead-letter view.
     status: Option<String>,
@@ -1364,6 +1716,13 @@ struct DeliveriesQuery {
     cursor: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/webhooks/deliveries",
+    tag = "webhooks",
+    params(DeliveriesQuery),
+    responses((status = 200, description = "Dual-mode: `{count, deliveries}`, or `{items, next_cursor}` when `cursor` is present. `?status=failed` is the dead-letter view."))
+)]
 async fn list_deliveries(
     State(state): State<AppState>,
     Query(query): Query<DeliveriesQuery>,
@@ -1387,6 +1746,16 @@ async fn list_deliveries(
     Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
 }
 
+#[utoipa::path(
+    get,
+    path = "/webhooks/deliveries/{id}",
+    tag = "webhooks",
+    params(("id" = String, Path, description = "Delivery id")),
+    responses(
+        (status = 200, description = "The delivery, including body", body = Object),
+        (status = 404, description = "Delivery not found", body = Object),
+    )
+)]
 async fn get_delivery(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1401,6 +1770,16 @@ async fn get_delivery(
 
 /// Re-sends a logged delivery, re-signing with the source's current secret
 /// (job callback secret or watch secret) when it still exists.
+#[utoipa::path(
+    post,
+    path = "/webhooks/deliveries/{id}/replay",
+    tag = "webhooks",
+    params(("id" = String, Path, description = "Delivery id")),
+    responses(
+        (status = 202, description = "Replay scheduled (`{id, replaying: true}`)"),
+        (status = 404, description = "Delivery not found", body = Object),
+    )
+)]
 async fn replay_delivery(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1434,7 +1813,7 @@ async fn replay_delivery(
 
 // ---- Full-text search -----------------------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct SearchQuery {
     q: String,
     #[serde(default = "default_search_limit")]
@@ -1454,6 +1833,16 @@ fn default_search_limit() -> usize {
 
 /// Full-text search across everything indexed from job results (BM25 ranked),
 /// with highlighted snippets and app/dataset facets over the matching set.
+#[utoipa::path(
+    get,
+    path = "/search",
+    tag = "search",
+    params(SearchQuery),
+    responses(
+        (status = 200, description = "`{query, count, hits, facets}` (BM25 ranked, highlighted snippets)"),
+        (status = 400, description = "Empty query", body = Object),
+    )
+)]
 async fn search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
@@ -1479,7 +1868,7 @@ async fn search(
 
 // ---- Saved searches (standing alerts) ---------------------------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct SavedSearchesQuery {
     #[serde(default = "default_limit")]
     limit: i64,
@@ -1487,6 +1876,13 @@ struct SavedSearchesQuery {
     cursor: Option<String>,
 }
 
+#[utoipa::path(
+    get,
+    path = "/searches",
+    tag = "search",
+    params(SavedSearchesQuery),
+    responses((status = 200, description = "Dual-mode: `{searches: [SavedSearch]}`, or `{items, next_cursor}` when `cursor` is present."))
+)]
 async fn list_saved_searches(
     State(state): State<AppState>,
     Query(query): Query<SavedSearchesQuery>,
@@ -1507,7 +1903,7 @@ async fn list_saved_searches(
     Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct CreateSavedSearchBody {
     /// Full-text query (same syntax as GET /search).
     query: String,
@@ -1520,6 +1916,16 @@ struct CreateSavedSearchBody {
     secret: Option<String>,
 }
 
+#[utoipa::path(
+    post,
+    path = "/searches",
+    tag = "search",
+    request_body = CreateSavedSearchBody,
+    responses(
+        (status = 201, description = "Created saved search", body = Object),
+        (status = 400, description = "Empty query or url not http(s)", body = Object),
+    )
+)]
 async fn create_saved_search(
     State(state): State<AppState>,
     Json(body): Json<CreateSavedSearchBody>,
@@ -1543,6 +1949,16 @@ async fn create_saved_search(
     Ok((StatusCode::CREATED, Json(search)))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/searches/{id}",
+    tag = "search",
+    params(("id" = String, Path, description = "Saved search id")),
+    responses(
+        (status = 200, description = "Deleted (`{deleted: true}`)"),
+        (status = 404, description = "Saved search not found", body = Object),
+    )
+)]
 async fn delete_saved_search(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1554,6 +1970,17 @@ async fn delete_saved_search(
     }
 }
 
+#[utoipa::path(
+    post,
+    path = "/searches/{id}/enabled",
+    tag = "search",
+    params(("id" = String, Path, description = "Saved search id")),
+    request_body = EnabledBody,
+    responses(
+        (status = 200, description = "`{id, enabled}`"),
+        (status = 404, description = "Saved search not found", body = Object),
+    )
+)]
 async fn set_saved_search_enabled(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -1566,12 +1993,22 @@ async fn set_saved_search_enabled(
     }
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, ToSchema)]
 struct DeleteDocsBody {
     ids: Vec<String>,
 }
 
 /// Removes specific documents from the search index by id.
+#[utoipa::path(
+    delete,
+    path = "/search/docs",
+    tag = "search",
+    request_body = DeleteDocsBody,
+    responses(
+        (status = 200, description = "`{deleted: <count>}`"),
+        (status = 400, description = "`ids` must be non-empty", body = Object),
+    )
+)]
 async fn delete_search_docs(
     State(state): State<AppState>,
     Json(body): Json<DeleteDocsBody>,
@@ -1585,6 +2022,16 @@ async fn delete_search_docs(
 }
 
 /// Removes every indexed document of one app's dataset.
+#[utoipa::path(
+    delete,
+    path = "/search/datasets/{app}/{dataset}",
+    tag = "search",
+    params(
+        ("app" = String, Path, description = "App name"),
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    responses((status = 200, description = "`{app, dataset, deleted: true}`"))
+)]
 async fn delete_search_dataset(
     State(state): State<AppState>,
     Path((app, dataset)): Path<(String, String)>,
@@ -1595,7 +2042,7 @@ async fn delete_search_dataset(
 
 // ---- Host profiles (learned tier memory + politeness) -----------------------
 
-#[derive(Deserialize)]
+#[derive(Deserialize, IntoParams)]
 struct HostsQuery {
     #[serde(default = "default_limit")]
     limit: i64,
@@ -1614,6 +2061,15 @@ async fn host_json(state: &AppState, mut profile: HostProfile) -> Value {
 
 /// Paginated list of learned host state: preferred tier, HTTP strikes, live
 /// politeness penalty, and last-outcome timestamps. Most-recently-active first.
+#[utoipa::path(
+    get,
+    path = "/hosts",
+    tag = "hosts",
+    params(HostsQuery),
+    responses((status = 200, description = "Dual-mode: `{hosts: [...]}` without `cursor=`, \
+        `{items, next_cursor}` with it. Each host: `{host, preferred_tier, http_strikes, \
+        penalty_ms (live), updated_at, penalty_updated_at}`"))
+)]
 async fn list_hosts(
     State(state): State<AppState>,
     Query(query): Query<HostsQuery>,
@@ -1639,6 +2095,17 @@ async fn list_hosts(
 
 /// One host's learned profile. 404 when the host has no learned state (no tier
 /// memory row and no live penalty).
+#[utoipa::path(
+    get,
+    path = "/hosts/{host}",
+    tag = "hosts",
+    params(("host" = String, Path, description = "Hostname (case-insensitive)")),
+    responses(
+        (status = 200, description = "`{host, preferred_tier, http_strikes, penalty_ms (live), \
+            updated_at, penalty_updated_at}`"),
+        (status = 404, description = "No learned state for this host", body = Object),
+    )
+)]
 async fn get_host(
     State(state): State<AppState>,
     Path(host): Path<String>,
@@ -1664,6 +2131,16 @@ async fn get_host(
 
 /// Resets a host's learned state: drops its tier memory (strikes + browser pin +
 /// persisted penalty) and clears the live governor penalty. 404 when unknown.
+#[utoipa::path(
+    delete,
+    path = "/hosts/{host}/memory",
+    tag = "hosts",
+    params(("host" = String, Path, description = "Hostname (case-insensitive)")),
+    responses(
+        (status = 200, description = "`{host, reset: true}`"),
+        (status = 404, description = "No learned state for this host", body = Object),
+    )
+)]
 async fn delete_host_memory(
     State(state): State<AppState>,
     Path(host): Path<String>,
@@ -1680,12 +2157,127 @@ async fn delete_host_memory(
 
 // ---- WASM plugins ---------------------------------------------------------
 
+#[utoipa::path(
+    get,
+    path = "/plugins",
+    tag = "plugins",
+    responses((status = 200, description = "`{plugins: [...]}`"))
+)]
 async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
     Json(json!({ "plugins": state.plugins.list() }))
 }
 
 /// Hot-swap: rescan the plugin directory and reload every `.wasm` module.
+#[utoipa::path(
+    post,
+    path = "/plugins/reload",
+    tag = "plugins",
+    responses((status = 200, description = "`{loaded: <count>}`"))
+)]
 async fn reload_plugins(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let loaded = state.plugins.reload().await?;
     Ok(Json(json!({ "loaded": loaded })))
+}
+
+#[cfg(test)]
+mod api_spec_tests {
+    use std::collections::BTreeSet;
+
+    /// Every `(METHOD, path)` operation the router serves. Because `router` and
+    /// the OpenAPI document are both generated from `openapi_router`, this set is
+    /// literally the routing table — so this list doubles as the canonical route
+    /// inventory. Adding or removing a route changes the spec and fails this test
+    /// until the list is updated, which is the point: drift can't land silently.
+    const EXPECTED: &[&str] = &[
+        "GET /health",
+        "GET /metrics",
+        "GET /events",
+        "GET /apps",
+        "POST /apps/{name}/jobs",
+        "GET /apps/{name}/datasets",
+        "GET /jobs",
+        "GET /jobs/{id}",
+        "DELETE /jobs/{id}",
+        "POST /jobs/{id}/retry",
+        "GET /jobs/{id}/stream",
+        "GET /jobs/{id}/costs",
+        "GET /costs",
+        "GET /schedules",
+        "POST /schedules",
+        "DELETE /schedules/{id}",
+        "POST /schedules/{id}/enabled",
+        "GET /datasets/{app}/{dataset}",
+        "GET /datasets/{app}/{dataset}/export",
+        "GET /datasets/{app}/{dataset}/duplicates",
+        "GET /datasets/{app}/{dataset}/changes",
+        "GET /datasets/{app}/{dataset}/history",
+        "GET /watches",
+        "POST /watches",
+        "DELETE /watches/{id}",
+        "POST /watches/{id}/enabled",
+        "GET /triggers",
+        "POST /triggers",
+        "DELETE /triggers/{id}",
+        "POST /triggers/{id}/enabled",
+        "POST /triggers/{id}/test",
+        "GET /triggers/{id}/runs",
+        "GET /webhooks/deliveries",
+        "GET /webhooks/deliveries/{id}",
+        "POST /webhooks/deliveries/{id}/replay",
+        "GET /hosts",
+        "GET /hosts/{host}",
+        "DELETE /hosts/{host}/memory",
+        "GET /plugins",
+        "POST /plugins/reload",
+        "GET /search",
+        "DELETE /search/docs",
+        "GET /searches",
+        "POST /searches",
+        "DELETE /searches/{id}",
+        "POST /searches/{id}/enabled",
+        "DELETE /search/datasets/{app}/{dataset}",
+        "GET /openapi.json",
+    ];
+
+    /// The `(METHOD, path)` operations actually present in the generated spec.
+    fn spec_operations() -> BTreeSet<String> {
+        let api = super::openapi_router().split_for_parts().1;
+        let json = serde_json::to_value(&api).expect("spec serializes");
+        let methods = ["get", "post", "put", "delete", "patch", "head", "options", "trace"];
+        let mut ops = BTreeSet::new();
+        for (path, item) in json["paths"].as_object().expect("paths object") {
+            for method in item.as_object().expect("path item object").keys() {
+                if methods.contains(&method.as_str()) {
+                    ops.insert(format!("{} {}", method.to_uppercase(), path));
+                }
+            }
+        }
+        ops
+    }
+
+    #[test]
+    fn spec_covers_exactly_the_registered_routes() {
+        let spec = spec_operations();
+        let expected: BTreeSet<String> = EXPECTED.iter().map(|s| s.to_string()).collect();
+        let missing: Vec<_> = expected.difference(&spec).collect();
+        let undocumented: Vec<_> = spec.difference(&expected).collect();
+        assert!(
+            missing.is_empty(),
+            "routes missing from the OpenAPI spec: {missing:?}"
+        );
+        assert!(
+            undocumented.is_empty(),
+            "spec has operations not in the expected inventory (update EXPECTED): {undocumented:?}"
+        );
+    }
+
+    #[test]
+    fn spec_is_valid_openapi_document() {
+        let api = super::openapi_router().split_for_parts().1;
+        let json = serde_json::to_value(&api).unwrap();
+        assert!(json["openapi"].as_str().unwrap().starts_with("3."));
+        assert_eq!(json["info"]["title"], "pumper HTTP API");
+        // Typed request bodies land in components.schemas (e.g. the enqueue body).
+        assert!(json["components"]["schemas"]["EnqueueBody"].is_object());
+    }
 }
