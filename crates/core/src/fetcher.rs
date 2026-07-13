@@ -132,15 +132,25 @@ impl Fetcher {
             http_req.ttl_override = req.ttl_override;
             match self.http.fetch(http_req).await {
                 Ok(resp) => {
-                    let markdown = html_to_markdown(&resp.body);
-                    let enough = resp.is_success() && markdown.chars().count() >= min_chars;
+                    // Convert to Markdown at most once, and only when a decision
+                    // (escalation) or the caller (to_markdown) actually needs it.
+                    // The `Http` strategy returns regardless, so it skips the
+                    // conversion entirely unless Markdown was requested.
+                    let needs_count = matches!(
+                        req.strategy,
+                        FetchStrategy::Auto | FetchStrategy::AutoWithResearch
+                    );
+                    let markdown =
+                        (req.to_markdown || needs_count).then(|| html_to_markdown(&resp.body));
+                    let text_len = markdown.as_ref().map(|m| m.chars().count());
+                    let enough = resp.is_success() && text_len.map_or(true, |n| n >= min_chars);
                     if enough || req.strategy == FetchStrategy::Http {
                         return Ok(outcome("http", &req, Some(resp.status), resp.body, markdown, escalations));
                     }
                     escalations.push(format!(
                         "http tier thin: status {}, {} chars of text",
                         resp.status,
-                        markdown.chars().count()
+                        text_len.unwrap_or(0)
                     ));
                 }
                 Err(e) if req.strategy == FetchStrategy::Http => return Err(e),
@@ -154,14 +164,21 @@ impl Fetcher {
             render.wait_for_selector = req.wait_for_selector.clone();
             match self.browser.render(render).await {
                 Ok(page) => {
-                    let markdown = html_to_markdown(&page.html);
-                    let enough = markdown.chars().count() >= min_chars;
+                    // Only AutoWithResearch escalates past the browser, so the
+                    // char count only decides anything there; every other
+                    // strategy returns the render as-is. Convert once, and only
+                    // when the decision or the caller needs Markdown.
+                    let needs_count = req.strategy == FetchStrategy::AutoWithResearch;
+                    let markdown =
+                        (req.to_markdown || needs_count).then(|| html_to_markdown(&page.html));
+                    let text_len = markdown.as_ref().map(|m| m.chars().count());
+                    let enough = text_len.map_or(true, |n| n >= min_chars);
                     if enough || req.strategy != FetchStrategy::AutoWithResearch {
                         return Ok(outcome("browser", &req, None, page.html, markdown, escalations));
                     }
                     escalations.push(format!(
                         "browser tier thin: {} chars of text",
-                        markdown.chars().count()
+                        text_len.unwrap_or(0)
                     ));
                 }
                 Err(e) if req.strategy == FetchStrategy::Browser => return Err(e),
@@ -206,14 +223,15 @@ fn outcome(
     req: &FetchRequest,
     status: Option<u16>,
     html: String,
-    markdown: String,
+    markdown: Option<String>,
     escalations: Vec<String>,
 ) -> FetchOutcome {
     FetchOutcome {
         url: req.url.clone(),
         engine,
         status,
-        markdown: req.to_markdown.then_some(markdown),
+        // `markdown` is only computed when needed; surface it solely when asked.
+        markdown: if req.to_markdown { markdown } else { None },
         text: None,
         html: Some(html),
         escalations,

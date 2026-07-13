@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use tokio::sync::Mutex;
+use dashmap::DashMap;
 use tokio::time::Instant;
 
 use crate::config::GovernorConfig;
@@ -18,18 +18,38 @@ const PENALTY_BASE: Duration = Duration::from_secs(1);
 const PENALTY_CAP: Duration = Duration::from_secs(300);
 const PENALTY_FLOOR: Duration = Duration::from_millis(100);
 
+/// Idle-host eviction bounds. When the per-host map grows past `MAX_HOSTS`, a
+/// sweep drops entries untouched for `IDLE_TTL` (keeping any still serving out
+/// a penalty). Bounds memory for long-lived servers hitting many origins.
+const MAX_HOSTS: usize = 4096;
+const IDLE_TTL: Duration = Duration::from_secs(3600);
+/// Amortize the (relatively pricey) size check across many acquires.
+const EVICT_CHECK_EVERY: u64 = 1024;
+
+/// Per-host politeness state. Held in one sharded map ([`DashMap`]) so distinct
+/// hosts never contend on a single global lock the way two `Mutex<HashMap>`s did.
+struct HostState {
+    /// Next free slot; acquire() claims one and advances it.
+    next_slot: Instant,
+    /// Learned extra spacing: doubled on 429/503 (respecting Retry-After),
+    /// halved on success, zeroed below the floor.
+    penalty: Duration,
+    /// Last time this host was touched — drives idle eviction.
+    last_seen: Instant,
+}
+
 pub struct Governor {
     enabled: bool,
     default_interval: Duration,
     per_domain: HashMap<String, Duration>,
     max_jitter: Duration,
-    /// Next free slot per host; acquire() claims one and advances it.
-    next_slot: Mutex<HashMap<String, Instant>>,
-    /// Learned extra spacing per host: doubled on 429/503 (respecting
-    /// Retry-After), halved on success, dropped below the floor.
-    penalties: Mutex<HashMap<String, Duration>>,
+    /// Sharded per-host slot + penalty state. Distinct hosts hit different
+    /// shards, so unrelated targets never serialize on each other.
+    hosts: DashMap<String, HostState>,
     /// Cheap deterministic jitter source (no rng dependency, resume-safe).
     tick: AtomicU64,
+    /// Acquire counter; gates the amortized idle-eviction sweep.
+    ops: AtomicU64,
 }
 
 impl Governor {
@@ -51,9 +71,9 @@ impl Governor {
             default_interval: interval(cfg.default_rps),
             per_domain,
             max_jitter: Duration::from_millis(cfg.jitter_ms),
-            next_slot: Mutex::new(HashMap::new()),
-            penalties: Mutex::new(HashMap::new()),
+            hosts: DashMap::new(),
             tick: AtomicU64::new(0),
+            ops: AtomicU64::new(0),
         }
     }
 
@@ -64,25 +84,32 @@ impl Governor {
             return;
         }
         let host = host.to_lowercase();
-        let penalty = { self.penalties.lock().await.get(&host).copied().unwrap_or(Duration::ZERO) };
-        let interval = self
-            .per_domain
-            .get(&host)
-            .copied()
-            .unwrap_or(self.default_interval)
-            + penalty;
-        if interval.is_zero() && self.max_jitter.is_zero() {
-            return;
+        let base = self.per_domain.get(&host).copied().unwrap_or(self.default_interval);
+
+        // Fast path: unlimited + unpenalized + no jitter needs no spacing and no
+        // state churn. Only a live penalty on this host forces the slow path.
+        if base.is_zero() && self.max_jitter.is_zero() {
+            let penalized = self.hosts.get(&host).map(|s| !s.penalty.is_zero()).unwrap_or(false);
+            if !penalized {
+                return;
+            }
         }
 
         let slot = {
-            let mut slots = self.next_slot.lock().await;
             let now = Instant::now();
-            let entry = slots.entry(host).or_insert(now);
-            let start = (*entry).max(now);
-            *entry = start + interval;
+            let mut entry = self.hosts.entry(host).or_insert_with(|| HostState {
+                next_slot: now,
+                penalty: Duration::ZERO,
+                last_seen: now,
+            });
+            entry.last_seen = now;
+            let interval = base + entry.penalty;
+            let start = entry.next_slot.max(now);
+            entry.next_slot = start + interval;
             start
         };
+
+        self.maybe_evict();
 
         let wake = slot + self.jitter();
         let now = Instant::now();
@@ -100,44 +127,64 @@ impl Governor {
             return;
         }
         let host = host.to_lowercase();
-        let next = {
-            let mut penalties = self.penalties.lock().await;
-            let current = penalties.get(&host).copied().unwrap_or(Duration::ZERO);
-            let doubled = if current.is_zero() { PENALTY_BASE } else { current.saturating_mul(2) };
-            let next = doubled.max(retry_after.unwrap_or(Duration::ZERO)).min(PENALTY_CAP);
-            penalties.insert(host.clone(), next);
-            next
+        let now = Instant::now();
+        let mut entry = self.hosts.entry(host.clone()).or_insert_with(|| HostState {
+            next_slot: now,
+            penalty: Duration::ZERO,
+            last_seen: now,
+        });
+        entry.last_seen = now;
+        let doubled = if entry.penalty.is_zero() {
+            PENALTY_BASE
+        } else {
+            entry.penalty.saturating_mul(2)
         };
-        {
-            let mut slots = self.next_slot.lock().await;
-            let now = Instant::now();
-            let entry = slots.entry(host.clone()).or_insert(now);
-            *entry = (*entry).max(now + next);
-        }
+        let next = doubled.max(retry_after.unwrap_or(Duration::ZERO)).min(PENALTY_CAP);
+        entry.penalty = next;
+        entry.next_slot = entry.next_slot.max(now + next);
+        drop(entry);
         tracing::warn!(host = %host, penalty_secs = next.as_secs_f64(), "rate-limited; backing off");
     }
 
-    /// Records a healthy response for `host`: the learned penalty halves and
-    /// is dropped entirely below the floor — recovery without a config change.
+    /// Records a healthy response for `host`: the learned penalty halves and is
+    /// zeroed below the floor — recovery without a config change. A no-op for a
+    /// host with no learned penalty (never inserts state).
     pub async fn reward(&self, host: &str) {
         let host = host.to_lowercase();
-        let mut penalties = self.penalties.lock().await;
-        if let Some(current) = penalties.get_mut(&host) {
-            *current /= 2;
-            if *current < PENALTY_FLOOR {
-                penalties.remove(&host);
+        if let Some(mut entry) = self.hosts.get_mut(&host) {
+            if entry.penalty.is_zero() {
+                return;
+            }
+            entry.last_seen = Instant::now();
+            entry.penalty /= 2;
+            if entry.penalty < PENALTY_FLOOR {
+                entry.penalty = Duration::ZERO;
             }
         }
     }
 
     /// The current learned extra spacing for a host (observability + tests).
     pub async fn penalty(&self, host: &str) -> Duration {
-        self.penalties
-            .lock()
-            .await
+        self.hosts
             .get(&host.to_lowercase())
-            .copied()
+            .map(|s| s.penalty)
             .unwrap_or(Duration::ZERO)
+    }
+
+    /// Amortized idle-host eviction: rarely checked, sweeps only when the map
+    /// has grown past the cap, and keeps hosts touched recently or still under
+    /// a penalty. Holds no entry ref (avoids a shard self-deadlock).
+    fn maybe_evict(&self) {
+        if self.ops.fetch_add(1, Ordering::Relaxed) % EVICT_CHECK_EVERY != 0 {
+            return;
+        }
+        if self.hosts.len() <= MAX_HOSTS {
+            return;
+        }
+        let now = Instant::now();
+        self.hosts.retain(|_, s| {
+            now.saturating_duration_since(s.last_seen) < IDLE_TTL || !s.penalty.is_zero()
+        });
     }
 
     fn jitter(&self) -> Duration {
@@ -154,11 +201,49 @@ impl Governor {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use super::*;
     use crate::config::GovernorConfig;
 
     fn governor() -> Governor {
         Governor::new(&GovernorConfig::default())
+    }
+
+    /// Distinct hosts never serialize on each other, yet each host's own
+    /// spacing still holds — the whole point of the per-host sharded map.
+    #[tokio::test]
+    async fn distinct_hosts_run_in_parallel_but_each_host_spaces() {
+        // 200ms per-host spacing, no jitter for a deterministic lower bound.
+        let cfg = GovernorConfig {
+            enabled: true,
+            default_rps: 5.0,
+            jitter_ms: 0,
+            per_domain: HashMap::new(),
+        };
+        let g = Arc::new(Governor::new(&cfg));
+
+        let start = Instant::now();
+        let mut tasks = Vec::new();
+        for i in 0..32 {
+            let g = g.clone();
+            tasks.push(tokio::spawn(async move {
+                let host = format!("h{i}.example");
+                // 3 acquires => 2 spacing gaps of 200ms each (~400ms) per host.
+                for _ in 0..3 {
+                    g.acquire(&host).await;
+                }
+            }));
+        }
+        for t in tasks {
+            t.await.unwrap();
+        }
+        let elapsed = start.elapsed();
+
+        // Lower bound: same-host spacing was enforced (two 200ms gaps).
+        assert!(elapsed >= Duration::from_millis(350), "per-host spacing lost: {elapsed:?}");
+        // Upper bound: 32 hosts ran concurrently, not serialized into ~12.8s.
+        assert!(elapsed < Duration::from_secs(3), "distinct hosts serialized: {elapsed:?}");
     }
 
     #[tokio::test]

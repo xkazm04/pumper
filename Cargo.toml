@@ -74,6 +74,7 @@ wasmtime = "46"
 tantivy = "0.26"
 
 # shared
+dashmap = "6"
 async-trait = "0.1"
 async-stream = "0.3"
 sha2 = "0.10"

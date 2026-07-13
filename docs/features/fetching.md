@@ -16,7 +16,7 @@ Always prefer the metered **`AppContext::fetch`** over `ctx.engines.fetch` — i
 
 ## Politeness governor (adaptive)
 
-Per-host token bucket: configured spacing (`[governor] default_rps`, `per_domain`, jitter) **plus a learned penalty**: a 429/503 doubles the host's extra spacing (1s base, honors a larger `Retry-After`, 5-min cap) and pushes the host's next slot out; any healthy response halves it (dropped below 100ms floor). In-memory — resets on restart by design.
+Per-host token bucket: configured spacing (`[governor] default_rps`, `per_domain`, jitter) **plus a learned penalty**: a 429/503 doubles the host's extra spacing (1s base, honors a larger `Retry-After`, 5-min cap) and pushes the host's next slot out; any healthy response halves it (dropped below 100ms floor). State is held in one sharded map keyed by host, so distinct hosts never contend; idle hosts are evicted once the map outgrows its cap. In-memory — resets on restart by design.
 
 ## Self-learning tier router
 
