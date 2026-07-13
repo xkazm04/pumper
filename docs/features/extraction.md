@@ -31,14 +31,22 @@ Status reflects the **rule match, before transforms** — it answers "did the se
 
 `DocReport` is a serde-transparent map `{ field -> {status, detail?} }` (`FieldStatus` is a `status`-tagged enum). Both are serde-stable for downstream serialization.
 
+### Input modes
+
+The `extractor` app takes **either** `urls` **or** `source` (exactly one):
+
+- **`urls`** (`"mode": "urls"`) — fetch each URL live (tiered, `strategy` param). Failed/empty fetches are attributed in `failed` and skipped, never upserted as all-null records.
+- **`source: {app, dataset, keys?}`** (`"mode": "source"`) — read stored bodies from a dataset instead of re-fetching. Each record must carry `artifact_path` (a body basename) and `job_id` (the origin job); the body is resolved at `data/artifacts/<source.app>/<job_id>/<artifact_path>` (the shared artifacts root, two levels above the extractor's own per-job dir). This is the crawl→extract seam: the crawl already wrote every kept page's body to disk, so re-extracting reads it instead of double-fetching. `keys` precedence: explicit `source.keys` → the firing trigger's `_trigger.keys` (dataset-trigger fan-out) → all live records (not removed, not `gone`), capped at 10,000. Records with no `artifact_path`/`job_id`, or an unreadable file, are counted in `missing` and listed per key in `missing_keys` — never silently null.
+
 ### `extractor` result shape
 
-The `extractor` app skips fetch failures instead of upserting all-null records, and reports aggregate quality:
+Both modes share the extraction + quality-report path and report aggregate quality:
 
-- `fetched` / `skipped` — docs that fetched vs. were dropped; `failed` lists the skipped URLs.
-- `fields_matched` / `fields_total` — matched extractions over total attempted across all kept docs.
-- `worst_fields` — fields that missed at least once, worst first: `{field, misses, errors, miss_rate}` (a miss is an `empty` or `error` status; `miss_rate` is misses ÷ docs).
-- `mode` — `"urls"` (see the crawl→extract seam below for `"source"`).
+- urls mode: `requested`, `fetched`, `skipped`, `failed` (skipped URLs).
+- source mode: `source {app, dataset}`, `requested`, `loaded`, `missing`, `missing_keys` (`[{key, reason}]`).
+- both: `new` / `changed` / `unchanged` (upsert outcome), `fields_matched` / `fields_total` (matched extractions over total attempted), and `worst_fields` — fields that missed at least once, worst first: `{field, misses, errors, miss_rate}` (a miss is an `empty` or `error` status; `miss_rate` is misses ÷ docs). Records are tagged `_url` = source URL / record key.
+
+**Artifact-retention caveat**: source mode depends on the origin job's bodies still being on disk. Crawl bodies live in per-job dirs (`data/artifacts/<app>/<job_id>/`) and there is **no retention/GC policy** — bodies persist until manually removed, and once removed those keys land in `missing_keys` on the next extract.
 
 ## HTML → Markdown
 

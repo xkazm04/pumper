@@ -37,6 +37,23 @@ Revisit does **not** follow links (no frontier expansion) unless `discover: true
 
 **Sentinel recipe:** schedule a revisit crawl (`POST /schedules {app:"crawl", cron, params:{mode:"revisit"}}`) after an initial full crawl has populated `pages`; add a dataset **watch** or **trigger** on the crawl app's `pages` dataset (`on_change: "changed"`) to get a webhook / chained job whenever a monitored page's content changes or goes gone. The `changed`/`gone` counts in the result summarize each sweep.
 
+## Crawl → extract pipeline (source mode)
+
+The crawl writes every kept page's body to disk and records `artifact_path` + `job_id` in `pages`. The [`extractor`](extraction.md) app can read those stored bodies directly instead of re-fetching — a **crawl → dataset trigger → extractor** pipeline with no double-fetch:
+
+1. **Crawl** a site (`POST /jobs {app:"crawl", params:{seeds:[..]}}`). Kept pages stream into the `pages` dataset, each with its body at `data/artifacts/crawl/<job_id>/page-NNNN.html`.
+2. **Trigger**: create a dataset trigger on `crawl`'s `pages` (`on_change:"any"` or `"changed"`) targeting the `extractor` app, with a params template that names the source and the rule set:
+   ```json
+   {"app":"extractor","params":{"source":{"app":"crawl","dataset":"pages"},
+     "rules":{"headline":{"type":"css","selector":"h1"}}}}
+   ```
+   At fire time the runtime merges `_trigger` (with the capped changed `keys`) over the template; the extractor reads `_trigger.keys` and processes exactly the pages that just changed, resolving each body against `data/artifacts/crawl/<job_id>/<artifact_path>`.
+3. **Extract**: extracted fields upsert into the extractor's own `extracted` dataset (override with `dataset`), with the per-field quality report (`fields_matched`/`worst_fields`) and any `missing_keys` for bodies no longer on disk.
+
+Run it manually the same way — omit the trigger and pass `source.keys` (or nothing, to sweep all live `pages`).
+
+**Artifact-retention caveat**: source mode reads bodies from the **origin crawl job's** per-job artifacts dir. There is **no retention/GC policy** — bodies persist until manually deleted; once a body is gone, its key surfaces in the extractor's `missing_keys` rather than as a silent null. A revisit crawl writes fresh bodies under a **new** `job_id` and updates the record's `job_id`, so extraction always follows the latest stored body.
+
 ## Result stats
 
 `crawled, kept, skipped_duplicates, skipped_robots, skipped_filtered, sitemap_seeded, failed, failed_by_host{}, skipped_botwall, robots_fetch_failures, checkpoint_errors, resumed, checkpoint_reset, hosts, frontier_remaining`, plus the `pages` dataset pointer + write outcome `pages_dataset, pages_new, pages_changed, pages_unchanged`. Revisit mode adds `revisit, revisited, unchanged_304, changed, gone, new` (`changed`/`new` mirror the live `pages_changed`/`pages_new`). Per-page detail is queried from the `pages` dataset, not returned inline (memory-bounded).

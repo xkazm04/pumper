@@ -8,11 +8,15 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use pumper_core::{
     extract_batch_with_report, AppContext, CompiledRuleSet, DocReport, Error, FetchRequest,
-    FetchStrategy, FieldStatus, Result, RuleSet, ScrapeApp,
+    FetchStrategy, FieldStatus, Record, Result, RuleSet, ScrapeApp, UpsertSummary,
 };
 use serde_json::{json, Value};
 
 pub struct Extractor;
+
+/// Max live records pulled from a source dataset when no explicit `keys` (and no
+/// `_trigger.keys`) narrow the set — bounds the dataset read and the fan-out.
+const SOURCE_LIST_LIMIT: i64 = 10_000;
 
 /// Aggregate the per-document reports into a quality signal for the job result:
 /// how many field extractions matched out of the total attempted, plus the
@@ -71,6 +75,72 @@ async fn run_extraction(
         .map_err(|e| Error::App(format!("extract task failed: {e}")))
 }
 
+/// Shared tail for both input modes: extract the `(key, doc)` pairs in parallel,
+/// tag each record with its source key as `_url`, upsert into `dataset`, and
+/// return the records plus the aggregate quality signal. `key` is a source URL
+/// (urls mode) or a dataset record key (source mode) — for the crawl `pages`
+/// dataset the key IS the canonical URL, so `_url` stays meaningful.
+async fn extract_and_upsert(
+    ctx: &AppContext,
+    compiled: Arc<CompiledRuleSet>,
+    dataset: &str,
+    keyed: Vec<(String, String)>,
+) -> Result<(Vec<Value>, u64, u64, Vec<Value>, UpsertSummary)> {
+    let docs: Vec<String> = keyed.iter().map(|(_, d)| d.clone()).collect();
+    let reported = run_extraction(compiled, docs).await?;
+    let (matched, total, worst) =
+        summarize_reports(&reported.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>());
+
+    let mut records: Vec<Value> = Vec::with_capacity(reported.len());
+    let items: Vec<(String, Value)> = keyed
+        .into_iter()
+        .map(|(key, _)| key)
+        .zip(reported)
+        .map(|(key, (mut rec, _))| {
+            if let Value::Object(map) = &mut rec {
+                map.insert("_url".into(), Value::String(key.clone()));
+            }
+            records.push(rec.clone());
+            (key, rec)
+        })
+        .collect();
+    let summary = ctx.upsert_many(dataset, &items).await?;
+    Ok((records, matched, total, worst, summary))
+}
+
+/// Resolves the stored body for one `source`-mode record and reads it. Records
+/// written by the crawl carry `artifact_path` (basename of `page-NNNN.html`)
+/// and `job_id` (the ORIGIN crawl job). Bodies live at
+/// `data/artifacts/<source_app>/<job_id>/<artifact_path>`, so we resolve against
+/// the shared artifacts root (this job's own dir is `.../extractor/<job_id>`,
+/// two levels below the root). Returns the body, or an error reason to report.
+async fn read_source_body(
+    ctx: &AppContext,
+    source_app: &str,
+    record: &Record,
+) -> std::result::Result<String, String> {
+    let artifact = record
+        .data
+        .get("artifact_path")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "record has no artifact_path".to_string())?;
+    let job_id = record
+        .data
+        .get("job_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| "record has no job_id".to_string())?;
+    let root = ctx
+        .artifacts_dir
+        .parent()
+        .and_then(std::path::Path::parent)
+        .ok_or_else(|| "cannot resolve artifacts root".to_string())?;
+    let path = root.join(source_app).join(job_id).join(artifact);
+    tokio::fs::read_to_string(&path)
+        .await
+        .map_err(|e| format!("unreadable artifact {}: {e}", path.display()))
+}
+
 #[async_trait]
 impl ScrapeApp for Extractor {
     fn name(&self) -> &'static str {
@@ -78,21 +148,16 @@ impl ScrapeApp for Extractor {
     }
 
     fn description(&self) -> &'static str {
-        "Fetch many URLs and extract fields in parallel via a declarative rule set. Params: \
-         {\"urls\": [..], \"rules\": {\"field\": {\"type\": \"css|regex|json|const\", ..}}, \
-         \"strategy\": \"http|browser|auto\", \"dataset\": \"extracted\"}"
+        "Fetch many URLs (or read stored crawl bodies) and extract fields in parallel via a \
+         declarative rule set. Params: {\"urls\": [..] OR \"source\": {\"app\": .., \
+         \"dataset\": .., \"keys\": [..]?}, \"rules\": {\"field\": {\"type\": \
+         \"css|regex|json|xpath|const\", ..}}, \"strategy\": \"http|browser|auto\", \
+         \"dataset\": \"extracted\"}. Source mode reads each record's stored body \
+         (artifact_path under the origin job's dir) instead of re-fetching; keys default to \
+         the firing trigger's _trigger.keys, else all live records."
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
-        let urls: Vec<String> = ctx
-            .params
-            .get("urls")
-            .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
-            .unwrap_or_default();
-        if urls.is_empty() {
-            return Err(Error::App("param 'urls' must be a non-empty array".into()));
-        }
         let rules: RuleSet = ctx
             .params
             .get("rules")
@@ -101,13 +166,6 @@ impl ScrapeApp for Extractor {
             .and_then(|v| serde_json::from_value(v).map_err(|e| Error::App(format!("bad rules: {e}"))))?;
         // Compile (and validate selectors/regex) once, before the fan-out.
         let compiled = Arc::new(rules.compile()?);
-
-        let strategy = match ctx.params.get("strategy").and_then(Value::as_str) {
-            Some("browser") => FetchStrategy::Browser,
-            Some("auto") => FetchStrategy::Auto,
-            Some("auto_with_research") => FetchStrategy::AutoWithResearch,
-            _ => FetchStrategy::Http,
-        };
         let dataset = ctx
             .params
             .get("dataset")
@@ -115,9 +173,44 @@ impl ScrapeApp for Extractor {
             .unwrap_or("extracted")
             .to_string();
 
+        // Two input modes: fetch live `urls`, or read stored bodies from a
+        // crawl→dataset `source`. Exactly one is required.
+        if ctx.params.get("source").is_some() {
+            self.run_source_mode(&ctx, compiled, &dataset).await
+        } else {
+            self.run_urls_mode(&ctx, compiled, &dataset).await
+        }
+    }
+}
+
+impl Extractor {
+    /// URLs mode: fetch each URL (tiered) and extract. Failed/empty fetches are
+    /// attributed in `failed` and skipped — never upserted as all-null records.
+    async fn run_urls_mode(
+        &self,
+        ctx: &AppContext,
+        compiled: Arc<CompiledRuleSet>,
+        dataset: &str,
+    ) -> Result<Value> {
+        let urls: Vec<String> = ctx
+            .params
+            .get("urls")
+            .and_then(Value::as_array)
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        if urls.is_empty() {
+            return Err(Error::App(
+                "param 'urls' must be a non-empty array (or provide 'source')".into(),
+            ));
+        }
+        let strategy = match ctx.params.get("strategy").and_then(Value::as_str) {
+            Some("browser") => FetchStrategy::Browser,
+            Some("auto") => FetchStrategy::Auto,
+            Some("auto_with_research") => FetchStrategy::AutoWithResearch,
+            _ => FetchStrategy::Http,
+        };
+
         // Fetch all URLs concurrently (the governor handles per-host politeness).
-        // The Fetcher is just Arcs — clone it out so the async tasks don't
-        // capture `ctx`, which we still need for the dataset upsert below.
         let fetcher = ctx.engines.fetch.clone();
         let fetches = urls.iter().map(|url| {
             let f = fetcher.clone();
@@ -125,8 +218,6 @@ impl ScrapeApp for Extractor {
             let mut req = FetchRequest::new(&url);
             req.strategy = strategy;
             async move {
-                // A failed (or empty) fetch is attributed to its URL and skipped
-                // — never upserted as an all-null record that pollutes the dataset.
                 match f.fetch(req).await {
                     Ok(out) => (url, out.html.or(out.text).filter(|d| !d.is_empty())),
                     Err(_) => (url, None),
@@ -136,44 +227,24 @@ impl ScrapeApp for Extractor {
         let fetched_pairs: Vec<(String, Option<String>)> =
             futures::future::join_all(fetches).await;
 
-        let mut keys: Vec<String> = Vec::new();
-        let mut docs: Vec<String> = Vec::new();
+        let mut keyed: Vec<(String, String)> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         for (url, doc) in fetched_pairs {
             match doc {
-                Some(d) => {
-                    keys.push(url);
-                    docs.push(d);
-                }
+                Some(d) => keyed.push((url, d)),
                 None => failed.push(url),
             }
         }
 
-        // Extract the surviving docs in parallel across all cores, with a
-        // per-field quality report per document.
-        let reported = run_extraction(compiled.clone(), docs).await?;
-        let (matched, total, worst) =
-            summarize_reports(&reported.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>());
-
-        // Tag each record with its source URL and upsert for dedup.
-        let mut records: Vec<Value> = Vec::with_capacity(reported.len());
-        let items: Vec<(String, Value)> = keys
-            .iter()
-            .zip(reported.into_iter())
-            .map(|(url, (mut rec, _))| {
-                if let Value::Object(map) = &mut rec {
-                    map.insert("_url".into(), Value::String(url.clone()));
-                }
-                records.push(rec.clone());
-                (url.clone(), rec)
-            })
-            .collect();
-        let summary = ctx.upsert_many(&dataset, &items).await?;
+        let requested = urls.len();
+        let fetched = keyed.len();
+        let (records, matched, total, worst, summary) =
+            extract_and_upsert(ctx, compiled, dataset, keyed).await?;
 
         Ok(json!({
             "mode": "urls",
-            "requested": urls.len(),
-            "fetched": keys.len(),
+            "requested": requested,
+            "fetched": fetched,
             "skipped": failed.len(),
             "failed": failed,
             "new": summary.new.len(),
@@ -183,6 +254,99 @@ impl ScrapeApp for Extractor {
             "fields_total": total,
             "worst_fields": worst,
             "records": records,
+        }))
+    }
+
+    /// Source mode: read stored crawl bodies from `{app, dataset, keys?}` instead
+    /// of re-fetching. Keys default to the firing trigger's `_trigger.keys`, else
+    /// every live record. Missing/unreadable artifacts are counted and listed
+    /// per key in `missing` rather than silently producing null records.
+    async fn run_source_mode(
+        &self,
+        ctx: &AppContext,
+        compiled: Arc<CompiledRuleSet>,
+        dataset: &str,
+    ) -> Result<Value> {
+        let source = ctx.params.get("source").and_then(Value::as_object).ok_or_else(|| {
+            Error::App("param 'source' must be an object {app, dataset, keys?}".into())
+        })?;
+        let src_app = source
+            .get("app")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::App("source.app is required".into()))?
+            .to_string();
+        let src_dataset = source
+            .get("dataset")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Error::App("source.dataset is required".into()))?
+            .to_string();
+
+        // Key precedence: explicit source.keys > _trigger.keys (crawl→extract via
+        // a dataset trigger) > all live records in the source dataset.
+        let str_array = |v: Option<&Value>| -> Option<Vec<String>> {
+            v.and_then(Value::as_array)
+                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+        };
+        let explicit_keys = str_array(source.get("keys"))
+            .or_else(|| str_array(ctx.params.pointer("/_trigger/keys")));
+
+        let mut keyed: Vec<(String, String)> = Vec::new();
+        let mut missing: Vec<Value> = Vec::new();
+        let requested: usize;
+
+        if let Some(keys) = explicit_keys {
+            // Named keys: fetch each record, then read its stored body. Both a
+            // missing record and an unreadable artifact are reported per key.
+            requested = keys.len();
+            for key in keys {
+                match ctx.datasets.get(&src_app, &src_dataset, &key).await? {
+                    Some(r) => match read_source_body(ctx, &src_app, &r).await {
+                        Ok(body) => keyed.push((key, body)),
+                        Err(reason) => missing.push(json!({"key": key, "reason": reason})),
+                    },
+                    None => missing
+                        .push(json!({"key": key, "reason": "no record in source dataset"})),
+                }
+            }
+        } else {
+            // No keys: process every live (not removed, not gone) record.
+            let records: Vec<Record> = ctx
+                .datasets
+                .list(&src_app, &src_dataset, SOURCE_LIST_LIMIT)
+                .await?
+                .into_iter()
+                .filter(|r| {
+                    r.removed_at.is_none()
+                        && !r.data.get("gone").and_then(Value::as_bool).unwrap_or(false)
+                })
+                .collect();
+            requested = records.len();
+            for r in &records {
+                match read_source_body(ctx, &src_app, r).await {
+                    Ok(body) => keyed.push((r.key.clone(), body)),
+                    Err(reason) => missing.push(json!({"key": r.key, "reason": reason})),
+                }
+            }
+        }
+
+        let loaded = keyed.len();
+        let (out_records, matched, total, worst, summary) =
+            extract_and_upsert(ctx, compiled, dataset, keyed).await?;
+
+        Ok(json!({
+            "mode": "source",
+            "source": {"app": src_app, "dataset": src_dataset},
+            "requested": requested,
+            "loaded": loaded,
+            "missing": missing.len(),
+            "missing_keys": missing,
+            "new": summary.new.len(),
+            "changed": summary.changed.len(),
+            "unchanged": summary.unchanged,
+            "fields_matched": matched,
+            "fields_total": total,
+            "worst_fields": worst,
+            "records": out_records,
         }))
     }
 }
