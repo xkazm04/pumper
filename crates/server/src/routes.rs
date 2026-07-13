@@ -35,6 +35,7 @@ use crate::state::AppState;
         (name = "costs", description = "Engine spend ledger"),
         (name = "schedules", description = "Cron schedules"),
         (name = "datasets", description = "Change-detected dataset records, export, history"),
+        (name = "grants", description = "Filtered query surface over the cross-source grants corpus"),
         (name = "watches", description = "Dataset change webhooks"),
         (name = "triggers", description = "Reactive pipelines"),
         (name = "webhooks", description = "Outbound delivery log"),
@@ -99,6 +100,8 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(set_saved_search_enabled))
         .routes(routes!(delete_search_dataset))
         .routes(routes!(extract_preview))
+        .routes(routes!(list_grants))
+        .routes(routes!(closing_soon))
         .routes(routes!(openapi_json))
 }
 
@@ -2479,6 +2482,197 @@ async fn fetch_preview_doc(state: &AppState, url: &str) -> Result<String, ApiErr
     Ok(html)
 }
 
+// ---------------------------------------------------------------------------
+// Grants query surface
+//
+// `grants/unified` is the cross-source corpus that grants-gov and ca-grants both
+// normalize into (see the `grants-common` crate, which owns these two names).
+// Until now it was reachable only through the generic dataset API, so every
+// consumer had to export the whole corpus and filter client-side. These two
+// routes push the filters into SQL.
+// ---------------------------------------------------------------------------
+
+/// Virtual app namespace holding the cross-source grants datasets. Mirrors
+/// `grants_common::{UNIFIED_APP, UNIFIED_DATASET}`; duplicated as literals rather
+/// than taking a server dependency on a library crate for two strings.
+const GRANTS_APP: &str = "grants";
+const GRANTS_DATASET: &str = "unified";
+
+/// Upper bound on `GET /grants?limit=`. The default is `default_limit` (50).
+const GRANTS_MAX_LIMIT: i64 = 500;
+
+/// Default closing-soon window, in days, matching the grants-gov digest.
+const CLOSING_SOON_DEFAULT_DAYS: i64 = 14;
+/// Rows the closing-soon view pulls before sorting. Sorting is by `close_date`,
+/// not by the `updated_at` order the store returns, so the whole window has to be
+/// in hand before it can be truncated — this bounds that read.
+const CLOSING_SOON_SCAN: i64 = 1000;
+/// Rows the closing-soon view returns. `count` reports the full window size.
+const CLOSING_SOON_CAP: usize = 200;
+
+/// Filters over `grants/unified`. All optional, all ANDed; with none set the
+/// route lists the whole live corpus.
+#[derive(Deserialize, IntoParams)]
+struct GrantsQuery {
+    /// Normalized status, exact match: `open` | `forecasted` | `closed`.
+    status: Option<String>,
+    /// Case-insensitive substring of the agency name (e.g. `health`).
+    agency: Option<String>,
+    /// Source app, exact match: `grants-gov` | `ca-grants`.
+    source: Option<String>,
+    /// Closes on or before this `YYYY-MM-DD`. Records with no close date are excluded.
+    closing_before: Option<String>,
+    /// Closes on or after this `YYYY-MM-DD`. Records with no close date are excluded.
+    closing_after: Option<String>,
+    /// Minimum money: keeps records whose `award_ceiling` OR `total_funding` is >= this.
+    min_award: Option<f64>,
+    #[serde(default = "default_limit")]
+    limit: i64,
+    /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
+    cursor: Option<String>,
+}
+
+/// A blank query param (`?status=`) means "unset", not "match the empty string" —
+/// otherwise a UI that always serializes its filter form would match nothing.
+fn filter_value(value: &Option<String>) -> Option<&str> {
+    value.as_deref().map(str::trim).filter(|s| !s.is_empty())
+}
+
+/// Grant dates are canonical `YYYY-MM-DD`, which sorts lexicographically — that is
+/// what lets the closing-window filters compare as text. Reject anything else
+/// rather than silently comparing a malformed string.
+fn parse_grant_date(value: &str, field: &str) -> Result<chrono::NaiveDate, ApiError> {
+    chrono::NaiveDate::parse_from_str(value, "%Y-%m-%d").map_err(|_| {
+        ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("'{field}' must be a YYYY-MM-DD date, got '{value}'"),
+        )
+    })
+}
+
+/// Translates the query params into store-level JSON predicates.
+fn grant_filters(query: &GrantsQuery) -> Result<Vec<pumper_core::datasets::JsonFilter>, ApiError> {
+    use pumper_core::datasets::JsonFilter;
+    let mut filters = Vec::new();
+    if let Some(status) = filter_value(&query.status) {
+        filters.push(JsonFilter::Eq { path: "$.status".into(), value: status.into() });
+    }
+    if let Some(source) = filter_value(&query.source) {
+        filters.push(JsonFilter::Eq { path: "$.source".into(), value: source.into() });
+    }
+    if let Some(agency) = filter_value(&query.agency) {
+        filters.push(JsonFilter::Contains { path: "$.agency".into(), value: agency.into() });
+    }
+    if let Some(before) = filter_value(&query.closing_before) {
+        parse_grant_date(before, "closing_before")?;
+        filters.push(JsonFilter::Lte { path: "$.close_date".into(), value: before.into() });
+    }
+    if let Some(after) = filter_value(&query.closing_after) {
+        parse_grant_date(after, "closing_after")?;
+        filters.push(JsonFilter::Gte { path: "$.close_date".into(), value: after.into() });
+    }
+    // A grant's "size" is reported inconsistently across sources: some publish a
+    // per-award ceiling, some only a program total. Matching either keeps a
+    // funder's largest number in play instead of demanding one specific field.
+    if let Some(min) = query.min_award {
+        filters.push(JsonFilter::NumGteAny {
+            paths: vec!["$.award_ceiling".into(), "$.total_funding".into()],
+            value: min,
+        });
+    }
+    Ok(filters)
+}
+
+#[utoipa::path(
+    get,
+    path = "/grants",
+    tag = "grants",
+    params(GrantsQuery),
+    responses(
+        (status = 200, description = "Live records from `grants/unified` matching every filter, newest-updated first. Dual-mode: `{grants: [Record]}`, or `{items, next_cursor}` when `cursor` is present (even empty)."),
+        (status = 400, description = "Malformed `closing_before` / `closing_after` date", body = Object),
+    )
+)]
+async fn list_grants(
+    State(state): State<AppState>,
+    Query(query): Query<GrantsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let filters = grant_filters(&query)?;
+    let limit = query.limit.clamp(1, GRANTS_MAX_LIMIT);
+    let Some(cursor) = &query.cursor else {
+        let grants = state
+            .datasets
+            .list_filtered(GRANTS_APP, GRANTS_DATASET, &filters, None, limit)
+            .await?;
+        return Ok(Json(json!({ "grants": grants })));
+    };
+    let after = parse_cursor(cursor);
+    let items = state
+        .datasets
+        .list_filtered(GRANTS_APP, GRANTS_DATASET, &filters, after, limit)
+        .await?;
+    let next_cursor = keyset_cursor(&items, limit, |r| {
+        format!("{}|{}", pumper_core::datasets::ts(r.updated_at), r.key)
+    });
+    Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
+}
+
+#[derive(Deserialize, IntoParams)]
+struct ClosingSoonQuery {
+    /// Window size in days from today. Default 14, clamped to 1..=365.
+    days: Option<i64>,
+}
+
+#[utoipa::path(
+    get,
+    path = "/grants/closing-soon",
+    tag = "grants",
+    params(ClosingSoonQuery),
+    responses((status = 200, description = "`{days, count, grants}` — live open grants closing within the window, soonest first. Each grant is its unified record `data` plus `key` and `days_left`. `count` is the window total; `grants` is capped at 200."))
+)]
+async fn closing_soon(
+    State(state): State<AppState>,
+    Query(query): Query<ClosingSoonQuery>,
+) -> Result<Json<Value>, ApiError> {
+    use pumper_core::datasets::JsonFilter;
+    let days = query.days.unwrap_or(CLOSING_SOON_DEFAULT_DAYS).clamp(1, 365);
+    let today = chrono::Utc::now().date_naive();
+    let until = today + chrono::Duration::days(days);
+
+    // Computed on read rather than materialized as a dataset: the corpus is small
+    // enough to scan, and a read view can never go stale between syncs — which a
+    // "closing soon" list, whose membership changes with the calendar and not with
+    // the data, absolutely would if it were snapshotted.
+    let filters = vec![
+        JsonFilter::Eq { path: "$.status".into(), value: "open".into() },
+        JsonFilter::Gte { path: "$.close_date".into(), value: today.to_string() },
+        JsonFilter::Lte { path: "$.close_date".into(), value: until.to_string() },
+    ];
+    let records = state
+        .datasets
+        .list_filtered(GRANTS_APP, GRANTS_DATASET, &filters, None, CLOSING_SOON_SCAN)
+        .await?;
+
+    let mut window: Vec<(i64, Value)> = records
+        .into_iter()
+        .filter_map(|r| {
+            let close = r.data.get("close_date").and_then(Value::as_str)?;
+            let close = chrono::NaiveDate::parse_from_str(close, "%Y-%m-%d").ok()?;
+            let days_left = (close - today).num_days();
+            let mut grant = r.data.as_object()?.clone();
+            grant.insert("key".into(), json!(r.key));
+            grant.insert("days_left".into(), json!(days_left));
+            Some((days_left, Value::Object(grant)))
+        })
+        .collect();
+    window.sort_by_key(|(days_left, _)| *days_left);
+
+    let count = window.len();
+    let grants: Vec<Value> =
+        window.into_iter().take(CLOSING_SOON_CAP).map(|(_, grant)| grant).collect();
+    Ok(Json(json!({ "days": days, "count": count, "grants": grants })))
+}
+
 #[cfg(test)]
 mod api_spec_tests {
     use std::collections::BTreeSet;
@@ -2539,6 +2733,8 @@ mod api_spec_tests {
         "POST /searches/{id}/enabled",
         "DELETE /search/datasets/{app}/{dataset}",
         "POST /extract/preview",
+        "GET /grants",
+        "GET /grants/closing-soon",
         "GET /openapi.json",
     ];
 

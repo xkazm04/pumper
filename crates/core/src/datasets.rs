@@ -65,6 +65,31 @@ pub struct RevisionPage {
     pub next_cursor: Option<String>,
 }
 
+/// A predicate over the JSON `data` column, letting callers build filtered views
+/// of a dataset without denormalizing fields into real columns. Paths are SQLite
+/// JSON paths (`$.status`) and are *bound as parameters*, never interpolated, so
+/// a caller cannot inject SQL through one.
+///
+/// Every variant is NULL-rejecting: a record whose field is absent or null never
+/// matches. That is the semantics a filter wants — "closing before X" should not
+/// surface records with no close date.
+#[derive(Debug, Clone)]
+pub enum JsonFilter {
+    /// `data->path` equals `value` exactly (case-sensitive).
+    Eq { path: String, value: String },
+    /// `data->path` contains `value` as a case-insensitive substring. Plain
+    /// substring semantics — `%` and `_` are literal, not wildcards.
+    Contains { path: String, value: String },
+    /// `data->path >= value` compared as text (lexicographic).
+    Gte { path: String, value: String },
+    /// `data->path <= value` compared as text (lexicographic).
+    Lte { path: String, value: String },
+    /// Numeric `>= value` on *any* of `paths` (OR). The `json_type` guard keeps a
+    /// field that happens to hold a string out of the comparison, because SQLite
+    /// sorts every TEXT value above every number and would otherwise match it.
+    NumGteAny { paths: Vec<String>, value: f64 },
+}
+
 /// A near-duplicate record pair and their SimHash Hamming distance.
 #[derive(Debug, Clone, Serialize)]
 pub struct DupPair {
@@ -505,6 +530,96 @@ impl Datasets {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
+        rows.into_iter().map(Record::try_from).collect()
+    }
+
+    /// Keyset page of *live* records (`removed_at IS NULL`) matching every filter,
+    /// ordered like `list_page` — (updated_at DESC, key DESC) — so the same
+    /// `<stored-ts>|<key>` cursor pages it. Filters are ANDed.
+    ///
+    /// Predicates run through `json_extract` on the `data` column, so this is a
+    /// full scan of the `(app, dataset)` partition with no index on the filtered
+    /// fields. That is the right trade while datasets are in the thousands: zero
+    /// schema coupling to any app's record shape, and filters can be added without
+    /// a migration. If a dataset grows to where the scan hurts, the escape hatch is
+    /// a generated column over the hot path plus an index on it — the query here
+    /// would not have to change.
+    pub async fn list_filtered(
+        &self,
+        app: &str,
+        dataset: &str,
+        filters: &[JsonFilter],
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<Record>> {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT key, data, first_seen, last_seen, updated_at, removed_at \
+             FROM records WHERE removed_at IS NULL AND app = ",
+        );
+        qb.push_bind(app);
+        qb.push(" AND dataset = ");
+        qb.push_bind(dataset);
+
+        for filter in filters {
+            match filter {
+                JsonFilter::Eq { path, value } => {
+                    qb.push(" AND json_extract(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") = ");
+                    qb.push_bind(value.as_str());
+                }
+                JsonFilter::Contains { path, value } => {
+                    qb.push(" AND instr(lower(COALESCE(json_extract(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push("), '')), lower(");
+                    qb.push_bind(value.as_str());
+                    qb.push(")) > 0");
+                }
+                JsonFilter::Gte { path, value } => {
+                    qb.push(" AND json_extract(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") >= ");
+                    qb.push_bind(value.as_str());
+                }
+                JsonFilter::Lte { path, value } => {
+                    qb.push(" AND json_extract(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") <= ");
+                    qb.push_bind(value.as_str());
+                }
+                // `(0 OR ...)` is the honest reading of "matches any of these
+                // paths": with no paths, nothing matches. NULL never satisfies the
+                // comparison, so records missing all the money fields drop out.
+                JsonFilter::NumGteAny { paths, value } => {
+                    qb.push(" AND (0");
+                    for path in paths {
+                        qb.push(" OR (json_type(data, ");
+                        qb.push_bind(path.as_str());
+                        qb.push(") IN ('integer', 'real') AND json_extract(data, ");
+                        qb.push_bind(path.as_str());
+                        qb.push(") >= ");
+                        qb.push_bind(*value);
+                        qb.push(")");
+                    }
+                    qb.push(")");
+                }
+            }
+        }
+
+        if let Some((after_ts, after_key)) = &after {
+            qb.push(" AND (updated_at < ");
+            qb.push_bind(after_ts.as_str());
+            qb.push(" OR (updated_at = ");
+            qb.push_bind(after_ts.as_str());
+            qb.push(" AND key < ");
+            qb.push_bind(after_key.as_str());
+            qb.push("))");
+        }
+
+        qb.push(" ORDER BY updated_at DESC, key DESC LIMIT ");
+        qb.push_bind(limit);
+
+        let rows: Vec<RecordRow> = qb.build_query_as().fetch_all(&self.pool).await?;
         rows.into_iter().map(Record::try_from).collect()
     }
 
