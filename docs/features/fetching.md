@@ -32,18 +32,21 @@ Optional fields (`http_status`, `content_chars`, `cache_hit`, `cost_usd`, `detai
 - **http** (`engine-http`): reqwest + cookie jar, retries w/ backoff (`RETRYABLE_STATUS` 429/502/503/504), fronted by the content-addressed TTL `http_cache` (GET-only; `HttpRequest.no_cache` bypasses) and the governor. **Conditional GET:** `HttpRequest.etag` / `HttpRequest.if_modified_since` (serde-defaulted) are sent as `If-None-Match` / `If-Modified-Since` (explicit `headers` still win); a `304 Not Modified` is passed through with its status intact and is **never** written to the cache over the prior full response (powers the crawler's revisit mode — [crawling.md](crawling.md)).
 - **browser** (`engine-browser`): headless Chrome render (chromiumoxide/CDP), `wait_for_selector`. One shared Chrome instance behind a relaunchable holder — details below.
 
-#### Browser engine: resilience & concurrency
+#### Browser engine: resilience, concurrency & cheap renders
 
 A single Chrome instance is shared across renders (persistent `[browser] user_data_dir`, so logins/cookies survive restarts). It is managed by a relaunchable holder:
 
 - **Relaunch on crash.** A background task drives the CDP handler loop and flips a liveness flag when Chrome's connection ends (crash or exit). The next render's acquire sees the dead flag and relaunches — a crash no longer wedges every future render until a server restart.
+- **Periodic recycle.** After `[browser] recycle_after_renders` renders (default 200; `0` disables) the holder relaunches on the next acquire to shed accumulated memory / leaked tabs. Crash-relaunch stays active regardless.
 - **Render concurrency cap.** `[browser] max_concurrent_renders` (default 4; `0` = unlimited) is a semaphore bounding simultaneous tabs, so N concurrent callers can't spawn N unbounded tabs.
+- **Resource blocking.** `[browser] block_resources` (default true) enables CDP request interception that drops **images, fonts, and media** (never stylesheets — CSS can matter for layout and selector waits) so scraping renders download only what the DOM needs. Enabling interception also disables Chrome's HTTP cache (cookies persist separately via the profile). Per-request `RenderRequest.load_all_resources` (serde-default `false`) opts a single render back into loading everything. When `block_resources` is false, interception is not wired at all (zero overhead).
+- **Memory guards.** Launch args include `--disable-dev-shm-usage` (avoid tiny `/dev/shm` crashing Chrome) and `--js-flags=--max-old-space-size=512` (cap the V8 heap at 512 MB).
 
-**`RenderRequest`** fields: `url`, `wait_for_selector`, `extra_wait_ms` (settle time; falls back to `[browser] default_wait_ms`), `evaluate` (JS expression; JSON result lands in `RenderedPage.evaluated`).
+**`RenderRequest`** fields: `url`, `wait_for_selector`, `extra_wait_ms` (settle time; falls back to `[browser] default_wait_ms`), `evaluate` (JS expression; JSON result lands in `RenderedPage.evaluated`), `load_all_resources`.
 
-**`RenderedPage`** fields: `html`, `final_url`, `evaluated`, plus honest wait signals — `nav_timed_out: bool` (the navigation-wait deadline elapsed and the DOM was captured mid-load, so HTML may be partial) and `selector_found: Option<bool>` (`Some(true)`/`Some(false)` for a requested `wait_for_selector` that did/didn't appear before the deadline; `None` when none was requested). Both are serde-defaulted.
+**`RenderedPage`** fields: `html`, `final_url`, `evaluated`, plus honest wait/cost signals — `nav_timed_out: bool` (the navigation-wait deadline elapsed and the DOM was captured mid-load, so HTML may be partial), `selector_found: Option<bool>` (`Some(true)`/`Some(false)` for a requested `wait_for_selector` that did/didn't appear before the deadline; `None` when none was requested), `blocked_resources: usize` (count of subresources dropped by interception this render). All three are serde-defaulted.
 
-Config keys (`[browser]`): `chrome_executable`, `headless` (true), `user_data_dir` (`data/browser-profile`), `default_wait_ms` (1000), `nav_timeout_secs` (30), `max_concurrent_renders` (4).
+Config keys (`[browser]`): `chrome_executable`, `headless` (true), `user_data_dir` (`data/browser-profile`), `default_wait_ms` (1000), `nav_timeout_secs` (30), `max_concurrent_renders` (4), `block_resources` (true), `recycle_after_renders` (200).
 
 ### Honest tier verdicts (bot-wall detection)
 

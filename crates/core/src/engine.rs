@@ -98,11 +98,21 @@ pub struct RenderRequest {
     /// [`RenderedPage::evaluated`].
     #[serde(default)]
     pub evaluate: Option<String>,
+    /// Opt this render out of resource blocking (`[browser] block_resources`):
+    /// load images/fonts/media too. Ignored when blocking is disabled globally.
+    #[serde(default)]
+    pub load_all_resources: bool,
 }
 
 impl RenderRequest {
     pub fn new(url: impl Into<String>) -> Self {
-        Self { url: url.into(), wait_for_selector: None, extra_wait_ms: None, evaluate: None }
+        Self {
+            url: url.into(),
+            wait_for_selector: None,
+            extra_wait_ms: None,
+            evaluate: None,
+            load_all_resources: false,
+        }
     }
 }
 
@@ -121,6 +131,11 @@ pub struct RenderedPage {
     /// requested. Serde-defaulted for compatibility.
     #[serde(default)]
     pub selector_found: Option<bool>,
+    /// Count of subresources (images/fonts/media) dropped by request interception
+    /// for this render. `0` when blocking is off or the render opted out. Serde-
+    /// defaulted for compatibility.
+    #[serde(default)]
+    pub blocked_resources: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]

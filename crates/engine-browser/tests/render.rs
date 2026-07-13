@@ -43,6 +43,36 @@ async fn renders_example_dot_com() {
     assert_eq!(page.selector_found, None, "no selector requested");
 }
 
+/// Direction 2: request interception drops images/fonts/media by default, and
+/// `load_all_resources` opts a single render back into loading everything.
+#[tokio::test]
+async fn blocks_heavy_resources_and_opt_out_loads_them() {
+    let engine = BrowserEngine::new(&test_cfg("pumper-browser-test-blocking"));
+    // A page with real images/fonts so interception has something to drop.
+    let url = "https://en.wikipedia.org/wiki/Main_Page";
+
+    let blocked = engine
+        .render(RenderRequest::new(url))
+        .await
+        .expect("blocking render should succeed");
+    assert!(
+        blocked.blocked_resources > 0,
+        "expected some image/font/media requests to be blocked, got {}",
+        blocked.blocked_resources
+    );
+
+    let mut opt_out = RenderRequest::new(url);
+    opt_out.load_all_resources = true;
+    let loaded = engine
+        .render(opt_out)
+        .await
+        .expect("opt-out render should succeed");
+    assert_eq!(
+        loaded.blocked_resources, 0,
+        "load_all_resources must block nothing"
+    );
+}
+
 /// Direction 1: the relaunchable holder is reused across sequential renders
 /// (the shared-instance path) — two renders on one engine both succeed.
 #[tokio::test]

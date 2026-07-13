@@ -3,36 +3,49 @@
 //! logged-in sessions survive restarts. Run once with `headless = false` to
 //! log in to a site manually; subsequent headless scrapes reuse the cookies.
 //!
-//! ## Resilience
+//! ## Resilience & cost
 //!
 //! The single shared Chrome instance lives behind a relaunchable holder
 //! ([`BrowserEngine::acquire`]). A background task drives the CDP handler loop
 //! and flips a liveness flag when Chrome's connection ends (crash or exit); the
 //! next acquire sees the dead flag and relaunches, so a crash no longer wedges
-//! every future render until a server restart. Concurrent renders are capped by
-//! `[browser] max_concurrent_renders` (a semaphore) so N callers can't spawn N
-//! unbounded tabs.
+//! every future render until a server restart. The holder also relaunches after
+//! `[browser] recycle_after_renders` renders to shed accumulated memory.
+//!
+//! Concurrent renders are capped by `[browser] max_concurrent_renders` (a
+//! semaphore) so N callers can't spawn N unbounded tabs. When
+//! `[browser] block_resources` is set, CDP request interception drops
+//! images/fonts/media (never stylesheets) so scraping renders stay cheap; a
+//! render can opt back in with `RenderRequest.load_all_resources`.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chromiumoxide::browser::{Browser as ChromeBrowser, BrowserConfig as ChromeConfig};
+use chromiumoxide::cdp::browser_protocol::fetch::{
+    ContinueRequestParams, EventRequestPaused, FailRequestParams,
+};
+use chromiumoxide::cdp::browser_protocol::network::{ErrorReason, ResourceType};
 use futures::StreamExt;
 use pumper_core::config::BrowserConfig;
 use pumper_core::{Browser, Error, RenderRequest, RenderedPage, Result};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
 
+/// Cap Chrome's V8 heap so a runaway page can't balloon the shared instance.
+const JS_HEAP_CAP_MB: u32 = 512;
+
 /// Whether a held Chrome instance must be relaunched before the next render.
 /// Pure so it can be unit-tested without a real browser: an instance is stale
-/// when its handler task has died (crash detection, `alive == false`).
-fn is_stale(alive: bool) -> bool {
-    !alive
+/// when its handler task has died (crash detection, `alive == false`) or it has
+/// served its recycle quota (`recycle > 0 && renders >= recycle`).
+fn is_stale(alive: bool, renders: u64, recycle: u64) -> bool {
+    !alive || (recycle > 0 && renders >= recycle)
 }
 
-/// A launched Chrome instance plus liveness bookkeeping.
+/// A launched Chrome instance plus liveness/recycle bookkeeping.
 struct LiveBrowser {
     /// Shared so concurrent renders each hold a clone and open their own tab
     /// against the same Chrome; `new_page` only needs `&self`.
@@ -41,6 +54,8 @@ struct LiveBrowser {
     /// (crash or clean exit). This is the crash-detection mechanism: the handler
     /// stream terminates iff the browser is gone. Checked on acquire.
     alive: Arc<AtomicBool>,
+    /// Renders served by this instance; drives periodic recycle.
+    renders: u64,
 }
 
 pub struct BrowserEngine {
@@ -76,7 +91,17 @@ impl BrowserEngine {
 
         let mut builder = ChromeConfig::builder()
             .user_data_dir(&user_data_dir)
-            .arg("--disable-blink-features=AutomationControlled");
+            .arg("--disable-blink-features=AutomationControlled")
+            // Avoid tiny /dev/shm in containers exhausting and crashing Chrome.
+            .arg("--disable-dev-shm-usage")
+            // Bound V8 heap so one heavy page can't OOM the shared instance.
+            .arg(format!("--js-flags=--max-old-space-size={JS_HEAP_CAP_MB}"));
+        if self.cfg.block_resources {
+            // Enable the Fetch domain so per-page drainers can drop subresources.
+            // (This also auto-disables Chrome's HTTP cache; cookies are separate
+            // and still persist via the profile dir.)
+            builder = builder.enable_request_intercept();
+        }
         if let Some(path) = &self.cfg.chrome_executable {
             builder = builder.chrome_executable(path);
         }
@@ -103,16 +128,17 @@ impl BrowserEngine {
             warn!("browser handler loop ended (chrome exited?)");
         });
 
-        Ok(LiveBrowser { browser: Arc::new(browser), alive })
+        Ok(LiveBrowser { browser: Arc::new(browser), alive, renders: 0 })
     }
 
     /// Returns a handle to a live Chrome, relaunching it if the previous one
-    /// died (crash detection).
+    /// died (crash detection) or hit the recycle threshold. Counts one render.
     async fn acquire(&self) -> Result<Arc<ChromeBrowser>> {
         let mut holder = self.holder.lock().await;
+        let recycle = self.cfg.recycle_after_renders;
         let stale = match holder.as_ref() {
             None => true,
-            Some(live) => is_stale(live.alive.load(Ordering::Relaxed)),
+            Some(live) => is_stale(live.alive.load(Ordering::Relaxed), live.renders, recycle),
         };
         if stale {
             // Drop the previous instance: `kill_on_drop` reaps its Chrome. Any
@@ -120,7 +146,8 @@ impl BrowserEngine {
             // alive until it finishes, then that clone drops and reaps.
             *holder = Some(self.launch().await?);
         }
-        let live = holder.as_ref().expect("holder populated above");
+        let live = holder.as_mut().expect("holder populated above");
+        live.renders += 1;
         Ok(live.browser.clone())
     }
 }
@@ -142,10 +169,63 @@ impl Browser for BrowserEngine {
         let browser = self.acquire().await?;
         let nav_timeout = Duration::from_secs(self.cfg.nav_timeout_secs);
 
+        // Start blank so the interception drainer is listening before the first
+        // (document) request fires; otherwise the initial navigation would pause
+        // with no one to resolve it and hang.
         let page = browser
-            .new_page(req.url.as_str())
+            .new_page("about:blank")
             .await
-            .map_err(|e| Error::Browser(format!("new_page {}: {e}", req.url)))?;
+            .map_err(|e| Error::Browser(format!("new_page: {e}")))?;
+
+        // Resource-blocking drainer. Only wired when interception is enabled at
+        // launch (`block_resources`); otherwise no Fetch events ever fire.
+        let blocked = Arc::new(AtomicUsize::new(0));
+        let drainer = if self.cfg.block_resources {
+            let block_heavy = !req.load_all_resources;
+            let drain_page = page.clone();
+            let counter = blocked.clone();
+            let mut paused = page
+                .event_listener::<EventRequestPaused>()
+                .await
+                .map_err(|e| Error::Browser(format!("intercept listener: {e}")))?;
+            Some(tokio::spawn(async move {
+                while let Some(ev) = paused.next().await {
+                    let drop_it = block_heavy
+                        && matches!(
+                            ev.resource_type,
+                            ResourceType::Image | ResourceType::Font | ResourceType::Media
+                        );
+                    if drop_it {
+                        // Fail the request so the resource never downloads.
+                        if drain_page
+                            .execute(FailRequestParams::new(
+                                ev.request_id.clone(),
+                                ErrorReason::BlockedByClient,
+                            ))
+                            .await
+                            .is_ok()
+                        {
+                            counter.fetch_add(1, Ordering::Relaxed);
+                        }
+                    } else {
+                        // Every paused request must be resolved or it hangs.
+                        let _ = drain_page
+                            .execute(ContinueRequestParams::new(ev.request_id.clone()))
+                            .await;
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
+        if let Err(e) = page.goto(req.url.as_str()).await {
+            if let Some(d) = &drainer {
+                d.abort();
+            }
+            let _ = page.close().await;
+            return Err(Error::Browser(format!("goto {}: {e}", req.url)));
+        }
 
         let mut nav_timed_out = false;
         match tokio::time::timeout(nav_timeout, page.wait_for_navigation()).await {
@@ -197,11 +277,26 @@ impl Browser for BrowserEngine {
             .map_err(|e| Error::Browser(format!("content: {e}")))?;
         let final_url = page.url().await.ok().flatten();
 
+        if let Some(d) = &drainer {
+            d.abort();
+        }
         if let Err(e) = page.close().await {
             warn!("page close: {e}");
         }
 
-        Ok(RenderedPage { html, final_url, evaluated, nav_timed_out, selector_found })
+        let blocked_resources = blocked.load(Ordering::Relaxed);
+        if blocked_resources > 0 {
+            info!(url = %req.url, blocked = blocked_resources, "blocked heavy subresources");
+        }
+
+        Ok(RenderedPage {
+            html,
+            final_url,
+            evaluated,
+            nav_timed_out,
+            selector_found,
+            blocked_resources,
+        })
     }
 }
 
@@ -232,10 +327,25 @@ mod tests {
     /// Crash detection: the handler task flips `alive` to false when Chrome's
     /// CDP stream ends. A dead flag must mark the holder stale so `acquire`
     /// relaunches — exactly like an empty holder. (Relaunching real Chrome in a
-    /// unit test is impractical; a gated live reuse test lives in tests/render.rs.)
+    /// unit test is impractical; a gated live crash-recovery test lives in
+    /// tests/render.rs.)
     #[test]
     fn dead_alive_flag_forces_relaunch() {
-        assert!(!is_stale(true), "a live instance is reused");
-        assert!(is_stale(false), "a dead handler task forces relaunch");
+        // Alive + under quota => reuse.
+        assert!(!is_stale(true, 0, 200));
+        assert!(!is_stale(true, 199, 200));
+        // Handler task died (crash/exit) => relaunch, regardless of counts.
+        assert!(is_stale(false, 0, 200));
+        assert!(is_stale(false, 5, 0));
+    }
+
+    #[test]
+    fn recycle_threshold_is_honored() {
+        // renders < threshold => fresh; >= threshold => stale.
+        assert!(!is_stale(true, 199, 200));
+        assert!(is_stale(true, 200, 200));
+        assert!(is_stale(true, 201, 200));
+        // 0 disables recycling regardless of count.
+        assert!(!is_stale(true, u64::MAX, 0));
     }
 }

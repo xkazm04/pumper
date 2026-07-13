@@ -196,6 +196,16 @@ pub struct BrowserConfig {
     /// Each render opens a page/tab; without a cap N concurrent renders spawn N
     /// unbounded tabs. `0` = unlimited.
     pub max_concurrent_renders: usize,
+    /// Block heavy subresources (images, fonts, media — never stylesheets) via
+    /// CDP request interception so scraping renders download only what the DOM
+    /// needs. Per-request `RenderRequest.load_all_resources` opts a single render
+    /// back into loading everything. When `false`, interception is not enabled at
+    /// all (zero overhead) and `load_all_resources` is moot.
+    pub block_resources: bool,
+    /// Relaunch the shared Chrome instance after this many renders to shed
+    /// accumulated memory/leaked tabs. `0` disables periodic recycling (Chrome
+    /// still relaunches on crash).
+    pub recycle_after_renders: u64,
 }
 
 impl Default for BrowserConfig {
@@ -207,6 +217,8 @@ impl Default for BrowserConfig {
             default_wait_ms: 1000,
             nav_timeout_secs: 30,
             max_concurrent_renders: 4,
+            block_resources: true,
+            recycle_after_renders: 200,
         }
     }
 }
