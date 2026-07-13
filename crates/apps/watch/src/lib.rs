@@ -29,7 +29,9 @@ impl ScrapeApp for Watch {
          fingerprints it into the `pages` dataset (keyed by URL), and reports \
          new/changed/unchanged with the field-level diff. Params: \
          {\"url\": \"...\", \"strategy\": \"http|browser|auto|auto_with_research\", \
-         \"wait_for_selector\": \".main\", \"min_content_chars\": 250}. \
+         \"wait_for_selector\": \".main\", \"min_content_chars\": 250, \
+         \"cache_ttl_secs\": 60}. Bypasses the HTTP cache by default so it sees \
+         live bodies; set `cache_ttl_secs` to cap staleness instead. \
          Schedule it via POST /schedules and subscribe via POST /watches."
     }
 
@@ -55,6 +57,13 @@ impl ScrapeApp for Watch {
             .get("min_content_chars")
             .and_then(Value::as_u64)
             .map(|n| n as usize);
+        // Monitors need live bodies, not up-to-TTL-stale cached ones. Default to
+        // a full cache bypass; a `cache_ttl_secs` param instead caps staleness
+        // to a short TTL (useful when several watches share one hot endpoint).
+        match ctx.params.get("cache_ttl_secs").and_then(Value::as_u64) {
+            Some(secs) => req.ttl_override = Some(secs),
+            None => req.no_cache = true,
+        }
 
         let outcome = ctx.fetch(req).await?;
         let markdown = outcome

@@ -4,7 +4,7 @@ One `Fetcher` escalates across three engines by cost: **http → browser → cla
 
 ## FetchRequest / FetchOutcome
 
-`FetchRequest`: `url`, `strategy` (`http | browser | auto | auto_with_research`), `wait_for_selector`, `min_content_chars`, `research_prompt`, `max_budget_usd` (Claude tier ceiling), `skip_http` (set by the tier router), `to_markdown`. `FetchOutcome`: winning `engine`, status, html/markdown/text, `escalations` trail (one line per tier rejection + router/budget notes), `cost_usd` (Claude tier actual).
+`FetchRequest`: `url`, `strategy` (`http | browser | auto | auto_with_research`), `wait_for_selector`, `min_content_chars`, `research_prompt`, `max_budget_usd` (Claude tier ceiling), `skip_http` (set by the tier router), `to_markdown`, `no_cache` (bypass the HTTP cache — always hit the network), `ttl_override` (per-fetch cache TTL in seconds; caps staleness without a full bypass). `FetchOutcome`: winning `engine`, status, html/markdown/text, `escalations` trail (one line per tier rejection + router/budget notes), `cost_usd` (Claude tier actual).
 
 Always prefer the metered **`AppContext::fetch`** over `ctx.engines.fetch` — it adds cost attribution, budget governance, and tier routing.
 
@@ -24,4 +24,4 @@ Per-host token bucket: configured spacing (`[governor] default_rps`, `per_domain
 
 ## Known gaps
 
-- `FetchRequest` has no cache-bypass flag (monitors see TTL'd bodies; `watch` app follow-up). No proxy pool / stealth tier (backlog moonshots).
+- No proxy pool / stealth tier (backlog moonshots).

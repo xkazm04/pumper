@@ -144,10 +144,35 @@ impl HttpClient for HttpEngine {
         let response = self.send(&req).await?;
 
         if let Some(key) = &cache_key {
-            self.cache
-                .put(key, &req.url, &response, self.cache.default_ttl())
-                .await?;
+            let ttl = req
+                .ttl_override
+                .map(Duration::from_secs)
+                .unwrap_or_else(|| self.cache.default_ttl());
+            self.cache.put(key, &req.url, &response, ttl).await?;
         }
         Ok(response)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_cache_makes_request_uncacheable() {
+        // A plain GET is cacheable; setting no_cache skips both cache read and
+        // write (the same gate governs the get() and put() paths in fetch()).
+        let mut req = HttpRequest::get("https://example.com/");
+        assert!(HttpEngine::cacheable(&req), "plain GET should be cacheable");
+        req.no_cache = true;
+        assert!(!HttpEngine::cacheable(&req), "no_cache must bypass the cache");
+    }
+
+    #[test]
+    fn ttl_override_does_not_affect_cacheability() {
+        // ttl_override shapes storage freshness, not whether a request is cached.
+        let mut req = HttpRequest::get("https://example.com/");
+        req.ttl_override = Some(30);
+        assert!(HttpEngine::cacheable(&req));
     }
 }

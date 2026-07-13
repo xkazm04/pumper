@@ -31,6 +31,11 @@ pub struct HttpRequest {
     /// Skip the response cache for this request (always hit the network).
     #[serde(default)]
     pub no_cache: bool,
+    /// Override the response-cache TTL (seconds) when this response is stored.
+    /// `None` uses the configured `[cache] ttl_secs`. Not part of the cache key
+    /// (it shapes freshness, not the answer) and ignored when uncacheable.
+    #[serde(default)]
+    pub ttl_override: Option<u64>,
 }
 
 impl HttpRequest {
@@ -41,6 +46,7 @@ impl HttpRequest {
             headers: HashMap::new(),
             body: None,
             no_cache: false,
+            ttl_override: None,
         }
     }
 }

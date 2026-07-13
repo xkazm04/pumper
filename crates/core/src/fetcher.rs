@@ -55,6 +55,15 @@ pub struct FetchRequest {
     /// Also produce clean Markdown alongside the raw HTML.
     #[serde(default)]
     pub to_markdown: bool,
+    /// Bypass the HTTP response cache — always hit the network. Monitors (e.g.
+    /// the `watch` app) set this to avoid serving up-to-TTL-stale bodies.
+    #[serde(default)]
+    pub no_cache: bool,
+    /// Override the HTTP response-cache TTL (seconds) for this fetch. `None`
+    /// uses the configured `[cache] ttl_secs`. A short value caps staleness
+    /// without a full cache bypass. Only affects the HTTP tier.
+    #[serde(default)]
+    pub ttl_override: Option<u64>,
 }
 
 impl FetchRequest {
@@ -68,6 +77,8 @@ impl FetchRequest {
             max_budget_usd: None,
             skip_http: false,
             to_markdown: false,
+            no_cache: false,
+            ttl_override: None,
         }
     }
 }
@@ -116,7 +127,10 @@ impl Fetcher {
             || (!req.skip_http
                 && matches!(req.strategy, FetchStrategy::Auto | FetchStrategy::AutoWithResearch));
         if try_http {
-            match self.http.fetch(HttpRequest::get(&req.url)).await {
+            let mut http_req = HttpRequest::get(&req.url);
+            http_req.no_cache = req.no_cache;
+            http_req.ttl_override = req.ttl_override;
+            match self.http.fetch(http_req).await {
                 Ok(resp) => {
                     let markdown = html_to_markdown(&resp.body);
                     let enough = resp.is_success() && markdown.chars().count() >= min_chars;
