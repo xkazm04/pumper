@@ -1,0 +1,37 @@
+---
+type: perfect/config
+repo: pumper
+created: 2026-07-13
+---
+
+# Perfect — pumper config
+
+## Gates
+- `cargo check --workspace`
+- `cargo test --workspace --lib` (fast, no network)
+- Clippy calibration: no NEW warnings in files the diff touched (never full-crate `-D warnings`)
+- Doc-sync: consumer-visible change ⇒ mapped `docs/features/*.md` updated (Stop hook enforces)
+
+## Worktree recipe
+```bash
+git worktree add .claude/worktrees/perfect-<ctx> -b worktree-perfect-<ctx>
+# builders: CARGO_TARGET_DIR=C:/Users/mkdol/dolla/pumper/target for every cargo command
+# live-server verification: copy config.toml → scratch storage path + different port
+```
+
+## Sizing & pacing
+- wave_size: 3 concurrent builders
+- max 3 directions per builder brief
+- direction size: ≲15 files, one builder session, no cross-context schema breaks
+- cooldown: 2 proposal rounds per context
+
+## User taste
+- 2026-07-13: In the trades context the user rejected the consumer-facing directions (provenance fields, exit-readiness endpoint) and kept substrate/data-correctness ones — weight future slates toward engine/data quality until steered otherwise. Exception: for the API context they took everything EXCEPT auth, including the wildcard (OpenAPI) — infra polish is welcome.
+- 2026-07-13: API-key auth rejected explicitly — parked decision stays parked; don't re-propose unprompted.
+- 2026-07-13: User accepted 4 directions when told only 2 slots remained — treat the 10-pool as a soft target, present full slates.
+
+## Skill improvement log
+- 2026-07-13 (round 1): Builders sometimes write doc edits to the MAIN checkout despite worktree instructions — the skill's brief template should add an explicit "NEVER touch <main path>" line (added to wave-2 briefs mid-session; F2/A2 complied). Consider a pre-flight `git status` check on main after each builder finishes.
+- 2026-07-13: Sequential same-context builders (F1→F2, A1→A2) worked well with a worktree `reset --hard master` between waves — cheaper than fresh worktrees and keeps the branch name stable.
+- 2026-07-13: Concurrent builders touching routes.rs produced one real integration task (OpenAPI × /hosts), not just textual conflicts — when a wave-2 builder adds a spec/coverage layer, later routes from OTHER branches must be folded into it at merge; budget Director time for that.
+- 2026-07-13: Prefetching the NEXT context's scout during gating hid all scout latency; caching the unused worker/scheduler brief in its context note preserved the spend across rounds.

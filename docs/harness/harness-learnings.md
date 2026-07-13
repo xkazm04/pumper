@@ -1,5 +1,14 @@
 # pumper — harness learnings
 
+## Structural facts (Perfect round 1, 2026-07-13)
+- **2026-07-13** — `/perfect` loop state lives in `.perfect/Perfect/` (queue, directions, session notes); skill at `.claude/skills/perfect/skill.md`. Round 1 shipped 12 directions across fetcher/trades/api contexts.
+- **2026-07-13** — `FetchOutcome.trace` is the machine-readable escalation signal (`TierTrace` per tier, `TierVerdict` enum); `escalations` strings are a rendered view — never string-match them for logic (the tier router keys on the enum).
+- **2026-07-13** — OpenAPI: routes register through `openapi_router()` (utoipa-axum `OpenApiRouter`) in `crates/server/src/routes.rs` — a new route needs a `#[utoipa::path]` annotation AND a line in the coverage test's `EXPECTED` inventory, or `cargo test -p pumper-server` fails.
+- **2026-07-13** — SSE events flow through `EventBus` (`crates/server/src/events.rs`): monotonic ids, 1024-event replay ring, `Last-Event-ID` resume, `reset` event on evicted gaps. Emit via the bus, never raw broadcast.
+- **2026-07-13** — Graceful shutdown: shared `CancellationToken` in AppState; worker drains up to `[worker] shutdown_drain_secs` (default 25) then re-queues survivors. New background loops must select on the token.
+- **2026-07-13** — Host profiles: `tier_memory` (migration 0016) carries strikes + browser pin (aging via `[fetcher] host_memory_ttl_secs`, default 7d) and write-behind governor penalty snapshots; inspect/reset via `GET/DELETE /hosts*`.
+- **2026-07-13** — `trades-common` crate = canonical trade taxonomy (`taxonomy::Trade`) + `trades/operator_economics` unified dataset + shared `salvage_json`/`validate` for the four agentic trades apps (all metered via `ctx.research` now).
+
 ## Structural facts
 - **2026-07-10** — Change detection substrate lives in `crates/core/src/datasets.rs` (`records` table, sha256 hash + simhash); as of wave 1 it also has `record_revisions` (field-level diff history) and `removed_at` (disappearance signal). Migrations in `crates/core/migrations/` via `sqlx::migrate!`.
 - **2026-07-10** — Apps are `ScrapeApp` trait impls under `crates/apps/*`; integration = workspace dep + `crates/server/Cargo.toml` + one line in `crates/server/src/registry.rs`. `crates/apps/*` is a workspace-member glob, but the dep entry in root `Cargo.toml [workspace.dependencies]` is still required.
