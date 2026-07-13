@@ -31,6 +31,12 @@ pub fn normalize_grants_gov(hit: &Value) -> Option<(String, Value)> {
         "award_floor": Value::Null,
         "award_ceiling": Value::Null,
         "total_funding": Value::Null,
+        // Search2 gives no per-opportunity category/eligibility facets (those are
+        // search filters, not hit fields), so these stay empty for this source.
+        "categories": Value::Array(vec![]),
+        "eligibilities": Value::Array(vec![]),
+        // ALN (Assistance Listing Number, formerly CFDA) lives in `cfdaList`.
+        "aln": aln_from_array(hit.get("cfdaList")),
         "url": str_of(hit, &["number"])
             .map(|n| format!("https://www.grants.gov/search-results-detail/{id}?opp={n}"))
             .unwrap_or_else(|| format!("https://www.grants.gov/search-results-detail/{id}")),
@@ -39,11 +45,18 @@ pub fn normalize_grants_gov(hit: &Value) -> Option<(String, Value)> {
     Some((format!("grants-gov:{id}"), unified))
 }
 
-/// Normalizes a California Grants Portal CKAN row. Column names are looked up
-/// defensively (several candidates per field) so portal schema drift degrades
-/// to nulls instead of breaking the run.
+/// Normalizes a California Grants Portal CKAN row. Column names were verified
+/// against a live `datastore_search` sample (2026-07-13); a couple of legacy
+/// candidates are kept as defensive fallbacks so a minor rename degrades to
+/// nulls instead of breaking the run.
+///
+/// Per-award amount is a single `EstAmounts` **range** column ("Between
+/// $100,000 and $10,000,000"), parsed into award_floor/ceiling; the earlier
+/// `EstAmountFloor`/`EstAmountCeiling`/`AmountCeiling` candidates do not exist.
+/// `EstAvailFunds` is the total-funding scalar ("$370,000,000").
 pub fn normalize_ca_grants(rec: &Value) -> Option<(String, Value)> {
     let id = str_of(rec, &["PortalID", "GrantID"])?;
+    let (award_floor, award_ceiling) = money_range(rec, &["EstAmounts"]);
     let unified = json!({
         "source": "ca-grants",
         "source_id": id,
@@ -54,9 +67,16 @@ pub fn normalize_ca_grants(rec: &Value) -> Option<(String, Value)> {
         "close_date": str_of(rec, &["ApplicationDeadline", "CloseDate", "Deadline"])
             .as_deref()
             .and_then(norm_date),
-        "award_floor": money_of(rec, &["EstAmountFloor", "AmountFloor"]),
-        "award_ceiling": money_of(rec, &["EstAmounts", "EstAmountCeiling", "AmountCeiling"]),
-        "total_funding": money_of(rec, &["EstAvailFunds", "TotalEstAvailFunds"]),
+        "award_floor": award_floor,
+        "award_ceiling": award_ceiling,
+        "total_funding": money_scalar(rec, &["EstAvailFunds"]),
+        // Portal taxonomies are single "; "-separated string columns. Category
+        // names themselves contain commas ("Housing, Community and Economic
+        // Development"), so only ';' is a separator.
+        "categories": str_list(rec, &["Categories"]),
+        "eligibilities": str_list(rec, &["ApplicantType"]),
+        // The CA portal publishes no ALN/CFDA number.
+        "aln": Value::Null,
         "url": str_of(rec, &["GrantURL", "URL", "Link"]),
         "description": str_of(rec, &["Description", "Purpose"])
             .map(|d| d.chars().take(500).collect::<String>()),
@@ -90,16 +110,8 @@ pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
             continue;
         }
         let status = rec.data.get("status").and_then(Value::as_str);
-        if !matches!(status, Some("open") | Some("forecasted")) {
-            continue;
-        }
-        let past_due = rec
-            .data
-            .get("close_date")
-            .and_then(Value::as_str)
-            .and_then(parse_date)
-            .is_some_and(|d| d < today);
-        if !past_due {
+        let close_date = rec.data.get("close_date").and_then(Value::as_str);
+        if !is_past_due_open(status, close_date, today) {
             continue;
         }
         let mut updated = rec.data.clone();
@@ -110,6 +122,15 @@ pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
         ctx.datasets.upsert_many(UNIFIED_APP, UNIFIED_DATASET, &updates).await?;
     }
     Ok(updates.len())
+}
+
+/// The sweep decision for one row: an `open`/`forecasted` opportunity whose
+/// `close_date` parses and is strictly before `today` should flip to `closed`.
+/// A missing/unparseable close date, a future/today date, or any other status
+/// is left untouched (a deadline that is exactly today has not passed).
+fn is_past_due_open(status: Option<&str>, close_date: Option<&str>, today: chrono::NaiveDate) -> bool {
+    matches!(status, Some("open") | Some("forecasted"))
+        && close_date.and_then(parse_date).is_some_and(|d| d < today)
 }
 
 /// Fraction of a run's normalized opportunities missing their `title` above
@@ -183,27 +204,130 @@ fn str_of(rec: &Value, fields: &[&str]) -> Option<String> {
         .map(String::from)
 }
 
-/// First parseable money value among candidates: numbers pass through,
-/// strings tolerate `$`, thousands separators, and surrounding text.
-fn money_of(rec: &Value, fields: &[&str]) -> Value {
+/// A "; "-separated taxonomy string column → a JSON array of trimmed,
+/// non-empty values (empty array when absent/blank). Only ';' splits, because
+/// the portal's category names contain commas.
+fn str_list(rec: &Value, fields: &[&str]) -> Value {
+    let items: Vec<Value> = str_of(rec, fields)
+        .map(|s| {
+            s.split(';')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(|p| Value::String(p.to_string()))
+                .collect()
+        })
+        .unwrap_or_default();
+    Value::Array(items)
+}
+
+/// Joins an ALN/CFDA list value (`["15.931", ...]`) into a single `", "`-joined
+/// string, or Null when absent/empty. Tolerates a bare string too.
+fn aln_from_array(v: Option<&Value>) -> Value {
+    let parts: Vec<String> = match v {
+        Some(Value::Array(a)) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+            .collect(),
+        Some(Value::String(s)) if !s.trim().is_empty() => vec![s.trim().to_string()],
+        _ => vec![],
+    };
+    if parts.is_empty() {
+        Value::Null
+    } else {
+        Value::String(parts.join(", "))
+    }
+}
+
+/// All money amounts found in a string, left-to-right. Handles currency symbols,
+/// thousands separators, decimals, and K/M/B magnitude suffixes
+/// ("$1.5M" → 1_500_000, "$100k" → 100_000). Zero and unparseable tokens are
+/// dropped, so "$0" and prose ("Dependant on submissions") yield an empty vec.
+fn scan_amounts(s: &str) -> Vec<f64> {
+    let bytes = s.as_bytes();
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if !bytes[i].is_ascii_digit() {
+            i += 1;
+            continue;
+        }
+        let start = i;
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b',' || bytes[i] == b'.') {
+            i += 1;
+        }
+        let digits: String = s[start..i].chars().filter(|c| *c != ',').collect();
+        // Optional single magnitude suffix immediately after the number.
+        let mult = match bytes.get(i).map(|b| *b as char) {
+            Some('k') | Some('K') => {
+                i += 1;
+                1_000.0
+            }
+            Some('m') | Some('M') => {
+                i += 1;
+                1_000_000.0
+            }
+            Some('b') | Some('B') => {
+                i += 1;
+                1_000_000_000.0
+            }
+            _ => 1.0,
+        };
+        if let Ok(v) = digits.trim_matches('.').parse::<f64>() {
+            let v = v * mult;
+            if v > 0.0 {
+                out.push(v);
+            }
+        }
+    }
+    out
+}
+
+/// Single money value for a scalar field: the first parseable amount among the
+/// candidate columns (JSON numbers pass through). Null when none is found.
+fn money_scalar(rec: &Value, fields: &[&str]) -> Value {
     for f in fields {
         match rec.get(*f) {
-            Some(Value::Number(n)) => return Value::from(n.as_f64().unwrap_or(0.0)),
+            Some(Value::Number(n)) => {
+                let v = n.as_f64().unwrap_or(0.0);
+                if v > 0.0 {
+                    return Value::from(v);
+                }
+            }
             Some(Value::String(s)) => {
-                let cleaned: String = s
-                    .chars()
-                    .filter(|c| c.is_ascii_digit() || *c == '.')
-                    .collect();
-                if let Ok(n) = cleaned.parse::<f64>() {
-                    if n > 0.0 {
-                        return Value::from(n);
-                    }
+                if let Some(v) = scan_amounts(s).into_iter().next() {
+                    return Value::from(v);
                 }
             }
             _ => {}
         }
     }
     Value::Null
+}
+
+/// (floor, ceiling) for a field that may express a range ("Between $100,000 and
+/// $10,000,000", "$100k-$500k"): min and max of the amounts found. A lone value
+/// collapses to (v, v); no amounts → (Null, Null).
+fn money_range(rec: &Value, fields: &[&str]) -> (Value, Value) {
+    for f in fields {
+        let amounts = match rec.get(*f) {
+            Some(Value::Number(n)) => {
+                let v = n.as_f64().unwrap_or(0.0);
+                if v > 0.0 { vec![v] } else { vec![] }
+            }
+            Some(Value::String(s)) => scan_amounts(s),
+            _ => vec![],
+        };
+        if amounts.is_empty() {
+            continue;
+        }
+        let min = amounts.iter().cloned().fold(f64::INFINITY, f64::min);
+        let max = amounts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        return (Value::from(min), Value::from(max));
+    }
+    (Value::Null, Value::Null)
 }
 
 /// The one date parser for the grant sources — used by normalization, the
@@ -252,28 +376,70 @@ mod tests {
         let hit = json!({
             "id": "356037", "number": "TEST-24-001", "title": "Rural Health",
             "agency": "HHS", "oppStatus": "posted",
-            "openDate": "07/01/2026", "closeDate": "08/15/2026"
+            "openDate": "07/01/2026", "closeDate": "08/15/2026",
+            "cfdaList": ["93.912", "93.913"]
         });
         let (key, v) = normalize_grants_gov(&hit).unwrap();
         assert_eq!(key, "grants-gov:356037");
         assert_eq!(v["status"], "open");
         assert_eq!(v["close_date"], "2026-08-15");
         assert_eq!(v["award_ceiling"], Value::Null);
+        // ALN joined from cfdaList; categories/eligibilities empty for this source.
+        assert_eq!(v["aln"], "93.912, 93.913");
+        assert_eq!(v["categories"], json!([]));
+        assert_eq!(v["eligibilities"], json!([]));
     }
 
     #[test]
     fn ca_grants_parses_money_dates_and_status() {
+        // Field values mirror the live portal sample (2026-07-13).
         let rec = json!({
             "PortalID": "CA-99", "Title": "Wildfire Prevention",
             "AgencyDept": "CAL FIRE", "Status": "active",
-            "ApplicationDeadline": "2026-09-30",
-            "EstAvailFunds": "$5,000,000", "GrantURL": "https://ca.gov/g/99"
+            "ApplicationDeadline": "2026-11-02 23:59:00",
+            "EstAvailFunds": "$5,000,000",
+            "EstAmounts": "Between $100,000 and $10,000,000",
+            "Categories": "Environment & Water; Disadvantaged Communities",
+            "ApplicantType": "Public Agency; Tribal Government",
+            "GrantURL": "https://ca.gov/g/99"
         });
         let (key, v) = normalize_ca_grants(&rec).unwrap();
         assert_eq!(key, "ca-grants:CA-99");
         assert_eq!(v["status"], "open");
-        assert_eq!(v["close_date"], "2026-09-30");
+        assert_eq!(v["close_date"], "2026-11-02");
         assert_eq!(v["total_funding"], json!(5_000_000.0));
+        // EstAmounts range → floor/ceiling.
+        assert_eq!(v["award_floor"], json!(100_000.0));
+        assert_eq!(v["award_ceiling"], json!(10_000_000.0));
+        // "; "-split taxonomies; CA has no ALN.
+        assert_eq!(v["categories"], json!(["Environment & Water", "Disadvantaged Communities"]));
+        assert_eq!(v["eligibilities"], json!(["Public Agency", "Tribal Government"]));
+        assert_eq!(v["aln"], Value::Null);
+    }
+
+    #[test]
+    fn money_parsing_handles_suffixes_ranges_and_prose() {
+        let m = |rec: &Value| money_scalar(rec, &["v"]);
+        // K/M/B suffixes.
+        assert_eq!(m(&json!({ "v": "$1.5M" })), json!(1_500_000.0));
+        assert_eq!(m(&json!({ "v": "$100k" })), json!(100_000.0));
+        assert_eq!(m(&json!({ "v": "$2B" })), json!(2_000_000_000.0));
+        // Thousands separators + currency symbol.
+        assert_eq!(m(&json!({ "v": "$370,000,000" })), json!(370_000_000.0));
+        // JSON number passes through.
+        assert_eq!(m(&json!({ "v": 250000 })), json!(250_000.0));
+        // Prose / zero → null.
+        assert_eq!(m(&json!({ "v": "Dependant on submissions" })), Value::Null);
+        assert_eq!(m(&json!({ "v": "$0" })), Value::Null);
+
+        // Ranges (real EstAmounts strings).
+        let r = |s: &str| money_range(&json!({ "v": s }), &["v"]);
+        assert_eq!(r("Between $100,000 and $10,000,000"), (json!(100_000.0), json!(10_000_000.0)));
+        assert_eq!(r("$100k-$500k"), (json!(100_000.0), json!(500_000.0)));
+        // Lone value collapses to (v, v).
+        assert_eq!(r("$250,000"), (json!(250_000.0), json!(250_000.0)));
+        // No amount → (Null, Null).
+        assert_eq!(r("Dependant on submissions"), (Value::Null, Value::Null));
     }
 
     #[test]
@@ -296,6 +462,21 @@ mod tests {
         assert!(parse_date("").is_none());
         assert!(parse_date("   ").is_none());
         assert!(parse_date("not a date").is_none());
+    }
+
+    #[test]
+    fn sweep_predicate_flips_only_past_due_open_or_forecasted() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        // Past-due open / forecasted → flip.
+        assert!(is_past_due_open(Some("open"), Some("2026-07-12"), today));
+        assert!(is_past_due_open(Some("forecasted"), Some("07/12/2026"), today));
+        // Deadline exactly today has not passed → leave.
+        assert!(!is_past_due_open(Some("open"), Some("2026-07-13"), today));
+        // Future, already-closed, missing/unparseable date → leave.
+        assert!(!is_past_due_open(Some("open"), Some("2026-08-01"), today));
+        assert!(!is_past_due_open(Some("closed"), Some("2026-01-01"), today));
+        assert!(!is_past_due_open(Some("open"), None, today));
+        assert!(!is_past_due_open(Some("open"), Some("n/a"), today));
     }
 
     #[test]
