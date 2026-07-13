@@ -1,4 +1,5 @@
 mod events;
+mod progress;
 mod registry;
 mod routes;
 mod scheduler;

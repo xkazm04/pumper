@@ -150,9 +150,22 @@ impl ScrapeApp for Crawl {
             counts: counts.clone(),
         });
 
-        let stats =
-            crawl(ctx.engines.http.clone(), cfg, Some(ctx.artifacts_dir.clone()), Some(sink))
-                .await?;
+        // Bridge core's crawl progress seam to the runtime reporter: each live
+        // snapshot is persisted (visible on GET /jobs/{id}) and emitted as a
+        // `progress` SSE event. The runtime throttles; this closure is cheap.
+        let reporter = ctx.progress.clone();
+        let progress: pumper_core::ProgressFn = Arc::new(move |snap| {
+            reporter.report(serde_json::to_value(snap).unwrap_or_default());
+        });
+
+        let stats = crawl(
+            ctx.engines.http.clone(),
+            cfg,
+            Some(ctx.artifacts_dir.clone()),
+            Some(sink),
+            Some(progress),
+        )
+        .await?;
 
         let pages_new = counts.new.load(Ordering::Relaxed);
         let pages_changed = counts.changed.load(Ordering::Relaxed);

@@ -17,6 +17,14 @@ Pumper runs **apps** (implementations of `ScrapeApp`, registered in `crates/serv
 - Worker (`crates/server/src/worker.rs`): global concurrency cap + per-app caps (`[worker]` config); wakes instantly on enqueue. After a successful run it indexes the result into search, computes the run's revision batch once, then fires dataset watches, dataset triggers, and saved searches; `finalize()` emits the terminal SSE event, the result webhook, and terminal-job triggers. All side effects are fail-open.
 - **Claim order / priority aging:** the worker claims the queued job with the highest *effective* priority = `priority + waited_secs / worker.priority_aging_coefficient_secs`. Aging is a starvation guard — a low-priority job stuck behind a continuous high-priority stream escalates as it waits (default coefficient `900`s → +1 level every 15 min) instead of never running. Set the coefficient to `0` to disable aging and fall back to strict `priority DESC, created_at`. Equal-(effective-)priority claims stay FIFO (oldest `created_at` first).
 
+## Live progress
+
+A long-running app reports compact progress snapshots through `AppContext::progress` (a `ProgressReporter`). The runtime (`crates/server/src/progress.rs`) keeps only the **latest snapshot per in-flight job in memory** (no jobs-table write — a restart drops it, which is acceptable: the job re-queues and re-reports) and emits it as a `progress` job event through the EventBus. Each reporter **throttles** its own persist+emit to ≥ every 2s or every 50 `report` calls, so an in-loop stride never floods the bus.
+
+- `GET /jobs/{id}` includes a `progress` field with the latest snapshot while the job runs (absent once terminal or after a restart) — the rest of the job JSON is unchanged.
+- The snapshot rides `progress`-status job SSE events on `/jobs/{id}/stream` and `/events` (non-terminal, so the per-job stream stays open); monotonic ids / replay semantics are unchanged.
+- The `crawl` app reports `{crawled, kept, failed, frontier, hosts}` (see [crawling.md](crawling.md)).
+
 ## Scheduler
 
 DB-backed cron (6-field, with seconds) reconciled every `schedule_tick_secs`. Apps can declare a static schedule (`ScrapeApp::schedule`, seeded idempotently); runtime CRUD via `GET/POST /schedules`, `DELETE /schedules/{id}`, `POST /schedules/{id}/enabled`. **Overlap guard:** a schedule whose previous job is still queued/running skips the tick without touching `last_run`, so exactly one catch-up run fires when it frees up.
@@ -30,7 +38,7 @@ DB-backed cron (6-field, with seconds) reconciled every `schedule_tick_secs`. Ap
 
 ## AppContext (what a running app gets)
 
-`job_id`, `app`, `params`, `engines`, `datasets`, `costs`, `budget_usd`, `research_cache`, `tiers`, `plugins`, `artifacts_dir` + helpers: `fetch` (metered, budget-governed, tier-routed), `research` (metered, cached), `upsert`/`upsert_many`/`sync_many`, `save_artifact`, `require_str`, `remaining_budget_usd`.
+`job_id`, `app`, `params`, `engines`, `datasets`, `costs`, `budget_usd`, `research_cache`, `tiers`, `plugins`, `progress` (throttled live-progress seam — see [Live progress](#live-progress)), `artifacts_dir` + helpers: `fetch` (metered, budget-governed, tier-routed), `research` (metered, cached), `upsert`/`upsert_many`/`sync_many`, `save_artifact`, `require_str`, `remaining_budget_usd`.
 
 ## Config
 

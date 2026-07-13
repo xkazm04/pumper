@@ -5,6 +5,8 @@
 - `GET /events` — stream of all job status transitions (`queued/running/succeeded/failed/cancelled`).
 - `GET /jobs/{id}/stream` — one job's transitions; replays the current state on connect and closes at terminal.
 
+**Live progress events.** Besides the `queued/running/succeeded/failed/cancelled` status transitions, a long-running job also emits `status: "progress"` events carrying its latest snapshot in `result` (e.g. the crawler's `{crawled, kept, failed, frontier, hosts}`). These are throttled (≥ every 2s per job) and non-terminal, so the per-job stream stays open through them; the latest snapshot is also on `GET /jobs/{id}` (`progress` field). See [runtime.md § Live progress](runtime.md#live-progress).
+
 **Resume with `Last-Event-ID`.** Every SSE event carries a process-global monotonic id (the `id:` field). Events are also kept in a bounded in-memory replay ring (last 1024). A client that reconnects with a `Last-Event-ID: <n>` header is replayed exactly the events it missed (`id > n`), filtered to the stream's scope. If the gap is older than the ring still holds, the server first emits a single `event: reset` (carrying the latest id as its `id:`) so the client knows to resync its view before live events resume. The same ring lets a live subscriber that falls behind the broadcast buffer recover the missed events instead of dropping them silently. The per-job stream's connect-time state snapshot has no id (it is a synthesized view, not a buffered transition); only real transitions are replayable.
 
 ## Outbound webhooks — one logged contract

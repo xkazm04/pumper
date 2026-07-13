@@ -126,6 +126,42 @@ impl UrlFilter {
     }
 }
 
+/// Compact live-progress snapshot emitted periodically DURING a crawl (not just
+/// at the end) via the [`ProgressFn`] seam, so a 100k-page crawl is observable
+/// mid-run instead of a black box until completion.
+#[derive(Debug, Clone, Serialize)]
+pub struct CrawlProgressSnapshot {
+    pub crawled: usize,
+    pub kept: usize,
+    pub failed: usize,
+    /// URLs still queued in the frontier.
+    pub frontier: usize,
+    /// Distinct hosts touched so far.
+    pub hosts: usize,
+}
+
+/// Periodic progress callback. Invoked every [`PROGRESS_STRIDE`] crawled pages
+/// (and once at the end) with a live snapshot. The app layer bridges it to the
+/// runtime's `ProgressReporter` (persist latest + emit a `progress` event);
+/// core stays runtime-agnostic. Cheap and non-blocking — the runtime throttles.
+pub type ProgressFn = Arc<dyn Fn(&CrawlProgressSnapshot) + Send + Sync>;
+
+/// How often (in crawled pages) the progress seam is invoked. The runtime
+/// throttles the actual persist/emit, so a tight stride here is cheap.
+const PROGRESS_STRIDE: usize = 20;
+
+fn emit_progress(progress: &Option<ProgressFn>, stats: &CrawlStats, frontier: usize, hosts: usize) {
+    if let Some(cb) = progress {
+        cb(&CrawlProgressSnapshot {
+            crawled: stats.crawled,
+            kept: stats.kept,
+            failed: stats.failed,
+            frontier,
+            hosts,
+        });
+    }
+}
+
 #[derive(Debug, Default, Serialize)]
 pub struct CrawlStats {
     pub crawled: usize,
@@ -282,6 +318,7 @@ pub async fn crawl(
     cfg: CrawlConfig,
     output_dir: Option<PathBuf>,
     mut sink: Option<Box<dyn PageSink>>,
+    progress: Option<ProgressFn>,
 ) -> Result<CrawlStats> {
     let concurrency = cfg.concurrency.clamp(1, 256);
     // Buffer of kept-page fingerprints awaiting the next batched sink flush.
@@ -479,6 +516,12 @@ pub async fn crawl(
         // dataset via the sink); the result keeps only counters + the artifacts
         // dir + `pages` dataset as pointers.
 
+        // Live progress: cheap seam call every stride; the runtime throttles the
+        // actual persist/emit so a huge crawl stays observable without spamming.
+        if stats.crawled % PROGRESS_STRIDE == 0 {
+            emit_progress(&progress, &stats, frontier.len(), hosts.len());
+        }
+
         if stats.kept >= cfg.max_pages {
             break;
         }
@@ -498,6 +541,9 @@ pub async fn crawl(
             stats.checkpoint_errors += 1;
         }
     }
+    // Final snapshot so a subscriber's last progress event reflects the true end
+    // state (the throttle may have suppressed the last periodic tick).
+    emit_progress(&progress, &stats, stats.frontier_remaining, stats.hosts);
     stats.failed_by_host = top_n_by_count(stats.failed_by_host, MAX_FAILED_HOSTS);
     Ok(stats)
 }
@@ -986,7 +1032,7 @@ mod tests {
         let records = Arc::new(SyncMutex::new(Vec::new()));
         let sink = Box::new(CollectSink { records: records.clone() });
 
-        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, Some(sink))
+        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, Some(sink), None)
             .await
             .unwrap();
 
@@ -1000,6 +1046,34 @@ mod tests {
         assert_ne!(home.simhash, 0, "body simhash recorded");
         assert!(recs.iter().any(|r| r.url == "https://ex.com/about"
             && r.title.as_deref() == Some("About")));
+    }
+
+    #[tokio::test]
+    async fn crawl_reports_progress_snapshots() {
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://ex.com/".to_string(),
+            (200, "<html><body><a href=\"/a\">a</a></body></html>".to_string()),
+        );
+        pages.insert(
+            "https://ex.com/a".to_string(),
+            (200, "<html><body><p>distinct content</p></body></html>".to_string()),
+        );
+        let http = Arc::new(MockHttp { pages, ..Default::default() });
+        let seen: Arc<SyncMutex<Vec<CrawlProgressSnapshot>>> = Arc::new(SyncMutex::new(Vec::new()));
+        let sink_seen = seen.clone();
+        let progress: ProgressFn = Arc::new(move |snap| sink_seen.lock().unwrap().push(snap.clone()));
+
+        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, Some(progress))
+            .await
+            .unwrap();
+
+        let snaps = seen.lock().unwrap();
+        assert!(!snaps.is_empty(), "at least the final progress snapshot is emitted");
+        let last = snaps.last().unwrap();
+        assert_eq!(last.crawled, stats.crawled, "final snapshot mirrors end stats");
+        assert_eq!(last.kept, stats.kept);
+        assert_eq!(last.hosts, stats.hosts);
     }
 
     #[tokio::test]
@@ -1029,7 +1103,7 @@ mod tests {
         fail.insert("https://ex.com/dead".to_string());
 
         let http = Arc::new(MockHttp { pages, fail });
-        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None).await.unwrap();
+        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, None).await.unwrap();
 
         // Kept: seed + /ok. /dead failed, /blocked + /cf are bot-walls.
         assert_eq!(stats.kept, 2, "only real-content pages kept");

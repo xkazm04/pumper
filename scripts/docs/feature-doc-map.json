@@ -11,6 +11,7 @@
         "crates/core/src/costs.rs",
         "crates/server/src/worker.rs",
         "crates/server/src/scheduler.rs",
+        "crates/server/src/progress.rs",
         "crates/server/src/state.rs",
         "crates/server/src/main.rs",
         "crates/server/src/registry.rs"

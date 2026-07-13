@@ -13,6 +13,26 @@ use crate::fetcher::{FetchOutcome, FetchRequest};
 use crate::plugin::Plugins;
 use crate::{Error, Result};
 
+/// A throttled live-progress seam. A long-running app (e.g. the crawler) calls
+/// [`ProgressReporter::report`] with a compact JSON snapshot; the runtime
+/// persists the latest snapshot (surfaced on `GET /jobs/{id}`) and emits it as a
+/// `progress` job event through the EventBus. Implementations MUST be cheap and
+/// non-blocking — `report` may be called very frequently — and throttle their
+/// own persistence/emission (the server impl coalesces to ≥ every 2s or N
+/// updates). Progress is in-flight telemetry only: a restart drops it.
+pub trait ProgressReporter: Send + Sync {
+    /// Report the job's current progress snapshot. Fire-and-forget.
+    fn report(&self, snapshot: Value);
+}
+
+/// No-op reporter — the default when a runtime wires no progress seam (tests,
+/// embedders). Reporting is silently dropped.
+pub struct NoProgress;
+
+impl ProgressReporter for NoProgress {
+    fn report(&self, _snapshot: Value) {}
+}
+
 /// Everything a job run gets from the runtime: its params, the engines, the
 /// dataset store (dedup + change detection), the sandboxed WASM plugin host,
 /// and a per-job artifacts directory for raw dumps (HTML, JSON, screenshots).
@@ -33,6 +53,9 @@ pub struct AppContext {
     pub tiers: Arc<crate::tiers::TierMemory>,
     /// Sandboxed WASM plugin host (fuel + memory limited).
     pub plugins: Arc<dyn Plugins>,
+    /// Throttled live-progress seam: long-running apps report compact snapshots
+    /// that surface on `GET /jobs/{id}` and as `progress` SSE events.
+    pub progress: Arc<dyn ProgressReporter>,
     pub artifacts_dir: PathBuf,
 }
 

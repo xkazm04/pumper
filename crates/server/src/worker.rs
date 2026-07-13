@@ -168,6 +168,9 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         research_cache: state.research_cache.clone(),
         tiers: state.tiers.clone(),
         plugins: state.plugins.clone(),
+        progress: state
+            .progress
+            .reporter(job.id, job.app.clone(), state.events.clone()),
         artifacts_dir: state
             .storage
             .artifacts_dir
@@ -454,6 +457,9 @@ async fn notify_saved_searches(state: &AppState, job: &Job) {
 
 /// Emits the terminal event and fires the result webhook, if configured.
 async fn finalize(state: &AppState, id: uuid::Uuid) {
+    // In-flight progress is done being useful once the job is terminal; drop the
+    // buffered snapshot so the map doesn't grow with completed jobs.
+    state.progress.clear(&id);
     let Ok(Some(job)) = state.storage.get(id).await else {
         return;
     };

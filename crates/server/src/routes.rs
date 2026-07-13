@@ -638,13 +638,20 @@ async fn list_jobs(
 async fn get_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
-) -> Result<Json<Job>, ApiError> {
-    state
+) -> Result<Json<Value>, ApiError> {
+    let job = state
         .storage
         .get(id)
         .await?
-        .map(Json)
-        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "job not found".into()))
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "job not found".into()))?;
+    let mut body = serde_json::to_value(&job).unwrap_or_else(|_| json!({}));
+    // A running long job's latest live-progress snapshot (in-memory; absent once
+    // the job finalizes or after a restart). Additive — the job fields are
+    // unchanged.
+    if let (Value::Object(map), Some(snapshot)) = (&mut body, state.progress.snapshot(&id)) {
+        map.insert("progress".into(), snapshot);
+    }
+    Ok(Json(body))
 }
 
 /// Re-queues a failed or cancelled job with one more attempt.

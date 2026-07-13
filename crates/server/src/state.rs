@@ -15,6 +15,7 @@ use tokio::sync::Notify;
 use tokio_util::sync::CancellationToken;
 
 use crate::events::EventBus;
+use crate::progress::ProgressStore;
 
 /// Capacity of the broadcast channel fanning live events to SSE subscribers.
 const EVENT_BROADCAST_CAPACITY: usize = 512;
@@ -47,6 +48,9 @@ pub struct AppState {
     /// Fan-out of job status transitions to SSE subscribers, with a bounded
     /// replay ring backing `Last-Event-ID` resume.
     pub events: Arc<EventBus>,
+    /// Latest live-progress snapshot per in-flight job (in-memory; surfaced on
+    /// `GET /jobs/{id}`). Dropped on restart — progress is ephemeral telemetry.
+    pub progress: Arc<ProgressStore>,
     /// Cancelled on SIGTERM/Ctrl-C to drive graceful shutdown: the worker stops
     /// claiming, in-flight jobs drain, and `axum::serve` stops accepting.
     pub shutdown: CancellationToken,
@@ -159,6 +163,7 @@ impl AppState {
             notify: Arc::new(Notify::new()),
             webhook_client,
             events,
+            progress: Arc::new(ProgressStore::new()),
             shutdown: CancellationToken::new(),
             job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
