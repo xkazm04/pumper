@@ -1,10 +1,8 @@
 [package]
-name = "app-state-tax"
+name = "trades-common"
 version.workspace = true
 edition.workspace = true
 
 [dependencies]
 pumper-core.workspace = true
-trades-common.workspace = true
-async-trait.workspace = true
 serde_json.workspace = true

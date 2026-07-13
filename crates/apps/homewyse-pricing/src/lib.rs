@@ -17,6 +17,8 @@
 use async_trait::async_trait;
 use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
+use trades_common::salvage_json;
+use trades_common::validate::{self, Rejection};
 
 pub struct HomewysePricing;
 
@@ -118,6 +120,10 @@ impl ScrapeApp for HomewysePricing {
 
         let mut all_records: Vec<(String, Value)> = Vec::new();
         let mut trade_summaries: Vec<Value> = Vec::new();
+        // Plausibility guards: a priced job whose band is out of order or
+        // non-positive is rejected (with reasons) rather than upserted. One
+        // pass, no re-run — the answer is already paid for.
+        let mut rejected: Vec<Rejection> = Vec::new();
         if let Some(trades) = data.get("trades").and_then(Value::as_array) {
             for t in trades {
                 let trade = t.get("trade").and_then(Value::as_str).unwrap_or("").to_string();
@@ -128,9 +134,22 @@ impl ScrapeApp for HomewysePricing {
                         if trade.is_empty() || job.is_empty() {
                             continue;
                         }
+                        let key = format!("{locality}:{trade}:{job}");
+                        let low = validate::num(j, "low");
+                        let median = validate::num(j, "median");
+                        let high = validate::num(j, "high");
+                        let mut reasons = Vec::new();
+                        validate::require_positive(&mut reasons, "low", low);
+                        validate::require_positive(&mut reasons, "median", median);
+                        validate::require_positive(&mut reasons, "high", high);
+                        validate::require_monotone(&mut reasons, "price", low, median, high);
+                        if !reasons.is_empty() {
+                            rejected.push(Rejection { key, reasons });
+                            continue;
+                        }
                         job_count += 1;
                         all_records.push((
-                            format!("{locality}:{trade}:{job}"),
+                            key,
                             json!({
                                 "locality": locality,
                                 "year": year,
@@ -165,6 +184,8 @@ impl ScrapeApp for HomewysePricing {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            "rejected": rejected.iter().map(Rejection::to_json).collect::<Vec<_>>(),
+            "rejected_count": rejected.len(),
             // Metered-engine telemetry — the console reads cost_usd for the run.
             "cost_usd": output.cost_usd,
             "duration_ms": output.duration_ms,
@@ -210,107 +231,4 @@ fn pricing_schema() -> Value {
         },
         "required": ["locality", "year", "trades"]
     })
-}
-
-/// Best-effort recovery of a JSON object the agent emitted but the engine couldn't
-/// parse into `output.json` — the common failure is a markdown ```json fence or a
-/// leading/trailing sentence. No re-run, no cost: it works on the raw text we already
-/// paid for. Returns None only when there's no parseable object at all.
-fn salvage_json(text: &str) -> Option<Value> {
-    let trimmed = text.trim();
-    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-        return Some(v);
-    }
-    let unfenced = strip_code_fence(trimmed);
-    if let Ok(v) = serde_json::from_str::<Value>(unfenced.trim()) {
-        return Some(v);
-    }
-    let span = first_balanced_object(unfenced)?;
-    serde_json::from_str::<Value>(span).ok()
-}
-
-/// Strip a leading ```json (or bare ```) fence and its closing ``` if present.
-fn strip_code_fence(text: &str) -> &str {
-    let t = text.trim();
-    let Some(rest) = t.strip_prefix("```") else {
-        return t;
-    };
-    // drop the optional language tag on the fence's first line
-    let rest = rest.split_once('\n').map(|(_, r)| r).unwrap_or(rest);
-    rest.strip_suffix("```").unwrap_or(rest).trim()
-}
-
-/// The first brace-balanced `{...}` span in `text`, respecting quoted strings and
-/// escapes so a `}` inside a string value doesn't close the object early.
-fn first_balanced_object(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let start = text.find('{')?;
-    let mut depth = 0usize;
-    let mut in_str = false;
-    let mut escaped = false;
-    for i in start..bytes.len() {
-        let c = bytes[i];
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == b'\\' {
-                escaped = true;
-            } else if c == b'"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match c {
-            b'"' => in_str = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..=i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn salvages_a_clean_object() {
-        let v = salvage_json(r#"{"locality":"Texas","trades":[]}"#).unwrap();
-        assert_eq!(v["locality"], "Texas");
-    }
-
-    #[test]
-    fn salvages_a_fenced_object() {
-        let raw = "```json\n{\"locality\":\"Texas\",\"trades\":[]}\n```";
-        let v = salvage_json(raw).unwrap();
-        assert_eq!(v["locality"], "Texas");
-    }
-
-    #[test]
-    fn salvages_an_object_wrapped_in_prose() {
-        let raw = "Here is the pricing data you asked for:\n{\"locality\":\"Texas\",\
-                   \"trades\":[{\"trade\":\"Plumbing\",\"jobs\":[]}]}\nHope that helps!";
-        let v = salvage_json(raw).unwrap();
-        assert_eq!(v["locality"], "Texas");
-        assert_eq!(v["trades"][0]["trade"], "Plumbing");
-    }
-
-    #[test]
-    fn does_not_close_early_on_a_brace_inside_a_string() {
-        let raw = r#"prefix {"note":"a } inside a string","ok":true} suffix"#;
-        let v = salvage_json(raw).unwrap();
-        assert_eq!(v["ok"], true);
-        assert_eq!(v["note"], "a } inside a string");
-    }
-
-    #[test]
-    fn returns_none_when_there_is_no_object() {
-        assert!(salvage_json("I could not find reliable pricing data.").is_none());
-    }
 }

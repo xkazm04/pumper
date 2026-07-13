@@ -184,6 +184,7 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+ "trades-common",
 ]
 
 [[package]]
@@ -242,6 +243,7 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+ "trades-common",
 ]
 
 [[package]]
@@ -251,6 +253,7 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+ "trades-common",
 ]
 
 [[package]]
@@ -260,6 +263,7 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+ "trades-common",
 ]
 
 [[package]]
@@ -4469,6 +4473,14 @@ dependencies = [
  "tracing",
  "tracing-core",
  "tracing-log",
+]
+
+[[package]]
+name = "trades-common"
+version = "0.1.0"
+dependencies = [
+ "pumper-core",
+ "serde_json",
 ]
 
 [[package]]

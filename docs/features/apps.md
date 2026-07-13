@@ -31,6 +31,15 @@ Apps are `ScrapeApp` implementations under `crates/apps/*`, registered in `crate
 
 Params defensively parsed from `ctx.params` with documented defaults; stable record keys; `upsert_many` for partial batches vs `sync_many` for full snapshots (removal detection); metered `ctx.fetch`/`ctx.research`; big payloads to artifacts; compact result JSON with new/changed counts (feeds cost-per-fresh-record and trigger summaries).
 
+## Output guards (agentic trades apps)
+
+All four trades apps (`trade-wages`, `homewyse-pricing`, `state-tax`, `valuation-multiples`) share output guards via the `trades-common` crate:
+
+- **Structured output**: every research request carries a `json_schema` (`claude --json-schema`), so the CLI validates the answer's shape.
+- **Salvage**: `trades_common::salvage_json` recovers a fenced or prose-wrapped object from raw text in ONE pass (no metered re-run) when the engine couldn't parse `output.json`.
+- **Plausibility** (`trades_common::validate`): bands must be monotone (low ≤ median ≤ high — wage entry/median/experienced hourly+annual, pricing low/median/high, SDE low/median/high), rates ∈ [0,100] (state top marginal, federal SE/QBI/top rates), magnitudes positive (wages, employment, prices, multiples). A record that violates any check is **rejected with per-record reasons** in the result (`rejected` array + `rejected_count`); valid siblings still upsert.
+- **Completeness** (`state-tax`): the 50 states + DC are enumerated in code (`US_JURISDICTIONS`); the result reports `states_covered`, `states_expected`, and a `missing_states` list.
+
 ## Known gaps
 
-Agentic apps other than homewyse lack `json_schema` output guards (backlog). Census YoY trend layer awaits multi-vintage accumulation.
+Census YoY trend layer awaits multi-vintage accumulation.

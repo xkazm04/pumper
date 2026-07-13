@@ -17,6 +17,8 @@
 use async_trait::async_trait;
 use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
+use trades_common::salvage_json;
+use trades_common::validate::{self, Rejection};
 
 pub struct ValuationMultiples;
 
@@ -80,6 +82,9 @@ impl ScrapeApp for ValuationMultiples {
         request.max_turns = max_turns;
         request.model = ctx.params.get("model").and_then(Value::as_str).map(String::from);
         request.effort = ctx.params.get("effort").and_then(Value::as_str).map(String::from);
+        // Constrain the final answer to the multiples schema (`claude --json-schema`);
+        // salvage_json below still catches anything the schema path misses.
+        request.json_schema = Some(multiples_schema());
         // Metered seam: records a cost event against the job, honors budget_usd,
         // and serves identical re-runs from the research cache (see core/app.rs).
         let output = ctx.research(request).await?;
@@ -90,14 +95,22 @@ impl ScrapeApp for ValuationMultiples {
         };
         ctx.save_artifact("research.json", &artifact).await?;
 
-        let data = output.json.clone().ok_or_else(|| {
-            Error::App(format!(
-                "valuation-multiples: agent did not return JSON (text starts: {})",
-                output.text.chars().take(160).collect::<String>()
-            ))
-        })?;
+        // Prefer parsed output; salvage a fenced/prose-wrapped object before giving up
+        // (one pass, no metered re-run).
+        let data = match output.json.clone() {
+            Some(j) => j,
+            None => salvage_json(&output.text).ok_or_else(|| {
+                Error::App(format!(
+                    "valuation-multiples: agent did not return JSON (text starts: {})",
+                    output.text.chars().take(160).collect::<String>()
+                ))
+            })?,
+        };
 
         let mut all_records: Vec<(String, Value)> = Vec::new();
+        // Plausibility guards: the SDE band must be ordered (low ≤ median ≤ high)
+        // and all multiples positive. Violators rejected with reasons.
+        let mut rejected: Vec<Rejection> = Vec::new();
         if let Some(trades) = data.get("trades").and_then(Value::as_array) {
             for t in trades {
                 let trade = t
@@ -109,17 +122,38 @@ impl ScrapeApp for ValuationMultiples {
                 if trade.is_empty() {
                     continue;
                 }
+                let key = format!("US:{trade}");
+                let mut reasons = Vec::new();
+                for f in [
+                    "sde_multiple_low",
+                    "sde_multiple_median",
+                    "sde_multiple_high",
+                    "revenue_multiple",
+                ] {
+                    validate::require_positive(&mut reasons, f, validate::num(t, f));
+                }
+                validate::require_monotone(
+                    &mut reasons,
+                    "sde_multiple",
+                    validate::num(t, "sde_multiple_low"),
+                    validate::num(t, "sde_multiple_median"),
+                    validate::num(t, "sde_multiple_high"),
+                );
+                if !reasons.is_empty() {
+                    rejected.push(Rejection { key, reasons });
+                    continue;
+                }
                 let mut rec = t.clone();
                 // National by trade — state = "US" so the ingest lifts market = "US".
                 rec["state"] = json!("US");
                 rec["year"] = json!(year);
-                all_records.push((format!("US:{trade}"), rec));
+                all_records.push((key, rec));
             }
         }
 
         if all_records.is_empty() {
             return Err(Error::App(
-                "valuation-multiples: agent JSON contained no trades".into(),
+                "valuation-multiples: agent JSON contained no plausible trades".into(),
             ));
         }
 
@@ -132,9 +166,40 @@ impl ScrapeApp for ValuationMultiples {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            "rejected": rejected.iter().map(Rejection::to_json).collect::<Vec<_>>(),
+            "rejected_count": rejected.len(),
             "cost_usd": output.cost_usd,
             "duration_ms": output.duration_ms,
             "num_turns": output.num_turns,
         }))
     }
+}
+
+/// Structured-output contract for `claude --json-schema`. Lenient (extra fields
+/// tolerated) so a valid answer is never rejected, but pins the multiples shape.
+fn multiples_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "year": { "type": "string" },
+            "trades": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "trade": { "type": "string" },
+                        "sde_multiple_median": { "type": "number" },
+                        "sde_multiple_low": { "type": "number" },
+                        "sde_multiple_high": { "type": "number" },
+                        "revenue_multiple": { "type": "number" },
+                        "notes": { "type": "string" }
+                    },
+                    "required": [
+                        "trade", "sde_multiple_median", "sde_multiple_low", "sde_multiple_high"
+                    ]
+                }
+            }
+        },
+        "required": ["year", "trades"]
+    })
 }

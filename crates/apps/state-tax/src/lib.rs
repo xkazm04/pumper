@@ -18,10 +18,21 @@
 use async_trait::async_trait;
 use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
+use trades_common::salvage_json;
+use trades_common::validate::{self, Rejection};
 
 pub struct StateTax;
 
 const DEFAULT_YEAR: &str = "2025";
+
+/// The 50 states + DC, enumerated in code so completeness is checked against a
+/// fixed roster rather than a run-count heuristic. Missing entries are reported.
+const US_JURISDICTIONS: [&str; 51] = [
+    "AL", "AK", "AZ", "AR", "CA", "CO", "CT", "DE", "FL", "GA", "HI", "ID", "IL", "IN", "IA", "KS",
+    "KY", "LA", "ME", "MD", "MA", "MI", "MN", "MS", "MO", "MT", "NE", "NV", "NH", "NJ", "NM", "NY",
+    "NC", "ND", "OH", "OK", "OR", "PA", "RI", "SC", "SD", "TN", "TX", "UT", "VT", "VA", "WA", "WV",
+    "WI", "WY", "DC",
+];
 
 #[async_trait]
 impl ScrapeApp for StateTax {
@@ -85,6 +96,9 @@ impl ScrapeApp for StateTax {
         request.max_turns = max_turns;
         request.model = ctx.params.get("model").and_then(Value::as_str).map(String::from);
         request.effort = ctx.params.get("effort").and_then(Value::as_str).map(String::from);
+        // Constrain the final answer to the tax schema (`claude --json-schema`);
+        // salvage_json below still catches anything the schema path misses.
+        request.json_schema = Some(tax_schema());
         // Metered seam: records a cost event against the job, honors budget_usd,
         // and serves identical re-runs from the research cache (see core/app.rs).
         let output = ctx.research(request).await?;
@@ -95,27 +109,42 @@ impl ScrapeApp for StateTax {
         };
         ctx.save_artifact("research.json", &artifact).await?;
 
-        let data = output.json.clone().ok_or_else(|| {
-            Error::App(format!(
-                "state-tax: agent did not return JSON (text starts: {})",
-                output.text.chars().take(160).collect::<String>()
-            ))
-        })?;
+        // Prefer parsed output; salvage a fenced/prose-wrapped object before giving up
+        // (one pass, no metered re-run).
+        let data = match output.json.clone() {
+            Some(j) => j,
+            None => salvage_json(&output.text).ok_or_else(|| {
+                Error::App(format!(
+                    "state-tax: agent did not return JSON (text starts: {})",
+                    output.text.chars().take(160).collect::<String>()
+                ))
+            })?,
+        };
 
         let mut all_records: Vec<(String, Value)> = Vec::new();
+        let mut rejected: Vec<Rejection> = Vec::new();
 
         // Federal small-business constants — one national record (state = "US" so the
-        // ingest lifts market = "US").
+        // ingest lifts market = "US"). Rate fields must fall in [0,100].
         if let Some(fed) = data.get("federal").filter(|v| v.is_object()) {
-            let mut rec = fed.clone();
-            rec["level"] = json!("federal");
-            rec["state"] = json!("US");
-            rec["state_name"] = json!("United States");
-            rec["year"] = json!(year);
-            all_records.push(("federal:US".to_string(), rec));
+            let mut reasons = Vec::new();
+            for f in ["self_employment_tax_rate", "qbi_deduction_pct", "top_marginal_rate"] {
+                validate::require_rate(&mut reasons, f, validate::num(fed, f));
+            }
+            if reasons.is_empty() {
+                let mut rec = fed.clone();
+                rec["level"] = json!("federal");
+                rec["state"] = json!("US");
+                rec["state_name"] = json!("United States");
+                rec["year"] = json!(year);
+                all_records.push(("federal:US".to_string(), rec));
+            } else {
+                rejected.push(Rejection { key: "federal:US".to_string(), reasons });
+            }
         }
 
-        // Per-state individual income-tax structure.
+        // Per-state individual income-tax structure. Top marginal rate ∈ [0,100].
+        let mut present: std::collections::HashSet<String> = std::collections::HashSet::new();
         if let Some(states) = data.get("states").and_then(Value::as_array) {
             for s in states {
                 let st = s
@@ -127,19 +156,32 @@ impl ScrapeApp for StateTax {
                 if st.is_empty() {
                     continue;
                 }
+                let mut reasons = Vec::new();
+                validate::require_rate(&mut reasons, "top_marginal_rate", validate::num(s, "top_marginal_rate"));
+                if !reasons.is_empty() {
+                    rejected.push(Rejection { key: format!("state:{st}"), reasons });
+                    continue;
+                }
                 let mut rec = s.clone();
                 rec["level"] = json!("state");
                 rec["state"] = json!(st);
                 rec["year"] = json!(year);
+                present.insert(st.clone());
                 all_records.push((format!("state:{st}"), rec));
             }
         }
 
-        if all_records.len() < 20 {
-            return Err(Error::App(format!(
-                "state-tax: only {} records parsed — expected ~52 (federal + 51 states)",
-                all_records.len()
-            )));
+        // Completeness against the fixed 50-states-+-DC roster.
+        let missing: Vec<&str> = US_JURISDICTIONS
+            .iter()
+            .copied()
+            .filter(|j| !present.contains(*j))
+            .collect();
+
+        if present.is_empty() {
+            return Err(Error::App(
+                "state-tax: agent JSON contained no plausible state records".into(),
+            ));
         }
 
         let summary = ctx.upsert_many("tax", &all_records).await?;
@@ -148,12 +190,54 @@ impl ScrapeApp for StateTax {
             "source": format!("agentic/tax/{year}"),
             "year": year,
             "records": all_records.len(),
+            "states_covered": present.len(),
+            "states_expected": US_JURISDICTIONS.len(),
+            "missing_states": missing,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            "rejected": rejected.iter().map(Rejection::to_json).collect::<Vec<_>>(),
+            "rejected_count": rejected.len(),
             "cost_usd": output.cost_usd,
             "duration_ms": output.duration_ms,
             "num_turns": output.num_turns,
         }))
     }
+}
+
+/// Structured-output contract for `claude --json-schema`. Lenient (extra fields
+/// tolerated) so a valid answer is never rejected, but pins the tax shape.
+fn tax_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "year": { "type": "string" },
+            "federal": {
+                "type": "object",
+                "properties": {
+                    "self_employment_tax_rate": { "type": "number" },
+                    "qbi_deduction_pct": { "type": "number" },
+                    "standard_deduction_single": { "type": "number" },
+                    "section_179_limit": { "type": "number" },
+                    "top_marginal_rate": { "type": "number" }
+                }
+            },
+            "states": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "state": { "type": "string" },
+                        "state_name": { "type": "string" },
+                        "income_tax_type": { "type": "string" },
+                        "top_marginal_rate": { "type": "number" },
+                        "top_bracket_threshold": { "type": "number" },
+                        "notes": { "type": "string" }
+                    },
+                    "required": ["state", "income_tax_type", "top_marginal_rate"]
+                }
+            }
+        },
+        "required": ["year", "federal", "states"]
+    })
 }

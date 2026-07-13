@@ -20,6 +20,8 @@
 use async_trait::async_trait;
 use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
+use trades_common::salvage_json;
+use trades_common::validate::{self, Rejection};
 
 pub struct TradeWages;
 
@@ -87,6 +89,9 @@ impl ScrapeApp for TradeWages {
         request.max_turns = max_turns;
         request.model = ctx.params.get("model").and_then(Value::as_str).map(String::from);
         request.effort = ctx.params.get("effort").and_then(Value::as_str).map(String::from);
+        // Constrain the final answer to the wage schema (`claude --json-schema`) so the
+        // CLI validates structure; salvage_json below still catches anything it misses.
+        request.json_schema = Some(wages_schema());
         // Metered seam: records a cost event against the job, honors budget_usd,
         // and serves identical re-runs from the research cache (see core/app.rs).
         let output = ctx.research(request).await?;
@@ -97,14 +102,23 @@ impl ScrapeApp for TradeWages {
         };
         ctx.save_artifact("research.json", &artifact).await?;
 
-        let data = output.json.clone().ok_or_else(|| {
-            Error::App(format!(
-                "trade-wages: agent did not return JSON (text starts: {})",
-                output.text.chars().take(160).collect::<String>()
-            ))
-        })?;
+        // Prefer the parsed structured output; salvage a fenced/prose-wrapped object
+        // from the raw text before giving up (one pass, no metered re-run).
+        let data = match output.json.clone() {
+            Some(j) => j,
+            None => salvage_json(&output.text).ok_or_else(|| {
+                Error::App(format!(
+                    "trade-wages: agent did not return JSON (text starts: {})",
+                    output.text.chars().take(160).collect::<String>()
+                ))
+            })?,
+        };
 
         let mut all_records: Vec<(String, Value)> = Vec::new();
+        // Plausibility guards: wage bands must be ordered (entry ≤ median ≤
+        // experienced, hourly + annual) and all magnitudes positive. Violators
+        // are rejected with reasons; valid trades still upsert.
+        let mut rejected: Vec<Rejection> = Vec::new();
         if let Some(trades) = data.get("trades").and_then(Value::as_array) {
             for t in trades {
                 let trade = t
@@ -116,18 +130,49 @@ impl ScrapeApp for TradeWages {
                 if trade.is_empty() {
                     continue;
                 }
+                let key = format!("US:{trade}");
+                let mut reasons = Vec::new();
+                for f in [
+                    "entry_hourly",
+                    "median_hourly",
+                    "experienced_hourly",
+                    "entry_annual",
+                    "median_annual",
+                    "experienced_annual",
+                    "employment",
+                ] {
+                    validate::require_positive(&mut reasons, f, validate::num(t, f));
+                }
+                validate::require_monotone(
+                    &mut reasons,
+                    "hourly",
+                    validate::num(t, "entry_hourly"),
+                    validate::num(t, "median_hourly"),
+                    validate::num(t, "experienced_hourly"),
+                );
+                validate::require_monotone(
+                    &mut reasons,
+                    "annual",
+                    validate::num(t, "entry_annual"),
+                    validate::num(t, "median_annual"),
+                    validate::num(t, "experienced_annual"),
+                );
+                if !reasons.is_empty() {
+                    rejected.push(Rejection { key, reasons });
+                    continue;
+                }
                 let mut rec = t.clone();
                 // National by trade — state = "US" so the ingest lifts market = "US".
                 rec["state"] = json!("US");
                 rec["year"] = json!(year);
                 rec["source"] = json!("BLS OEWS (agentic)");
-                all_records.push((format!("US:{trade}"), rec));
+                all_records.push((key, rec));
             }
         }
 
         if all_records.is_empty() {
             return Err(Error::App(
-                "trade-wages: agent JSON contained no trades".into(),
+                "trade-wages: agent JSON contained no plausible trades".into(),
             ));
         }
 
@@ -140,9 +185,45 @@ impl ScrapeApp for TradeWages {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            "rejected": rejected.iter().map(Rejection::to_json).collect::<Vec<_>>(),
+            "rejected_count": rejected.len(),
             "cost_usd": output.cost_usd,
             "duration_ms": output.duration_ms,
             "num_turns": output.num_turns,
         }))
     }
+}
+
+/// Structured-output contract for `claude --json-schema`. Lenient (extra fields
+/// tolerated) so a valid answer is never rejected, but pins the wage-band shape.
+fn wages_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "year": { "type": "string" },
+            "trades": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "trade": { "type": "string" },
+                        "soc_code": { "type": "string" },
+                        "occupation": { "type": "string" },
+                        "median_hourly": { "type": "number" },
+                        "median_annual": { "type": "number" },
+                        "entry_hourly": { "type": "number" },
+                        "entry_annual": { "type": "number" },
+                        "experienced_hourly": { "type": "number" },
+                        "experienced_annual": { "type": "number" },
+                        "employment": { "type": "number" }
+                    },
+                    "required": [
+                        "trade", "median_hourly", "median_annual", "entry_hourly",
+                        "entry_annual", "experienced_hourly", "experienced_annual"
+                    ]
+                }
+            }
+        },
+        "required": ["year", "trades"]
+    })
 }
