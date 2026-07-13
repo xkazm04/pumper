@@ -19,6 +19,7 @@ use async_trait::async_trait;
 use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
 use trades_common::salvage_json;
+use trades_common::unified;
 use trades_common::validate::{self, Rejection};
 
 pub struct StateTax;
@@ -186,6 +187,10 @@ impl ScrapeApp for StateTax {
 
         let summary = ctx.upsert_many("tax", &all_records).await?;
 
+        // Cross-source layer: state-tax contributes the federal + illustrative-state
+        // tax context to trades/operator_economics (mirrors grants-common's sync).
+        let unified = unified::sync_operator_economics(&ctx).await?;
+
         Ok(json!({
             "source": format!("agentic/tax/{year}"),
             "year": year,
@@ -198,6 +203,7 @@ impl ScrapeApp for StateTax {
             "unchanged": summary.unchanged,
             "rejected": rejected.iter().map(Rejection::to_json).collect::<Vec<_>>(),
             "rejected_count": rejected.len(),
+            "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
             "cost_usd": output.cost_usd,
             "duration_ms": output.duration_ms,
             "num_turns": output.num_turns,

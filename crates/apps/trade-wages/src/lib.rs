@@ -21,6 +21,8 @@ use async_trait::async_trait;
 use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
 use trades_common::salvage_json;
+use trades_common::taxonomy;
+use trades_common::unified;
 use trades_common::validate::{self, Rejection};
 
 pub struct TradeWages;
@@ -67,10 +69,11 @@ impl ScrapeApp for TradeWages {
             .map(|t| t as u32)
             .or(Some(25));
 
+        let trades = taxonomy::prompt_list();
         let prompt = format!(
             "You are a US labor-market analyst. For BLS OEWS year {year}, compile the \
              national wage band for the tradesperson occupation behind each of these \
-             home-services trades: Plumbing, Electrical, HVAC, Landscaping, Pool service. \
+             home-services trades: {trades}. \
              Use web search on bls.gov/oes to get the current figures. Map each trade to \
              its best-fit BLS SOC occupation (e.g. Plumbing -> 47-2152 Plumbers, \
              Pipefitters & Steamfitters; Electrical -> 47-2111 Electricians; HVAC -> \
@@ -119,16 +122,25 @@ impl ScrapeApp for TradeWages {
         // experienced, hourly + annual) and all magnitudes positive. Violators
         // are rejected with reasons; valid trades still upsert.
         let mut rejected: Vec<Rejection> = Vec::new();
+        // Trade labels the model returned that don't map to a canonical trade —
+        // kept raw (not dropped) but surfaced so drift is visible.
+        let mut unknown_trades: Vec<String> = Vec::new();
         if let Some(trades) = data.get("trades").and_then(Value::as_array) {
             for t in trades {
-                let trade = t
+                let raw = t
                     .get("trade")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                if trade.is_empty() {
+                if raw.is_empty() {
                     continue;
+                }
+                // Normalize to a canonical label so phrasing drift can't mint a
+                // duplicate key; unknown labels keep the raw string and are flagged.
+                let (trade, known) = taxonomy::canonicalize(&raw);
+                if !known {
+                    unknown_trades.push(raw.clone());
                 }
                 let key = format!("US:{trade}");
                 let mut reasons = Vec::new();
@@ -162,6 +174,9 @@ impl ScrapeApp for TradeWages {
                     continue;
                 }
                 let mut rec = t.clone();
+                // Store the canonical label so the record key and its `trade`
+                // field agree, regardless of the model's phrasing.
+                rec["trade"] = json!(trade);
                 // National by trade — state = "US" so the ingest lifts market = "US".
                 rec["state"] = json!("US");
                 rec["year"] = json!(year);
@@ -178,6 +193,10 @@ impl ScrapeApp for TradeWages {
 
         let summary = ctx.upsert_many("wages", &all_records).await?;
 
+        // Cross-source layer: rebuild trades/operator_economics from the current
+        // state of all four source datasets (mirrors grants-common's sync_unified).
+        let unified = unified::sync_operator_economics(&ctx).await?;
+
         Ok(json!({
             "source": format!("agentic/wages/{year}"),
             "year": year,
@@ -187,6 +206,8 @@ impl ScrapeApp for TradeWages {
             "unchanged": summary.unchanged,
             "rejected": rejected.iter().map(Rejection::to_json).collect::<Vec<_>>(),
             "rejected_count": rejected.len(),
+            "unknown_trades": unknown_trades,
+            "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
             "cost_usd": output.cost_usd,
             "duration_ms": output.duration_ms,
             "num_turns": output.num_turns,

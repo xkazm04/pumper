@@ -18,6 +18,8 @@ use async_trait::async_trait;
 use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
 use trades_common::salvage_json;
+use trades_common::taxonomy;
+use trades_common::unified;
 use trades_common::validate::{self, Rejection};
 
 pub struct HomewysePricing;
@@ -72,10 +74,11 @@ impl ScrapeApp for HomewysePricing {
             .map(|t| t as u32)
             .or(Some(20));
 
+        let trades = taxonomy::prompt_list();
         let prompt = format!(
             "You are a home-services pricing analyst. Using web search and page fetches, \
              research the TYPICAL PRICE A CUSTOMER PAYS in {locality} ({year}) for common \
-             jobs in these trades: Plumbing, Electrical, HVAC, Landscaping, Pool service. \
+             jobs in these trades: {trades}. \
              Cross-check across at least two cost guides (e.g. Homewyse, Angi, Thumbtack, \
              HomeAdvisor). For each trade give 3-4 representative jobs, each with a \
              low/median/high USD range.\n\n\
@@ -124,9 +127,16 @@ impl ScrapeApp for HomewysePricing {
         // non-positive is rejected (with reasons) rather than upserted. One
         // pass, no re-run — the answer is already paid for.
         let mut rejected: Vec<Rejection> = Vec::new();
+        let mut unknown_trades: Vec<String> = Vec::new();
         if let Some(trades) = data.get("trades").and_then(Value::as_array) {
             for t in trades {
-                let trade = t.get("trade").and_then(Value::as_str).unwrap_or("").to_string();
+                let raw = t.get("trade").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                // Normalize to a canonical label so the pricing rows join to the
+                // unified layer by the same trade string; unknown labels flagged.
+                let (trade, known) = taxonomy::canonicalize(&raw);
+                if !raw.is_empty() && !known {
+                    unknown_trades.push(raw.clone());
+                }
                 let mut job_count = 0;
                 if let Some(jobs) = t.get("jobs").and_then(Value::as_array) {
                     for j in jobs {
@@ -175,6 +185,10 @@ impl ScrapeApp for HomewysePricing {
 
         let summary = ctx.upsert_many("pricing", &all_records).await?;
 
+        // Cross-source layer: rebuild trades/operator_economics from all four
+        // source datasets (mirrors grants-common's sync_unified).
+        let unified = unified::sync_operator_economics(&ctx).await?;
+
         Ok(json!({
             "source": format!("agentic/pricing/{year}"),
             "locality": locality,
@@ -186,6 +200,8 @@ impl ScrapeApp for HomewysePricing {
             "unchanged": summary.unchanged,
             "rejected": rejected.iter().map(Rejection::to_json).collect::<Vec<_>>(),
             "rejected_count": rejected.len(),
+            "unknown_trades": unknown_trades,
+            "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
             // Metered-engine telemetry — the console reads cost_usd for the run.
             "cost_usd": output.cost_usd,
             "duration_ms": output.duration_ms,

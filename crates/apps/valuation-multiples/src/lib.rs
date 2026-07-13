@@ -18,6 +18,8 @@ use async_trait::async_trait;
 use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
 use trades_common::salvage_json;
+use trades_common::taxonomy;
+use trades_common::unified;
 use trades_common::validate::{self, Rejection};
 
 pub struct ValuationMultiples;
@@ -63,10 +65,11 @@ impl ScrapeApp for ValuationMultiples {
             .map(|t| t as u32)
             .or(Some(25));
 
+        let trades = taxonomy::prompt_list();
         let prompt = format!(
             "You are a business-valuation analyst for small US home-services companies. \
              For {year}, compile the typical SMALL-BUSINESS valuation multiples for each of \
-             these trades: Plumbing, Electrical, HVAC, Landscaping, Pool service. Use web \
+             these trades: {trades}. Use web \
              search + business-broker sources (e.g. BizBuySell Insight, brokerage reports). \
              Give the seller's-discretionary-earnings (SDE) multiple as a median with a \
              low/high band, plus a typical revenue multiple.\n\n\
@@ -111,16 +114,22 @@ impl ScrapeApp for ValuationMultiples {
         // Plausibility guards: the SDE band must be ordered (low ≤ median ≤ high)
         // and all multiples positive. Violators rejected with reasons.
         let mut rejected: Vec<Rejection> = Vec::new();
+        let mut unknown_trades: Vec<String> = Vec::new();
         if let Some(trades) = data.get("trades").and_then(Value::as_array) {
             for t in trades {
-                let trade = t
+                let raw = t
                     .get("trade")
                     .and_then(Value::as_str)
                     .unwrap_or("")
                     .trim()
                     .to_string();
-                if trade.is_empty() {
+                if raw.is_empty() {
                     continue;
+                }
+                // Normalize to a canonical label; unknown labels keep raw + flag.
+                let (trade, known) = taxonomy::canonicalize(&raw);
+                if !known {
+                    unknown_trades.push(raw.clone());
                 }
                 let key = format!("US:{trade}");
                 let mut reasons = Vec::new();
@@ -144,6 +153,8 @@ impl ScrapeApp for ValuationMultiples {
                     continue;
                 }
                 let mut rec = t.clone();
+                // Store the canonical label so key and `trade` field agree.
+                rec["trade"] = json!(trade);
                 // National by trade — state = "US" so the ingest lifts market = "US".
                 rec["state"] = json!("US");
                 rec["year"] = json!(year);
@@ -159,6 +170,10 @@ impl ScrapeApp for ValuationMultiples {
 
         let summary = ctx.upsert_many("valuation", &all_records).await?;
 
+        // Cross-source layer: rebuild trades/operator_economics from all four
+        // source datasets (mirrors grants-common's sync_unified).
+        let unified = unified::sync_operator_economics(&ctx).await?;
+
         Ok(json!({
             "source": format!("agentic/valuation/{year}"),
             "year": year,
@@ -168,6 +183,8 @@ impl ScrapeApp for ValuationMultiples {
             "unchanged": summary.unchanged,
             "rejected": rejected.iter().map(Rejection::to_json).collect::<Vec<_>>(),
             "rejected_count": rejected.len(),
+            "unknown_trades": unknown_trades,
+            "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
             "cost_usd": output.cost_usd,
             "duration_ms": output.duration_ms,
             "num_turns": output.num_turns,
