@@ -87,6 +87,12 @@ pub struct WorkerConfig {
     /// finish before re-queuing whatever is still running (mirrors
     /// `recover_stuck`) and exiting.
     pub shutdown_drain_secs: u64,
+    /// Priority-aging starvation guard: a queued job's *effective* priority rises
+    /// by one level for every this-many seconds it has waited, so a low-priority
+    /// job under a continuous high-priority stream eventually claims instead of
+    /// starving forever. `0` disables aging — claim order is then exactly
+    /// `priority DESC, created_at` (the historical behaviour).
+    pub priority_aging_coefficient_secs: f64,
 }
 
 impl Default for WorkerConfig {
@@ -99,6 +105,11 @@ impl Default for WorkerConfig {
             app_concurrency: HashMap::new(),
             schedule_tick_secs: 15,
             shutdown_drain_secs: 25,
+            // +1 effective priority per 15 min waited: same-minute enqueues keep
+            // their intended priority order, while a job starved behind a busy
+            // higher-priority stream escalates past it within the hour rather
+            // than never. Matches the job-timeout / schedule scale.
+            priority_aging_coefficient_secs: 900.0,
         }
     }
 }

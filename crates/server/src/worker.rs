@@ -36,7 +36,8 @@ pub async fn run(state: AppState) {
         }
 
         let blocked = blocked_apps(&state, &running).await;
-        match state.storage.claim_next(&blocked).await {
+        let aging = state.config.worker.priority_aging_coefficient_secs;
+        match state.storage.claim_next(&blocked, aging).await {
             Ok(Some(job)) => {
                 {
                     let mut counts = running.lock().await;

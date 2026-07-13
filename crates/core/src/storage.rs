@@ -172,17 +172,35 @@ impl Storage {
     /// Atomically claims the highest-priority due job and flips it to `running`.
     /// Apps listed in `blocked` are skipped, which is how the worker enforces
     /// per-app concurrency limits (fairness across many apps' queues).
-    pub async fn claim_next(&self, blocked: &[String]) -> Result<Option<Job>> {
+    ///
+    /// `aging_coeff` is the priority-aging starvation guard (`WorkerConfig::
+    /// priority_aging_coefficient_secs`): the claim orders by *effective*
+    /// priority = `priority + waited_secs / aging_coeff`, so a long-waiting
+    /// low-priority job overtakes fresh high-priority work instead of starving.
+    /// `0.0` (or negative) restores the plain `priority DESC, created_at` order.
+    /// The `created_at` tiebreak keeps equal-(effective-)priority claims FIFO.
+    pub async fn claim_next(&self, blocked: &[String], aging_coeff: f64) -> Result<Option<Job>> {
         let exclusion = if blocked.is_empty() {
             String::new()
         } else {
             let marks: Vec<String> = (0..blocked.len()).map(|i| format!("?{}", i + 2)).collect();
             format!(" AND app NOT IN ({})", marks.join(", "))
         };
+        // Effective-priority expression. The coefficient is a trusted config
+        // f64 (not user input), so inlining it is safe; the bind slots (?1, ?2…)
+        // stay reserved for the timestamp and the blocked-app list.
+        let order = if aging_coeff > 0.0 {
+            format!(
+                "(priority + (julianday(?1) - julianday(created_at)) * 86400.0 / {aging_coeff}) \
+                 DESC, created_at"
+            )
+        } else {
+            "priority DESC, created_at".to_string()
+        };
         let sql = format!(
             "UPDATE jobs SET status = 'running', attempts = attempts + 1, started_at = ?1 \
              WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND available_at <= ?1{exclusion} \
-                         ORDER BY priority DESC, created_at LIMIT 1) \
+                         ORDER BY {order} LIMIT 1) \
              RETURNING {JOB_COLUMNS}"
         );
         let mut query = sqlx::query_as::<_, JobRow>(&sql).bind(now());
