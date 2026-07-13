@@ -1,12 +1,18 @@
 //! High-concurrency broad crawler. A bounded, deduplicated URL frontier feeds a
 //! pool of concurrent fetch tasks (tokio holds thousands cheaply, at ~KB per
 //! task); page bodies are written to disk as they arrive rather than
-//! accumulated, so memory stays bounded by the concurrency level, not the crawl
-//! size. Politeness comes from the shared per-domain governor (inside the http
-//! engine) plus robots.txt; near-duplicate pages are dropped via SimHash.
+//! accumulated. Politeness comes from the shared per-domain governor (inside the
+//! http engine) plus robots.txt; near-duplicate pages are dropped via SimHash.
 //!
 //! This is the shape asyncio struggles with: high connection concurrency with
-//! GIL-free body parsing and constant memory under backpressure.
+//! GIL-free body parsing under backpressure.
+//!
+//! Memory: page bodies stream to disk (never held), per-page fingerprints stream
+//! to the dataset via a [`PageSink`] (never accumulated in the result), and
+//! near-dup detection uses a banded SimHash index (candidate lookup, not an
+//! O(n) scan per page). What DOES grow with the crawl are the frontier seen-set
+//! (capped at `MAX_FRONTIER`) and the kept-page SimHash fingerprints (8 bytes
+//! each) — both bounded, neither the page bodies.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -120,16 +126,6 @@ impl UrlFilter {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct CrawlPage {
-    pub url: String,
-    pub depth: u32,
-    pub status: u16,
-    pub bytes: usize,
-    pub links: usize,
-    pub duplicate: bool,
-}
-
 #[derive(Debug, Default, Serialize)]
 pub struct CrawlStats {
     pub crawled: usize,
@@ -155,9 +151,11 @@ pub struct CrawlStats {
     pub checkpoint_errors: usize,
     /// True when this run restored frontier state from a checkpoint.
     pub resumed: bool,
+    /// True when a checkpoint existed but was an incompatible (older) format and
+    /// was discarded for a clean fresh start rather than a silently-wrong resume.
+    pub checkpoint_reset: bool,
     pub hosts: usize,
     pub frontier_remaining: usize,
-    pub pages: Vec<CrawlPage>,
 }
 
 /// Bounded, deduplicated URL queue.
@@ -189,6 +187,80 @@ impl Frontier {
     }
 }
 
+/// Banded SimHash index for near-duplicate detection — SAME Hamming-distance
+/// semantics as a linear scan (`any kept within distance d`), but candidate
+/// lookup instead of an O(n) scan per page.
+///
+/// Pigeonhole: two 64-bit hashes within Hamming distance `d` differ in at most
+/// `d` bits, so across `b = d + 1` contiguous bit-bands at least one band is
+/// bit-identical. Each kept hash is bucketed by every band value; a query
+/// gathers candidates from its own band buckets and verifies the true Hamming
+/// distance. That guarantees no false negatives (a true near-dup always shares
+/// a band) — the exact same decision the linear scan would make, only faster.
+struct SimHashIndex {
+    distance: u32,
+    /// Per-band `(shift, mask)` to extract that band's value from a hash.
+    segs: Vec<(u32, u64)>,
+    /// Per-band bucket: band value -> hashes carrying it.
+    buckets: Vec<HashMap<u64, Vec<u64>>>,
+    /// Every kept hash, in insert order — persisted to the checkpoint so dedup
+    /// survives a resume (8 bytes each: bounded by kept count, not bodies).
+    all: Vec<u64>,
+}
+
+impl SimHashIndex {
+    fn new(distance: u32) -> Self {
+        // b = d + 1 bands guarantee a shared band for any pair within distance d.
+        let bands = (distance + 1).clamp(1, 64) as usize;
+        let base = 64 / bands;
+        let rem = 64 % bands;
+        let mut segs = Vec::with_capacity(bands);
+        let mut shift = 0u32;
+        for i in 0..bands {
+            let width = base + if i < rem { 1 } else { 0 };
+            let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+            segs.push((shift, mask));
+            shift += width as u32;
+        }
+        Self { distance, segs, buckets: vec![HashMap::new(); bands], all: Vec::new() }
+    }
+
+    /// Rebuilds an index (e.g. after a checkpoint resume) from kept hashes.
+    fn from_hashes(distance: u32, hashes: Vec<u64>) -> Self {
+        let mut idx = Self::new(distance);
+        for h in hashes {
+            idx.insert(h);
+        }
+        idx
+    }
+
+    /// True when some already-kept hash is within `distance` Hamming bits of
+    /// `hash`. Identical decision to `all.iter().any(|h| hamming(*h, hash) <= d)`.
+    fn is_near_dup(&self, hash: u64) -> bool {
+        for (i, (shift, mask)) in self.segs.iter().enumerate() {
+            let band = (hash >> shift) & mask;
+            if let Some(cands) = self.buckets[i].get(&band) {
+                if cands.iter().any(|&h| hamming(h, hash) <= self.distance) {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    fn insert(&mut self, hash: u64) {
+        for (i, (shift, mask)) in self.segs.iter().enumerate() {
+            let band = (hash >> shift) & mask;
+            self.buckets[i].entry(band).or_default().push(hash);
+        }
+        self.all.push(hash);
+    }
+
+    fn hashes(&self) -> &[u64] {
+        &self.all
+    }
+}
+
 struct Fetched {
     url: String,
     depth: u32,
@@ -216,17 +288,30 @@ pub async fn crawl(
     let mut sink_buf: Vec<CrawlPageRecord> = Vec::new();
     let filter = UrlFilter::compile(&cfg)?;
     let mut frontier = Frontier::new();
-    let mut kept_hashes: Vec<u64> = Vec::new();
+    let mut dedup_index = SimHashIndex::new(cfg.dedup_distance);
     let mut resumed = false;
+    let mut checkpoint_reset = false;
 
     // Restore a prior run's frontier + dedup state before seeding, so already
-    // -seen URLs (including the seeds) aren't re-enqueued.
+    // -seen URLs (including the seeds) aren't re-enqueued. An incompatible
+    // (older-format) checkpoint is discarded for a clean fresh start — never a
+    // silently-wrong partial resume.
     if let Some(path) = &cfg.checkpoint {
-        if let Some(cp) = Checkpoint::load(path).await {
-            frontier.queue = cp.queue.into_iter().collect();
-            frontier.seen = cp.seen.into_iter().collect();
-            kept_hashes = cp.kept_hashes;
-            resumed = true;
+        match Checkpoint::load(path).await {
+            CheckpointLoad::Loaded(cp) => {
+                frontier.queue = cp.queue.into_iter().collect();
+                frontier.seen = cp.seen.into_iter().collect();
+                dedup_index = SimHashIndex::from_hashes(cfg.dedup_distance, cp.kept_hashes);
+                resumed = true;
+            }
+            CheckpointLoad::Incompatible => {
+                checkpoint_reset = true;
+                tracing::warn!(
+                    path = %path.display(),
+                    "crawl: checkpoint format incompatible — discarding for a fresh start"
+                );
+            }
+            CheckpointLoad::None => {}
         }
     }
 
@@ -247,6 +332,7 @@ pub async fn crawl(
     let mut hosts: HashSet<String> = HashSet::new();
     let mut stats = CrawlStats::default();
     stats.resumed = resumed;
+    stats.checkpoint_reset = checkpoint_reset;
     let mut in_flight = FuturesUnordered::new();
     // Per-host earliest-next-fetch, driven by robots.txt Crawl-delay.
     let mut next_allowed: HashMap<String, tokio::time::Instant> = HashMap::new();
@@ -333,13 +419,12 @@ pub async fn crawl(
         stats.crawled += 1;
 
         let hash = simhash(&fetched.body);
-        let duplicate = cfg.dedup_distance > 0
-            && kept_hashes.iter().any(|h| hamming(*h, hash) <= cfg.dedup_distance);
+        let duplicate = cfg.dedup_distance > 0 && dedup_index.is_near_dup(hash);
 
         if duplicate {
             stats.skipped_duplicates += 1;
         } else {
-            kept_hashes.push(hash);
+            dedup_index.insert(hash);
             stats.kept += 1;
             let artifact_name = format!("page-{:04}.html", stats.kept);
             if let Some(dir) = &output_dir {
@@ -373,7 +458,7 @@ pub async fn crawl(
             // Periodic checkpoint so a killed process loses at most one stride.
             if stats.kept % CHECKPOINT_STRIDE == 0 {
                 if let Some(path) = &cfg.checkpoint {
-                    if !Checkpoint::save(path, &frontier, &kept_hashes).await {
+                    if !Checkpoint::save(path, &frontier, dedup_index.hashes()).await {
                         stats.checkpoint_errors += 1;
                     }
                 }
@@ -390,14 +475,9 @@ pub async fn crawl(
             }
         }
 
-        stats.pages.push(CrawlPage {
-            url: fetched.url,
-            depth: fetched.depth,
-            status: fetched.status,
-            bytes: fetched.body.len(),
-            links: fetched.links.len(),
-            duplicate,
-        });
+        // Per-page metadata is NOT accumulated in memory (it streams to the
+        // dataset via the sink); the result keeps only counters + the artifacts
+        // dir + `pages` dataset as pointers.
 
         if stats.kept >= cfg.max_pages {
             break;
@@ -414,7 +494,7 @@ pub async fn crawl(
     stats.hosts = hosts.len();
     stats.frontier_remaining = frontier.queue.len();
     if let Some(path) = &cfg.checkpoint {
-        if !Checkpoint::save(path, &frontier, &kept_hashes).await {
+        if !Checkpoint::save(path, &frontier, dedup_index.hashes()).await {
             stats.checkpoint_errors += 1;
         }
     }
@@ -439,19 +519,46 @@ fn top_n_by_count(map: HashMap<String, usize>, n: usize) -> HashMap<String, usiz
     entries.into_iter().take(n).collect()
 }
 
+/// Current checkpoint schema version. Bumped when the persisted shape changes;
+/// a mismatch triggers a clean fresh start rather than a silently-wrong resume.
+const CHECKPOINT_VERSION: u32 = 1;
+
+/// Result of attempting to restore a checkpoint.
+enum CheckpointLoad {
+    /// No checkpoint file present (or unreadable) — start fresh, not an error.
+    None,
+    /// A compatible checkpoint restored.
+    Loaded(Checkpoint),
+    /// A file existed but was an incompatible version / unparseable format;
+    /// discarded for a fresh start (surfaced as `checkpoint_reset`).
+    Incompatible,
+}
+
 /// Persisted frontier state: what is still queued, what has been seen, and the
 /// SimHash fingerprints of kept pages (so dedup survives the resume too).
 #[derive(Serialize, Deserialize)]
 struct Checkpoint {
+    /// Schema version; `#[serde(default)]` makes pre-versioning files parse as
+    /// version 0, which then fails the compatibility check → fresh start.
+    #[serde(default)]
+    version: u32,
     queue: Vec<(String, u32)>,
     seen: Vec<String>,
     kept_hashes: Vec<u64>,
 }
 
 impl Checkpoint {
-    async fn load(path: &PathBuf) -> Option<Self> {
-        let bytes = tokio::fs::read(path).await.ok()?;
-        serde_json::from_slice(&bytes).ok()
+    async fn load(path: &PathBuf) -> CheckpointLoad {
+        // A missing/unreadable file is a fresh start, not a reset signal.
+        let Ok(bytes) = tokio::fs::read(path).await else {
+            return CheckpointLoad::None;
+        };
+        // A file that IS present but doesn't parse as the current version is an
+        // incompatible/corrupt checkpoint — never resume from it silently.
+        match serde_json::from_slice::<Checkpoint>(&bytes) {
+            Ok(cp) if cp.version == CHECKPOINT_VERSION => CheckpointLoad::Loaded(cp),
+            _ => CheckpointLoad::Incompatible,
+        }
     }
 
     /// Best-effort save; checkpointing must never fail the crawl, but a failure
@@ -459,6 +566,7 @@ impl Checkpoint {
     /// surface a `checkpoint_errors` count in the result.
     async fn save(path: &PathBuf, frontier: &Frontier, kept_hashes: &[u64]) -> bool {
         let cp = Checkpoint {
+            version: CHECKPOINT_VERSION,
             queue: frontier.queue.iter().cloned().collect(),
             seen: frontier.seen.iter().cloned().collect(),
             kept_hashes: kept_hashes.to_vec(),
@@ -929,6 +1037,98 @@ mod tests {
         assert_eq!(stats.failed, 1, "transport failure counted, not swallowed");
         assert_eq!(stats.failed_by_host.get("ex.com").copied(), Some(1));
         assert_eq!(stats.skipped_botwall, 2, "403 block + CF challenge both bot-walls");
+    }
+
+    #[test]
+    fn simhash_index_matches_linear_scan() {
+        // A cheap deterministic PRNG (xorshift) so the fixture is reproducible
+        // without a rand dependency.
+        let mut state: u64 = 0x9e3779b97f4a7c15;
+        let mut next = || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        // Cover several distances, incl. 0 (exact) and a wide band.
+        for &distance in &[0u32, 1, 3, 5, 12, 20] {
+            let mut linear: Vec<u64> = Vec::new();
+            let mut index = SimHashIndex::new(distance);
+            for _ in 0..600 {
+                // Mix fully-random hashes with near-neighbours of existing kept
+                // ones (flip a few bits) so near-dups actually occur.
+                let base = if !linear.is_empty() && next() % 2 == 0 {
+                    let pick = linear[(next() as usize) % linear.len()];
+                    let flips = (next() % (distance as u64 + 3)) as u32;
+                    let mut h = pick;
+                    for _ in 0..flips {
+                        h ^= 1u64 << (next() % 64);
+                    }
+                    h
+                } else {
+                    next()
+                };
+
+                let linear_dup =
+                    distance > 0 && linear.iter().any(|&h| hamming(h, base) <= distance);
+                let index_dup = distance > 0 && index.is_near_dup(base);
+                assert_eq!(
+                    linear_dup, index_dup,
+                    "distance {distance}: banded index disagreed with linear scan on {base:#x}"
+                );
+                // Mirror the crawl's keep policy in both structures.
+                if !linear_dup {
+                    linear.push(base);
+                    index.insert(base);
+                }
+            }
+            assert_eq!(index.hashes().len(), linear.len());
+        }
+    }
+
+    #[test]
+    fn simhash_index_from_hashes_roundtrips() {
+        let hashes = vec![0x1u64, 0xFFu64, 0xDEAD_BEEFu64];
+        let index = SimHashIndex::from_hashes(3, hashes.clone());
+        assert_eq!(index.hashes(), hashes.as_slice());
+        // Exact members are trivially within distance 3.
+        assert!(index.is_near_dup(0x1));
+        // A bit-flip within distance is caught; far-away is not.
+        assert!(index.is_near_dup(0x1 ^ 0b110));
+        assert!(!index.is_near_dup(!0u64));
+    }
+
+    #[tokio::test]
+    async fn checkpoint_version_mismatch_forces_fresh_start() {
+        let dir = std::env::temp_dir().join(format!("pumper-crawl-cp-{}", std::process::id()));
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let path = dir.join("cp.json");
+
+        // A missing file is a fresh start, not a reset.
+        assert!(matches!(Checkpoint::load(&path).await, CheckpointLoad::None));
+
+        // A pre-versioning file (no `version` field) parses as version 0 and is
+        // rejected as incompatible rather than resumed silently-wrong.
+        tokio::fs::write(
+            &path,
+            br#"{"queue":[["https://x.com/",0]],"seen":["https://x.com/"],"kept_hashes":[1,2]}"#,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(Checkpoint::load(&path).await, CheckpointLoad::Incompatible));
+
+        // A current-version checkpoint round-trips.
+        let mut frontier = Frontier::new();
+        frontier.push("https://x.com/".into(), 0);
+        assert!(Checkpoint::save(&path, &frontier, &[7u64]).await);
+        match Checkpoint::load(&path).await {
+            CheckpointLoad::Loaded(cp) => {
+                assert_eq!(cp.version, CHECKPOINT_VERSION);
+                assert_eq!(cp.kept_hashes, vec![7]);
+            }
+            _ => panic!("expected a compatible checkpoint to load"),
+        }
+        tokio::fs::remove_dir_all(&dir).await.ok();
     }
 
     #[test]

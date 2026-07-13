@@ -47,7 +47,7 @@ pub use storage::{
 pub use tiers::{HostProfile, TierMemory};
 
 pub use config::Config;
-pub use crawl::{crawl, CrawlConfig, CrawlPage, CrawlPageRecord, CrawlStats, PageSink};
+pub use crawl::{crawl, CrawlConfig, CrawlPageRecord, CrawlStats, PageSink};
 pub use simhash::{hamming, simhash, simhash_value};
 pub use extract::{extract_batch, extract_one, CompiledRuleSet, FieldRule, Rule, RuleSet, Transform};
 pub use engine::{

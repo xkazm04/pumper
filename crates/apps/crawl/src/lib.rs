@@ -171,13 +171,15 @@ impl ScrapeApp for Crawl {
             "robots_fetch_failures": stats.robots_fetch_failures,
             "checkpoint_errors": stats.checkpoint_errors,
             "resumed": stats.resumed,
+            "checkpoint_reset": stats.checkpoint_reset,
             "hosts": stats.hosts,
             "frontier_remaining": stats.frontier_remaining,
-            // Dataset write outcome for the `pages` dataset.
+            // Per-page metadata lives in the `pages` dataset (streamed during the
+            // crawl), not in the result — only the write outcome is echoed here.
+            "pages_dataset": "pages",
             "pages_new": pages_new,
             "pages_changed": pages_changed,
             "pages_unchanged": pages_unchanged,
-            "pages": stats.pages,
         }))
     }
 }
