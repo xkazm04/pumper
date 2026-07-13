@@ -57,7 +57,7 @@ impl AppState {
         let http = Arc::new(HttpEngine::new(&config.http, governor, cache.clone())?);
         let browser = Arc::new(BrowserEngine::new(&config.browser));
         let claude = Arc::new(ClaudeEngine::new(&config.claude));
-        let fetch = Fetcher::new(http.clone(), browser.clone(), claude.clone());
+        let fetch = Fetcher::new(http.clone(), browser.clone(), claude.clone(), &config.fetcher);
         let engines = EngineSet { http, browser, claude, fetch };
 
         let plugins: Arc<dyn Plugins> = if config.plugins.enabled {

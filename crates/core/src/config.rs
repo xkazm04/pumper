@@ -14,6 +14,7 @@ pub struct Config {
     pub http: HttpConfig,
     pub browser: BrowserConfig,
     pub claude: ClaudeConfig,
+    pub fetcher: FetcherConfig,
     pub governor: GovernorConfig,
     pub cache: CacheConfig,
     pub plugins: PluginConfig,
@@ -226,6 +227,22 @@ impl Default for ClaudeConfig {
     }
 }
 
+/// Tiered-fetcher tuning that isn't per-request.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct FetcherConfig {
+    /// Default escalation threshold: a tier whose extracted text is shorter
+    /// than this (in chars) is "thin" and escalates. A per-request
+    /// `FetchRequest.min_content_chars` overrides it.
+    pub min_content_chars: usize,
+}
+
+impl Default for FetcherConfig {
+    fn default() -> Self {
+        Self { min_content_chars: 250 }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct GovernorConfig {
@@ -237,15 +254,28 @@ pub struct GovernorConfig {
     pub jitter_ms: u64,
     /// Per-host overrides, keyed by hostname (e.g. "news.ycombinator.com").
     pub per_domain: HashMap<String, f64>,
+    /// Learned-penalty base: the first 429/503 adds this much extra spacing,
+    /// doubling on each subsequent hit.
+    pub penalty_base_secs: u64,
+    /// Hard cap on the learned penalty.
+    pub penalty_cap_secs: u64,
+    /// Floor (ms) below which a decaying penalty is dropped to zero.
+    pub penalty_floor_ms: u64,
 }
 
 impl Default for GovernorConfig {
     fn default() -> Self {
+        use crate::governor::{
+            DEFAULT_PENALTY_BASE_SECS, DEFAULT_PENALTY_CAP_SECS, DEFAULT_PENALTY_FLOOR_MS,
+        };
         Self {
             enabled: true,
             default_rps: 2.0,
             jitter_ms: 250,
             per_domain: HashMap::new(),
+            penalty_base_secs: DEFAULT_PENALTY_BASE_SECS,
+            penalty_cap_secs: DEFAULT_PENALTY_CAP_SECS,
+            penalty_floor_ms: DEFAULT_PENALTY_FLOOR_MS,
         }
     }
 }

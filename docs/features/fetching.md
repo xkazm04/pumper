@@ -1,6 +1,6 @@
 # Tiered fetching & engines
 
-One `Fetcher` escalates across three engines by cost: **http → browser → claude**, climbing only when the result looks insufficient (`min_content_chars`, default 250).
+One `Fetcher` escalates across three engines by cost: **http → browser → claude**, climbing only when the result looks insufficient — too little content (`[fetcher] min_content_chars`, default 250; per-request `min_content_chars` overrides) **or a bot-wall / challenge page**.
 
 ## FetchRequest / FetchOutcome
 
@@ -12,11 +12,15 @@ Always prefer the metered **`AppContext::fetch`** over `ctx.engines.fetch` — i
 
 - **http** (`engine-http`): reqwest + cookie jar, retries w/ backoff (`RETRYABLE_STATUS` 429/502/503/504), fronted by the content-addressed TTL `http_cache` (GET-only; `HttpRequest.no_cache` bypasses) and the governor.
 - **browser** (`engine-browser`): headless render, `wait_for_selector`.
+
+### Honest tier verdicts (bot-wall detection)
+
+A tier no longer passes purely on char count. On escalating strategies (`auto`, `auto_with_research`) the HTTP tier escalates instead of returning content when the response is a bot-wall: a challenge/block **status** (403/429/503) or a conservative **challenge-page marker** in the body's leading window (Cloudflare "checking your browser" / "just a moment" / `cf-browser-verification`, "enable javascript", captcha, "verify you are human", "ddos protection by"). The browser tier applies the same marker heuristic before handing off to Claude (it has no HTTP status). Blocked tiers add a `... blocked: <reason>` line to the `escalations` trail. The explicit `http` / `browser` strategies still return the body as-is for the caller to inspect.
 - **claude** (`engine-claude`): Claude Code CLI as a research engine — roles from `[claude.roles]` (model/effort/budget presets), `json_schema` constrained output, `resume_session`, reports `total_cost_usd`. Cached via the research cache (see [runtime.md](runtime.md)).
 
 ## Politeness governor (adaptive)
 
-Per-host token bucket: configured spacing (`[governor] default_rps`, `per_domain`, jitter) **plus a learned penalty**: a 429/503 doubles the host's extra spacing (1s base, honors a larger `Retry-After`, 5-min cap) and pushes the host's next slot out; any healthy response halves it (dropped below 100ms floor). State is held in one sharded map keyed by host, so distinct hosts never contend; idle hosts are evicted once the map outgrows its cap. In-memory — resets on restart by design.
+Per-host token bucket: configured spacing (`[governor] default_rps`, `per_domain`, jitter) **plus a learned penalty**: a 429/503 doubles the host's extra spacing and pushes the host's next slot out; only a genuinely healthy **2xx** response halves it (a 4xx like 404/403 is not health and no longer rewards faster spacing; other 5xx stay neutral). Penalty bounds are configurable — `[governor] penalty_base_secs` (default 1), `penalty_cap_secs` (300), `penalty_floor_ms` (100, below which a decaying penalty is dropped). Both `Retry-After` forms are honored: delta-seconds and an HTTP-date (converted to a delay from now); a larger `Retry-After` wins over doubling. State is held in one sharded map keyed by host, so distinct hosts never contend; idle hosts are evicted once the map outgrows its cap. In-memory — resets on restart by design.
 
 ## Self-learning tier router
 

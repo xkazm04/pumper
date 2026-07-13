@@ -75,12 +75,14 @@ impl HttpEngine {
                 Ok(response) => {
                     let status = response.status().as_u16();
                     // Adaptive politeness: rate-limit/overload responses teach
-                    // the governor a longer per-host spacing; anything else
-                    // (even a 404) decays a learned penalty back down.
+                    // the governor a longer per-host spacing; only a genuinely
+                    // healthy (2xx) response decays a learned penalty. A 4xx
+                    // (e.g. 404/403) is NOT health — it must not reward the host
+                    // with faster spacing — and other 5xx are left neutral.
                     if let Some(host) = &host {
                         if matches!(status, 429 | 503) {
                             self.governor.penalize(host, retry_after(&response)).await;
-                        } else {
+                        } else if (200..300).contains(&status) {
                             self.governor.reward(host).await;
                         }
                     }
@@ -116,18 +118,40 @@ impl HttpEngine {
     }
 }
 
-/// Seconds-form `Retry-After` header (the HTTP-date form is rare on rate
-/// limiters and simply falls back to the doubling policy).
+/// Parses a `Retry-After` header. Both RFC 7231 forms are honored: delta
+/// -seconds (`Retry-After: 120`) and an HTTP-date (`Retry-After: Wed, 21 Oct
+/// 2025 07:28:00 GMT`), the latter converted to a delay from now. Clamped to
+/// 10 minutes; a past/malformed date yields `None` (falls back to doubling).
 fn retry_after(response: &reqwest::Response) -> Option<Duration> {
-    response
-        .headers()
-        .get("retry-after")?
-        .to_str()
-        .ok()?
-        .trim()
-        .parse::<u64>()
+    let raw = response.headers().get("retry-after")?.to_str().ok()?.trim();
+    retry_after_value(raw, chrono::Utc::now())
+}
+
+/// Header-value parsing split out for testing (the `now` reference makes the
+/// HTTP-date form deterministic).
+fn retry_after_value(raw: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Duration> {
+    const MAX_SECS: u64 = 600;
+    if let Ok(secs) = raw.parse::<u64>() {
+        return Some(Duration::from_secs(secs.min(MAX_SECS)));
+    }
+    let when = parse_http_date(raw)?;
+    let secs = when.signed_duration_since(now).num_seconds();
+    if secs <= 0 {
+        return Some(Duration::ZERO);
+    }
+    Some(Duration::from_secs((secs as u64).min(MAX_SECS)))
+}
+
+/// Parses an HTTP-date. The RFC 7231-mandated IMF-fixdate form ("Sun, 06 Nov
+/// 1994 08:49:37 GMT") is tried first; a numeric-offset RFC 2822 date is
+/// accepted as a fallback.
+fn parse_http_date(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, "%a, %d %b %Y %H:%M:%S GMT") {
+        return Some(chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc));
+    }
+    chrono::DateTime::parse_from_rfc2822(raw)
         .ok()
-        .map(|secs| Duration::from_secs(secs.min(600)))
+        .map(|d| d.with_timezone(&chrono::Utc))
 }
 
 #[async_trait]
@@ -174,5 +198,37 @@ mod tests {
         let mut req = HttpRequest::get("https://example.com/");
         req.ttl_override = Some(30);
         assert!(HttpEngine::cacheable(&req));
+    }
+
+    #[test]
+    fn retry_after_delta_seconds() {
+        let now = chrono::Utc::now();
+        assert_eq!(retry_after_value("120", now), Some(Duration::from_secs(120)));
+        // Clamped to 10 minutes.
+        assert_eq!(retry_after_value("99999", now), Some(Duration::from_secs(600)));
+    }
+
+    #[test]
+    fn retry_after_http_date() {
+        // IMF-fixdate ("... GMT") is the form real rate limiters emit. chrono
+        // validates the weekday against the date, so use the RFC 7231 example
+        // (06 Nov 1994 is a Sunday).
+        let now = chrono::NaiveDate::from_ymd_opt(1994, 11, 6)
+            .unwrap()
+            .and_hms_opt(8, 49, 37)
+            .unwrap()
+            .and_utc();
+        // 90 seconds in the future.
+        let later = "Sun, 06 Nov 1994 08:51:07 GMT";
+        assert_eq!(retry_after_value(later, now), Some(Duration::from_secs(90)));
+        // A date in the past yields a zero (immediate) delay, not None.
+        let past = "Sun, 06 Nov 1994 08:48:00 GMT";
+        assert_eq!(retry_after_value(past, now), Some(Duration::ZERO));
+    }
+
+    #[test]
+    fn retry_after_malformed_is_none() {
+        let now = chrono::Utc::now();
+        assert_eq!(retry_after_value("not-a-date", now), None);
     }
 }

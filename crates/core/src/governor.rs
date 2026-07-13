@@ -13,10 +13,10 @@ use tokio::time::Instant;
 
 use crate::config::GovernorConfig;
 
-/// Adaptive penalty bounds, learned from rate-limit responses.
-const PENALTY_BASE: Duration = Duration::from_secs(1);
-const PENALTY_CAP: Duration = Duration::from_secs(300);
-const PENALTY_FLOOR: Duration = Duration::from_millis(100);
+/// Default adaptive-penalty bounds (overridable via `[governor]` config).
+pub const DEFAULT_PENALTY_BASE_SECS: u64 = 1;
+pub const DEFAULT_PENALTY_CAP_SECS: u64 = 300;
+pub const DEFAULT_PENALTY_FLOOR_MS: u64 = 100;
 
 /// Idle-host eviction bounds. When the per-host map grows past `MAX_HOSTS`, a
 /// sweep drops entries untouched for `IDLE_TTL` (keeping any still serving out
@@ -50,6 +50,10 @@ pub struct Governor {
     tick: AtomicU64,
     /// Acquire counter; gates the amortized idle-eviction sweep.
     ops: AtomicU64,
+    /// Learned-penalty bounds (from `[governor]` config).
+    penalty_base: Duration,
+    penalty_cap: Duration,
+    penalty_floor: Duration,
 }
 
 impl Governor {
@@ -74,6 +78,9 @@ impl Governor {
             hosts: DashMap::new(),
             tick: AtomicU64::new(0),
             ops: AtomicU64::new(0),
+            penalty_base: Duration::from_secs(cfg.penalty_base_secs),
+            penalty_cap: Duration::from_secs(cfg.penalty_cap_secs),
+            penalty_floor: Duration::from_millis(cfg.penalty_floor_ms),
         }
     }
 
@@ -135,11 +142,11 @@ impl Governor {
         });
         entry.last_seen = now;
         let doubled = if entry.penalty.is_zero() {
-            PENALTY_BASE
+            self.penalty_base
         } else {
             entry.penalty.saturating_mul(2)
         };
-        let next = doubled.max(retry_after.unwrap_or(Duration::ZERO)).min(PENALTY_CAP);
+        let next = doubled.max(retry_after.unwrap_or(Duration::ZERO)).min(self.penalty_cap);
         entry.penalty = next;
         entry.next_slot = entry.next_slot.max(now + next);
         drop(entry);
@@ -157,7 +164,7 @@ impl Governor {
             }
             entry.last_seen = Instant::now();
             entry.penalty /= 2;
-            if entry.penalty < PENALTY_FLOOR {
+            if entry.penalty < self.penalty_floor {
                 entry.penalty = Duration::ZERO;
             }
         }
@@ -220,6 +227,7 @@ mod tests {
             default_rps: 5.0,
             jitter_ms: 0,
             per_domain: HashMap::new(),
+            ..GovernorConfig::default()
         };
         let g = Arc::new(Governor::new(&cfg));
 
@@ -248,12 +256,14 @@ mod tests {
 
     #[tokio::test]
     async fn penalize_doubles_honors_retry_after_and_caps() {
+        let base = Duration::from_secs(DEFAULT_PENALTY_BASE_SECS);
+        let cap = Duration::from_secs(DEFAULT_PENALTY_CAP_SECS);
         let g = governor();
         assert_eq!(g.penalty("X.com").await, Duration::ZERO);
         g.penalize("x.com", None).await;
-        assert_eq!(g.penalty("x.com").await, PENALTY_BASE);
+        assert_eq!(g.penalty("x.com").await, base);
         g.penalize("x.com", None).await;
-        assert_eq!(g.penalty("X.COM").await, PENALTY_BASE * 2, "case-insensitive host");
+        assert_eq!(g.penalty("X.COM").await, base * 2, "case-insensitive host");
         // A larger server Retry-After wins over doubling.
         g.penalize("x.com", Some(Duration::from_secs(60))).await;
         assert_eq!(g.penalty("x.com").await, Duration::from_secs(60));
@@ -261,7 +271,7 @@ mod tests {
         for _ in 0..10 {
             g.penalize("x.com", None).await;
         }
-        assert_eq!(g.penalty("x.com").await, PENALTY_CAP);
+        assert_eq!(g.penalty("x.com").await, cap);
         // Other hosts are unaffected.
         assert_eq!(g.penalty("y.com").await, Duration::ZERO);
     }
