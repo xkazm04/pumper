@@ -432,6 +432,28 @@ impl Storage {
         rows.into_iter().map(Schedule::try_from).collect()
     }
 
+    /// Keyset page of schedules ordered (created_at DESC, id DESC). `after` is
+    /// the previous page's last (created_at-as-stored, id); None starts at the top.
+    pub async fn list_schedules_page(
+        &self,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<Schedule>> {
+        let (after_ts, after_id) = split_after(after);
+        let rows: Vec<ScheduleRow> = sqlx::query_as(
+            "SELECT id, app, cron, params, enabled, priority, last_run, created_at \
+             FROM schedules \
+             WHERE (?1 IS NULL OR created_at < ?1 OR (created_at = ?1 AND id < ?2)) \
+             ORDER BY created_at DESC, id DESC LIMIT ?3",
+        )
+        .bind(after_ts)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Schedule::try_from).collect()
+    }
+
     pub async fn get_schedule(&self, id: &str) -> Result<Option<Schedule>> {
         let row: Option<ScheduleRow> = sqlx::query_as(
             "SELECT id, app, cron, params, enabled, priority, last_run, created_at \
@@ -518,6 +540,30 @@ impl Storage {
         rows.into_iter().map(Watch::try_from).collect()
     }
 
+    /// Keyset page of watches ordered (created_at DESC, id DESC), optionally
+    /// filtered by app. `after` is the previous page's last (created_at, id).
+    pub async fn list_watches_page(
+        &self,
+        app: Option<&str>,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<Watch>> {
+        let (after_ts, after_id) = split_after(after);
+        let rows: Vec<WatchRow> = sqlx::query_as(
+            "SELECT id, app, dataset, url, secret, enabled, created_at FROM watches \
+             WHERE (?1 IS NULL OR app = ?1) \
+             AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
+             ORDER BY created_at DESC, id DESC LIMIT ?4",
+        )
+        .bind(app)
+        .bind(after_ts)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Watch::try_from).collect()
+    }
+
     /// Enabled watches for an app — the delivery set for change webhooks.
     pub async fn enabled_watches(&self, app: &str) -> Result<Vec<Watch>> {
         let rows: Vec<WatchRow> = sqlx::query_as(
@@ -594,6 +640,30 @@ impl Storage {
              WHERE (?1 IS NULL OR source_app = ?1) ORDER BY created_at"
         ))
         .bind(source_app)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Trigger::try_from).collect()
+    }
+
+    /// Keyset page of triggers ordered (created_at DESC, id DESC), optionally
+    /// filtered by source app. `after` is the previous page's last (created_at, id).
+    pub async fn list_triggers_page(
+        &self,
+        source_app: Option<&str>,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<Trigger>> {
+        let (after_ts, after_id) = split_after(after);
+        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+            "SELECT {TRIGGER_COLUMNS} FROM triggers \
+             WHERE (?1 IS NULL OR source_app = ?1) \
+             AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
+             ORDER BY created_at DESC, id DESC LIMIT ?4"
+        ))
+        .bind(source_app)
+        .bind(after_ts)
+        .bind(after_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Trigger::try_from).collect()
@@ -689,6 +759,30 @@ impl Storage {
              FROM saved_searches WHERE (?1 = 0 OR enabled = 1) ORDER BY created_at",
         )
         .bind(enabled_only as i64)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(SavedSearch::try_from).collect()
+    }
+
+    /// Keyset page of saved searches ordered (created_at DESC, id DESC). `after`
+    /// is the previous page's last (created_at, id); None starts at the top.
+    pub async fn list_saved_searches_page(
+        &self,
+        enabled_only: bool,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<SavedSearch>> {
+        let (after_ts, after_id) = split_after(after);
+        let rows: Vec<SavedSearchRow> = sqlx::query_as(
+            "SELECT id, query, app, dataset, url, secret, enabled, created_at \
+             FROM saved_searches WHERE (?1 = 0 OR enabled = 1) \
+             AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
+             ORDER BY created_at DESC, id DESC LIMIT ?4",
+        )
+        .bind(enabled_only as i64)
+        .bind(after_ts)
+        .bind(after_id)
+        .bind(limit)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(SavedSearch::try_from).collect()
@@ -800,6 +894,32 @@ impl Storage {
              WHERE (?1 IS NULL OR status = ?1) ORDER BY created_at DESC LIMIT ?2",
         )
         .bind(status)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Delivery::try_from).collect()
+    }
+
+    /// Keyset page of deliveries ordered (created_at DESC, id DESC), optionally
+    /// filtered by status. Bodies excluded (same as `list_deliveries`). `after`
+    /// is the previous page's last (created_at, id).
+    pub async fn list_deliveries_page(
+        &self,
+        status: Option<&str>,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<Delivery>> {
+        let (after_ts, after_id) = split_after(after);
+        let rows: Vec<DeliveryRow> = sqlx::query_as(
+            "SELECT id, kind, ref_id, url, event, '' AS body, status, attempts, last_error, \
+             created_at, updated_at FROM webhook_deliveries \
+             WHERE (?1 IS NULL OR status = ?1) \
+             AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
+             ORDER BY created_at DESC, id DESC LIMIT ?4",
+        )
+        .bind(status)
+        .bind(after_ts)
+        .bind(after_id)
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
@@ -1113,6 +1233,12 @@ impl TryFrom<ScheduleRow> for Schedule {
             created_at: parse_ts(&r.created_at)?,
         })
     }
+}
+
+/// Splits an optional keyset cursor pair into two bind-ready Options, so a
+/// single SQL `WHERE (?1 IS NULL OR ...)` clause covers the first-page case.
+fn split_after(after: Option<(String, String)>) -> (Option<String>, Option<String>) {
+    after.map(|(t, i)| (Some(t), Some(i))).unwrap_or((None, None))
 }
 
 /// Fixed-width RFC 3339 UTC ("...Z", µs precision) so that lexicographic

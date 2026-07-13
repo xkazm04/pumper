@@ -1,25 +1,27 @@
 # HTTP API
 
-Axum server (default port 8088, `[server]` config). **Local power mode: no auth, permissive CORS** — any localhost app may call it (API-key auth is a parked decision). Errors: `{"error": "..."}` with proper status.
+Axum server (default port 8088, `[server]` config). **Local power mode: no auth, permissive CORS** — any localhost app may call it (API-key auth is a parked decision).
+
+**Errors:** `{"error": "<message>", "code": "<code>"}` with the matching HTTP status. `code` is a stable machine-readable string derived from the status — branch on it instead of the human message: `bad_request` (400, validation), `not_found` (404), `conflict` (409, wrong state), `too_large` (413), `internal` (500). Not-found, wrong-state, and bad-input are raised explicitly by handlers; unexpected engine/storage failures are `internal`/500.
 
 | Area | Routes |
 | --- | --- |
 | Health/metrics | `GET /health` · `GET /metrics` (Prometheus text: jobs by status, apps, schedules, `pumper_cost_usd{app,engine}`) |
 | Apps | `GET /apps` · `POST /apps/{name}/jobs` (enqueue; `Idempotency-Key` header supported) · `GET /apps/{name}/datasets` |
-| Jobs | `GET /jobs?app=&status=&limit=&cursor=` (cursor ⇒ `{items,next_cursor}`) · `GET /jobs/{id}` · `DELETE /jobs/{id}` (cancel queued) · `POST /jobs/{id}/retry` · `GET /jobs/{id}/stream` (SSE) · `GET /jobs/{id}/costs` |
+| Jobs | `GET /jobs?app=&status=&limit=&cursor=` (cursor ⇒ `{items,next_cursor}`) · `GET /jobs/{id}` · `DELETE /jobs/{id}` (cancel queued; 404 no job, 409 wrong state) · `POST /jobs/{id}/retry` (404 no job, 409 wrong state) · `GET /jobs/{id}/stream` (SSE) · `GET /jobs/{id}/costs` |
 | Costs | `GET /costs?app=&since=` |
-| Schedules | `GET/POST /schedules` · `DELETE /schedules/{id}` · `POST /schedules/{id}/enabled` |
-| Datasets | `GET /datasets/{app}/{ds}?limit=&cursor=` · `GET .../export?format=json\|ndjson\|csv` · `GET .../duplicates?distance=` · `GET .../changes?since=&limit=` · `GET .../history?key=` |
-| Watches | `GET/POST /watches` · `DELETE /watches/{id}` · `POST /watches/{id}/enabled` |
-| Webhook deliveries | `GET /webhooks/deliveries?status=` · `GET /webhooks/deliveries/{id}` · `POST /webhooks/deliveries/{id}/replay` |
-| Triggers | `GET/POST /triggers` · `DELETE /triggers/{id}` · `POST /triggers/{id}/enabled` · `POST /triggers/{id}/test?fire=` · `GET /triggers/{id}/runs` |
+| Schedules | `GET /schedules?limit=&cursor=` · `POST /schedules` · `DELETE /schedules/{id}` · `POST /schedules/{id}/enabled` |
+| Datasets | `GET /datasets/{app}/{ds}?limit=&cursor=` · `GET .../export?format=json\|ndjson\|csv` · `GET .../duplicates?distance=` · `GET .../changes?since=&limit=&cursor=` · `GET .../history?key=&limit=&cursor=` |
+| Watches | `GET /watches?app=&limit=&cursor=` · `POST /watches` · `DELETE /watches/{id}` · `POST /watches/{id}/enabled` |
+| Webhook deliveries | `GET /webhooks/deliveries?status=&limit=&cursor=` · `GET /webhooks/deliveries/{id}` · `POST /webhooks/deliveries/{id}/replay` |
+| Triggers | `GET /triggers?app=&limit=&cursor=` · `POST /triggers` · `DELETE /triggers/{id}` · `POST /triggers/{id}/enabled` · `POST /triggers/{id}/test?fire=` · `GET /triggers/{id}/runs` |
 | Search | `GET /search?q=&limit=&app=&dataset=&fuzzy=` · `DELETE /search/docs` · `DELETE /search/datasets/{app}/{ds}` |
-| Saved searches | `GET/POST /searches` · `DELETE /searches/{id}` · `POST /searches/{id}/enabled` |
+| Saved searches | `GET /searches?limit=&cursor=` · `POST /searches` · `DELETE /searches/{id}` · `POST /searches/{id}/enabled` |
 | Events | `GET /events` (SSE all jobs) |
 | Plugins | `GET /plugins` · `POST /plugins/reload` |
 
-Conventions: enable/disable is always `POST …/{id}/enabled {"enabled": bool}`; list endpoints keep legacy bare-array shapes unless `cursor=` is present; details of each area live in the sibling feature docs.
+Conventions: enable/disable is always `POST …/{id}/enabled {"enabled": bool}`; every list endpoint is dual-mode — without `cursor=` it returns its legacy shape (bare array or `{watches|triggers|searches|changes|revisions|deliveries: [...]}`, unbounded except where a legacy `limit` already applied), and with `cursor=` present (even empty, for page 1) it returns `{items, next_cursor}` and pages by keyset. Cursors are opaque `<stored-ts>|<tiebreak>` tokens (`next_cursor` is `null` on the last page); pass the previous response's `next_cursor` back as `cursor=`. The `changes`/`history` feeds page the full revision set — the legacy no-cursor shapes still clamp at 1000/500 rows, but `cursor=` reaches everything past that. Details of each area live in the sibling feature docs.
 
 ## Known gaps
 
-No OpenAPI spec/Swagger UI (backlog). No pagination on schedules/watches/triggers lists (small tables).
+No OpenAPI spec/Swagger UI (backlog).

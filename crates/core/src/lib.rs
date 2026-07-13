@@ -35,7 +35,9 @@ pub use cache::{HttpCache, ResearchCache};
 #[cfg(feature = "storage")]
 pub use costs::{CostEvent, CostLedger, CostSummary};
 #[cfg(feature = "storage")]
-pub use datasets::{diff_values, ChangeKind, Datasets, DupPair, Record, Revision, UpsertSummary};
+pub use datasets::{
+    diff_values, ChangeKind, Datasets, DupPair, Record, Revision, RevisionPage, UpsertSummary,
+};
 #[cfg(feature = "storage")]
 pub use storage::{
     Delivery, EnqueueOptions, NewTrigger, SavedSearch, Schedule, Storage, Trigger, Watch,

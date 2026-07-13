@@ -67,14 +67,33 @@ pub fn router(state: AppState) -> Router {
 
 struct ApiError(StatusCode, String);
 
+/// Stable machine-readable code derived from the HTTP status, sent alongside the
+/// human `error` string so consumers can branch without string-matching. Kept in
+/// lockstep with the statuses the handlers actually emit.
+fn error_code(status: StatusCode) -> &'static str {
+    match status {
+        StatusCode::BAD_REQUEST => "bad_request",
+        StatusCode::NOT_FOUND => "not_found",
+        StatusCode::CONFLICT => "conflict",
+        StatusCode::PAYLOAD_TOO_LARGE => "too_large",
+        StatusCode::UNPROCESSABLE_ENTITY => "unprocessable",
+        _ => "internal",
+    }
+}
+
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
-        (self.0, Json(json!({ "error": self.1 }))).into_response()
+        let code = error_code(self.0);
+        (self.0, Json(json!({ "error": self.1, "code": code }))).into_response()
     }
 }
 
 impl From<pumper_core::Error> for ApiError {
     fn from(e: pumper_core::Error) -> Self {
+        // Engine/storage/parse/config failures are all unexpected at the request
+        // boundary. The client-distinguishable outcomes — missing resource (404),
+        // wrong state (409), bad input (400) — are raised explicitly by the
+        // handlers, which know the semantics a bare `Error` cannot express.
         Self(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
     }
 }
@@ -277,6 +296,22 @@ fn parse_cursor(cursor: &str) -> Option<(String, String)> {
     trimmed.split_once('|').map(|(t, k)| (t.to_string(), k.to_string()))
 }
 
+/// Cursor variant for revision feeds whose tiebreak is numeric (a rowid or a
+/// per-key revision number). A malformed or empty cursor pages from the top.
+fn parse_cursor_i64(cursor: &str) -> Option<(String, i64)> {
+    parse_cursor(cursor).and_then(|(t, k)| k.parse().ok().map(|n| (t, n)))
+}
+
+/// Next-page cursor for a keyset page: `Some` only when the page came back full
+/// (so more rows may remain), built from the last item. Mirrors the inline
+/// pattern on `/jobs` and `/datasets/...`.
+fn keyset_cursor<T>(items: &[T], limit: i64, encode: impl Fn(&T) -> String) -> Option<String> {
+    ((items.len() as i64) == limit)
+        .then(|| items.last())
+        .flatten()
+        .map(encode)
+}
+
 async fn list_jobs(
     State(state): State<AppState>,
     Query(query): Query<ListQuery>,
@@ -332,10 +367,23 @@ async fn retry_job(
             state.notify.notify_one();
             Ok((StatusCode::ACCEPTED, Json(job)))
         }
-        None => Err(ApiError(
-            StatusCode::CONFLICT,
-            "job not found or not in a retryable state (failed/cancelled)".into(),
-        )),
+        None => Err(job_state_error(
+            &state,
+            id,
+            "job is not in a retryable state (failed/cancelled)",
+        )
+        .await),
+    }
+}
+
+/// Distinguishes a missing job (404) from a job in the wrong state (409) after a
+/// state-guarded mutation reported no rows changed — one extra lookup to give the
+/// caller an actionable status instead of a blanket conflict.
+async fn job_state_error(state: &AppState, id: Uuid, wrong_state: &str) -> ApiError {
+    match state.storage.get(id).await {
+        Ok(Some(_)) => ApiError(StatusCode::CONFLICT, wrong_state.into()),
+        Ok(None) => ApiError(StatusCode::NOT_FOUND, "job not found".into()),
+        Err(e) => e.into(),
     }
 }
 
@@ -350,10 +398,7 @@ async fn cancel_job(
             .ok();
         Ok(Json(json!({ "cancelled": true })))
     } else {
-        Err(ApiError(
-            StatusCode::CONFLICT,
-            "job not found or not in 'queued' state".into(),
-        ))
+        Err(job_state_error(&state, id, "job is not in 'queued' state (already running or terminal)").await)
     }
 }
 
@@ -417,8 +462,28 @@ async fn cost_summary(
 
 // ---- Schedules ------------------------------------------------------------
 
-async fn list_schedules(State(state): State<AppState>) -> Result<Json<Vec<Schedule>>, ApiError> {
-    Ok(Json(state.storage.list_schedules().await?))
+#[derive(Deserialize)]
+struct SchedulesQuery {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
+    cursor: Option<String>,
+}
+
+async fn list_schedules(
+    State(state): State<AppState>,
+    Query(query): Query<SchedulesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(cursor) = &query.cursor else {
+        return Ok(Json(json!(state.storage.list_schedules().await?)));
+    };
+    let limit = query.limit.clamp(1, 500);
+    let after = parse_cursor(cursor);
+    let items = state.storage.list_schedules_page(after, limit).await?;
+    let next_cursor = keyset_cursor(&items, limit, |s| {
+        format!("{}|{}", pumper_core::datasets::ts(s.created_at), s.id)
+    });
+    Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
 }
 
 #[derive(Deserialize)]
@@ -646,6 +711,9 @@ struct ChangesQuery {
     since: Option<String>,
     #[serde(default = "default_limit")]
     limit: i64,
+    /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
+    /// Pages the full feed past the legacy 1000-row clamp; `since` still applies.
+    cursor: Option<String>,
 }
 
 /// Change feed for a dataset: new/changed/removed revisions, newest first,
@@ -664,16 +732,24 @@ async fn dataset_changes(
                 .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid 'since': {e}")))
         })
         .transpose()?;
-    let changes = state
+    let Some(cursor) = &query.cursor else {
+        let changes = state
+            .datasets
+            .changes_since(&app, Some(&dataset), since, query.limit.clamp(1, 1000))
+            .await?;
+        return Ok(Json(json!({
+            "app": app,
+            "dataset": dataset,
+            "count": changes.len(),
+            "changes": changes,
+        })));
+    };
+    let after = parse_cursor_i64(cursor);
+    let page = state
         .datasets
-        .changes_since(&app, Some(&dataset), since, query.limit.clamp(1, 1000))
+        .changes_page(&app, Some(&dataset), since, after, query.limit.clamp(1, 1000))
         .await?;
-    Ok(Json(json!({
-        "app": app,
-        "dataset": dataset,
-        "count": changes.len(),
-        "changes": changes,
-    })))
+    Ok(Json(json!({ "items": page.items, "next_cursor": page.next_cursor })))
 }
 
 #[derive(Deserialize)]
@@ -682,6 +758,9 @@ struct HistoryQuery {
     key: String,
     #[serde(default = "default_limit")]
     limit: i64,
+    /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
+    /// Pages the full history past the legacy 500-row clamp.
+    cursor: Option<String>,
 }
 
 /// A single record's revision history, newest first.
@@ -690,17 +769,25 @@ async fn record_history(
     Path((app, dataset)): Path<(String, String)>,
     Query(query): Query<HistoryQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let revisions = state
+    let Some(cursor) = &query.cursor else {
+        let revisions = state
+            .datasets
+            .history(&app, &dataset, &query.key, query.limit.clamp(1, 500))
+            .await?;
+        return Ok(Json(json!({
+            "app": app,
+            "dataset": dataset,
+            "key": query.key,
+            "count": revisions.len(),
+            "revisions": revisions,
+        })));
+    };
+    let after = parse_cursor_i64(cursor);
+    let page = state
         .datasets
-        .history(&app, &dataset, &query.key, query.limit.clamp(1, 500))
+        .history_page(&app, &dataset, &query.key, after, query.limit.clamp(1, 500))
         .await?;
-    Ok(Json(json!({
-        "app": app,
-        "dataset": dataset,
-        "key": query.key,
-        "count": revisions.len(),
-        "revisions": revisions,
-    })))
+    Ok(Json(json!({ "items": page.items, "next_cursor": page.next_cursor })))
 }
 
 // ---- Dataset watches --------------------------------------------------------
@@ -708,14 +795,30 @@ async fn record_history(
 #[derive(Deserialize)]
 struct WatchesQuery {
     app: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: i64,
+    /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
+    cursor: Option<String>,
 }
 
 async fn list_watches(
     State(state): State<AppState>,
     Query(query): Query<WatchesQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let watches = state.storage.list_watches(query.app.as_deref()).await?;
-    Ok(Json(json!({ "watches": watches })))
+    let Some(cursor) = &query.cursor else {
+        let watches = state.storage.list_watches(query.app.as_deref()).await?;
+        return Ok(Json(json!({ "watches": watches })));
+    };
+    let limit = query.limit.clamp(1, 500);
+    let after = parse_cursor(cursor);
+    let items = state
+        .storage
+        .list_watches_page(query.app.as_deref(), after, limit)
+        .await?;
+    let next_cursor = keyset_cursor(&items, limit, |w| {
+        format!("{}|{}", pumper_core::datasets::ts(w.created_at), w.id)
+    });
+    Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
 }
 
 #[derive(Deserialize)]
@@ -779,14 +882,30 @@ async fn set_watch_enabled(
 #[derive(Deserialize)]
 struct TriggersQuery {
     app: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: i64,
+    /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
+    cursor: Option<String>,
 }
 
 async fn list_triggers(
     State(state): State<AppState>,
     Query(query): Query<TriggersQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let triggers = state.storage.list_triggers(query.app.as_deref()).await?;
-    Ok(Json(json!({ "triggers": triggers })))
+    let Some(cursor) = &query.cursor else {
+        let triggers = state.storage.list_triggers(query.app.as_deref()).await?;
+        return Ok(Json(json!({ "triggers": triggers })));
+    };
+    let limit = query.limit.clamp(1, 500);
+    let after = parse_cursor(cursor);
+    let items = state
+        .storage
+        .list_triggers_page(query.app.as_deref(), after, limit)
+        .await?;
+    let next_cursor = keyset_cursor(&items, limit, |t| {
+        format!("{}|{}", pumper_core::datasets::ts(t.created_at), t.id)
+    });
+    Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
 }
 
 #[derive(Deserialize)]
@@ -1007,17 +1126,31 @@ struct DeliveriesQuery {
     status: Option<String>,
     #[serde(default = "default_limit")]
     limit: i64,
+    /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
+    cursor: Option<String>,
 }
 
 async fn list_deliveries(
     State(state): State<AppState>,
     Query(query): Query<DeliveriesQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let deliveries = state
+    let limit = query.limit.clamp(1, 500);
+    let Some(cursor) = &query.cursor else {
+        let deliveries = state
+            .storage
+            .list_deliveries(query.status.as_deref(), limit)
+            .await?;
+        return Ok(Json(json!({ "count": deliveries.len(), "deliveries": deliveries })));
+    };
+    let after = parse_cursor(cursor);
+    let items = state
         .storage
-        .list_deliveries(query.status.as_deref(), query.limit.clamp(1, 500))
+        .list_deliveries_page(query.status.as_deref(), after, limit)
         .await?;
-    Ok(Json(json!({ "count": deliveries.len(), "deliveries": deliveries })))
+    let next_cursor = keyset_cursor(&items, limit, |d| {
+        format!("{}|{}", pumper_core::datasets::ts(d.created_at), d.id)
+    });
+    Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
 }
 
 async fn get_delivery(
@@ -1112,9 +1245,32 @@ async fn search(
 
 // ---- Saved searches (standing alerts) ---------------------------------------
 
-async fn list_saved_searches(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let searches = state.storage.list_saved_searches(false).await?;
-    Ok(Json(json!({ "searches": searches })))
+#[derive(Deserialize)]
+struct SavedSearchesQuery {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
+    cursor: Option<String>,
+}
+
+async fn list_saved_searches(
+    State(state): State<AppState>,
+    Query(query): Query<SavedSearchesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let Some(cursor) = &query.cursor else {
+        let searches = state.storage.list_saved_searches(false).await?;
+        return Ok(Json(json!({ "searches": searches })));
+    };
+    let limit = query.limit.clamp(1, 500);
+    let after = parse_cursor(cursor);
+    let items = state
+        .storage
+        .list_saved_searches_page(false, after, limit)
+        .await?;
+    let next_cursor = keyset_cursor(&items, limit, |s| {
+        format!("{}|{}", pumper_core::datasets::ts(s.created_at), s.id)
+    });
+    Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
 }
 
 #[derive(Deserialize)]

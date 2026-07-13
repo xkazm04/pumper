@@ -55,6 +55,16 @@ pub struct Revision {
     pub created_at: DateTime<Utc>,
 }
 
+/// A keyset page of revisions plus the cursor to fetch the next page (None at
+/// the end). The tiebreak differs by feed — rowid for the cross-key change feed,
+/// per-key `revision` for a single record's history — so the cursor is built
+/// inside the store rather than reconstructed from a `Revision` field.
+#[derive(Debug, Clone, Serialize)]
+pub struct RevisionPage {
+    pub items: Vec<Revision>,
+    pub next_cursor: Option<String>,
+}
+
 /// A near-duplicate record pair and their SimHash Hamming distance.
 #[derive(Debug, Clone, Serialize)]
 pub struct DupPair {
@@ -242,6 +252,81 @@ impl Datasets {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Revision::try_from).collect()
+    }
+
+    /// Keyset page of a single record's revision history, newest first. `after`
+    /// is the previous page's last (created_at-as-stored, revision); None starts
+    /// at the newest. Revisions are per-key monotonic, so `revision` is a unique,
+    /// stable tiebreak within the (app, dataset, key).
+    pub async fn history_page(
+        &self,
+        app: &str,
+        dataset: &str,
+        key: &str,
+        after: Option<(String, i64)>,
+        limit: i64,
+    ) -> Result<RevisionPage> {
+        let (after_ts, after_rev) = after.map(|(t, r)| (Some(t), Some(r))).unwrap_or((None, None));
+        let rows: Vec<RevisionRow> = sqlx::query_as(
+            "SELECT app, dataset, key, revision, change, data, diff, created_at \
+             FROM record_revisions WHERE app = ?1 AND dataset = ?2 AND key = ?3 \
+             AND (?4 IS NULL OR created_at < ?4 OR (created_at = ?4 AND revision < ?5)) \
+             ORDER BY revision DESC LIMIT ?6",
+        )
+        .bind(app)
+        .bind(dataset)
+        .bind(key)
+        .bind(after_ts)
+        .bind(after_rev)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let items: Vec<Revision> = rows.into_iter().map(Revision::try_from).collect::<Result<_>>()?;
+        let next_cursor = ((items.len() as i64) == limit)
+            .then(|| items.last())
+            .flatten()
+            .map(|r| format!("{}|{}", ts(r.created_at), r.revision));
+        Ok(RevisionPage { items, next_cursor })
+    }
+
+    /// Keyset page of the change feed (revisions across a dataset, or all of an
+    /// app's datasets when `dataset` is None), newest first, optionally only
+    /// those after `since`. `after` is the previous page's last (created_at, rowid);
+    /// rowid is the stable tiebreak because a batch can share a microsecond stamp.
+    pub async fn changes_page(
+        &self,
+        app: &str,
+        dataset: Option<&str>,
+        since: Option<DateTime<Utc>>,
+        after: Option<(String, i64)>,
+        limit: i64,
+    ) -> Result<RevisionPage> {
+        let (after_ts, after_rowid) =
+            after.map(|(t, r)| (Some(t), Some(r))).unwrap_or((None, None));
+        let rows: Vec<RevisionFeedRow> = sqlx::query_as(
+            "SELECT rowid AS rowid, app, dataset, key, revision, change, data, diff, created_at \
+             FROM record_revisions \
+             WHERE app = ?1 AND (?2 IS NULL OR dataset = ?2) AND (?3 IS NULL OR created_at > ?3) \
+             AND (?4 IS NULL OR created_at < ?4 OR (created_at = ?4 AND rowid < ?5)) \
+             ORDER BY created_at DESC, rowid DESC LIMIT ?6",
+        )
+        .bind(app)
+        .bind(dataset)
+        .bind(since.map(ts))
+        .bind(after_ts)
+        .bind(after_rowid)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        let next_cursor = ((rows.len() as i64) == limit)
+            .then(|| rows.last())
+            .flatten()
+            .map(|r| format!("{}|{}", r.inner.created_at, r.rowid));
+        let items: Vec<Revision> = rows
+            .into_iter()
+            .map(|r| Revision::try_from(r.inner))
+            .collect::<Result<_>>()?;
+        Ok(RevisionPage { items, next_cursor })
     }
 
     /// Full-snapshot removal detection: marks live records whose key is absent
@@ -457,6 +542,16 @@ struct RevisionRow {
     data: Option<String>,
     diff: Option<String>,
     created_at: String,
+}
+
+/// The change feed needs a stable per-row tiebreak; `record_revisions` has no
+/// single-column surrogate key, so we page on the implicit `rowid` (monotonic
+/// with insert order) carried alongside the flattened revision columns.
+#[derive(sqlx::FromRow)]
+struct RevisionFeedRow {
+    rowid: i64,
+    #[sqlx(flatten)]
+    inner: RevisionRow,
 }
 
 impl TryFrom<RevisionRow> for Revision {
