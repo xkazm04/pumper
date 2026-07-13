@@ -55,11 +55,12 @@ fn walk(node: NodeRef<Node>, out: &mut String, ctx: &mut Ctx) {
                     walk_children(node, out, ctx);
                     block(out);
                 }
-                "p" | "div" | "section" | "article" | "main" | "tr" => {
+                "p" | "div" | "section" | "article" | "main" => {
                     block(out);
                     walk_children(node, out, ctx);
                     block(out);
                 }
+                "table" => render_table(node, out, ctx),
                 "ul" | "ol" => {
                     block(out);
                     ctx.list_stack.push(if name == "ol" { Some(1) } else { None });
@@ -133,6 +134,79 @@ fn walk_children(node: NodeRef<Node>, out: &mut String, ctx: &mut Ctx) {
     for child in node.children() {
         walk(child, out, ctx);
     }
+}
+
+/// Renders a `<table>` as a GitHub pipe table. **The first row is the header**:
+/// when it holds `<th>` cells they become the headers; a `<th>`-less table
+/// promotes its first `<tr>` (data row) to the header instead. Cells with
+/// nested block content degrade to inline text (whitespace collapsed, `|`
+/// escaped). Empty tables emit nothing.
+fn render_table(node: NodeRef<Node>, out: &mut String, ctx: &Ctx) {
+    let mut rows: Vec<Vec<String>> = Vec::new();
+    collect_rows(node, &mut rows, ctx);
+    rows.retain(|r| !r.is_empty());
+    let Some(cols) = rows.iter().map(Vec::len).max().filter(|c| *c > 0) else {
+        return; // no cells → nothing to render
+    };
+
+    block(out);
+    emit_row(out, &rows[0], cols);
+    out.push('|');
+    for _ in 0..cols {
+        out.push_str(" --- |");
+    }
+    out.push('\n');
+    for row in &rows[1..] {
+        emit_row(out, row, cols);
+    }
+    block(out);
+}
+
+/// Walks a table subtree collecting one `Vec<cell>` per `<tr>`. Recurses through
+/// `<thead>`/`<tbody>`/`<tfoot>` wrappers; a nested `<table>` inside a cell is
+/// NOT scanned for rows here (its text is flattened into the cell by
+/// [`cell_text`]).
+fn collect_rows(node: NodeRef<Node>, rows: &mut Vec<Vec<String>>, ctx: &Ctx) {
+    for child in node.children() {
+        if let Node::Element(el) = child.value() {
+            match el.name() {
+                "tr" => {
+                    let mut cells = Vec::new();
+                    for cell in child.children() {
+                        if let Node::Element(c) = cell.value() {
+                            if matches!(c.name(), "td" | "th") {
+                                cells.push(cell_text(cell, ctx));
+                            }
+                        }
+                    }
+                    rows.push(cells);
+                }
+                "table" => {} // nested table: flattened as cell text, not rows
+                _ => collect_rows(child, rows, ctx),
+            }
+        }
+    }
+}
+
+/// Renders one cell's content as a single inline string: full inline markdown
+/// (bold, links, …) with whitespace/newlines collapsed and `|` escaped so it
+/// can't break the pipe-table grid.
+fn cell_text(cell: NodeRef<Node>, ctx: &Ctx) -> String {
+    let mut buf = String::new();
+    let mut c = ctx.clone();
+    walk_children(cell, &mut buf, &mut c);
+    buf.split_whitespace().collect::<Vec<_>>().join(" ").replace('|', "\\|")
+}
+
+/// Emits one `| a | b |` table row, padding short rows to `cols` cells.
+fn emit_row(out: &mut String, cells: &[String], cols: usize) {
+    out.push('|');
+    for i in 0..cols {
+        out.push(' ');
+        out.push_str(cells.get(i).map(String::as_str).unwrap_or(""));
+        out.push_str(" |");
+    }
+    out.push('\n');
 }
 
 fn wrap(node: NodeRef<Node>, out: &mut String, ctx: &mut Ctx, marker: &str) {
@@ -232,5 +306,47 @@ mod tests {
     #[test]
     fn empty_input() {
         assert_eq!(html_to_markdown(""), "");
+    }
+
+    #[test]
+    fn table_with_th_header() {
+        let html = r#"<table>
+            <thead><tr><th>Name</th><th>Price</th></tr></thead>
+            <tbody>
+              <tr><td>Widget</td><td>$9.99</td></tr>
+              <tr><td>Gadget</td><td>$12.00</td></tr>
+            </tbody>
+        </table>"#;
+        let md = html_to_markdown(html);
+        assert!(md.contains("| Name | Price |"), "{md}");
+        assert!(md.contains("| --- | --- |"), "{md}");
+        assert!(md.contains("| Widget | $9.99 |"), "{md}");
+        assert!(md.contains("| Gadget | $12.00 |"), "{md}");
+    }
+
+    #[test]
+    fn table_without_th_promotes_first_row() {
+        let html = "<table><tr><td>a</td><td>b</td></tr><tr><td>1</td><td>2</td></tr></table>";
+        let md = html_to_markdown(html);
+        // First row becomes the header, followed by the separator, then data.
+        let expected = "| a | b |\n| --- | --- |\n| 1 | 2 |";
+        assert_eq!(md, expected, "{md}");
+    }
+
+    #[test]
+    fn table_messy_cells_degrade_to_inline() {
+        let html = r#"<table>
+            <tr><th>Item</th><th>Note</th></tr>
+            <tr>
+              <td><strong>Big</strong> box</td>
+              <td><p>line one</p><p>line two | with pipe</p></td>
+            </tr>
+        </table>"#;
+        let md = html_to_markdown(html);
+        // Nested block content collapses to one inline line; pipe is escaped.
+        assert!(md.contains("| **Big** box | line one line two \\| with pipe |"), "{md}");
+        // Ragged rows are padded so the grid stays rectangular.
+        let ragged = html_to_markdown("<table><tr><th>a</th><th>b</th></tr><tr><td>x</td></tr></table>");
+        assert!(ragged.contains("| x |  |"), "{ragged}");
     }
 }

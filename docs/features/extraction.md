@@ -10,7 +10,9 @@ A `RuleSet` maps output fields to rules, compiled once and run over document bat
 - `xpath` — XPath over the HTML (pure-Rust `skyscraper`); attribute nodes yield their value, text nodes content, elements recursive text; `all` supported; invalid expressions fail at compile. Covers parent/ancestor axes CSS can't express.
 - `const` — literal value.
 
-**Transforms**: each field takes an optional `transforms` chain applied after the rule (element-wise over arrays): `trim`, `lowercase`, `uppercase`, `to_number` (currency/thousands tolerant), `to_int`, `to_bool`, `regex_replace {pattern, replacement}`, `split {sep, index?}`, `default {value}` (on null). Backward compatible — plain rule JSON still parses (serde-flattened `FieldRule`).
+**Transforms**: each field takes an optional `transforms` chain applied after the rule (element-wise over arrays): `trim`, `lowercase`, `uppercase`, `to_number`, `to_int`, `to_bool`, `regex_replace {pattern, replacement}`, `split {sep, index?}`, `default {value}` (on null). Backward compatible — plain rule JSON still parses (serde-flattened `FieldRule`).
+
+`to_number`/`to_int` parse the **first valid decimal number** in the string, tolerating a leading currency symbol and `,` thousands separators — without concatenating digits across separators: `"1-2"` → `1` (a range, not `-12`), `"$1,234.50"` → `1234.5`, `"3.5%"` → `3.5`, `"2026-07-10"` → `2026`. A sign only binds when it directly precedes the digits (`"-5"` → `-5`).
 
 Exposed via the `extractor` app: fetch a URL (tiered) and apply a params-supplied rule set.
 
@@ -41,6 +43,8 @@ The `extractor` app skips fetch failures instead of upserting all-null records, 
 ## HTML → Markdown
 
 `pumper_core::html_to_markdown` — boilerplate-skipping converter used by the fetcher (`to_markdown`), `readable`/`watch` apps, and SEDIA clean-text enrichment.
+
+`<table>` renders as a **GitHub pipe table**. The first row is the header: `<th>` cells become the headers, and a `<th>`-less table promotes its first `<tr>` to the header. `<thead>`/`<tbody>`/`<tfoot>` wrappers are traversed; ragged rows are padded to a rectangular grid; cells with nested block content degrade to inline text (whitespace collapsed, `|` escaped); a nested table's text is flattened into its enclosing cell.
 
 ## WASM plugin sandbox (`engine-wasm`, `plugin` app)
 

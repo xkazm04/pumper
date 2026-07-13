@@ -234,13 +234,7 @@ fn map_str(value: Value, f: impl Fn(&str) -> Value) -> Value {
 fn coerce_number(value: Value, int: bool) -> Value {
     let num = match &value {
         Value::Number(n) => n.as_f64(),
-        Value::String(s) => {
-            let cleaned: String = s
-                .chars()
-                .filter(|c| c.is_ascii_digit() || *c == '.' || *c == '-')
-                .collect();
-            cleaned.parse::<f64>().ok()
-        }
+        Value::String(s) => parse_first_number(s),
         _ => None,
     };
     match num {
@@ -248,6 +242,60 @@ fn coerce_number(value: Value, int: bool) -> Value {
         Some(n) => serde_json::Number::from_f64(n).map(Value::Number).unwrap_or(Value::Null),
         None => Value::Null,
     }
+}
+
+/// Parses the FIRST valid decimal number found in a string, tolerating leading
+/// currency symbols and `,` thousands separators. Unlike a naive
+/// "strip every non-digit" pass, this does NOT concatenate digits across
+/// separators: `"1-2"` → `1` (a range, not `-12`), `"$1,234.50"` → `1234.5`,
+/// `"3.5%"` → `3.5`. A sign only binds when it directly precedes the digits
+/// (`"-5"` → `-5`, but the `-` in `"1-2"` is a separator, not a sign).
+fn parse_first_number(s: &str) -> Option<f64> {
+    let b = s.as_bytes();
+    let n = b.len();
+    let is_digit = |i: usize| b.get(i).is_some_and(u8::is_ascii_digit);
+    let mut i = 0;
+    while i < n {
+        // Does a number token start at `i`?
+        let starts = match b[i] {
+            b'-' | b'+' => is_digit(i + 1) || (b.get(i + 1) == Some(&b'.') && is_digit(i + 2)),
+            b'.' => is_digit(i + 1),
+            c => c.is_ascii_digit(),
+        };
+        if !starts {
+            i += 1;
+            continue;
+        }
+        let mut buf = String::new();
+        let mut j = i;
+        if b[j] == b'-' || b[j] == b'+' {
+            if b[j] == b'-' {
+                buf.push('-');
+            }
+            j += 1;
+        }
+        let mut seen_dot = false;
+        while j < n {
+            match b[j] {
+                d if d.is_ascii_digit() => {
+                    buf.push(d as char);
+                    j += 1;
+                }
+                // Thousands separator: only between digits.
+                b',' if is_digit(j + 1) => j += 1,
+                // Decimal point: only the first, and only if a digit follows
+                // (so a sentence-ending period isn't swallowed).
+                b'.' if !seen_dot && is_digit(j + 1) => {
+                    seen_dot = true;
+                    buf.push('.');
+                    j += 1;
+                }
+                _ => break,
+            }
+        }
+        return buf.parse::<f64>().ok();
+    }
+    None
 }
 
 /// Compiled, thread-shareable rule set. `Send + Sync` so a `&CompiledRuleSet`
@@ -531,6 +579,34 @@ mod tests {
         assert_eq!(out["year"], json!(2026));
         assert_eq!(out["missing"], json!("n/a"));
         assert_eq!(out["active"], json!(true));
+    }
+
+    #[test]
+    fn to_number_parses_first_valid_number() {
+        // Drive coerce_number through a const rule + to_number transform.
+        let cases = [
+            ("1-2", json!(1.0)),          // range: not -12
+            ("$1,234.50", json!(1234.5)), // currency + thousands
+            ("3.5%", json!(3.5)),        // trailing percent
+            ("-5.5", json!(-5.5)),       // real negative
+            ("2026-07-10", json!(2026.0)), // date: first component only
+            ("abc", json!(null)),        // no number -> null
+            ("  42 ", json!(42.0)),      // surrounding whitespace
+            ("Price: 9.99 USD", json!(9.99)), // embedded
+        ];
+        for (input, want) in cases {
+            let rules = ruleset(json!({
+                "n": {"type": "const", "value": input, "transforms": [{"op": "to_number"}]}
+            }));
+            let out = &extract_batch(&rules, std::slice::from_ref(&String::new()))[0];
+            assert_eq!(out["n"], want, "input {input:?}");
+        }
+        // to_int truncates toward zero after the same parse.
+        let rules = ruleset(json!({
+            "n": {"type": "const", "value": "$1,234.90", "transforms": [{"op": "to_int"}]}
+        }));
+        let out = &extract_batch(&rules, std::slice::from_ref(&String::new()))[0];
+        assert_eq!(out["n"], json!(1234));
     }
 
     #[test]
