@@ -20,6 +20,21 @@ pub struct Config {
     pub plugins: PluginConfig,
     pub search: SearchConfig,
     pub triggers: TriggersConfig,
+    pub webhooks: WebhooksConfig,
+}
+
+/// Global outbound-webhook subscriptions that aren't tied to a per-resource row
+/// (watches/saved-searches). A single config-level firehose is the lightest fit
+/// for a cross-app "any job failed" signal, which has no natural per-resource key.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct WebhooksConfig {
+    /// If set, every job that fails *permanently* (attempts exhausted, including
+    /// reaper-caused failures) POSTs a `job.failed` event here. Independent of a
+    /// job's own `callback_url`, which already receives the terminal job JSON.
+    pub failure_url: Option<String>,
+    /// Optional HMAC-SHA256 signing secret for `failure_url` deliveries.
+    pub failure_secret: Option<String>,
 }
 
 /// Reactive-pipeline trigger evaluation limits.

@@ -453,6 +453,19 @@ impl Storage {
         Ok(rows)
     }
 
+    /// Permanently-failed job count per app — the DB-derived source for the
+    /// `pumper_job_failures_total{app}` metric. Reflects the current number of
+    /// rows in the `failed` state (a job later retried leaves the set), so it is
+    /// not a strictly monotonic process counter.
+    pub async fn failure_counts(&self) -> Result<Vec<(String, i64)>> {
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT app, COUNT(*) FROM jobs WHERE status = 'failed' GROUP BY app",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Execution-duration (started→finished) and queue-wait (created→started)
     /// aggregates for the metrics endpoint, computed in one pass. Durations come
     /// from `julianday` deltas over the fixed-width RFC-3339 timestamps (× 86400

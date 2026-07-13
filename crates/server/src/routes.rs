@@ -194,6 +194,7 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
     }
 
     let counts = state.storage.status_counts().await?;
+    let failures = state.storage.failure_counts().await?;
     let timing = state.storage.job_timing_stats().await?;
     let schedules = state.storage.list_schedules().await?;
     let mut out = String::new();
@@ -201,6 +202,15 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
     for status in ["queued", "running", "succeeded", "failed", "cancelled"] {
         let n = counts.iter().find(|(s, _)| s == status).map_or(0, |(_, n)| *n);
         out.push_str(&format!("pumper_jobs{{status=\"{status}\"}} {n}\n"));
+    }
+    // Permanent failures per app. DB-derived (current `failed` row count per app),
+    // so not strictly monotonic — a retried job leaves the failed set.
+    out.push_str(
+        "# HELP pumper_job_failures_total Permanently-failed jobs by app (DB-derived count)\n\
+         # TYPE pumper_job_failures_total counter\n",
+    );
+    for (app, n) in &failures {
+        out.push_str(&format!("pumper_job_failures_total{{app=\"{app}\"}} {n}\n"));
     }
     out.push_str(
         "# HELP pumper_job_duration_seconds Job execution time (started -> finished)\n\

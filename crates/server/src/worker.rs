@@ -468,6 +468,21 @@ async fn finalize(state: &AppState, id: uuid::Uuid) {
     event.error = job.error.clone();
     publish(state, event);
     webhook::dispatch(state.webhook_client.clone(), state.storage.clone(), job.clone());
+    // Permanent-failure firehose: a job that exhausted its attempts (app error,
+    // timeout, or a reaped stale lease — all land here via `finalize`) notifies
+    // the global `[webhooks] failure_url` subscriber, if configured. Retryable
+    // requeues never reach `finalize`, so this is permanent failures only.
+    if job.status == JobStatus::Failed {
+        if let Some(url) = &state.config.webhooks.failure_url {
+            webhook::dispatch_failure(
+                state.webhook_client.clone(),
+                state.storage.clone(),
+                url,
+                state.config.webhooks.failure_secret.clone(),
+                &job,
+            );
+        }
+    }
     // Terminal-job triggers: the job's final status is an event other apps can
     // chain on (e.g. "when crawl succeeds, run extract").
     crate::triggers::fire_terminal_triggers(state, &job).await;

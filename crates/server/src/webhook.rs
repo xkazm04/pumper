@@ -100,6 +100,28 @@ pub fn dispatch_event(
     );
 }
 
+/// Spawns a best-effort, logged `job.failed` delivery to the global failure
+/// subscriber (`[webhooks] failure_url`). Fires on PERMANENT failure only — a
+/// job's own `callback_url` already receives the terminal job JSON, so this is
+/// the cross-app firehose path, not a per-job duplicate.
+pub fn dispatch_failure(
+    client: reqwest::Client,
+    storage: Arc<Storage>,
+    url: &str,
+    secret: Option<String>,
+    job: &Job,
+) {
+    let payload = serde_json::json!({
+        "event": "job.failed",
+        "job_id": job.id,
+        "app": job.app,
+        "error": job.error,
+        "attempts": job.attempts,
+        "schedule_id": job.schedule_id,
+    });
+    dispatch_event(client, storage, "failure", &job.id.to_string(), url, "job.failed", payload, secret);
+}
+
 /// Re-sends a logged delivery (the dead-letter replay path). The caller has
 /// already resolved the signing secret from the delivery's source.
 pub fn replay(

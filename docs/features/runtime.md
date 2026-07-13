@@ -48,7 +48,11 @@ Each schedule carries three cron-maturity fields (`schedules` table cols `timezo
 
 ## Config
 
-`config.toml` (or `$PUMPER_CONFIG`), `#[serde(default)]` throughout — sections: `server, worker, storage, http, browser, claude, governor, cache, plugins, search, triggers`. New fields need both the serde default and the manual `Default` impl.
+`config.toml` (or `$PUMPER_CONFIG`), `#[serde(default)]` throughout — sections: `server, worker, storage, http, browser, claude, governor, cache, plugins, search, triggers, webhooks`. New fields need both the serde default and the manual `Default` impl. `[webhooks]` holds `failure_url`/`failure_secret` — the optional global `job.failed` firehose (see [events-webhooks.md](events-webhooks.md)).
+
+## Metrics
+
+`GET /metrics` (Prometheus text, cached ~5s): `pumper_jobs{status}` gauges, `pumper_job_failures_total{app}` (permanently-failed jobs per app — **DB-derived** from the current `failed` row count, so it resets/decreases if failed jobs are retried or purged rather than being a strictly monotonic process counter), `pumper_job_duration_seconds` + `pumper_job_queue_wait_seconds` summaries (`_sum`/`_count`/`_max`), `pumper_cost_usd{app,engine}`, `pumper_apps`, `pumper_schedules{enabled}`.
 
 ## Known gaps
 

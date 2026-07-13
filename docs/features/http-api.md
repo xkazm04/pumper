@@ -8,7 +8,7 @@ Axum server (default port 8088, `[server]` config). **Local power mode: no auth,
 
 | Area | Routes |
 | --- | --- |
-| Health/metrics | `GET /health` · `GET /metrics` (Prometheus text: jobs by status, apps, schedules, `pumper_cost_usd{app,engine}`, `pumper_job_duration_seconds` + `pumper_job_queue_wait_seconds` summaries with `_sum`/`_count`/`_max`; body cached ~5s so scrape bursts don't re-run the aggregates) |
+| Health/metrics | `GET /health` · `GET /metrics` (Prometheus text: jobs by status, `pumper_job_failures_total{app}` (DB-derived permanent-failure count per app), apps, schedules, `pumper_cost_usd{app,engine}`, `pumper_job_duration_seconds` + `pumper_job_queue_wait_seconds` summaries with `_sum`/`_count`/`_max`; body cached ~5s so scrape bursts don't re-run the aggregates) |
 | Apps | `GET /apps` · `POST /apps/{name}/jobs` (enqueue; `Idempotency-Key` header supported) · `GET /apps/{name}/datasets` |
 | Jobs | `GET /jobs?app=&status=&limit=&cursor=` (cursor ⇒ `{items,next_cursor}`) · `GET /jobs/{id}` (adds a `progress` field with the latest live snapshot while running) · `DELETE /jobs/{id}` (cancel: queued synchronously, or a `running` job via its cancellation token — response adds `running:true`; 404 no job, 409 already terminal) · `POST /jobs/{id}/retry` (404 no job, 409 wrong state) · `POST /jobs/retry` bulk (body `{status=failed\|cancelled, app?, limit≤500}` ⇒ `{retried,ids}`; 400 bad status) · `POST /jobs/{id}/reset` (re-queue a `running` job; 404 no job, 409 not running) · `GET /jobs/{id}/stream` (SSE) · `GET /jobs/{id}/costs` |
 | Costs | `GET /costs?app=&since=` |
