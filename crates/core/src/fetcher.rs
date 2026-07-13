@@ -489,7 +489,7 @@ fn outcome(
 /// challenge-page text markers in the body's leading window (a 200 "enable
 /// JavaScript" or Cloudflare interstitial that would otherwise pass a char
 /// count).
-fn http_bot_wall(status: u16, body: &str) -> Option<String> {
+pub(crate) fn http_bot_wall(status: u16, body: &str) -> Option<String> {
     match status {
         403 => return Some("challenge/block status 403".into()),
         429 => return Some("rate-limited status 429".into()),

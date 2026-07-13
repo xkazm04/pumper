@@ -164,6 +164,12 @@ impl ScrapeApp for Crawl {
             "skipped_robots": stats.skipped_robots,
             "skipped_filtered": stats.skipped_filtered,
             "sitemap_seeded": stats.sitemap_seeded,
+            // Honest failure/bot-wall accounting (previously swallowed silently).
+            "failed": stats.failed,
+            "failed_by_host": stats.failed_by_host,
+            "skipped_botwall": stats.skipped_botwall,
+            "robots_fetch_failures": stats.robots_fetch_failures,
+            "checkpoint_errors": stats.checkpoint_errors,
             "resumed": stats.resumed,
             "hosts": stats.hosts,
             "frontier_remaining": stats.frontier_remaining,

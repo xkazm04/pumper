@@ -140,6 +140,19 @@ pub struct CrawlStats {
     pub skipped_filtered: usize,
     /// URLs seeded into the frontier from sitemaps.
     pub sitemap_seeded: usize,
+    /// Fetches that failed at the transport layer (DNS/TLS/connection/timeout) —
+    /// previously swallowed silently.
+    pub failed: usize,
+    /// Failure counts by host, capped to the top 20 offenders at the end.
+    pub failed_by_host: HashMap<String, usize>,
+    /// Responses classified as a bot-wall / challenge (status 403/429/503 or a
+    /// challenge marker) and therefore NOT kept — see `fetcher::http_bot_wall`.
+    pub skipped_botwall: usize,
+    /// robots.txt fetches that failed at the transport layer (fail-open to
+    /// allow-all, but surfaced rather than hidden).
+    pub robots_fetch_failures: usize,
+    /// Checkpoint saves that failed to persist (write/rename error).
+    pub checkpoint_errors: usize,
     /// True when this run restored frontier state from a checkpoint.
     pub resumed: bool,
     pub hosts: usize,
@@ -225,7 +238,9 @@ pub async fn crawl(
         frontier.push(canonicalize_str(seed), 0);
     }
     if let Some(dir) = &output_dir {
-        tokio::fs::create_dir_all(dir).await.ok();
+        if let Err(e) = tokio::fs::create_dir_all(dir).await {
+            tracing::warn!(dir = %dir.display(), "crawl: output dir create failed: {e}");
+        }
     }
 
     let mut robots: HashMap<String, RobotRules> = HashMap::new();
@@ -240,7 +255,10 @@ pub async fn crawl(
     if cfg.sitemap_seeds {
         let hosts: Vec<String> = seed_hosts.iter().cloned().collect();
         for host in hosts {
-            let declared = robots_for(&mut robots, &http, &host).await.sitemaps.clone();
+            let declared = robots_for(&mut robots, &http, &host, &mut stats.robots_fetch_failures)
+                .await
+                .sitemaps
+                .clone();
             let budget = MAX_SITEMAP_SEEDS.saturating_sub(stats.sitemap_seeded);
             if budget == 0 {
                 break;
@@ -260,7 +278,8 @@ pub async fn crawl(
             let host = host_of(&url).unwrap_or_default();
             let mut crawl_delay = None;
             if cfg.respect_robots && !host.is_empty() {
-                let rules = robots_for(&mut robots, &http, &host).await;
+                let rules =
+                    robots_for(&mut robots, &http, &host, &mut stats.robots_fetch_failures).await;
                 if !rules.allowed(&url) {
                     stats.skipped_robots += 1;
                     continue;
@@ -295,8 +314,21 @@ pub async fn crawl(
         let Some(result) = in_flight.next().await else {
             break;
         };
-        let Some(fetched) = result else {
-            continue; // fetch failed; skip
+        let fetched = match result {
+            CrawlFetch::Page(f) => f,
+            CrawlFetch::Failed(url) => {
+                stats.failed += 1;
+                if let Some(host) = host_of(&url) {
+                    *stats.failed_by_host.entry(host).or_default() += 1;
+                }
+                tracing::debug!(url = %url, "crawl: fetch failed");
+                continue;
+            }
+            CrawlFetch::BotWall(url, reason) => {
+                stats.skipped_botwall += 1;
+                tracing::debug!(url = %url, reason = %reason, "crawl: skipped bot-wall");
+                continue;
+            }
         };
         stats.crawled += 1;
 
@@ -312,7 +344,9 @@ pub async fn crawl(
             let artifact_name = format!("page-{:04}.html", stats.kept);
             if let Some(dir) = &output_dir {
                 let file = dir.join(&artifact_name);
-                let _ = tokio::fs::write(file, &fetched.body).await;
+                if let Err(e) = tokio::fs::write(&file, &fetched.body).await {
+                    tracing::warn!(path = %file.display(), "crawl: page write failed: {e}");
+                }
             }
             // Stream this kept page's compact fingerprint to the sink (batched).
             if sink.is_some() {
@@ -339,7 +373,9 @@ pub async fn crawl(
             // Periodic checkpoint so a killed process loses at most one stride.
             if stats.kept % CHECKPOINT_STRIDE == 0 {
                 if let Some(path) = &cfg.checkpoint {
-                    Checkpoint::save(path, &frontier, &kept_hashes).await;
+                    if !Checkpoint::save(path, &frontier, &kept_hashes).await {
+                        stats.checkpoint_errors += 1;
+                    }
                 }
             }
             // Enqueue newly discovered links within the depth budget.
@@ -378,12 +414,30 @@ pub async fn crawl(
     stats.hosts = hosts.len();
     stats.frontier_remaining = frontier.queue.len();
     if let Some(path) = &cfg.checkpoint {
-        Checkpoint::save(path, &frontier, &kept_hashes).await;
+        if !Checkpoint::save(path, &frontier, &kept_hashes).await {
+            stats.checkpoint_errors += 1;
+        }
     }
+    stats.failed_by_host = top_n_by_count(stats.failed_by_host, MAX_FAILED_HOSTS);
     Ok(stats)
 }
 
 const CHECKPOINT_STRIDE: usize = 25;
+
+/// Cap on the per-host failure map surfaced in the result — only the worst
+/// offenders are useful; the total lives in `failed`.
+const MAX_FAILED_HOSTS: usize = 20;
+
+/// Keeps the `n` highest-count entries of a host→count map (ties broken by host
+/// name for determinism), dropping the long tail so the result stays compact.
+fn top_n_by_count(map: HashMap<String, usize>, n: usize) -> HashMap<String, usize> {
+    if map.len() <= n {
+        return map;
+    }
+    let mut entries: Vec<(String, usize)> = map.into_iter().collect();
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    entries.into_iter().take(n).collect()
+}
 
 /// Persisted frontier state: what is still queued, what has been seen, and the
 /// SimHash fingerprints of kept pages (so dedup survives the resume too).
@@ -400,23 +454,54 @@ impl Checkpoint {
         serde_json::from_slice(&bytes).ok()
     }
 
-    /// Best-effort save; checkpointing must never fail the crawl.
-    async fn save(path: &PathBuf, frontier: &Frontier, kept_hashes: &[u64]) {
+    /// Best-effort save; checkpointing must never fail the crawl, but a failure
+    /// is no longer swallowed — returns `false` (and warn-logs) so the caller can
+    /// surface a `checkpoint_errors` count in the result.
+    async fn save(path: &PathBuf, frontier: &Frontier, kept_hashes: &[u64]) -> bool {
         let cp = Checkpoint {
             queue: frontier.queue.iter().cloned().collect(),
             seen: frontier.seen.iter().cloned().collect(),
             kept_hashes: kept_hashes.to_vec(),
         };
-        let Ok(bytes) = serde_json::to_vec(&cp) else { return };
+        let bytes = match serde_json::to_vec(&cp) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), "crawl: checkpoint serialize failed: {e}");
+                return false;
+            }
+        };
         if let Some(parent) = path.parent() {
-            tokio::fs::create_dir_all(parent).await.ok();
+            if let Err(e) = tokio::fs::create_dir_all(parent).await {
+                tracing::warn!(path = %path.display(), "crawl: checkpoint dir create failed: {e}");
+                return false;
+            }
         }
         // Write-then-rename so a crash mid-write can't corrupt the checkpoint.
         let tmp = path.with_extension("json.tmp");
-        if tokio::fs::write(&tmp, bytes).await.is_ok() {
-            tokio::fs::rename(&tmp, path).await.ok();
+        if let Err(e) = tokio::fs::write(&tmp, bytes).await {
+            tracing::warn!(path = %tmp.display(), "crawl: checkpoint write failed: {e}");
+            return false;
         }
+        if let Err(e) = tokio::fs::rename(&tmp, path).await {
+            tracing::warn!(path = %path.display(), "crawl: checkpoint rename failed: {e}");
+            return false;
+        }
+        true
     }
+}
+
+/// Disposition of one fetch attempt. Previously a bare `Option<Fetched>` that
+/// collapsed transport failures and bot-walls into an indistinguishable `None`,
+/// which the loop dropped silently. Now each outcome is counted honestly.
+enum CrawlFetch {
+    /// A real content response, ready to dedup / keep.
+    Page(Fetched),
+    /// Transport-layer failure (DNS/TLS/connection/timeout). Carries the URL for
+    /// per-host attribution.
+    Failed(String),
+    /// Classified as a bot-wall / challenge (see `fetcher::http_bot_wall`) — not
+    /// stored as content. Carries the URL and the classification reason.
+    BotWall(String, String),
 }
 
 async fn fetch_one(
@@ -424,10 +509,18 @@ async fn fetch_one(
     url: String,
     depth: u32,
     same_domain: bool,
-) -> Option<Fetched> {
-    let resp = http.fetch(HttpRequest::get(&url)).await.ok()?;
+) -> CrawlFetch {
+    let resp = match http.fetch(HttpRequest::get(&url)).await {
+        Ok(resp) => resp,
+        Err(_) => return CrawlFetch::Failed(url),
+    };
+    // A challenge/block response (403/429/503 or a Cloudflare/JS/CAPTCHA marker
+    // on a 200) is not content — reuse the fetcher's shared classifier.
+    if let Some(reason) = crate::fetcher::http_bot_wall(resp.status, &resp.body) {
+        return CrawlFetch::BotWall(url, reason);
+    }
     let parsed = parse_page(&resp.body, &url, same_domain);
-    Some(Fetched {
+    CrawlFetch::Page(Fetched {
         url,
         depth,
         status: resp.status,
@@ -563,12 +656,21 @@ async fn robots_for<'a>(
     cache: &'a mut HashMap<String, RobotRules>,
     http: &Arc<dyn HttpClient>,
     host: &str,
+    fetch_failures: &mut usize,
 ) -> &'a RobotRules {
     if !cache.contains_key(host) {
         let url = format!("https://{host}/robots.txt");
         let rules = match http.fetch(HttpRequest::get(&url)).await {
             Ok(resp) if resp.is_success() => RobotRules::parse(&resp.body),
-            _ => RobotRules::allow_all(),
+            // A non-2xx (e.g. 404 "no robots") is a legitimate allow-all.
+            Ok(_) => RobotRules::allow_all(),
+            // A transport failure is NOT "no robots" — fail open, but count it
+            // instead of silently pretending the host allowed everything.
+            Err(e) => {
+                *fetch_failures += 1;
+                tracing::debug!(%host, "crawl: robots.txt fetch failed: {e}");
+                RobotRules::allow_all()
+            }
         };
         cache.insert(host.to_string(), rules);
     }
@@ -702,14 +804,20 @@ mod tests {
     use crate::engine::HttpResponse;
     use std::sync::Mutex as SyncMutex;
 
-    /// Serves canned `(status, body)` per URL; unknown URLs → 404 empty.
+    /// Serves canned `(status, body)` per URL; URLs in `fail` return a transport
+    /// error; unknown URLs → 404 empty.
+    #[derive(Default)]
     struct MockHttp {
         pages: HashMap<String, (u16, String)>,
+        fail: HashSet<String>,
     }
 
     #[async_trait]
     impl HttpClient for MockHttp {
         async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            if self.fail.contains(&req.url) {
+                return Err(crate::Error::App(format!("simulated transport failure: {}", req.url)));
+            }
             let (status, body) =
                 self.pages.get(&req.url).cloned().unwrap_or((404, String::new()));
             Ok(HttpResponse {
@@ -766,7 +874,7 @@ mod tests {
                    <p>About us page content.</p></body></html>"
                 .to_string()),
         );
-        let http = Arc::new(MockHttp { pages });
+        let http = Arc::new(MockHttp { pages, ..Default::default() });
         let records = Arc::new(SyncMutex::new(Vec::new()));
         let sink = Box::new(CollectSink { records: records.clone() });
 
@@ -784,6 +892,56 @@ mod tests {
         assert_ne!(home.simhash, 0, "body simhash recorded");
         assert!(recs.iter().any(|r| r.url == "https://ex.com/about"
             && r.title.as_deref() == Some("About")));
+    }
+
+    #[tokio::test]
+    async fn crawl_counts_failures_and_botwalls() {
+        // Seed links to four children: one good, one transport failure, one 403
+        // block, one 200 Cloudflare challenge page.
+        let seed = "<html><body>\
+            <a href=\"/ok\">ok</a><a href=\"/dead\">dead</a>\
+            <a href=\"/blocked\">blocked</a><a href=\"/cf\">cf</a></body></html>";
+        let mut pages = HashMap::new();
+        pages.insert("https://ex.com/".to_string(), (200, seed.to_string()));
+        pages.insert(
+            "https://ex.com/ok".to_string(),
+            (200, "<html><body><p>real content here</p></body></html>".to_string()),
+        );
+        // 403 hard block.
+        pages.insert("https://ex.com/blocked".to_string(), (403, "denied".to_string()));
+        // 200 with a Cloudflare interstitial marker — must classify as bot-wall.
+        pages.insert(
+            "https://ex.com/cf".to_string(),
+            (200, "<html><head><title>Just a moment...</title></head><body>\
+                   <div class=\"cf-browser-verification\">Checking your browser\
+                   </div></body></html>"
+                .to_string()),
+        );
+        let mut fail = HashSet::new();
+        fail.insert("https://ex.com/dead".to_string());
+
+        let http = Arc::new(MockHttp { pages, fail });
+        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None).await.unwrap();
+
+        // Kept: seed + /ok. /dead failed, /blocked + /cf are bot-walls.
+        assert_eq!(stats.kept, 2, "only real-content pages kept");
+        assert_eq!(stats.crawled, 2, "crawled counts only real responses");
+        assert_eq!(stats.failed, 1, "transport failure counted, not swallowed");
+        assert_eq!(stats.failed_by_host.get("ex.com").copied(), Some(1));
+        assert_eq!(stats.skipped_botwall, 2, "403 block + CF challenge both bot-walls");
+    }
+
+    #[test]
+    fn top_n_by_count_keeps_worst_offenders() {
+        let mut map = HashMap::new();
+        map.insert("a".to_string(), 1);
+        map.insert("b".to_string(), 5);
+        map.insert("c".to_string(), 3);
+        let top = top_n_by_count(map, 2);
+        assert_eq!(top.len(), 2);
+        assert_eq!(top.get("b").copied(), Some(5));
+        assert_eq!(top.get("c").copied(), Some(3));
+        assert!(!top.contains_key("a"), "smallest dropped");
     }
 
     #[test]
