@@ -6,7 +6,7 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
-use pumper_core::{EnqueueOptions, Job, JobStatus, Schedule};
+use pumper_core::{EnqueueOptions, HostProfile, Job, JobStatus, Schedule};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use tokio::sync::broadcast::error::RecvError;
@@ -48,6 +48,9 @@ pub fn router(state: AppState) -> Router {
         .route("/webhooks/deliveries", get(list_deliveries))
         .route("/webhooks/deliveries/{id}", get(get_delivery))
         .route("/webhooks/deliveries/{id}/replay", post(replay_delivery))
+        .route("/hosts", get(list_hosts))
+        .route("/hosts/{host}", get(get_host))
+        .route("/hosts/{host}/memory", axum::routing::delete(delete_host_memory))
         .route("/plugins", get(list_plugins))
         .route("/plugins/reload", post(reload_plugins))
         .route("/search", get(search))
@@ -1464,6 +1467,91 @@ async fn delete_search_dataset(
 ) -> Result<Json<Value>, ApiError> {
     state.search.delete_dataset(&app, &dataset).await?;
     Ok(Json(json!({ "app": app, "dataset": dataset, "deleted": true })))
+}
+
+// ---- Host profiles (learned tier memory + politeness) -----------------------
+
+#[derive(Deserialize)]
+struct HostsQuery {
+    #[serde(default = "default_limit")]
+    limit: i64,
+    /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
+    cursor: Option<String>,
+}
+
+/// Serializes a stored profile with the **live** governor penalty merged in
+/// (the row's `penalty_ms` is only the last write-behind snapshot; the
+/// in-memory value is authoritative and fresher).
+async fn host_json(state: &AppState, mut profile: HostProfile) -> Value {
+    let live = state.governor.penalty(&profile.host).await;
+    profile.penalty_ms = live.as_millis().min(i64::MAX as u128) as i64;
+    json!(profile)
+}
+
+/// Paginated list of learned host state: preferred tier, HTTP strikes, live
+/// politeness penalty, and last-outcome timestamps. Most-recently-active first.
+async fn list_hosts(
+    State(state): State<AppState>,
+    Query(query): Query<HostsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = query.limit.clamp(1, 500);
+    let after = query.cursor.as_deref().and_then(parse_cursor);
+    let profiles = state.tiers.list_page(after, limit).await?;
+    let next_cursor = keyset_cursor(&profiles, limit, |p| {
+        format!("{}|{}", p.updated_at, p.host)
+    });
+    let mut items = Vec::with_capacity(profiles.len());
+    for p in profiles {
+        items.push(host_json(&state, p).await);
+    }
+    // Dual-mode, matching every other list endpoint: no cursor ⇒ legacy
+    // `{hosts: [...]}` shape; cursor present ⇒ `{items, next_cursor}`.
+    if query.cursor.is_none() {
+        Ok(Json(json!({ "hosts": items })))
+    } else {
+        Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
+    }
+}
+
+/// One host's learned profile. 404 when the host has no learned state (no tier
+/// memory row and no live penalty).
+async fn get_host(
+    State(state): State<AppState>,
+    Path(host): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let host = host.to_lowercase();
+    if let Some(profile) = state.tiers.get(&host).await? {
+        return Ok(Json(host_json(&state, profile).await));
+    }
+    // No stored row, but a live penalty may exist ahead of the next snapshot.
+    let live = state.governor.penalty(&host).await;
+    if !live.is_zero() {
+        return Ok(Json(json!({
+            "host": host,
+            "preferred_tier": Value::Null,
+            "http_strikes": 0,
+            "penalty_ms": live.as_millis().min(i64::MAX as u128) as i64,
+            "updated_at": Value::Null,
+            "penalty_updated_at": Value::Null,
+        })));
+    }
+    Err(ApiError(StatusCode::NOT_FOUND, "unknown host".into()))
+}
+
+/// Resets a host's learned state: drops its tier memory (strikes + browser pin +
+/// persisted penalty) and clears the live governor penalty. 404 when unknown.
+async fn delete_host_memory(
+    State(state): State<AppState>,
+    Path(host): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let host = host.to_lowercase();
+    let forgot = state.tiers.forget(&host).await?;
+    let cleared = state.governor.clear(&host);
+    if forgot || cleared {
+        Ok(Json(json!({ "host": host, "reset": true })))
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "unknown host".into()))
+    }
 }
 
 // ---- WASM plugins ---------------------------------------------------------

@@ -178,6 +178,38 @@ impl Governor {
             .unwrap_or(Duration::ZERO)
     }
 
+    /// Snapshot of every host currently carrying a non-zero learned penalty, as
+    /// `(host, penalty)`. Feeds the write-behind persistence so penalties
+    /// survive a restart. Cheap: a lock-free `DashMap` walk of penalized hosts.
+    pub fn snapshot_penalties(&self) -> Vec<(String, Duration)> {
+        self.hosts
+            .iter()
+            .filter(|e| !e.value().penalty.is_zero())
+            .map(|e| (e.key().clone(), e.value().penalty))
+            .collect()
+    }
+
+    /// Seeds a host's learned penalty from persisted state on boot. A no-op for
+    /// a zero penalty (nothing to restore). Does not push the next slot out —
+    /// spacing resumes naturally on the next acquire.
+    pub fn restore_penalty(&self, host: &str, penalty: Duration) {
+        if penalty.is_zero() {
+            return;
+        }
+        let now = Instant::now();
+        self.hosts
+            .entry(host.to_lowercase())
+            .or_insert_with(|| HostState { next_slot: now, penalty: Duration::ZERO, last_seen: now })
+            .penalty = penalty;
+    }
+
+    /// Forgets a host's live politeness state (learned penalty + slot). Returns
+    /// whether any state existed. Used by `DELETE /hosts/{host}/memory` to reset
+    /// the learned penalty alongside the tier memory.
+    pub fn clear(&self, host: &str) -> bool {
+        self.hosts.remove(&host.to_lowercase()).is_some()
+    }
+
     /// Amortized idle-host eviction: rarely checked, sweeps only when the map
     /// has grown past the cap, and keeps hosts touched recently or still under
     /// a penalty. Holds no entry ref (avoids a shard self-deadlock).
@@ -289,5 +321,35 @@ mod tests {
         // Reward on an unpenalized host is a no-op.
         g.reward("y.com").await;
         assert_eq!(g.penalty("y.com").await, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn snapshot_restore_and_clear_round_trip() {
+        let g = governor();
+        g.penalize("a.com", None).await; // base penalty
+        g.penalize("b.com", Some(Duration::from_secs(5))).await;
+
+        // snapshot_penalties captures only penalized hosts.
+        let mut snap = g.snapshot_penalties();
+        snap.sort_by(|x, y| x.0.cmp(&y.0));
+        assert_eq!(snap.len(), 2);
+        assert_eq!(snap[0].0, "a.com");
+        assert_eq!(snap[1], ("b.com".to_string(), Duration::from_secs(5)));
+
+        // A fresh governor (simulated restart) restores the penalties.
+        let g2 = governor();
+        assert_eq!(g2.penalty("b.com").await, Duration::ZERO);
+        for (host, penalty) in &snap {
+            g2.restore_penalty(host, *penalty);
+        }
+        assert_eq!(g2.penalty("b.com").await, Duration::from_secs(5));
+        // A zero restore is a no-op (never inserts state).
+        g2.restore_penalty("c.com", Duration::ZERO);
+        assert!(!g2.clear("c.com"), "zero restore must not create state");
+
+        // clear() forgets a host and reports whether state existed.
+        assert!(g2.clear("b.com"));
+        assert_eq!(g2.penalty("b.com").await, Duration::ZERO);
+        assert!(!g2.clear("b.com"), "second clear is a no-op");
     }
 }

@@ -34,6 +34,17 @@ jitter_ms = 250             # random extra delay to de-sync bursts
 # [governor.per_domain]     # per-host overrides
 # "news.ycombinator.com" = 1.0
 
+# Tiered fetcher (http -> browser -> claude) tuning that isn't per-request.
+[fetcher]
+min_content_chars = 250         # a tier whose extracted text is thinner escalates
+# Host profiles (learned tier memory): strikes + the browser pin decay after
+# this age, giving an aged-out host a fresh crack at the cheap HTTP tier
+# (0 = never age, the old pin-forever behaviour).
+host_memory_ttl_secs = 604800   # 7 days
+# How often the governor's learned per-host penalties are snapshotted to the DB
+# so they survive a restart (0 = in-memory only).
+host_penalty_persist_secs = 60
+
 # Content-addressed HTTP response cache with TTL.
 [cache]
 enabled = true

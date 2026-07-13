@@ -24,6 +24,9 @@ pub struct AppState {
     pub cache: Arc<HttpCache>,
     pub research_cache: Arc<ResearchCache>,
     pub tiers: Arc<TierMemory>,
+    /// Live politeness governor — exposed so the `/hosts` diagnostics can read
+    /// the current learned penalty and `DELETE /hosts/{host}/memory` can clear it.
+    pub governor: Arc<Governor>,
     pub engines: Arc<EngineSet>,
     /// Sandboxed WASM plugin host.
     pub plugins: Arc<dyn Plugins>,
@@ -51,10 +54,47 @@ impl AppState {
             storage.pool(),
             config.claude.research_cache_ttl_secs,
         ));
-        let tiers = Arc::new(TierMemory::new(storage.pool()));
+        let tiers = Arc::new(TierMemory::new(
+            storage.pool(),
+            config.fetcher.host_memory_ttl_secs,
+        ));
         let governor = Arc::new(Governor::new(&config.governor));
 
-        let http = Arc::new(HttpEngine::new(&config.http, governor, cache.clone())?);
+        // Restore the governor's learned per-host penalties from the last
+        // write-behind snapshot so politeness survives a restart.
+        match tiers.load_penalties().await {
+            Ok(saved) => {
+                for (host, penalty_ms) in saved {
+                    governor.restore_penalty(&host, Duration::from_millis(penalty_ms));
+                }
+            }
+            Err(e) => tracing::warn!("failed to restore host penalties: {e}"),
+        }
+
+        // Write-behind: periodically snapshot the governor's learned penalties
+        // into the host-profile table so they persist across restarts.
+        let persist_secs = config.fetcher.host_penalty_persist_secs;
+        if persist_secs > 0 {
+            let governor = governor.clone();
+            let tiers = tiers.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(persist_secs));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let snapshot: Vec<(String, u64)> = governor
+                        .snapshot_penalties()
+                        .into_iter()
+                        .map(|(host, penalty)| (host, penalty.as_millis().min(u64::MAX as u128) as u64))
+                        .collect();
+                    if let Err(e) = tiers.save_penalties(&snapshot).await {
+                        tracing::warn!("host penalty write-behind failed: {e}");
+                    }
+                }
+            });
+        }
+
+        let http = Arc::new(HttpEngine::new(&config.http, governor.clone(), cache.clone())?);
         let browser = Arc::new(BrowserEngine::new(&config.browser));
         let claude = Arc::new(ClaudeEngine::new(&config.claude));
         let fetch = Fetcher::new(http.clone(), browser.clone(), claude.clone(), &config.fetcher);
@@ -93,6 +133,7 @@ impl AppState {
             cache,
             research_cache,
             tiers,
+            governor,
             engines: Arc::new(engines),
             plugins,
             search,

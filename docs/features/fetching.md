@@ -39,12 +39,21 @@ A tier no longer passes purely on char count. On escalating strategies (`auto`, 
 
 ## Politeness governor (adaptive)
 
-Per-host token bucket: configured spacing (`[governor] default_rps`, `per_domain`, jitter) **plus a learned penalty**: a 429/503 doubles the host's extra spacing and pushes the host's next slot out; only a genuinely healthy **2xx** response halves it (a 4xx like 404/403 is not health and no longer rewards faster spacing; other 5xx stay neutral). Penalty bounds are configurable — `[governor] penalty_base_secs` (default 1), `penalty_cap_secs` (300), `penalty_floor_ms` (100, below which a decaying penalty is dropped). Both `Retry-After` forms are honored: delta-seconds and an HTTP-date (converted to a delay from now); a larger `Retry-After` wins over doubling. State is held in one sharded map keyed by host, so distinct hosts never contend; idle hosts are evicted once the map outgrows its cap. In-memory — resets on restart by design.
+Per-host token bucket: configured spacing (`[governor] default_rps`, `per_domain`, jitter) **plus a learned penalty**: a 429/503 doubles the host's extra spacing and pushes the host's next slot out; only a genuinely healthy **2xx** response halves it (a 4xx like 404/403 is not health and no longer rewards faster spacing; other 5xx stay neutral). Penalty bounds are configurable — `[governor] penalty_base_secs` (default 1), `penalty_cap_secs` (300), `penalty_floor_ms` (100, below which a decaying penalty is dropped). Both `Retry-After` forms are honored: delta-seconds and an HTTP-date (converted to a delay from now); a larger `Retry-After` wins over doubling. State is held in one sharded map keyed by host, so distinct hosts never contend; idle hosts are evicted once the map outgrows its cap. Learned penalties are **persisted** (see host profiles below) so they survive a restart.
 
-## Self-learning tier router
+## Self-learning tier router (host profiles)
 
-`tier_memory` table (persistent): an HTTP-tier loss (trail shows http failed/thin while a higher tier won) adds a strike per host; **3 consecutive strikes** flip the host to start at the browser tier (`skip_http`, noted in the trail). One HTTP win resets. Explicit `Http` strategy always overrides. Learning happens at the `AppContext::fetch` seam — engines stay stateless.
+`tier_memory` table (a.k.a. host profiles): an HTTP-tier loss (the http tier's structured `verdict` is `thin`/`blocked`/`error` while a higher tier won) adds a strike per host; **3 consecutive strikes** flip the host to start at the browser tier (`skip_http`, noted in the trail). One HTTP win resets. Explicit `Http` strategy always overrides. Learning happens at the `AppContext::fetch` seam — engines stay stateless.
+
+**Aging (v2).** Strikes and the browser pin decay after `[fetcher] host_memory_ttl_secs` (default 7 days; `0` disables aging). A host whose last strike is older than the TTL reads back as unpinned, so it gets a fresh crack at the cheap HTTP tier instead of staying pinned until a lucky win — and a single fresh loss after aging out does **not** immediately re-pin (stale strikes reset to one). Aging is applied lazily on read via the `updated_at` timestamp; no sweep job.
+
+**Penalty persistence (v2).** The governor's learned per-host penalty is written behind into the host-profile row (`penalty_ms`, `penalty_updated_at`) every `[fetcher] host_penalty_persist_secs` (default 60s; `0` disables) and restored into the in-memory governor on boot. The snapshot deliberately never touches `updated_at`, so persisting a penalty doesn't reset strike aging. Only the last non-zero penalty is kept; it re-decays on the next healthy response.
+
+Learned host state is inspectable and resettable via the `/hosts` API (see [http-api.md](http-api.md)): `GET /hosts` (paginated), `GET /hosts/{host}`, `DELETE /hosts/{host}/memory` (clears strikes, pin, and the live + persisted penalty). The `penalty_ms` reported by those endpoints is the **live** governor value (the row's stored snapshot is only for boot restore).
+
+Config keys (`[fetcher]`): `min_content_chars` (250), `host_memory_ttl_secs` (604800), `host_penalty_persist_secs` (60).
 
 ## Known gaps
 
 - No proxy pool / stealth tier (backlog moonshots).
+- Aging is time-based only; there is no success-rate / half-life model of host reliability.

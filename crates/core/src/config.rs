@@ -235,11 +235,25 @@ pub struct FetcherConfig {
     /// than this (in chars) is "thin" and escalates. A per-request
     /// `FetchRequest.min_content_chars` overrides it.
     pub min_content_chars: usize,
+    /// Age (seconds) after which a host's learned tier memory decays: strikes
+    /// older than this — and the browser pin they earned — lapse, so a host that
+    /// failed a while ago gets a fresh crack at the cheap HTTP tier instead of
+    /// staying pinned until a lucky win. `0` disables aging (the old
+    /// pin-forever behaviour). Default: 7 days.
+    pub host_memory_ttl_secs: u64,
+    /// How often (seconds) the governor's learned per-host penalties are
+    /// snapshotted to the DB so they survive a restart (restored on boot).
+    /// `0` disables persistence (penalties stay purely in-memory). Default: 60s.
+    pub host_penalty_persist_secs: u64,
 }
 
 impl Default for FetcherConfig {
     fn default() -> Self {
-        Self { min_content_chars: 250 }
+        Self {
+            min_content_chars: 250,
+            host_memory_ttl_secs: 7 * 24 * 3600,
+            host_penalty_persist_secs: 60,
+        }
     }
 }
 

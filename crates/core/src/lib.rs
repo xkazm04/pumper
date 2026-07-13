@@ -44,7 +44,7 @@ pub use storage::{
     Watch,
 };
 #[cfg(feature = "storage")]
-pub use tiers::TierMemory;
+pub use tiers::{HostProfile, TierMemory};
 
 pub use config::Config;
 pub use crawl::{crawl, CrawlConfig, CrawlPage, CrawlStats};

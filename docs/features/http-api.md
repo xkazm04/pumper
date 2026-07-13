@@ -18,6 +18,7 @@ Axum server (default port 8088, `[server]` config). **Local power mode: no auth,
 | Search | `GET /search?q=&limit=&app=&dataset=&fuzzy=` · `DELETE /search/docs` · `DELETE /search/datasets/{app}/{ds}` |
 | Saved searches | `GET /searches?limit=&cursor=` · `POST /searches` · `DELETE /searches/{id}` · `POST /searches/{id}/enabled` |
 | Events | `GET /events` (SSE all jobs) |
+| Hosts | `GET /hosts?limit=&cursor=` (learned tier memory + politeness per host) · `GET /hosts/{host}` (404 unknown) · `DELETE /hosts/{host}/memory` (reset strikes+pin+penalty; 404 unknown) |
 | Plugins | `GET /plugins` · `POST /plugins/reload` |
 
 Conventions: enable/disable is always `POST …/{id}/enabled {"enabled": bool}`; every list endpoint is dual-mode — without `cursor=` it returns its legacy shape (bare array or `{watches|triggers|searches|changes|revisions|deliveries: [...]}`, unbounded except where a legacy `limit` already applied), and with `cursor=` present (even empty, for page 1) it returns `{items, next_cursor}` and pages by keyset. Cursors are opaque `<stored-ts>|<tiebreak>` tokens (`next_cursor` is `null` on the last page); pass the previous response's `next_cursor` back as `cursor=`. The `changes`/`history` feeds page the full revision set — the legacy no-cursor shapes still clamp at 1000/500 rows, but `cursor=` reaches everything past that. Details of each area live in the sibling feature docs.
@@ -32,6 +33,14 @@ Conventions: enable/disable is always `POST …/{id}/enabled {"enabled": bool}`;
 All three send `content-disposition: attachment; filename="{ds}.{ext}"`.
 
 `GET /datasets/{app}/{ds}/duplicates` runs an in-memory O(n²) pairwise SimHash sweep, so it is bounded: datasets over **10,000 records** return `413 too_large` (the message carries the actual count and the cap) rather than pinning a core. Narrow the dataset or run the scan offline.
+
+## Host profiles (`/hosts`)
+
+Diagnostics over the tiered fetcher's learned per-host state (see [fetching.md](fetching.md)). Each host object: `host`, `preferred_tier` (`"browser"` when pinned, else `null`), `http_strikes`, `penalty_ms` (the **live** governor politeness penalty in ms — the stored snapshot is only for boot restore), `updated_at` (last tier-outcome change), `penalty_updated_at` (last penalty snapshot, or `null`).
+
+- `GET /hosts` — dual-mode list, most-recently-active first: no `cursor=` ⇒ `{hosts: [...]}`; `cursor=` present ⇒ `{items, next_cursor}` keyset-paged by `<updated_at>|<host>`.
+- `GET /hosts/{host}` — one host's profile; `404 not_found` when the host has no learned state. A host with only a live (not-yet-snapshotted) penalty is still returned.
+- `DELETE /hosts/{host}/memory` — resets the host: drops strikes + browser pin + persisted penalty **and** clears the live governor penalty; `{host, reset: true}` on success, `404 not_found` when unknown.
 
 ## Known gaps
 
