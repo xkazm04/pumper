@@ -87,6 +87,17 @@ pub struct WorkerConfig {
     /// finish before re-queuing whatever is still running (mirrors
     /// `recover_stuck`) and exiting.
     pub shutdown_drain_secs: u64,
+    /// How often (seconds) the worker stamps a liveness heartbeat on each running
+    /// job. The reaper uses the heartbeat to tell a slow-but-alive job from a
+    /// hung one, so a job that keeps `.await`-ing (however slow) is never reaped
+    /// while a task wedged in a non-yielding loop stops heartbeating and is.
+    /// `0` disables heartbeating.
+    pub heartbeat_secs: u64,
+    /// A running job whose last heartbeat is older than this (seconds) is treated
+    /// as hung and re-queued by the reaper with failure semantics (attempts +
+    /// backoff apply; an exhausted job fails permanently). Must exceed
+    /// `heartbeat_secs`. `0` disables the reaper.
+    pub stale_after_secs: u64,
     /// Priority-aging starvation guard: a queued job's *effective* priority rises
     /// by one level for every this-many seconds it has waited, so a low-priority
     /// job under a continuous high-priority stream eventually claims instead of
@@ -105,6 +116,11 @@ impl Default for WorkerConfig {
             app_concurrency: HashMap::new(),
             schedule_tick_secs: 15,
             shutdown_drain_secs: 25,
+            // Heartbeat every 30s; reap after 120s (4 missed beats) so a slow but
+            // alive job is never mistaken for a hung one, while a wedged task is
+            // recovered within a couple of minutes.
+            heartbeat_secs: 30,
+            stale_after_secs: 120,
             // +1 effective priority per 15 min waited: same-minute enqueues keep
             // their intended priority order, while a job starved behind a busy
             // higher-priority stream escalates past it within the hour rather

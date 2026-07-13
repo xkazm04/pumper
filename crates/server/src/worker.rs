@@ -180,12 +180,28 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     tokio::pin!(run);
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
-    // Race the app future against the wall-clock timeout and the cancel token.
-    let outcome = tokio::select! {
-        biased;
-        _ = cancel.cancelled() => Outcome::Cancelled,
-        _ = &mut sleep => Outcome::TimedOut,
-        res = &mut run => Outcome::Finished(res),
+    // Heartbeat interval: fires only while the app future yields (awaits). If the
+    // app wedges in a non-yielding loop this select can't reach the heartbeat
+    // branch, so the heartbeat goes stale and the reaper recovers the job — while
+    // a slow-but-alive job keeps beating and is never reaped.
+    let hb_secs = state.config.worker.heartbeat_secs;
+    let mut heartbeat = (hb_secs > 0).then(|| {
+        let mut i = tokio::time::interval(Duration::from_secs(hb_secs));
+        i.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        i
+    });
+    // Race the app future against the wall-clock timeout, the cancel token, and
+    // the heartbeat tick.
+    let outcome = loop {
+        tokio::select! {
+            biased;
+            _ = cancel.cancelled() => break Outcome::Cancelled,
+            _ = &mut sleep => break Outcome::TimedOut,
+            res = &mut run => break Outcome::Finished(res),
+            _ = maybe_tick(&mut heartbeat) => {
+                let _ = state.storage.heartbeat(job.id, job.attempts).await;
+            }
+        }
     };
 
     match outcome {
@@ -261,6 +277,49 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         }
     }
     finalize(&state, job.id).await;
+}
+
+/// Ticks the heartbeat interval when enabled, or waits forever when it isn't —
+/// so the heartbeat select branch simply never fires with heartbeating disabled.
+async fn maybe_tick(hb: &mut Option<tokio::time::Interval>) {
+    match hb {
+        Some(interval) => {
+            interval.tick().await;
+        }
+        None => std::future::pending::<()>().await,
+    }
+}
+
+/// One reaper pass: re-queues (or permanently fails) running jobs whose lease
+/// (heartbeat) has gone stale, then routes each outcome the same way the worker
+/// would have. Re-queued jobs wake the worker; permanently-failed ones go
+/// through `finalize` so their callback + terminal triggers fire like any other
+/// failure. Piggybacks the scheduler tick (`stale_after_secs == 0` disables it).
+pub async fn reap_once(state: &AppState) {
+    let stale = state.config.worker.stale_after_secs;
+    if stale == 0 {
+        return;
+    }
+    let reaped = match state.storage.reap_stale(stale as i64).await {
+        Ok(reaped) => reaped,
+        Err(e) => {
+            error!("stuck-job reaper failed: {e}");
+            return;
+        }
+    };
+    for (id, app, status) in reaped {
+        match status {
+            JobStatus::Queued => {
+                warn!(job = %id, %app, "reaped stale job: re-queued for another attempt");
+                publish(state, JobEvent::new(id, app, "queued"));
+                state.notify.notify_one();
+            }
+            _ => {
+                warn!(job = %id, %app, "reaped stale job: attempts exhausted, failing permanently");
+                finalize(state, id).await;
+            }
+        }
+    }
 }
 
 /// Everything this run wrote: revisions after the attempt's start. Fail-open

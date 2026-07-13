@@ -26,6 +26,10 @@ pub async fn run(state: AppState) {
         if let Err(e) = reconcile(&state).await {
             error!("scheduler reconcile failed: {e}");
         }
+        // Piggyback the scheduler tick to run the stuck-job reaper: re-queue
+        // running jobs whose heartbeat lease has gone stale (a hung task on a
+        // live server). Cheap — one indexed scan of `running` jobs.
+        crate::worker::reap_once(&state).await;
         // Stop enqueuing new scheduled work as soon as shutdown is signalled.
         tokio::select! {
             _ = state.shutdown.cancelled() => break,

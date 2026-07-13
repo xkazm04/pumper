@@ -198,7 +198,8 @@ impl Storage {
             "priority DESC, created_at".to_string()
         };
         let sql = format!(
-            "UPDATE jobs SET status = 'running', attempts = attempts + 1, started_at = ?1 \
+            "UPDATE jobs SET status = 'running', attempts = attempts + 1, started_at = ?1, \
+             heartbeat_at = ?1 \
              WHERE id = (SELECT id FROM jobs WHERE status = 'queued' AND available_at <= ?1{exclusion} \
                          ORDER BY {order} LIMIT 1) \
              RETURNING {JOB_COLUMNS}"
@@ -487,6 +488,50 @@ impl Storage {
                 .execute(&self.pool)
                 .await?;
         Ok(result.rows_affected())
+    }
+
+    /// Stamps a liveness heartbeat on a running job, guarded on `(status,
+    /// attempts)` so a stale task can't refresh a row it no longer owns. Returns
+    /// whether the write landed.
+    pub async fn heartbeat(&self, id: Uuid, attempt: i64) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE jobs SET heartbeat_at = ?2 \
+             WHERE id = ?1 AND status = 'running' AND attempts = ?3",
+        )
+        .bind(id.to_string())
+        .bind(now())
+        .bind(attempt)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// The stuck-job reaper: re-queues (or permanently fails) every running job
+    /// whose last heartbeat is older than `stale_secs`. Staleness is measured
+    /// from `heartbeat_at`, falling back to `started_at`/`created_at` for rows
+    /// predating the heartbeat column. Each stale job goes through `fail`, so a
+    /// hung lease is treated exactly like a failure — attempts and backoff apply,
+    /// and an attempts-exhausted job fails permanently. Returns `(id, app,
+    /// resulting status)` per reaped job. A job the worker completes between the
+    /// scan and the `fail` is skipped by the `(status, attempts)` fence.
+    pub async fn reap_stale(&self, stale_secs: i64) -> Result<Vec<(Uuid, String, JobStatus)>> {
+        let cutoff = ts(Utc::now() - chrono::Duration::seconds(stale_secs));
+        let sql = format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'running' \
+             AND COALESCE(heartbeat_at, started_at, created_at) < ?1"
+        );
+        let rows: Vec<JobRow> = sqlx::query_as(&sql).bind(&cutoff).fetch_all(&self.pool).await?;
+        let mut reaped = Vec::new();
+        for row in rows {
+            let job = Job::try_from(row)?;
+            if let Some(status) = self
+                .fail(job.id, job.attempts, "lease expired (heartbeat stale)")
+                .await?
+            {
+                reaped.push((job.id, job.app, status));
+            }
+        }
+        Ok(reaped)
     }
 
     // ---- Schedules --------------------------------------------------------

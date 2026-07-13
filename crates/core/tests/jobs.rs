@@ -223,3 +223,97 @@ async fn retry_bulk_requeues_filtered_batch() {
     drop(storage);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+/// Inserts a `running` job with an explicit heartbeat age (seconds ago).
+async fn insert_running(
+    pool: &SqlitePool,
+    app: &str,
+    attempts: i64,
+    max_attempts: i64,
+    heartbeat_secs_ago: i64,
+) -> Uuid {
+    let id = Uuid::new_v4();
+    let now = Utc::now();
+    let started = (now - Duration::seconds(heartbeat_secs_ago + 1))
+        .to_rfc3339_opts(SecondsFormat::Micros, true);
+    let hb = (now - Duration::seconds(heartbeat_secs_ago)).to_rfc3339_opts(SecondsFormat::Micros, true);
+    sqlx::query(
+        "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
+         created_at, available_at, started_at, heartbeat_at) \
+         VALUES (?1, ?2, '{}', 'running', ?3, ?4, 0, ?5, ?5, ?5, ?6)",
+    )
+    .bind(id.to_string())
+    .bind(app)
+    .bind(attempts)
+    .bind(max_attempts)
+    .bind(&started)
+    .bind(&hb)
+    .execute(pool)
+    .await
+    .expect("insert running job");
+    id
+}
+
+#[tokio::test]
+async fn reaper_requeues_stale_but_leaves_fresh_running_jobs() {
+    let (storage, dir) = fresh_db("reap").await;
+    let pool = storage.pool();
+
+    // Hung: last heartbeat 300s ago, attempts remain -> re-queued.
+    let stale = insert_running(&pool, "a", 1, 3, 300).await;
+    // Slow-but-alive: heartbeat 5s ago -> never reaped.
+    let fresh = insert_running(&pool, "a", 1, 3, 5).await;
+
+    let reaped = storage.reap_stale(120).await.unwrap();
+    assert_eq!(reaped.len(), 1, "only the stale job is reaped");
+    assert_eq!(reaped[0].0, stale);
+    assert_eq!(reaped[0].2, JobStatus::Queued);
+
+    assert_eq!(storage.get(stale).await.unwrap().unwrap().status, JobStatus::Queued);
+    assert_eq!(
+        storage.get(fresh).await.unwrap().unwrap().status,
+        JobStatus::Running,
+        "a slow-but-alive job must survive the reaper"
+    );
+
+    drop(storage);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn reaper_fails_permanently_when_attempts_exhausted() {
+    let (storage, dir) = fresh_db("reap-exhausted").await;
+    let pool = storage.pool();
+
+    // Stale AND out of attempts (attempts == max) -> permanent failure.
+    let stale = insert_running(&pool, "a", 3, 3, 300).await;
+    let reaped = storage.reap_stale(120).await.unwrap();
+    assert_eq!(reaped.len(), 1);
+    assert_eq!(reaped[0].2, JobStatus::Failed);
+
+    let job = storage.get(stale).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Failed);
+    assert!(job.error.unwrap().contains("lease expired"));
+
+    drop(storage);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn heartbeat_refresh_keeps_a_job_off_the_reaper() {
+    let (storage, dir) = fresh_db("heartbeat").await;
+    let pool = storage.pool();
+
+    let running = insert_running(&pool, "a", 1, 1, 300).await;
+    // Before the beat it would be reaped; the beat refreshes the lease.
+    assert!(storage.heartbeat(running, 1).await.unwrap());
+    assert!(
+        storage.reap_stale(120).await.unwrap().is_empty(),
+        "a freshly-heartbeated job is not stale"
+    );
+    // Attempt-guarded: a stale task can't refresh a row it no longer owns.
+    assert!(!storage.heartbeat(running, 2).await.unwrap());
+
+    drop(storage);
+    std::fs::remove_dir_all(&dir).ok();
+}
