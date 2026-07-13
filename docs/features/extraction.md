@@ -14,6 +14,30 @@ A `RuleSet` maps output fields to rules, compiled once and run over document bat
 
 Exposed via the `extractor` app: fetch a URL (tiered) and apply a params-supplied rule set.
 
+## Extraction quality report
+
+Every field extraction carries a **status** so a broken selector no longer collapses into the same silent `Null` as a genuinely absent field:
+
+- `matched` — the rule ran and produced a non-empty value.
+- `empty` — the rule ran but produced nothing (`null`, empty string, or empty array): the field is absent in this document, not mis-configured.
+- `error` — the rule could not run because the document was the wrong format (a `json` rule over a non-JSON body, or an `xpath` rule over unparseable HTML), with a `detail` string.
+
+Status reflects the **rule match, before transforms** — it answers "did the selector find anything?" independent of downstream coercion. API (`extract.rs`):
+
+- `extract_one_with_report(rules, doc) -> (Value, DocReport)`
+- `extract_batch_with_report(rules, docs) -> Vec<(Value, DocReport)>`
+
+`DocReport` is a serde-transparent map `{ field -> {status, detail?} }` (`FieldStatus` is a `status`-tagged enum). Both are serde-stable for downstream serialization.
+
+### `extractor` result shape
+
+The `extractor` app skips fetch failures instead of upserting all-null records, and reports aggregate quality:
+
+- `fetched` / `skipped` — docs that fetched vs. were dropped; `failed` lists the skipped URLs.
+- `fields_matched` / `fields_total` — matched extractions over total attempted across all kept docs.
+- `worst_fields` — fields that missed at least once, worst first: `{field, misses, errors, miss_rate}` (a miss is an `empty` or `error` status; `miss_rate` is misses ÷ docs).
+- `mode` — `"urls"` (see the crawl→extract seam below for `"source"`).
+
 ## HTML → Markdown
 
 `pumper_core::html_to_markdown` — boilerplate-skipping converter used by the fetcher (`to_markdown`), `readable`/`watch` apps, and SEDIA clean-text enrichment.

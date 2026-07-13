@@ -53,7 +53,10 @@ pub use crawl::{
     ProgressFn, RevisitSeed,
 };
 pub use simhash::{hamming, simhash, simhash_value};
-pub use extract::{extract_batch, extract_one, CompiledRuleSet, FieldRule, Rule, RuleSet, Transform};
+pub use extract::{
+    extract_batch, extract_batch_with_report, extract_one, extract_one_with_report,
+    CompiledRuleSet, DocReport, FieldRule, FieldStatus, Rule, RuleSet, Transform,
+};
 pub use engine::{
     Browser, EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, RenderRequest,
     RenderedPage, Researcher, ResearchOutput, ResearchRequest,

@@ -270,10 +270,63 @@ impl CompiledRuleSet {
     }
 }
 
+/// Per-field extraction outcome — the quality signal that separates a broken
+/// selector's silent `Null` from a field that is genuinely absent. `serde`-stable
+/// (a `status` tag): consumers (e.g. the extractor's aggregate result and the
+/// preview endpoint) serialize this directly.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum FieldStatus {
+    /// The rule ran and produced a non-empty value.
+    Matched,
+    /// The rule ran but produced nothing (`null`, empty string, or empty
+    /// array) — the field is absent in this document, not mis-configured.
+    Empty,
+    /// The rule could not run: the document was not in the format the rule
+    /// needs (e.g. a `json` rule over a body that is not JSON, or an `xpath`
+    /// rule over unparseable HTML). Distinguishes a bad input from a real miss.
+    Error { detail: String },
+}
+
+impl FieldStatus {
+    /// Classifies a rule's raw (pre-transform) output. `ran` is false when the
+    /// rule's required parse failed, so the rule never actually evaluated.
+    fn classify(ran: bool, raw: &Value, detail: &str) -> FieldStatus {
+        if !ran {
+            return FieldStatus::Error { detail: detail.to_string() };
+        }
+        match raw {
+            Value::Null => FieldStatus::Empty,
+            Value::String(s) if s.trim().is_empty() => FieldStatus::Empty,
+            Value::Array(a) if a.is_empty() => FieldStatus::Empty,
+            _ => FieldStatus::Matched,
+        }
+    }
+}
+
+/// Per-document field-status map — the report companion to an extracted record.
+/// Status reflects the rule match (before transforms), so it answers "did the
+/// selector find anything?" independent of downstream coercion.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct DocReport {
+    pub fields: BTreeMap<String, FieldStatus>,
+}
+
 /// Extracts one document into a JSON object. HTML is parsed at most once (only
 /// if any CSS rule needs it); the JSON body is parsed at most once with
 /// simd-json (only if any JSON rule needs it).
 pub fn extract_one(rules: &CompiledRuleSet, doc: &str) -> Value {
+    extract_one_impl(rules, doc, false).0
+}
+
+/// Like [`extract_one`] but also returns a per-field [`DocReport`] classifying
+/// each field as matched / empty / error.
+pub fn extract_one_with_report(rules: &CompiledRuleSet, doc: &str) -> (Value, DocReport) {
+    extract_one_impl(rules, doc, true)
+}
+
+fn extract_one_impl(rules: &CompiledRuleSet, doc: &str, want_report: bool) -> (Value, DocReport) {
     let html = rules.needs_html().then(|| Html::parse_document(doc));
     let json = if rules.needs_json() {
         let mut bytes = doc.as_bytes().to_vec();
@@ -288,37 +341,54 @@ pub fn extract_one(rules: &CompiledRuleSet, doc: &str) -> Value {
     };
 
     let mut obj = Map::with_capacity(rules.fields.len());
+    let mut report = DocReport::default();
     for (name, rule, transforms) in &rules.fields {
-        let mut value = match rule {
+        // (raw value, whether the rule's required parse was available, error detail)
+        let (mut value, ran, detail): (Value, bool, &str) = match rule {
             CompiledRule::Css { selector, attr, all } => {
-                css_extract(html.as_ref().unwrap(), selector, attr.as_deref(), *all)
+                (css_extract(html.as_ref().unwrap(), selector, attr.as_deref(), *all), true, "")
             }
-            CompiledRule::Regex { re, group } => re
-                .captures(doc)
-                .and_then(|c| c.get(*group))
-                .map(|m| Value::String(m.as_str().to_string()))
-                .unwrap_or(Value::Null),
-            CompiledRule::Json { pointer } => json
-                .as_ref()
-                .and_then(|j| j.pointer(pointer).cloned())
-                .unwrap_or(Value::Null),
-            CompiledRule::Xpath { xpath, all } => xpath_tree
-                .as_ref()
-                .map(|tree| xpath_extract(tree, xpath, *all))
-                .unwrap_or(Value::Null),
-            CompiledRule::Const { value } => value.clone(),
+            CompiledRule::Regex { re, group } => (
+                re.captures(doc)
+                    .and_then(|c| c.get(*group))
+                    .map(|m| Value::String(m.as_str().to_string()))
+                    .unwrap_or(Value::Null),
+                true,
+                "",
+            ),
+            CompiledRule::Json { pointer } => match json.as_ref() {
+                Some(j) => (j.pointer(pointer).cloned().unwrap_or(Value::Null), true, ""),
+                None => (Value::Null, false, "body did not parse as JSON"),
+            },
+            CompiledRule::Xpath { xpath, all } => match xpath_tree.as_ref() {
+                Some(tree) => (xpath_extract(tree, xpath, *all), true, ""),
+                None => (Value::Null, false, "document did not parse as HTML for xpath"),
+            },
+            CompiledRule::Const { value } => (value.clone(), true, ""),
         };
+        if want_report {
+            report.fields.insert(name.clone(), FieldStatus::classify(ran, &value, detail));
+        }
         for t in transforms {
             value = t.apply(value);
         }
         obj.insert(name.clone(), value);
     }
-    Value::Object(obj)
+    (Value::Object(obj), report)
 }
 
 /// Extracts a whole batch in parallel across all cores.
 pub fn extract_batch(rules: &CompiledRuleSet, docs: &[String]) -> Vec<Value> {
     docs.par_iter().map(|doc| extract_one(rules, doc)).collect()
+}
+
+/// Extracts a whole batch in parallel, pairing each record with its
+/// [`DocReport`]. Same ordering guarantees as [`extract_batch`].
+pub fn extract_batch_with_report(
+    rules: &CompiledRuleSet,
+    docs: &[String],
+) -> Vec<(Value, DocReport)> {
+    docs.par_iter().map(|doc| extract_one_with_report(rules, doc)).collect()
 }
 
 fn xpath_extract(
@@ -461,6 +531,56 @@ mod tests {
         assert_eq!(out["year"], json!(2026));
         assert_eq!(out["missing"], json!("n/a"));
         assert_eq!(out["active"], json!(true));
+    }
+
+    #[test]
+    fn report_statuses_per_rule_type() {
+        use super::{extract_one_with_report, FieldStatus};
+        let rules = ruleset(json!({
+            "title":   {"type": "css", "selector": "h1"},        // matched
+            "missing": {"type": "css", "selector": ".nope"},     // empty (absent)
+            "blank":   {"type": "css", "selector": ".empty"},    // empty (whitespace only)
+            "items":   {"type": "css", "selector": "li", "all": true}, // empty array
+            "price":   {"type": "regex", "pattern": "\\$([0-9]+)", "group": 1}, // matched
+            "noprice": {"type": "regex", "pattern": "€([0-9]+)", "group": 1},   // empty
+            "name":    {"type": "json", "pointer": "/name"},     // error: body isn't JSON
+            "lit":     {"type": "const", "value": "x"}           // matched
+        }));
+        let doc = r#"<h1>Hi</h1><span class="empty">   </span> costs $42"#.to_string();
+        let (values, report) = extract_one_with_report(&rules, &doc);
+        assert_eq!(report.fields["title"], FieldStatus::Matched);
+        assert_eq!(report.fields["missing"], FieldStatus::Empty);
+        assert_eq!(report.fields["blank"], FieldStatus::Empty);
+        assert_eq!(report.fields["items"], FieldStatus::Empty);
+        assert_eq!(report.fields["price"], FieldStatus::Matched);
+        assert_eq!(report.fields["noprice"], FieldStatus::Empty);
+        assert!(matches!(report.fields["name"], FieldStatus::Error { .. }));
+        assert_eq!(report.fields["lit"], FieldStatus::Matched);
+        // The value map still carries the extracted record alongside the report.
+        assert_eq!(values["title"], json!("Hi"));
+
+        // serde round-trips the tagged status enum (preview endpoint depends on it).
+        let wire = serde_json::to_value(&report).unwrap();
+        assert_eq!(wire["title"], json!({"status": "matched"}));
+        assert_eq!(wire["name"]["status"], json!("error"));
+        assert!(wire["name"]["detail"].is_string());
+    }
+
+    #[test]
+    fn report_error_vs_empty_for_json() {
+        use super::{extract_one_with_report, FieldStatus};
+        let rules = ruleset(json!({
+            "present": {"type": "json", "pointer": "/a"},
+            "absent":  {"type": "json", "pointer": "/missing"}
+        }));
+        // Valid JSON body: present matches, absent is a real miss (Empty, not Error).
+        let (_, ok) = extract_one_with_report(&rules, &r#"{"a": 1}"#.to_string());
+        assert_eq!(ok.fields["present"], FieldStatus::Matched);
+        assert_eq!(ok.fields["absent"], FieldStatus::Empty);
+        // Non-JSON body: every json field is Error (bad input), not a silent miss.
+        let (_, bad) = extract_one_with_report(&rules, &"<html>not json</html>".to_string());
+        assert!(matches!(bad.fields["present"], FieldStatus::Error { .. }));
+        assert!(matches!(bad.fields["absent"], FieldStatus::Error { .. }));
     }
 
     #[test]
