@@ -44,6 +44,15 @@ impl HttpEngine {
         for (key, value) in &req.headers {
             builder = builder.header(key, value);
         }
+        // Conditional GET validators for incremental recrawl. Explicit headers in
+        // `req.headers` win (inserted first, above) — these only add the standard
+        // revalidation headers when the caller supplied a stored validator.
+        if let Some(etag) = &req.etag {
+            builder = builder.header("if-none-match", etag);
+        }
+        if let Some(since) = &req.if_modified_since {
+            builder = builder.header("if-modified-since", since);
+        }
         if let Some(body) = &req.body {
             builder = builder.body(body.clone());
         }
@@ -167,7 +176,13 @@ impl HttpClient for HttpEngine {
 
         let response = self.send(&req).await?;
 
+        // A 304 Not Modified is a revalidation signal, not content — its (empty)
+        // body must never overwrite a cached full response. Pass the status
+        // through untouched so conditional-GET callers can act on it.
         if let Some(key) = &cache_key {
+            if response.status == 304 {
+                return Ok(response);
+            }
             let ttl = req
                 .ttl_override
                 .map(Duration::from_secs)

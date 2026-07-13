@@ -186,5 +186,7 @@ fn post_json(url: &str, body: String) -> HttpRequest {
         body: Some(body),
         no_cache: false,
         ttl_override: None,
+        etag: None,
+        if_modified_since: None,
     }
 }

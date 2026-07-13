@@ -36,6 +36,18 @@ pub struct HttpRequest {
     /// (it shapes freshness, not the answer) and ignored when uncacheable.
     #[serde(default)]
     pub ttl_override: Option<u64>,
+    /// Conditional GET validator: sent as `If-None-Match` so the origin can
+    /// answer `304 Not Modified` (empty body) when the resource is unchanged.
+    /// Powers incremental recrawl / change-monitoring. Usually paired with
+    /// `no_cache` so the request actually revalidates instead of being served
+    /// from the local TTL cache.
+    #[serde(default)]
+    pub etag: Option<String>,
+    /// Conditional GET validator: sent as `If-Modified-Since` (an HTTP-date
+    /// string, typically the origin's prior `Last-Modified`). Same 304 contract
+    /// as `etag`.
+    #[serde(default)]
+    pub if_modified_since: Option<String>,
 }
 
 impl HttpRequest {
@@ -47,6 +59,8 @@ impl HttpRequest {
             body: None,
             no_cache: false,
             ttl_override: None,
+            etag: None,
+            if_modified_since: None,
         }
     }
 }
@@ -177,4 +191,26 @@ pub struct EngineSet {
     pub claude: Arc<dyn Researcher>,
     /// Tiered fetcher that picks/escalates engines automatically.
     pub fetch: crate::fetcher::Fetcher,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn http_request_conditional_validators_are_serde_defaulted() {
+        // Older payloads (and the common case) omit the conditional fields.
+        let req: HttpRequest = serde_json::from_str(r#"{"url":"https://x/"}"#).unwrap();
+        assert!(req.etag.is_none());
+        assert!(req.if_modified_since.is_none());
+        // When present they round-trip.
+        let req2: HttpRequest = serde_json::from_str(
+            r#"{"url":"https://x/","etag":"\"abc\"","if_modified_since":"Wed, 21 Oct 2025 07:28:00 GMT"}"#,
+        )
+        .unwrap();
+        assert_eq!(req2.etag.as_deref(), Some("\"abc\""));
+        assert_eq!(req2.if_modified_since.as_deref(), Some("Wed, 21 Oct 2025 07:28:00 GMT"));
+        // The convenience constructor leaves them unset.
+        assert!(HttpRequest::get("https://x/").etag.is_none());
+    }
 }

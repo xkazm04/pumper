@@ -4,7 +4,7 @@ High-concurrency frontier crawler (`crawl()` in core; exposed as the `crawl` app
 
 ## CrawlConfig (app params)
 
-`seeds` (required), `max_pages` (50), `max_depth` (2), `concurrency` (16), `same_domain` (true), `dedup_distance` (3, 0 disables), `respect_robots` (true), `include_patterns` / `exclude_patterns` (regex; include = any-must-match, exclude drops after; **seeds exempt**), `sitemap_seeds` (false), `checkpoint` (name string → resumable frontier).
+`seeds` (required unless `mode:"revisit"`), `max_pages` (50), `max_depth` (2), `concurrency` (16), `same_domain` (true), `dedup_distance` (3, 0 disables), `respect_robots` (true), `include_patterns` / `exclude_patterns` (regex; include = any-must-match, exclude drops after; **seeds exempt**), `sitemap_seeds` (false), `checkpoint` (name string → resumable frontier), `mode` (`"revisit"` → incremental recrawl, see below), `discover` (false; revisit-only link-following opt-in).
 
 ## Behaviors
 
@@ -21,15 +21,28 @@ High-concurrency frontier crawler (`crawl()` in core; exposed as the `crawl` app
 
 Every **kept** page is upserted into the crawl app's `pages` dataset as it is crawled (streamed in batches of 50 via a sink seam — `upsert_many`, **partial-batch semantics, never `sync_many`**: a crawl is a partial view, so absent URLs are never marked removed). Record **key = canonical URL**; the value is a compact fingerprint, never the body:
 
-`url, title` (extracted from `<title>`), `status, content_chars` (visible-text char count, script/style excluded), `simhash, excerpt` (first ~300 text chars), `artifact_path` (the `page-NNNN.html` basename under the job's artifacts dir), `depth, job_id`.
+`url, title` (extracted from `<title>`), `status, content_chars` (visible-text char count, script/style excluded), `simhash, excerpt` (first ~300 text chars), `artifact_path` (the `page-NNNN.html` basename under the job's artifacts dir), `depth, job_id`, and `etag` / `last_modified` (response validators captured from every fetch, so a later revisit can send conditional GETs). A revisit that finds a page gone rewrites its record to `{url, status, gone: true, job_id}` (see below).
 
 This makes crawled pages queryable/diffable and lets **dataset triggers + watches fire per-page** through the normal dataset-change path (`fire_dataset_triggers` / watch notifications run off the run's revisions). Note: the full-text **search indexer** is result-key based (`records`/`stories`/`items`), so dataset records are not auto-indexed into search — that path is unchanged here.
 
+## Incremental recrawl — site-change sentinel (`mode: "revisit"`)
+
+Instead of crawling from scratch, a **revisit** run seeds the frontier from the existing live `pages` records (up to 10,000 per run, via a read-side `PageSource` seam mirroring the `PageSink`) and re-checks each with a **conditional GET** using the stored `etag` / `last_modified`:
+
+- **`304 Not Modified`** → counted `unchanged_304`, cheap: the body is never downloaded or re-fingerprinted.
+- **changed body (`200`)** → re-fingerprinted, body re-written, record upserted (a `changed` revision) with the fresh validators.
+- **`404` / `410`** → the record is flagged **`gone: true`** via an explicit per-key upsert. This is a deliberate choice over `sync_many` snapshot-removal: a revisit is a *partial* view (bounded seed set), so blanket "absent ⇒ removed" would be wrong. The gone upsert is a normal `changed` revision, so dataset triggers/watches fire on it. Already-gone and already-removed records are skipped as seeds so a sentinel doesn't keep re-probing dead URLs.
+
+Revisit does **not** follow links (no frontier expansion) unless `discover: true`. Conditional requests set `no_cache` so they revalidate against the origin instead of being served from the local TTL cache; a `304` passes through the http engine untouched and is never cached over the prior full response.
+
+**Sentinel recipe:** schedule a revisit crawl (`POST /schedules {app:"crawl", cron, params:{mode:"revisit"}}`) after an initial full crawl has populated `pages`; add a dataset **watch** or **trigger** on the crawl app's `pages` dataset (`on_change: "changed"`) to get a webhook / chained job whenever a monitored page's content changes or goes gone. The `changed`/`gone` counts in the result summarize each sweep.
+
 ## Result stats
 
-`crawled, kept, skipped_duplicates, skipped_robots, skipped_filtered, sitemap_seeded, failed, failed_by_host{}, skipped_botwall, robots_fetch_failures, checkpoint_errors, resumed, checkpoint_reset, hosts, frontier_remaining`, plus the `pages` dataset pointer + write outcome `pages_dataset, pages_new, pages_changed, pages_unchanged`. Per-page detail is queried from the `pages` dataset, not returned inline (memory-bounded).
+`crawled, kept, skipped_duplicates, skipped_robots, skipped_filtered, sitemap_seeded, failed, failed_by_host{}, skipped_botwall, robots_fetch_failures, checkpoint_errors, resumed, checkpoint_reset, hosts, frontier_remaining`, plus the `pages` dataset pointer + write outcome `pages_dataset, pages_new, pages_changed, pages_unchanged`. Revisit mode adds `revisit, revisited, unchanged_304, changed, gone, new` (`changed`/`new` mirror the live `pages_changed`/`pages_new`). Per-page detail is queried from the `pages` dataset, not returned inline (memory-bounded).
 
 ## Known gaps
 
 - Crawl-delay gates dispatch; same-host in-flight fetches dispatched earlier can still cluster (the engine-level governor softens this). Frontier capped at 100k seen URLs. No JS rendering in the crawl loop (http engine only).
+- Revisit seeds are capped at 10k live `pages` records per run and `max_pages` still caps re-fingerprinted (changed/new) pages, so a very large monitored set is swept across multiple runs, not all at once. Conditional-GET support depends on the origin sending `ETag`/`Last-Modified`; origins that send neither are always re-fetched in full (still diffed by simhash, just not cheaply).
 - Dataset records are not fed to the full-text search index (indexer explodes result keys, not dataset rows).

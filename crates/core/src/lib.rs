@@ -48,7 +48,8 @@ pub use tiers::{HostProfile, TierMemory};
 
 pub use config::Config;
 pub use crawl::{
-    crawl, CrawlConfig, CrawlPageRecord, CrawlProgressSnapshot, CrawlStats, PageSink, ProgressFn,
+    crawl, CrawlConfig, CrawlPageRecord, CrawlProgressSnapshot, CrawlStats, PageSink, PageSource,
+    ProgressFn, RevisitSeed,
 };
 pub use simhash::{hamming, simhash, simhash_value};
 pub use extract::{extract_batch, extract_one, CompiledRuleSet, FieldRule, Rule, RuleSet, Transform};

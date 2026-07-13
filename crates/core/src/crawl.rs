@@ -59,6 +59,36 @@ pub struct CrawlPageRecord {
     /// (`page-NNNN.html`), or empty when bodies aren't being written.
     pub artifact_path: String,
     pub depth: u32,
+    /// Response `ETag`, when the origin sent one — stored so a later revisit can
+    /// send `If-None-Match` and get a cheap `304`.
+    pub etag: Option<String>,
+    /// Response `Last-Modified`, when present — the `If-Modified-Since` validator
+    /// for a later revisit.
+    pub last_modified: Option<String>,
+    /// Set on a revisit when the page returned `404`/`410` — a removal signal.
+    /// Normal kept pages carry `false`. Gone markers carry only `url`, `status`
+    /// and this flag; the rest is empty.
+    pub gone: bool,
+}
+
+/// One existing page handed back by a [`PageSource`] to seed a revisit: the
+/// canonical URL plus whatever conditional-GET validators were stored last time.
+#[derive(Debug, Clone)]
+pub struct RevisitSeed {
+    pub url: String,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
+
+/// Reads existing page records to seed an incremental recrawl. The app layer
+/// implements this over `ctx.datasets` (the `pages` dataset written by
+/// [`PageSink`]); core stays storage-agnostic — the read-side mirror of the
+/// write-side `PageSink`. Implementations must not fail the crawl — return an
+/// empty vec and log on error.
+#[async_trait]
+pub trait PageSource: Send {
+    /// Existing pages to revisit (canonical URL + stored validators).
+    async fn seeds(&self) -> Vec<RevisitSeed>;
 }
 
 /// A streaming consumer of KEPT-page fingerprints, called in batches during the
@@ -93,6 +123,17 @@ pub struct CrawlConfig {
     /// periodically and at the end — so an interrupted or page-capped crawl
     /// resumes where it left off instead of refetching everything.
     pub checkpoint: Option<PathBuf>,
+    /// Incremental recrawl / site-change sentinel mode. When true the frontier is
+    /// seeded from existing `pages` records (via the [`PageSource`] seam) and each
+    /// known page is fetched with a conditional GET using its stored
+    /// `etag`/`last_modified`: a `304` is counted `unchanged_304` (cheap, not
+    /// re-fingerprinted), a changed body is re-fingerprinted + upserted, and a
+    /// `404`/`410` flags the page `gone`. Does NOT follow links unless `discover`.
+    pub revisit: bool,
+    /// In revisit mode, opt in to link-following (expand the frontier with newly
+    /// discovered URLs). Ignored outside revisit mode (normal crawls always
+    /// follow links within the depth budget).
+    pub discover: bool,
 }
 
 /// Compiled include/exclude filter.
@@ -150,6 +191,25 @@ pub type ProgressFn = Arc<dyn Fn(&CrawlProgressSnapshot) + Send + Sync>;
 /// throttles the actual persist/emit, so a tight stride here is cheap.
 const PROGRESS_STRIDE: usize = 20;
 
+/// A minimal removal marker for a page a revisit found `404`/`410`. Carries only
+/// `url`, `status` and `gone: true`; the app upserts it so the record flips to a
+/// `gone` state (a changed revision that triggers/watches fire on).
+fn gone_record(url: String, status: u16) -> CrawlPageRecord {
+    CrawlPageRecord {
+        url,
+        title: None,
+        status,
+        content_chars: 0,
+        simhash: 0,
+        excerpt: String::new(),
+        artifact_path: String::new(),
+        depth: 0,
+        etag: None,
+        last_modified: None,
+        gone: true,
+    }
+}
+
 fn emit_progress(progress: &Option<ProgressFn>, stats: &CrawlStats, frontier: usize, hosts: usize) {
     if let Some(cb) = progress {
         cb(&CrawlProgressSnapshot {
@@ -192,6 +252,13 @@ pub struct CrawlStats {
     pub checkpoint_reset: bool,
     pub hosts: usize,
     pub frontier_remaining: usize,
+    /// Revisit mode: known pages fetched with a conditional GET (200 + 304 + gone).
+    pub revisited: usize,
+    /// Revisit mode: conditional GETs answered `304 Not Modified` (unchanged,
+    /// not re-fingerprinted).
+    pub unchanged_304: usize,
+    /// Revisit mode: known pages that returned `404`/`410` and were flagged gone.
+    pub gone: usize,
 }
 
 /// Bounded, deduplicated URL queue.
@@ -306,6 +373,10 @@ struct Fetched {
     title: Option<String>,
     content_chars: usize,
     excerpt: String,
+    /// Response `ETag` / `Last-Modified` (case-insensitive header lookup),
+    /// stored into the page record so a later revisit can revalidate.
+    etag: Option<String>,
+    last_modified: Option<String>,
 }
 
 /// Crawls from the seeds, writing kept page bodies under `output_dir` (if set).
@@ -318,11 +389,16 @@ pub async fn crawl(
     cfg: CrawlConfig,
     output_dir: Option<PathBuf>,
     mut sink: Option<Box<dyn PageSink>>,
+    source: Option<Box<dyn PageSource>>,
     progress: Option<ProgressFn>,
 ) -> Result<CrawlStats> {
     let concurrency = cfg.concurrency.clamp(1, 256);
     // Buffer of kept-page fingerprints awaiting the next batched sink flush.
     let mut sink_buf: Vec<CrawlPageRecord> = Vec::new();
+    // Revisit: per-known-URL stored validators (etag, last_modified). Presence in
+    // this map marks a URL as "known" — it gets a conditional GET and 304/gone
+    // handling; discovered URLs are absent and fetched normally.
+    let mut conditional: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
     let filter = UrlFilter::compile(&cfg)?;
     let mut frontier = Frontier::new();
     let mut dedup_index = SimHashIndex::new(cfg.dedup_distance);
@@ -358,6 +434,20 @@ pub async fn crawl(
             seed_hosts.insert(host);
         }
         frontier.push(canonicalize_str(seed), 0);
+    }
+    // Revisit: seed the frontier from existing page records and remember each
+    // one's stored validators for the conditional GET.
+    if cfg.revisit {
+        if let Some(source) = source {
+            for seed in source.seeds().await {
+                let url = canonicalize_str(&seed.url);
+                if let Some(host) = host_of(&url) {
+                    seed_hosts.insert(host);
+                }
+                conditional.insert(url.clone(), (seed.etag, seed.last_modified));
+                frontier.push(url, 0);
+            }
+        }
     }
     if let Some(dir) = &output_dir {
         if let Err(e) = tokio::fs::create_dir_all(dir).await {
@@ -423,7 +513,9 @@ pub async fn crawl(
             hosts.insert(host);
             let http = http.clone();
             let same_domain = cfg.same_domain;
-            in_flight.push(async move { fetch_one(http, url, depth, same_domain).await });
+            // A known page (in `conditional`) gets a revalidating conditional GET.
+            let cond = if cfg.revisit { conditional.get(&url).cloned() } else { None };
+            in_flight.push(async move { fetch_one(http, url, depth, same_domain, cond).await });
         }
 
         if in_flight.is_empty() {
@@ -452,8 +544,37 @@ pub async fn crawl(
                 tracing::debug!(url = %url, reason = %reason, "crawl: skipped bot-wall");
                 continue;
             }
+            CrawlFetch::NotModified(url) => {
+                // Cheap unchanged: no body downloaded, not re-fingerprinted.
+                stats.revisited += 1;
+                stats.unchanged_304 += 1;
+                tracing::debug!(url = %url, "crawl: 304 unchanged");
+                continue;
+            }
+            CrawlFetch::Gone(url, status) => {
+                stats.revisited += 1;
+                stats.gone += 1;
+                tracing::debug!(url = %url, status, "crawl: page gone");
+                // Emit a gone marker through the sink so the dataset reflects the
+                // removal (explicit per-key `gone` field, NOT a sync_many snapshot
+                // removal — a revisit is a partial view).
+                if sink.is_some() {
+                    sink_buf.push(gone_record(url, status));
+                    if sink_buf.len() >= PAGE_SINK_STRIDE {
+                        if let Some(s) = sink.as_mut() {
+                            s.emit(std::mem::take(&mut sink_buf)).await;
+                        }
+                    }
+                }
+                continue;
+            }
         };
         stats.crawled += 1;
+        // A known page fetched with a conditional GET that came back 200 (or a
+        // discovered link is absent from `conditional`): count the revisit.
+        if cfg.revisit && conditional.contains_key(&fetched.url) {
+            stats.revisited += 1;
+        }
 
         let hash = simhash(&fetched.body);
         let duplicate = cfg.dedup_distance > 0 && dedup_index.is_near_dup(hash);
@@ -485,6 +606,9 @@ pub async fn crawl(
                         String::new()
                     },
                     depth: fetched.depth,
+                    etag: fetched.etag.clone(),
+                    last_modified: fetched.last_modified.clone(),
+                    gone: false,
                 });
                 if sink_buf.len() >= PAGE_SINK_STRIDE {
                     if let Some(s) = sink.as_mut() {
@@ -500,8 +624,11 @@ pub async fn crawl(
                     }
                 }
             }
-            // Enqueue newly discovered links within the depth budget.
-            if fetched.depth < cfg.max_depth {
+            // Enqueue newly discovered links within the depth budget. Revisit
+            // mode does NOT follow links unless `discover` is set — a sentinel
+            // recrawl re-checks the known set, it doesn't expand it.
+            let expand = !cfg.revisit || cfg.discover;
+            if expand && fetched.depth < cfg.max_depth {
                 for link in &fetched.links {
                     if !filter.allows(link) {
                         stats.skipped_filtered += 1;
@@ -656,6 +783,21 @@ enum CrawlFetch {
     /// Classified as a bot-wall / challenge (see `fetcher::http_bot_wall`) — not
     /// stored as content. Carries the URL and the classification reason.
     BotWall(String, String),
+    /// Revisit only: a conditional GET answered `304 Not Modified` — the page is
+    /// unchanged and was not re-downloaded/re-fingerprinted.
+    NotModified(String),
+    /// Revisit only: a known page returned `404`/`410` — flag it gone. Carries
+    /// the URL and the status.
+    Gone(String, u16),
+}
+
+/// Case-insensitive header lookup returning a non-empty value.
+fn header_value(headers: &HashMap<String, String>, name: &str) -> Option<String> {
+    headers
+        .iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case(name))
+        .map(|(_, v)| v.clone())
+        .filter(|v| !v.is_empty())
 }
 
 async fn fetch_one(
@@ -663,16 +805,39 @@ async fn fetch_one(
     url: String,
     depth: u32,
     same_domain: bool,
+    // `Some` ⇒ this is a revisit of a KNOWN page: send its stored validators as a
+    // conditional GET (bypassing the TTL cache so it actually revalidates) and
+    // resolve `304`/`404`/`410` specially. `None` ⇒ a normal full fetch.
+    conditional: Option<(Option<String>, Option<String>)>,
 ) -> CrawlFetch {
-    let resp = match http.fetch(HttpRequest::get(&url)).await {
+    let mut req = HttpRequest::get(&url);
+    if let Some((etag, last_modified)) = &conditional {
+        // Force a network revalidation; the TTL cache would otherwise serve a
+        // 200 and defeat the whole point of the conditional GET.
+        req.no_cache = true;
+        req.etag = etag.clone();
+        req.if_modified_since = last_modified.clone();
+    }
+    let resp = match http.fetch(req).await {
         Ok(resp) => resp,
         Err(_) => return CrawlFetch::Failed(url),
     };
+    // Known-page revisit outcomes take priority over content parsing.
+    if conditional.is_some() {
+        if resp.status == 304 {
+            return CrawlFetch::NotModified(url);
+        }
+        if matches!(resp.status, 404 | 410) {
+            return CrawlFetch::Gone(url, resp.status);
+        }
+    }
     // A challenge/block response (403/429/503 or a Cloudflare/JS/CAPTCHA marker
     // on a 200) is not content — reuse the fetcher's shared classifier.
     if let Some(reason) = crate::fetcher::http_bot_wall(resp.status, &resp.body) {
         return CrawlFetch::BotWall(url, reason);
     }
+    let etag = header_value(&resp.headers, "etag");
+    let last_modified = header_value(&resp.headers, "last-modified");
     let parsed = parse_page(&resp.body, &url, same_domain);
     CrawlFetch::Page(Fetched {
         url,
@@ -683,6 +848,8 @@ async fn fetch_one(
         title: parsed.title,
         content_chars: parsed.content_chars,
         excerpt: parsed.excerpt,
+        etag,
+        last_modified,
     })
 }
 
@@ -959,11 +1126,18 @@ mod tests {
     use std::sync::Mutex as SyncMutex;
 
     /// Serves canned `(status, body)` per URL; URLs in `fail` return a transport
-    /// error; unknown URLs → 404 empty.
+    /// error; unknown URLs → 404 empty. Honors conditional GETs: a request whose
+    /// `If-None-Match` (`req.etag`) equals the URL's `etags` entry gets a bare
+    /// `304`; `resp_etags` entries are echoed as an `ETag` header on 200s.
     #[derive(Default)]
     struct MockHttp {
         pages: HashMap<String, (u16, String)>,
         fail: HashSet<String>,
+        /// Current server-side validator per URL — a matching `If-None-Match`
+        /// yields 304.
+        etags: HashMap<String, String>,
+        /// `ETag` header value returned on a 200 (stored into the page record).
+        resp_etags: HashMap<String, String>,
     }
 
     #[async_trait]
@@ -972,15 +1146,27 @@ mod tests {
             if self.fail.contains(&req.url) {
                 return Err(crate::Error::App(format!("simulated transport failure: {}", req.url)));
             }
+            // Conditional GET: matching validator ⇒ 304 Not Modified, empty body.
+            if let Some(sent) = &req.etag {
+                if self.etags.get(&req.url) == Some(sent) {
+                    return Ok(HttpResponse {
+                        status: 304,
+                        headers: HashMap::new(),
+                        body: String::new(),
+                        final_url: req.url,
+                        cache_hit: false,
+                    });
+                }
+            }
             let (status, body) =
                 self.pages.get(&req.url).cloned().unwrap_or((404, String::new()));
-            Ok(HttpResponse {
-                status,
-                headers: HashMap::new(),
-                body,
-                final_url: req.url,
-                cache_hit: false,
-            })
+            let mut headers = HashMap::new();
+            if status == 200 {
+                if let Some(tag) = self.resp_etags.get(&req.url) {
+                    headers.insert("ETag".to_string(), tag.clone());
+                }
+            }
+            Ok(HttpResponse { status, headers, body, final_url: req.url, cache_hit: false })
         }
     }
 
@@ -1010,6 +1196,8 @@ mod tests {
             exclude_patterns: vec![],
             sitemap_seeds: false,
             checkpoint: None,
+            revisit: false,
+            discover: false,
         }
     }
 
@@ -1032,7 +1220,7 @@ mod tests {
         let records = Arc::new(SyncMutex::new(Vec::new()));
         let sink = Box::new(CollectSink { records: records.clone() });
 
-        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, Some(sink), None)
+        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, Some(sink), None, None)
             .await
             .unwrap();
 
@@ -1064,7 +1252,7 @@ mod tests {
         let sink_seen = seen.clone();
         let progress: ProgressFn = Arc::new(move |snap| sink_seen.lock().unwrap().push(snap.clone()));
 
-        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, Some(progress))
+        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, None, Some(progress))
             .await
             .unwrap();
 
@@ -1074,6 +1262,98 @@ mod tests {
         assert_eq!(last.crawled, stats.crawled, "final snapshot mirrors end stats");
         assert_eq!(last.kept, stats.kept);
         assert_eq!(last.hosts, stats.hosts);
+    }
+
+    /// A [`PageSource`] that hands back a fixed seed list.
+    struct SeedSource(Vec<RevisitSeed>);
+
+    #[async_trait]
+    impl PageSource for SeedSource {
+        async fn seeds(&self) -> Vec<RevisitSeed> {
+            self.0.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn revisit_counts_unchanged_changed_and_gone() {
+        // Three known pages: one 304-unchanged, one changed (200 + new body/etag),
+        // one gone (404). Revisit does NOT follow links (discover off).
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://ex.com/changed".to_string(),
+            (200, "<html><body><p>brand new content this run</p></body></html>".to_string()),
+        );
+        // /stable is 304 (validator matches); /gone is unknown → 404.
+        let mut etags = HashMap::new();
+        etags.insert("https://ex.com/stable".to_string(), "v1".to_string());
+        let mut resp_etags = HashMap::new();
+        resp_etags.insert("https://ex.com/changed".to_string(), "new-tag".to_string());
+        let http = Arc::new(MockHttp { pages, etags, resp_etags, ..Default::default() });
+
+        let source = Box::new(SeedSource(vec![
+            RevisitSeed {
+                url: "https://ex.com/stable".into(),
+                etag: Some("v1".into()),
+                last_modified: None,
+            },
+            RevisitSeed {
+                url: "https://ex.com/changed".into(),
+                etag: Some("stale".into()),
+                last_modified: None,
+            },
+            RevisitSeed { url: "https://ex.com/gone".into(), etag: None, last_modified: None },
+        ]));
+
+        let records = Arc::new(SyncMutex::new(Vec::new()));
+        let sink = Box::new(CollectSink { records: records.clone() });
+
+        let mut cfg = test_cfg(&[]);
+        cfg.revisit = true;
+
+        let stats = crawl(http, cfg, None, Some(sink), Some(source), None).await.unwrap();
+
+        assert_eq!(stats.revisited, 3, "all three known pages revisited");
+        assert_eq!(stats.unchanged_304, 1, "the matching-validator page is a cheap 304");
+        assert_eq!(stats.gone, 1, "the 404 page is flagged gone");
+        assert_eq!(stats.kept, 1, "only the changed page is re-fingerprinted/kept");
+        assert_eq!(stats.crawled, 1, "only the 200 counts as crawled");
+
+        let recs = records.lock().unwrap();
+        let live: Vec<_> = recs.iter().filter(|r| !r.gone).collect();
+        let gone: Vec<_> = recs.iter().filter(|r| r.gone).collect();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].url, "https://ex.com/changed");
+        assert_eq!(live[0].etag.as_deref(), Some("new-tag"), "response ETag stored");
+        assert_eq!(gone.len(), 1);
+        assert_eq!(gone[0].url, "https://ex.com/gone");
+        assert_eq!(gone[0].status, 404);
+    }
+
+    #[tokio::test]
+    async fn revisit_does_not_follow_links_without_discover() {
+        // A known page links to a NEW url; without discover the frontier must not
+        // expand to it.
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://ex.com/hub".to_string(),
+            (200, "<html><body><a href=\"/newly-linked\">new</a></body></html>".to_string()),
+        );
+        pages.insert(
+            "https://ex.com/newly-linked".to_string(),
+            (200, "<html><body><p>should not be crawled</p></body></html>".to_string()),
+        );
+        let http = Arc::new(MockHttp { pages, ..Default::default() });
+        let source = Box::new(SeedSource(vec![RevisitSeed {
+            url: "https://ex.com/hub".into(),
+            etag: None,
+            last_modified: None,
+        }]));
+        let mut cfg = test_cfg(&[]);
+        cfg.revisit = true; // discover stays false
+
+        let stats = crawl(http, cfg, None, None, Some(source), None).await.unwrap();
+        assert_eq!(stats.crawled, 1, "only the seeded hub is fetched; no link-following");
+        assert_eq!(stats.revisited, 1);
     }
 
     #[tokio::test]
@@ -1102,8 +1382,8 @@ mod tests {
         let mut fail = HashSet::new();
         fail.insert("https://ex.com/dead".to_string());
 
-        let http = Arc::new(MockHttp { pages, fail });
-        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, None).await.unwrap();
+        let http = Arc::new(MockHttp { pages, fail, ..Default::default() });
+        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, None, None).await.unwrap();
 
         // Kept: seed + /ok. /dead failed, /blocked + /cf are bot-walls.
         assert_eq!(stats.kept, 2, "only real-content pages kept");
@@ -1253,6 +1533,8 @@ mod tests {
             exclude_patterns: vec!["\\.pdf$".into()],
             sitemap_seeds: false,
             checkpoint: None,
+            revisit: false,
+            discover: false,
         };
         let f = UrlFilter::compile(&cfg).unwrap();
         assert!(f.allows("https://x.com/blog/post"));
