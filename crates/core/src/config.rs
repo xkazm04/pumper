@@ -86,11 +86,17 @@ impl Config {
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
+    /// Cross-origin allow-list for the HTTP API. Empty (the default) means CORS
+    /// is OFF — same-origin only — so this unauthenticated, mutating API cannot be
+    /// driven cross-origin by any site the operator happens to visit (a permissive
+    /// allow-all is defeated by DNS-rebinding). Add specific origins (e.g.
+    /// "http://localhost:5173") to opt a trusted local UI in.
+    pub cors_allowed_origins: Vec<String>,
 }
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { host: "127.0.0.1".into(), port: 8088 }
+        Self { host: "127.0.0.1".into(), port: 8088, cors_allowed_origins: Vec::new() }
     }
 }
 
