@@ -1,7 +1,7 @@
-# Refactor + Bug-Hunt — Fix Waves 1–3 (pumper, 2026-07-14)
+# Refactor + Bug-Hunt — Fix Waves 1–4 (pumper, 2026-07-14)
 
-> 8 findings closed in 7 atomic commits across 3 themed waves.
-> Baseline preserved: `cargo build` clean, tests **177 → 179** (2 regression tests added), 0 warnings throughout.
+> **15 findings closed in 12 atomic commits** across 4 themed waves + the deferred dataset-upsert atomicity fix.
+> Baseline preserved: `cargo build` clean, tests **177 → 182** (5 regression tests added), 0 warnings throughout.
 > Branch: `vibeman/refactor-bughunt-2026-07-14` (off `master`, not pushed).
 
 ## Commits
@@ -15,8 +15,20 @@
 | 5 | `469c8ab` | czech-labour-market-mpsv #1 | **C** | `crates/apps/mpsv-vpm/src/lib.rs` |
 | 6 | `c7f1d11` | engine-capability-traits #1, tiered-fetcher-politeness #1 | H + H | `cache.rs`, `engine.rs`, `engine-http/lib.rs`, `tests/cache.rs` |
 | 7 | `50578b3` | live-events-webhooks #1, #2 | H + M | `crates/server/src/events.rs` |
+| 8 | `573aa0c` | dataset-store-change-detection #1 | H | `crates/core/src/datasets.rs`, `tests/datasets.rs` |
+| 9 | `93d0969` | us-trades-business-density-census #1, #2 | H + H | census-density, census-nonemp |
+| 10 | `12bf8e3` | us-trades-wages-tax-valuation #2 | H | `crates/apps/homewyse-pricing/src/lib.rs` |
+| 11 | `725e218` | czech-labour-market-mpsv #4 | M | `crates/apps/mpsv-vpm/src/lib.rs` |
 
-Result: **all 4 Criticals + 4 Highs + 2 Mediums closed** (10 findings).
+Result: **all 4 Criticals + 8 Highs + 3 Mediums closed** (15 findings). 87 findings remain open.
+
+## Deferred item resolved — dataset upsert atomicity (`573aa0c`, High)
+The top follow-up from the Waves 1–3 checkpoint. `Datasets::upsert` ran its SELECT, record write, and revision append as three separate autocommit statements, so concurrent same-key writers corrupted the revision/diff chain or aborted the batch. The sequence now runs inside a `BEGIN IMMEDIATE` transaction on one pooled connection (writers serialize via the up-front write lock; `IMMEDIATE` avoids the `SQLITE_BUSY_SNAPSHOT` that a deferred read-then-write upgrade hits under WAL). `add_revision` is now generic over the executor. Regression test: 20 concurrent same-key upserts → a contiguous 1..=20 revision chain.
+
+## Wave 4 — Scraper data-truth (3 Highs + 1 Medium)
+- **Census jam/suppression sentinels** (`93d0969`). Negative jam sentinels (`-666666666`) were parsed as valid negatives and summed into national totals; suppressed cells became `0` yet counted as reported places (fabricated $0 markets). A shared `census_num` helper treats missing/non-numeric/negative as suppressed; rows with a suppressed primary metric are skipped, not fabricated.
+- **homewyse validated prices** (`12bf8e3`). Records stored the raw `j.get("low")` after validating parsed copies, so string-quoted prices were dropped by the unified rollup. Now the validated numbers are persisted.
+- **mpsv string-encoded stats** (`725e218`). `official_wage_index` used `as_f64()` only, dropping any benchmark row whose stat arrived as a string; a `wage_num` helper accepts numbers and Czech-formatted strings (whitespace thousands, decimal comma).
 
 ## Wave 1 — Crash & sandbox safety (all 4 Criticals)
 
