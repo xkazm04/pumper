@@ -36,7 +36,11 @@ impl HttpCache {
         self.default_ttl
     }
 
-    /// Stable cache key for a request.
+    /// Stable cache key for a request. Covers every input that varies the
+    /// response: method, url, body, **request headers** (content negotiation via
+    /// `Accept`/`Accept-Language`, etc.) and **proxy** (geo-variant egress).
+    /// Headers are sorted first — `HashMap` iteration order is nondeterministic
+    /// and would otherwise scatter the key for identical requests across runs.
     pub fn key(req: &HttpRequest) -> String {
         let mut hasher = Sha256::new();
         hasher.update(format!("{:?}", req.method).as_bytes());
@@ -46,20 +50,42 @@ impl HttpCache {
         if let Some(body) = &req.body {
             hasher.update(body.as_bytes());
         }
+        hasher.update([0]);
+        let mut headers: Vec<(&String, &String)> = req.headers.iter().collect();
+        headers.sort();
+        for (k, v) in headers {
+            hasher.update(k.as_bytes());
+            hasher.update([1]);
+            hasher.update(v.as_bytes());
+            hasher.update([0]);
+        }
+        hasher.update([0]);
+        if let Some(proxy) = &req.proxy {
+            hasher.update(proxy.as_bytes());
+        }
         format!("{:x}", hasher.finalize())
     }
 
-    /// Returns a live (non-expired) cached response, if any.
-    pub async fn get(&self, key: &str) -> Result<Option<HttpResponse>> {
+    /// Returns a live (non-expired) cached response, if any. `max_age` caps read
+    /// staleness: an entry created more than `max_age` ago is treated as a miss
+    /// even if its stored TTL has not expired — so a short-TTL reader is never
+    /// served a long-TTL writer's stale body (the two-watches-on-one-endpoint
+    /// case). `None` means "any live entry".
+    pub async fn get(&self, key: &str, max_age: Option<Duration>) -> Result<Option<HttpResponse>> {
         if !self.enabled {
             return Ok(None);
         }
+        let now = Utc::now();
+        let min_created = max_age
+            .and_then(|d| chrono::Duration::from_std(d).ok())
+            .map(|d| ts(now - d));
         let row: Option<(i64, String, String, String)> = sqlx::query_as(
             "SELECT status, headers, body, final_url FROM http_cache \
-             WHERE key = ?1 AND expires_at > ?2",
+             WHERE key = ?1 AND expires_at > ?2 AND (?3 IS NULL OR created_at > ?3)",
         )
         .bind(key)
-        .bind(ts(Utc::now()))
+        .bind(ts(now))
+        .bind(min_created)
         .fetch_optional(&self.pool)
         .await?;
 
@@ -112,6 +138,31 @@ impl HttpCache {
 
 fn ts(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Micros, true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(url: &str) -> HttpRequest {
+        serde_json::from_value(serde_json::json!({ "url": url })).unwrap()
+    }
+
+    #[test]
+    fn cache_key_varies_on_headers_and_proxy_and_is_stable() {
+        let base = req("https://x.test/a");
+        let k = HttpCache::key(&base);
+        // Stable across identical requests (and across HashMap orderings).
+        assert_eq!(k, HttpCache::key(&req("https://x.test/a")));
+        // Content-negotiation headers change the response → change the identity.
+        let mut with_lang = base.clone();
+        with_lang.headers.insert("Accept-Language".into(), "cs".into());
+        assert_ne!(k, HttpCache::key(&with_lang));
+        // Proxy (geo-variant egress) changes the identity.
+        let mut with_proxy = base.clone();
+        with_proxy.proxy = Some("http://eu.proxy:8080".into());
+        assert_ne!(k, HttpCache::key(&with_proxy));
+    }
 }
 
 /// Cost-aware cache for Claude research runs. Research spends real money, so
