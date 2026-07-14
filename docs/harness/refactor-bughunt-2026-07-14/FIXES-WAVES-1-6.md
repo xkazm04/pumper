@@ -1,9 +1,16 @@
-# Refactor + Bug-Hunt — Fix Waves 1–5 (pumper, 2026-07-14)
+# Refactor + Bug-Hunt — Fix Waves 1–6 (pumper, 2026-07-14)
 
-> **22 findings closed in 19 atomic commits** across 5 themed waves + the deferred dataset-upsert atomicity fix.
-> Severity closed: **all 4 Criticals + 14 Highs + 4 Mediums.** 80 findings remain open.
-> Baseline preserved: `cargo build` clean, tests **177 → 183** (6 regression tests added), 0 warnings, 0 regressions throughout.
+> **25 findings closed in 20 atomic commits** across 6 themed waves + the deferred dataset-upsert atomicity fix.
+> Severity closed: **all 4 Criticals + 15 Highs + 6 Mediums.** 77 findings remain open.
+> Baseline preserved: `cargo build` clean, tests **177 → 184** (7 regression tests added), 0 warnings, 0 regressions throughout.
 > Branch: `vibeman/refactor-bughunt-2026-07-14` (off `master`, not pushed).
+
+## Wave 6 — Crawler correctness: 1 High + 2 Mediums (`f4c6b42`)
+- **Near-dup links** (High) — outbound links are now followed from near-duplicate pages too, not just kept ones; previously subtrees reachable only via a near-dup page (pagination/faceted nav) were silently under-crawled.
+- **Frontier cap counter** (Medium) — URLs refused at the `MAX_FRONTIER` cap are now counted and surfaced as `stats.frontier_dropped` instead of being silently dropped.
+- **robots Allow/wildcards** (Medium) — `RobotRules` now honors `Allow` directives and `*`/`$` wildcards with longest-match precedence (Google robots spec), matching path+query; was Disallow-prefix-only. Tests added.
+
+**Deferred with reason (crawler):** robots.txt fetch awaited in the scheduling loop (High — needs concurrent robots prefetch / a core-loop restructure; the stall is bounded to once per new host and HTTP-timeout-capped); crawl-delay 200 ms re-churn (Medium — an optimization; correct today); revisit treats a single 404/410 as permanently gone (Medium — needs a gone-count/gone-since schema field to tell transient from dead).
 
 ## Wave 5 — Honest results (empty/garbage ≠ success): 6 Highs + 1 Medium
 The dominant open theme. A scrape/query that fails or returns nothing must not report success.
