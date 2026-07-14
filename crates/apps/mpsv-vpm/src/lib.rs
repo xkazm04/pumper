@@ -528,6 +528,24 @@ fn sphere_for_org(org: &str) -> &'static str {
     }
 }
 
+/// Reads a numeric field the ISPV feed may deliver as a JSON number OR a quoted
+/// (possibly Czech-formatted) string; `as_f64` alone silently dropped the whole
+/// row when a stat arrived string-encoded. Strips whitespace/NBSP thousands
+/// separators and accepts a decimal comma.
+fn wage_num(v: &Value, key: &str) -> Option<f64> {
+    match v.get(key) {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => {
+            let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+            cleaned
+                .parse::<f64>()
+                .ok()
+                .or_else(|| cleaned.replacen(',', ".", 1).parse::<f64>().ok())
+        }
+        _ => None,
+    }
+}
+
 /// Index of official ISPV rows: (CZ-ISCO unit group, sfera) → (medianMzda,
 /// mzdaPrumer). Rows without a positive monthly median are dropped — no
 /// benchmark can honestly be computed against them.
@@ -538,11 +556,10 @@ fn official_wage_index<'a>(
     for r in rows {
         let Some(czisco) = r.get("czIsco").and_then(Value::as_str) else { continue };
         let sfera = r.get("sfera").and_then(Value::as_str).unwrap_or("").to_string();
-        let Some(median) = r.get("medianMzda").and_then(Value::as_f64).filter(|m| *m > 0.0)
-        else {
+        let Some(median) = wage_num(r, "medianMzda").filter(|m| *m > 0.0) else {
             continue;
         };
-        let mean = r.get("mzdaPrumer").and_then(Value::as_f64).filter(|m| *m > 0.0);
+        let mean = wage_num(r, "mzdaPrumer").filter(|m| *m > 0.0);
         index.insert((unit_group(czisco), sfera), (median, mean));
     }
     index
@@ -980,6 +997,27 @@ mod tests {
         assert_eq!(sphere_for_org("public"), "PLATOVA");
         assert_eq!(sphere_for_org("private"), "MZDOVA");
         assert_eq!(sphere_for_org("agency"), "MZDOVA");
+    }
+
+    #[test]
+    fn wage_num_accepts_number_and_czech_string_forms() {
+        assert_eq!(wage_num(&json!({ "m": 111959.0 }), "m"), Some(111959.0));
+        assert_eq!(wage_num(&json!({ "m": "111959" }), "m"), Some(111959.0));
+        assert_eq!(wage_num(&json!({ "m": "111 959" }), "m"), Some(111959.0)); // space thousands
+        assert_eq!(wage_num(&json!({ "m": "40000,50" }), "m"), Some(40000.5)); // Czech decimal comma
+        assert_eq!(wage_num(&json!({ "m": "n/a" }), "m"), None);
+        assert_eq!(wage_num(&json!({}), "m"), None);
+    }
+
+    #[test]
+    fn official_index_reads_string_encoded_stats() {
+        // Regression: as_f64-only dropped rows whose stats arrived as strings.
+        let rows = vec![json!({"czIsco": "CzIsco/1120", "sfera": "MZDOVA", "medianMzda": "111959", "mzdaPrumer": "190185"})];
+        let idx = official_wage_index(rows.iter());
+        assert_eq!(idx.len(), 1);
+        let (median, mean) = idx[&("1120".to_string(), "MZDOVA".to_string())];
+        assert_eq!(median, 111959.0);
+        assert_eq!(mean, Some(190185.0));
     }
 
     #[test]
