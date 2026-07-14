@@ -166,9 +166,13 @@ impl ScrapeApp for HomewysePricing {
                                 "trade": trade,
                                 "job": job,
                                 "unit": j.get("unit").and_then(Value::as_str).unwrap_or("flat"),
-                                "low": j.get("low"),
-                                "median": j.get("median"),
-                                "high": j.get("high"),
+                                // Store the validated numbers, not the raw values:
+                                // a string-quoted price ("1234") passes validation
+                                // via validate::num but, stored raw, is read back as
+                                // a non-number and silently dropped from the rollup.
+                                "low": low,
+                                "median": median,
+                                "high": high,
                             }),
                         ));
                     }
