@@ -72,11 +72,16 @@ impl ScrapeApp for Plugin {
         let items: Vec<(String, Value)> = urls
             .iter()
             .zip(results.iter_mut())
-            .map(|(url, rec)| {
+            .filter_map(|(url, rec)| {
+                // Fetch/plugin failures are reported in the summary, not written
+                // into the output dataset as if they were extracted records.
+                if rec.get("error").is_some() {
+                    return None;
+                }
                 if let Value::Object(map) = rec {
                     map.insert("_url".into(), Value::String(url.clone()));
                 }
-                (url.clone(), rec.clone())
+                Some((url.clone(), rec.clone()))
             })
             .collect();
         let summary = ctx.upsert_many(&dataset, &items).await?;
