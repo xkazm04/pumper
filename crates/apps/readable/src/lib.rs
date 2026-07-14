@@ -3,7 +3,7 @@
 //! HTML-to-Markdown preprocessing pipeline in one call.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, FetchRequest, FetchStrategy, Result, ScrapeApp};
+use pumper_core::{AppContext, Error, FetchRequest, FetchStrategy, Result, ScrapeApp};
 use serde_json::{json, Value};
 
 pub struct Readable;
@@ -50,6 +50,14 @@ impl ScrapeApp for Readable {
             .clone()
             .or_else(|| outcome.text.clone())
             .unwrap_or_default();
+        if markdown.trim().is_empty() {
+            // A successful fetch that yields no readable content is a failed
+            // extraction, not an empty-but-valid result — don't report it as OK.
+            return Err(Error::App(format!(
+                "readable: extracted no content from {} (engine {}, status {:?})",
+                outcome.url, outcome.engine, outcome.status
+            )));
+        }
         ctx.save_artifact("page.md", markdown.as_bytes()).await?;
 
         Ok(json!({
