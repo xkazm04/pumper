@@ -12,6 +12,10 @@ use sqlx::SqlitePool;
 
 use crate::{Error, Result};
 
+/// Upper bound on the pairs returned by `duplicate_pairs`, so a pathological
+/// dataset can't produce an unbounded result list.
+const MAX_DUP_PAIRS: usize = 10_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
@@ -416,6 +420,12 @@ impl Datasets {
         dataset: &str,
         present: &[String],
     ) -> Result<Vec<String>> {
+        // An empty snapshot almost always means the scrape failed, not that the
+        // entire dataset genuinely disappeared. Refuse to tombstone everything —
+        // callers that legitimately empty a dataset should delete explicitly.
+        if present.is_empty() {
+            return Ok(Vec::new());
+        }
         let live: Vec<String> = sqlx::query_scalar(
             "SELECT key FROM records WHERE app = ?1 AND dataset = ?2 AND removed_at IS NULL",
         )
@@ -475,14 +485,18 @@ impl Datasets {
         dataset: &str,
         max_distance: u32,
     ) -> Result<Vec<DupPair>> {
-        let rows: Vec<(String, i64)> =
-            sqlx::query_as("SELECT key, simhash FROM records WHERE app = ?1 AND dataset = ?2")
-                .bind(app)
-                .bind(dataset)
-                .fetch_all(&self.pool)
-                .await?;
+        // Only compare live records — tombstoned rows are gone and reporting them
+        // as duplicates is noise.
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT key, simhash FROM records \
+             WHERE app = ?1 AND dataset = ?2 AND removed_at IS NULL",
+        )
+        .bind(app)
+        .bind(dataset)
+        .fetch_all(&self.pool)
+        .await?;
         let mut pairs = Vec::new();
-        for i in 0..rows.len() {
+        'scan: for i in 0..rows.len() {
             if rows[i].1 == 0 {
                 continue;
             }
@@ -497,6 +511,11 @@ impl Datasets {
                         b: rows[j].0.clone(),
                         distance,
                     });
+                    // Bound the result: a pathological dataset must not return an
+                    // unbounded pair list.
+                    if pairs.len() >= MAX_DUP_PAIRS {
+                        break 'scan;
+                    }
                 }
             }
         }
@@ -627,17 +646,35 @@ impl Datasets {
                     qb.push_bind(value.as_str());
                     qb.push(")) > 0");
                 }
+                // Compare numerically when the JSON field is a number, else as
+                // text. SQLite sorts all numbers below all text, so a plain `>=`
+                // of a numeric field against a text-bound value always fails; the
+                // text branch preserves the existing ISO-date behavior unchanged.
                 JsonFilter::Gte { path, value } => {
-                    qb.push(" AND json_extract(data, ");
+                    qb.push(" AND (CASE WHEN json_type(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") IN ('integer','real') THEN json_extract(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") >= CAST(");
+                    qb.push_bind(value.as_str());
+                    qb.push(" AS REAL) ELSE json_extract(data, ");
                     qb.push_bind(path.as_str());
                     qb.push(") >= ");
                     qb.push_bind(value.as_str());
+                    qb.push(" END)");
                 }
                 JsonFilter::Lte { path, value } => {
-                    qb.push(" AND json_extract(data, ");
+                    qb.push(" AND (CASE WHEN json_type(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") IN ('integer','real') THEN json_extract(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") <= CAST(");
+                    qb.push_bind(value.as_str());
+                    qb.push(" AS REAL) ELSE json_extract(data, ");
                     qb.push_bind(path.as_str());
                     qb.push(") <= ");
                     qb.push_bind(value.as_str());
+                    qb.push(" END)");
                 }
                 // `(0 OR ...)` is the honest reading of "matches any of these
                 // paths": with no paths, nothing matches. NULL never satisfies the
