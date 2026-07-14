@@ -87,14 +87,17 @@ impl EventBus {
     /// Stamps `event` with the next id, buffers it, and broadcasts it. Returns
     /// the assigned id. Broadcast errors (no subscribers) are ignored.
     pub fn emit(&self, event: JobEvent) -> u64 {
+        // Assign the id, buffer, and broadcast all under the ring lock so
+        // concurrent emitters (per-job worker tasks + HTTP handlers) can't
+        // interleave: without this, seq assignment happened before the lock, so a
+        // higher id could be buffered/sent ahead of a lower one — corrupting ring
+        // and wire order and triggering false `reset` gaps for live subscribers.
+        let mut ring = self.ring.lock().unwrap();
         let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
-        {
-            let mut ring = self.ring.lock().unwrap();
-            if ring.len() >= self.capacity {
-                ring.pop_front();
-            }
-            ring.push_back((seq, event.clone()));
+        if ring.len() >= self.capacity {
+            ring.pop_front();
         }
+        ring.push_back((seq, event.clone()));
         let _ = self.tx.send((seq, event));
         seq
     }
@@ -109,7 +112,9 @@ impl EventBus {
         };
         // The next id the caller wants is `after + 1`. If that id predates the
         // oldest buffered event, the gap was evicted and can't be replayed.
-        if *oldest > after + 1 {
+        // `saturating_add` guards an adversarial `Last-Event-ID: u64::MAX` (a
+        // plain `+ 1` panics in debug / wraps to 0 in release).
+        if *oldest > after.saturating_add(1) {
             return Replay::Reset;
         }
         let events = ring
