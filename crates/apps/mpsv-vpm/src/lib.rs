@@ -704,8 +704,6 @@ struct Posting {
     #[serde(default)]
     pozadovanaProfese: Option<LangText>,
     #[serde(default)]
-    typMzdy: Option<IdRef>,
-    #[serde(default)]
     minPozadovaneVzdelani: Option<IdRef>,
     #[serde(default)]
     profeseCzIsco: Option<IdRef>,
@@ -803,20 +801,16 @@ impl Posting {
             .filter(|s| !s.is_empty())
     }
 
-    fn is_monthly(&self) -> bool {
-        self.typMzdy
-            .as_ref()
-            .and_then(|t| t.id.as_deref())
-            .map(|id| id.contains("mesic"))
-            .unwrap_or(false)
-    }
-
     /// A single representative CZK monthly figure: midpoint of the band when both
-    /// ends are given, else whichever end is present; `None` if not a sane monthly.
+    /// ends are given, else whichever end is present; `None` if the value isn't a
+    /// sane monthly salary.
+    ///
+    /// The presence of `mesicniMzda*` ("monthly wage") within the monthly band IS
+    /// the monthly signal — the API exposes no hourly wage fields, and `typMzdy.id`
+    /// is a codebook URI (`"TypMzdy/N"`, like `CzIsco/93291`), not a substring-
+    /// matchable label, so the old `id.contains("mesic")` gate matched nothing and
+    /// silently discarded every salary in the distribution.
     fn monthly_salary_point(&self) -> Option<f64> {
-        if !self.is_monthly() {
-            return None;
-        }
         let point = match (self.mesicniMzdaOd, self.mesicniMzdaDo) {
             (Some(a), Some(b)) if a > 0.0 && b > 0.0 => (a + b) / 2.0,
             (Some(a), _) if a > 0.0 => a,
@@ -958,6 +952,27 @@ mod tests {
             .into_iter()
             .map(|((g, s), c)| ((g.to_string(), s.to_string()), c))
             .collect()
+    }
+
+    #[test]
+    fn monthly_salary_extracted_without_relying_on_type_code() {
+        // Regression: the salary distribution was silently emptied because the old
+        // `is_monthly()` gate string-matched "mesic" against the codebook-URI
+        // `typMzdy.id` ("TypMzdy/1"), which never contains it. The presence of the
+        // monthly-wage fields within the sane band is the signal.
+        let p: Posting = serde_json::from_value(json!({
+            "mesicniMzdaOd": 40000.0,
+            "mesicniMzdaDo": 60000.0,
+            "typMzdy": { "id": "TypMzdy/1" }
+        }))
+        .unwrap();
+        assert_eq!(p.monthly_salary_point(), Some(50_000.0));
+
+        // Sub-band (hourly-looking) and absent values yield None, never fabricated.
+        let hourly: Posting = serde_json::from_value(json!({ "mesicniMzdaOd": 150.0 })).unwrap();
+        assert_eq!(hourly.monthly_salary_point(), None);
+        let empty: Posting = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty.monthly_salary_point(), None);
     }
 
     #[test]
