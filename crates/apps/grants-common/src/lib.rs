@@ -343,7 +343,14 @@ pub fn parse_date(s: &str) -> Option<chrono::NaiveDate> {
     }
     chrono::NaiveDate::parse_from_str(s, "%m/%d/%Y")
         .or_else(|_| chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d"))
-        .or_else(|_| chrono::NaiveDate::parse_from_str(&s[..s.len().min(10)], "%Y-%m-%d"))
+        .or_else(|_| {
+            // Datetime forms (`2026-11-02 23:59:00`, `2026-11-02T23:59:00Z`): take
+            // the date part before the first space or `T`. Split on chars (not a
+            // byte slice) so a non-ASCII value — e.g. an em-dash in "Deadline—see
+            // website" — yields None instead of panicking on a non-char boundary.
+            let date_part = s.split(['T', ' ']).next().unwrap_or(s);
+            chrono::NaiveDate::parse_from_str(date_part, "%Y-%m-%d")
+        })
         .ok()
 }
 
@@ -462,6 +469,10 @@ mod tests {
         assert!(parse_date("").is_none());
         assert!(parse_date("   ").is_none());
         assert!(parse_date("not a date").is_none());
+        // Regression: a non-ASCII char straddling byte 10 must not panic on a
+        // non-char-boundary slice — an em-dash close-date cell yields None.
+        assert!(parse_date("Deadline—see website").is_none());
+        assert!(parse_date("—").is_none());
     }
 
     #[test]
