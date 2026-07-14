@@ -139,17 +139,55 @@ impl Datasets {
         let hash = hash_value(value);
         let sim = crate::simhash::simhash_value(value) as i64;
         let now = Utc::now();
+
+        // The read → write → add_revision sequence must be atomic: as three
+        // separate autocommit statements, concurrent same-key writers (per-app
+        // worker concurrency can exceed 1) either collided on the PK and aborted
+        // the batch, or diffed against a stale base and corrupted the revision
+        // chain the change-feed relies on. BEGIN IMMEDIATE takes the write lock up
+        // front so writers serialize (busy_timeout makes the second wait); a plain
+        // DEFERRED begin would instead fail the read-then-write upgrade with
+        // SQLITE_BUSY_SNAPSHOT under WAL.
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let result =
+            Self::upsert_in_tx(&mut conn, app, dataset, key, value, hash.as_str(), sim, now).await;
+        match result {
+            Ok(kind) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(kind)
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Transactional body of `upsert`: the SELECT + record write + revision append
+    /// run on one connection already inside a write transaction, so they commit
+    /// (or roll back) as a unit.
+    async fn upsert_in_tx(
+        conn: &mut sqlx::SqliteConnection,
+        app: &str,
+        dataset: &str,
+        key: &str,
+        value: &Value,
+        hash: &str,
+        sim: i64,
+        now: DateTime<Utc>,
+    ) -> Result<ChangeKind> {
         let existing: Option<(String, String, Option<String>)> = sqlx::query_as(
             "SELECT hash, data, removed_at FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3",
         )
         .bind(app)
         .bind(dataset)
         .bind(key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         match existing {
-            Some((prev, _, removed_at)) if prev == hash && removed_at.is_none() => {
+            Some((prev, _, removed_at)) if prev.as_str() == hash && removed_at.is_none() => {
                 sqlx::query(
                     "UPDATE records SET last_seen = ?4 WHERE app = ?1 AND dataset = ?2 AND key = ?3",
                 )
@@ -157,7 +195,7 @@ impl Datasets {
                 .bind(dataset)
                 .bind(key)
                 .bind(ts(now))
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
                 Ok(ChangeKind::Unchanged)
             }
@@ -169,16 +207,25 @@ impl Datasets {
                 .bind(app)
                 .bind(dataset)
                 .bind(key)
-                .bind(&hash)
+                .bind(hash)
                 .bind(value.to_string())
                 .bind(sim)
                 .bind(ts(now))
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
                 let old: Value = serde_json::from_str(&old_data).unwrap_or(Value::Null);
                 let diff = diff_values(&old, value);
-                self.add_revision(app, dataset, key, "changed", Some(value), Some(&diff), now)
-                    .await?;
+                Self::add_revision(
+                    &mut *conn,
+                    app,
+                    dataset,
+                    key,
+                    "changed",
+                    Some(value),
+                    Some(&diff),
+                    now,
+                )
+                .await?;
                 Ok(ChangeKind::Changed)
             }
             None => {
@@ -189,13 +236,13 @@ impl Datasets {
                 .bind(app)
                 .bind(dataset)
                 .bind(key)
-                .bind(&hash)
+                .bind(hash)
                 .bind(value.to_string())
                 .bind(sim)
                 .bind(ts(now))
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
-                self.add_revision(app, dataset, key, "new", Some(value), None, now)
+                Self::add_revision(&mut *conn, app, dataset, key, "new", Some(value), None, now)
                     .await?;
                 Ok(ChangeKind::New)
             }
@@ -203,9 +250,11 @@ impl Datasets {
     }
 
     /// Appends the next revision for a record (revision numbers are per-key,
-    /// starting at 1).
-    async fn add_revision(
-        &self,
+    /// starting at 1). Runs on the caller-supplied executor so it can share the
+    /// caller's transaction — the per-key `MAX(revision)` subquery must see the
+    /// same in-flight state as the record write it accompanies.
+    async fn add_revision<'e, E>(
+        executor: E,
         app: &str,
         dataset: &str,
         key: &str,
@@ -213,7 +262,10 @@ impl Datasets {
         data: Option<&Value>,
         diff: Option<&Value>,
         when: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        E: sqlx::SqliteExecutor<'e>,
+    {
         sqlx::query(
             "INSERT INTO record_revisions (app, dataset, key, revision, change, data, diff, created_at) \
              VALUES (?1, ?2, ?3, \
@@ -228,7 +280,7 @@ impl Datasets {
         .bind(data.map(Value::to_string))
         .bind(diff.map(Value::to_string))
         .bind(ts(when))
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -388,7 +440,7 @@ impl Datasets {
             .bind(ts(now))
             .execute(&self.pool)
             .await?;
-            self.add_revision(app, dataset, &key, "removed", None, None, now)
+            Self::add_revision(&self.pool, app, dataset, &key, "removed", None, None, now)
                 .await?;
             removed.push(key);
         }
