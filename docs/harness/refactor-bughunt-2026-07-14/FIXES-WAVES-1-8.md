@@ -1,9 +1,14 @@
-# Refactor + Bug-Hunt — Fix Waves 1–7 (pumper, 2026-07-14)
+# Refactor + Bug-Hunt — Fix Waves 1–8 (pumper, 2026-07-14)
 
-> **29 findings closed in 22 atomic commits** across 7 themed waves + the deferred dataset-upsert atomicity fix.
-> Severity closed: **all 4 Criticals + 17 Highs + 8 Mediums.** 73 findings remain open.
-> Baseline preserved: `cargo build` clean, tests **177 → 184** (7 regression tests added), 0 warnings, 0 regressions throughout.
+> **36 findings closed in 25 atomic commits** across 8 themed waves + the deferred dataset-upsert atomicity fix.
+> Severity closed: **all 4 Criticals + 18 Highs + 14 Mediums.** 66 findings remain open (mostly the ~18-finding duplication/refactor tail + low tail).
+> Baseline preserved: `cargo build` clean, tests **177 → 185** (8 regression tests added), 0 warnings, 0 regressions throughout.
 > Branch: `vibeman/refactor-bughunt-2026-07-14` (off `master`, not pushed).
+
+## Wave 8 — Change-detection integrity: 1 High + 6 Mediums
+- **homewyse stable key** (`07b3fe3`, High) — pricing rows now key on a canonical slug of trade+job, so model phrasing drift stops minting duplicate rows that corrupt the benchmark.
+- **Core change-detection** (`265edbb`, 4 Mediums) — `detect_removed` refuses to tombstone the whole dataset on an empty (failed-scrape) snapshot; `JsonFilter::Gte/Lte` compare numerically for numeric fields (SQLite's number<text sort made them always-false), text unchanged for ISO dates; SimHash uses a version-stable FNV-1a + splitmix64 finalizer instead of `DefaultHasher` (which drifts across toolchains); `duplicate_pairs` skips tombstoned rows and caps its result.
+- **sync_many for full snapshots** (`f635244`, 2 Mediums) — HackerNews and state-tax use `sync_many` so a dropped story/state is marked removed instead of lingering (protected by the empty-snapshot guard).
 
 ## Wave 7 — API hardening + resource bounds: 2 Highs + 2 Mediums
 - **CORS off by default** (`aa84250`, High) — was `CorsLayer::permissive()` (allow-all) over a mutating, unauthenticated API; now same-origin only, with a `[server] cors_allowed_origins` opt-in.
