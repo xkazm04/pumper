@@ -62,6 +62,18 @@ pub struct AppContext {
 impl AppContext {
     /// Writes a file under `data/artifacts/<app>/<job_id>/` and returns its path.
     pub async fn save_artifact(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
+        // `name` may be composed from job params (e.g. census `cbp-{naics}.json`),
+        // so reject anything that isn't a single safe segment — otherwise a `..`
+        // or absolute name escapes the per-job artifact dir.
+        if name.is_empty()
+            || name == "."
+            || name == ".."
+            || name.contains('/')
+            || name.contains('\\')
+            || std::path::Path::new(name).is_absolute()
+        {
+            return Err(Error::App(format!("unsafe artifact name: {name:?}")));
+        }
         tokio::fs::create_dir_all(&self.artifacts_dir).await?;
         let path = self.artifacts_dir.join(name);
         tokio::fs::write(&path, bytes).await?;
