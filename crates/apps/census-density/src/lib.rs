@@ -236,20 +236,22 @@ impl ScrapeApp for CensusDensity {
             let mut total_emp: i64 = 0;
             let mut ranked: Vec<(String, i64)> = Vec::new();
 
+            // Census encodes disclosure suppression and jam values as sentinels
+            // like -666666666; treat any missing, non-numeric, or negative cell as
+            // suppressed so it is never summed into a total or counted as a place.
+            let census_num = |cell: Option<&String>| -> Option<i64> {
+                cell.and_then(|s| s.trim().parse::<i64>().ok()).filter(|v| *v >= 0)
+            };
+
             for row in rows.iter().skip(1) {
                 let geo_code = row.get(i_geo).cloned().unwrap_or_default();
-                let estab = row
-                    .get(i_estab)
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(0);
-                let emp = i_emp
-                    .and_then(|i| row.get(i))
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(0);
-                let pay = i_pay
-                    .and_then(|i| row.get(i))
-                    .and_then(|s| s.parse::<i64>().ok())
-                    .unwrap_or(0);
+                let Some(estab) = census_num(row.get(i_estab)) else {
+                    // Suppressed/jammed primary cell: not a genuinely reported
+                    // place — skip rather than fabricate a 0-establishment row.
+                    continue;
+                };
+                let emp = i_emp.and_then(|i| census_num(row.get(i))).unwrap_or(0);
+                let pay = i_pay.and_then(|i| census_num(row.get(i))).unwrap_or(0);
 
                 let (st_fips, county_fips) = if geo == "county" {
                     let st = i_state

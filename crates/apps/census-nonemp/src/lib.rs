@@ -191,10 +191,20 @@ impl ScrapeApp for CensusNonemp {
             let mut total_estab: i64 = 0;
             let mut total_rcpt: i64 = 0;
 
+            // Census encodes disclosure suppression and jam values as sentinels
+            // like -666666666; treat any missing, non-numeric, or negative cell as
+            // suppressed so it is never summed or counted as a reported operator.
+            let census_num = |cell: Option<&String>| -> Option<i64> {
+                cell.and_then(|s| s.trim().parse::<i64>().ok()).filter(|v| *v >= 0)
+            };
+
             for row in rows.iter().skip(1) {
-                let estab = row.get(i_estab).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let Some(estab) = census_num(row.get(i_estab)) else {
+                    // Suppressed/jammed primary cell → not a reported operator place.
+                    continue;
+                };
                 // NRCPTOT is in $1,000s.
-                let rcpt = row.get(i_rcpt).and_then(|s| s.parse::<i64>().ok()).unwrap_or(0);
+                let rcpt = census_num(row.get(i_rcpt)).unwrap_or(0);
                 let st_fips = row.get(i_state).cloned().unwrap_or_default();
                 let state = state_abbr(&st_fips).to_string();
                 let avg = if estab > 0 { (rcpt * 1000) / estab } else { 0 };
