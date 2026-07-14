@@ -153,11 +153,14 @@ impl IntoResponse for ApiError {
 
 impl From<pumper_core::Error> for ApiError {
     fn from(e: pumper_core::Error) -> Self {
-        // Engine/storage/parse/config failures are all unexpected at the request
-        // boundary. The client-distinguishable outcomes — missing resource (404),
-        // wrong state (409), bad input (400) — are raised explicitly by the
-        // handlers, which know the semantics a bare `Error` cannot express.
-        Self(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        // A BadRequest is the one core error that is definitionally the client's
+        // fault (a malformed query/filter/rule) → 400. Everything else is
+        // unexpected at the request boundary → 500; the client-distinguishable
+        // outcomes (404/409/400) are otherwise raised explicitly by the handlers.
+        match e {
+            pumper_core::Error::BadRequest(msg) => Self(StatusCode::BAD_REQUEST, msg),
+            other => Self(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        }
     }
 }
 

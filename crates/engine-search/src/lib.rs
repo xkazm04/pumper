@@ -216,7 +216,7 @@ impl Search for TantivyIndex {
             }
             let parsed = parser
                 .parse_query(&req.q)
-                .map_err(|e| Error::App(format!("bad search query: {e}")))?;
+                .map_err(|e| Error::BadRequest(format!("bad search query: {e}")))?;
 
             // Scope by app/dataset via exact term filters.
             let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, parsed)];
