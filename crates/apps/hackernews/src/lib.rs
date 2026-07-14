@@ -55,6 +55,15 @@ impl ScrapeApp for HackerNews {
             stories.extend(parse_front_page(&response.body, offset));
         }
 
+        if stories.is_empty() {
+            // The front page always lists stories; a 200 that parses to zero rows
+            // means markup drift or a soft rate-limit page — fail rather than
+            // silently record an empty run as success.
+            return Err(Error::App(
+                "HN: fetched pages but parsed 0 stories (markup drift or soft rate-limit)".into(),
+            ));
+        }
+
         ctx.save_artifact("stories.json", &serde_json::to_vec_pretty(&stories)?)
             .await?;
 
