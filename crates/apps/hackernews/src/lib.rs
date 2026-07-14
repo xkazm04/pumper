@@ -77,7 +77,9 @@ impl ScrapeApp for HackerNews {
                 (key, serde_json::to_value(s).unwrap_or(Value::Null))
             })
             .collect();
-        let summary = ctx.upsert_many("stories", &items).await?;
+        // The front page is a full snapshot, so use sync_many: a story that has
+        // dropped off is marked removed rather than lingering forever.
+        let summary = ctx.sync_many("stories", &items).await?;
 
         Ok(json!({
             "count": stories.len(),
