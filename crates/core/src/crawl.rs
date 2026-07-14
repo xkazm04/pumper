@@ -230,6 +230,9 @@ pub struct CrawlStats {
     pub skipped_robots: usize,
     /// Discovered links dropped by include/exclude URL patterns.
     pub skipped_filtered: usize,
+    /// Discovered URLs refused because the frontier hit its `MAX_FRONTIER` cap —
+    /// coverage was truncated (0 = the whole discovered graph fit).
+    pub frontier_dropped: usize,
     /// URLs seeded into the frontier from sitemaps.
     pub sitemap_seeded: usize,
     /// Fetches that failed at the transport layer (DNS/TLS/connection/timeout) —
@@ -265,18 +268,30 @@ pub struct CrawlStats {
 struct Frontier {
     queue: VecDeque<(String, u32)>,
     seen: HashSet<String>,
+    /// New URLs refused because the seen-set hit `MAX_FRONTIER` (coverage was
+    /// truncated). Tracked so a capped crawl is reported honestly rather than
+    /// silently dropping discovered URLs.
+    dropped: usize,
 }
 
 impl Frontier {
     fn new() -> Self {
-        Self { queue: VecDeque::new(), seen: HashSet::new() }
+        Self { queue: VecDeque::new(), seen: HashSet::new(), dropped: 0 }
     }
     fn push(&mut self, url: String, depth: u32) {
-        if self.seen.len() >= MAX_FRONTIER || self.seen.contains(&url) {
+        if self.seen.contains(&url) {
+            return; // already discovered — normal dedup, not a coverage drop
+        }
+        if self.seen.len() >= MAX_FRONTIER {
+            self.dropped += 1;
             return;
         }
         self.seen.insert(url.clone());
         self.queue.push_back((url, depth));
+    }
+    /// Count of discovered URLs refused because the frontier cap was reached.
+    fn dropped(&self) -> usize {
+        self.dropped
     }
     fn pop(&mut self) -> Option<(String, u32)> {
         self.queue.pop_front()
@@ -624,18 +639,23 @@ pub async fn crawl(
                     }
                 }
             }
-            // Enqueue newly discovered links within the depth budget. Revisit
-            // mode does NOT follow links unless `discover` is set — a sentinel
-            // recrawl re-checks the known set, it doesn't expand it.
-            let expand = !cfg.revisit || cfg.discover;
-            if expand && fetched.depth < cfg.max_depth {
-                for link in &fetched.links {
-                    if !filter.allows(link) {
-                        stats.skipped_filtered += 1;
-                        continue;
-                    }
-                    frontier.push(link.clone(), fetched.depth + 1);
+        }
+
+        // Enqueue newly discovered links within the depth budget — for BOTH kept
+        // and near-duplicate pages. A page being a content near-dup of another
+        // does NOT mean its outbound links are already known; following them only
+        // from kept pages silently under-crawls subtrees (pagination / faceted
+        // nav) reachable only via a near-dup page. The frontier's own URL seen-set
+        // still prevents re-fetching. (Revisit mode does not expand unless
+        // `discover` is set — a sentinel recrawl re-checks, it doesn't expand.)
+        let expand = !cfg.revisit || cfg.discover;
+        if expand && fetched.depth < cfg.max_depth {
+            for link in &fetched.links {
+                if !filter.allows(link) {
+                    stats.skipped_filtered += 1;
+                    continue;
                 }
+                frontier.push(link.clone(), fetched.depth + 1);
             }
         }
 
@@ -663,6 +683,7 @@ pub async fn crawl(
 
     stats.hosts = hosts.len();
     stats.frontier_remaining = frontier.queue.len();
+    stats.frontier_dropped = frontier.dropped();
     if let Some(path) = &cfg.checkpoint {
         if !Checkpoint::save(path, &frontier, dedup_index.hashes()).await {
             stats.checkpoint_errors += 1;
@@ -998,18 +1019,21 @@ async fn robots_for<'a>(
     cache.get(host).unwrap()
 }
 
-/// Minimal robots.txt rules for the `*` user-agent: Disallow-prefix matching,
-/// plus the `Crawl-delay` for that group and the (group-independent)
-/// `Sitemap:` directives.
+/// robots.txt rules for the `*` user-agent: ordered Allow/Disallow patterns
+/// (with `*`/`$` wildcards and longest-match precedence), plus the `Crawl-delay`
+/// for that group and the (group-independent) `Sitemap:` directives.
 struct RobotRules {
-    disallows: Vec<String>,
+    /// `(is_allow, pattern)` in file order. A path is matched against every
+    /// pattern; the longest match wins, and an `Allow` beats a `Disallow` on an
+    /// equal-length tie (the common Google robots precedence).
+    rules: Vec<(bool, String)>,
     crawl_delay: Option<f64>,
     sitemaps: Vec<String>,
 }
 
 impl RobotRules {
     fn allow_all() -> Self {
-        Self { disallows: Vec::new(), crawl_delay: None, sitemaps: Vec::new() }
+        Self { rules: Vec::new(), crawl_delay: None, sitemaps: Vec::new() }
     }
 
     fn parse(text: &str) -> Self {
@@ -1028,7 +1052,10 @@ impl RobotRules {
             match key.as_str() {
                 "user-agent" => in_star_group = value == "*",
                 "disallow" if in_star_group && !value.is_empty() => {
-                    rules.disallows.push(value.to_string());
+                    rules.rules.push((false, value.to_string()));
+                }
+                "allow" if in_star_group && !value.is_empty() => {
+                    rules.rules.push((true, value.to_string()));
                 }
                 "crawl-delay" if in_star_group => {
                     rules.crawl_delay = value.parse::<f64>().ok().filter(|d| *d > 0.0);
@@ -1043,10 +1070,60 @@ impl RobotRules {
     fn allowed(&self, url: &str) -> bool {
         let path = Url::parse(url)
             .ok()
-            .map(|u| u.path().to_string())
+            .map(|u| match u.query() {
+                Some(q) => format!("{}?{}", u.path(), q),
+                None => u.path().to_string(),
+            })
             .unwrap_or_else(|| "/".to_string());
-        !self.disallows.iter().any(|d| path.starts_with(d))
+        // Longest matching pattern wins; Allow beats Disallow on an equal-length
+        // tie; no match at all → allowed.
+        let mut best: Option<(usize, bool)> = None; // (specificity, is_allow)
+        for (is_allow, pattern) in &self.rules {
+            if let Some(len) = robots_match_len(pattern, &path) {
+                let better = match best {
+                    None => true,
+                    Some((blen, ballow)) => len > blen || (len == blen && *is_allow && !ballow),
+                };
+                if better {
+                    best = Some((len, *is_allow));
+                }
+            }
+        }
+        best.map(|(_, is_allow)| is_allow).unwrap_or(true)
     }
+}
+
+/// Matches a robots path pattern against `path`, returning the pattern's
+/// specificity (byte length, minus a trailing `$`) when it matches, else `None`.
+/// Robots patterns match from the START of the path; `*` matches any run
+/// (including empty) and a trailing `$` anchors the match to the path end.
+fn robots_match_len(pattern: &str, path: &str) -> Option<usize> {
+    let anchored = pattern.ends_with('$');
+    let pat = if anchored { &pattern[..pattern.len() - 1] } else { pattern };
+    let mut pos = 0usize;
+    for (i, seg) in pat.split('*').enumerate() {
+        if seg.is_empty() {
+            continue;
+        }
+        if i == 0 {
+            // The first literal segment is anchored to the path start.
+            if !path[pos..].starts_with(seg) {
+                return None;
+            }
+            pos += seg.len();
+        } else {
+            match path[pos..].find(seg) {
+                Some(idx) => pos += idx + seg.len(),
+                None => return None,
+            }
+        }
+    }
+    // `$` requires the match to reach the end of the path (unless the pattern
+    // ends with `*`, which already permits any suffix).
+    if anchored && !pat.ends_with('*') && pos != path.len() {
+        return None;
+    }
+    Some(pat.len())
 }
 
 /// Hard caps for sitemap seeding: nested sitemaps followed per index, and total
@@ -1509,6 +1586,21 @@ mod tests {
         assert_eq!(rules.sitemaps[0], "https://x.com/sitemap.xml");
         assert!(!rules.allowed("https://x.com/admin/x"));
         assert!(rules.allowed("https://x.com/pub"));
+    }
+
+    #[test]
+    fn robots_allow_overrides_and_wildcards_match() {
+        let r = RobotRules::parse(
+            "User-agent: *\nDisallow: /private\nAllow: /private/public\nDisallow: /*.pdf$\n",
+        );
+        // A longer Allow beats the shorter Disallow it sits under.
+        assert!(!r.allowed("https://x.test/private/secret"));
+        assert!(r.allowed("https://x.test/private/public/page"));
+        // `$`-anchored wildcard blocks only exact `.pdf` endings.
+        assert!(!r.allowed("https://x.test/files/doc.pdf"));
+        assert!(r.allowed("https://x.test/files/doc.pdfx"));
+        // No matching rule → allowed.
+        assert!(r.allowed("https://x.test/anything"));
     }
 
     #[test]
