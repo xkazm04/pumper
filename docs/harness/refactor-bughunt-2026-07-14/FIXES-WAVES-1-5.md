@@ -1,8 +1,19 @@
-# Refactor + Bug-Hunt — Fix Waves 1–4 (pumper, 2026-07-14)
+# Refactor + Bug-Hunt — Fix Waves 1–5 (pumper, 2026-07-14)
 
-> **15 findings closed in 12 atomic commits** across 4 themed waves + the deferred dataset-upsert atomicity fix.
-> Baseline preserved: `cargo build` clean, tests **177 → 182** (5 regression tests added), 0 warnings throughout.
+> **22 findings closed in 19 atomic commits** across 5 themed waves + the deferred dataset-upsert atomicity fix.
+> Severity closed: **all 4 Criticals + 14 Highs + 4 Mediums.** 80 findings remain open.
+> Baseline preserved: `cargo build` clean, tests **177 → 183** (6 regression tests added), 0 warnings, 0 regressions throughout.
 > Branch: `vibeman/refactor-bughunt-2026-07-14` (off `master`, not pushed).
+
+## Wave 5 — Honest results (empty/garbage ≠ success): 6 Highs + 1 Medium
+The dominant open theme. A scrape/query that fails or returns nothing must not report success.
+- **eu-sedia drift guard** (`2a80c0c`) — positive `totalResults` with zero parsed rows now errors instead of returning `fetched: 0` as success.
+- **hackernews** (`1742ce3`) — a 200 that parses to zero stories (drift/soft rate-limit) now errors.
+- **readable** (`cce1ced`) — empty extraction now errors instead of returning an empty-but-ok 200.
+- **plugin** (`daa0556`) — fetch/plugin `{error}` records are no longer upserted into the output dataset.
+- **research** (`f64e5b1`) — the `json_schema` guardrail is now set, and `structured` only holds when the returned object matches the promised shape (else falls back to text).
+- **extract json-pointer** (`ec71f42`) — a malformed pointer now fails `compile()` (like css/regex/xpath) instead of becoming a silent `Empty` miss.
+- **search 400** (`eff7fcf`) — a malformed query returns HTTP 400 via a new `Error::BadRequest` variant, not a 500.
 
 ## Commits
 
