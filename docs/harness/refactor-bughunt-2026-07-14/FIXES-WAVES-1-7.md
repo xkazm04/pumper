@@ -1,9 +1,17 @@
-# Refactor + Bug-Hunt — Fix Waves 1–6 (pumper, 2026-07-14)
+# Refactor + Bug-Hunt — Fix Waves 1–7 (pumper, 2026-07-14)
 
-> **25 findings closed in 20 atomic commits** across 6 themed waves + the deferred dataset-upsert atomicity fix.
-> Severity closed: **all 4 Criticals + 15 Highs + 6 Mediums.** 77 findings remain open.
+> **29 findings closed in 22 atomic commits** across 7 themed waves + the deferred dataset-upsert atomicity fix.
+> Severity closed: **all 4 Criticals + 17 Highs + 8 Mediums.** 73 findings remain open.
 > Baseline preserved: `cargo build` clean, tests **177 → 184** (7 regression tests added), 0 warnings, 0 regressions throughout.
 > Branch: `vibeman/refactor-bughunt-2026-07-14` (off `master`, not pushed).
+
+## Wave 7 — API hardening + resource bounds: 2 Highs + 2 Mediums
+- **CORS off by default** (`aa84250`, High) — was `CorsLayer::permissive()` (allow-all) over a mutating, unauthenticated API; now same-origin only, with a `[server] cors_allowed_origins` opt-in.
+- **Chrome launch outside the global lock** (`b4526d0`, High) — `acquire()` no longer holds the holders mutex across `launch().await`, so one profile's cold start / crash-relaunch can't stall the whole render pool.
+- **max_attempts clamped** (`aa84250`, Medium) — client-supplied `max_attempts` is bounded to [1, 20] on jobs/schedules/triggers (was unbounded → non-terminating retries).
+- **Browser tab leak on content error** (`b4526d0`, Medium) — a failed `page.content()` now still aborts the drainer + closes the tab instead of leaking both.
+
+**Deferred with reason (API):** non-cursor list branches ignore `limit` (Medium — a wide mechanical change across ~11 endpoints; better as a focused pass so each legacy branch converts to a capped paged read); `webhook_deliveries` unbounded growth (Medium — needs a purge method + a scheduler-tick caller, like `HttpCache::purge_expired`).
 
 ## Wave 6 — Crawler correctness: 1 High + 2 Mediums (`f4c6b42`)
 - **Near-dup links** (High) — outbound links are now followed from near-duplicate pages too, not just kept ones; previously subtrees reachable only via a near-dup page (pagination/faceted nav) were silently under-crawled.
