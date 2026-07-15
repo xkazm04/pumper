@@ -523,6 +523,44 @@ impl Datasets {
         Ok(pairs)
     }
 
+    /// Recomputes every record's SimHash from its stored JSON, rewriting only the
+    /// rows whose fingerprint actually changed. Returns that count.
+    ///
+    /// This is the one-shot to run after the SimHash token hash changes: old and
+    /// new fingerprints are not comparable, so a table holding a mix of both
+    /// yields meaningless Hamming distances and silently wrong near-dup results.
+    /// Only the derived `simhash` column is touched — `data`, `hash` and the
+    /// timestamps are left alone so the change-feed sees no spurious revisions.
+    /// Run with the worker stopped; the whole rewrite is one transaction.
+    pub async fn reindex_simhashes(&self) -> Result<usize> {
+        let rows: Vec<(String, String, String, String, i64)> =
+            sqlx::query_as("SELECT app, dataset, key, data, simhash FROM records")
+                .fetch_all(&self.pool)
+                .await?;
+
+        let mut tx = self.pool.begin().await?;
+        let mut changed = 0usize;
+        for (app, dataset, key, data, old_sim) in rows {
+            let value: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+            let sim = crate::simhash::simhash_value(&value) as i64;
+            if sim == old_sim {
+                continue;
+            }
+            sqlx::query(
+                "UPDATE records SET simhash = ?4 WHERE app = ?1 AND dataset = ?2 AND key = ?3",
+            )
+            .bind(&app)
+            .bind(&dataset)
+            .bind(&key)
+            .bind(sim)
+            .execute(&mut *tx)
+            .await?;
+            changed += 1;
+        }
+        tx.commit().await?;
+        Ok(changed)
+    }
+
     /// Number of records in a dataset (removed rows included) — the bound the
     /// duplicate scan checks before its O(n²) pairwise SimHash comparison.
     pub async fn record_count(&self, app: &str, dataset: &str) -> Result<i64> {

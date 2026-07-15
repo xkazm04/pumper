@@ -21,6 +21,48 @@ async fn fresh_db(tag: &str) -> (Storage, std::path::PathBuf) {
     (storage, dir)
 }
 
+#[tokio::test]
+async fn reindex_rewrites_stale_simhashes_without_touching_content() {
+    let (storage, dir) = fresh_db("datasets-reindex").await;
+    let pool = storage.pool();
+    let ds = Datasets::new(storage.pool());
+
+    ds.upsert("app", "d", "k", &json!({ "title": "hello world simhash reindex" }))
+        .await
+        .unwrap();
+
+    // What the current hash should produce, plus the content fields that must NOT move.
+    let (correct_sim, hash_before, updated_before): (i64, String, String) =
+        sqlx::query_as("SELECT simhash, hash, updated_at FROM records WHERE key = 'k'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+    // Simulate a fingerprint left behind by an older token hash.
+    sqlx::query("UPDATE records SET simhash = 12345 WHERE key = 'k'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(ds.reindex_simhashes().await.unwrap(), 1, "stale row must be rewritten");
+
+    let (sim_after, hash_after, updated_after): (i64, String, String) =
+        sqlx::query_as("SELECT simhash, hash, updated_at FROM records WHERE key = 'k'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(sim_after, correct_sim, "simhash recomputed from the stored data");
+    // Content hash + timestamps untouched → the change-feed sees no fake revision.
+    assert_eq!(hash_after, hash_before, "content hash must not move");
+    assert_eq!(updated_after, updated_before, "updated_at must not move");
+
+    // Idempotent: a second run finds nothing to rewrite.
+    assert_eq!(ds.reindex_simhashes().await.unwrap(), 0, "reindex must be idempotent");
+
+    drop(storage);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_same_key_upserts_keep_revision_chain_intact() {
     let (storage, dir) = fresh_db("datasets-concurrency").await;
