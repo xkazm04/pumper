@@ -147,24 +147,7 @@ impl ScrapeApp for CensusDensity {
             };
 
         // Key: param → env. Census requires it (keyless 302 → missing_key.html).
-        let api_key = ctx
-            .params
-            .get("api_key")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| std::env::var("CENSUS_API_KEY").ok())
-            .filter(|k| !k.trim().is_empty());
-        let api_key = match api_key {
-            Some(k) => k,
-            None => {
-                return Err(Error::App(
-                    "census-density needs a free Census API key — set env \
-                     CENSUS_API_KEY or pass params.api_key. Get one instantly at \
-                     https://api.census.gov/data/key_signup.html"
-                        .into(),
-                ))
-            }
-        };
+        let api_key = census_common::api_key(&ctx, "census-density")?;
 
         if geo == "county" && (states.is_empty() || states == "*") {
             return Err(Error::App(
@@ -236,22 +219,16 @@ impl ScrapeApp for CensusDensity {
             let mut total_emp: i64 = 0;
             let mut ranked: Vec<(String, i64)> = Vec::new();
 
-            // Census encodes disclosure suppression and jam values as sentinels
-            // like -666666666; treat any missing, non-numeric, or negative cell as
-            // suppressed so it is never summed into a total or counted as a place.
-            let census_num = |cell: Option<&String>| -> Option<i64> {
-                cell.and_then(|s| s.trim().parse::<i64>().ok()).filter(|v| *v >= 0)
-            };
 
             for row in rows.iter().skip(1) {
                 let geo_code = row.get(i_geo).cloned().unwrap_or_default();
-                let Some(estab) = census_num(row.get(i_estab)) else {
+                let Some(estab) = census_common::census_num(row.get(i_estab)) else {
                     // Suppressed/jammed primary cell: not a genuinely reported
                     // place — skip rather than fabricate a 0-establishment row.
                     continue;
                 };
-                let emp = i_emp.and_then(|i| census_num(row.get(i))).unwrap_or(0);
-                let pay = i_pay.and_then(|i| census_num(row.get(i))).unwrap_or(0);
+                let emp = i_emp.and_then(|i| census_common::census_num(row.get(i))).unwrap_or(0);
+                let pay = i_pay.and_then(|i| census_common::census_num(row.get(i))).unwrap_or(0);
 
                 let (st_fips, county_fips) = if geo == "county" {
                     let st = i_state
@@ -263,8 +240,8 @@ impl ScrapeApp for CensusDensity {
                     (geo_code.clone(), None)
                 };
                 let place = match &county_fips {
-                    Some(c) => format!("{}·{}", state_abbr(&st_fips), c),
-                    None => state_abbr(&st_fips).to_string(),
+                    Some(c) => format!("{}·{}", census_common::state_abbr(&st_fips), c),
+                    None => census_common::state_abbr(&st_fips).to_string(),
                 };
                 let key = match &county_fips {
                     Some(c) => format!("{naics}:{st_fips}{c}"),
@@ -608,8 +585,8 @@ fn for_clause(geo: &str, states: &str) -> String {
 /// Place label matching the CBP loop: state abbreviation, or `AB·CCC` for a county.
 fn place_of(st_fips: &str, county_fips: Option<&str>) -> String {
     match county_fips {
-        Some(c) => format!("{}·{}", state_abbr(st_fips), c),
-        None => state_abbr(st_fips).to_string(),
+        Some(c) => format!("{}·{}", census_common::state_abbr(st_fips), c),
+        None => census_common::state_abbr(st_fips).to_string(),
     }
 }
 
@@ -777,21 +754,3 @@ mod tests {
     }
 }
 
-/// 2-digit state FIPS → USPS abbreviation (50 states + DC + PR). Unknown codes
-/// pass through unchanged so nothing is silently dropped.
-fn state_abbr(fips: &str) -> &str {
-    match fips {
-        "01" => "AL", "02" => "AK", "04" => "AZ", "05" => "AR", "06" => "CA",
-        "08" => "CO", "09" => "CT", "10" => "DE", "11" => "DC", "12" => "FL",
-        "13" => "GA", "15" => "HI", "16" => "ID", "17" => "IL", "18" => "IN",
-        "19" => "IA", "20" => "KS", "21" => "KY", "22" => "LA", "23" => "ME",
-        "24" => "MD", "25" => "MA", "26" => "MI", "27" => "MN", "28" => "MS",
-        "29" => "MO", "30" => "MT", "31" => "NE", "32" => "NV", "33" => "NH",
-        "34" => "NJ", "35" => "NM", "36" => "NY", "37" => "NC", "38" => "ND",
-        "39" => "OH", "40" => "OK", "41" => "OR", "42" => "PA", "44" => "RI",
-        "45" => "SC", "46" => "SD", "47" => "TN", "48" => "TX", "49" => "UT",
-        "50" => "VT", "51" => "VA", "53" => "WA", "54" => "WV", "55" => "WI",
-        "56" => "WY", "72" => "PR",
-        other => other,
-    }
-}

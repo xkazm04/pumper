@@ -171,18 +171,13 @@ impl ScrapeApp for GrantsGov {
 
         let summary = ctx.upsert_many("opportunities", &items).await?;
 
-        // Cross-source layer: normalize into grants/unified and link SimHash
-        // near-duplicates syndicated across portals.
+        // Cross-source layer: normalize into grants/unified, sweep past-due rows
+        // closed, and link SimHash near-duplicates syndicated across portals.
         let unified_items: Vec<(String, Value)> = hits
             .iter()
             .filter_map(grants_common::normalize_grants_gov)
             .collect();
-        let unified = grants_common::sync_unified(&ctx, &unified_items).await?;
-        // Lifecycle: flip past-due open/forecasted unified rows to closed (this
-        // upsert-only source never sees a delisting otherwise).
-        let swept = grants_common::sweep_closed(&ctx).await?;
-        let cross_source_dups = grants_common::link_duplicates(&ctx, 3).await?;
-        let warnings = grants_common::drift_warnings(&unified_items);
+        let cross = grants_common::finalize_unified(&ctx, &unified_items).await?;
 
         // Closing-soon digest: posted opportunities whose closeDate falls within
         // the next `digestDays` days, soonest first — the deadline-alert surface
@@ -197,7 +192,7 @@ impl ScrapeApp for GrantsGov {
         ctx.save_artifact("closing_soon.json", &serde_json::to_vec_pretty(&closing_soon)?)
             .await?;
 
-        Ok(json!({
+        let mut out = json!({
             "source": "grants.gov/search2",
             "oppStatuses": statuses,
             "hitCount": hit_count,
@@ -209,14 +204,9 @@ impl ScrapeApp for GrantsGov {
             "digestDays": digest_days,
             "closingSoonCount": closing_soon.len(),
             "closingSoon": closing_soon.iter().take(25).collect::<Vec<_>>(),
-            "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
-            "swept": swept,
-            "warnings": warnings,
-            "crossSourceDups": cross_source_dups,
-            // Per-opportunity search docs come from the unified dataset (compact
-            // result, one indexed doc per grant) — see worker `dataset_search_docs`.
-            "index_datasets": [{ "app": grants_common::UNIFIED_APP, "dataset": grants_common::UNIFIED_DATASET }],
-        }))
+        });
+        cross.merge_into(&mut out);
+        Ok(out)
     }
 }
 

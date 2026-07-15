@@ -1,9 +1,18 @@
-# Refactor + Bug-Hunt — Fix Waves 1–9 (pumper, 2026-07-14)
+# Refactor + Bug-Hunt — Fix Waves 1–10 (pumper, 2026-07-14 → 07-15)
 
-> **39 findings closed in 27 atomic commits** across 9 themed waves + the deferred dataset-upsert atomicity fix.
-> Severity closed: **all 4 Criticals + 18 Highs + 17 Mediums.** 63 findings remain open (the app-level duplication tail + low tail).
-> Baseline preserved: `cargo build` clean, tests **177 → 185** (8 regression tests added), 0 warnings, 0 regressions throughout.
-> Branch: `vibeman/refactor-bughunt-2026-07-14` (off `master`, not pushed).
+> **44 findings closed** across 10 themed waves + the deferred dataset-upsert atomicity fix + the SimHash reindex.
+> Severity closed: **all 4 Criticals + 19 Highs + 20 Mediums + 1 Low.** 58 findings remain open (the rest of the duplication tail + low tail).
+> Baseline preserved: `cargo build` clean, tests **177 → 188** (11 regression tests added), 0 warnings, 0 regressions throughout.
+> Waves 1–9 merged to `master` via PR #1 (`8864abc`); the SimHash reindex shipped as `b2e1da7`.
+
+## Wave 10 — Duplication tail, part 1 (1 High + 3 Mediums + 1 Low)
+Taken in value order, each verified with the full gates. The two shared-crate extractions target duplication that **demonstrably caused divergent bugs**.
+- **Grants cross-source finalize** (`f2cff4f`, **High**) — grants-gov and ca-grants each hand-rolled the same four-call tail (`sync_unified` → `sweep_closed` → `link_duplicates(.., 3)` → `drift_warnings`) plus an identical 5-key JSON tail; only `normalize_*` differed. Now `grants_common::finalize_unified()` returning a `UnifiedOutcome`, with the dup-distance literal promoted to `DUP_DISTANCE`. A new grant source gets the whole cross-source layer from one call.
+- **census-common** (`276d48b`, Medium) — the two Census apps duplicated `state_abbr` (byte-identical), the api-key resolution, and the `census_num` suppression guard. That duplication is *why* the negative jam-sentinel check landed in `fetch_denominator` but not the primary parsers. New `census-common` crate (matching `grants-common`/`trades-common`) owns all three; unit-tested.
+- **trades research step** (`1793cf7`, Medium) — all four agentic trades apps opened with a byte-for-byte copy of research → archive `research.json` → parse-or-salvage. Now `trades_common::research_json(ctx, app, request)`.
+- **since parser + inert serde** (`98e91b3`, Low + Medium) — the RFC-3339 `since` parser was duplicated in two handlers → `parse_since()`. And `HttpResponse`/`RenderedPage` carried four `#[serde(default)]` attributes whose docs claimed deserialization compatibility — both derive `Serialize` **only**, so the attributes were inert and the docs described a guarantee that never existed. Removed; behavior unchanged.
+
+**Still open in the tail:** cross-engine bounded-LRU (engine-http vs engine-browser); the ~11-way dual-mode list-handler boilerplate; the fetcher's near-duplicate tier-attempt blocks; eu-sedia not wired into `grants/unified` (a coverage gap — now cheap given `finalize_unified`, but it needs a `normalize_eu_sedia` mapping); plus the Low tail (LCG jitter, webhook dispatch preamble, `Cell::to_value`, plugin `alloc`, extractor param idioms, budget clamp, registry ordering, `NoSearch`/`NoPlugins` inconsistency).
 
 ## Wave 9 — Consolidation + registry integrity: 3 Mediums
 Duplication is the highest-regression-risk category, so this wave took the subset where dedup *fixes a real latent bug*, leaving the app-level consolidation for dedicated sessions.

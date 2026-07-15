@@ -89,6 +89,7 @@ name = "app-census-density"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "census-common",
  "pumper-core",
  "serde_json",
 ]
@@ -99,6 +100,7 @@ version = "0.1.0"
 dependencies = [
  "app-census-density",
  "async-trait",
+ "census-common",
  "pumper-core",
  "serde_json",
 ]
@@ -548,6 +550,14 @@ name = "census"
 version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4f4c707c6a209cbe82d10abd08e1ea8995e9ea937d2550646e02798948992be0"
+
+[[package]]
+name = "census-common"
+version = "0.1.0"
+dependencies = [
+ "pumper-core",
+ "serde_json",
+]
 
 [[package]]
 name = "cfg-if"

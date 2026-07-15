@@ -5,6 +5,7 @@ edition.workspace = true
 
 [dependencies]
 pumper-core.workspace = true
+census-common.workspace = true
 # For the shared employer+solo `census/market_blend` derivation (both Census
 # apps re-blend after their own upserts so the blend tracks whichever ran last).
 app-census-density.workspace = true

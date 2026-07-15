@@ -16,6 +16,59 @@ pub const UNIFIED_APP: &str = "grants";
 pub const UNIFIED_DATASET: &str = "unified";
 pub const DUP_DATASET: &str = "duplicate_links";
 
+/// SimHash Hamming distance for cross-source near-duplicate linking. One
+/// constant so every source links identically — a per-app literal drifts.
+pub const DUP_DISTANCE: u32 = 3;
+
+/// What the shared cross-source finalize produced, for the source's result JSON.
+pub struct UnifiedOutcome {
+    pub unified: UpsertSummary,
+    pub swept: usize,
+    pub cross_source_dups: usize,
+    pub warnings: Vec<String>,
+}
+
+impl UnifiedOutcome {
+    /// Merges the cross-source fields into a source app's result object so every
+    /// grant source reports the unified layer with one identical shape.
+    pub fn merge_into(&self, out: &mut Value) {
+        let Value::Object(map) = out else { return };
+        map.insert(
+            "unified".into(),
+            json!({ "new": self.unified.new.len(), "changed": self.unified.changed.len() }),
+        );
+        map.insert("swept".into(), json!(self.swept));
+        map.insert("warnings".into(), json!(self.warnings));
+        map.insert("crossSourceDups".into(), json!(self.cross_source_dups));
+        // Per-opportunity search docs come from the unified dataset (compact
+        // result, one indexed doc per grant) — see worker `dataset_search_docs`.
+        map.insert(
+            "index_datasets".into(),
+            json!([{ "app": UNIFIED_APP, "dataset": UNIFIED_DATASET }]),
+        );
+    }
+}
+
+/// The cross-source tail every grant source runs after storing its raw records:
+/// publish the normalized batch into `grants/unified`, sweep past-due rows to
+/// closed, link near-duplicates, and collect drift warnings.
+///
+/// Shared so the sources cannot drift apart — before this, each app hand-rolled
+/// the same four calls, and one silently skipping the sweep (or linking at a
+/// different distance) would be invisible.
+pub async fn finalize_unified(
+    ctx: &AppContext,
+    unified_items: &[(String, Value)],
+) -> Result<UnifiedOutcome> {
+    let unified = sync_unified(ctx, unified_items).await?;
+    // Lifecycle: flip past-due open/forecasted unified rows to closed — these
+    // upsert-only sources never see a delisting otherwise.
+    let swept = sweep_closed(ctx).await?;
+    let cross_source_dups = link_duplicates(ctx, DUP_DISTANCE).await?;
+    let warnings = drift_warnings(unified_items);
+    Ok(UnifiedOutcome { unified, swept, cross_source_dups, warnings })
+}
+
 /// Normalizes a grants.gov Search2 `oppHits[]` entry. Award amounts are not
 /// present in Search2 results, so the money fields stay null for this source.
 pub fn normalize_grants_gov(hit: &Value) -> Option<(String, Value)> {

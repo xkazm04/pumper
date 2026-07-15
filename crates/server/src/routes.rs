@@ -138,6 +138,18 @@ pub fn router(state: AppState) -> Router {
 /// can't request a practically-non-terminating retry loop.
 const MAX_ATTEMPTS_CAP: i64 = 20;
 
+/// Parses an optional RFC-3339 `since` query param. A malformed value is the
+/// client's mistake, so it is a 400 — not the blanket 500 a bare `?` would give.
+fn parse_since(since: Option<&str>) -> Result<Option<chrono::DateTime<chrono::Utc>>, ApiError> {
+    since
+        .map(|s| {
+            chrono::DateTime::parse_from_rfc3339(s)
+                .map(|d| d.with_timezone(&chrono::Utc))
+                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid 'since': {e}")))
+        })
+        .transpose()
+}
+
 /// Serves the generated OpenAPI 3.1 document. The spec is rebuilt from the same
 /// route registration used by `router`, so it always matches what is served.
 #[utoipa::path(
@@ -916,15 +928,7 @@ async fn cost_summary(
     State(state): State<AppState>,
     Query(query): Query<CostSummaryQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let since = query
-        .since
-        .as_deref()
-        .map(|s| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|d| d.with_timezone(&chrono::Utc))
-                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid 'since': {e}")))
-        })
-        .transpose()?;
+    let since = parse_since(query.since.as_deref())?;
     let summary = state.costs.summary(query.app.as_deref(), since).await?;
     let total: f64 = summary.iter().map(|s| s.cost_usd).sum();
     Ok(Json(json!({ "total_usd": total, "by_app_engine": summary })))
@@ -1374,15 +1378,7 @@ async fn dataset_changes(
     Path((app, dataset)): Path<(String, String)>,
     Query(query): Query<ChangesQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let since = query
-        .since
-        .as_deref()
-        .map(|s| {
-            chrono::DateTime::parse_from_rfc3339(s)
-                .map(|d| d.with_timezone(&chrono::Utc))
-                .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("invalid 'since': {e}")))
-        })
-        .transpose()?;
+    let since = parse_since(query.since.as_deref())?;
     let Some(cursor) = &query.cursor else {
         let changes = state
             .datasets

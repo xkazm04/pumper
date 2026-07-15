@@ -166,9 +166,7 @@ pub struct HttpResponse {
     pub final_url: String,
     /// Whether this response was served from the HTTP cache rather than the
     /// network. Set by the engine; surfaced in the tiered-fetch trace so callers
-    /// can distinguish a cache hit from a live fetch. `#[serde(default)]` keeps
-    /// older serialized responses (which predate the field) deserializable.
-    #[serde(default)]
+    /// can distinguish a cache hit from a live fetch.
     pub cache_hit: bool,
 }
 
@@ -223,18 +221,14 @@ pub struct RenderedPage {
     pub evaluated: Option<Value>,
     /// `true` when the navigation-wait deadline elapsed and the DOM was captured
     /// mid-load — the HTML may be partial. Distinguishes an honest timeout from a
-    /// clean load. Serde-defaulted so older payloads deserialize.
-    #[serde(default)]
+    /// clean load.
     pub nav_timed_out: bool,
     /// Outcome of a `wait_for_selector`: `Some(true)` the selector appeared,
     /// `Some(false)` it never did before the deadline, `None` no selector was
-    /// requested. Serde-defaulted for compatibility.
-    #[serde(default)]
+    /// requested.
     pub selector_found: Option<bool>,
     /// Count of subresources (images/fonts/media) dropped by request interception
-    /// for this render. `0` when blocking is off or the render opted out. Serde-
-    /// defaulted for compatibility.
-    #[serde(default)]
+    /// for this render. `0` when blocking is off or the render opted out.
     pub blocked_resources: usize,
 }
 

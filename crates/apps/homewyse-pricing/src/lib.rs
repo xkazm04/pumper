@@ -17,7 +17,6 @@
 use async_trait::async_trait;
 use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
-use trades_common::salvage_json;
 use trades_common::taxonomy;
 use trades_common::unified;
 use trades_common::validate::{self, Rejection};
@@ -97,29 +96,8 @@ impl ScrapeApp for HomewysePricing {
         // that failed ~1/3 of runs (e.g. a dropped key, `"low":150,"300,"high":500`). The
         // salvage_json fallback below still catches anything the schema path misses.
         request.json_schema = Some(pricing_schema());
-        // Metered seam: records a cost event against the job, honors budget_usd,
-        // and serves identical re-runs from the research cache (see core/app.rs).
-        let output = ctx.research(request).await?;
-
-        let artifact = match &output.json {
-            Some(j) => serde_json::to_vec_pretty(j)?,
-            None => output.text.clone().into_bytes(),
-        };
-        ctx.save_artifact("research.json", &artifact).await?;
-
-        // The agent usually returns a clean object, but ~1/3 of runs wrap it in a
-        // markdown fence or add a sentence around it, which the engine can't parse into
-        // `output.json`. Salvage the object from the raw text before giving up — this is
-        // free (no re-run), unlike a job-level retry of the whole (metered) research.
-        let data = match output.json.clone() {
-            Some(j) => j,
-            None => salvage_json(&output.text).ok_or_else(|| {
-                Error::App(format!(
-                    "homewyse-pricing: agent did not return JSON (text starts: {})",
-                    output.text.chars().take(160).collect::<String>()
-                ))
-            })?,
-        };
+        let (data, output) =
+            trades_common::research_json(&ctx, "homewyse-pricing", request).await?;
 
         let mut all_records: Vec<(String, Value)> = Vec::new();
         let mut trade_summaries: Vec<Value> = Vec::new();
