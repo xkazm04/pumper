@@ -317,19 +317,14 @@ impl Fetcher {
                     });
                 }
                 Err(e) if req.strategy == FetchStrategy::Http => return Err(e),
-                Err(e) => {
-                    escalations.push(format!("http tier failed: {e}"));
-                    trace.push(TierTrace {
-                        tier: FetchTier::Http,
-                        verdict: TierVerdict::Error,
-                        http_status: None,
-                        content_chars: None,
-                        cache_hit: None,
-                        latency_ms: elapsed_ms(started),
-                        cost_usd: None,
-                        detail: Some(e.to_string()),
-                    });
-                }
+                Err(e) => trace_tier_error(
+                    &mut escalations,
+                    &mut trace,
+                    FetchTier::Http,
+                    "http",
+                    &e,
+                    started,
+                ),
             }
         }
 
@@ -401,19 +396,14 @@ impl Fetcher {
                     });
                 }
                 Err(e) if req.strategy == FetchStrategy::Browser => return Err(e),
-                Err(e) => {
-                    escalations.push(format!("browser tier failed: {e}"));
-                    trace.push(TierTrace {
-                        tier: FetchTier::Browser,
-                        verdict: TierVerdict::Error,
-                        http_status: None,
-                        content_chars: None,
-                        cache_hit: None,
-                        latency_ms: elapsed_ms(started),
-                        cost_usd: None,
-                        detail: Some(e.to_string()),
-                    });
-                }
+                Err(e) => trace_tier_error(
+                    &mut escalations,
+                    &mut trace,
+                    FetchTier::Browser,
+                    "browser",
+                    &e,
+                    started,
+                ),
             }
         }
 
@@ -462,6 +452,35 @@ impl Fetcher {
 }
 
 /// Milliseconds since `started`, saturating into a `u64` for the trace.
+/// Records a tier that errored out: the human-readable escalation line plus the
+/// machine-readable `Error` trace entry. Identical for every tier bar its name,
+/// so it lives here rather than being re-typed in each tier's error arm.
+///
+/// The tier *bodies* stay deliberately explicit: each tier's "good enough"
+/// criteria genuinely differ (HTTP weighs status + bot-wall, the browser weighs
+/// challenge markers, and the return-early condition differs per strategy), and
+/// that per-tier judgement is the whole point of a tiered fetcher.
+fn trace_tier_error(
+    escalations: &mut Vec<String>,
+    trace: &mut Vec<TierTrace>,
+    tier: FetchTier,
+    name: &str,
+    err: &Error,
+    started: Instant,
+) {
+    escalations.push(format!("{name} tier failed: {err}"));
+    trace.push(TierTrace {
+        tier,
+        verdict: TierVerdict::Error,
+        http_status: None,
+        content_chars: None,
+        cache_hit: None,
+        latency_ms: elapsed_ms(started),
+        cost_usd: None,
+        detail: Some(err.to_string()),
+    });
+}
+
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u64::MAX as u128) as u64
 }
