@@ -145,20 +145,15 @@ impl ScrapeApp for CaGrants {
 
         let summary = ctx.upsert_many("opportunities", &items).await?;
 
-        // Cross-source layer: normalize into grants/unified and link SimHash
-        // near-duplicates syndicated across portals.
+        // Cross-source layer: normalize into grants/unified, sweep past-due rows
+        // closed, and link SimHash near-duplicates syndicated across portals.
         let unified_items: Vec<(String, Value)> = records
             .iter()
             .filter_map(grants_common::normalize_ca_grants)
             .collect();
-        let unified = grants_common::sync_unified(&ctx, &unified_items).await?;
-        // Lifecycle: flip past-due open/forecasted unified rows to closed (this
-        // upsert-only source never sees a delisting otherwise).
-        let swept = grants_common::sweep_closed(&ctx).await?;
-        let cross_source_dups = grants_common::link_duplicates(&ctx, 3).await?;
-        let warnings = grants_common::drift_warnings(&unified_items);
+        let cross = grants_common::finalize_unified(&ctx, &unified_items).await?;
 
-        Ok(json!({
+        let mut out = json!({
             "source": "data.ca.gov/california-grants-portal",
             "status": status,
             "total": total,
@@ -167,14 +162,9 @@ impl ScrapeApp for CaGrants {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
-            "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
-            "swept": swept,
-            "warnings": warnings,
-            "crossSourceDups": cross_source_dups,
-            // Per-opportunity search docs come from the unified dataset (compact
-            // result, one indexed doc per grant) — see worker `dataset_search_docs`.
-            "index_datasets": [{ "app": grants_common::UNIFIED_APP, "dataset": grants_common::UNIFIED_DATASET }],
-        }))
+        });
+        cross.merge_into(&mut out);
+        Ok(out)
     }
 }
 
