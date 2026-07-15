@@ -46,7 +46,9 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
 use chromiumoxide::cdp::browser_protocol::network::{ErrorReason, ResourceType};
 use futures::StreamExt;
 use pumper_core::config::BrowserConfig;
-use pumper_core::{profile_browser_dir, Browser, Error, RenderRequest, RenderedPage, Result};
+use pumper_core::{
+    lru_touch_evict, profile_browser_dir, Browser, Error, RenderRequest, RenderedPage, Result,
+};
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
 
@@ -91,21 +93,6 @@ struct Holders {
     order: VecDeque<String>,
 }
 
-/// Marks `key` most-recently-used and returns the keys that must be closed to
-/// keep at most `cap` instances alive. Pure, so the eviction policy is unit
-/// testable without launching Chrome. `key` is never among the evictions (it is
-/// the newest) as long as `cap >= 1`.
-fn touch_lru(order: &mut VecDeque<String>, key: &str, cap: usize) -> Vec<String> {
-    order.retain(|k| k != key);
-    order.push_back(key.to_string());
-    let mut evicted = Vec::new();
-    while order.len() > cap.max(1) {
-        if let Some(old) = order.pop_front() {
-            evicted.push(old);
-        }
-    }
-    evicted
-}
 
 pub struct BrowserEngine {
     cfg: BrowserConfig,
@@ -253,7 +240,7 @@ impl BrowserEngine {
     /// used profile past `MAX_LIVE_PROFILES`) and returns its browser handle. The
     /// caller must hold the holders lock and `key` must be populated.
     fn checkout(holders: &mut Holders, key: &str) -> Arc<ChromeBrowser> {
-        for evicted in touch_lru(&mut holders.order, key, MAX_LIVE_PROFILES) {
+        for evicted in lru_touch_evict(&mut holders.order, key, MAX_LIVE_PROFILES) {
             // Closing = dropping the holder (kill_on_drop reaps its Chrome).
             if holders.live.remove(&evicted).is_some() {
                 info!(profile = %evicted, "closing least-recently-used browser profile");
@@ -462,20 +449,20 @@ mod tests {
         // Filling to the cap evicts nothing.
         let mut order = VecDeque::new();
         for i in 0..MAX_LIVE_PROFILES {
-            assert!(touch_lru(&mut order, &format!("p{i}"), MAX_LIVE_PROFILES).is_empty());
+            assert!(lru_touch_evict(&mut order, &format!("p{i}"), MAX_LIVE_PROFILES).is_empty());
         }
         assert_eq!(order.len(), MAX_LIVE_PROFILES);
         // Touching p0 makes it most-recent, so p1 becomes the victim when a new
         // profile pushes past the cap.
-        assert!(touch_lru(&mut order, "p0", MAX_LIVE_PROFILES).is_empty());
-        let evicted = touch_lru(&mut order, "pN", MAX_LIVE_PROFILES);
+        assert!(lru_touch_evict(&mut order, "p0", MAX_LIVE_PROFILES).is_empty());
+        let evicted = lru_touch_evict(&mut order, "pN", MAX_LIVE_PROFILES);
         assert_eq!(evicted, vec!["p1".to_string()], "least-recently-used closed");
         assert_eq!(order.len(), MAX_LIVE_PROFILES);
         assert!(order.contains(&"p0".to_string()), "recently used kept alive");
         assert!(order.contains(&"pN".to_string()), "newest is live");
         // The key just acquired is never itself evicted.
         let mut tight = VecDeque::from(vec!["a".to_string()]);
-        assert_eq!(touch_lru(&mut tight, "b", 1), vec!["a".to_string()]);
+        assert_eq!(lru_touch_evict(&mut tight, "b", 1), vec!["a".to_string()]);
         assert_eq!(tight, VecDeque::from(vec!["b".to_string()]));
     }
 
