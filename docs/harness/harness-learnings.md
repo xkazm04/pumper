@@ -1,5 +1,10 @@
 # pumper — harness learnings
 
+## Duplication tail, part 2 (2026-07-15)
+- **2026-07-15** — New core primitives: `pumper_core::lru::{lru_touch, lru_touch_evict}` (bounded-LRU over a `VecDeque` key order — used by engine-http's ClientPool and engine-browser's Holders; `lru_touch_evict` returns evicted keys, cap floored at 1) and `pumper_core::jitter::lcg_fraction(seed)` (the LCG scramble → `[0,1)` shared by governor pacing + HTTP retry backoff). Use these instead of re-rolling either.
+- **2026-07-15** — `webhook::dispatch_event` is now generic over `Serialize` and is the ONLY caller of `spawn_logged`; `dispatch`/`dispatch_change` delegate to it. The "every event goes through dispatch_event" convention is now structural — keep it that way.
+- **2026-07-15** — Refactor-verification tactic that paid off repeatedly: prefer extractions whose **existing tests assert concrete values** (engine-http `retry_delay_*`, `client_pool_is_lru_bounded`, browser `holders_are_lru_bounded`). If they pass untouched after the extraction, behavior is preserved — far stronger than a fresh test written against the new code.
+
 ## Duplication tail, part 1 (2026-07-15)
 - **2026-07-15** — Shared-crate pattern is now `grants-common` / `trades-common` / **`census-common`** (new). A `*-common` lib lives under `crates/apps/` (the workspace-member glob picks it up) but still needs a `[workspace.dependencies]` entry in the root Cargo.toml + a `.workspace = true` dep in each consumer. New seams: `grants_common::finalize_unified()` (+ `UnifiedOutcome`, `DUP_DISTANCE`) — the whole cross-source tail in one call, so a new grant source can't half-wire it; `trades_common::research_json(ctx, app, request)` — research → archive → parse-or-salvage, returns `(Value, ResearchOutput)`; `census_common::{census_num, api_key, state_abbr}`.
 - **2026-07-15** — **`#[serde(default)]` on a `Serialize`-only struct is INERT.** `HttpResponse`/`RenderedPage` carried four of them with docs claiming "keeps older payloads deserializable" — a guarantee that never existed. Check the derive list before trusting a serde attribute (or its comment).
