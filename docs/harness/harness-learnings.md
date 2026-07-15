@@ -1,5 +1,10 @@
 # pumper — harness learnings
 
+## Duplication tail, part 3 (2026-07-15)
+- **2026-07-15** — Dual-mode list handlers: ALL cursor encoding goes through `keyset_cursor(&items, limit, encode)` (9 sites) — never hand-roll `len()==limit -> last() -> map`. Every client-facing legacy (non-cursor) branch is capped via its `_page(.., None, limit)` variant. The only intentionally-unbounded reads are `/metrics` (TTL-cached), `scheduler::reconcile`, and the worker's saved-search eval — they need the full set.
+- **2026-07-15** — Deliberate NON-dedups (don't "fix" these): the dual-mode list *shape* (a macro/async-closure generics would cost more readability than it saves); plugin `alloc` duplicated across the two example plugin crates (they're examples — self-containment is the point); the fetcher's tier BODIES (per-tier "good enough" criteria genuinely differ — only the error arm is shared, via `trace_tier_error`); `require_budget`'s single caller (`fetch` downgrades on exhaustion, `research` errors — different by design).
+- **2026-07-15** — LESSON: a "N-way boilerplate" finding usually has a small genuine core (here: 2 handlers hand-rolling an existing helper) wrapped in a lot of structure that *should* stay explicit. Fix the core; document the rest as deliberate.
+
 ## Duplication tail, part 2 (2026-07-15)
 - **2026-07-15** — New core primitives: `pumper_core::lru::{lru_touch, lru_touch_evict}` (bounded-LRU over a `VecDeque` key order — used by engine-http's ClientPool and engine-browser's Holders; `lru_touch_evict` returns evicted keys, cap floored at 1) and `pumper_core::jitter::lcg_fraction(seed)` (the LCG scramble → `[0,1)` shared by governor pacing + HTTP retry backoff). Use these instead of re-rolling either.
 - **2026-07-15** — `webhook::dispatch_event` is now generic over `Serialize` and is the ONLY caller of `spawn_logged`; `dispatch`/`dispatch_change` delegate to it. The "every event goes through dispatch_event" convention is now structural — keep it that way.
