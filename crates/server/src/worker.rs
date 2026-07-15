@@ -453,7 +453,7 @@ async fn notify_saved_searches(state: &AppState, job: &Job) {
             &search.id,
             &search.url,
             "search.matched",
-            payload,
+            &payload,
             search.secret.clone(),
         );
     }

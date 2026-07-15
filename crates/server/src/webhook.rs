@@ -23,24 +23,9 @@ pub fn dispatch(client: reqwest::Client, storage: Arc<Storage>, job: Job) {
     let Some(url) = job.callback_url.clone() else {
         return;
     };
-    let body = match serde_json::to_vec(&job) {
-        Ok(body) => body,
-        Err(e) => {
-            warn!(job = %job.id, "webhook serialize failed: {e}");
-            return;
-        }
-    };
     let secret = job.callback_secret.clone();
-    spawn_logged(
-        client,
-        storage,
-        "job".to_string(),
-        job.id.to_string(),
-        url,
-        "job.terminal".to_string(),
-        body,
-        secret,
-    );
+    let id = job.id.to_string();
+    dispatch_event(client, storage, "job", &id, &url, "job.terminal", &job, secret);
 }
 
 /// Spawns a best-effort, logged delivery of a `dataset.changed` event.
@@ -50,21 +35,14 @@ pub fn dispatch_change(
     watch: Watch,
     payload: serde_json::Value,
 ) {
-    let body = match serde_json::to_vec(&payload) {
-        Ok(body) => body,
-        Err(e) => {
-            warn!(watch = %watch.id, "change webhook serialize failed: {e}");
-            return;
-        }
-    };
-    spawn_logged(
+    dispatch_event(
         client,
         storage,
-        "change".to_string(),
-        watch.id.clone(),
-        watch.url.clone(),
-        "dataset.changed".to_string(),
-        body,
+        "change",
+        &watch.id.clone(),
+        &watch.url.clone(),
+        "dataset.changed",
+        &payload,
         watch.secret.clone(),
     );
 }
@@ -78,10 +56,10 @@ pub fn dispatch_event(
     ref_id: &str,
     url: &str,
     event: &str,
-    payload: serde_json::Value,
+    payload: &impl serde::Serialize,
     secret: Option<String>,
 ) {
-    let body = match serde_json::to_vec(&payload) {
+    let body = match serde_json::to_vec(payload) {
         Ok(body) => body,
         Err(e) => {
             warn!(kind = %kind, ref_id = %ref_id, "webhook serialize failed: {e}");
@@ -119,7 +97,7 @@ pub fn dispatch_failure(
         "attempts": job.attempts,
         "schedule_id": job.schedule_id,
     });
-    dispatch_event(client, storage, "failure", &job.id.to_string(), url, "job.failed", payload, secret);
+    dispatch_event(client, storage, "failure", &job.id.to_string(), url, "job.failed", &payload, secret);
 }
 
 /// Re-sends a logged delivery (the dead-letter replay path). The caller has
