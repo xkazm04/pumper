@@ -672,10 +672,9 @@ async fn list_jobs(
         .storage
         .list_page(query.app.as_deref(), status, after, limit)
         .await?;
-    let next_cursor = ((jobs.len() as i64) == limit)
-        .then(|| jobs.last())
-        .flatten()
-        .map(|j| format!("{}|{}", pumper_core::datasets::ts(j.created_at), j.id));
+    let next_cursor = keyset_cursor(&jobs, limit, |j| {
+        format!("{}|{}", pumper_core::datasets::ts(j.created_at), j.id)
+    });
     Ok(Json(json!({ "items": jobs, "next_cursor": next_cursor })))
 }
 
@@ -955,10 +954,13 @@ async fn list_schedules(
     State(state): State<AppState>,
     Query(query): Query<SchedulesQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let Some(cursor) = &query.cursor else {
-        return Ok(Json(json!(state.storage.list_schedules().await?)));
-    };
     let limit = query.limit.clamp(1, 500);
+    let Some(cursor) = &query.cursor else {
+        // Legacy bare-array mode is still capped: an uncursored list must not
+        // stream an entire table.
+        let items = state.storage.list_schedules_page(None, limit).await?;
+        return Ok(Json(json!(items)));
+    };
     let after = parse_cursor(cursor);
     let items = state.storage.list_schedules_page(after, limit).await?;
     let next_cursor = keyset_cursor(&items, limit, |s| {
@@ -1134,10 +1136,9 @@ async fn list_records(
     };
     let after = parse_cursor(cursor);
     let records = state.datasets.list_page(&app, &dataset, after, limit).await?;
-    let next_cursor = ((records.len() as i64) == limit)
-        .then(|| records.last())
-        .flatten()
-        .map(|r| format!("{}|{}", pumper_core::datasets::ts(r.updated_at), r.key));
+    let next_cursor = keyset_cursor(&records, limit, |r| {
+        format!("{}|{}", pumper_core::datasets::ts(r.updated_at), r.key)
+    });
     Ok(Json(json!({ "items": records, "next_cursor": next_cursor })))
 }
 
@@ -1470,11 +1471,16 @@ async fn list_watches(
     State(state): State<AppState>,
     Query(query): Query<WatchesQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let limit = query.limit.clamp(1, 500);
     let Some(cursor) = &query.cursor else {
-        let watches = state.storage.list_watches(query.app.as_deref()).await?;
+        // Legacy bare-array mode is still capped: an uncursored list must not
+        // stream an entire table.
+        let watches = state
+            .storage
+            .list_watches_page(query.app.as_deref(), None, limit)
+            .await?;
         return Ok(Json(json!({ "watches": watches })));
     };
-    let limit = query.limit.clamp(1, 500);
     let after = parse_cursor(cursor);
     let items = state
         .storage
@@ -1596,11 +1602,16 @@ async fn list_triggers(
     State(state): State<AppState>,
     Query(query): Query<TriggersQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let limit = query.limit.clamp(1, 500);
     let Some(cursor) = &query.cursor else {
-        let triggers = state.storage.list_triggers(query.app.as_deref()).await?;
+        // Legacy bare-array mode is still capped: an uncursored list must not
+        // stream an entire table.
+        let triggers = state
+            .storage
+            .list_triggers_page(query.app.as_deref(), None, limit)
+            .await?;
         return Ok(Json(json!({ "triggers": triggers })));
     };
-    let limit = query.limit.clamp(1, 500);
     let after = parse_cursor(cursor);
     let items = state
         .storage
@@ -2054,11 +2065,16 @@ async fn list_saved_searches(
     State(state): State<AppState>,
     Query(query): Query<SavedSearchesQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    let limit = query.limit.clamp(1, 500);
     let Some(cursor) = &query.cursor else {
-        let searches = state.storage.list_saved_searches(false).await?;
+        // Legacy bare-array mode is still capped: an uncursored list must not
+        // stream an entire table.
+        let searches = state
+            .storage
+            .list_saved_searches_page(false, None, limit)
+            .await?;
         return Ok(Json(json!({ "searches": searches })));
     };
-    let limit = query.limit.clamp(1, 500);
     let after = parse_cursor(cursor);
     let items = state
         .storage

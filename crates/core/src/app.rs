@@ -89,6 +89,13 @@ impl AppContext {
         Ok(Some((budget - spent).max(0.0)))
     }
 
+    /// Clamps a per-call budget ceiling to the job's remaining headroom: keep the
+    /// caller's own ceiling when it is already tighter, else adopt the headroom.
+    /// Shared by the two metered seams, which otherwise re-typed the expression.
+    fn clamp_to_headroom(ceiling: Option<f64>, remaining: f64) -> f64 {
+        ceiling.map_or(remaining, |b| b.min(remaining))
+    }
+
     /// Errors when the job's spend ceiling is already reached — the abort
     /// switch for metered Claude calls. Returns the remaining headroom.
     async fn require_budget(&self) -> Result<Option<f64>> {
@@ -149,7 +156,7 @@ impl AppContext {
                 }
                 Some(remaining) => {
                     req.max_budget_usd =
-                        Some(req.max_budget_usd.map_or(remaining, |b| b.min(remaining)));
+                        Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
                 }
                 None => {}
             }
@@ -247,7 +254,7 @@ impl AppContext {
         }
 
         if let Some(remaining) = self.require_budget().await? {
-            req.max_budget_usd = Some(req.max_budget_usd.map_or(remaining, |b| b.min(remaining)));
+            req.max_budget_usd = Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
         }
         let out = self.engines.claude.research(req).await?;
         if let Err(e) = self

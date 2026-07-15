@@ -1,9 +1,22 @@
-# Refactor + Bug-Hunt — Fix Waves 1–11 (pumper, 2026-07-14 → 07-15)
+# Refactor + Bug-Hunt — Fix Waves 1–12 (pumper, 2026-07-14 → 07-15)
 
-> **47 findings closed** across 11 themed waves + the deferred dataset-upsert atomicity fix + the SimHash reindex.
-> Severity closed: **all 4 Criticals + 19 Highs + 21 Mediums + 3 Lows.** 55 findings remain open.
-> Baseline preserved: `cargo build` clean, tests **177 → 192** (15 regression tests added), 0 warnings, 0 regressions throughout.
-> Waves 1–9 merged via PR #1 (`8864abc`); SimHash reindex `b2e1da7`; Wave 10 via PR #2 (`36f1e41`).
+> **51 findings closed** across 12 themed waves + the deferred dataset-upsert atomicity fix + the SimHash reindex.
+> Severity closed: **all 4 Criticals + 19 Highs + 24 Mediums + 4 Lows.** 51 findings remain open.
+> Baseline preserved: `cargo build` clean, tests **177 → 192**, 0 warnings, 0 regressions throughout.
+> Merged via PR #1 (`8864abc`), reindex `b2e1da7`, PR #2 (`36f1e41`), PR #3 (`cc7bcb8`).
+
+## Wave 12 — Duplication tail, part 3 (3 Mediums + 1 Low)
+The judgement wave: dedupe what is mechanical, keep what is meaningfully different — and say which is which.
+- **Cursor drift + unbounded lists** (`cc9a37d`, 2 Mediums) — a `keyset_cursor()` helper already existed and 7 handlers used it, but `list_jobs` and the records handler hand-rolled the identical `len()==limit → last() → encode` logic. That drift *is* what the "11-way boilerplate" finding was really about; all 9 sites now use the helper. Separately (closing the Medium deferred in Wave 7) four legacy non-cursor branches ignored `limit` and returned whole tables — schedules, watches, triggers, saved searches — each now serves a capped first page via its existing `_page` variant. The three surviving unbounded reads are deliberate and internal: `/metrics` (TTL-cached gauges), the scheduler reconcile loop, and the worker's saved-search evaluation genuinely need the full set.
+- **Tier error arm** (`004fbcf`, Medium) — the http/browser error arms were byte-identical bar the enum variant → `trace_tier_error()`. The tier **bodies** are deliberately left explicit and the helper's doc says why: HTTP weighs status + bot-wall and carries `cache_hit`/`http_status`, the browser weighs challenge markers and has no status, `needs_count` differs, and the return-early condition differs per strategy. Collapsing them needs generic machinery over two unrelated request/response types and would hide the per-tier judgement that is the point of a tiered fetcher.
+- **Budget headroom clamp** (`e469694`, Low) — both metered seams re-typed the ceiling-vs-headroom expression → `clamp_to_headroom()`. `require_budget()` keeps its single caller **on purpose**: on exhaustion `research` errors while `fetch` downgrades to the free tiers rather than failing the whole fetch.
+
+### Explicitly not deduped (and why)
+- **The dual-mode list shape** — collapsing it needs a macro or heavy generics over async closures; that costs more readability than the ~8 lines it saves.
+- **Plugin `alloc`** (wasm #5) — byte-identical across the two example plugin crates, but they are *examples*: self-containment is the feature. Sharing it would make them worse teaching material.
+- **`NoSearch`/`NoPlugins` inconsistency** (engine-capability #5) — a product decision, not a refactor: should a query against a disabled search engine return empty (current) or error like `NoPlugins` does?
+
+**Genuinely still open:** eu-sedia → `grants/unified` wiring (a *coverage gap*, not duplication — needs a real `normalize_eu_sedia` field mapping); `Cell::to_value`/`to_region_value` percentile serialization; extractor param idioms across four apps; registry ordering vs Cargo.toml.
 
 ## Wave 11 — Duplication tail, part 2 (1 Medium + 2 Lows)
 Shared primitives extracted to core; each verified by the *existing* engine tests passing untouched (they assert concrete values, so they prove behavior was preserved).
