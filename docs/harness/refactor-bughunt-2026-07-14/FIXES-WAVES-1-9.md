@@ -1,9 +1,16 @@
-# Refactor + Bug-Hunt — Fix Waves 1–8 (pumper, 2026-07-14)
+# Refactor + Bug-Hunt — Fix Waves 1–9 (pumper, 2026-07-14)
 
-> **36 findings closed in 25 atomic commits** across 8 themed waves + the deferred dataset-upsert atomicity fix.
-> Severity closed: **all 4 Criticals + 18 Highs + 14 Mediums.** 66 findings remain open (mostly the ~18-finding duplication/refactor tail + low tail).
+> **39 findings closed in 27 atomic commits** across 9 themed waves + the deferred dataset-upsert atomicity fix.
+> Severity closed: **all 4 Criticals + 18 Highs + 17 Mediums.** 63 findings remain open (the app-level duplication tail + low tail).
 > Baseline preserved: `cargo build` clean, tests **177 → 185** (8 regression tests added), 0 warnings, 0 regressions throughout.
 > Branch: `vibeman/refactor-bughunt-2026-07-14` (off `master`, not pushed).
+
+## Wave 9 — Consolidation + registry integrity: 3 Mediums
+Duplication is the highest-regression-risk category, so this wave took the subset where dedup *fixes a real latent bug*, leaving the app-level consolidation for dedicated sessions.
+- **Search write epilogue** (`8a521cf`, 2 Mediums) — the three mutating paths each hand-rolled `lock → edit → commit → reload` (which is how they drifted); it now lives once in `write_then_commit()`. The same consolidation fixes the writer-lock poisoning: every path did `lock().unwrap()`, so one panicking write permanently disabled **all** indexing and deletes while reads masked it. The shared epilogue recovers the guard.
+- **Registry duplicate-id** (`c01412a`, Medium) — `registry::apps()` was `.collect()`ed into a HashMap, so a colliding `ScrapeApp::name()` silently overwrote an app (no route, no schedule, success-looking startup log). Registration now bails at boot naming the offending id.
+
+**Remaining duplication tail (deliberately deferred to dedicated sessions):** the two grant `run()` bodies + HTTP builders → `grants-common` (High); the two census apps' verbatim/structural duplication (which is *why* the sentinel bug diverged); the four trades apps' artifact-save + salvage block → `trades-common`; the ~11-way dual-mode list-handler boilerplate; cross-engine bounded-LRU (engine-http vs engine-browser); the fetcher's near-duplicate tier-attempt blocks; plus the Low tail (LCG jitter, `since` parser, dispatch preamble, `Cell::to_value`, plugin `alloc`). These are wide, cross-crate, and carry real regression risk — worth their own focused pass with the gates re-run per step.
 
 ## Wave 8 — Change-detection integrity: 1 High + 6 Mediums
 - **homewyse stable key** (`07b3fe3`, High) — pricing rows now key on a canonical slug of trade+job, so model phrasing drift stops minting duplicate rows that corrupt the benchmark.
