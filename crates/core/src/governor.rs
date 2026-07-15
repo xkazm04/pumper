@@ -232,9 +232,7 @@ impl Governor {
         }
         // Deterministic LCG step — spreads requests without pulling in `rand`.
         let n = self.tick.fetch_add(1, Ordering::Relaxed);
-        let scrambled = n.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
-        let frac = (scrambled >> 33) as f64 / (1u64 << 31) as f64;
-        self.max_jitter.mul_f64(frac.min(1.0))
+        self.max_jitter.mul_f64(crate::jitter::lcg_fraction(n))
     }
 }
 

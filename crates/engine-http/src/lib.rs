@@ -204,8 +204,7 @@ impl ClientPool {
     /// LRU lookup: returns a cached client for `key`, touching it as most-recent.
     fn get(&mut self, key: &str) -> Option<reqwest::Client> {
         let client = self.clients.get(key).cloned()?;
-        self.order.retain(|k| k != key);
-        self.order.push_back(key.to_string());
+        pumper_core::lru_touch(&mut self.order, key);
         Some(client)
     }
 
@@ -213,12 +212,8 @@ impl ClientPool {
     /// used entries until the pool is within `cap`.
     fn insert(&mut self, key: &str, client: reqwest::Client, cap: usize) {
         self.clients.insert(key.to_string(), client);
-        self.order.retain(|k| k != key);
-        self.order.push_back(key.to_string());
-        while self.order.len() > cap {
-            if let Some(evict) = self.order.pop_front() {
-                self.clients.remove(&evict);
-            }
+        for evict in pumper_core::lru_touch_evict(&mut self.order, key, cap) {
+            self.clients.remove(&evict);
         }
     }
 }
@@ -490,17 +485,15 @@ fn jitter_seed(url: &str, attempt: u32) -> u64 {
 /// exponential backoff (`base_ms * 2^(attempt-1)`) and any server `Retry-After`,
 /// plus hash-based jitter up to `RETRY_JITTER_FRAC` of that floor. `attempt` is
 /// 1-based (the first retry). No `rand` dependency — jitter is derived from
-/// `seed` exactly like the governor.
+/// `seed` via the shared `pumper_core::lcg_fraction`, exactly like the governor.
 fn retry_delay(attempt: u32, retry_after: Option<Duration>, base_ms: u64, seed: u64) -> Duration {
     let exp = attempt.saturating_sub(1).min(20); // cap the shift; 2^20 ms ≈ 17min
     let backoff = Duration::from_millis(base_ms.saturating_mul(2u64.saturating_pow(exp)));
     let floor = backoff.max(retry_after.unwrap_or(Duration::ZERO));
-    // Deterministic LCG scramble of the seed -> fraction in [0,1).
-    let scrambled = seed
-        .wrapping_mul(6364136223846793005)
-        .wrapping_add(1442695040888963407);
-    let frac = (scrambled >> 33) as f64 / (1u64 << 31) as f64;
-    floor + floor.mul_f64(RETRY_JITTER_FRAC * frac.min(1.0))
+    // Deterministic scramble of the seed -> fraction in [0,1) (shared with the
+    // governor's pacing jitter).
+    let frac = pumper_core::lcg_fraction(seed);
+    floor + floor.mul_f64(RETRY_JITTER_FRAC * frac)
 }
 
 /// Parses a `Retry-After` header. Both RFC 7231 forms are honored: delta

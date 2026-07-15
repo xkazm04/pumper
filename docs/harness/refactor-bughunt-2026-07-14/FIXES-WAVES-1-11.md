@@ -1,9 +1,17 @@
-# Refactor + Bug-Hunt — Fix Waves 1–10 (pumper, 2026-07-14 → 07-15)
+# Refactor + Bug-Hunt — Fix Waves 1–11 (pumper, 2026-07-14 → 07-15)
 
-> **44 findings closed** across 10 themed waves + the deferred dataset-upsert atomicity fix + the SimHash reindex.
-> Severity closed: **all 4 Criticals + 19 Highs + 20 Mediums + 1 Low.** 58 findings remain open (the rest of the duplication tail + low tail).
-> Baseline preserved: `cargo build` clean, tests **177 → 188** (11 regression tests added), 0 warnings, 0 regressions throughout.
-> Waves 1–9 merged to `master` via PR #1 (`8864abc`); the SimHash reindex shipped as `b2e1da7`.
+> **47 findings closed** across 11 themed waves + the deferred dataset-upsert atomicity fix + the SimHash reindex.
+> Severity closed: **all 4 Criticals + 19 Highs + 21 Mediums + 3 Lows.** 55 findings remain open.
+> Baseline preserved: `cargo build` clean, tests **177 → 192** (15 regression tests added), 0 warnings, 0 regressions throughout.
+> Waves 1–9 merged via PR #1 (`8864abc`); SimHash reindex `b2e1da7`; Wave 10 via PR #2 (`36f1e41`).
+
+## Wave 11 — Duplication tail, part 2 (1 Medium + 2 Lows)
+Shared primitives extracted to core; each verified by the *existing* engine tests passing untouched (they assert concrete values, so they prove behavior was preserved).
+- **Bounded LRU** (`c6d08f4`, Medium) — engine-http's `ClientPool` and engine-browser's `Holders` each hand-rolled the same retain/push_back/evict dance, with the "never evict the key you just touched" floor present in one and absent in the other. Now `pumper_core::lru::{lru_touch, lru_touch_evict}`, returning evicted keys so each caller drops its own map entries.
+- **Deterministic jitter** (`109b579`, Low) — the governor's pacing jitter and the HTTP retry backoff each carried the same LCG constants; engine-http's doc already conceded it worked "exactly like the governor". Now `pumper_core::jitter::lcg_fraction(seed)`.
+- **Webhook dispatch** (`21445d9`, Low) — the module documents `dispatch_event` as the one logged/signed/replayable path, but `dispatch` and `dispatch_change` bypassed it, each re-implementing the serialize-or-warn preamble and calling `spawn_logged` directly. Both now delegate; `spawn_logged` has exactly one caller, so the single-path claim is structural rather than aspirational.
+
+**Still open in the tail:** the ~11-way dual-mode list-handler boilerplate (wide; a macro would collapse it but hurts readability — deserves a deliberate call); the fetcher's near-duplicate tier-attempt blocks (core fetch path); eu-sedia not wired into `grants/unified` (a coverage gap needing a real `normalize_eu_sedia` field mapping); plus `Cell::to_value`, plugin `alloc` (example crates — arguably *should* stay standalone), extractor param idioms, budget clamp, registry ordering. **Deferred with reason:** `NoSearch`/`NoPlugins` inconsistency — making a disabled search error instead of returning empty is a product decision about what a search against a disabled engine should mean.
 
 ## Wave 10 — Duplication tail, part 1 (1 High + 3 Mediums + 1 Low)
 Taken in value order, each verified with the full gates. The two shared-crate extractions target duplication that **demonstrably caused divergent bugs**.
