@@ -95,24 +95,7 @@ impl ScrapeApp for CensusNonemp {
                     .collect(),
             };
 
-        let api_key = ctx
-            .params
-            .get("api_key")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .or_else(|| std::env::var("CENSUS_API_KEY").ok())
-            .filter(|k| !k.trim().is_empty());
-        let api_key = match api_key {
-            Some(k) => k,
-            None => {
-                return Err(Error::App(
-                    "census-nonemp needs a free Census API key — set env \
-                     CENSUS_API_KEY or pass params.api_key. Get one instantly at \
-                     https://api.census.gov/data/key_signup.html"
-                        .into(),
-                ))
-            }
-        };
+        let api_key = census_common::api_key(&ctx, "census-nonemp")?;
 
         let for_clause = if states.is_empty() || states == "*" {
             "for=state:*".to_string()
@@ -191,22 +174,15 @@ impl ScrapeApp for CensusNonemp {
             let mut total_estab: i64 = 0;
             let mut total_rcpt: i64 = 0;
 
-            // Census encodes disclosure suppression and jam values as sentinels
-            // like -666666666; treat any missing, non-numeric, or negative cell as
-            // suppressed so it is never summed or counted as a reported operator.
-            let census_num = |cell: Option<&String>| -> Option<i64> {
-                cell.and_then(|s| s.trim().parse::<i64>().ok()).filter(|v| *v >= 0)
-            };
-
             for row in rows.iter().skip(1) {
-                let Some(estab) = census_num(row.get(i_estab)) else {
+                let Some(estab) = census_common::census_num(row.get(i_estab)) else {
                     // Suppressed/jammed primary cell → not a reported operator place.
                     continue;
                 };
                 // NRCPTOT is in $1,000s.
-                let rcpt = census_num(row.get(i_rcpt)).unwrap_or(0);
+                let rcpt = census_common::census_num(row.get(i_rcpt)).unwrap_or(0);
                 let st_fips = row.get(i_state).cloned().unwrap_or_default();
-                let state = state_abbr(&st_fips).to_string();
+                let state = census_common::state_abbr(&st_fips).to_string();
                 let avg = if estab > 0 { (rcpt * 1000) / estab } else { 0 };
 
                 total_estab += estab;
@@ -274,21 +250,3 @@ impl ScrapeApp for CensusNonemp {
     }
 }
 
-/// 2-digit state FIPS → USPS abbreviation (50 states + DC + PR). Unknown codes pass
-/// through unchanged so nothing is silently dropped.
-fn state_abbr(fips: &str) -> &str {
-    match fips {
-        "01" => "AL", "02" => "AK", "04" => "AZ", "05" => "AR", "06" => "CA",
-        "08" => "CO", "09" => "CT", "10" => "DE", "11" => "DC", "12" => "FL",
-        "13" => "GA", "15" => "HI", "16" => "ID", "17" => "IL", "18" => "IN",
-        "19" => "IA", "20" => "KS", "21" => "KY", "22" => "LA", "23" => "ME",
-        "24" => "MD", "25" => "MA", "26" => "MI", "27" => "MN", "28" => "MS",
-        "29" => "MO", "30" => "MT", "31" => "NE", "32" => "NV", "33" => "NH",
-        "34" => "NJ", "35" => "NM", "36" => "NY", "37" => "NC", "38" => "ND",
-        "39" => "OH", "40" => "OK", "41" => "OR", "42" => "PA", "44" => "RI",
-        "45" => "SC", "46" => "SD", "47" => "TN", "48" => "TX", "49" => "UT",
-        "50" => "VT", "51" => "VA", "53" => "WA", "54" => "WV", "55" => "WI",
-        "56" => "WY", "72" => "PR",
-        other => other,
-    }
-}
