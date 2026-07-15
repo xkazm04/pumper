@@ -20,7 +20,6 @@
 use async_trait::async_trait;
 use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
-use trades_common::salvage_json;
 use trades_common::taxonomy;
 use trades_common::unified;
 use trades_common::validate::{self, Rejection};
@@ -95,27 +94,8 @@ impl ScrapeApp for TradeWages {
         // Constrain the final answer to the wage schema (`claude --json-schema`) so the
         // CLI validates structure; salvage_json below still catches anything it misses.
         request.json_schema = Some(wages_schema());
-        // Metered seam: records a cost event against the job, honors budget_usd,
-        // and serves identical re-runs from the research cache (see core/app.rs).
-        let output = ctx.research(request).await?;
-
-        let artifact = match &output.json {
-            Some(j) => serde_json::to_vec_pretty(j)?,
-            None => output.text.clone().into_bytes(),
-        };
-        ctx.save_artifact("research.json", &artifact).await?;
-
-        // Prefer the parsed structured output; salvage a fenced/prose-wrapped object
-        // from the raw text before giving up (one pass, no metered re-run).
-        let data = match output.json.clone() {
-            Some(j) => j,
-            None => salvage_json(&output.text).ok_or_else(|| {
-                Error::App(format!(
-                    "trade-wages: agent did not return JSON (text starts: {})",
-                    output.text.chars().take(160).collect::<String>()
-                ))
-            })?,
-        };
+        let (data, output) =
+            trades_common::research_json(&ctx, "trade-wages", request).await?;
 
         let mut all_records: Vec<(String, Value)> = Vec::new();
         // Plausibility guards: wage bands must be ordered (entry ≤ median ≤

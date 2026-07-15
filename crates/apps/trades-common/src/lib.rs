@@ -1,7 +1,9 @@
 //! Shared layer for the four agentic US-trades reference apps (trade-wages,
 //! homewyse-pricing, state-tax, valuation-multiples).
 //!
-//! Two concerns live here so they stay consistent across all four apps:
+//! Concerns live here so they stay consistent across all four apps:
+//!   - [`research_json`]: the whole metered research → archive → parse-or-salvage
+//!     step every one of them opens with.
 //!   - [`salvage_json`]: recover a JSON object the agent emitted but the engine
 //!     couldn't parse (markdown fence / surrounding prose). One pass, no re-run,
 //!     no cost — it works on text already paid for.
@@ -9,7 +11,46 @@
 //!     magnitudes) so a nonsensical record is rejected with per-record detail
 //!     instead of silently upserted.
 
+use pumper_core::{AppContext, Error, ResearchOutput, ResearchRequest, Result};
 use serde_json::Value;
+
+/// Runs a metered research request, archives the raw answer as `research.json`,
+/// and returns its JSON alongside the raw output (which the caller still needs
+/// for cost/duration reporting).
+///
+/// Prefers the schema-validated `output.json`, salvaging a fenced/prose-wrapped
+/// object from the raw text before giving up — one pass, no metered re-run.
+/// `app` names the caller in the error.
+///
+/// All four agentic trades apps open with exactly this; copy-pasting it four
+/// times let the artifact name, the salvage fallback and the error shape drift
+/// independently.
+pub async fn research_json(
+    ctx: &AppContext,
+    app: &str,
+    request: ResearchRequest,
+) -> Result<(Value, ResearchOutput)> {
+    // Metered seam: records a cost event against the job, honors budget_usd, and
+    // serves identical re-runs from the research cache (see core/app.rs).
+    let output = ctx.research(request).await?;
+
+    let artifact = match &output.json {
+        Some(j) => serde_json::to_vec_pretty(j)?,
+        None => output.text.clone().into_bytes(),
+    };
+    ctx.save_artifact("research.json", &artifact).await?;
+
+    let data = match output.json.clone() {
+        Some(j) => j,
+        None => salvage_json(&output.text).ok_or_else(|| {
+            Error::App(format!(
+                "{app}: agent did not return JSON (text starts: {})",
+                output.text.chars().take(160).collect::<String>()
+            ))
+        })?,
+    };
+    Ok((data, output))
+}
 
 /// Best-effort recovery of a JSON object the agent emitted but the engine
 /// couldn't parse into `output.json` — the common failure is a markdown
