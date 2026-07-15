@@ -22,6 +22,7 @@ pub mod error;
 pub mod extract;
 pub mod fetcher;
 pub mod governor;
+pub mod jitter;
 pub mod job;
 pub mod lru;
 pub mod markdown;
@@ -70,6 +71,7 @@ pub use fetcher::{
 };
 pub use governor::Governor;
 pub use job::{Job, JobStatus};
+pub use jitter::lcg_fraction;
 pub use lru::{lru_touch, lru_touch_evict};
 pub use markdown::html_to_markdown;
 pub use plugin::{NoPlugins, Plugins};
