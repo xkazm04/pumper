@@ -36,15 +36,29 @@ async fn put_honors_explicit_ttl() {
     // subsequent read finds nothing live. This is what a short ttl_override
     // buys a monitor — the body is refreshed rather than served stale.
     cache.put(&key, &req.url, &response, Duration::ZERO).await.unwrap();
-    assert!(cache.get(&key).await.unwrap().is_none(), "zero TTL must not read back live");
+    assert!(cache.get(&key, None).await.unwrap().is_none(), "zero TTL must not read back live");
 
     // A generous TTL keeps the same entry live.
     cache
         .put(&key, &req.url, &response, Duration::from_secs(3600))
         .await
         .unwrap();
-    let hit = cache.get(&key).await.unwrap().expect("long TTL should read back live");
+    let hit = cache.get(&key, None).await.unwrap().expect("long TTL should read back live");
     assert_eq!(hit.body, "hello world");
+
+    // Read-staleness cap (the ttl_override-on-read guarantee): a generous max_age
+    // still hits the fresh entry...
+    assert!(
+        cache.get(&key, Some(Duration::from_secs(3600))).await.unwrap().is_some(),
+        "fresh entry passes a generous max_age"
+    );
+    // ...but once the entry has aged past a tiny max_age it is a miss, even though
+    // its stored TTL is still live — a short-TTL reader is not served stale content.
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert!(
+        cache.get(&key, Some(Duration::from_millis(5))).await.unwrap().is_none(),
+        "entry older than max_age must be treated as stale"
+    );
 
     drop(storage);
     std::fs::remove_dir_all(&dir).ok();

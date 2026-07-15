@@ -528,6 +528,24 @@ fn sphere_for_org(org: &str) -> &'static str {
     }
 }
 
+/// Reads a numeric field the ISPV feed may deliver as a JSON number OR a quoted
+/// (possibly Czech-formatted) string; `as_f64` alone silently dropped the whole
+/// row when a stat arrived string-encoded. Strips whitespace/NBSP thousands
+/// separators and accepts a decimal comma.
+fn wage_num(v: &Value, key: &str) -> Option<f64> {
+    match v.get(key) {
+        Some(Value::Number(n)) => n.as_f64(),
+        Some(Value::String(s)) => {
+            let cleaned: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+            cleaned
+                .parse::<f64>()
+                .ok()
+                .or_else(|| cleaned.replacen(',', ".", 1).parse::<f64>().ok())
+        }
+        _ => None,
+    }
+}
+
 /// Index of official ISPV rows: (CZ-ISCO unit group, sfera) → (medianMzda,
 /// mzdaPrumer). Rows without a positive monthly median are dropped — no
 /// benchmark can honestly be computed against them.
@@ -538,11 +556,10 @@ fn official_wage_index<'a>(
     for r in rows {
         let Some(czisco) = r.get("czIsco").and_then(Value::as_str) else { continue };
         let sfera = r.get("sfera").and_then(Value::as_str).unwrap_or("").to_string();
-        let Some(median) = r.get("medianMzda").and_then(Value::as_f64).filter(|m| *m > 0.0)
-        else {
+        let Some(median) = wage_num(r, "medianMzda").filter(|m| *m > 0.0) else {
             continue;
         };
-        let mean = r.get("mzdaPrumer").and_then(Value::as_f64).filter(|m| *m > 0.0);
+        let mean = wage_num(r, "mzdaPrumer").filter(|m| *m > 0.0);
         index.insert((unit_group(czisco), sfera), (median, mean));
     }
     index
@@ -704,8 +721,6 @@ struct Posting {
     #[serde(default)]
     pozadovanaProfese: Option<LangText>,
     #[serde(default)]
-    typMzdy: Option<IdRef>,
-    #[serde(default)]
     minPozadovaneVzdelani: Option<IdRef>,
     #[serde(default)]
     profeseCzIsco: Option<IdRef>,
@@ -803,20 +818,16 @@ impl Posting {
             .filter(|s| !s.is_empty())
     }
 
-    fn is_monthly(&self) -> bool {
-        self.typMzdy
-            .as_ref()
-            .and_then(|t| t.id.as_deref())
-            .map(|id| id.contains("mesic"))
-            .unwrap_or(false)
-    }
-
     /// A single representative CZK monthly figure: midpoint of the band when both
-    /// ends are given, else whichever end is present; `None` if not a sane monthly.
+    /// ends are given, else whichever end is present; `None` if the value isn't a
+    /// sane monthly salary.
+    ///
+    /// The presence of `mesicniMzda*` ("monthly wage") within the monthly band IS
+    /// the monthly signal — the API exposes no hourly wage fields, and `typMzdy.id`
+    /// is a codebook URI (`"TypMzdy/N"`, like `CzIsco/93291`), not a substring-
+    /// matchable label, so the old `id.contains("mesic")` gate matched nothing and
+    /// silently discarded every salary in the distribution.
     fn monthly_salary_point(&self) -> Option<f64> {
-        if !self.is_monthly() {
-            return None;
-        }
         let point = match (self.mesicniMzdaOd, self.mesicniMzdaDo) {
             (Some(a), Some(b)) if a > 0.0 && b > 0.0 => (a + b) / 2.0,
             (Some(a), _) if a > 0.0 => a,
@@ -961,10 +972,52 @@ mod tests {
     }
 
     #[test]
+    fn monthly_salary_extracted_without_relying_on_type_code() {
+        // Regression: the salary distribution was silently emptied because the old
+        // `is_monthly()` gate string-matched "mesic" against the codebook-URI
+        // `typMzdy.id` ("TypMzdy/1"), which never contains it. The presence of the
+        // monthly-wage fields within the sane band is the signal.
+        let p: Posting = serde_json::from_value(json!({
+            "mesicniMzdaOd": 40000.0,
+            "mesicniMzdaDo": 60000.0,
+            "typMzdy": { "id": "TypMzdy/1" }
+        }))
+        .unwrap();
+        assert_eq!(p.monthly_salary_point(), Some(50_000.0));
+
+        // Sub-band (hourly-looking) and absent values yield None, never fabricated.
+        let hourly: Posting = serde_json::from_value(json!({ "mesicniMzdaOd": 150.0 })).unwrap();
+        assert_eq!(hourly.monthly_salary_point(), None);
+        let empty: Posting = serde_json::from_value(json!({})).unwrap();
+        assert_eq!(empty.monthly_salary_point(), None);
+    }
+
+    #[test]
     fn sphere_mapping_public_vs_rest() {
         assert_eq!(sphere_for_org("public"), "PLATOVA");
         assert_eq!(sphere_for_org("private"), "MZDOVA");
         assert_eq!(sphere_for_org("agency"), "MZDOVA");
+    }
+
+    #[test]
+    fn wage_num_accepts_number_and_czech_string_forms() {
+        assert_eq!(wage_num(&json!({ "m": 111959.0 }), "m"), Some(111959.0));
+        assert_eq!(wage_num(&json!({ "m": "111959" }), "m"), Some(111959.0));
+        assert_eq!(wage_num(&json!({ "m": "111 959" }), "m"), Some(111959.0)); // space thousands
+        assert_eq!(wage_num(&json!({ "m": "40000,50" }), "m"), Some(40000.5)); // Czech decimal comma
+        assert_eq!(wage_num(&json!({ "m": "n/a" }), "m"), None);
+        assert_eq!(wage_num(&json!({}), "m"), None);
+    }
+
+    #[test]
+    fn official_index_reads_string_encoded_stats() {
+        // Regression: as_f64-only dropped rows whose stats arrived as strings.
+        let rows = vec![json!({"czIsco": "CzIsco/1120", "sfera": "MZDOVA", "medianMzda": "111959", "mzdaPrumer": "190185"})];
+        let idx = official_wage_index(rows.iter());
+        assert_eq!(idx.len(), 1);
+        let (median, mean) = idx[&("1120".to_string(), "MZDOVA".to_string())];
+        assert_eq!(median, 111959.0);
+        assert_eq!(mean, Some(190185.0));
     }
 
     #[test]

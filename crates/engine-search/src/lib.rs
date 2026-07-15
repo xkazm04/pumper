@@ -111,17 +111,40 @@ impl TantivyIndex {
     }
 }
 
+impl TantivyIndex {
+    /// Runs `edit` against the index writer on a blocking thread, then commits and
+    /// reloads the reader. The lock → edit → commit → reload epilogue lives here
+    /// once so the mutating paths can't drift apart.
+    ///
+    /// A poisoned writer lock is recovered rather than unwrapped: a single
+    /// panicking write must not permanently disable all indexing and deletes for
+    /// the process while reads keep succeeding and mask it.
+    async fn write_then_commit<F>(&self, what: &'static str, edit: F) -> Result<()>
+    where
+        F: FnOnce(&mut IndexWriter) -> Result<()> + Send + 'static,
+    {
+        let writer = self.writer.clone();
+        let reader = self.reader.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut w = writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            edit(&mut w)?;
+            w.commit().map_err(|e| Error::App(format!("commit: {e}")))?;
+            reader.reload().map_err(|e| Error::App(format!("reader reload: {e}")))?;
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::App(format!("{what} task panicked: {e}")))?
+    }
+}
+
 #[async_trait]
 impl Search for TantivyIndex {
     async fn index(&self, docs: Vec<SearchDoc>) -> Result<()> {
         if docs.is_empty() {
             return Ok(());
         }
-        let writer = self.writer.clone();
-        let reader = self.reader.clone();
         let f = self.fields;
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut w = writer.lock().unwrap();
+        self.write_then_commit("index", move |w| {
             for d in docs {
                 // Upsert: drop any prior document with this id, then add.
                 w.delete_term(Term::from_field_text(f.id, &d.id));
@@ -135,41 +158,30 @@ impl Search for TantivyIndex {
                 ))
                 .map_err(|e| Error::App(format!("add_document: {e}")))?;
             }
-            w.commit().map_err(|e| Error::App(format!("commit: {e}")))?;
-            reader.reload().map_err(|e| Error::App(format!("reader reload: {e}")))?;
             Ok(())
         })
         .await
-        .map_err(|e| Error::App(format!("index task panicked: {e}")))?
     }
 
     async fn delete_ids(&self, ids: &[String]) -> Result<()> {
         if ids.is_empty() {
             return Ok(());
         }
-        let writer = self.writer.clone();
-        let reader = self.reader.clone();
         let f = self.fields;
         let ids = ids.to_vec();
-        tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut w = writer.lock().unwrap();
+        self.write_then_commit("delete", move |w| {
             for id in &ids {
                 w.delete_term(Term::from_field_text(f.id, id));
             }
-            w.commit().map_err(|e| Error::App(format!("commit: {e}")))?;
-            reader.reload().map_err(|e| Error::App(format!("reader reload: {e}")))?;
             Ok(())
         })
         .await
-        .map_err(|e| Error::App(format!("delete task panicked: {e}")))?
     }
 
     async fn delete_dataset(&self, app: &str, dataset: &str) -> Result<()> {
-        let writer = self.writer.clone();
-        let reader = self.reader.clone();
         let f = self.fields;
         let (app, dataset) = (app.to_string(), dataset.to_string());
-        tokio::task::spawn_blocking(move || -> Result<()> {
+        self.write_then_commit("delete", move |w| {
             // Dataset names may repeat across apps — delete the conjunction,
             // not the bare dataset term.
             let query = BooleanQuery::new(vec![
@@ -188,15 +200,11 @@ impl Search for TantivyIndex {
                     )),
                 ),
             ]);
-            let mut w = writer.lock().unwrap();
             w.delete_query(Box::new(query))
                 .map_err(|e| Error::App(format!("delete_query: {e}")))?;
-            w.commit().map_err(|e| Error::App(format!("commit: {e}")))?;
-            reader.reload().map_err(|e| Error::App(format!("reader reload: {e}")))?;
             Ok(())
         })
         .await
-        .map_err(|e| Error::App(format!("delete task panicked: {e}")))?
     }
 
     async fn query(&self, req: SearchRequest) -> Result<SearchResponse> {
@@ -216,7 +224,7 @@ impl Search for TantivyIndex {
             }
             let parsed = parser
                 .parse_query(&req.q)
-                .map_err(|e| Error::App(format!("bad search query: {e}")))?;
+                .map_err(|e| Error::BadRequest(format!("bad search query: {e}")))?;
 
             // Scope by app/dataset via exact term filters.
             let mut clauses: Vec<(Occur, Box<dyn Query>)> = vec![(Occur::Must, parsed)];

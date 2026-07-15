@@ -185,7 +185,9 @@ impl ScrapeApp for StateTax {
             ));
         }
 
-        let summary = ctx.upsert_many("tax", &all_records).await?;
+        // Full 50-state + DC snapshot, so sync_many: a state that drops out of a
+        // later run is marked removed instead of lingering as stale data.
+        let summary = ctx.sync_many("tax", &all_records).await?;
 
         // Cross-source layer: state-tax contributes the federal + illustrative-state
         // tax context to trades/operator_economics (mirrors grants-common's sync).

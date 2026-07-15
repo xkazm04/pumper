@@ -110,6 +110,15 @@ impl ScrapeApp for EuSedia {
                 .cloned()
                 .unwrap_or_default();
             let got = hits.len() as u64;
+            if pages_fetched == 0 && total > 0 && got == 0 {
+                // Positive totalResults but zero parsed rows means the `results`
+                // array was renamed/moved upstream. Refuse to report an empty run
+                // as success (grants-gov guards this same drift).
+                return Err(Error::App(format!(
+                    "eu-sedia: API reported {total} results but parsed 0 rows from \
+                     'results' — likely an upstream schema change"
+                )));
+            }
             for hit in &hits {
                 let (key, record) = normalize(hit);
                 if record.get("description_text").is_some_and(|v| !v.is_null()) {

@@ -109,12 +109,34 @@ fn openapi_router() -> OpenApiRouter<AppState> {
 
 pub fn router(state: AppState) -> Router {
     let (router, _api) = openapi_router().split_for_parts();
-    router
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        // Local power mode: any localhost web app may call this API directly.
-        .layer(tower_http::cors::CorsLayer::permissive())
-        .with_state(state)
+    let router = router.layer(tower_http::trace::TraceLayer::new_for_http());
+    // CORS is OFF by default (same-origin only). A permissive allow-all on an
+    // unauthenticated, mutating, data-bearing API lets any site the operator
+    // visits drive it cross-origin (DNS-rebinding defeats the localhost
+    // assumption). A trusted local UI opts in via [server] cors_allowed_origins.
+    let origins: Vec<axum::http::HeaderValue> = state
+        .config
+        .server
+        .cors_allowed_origins
+        .iter()
+        .filter_map(|o| o.parse().ok())
+        .collect();
+    let router = if origins.is_empty() {
+        router
+    } else {
+        router.layer(
+            tower_http::cors::CorsLayer::new()
+                .allow_origin(origins)
+                .allow_methods(tower_http::cors::Any)
+                .allow_headers(tower_http::cors::Any),
+        )
+    };
+    router.with_state(state)
 }
+
+/// Upper bound on a client-supplied `max_attempts`, so a job/schedule/trigger
+/// can't request a practically-non-terminating retry loop.
+const MAX_ATTEMPTS_CAP: i64 = 20;
 
 /// Serves the generated OpenAPI 3.1 document. The spec is rebuilt from the same
 /// route registration used by `router`, so it always matches what is served.
@@ -153,11 +175,14 @@ impl IntoResponse for ApiError {
 
 impl From<pumper_core::Error> for ApiError {
     fn from(e: pumper_core::Error) -> Self {
-        // Engine/storage/parse/config failures are all unexpected at the request
-        // boundary. The client-distinguishable outcomes — missing resource (404),
-        // wrong state (409), bad input (400) — are raised explicitly by the
-        // handlers, which know the semantics a bare `Error` cannot express.
-        Self(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        // A BadRequest is the one core error that is definitionally the client's
+        // fault (a malformed query/filter/rule) → 400. Everything else is
+        // unexpected at the request boundary → 500; the client-distinguishable
+        // outcomes (404/409/400) are otherwise raised explicitly by the handlers.
+        match e {
+            pumper_core::Error::BadRequest(msg) => Self(StatusCode::BAD_REQUEST, msg),
+            other => Self(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        }
     }
 }
 
@@ -546,7 +571,7 @@ async fn enqueue_job(
         .filter(|k| !k.trim().is_empty());
     let opts = EnqueueOptions {
         params: body.params.unwrap_or_else(|| app.default_params()),
-        max_attempts: body.max_attempts.unwrap_or(1),
+        max_attempts: body.max_attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS_CAP),
         delay_secs: body.delay_secs.unwrap_or(0),
         priority: body.priority.unwrap_or(0),
         callback_url: body.callback_url,
@@ -1002,7 +1027,7 @@ async fn create_schedule(
             priority: body.priority.unwrap_or(0),
             timezone: body.timezone.as_deref(),
             misfire_policy,
-            max_attempts: body.max_attempts,
+            max_attempts: body.max_attempts.map(|n| n.clamp(1, MAX_ATTEMPTS_CAP)),
         })
         .await?;
     Ok((StatusCode::CREATED, Json(schedule)))
@@ -1674,7 +1699,7 @@ async fn create_trigger(
             params: &params,
             budget_usd: body.budget_usd.filter(|b| *b > 0.0),
             priority: body.priority.unwrap_or(0),
-            max_attempts: body.max_attempts.unwrap_or(1),
+            max_attempts: body.max_attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS_CAP),
         })
         .await?;
     Ok((StatusCode::CREATED, Json(trigger)))

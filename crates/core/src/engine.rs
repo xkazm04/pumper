@@ -92,9 +92,12 @@ pub struct HttpRequest {
     /// Skip the response cache for this request (always hit the network).
     #[serde(default)]
     pub no_cache: bool,
-    /// Override the response-cache TTL (seconds) when this response is stored.
-    /// `None` uses the configured `[cache] ttl_secs`. Not part of the cache key
-    /// (it shapes freshness, not the answer) and ignored when uncacheable.
+    /// Override the response-cache TTL (seconds). On write it sets how long the
+    /// stored response stays fresh; on read it also caps accepted staleness, so a
+    /// caller asking for `<=N`-second-old content is never served a longer-lived
+    /// entry another caller wrote. `None` uses the configured `[cache] ttl_secs`.
+    /// Not part of the cache key (it shapes freshness, not the answer) and ignored
+    /// when uncacheable.
     #[serde(default)]
     pub ttl_override: Option<u64>,
     /// Conditional GET validator: sent as `If-None-Match` so the origin can

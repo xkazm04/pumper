@@ -141,10 +141,20 @@ impl AppState {
             Arc::new(NoSearch)
         };
 
-        let registry: HashMap<String, Arc<dyn ScrapeApp>> = crate::registry::apps()
-            .into_iter()
-            .map(|app| (app.name().to_string(), app))
-            .collect();
+        // Collect explicitly rather than `.collect()`: a colliding ScrapeApp::name()
+        // would silently overwrite the earlier app — it vanishes with no route, no
+        // schedule, and a startup log that still claims success. A duplicate id is
+        // a registration mistake, so fail loudly at boot.
+        let apps = crate::registry::apps();
+        let mut registry: HashMap<String, Arc<dyn ScrapeApp>> = HashMap::with_capacity(apps.len());
+        for app in apps {
+            let name = app.name().to_string();
+            if registry.insert(name.clone(), app).is_some() {
+                anyhow::bail!(
+                    "duplicate app id '{name}' in registry::apps() — every ScrapeApp::name() must be unique"
+                );
+            }
+        }
         tracing::info!(
             apps = ?registry.keys().collect::<Vec<_>>(),
             "registered scraping apps"

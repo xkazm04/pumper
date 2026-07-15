@@ -112,7 +112,17 @@ fn load_dir(engine: &Engine, dir: &Path) -> HashMap<String, Module> {
 }
 
 fn execute(engine: Engine, module: Module, input: String, fuel: u64, max_memory: usize) -> Result<Value> {
-    let limits = StoreLimitsBuilder::new().memory_size(max_memory).build();
+    // Cap every store-growable resource, not just linear memory: a module can
+    // otherwise exhaust host RAM at instantiation via huge tables/instances,
+    // sidestepping `memory_size` entirely. These bounds are generous for a
+    // single extraction plugin (one instance, one memory, a small call table).
+    let limits = StoreLimitsBuilder::new()
+        .memory_size(max_memory)
+        .memories(1)
+        .tables(4)
+        .table_elements(1_000_000)
+        .instances(1)
+        .build();
     let mut store = Store::new(&engine, limits);
     store.limiter(|l| l as &mut dyn ResourceLimiter);
     store
@@ -150,6 +160,17 @@ fn execute(engine: Engine, module: Module, input: String, fuel: u64, max_memory:
 
     let out_ptr = (packed >> 32) as usize;
     let out_len = (packed & 0xffff_ffff) as usize;
+    // The guest fully controls `out_len` (low 32 bits of the packed return).
+    // Validate the [out_ptr, out_ptr+out_len) range lies within the plugin's own
+    // linear memory BEFORE allocating: otherwise a crafted return (up to ~4 GiB)
+    // drives a giant host-side `vec![0u8; out_len]` that the linear-memory cap
+    // never constrains, aborting the whole process on allocation failure.
+    let mem_size = memory.data_size(&store);
+    if out_ptr.checked_add(out_len).map_or(true, |end| end > mem_size) {
+        return Err(Error::App(format!(
+            "plugin output range out of bounds: ptr={out_ptr} len={out_len} mem={mem_size}"
+        )));
+    }
     let mut out = vec![0u8; out_len];
     memory
         .read(&store, out_ptr, &mut out)

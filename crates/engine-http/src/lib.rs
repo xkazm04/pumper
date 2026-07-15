@@ -544,7 +544,11 @@ impl HttpClient for HttpEngine {
     async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
         let cache_key = Self::cacheable(&req).then(|| HttpCache::key(&req));
         if let Some(key) = &cache_key {
-            if let Some(hit) = self.cache.get(key).await? {
+            // ttl_override caps read staleness too, not just storage TTL: a reader
+            // asking for <=N-second-old content must not be handed a longer-lived
+            // entry written by another caller.
+            let max_age = req.ttl_override.map(Duration::from_secs);
+            if let Some(hit) = self.cache.get(key, max_age).await? {
                 debug!(url = %req.url, "cache hit");
                 return Ok(hit);
             }

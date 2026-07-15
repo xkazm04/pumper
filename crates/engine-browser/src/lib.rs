@@ -215,30 +215,53 @@ impl BrowserEngine {
         // Validated (and the path built) before any lock is taken.
         let user_data_dir = self.user_data_dir(profile)?;
         let key = profile.unwrap_or(DEFAULT_PROFILE_KEY).to_string();
-
-        let mut holders = self.holders.lock().await;
         let recycle = self.cfg.recycle_after_renders;
-        let stale = match holders.live.get(&key) {
-            None => true,
-            Some(live) => is_stale(live.alive.load(Ordering::Relaxed), live.renders, recycle),
-        };
-        if stale {
-            // Replacing an entry drops the previous instance: `kill_on_drop`
-            // reaps its Chrome. Any in-flight render still holding an Arc clone
-            // keeps its own Chrome alive until it finishes, then that clone
-            // drops and reaps.
-            let live = self.launch(&user_data_dir).await?;
-            holders.live.insert(key.clone(), live);
+
+        // Fast path: a live, fresh holder already exists — hand it out under the
+        // lock without launching anything.
+        {
+            let mut holders = self.holders.lock().await;
+            let fresh = holders
+                .live
+                .get(&key)
+                .is_some_and(|l| !is_stale(l.alive.load(Ordering::Relaxed), l.renders, recycle));
+            if fresh {
+                return Ok(Self::checkout(&mut holders, &key));
+            }
         }
-        for evicted in touch_lru(&mut holders.order, &key, MAX_LIVE_PROFILES) {
-            // Closing = dropping the holder (same reaping semantics as above).
+
+        // Slow path: launch Chrome WITHOUT holding the global holders lock, so a
+        // cold start / crash-relaunch / recycle for one profile does not stall
+        // renders for every other profile (a launch can take up to ~20s).
+        let launched = self.launch(&user_data_dir).await?;
+
+        // Re-lock and install. If another task installed a fresh holder for this
+        // key while we launched, keep theirs and let our just-launched instance
+        // drop (`kill_on_drop` reaps it).
+        let mut holders = self.holders.lock().await;
+        let now_fresh = holders
+            .live
+            .get(&key)
+            .is_some_and(|l| !is_stale(l.alive.load(Ordering::Relaxed), l.renders, recycle));
+        if !now_fresh {
+            holders.live.insert(key.clone(), launched);
+        }
+        Ok(Self::checkout(&mut holders, &key))
+    }
+
+    /// Bumps the LRU order + render counter for `key` (evicting the least-recently
+    /// used profile past `MAX_LIVE_PROFILES`) and returns its browser handle. The
+    /// caller must hold the holders lock and `key` must be populated.
+    fn checkout(holders: &mut Holders, key: &str) -> Arc<ChromeBrowser> {
+        for evicted in touch_lru(&mut holders.order, key, MAX_LIVE_PROFILES) {
+            // Closing = dropping the holder (kill_on_drop reaps its Chrome).
             if holders.live.remove(&evicted).is_some() {
                 info!(profile = %evicted, "closing least-recently-used browser profile");
             }
         }
-        let live = holders.live.get_mut(&key).expect("holder populated above");
+        let live = holders.live.get_mut(key).expect("holder populated above");
         live.renders += 1;
-        Ok(live.browser.clone())
+        live.browser.clone()
     }
 }
 
@@ -361,18 +384,18 @@ impl Browser for BrowserEngine {
             None => None,
         };
 
-        let html = page
-            .content()
-            .await
-            .map_err(|e| Error::Browser(format!("content: {e}")))?;
+        // Capture content + url, then ALWAYS release the tab and the interception
+        // drainer — even if content() failed, so a failed render does not leak a
+        // Chrome tab plus a background drainer task.
+        let content = page.content().await;
         let final_url = page.url().await.ok().flatten();
-
         if let Some(d) = &drainer {
             d.abort();
         }
         if let Err(e) = page.close().await {
             warn!("page close: {e}");
         }
+        let html = content.map_err(|e| Error::Browser(format!("content: {e}")))?;
 
         let blocked_resources = blocked.load(Ordering::Relaxed);
         if blocked_resources > 0 {

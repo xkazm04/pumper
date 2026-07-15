@@ -2,10 +2,7 @@
 //! *similar* documents get *similar* fingerprints (small Hamming distance),
 //! unlike a normal content hash where one byte flips everything. Lets the
 //! dataset store detect near-duplicate pages — not just exact changes — with no
-//! external service. Pure Rust and deterministic (fixed-key SipHash).
-
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+//! external service. Pure Rust and deterministic (version-stable FNV-1a hash).
 
 use serde_json::Value;
 
@@ -72,9 +69,24 @@ fn tokenize(text: &str) -> impl Iterator<Item = String> + '_ {
 }
 
 fn hash_token(token: &str) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    token.hash(&mut hasher);
-    hasher.finish()
+    // FNV-1a: a fixed, version-stable hash. `DefaultHasher` (SipHash) has no
+    // documented cross-version output stability, so persisted simhashes would
+    // silently drift after a toolchain upgrade and defeat dedup against records
+    // stored under the old hash. (One-time reindex when adopting this.)
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for byte in token.as_bytes() {
+        hash ^= *byte as u64;
+        hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    // splitmix64 finalizer — FNV-1a alone has weak avalanche (low bits barely
+    // mix), which skews the per-bit SimHash votes and inflates near-dup distance.
+    // This gives ~half-the-bits-flip diffusion, restoring SimHash separation.
+    hash ^= hash >> 30;
+    hash = hash.wrapping_mul(0xbf58_476d_1ce4_e5b9);
+    hash ^= hash >> 27;
+    hash = hash.wrapping_mul(0x94d0_49bb_1331_11eb);
+    hash ^= hash >> 31;
+    hash
 }
 
 #[cfg(test)]

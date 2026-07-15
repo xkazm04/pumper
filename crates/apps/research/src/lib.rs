@@ -52,16 +52,32 @@ impl ScrapeApp for Research {
         request.max_turns = max_turns;
         request.model = model;
         request.effort = effort;
+        // Actually use the json_schema guardrail so the model is steered to the
+        // shape we promise downstream instead of accepting any object it returns.
+        request.json_schema = Some(json!({
+            "type": "object",
+            "required": ["summary", "key_findings", "sources"],
+            "properties": {
+                "summary": { "type": "string" },
+                "key_findings": { "type": "array", "items": { "type": "string" } },
+                "sources": { "type": "array" }
+            }
+        }));
         let output = ctx.research(request).await?;
 
-        let report = output
-            .json
-            .clone()
-            .unwrap_or_else(|| Value::String(output.text.clone()));
+        // `structured` must mean "matched the promised shape", not merely "some
+        // JSON came back" — otherwise a hallucinated/wrong-shape object is stamped
+        // structured:true and stored as if trustworthy.
+        let structured = output.json.as_ref().is_some_and(is_report_shaped);
+        let report = if structured {
+            output.json.clone().unwrap()
+        } else {
+            Value::String(output.text.clone())
+        };
         let result = json!({
             "query": query,
             "report": report,
-            "structured": output.json.is_some(),
+            "structured": structured,
             "cost_usd": output.cost_usd,
             "duration_ms": output.duration_ms,
             "num_turns": output.num_turns,
@@ -71,4 +87,13 @@ impl ScrapeApp for Research {
             .await?;
         Ok(result)
     }
+}
+
+/// True when a research report matches the promised shape: a `summary` string
+/// plus `key_findings` and `sources` arrays. Guards against marking a
+/// hallucinated or wrong-shape object as `structured`.
+fn is_report_shaped(v: &Value) -> bool {
+    v.get("summary").is_some_and(Value::is_string)
+        && v.get("key_findings").is_some_and(Value::is_array)
+        && v.get("sources").is_some_and(Value::is_array)
 }

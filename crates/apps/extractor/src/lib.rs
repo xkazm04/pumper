@@ -114,6 +114,22 @@ async fn extract_and_upsert(
 /// `data/artifacts/<source_app>/<job_id>/<artifact_path>`, so we resolve against
 /// the shared artifacts root (this job's own dir is `.../extractor/<job_id>`,
 /// two levels below the root). Returns the body, or an error reason to report.
+/// Rejects a string that is not a single safe path segment (empty, `.`/`..`,
+/// contains a separator, or absolute) — the guard against path traversal when
+/// composing an artifact path from untrusted record/param data.
+fn safe_segment(s: &str, what: &str) -> std::result::Result<(), String> {
+    if s.is_empty()
+        || s == "."
+        || s == ".."
+        || s.contains('/')
+        || s.contains('\\')
+        || std::path::Path::new(s).is_absolute()
+    {
+        return Err(format!("unsafe {what}: {s:?}"));
+    }
+    Ok(())
+}
+
 async fn read_source_body(
     ctx: &AppContext,
     source_app: &str,
@@ -130,6 +146,13 @@ async fn read_source_body(
         .get("job_id")
         .and_then(Value::as_str)
         .ok_or_else(|| "record has no job_id".to_string())?;
+    // `source_app`, `job_id` and `artifact_path` all come from untrusted
+    // params/record data, and `Path::join` lets an absolute or `..` component
+    // escape the artifacts root (arbitrary server-file read into job output).
+    // Each must be a single safe path segment.
+    safe_segment(source_app, "source app")?;
+    safe_segment(job_id, "job_id")?;
+    safe_segment(artifact, "artifact_path")?;
     let root = ctx
         .artifacts_dir
         .parent()

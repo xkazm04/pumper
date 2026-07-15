@@ -12,6 +12,10 @@ use sqlx::SqlitePool;
 
 use crate::{Error, Result};
 
+/// Upper bound on the pairs returned by `duplicate_pairs`, so a pathological
+/// dataset can't produce an unbounded result list.
+const MAX_DUP_PAIRS: usize = 10_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChangeKind {
@@ -139,17 +143,55 @@ impl Datasets {
         let hash = hash_value(value);
         let sim = crate::simhash::simhash_value(value) as i64;
         let now = Utc::now();
+
+        // The read → write → add_revision sequence must be atomic: as three
+        // separate autocommit statements, concurrent same-key writers (per-app
+        // worker concurrency can exceed 1) either collided on the PK and aborted
+        // the batch, or diffed against a stale base and corrupted the revision
+        // chain the change-feed relies on. BEGIN IMMEDIATE takes the write lock up
+        // front so writers serialize (busy_timeout makes the second wait); a plain
+        // DEFERRED begin would instead fail the read-then-write upgrade with
+        // SQLITE_BUSY_SNAPSHOT under WAL.
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let result =
+            Self::upsert_in_tx(&mut conn, app, dataset, key, value, hash.as_str(), sim, now).await;
+        match result {
+            Ok(kind) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(kind)
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Transactional body of `upsert`: the SELECT + record write + revision append
+    /// run on one connection already inside a write transaction, so they commit
+    /// (or roll back) as a unit.
+    async fn upsert_in_tx(
+        conn: &mut sqlx::SqliteConnection,
+        app: &str,
+        dataset: &str,
+        key: &str,
+        value: &Value,
+        hash: &str,
+        sim: i64,
+        now: DateTime<Utc>,
+    ) -> Result<ChangeKind> {
         let existing: Option<(String, String, Option<String>)> = sqlx::query_as(
             "SELECT hash, data, removed_at FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3",
         )
         .bind(app)
         .bind(dataset)
         .bind(key)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *conn)
         .await?;
 
         match existing {
-            Some((prev, _, removed_at)) if prev == hash && removed_at.is_none() => {
+            Some((prev, _, removed_at)) if prev.as_str() == hash && removed_at.is_none() => {
                 sqlx::query(
                     "UPDATE records SET last_seen = ?4 WHERE app = ?1 AND dataset = ?2 AND key = ?3",
                 )
@@ -157,7 +199,7 @@ impl Datasets {
                 .bind(dataset)
                 .bind(key)
                 .bind(ts(now))
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
                 Ok(ChangeKind::Unchanged)
             }
@@ -169,16 +211,25 @@ impl Datasets {
                 .bind(app)
                 .bind(dataset)
                 .bind(key)
-                .bind(&hash)
+                .bind(hash)
                 .bind(value.to_string())
                 .bind(sim)
                 .bind(ts(now))
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
                 let old: Value = serde_json::from_str(&old_data).unwrap_or(Value::Null);
                 let diff = diff_values(&old, value);
-                self.add_revision(app, dataset, key, "changed", Some(value), Some(&diff), now)
-                    .await?;
+                Self::add_revision(
+                    &mut *conn,
+                    app,
+                    dataset,
+                    key,
+                    "changed",
+                    Some(value),
+                    Some(&diff),
+                    now,
+                )
+                .await?;
                 Ok(ChangeKind::Changed)
             }
             None => {
@@ -189,13 +240,13 @@ impl Datasets {
                 .bind(app)
                 .bind(dataset)
                 .bind(key)
-                .bind(&hash)
+                .bind(hash)
                 .bind(value.to_string())
                 .bind(sim)
                 .bind(ts(now))
-                .execute(&self.pool)
+                .execute(&mut *conn)
                 .await?;
-                self.add_revision(app, dataset, key, "new", Some(value), None, now)
+                Self::add_revision(&mut *conn, app, dataset, key, "new", Some(value), None, now)
                     .await?;
                 Ok(ChangeKind::New)
             }
@@ -203,9 +254,11 @@ impl Datasets {
     }
 
     /// Appends the next revision for a record (revision numbers are per-key,
-    /// starting at 1).
-    async fn add_revision(
-        &self,
+    /// starting at 1). Runs on the caller-supplied executor so it can share the
+    /// caller's transaction — the per-key `MAX(revision)` subquery must see the
+    /// same in-flight state as the record write it accompanies.
+    async fn add_revision<'e, E>(
+        executor: E,
         app: &str,
         dataset: &str,
         key: &str,
@@ -213,7 +266,10 @@ impl Datasets {
         data: Option<&Value>,
         diff: Option<&Value>,
         when: DateTime<Utc>,
-    ) -> Result<()> {
+    ) -> Result<()>
+    where
+        E: sqlx::SqliteExecutor<'e>,
+    {
         sqlx::query(
             "INSERT INTO record_revisions (app, dataset, key, revision, change, data, diff, created_at) \
              VALUES (?1, ?2, ?3, \
@@ -228,7 +284,7 @@ impl Datasets {
         .bind(data.map(Value::to_string))
         .bind(diff.map(Value::to_string))
         .bind(ts(when))
-        .execute(&self.pool)
+        .execute(executor)
         .await?;
         Ok(())
     }
@@ -364,6 +420,12 @@ impl Datasets {
         dataset: &str,
         present: &[String],
     ) -> Result<Vec<String>> {
+        // An empty snapshot almost always means the scrape failed, not that the
+        // entire dataset genuinely disappeared. Refuse to tombstone everything —
+        // callers that legitimately empty a dataset should delete explicitly.
+        if present.is_empty() {
+            return Ok(Vec::new());
+        }
         let live: Vec<String> = sqlx::query_scalar(
             "SELECT key FROM records WHERE app = ?1 AND dataset = ?2 AND removed_at IS NULL",
         )
@@ -388,7 +450,7 @@ impl Datasets {
             .bind(ts(now))
             .execute(&self.pool)
             .await?;
-            self.add_revision(app, dataset, &key, "removed", None, None, now)
+            Self::add_revision(&self.pool, app, dataset, &key, "removed", None, None, now)
                 .await?;
             removed.push(key);
         }
@@ -423,14 +485,18 @@ impl Datasets {
         dataset: &str,
         max_distance: u32,
     ) -> Result<Vec<DupPair>> {
-        let rows: Vec<(String, i64)> =
-            sqlx::query_as("SELECT key, simhash FROM records WHERE app = ?1 AND dataset = ?2")
-                .bind(app)
-                .bind(dataset)
-                .fetch_all(&self.pool)
-                .await?;
+        // Only compare live records — tombstoned rows are gone and reporting them
+        // as duplicates is noise.
+        let rows: Vec<(String, i64)> = sqlx::query_as(
+            "SELECT key, simhash FROM records \
+             WHERE app = ?1 AND dataset = ?2 AND removed_at IS NULL",
+        )
+        .bind(app)
+        .bind(dataset)
+        .fetch_all(&self.pool)
+        .await?;
         let mut pairs = Vec::new();
-        for i in 0..rows.len() {
+        'scan: for i in 0..rows.len() {
             if rows[i].1 == 0 {
                 continue;
             }
@@ -445,6 +511,11 @@ impl Datasets {
                         b: rows[j].0.clone(),
                         distance,
                     });
+                    // Bound the result: a pathological dataset must not return an
+                    // unbounded pair list.
+                    if pairs.len() >= MAX_DUP_PAIRS {
+                        break 'scan;
+                    }
                 }
             }
         }
@@ -575,17 +646,35 @@ impl Datasets {
                     qb.push_bind(value.as_str());
                     qb.push(")) > 0");
                 }
+                // Compare numerically when the JSON field is a number, else as
+                // text. SQLite sorts all numbers below all text, so a plain `>=`
+                // of a numeric field against a text-bound value always fails; the
+                // text branch preserves the existing ISO-date behavior unchanged.
                 JsonFilter::Gte { path, value } => {
-                    qb.push(" AND json_extract(data, ");
+                    qb.push(" AND (CASE WHEN json_type(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") IN ('integer','real') THEN json_extract(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") >= CAST(");
+                    qb.push_bind(value.as_str());
+                    qb.push(" AS REAL) ELSE json_extract(data, ");
                     qb.push_bind(path.as_str());
                     qb.push(") >= ");
                     qb.push_bind(value.as_str());
+                    qb.push(" END)");
                 }
                 JsonFilter::Lte { path, value } => {
-                    qb.push(" AND json_extract(data, ");
+                    qb.push(" AND (CASE WHEN json_type(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") IN ('integer','real') THEN json_extract(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") <= CAST(");
+                    qb.push_bind(value.as_str());
+                    qb.push(" AS REAL) ELSE json_extract(data, ");
                     qb.push_bind(path.as_str());
                     qb.push(") <= ");
                     qb.push_bind(value.as_str());
+                    qb.push(" END)");
                 }
                 // `(0 OR ...)` is the honest reading of "matches any of these
                 // paths": with no paths, nothing matches. NULL never satisfies the

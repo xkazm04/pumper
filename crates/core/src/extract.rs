@@ -113,7 +113,18 @@ impl RuleSet {
                         .map_err(|e| Error::Parse(format!("bad regex '{pattern}': {e}")))?;
                     CompiledRule::Regex { re, group: *group }
                 }
-                Rule::Json { pointer } => CompiledRule::Json { pointer: pointer.clone() },
+                Rule::Json { pointer } => {
+                    // RFC 6901: a pointer is the empty string or begins with '/'.
+                    // Validate here like css/regex/xpath so a malformed pointer is
+                    // an Error at compile time, not an indistinguishable Empty miss
+                    // at extract time (which defeats the DocReport/FieldStatus signal).
+                    if !pointer.is_empty() && !pointer.starts_with('/') {
+                        return Err(Error::Parse(format!(
+                            "bad json pointer '{pointer}': must be empty or start with '/'"
+                        )));
+                    }
+                    CompiledRule::Json { pointer: pointer.clone() }
+                }
                 Rule::Xpath { xpath, all } => {
                     let parsed = skyscraper::xpath::parse(xpath)
                         .map_err(|e| Error::Parse(format!("bad xpath '{xpath}': {e}")))?;
@@ -657,6 +668,22 @@ mod tests {
         let (_, bad) = extract_one_with_report(&rules, &"<html>not json</html>".to_string());
         assert!(matches!(bad.fields["present"], FieldStatus::Error { .. }));
         assert!(matches!(bad.fields["absent"], FieldStatus::Error { .. }));
+    }
+
+    #[test]
+    fn compile_rejects_malformed_json_pointer() {
+        // A pointer missing the leading '/' is invalid RFC 6901 — it must fail at
+        // compile time, not become a silent Empty miss at extract time.
+        let bad: RuleSet =
+            serde_json::from_value(json!({ "bad": {"type": "json", "pointer": "a/b"} })).unwrap();
+        assert!(bad.compile().is_err(), "malformed json pointer must fail compile");
+        // Valid pointers (empty or '/'-prefixed) still compile.
+        let ok: RuleSet = serde_json::from_value(json!({
+            "root": {"type": "json", "pointer": ""},
+            "nested": {"type": "json", "pointer": "/a/b"}
+        }))
+        .unwrap();
+        assert!(ok.compile().is_ok());
     }
 
     #[test]

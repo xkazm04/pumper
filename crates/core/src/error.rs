@@ -20,6 +20,11 @@ pub enum Error {
     Config(String),
     #[error("app: {0}")]
     App(String),
+    /// Client-supplied input the server understood but rejected (a malformed
+    /// query, filter, or rule). Maps to HTTP 400 at the request boundary — unlike
+    /// `Parse`, which also covers server-internal decode failures (HTTP 500).
+    #[error("bad request: {0}")]
+    BadRequest(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]

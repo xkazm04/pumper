@@ -144,7 +144,12 @@ impl ScrapeApp for HomewysePricing {
                         if trade.is_empty() || job.is_empty() {
                             continue;
                         }
-                        let key = format!("{locality}:{trade}:{job}");
+                        // Key on a stable slug of trade+job, not the model's raw
+                        // free text: otherwise trivial phrasing drift ("Install
+                        // 30-gal heater" vs "install 30 gal heater") mints a new key
+                        // every run and accumulates stale duplicate rows unboundedly.
+                        // The original strings are still stored for display.
+                        let key = format!("{locality}:{}:{}", slugify(&trade), slugify(&job));
                         let low = validate::num(j, "low");
                         let median = validate::num(j, "median");
                         let high = validate::num(j, "high");
@@ -166,9 +171,13 @@ impl ScrapeApp for HomewysePricing {
                                 "trade": trade,
                                 "job": job,
                                 "unit": j.get("unit").and_then(Value::as_str).unwrap_or("flat"),
-                                "low": j.get("low"),
-                                "median": j.get("median"),
-                                "high": j.get("high"),
+                                // Store the validated numbers, not the raw values:
+                                // a string-quoted price ("1234") passes validation
+                                // via validate::num but, stored raw, is read back as
+                                // a non-number and silently dropped from the rollup.
+                                "low": low,
+                                "median": median,
+                                "high": high,
                             }),
                         ));
                     }
@@ -247,4 +256,38 @@ fn pricing_schema() -> Value {
         },
         "required": ["locality", "year", "trades"]
     })
+}
+
+/// Canonical slug for a free-text label: lowercased alphanumerics with runs of
+/// other characters collapsed to single hyphens. Gives a stable dataset key so
+/// minor phrasing/whitespace/case drift maps to the same record instead of
+/// accumulating duplicates.
+fn slugify(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut prev_dash = false;
+    for c in s.chars() {
+        if c.is_alphanumeric() {
+            out.extend(c.to_lowercase());
+            prev_dash = false;
+        } else if !prev_dash && !out.is_empty() {
+            out.push('-');
+            prev_dash = true;
+        }
+    }
+    out.trim_end_matches('-').to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::slugify;
+
+    #[test]
+    fn slugify_stabilizes_phrasing_drift() {
+        assert_eq!(slugify("Install 30-gal water heater"), "install-30-gal-water-heater");
+        // Case / spacing / punctuation drift collapses to the same key.
+        assert_eq!(slugify("install 30 gal water heater"), slugify("Install 30-gal  water heater"));
+        // Meaningful differences are preserved.
+        assert_ne!(slugify("30-gal heater"), slugify("40-gal heater"));
+        assert_eq!(slugify("  --Trim--  "), "trim");
+    }
 }
