@@ -838,6 +838,18 @@ impl Datasets {
         Ok(count)
     }
 
+    /// Distinct `(app, dataset)` pairs that have at least one live record — the
+    /// set the search-backfill walks to rebuild the index from stored records.
+    pub async fn list_all_datasets(&self) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT app, dataset FROM records WHERE removed_at IS NULL \
+             ORDER BY app, dataset",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Distinct dataset names for an app.
     pub async fn datasets(&self, app: &str) -> Result<Vec<String>> {
         let names: Vec<String> =

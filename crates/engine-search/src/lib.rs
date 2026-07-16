@@ -64,11 +64,14 @@ impl TantivyIndex {
         let index = match Index::open_in_dir(&cfg.dir) {
             Ok(index) if body_is_stored(&index) => index,
             Ok(_) => {
-                // Pre-snippet index (body not stored): rebuild. The index is a
-                // derived artifact — it refills as jobs run.
+                // Pre-snippet index (body not stored): rebuild EMPTY. Previously
+                // indexed docs are gone until re-indexed — the worker only refills
+                // a dataset when its app next runs, so rebuild explicitly.
                 tracing::warn!(
                     dir = %cfg.dir.display(),
-                    "search index schema outdated (body not stored); rebuilding empty"
+                    "search index schema outdated (body not stored); rebuilt EMPTY — \
+                     previously indexed documents are gone. Rebuild from stored records \
+                     with: cargo run -p pumper-server --bin search-backfill"
                 );
                 std::fs::remove_dir_all(&cfg.dir)?;
                 std::fs::create_dir_all(&cfg.dir)?;
