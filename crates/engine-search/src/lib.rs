@@ -207,6 +207,11 @@ impl Search for TantivyIndex {
         .await
     }
 
+    async fn doc_count(&self) -> Result<u64> {
+        // num_docs reflects the last committed segment set the reader has loaded.
+        Ok(self.reader.searcher().num_docs())
+    }
+
     async fn query(&self, req: SearchRequest) -> Result<SearchResponse> {
         let index = self.index.clone();
         let reader = self.reader.clone();

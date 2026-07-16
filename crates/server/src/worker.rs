@@ -558,7 +558,7 @@ fn search_docs(app: &str, job_id: Uuid, result: &Value) -> Vec<SearchDoc> {
 /// Note: because this no longer rebuilds the full index each run, a *wiped* index
 /// (schema-drift rebuild) is refilled only as rows change; the standalone
 /// backfill/reindex path (search finding #2) is the recovery for that case.
-/// Doc ids are `<app>:<dataset>:<key>` (see `dataset_doc_id`), so a re-index
+/// Doc ids are `<app>:<dataset>:<key>` (`SearchDoc::dataset_id`), so a re-index
 /// replaces rather than duplicates. Failures are logged, not fatal — search is a
 /// derived artifact and must never fail a completed job.
 async fn dataset_search_docs(
@@ -600,9 +600,9 @@ async fn dataset_search_docs(
                 continue;
             }
             if rev.change == "removed" {
-                deletes.push(dataset_doc_id(app, dataset, &rev.key));
+                deletes.push(SearchDoc::dataset_id(app, dataset, &rev.key));
             } else if let Some(data) = &rev.data {
-                docs.push(dataset_doc(app, dataset, &rev.key, data));
+                docs.push(SearchDoc::from_dataset_record(app, dataset, &rev.key, data));
             }
         }
     }
@@ -611,32 +611,6 @@ async fn dataset_search_docs(
 
 /// One search document for a stored dataset record (stable id, app+dataset
 /// preserved for facets). Mirrors `record_doc`'s title/url field picking.
-/// Stable search-doc id for a dataset record. The index-and-delete paths must
-/// agree on this exactly, or a removal deletes nothing.
-fn dataset_doc_id(app: &str, dataset: &str, key: &str) -> String {
-    format!("{app}:{dataset}:{key}")
-}
-
-fn dataset_doc(app: &str, dataset: &str, key: &str, rec: &Value) -> SearchDoc {
-    let url = ["_url", "url"]
-        .iter()
-        .find_map(|k| rec.get(*k).and_then(Value::as_str))
-        .unwrap_or("")
-        .to_string();
-    let title = ["title", "name", "headline", "full_name"]
-        .iter()
-        .find_map(|k| rec.get(*k).and_then(Value::as_str))
-        .unwrap_or("")
-        .to_string();
-    SearchDoc {
-        id: dataset_doc_id(app, dataset, key),
-        app: app.to_string(),
-        dataset: dataset.to_string(),
-        url,
-        title,
-        body: rec.to_string(),
-    }
-}
 
 fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
     let url = ["_url", "url"]

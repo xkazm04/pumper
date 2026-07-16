@@ -22,6 +22,40 @@ pub struct SearchDoc {
     pub body: String,
 }
 
+impl SearchDoc {
+    /// Stable doc id for a dataset record: `<app>:<dataset>:<key>`. The live index
+    /// path, the delete path, and the offline backfill must all agree on this
+    /// exactly, or a re-index duplicates and a delete misses.
+    pub fn dataset_id(app: &str, dataset: &str, key: &str) -> String {
+        format!("{app}:{dataset}:{key}")
+    }
+
+    /// Builds the search document for a stored dataset record, pulling url/title
+    /// from the record's conventional fields. Shared by the worker's post-job
+    /// indexing and the `search-backfill` bin so the two produce identical docs.
+    pub fn from_dataset_record(
+        app: &str,
+        dataset: &str,
+        key: &str,
+        rec: &serde_json::Value,
+    ) -> SearchDoc {
+        let pick = |keys: &[&str]| -> String {
+            keys.iter()
+                .find_map(|k| rec.get(*k).and_then(serde_json::Value::as_str))
+                .unwrap_or("")
+                .to_string()
+        };
+        SearchDoc {
+            id: Self::dataset_id(app, dataset, key),
+            app: app.to_string(),
+            dataset: dataset.to_string(),
+            url: pick(&["_url", "url"]),
+            title: pick(&["title", "name", "headline", "full_name"]),
+            body: rec.to_string(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct SearchHit {
     pub id: String,
@@ -91,6 +125,11 @@ pub trait Search: Send + Sync {
     /// Removes every document of one app's dataset and commits — the cleanup
     /// path when a dataset is retired or re-imported from scratch.
     async fn delete_dataset(&self, app: &str, dataset: &str) -> Result<()>;
+
+    /// Number of documents currently in the index. Zero on a fresh, wiped, or
+    /// disabled index — the signal that a backfill is needed (an emptied index
+    /// otherwise looks healthy: queries return 200 with fewer hits).
+    async fn doc_count(&self) -> Result<u64>;
 }
 
 /// Fallback used when search is disabled.
@@ -109,5 +148,8 @@ impl Search for NoSearch {
     }
     async fn delete_dataset(&self, _app: &str, _dataset: &str) -> Result<()> {
         Ok(())
+    }
+    async fn doc_count(&self) -> Result<u64> {
+        Ok(0)
     }
 }

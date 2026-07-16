@@ -101,6 +101,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(delete_saved_search))
         .routes(routes!(set_saved_search_enabled))
         .routes(routes!(delete_search_dataset))
+        .routes(routes!(search_status))
         .routes(routes!(extract_preview))
         .routes(routes!(list_grants))
         .routes(routes!(closing_soon))
@@ -2044,6 +2045,20 @@ async fn search(
     })))
 }
 
+#[utoipa::path(
+    get,
+    path = "/search/status",
+    tag = "search",
+    responses((status = 200, description = "`{enabled, doc_count}` — number of documents in the index. `doc_count: 0` on an enabled index means it was wiped (schema drift) or never populated; rebuild with the `search-backfill` bin."))
+)]
+async fn search_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let doc_count = state.search.doc_count().await?;
+    Ok(Json(json!({
+        "enabled": state.config.search.enabled,
+        "doc_count": doc_count,
+    })))
+}
+
 // ---- Saved searches (standing alerts) ---------------------------------------
 
 #[derive(Deserialize, IntoParams)]
@@ -2859,6 +2874,7 @@ mod api_spec_tests {
         "GET /plugins",
         "POST /plugins/reload",
         "GET /search",
+        "GET /search/status",
         "DELETE /search/docs",
         "GET /searches",
         "POST /searches",
