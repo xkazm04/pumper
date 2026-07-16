@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use app_extractor::Extractor;
 use async_trait::async_trait;
-use pumper_core::config::{FetcherConfig, StorageConfig};
+use pumper_core::config::{FetcherConfig, GovernorConfig, StorageConfig};
 use pumper_core::{
-    AppContext, Browser, CostLedger, Datasets, EngineSet, Fetcher, HttpClient, HttpRequest,
-    HttpResponse, NoPlugins, NoProgress, RenderRequest, RenderedPage, ResearchCache, ResearchOutput,
-    ResearchRequest, Researcher, Result, ScrapeApp, SpentTotal, Storage, TierMemory,
+    AppContext, Browser, CostLedger, Datasets, EngineSet, Fetcher, Governor, HttpClient,
+    HttpRequest, HttpResponse, NoPlugins, NoProgress, RenderRequest, RenderedPage, ResearchCache,
+    ResearchOutput, ResearchRequest, Researcher, Result, ScrapeApp, SpentTotal, Storage, TierMemory,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -50,6 +50,7 @@ async fn ctx_with(root: std::path::PathBuf, storage: &Storage, params: Value) ->
             Arc::new(DeadHttp),
             Arc::new(DeadBrowser),
             Arc::new(DeadResearcher),
+            Arc::new(Governor::new(&GovernorConfig::default())),
             &FetcherConfig::default(),
         ),
     });
