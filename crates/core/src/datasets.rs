@@ -124,6 +124,13 @@ pub struct Datasets {
     pool: SqlitePool,
 }
 
+/// Records committed per write transaction in the batch write paths
+/// (`upsert_many`, `detect_removed`). Trades throughput (fewer commits/fsyncs and
+/// write-lock acquisitions) against how long one batch holds the write lock
+/// against other apps' workers. 500 records of non-commit work is a few tens of
+/// ms — well inside the 5s `busy_timeout`.
+const UPSERT_CHUNK: usize = 500;
+
 impl Datasets {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -458,6 +465,21 @@ impl Datasets {
     }
 
     /// Upserts many records, returning a summary of new/changed/unchanged.
+    ///
+    /// This is the most-executed write path in the product (every ingest run
+    /// upserts its whole listing). Rather than one `BEGIN IMMEDIATE` transaction
+    /// per record — a WAL commit/fsync and a database-wide write-lock acquisition
+    /// each, so a 5k-record batch was 5k commits — records are committed in chunks
+    /// of `UPSERT_CHUNK` on a single held connection: ~10 commits for that batch,
+    /// and the write lock is taken ~10 times instead of 5k (the mechanism behind
+    /// cross-app write stalls during a large sync). Each record keeps its exact
+    /// per-record read→write→revision semantics via `upsert_in_tx`.
+    ///
+    /// A failure rolls back its own chunk and propagates; chunks committed before
+    /// it stay committed (the same partial-progress-then-error shape the old
+    /// per-record loop had). The chunk size bounds how long the write lock is held
+    /// against other apps' workers — 500 records of non-commit work stays well
+    /// inside the 5s `busy_timeout`.
     pub async fn upsert_many(
         &self,
         app: &str,
@@ -465,11 +487,43 @@ impl Datasets {
         items: &[(String, Value)],
     ) -> Result<UpsertSummary> {
         let mut summary = UpsertSummary::default();
-        for (key, value) in items {
-            match self.upsert(app, dataset, key, value).await? {
-                ChangeKind::New => summary.new.push(key.clone()),
-                ChangeKind::Changed => summary.changed.push(key.clone()),
-                ChangeKind::Unchanged => summary.unchanged += 1,
+        if items.is_empty() {
+            return Ok(summary);
+        }
+        let mut conn = self.pool.acquire().await?;
+        for chunk in items.chunks(UPSERT_CHUNK) {
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            // Accumulate this chunk separately so a mid-chunk failure that rolls
+            // back doesn't leave the returned summary claiming uncommitted rows.
+            let mut chunk_summary = UpsertSummary::default();
+            let mut chunk_result: Result<()> = Ok(());
+            for (key, value) in chunk {
+                let hash = hash_value(value);
+                let sim = crate::simhash::simhash_value(value) as i64;
+                let now = Utc::now();
+                match Self::upsert_in_tx(&mut conn, app, dataset, key, value, hash.as_str(), sim, now)
+                    .await
+                {
+                    Ok(ChangeKind::New) => chunk_summary.new.push(key.clone()),
+                    Ok(ChangeKind::Changed) => chunk_summary.changed.push(key.clone()),
+                    Ok(ChangeKind::Unchanged) => chunk_summary.unchanged += 1,
+                    Err(e) => {
+                        chunk_result = Err(e);
+                        break;
+                    }
+                }
+            }
+            match chunk_result {
+                Ok(()) => {
+                    sqlx::query("COMMIT").execute(&mut *conn).await?;
+                    summary.new.extend(chunk_summary.new);
+                    summary.changed.extend(chunk_summary.changed);
+                    summary.unchanged += chunk_summary.unchanged;
+                }
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(e);
+                }
             }
         }
         Ok(summary)

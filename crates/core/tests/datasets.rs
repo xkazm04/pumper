@@ -157,3 +157,53 @@ async fn list_filtered_ordered_returns_soonest_rows_past_the_cap() {
     drop(storage);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn upsert_many_is_correct_across_chunk_boundaries() {
+    // 600 records exceeds the 500-record commit chunk, so this exercises the
+    // multi-transaction batch path. Correctness must be identical to per-record.
+    let (storage, dir) = fresh_db("datasets-upsert-many").await;
+    let ds = Datasets::new(storage.pool());
+
+    let items: Vec<(String, serde_json::Value)> = (0..600)
+        .map(|i| (format!("k{i:04}"), json!({ "n": i })))
+        .collect();
+
+    // First run: all new.
+    let s1 = ds.upsert_many("app", "d", &items).await.unwrap();
+    assert_eq!(s1.new.len(), 600);
+    assert_eq!(s1.changed.len(), 0);
+    assert_eq!(s1.unchanged, 0);
+
+    // Re-run identical: all unchanged (no new revisions).
+    let s2 = ds.upsert_many("app", "d", &items).await.unwrap();
+    assert_eq!(s2.unchanged, 600, "identical re-upsert is all unchanged");
+    assert_eq!(s2.new.len(), 0);
+
+    // Change one record on each side of the chunk boundary.
+    let changed = vec![
+        ("k0007".to_string(), json!({ "n": 7, "extra": true })),
+        ("k0512".to_string(), json!({ "n": 512, "extra": true })),
+    ];
+    let s3 = ds.upsert_many("app", "d", &changed).await.unwrap();
+    assert_eq!(s3.changed.len(), 2);
+
+    // Every record resolves to exactly one row; the two changed keys have 2
+    // revisions (new + changed), the rest have 1 — the chain stayed intact.
+    let pool = storage.pool();
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE app='app' AND dataset='d'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(total, 600);
+    let revs_changed: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM record_revisions WHERE app='app' AND dataset='d' AND key='k0512'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(revs_changed, 2, "new + changed revisions");
+
+    drop(storage);
+    std::fs::remove_dir_all(&dir).ok();
+}
