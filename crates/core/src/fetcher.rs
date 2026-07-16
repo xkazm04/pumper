@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::config::FetcherConfig;
 use crate::engine::{Browser, HttpClient, HttpRequest, RenderRequest, Researcher};
 use crate::governor::Governor;
-use crate::markdown::html_to_markdown;
+use crate::markdown::{html_to_markdown, text_len_capped};
 use crate::{Error, ResearchRequest, Result};
 
 /// Case-insensitive marker phrases that identify a bot-wall / interstitial
@@ -268,9 +268,16 @@ impl Fetcher {
                     let wall = needs_count
                         .then(|| http_bot_wall(resp.status, &resp.body))
                         .flatten();
-                    let markdown =
-                        (req.to_markdown || needs_count).then(|| html_to_markdown(&resp.body));
-                    let text_len = markdown.as_ref().map(|m| m.chars().count());
+                    // Build the Markdown document only when the caller wants it.
+                    // For the escalation decision alone, count text with an
+                    // early-exit capped counter instead of materializing (then
+                    // discarding) a full-page Markdown String.
+                    let markdown = req.to_markdown.then(|| html_to_markdown(&resp.body));
+                    let text_len = match &markdown {
+                        Some(md) => Some(md.chars().count()),
+                        None if needs_count => Some(text_len_capped(&resp.body, min_chars)),
+                        None => None,
+                    };
                     let cache_hit = Some(resp.cache_hit);
                     let enough = wall.is_none()
                         && resp.is_success()
@@ -364,9 +371,15 @@ impl Fetcher {
                     // browser has no HTTP status), so add a marker heuristic
                     // beyond char count before handing off to Claude.
                     let wall = needs_count.then(|| challenge_marker(&page.html)).flatten();
-                    let markdown =
-                        (req.to_markdown || needs_count).then(|| html_to_markdown(&page.html));
-                    let text_len = markdown.as_ref().map(|m| m.chars().count());
+                    // Build Markdown only for the caller; the escalation decision
+                    // uses the capped text counter (no full-page String built and
+                    // thrown away when to_markdown is false).
+                    let markdown = req.to_markdown.then(|| html_to_markdown(&page.html));
+                    let text_len = match &markdown {
+                        Some(md) => Some(md.chars().count()),
+                        None if needs_count => Some(text_len_capped(&page.html, min_chars)),
+                        None => None,
+                    };
                     let enough = wall.is_none() && text_len.map_or(true, |n| n >= min_chars);
                     if enough || req.strategy != FetchStrategy::AutoWithResearch {
                         // A healthy browser fetch decays any learned penalty on the
