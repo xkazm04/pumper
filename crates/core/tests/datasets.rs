@@ -255,3 +255,41 @@ async fn detect_removed_tombstones_with_matching_removed_revisions() {
     drop(storage);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn delete_record_and_dataset_remove_rows_and_revisions() {
+    let (storage, dir) = fresh_db("datasets-delete").await;
+    let ds = Datasets::new(storage.pool());
+    let pool = storage.pool();
+
+    // Seed 3 records, changing one so it has 2 revisions.
+    ds.upsert("app", "d", "k1", &json!({ "n": 1 })).await.unwrap();
+    ds.upsert("app", "d", "k2", &json!({ "n": 2 })).await.unwrap();
+    ds.upsert("app", "d", "k2", &json!({ "n": 22 })).await.unwrap();
+    ds.upsert("app", "d", "k3", &json!({ "n": 3 })).await.unwrap();
+
+    // delete_record removes the row AND its whole revision history.
+    assert!(ds.delete_record("app", "d", "k2").await.unwrap(), "existed");
+    let rec_rows: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE app='app' AND dataset='d' AND key='k2'")
+            .fetch_one(&pool).await.unwrap();
+    let rev_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM record_revisions WHERE app='app' AND dataset='d' AND key='k2'",
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!((rec_rows, rev_rows), (0, 0), "record and its 2 revisions gone");
+    // Deleting a missing record reports false, doesn't error.
+    assert!(!ds.delete_record("app", "d", "k2").await.unwrap(), "already gone");
+
+    // delete_dataset removes the remaining records + all revisions, returns count.
+    let removed = ds.delete_dataset("app", "d").await.unwrap();
+    assert_eq!(removed, 2, "k1 + k3 removed");
+    let total_recs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE app='app' AND dataset='d'")
+        .fetch_one(&pool).await.unwrap();
+    let total_revs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM record_revisions WHERE app='app' AND dataset='d'")
+            .fetch_one(&pool).await.unwrap();
+    assert_eq!((total_recs, total_revs), (0, 0), "dataset fully gone");
+
+    drop(storage);
+    std::fs::remove_dir_all(&dir).ok();
+}

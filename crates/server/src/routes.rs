@@ -73,7 +73,8 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_schedules, create_schedule))
         .routes(routes!(delete_schedule))
         .routes(routes!(set_schedule_enabled))
-        .routes(routes!(list_records))
+        .routes(routes!(list_records, delete_dataset_route))
+        .routes(routes!(delete_record_route))
         .routes(routes!(export_records))
         .routes(routes!(dataset_duplicates))
         .routes(routes!(dataset_changes))
@@ -1141,6 +1142,61 @@ async fn list_records(
         format!("{}|{}", pumper_core::datasets::ts(r.updated_at), r.key)
     });
     Ok(Json(json!({ "items": records, "next_cursor": next_cursor })))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/datasets/{app}/{dataset}",
+    tag = "datasets",
+    params(
+        ("app" = String, Path, description = "App name"),
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    responses((status = 200, description = "`{app, dataset, deleted}` — records removed (with their full revision history and search docs). Hard delete; use for retiring or re-importing a dataset."))
+)]
+async fn delete_dataset_route(
+    State(state): State<AppState>,
+    Path((app, dataset)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let deleted = state.datasets.delete_dataset(&app, &dataset).await?;
+    // Drop the dataset's search docs too (best-effort — the records are already
+    // gone; a stale search doc would just return a hit for a deleted record).
+    if let Err(e) = state.search.delete_dataset(&app, &dataset).await {
+        tracing::warn!(%app, %dataset, "dataset deleted but search cleanup failed: {e}");
+    }
+    Ok(Json(json!({ "app": app, "dataset": dataset, "deleted": deleted })))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/datasets/{app}/{dataset}/records/{key}",
+    tag = "datasets",
+    params(
+        ("app" = String, Path, description = "App name"),
+        ("dataset" = String, Path, description = "Dataset name"),
+        ("key" = String, Path, description = "Record key"),
+    ),
+    responses(
+        (status = 200, description = "Deleted (`{deleted: true}`) — the record and its full revision history."),
+        (status = 404, description = "Record not found", body = Object),
+    )
+)]
+async fn delete_record_route(
+    State(state): State<AppState>,
+    Path((app, dataset, key)): Path<(String, String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let existed = state.datasets.delete_record(&app, &dataset, &key).await?;
+    if !existed {
+        return Err(ApiError(StatusCode::NOT_FOUND, "record not found".into()));
+    }
+    if let Err(e) = state
+        .search
+        .delete_ids(&[pumper_core::SearchDoc::dataset_id(&app, &dataset, &key)])
+        .await
+    {
+        tracing::warn!(%app, %dataset, %key, "record deleted but search cleanup failed: {e}");
+    }
+    Ok(Json(json!({ "deleted": true })))
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -2852,6 +2908,8 @@ mod api_spec_tests {
         "GET /datasets/{app}/{dataset}",
         "GET /datasets/{app}/{dataset}/export",
         "GET /datasets/{app}/{dataset}/duplicates",
+        "DELETE /datasets/{app}/{dataset}",
+        "DELETE /datasets/{app}/{dataset}/records/{key}",
         "GET /datasets/{app}/{dataset}/changes",
         "GET /datasets/{app}/{dataset}/history",
         "GET /watches",

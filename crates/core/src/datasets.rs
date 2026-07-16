@@ -571,6 +571,86 @@ impl Datasets {
         Ok(summary)
     }
 
+    /// Permanently deletes one record and its entire revision history in one
+    /// transaction; returns whether the record existed.
+    ///
+    /// Distinct from full-snapshot removal (`detect_removed`), which *tombstones*
+    /// (sets `removed_at` + a `removed` revision) so the disappearance is a
+    /// change-feed signal. This is a hard delete — the row and all its history are
+    /// gone — for an explicit operator action or a data-removal request. The
+    /// caller is responsible for dropping the record's search doc.
+    pub async fn delete_record(&self, app: &str, dataset: &str, key: &str) -> Result<bool> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let outcome = Self::delete_record_in_tx(&mut conn, app, dataset, key).await;
+        match outcome {
+            Ok(existed) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(existed)
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn delete_record_in_tx(
+        conn: &mut sqlx::SqliteConnection,
+        app: &str,
+        dataset: &str,
+        key: &str,
+    ) -> Result<bool> {
+        let existed = sqlx::query("DELETE FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3")
+            .bind(app)
+            .bind(dataset)
+            .bind(key)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected()
+            > 0;
+        sqlx::query("DELETE FROM record_revisions WHERE app = ?1 AND dataset = ?2 AND key = ?3")
+            .bind(app)
+            .bind(dataset)
+            .bind(key)
+            .execute(&mut *conn)
+            .await?;
+        Ok(existed)
+    }
+
+    /// Permanently deletes an entire dataset — every record and all revision
+    /// history — in one transaction; returns the number of records removed. For
+    /// retiring a dataset or a full re-import. The caller drops the search docs.
+    pub async fn delete_dataset(&self, app: &str, dataset: &str) -> Result<u64> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let outcome: Result<u64> = async {
+            let removed = sqlx::query("DELETE FROM records WHERE app = ?1 AND dataset = ?2")
+                .bind(app)
+                .bind(dataset)
+                .execute(&mut *conn)
+                .await?
+                .rows_affected();
+            sqlx::query("DELETE FROM record_revisions WHERE app = ?1 AND dataset = ?2")
+                .bind(app)
+                .bind(dataset)
+                .execute(&mut *conn)
+                .await?;
+            Ok(removed)
+        }
+        .await;
+        match outcome {
+            Ok(removed) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(removed)
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
     /// Finds near-duplicate record pairs within a dataset using SimHash Hamming
     /// distance (semantic dedup — catches near-identical content, not just exact
     /// matches). O(n²) scan, fine for local datasets. Records with no textual
