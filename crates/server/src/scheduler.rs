@@ -11,6 +11,7 @@
 //! `fire_once` runs a single job (the historical behaviour), `skip` runs none
 //! and simply advances past the missed firings.
 
+use std::collections::HashMap;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -30,17 +31,28 @@ const DEFAULT_SCHEDULE_MAX_ATTEMPTS: i64 = 3;
 
 /// Cap on how many missed firings are enumerated per schedule per tick when
 /// sizing a backlog, so a frequent schedule that fell far behind can't spin.
-/// Reported "missed"/"collapsed" counts saturate at this bound.
+/// Reported "missed" count (misfire-skip path) saturates at this bound. Walked at
+/// most once per schedule, since Skip then advances `last_run` past the backlog.
 const MAX_MISFIRE_SCAN: usize = 10_000;
+
+/// The `Fire` path enumerates the pending backlog no further than this — enough to
+/// log a meaningful `collapsed` count while keeping per-tick work O(1) even when
+/// the overlap guard keeps a schedule due for hours. Realistic backlogs are exact;
+/// larger ones saturate here (the value is diagnostic only).
+const COLLAPSE_LOG_CAP: usize = 64;
 
 pub async fn run(state: AppState) {
     let tick = Duration::from_secs(state.config.worker.schedule_tick_secs.max(1));
     info!(tick_secs = tick.as_secs(), "scheduler started");
+    // Parsed crons cached across ticks, keyed by expression string, so we don't
+    // re-parse every schedule's cron on every tick (an edited cron is a new key and
+    // re-parses). Lives here so it outlives a single reconcile.
+    let mut cron_cache: HashMap<String, CronSchedule> = HashMap::new();
     loop {
         if state.shutdown.is_cancelled() {
             break;
         }
-        if let Err(e) = reconcile(&state).await {
+        if let Err(e) = reconcile(&state, &mut cron_cache).await {
             error!("scheduler reconcile failed: {e}");
         }
         // Piggyback the scheduler tick to run the stuck-job reaper: re-queue
@@ -56,7 +68,10 @@ pub async fn run(state: AppState) {
     info!("scheduler stopped");
 }
 
-async fn reconcile(state: &AppState) -> anyhow::Result<()> {
+async fn reconcile(
+    state: &AppState,
+    cron_cache: &mut HashMap<String, CronSchedule>,
+) -> anyhow::Result<()> {
     let now = Utc::now();
     // A firing more than two ticks late was missed while the scheduler was down
     // (a healthy tick catches a due firing within one interval). This is the
@@ -67,11 +82,15 @@ async fn reconcile(state: &AppState) -> anyhow::Result<()> {
         if !schedule.enabled {
             continue;
         }
-        let cron = match CronSchedule::from_str(&schedule.cron) {
-            Ok(cron) => cron,
-            Err(e) => {
-                warn!(id = %schedule.id, cron = %schedule.cron, "invalid cron: {e}");
-                continue;
+        let cron = if let Some(cron) = cron_cache.get(&schedule.cron) {
+            cron
+        } else {
+            match CronSchedule::from_str(&schedule.cron) {
+                Ok(cron) => cron_cache.entry(schedule.cron.clone()).or_insert(cron),
+                Err(e) => {
+                    warn!(id = %schedule.id, cron = %schedule.cron, "invalid cron: {e}");
+                    continue;
+                }
             }
         };
         let tz = parse_tz(schedule.timezone.as_deref());
@@ -79,7 +98,7 @@ async fn reconcile(state: &AppState) -> anyhow::Result<()> {
         let reference = schedule.last_run.unwrap_or(schedule.created_at);
         let misfire_skip = schedule.misfire_policy == "skip";
 
-        match decide(&cron, tz, reference, now, misfire_skip, grace) {
+        match decide(cron, tz, reference, now, misfire_skip, grace) {
             Action::Idle => continue,
             Action::Skip { missed } => {
                 info!(
@@ -164,30 +183,48 @@ fn decide(
     let reference_tz = reference.with_timezone(&tz);
     let now_tz = now.with_timezone(&tz);
 
-    // Enumerate firings in (reference, now], capped.
-    let mut count = 0usize;
-    let mut earliest: Option<DateTime<Tz>> = None;
-    for fire in cron.after(&reference_tz) {
-        if fire > now_tz {
-            break;
-        }
-        earliest.get_or_insert(fire);
-        count += 1;
-        if count >= MAX_MISFIRE_SCAN {
-            break;
-        }
-    }
-    let Some(earliest) = earliest else {
-        return Action::Idle;
+    let mut iter = cron.after(&reference_tz);
+    // The earliest pending firing is one iterator step: firings come out
+    // increasing, so if the first is still in the future nothing is due. This
+    // avoids enumerating the whole backlog just to find the oldest one.
+    let earliest = match iter.next() {
+        Some(fire) if fire <= now_tz => fire,
+        _ => return Action::Idle,
     };
 
     // Misfire = the oldest pending firing is more than `grace` behind now.
     let missed = now_tz.signed_duration_since(earliest) > grace;
     if missed && misfire_skip {
-        Action::Skip { missed: count }
+        // Skip advances past ALL missed firings, so it needs the exact count — but
+        // this happens once (the tick then touches last_run), not every tick.
+        let mut missed = 1usize;
+        for fire in iter {
+            if fire > now_tz {
+                break;
+            }
+            missed += 1;
+            if missed >= MAX_MISFIRE_SCAN {
+                break;
+            }
+        }
+        Action::Skip { missed }
     } else {
-        // fire_once, or skip-but-on-time: one run; any extras are collapsed.
-        Action::Fire { collapsed: count.saturating_sub(1) }
+        // Fire enqueues ONE run no matter how many firings are pending, and the
+        // overlap guard can keep this schedule "due" for many ticks — so bound the
+        // enumeration to a small cap instead of re-walking the whole growing
+        // backlog every tick. `collapsed` is a diagnostic log field: exact for
+        // realistic backlogs, saturating at the cap for pathological ones.
+        let mut collapsed = 0usize;
+        for fire in iter {
+            if fire > now_tz {
+                break;
+            }
+            collapsed += 1;
+            if collapsed >= COLLAPSE_LOG_CAP {
+                break;
+            }
+        }
+        Action::Fire { collapsed }
     }
 }
 
