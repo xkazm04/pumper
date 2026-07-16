@@ -38,13 +38,14 @@ impl ScrapeApp for GrantsGov {
     }
 
     /// Daily full sync of open opportunities at 09:00 UTC. Scheduled runs use
-    /// `default_params`, which are sufficient (posted+forecasted, 25×100 rows).
+    /// `default_params`: posted+forecasted at the API's max 1000-row page size, so
+    /// the corpus is covered in ~3 round-trips and the ceiling is 25k, not 2.5k.
     fn schedule(&self) -> Option<&'static str> {
         Some("0 0 9 * * *")
     }
 
     fn default_params(&self) -> Value {
-        json!({ "oppStatuses": "posted|forecasted", "rows": 100, "maxPages": 25 })
+        json!({ "oppStatuses": "posted|forecasted", "rows": 1000, "maxPages": 25 })
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -141,6 +142,13 @@ impl ScrapeApp for GrantsGov {
             }
         }
 
+        // Honest coverage: stopping on the page cap while records remain is a
+        // silently-partial corpus. The prior code returned Ok identically to a
+        // genuine full sweep, so a truncated run was indistinguishable from a
+        // complete one — same failure the drift guard below already refuses for
+        // the empty case.
+        let truncated = pages >= max_pages && start < hit_count;
+
         // Drift guard: the server reported a positive hitCount but we parsed zero
         // opportunities out of `data.oppHits` — the array was renamed/moved and
         // `unwrap_or_default` silently emptied it. Fail loudly instead of
@@ -204,9 +212,34 @@ impl ScrapeApp for GrantsGov {
             "digestDays": digest_days,
             "closingSoonCount": closing_soon.len(),
             "closingSoon": closing_soon.iter().take(25).collect::<Vec<_>>(),
+            "truncated": truncated,
         });
         cross.merge_into(&mut out);
+        if truncated {
+            append_warning(
+                &mut out,
+                format!(
+                    "coverage truncated: stopped at maxPages={max_pages} after {} of \
+                     {hit_count} records — raise rows/maxPages to cover the full corpus",
+                    hits.len()
+                ),
+            );
+        }
         Ok(out)
+    }
+}
+
+/// Appends a warning to a result's `warnings` array (creating it if absent).
+/// `UnifiedOutcome::merge_into` sets `warnings` to the drift warnings, so any
+/// coverage warning must be pushed *after* the merge to survive.
+fn append_warning(out: &mut Value, msg: String) {
+    if let Value::Object(map) = out {
+        match map.get_mut("warnings") {
+            Some(Value::Array(w)) => w.push(json!(msg)),
+            _ => {
+                map.insert("warnings".into(), json!([msg]));
+            }
+        }
     }
 }
 
