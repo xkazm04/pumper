@@ -135,3 +135,18 @@
 ## Open follow-ups (from perf-feature scan Wave 1, 2026-07-16)
 - grants-gov#1 money enrichment via POST /v1/api/fetchOpportunity — DEFERRED: needs a saved fetchOpportunity response to verify field names/nesting (awardFloor/awardCeiling/estimatedTotalProgramFunding/applicantTypes/fundingActivityCategories) + a backfill-drain (re-enrich money-null unified rows over days) so a per-run cap doesn't stall. Money stays Null for grants-gov until then (status quo, no regression).
 - eu-sedia#3 CMS-fee-schedule self-baselining watcher (Med); grants-gov#3 finalize_unified once-per-sync (fold into Wave 2 write-amplification).
+
+## Anti-patterns to avoid (perf-feature scan Wave 2, 2026-07-16)
+- **Per-record transaction for a batch write.** `upsert_many` looped `upsert()` = one BEGIN IMMEDIATE/commit/fsync + write-lock grab per record (5k-record batch = 5k commits). Chunk the batch (500) on one held connection via the existing `*_in_tx(conn,…)` seam — commit boundary = batch, not row.
+- **A two-row write hardened in one path but not another.** `upsert` got BEGIN IMMEDIATE for its record+revision pair; `detect_removed` wrote the same pair as 2 autocommits — a crash between them tombstoned a record with NO `removed` revision, and the next sync never revisits it (removed_at already set) → the removal signal is lost PERMANENTLY. When hardening one writer, grep every site writing the same row-pair.
+- **Rebuilding a derived index from scratch every event.** worker `dataset_search_docs` re-indexed the WHOLE named dataset per job (O(corpus)×freq; grants/unified twice daily). Drive it from the change feed (revisions since job start) → O(changes); route `removed` revisions to `Search::delete_ids`. Note the hidden dependency: no full rebuild means a wiped index needs a separate backfill bin (search#2).
+- **Expensive periodic work gated by item count.** crawl `Checkpoint::save` is O(frontier) fired every 25 pages = O(pages/25 × frontier) (~40GB on a 100k crawl). Gate by wall-clock (5s min interval) → O(frontier × duration); keep the unconditional final save.
+
+## Structural facts (perf-feature scan Wave 2, 2026-07-16)
+- **2026-07-16** — `Datasets::upsert_many` + `detect_removed` now commit in chunks of `UPSERT_CHUNK`=500 on one connection (were per-record). `remove_in_tx` mirrors `upsert_in_tx`. worker `dataset_search_docs` now returns (docs, delete_ids) from `changes_since(app,dataset,job.started_at)` — indexes only touched keys; `dataset_doc_id` centralizes the `<app>:<dataset>:<key>` id. `grants_common::sweep_closed` filters status IN {open,forecasted} via `list_filtered` (was full-corpus `list`).
+- **2026-07-16** — The dataset an `index_datasets` spec names (e.g. `grants/unified`) lives in a DIFFERENT app namespace (`grants`) than the running app (`grants-gov`); worker indexing must scope `changes_since` to the spec's app, not `job.app`.
+
+## Open follow-ups (from perf-feature scan Wave 2, 2026-07-16)
+- dataset-store#3 (High): no delete/retention API — store only grows (unbounded revisions). 3-part feature (delete_record/delete_dataset + prune_revisions + janitor tick). Its own session.
+- search#2 (High): backfill/reindex bin — Wave-2 incremental indexing now DEPENDS on it for wiped-index recovery. Pairs with dataset-store#3.
+- broad-crawler#1 tail: delta/journal checkpoint + off-loop single-flight save (time-gate removed the amplification; these remove the per-save frontier serialize + fetch stall).
