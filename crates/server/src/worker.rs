@@ -242,9 +242,17 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             // name datasets to index per-record via `index_datasets` — see
             // `dataset_search_docs`.
             let mut docs = search_docs(&job.app, job.id, &result);
-            docs.extend(dataset_search_docs(&state, &result).await);
+            let (dataset_docs, dataset_deletes) = dataset_search_docs(&state, &job, &result).await;
+            docs.extend(dataset_docs);
             if let Err(e) = state.search.index(docs).await {
                 warn!(job = %job.id, "search index failed: {e}");
+            }
+            // Removed records (this run's `removed` revisions) are dropped from the
+            // index rather than left as stale hits.
+            if !dataset_deletes.is_empty() {
+                if let Err(e) = state.search.delete_ids(&dataset_deletes).await {
+                    warn!(job = %job.id, "search delete failed: {e}");
+                }
             }
             match state.storage.complete(job.id, job.attempts, result).await {
                 Ok(true) => info!(job = %job.id, "job succeeded"),
@@ -534,17 +542,35 @@ fn search_docs(app: &str, job_id: Uuid, result: &Value) -> Vec<SearchDoc> {
     docs
 }
 
-/// Per-record search docs for datasets the result names in `index_datasets`
-/// (`[{ "app", "dataset" }]`). Lets an app with a large record set keep its job
-/// result compact (counts, not arrays) yet still get one search document per
-/// live record. Doc ids are `<app>:<dataset>:<key>`, so a re-run replaces rather
-/// than duplicates. Removed records are skipped. Failures are logged, not fatal
-/// — search is a derived artifact and must never fail a completed job.
-async fn dataset_search_docs(state: &AppState, result: &Value) -> Vec<SearchDoc> {
+/// Search docs + delete-ids for datasets the result names in `index_datasets`
+/// (`[{ "app", "dataset" }]`), covering **only the records this run touched** —
+/// not the whole dataset.
+///
+/// The old version re-read and re-indexed the entire named dataset on every job
+/// completion (`list(.., 100_000)` → one doc per live record → delete+add each in
+/// Tantivy). For a dataset like `grants/unified` (~5k rows, synced daily by two
+/// apps) that is ~100–1000× write amplification for the handful of rows that
+/// actually changed, and it grows with the corpus forever. Instead this reads the
+/// dataset's revisions since the job started (the change feed already records
+/// them), indexes the new/changed keys from their snapshots, and returns the
+/// `removed` keys for deletion — cost O(changes), not O(corpus).
+///
+/// Note: because this no longer rebuilds the full index each run, a *wiped* index
+/// (schema-drift rebuild) is refilled only as rows change; the standalone
+/// backfill/reindex path (search finding #2) is the recovery for that case.
+/// Doc ids are `<app>:<dataset>:<key>` (see `dataset_doc_id`), so a re-index
+/// replaces rather than duplicates. Failures are logged, not fatal — search is a
+/// derived artifact and must never fail a completed job.
+async fn dataset_search_docs(
+    state: &AppState,
+    job: &Job,
+    result: &Value,
+) -> (Vec<SearchDoc>, Vec<String>) {
     let Some(specs) = result.get("index_datasets").and_then(Value::as_array) else {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     };
     let mut docs = Vec::new();
+    let mut deletes = Vec::new();
     for spec in specs {
         let (Some(app), Some(dataset)) = (
             spec.get("app").and_then(Value::as_str),
@@ -552,23 +578,45 @@ async fn dataset_search_docs(state: &AppState, result: &Value) -> Vec<SearchDoc>
         ) else {
             continue;
         };
-        match state.datasets.list(app, dataset, 100_000).await {
-            Ok(records) => {
-                for rec in records {
-                    if rec.removed_at.is_some() {
-                        continue;
-                    }
-                    docs.push(dataset_doc(app, dataset, &rec.key, &rec.data));
-                }
+        // This dataset's revisions from this run. Scoped to `app`/`dataset`
+        // explicitly because the indexed dataset (e.g. `grants/unified`) lives in a
+        // different app namespace than the running app (e.g. `grants-gov`).
+        let revs = match state
+            .datasets
+            .changes_since(app, Some(dataset), job.started_at, 100_000)
+            .await
+        {
+            Ok(revs) => revs,
+            Err(e) => {
+                warn!("index_datasets: failed to load changes for {app}/{dataset}: {e}");
+                continue;
             }
-            Err(e) => warn!("index_datasets: failed to load {app}/{dataset}: {e}"),
+        };
+        // changes_since is newest-first; keep only the latest revision per key so
+        // a key changed twice in one run is indexed/deleted once, from its final state.
+        let mut seen = std::collections::HashSet::new();
+        for rev in revs {
+            if !seen.insert(rev.key.clone()) {
+                continue;
+            }
+            if rev.change == "removed" {
+                deletes.push(dataset_doc_id(app, dataset, &rev.key));
+            } else if let Some(data) = &rev.data {
+                docs.push(dataset_doc(app, dataset, &rev.key, data));
+            }
         }
     }
-    docs
+    (docs, deletes)
 }
 
 /// One search document for a stored dataset record (stable id, app+dataset
 /// preserved for facets). Mirrors `record_doc`'s title/url field picking.
+/// Stable search-doc id for a dataset record. The index-and-delete paths must
+/// agree on this exactly, or a removal deletes nothing.
+fn dataset_doc_id(app: &str, dataset: &str, key: &str) -> String {
+    format!("{app}:{dataset}:{key}")
+}
+
 fn dataset_doc(app: &str, dataset: &str, key: &str, rec: &Value) -> SearchDoc {
     let url = ["_url", "url"]
         .iter()
@@ -581,7 +629,7 @@ fn dataset_doc(app: &str, dataset: &str, key: &str, rec: &Value) -> SearchDoc {
         .unwrap_or("")
         .to_string();
     SearchDoc {
-        id: format!("{app}:{dataset}:{key}"),
+        id: dataset_doc_id(app, dataset, key),
         app: app.to_string(),
         dataset: dataset.to_string(),
         url,
