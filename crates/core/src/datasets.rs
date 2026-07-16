@@ -651,6 +651,42 @@ impl Datasets {
         }
     }
 
+    /// Trims revision history: deletes revisions created before `older_than`, but
+    /// always keeps at least the newest `keep_min_per_key` revisions of every
+    /// record so the diff chain and `history` stay usable. Returns the number
+    /// pruned. Records themselves are untouched — only history shrinks.
+    ///
+    /// `record_revisions` stores a full snapshot per revision and is append-only,
+    /// so on a scheduled source it grows without bound (≈ GB/year per active
+    /// dataset); this is the knob that bounds it. The retention janitor calls it,
+    /// but it is safe to call directly.
+    pub async fn prune_revisions(
+        &self,
+        older_than: DateTime<Utc>,
+        keep_min_per_key: i64,
+    ) -> Result<u64> {
+        let keep = keep_min_per_key.max(0);
+        // A revision is pruned when it is older than the cutoff AND it is not
+        // among the newest `keep` for its key — i.e. more than `keep` revisions of
+        // that key have a revision number >= this one. Correlated subquery (no
+        // window function, no DELETE-target alias) for SQLite portability; the
+        // (app,dataset,key,revision) PK backs both predicates.
+        let result = sqlx::query(
+            "DELETE FROM record_revisions \
+             WHERE created_at < ?1 \
+               AND (SELECT COUNT(*) FROM record_revisions AS n \
+                    WHERE n.app = record_revisions.app \
+                      AND n.dataset = record_revisions.dataset \
+                      AND n.key = record_revisions.key \
+                      AND n.revision >= record_revisions.revision) > ?2",
+        )
+        .bind(ts(older_than))
+        .bind(keep)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
+
     /// Finds near-duplicate record pairs within a dataset using SimHash Hamming
     /// distance (semantic dedup — catches near-identical content, not just exact
     /// matches). O(n²) scan, fine for local datasets. Records with no textual

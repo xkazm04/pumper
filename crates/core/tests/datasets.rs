@@ -293,3 +293,46 @@ async fn delete_record_and_dataset_remove_rows_and_revisions() {
     drop(storage);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn prune_revisions_keeps_the_newest_n_and_respects_the_cutoff() {
+    let (storage, dir) = fresh_db("datasets-prune").await;
+    let ds = Datasets::new(storage.pool());
+    let pool = storage.pool();
+
+    // 5 revisions for k (1 new + 4 changed), 3 for k2.
+    for v in 1..=5 {
+        ds.upsert("app", "d", "k", &json!({ "n": v })).await.unwrap();
+    }
+    for v in 1..=3 {
+        ds.upsert("app", "d", "k2", &json!({ "n": v })).await.unwrap();
+    }
+
+    // Cutoff in the past: nothing is older, so nothing is pruned.
+    let none = ds
+        .prune_revisions(chrono::Utc::now() - chrono::Duration::days(1), 1)
+        .await
+        .unwrap();
+    assert_eq!(none, 0, "no revision predates the cutoff");
+
+    // Cutoff in the future (all revisions older), keep newest 2 per key:
+    // k prunes 3 (5 -> 2), k2 prunes 1 (3 -> 2) = 4.
+    let pruned = ds
+        .prune_revisions(chrono::Utc::now() + chrono::Duration::days(1), 2)
+        .await
+        .unwrap();
+    assert_eq!(pruned, 4);
+
+    // The kept revisions are the newest 2 of each key (highest revision numbers).
+    let kept_k: Vec<i64> = sqlx::query_scalar(
+        "SELECT revision FROM record_revisions WHERE app='app' AND dataset='d' AND key='k' ORDER BY revision",
+    ).fetch_all(&pool).await.unwrap();
+    assert_eq!(kept_k, vec![4, 5], "newest 2 of k survive");
+    let kept_k2: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM record_revisions WHERE app='app' AND dataset='d' AND key='k2'",
+    ).fetch_one(&pool).await.unwrap();
+    assert_eq!(kept_k2, 2);
+
+    drop(storage);
+    std::fs::remove_dir_all(&dir).ok();
+}
