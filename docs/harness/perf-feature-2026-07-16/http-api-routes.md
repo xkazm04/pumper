@@ -1,0 +1,37 @@
+# HTTP API & Routes — perf-optimizer + feature-scout scan
+
+> Total: 3
+> Critical: 0 | High: 2 | Medium: 1 | Low: 0
+
+## 1. Push `closing-soon` ordering into SQL — the 1000-row scan is ordered by the wrong column
+
+- **Severity**: High
+- **Lens**: perf-optimizer
+- **Category**: unbounded-query
+- **File**: crates/server/src/routes.rs:2755-2796 (scan cap 2631; `list_filtered` ORDER BY at crates/core/src/datasets.rs:746)
+- **Scenario**: An operator calls `GET /grants/closing-soon?days=365` (the route clamps `days` to 1..=365) to build a deadline calendar over the cross-source corpus. They get 200 grants back and a `count` they trust.
+- **Root cause**: The handler asks `list_filtered` for `CLOSING_SOON_SCAN = 1000` rows, but `list_filtered` ends in `ORDER BY updated_at DESC, key DESC` — it has no notion of `close_date`. The date sort (`window.sort_by_key(|(days_left, _)| *days_left)`) happens in memory *after* the LIMIT has already chosen which rows come back. So the 1000 rows are the most-recently-*updated* matches, an arbitrary subset with respect to closing date. The code comment says "the whole window has to be in hand before it can be truncated", which is exactly what the LIMIT prevents once the window exceeds 1000.
+- **Impact**: Two failures, both silent. (a) **Correctness**: past 1000 matches, a grant closing *tomorrow* is omitted entirely if its record happens to be stale — the "soonest first" list is not soonest-first over the corpus, only over a random slice. At `days=365` on a multi-thousand-row open corpus this is the normal case, not an edge case. (b) **Honesty**: `count` is documented as "the window total" but saturates at exactly 1000, so the caller cannot even detect the truncation. Perf-wise the route also deserializes 1000 full `data` blobs to discard 800 of them.
+- **Fix sketch**: Add a `close_date`-ordered variant rather than widening the scan (widening only moves the cliff). Two options: (1) extend `pumper_core::datasets` with an `order_by_json_path` parameter on `list_filtered` so the `ORDER BY json_extract(data, '$.close_date') ASC` and the `LIMIT CLOSING_SOON_CAP` happen in one indexed SQL pass — then `days_left` is computed only for the 200 rows actually returned; (2) pair it with a `count_filtered` using the same `JsonFilter` predicates so `count` reports the true window total independent of the returned cap. Option (1) also removes the in-memory sort. If the scan cap must stay as a safety valve, at minimum report `"truncated": records.len() as i64 == CLOSING_SOON_SCAN` so callers can see it.
+
+## 2. Expose the generic `JsonFilter` surface on `/datasets/{app}/{dataset}` and `/export`
+
+- **Severity**: High
+- **Lens**: feature-scout
+- **Category**: feature-gap
+- **File**: crates/server/src/routes.rs:2607-2740 (`grant_filters`, `list_grants`), 1127-1143 (`list_records`), 1193-1279 (`export_records`)
+- **Scenario**: A consumer of `cms-fee-schedule`, `census-nonemp`, `state-tax`, or any of the ~17 other registered apps wants "rows where `$.state = 'CA'`". Today the only options are `GET /datasets/{app}/{dataset}?cursor=` (no filters — pages the whole dataset) or `/export` (streams the entire corpus). Both mean pulling everything and filtering client-side.
+- **Root cause**: The machinery is already generic and already shipped. `Datasets::list_filtered(app, dataset, &[JsonFilter], after, limit)` takes app/dataset as plain parameters and pushes `Eq`/`Contains`/`Gte`/`Lte`/`NumGteAny` into SQL with proper keyset paging. But the only route that reaches it hardcodes `GRANTS_APP`/`GRANTS_DATASET` and a fixed six-param `GrantsQuery` struct. The header comment on the grants block names the problem precisely — "every consumer had to export the whole corpus and filter client-side" — and then solves it for exactly one dataset. Every other app still has that problem.
+- **Impact**: Unlocks the filtered-query surface for the whole app fleet at roughly the cost of a query-param parser. Removes the "export N MB, keep 50 rows" pattern for every non-grants dataset; the SQL `WHERE` also lets SQLite skip rows the current path deserializes into `Record` structs and throws away. Filtered `/export` in particular turns a whole-corpus stream into a targeted one — the single biggest payload win available on this surface.
+- **Fix sketch**: Add a repeatable `filter` query param with a compact grammar (`?filter=$.state:eq:CA&filter=$.amount:gte:1000`) parsed into `Vec<JsonFilter>` by a shared `parse_filters(&[String]) -> Result<Vec<JsonFilter>, ApiError>` — malformed specs map to the existing `Error::BadRequest` → 400 path. Then: (a) `list_records` calls `list_filtered` instead of `list`/`list_page` when filters are present; (b) `stream_export` threads `&[JsonFilter]` through its `list_page` batch loop (it already keyset-pages, so `list_filtered` drops in with the same `after` tuple); (c) re-express `grant_filters` on top of `parse_filters` so `/grants` stays a documented convenience alias over the generic engine rather than a parallel implementation. `parse_grant_date` validation generalizes to a per-path type check.
+
+## 3. Add a compression layer to the router
+
+- **Severity**: Medium
+- **Lens**: perf-optimizer
+- **Category**: compression
+- **File**: crates/server/src/routes.rs:110-135 (`router`); Cargo.toml:54 (`tower-http` features)
+- **Scenario**: A consumer exports a dataset (`GET /datasets/{app}/{dataset}/export`), pages `/grants?limit=500`, or pulls `/datasets/{app}/{dataset}?limit=1000`. Every byte of highly-repetitive JSON goes out uncompressed, even when the client sent `accept-encoding: gzip`.
+- **Root cause**: The router stack is `TraceLayer` plus an optional `CorsLayer` — no `CompressionLayer`. The workspace pins `tower-http = { version = "0.6", features = ["trace", "cors"] }`, so the compression feature isn't even compiled in; this reads as an omission rather than a decision (no comment argues against it, unlike the deliberate CORS-off rationale directly above).
+- **Impact**: Record JSON is structurally repetitive (identical keys on every row, RFC-3339 timestamps, `data` blobs), so gzip typically lands 5–10x on this shape; a 50 MB export becomes ~5–8 MB. Bounded honestly: pumper is local-first, so on a loopback consumer this trades CPU for bandwidth that isn't scarce — the real win is remote/tunneled consumers and the streamed export path, where transfer time dominates. `CompressionLayer` is opt-in per request (it only acts on `accept-encoding`), so localhost clients that don't ask are unaffected.
+- **Fix sketch**: Add `"compression-gzip"` (optionally `"compression-br"`) to the workspace `tower-http` features, then layer `tower_http::compression::CompressionLayer::new()` in `router` alongside the existing `TraceLayer`. Two constraints to respect: (a) apply it *below* the SSE routes or configure it not to buffer `text/event-stream` — compressing `/events` and `/jobs/{id}/stream` would defeat `KeepAlive` and delay event delivery; `CompressionLayer` already skips SSE by content-type, but the path-coverage test should pin that; (b) verify `stream_export` still yields incrementally (compression must not accumulate the whole body) — assert constant memory on a large export, since the no-row-cap streaming guarantee in that route's doc comment is the property most at risk. Metric to watch: `content-length` on a fixed `/grants?limit=500` request before/after, plus export wall-clock over a non-loopback link.
