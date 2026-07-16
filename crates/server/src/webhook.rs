@@ -112,7 +112,7 @@ pub fn replay(
     secret: Option<String>,
 ) {
     tokio::spawn(async move {
-        let outcome = deliver(&client, &url, &event, &body, secret.as_deref()).await;
+        let outcome = deliver(&client, &url, &event, &delivery_id, &body, secret.as_deref()).await;
         log_outcome(&storage, &delivery_id, &url, outcome).await;
     });
 }
@@ -137,11 +137,16 @@ fn spawn_logged(
             Ok(id) => id,
             Err(e) => {
                 warn!(url = %url, "delivery log write failed (sending anyway): {e}");
-                let _ = deliver(&client, &url, &event, &body, secret.as_deref()).await;
+                // No persisted id — send with a generated one so the receiver still
+                // gets an idempotency key (this delivery just isn't in the log/DLQ).
+                let fallback_id = uuid::Uuid::new_v4().to_string();
+                let _ =
+                    deliver(&client, &url, &event, &fallback_id, &body, secret.as_deref()).await;
                 return;
             }
         };
-        let outcome = deliver(&client, &url, &event, &body, secret.as_deref()).await;
+        let outcome =
+            deliver(&client, &url, &event, &delivery_id, &body, secret.as_deref()).await;
         log_outcome(&storage, &delivery_id, &url, outcome).await;
     });
 }
@@ -172,21 +177,28 @@ async fn deliver(
     client: &reqwest::Client,
     url: &str,
     event: &str,
+    delivery_id: &str,
     body: &[u8],
     secret: Option<&str>,
 ) -> (bool, i64, Option<String>) {
-    let signature = secret.map(|s| sign(s.as_bytes(), body));
     let mut last_error = None;
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
             tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
         }
+        // Per-attempt timestamp, covered by the signature so the receiver can
+        // reject stale deliveries. The delivery id is STABLE across retries and
+        // replays — that stability is what makes it a usable idempotency key.
+        let ts = chrono::Utc::now().timestamp();
         let mut req = client
             .post(url)
             .header("content-type", "application/json")
             .header("x-pumper-event", event)
+            .header("x-pumper-delivery-id", delivery_id)
+            .header("x-pumper-timestamp", ts.to_string())
             .body(body.to_vec());
-        if let Some(sig) = &signature {
+        if let Some(secret) = secret {
+            let sig = sign(secret.as_bytes(), ts, delivery_id, body);
             req = req.header("x-pumper-signature", format!("sha256={sig}"));
         }
         match req.send().await {
@@ -200,8 +212,12 @@ async fn deliver(
     (false, MAX_ATTEMPTS as i64, last_error)
 }
 
-fn sign(secret: &[u8], body: &[u8]) -> String {
+/// Signature base `HMAC(secret, "{ts}.{delivery_id}." ++ body)` — the timestamp
+/// and delivery id are covered so a captured request can't be replayed with a
+/// fresh timestamp, and the receiver can bind the signature to the idempotency key.
+fn sign(secret: &[u8], ts: i64, delivery_id: &str, body: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret).expect("hmac accepts any key length");
+    mac.update(format!("{ts}.{delivery_id}.").as_bytes());
     mac.update(body);
     hex::encode(mac.finalize().into_bytes())
 }

@@ -11,7 +11,11 @@
 
 ## Outbound webhooks — one logged contract
 
-All webhook kinds share one delivery loop (`webhook.rs::deliver`): POST JSON, `x-pumper-event` header, optional HMAC-SHA256 body signature (`x-pumper-signature: sha256=<hex>`), 3 attempts with linear backoff, fire-and-forget (never blocks the worker). **New event kinds must go through `webhook::dispatch_event`** — never hand-roll a send.
+All webhook kinds share one delivery loop (`webhook.rs::deliver`): POST JSON, 3 attempts with linear backoff, fire-and-forget (never blocks the worker). **New event kinds must go through `webhook::dispatch_event`** — never hand-roll a send. Every delivery carries these headers:
+- `x-pumper-event` — the event name.
+- `x-pumper-delivery-id` — a **stable idempotency key** for this delivery: the same id across all retries AND a manual `/replay`, so a receiver can dedup (at-least-once delivery means the same delivery can arrive more than once).
+- `x-pumper-timestamp` — unix seconds, set per attempt; a receiver can reject stale timestamps.
+- `x-pumper-signature: sha256=<hex>` (when a secret is configured) — `HMAC(secret, "{timestamp}.{delivery_id}." ++ body)`. The timestamp and delivery id are covered, so a captured signed request can't be replayed with a fresh timestamp, and the signature binds to the idempotency key. Recompute the base to verify: concatenate the `x-pumper-timestamp` and `x-pumper-delivery-id` header values as `"{ts}.{id}."` in front of the raw body.
 
 Kinds:
 
