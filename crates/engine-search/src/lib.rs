@@ -11,10 +11,14 @@ use pumper_core::{
     Error, FacetCount, Result, Search, SearchDoc, SearchFacets, SearchHit, SearchRequest,
     SearchResponse,
 };
+use std::ops::Bound;
+
 use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
-use tantivy::schema::{Field, IndexRecordOption, Schema, STORED, STRING, TEXT};
-use tantivy::{doc, Document, Index, IndexReader, IndexWriter, TantivyDocument, Term};
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
+use tantivy::schema::{Field, IndexRecordOption, Schema, FAST, INDEXED, STORED, STRING, TEXT};
+use tantivy::{doc, Document, Index, IndexReader, IndexWriter, Order, TantivyDocument, Term};
+
+use pumper_core::SearchSort;
 
 /// Facet counts are computed over at most this many top-ranked matches — an
 /// honest sample that stays cheap on large result sets.
@@ -28,7 +32,12 @@ struct Fields {
     url: Field,
     title: Field,
     body: Field,
+    indexed_at: Field,
 }
+
+/// Field names the current build's schema expects. An opened index missing any of
+/// these (or with body not stored) is an older schema and is rebuilt.
+const SCHEMA_FIELDS: &[&str] = &["id", "app", "dataset", "url", "title", "body", "indexed_at"];
 
 pub struct TantivyIndex {
     index: Index,
@@ -38,13 +47,19 @@ pub struct TantivyIndex {
     reader: IndexReader,
 }
 
-/// True when the opened index already stores the body field (snippet-capable).
-fn body_is_stored(index: &Index) -> bool {
-    index
-        .schema()
+/// True when the opened index matches the current build's schema: every expected
+/// field is present and `body` is stored (snippet-capable). A mismatch — an older
+/// index missing a field this build added (e.g. `indexed_at`) — triggers a
+/// rebuild. Generalizes the old body-stored probe so future field additions are
+/// deliberate schema versions rather than silent incompatibilities.
+fn schema_is_current(index: &Index) -> bool {
+    let schema = index.schema();
+    let all_present = SCHEMA_FIELDS.iter().all(|name| schema.get_field(name).is_ok());
+    let body_stored = schema
         .get_field("body")
-        .map(|f| index.schema().get_field_entry(f).is_stored())
-        .unwrap_or(false)
+        .map(|f| schema.get_field_entry(f).is_stored())
+        .unwrap_or(false);
+    all_present && body_stored
 }
 
 impl TantivyIndex {
@@ -58,20 +73,24 @@ impl TantivyIndex {
         builder.add_text_field("title", TEXT | STORED);
         // Body is stored so hits can carry highlighted snippets.
         builder.add_text_field("body", TEXT | STORED);
+        // Recency dimension: FAST for order-by + range, INDEXED for the range
+        // query, STORED so it can be returned. Unix seconds.
+        builder.add_i64_field("indexed_at", INDEXED | STORED | FAST);
         let schema = builder.build();
 
         std::fs::create_dir_all(&cfg.dir)?;
         let index = match Index::open_in_dir(&cfg.dir) {
-            Ok(index) if body_is_stored(&index) => index,
+            Ok(index) if schema_is_current(&index) => index,
             Ok(_) => {
-                // Pre-snippet index (body not stored): rebuild EMPTY. Previously
-                // indexed docs are gone until re-indexed — the worker only refills
-                // a dataset when its app next runs, so rebuild explicitly.
+                // Older schema (missing a field this build added, or body not
+                // stored): rebuild EMPTY. Previously indexed docs are gone until
+                // re-indexed — the worker only refills a dataset when its app next
+                // runs, so rebuild explicitly.
                 tracing::warn!(
                     dir = %cfg.dir.display(),
-                    "search index schema outdated (body not stored); rebuilt EMPTY — \
-                     previously indexed documents are gone. Rebuild from stored records \
-                     with: cargo run -p pumper-server --bin search-backfill"
+                    "search index schema outdated; rebuilt EMPTY — previously indexed \
+                     documents are gone. Rebuild from stored records with: \
+                     cargo run -p pumper-server --bin search-backfill"
                 );
                 std::fs::remove_dir_all(&cfg.dir)?;
                 std::fs::create_dir_all(&cfg.dir)?;
@@ -94,6 +113,7 @@ impl TantivyIndex {
             url: field("url")?,
             title: field("title")?,
             body: field("body")?,
+            indexed_at: field("indexed_at")?,
         };
 
         let writer: IndexWriter = index
@@ -158,6 +178,7 @@ impl Search for TantivyIndex {
                     f.url => d.url,
                     f.title => d.title,
                     f.body => d.body,
+                    f.indexed_at => d.indexed_at,
                 ))
                 .map_err(|e| Error::App(format!("add_document: {e}")))?;
             }
@@ -254,6 +275,17 @@ impl Search for TantivyIndex {
                     )),
                 ));
             }
+            // Recency floor: only docs indexed at/after `since` (a "what's new"
+            // feed). Half-open [since, ∞) range on the fast i64 field.
+            if let Some(since) = req.since {
+                clauses.push((
+                    Occur::Must,
+                    Box::new(RangeQuery::new(
+                        Bound::Included(Term::from_field_i64(f.indexed_at, since)),
+                        Bound::Unbounded,
+                    )),
+                ));
+            }
             let query: Box<dyn Query> = if clauses.len() == 1 {
                 clauses.pop().unwrap().1
             } else {
@@ -261,9 +293,25 @@ impl Search for TantivyIndex {
             };
 
             let sample_size = req.limit.max(FACET_SAMPLE);
-            let top = searcher
-                .search(&query, &TopDocs::with_limit(sample_size).order_by_score())
-                .map_err(|e| Error::App(format!("search: {e}")))?;
+            // Order by relevance or recency. The recency collector yields the
+            // fast-field value in place of a BM25 score; normalize both to
+            // `(f32 score, DocAddress)` so the hit-building loop is shared (a
+            // newest-sorted hit carries score 0.0 — it was not ranked by relevance).
+            let top: Vec<(f32, tantivy::DocAddress)> = match req.sort {
+                SearchSort::Score => searcher
+                    .search(&query, &TopDocs::with_limit(sample_size).order_by_score())
+                    .map_err(|e| Error::App(format!("search: {e}")))?,
+                SearchSort::Newest => searcher
+                    .search(
+                        &query,
+                        &TopDocs::with_limit(sample_size)
+                            .order_by_fast_field::<i64>("indexed_at", Order::Desc),
+                    )
+                    .map_err(|e| Error::App(format!("search: {e}")))?
+                    .into_iter()
+                    .map(|(_ts, addr)| (0.0_f32, addr))
+                    .collect(),
+            };
 
             // Highlighted body fragments; best-effort (empty on failure).
             let snippets =

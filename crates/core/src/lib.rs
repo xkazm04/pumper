@@ -77,5 +77,5 @@ pub use markdown::html_to_markdown;
 pub use plugin::{NoPlugins, Plugins};
 pub use search::{
     FacetCount, NoSearch, Search, SearchDoc, SearchFacets, SearchHit, SearchRequest,
-    SearchResponse,
+    SearchResponse, SearchSort,
 };

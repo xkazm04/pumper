@@ -2060,6 +2060,10 @@ struct SearchQuery {
     /// Typo tolerance (edit distance 1). Quoted phrases stay exact.
     #[serde(default)]
     fuzzy: bool,
+    /// Ordering: `score` (relevance, default) or `newest` (most recently indexed).
+    sort: Option<String>,
+    /// Only hits indexed at/after this unix-seconds instant (a "what's new" feed).
+    since: Option<i64>,
 }
 
 fn default_search_limit() -> usize {
@@ -2074,7 +2078,7 @@ fn default_search_limit() -> usize {
     tag = "search",
     params(SearchQuery),
     responses(
-        (status = 200, description = "`{query, count, hits, facets}` (BM25 ranked, highlighted snippets)"),
+        (status = 200, description = "`{query, count, hits, facets}` — BM25 ranked (or `sort=newest`), highlighted snippets. `sort=newest` orders by index time; `since=<unix-secs>` filters to recent docs."),
         (status = 400, description = "Empty query", body = Object),
     )
 )]
@@ -2085,12 +2089,24 @@ async fn search(
     if query.q.trim().is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "query 'q' is required".into()));
     }
+    let sort = match query.sort.as_deref() {
+        None | Some("score") => pumper_core::SearchSort::Score,
+        Some("newest") => pumper_core::SearchSort::Newest,
+        Some(other) => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("unknown sort '{other}' (expected 'score' or 'newest')"),
+            ))
+        }
+    };
     let req = pumper_core::SearchRequest {
         q: query.q.clone(),
         limit: query.limit.clamp(1, 100),
         app: query.app,
         dataset: query.dataset,
         fuzzy: query.fuzzy,
+        sort,
+        since: query.since,
     };
     let results = state.search.query(req).await?;
     Ok(Json(json!({

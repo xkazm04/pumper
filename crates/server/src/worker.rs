@@ -436,6 +436,7 @@ async fn notify_saved_searches(state: &AppState, job: &Job) {
             app: search.app.clone(),
             dataset: search.dataset.clone(),
             fuzzy: false,
+            ..Default::default()
         };
         let results = match state.search.query(req).await {
             Ok(results) => results,
@@ -537,6 +538,8 @@ fn search_docs(app: &str, job_id: Uuid, result: &Value) -> Vec<SearchDoc> {
             url: String::new(),
             title: app.to_string(),
             body: result.to_string(),
+            // Job-result docs carry no record timestamp — index at completion time.
+            indexed_at: chrono::Utc::now().timestamp(),
         });
     }
     docs
@@ -602,7 +605,13 @@ async fn dataset_search_docs(
             if rev.change == "removed" {
                 deletes.push(SearchDoc::dataset_id(app, dataset, &rev.key));
             } else if let Some(data) = &rev.data {
-                docs.push(SearchDoc::from_dataset_record(app, dataset, &rev.key, data));
+                docs.push(SearchDoc::from_dataset_record(
+                    app,
+                    dataset,
+                    &rev.key,
+                    data,
+                    rev.created_at.timestamp(),
+                ));
             }
         }
     }
@@ -635,5 +644,7 @@ fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
         url,
         title,
         body: rec.to_string(),
+        // Job-result docs carry no record timestamp — index at completion time.
+        indexed_at: chrono::Utc::now().timestamp(),
     }
 }

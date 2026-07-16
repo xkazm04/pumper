@@ -64,7 +64,13 @@ async fn main() -> anyhow::Result<()> {
             if rec.removed_at.is_some() {
                 continue; // tombstoned rows are not searchable
             }
-            buf.push(SearchDoc::from_dataset_record(&app, &dataset, &rec.key, &rec.data));
+            buf.push(SearchDoc::from_dataset_record(
+                &app,
+                &dataset,
+                &rec.key,
+                &rec.data,
+                rec.updated_at.timestamp(),
+            ));
             indexed += 1;
             if buf.len() >= INDEX_CHUNK {
                 search.index(std::mem::take(&mut buf)).await?;

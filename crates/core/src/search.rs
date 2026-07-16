@@ -20,6 +20,10 @@ pub struct SearchDoc {
     pub url: String,
     pub title: String,
     pub body: String,
+    /// Unix seconds the record was last written — the recency dimension for
+    /// `sort=newest` and `since=` filtering. The record's stored timestamp, or
+    /// now for docs with none (job-result docs).
+    pub indexed_at: i64,
 }
 
 impl SearchDoc {
@@ -31,13 +35,16 @@ impl SearchDoc {
     }
 
     /// Builds the search document for a stored dataset record, pulling url/title
-    /// from the record's conventional fields. Shared by the worker's post-job
-    /// indexing and the `search-backfill` bin so the two produce identical docs.
+    /// from the record's conventional fields. `indexed_at` is the record's stored
+    /// timestamp in unix seconds (the recency dimension). Shared by the worker's
+    /// post-job indexing and the `search-backfill` bin so the two produce
+    /// identical docs.
     pub fn from_dataset_record(
         app: &str,
         dataset: &str,
         key: &str,
         rec: &serde_json::Value,
+        indexed_at: i64,
     ) -> SearchDoc {
         let pick = |keys: &[&str]| -> String {
             keys.iter()
@@ -52,6 +59,7 @@ impl SearchDoc {
             url: pick(&["_url", "url"]),
             title: pick(&["title", "name", "headline", "full_name"]),
             body: rec.to_string(),
+            indexed_at,
         }
     }
 }
@@ -69,6 +77,16 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+/// Result ordering for a search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SearchSort {
+    /// BM25 relevance, highest first (the default).
+    #[default]
+    Score,
+    /// Most recently indexed first — recency over relevance on a changing corpus.
+    Newest,
+}
+
 /// A full-text query with optional app/dataset scoping.
 #[derive(Debug, Clone, Default)]
 pub struct SearchRequest {
@@ -81,6 +99,10 @@ pub struct SearchRequest {
     /// Typo tolerance: match terms within edit distance 1. Quoted phrases
     /// (`"exact phrase"`) work in either mode via the query syntax.
     pub fuzzy: bool,
+    /// Result ordering (relevance or recency).
+    pub sort: SearchSort,
+    /// Only hits indexed at/after this unix-seconds instant (a "what's new" feed).
+    pub since: Option<i64>,
 }
 
 impl SearchRequest {
