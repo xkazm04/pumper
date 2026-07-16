@@ -80,6 +80,7 @@ async fn source_mode_extracts_stored_bodies_and_reports_missing() {
     let cfg = StorageConfig {
         database_path: root.join("pumper.db"),
         artifacts_dir: root.join("artifacts-unused"),
+        ..StorageConfig::default()
     };
     let storage = Storage::connect(&cfg).await.expect("connect + migrate");
     let pool = storage.pool();
@@ -150,6 +151,7 @@ async fn source_mode_without_keys_sweeps_live_records() {
     let cfg = StorageConfig {
         database_path: root.join("pumper.db"),
         artifacts_dir: root.join("artifacts-unused"),
+        ..StorageConfig::default()
     };
     let storage = Storage::connect(&cfg).await.expect("connect + migrate");
     let pool = storage.pool();

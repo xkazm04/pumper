@@ -24,6 +24,7 @@ async fn put_honors_explicit_ttl() {
     let cfg = StorageConfig {
         database_path: dir.join("pumper.db"),
         artifacts_dir: dir.join("artifacts"),
+        ..StorageConfig::default()
     };
     let storage = Storage::connect(&cfg).await.expect("connect + migrate");
     let cache = HttpCache::new(storage.pool(), &CacheConfig { enabled: true, ttl_secs: 3600 });

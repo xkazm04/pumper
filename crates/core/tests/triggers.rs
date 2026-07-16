@@ -13,6 +13,7 @@ async fn trigger_crud_idempotent_fire_and_lineage() {
     let cfg = StorageConfig {
         database_path: dir.join("pumper.db"),
         artifacts_dir: dir.join("artifacts"),
+        ..StorageConfig::default()
     };
     let storage = Storage::connect(&cfg).await.expect("connect + migrate");
 

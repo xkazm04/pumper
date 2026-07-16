@@ -48,6 +48,7 @@ async fn new_engine(root: &Path, vault: PathBuf) -> HttpEngine {
     let storage = Storage::connect(&StorageConfig {
         database_path: root.join("pumper.db"),
         artifacts_dir: root.join("artifacts"),
+        ..StorageConfig::default()
     })
     .await
     .expect("storage");

@@ -228,6 +228,14 @@ impl Default for WorkerConfig {
 pub struct StorageConfig {
     pub database_path: PathBuf,
     pub artifacts_dir: PathBuf,
+    /// Revision-history retention. When `> 0`, a janitor periodically prunes
+    /// `record_revisions` older than this many days, always keeping the newest
+    /// `revision_retention_keep_min` revisions per record so the diff chain stays
+    /// usable. `0` (the default) disables pruning — a dataset's accrued history is
+    /// the product's value, so deleting it must be an explicit opt-in.
+    pub revision_retention_days: u64,
+    /// Newest revisions always kept per record when pruning is enabled.
+    pub revision_retention_keep_min: i64,
 }
 
 impl Default for StorageConfig {
@@ -235,6 +243,8 @@ impl Default for StorageConfig {
         Self {
             database_path: "data/pumper.db".into(),
             artifacts_dir: "data/artifacts".into(),
+            revision_retention_days: 0, // off by default
+            revision_retention_keep_min: 5,
         }
     }
 }

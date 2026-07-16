@@ -52,6 +52,7 @@ async fn main() -> anyhow::Result<()> {
     let worker = tokio::spawn(worker::run(state.clone()));
     tokio::spawn(scheduler::run(state.clone()));
     tokio::spawn(cache_janitor(state.clone()));
+    tokio::spawn(retention_janitor(state.clone()));
 
     let addr = format!("{}:{}", state.config.server.host, state.config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -168,6 +169,34 @@ async fn cache_janitor(state: AppState) {
             Ok(n) if n > 0 => tracing::info!(purged = n, "cache janitor evicted expired entries"),
             Ok(_) => {}
             Err(e) => tracing::warn!("cache purge failed: {e}"),
+        }
+    }
+}
+
+/// Prunes revision history older than the configured retention window (keeping
+/// the newest N per record) so `record_revisions` doesn't grow without bound.
+/// Off unless `[storage] revision_retention_days > 0` — deleting a dataset's
+/// accrued history is opt-in.
+async fn retention_janitor(state: AppState) {
+    let days = state.config.storage.revision_retention_days;
+    if days == 0 {
+        return; // retention disabled
+    }
+    let keep_min = state.config.storage.revision_retention_keep_min;
+    let interval = std::time::Duration::from_secs(6 * 3600);
+    tracing::info!(days, keep_min, "revision retention janitor enabled");
+    loop {
+        tokio::select! {
+            _ = state.shutdown.cancelled() => break,
+            _ = tokio::time::sleep(interval) => {}
+        }
+        let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+        match state.datasets.prune_revisions(cutoff, keep_min).await {
+            Ok(n) if n > 0 => {
+                tracing::info!(pruned = n, days, "retention janitor pruned old revisions")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("revision prune failed: {e}"),
         }
     }
 }
