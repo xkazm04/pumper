@@ -8,11 +8,11 @@ use std::sync::Arc;
 
 use app_extractor::Extractor;
 use async_trait::async_trait;
-use pumper_core::config::{FetcherConfig, StorageConfig};
+use pumper_core::config::{FetcherConfig, GovernorConfig, StorageConfig};
 use pumper_core::{
-    AppContext, Browser, CostLedger, Datasets, EngineSet, Fetcher, HttpClient, HttpRequest,
-    HttpResponse, NoPlugins, NoProgress, RenderRequest, RenderedPage, ResearchCache, ResearchOutput,
-    ResearchRequest, Researcher, Result, ScrapeApp, Storage, TierMemory,
+    AppContext, Browser, CostLedger, Datasets, EngineSet, Fetcher, Governor, HttpClient,
+    HttpRequest, HttpResponse, NoPlugins, NoProgress, RenderRequest, RenderedPage, ResearchCache,
+    ResearchOutput, ResearchRequest, Researcher, Result, ScrapeApp, SpentTotal, Storage, TierMemory,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -50,6 +50,7 @@ async fn ctx_with(root: std::path::PathBuf, storage: &Storage, params: Value) ->
             Arc::new(DeadHttp),
             Arc::new(DeadBrowser),
             Arc::new(DeadResearcher),
+            Arc::new(Governor::new(&GovernorConfig::default())),
             &FetcherConfig::default(),
         ),
     });
@@ -62,6 +63,7 @@ async fn ctx_with(root: std::path::PathBuf, storage: &Storage, params: Value) ->
         datasets: Arc::new(Datasets::new(pool.clone())),
         costs: Arc::new(CostLedger::new(pool.clone())),
         budget_usd: None,
+        spent_usd: Arc::new(SpentTotal::default()),
         research_cache: Arc::new(ResearchCache::new(pool.clone(), 3600)),
         tiers: Arc::new(TierMemory::new(pool.clone(), 3600)),
         plugins: Arc::new(NoPlugins),
@@ -78,6 +80,7 @@ async fn source_mode_extracts_stored_bodies_and_reports_missing() {
     let cfg = StorageConfig {
         database_path: root.join("pumper.db"),
         artifacts_dir: root.join("artifacts-unused"),
+        ..StorageConfig::default()
     };
     let storage = Storage::connect(&cfg).await.expect("connect + migrate");
     let pool = storage.pool();
@@ -148,6 +151,7 @@ async fn source_mode_without_keys_sweeps_live_records() {
     let cfg = StorageConfig {
         database_path: root.join("pumper.db"),
         artifacts_dir: root.join("artifacts-unused"),
+        ..StorageConfig::default()
     };
     let storage = Storage::connect(&cfg).await.expect("connect + migrate");
     let pool = storage.pool();

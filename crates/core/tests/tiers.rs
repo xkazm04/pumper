@@ -10,6 +10,7 @@ async fn fresh_db(tag: &str) -> (Storage, std::path::PathBuf) {
     let cfg = StorageConfig {
         database_path: dir.join("pumper.db"),
         artifacts_dir: dir.join("artifacts"),
+        ..StorageConfig::default()
     };
     let storage = Storage::connect(&cfg).await.expect("connect + migrate");
     (storage, dir)
@@ -21,6 +22,7 @@ async fn learns_browser_after_three_strikes_and_resets_on_http_win() {
     let cfg = StorageConfig {
         database_path: dir.join("pumper.db"),
         artifacts_dir: dir.join("artifacts"),
+        ..StorageConfig::default()
     };
     let storage = Storage::connect(&cfg).await.expect("connect + migrate");
     // ttl 0 disables aging — this test covers the classic strike/reset path.

@@ -143,6 +143,7 @@ name = "app-eu-sedia"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "grants-common",
  "pumper-core",
  "serde_json",
 ]

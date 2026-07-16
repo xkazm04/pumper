@@ -11,10 +11,18 @@ use pumper_core::{
     Error, FacetCount, Result, Search, SearchDoc, SearchFacets, SearchHit, SearchRequest,
     SearchResponse,
 };
-use tantivy::collector::TopDocs;
-use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, TermQuery};
-use tantivy::schema::{Field, IndexRecordOption, Schema, STORED, STRING, TEXT};
-use tantivy::{doc, Document, Index, IndexReader, IndexWriter, TantivyDocument, Term};
+use std::ops::Bound;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use tokio::sync::Notify;
+
+use tantivy::collector::{Count, MultiCollector, TopDocs};
+use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
+use tantivy::schema::{Field, IndexRecordOption, Schema, FAST, INDEXED, STORED, STRING, TEXT};
+use tantivy::{doc, Document, Index, IndexReader, IndexWriter, Order, TantivyDocument, Term};
+
+use pumper_core::SearchSort;
 
 /// Facet counts are computed over at most this many top-ranked matches — an
 /// honest sample that stays cheap on large result sets.
@@ -28,7 +36,22 @@ struct Fields {
     url: Field,
     title: Field,
     body: Field,
+    indexed_at: Field,
 }
+
+/// Field names the current build's schema expects. An opened index missing any of
+/// these (or with body not stored) is an older schema and is rebuilt.
+const SCHEMA_FIELDS: &[&str] = &["id", "app", "dataset", "url", "title", "body", "indexed_at"];
+
+/// Background-commit cadence: the committer flushes at most this often, so a
+/// burst of jobs amortizes into a handful of commits instead of one fsync each.
+/// Small enough that search freshness lags by no more than this on the happy
+/// path; a hard kill loses at most this window of uncommitted `index()` writes
+/// (an accepted cost for a derived artifact — the backfill bin rebuilds it).
+const COMMIT_INTERVAL: Duration = Duration::from_millis(250);
+/// Commit early (don't wait for the interval) once this many docs are pending, to
+/// bound the writer's in-memory buffer during a large backfill.
+const COMMIT_PENDING_THRESHOLD: usize = 512;
 
 pub struct TantivyIndex {
     index: Index,
@@ -36,15 +59,91 @@ pub struct TantivyIndex {
     fields: Fields,
     writer: Arc<Mutex<IndexWriter>>,
     reader: IndexReader,
+    /// Uncommitted `index()` docs since the last commit. Only mutated while the
+    /// writer lock is held (or reset by a commit that holds it), so it stays
+    /// consistent with the writer's actual uncommitted set.
+    pending: Arc<AtomicUsize>,
+    /// Wakes the background committer immediately (threshold crossed / flush).
+    wake: Arc<Notify>,
+    /// Signals the committer to do a final commit and stop (on Drop).
+    shutdown: Arc<Notify>,
 }
 
-/// True when the opened index already stores the body field (snippet-capable).
-fn body_is_stored(index: &Index) -> bool {
-    index
-        .schema()
+impl Drop for TantivyIndex {
+    fn drop(&mut self) {
+        // Let the committer flush the uncommitted tail and exit.
+        self.shutdown.notify_one();
+    }
+}
+
+/// Commits the writer and reloads the reader, then clears the pending count. Runs
+/// the fsync on a blocking thread. Shared by the background committer and the
+/// synchronous paths.
+async fn commit_and_reload(
+    writer: Arc<Mutex<IndexWriter>>,
+    reader: IndexReader,
+    pending: Arc<AtomicUsize>,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut w = writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        w.commit().map_err(|e| Error::App(format!("commit: {e}")))?;
+        reader.reload().map_err(|e| Error::App(format!("reader reload: {e}")))?;
+        // Safe under the writer lock: no `index()` can add between the commit and
+        // this reset, so it can't clear a doc that wasn't just committed.
+        pending.store(0, Ordering::Relaxed);
+        Ok(())
+    })
+    .await
+    .map_err(|e| Error::App(format!("commit task panicked: {e}")))?
+}
+
+/// The background committer: commits pending `index()` writes on an interval, or
+/// sooner when woken (pending threshold crossed / explicit flush wake), and does a
+/// final commit on shutdown so a graceful stop doesn't drop the tail.
+fn spawn_committer(
+    writer: Arc<Mutex<IndexWriter>>,
+    reader: IndexReader,
+    pending: Arc<AtomicUsize>,
+    wake: Arc<Notify>,
+    shutdown: Arc<Notify>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(COMMIT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => {
+                    if pending.load(Ordering::Relaxed) > 0 {
+                        let _ = commit_and_reload(writer.clone(), reader.clone(), pending.clone()).await;
+                    }
+                    break;
+                }
+                _ = interval.tick() => {}
+                _ = wake.notified() => {}
+            }
+            if pending.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            if let Err(e) = commit_and_reload(writer.clone(), reader.clone(), pending.clone()).await {
+                tracing::warn!("background search commit failed: {e}");
+            }
+        }
+    });
+}
+
+/// True when the opened index matches the current build's schema: every expected
+/// field is present and `body` is stored (snippet-capable). A mismatch — an older
+/// index missing a field this build added (e.g. `indexed_at`) — triggers a
+/// rebuild. Generalizes the old body-stored probe so future field additions are
+/// deliberate schema versions rather than silent incompatibilities.
+fn schema_is_current(index: &Index) -> bool {
+    let schema = index.schema();
+    let all_present = SCHEMA_FIELDS.iter().all(|name| schema.get_field(name).is_ok());
+    let body_stored = schema
         .get_field("body")
-        .map(|f| index.schema().get_field_entry(f).is_stored())
-        .unwrap_or(false)
+        .map(|f| schema.get_field_entry(f).is_stored())
+        .unwrap_or(false);
+    all_present && body_stored
 }
 
 impl TantivyIndex {
@@ -58,17 +157,24 @@ impl TantivyIndex {
         builder.add_text_field("title", TEXT | STORED);
         // Body is stored so hits can carry highlighted snippets.
         builder.add_text_field("body", TEXT | STORED);
+        // Recency dimension: FAST for order-by + range, INDEXED for the range
+        // query, STORED so it can be returned. Unix seconds.
+        builder.add_i64_field("indexed_at", INDEXED | STORED | FAST);
         let schema = builder.build();
 
         std::fs::create_dir_all(&cfg.dir)?;
         let index = match Index::open_in_dir(&cfg.dir) {
-            Ok(index) if body_is_stored(&index) => index,
+            Ok(index) if schema_is_current(&index) => index,
             Ok(_) => {
-                // Pre-snippet index (body not stored): rebuild. The index is a
-                // derived artifact — it refills as jobs run.
+                // Older schema (missing a field this build added, or body not
+                // stored): rebuild EMPTY. Previously indexed docs are gone until
+                // re-indexed — the worker only refills a dataset when its app next
+                // runs, so rebuild explicitly.
                 tracing::warn!(
                     dir = %cfg.dir.display(),
-                    "search index schema outdated (body not stored); rebuilding empty"
+                    "search index schema outdated; rebuilt EMPTY — previously indexed \
+                     documents are gone. Rebuild from stored records with: \
+                     cargo run -p pumper-server --bin search-backfill"
                 );
                 std::fs::remove_dir_all(&cfg.dir)?;
                 std::fs::create_dir_all(&cfg.dir)?;
@@ -91,6 +197,7 @@ impl TantivyIndex {
             url: field("url")?,
             title: field("title")?,
             body: field("body")?,
+            indexed_at: field("indexed_at")?,
         };
 
         let writer: IndexWriter = index
@@ -101,13 +208,12 @@ impl TantivyIndex {
             .map_err(|e| Error::App(format!("search reader: {e}")))?;
 
         tracing::info!(dir = %cfg.dir.display(), "opened search index");
-        Ok(Self {
-            index,
-            schema: s,
-            fields,
-            writer: Arc::new(Mutex::new(writer)),
-            reader,
-        })
+        let writer = Arc::new(Mutex::new(writer));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::new(Notify::new());
+        let shutdown = Arc::new(Notify::new());
+        spawn_committer(writer.clone(), reader.clone(), pending.clone(), wake.clone(), shutdown.clone());
+        Ok(Self { index, schema: s, fields, writer, reader, pending, wake, shutdown })
     }
 }
 
@@ -125,15 +231,43 @@ impl TantivyIndex {
     {
         let writer = self.writer.clone();
         let reader = self.reader.clone();
+        let pending = self.pending.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut w = writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             edit(&mut w)?;
             w.commit().map_err(|e| Error::App(format!("commit: {e}")))?;
             reader.reload().map_err(|e| Error::App(format!("reader reload: {e}")))?;
+            // This commit flushed every uncommitted write, incl. deferred index()s.
+            pending.store(0, Ordering::Relaxed);
             Ok(())
         })
         .await
         .map_err(|e| Error::App(format!("{what} task panicked: {e}")))?
+    }
+
+    /// Applies an edit to the writer but does NOT commit — the background
+    /// committer flushes it within `COMMIT_INTERVAL` (or sooner past the pending
+    /// threshold). This is the amortization: a burst of `index()` calls shares one
+    /// commit/fsync instead of paying one each. Callers that need immediate
+    /// visibility (the saved-search runner, the backfill bin) call `flush`.
+    async fn write_deferred<F>(&self, what: &'static str, added: usize, edit: F) -> Result<()>
+    where
+        F: FnOnce(&mut IndexWriter) -> Result<()> + Send + 'static,
+    {
+        let writer = self.writer.clone();
+        let pending = self.pending.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut w = writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            edit(&mut w)?;
+            pending.fetch_add(added, Ordering::Relaxed);
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::App(format!("{what} task panicked: {e}")))??;
+        if self.pending.load(Ordering::Relaxed) >= COMMIT_PENDING_THRESHOLD {
+            self.wake.notify_one();
+        }
+        Ok(())
     }
 }
 
@@ -144,7 +278,10 @@ impl Search for TantivyIndex {
             return Ok(());
         }
         let f = self.fields;
-        self.write_then_commit("index", move |w| {
+        let added = docs.len();
+        // Deferred: the background committer flushes this, so hundreds of small
+        // jobs no longer pay a full commit/fsync each.
+        self.write_deferred("index", added, move |w| {
             for d in docs {
                 // Upsert: drop any prior document with this id, then add.
                 w.delete_term(Term::from_field_text(f.id, &d.id));
@@ -155,12 +292,19 @@ impl Search for TantivyIndex {
                     f.url => d.url,
                     f.title => d.title,
                     f.body => d.body,
+                    f.indexed_at => d.indexed_at,
                 ))
                 .map_err(|e| Error::App(format!("add_document: {e}")))?;
             }
             Ok(())
         })
         .await
+    }
+
+    async fn flush(&self) -> Result<()> {
+        // Force a commit now and make prior deferred index() writes visible.
+        // Reuses the commit epilogue with an empty edit.
+        self.write_then_commit("flush", |_w| Ok(())).await
     }
 
     async fn delete_ids(&self, ids: &[String]) -> Result<()> {
@@ -207,6 +351,11 @@ impl Search for TantivyIndex {
         .await
     }
 
+    async fn doc_count(&self) -> Result<u64> {
+        // num_docs reflects the last committed segment set the reader has loaded.
+        Ok(self.reader.searcher().num_docs())
+    }
+
     async fn query(&self, req: SearchRequest) -> Result<SearchResponse> {
         let index = self.index.clone();
         let reader = self.reader.clone();
@@ -246,16 +395,62 @@ impl Search for TantivyIndex {
                     )),
                 ));
             }
+            // Recency floor: only docs indexed at/after `since` (a "what's new"
+            // feed). Half-open [since, ∞) range on the fast i64 field.
+            if let Some(since) = req.since {
+                clauses.push((
+                    Occur::Must,
+                    Box::new(RangeQuery::new(
+                        Bound::Included(Term::from_field_i64(f.indexed_at, since)),
+                        Bound::Unbounded,
+                    )),
+                ));
+            }
             let query: Box<dyn Query> = if clauses.len() == 1 {
                 clauses.pop().unwrap().1
             } else {
                 Box::new(BooleanQuery::new(clauses))
             };
 
-            let sample_size = req.limit.max(FACET_SAMPLE);
-            let top = searcher
-                .search(&query, &TopDocs::with_limit(sample_size).order_by_score())
-                .map_err(|e| Error::App(format!("search: {e}")))?;
+            // Rank enough docs to cover the requested page AND the facet sample.
+            let sample_size = req.offset.saturating_add(req.limit).max(FACET_SAMPLE);
+            // One collector pass yields both the ranked window and the EXACT match
+            // total (via a Count collector) — so `total` is the real denominator
+            // for paging, not the page size. Order by relevance or recency; the
+            // recency collector yields the fast-field value in place of a BM25
+            // score, normalized to `(f32, DocAddress)` (score 0.0) so the
+            // hit-building loop is shared.
+            let (top, total): (Vec<(f32, tantivy::DocAddress)>, u64) = match req.sort {
+                SearchSort::Score => {
+                    let mut multi = MultiCollector::new();
+                    let count_h = multi.add_collector(Count);
+                    let top_h =
+                        multi.add_collector(TopDocs::with_limit(sample_size).order_by_score());
+                    let mut fruits = searcher
+                        .search(&query, &multi)
+                        .map_err(|e| Error::App(format!("search: {e}")))?;
+                    let total = count_h.extract(&mut fruits) as u64;
+                    (top_h.extract(&mut fruits), total)
+                }
+                SearchSort::Newest => {
+                    let mut multi = MultiCollector::new();
+                    let count_h = multi.add_collector(Count);
+                    let top_h = multi.add_collector(
+                        TopDocs::with_limit(sample_size)
+                            .order_by_fast_field::<i64>("indexed_at", Order::Desc),
+                    );
+                    let mut fruits = searcher
+                        .search(&query, &multi)
+                        .map_err(|e| Error::App(format!("search: {e}")))?;
+                    let total = count_h.extract(&mut fruits) as u64;
+                    let top = top_h
+                        .extract(&mut fruits)
+                        .into_iter()
+                        .map(|(_ts, addr)| (0.0_f32, addr))
+                        .collect();
+                    (top, total)
+                }
+            };
 
             // Highlighted body fragments; best-effort (empty on failure).
             let snippets =
@@ -281,7 +476,9 @@ impl Search for TantivyIndex {
                 let (app, dataset) = (get("app"), get("dataset"));
                 *app_counts.entry(app.clone()).or_insert(0) += 1;
                 *dataset_counts.entry(dataset.clone()).or_insert(0) += 1;
-                if i < req.limit {
+                // Hits are the `offset..offset+limit` window; facets still sample
+                // the whole ranked set above.
+                if i >= req.offset && i < req.offset + req.limit {
                     let snippet = snippets
                         .as_ref()
                         .map(|g| g.snippet_from_doc(&doc).to_html())
@@ -311,6 +508,7 @@ impl Search for TantivyIndex {
                     apps: to_facets(app_counts),
                     datasets: to_facets(dataset_counts),
                 },
+                total,
             })
         })
         .await

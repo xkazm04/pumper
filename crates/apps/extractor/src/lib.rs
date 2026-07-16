@@ -23,12 +23,14 @@ const SOURCE_LIST_LIMIT: i64 = 10_000;
 /// fields with the highest miss rate (an empty or errored extraction is a miss).
 /// Returns `(matched, total, worst_fields)`; `worst_fields` lists only fields
 /// that missed at least once, worst first.
-fn summarize_reports(reports: &[DocReport]) -> (u64, u64, Vec<Value>) {
+fn summarize_reports<'a>(reports: impl IntoIterator<Item = &'a DocReport>) -> (u64, u64, Vec<Value>) {
     let mut matched: u64 = 0;
     let mut total: u64 = 0;
+    let mut doc_count: u64 = 0;
     // field -> (misses, errors)
     let mut misses: std::collections::BTreeMap<&str, (u64, u64)> = std::collections::BTreeMap::new();
     for report in reports {
+        doc_count += 1;
         for (field, status) in &report.fields {
             total += 1;
             let entry = misses.entry(field.as_str()).or_default();
@@ -42,7 +44,7 @@ fn summarize_reports(reports: &[DocReport]) -> (u64, u64, Vec<Value>) {
             }
         }
     }
-    let docs = reports.len().max(1) as f64;
+    let docs = doc_count.max(1) as f64;
     let mut worst: Vec<Value> = misses
         .into_iter()
         .filter(|(_, (m, _))| *m > 0)
@@ -86,15 +88,17 @@ async fn extract_and_upsert(
     dataset: &str,
     keyed: Vec<(String, String)>,
 ) -> Result<(Vec<Value>, u64, u64, Vec<Value>, UpsertSummary)> {
-    let docs: Vec<String> = keyed.iter().map(|(_, d)| d.clone()).collect();
+    // Split keys from bodies without copying either — `keyed` is owned and dropped
+    // here anyway (was: `.iter().map(|(_,d)| d.clone())`, deep-cloning every HTML
+    // body and roughly doubling peak RSS over the whole batch).
+    let (keys, docs): (Vec<String>, Vec<String>) = keyed.into_iter().unzip();
     let reported = run_extraction(compiled, docs).await?;
-    let (matched, total, worst) =
-        summarize_reports(&reported.iter().map(|(_, r)| r.clone()).collect::<Vec<_>>());
+    // Borrow the reports rather than deep-cloning each into a throwaway Vec.
+    let (matched, total, worst) = summarize_reports(reported.iter().map(|(_, r)| r));
 
     let mut records: Vec<Value> = Vec::with_capacity(reported.len());
-    let items: Vec<(String, Value)> = keyed
+    let items: Vec<(String, Value)> = keys
         .into_iter()
-        .map(|(key, _)| key)
         .zip(reported)
         .map(|(key, (mut rec, _))| {
             if let Value::Object(map) = &mut rec {
@@ -398,7 +402,7 @@ mod tests {
                 ("sku", FieldStatus::Matched),
             ]),
         ];
-        let (matched, total, worst) = summarize_reports(&reports);
+        let (matched, total, worst) = summarize_reports(reports.iter());
         assert_eq!(total, 6);
         assert_eq!(matched, 3); // 2 titles + 1 sku
         // price misses twice (worst), sku misses once with one error; title never misses.
@@ -416,7 +420,7 @@ mod tests {
     #[test]
     fn all_matched_has_no_worst_fields() {
         let reports = vec![report(&[("a", FieldStatus::Matched), ("b", FieldStatus::Matched)])];
-        let (matched, total, worst) = summarize_reports(&reports);
+        let (matched, total, worst) = summarize_reports(reports.iter());
         assert_eq!((matched, total), (2, 2));
         assert!(worst.is_empty());
     }

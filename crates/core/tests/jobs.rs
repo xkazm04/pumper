@@ -16,6 +16,7 @@ async fn fresh_db(tag: &str) -> (Storage, std::path::PathBuf) {
     let cfg = StorageConfig {
         database_path: dir.join("pumper.db"),
         artifacts_dir: dir.join("artifacts"),
+        ..StorageConfig::default()
     };
     let storage = Storage::connect(&cfg).await.expect("connect + migrate");
     (storage, dir)

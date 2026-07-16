@@ -3,6 +3,12 @@
 //! escalation (http -> browser -> claude) or a burst of jobs never hammers a
 //! single origin. Hosts are independent, so unrelated targets never wait on
 //! each other.
+//!
+//! The HTTP tier acquires here from inside `HttpEngine::send` (so raw-HTTP
+//! callers like the crawler are governed too); the browser tier acquires from
+//! `Fetcher::fetch`, which also feeds `penalize`/`reward` from the browser
+//! render's verdict. Both tiers share one `Governor` instance, so an
+//! http -> browser escalation to the same host stays coherently spaced.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};

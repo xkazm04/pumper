@@ -64,6 +64,8 @@ impl Config {
             let mut cfg: Config =
                 toml::from_str(&raw).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
             cfg.normalize();
+            cfg.validate()
+                .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
             Ok(cfg)
         } else {
             tracing::warn!("config file {} not found, using defaults", path.display());
@@ -78,6 +80,64 @@ impl Config {
         if self.browser.proxy.is_none() {
             self.browser.proxy = self.http.proxy.clone();
         }
+    }
+
+    /// Rejects semantically-broken key combinations that parse fine but produce a
+    /// silently-dead service. Each rule guards an invariant that was previously
+    /// only a doc-comment; the failure modes they prevent are invisible at the
+    /// config layer and surface far away (reap storms, a worker that claims
+    /// nothing, a penalty cap that never applies).
+    ///
+    /// `0` is a documented disable switch for `heartbeat_secs`, `stale_after_secs`
+    /// and `priority_aging_coefficient_secs`, so each rule only binds when the
+    /// features it relates are both actually on.
+    pub fn validate(&self) -> Result<()> {
+        let w = &self.worker;
+
+        // The reaper decides "hung" by comparing a job's last heartbeat against
+        // `stale_after_secs`. If beats are rarer than the threshold, every healthy
+        // in-flight job looks hung: re-queued mid-run, restarted, reaped again,
+        // until `max_attempts` is exhausted. No job ever completes.
+        if w.heartbeat_secs > 0 && w.stale_after_secs > 0 && w.stale_after_secs <= w.heartbeat_secs {
+            return Err(Error::Config(format!(
+                "[worker] stale_after_secs ({}) must exceed heartbeat_secs ({}) — \
+                 otherwise every healthy job is reaped as hung",
+                w.stale_after_secs, w.heartbeat_secs
+            )));
+        }
+
+        // Both the reaper and the timeout terminate a job. If the reaper fires
+        // first it re-queues with attempt semantics, racing the timeout that was
+        // meant to be the job's hard wall.
+        if w.stale_after_secs > 0 && w.job_timeout_secs > 0 && w.job_timeout_secs <= w.stale_after_secs
+        {
+            return Err(Error::Config(format!(
+                "[worker] job_timeout_secs ({}) must exceed stale_after_secs ({}) — \
+                 otherwise the reaper races the job timeout",
+                w.job_timeout_secs, w.stale_after_secs
+            )));
+        }
+
+        // A worker with no concurrency claims nothing: the queue fills and drains
+        // never, with no error anywhere.
+        if w.concurrency == 0 {
+            return Err(Error::Config(
+                "[worker] concurrency must be > 0 — a worker with 0 slots claims no jobs".into(),
+            ));
+        }
+
+        // A cap below the base means the very first penalty already exceeds it, so
+        // the cap silently stops being a cap.
+        let g = &self.governor;
+        if g.enabled && g.penalty_base_secs > g.penalty_cap_secs {
+            return Err(Error::Config(format!(
+                "[governor] penalty_cap_secs ({}) must be >= penalty_base_secs ({}) — \
+                 otherwise the cap never applies",
+                g.penalty_cap_secs, g.penalty_base_secs
+            )));
+        }
+
+        Ok(())
     }
 }
 
@@ -168,6 +228,14 @@ impl Default for WorkerConfig {
 pub struct StorageConfig {
     pub database_path: PathBuf,
     pub artifacts_dir: PathBuf,
+    /// Revision-history retention. When `> 0`, a janitor periodically prunes
+    /// `record_revisions` older than this many days, always keeping the newest
+    /// `revision_retention_keep_min` revisions per record so the diff chain stays
+    /// usable. `0` (the default) disables pruning — a dataset's accrued history is
+    /// the product's value, so deleting it must be an explicit opt-in.
+    pub revision_retention_days: u64,
+    /// Newest revisions always kept per record when pruning is enabled.
+    pub revision_retention_keep_min: i64,
 }
 
 impl Default for StorageConfig {
@@ -175,6 +243,8 @@ impl Default for StorageConfig {
         Self {
             database_path: "data/pumper.db".into(),
             artifacts_dir: "data/artifacts".into(),
+            revision_retention_days: 0, // off by default
+            revision_retention_keep_min: 5,
         }
     }
 }
@@ -258,6 +328,13 @@ pub struct BrowserConfig {
     /// URL — an authenticated proxy prompts interactively, so browser-tier proxy
     /// auth is unsupported (a known gap).
     pub proxy: Option<String>,
+    /// Cap on captured HTML per render (bytes). The browser-tier mirror of
+    /// `[http] max_body_bytes`: a JS-heavy page can build a huge DOM, and without
+    /// this the whole serialized HTML is buffered into an unbounded String — the
+    /// exact scenario the HTTP cap guards, but on the more expensive tier. Default
+    /// 16 MiB, matching `[http] max_body_bytes`. `0` disables the cap.
+    /// `RenderRequest.max_body_bytes` overrides it per render.
+    pub max_html_bytes: u64,
 }
 
 impl Default for BrowserConfig {
@@ -272,6 +349,7 @@ impl Default for BrowserConfig {
             block_resources: true,
             recycle_after_renders: 200,
             proxy: None,
+            max_html_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
@@ -471,6 +549,91 @@ impl Default for SearchConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shipped_defaults_are_valid() {
+        Config::default().validate().expect("shipped defaults must satisfy their own invariants");
+    }
+
+    #[test]
+    fn stale_after_below_heartbeat_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.worker.heartbeat_secs = 300;
+        cfg.worker.stale_after_secs = 120;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("stale_after_secs"), "{err}");
+        assert!(err.contains("heartbeat_secs"), "{err}");
+    }
+
+    #[test]
+    fn stale_after_equal_to_heartbeat_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.worker.heartbeat_secs = 120;
+        cfg.worker.stale_after_secs = 120;
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn zero_disables_the_reaper_rather_than_failing_validation() {
+        // `0` is the documented disable switch for both knobs; a disabled reaper
+        // cannot mis-reap, so the ordering rule must not bind.
+        let mut cfg = Config::default();
+        cfg.worker.heartbeat_secs = 300;
+        cfg.worker.stale_after_secs = 0;
+        assert!(cfg.validate().is_ok());
+
+        let mut cfg = Config::default();
+        cfg.worker.heartbeat_secs = 0;
+        cfg.worker.stale_after_secs = 5;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn job_timeout_below_stale_after_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.worker.heartbeat_secs = 30;
+        cfg.worker.stale_after_secs = 600;
+        cfg.worker.job_timeout_secs = 300;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("job_timeout_secs"), "{err}");
+    }
+
+    #[test]
+    fn zero_worker_concurrency_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.worker.concurrency = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("concurrency"), "{err}");
+    }
+
+    #[test]
+    fn governor_penalty_cap_below_base_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.governor.penalty_base_secs = 60;
+        cfg.governor.penalty_cap_secs = 30;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("penalty_cap_secs"), "{err}");
+    }
+
+    #[test]
+    fn disabled_governor_skips_its_penalty_rule() {
+        let mut cfg = Config::default();
+        cfg.governor.enabled = false;
+        cfg.governor.penalty_base_secs = 60;
+        cfg.governor.penalty_cap_secs = 30;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn the_shipped_config_file_is_valid() {
+        // Guards against the repo's own config.toml drifting into a state that
+        // would refuse to boot.
+        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.toml"))
+            .expect("repo config.toml must be readable from the core crate");
+        let mut cfg: Config = toml::from_str(&raw).expect("repo config.toml must parse");
+        cfg.normalize();
+        cfg.validate().expect("repo config.toml must satisfy the invariants");
+    }
 
     #[test]
     fn http_defaults_match_prior_hardcoded_values() {

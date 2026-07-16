@@ -478,6 +478,8 @@ pub async fn crawl(
     let mut in_flight = FuturesUnordered::new();
     // Per-host earliest-next-fetch, driven by robots.txt Crawl-delay.
     let mut next_allowed: HashMap<String, tokio::time::Instant> = HashMap::new();
+    // Last intermediate checkpoint save. Time-based, not page-based (see below).
+    let mut last_checkpoint = tokio::time::Instant::now();
 
     // Expand seeds from each seed host's sitemaps before crawling.
     if cfg.sitemap_seeds {
@@ -599,7 +601,14 @@ pub async fn crawl(
         } else {
             dedup_index.insert(hash);
             stats.kept += 1;
-            let artifact_name = format!("page-{:04}.html", stats.kept);
+            // URL-addressed, NOT the per-run `stats.kept` counter: that counter
+            // restarts at 0 on a checkpoint resume, so a resumed crawl would write
+            // page-0001.html over the prior run's page-0001.html — a different URL's
+            // body — leaving earlier `pages` records' `artifact_path` pointing at
+            // the wrong content. Keying the file on the (canonical, frontier-unique)
+            // URL makes the name stable across runs: each URL owns one file, and a
+            // revisit updates it in place.
+            let artifact_name = artifact_name(&fetched.url);
             if let Some(dir) = &output_dir {
                 let file = dir.join(&artifact_name);
                 if let Err(e) = tokio::fs::write(&file, &fetched.body).await {
@@ -631,13 +640,24 @@ pub async fn crawl(
                     }
                 }
             }
-            // Periodic checkpoint so a killed process loses at most one stride.
-            if stats.kept % CHECKPOINT_STRIDE == 0 {
+            // Periodic checkpoint, gated by wall-clock rather than page count.
+            // `Checkpoint::save` serializes the WHOLE frontier (up to MAX_FRONTIER
+            // seen-strings + queue + kept hashes) — O(frontier), not O(delta) — so
+            // firing it every N kept pages made total checkpoint work
+            // O(pages/N × frontier): a 100k-page crawl did thousands of full ~10 MB
+            // rewrites (tens of GB of write amplification) for state that moved by a
+            // handful of pages, and each inline save stalled every in-flight fetch.
+            // A minimum interval decouples save count from crawl size; the final
+            // save below still captures the true end state, and the frontier's own
+            // seen-set makes a resume idempotent, so widening the worst-case resume
+            // loss from N pages to a few seconds is safe.
+            if cfg.checkpoint.is_some() && last_checkpoint.elapsed() >= CHECKPOINT_MIN_INTERVAL {
                 if let Some(path) = &cfg.checkpoint {
                     if !Checkpoint::save(path, &frontier, dedup_index.hashes()).await {
                         stats.checkpoint_errors += 1;
                     }
                 }
+                last_checkpoint = tokio::time::Instant::now();
             }
         }
 
@@ -696,7 +716,25 @@ pub async fn crawl(
     Ok(stats)
 }
 
-const CHECKPOINT_STRIDE: usize = 25;
+/// Minimum wall-clock between intermediate checkpoint saves. Each save is a full
+/// O(frontier) serialize, so this bounds total checkpoint work by crawl *duration*
+/// instead of page count. The final save on exit is unconditional, so this only
+/// affects mid-crawl resume granularity (a few seconds of re-crawl, which the
+/// seen-set makes idempotent).
+const CHECKPOINT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Stable, filesystem-safe artifact filename for a page, addressed by its URL
+/// rather than a per-run sequence number. The frontier de-duplicates URLs, so
+/// this is unique within a crawl; being a pure function of the URL, it is also
+/// stable across resumes and revisits (the `pages` record's `artifact_path` and
+/// the file on disk can never disagree). 16 bytes of SHA-256 (128 bits) is far
+/// beyond collision range for any single crawl's URL set.
+fn artifact_name(url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(url.as_bytes());
+    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("page-{hex}.html")
+}
 
 /// Cap on the per-host failure map surfaced in the result — only the worst
 /// offenders are useful; the total lives in `failed`.
@@ -1201,6 +1239,22 @@ mod tests {
     use super::*;
     use crate::engine::HttpResponse;
     use std::sync::Mutex as SyncMutex;
+
+    #[test]
+    fn artifact_name_is_url_addressed_stable_and_collision_free() {
+        // Same URL always maps to the same file — no dependence on a per-run
+        // counter, so a resumed crawl (stats.kept restarts at 0) can't overwrite a
+        // prior run's page with a different URL's body.
+        let a1 = artifact_name("https://example.com/a");
+        let a2 = artifact_name("https://example.com/a");
+        assert_eq!(a1, a2, "stable per URL");
+        // Distinct URLs get distinct names.
+        assert_ne!(a1, artifact_name("https://example.com/b"));
+        // Filesystem-safe: page-<32 hex>.html, no path separators.
+        assert!(a1.starts_with("page-") && a1.ends_with(".html"), "{a1}");
+        assert!(!a1.contains('/') && !a1.contains('\\'), "{a1}");
+        assert_eq!(a1.len(), "page-".len() + 32 + ".html".len());
+    }
 
     /// Serves canned `(status, body)` per URL; URLs in `fail` return a transport
     /// error; unknown URLs → 404 empty. Honors conditional GETs: a request whose

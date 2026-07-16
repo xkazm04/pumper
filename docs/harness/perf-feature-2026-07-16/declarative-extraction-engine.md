@@ -1,0 +1,37 @@
+# Declarative Extraction Engine — perf-optimizer + feature-scout scan
+
+> Total: 3
+> Critical: 0 | High: 2 | Medium: 1 | Low: 0
+
+## 1. Accept borrowed documents in the batch API so callers stop cloning every body
+
+- **Severity**: High
+- **Lens**: perf-optimizer
+- **Category**: allocation / memory
+- **File**: crates/core/src/extract.rs:440-451
+- **Scenario**: `extractor` source-mode runs over a crawl dataset — up to 10,000 stored bodies (documented cap in `docs/features/extraction.md`). Each body is a full HTML page.
+- **Root cause**: `extract_batch` / `extract_batch_with_report` take `docs: &[String]`, an owned-`String` slice. The only caller that matters cannot satisfy that without a copy: `crates/apps/extractor/src/lib.rs:89` does `let docs: Vec<String> = keyed.iter().map(|(_, d)| d.clone()).collect();` — a deep copy of every body — and `keyed` stays alive until line 95 (`keyed.into_iter()`), so both full sets of bodies are resident simultaneously. The engine only ever reads the docs (`&str` is all `Html::parse_document`, `re.captures`, `skyscraper::html::parse` and `doc.as_bytes()` need), so the owned requirement buys nothing.
+- **Impact**: Peak RSS for the extract phase is ~2× the corpus. At a 10k-doc batch × ~200 KB average body, that is ~2 GB of live bodies becoming ~4 GB, plus 10k allocations + memcpys of the whole corpus before any work starts. The clone is pure waste — it is freed immediately after. Measure with peak RSS around the `run_extraction` await and wall-time of `extract_and_upsert` on a 10k-doc source-mode job.
+- **Fix sketch**: Make the batch entry points generic over borrowed text — `pub fn extract_batch_with_report<S: AsRef<str> + Sync>(rules: &CompiledRuleSet, docs: &[S]) -> Vec<(Value, DocReport)>`, with the rayon body calling `extract_one_with_report(rules, doc.as_ref())`. `String` still satisfies the bound, so `extract_batch`'s existing callers and the tests (`std::slice::from_ref(&doc)`) compile unchanged. The extractor then builds `Vec<&str>` from `keyed` (borrow, no body copy) instead of `Vec<String>`. Trade-off: a generic param on two public fns; `extract_one` already takes `&str` so the surface stays coherent.
+
+## 2. Add a repeating-container rule so list pages yield one record per item
+
+- **Severity**: High
+- **Lens**: feature-scout
+- **Category**: feature-gap
+- **File**: crates/core/src/extract.rs:25-51, 402-437
+- **Scenario**: The single most common scraping shape — a listing page with 50 product cards, a job board, a search-results page. A user writes `{"name": {"type":"css","selector":".card h3","all":true}, "price": {"type":"css","selector":".card .price","all":true}}` and expects 50 rows.
+- **Root cause**: `Rule` has no container/scope variant, and `extract_one_impl` builds exactly one flat `Map` per document — every rule is evaluated against the whole-document root (`css_extract(html.as_ref().unwrap(), ...)` selects from `&Html`, never from a subtree). `all: true` is the only multi-value escape hatch and it returns **independent parallel arrays**. The arrays are positionally meaningless: if card #12 has no `.price`, `price` has 49 entries against `name`'s 50 and every subsequent pair is silently mis-zipped — bad data that `DocReport` cannot see, because per-field status is computed per document, not per item. The extractor then upserts one record per document (`extract_and_upsert`, extractor lib.rs:83-109), so 50 items collapse into 1 row of arrays. This corroborates backlog idea `ae072557` ("Repeating-container extraction for list pages", vision-scan T11) with the concrete mechanism.
+- **Impact**: List-page scraping — the platform's bread-and-butter case — is either impossible or silently wrong. It is the gap most likely to make a user reach for Python instead, which is precisely the comparison the module docs pick a fight with.
+- **Fix sketch**: Add `Rule::Each { selector: String, fields: BTreeMap<String, FieldRule> }`, compiling to `CompiledRule::Each { selector: Selector, fields: Vec<(String, CompiledRule, Vec<CompiledTransform>)> }` (recursive compile via the existing `RuleSet::compile` loop; keep `needs_html()` true when any `Each` exists). At extract time, for each `ElementRef` from `html.select(selector)`, run the inner fields **scoped to that element** — `css_extract` needs an `ElementRef`-rooted variant, which `scraper` supports via `ElementRef::select`. Emit a `Value::Array` of objects, so each item's fields stay bound together and a missing `.price` is a `null` on *its own* item. Non-`css` inner rules (regex over the element's HTML, `const`) work naturally; scope `xpath`/`json` out of v1 and reject them at compile with a clear `Error::Parse`. Follow-up (separable): let the extractor fan an `Each` array out into one dataset record per item.
+
+## 3. Expose HTML→Markdown as a scoped extraction rule, not just a whole-page fetcher flag
+
+- **Severity**: Medium
+- **Lens**: feature-scout
+- **Category**: feature-gap / integration
+- **File**: crates/core/src/extract.rs:487-503, crates/core/src/markdown.rs:17-23
+- **Scenario**: Extract an article body / docs page / product description as structured text to store or hand to the Claude engine — the exact job `html_to_markdown` exists for, but scoped to the one element that matters rather than the whole page.
+- **Root cause**: The two halves of this context never touch. `css_extract`'s no-`attr` path is `Value::String(el.text().collect::<String>().trim().to_string())` — it concatenates raw text nodes, destroying every structural signal: headings, list items, table rows, links and code blocks all fuse into one undelimited run (`el.text()` does not even insert spaces at element boundaries, so `<li>a</li><li>b</li>` yields `"ab"`). `html_to_markdown` is reachable only through the fetcher's `to_markdown` flag (fetcher.rs:264, 350), which converts the **entire response body** — so a user who wants clean Markdown of `article.content` has no path: whole-page Markdown keeps the chrome `SKIP` misses, and a scoped CSS rule flattens the structure. `markdown.rs` already renders tables as pipe tables, which the current `.text()` path shreds outright.
+- **Impact**: The pitch in markdown.rs's own doc comment — "shrinking a page to the tokens that matter before handing it to the Claude engine" — is unreachable from the rule engine, the place where "the tokens that matter" is actually specified. Also directly relevant to backlog ideas `505d9b9c` (LLM-ready Markdown endpoint) and `f4e82c6f` (article-content extraction), and it costs no new parse: the `Html` tree is already built.
+- **Fix sketch**: Add `Transform::ToMarkdown` → `CompiledTransform::ToMarkdown`, applying via `map_str` in `apply_scalar` — this composes with the existing chain and works element-wise over `all: true` arrays for free. It needs the rule to yield *HTML*, so pair it with an `html: bool` flag on `Rule::Css` that makes `css_extract`'s `render` return `el.html()` instead of `el.text()` (an `attr`-like third mode), giving `{"type":"css","selector":"article","html":true,"transforms":[{"op":"to_markdown"}]}`. To convert a fragment, `markdown.rs` needs a sibling entry point — `pub fn html_fragment_to_markdown(&str)` using `Html::parse_fragment` and the same `walk`/`normalize` path, since `parse_document` would wrap the fragment in `<html><body>`. Trade-off: `html: true` widens the `Css` rule's surface; `SKIP` still applies inside the subtree, which is the desired behavior (a nested `<form>` in an article stays dropped).

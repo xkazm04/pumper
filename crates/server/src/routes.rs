@@ -73,7 +73,8 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_schedules, create_schedule))
         .routes(routes!(delete_schedule))
         .routes(routes!(set_schedule_enabled))
-        .routes(routes!(list_records))
+        .routes(routes!(list_records, delete_dataset_route))
+        .routes(routes!(delete_record_route))
         .routes(routes!(export_records))
         .routes(routes!(dataset_duplicates))
         .routes(routes!(dataset_changes))
@@ -101,6 +102,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(delete_saved_search))
         .routes(routes!(set_saved_search_enabled))
         .routes(routes!(delete_search_dataset))
+        .routes(routes!(search_status))
         .routes(routes!(extract_preview))
         .routes(routes!(list_grants))
         .routes(routes!(closing_soon))
@@ -109,7 +111,17 @@ fn openapi_router() -> OpenApiRouter<AppState> {
 
 pub fn router(state: AppState) -> Router {
     let (router, _api) = openapi_router().split_for_parts();
-    let router = router.layer(tower_http::trace::TraceLayer::new_for_http());
+    // gzip/br responses when the client sends accept-encoding — record JSON is
+    // highly repetitive (identical keys per row, ISO timestamps) so it compresses
+    // ~5-10x, a real win for remote consumers and the streamed export path.
+    // CompressionLayer's default predicate skips already-small and SSE
+    // (`text/event-stream`) responses, so /events and /jobs/{id}/stream keep their
+    // incremental KeepAlive delivery; it wraps the body stream (no full buffering),
+    // so the export path stays constant-memory. Localhost clients that don't send
+    // accept-encoding are unaffected.
+    let router = router
+        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(tower_http::trace::TraceLayer::new_for_http());
     // CORS is OFF by default (same-origin only). A permissive allow-all on an
     // unauthenticated, mutating, data-bearing API lets any site the operator
     // visits drive it cross-origin (DNS-rebinding defeats the localhost
@@ -1142,6 +1154,61 @@ async fn list_records(
     Ok(Json(json!({ "items": records, "next_cursor": next_cursor })))
 }
 
+#[utoipa::path(
+    delete,
+    path = "/datasets/{app}/{dataset}",
+    tag = "datasets",
+    params(
+        ("app" = String, Path, description = "App name"),
+        ("dataset" = String, Path, description = "Dataset name"),
+    ),
+    responses((status = 200, description = "`{app, dataset, deleted}` — records removed (with their full revision history and search docs). Hard delete; use for retiring or re-importing a dataset."))
+)]
+async fn delete_dataset_route(
+    State(state): State<AppState>,
+    Path((app, dataset)): Path<(String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let deleted = state.datasets.delete_dataset(&app, &dataset).await?;
+    // Drop the dataset's search docs too (best-effort — the records are already
+    // gone; a stale search doc would just return a hit for a deleted record).
+    if let Err(e) = state.search.delete_dataset(&app, &dataset).await {
+        tracing::warn!(%app, %dataset, "dataset deleted but search cleanup failed: {e}");
+    }
+    Ok(Json(json!({ "app": app, "dataset": dataset, "deleted": deleted })))
+}
+
+#[utoipa::path(
+    delete,
+    path = "/datasets/{app}/{dataset}/records/{key}",
+    tag = "datasets",
+    params(
+        ("app" = String, Path, description = "App name"),
+        ("dataset" = String, Path, description = "Dataset name"),
+        ("key" = String, Path, description = "Record key"),
+    ),
+    responses(
+        (status = 200, description = "Deleted (`{deleted: true}`) — the record and its full revision history."),
+        (status = 404, description = "Record not found", body = Object),
+    )
+)]
+async fn delete_record_route(
+    State(state): State<AppState>,
+    Path((app, dataset, key)): Path<(String, String, String)>,
+) -> Result<Json<Value>, ApiError> {
+    let existed = state.datasets.delete_record(&app, &dataset, &key).await?;
+    if !existed {
+        return Err(ApiError(StatusCode::NOT_FOUND, "record not found".into()));
+    }
+    if let Err(e) = state
+        .search
+        .delete_ids(&[pumper_core::SearchDoc::dataset_id(&app, &dataset, &key)])
+        .await
+    {
+        tracing::warn!(%app, %dataset, %key, "record deleted but search cleanup failed: {e}");
+    }
+    Ok(Json(json!({ "deleted": true })))
+}
+
 #[derive(Deserialize, IntoParams)]
 struct ExportQuery {
     /// 'json' (default) | 'ndjson' | 'csv'. All three stream in constant memory.
@@ -2003,6 +2070,12 @@ struct SearchQuery {
     /// Typo tolerance (edit distance 1). Quoted phrases stay exact.
     #[serde(default)]
     fuzzy: bool,
+    /// Ordering: `score` (relevance, default) or `newest` (most recently indexed).
+    sort: Option<String>,
+    /// Only hits indexed at/after this unix-seconds instant (a "what's new" feed).
+    since: Option<i64>,
+    /// Skip this many ranked hits before `limit` (page 2 = `offset=limit`). Capped.
+    offset: Option<usize>,
 }
 
 fn default_search_limit() -> usize {
@@ -2017,7 +2090,7 @@ fn default_search_limit() -> usize {
     tag = "search",
     params(SearchQuery),
     responses(
-        (status = 200, description = "`{query, count, hits, facets}` (BM25 ranked, highlighted snippets)"),
+        (status = 200, description = "`{query, total, count, hits, facets}` — BM25 ranked (or `sort=newest`), highlighted snippets. `total` is the full match count; `count` is the returned page size. `offset` pages (offset=limit → page 2); `sort=newest` orders by index time; `since=<unix-secs>` filters to recent docs."),
         (status = 400, description = "Empty query", body = Object),
     )
 )]
@@ -2028,19 +2101,52 @@ async fn search(
     if query.q.trim().is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "query 'q' is required".into()));
     }
+    let sort = match query.sort.as_deref() {
+        None | Some("score") => pumper_core::SearchSort::Score,
+        Some("newest") => pumper_core::SearchSort::Newest,
+        Some(other) => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("unknown sort '{other}' (expected 'score' or 'newest')"),
+            ))
+        }
+    };
     let req = pumper_core::SearchRequest {
         q: query.q.clone(),
         limit: query.limit.clamp(1, 100),
         app: query.app,
         dataset: query.dataset,
         fuzzy: query.fuzzy,
+        sort,
+        since: query.since,
+        // Clamp like `limit`: deep Tantivy offsets get progressively costlier.
+        offset: query.offset.unwrap_or(0).min(SEARCH_MAX_OFFSET),
     };
     let results = state.search.query(req).await?;
     Ok(Json(json!({
         "query": query.q,
+        // The real match count (was hits.len(), i.e. the page size).
+        "total": results.total,
         "count": results.hits.len(),
         "hits": results.hits,
         "facets": results.facets,
+    })))
+}
+
+/// Upper bound on `GET /search?offset=` — deep offsets get costlier in Tantivy.
+const SEARCH_MAX_OFFSET: usize = 10_000;
+
+#[utoipa::path(
+    get,
+    path = "/search/status",
+    tag = "search",
+    responses((status = 200, description = "`{enabled, doc_count}` — number of documents in the index. `doc_count: 0` on an enabled index means it was wiped (schema drift) or never populated; rebuild with the `search-backfill` bin."))
+)]
+async fn search_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let doc_count = state.search.doc_count().await?;
+    Ok(Json(json!({
+        "enabled": state.config.search.enabled,
+        "doc_count": doc_count,
     })))
 }
 
@@ -2607,8 +2713,9 @@ async fn fetch_preview_doc(state: &AppState, url: &str) -> Result<String, ApiErr
 // ---------------------------------------------------------------------------
 // Grants query surface
 //
-// `grants/unified` is the cross-source corpus that grants-gov and ca-grants both
-// normalize into (see the `grants-common` crate, which owns these two names).
+// `grants/unified` is the cross-source corpus that grants-gov, ca-grants, and
+// eu-sedia all normalize into (see the `grants-common` crate, which owns these
+// two names).
 // Until now it was reachable only through the generic dataset API, so every
 // consumer had to export the whole corpus and filter client-side. These two
 // routes push the filters into SQL.
@@ -2625,11 +2732,9 @@ const GRANTS_MAX_LIMIT: i64 = 500;
 
 /// Default closing-soon window, in days, matching the grants-gov digest.
 const CLOSING_SOON_DEFAULT_DAYS: i64 = 14;
-/// Rows the closing-soon view pulls before sorting. Sorting is by `close_date`,
-/// not by the `updated_at` order the store returns, so the whole window has to be
-/// in hand before it can be truncated — this bounds that read.
-const CLOSING_SOON_SCAN: i64 = 1000;
-/// Rows the closing-soon view returns. `count` reports the full window size.
+/// Rows the closing-soon view returns, ordered soonest-first in SQL. `count`
+/// reports the full window size independently, so the cap is not a silent
+/// truncation of the total.
 const CLOSING_SOON_CAP: usize = 200;
 
 /// Filters over `grants/unified`. All optional, all ANDed; with none set the
@@ -2640,7 +2745,7 @@ struct GrantsQuery {
     status: Option<String>,
     /// Case-insensitive substring of the agency name (e.g. `health`).
     agency: Option<String>,
-    /// Source app, exact match: `grants-gov` | `ca-grants`.
+    /// Source app, exact match: `grants-gov` | `ca-grants` | `eu-sedia`.
     source: Option<String>,
     /// Closes on or before this `YYYY-MM-DD`. Records with no close date are excluded.
     closing_before: Option<String>,
@@ -2761,21 +2866,37 @@ async fn closing_soon(
     let today = chrono::Utc::now().date_naive();
     let until = today + chrono::Duration::days(days);
 
-    // Computed on read rather than materialized as a dataset: the corpus is small
-    // enough to scan, and a read view can never go stale between syncs — which a
-    // "closing soon" list, whose membership changes with the calendar and not with
-    // the data, absolutely would if it were snapshotted.
+    // Computed on read rather than materialized as a dataset: a read view can
+    // never go stale between syncs — which a "closing soon" list, whose membership
+    // changes with the calendar and not with the data, absolutely would if it were
+    // snapshotted.
     let filters = vec![
         JsonFilter::Eq { path: "$.status".into(), value: "open".into() },
         JsonFilter::Gte { path: "$.close_date".into(), value: today.to_string() },
         JsonFilter::Lte { path: "$.close_date".into(), value: until.to_string() },
     ];
+    // Order by close_date ASC and cap in SQL, so the returned rows are genuinely
+    // the soonest-closing across the whole corpus — not an arbitrary
+    // most-recently-updated slice that an in-memory sort would only reorder. The
+    // true window total comes from a separate COUNT, so `count` reflects every
+    // matching grant rather than saturating at the return cap.
+    let count = state
+        .datasets
+        .count_filtered(GRANTS_APP, GRANTS_DATASET, &filters)
+        .await?;
     let records = state
         .datasets
-        .list_filtered(GRANTS_APP, GRANTS_DATASET, &filters, None, CLOSING_SOON_SCAN)
+        .list_filtered_ordered(
+            GRANTS_APP,
+            GRANTS_DATASET,
+            &filters,
+            "$.close_date",
+            CLOSING_SOON_CAP as i64,
+        )
         .await?;
 
-    let mut window: Vec<(i64, Value)> = records
+    // SQL already returns these soonest-first; just attach key + days_left.
+    let grants: Vec<Value> = records
         .into_iter()
         .filter_map(|r| {
             let close = r.data.get("close_date").and_then(Value::as_str)?;
@@ -2784,14 +2905,9 @@ async fn closing_soon(
             let mut grant = r.data.as_object()?.clone();
             grant.insert("key".into(), json!(r.key));
             grant.insert("days_left".into(), json!(days_left));
-            Some((days_left, Value::Object(grant)))
+            Some(Value::Object(grant))
         })
         .collect();
-    window.sort_by_key(|(days_left, _)| *days_left);
-
-    let count = window.len();
-    let grants: Vec<Value> =
-        window.into_iter().take(CLOSING_SOON_CAP).map(|(_, grant)| grant).collect();
     Ok(Json(json!({ "days": days, "count": count, "grants": grants })))
 }
 
@@ -2827,6 +2943,8 @@ mod api_spec_tests {
         "GET /datasets/{app}/{dataset}",
         "GET /datasets/{app}/{dataset}/export",
         "GET /datasets/{app}/{dataset}/duplicates",
+        "DELETE /datasets/{app}/{dataset}",
+        "DELETE /datasets/{app}/{dataset}/records/{key}",
         "GET /datasets/{app}/{dataset}/changes",
         "GET /datasets/{app}/{dataset}/history",
         "GET /watches",
@@ -2849,6 +2967,7 @@ mod api_spec_tests {
         "GET /plugins",
         "POST /plugins/reload",
         "GET /search",
+        "GET /search/status",
         "DELETE /search/docs",
         "GET /searches",
         "POST /searches",

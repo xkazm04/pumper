@@ -72,6 +72,13 @@ fn is_stale(alive: bool, renders: u64, recycle: u64) -> bool {
     !alive || (recycle > 0 && renders >= recycle)
 }
 
+/// Whether captured HTML of `html_len` bytes exceeds the `cap`. Pure so the cap
+/// decision is unit-testable without Chrome. `cap == 0` disables the cap; strictly
+/// over the cap fails (exactly at the cap is allowed, mirroring the HTTP tier).
+fn over_html_cap(html_len: u64, cap: u64) -> bool {
+    cap > 0 && html_len > cap
+}
+
 /// A launched Chrome instance plus liveness/recycle bookkeeping.
 struct LiveBrowser {
     /// Shared so concurrent renders each hold a clone and open their own tab
@@ -384,6 +391,18 @@ impl Browser for BrowserEngine {
         }
         let html = content.map_err(|e| Error::Browser(format!("content: {e}")))?;
 
+        // Cap the captured HTML like the HTTP tier caps its body, so a pathological
+        // JS-built DOM can't balloon memory on the expensive tier — a typed error
+        // naming the cap and URL, symmetric with `Error::Http`.
+        let cap = req.max_body_bytes.unwrap_or(self.cfg.max_html_bytes);
+        if over_html_cap(html.len() as u64, cap) {
+            return Err(Error::Browser(format!(
+                "rendered HTML from {} ({} bytes) exceeds max_html_bytes cap of {cap} bytes",
+                req.url,
+                html.len()
+            )));
+        }
+
         let blocked_resources = blocked.load(Ordering::Relaxed);
         if blocked_resources > 0 {
             info!(url = %req.url, blocked = blocked_resources, "blocked heavy subresources");
@@ -495,5 +514,14 @@ mod tests {
         assert!(is_stale(true, 201, 200));
         // 0 disables recycling regardless of count.
         assert!(!is_stale(true, u64::MAX, 0));
+    }
+
+    #[test]
+    fn html_cap_is_strict_and_disabled_by_zero() {
+        assert!(!over_html_cap(100, 100), "exactly at the cap is allowed");
+        assert!(!over_html_cap(99, 100));
+        assert!(over_html_cap(101, 100), "strictly over fails");
+        // 0 disables the cap regardless of size.
+        assert!(!over_html_cap(u64::MAX, 0));
     }
 }

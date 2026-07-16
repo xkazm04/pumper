@@ -41,7 +41,7 @@ impl ScrapeApp for CaGrants {
     }
 
     fn default_params(&self) -> Value {
-        json!({ "status": "active", "limit": 100, "maxPages": 25 })
+        json!({ "status": "active", "limit": 1000, "maxPages": 25 })
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -124,6 +124,10 @@ impl ScrapeApp for CaGrants {
             }
         }
 
+        // Honest coverage: hitting the page cap while records remain is a
+        // silently-partial corpus, previously indistinguishable from a full sweep.
+        let truncated = pages >= max_pages && offset < total;
+
         // Drift guard: CKAN reported a positive `result.total` but we parsed zero
         // records — the `result.records` array was renamed/moved and
         // `unwrap_or_default` silently emptied it. Fail loudly instead of
@@ -162,8 +166,25 @@ impl ScrapeApp for CaGrants {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            "truncated": truncated,
         });
         cross.merge_into(&mut out);
+        if truncated {
+            // Pushed after the merge, which sets `warnings` to the drift warnings.
+            if let Value::Object(map) = &mut out {
+                let msg = format!(
+                    "coverage truncated: stopped at maxPages={max_pages} after {} of \
+                     {total} records — raise limit/maxPages to cover the full corpus",
+                    records.len()
+                );
+                match map.get_mut("warnings") {
+                    Some(Value::Array(w)) => w.push(json!(msg)),
+                    _ => {
+                        map.insert("warnings".into(), json!([msg]));
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 }

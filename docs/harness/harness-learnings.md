@@ -108,3 +108,88 @@
 ## Structural facts (Wave 3 additions)
 - **2026-07-10** — Extraction rules: `RuleSet.fields` maps to `FieldRule {rule, transforms}` (serde-flattened; old plain-rule JSON still parses). Rule types: css/regex/json/xpath/const. XPath via `skyscraper` crate (pure Rust, HTML-native; heavy grammar crate, ~1min cold-build cost).
 - **2026-07-10** — Crawler checkpoints live at `data/artifacts/<app>/checkpoints/<name>.json` (beside per-job dirs, not inside them) so cross-job resume works.
+
+## Structural facts (perf-feature scan Wave 3, 2026-07-16)
+- **2026-07-16** — The politeness governor and cost/tier metering are wired PER-ENGINE, not at the tier seam: `Governor::acquire/penalize/reward` and cost recording historically lived only inside `HttpEngine::send` and `AppContext::fetch`. Any app that drives an engine raw (the `crawl` app → `pumper_core::crawl` with `ctx.engines.http`) bypassed all of it. Fixed: the browser tier is now governed from `Fetcher::fetch` (shares the HTTP engine's `Arc<Governor>`), and raw-engine apps meter via the new public `AppContext::meter` / `AppContext::learn_tier` seams.
+- **2026-07-16** — `Config::load()` now calls `Config::validate()` (core/src/config.rs) after `normalize()`, rejecting semantically-broken worker/governor combos (stale_after<=heartbeat, timeout<=stale_after, concurrency==0, penalty_cap<base). `0` remains a disable switch for heartbeat/stale/aging. A test asserts the repo's own `config.toml` passes.
+- **2026-07-16** — `costs::SpentTotal` (AtomicU64-bit-cast f64) is the job's in-memory running spend, seeded from the ledger at `AppContext` construction and advanced by `meter`. `remaining_budget_usd` reads it instead of re-`SUM`-ing `cost_events` per call. `CostLedger::job_total` stays the source of truth / seed.
+
+## Anti-patterns to avoid (perf-feature scan, 2026-07-16)
+- **Guard-at-the-wrong-seam** — a control (budget/politeness/metering/tier-learning) wired inside ONE engine method silently exempts every caller that reaches the resource another way. When auditing a shipped control, grep ALL call sites of the underlying resource, not just the blessed wrapper.
+- **Per-item DB writes on a raw high-volume path** — don't meter per fetch on the crawl path (single-writer contention). Tally in memory, flush O(distinct-hosts) after the loop.
+
+## Open follow-ups (from perf-feature scan Wave 3, 2026-07-16)
+- 59 of 63 findings still open on branch `vibeman/perf-feature-2026-07-16` (not pushed). Highest value: Wave 1 grants coverage&truth incl. the 1 Critical (eu-sedia→`grants/unified`: needs `normalize_eu_sedia`; SEDIA statuses are numeric codes that break `?status=open` if passed through `norm_status`; EUR `budgetOverview` → map money to `Null`, unified has no currency dim). Wave 2 write-amplification (full-dataset reindex per job, per-record upsert/detect_removed txns, quadratic crawl checkpoint).
+- Out-of-lens bug: crawl `artifact_name` = `format!("page-{:04}.html", stats.kept)` and `stats.kept` restarts at 0 on checkpoint resume → resumed crawl overwrites prior run's page-NNNN.html, leaving `pages.artifact_path` pointing at the wrong body. Bug-hunter shape; fix regardless of wave.
+
+## Anti-patterns to avoid (perf-feature scan Wave 1, 2026-07-16)
+- **Numeric status codes passed through a word-vocabulary normalizer.** When a source encodes status as opaque codes (SEDIA `31094502`) and `grants_common::norm_status` passes unknowns through lowercased, a naive map writes the literal code into `status` — silently breaking every `?status=open` filter and `sweep_closed`. Map codes→words explicitly; unknown→Null. See `normalize_eu_sedia`/`sedia_status`.
+- **Foreign currency in a currency-less schema → Null, never a number.** SEDIA `budgetOverview` is EUR; `grants/unified` has no currency dimension, so its money fields stay Null rather than filing euros as ca-grants dollars. (Same money-truth class as grant-writing-nonprofits' EUR-as-USD.)
+- **LIMIT before ORDER BY is a silent wrong answer.** `closing-soon` LIMITed by `updated_at DESC` then sorted `close_date` in memory, so past the cap the soonest grants were dropped. Any top-N-by-data-field must ORDER in SQL before the LIMIT — `Datasets::list_filtered_ordered`; pair with `count_filtered` so the total isn't the cap.
+- **Don't invent an upstream param to fix pagination.** SEDIA match-all has no verifiable stable sort, so instead of guessing a `sortBy` name (that may silently no-op), widen `maxPages` + flag `truncated`.
+
+## Structural facts (perf-feature scan Wave 1, 2026-07-16)
+- **2026-07-16** — eu-sedia now normalizes into `grants/unified` via `grants_common::normalize_eu_sedia` (takes the eu-sedia app's already-cleaned `opportunities` record, not the raw hit). All three grant sources (grants-gov, ca-grants, eu-sedia) call `finalize_unified` — so `sweep_closed`/`link_duplicates` now run 3× per day (grants-gov#3 deferred; cheap fix = `list_filtered` predicate on the sweep).
+- **2026-07-16** — `Datasets` gained `list_filtered_ordered` (ORDER BY a JSON path ASC + LIMIT in SQL) and `count_filtered` (true window total); both share `push_json_filters` with `list_filtered` (whose behaviour is unchanged).
+
+## Open follow-ups (from perf-feature scan Wave 1, 2026-07-16)
+- grants-gov#1 money enrichment via POST /v1/api/fetchOpportunity — DEFERRED: needs a saved fetchOpportunity response to verify field names/nesting (awardFloor/awardCeiling/estimatedTotalProgramFunding/applicantTypes/fundingActivityCategories) + a backfill-drain (re-enrich money-null unified rows over days) so a per-run cap doesn't stall. Money stays Null for grants-gov until then (status quo, no regression).
+- eu-sedia#3 CMS-fee-schedule self-baselining watcher (Med); grants-gov#3 finalize_unified once-per-sync (fold into Wave 2 write-amplification).
+
+## Anti-patterns to avoid (perf-feature scan Wave 2, 2026-07-16)
+- **Per-record transaction for a batch write.** `upsert_many` looped `upsert()` = one BEGIN IMMEDIATE/commit/fsync + write-lock grab per record (5k-record batch = 5k commits). Chunk the batch (500) on one held connection via the existing `*_in_tx(conn,…)` seam — commit boundary = batch, not row.
+- **A two-row write hardened in one path but not another.** `upsert` got BEGIN IMMEDIATE for its record+revision pair; `detect_removed` wrote the same pair as 2 autocommits — a crash between them tombstoned a record with NO `removed` revision, and the next sync never revisits it (removed_at already set) → the removal signal is lost PERMANENTLY. When hardening one writer, grep every site writing the same row-pair.
+- **Rebuilding a derived index from scratch every event.** worker `dataset_search_docs` re-indexed the WHOLE named dataset per job (O(corpus)×freq; grants/unified twice daily). Drive it from the change feed (revisions since job start) → O(changes); route `removed` revisions to `Search::delete_ids`. Note the hidden dependency: no full rebuild means a wiped index needs a separate backfill bin (search#2).
+- **Expensive periodic work gated by item count.** crawl `Checkpoint::save` is O(frontier) fired every 25 pages = O(pages/25 × frontier) (~40GB on a 100k crawl). Gate by wall-clock (5s min interval) → O(frontier × duration); keep the unconditional final save.
+
+## Structural facts (perf-feature scan Wave 2, 2026-07-16)
+- **2026-07-16** — `Datasets::upsert_many` + `detect_removed` now commit in chunks of `UPSERT_CHUNK`=500 on one connection (were per-record). `remove_in_tx` mirrors `upsert_in_tx`. worker `dataset_search_docs` now returns (docs, delete_ids) from `changes_since(app,dataset,job.started_at)` — indexes only touched keys; `dataset_doc_id` centralizes the `<app>:<dataset>:<key>` id. `grants_common::sweep_closed` filters status IN {open,forecasted} via `list_filtered` (was full-corpus `list`).
+- **2026-07-16** — The dataset an `index_datasets` spec names (e.g. `grants/unified`) lives in a DIFFERENT app namespace (`grants`) than the running app (`grants-gov`); worker indexing must scope `changes_since` to the spec's app, not `job.app`.
+
+## Open follow-ups (from perf-feature scan Wave 2, 2026-07-16)
+- dataset-store#3 (High): no delete/retention API — store only grows (unbounded revisions). 3-part feature (delete_record/delete_dataset + prune_revisions + janitor tick). Its own session.
+- search#2 (High): backfill/reindex bin — Wave-2 incremental indexing now DEPENDS on it for wiped-index recovery. Pairs with dataset-store#3.
+- broad-crawler#1 tail: delta/journal checkpoint + off-loop single-flight save (time-gate removed the amplification; these remove the per-save frontier serialize + fetch stall).
+
+## Structural facts (retention + search-backfill session, 2026-07-16)
+- **2026-07-16** — `SearchDoc::from_dataset_record` + `SearchDoc::dataset_id` live in `pumper_core::search` (moved from a private worker fn) so the live worker indexing AND the `search-backfill` bin build identical docs. `Search::doc_count` added (trait + TantivyIndex `num_docs` + NoSearch→0), surfaced on `GET /search/status`.
+- **2026-07-16** — `--bin search-backfill` (crates/server/src/bin/) rebuilds the search index from stored records; scope REQUIRED (`--all`/`--app`/`--app --dataset`). Run with the server STOPPED (Tantivy exclusive writer lock). The live path only maintains datasets named in an app's `index_datasets` (today grants/unified), so backfilling others makes them searchable but not incrementally maintained.
+- **2026-07-16** — `Datasets::{delete_record,delete_dataset,prune_revisions,list_all_datasets}` added. delete_* are HARD deletes (records+revisions in one BEGIN IMMEDIATE) distinct from detect_removed tombstoning; DELETE routes also drop search docs. Retention janitor in main.rs prunes revisions every 6h, OFF by default (`[storage] revision_retention_days=0`).
+
+## Anti-patterns to avoid (retention + search-backfill session, 2026-07-16)
+- **Removing a full-rebuild without shipping a rebuild path.** Wave 2's delta-indexing removed the accidental "re-index whole dataset per run" safety net → a wiped index only refilled as apps ran. Any "index by delta" change must ship a backfill bin + an observable doc_count.
+- **Divergent doc builders for live vs backfill index paths.** If they build docs differently (id, fields), a re-index silently duplicates or mis-deletes. One shared `from_record` builder.
+- **Destructive retention defaulting ON.** Silently pruning a user's accrued history is data loss; the retention janitor is opt-in and no-ops when disabled.
+
+## Structural facts (search#3 + crawl-bug, 2026-07-16)
+- **2026-07-16** — Search schema gained an `indexed_at` i64 FAST|INDEXED|STORED field (unix secs). `SearchDoc.indexed_at` populated from rev.created_at (live worker), rec.updated_at (backfill bin), or now (job-result docs). `SearchRequest.{sort:SearchSort(Score|Newest),since:Option<i64>}`; GET /search takes `?sort=newest`&`?since=`. `body_is_stored`→`schema_is_current` (checks all SCHEMA_FIELDS present + body stored) so field additions trigger the rebuild path. After this change the real index was rebuilt via `search-backfill --all` (5196 docs w/ timestamps).
+- **2026-07-16** — crawl page artifacts are now named `page-<sha256(url)[..16]>.html` (was `page-{stats.kept:04}.html`). URL-addressed = stable across resume/revisit; the per-run stats.kept counter no longer determines the filename.
+
+## Anti-patterns to avoid (search#3 + crawl-bug, 2026-07-16)
+- **Per-run sequence number as a durable artifact name.** crawl `page-{stats.kept:04}.html` — stats.kept restarts at 0 on checkpoint resume, so a resumed crawl overwrote prior page-0001.html with a different URL's body while old `pages` records still pointed there (silent corruption). Content/URL-address derived artifacts so record and file can never disagree.
+- **A search-schema change without its rebuild path.** Adding `indexed_at` trips the drift check → wipes the index. Land it AFTER the backfill bin exists and re-run it, so it's a clean rebuild not silent data loss.
+
+## Structural facts (search#1, 2026-07-16)
+- **2026-07-16** — `Search::index()` no longer commits synchronously; a background committer task (spawned in `TantivyIndex::new`) commits every 250ms (`COMMIT_INTERVAL`) or once 512 docs pending (`COMMIT_PENDING_THRESHOLD`). New `Search::flush()` (default no-op) forces a commit; called by the worker's saved-search runner (only when enabled searches exist) and by the search-backfill bin before doc_count/exit. `delete_ids`/`delete_dataset` KEEP synchronous commit (rare operator paths). `pending` count mutated only under the writer lock. TantivyIndex::drop signals a final commit. ALL 3 search findings (#1 committer, #2 backfill+doc_count, #3 indexed_at recency) now closed.
+
+## Anti-patterns to avoid (search#1, 2026-07-16)
+- **Committing a derived index per write.** Tantivy commit = segment flush + fsync + reader reload; doing it per finished job made a burst of small jobs pay one fsync each and serialize on the writer lock. Defer to an interval/threshold background committer; expose flush() for the few paths needing own-write visibility. Bounded tail loss on hard kill is acceptable for a rebuildable derived artifact.
+
+## Structural facts (medium-tail batch 1, 2026-07-16)
+- **2026-07-16** — `markdown::text_len_capped(html, cap)` counts visible text (SKIP subtrees, whitespace-collapsed) with early-exit at cap — the tier-escalation predicate, avoiding a full html_to_markdown build+discard on the extractor/plugin hot paths (to_markdown=false). Both fetcher tiers use it.
+- **2026-07-16** — Browser tier now caps captured HTML: `[browser] max_html_bytes` (default 16 MiB = [http] max_body_bytes; 0=off) + `RenderRequest.max_body_bytes` override; over-cap → Error::Browser. Pure `over_html_cap` helper. `Plugins::reload()` compiles via spawn_blocking (was on the tokio worker). census `sync_market_blend` reads geo=state via list_filtered (was full-corpus). extractor `extract_and_upsert` uses unzip + `summarize_reports(impl IntoIterator<Item=&DocReport>)` (was deep-cloning bodies+reports).
+
+## Anti-patterns to avoid (medium-tail batch 1, 2026-07-16)
+- **Building the product to compute a predicate.** Fetcher built a full Markdown document just to count chars for the thin-content escalation decision, then discarded it. Split predicate (capped text counter, early-exit) from product (the Markdown, only when requested).
+- **Cloning owned data to reshape it.** `keyed.iter().map(|(_,d)| d.clone())` deep-cloned every body to split keys from docs while `keyed` was dropped right after — `into_iter().unzip()` is zero-copy. Pass `impl IntoIterator<Item=&T>` instead of collecting a `Vec<T::clone>` for a read-only summarizer.
+- **A cap on the cheap path but not the expensive one.** HTTP capped its body; the browser tier (more expensive, bigger DOMs) buffered unbounded. Make the size guard a tier-agnostic contract, not a property of one engine's streaming.
+- **Filtering after deserialization.** census read the whole dataset and dropped county rows in Rust; push the `geo=state` predicate into SQL via list_filtered so rows never cross the boundary (also removes the ORDER-BY-LIMIT truncation cliff).
+
+## Structural facts (medium-tail batch 2, 2026-07-16)
+- **2026-07-16** — Router has a CompressionLayer (gzip/br; skips SSE, streams). Search gained SearchRequest.offset + SearchResponse.total (exact via Count in a MultiCollector pass); GET /search?offset= clamped SEARCH_MAX_OFFSET=10k; returns total(match count)+count(page size). Webhook deliveries carry x-pumper-delivery-id (stable idempotency key across retries/replay) + x-pumper-timestamp; signature base = HMAC(secret,"{ts}.{id}."++body). Scheduler decide() is O(1) per tick (earliest via one iterator step; Fire enumerates ≤COLLAPSE_LOG_CAP=64; Skip full but one-time); parsed crons cached in run() by expression string.
+
+## Anti-patterns to avoid (medium-tail batch 2, 2026-07-16)
+- **`count` = page size masquerading as a total.** /search reported hits.len() as count. Add a real total (Count collector, same pass) + offset for page 2.
+- **Webhook with body-only HMAC, no id/ts.** No idempotency key + unbounded replay window. Sign "{ts}.{delivery_id}."++body; keep delivery_id stable across retries/replays.
+- **Enumerating a whole backlog for a number one branch ignores.** Scheduler counted every missed firing per tick though Fire only logs it; find the cheap discriminator (earliest firing) first, bound the diagnostic walk.
+- **Test unique-dir from a timestamp alone races under parallelism.** Same-nanosecond collision → two TantivyIndex fight the writer lock. Use an atomic counter.

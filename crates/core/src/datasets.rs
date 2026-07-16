@@ -124,6 +124,13 @@ pub struct Datasets {
     pool: SqlitePool,
 }
 
+/// Records committed per write transaction in the batch write paths
+/// (`upsert_many`, `detect_removed`). Trades throughput (fewer commits/fsyncs and
+/// write-lock acquisitions) against how long one batch holds the write lock
+/// against other apps' workers. 500 records of non-commit work is a few tens of
+/// ms — well inside the 5s `busy_timeout`.
+const UPSERT_CHUNK: usize = 500;
+
 impl Datasets {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -435,29 +442,86 @@ impl Datasets {
         .await?;
         let present: std::collections::HashSet<&str> =
             present.iter().map(String::as_str).collect();
-        let now = Utc::now();
-        let mut removed = Vec::new();
-        for key in live {
-            if present.contains(key.as_str()) {
-                continue;
-            }
-            sqlx::query(
-                "UPDATE records SET removed_at = ?4 WHERE app = ?1 AND dataset = ?2 AND key = ?3",
-            )
-            .bind(app)
-            .bind(dataset)
-            .bind(&key)
-            .bind(ts(now))
-            .execute(&self.pool)
-            .await?;
-            Self::add_revision(&self.pool, app, dataset, &key, "removed", None, None, now)
-                .await?;
-            removed.push(key);
+        let to_remove: Vec<String> =
+            live.into_iter().filter(|k| !present.contains(k.as_str())).collect();
+        if to_remove.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(removed)
+        let now = Utc::now();
+
+        // Two fixes over the old per-key pair of autocommit writes:
+        //   (1) Atomicity — the `UPDATE removed_at` and its `removed` revision now
+        //       run in ONE transaction, so a crash between them can't tombstone a
+        //       record with no revision. That was a permanent signal loss: the
+        //       next sync sees `removed_at` already set and the key still absent,
+        //       so it never revisits the key and the change feed / watches / dataset
+        //       triggers never fire for that removal. `upsert` was hardened for
+        //       exactly this reason; `detect_removed` writes the same two rows and
+        //       had been missed.
+        //   (2) Cost — chunked commits instead of 2 write transactions per key
+        //       (a 2k-key removal was 4k commits).
+        let mut conn = self.pool.acquire().await?;
+        for chunk in to_remove.chunks(UPSERT_CHUNK) {
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            let mut chunk_result: Result<()> = Ok(());
+            for key in chunk {
+                if let Err(e) = Self::remove_in_tx(&mut conn, app, dataset, key, now).await {
+                    chunk_result = Err(e);
+                    break;
+                }
+            }
+            match chunk_result {
+                Ok(()) => {
+                    sqlx::query("COMMIT").execute(&mut *conn).await?;
+                }
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(to_remove)
+    }
+
+    /// Transactional body of one removal: tombstone the record and append its
+    /// `removed` revision on one connection inside a write transaction, so the two
+    /// commit as a unit (mirrors `upsert_in_tx`).
+    async fn remove_in_tx(
+        conn: &mut sqlx::SqliteConnection,
+        app: &str,
+        dataset: &str,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE records SET removed_at = ?4 WHERE app = ?1 AND dataset = ?2 AND key = ?3",
+        )
+        .bind(app)
+        .bind(dataset)
+        .bind(key)
+        .bind(ts(now))
+        .execute(&mut *conn)
+        .await?;
+        Self::add_revision(&mut *conn, app, dataset, key, "removed", None, None, now).await?;
+        Ok(())
     }
 
     /// Upserts many records, returning a summary of new/changed/unchanged.
+    ///
+    /// This is the most-executed write path in the product (every ingest run
+    /// upserts its whole listing). Rather than one `BEGIN IMMEDIATE` transaction
+    /// per record — a WAL commit/fsync and a database-wide write-lock acquisition
+    /// each, so a 5k-record batch was 5k commits — records are committed in chunks
+    /// of `UPSERT_CHUNK` on a single held connection: ~10 commits for that batch,
+    /// and the write lock is taken ~10 times instead of 5k (the mechanism behind
+    /// cross-app write stalls during a large sync). Each record keeps its exact
+    /// per-record read→write→revision semantics via `upsert_in_tx`.
+    ///
+    /// A failure rolls back its own chunk and propagates; chunks committed before
+    /// it stay committed (the same partial-progress-then-error shape the old
+    /// per-record loop had). The chunk size bounds how long the write lock is held
+    /// against other apps' workers — 500 records of non-commit work stays well
+    /// inside the 5s `busy_timeout`.
     pub async fn upsert_many(
         &self,
         app: &str,
@@ -465,14 +529,162 @@ impl Datasets {
         items: &[(String, Value)],
     ) -> Result<UpsertSummary> {
         let mut summary = UpsertSummary::default();
-        for (key, value) in items {
-            match self.upsert(app, dataset, key, value).await? {
-                ChangeKind::New => summary.new.push(key.clone()),
-                ChangeKind::Changed => summary.changed.push(key.clone()),
-                ChangeKind::Unchanged => summary.unchanged += 1,
+        if items.is_empty() {
+            return Ok(summary);
+        }
+        let mut conn = self.pool.acquire().await?;
+        for chunk in items.chunks(UPSERT_CHUNK) {
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            // Accumulate this chunk separately so a mid-chunk failure that rolls
+            // back doesn't leave the returned summary claiming uncommitted rows.
+            let mut chunk_summary = UpsertSummary::default();
+            let mut chunk_result: Result<()> = Ok(());
+            for (key, value) in chunk {
+                let hash = hash_value(value);
+                let sim = crate::simhash::simhash_value(value) as i64;
+                let now = Utc::now();
+                match Self::upsert_in_tx(&mut conn, app, dataset, key, value, hash.as_str(), sim, now)
+                    .await
+                {
+                    Ok(ChangeKind::New) => chunk_summary.new.push(key.clone()),
+                    Ok(ChangeKind::Changed) => chunk_summary.changed.push(key.clone()),
+                    Ok(ChangeKind::Unchanged) => chunk_summary.unchanged += 1,
+                    Err(e) => {
+                        chunk_result = Err(e);
+                        break;
+                    }
+                }
+            }
+            match chunk_result {
+                Ok(()) => {
+                    sqlx::query("COMMIT").execute(&mut *conn).await?;
+                    summary.new.extend(chunk_summary.new);
+                    summary.changed.extend(chunk_summary.changed);
+                    summary.unchanged += chunk_summary.unchanged;
+                }
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(e);
+                }
             }
         }
         Ok(summary)
+    }
+
+    /// Permanently deletes one record and its entire revision history in one
+    /// transaction; returns whether the record existed.
+    ///
+    /// Distinct from full-snapshot removal (`detect_removed`), which *tombstones*
+    /// (sets `removed_at` + a `removed` revision) so the disappearance is a
+    /// change-feed signal. This is a hard delete — the row and all its history are
+    /// gone — for an explicit operator action or a data-removal request. The
+    /// caller is responsible for dropping the record's search doc.
+    pub async fn delete_record(&self, app: &str, dataset: &str, key: &str) -> Result<bool> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let outcome = Self::delete_record_in_tx(&mut conn, app, dataset, key).await;
+        match outcome {
+            Ok(existed) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(existed)
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    async fn delete_record_in_tx(
+        conn: &mut sqlx::SqliteConnection,
+        app: &str,
+        dataset: &str,
+        key: &str,
+    ) -> Result<bool> {
+        let existed = sqlx::query("DELETE FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3")
+            .bind(app)
+            .bind(dataset)
+            .bind(key)
+            .execute(&mut *conn)
+            .await?
+            .rows_affected()
+            > 0;
+        sqlx::query("DELETE FROM record_revisions WHERE app = ?1 AND dataset = ?2 AND key = ?3")
+            .bind(app)
+            .bind(dataset)
+            .bind(key)
+            .execute(&mut *conn)
+            .await?;
+        Ok(existed)
+    }
+
+    /// Permanently deletes an entire dataset — every record and all revision
+    /// history — in one transaction; returns the number of records removed. For
+    /// retiring a dataset or a full re-import. The caller drops the search docs.
+    pub async fn delete_dataset(&self, app: &str, dataset: &str) -> Result<u64> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let outcome: Result<u64> = async {
+            let removed = sqlx::query("DELETE FROM records WHERE app = ?1 AND dataset = ?2")
+                .bind(app)
+                .bind(dataset)
+                .execute(&mut *conn)
+                .await?
+                .rows_affected();
+            sqlx::query("DELETE FROM record_revisions WHERE app = ?1 AND dataset = ?2")
+                .bind(app)
+                .bind(dataset)
+                .execute(&mut *conn)
+                .await?;
+            Ok(removed)
+        }
+        .await;
+        match outcome {
+            Ok(removed) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(removed)
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Trims revision history: deletes revisions created before `older_than`, but
+    /// always keeps at least the newest `keep_min_per_key` revisions of every
+    /// record so the diff chain and `history` stay usable. Returns the number
+    /// pruned. Records themselves are untouched — only history shrinks.
+    ///
+    /// `record_revisions` stores a full snapshot per revision and is append-only,
+    /// so on a scheduled source it grows without bound (≈ GB/year per active
+    /// dataset); this is the knob that bounds it. The retention janitor calls it,
+    /// but it is safe to call directly.
+    pub async fn prune_revisions(
+        &self,
+        older_than: DateTime<Utc>,
+        keep_min_per_key: i64,
+    ) -> Result<u64> {
+        let keep = keep_min_per_key.max(0);
+        // A revision is pruned when it is older than the cutoff AND it is not
+        // among the newest `keep` for its key — i.e. more than `keep` revisions of
+        // that key have a revision number >= this one. Correlated subquery (no
+        // window function, no DELETE-target alias) for SQLite portability; the
+        // (app,dataset,key,revision) PK backs both predicates.
+        let result = sqlx::query(
+            "DELETE FROM record_revisions \
+             WHERE created_at < ?1 \
+               AND (SELECT COUNT(*) FROM record_revisions AS n \
+                    WHERE n.app = record_revisions.app \
+                      AND n.dataset = record_revisions.dataset \
+                      AND n.key = record_revisions.key \
+                      AND n.revision >= record_revisions.revision) > ?2",
+        )
+        .bind(ts(older_than))
+        .bind(keep)
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
     }
 
     /// Finds near-duplicate record pairs within a dataset using SimHash Hamming
@@ -669,69 +881,7 @@ impl Datasets {
         qb.push(" AND dataset = ");
         qb.push_bind(dataset);
 
-        for filter in filters {
-            match filter {
-                JsonFilter::Eq { path, value } => {
-                    qb.push(" AND json_extract(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") = ");
-                    qb.push_bind(value.as_str());
-                }
-                JsonFilter::Contains { path, value } => {
-                    qb.push(" AND instr(lower(COALESCE(json_extract(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push("), '')), lower(");
-                    qb.push_bind(value.as_str());
-                    qb.push(")) > 0");
-                }
-                // Compare numerically when the JSON field is a number, else as
-                // text. SQLite sorts all numbers below all text, so a plain `>=`
-                // of a numeric field against a text-bound value always fails; the
-                // text branch preserves the existing ISO-date behavior unchanged.
-                JsonFilter::Gte { path, value } => {
-                    qb.push(" AND (CASE WHEN json_type(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") IN ('integer','real') THEN json_extract(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") >= CAST(");
-                    qb.push_bind(value.as_str());
-                    qb.push(" AS REAL) ELSE json_extract(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") >= ");
-                    qb.push_bind(value.as_str());
-                    qb.push(" END)");
-                }
-                JsonFilter::Lte { path, value } => {
-                    qb.push(" AND (CASE WHEN json_type(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") IN ('integer','real') THEN json_extract(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") <= CAST(");
-                    qb.push_bind(value.as_str());
-                    qb.push(" AS REAL) ELSE json_extract(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") <= ");
-                    qb.push_bind(value.as_str());
-                    qb.push(" END)");
-                }
-                // `(0 OR ...)` is the honest reading of "matches any of these
-                // paths": with no paths, nothing matches. NULL never satisfies the
-                // comparison, so records missing all the money fields drop out.
-                JsonFilter::NumGteAny { paths, value } => {
-                    qb.push(" AND (0");
-                    for path in paths {
-                        qb.push(" OR (json_type(data, ");
-                        qb.push_bind(path.as_str());
-                        qb.push(") IN ('integer', 'real') AND json_extract(data, ");
-                        qb.push_bind(path.as_str());
-                        qb.push(") >= ");
-                        qb.push_bind(*value);
-                        qb.push(")");
-                    }
-                    qb.push(")");
-                }
-            }
-        }
+        push_json_filters(&mut qb, filters);
 
         if let Some((after_ts, after_key)) = &after {
             qb.push(" AND (updated_at < ");
@@ -750,6 +900,72 @@ impl Datasets {
         rows.into_iter().map(Record::try_from).collect()
     }
 
+    /// Live records matching `filters`, ordered ascending by a JSON path (then
+    /// key for determinism) with the LIMIT applied to the *sorted* rows in SQL.
+    ///
+    /// This is the correctness-critical difference from [`list_filtered`], which
+    /// orders by `updated_at DESC`: a caller that wants the N soonest-closing or
+    /// N smallest-award rows must sort in SQL *before* the LIMIT, or the LIMIT
+    /// picks an arbitrary window (by update recency) and the subsequent in-memory
+    /// sort only reorders that wrong subset. No cursor — this is a top-N view.
+    pub async fn list_filtered_ordered(
+        &self,
+        app: &str,
+        dataset: &str,
+        filters: &[JsonFilter],
+        order_by_path: &str,
+        limit: i64,
+    ) -> Result<Vec<Record>> {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT key, data, first_seen, last_seen, updated_at, removed_at \
+             FROM records WHERE removed_at IS NULL AND app = ",
+        );
+        qb.push_bind(app);
+        qb.push(" AND dataset = ");
+        qb.push_bind(dataset);
+        push_json_filters(&mut qb, filters);
+        qb.push(" ORDER BY json_extract(data, ");
+        qb.push_bind(order_by_path);
+        qb.push(") ASC, key ASC LIMIT ");
+        qb.push_bind(limit);
+
+        let rows: Vec<RecordRow> = qb.build_query_as().fetch_all(&self.pool).await?;
+        rows.into_iter().map(Record::try_from).collect()
+    }
+
+    /// Count of live records matching `filters` — the true total behind a capped
+    /// list, so a view can report the real window size instead of saturating at
+    /// its scan/return cap.
+    pub async fn count_filtered(
+        &self,
+        app: &str,
+        dataset: &str,
+        filters: &[JsonFilter],
+    ) -> Result<i64> {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT COUNT(*) FROM records WHERE removed_at IS NULL AND app = ",
+        );
+        qb.push_bind(app);
+        qb.push(" AND dataset = ");
+        qb.push_bind(dataset);
+        push_json_filters(&mut qb, filters);
+
+        let count: i64 = qb.build_query_scalar().fetch_one(&self.pool).await?;
+        Ok(count)
+    }
+
+    /// Distinct `(app, dataset)` pairs that have at least one live record — the
+    /// set the search-backfill walks to rebuild the index from stored records.
+    pub async fn list_all_datasets(&self) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT DISTINCT app, dataset FROM records WHERE removed_at IS NULL \
+             ORDER BY app, dataset",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
     /// Distinct dataset names for an app.
     pub async fn datasets(&self, app: &str) -> Result<Vec<String>> {
         let names: Vec<String> =
@@ -758,6 +974,75 @@ impl Datasets {
                 .fetch_all(&self.pool)
                 .await?;
         Ok(names)
+    }
+}
+
+/// Appends the ` AND …` predicate clauses for a set of [`JsonFilter`]s onto a
+/// query builder. Shared by `list_filtered`, `list_filtered_ordered`, and
+/// `count_filtered` so the three can never interpret a filter differently.
+fn push_json_filters<'a>(qb: &mut sqlx::QueryBuilder<'a, sqlx::Sqlite>, filters: &'a [JsonFilter]) {
+    for filter in filters {
+        match filter {
+            JsonFilter::Eq { path, value } => {
+                qb.push(" AND json_extract(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") = ");
+                qb.push_bind(value.as_str());
+            }
+            JsonFilter::Contains { path, value } => {
+                qb.push(" AND instr(lower(COALESCE(json_extract(data, ");
+                qb.push_bind(path.as_str());
+                qb.push("), '')), lower(");
+                qb.push_bind(value.as_str());
+                qb.push(")) > 0");
+            }
+            // Compare numerically when the JSON field is a number, else as text.
+            // SQLite sorts all numbers below all text, so a plain `>=` of a numeric
+            // field against a text-bound value always fails; the text branch
+            // preserves the existing ISO-date behavior unchanged.
+            JsonFilter::Gte { path, value } => {
+                qb.push(" AND (CASE WHEN json_type(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") IN ('integer','real') THEN json_extract(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") >= CAST(");
+                qb.push_bind(value.as_str());
+                qb.push(" AS REAL) ELSE json_extract(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") >= ");
+                qb.push_bind(value.as_str());
+                qb.push(" END)");
+            }
+            JsonFilter::Lte { path, value } => {
+                qb.push(" AND (CASE WHEN json_type(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") IN ('integer','real') THEN json_extract(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") <= CAST(");
+                qb.push_bind(value.as_str());
+                qb.push(" AS REAL) ELSE json_extract(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") <= ");
+                qb.push_bind(value.as_str());
+                qb.push(" END)");
+            }
+            // `(0 OR ...)` is the honest reading of "matches any of these paths":
+            // with no paths, nothing matches. NULL never satisfies the comparison,
+            // so records missing all the money fields drop out.
+            JsonFilter::NumGteAny { paths, value } => {
+                qb.push(" AND (0");
+                for path in paths {
+                    qb.push(" OR (json_type(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") IN ('integer', 'real') AND json_extract(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") >= ");
+                    qb.push_bind(*value);
+                    qb.push(")");
+                }
+                qb.push(")");
+            }
+        }
     }
 }
 

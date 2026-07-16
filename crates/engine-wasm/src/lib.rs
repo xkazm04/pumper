@@ -79,7 +79,14 @@ impl Plugins for WasmPluginHost {
     }
 
     async fn reload(&self) -> Result<usize> {
-        let modules = load_dir(&self.engine, &self.dir);
+        // load_dir is synchronous fs + a full Cranelift compile per module. Run it
+        // off the async runtime — as `run` already does for the same reason — so a
+        // dir of 10-20 modules (~0.2-2s of compile) doesn't park a tokio worker and
+        // stall unrelated in-flight requests. Only the brief lock swap stays inline.
+        let (engine, dir) = (self.engine.clone(), self.dir.clone());
+        let modules = tokio::task::spawn_blocking(move || load_dir(&engine, &dir))
+            .await
+            .map_err(|e| Error::App(format!("plugin reload task panicked: {e}")))?;
         let count = modules.len();
         *self.modules.write().unwrap() = modules;
         tracing::info!(count, "reloaded wasm plugins");

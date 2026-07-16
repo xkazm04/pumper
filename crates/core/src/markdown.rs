@@ -22,6 +22,72 @@ pub fn html_to_markdown(html: &str) -> String {
     normalize(&out)
 }
 
+/// Characters of visible text (SKIP subtrees dropped, whitespace collapsed the
+/// same way the Markdown conversion collapses it), counted only up to `cap` and
+/// saturating there.
+///
+/// The tier-escalation decision only needs a predicate — "is there at least N
+/// chars of content?" — not a Markdown document. On the extractor/plugin hot
+/// paths, which don't request Markdown, using this instead of building and
+/// discarding a full `html_to_markdown` avoids a whole DOM serialize plus a
+/// document-sized `String` allocation per page, and it early-exits the walk once
+/// `cap` is reached. (It counts text, not markup/link URLs, so it is a slight
+/// under-count of the Markdown length — the right direction for "real content".)
+pub fn text_len_capped(html: &str, cap: usize) -> usize {
+    if cap == 0 {
+        return 0;
+    }
+    let doc = Html::parse_document(html);
+    let mut count = 0usize;
+    // Mirror `push_text`: a leading whitespace at a word boundary isn't counted.
+    let mut prev_ws = true;
+    count_text(doc.tree.root(), cap, &mut count, &mut prev_ws);
+    count
+}
+
+fn count_text(node: NodeRef<Node>, cap: usize, count: &mut usize, prev_ws: &mut bool) {
+    if *count >= cap {
+        return;
+    }
+    match node.value() {
+        Node::Text(text) => {
+            for ch in text.text.chars() {
+                if ch.is_whitespace() {
+                    if !*prev_ws {
+                        *count += 1;
+                        *prev_ws = true;
+                    }
+                } else {
+                    *count += 1;
+                    *prev_ws = false;
+                }
+                if *count >= cap {
+                    return;
+                }
+            }
+        }
+        Node::Element(el) => {
+            if SKIP.contains(&el.name()) {
+                return;
+            }
+            for child in node.children() {
+                count_text(child, cap, count, prev_ws);
+                if *count >= cap {
+                    return;
+                }
+            }
+        }
+        _ => {
+            for child in node.children() {
+                count_text(child, cap, count, prev_ws);
+                if *count >= cap {
+                    return;
+                }
+            }
+        }
+    }
+}
+
 #[derive(Default, Clone)]
 struct Ctx {
     /// Preserve whitespace inside <pre>.
@@ -278,7 +344,27 @@ fn normalize(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::html_to_markdown;
+    use super::{html_to_markdown, text_len_capped};
+
+    #[test]
+    fn text_len_capped_saturates_and_agrees_with_markdown_on_the_threshold() {
+        // A content-rich page: both the capped counter and the full markdown are
+        // over the threshold (the counter saturates at the cap).
+        let rich = format!("<main><p>{}</p></main>", "word ".repeat(200)); // ~1000 chars
+        assert_eq!(text_len_capped(&rich, 250), 250, "saturates at the cap");
+        assert!(html_to_markdown(&rich).chars().count() >= 250);
+
+        // A thin page: both are under the threshold, and the counter returns the
+        // exact (un-saturated) length.
+        let thin = "<main><p>just a little</p></main>";
+        let n = text_len_capped(thin, 250);
+        assert!(n < 250 && n == "just a little".len(), "exact when below cap: {n}");
+        assert!(html_to_markdown(thin).chars().count() < 250);
+
+        // Boilerplate is dropped, same as the markdown conversion.
+        let boiler = "<nav>Home About Contact Services</nav><footer>copyright notice here</footer><p>hi</p>";
+        assert_eq!(text_len_capped(boiler, 250), "hi".len(), "nav/footer skipped");
+    }
 
     #[test]
     fn strips_boilerplate_and_keeps_content() {

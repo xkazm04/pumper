@@ -35,7 +35,7 @@ pub use app::{AppContext, NoProgress, ProgressReporter, ScrapeApp};
 #[cfg(feature = "storage")]
 pub use cache::{HttpCache, ResearchCache};
 #[cfg(feature = "storage")]
-pub use costs::{CostEvent, CostLedger, CostSummary};
+pub use costs::{CostEvent, CostLedger, CostSummary, SpentTotal};
 #[cfg(feature = "storage")]
 pub use datasets::{
     diff_values, ChangeKind, Datasets, DupPair, Record, Revision, RevisionPage, UpsertSummary,
@@ -77,5 +77,5 @@ pub use markdown::html_to_markdown;
 pub use plugin::{NoPlugins, Plugins};
 pub use search::{
     FacetCount, NoSearch, Search, SearchDoc, SearchFacets, SearchHit, SearchRequest,
-    SearchResponse,
+    SearchResponse, SearchSort,
 };

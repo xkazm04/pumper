@@ -416,9 +416,25 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
             .map(|r| r.data)
             .collect()
     };
+    // The blend only ever uses state rows (the solo side has no county grain), so
+    // filter `geo = state` in SQL — SQLite drops the county rows before they cross
+    // the boundary and get JSON-parsed. Previously this read the ENTIRE
+    // establishments dataset (up to 50k) and discarded county rows in Rust after
+    // deserialization (~98% wasted on a nationwide county run), and the
+    // `ORDER BY updated_at DESC LIMIT 50000` meant a large dataset could silently
+    // return a recency window instead of the state rows the blend needs.
     let employers = live(
         ctx.datasets
-            .list("census-density", "establishments", BLEND_READ_LIMIT)
+            .list_filtered(
+                "census-density",
+                "establishments",
+                &[pumper_core::datasets::JsonFilter::Eq {
+                    path: "$.geo".into(),
+                    value: "state".into(),
+                }],
+                None,
+                BLEND_READ_LIMIT,
+            )
             .await?,
     );
     let solos = live(

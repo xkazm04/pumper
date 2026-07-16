@@ -17,6 +17,12 @@ schedule_tick_secs = 15      # how often the scheduler checks cron schedules
 [storage]
 database_path = "data/pumper.db"
 artifacts_dir = "data/artifacts"
+# Revision-history retention (OFF by default — a dataset's accrued history is the
+# product's value, so pruning is opt-in). When enabled, a janitor prunes
+# `record_revisions` older than N days every 6h, always keeping the newest
+# `revision_retention_keep_min` per record so diffs/history stay usable.
+# revision_retention_days = 90
+# revision_retention_keep_min = 5
 
 [http]
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -62,6 +68,9 @@ headless = true
 user_data_dir = "data/browser-profile"
 default_wait_ms = 1000
 nav_timeout_secs = 30
+# Cap on captured HTML per render (bytes); mirrors [http] max_body_bytes so a
+# JS-heavy page can't balloon memory on the browser tier. Default 16 MiB; 0 = off.
+# max_html_bytes = 16777216
 
 [claude]
 binary = "claude"

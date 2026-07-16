@@ -3,17 +3,73 @@
 //! governor, dropping near-duplicate pages, and streaming page bodies to the
 //! job's artifact directory.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use pumper_core::{
-    crawl, AppContext, CrawlConfig, CrawlPageRecord, Datasets, Error, PageSink, PageSource, Result,
-    RevisitSeed, ScrapeApp,
+    crawl, AppContext, CrawlConfig, CrawlPageRecord, Datasets, Error, HttpClient, HttpRequest,
+    HttpResponse, PageSink, PageSource, Result, RevisitSeed, ScrapeApp,
 };
 use serde_json::{json, Value};
 
 pub struct Crawl;
+
+/// Per-host fetch tally accumulated by [`MeteringHttpClient`] over a crawl.
+#[derive(Default)]
+struct HostTally {
+    fetches: usize,
+    /// True if any fetch to this host hit a bot-wall status or failed at the
+    /// transport layer — the signal the tier router learns from.
+    http_lost: bool,
+}
+
+/// Wraps the raw HTTP client the crawler drives so the crawl — the platform's
+/// highest-volume fetch path — stops being invisible to the cost ledger and the
+/// learned tier router. It cannot route through `AppContext::fetch` (it owns its
+/// own concurrency/robots/frontier control), so instead it tallies per-host
+/// outcomes here and the app flushes them through the metered seams *after* the
+/// crawl, in O(hosts) writes rather than O(fetches) — deliberately not one DB
+/// write per fetch, which would re-create the write contention that motivated
+/// the budget-total change in this same wave.
+struct MeteringHttpClient {
+    inner: Arc<dyn HttpClient>,
+    tallies: Arc<Mutex<HashMap<String, HostTally>>>,
+}
+
+#[async_trait]
+impl HttpClient for MeteringHttpClient {
+    async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+        let host = host_of(&req.url);
+        let result = self.inner.fetch(req).await;
+        if let Some(host) = host {
+            // Same bot-wall status set as `fetcher::http_bot_wall` (which is
+            // crate-private); a transport error is also an HTTP-tier loss.
+            let lost = match &result {
+                Ok(resp) => matches!(resp.status, 403 | 429 | 503),
+                Err(_) => true,
+            };
+            // std Mutex, no `.await` held across the guard.
+            let mut tallies = self.tallies.lock().unwrap_or_else(|e| e.into_inner());
+            let tally = tallies.entry(host).or_default();
+            tally.fetches += 1;
+            tally.http_lost |= lost;
+        }
+        result
+    }
+}
+
+/// Lowercased host of an http(s) URL — enough for crawl targets, without pulling
+/// in the `url` crate. Strips scheme, any `userinfo@`, the path/query/fragment,
+/// and the port.
+fn host_of(url: &str) -> Option<String> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority = after_scheme.split(['/', '?', '#']).next()?;
+    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let host = authority.split(':').next()?;
+    (!host.is_empty()).then(|| host.to_lowercase())
+}
 
 /// Max existing `pages` records loaded as revisit seeds per run (bounds the
 /// dataset read and the frontier). A larger known set is revisited across runs.
@@ -237,8 +293,17 @@ impl ScrapeApp for Crawl {
             reporter.report(serde_json::to_value(snap).unwrap_or_default());
         });
 
+        // Meter the crawl's fetches: wrap the raw HTTP client so per-host outcomes
+        // are tallied, then attribute them to the job through the cost ledger and
+        // tier router after the crawl (see MeteringHttpClient).
+        let tallies = Arc::new(Mutex::new(HashMap::<String, HostTally>::new()));
+        let metered_http: Arc<dyn HttpClient> = Arc::new(MeteringHttpClient {
+            inner: ctx.engines.http.clone(),
+            tallies: tallies.clone(),
+        });
+
         let stats = crawl(
-            ctx.engines.http.clone(),
+            metered_http,
             cfg,
             Some(ctx.artifacts_dir.clone()),
             Some(sink),
@@ -246,6 +311,18 @@ impl ScrapeApp for Crawl {
             Some(progress),
         )
         .await?;
+
+        // Flush the tally: one cost event + one tier-router signal per host. HTTP
+        // fetches cost $0 (only the Claude tier spends), so this feeds call-count /
+        // ROI accounting and, crucially, teaches the router which hosts bot-wall
+        // the HTTP tier — the crawl's richest signal, previously discarded.
+        let tallies = std::mem::take(&mut *tallies.lock().unwrap_or_else(|e| e.into_inner()));
+        for (host, tally) in tallies {
+            let url = format!("https://{host}/");
+            let detail = format!("crawl: {} http fetches", tally.fetches);
+            ctx.meter("http", Some(&url), 0.0, Some(&detail)).await;
+            ctx.learn_tier(&host, "http", tally.http_lost).await;
+        }
 
         let pages_new = counts.new.load(Ordering::Relaxed);
         let pages_changed = counts.changed.load(Ordering::Relaxed);
@@ -282,5 +359,29 @@ impl ScrapeApp for Crawl {
             "new": pages_new,
             "gone": stats.gone,
         }))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_of;
+
+    #[test]
+    fn extracts_lowercased_host() {
+        assert_eq!(host_of("https://Example.COM/path?q=1"), Some("example.com".into()));
+        assert_eq!(host_of("http://example.com"), Some("example.com".into()));
+    }
+
+    #[test]
+    fn strips_port_userinfo_and_path() {
+        assert_eq!(host_of("https://user:pw@host.example:8443/a/b"), Some("host.example".into()));
+        assert_eq!(host_of("https://host.example:443/"), Some("host.example".into()));
+        assert_eq!(host_of("https://host.example/a?x#y"), Some("host.example".into()));
+    }
+
+    #[test]
+    fn rejects_empty_or_hostless() {
+        assert_eq!(host_of("https:///just-a-path"), None);
+        assert_eq!(host_of(""), None);
     }
 }

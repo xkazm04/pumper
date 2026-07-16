@@ -13,7 +13,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::FetcherConfig;
 use crate::engine::{Browser, HttpClient, HttpRequest, RenderRequest, Researcher};
-use crate::markdown::html_to_markdown;
+use crate::governor::Governor;
+use crate::markdown::{html_to_markdown, text_len_capped};
 use crate::{Error, ResearchRequest, Result};
 
 /// Case-insensitive marker phrases that identify a bot-wall / interstitial
@@ -212,6 +213,12 @@ pub struct Fetcher {
     http: Arc<dyn HttpClient>,
     browser: Arc<dyn Browser>,
     claude: Arc<dyn Researcher>,
+    /// The same per-host politeness governor the HTTP engine uses. The HTTP tier
+    /// is governed inside `HttpEngine::send` (so raw-HTTP callers like the crawler
+    /// are still spaced); the browser tier has no such internal seam, so the
+    /// Fetcher governs it here — sharing this one instance keeps per-host spacing
+    /// coherent across an http -> browser escalation.
+    governor: Arc<Governor>,
     /// Default escalation threshold from `[fetcher] min_content_chars`; a
     /// per-request `min_content_chars` overrides it.
     min_content_chars: usize,
@@ -222,9 +229,10 @@ impl Fetcher {
         http: Arc<dyn HttpClient>,
         browser: Arc<dyn Browser>,
         claude: Arc<dyn Researcher>,
+        governor: Arc<Governor>,
         cfg: &FetcherConfig,
     ) -> Self {
-        Self { http, browser, claude, min_content_chars: cfg.min_content_chars }
+        Self { http, browser, claude, governor, min_content_chars: cfg.min_content_chars }
     }
 
     pub async fn fetch(&self, req: FetchRequest) -> Result<FetchOutcome> {
@@ -260,9 +268,16 @@ impl Fetcher {
                     let wall = needs_count
                         .then(|| http_bot_wall(resp.status, &resp.body))
                         .flatten();
-                    let markdown =
-                        (req.to_markdown || needs_count).then(|| html_to_markdown(&resp.body));
-                    let text_len = markdown.as_ref().map(|m| m.chars().count());
+                    // Build the Markdown document only when the caller wants it.
+                    // For the escalation decision alone, count text with an
+                    // early-exit capped counter instead of materializing (then
+                    // discarding) a full-page Markdown String.
+                    let markdown = req.to_markdown.then(|| html_to_markdown(&resp.body));
+                    let text_len = match &markdown {
+                        Some(md) => Some(md.chars().count()),
+                        None if needs_count => Some(text_len_capped(&resp.body, min_chars)),
+                        None => None,
+                    };
                     let cache_hit = Some(resp.cache_hit);
                     let enough = wall.is_none()
                         && resp.is_success()
@@ -333,6 +348,16 @@ impl Fetcher {
             let mut render = RenderRequest::new(&req.url);
             render.wait_for_selector = req.wait_for_selector.clone();
             render.profile = req.profile.clone();
+            // Space the browser render per-host, exactly as the HTTP tier is
+            // spaced inside its engine. Critical because the learned tier router
+            // pins repeatedly-blocked hosts to the browser tier — so without this
+            // the hosts already hostile to us would receive *unlimited* renders.
+            let host = url::Url::parse(&req.url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_lowercase));
+            if let Some(host) = &host {
+                self.governor.acquire(host).await;
+            }
             let started = Instant::now();
             match self.browser.render(render).await {
                 Ok(page) => {
@@ -346,11 +371,23 @@ impl Fetcher {
                     // browser has no HTTP status), so add a marker heuristic
                     // beyond char count before handing off to Claude.
                     let wall = needs_count.then(|| challenge_marker(&page.html)).flatten();
-                    let markdown =
-                        (req.to_markdown || needs_count).then(|| html_to_markdown(&page.html));
-                    let text_len = markdown.as_ref().map(|m| m.chars().count());
+                    // Build Markdown only for the caller; the escalation decision
+                    // uses the capped text counter (no full-page String built and
+                    // thrown away when to_markdown is false).
+                    let markdown = req.to_markdown.then(|| html_to_markdown(&page.html));
+                    let text_len = match &markdown {
+                        Some(md) => Some(md.chars().count()),
+                        None if needs_count => Some(text_len_capped(&page.html, min_chars)),
+                        None => None,
+                    };
                     let enough = wall.is_none() && text_len.map_or(true, |n| n >= min_chars);
                     if enough || req.strategy != FetchStrategy::AutoWithResearch {
+                        // A healthy browser fetch decays any learned penalty on the
+                        // host (no-op when unpenalized) — the recovery half of the
+                        // loop, mirroring the HTTP tier's reward-on-success.
+                        if let Some(host) = &host {
+                            self.governor.reward(host).await;
+                        }
                         trace.push(TierTrace {
                             tier: FetchTier::Browser,
                             verdict: TierVerdict::Ok,
@@ -373,6 +410,14 @@ impl Fetcher {
                     }
                     let (verdict, detail) = match wall {
                         Some(reason) => {
+                            // A browser-tier bot-wall teaches the governor to back
+                            // off this host — previously the adaptive penalty was
+                            // blind on the browser tier, exactly where the router
+                            // concentrates blocked-host traffic. No status here, so
+                            // no server Retry-After to honor.
+                            if let Some(host) = &host {
+                                self.governor.penalize(host, None).await;
+                            }
                             escalations.push(format!("browser tier blocked: {reason}"));
                             (TierVerdict::Blocked, Some(reason))
                         }
@@ -644,5 +689,126 @@ mod tests {
         assert!(challenge_marker(html).is_some());
         let real = "<html><body><article>A long, ordinary news story with no gates.</article></body></html>";
         assert!(challenge_marker(real).is_none());
+    }
+
+    // --- Browser-tier governor integration ---
+
+    use std::time::Duration;
+
+    use crate::config::GovernorConfig;
+    use crate::engine::{HttpResponse, RenderedPage, ResearchOutput};
+    use async_trait::async_trait;
+
+    /// Browser stub that returns a fixed HTML body for every render.
+    struct StubBrowser {
+        html: String,
+    }
+    #[async_trait]
+    impl Browser for StubBrowser {
+        async fn render(&self, _req: RenderRequest) -> Result<RenderedPage> {
+            Ok(RenderedPage { html: self.html.clone(), ..Default::default() })
+        }
+    }
+
+    struct DeadHttp;
+    #[async_trait]
+    impl HttpClient for DeadHttp {
+        async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
+            panic!("http tier must not be called: these tests skip_http");
+        }
+    }
+
+    /// Researcher stub — the Claude tier the AutoWithResearch strategy falls
+    /// through to after a blocked/thin browser render.
+    struct StubResearcher;
+    #[async_trait]
+    impl Researcher for StubResearcher {
+        async fn research(&self, _req: ResearchRequest) -> Result<ResearchOutput> {
+            Ok(ResearchOutput {
+                text: "researched content".into(),
+                json: None,
+                cost_usd: Some(0.0),
+                duration_ms: None,
+                num_turns: None,
+                session_id: None,
+            })
+        }
+    }
+
+    fn fetcher_with(browser: StubBrowser, governor: Arc<Governor>) -> Fetcher {
+        Fetcher::new(
+            Arc::new(DeadHttp),
+            Arc::new(browser),
+            Arc::new(StubResearcher),
+            governor,
+            &FetcherConfig { min_content_chars: 100, ..FetcherConfig::default() },
+        )
+    }
+
+    fn enabled_governor() -> Arc<Governor> {
+        // Politeness spacing disabled (rps huge, no jitter) so the test never
+        // sleeps; only the learned penalty behaviour is under test.
+        let cfg = GovernorConfig {
+            enabled: true,
+            default_rps: 1_000_000.0,
+            jitter_ms: 0,
+            ..GovernorConfig::default()
+        };
+        Arc::new(Governor::new(&cfg))
+    }
+
+    #[tokio::test]
+    async fn browser_tier_bot_wall_penalizes_the_host() {
+        // A challenge wall reached via the browser tier must teach the governor
+        // to back off — the learning hole this change closes (previously the
+        // browser tier never called penalize).
+        let governor = enabled_governor();
+        let wall = "<html><head><title>Just a moment...</title></head><body>\
+            <div class=\"cf-browser-verification\">Checking your browser before accessing.</div>\
+            </body></html>";
+        let fetcher = fetcher_with(StubBrowser { html: wall.into() }, governor.clone());
+
+        assert_eq!(governor.penalty("blocked.example").await, Duration::ZERO);
+
+        let mut req = FetchRequest::new("https://blocked.example/page");
+        req.strategy = FetchStrategy::AutoWithResearch;
+        req.skip_http = true; // straight to the browser tier
+        let outcome = fetcher.fetch(req).await.unwrap();
+
+        // The wall drove escalation to the Claude tier...
+        assert_eq!(outcome.engine, "claude");
+        assert!(outcome.trace.iter().any(|t| t.tier == FetchTier::Browser
+            && t.verdict == TierVerdict::Blocked));
+        // ...and the governor learned a penalty for the host.
+        assert!(
+            governor.penalty("blocked.example").await > Duration::ZERO,
+            "browser bot-wall must penalize the host"
+        );
+    }
+
+    #[tokio::test]
+    async fn healthy_browser_render_rewards_the_host() {
+        // A clean browser fetch decays a pre-existing learned penalty (the
+        // recovery half of the loop), mirroring the HTTP tier's reward-on-success.
+        let governor = enabled_governor();
+        governor.penalize("recovering.example", Some(Duration::from_secs(4))).await;
+        assert_eq!(governor.penalty("recovering.example").await, Duration::from_secs(4));
+
+        let good = "<html><body><article>A perfectly ordinary page with plenty of \
+            real readable content, well past the hundred-character threshold used \
+            for escalation decisions in this test.</article></body></html>";
+        let fetcher = fetcher_with(StubBrowser { html: good.into() }, governor.clone());
+
+        let mut req = FetchRequest::new("https://recovering.example/page");
+        req.strategy = FetchStrategy::Browser; // browser-only: returns the render as-is
+        let outcome = fetcher.fetch(req).await.unwrap();
+        assert_eq!(outcome.engine, "browser");
+
+        // reward() halves the learned penalty.
+        assert_eq!(
+            governor.penalty("recovering.example").await,
+            Duration::from_secs(2),
+            "healthy browser render must decay the penalty"
+        );
     }
 }
