@@ -199,6 +199,11 @@ pub struct RenderRequest {
     /// instance (`[browser] user_data_dir`) — exactly the previous behavior.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Cap on the captured HTML size (bytes); over-cap renders fail instead of
+    /// buffering an unbounded DOM. `None` falls back to `[browser] max_html_bytes`
+    /// — the browser-tier mirror of `HttpRequest.max_body_bytes`.
+    #[serde(default)]
+    pub max_body_bytes: Option<u64>,
 }
 
 impl RenderRequest {
@@ -210,6 +215,7 @@ impl RenderRequest {
             evaluate: None,
             load_all_resources: false,
             profile: None,
+            max_body_bytes: None,
         }
     }
 }

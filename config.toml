@@ -68,6 +68,9 @@ headless = true
 user_data_dir = "data/browser-profile"
 default_wait_ms = 1000
 nav_timeout_secs = 30
+# Cap on captured HTML per render (bytes); mirrors [http] max_body_bytes so a
+# JS-heavy page can't balloon memory on the browser tier. Default 16 MiB; 0 = off.
+# max_html_bytes = 16777216
 
 [claude]
 binary = "claude"

@@ -328,6 +328,13 @@ pub struct BrowserConfig {
     /// URL — an authenticated proxy prompts interactively, so browser-tier proxy
     /// auth is unsupported (a known gap).
     pub proxy: Option<String>,
+    /// Cap on captured HTML per render (bytes). The browser-tier mirror of
+    /// `[http] max_body_bytes`: a JS-heavy page can build a huge DOM, and without
+    /// this the whole serialized HTML is buffered into an unbounded String — the
+    /// exact scenario the HTTP cap guards, but on the more expensive tier. Default
+    /// 16 MiB, matching `[http] max_body_bytes`. `0` disables the cap.
+    /// `RenderRequest.max_body_bytes` overrides it per render.
+    pub max_html_bytes: u64,
 }
 
 impl Default for BrowserConfig {
@@ -342,6 +349,7 @@ impl Default for BrowserConfig {
             block_resources: true,
             recycle_after_renders: 200,
             proxy: None,
+            max_html_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
