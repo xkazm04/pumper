@@ -184,3 +184,12 @@
 - **Cloning owned data to reshape it.** `keyed.iter().map(|(_,d)| d.clone())` deep-cloned every body to split keys from docs while `keyed` was dropped right after — `into_iter().unzip()` is zero-copy. Pass `impl IntoIterator<Item=&T>` instead of collecting a `Vec<T::clone>` for a read-only summarizer.
 - **A cap on the cheap path but not the expensive one.** HTTP capped its body; the browser tier (more expensive, bigger DOMs) buffered unbounded. Make the size guard a tier-agnostic contract, not a property of one engine's streaming.
 - **Filtering after deserialization.** census read the whole dataset and dropped county rows in Rust; push the `geo=state` predicate into SQL via list_filtered so rows never cross the boundary (also removes the ORDER-BY-LIMIT truncation cliff).
+
+## Structural facts (medium-tail batch 2, 2026-07-16)
+- **2026-07-16** — Router has a CompressionLayer (gzip/br; skips SSE, streams). Search gained SearchRequest.offset + SearchResponse.total (exact via Count in a MultiCollector pass); GET /search?offset= clamped SEARCH_MAX_OFFSET=10k; returns total(match count)+count(page size). Webhook deliveries carry x-pumper-delivery-id (stable idempotency key across retries/replay) + x-pumper-timestamp; signature base = HMAC(secret,"{ts}.{id}."++body). Scheduler decide() is O(1) per tick (earliest via one iterator step; Fire enumerates ≤COLLAPSE_LOG_CAP=64; Skip full but one-time); parsed crons cached in run() by expression string.
+
+## Anti-patterns to avoid (medium-tail batch 2, 2026-07-16)
+- **`count` = page size masquerading as a total.** /search reported hits.len() as count. Add a real total (Count collector, same pass) + offset for page 2.
+- **Webhook with body-only HMAC, no id/ts.** No idempotency key + unbounded replay window. Sign "{ts}.{delivery_id}."++body; keep delivery_id stable across retries/replays.
+- **Enumerating a whole backlog for a number one branch ignores.** Scheduler counted every missed firing per tick though Fire only logs it; find the cheap discriminator (earliest firing) first, bound the diagnostic walk.
+- **Test unique-dir from a timestamp alone races under parallelism.** Same-nanosecond collision → two TantivyIndex fight the writer lock. Use an atomic counter.
