@@ -150,3 +150,13 @@
 - dataset-store#3 (High): no delete/retention API — store only grows (unbounded revisions). 3-part feature (delete_record/delete_dataset + prune_revisions + janitor tick). Its own session.
 - search#2 (High): backfill/reindex bin — Wave-2 incremental indexing now DEPENDS on it for wiped-index recovery. Pairs with dataset-store#3.
 - broad-crawler#1 tail: delta/journal checkpoint + off-loop single-flight save (time-gate removed the amplification; these remove the per-save frontier serialize + fetch stall).
+
+## Structural facts (retention + search-backfill session, 2026-07-16)
+- **2026-07-16** — `SearchDoc::from_dataset_record` + `SearchDoc::dataset_id` live in `pumper_core::search` (moved from a private worker fn) so the live worker indexing AND the `search-backfill` bin build identical docs. `Search::doc_count` added (trait + TantivyIndex `num_docs` + NoSearch→0), surfaced on `GET /search/status`.
+- **2026-07-16** — `--bin search-backfill` (crates/server/src/bin/) rebuilds the search index from stored records; scope REQUIRED (`--all`/`--app`/`--app --dataset`). Run with the server STOPPED (Tantivy exclusive writer lock). The live path only maintains datasets named in an app's `index_datasets` (today grants/unified), so backfilling others makes them searchable but not incrementally maintained.
+- **2026-07-16** — `Datasets::{delete_record,delete_dataset,prune_revisions,list_all_datasets}` added. delete_* are HARD deletes (records+revisions in one BEGIN IMMEDIATE) distinct from detect_removed tombstoning; DELETE routes also drop search docs. Retention janitor in main.rs prunes revisions every 6h, OFF by default (`[storage] revision_retention_days=0`).
+
+## Anti-patterns to avoid (retention + search-backfill session, 2026-07-16)
+- **Removing a full-rebuild without shipping a rebuild path.** Wave 2's delta-indexing removed the accidental "re-index whole dataset per run" safety net → a wiped index only refilled as apps ran. Any "index by delta" change must ship a backfill bin + an observable doc_count.
+- **Divergent doc builders for live vs backfill index paths.** If they build docs differently (id, fields), a re-index silently duplicates or mis-deletes. One shared `from_record` builder.
+- **Destructive retention defaulting ON.** Silently pruning a user's accrued history is data loss; the retention janitor is opt-in and no-ops when disabled.
