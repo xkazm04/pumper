@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use tokio::sync::Notify;
 
-use tantivy::collector::TopDocs;
+use tantivy::collector::{Count, MultiCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::{Field, IndexRecordOption, Schema, FAST, INDEXED, STORED, STRING, TEXT};
 use tantivy::{doc, Document, Index, IndexReader, IndexWriter, Order, TantivyDocument, Term};
@@ -412,25 +412,44 @@ impl Search for TantivyIndex {
                 Box::new(BooleanQuery::new(clauses))
             };
 
-            let sample_size = req.limit.max(FACET_SAMPLE);
-            // Order by relevance or recency. The recency collector yields the
-            // fast-field value in place of a BM25 score; normalize both to
-            // `(f32 score, DocAddress)` so the hit-building loop is shared (a
-            // newest-sorted hit carries score 0.0 — it was not ranked by relevance).
-            let top: Vec<(f32, tantivy::DocAddress)> = match req.sort {
-                SearchSort::Score => searcher
-                    .search(&query, &TopDocs::with_limit(sample_size).order_by_score())
-                    .map_err(|e| Error::App(format!("search: {e}")))?,
-                SearchSort::Newest => searcher
-                    .search(
-                        &query,
-                        &TopDocs::with_limit(sample_size)
+            // Rank enough docs to cover the requested page AND the facet sample.
+            let sample_size = req.offset.saturating_add(req.limit).max(FACET_SAMPLE);
+            // One collector pass yields both the ranked window and the EXACT match
+            // total (via a Count collector) — so `total` is the real denominator
+            // for paging, not the page size. Order by relevance or recency; the
+            // recency collector yields the fast-field value in place of a BM25
+            // score, normalized to `(f32, DocAddress)` (score 0.0) so the
+            // hit-building loop is shared.
+            let (top, total): (Vec<(f32, tantivy::DocAddress)>, u64) = match req.sort {
+                SearchSort::Score => {
+                    let mut multi = MultiCollector::new();
+                    let count_h = multi.add_collector(Count);
+                    let top_h =
+                        multi.add_collector(TopDocs::with_limit(sample_size).order_by_score());
+                    let mut fruits = searcher
+                        .search(&query, &multi)
+                        .map_err(|e| Error::App(format!("search: {e}")))?;
+                    let total = count_h.extract(&mut fruits) as u64;
+                    (top_h.extract(&mut fruits), total)
+                }
+                SearchSort::Newest => {
+                    let mut multi = MultiCollector::new();
+                    let count_h = multi.add_collector(Count);
+                    let top_h = multi.add_collector(
+                        TopDocs::with_limit(sample_size)
                             .order_by_fast_field::<i64>("indexed_at", Order::Desc),
-                    )
-                    .map_err(|e| Error::App(format!("search: {e}")))?
-                    .into_iter()
-                    .map(|(_ts, addr)| (0.0_f32, addr))
-                    .collect(),
+                    );
+                    let mut fruits = searcher
+                        .search(&query, &multi)
+                        .map_err(|e| Error::App(format!("search: {e}")))?;
+                    let total = count_h.extract(&mut fruits) as u64;
+                    let top = top_h
+                        .extract(&mut fruits)
+                        .into_iter()
+                        .map(|(_ts, addr)| (0.0_f32, addr))
+                        .collect();
+                    (top, total)
+                }
             };
 
             // Highlighted body fragments; best-effort (empty on failure).
@@ -457,7 +476,9 @@ impl Search for TantivyIndex {
                 let (app, dataset) = (get("app"), get("dataset"));
                 *app_counts.entry(app.clone()).or_insert(0) += 1;
                 *dataset_counts.entry(dataset.clone()).or_insert(0) += 1;
-                if i < req.limit {
+                // Hits are the `offset..offset+limit` window; facets still sample
+                // the whole ranked set above.
+                if i >= req.offset && i < req.offset + req.limit {
                     let snippet = snippets
                         .as_ref()
                         .map(|g| g.snippet_from_doc(&doc).to_html())
@@ -487,6 +508,7 @@ impl Search for TantivyIndex {
                     apps: to_facets(app_counts),
                     datasets: to_facets(dataset_counts),
                 },
+                total,
             })
         })
         .await

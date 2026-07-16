@@ -2074,6 +2074,8 @@ struct SearchQuery {
     sort: Option<String>,
     /// Only hits indexed at/after this unix-seconds instant (a "what's new" feed).
     since: Option<i64>,
+    /// Skip this many ranked hits before `limit` (page 2 = `offset=limit`). Capped.
+    offset: Option<usize>,
 }
 
 fn default_search_limit() -> usize {
@@ -2088,7 +2090,7 @@ fn default_search_limit() -> usize {
     tag = "search",
     params(SearchQuery),
     responses(
-        (status = 200, description = "`{query, count, hits, facets}` — BM25 ranked (or `sort=newest`), highlighted snippets. `sort=newest` orders by index time; `since=<unix-secs>` filters to recent docs."),
+        (status = 200, description = "`{query, total, count, hits, facets}` — BM25 ranked (or `sort=newest`), highlighted snippets. `total` is the full match count; `count` is the returned page size. `offset` pages (offset=limit → page 2); `sort=newest` orders by index time; `since=<unix-secs>` filters to recent docs."),
         (status = 400, description = "Empty query", body = Object),
     )
 )]
@@ -2117,15 +2119,22 @@ async fn search(
         fuzzy: query.fuzzy,
         sort,
         since: query.since,
+        // Clamp like `limit`: deep Tantivy offsets get progressively costlier.
+        offset: query.offset.unwrap_or(0).min(SEARCH_MAX_OFFSET),
     };
     let results = state.search.query(req).await?;
     Ok(Json(json!({
         "query": query.q,
+        // The real match count (was hits.len(), i.e. the page size).
+        "total": results.total,
         "count": results.hits.len(),
         "hits": results.hits,
         "facets": results.facets,
     })))
 }
+
+/// Upper bound on `GET /search?offset=` — deep offsets get costlier in Tantivy.
+const SEARCH_MAX_OFFSET: usize = 10_000;
 
 #[utoipa::path(
     get,

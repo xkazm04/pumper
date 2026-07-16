@@ -103,6 +103,8 @@ pub struct SearchRequest {
     pub sort: SearchSort,
     /// Only hits indexed at/after this unix-seconds instant (a "what's new" feed).
     pub since: Option<i64>,
+    /// Skip this many ranked hits before `limit` — page 2 = `offset: limit`.
+    pub offset: usize,
 }
 
 impl SearchRequest {
@@ -129,6 +131,9 @@ pub struct SearchFacets {
 pub struct SearchResponse {
     pub hits: Vec<SearchHit>,
     pub facets: SearchFacets,
+    /// Total documents matching the query, independent of `limit`/`offset` — the
+    /// denominator for paging (was silently reported as the page size).
+    pub total: u64,
 }
 
 #[async_trait]
