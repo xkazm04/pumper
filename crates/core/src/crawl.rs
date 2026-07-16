@@ -478,6 +478,8 @@ pub async fn crawl(
     let mut in_flight = FuturesUnordered::new();
     // Per-host earliest-next-fetch, driven by robots.txt Crawl-delay.
     let mut next_allowed: HashMap<String, tokio::time::Instant> = HashMap::new();
+    // Last intermediate checkpoint save. Time-based, not page-based (see below).
+    let mut last_checkpoint = tokio::time::Instant::now();
 
     // Expand seeds from each seed host's sitemaps before crawling.
     if cfg.sitemap_seeds {
@@ -631,13 +633,24 @@ pub async fn crawl(
                     }
                 }
             }
-            // Periodic checkpoint so a killed process loses at most one stride.
-            if stats.kept % CHECKPOINT_STRIDE == 0 {
+            // Periodic checkpoint, gated by wall-clock rather than page count.
+            // `Checkpoint::save` serializes the WHOLE frontier (up to MAX_FRONTIER
+            // seen-strings + queue + kept hashes) — O(frontier), not O(delta) — so
+            // firing it every N kept pages made total checkpoint work
+            // O(pages/N × frontier): a 100k-page crawl did thousands of full ~10 MB
+            // rewrites (tens of GB of write amplification) for state that moved by a
+            // handful of pages, and each inline save stalled every in-flight fetch.
+            // A minimum interval decouples save count from crawl size; the final
+            // save below still captures the true end state, and the frontier's own
+            // seen-set makes a resume idempotent, so widening the worst-case resume
+            // loss from N pages to a few seconds is safe.
+            if cfg.checkpoint.is_some() && last_checkpoint.elapsed() >= CHECKPOINT_MIN_INTERVAL {
                 if let Some(path) = &cfg.checkpoint {
                     if !Checkpoint::save(path, &frontier, dedup_index.hashes()).await {
                         stats.checkpoint_errors += 1;
                     }
                 }
+                last_checkpoint = tokio::time::Instant::now();
             }
         }
 
@@ -696,7 +709,12 @@ pub async fn crawl(
     Ok(stats)
 }
 
-const CHECKPOINT_STRIDE: usize = 25;
+/// Minimum wall-clock between intermediate checkpoint saves. Each save is a full
+/// O(frontier) serialize, so this bounds total checkpoint work by crawl *duration*
+/// instead of page count. The final save on exit is unconditional, so this only
+/// affects mid-crawl resume granularity (a few seconds of re-crawl, which the
+/// seen-set makes idempotent).
+const CHECKPOINT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Cap on the per-host failure map surfaced in the result — only the worst
 /// offenders are useful; the total lives in `failed`.
