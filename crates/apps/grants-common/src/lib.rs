@@ -137,6 +137,106 @@ pub fn normalize_ca_grants(rec: &Value) -> Option<(String, Value)> {
     Some((format!("ca-grants:{id}"), unified))
 }
 
+/// Normalizes an eu-sedia **already-normalized** `opportunities` record (the
+/// output of the eu-sedia app's own `normalize`, so titles/descriptions are
+/// already entity-decoded) into the unified schema.
+///
+/// Two SEDIA-specific traps are handled here so the pan-EU corpus doesn't
+/// silently corrupt the shared query surface:
+/// - **status** is a numeric code (`31094502`=open, `31094501`=forthcoming), not
+///   a word. Passing it through `norm_status` would write the literal digits into
+///   `status` and break every `?status=open` filter and the sweep predicate, so
+///   the two real codes are mapped explicitly and anything else is left `Null`.
+/// - **money** (`budgetOverview`) is EUR and the unified schema has no currency
+///   dimension, so award/funding stay `Null` rather than filing euros as if they
+///   were ca-grants dollars. (Revisit once unified gains a `currency` field.)
+pub fn normalize_eu_sedia(rec: &Value) -> Option<(String, Value)> {
+    let id = str_of(rec, &["identifier"])?;
+    let today = chrono::Utc::now().date_naive();
+    let unified = json!({
+        "source": "eu-sedia",
+        "source_id": id,
+        "title": str_of(rec, &["title"]),
+        "agency": sedia_agency(rec),
+        "status": sedia_status(str_of(rec, &["status"]).as_deref()),
+        "open_date": str_of(rec, &["startDate"]).as_deref().and_then(norm_date),
+        "close_date": sedia_close_date(rec.get("deadlineDate").unwrap_or(&Value::Null), today),
+        // EUR, and unified has no currency dimension — Null, never fabricated USD.
+        "award_floor": Value::Null,
+        "award_ceiling": Value::Null,
+        "total_funding": Value::Null,
+        "categories": sedia_categories(rec),
+        // Not present in the SEDIA search hit.
+        "eligibilities": Value::Array(vec![]),
+        // ALN/CFDA is a US-only concept.
+        "aln": Value::Null,
+        "url": str_of(rec, &["url"]),
+        // Already-cleaned plain text; match the 500-char cap the other sources use.
+        "description": str_of(rec, &["description_text"])
+            .map(|d| d.chars().take(500).collect::<String>()),
+    });
+    Some((format!("eu-sedia:{id}"), unified))
+}
+
+/// SEDIA has no agency column; the framework programme (e.g. "Horizon Europe")
+/// is the honest analogue, qualified by the call identifier when present.
+fn sedia_agency(rec: &Value) -> Value {
+    match (str_of(rec, &["frameworkProgramme"]), str_of(rec, &["callIdentifier"])) {
+        (Some(fp), Some(call)) => Value::String(format!("{fp} — {call}")),
+        (Some(fp), None) => Value::String(fp),
+        (None, Some(call)) => Value::String(call),
+        (None, None) => Value::Null,
+    }
+}
+
+/// typesOfAction + programmePeriod as the category axis — the SEDIA search hit
+/// carries no topic taxonomy.
+fn sedia_categories(rec: &Value) -> Value {
+    let mut cats = Vec::new();
+    if let Some(t) = str_of(rec, &["typesOfAction"]) {
+        cats.push(Value::String(t));
+    }
+    if let Some(p) = str_of(rec, &["programmePeriod"]) {
+        cats.push(Value::String(p));
+    }
+    Value::Array(cats)
+}
+
+/// Maps SEDIA numeric status codes to the canonical vocabulary. Only the two
+/// codes the app queries are known; anything else is `Null` rather than passed
+/// through `norm_status` (which would emit the literal code).
+fn sedia_status(code: Option<&str>) -> Value {
+    match code {
+        Some("31094502") => Value::String("open".into()),
+        Some("31094501") => Value::String("forecasted".into()),
+        _ => Value::Null,
+    }
+}
+
+/// The unified `close_date` for a SEDIA topic. `deadlineDate` is kept whole
+/// because multi-stage/multi-cutoff calls carry several dates: the effective
+/// deadline is the earliest cutoff still upcoming, and once every cutoff is past
+/// the latest one (so `sweep_closed` can retire the topic). Taking `[0]` blindly
+/// would flip a still-open two-stage call to `closed` the moment its first cutoff
+/// passes. Accepts an array or a lone value; unparseable/absent → `None`.
+fn sedia_close_date(deadline: &Value, today: chrono::NaiveDate) -> Option<String> {
+    let mut dates: Vec<chrono::NaiveDate> = match deadline {
+        Value::Array(a) => a.iter().filter_map(Value::as_str).filter_map(parse_date).collect(),
+        Value::String(s) => parse_date(s).into_iter().collect(),
+        _ => Vec::new(),
+    };
+    if dates.is_empty() {
+        return None;
+    }
+    dates.sort_unstable();
+    let chosen = dates
+        .iter()
+        .find(|d| **d >= today)
+        .copied()
+        .unwrap_or_else(|| *dates.last().unwrap());
+    Some(chosen.to_string())
+}
+
 /// Upserts normalized grants into the cross-source unified dataset.
 pub async fn sync_unified(
     ctx: &AppContext,
@@ -541,6 +641,81 @@ mod tests {
         assert!(!is_past_due_open(Some("closed"), Some("2026-01-01"), today));
         assert!(!is_past_due_open(Some("open"), None, today));
         assert!(!is_past_due_open(Some("open"), Some("n/a"), today));
+    }
+
+    #[test]
+    fn eu_sedia_normalizes_with_status_codes_null_money_and_stage_deadline() {
+        // A normalized eu-sedia record (the eu-sedia app's `normalize` output):
+        // status is a numeric code, deadlineDate is a multi-stage array, budget
+        // is EUR.
+        let today = chrono::Utc::now().date_naive();
+        let stage1 = (today - chrono::Duration::days(30))
+            .format("%Y-%m-%dT17:00:00Z")
+            .to_string();
+        let stage2 = (today + chrono::Duration::days(60))
+            .format("%Y-%m-%dT17:00:00Z")
+            .to_string();
+        let rec = json!({
+            "identifier": "HORIZON-CL4-2026-DATA-01",
+            "title": "AI & Robotics – Phase II",
+            "status": "31094502",                               // as stored: a string code
+            "frameworkProgramme": "Horizon Europe",
+            "callIdentifier": "HORIZON-CL4-2026-01",
+            "typesOfAction": "HORIZON-RIA",
+            "programmePeriod": "2021-2027",
+            "startDate": "2026-01-15",
+            "deadlineDate": [stage1, stage2.clone()],
+            "budgetOverview": "EUR 10 000 000",
+            "url": "https://ec.europa.eu/x",
+            "description_text": "Expected Outcome: projects contribute to a trustworthy AI single market.",
+        });
+        let (key, v) = normalize_eu_sedia(&rec).unwrap();
+        assert_eq!(key, "eu-sedia:HORIZON-CL4-2026-DATA-01");
+        assert_eq!(v["source"], "eu-sedia");
+        // Numeric code mapped to the canonical word, NOT passed through literally.
+        assert_eq!(v["status"], "open");
+        // Money stays Null (EUR, no currency dimension) — never fabricated USD.
+        assert_eq!(v["award_floor"], Value::Null);
+        assert_eq!(v["award_ceiling"], Value::Null);
+        assert_eq!(v["total_funding"], Value::Null);
+        // Multi-stage deadline: the earliest cutoff still upcoming wins, not [0].
+        assert_eq!(v["close_date"], stage2.split('T').next().unwrap());
+        assert_eq!(v["agency"], "Horizon Europe — HORIZON-CL4-2026-01");
+        assert_eq!(v["categories"], json!(["HORIZON-RIA", "2021-2027"]));
+        assert_eq!(v["aln"], Value::Null);
+        assert_eq!(v["eligibilities"], json!([]));
+    }
+
+    #[test]
+    fn eu_sedia_unknown_status_code_is_null_not_passed_through() {
+        // An unrecognized code must not leak into `status` (it would break
+        // ?status=open and the sweep predicate).
+        let rec = json!({ "identifier": "X", "status": "99999999" });
+        let (_, v) = normalize_eu_sedia(&rec).unwrap();
+        assert_eq!(v["status"], Value::Null);
+    }
+
+    #[test]
+    fn eu_sedia_close_date_prefers_earliest_upcoming_else_latest_past() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
+        let d = |s: &str| Value::String(s.to_string());
+        // All future → earliest.
+        let all_future = json!([d("2026-09-01"), d("2026-08-01")]);
+        assert_eq!(sedia_close_date(&all_future, today).as_deref(), Some("2026-08-01"));
+        // Mixed → earliest that is >= today (a passed first cutoff is skipped).
+        let mixed = json!([d("2026-03-01"), d("2026-09-01")]);
+        assert_eq!(sedia_close_date(&mixed, today).as_deref(), Some("2026-09-01"));
+        // All past → latest (so the sweep can retire it).
+        let all_past = json!([d("2026-01-01"), d("2026-05-01")]);
+        assert_eq!(sedia_close_date(&all_past, today).as_deref(), Some("2026-05-01"));
+        // Absent / unparseable → None (forecasted topics legitimately lack one).
+        assert_eq!(sedia_close_date(&Value::Null, today), None);
+        assert_eq!(sedia_close_date(&json!([d("n/a")]), today), None);
+    }
+
+    #[test]
+    fn eu_sedia_row_without_identifier_is_skipped() {
+        assert!(normalize_eu_sedia(&json!({ "title": "no id" })).is_none());
     }
 
     #[test]

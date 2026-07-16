@@ -2607,8 +2607,9 @@ async fn fetch_preview_doc(state: &AppState, url: &str) -> Result<String, ApiErr
 // ---------------------------------------------------------------------------
 // Grants query surface
 //
-// `grants/unified` is the cross-source corpus that grants-gov and ca-grants both
-// normalize into (see the `grants-common` crate, which owns these two names).
+// `grants/unified` is the cross-source corpus that grants-gov, ca-grants, and
+// eu-sedia all normalize into (see the `grants-common` crate, which owns these
+// two names).
 // Until now it was reachable only through the generic dataset API, so every
 // consumer had to export the whole corpus and filter client-side. These two
 // routes push the filters into SQL.
@@ -2640,7 +2641,7 @@ struct GrantsQuery {
     status: Option<String>,
     /// Case-insensitive substring of the agency name (e.g. `health`).
     agency: Option<String>,
-    /// Source app, exact match: `grants-gov` | `ca-grants`.
+    /// Source app, exact match: `grants-gov` | `ca-grants` | `eu-sedia`.
     source: Option<String>,
     /// Closes on or before this `YYYY-MM-DD`. Records with no close date are excluded.
     closing_before: Option<String>,

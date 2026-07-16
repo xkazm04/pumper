@@ -137,7 +137,17 @@ impl ScrapeApp for EuSedia {
 
         let summary = ctx.upsert_many("opportunities", &records).await?;
 
-        Ok(json!({
+        // Cross-source layer: publish the pan-EU corpus into grants/unified so it
+        // joins GET /grants filtering, closing-soon, sweep_closed, cross-source
+        // dedup, and per-opportunity search — the same tail grants-gov/ca-grants
+        // run. Normalizes from the already-cleaned `opportunities` records.
+        let unified_items: Vec<(String, Value)> = records
+            .iter()
+            .filter_map(|(_, rec)| grants_common::normalize_eu_sedia(rec))
+            .collect();
+        let cross = grants_common::finalize_unified(&ctx, &unified_items).await?;
+
+        let mut out = json!({
             "source": "ec.europa.eu/funding-tenders/sedia",
             "types": types,
             "statuses": statuses,
@@ -148,7 +158,9 @@ impl ScrapeApp for EuSedia {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
-        }))
+        });
+        cross.merge_into(&mut out);
+        Ok(out)
     }
 }
 
