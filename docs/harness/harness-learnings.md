@@ -174,3 +174,13 @@
 
 ## Anti-patterns to avoid (search#1, 2026-07-16)
 - **Committing a derived index per write.** Tantivy commit = segment flush + fsync + reader reload; doing it per finished job made a burst of small jobs pay one fsync each and serialize on the writer lock. Defer to an interval/threshold background committer; expose flush() for the few paths needing own-write visibility. Bounded tail loss on hard kill is acceptable for a rebuildable derived artifact.
+
+## Structural facts (medium-tail batch 1, 2026-07-16)
+- **2026-07-16** — `markdown::text_len_capped(html, cap)` counts visible text (SKIP subtrees, whitespace-collapsed) with early-exit at cap — the tier-escalation predicate, avoiding a full html_to_markdown build+discard on the extractor/plugin hot paths (to_markdown=false). Both fetcher tiers use it.
+- **2026-07-16** — Browser tier now caps captured HTML: `[browser] max_html_bytes` (default 16 MiB = [http] max_body_bytes; 0=off) + `RenderRequest.max_body_bytes` override; over-cap → Error::Browser. Pure `over_html_cap` helper. `Plugins::reload()` compiles via spawn_blocking (was on the tokio worker). census `sync_market_blend` reads geo=state via list_filtered (was full-corpus). extractor `extract_and_upsert` uses unzip + `summarize_reports(impl IntoIterator<Item=&DocReport>)` (was deep-cloning bodies+reports).
+
+## Anti-patterns to avoid (medium-tail batch 1, 2026-07-16)
+- **Building the product to compute a predicate.** Fetcher built a full Markdown document just to count chars for the thin-content escalation decision, then discarded it. Split predicate (capped text counter, early-exit) from product (the Markdown, only when requested).
+- **Cloning owned data to reshape it.** `keyed.iter().map(|(_,d)| d.clone())` deep-cloned every body to split keys from docs while `keyed` was dropped right after — `into_iter().unzip()` is zero-copy. Pass `impl IntoIterator<Item=&T>` instead of collecting a `Vec<T::clone>` for a read-only summarizer.
+- **A cap on the cheap path but not the expensive one.** HTTP capped its body; the browser tier (more expensive, bigger DOMs) buffered unbounded. Make the size guard a tier-agnostic contract, not a property of one engine's streaming.
+- **Filtering after deserialization.** census read the whole dataset and dropped county rows in Rust; push the `geo=state` predicate into SQL via list_filtered so rows never cross the boundary (also removes the ORDER-BY-LIMIT truncation cliff).
