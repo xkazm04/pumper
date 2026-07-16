@@ -47,7 +47,13 @@ impl ScrapeApp for EuSedia {
     }
 
     fn default_params(&self) -> Value {
-        json!({ "types": ["1", "2"], "statuses": ["31094502"], "pageSize": 100, "maxPages": 10 })
+        // maxPages 50 (the clamp max) → up to 5000 topics at pageSize 100, so the
+        // 1000-topic-plus Horizon corpus isn't silently cut. SEDIA's match-all is
+        // server-relevance-ordered with no stable sort we can pin, so the window is
+        // not deterministic across runs; covering the whole corpus is what keeps
+        // topics from drifting in and out of it. `truncated` is the tripwire if
+        // even 5000 isn't enough.
+        json!({ "types": ["1", "2"], "statuses": ["31094502"], "pageSize": 100, "maxPages": 50 })
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -63,7 +69,7 @@ impl ScrapeApp for EuSedia {
             .params
             .get("maxPages")
             .and_then(Value::as_u64)
-            .unwrap_or(10)
+            .unwrap_or(50)
             .clamp(1, 50);
 
         // Elasticsearch-style bool query: open grant topics.
@@ -104,12 +110,11 @@ impl ScrapeApp for EuSedia {
                     .await?;
             }
 
-            let hits = parsed
-                .get("results")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let got = hits.len() as u64;
+            // Borrow the results array rather than cloning it whole — each hit's
+            // `descriptionByte` is tens of KB of topic HTML, and `normalize` clones
+            // only the fields it keeps.
+            let hits = parsed.get("results").and_then(Value::as_array);
+            let got = hits.map_or(0, Vec::len) as u64;
             if pages_fetched == 0 && total > 0 && got == 0 {
                 // Positive totalResults but zero parsed rows means the `results`
                 // array was renamed/moved upstream. Refuse to report an empty run
@@ -119,12 +124,14 @@ impl ScrapeApp for EuSedia {
                      'results' — likely an upstream schema change"
                 )));
             }
-            for hit in &hits {
-                let (key, record) = normalize(hit);
-                if record.get("description_text").is_some_and(|v| !v.is_null()) {
-                    enriched += 1;
+            if let Some(hits) = hits {
+                for hit in hits {
+                    let (key, record) = normalize(hit);
+                    if record.get("description_text").is_some_and(|v| !v.is_null()) {
+                        enriched += 1;
+                    }
+                    records.push((key, record));
                 }
-                records.push((key, record));
             }
             pages_fetched += 1;
             page += 1;
@@ -134,6 +141,11 @@ impl ScrapeApp for EuSedia {
                 break;
             }
         }
+
+        // Honest coverage: hitting the page cap while topics remain is a
+        // silently-partial, non-deterministic window (SEDIA match-all has no stable
+        // sort), so a truncated run must not read as a clean sweep.
+        let truncated = pages_fetched >= max_pages && (pages_fetched * page_size) < total;
 
         let summary = ctx.upsert_many("opportunities", &records).await?;
 
@@ -158,8 +170,26 @@ impl ScrapeApp for EuSedia {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            "truncated": truncated,
         });
         cross.merge_into(&mut out);
+        if truncated {
+            // After merge_into, which sets `warnings` to the drift warnings.
+            if let Value::Object(map) = &mut out {
+                let msg = format!(
+                    "coverage truncated: stopped at maxPages={max_pages} after {} of \
+                     {total} topics — the SEDIA match-all window is non-deterministic, \
+                     so uncovered topics drift in and out between runs",
+                    records.len()
+                );
+                match map.get_mut("warnings") {
+                    Some(Value::Array(w)) => w.push(json!(msg)),
+                    _ => {
+                        map.insert("warnings".into(), json!([msg]));
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 }
