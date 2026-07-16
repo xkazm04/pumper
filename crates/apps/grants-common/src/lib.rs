@@ -254,14 +254,27 @@ pub async fn sync_unified(
 /// records a `changed` revision (the delisting signal `removed_at` can't give on
 /// a partial-view source). Returns the number of rows swept to `closed`.
 pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
+    use pumper_core::datasets::JsonFilter;
     let today = chrono::Utc::now().date_naive();
-    // Local datasets are small (both sources cap well under this); one read.
-    let rows = ctx.datasets.list(UNIFIED_APP, UNIFIED_DATASET, 1_000_000).await?;
+    // Load only the sweep candidates (status open/forecasted), not the whole
+    // corpus. Over time most unified rows are already `closed` and can never flip
+    // again, yet the old full read deserialized every one of them on every sync —
+    // and `finalize_unified` runs this once per source, now three (grants-gov,
+    // ca-grants, eu-sedia), so the wasted scan was paid 3×/day. `list_filtered`
+    // also already excludes tombstoned rows. (Deduplicating the 3 invocations into
+    // one per sync cycle is a separate, larger change; making each cheap is the
+    // pragmatic win.)
+    let mut rows = Vec::new();
+    for status in ["open", "forecasted"] {
+        let filter = [JsonFilter::Eq { path: "$.status".into(), value: status.into() }];
+        rows.extend(
+            ctx.datasets
+                .list_filtered(UNIFIED_APP, UNIFIED_DATASET, &filter, None, 1_000_000)
+                .await?,
+        );
+    }
     let mut updates: Vec<(String, Value)> = Vec::new();
     for rec in rows {
-        if rec.removed_at.is_some() {
-            continue;
-        }
         let status = rec.data.get("status").and_then(Value::as_str);
         let close_date = rec.data.get("close_date").and_then(Value::as_str);
         if !is_past_due_open(status, close_date, today) {
