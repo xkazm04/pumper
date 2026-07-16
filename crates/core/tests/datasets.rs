@@ -207,3 +207,51 @@ async fn upsert_many_is_correct_across_chunk_boundaries() {
     drop(storage);
     std::fs::remove_dir_all(&dir).ok();
 }
+
+#[tokio::test]
+async fn detect_removed_tombstones_with_matching_removed_revisions() {
+    // Every tombstone must have its `removed` revision — the atomicity guarantee.
+    // A tombstone without a revision is a permanently-lost removal signal.
+    let (storage, dir) = fresh_db("datasets-detect-removed").await;
+    let ds = Datasets::new(storage.pool());
+    let pool = storage.pool();
+
+    // Seed 5 live records.
+    let items: Vec<(String, serde_json::Value)> = (0..5)
+        .map(|i| (format!("k{i}"), json!({ "n": i })))
+        .collect();
+    ds.upsert_many("app", "d", &items).await.unwrap();
+
+    // Next full snapshot drops k1 and k3.
+    let present: Vec<String> = vec!["k0".into(), "k2".into(), "k4".into()];
+    let mut removed = ds.detect_removed("app", "d", &present).await.unwrap();
+    removed.sort();
+    assert_eq!(removed, vec!["k1".to_string(), "k3".to_string()]);
+
+    // Each removed key is tombstoned AND has a `removed` revision (they agree).
+    for key in ["k1", "k3"] {
+        let removed_at: Option<String> = sqlx::query_scalar(
+            "SELECT removed_at FROM records WHERE app='app' AND dataset='d' AND key=?1",
+        )
+        .bind(key)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(removed_at.is_some(), "{key} must be tombstoned");
+        let rev_changes: Vec<String> = sqlx::query_scalar(
+            "SELECT change FROM record_revisions WHERE app='app' AND dataset='d' AND key=?1 ORDER BY revision",
+        )
+        .bind(key)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(rev_changes, vec!["new", "removed"], "{key} revision chain: new then removed");
+    }
+
+    // Idempotent: a second identical snapshot re-removes nothing (already tombstoned).
+    let removed2 = ds.detect_removed("app", "d", &present).await.unwrap();
+    assert!(removed2.is_empty(), "already-removed keys are not re-removed");
+
+    drop(storage);
+    std::fs::remove_dir_all(&dir).ok();
+}

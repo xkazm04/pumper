@@ -442,26 +442,68 @@ impl Datasets {
         .await?;
         let present: std::collections::HashSet<&str> =
             present.iter().map(String::as_str).collect();
-        let now = Utc::now();
-        let mut removed = Vec::new();
-        for key in live {
-            if present.contains(key.as_str()) {
-                continue;
-            }
-            sqlx::query(
-                "UPDATE records SET removed_at = ?4 WHERE app = ?1 AND dataset = ?2 AND key = ?3",
-            )
-            .bind(app)
-            .bind(dataset)
-            .bind(&key)
-            .bind(ts(now))
-            .execute(&self.pool)
-            .await?;
-            Self::add_revision(&self.pool, app, dataset, &key, "removed", None, None, now)
-                .await?;
-            removed.push(key);
+        let to_remove: Vec<String> =
+            live.into_iter().filter(|k| !present.contains(k.as_str())).collect();
+        if to_remove.is_empty() {
+            return Ok(Vec::new());
         }
-        Ok(removed)
+        let now = Utc::now();
+
+        // Two fixes over the old per-key pair of autocommit writes:
+        //   (1) Atomicity — the `UPDATE removed_at` and its `removed` revision now
+        //       run in ONE transaction, so a crash between them can't tombstone a
+        //       record with no revision. That was a permanent signal loss: the
+        //       next sync sees `removed_at` already set and the key still absent,
+        //       so it never revisits the key and the change feed / watches / dataset
+        //       triggers never fire for that removal. `upsert` was hardened for
+        //       exactly this reason; `detect_removed` writes the same two rows and
+        //       had been missed.
+        //   (2) Cost — chunked commits instead of 2 write transactions per key
+        //       (a 2k-key removal was 4k commits).
+        let mut conn = self.pool.acquire().await?;
+        for chunk in to_remove.chunks(UPSERT_CHUNK) {
+            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+            let mut chunk_result: Result<()> = Ok(());
+            for key in chunk {
+                if let Err(e) = Self::remove_in_tx(&mut conn, app, dataset, key, now).await {
+                    chunk_result = Err(e);
+                    break;
+                }
+            }
+            match chunk_result {
+                Ok(()) => {
+                    sqlx::query("COMMIT").execute(&mut *conn).await?;
+                }
+                Err(e) => {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                    return Err(e);
+                }
+            }
+        }
+        Ok(to_remove)
+    }
+
+    /// Transactional body of one removal: tombstone the record and append its
+    /// `removed` revision on one connection inside a write transaction, so the two
+    /// commit as a unit (mirrors `upsert_in_tx`).
+    async fn remove_in_tx(
+        conn: &mut sqlx::SqliteConnection,
+        app: &str,
+        dataset: &str,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE records SET removed_at = ?4 WHERE app = ?1 AND dataset = ?2 AND key = ?3",
+        )
+        .bind(app)
+        .bind(dataset)
+        .bind(key)
+        .bind(ts(now))
+        .execute(&mut *conn)
+        .await?;
+        Self::add_revision(&mut *conn, app, dataset, key, "removed", None, None, now).await?;
+        Ok(())
     }
 
     /// Upserts many records, returning a summary of new/changed/unchanged.
