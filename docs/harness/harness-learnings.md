@@ -168,3 +168,9 @@
 ## Anti-patterns to avoid (search#3 + crawl-bug, 2026-07-16)
 - **Per-run sequence number as a durable artifact name.** crawl `page-{stats.kept:04}.html` — stats.kept restarts at 0 on checkpoint resume, so a resumed crawl overwrote prior page-0001.html with a different URL's body while old `pages` records still pointed there (silent corruption). Content/URL-address derived artifacts so record and file can never disagree.
 - **A search-schema change without its rebuild path.** Adding `indexed_at` trips the drift check → wipes the index. Land it AFTER the backfill bin exists and re-run it, so it's a clean rebuild not silent data loss.
+
+## Structural facts (search#1, 2026-07-16)
+- **2026-07-16** — `Search::index()` no longer commits synchronously; a background committer task (spawned in `TantivyIndex::new`) commits every 250ms (`COMMIT_INTERVAL`) or once 512 docs pending (`COMMIT_PENDING_THRESHOLD`). New `Search::flush()` (default no-op) forces a commit; called by the worker's saved-search runner (only when enabled searches exist) and by the search-backfill bin before doc_count/exit. `delete_ids`/`delete_dataset` KEEP synchronous commit (rare operator paths). `pending` count mutated only under the writer lock. TantivyIndex::drop signals a final commit. ALL 3 search findings (#1 committer, #2 backfill+doc_count, #3 indexed_at recency) now closed.
+
+## Anti-patterns to avoid (search#1, 2026-07-16)
+- **Committing a derived index per write.** Tantivy commit = segment flush + fsync + reader reload; doing it per finished job made a burst of small jobs pay one fsync each and serialize on the writer lock. Defer to an interval/threshold background committer; expose flush() for the few paths needing own-write visibility. Bounded tail loss on hard kill is acceptable for a rebuildable derived artifact.
