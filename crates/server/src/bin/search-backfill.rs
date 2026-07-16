@@ -83,6 +83,9 @@ async fn main() -> anyhow::Result<()> {
         total += indexed;
     }
 
+    // index() defers its commit to a background committer, but this process exits
+    // right after — flush so the tail is durable and doc_count is accurate.
+    search.flush().await?;
     let doc_count = search.doc_count().await?;
     println!(
         "search backfill complete: {total} record(s) indexed; index now holds {doc_count} document(s)"

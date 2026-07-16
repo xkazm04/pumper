@@ -12,6 +12,10 @@ use pumper_core::{
     SearchResponse,
 };
 use std::ops::Bound;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
+
+use tokio::sync::Notify;
 
 use tantivy::collector::TopDocs;
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
@@ -39,12 +43,92 @@ struct Fields {
 /// these (or with body not stored) is an older schema and is rebuilt.
 const SCHEMA_FIELDS: &[&str] = &["id", "app", "dataset", "url", "title", "body", "indexed_at"];
 
+/// Background-commit cadence: the committer flushes at most this often, so a
+/// burst of jobs amortizes into a handful of commits instead of one fsync each.
+/// Small enough that search freshness lags by no more than this on the happy
+/// path; a hard kill loses at most this window of uncommitted `index()` writes
+/// (an accepted cost for a derived artifact — the backfill bin rebuilds it).
+const COMMIT_INTERVAL: Duration = Duration::from_millis(250);
+/// Commit early (don't wait for the interval) once this many docs are pending, to
+/// bound the writer's in-memory buffer during a large backfill.
+const COMMIT_PENDING_THRESHOLD: usize = 512;
+
 pub struct TantivyIndex {
     index: Index,
     schema: Schema,
     fields: Fields,
     writer: Arc<Mutex<IndexWriter>>,
     reader: IndexReader,
+    /// Uncommitted `index()` docs since the last commit. Only mutated while the
+    /// writer lock is held (or reset by a commit that holds it), so it stays
+    /// consistent with the writer's actual uncommitted set.
+    pending: Arc<AtomicUsize>,
+    /// Wakes the background committer immediately (threshold crossed / flush).
+    wake: Arc<Notify>,
+    /// Signals the committer to do a final commit and stop (on Drop).
+    shutdown: Arc<Notify>,
+}
+
+impl Drop for TantivyIndex {
+    fn drop(&mut self) {
+        // Let the committer flush the uncommitted tail and exit.
+        self.shutdown.notify_one();
+    }
+}
+
+/// Commits the writer and reloads the reader, then clears the pending count. Runs
+/// the fsync on a blocking thread. Shared by the background committer and the
+/// synchronous paths.
+async fn commit_and_reload(
+    writer: Arc<Mutex<IndexWriter>>,
+    reader: IndexReader,
+    pending: Arc<AtomicUsize>,
+) -> Result<()> {
+    tokio::task::spawn_blocking(move || -> Result<()> {
+        let mut w = writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        w.commit().map_err(|e| Error::App(format!("commit: {e}")))?;
+        reader.reload().map_err(|e| Error::App(format!("reader reload: {e}")))?;
+        // Safe under the writer lock: no `index()` can add between the commit and
+        // this reset, so it can't clear a doc that wasn't just committed.
+        pending.store(0, Ordering::Relaxed);
+        Ok(())
+    })
+    .await
+    .map_err(|e| Error::App(format!("commit task panicked: {e}")))?
+}
+
+/// The background committer: commits pending `index()` writes on an interval, or
+/// sooner when woken (pending threshold crossed / explicit flush wake), and does a
+/// final commit on shutdown so a graceful stop doesn't drop the tail.
+fn spawn_committer(
+    writer: Arc<Mutex<IndexWriter>>,
+    reader: IndexReader,
+    pending: Arc<AtomicUsize>,
+    wake: Arc<Notify>,
+    shutdown: Arc<Notify>,
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(COMMIT_INTERVAL);
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                _ = shutdown.notified() => {
+                    if pending.load(Ordering::Relaxed) > 0 {
+                        let _ = commit_and_reload(writer.clone(), reader.clone(), pending.clone()).await;
+                    }
+                    break;
+                }
+                _ = interval.tick() => {}
+                _ = wake.notified() => {}
+            }
+            if pending.load(Ordering::Relaxed) == 0 {
+                continue;
+            }
+            if let Err(e) = commit_and_reload(writer.clone(), reader.clone(), pending.clone()).await {
+                tracing::warn!("background search commit failed: {e}");
+            }
+        }
+    });
 }
 
 /// True when the opened index matches the current build's schema: every expected
@@ -124,13 +208,12 @@ impl TantivyIndex {
             .map_err(|e| Error::App(format!("search reader: {e}")))?;
 
         tracing::info!(dir = %cfg.dir.display(), "opened search index");
-        Ok(Self {
-            index,
-            schema: s,
-            fields,
-            writer: Arc::new(Mutex::new(writer)),
-            reader,
-        })
+        let writer = Arc::new(Mutex::new(writer));
+        let pending = Arc::new(AtomicUsize::new(0));
+        let wake = Arc::new(Notify::new());
+        let shutdown = Arc::new(Notify::new());
+        spawn_committer(writer.clone(), reader.clone(), pending.clone(), wake.clone(), shutdown.clone());
+        Ok(Self { index, schema: s, fields, writer, reader, pending, wake, shutdown })
     }
 }
 
@@ -148,15 +231,43 @@ impl TantivyIndex {
     {
         let writer = self.writer.clone();
         let reader = self.reader.clone();
+        let pending = self.pending.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
             let mut w = writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             edit(&mut w)?;
             w.commit().map_err(|e| Error::App(format!("commit: {e}")))?;
             reader.reload().map_err(|e| Error::App(format!("reader reload: {e}")))?;
+            // This commit flushed every uncommitted write, incl. deferred index()s.
+            pending.store(0, Ordering::Relaxed);
             Ok(())
         })
         .await
         .map_err(|e| Error::App(format!("{what} task panicked: {e}")))?
+    }
+
+    /// Applies an edit to the writer but does NOT commit — the background
+    /// committer flushes it within `COMMIT_INTERVAL` (or sooner past the pending
+    /// threshold). This is the amortization: a burst of `index()` calls shares one
+    /// commit/fsync instead of paying one each. Callers that need immediate
+    /// visibility (the saved-search runner, the backfill bin) call `flush`.
+    async fn write_deferred<F>(&self, what: &'static str, added: usize, edit: F) -> Result<()>
+    where
+        F: FnOnce(&mut IndexWriter) -> Result<()> + Send + 'static,
+    {
+        let writer = self.writer.clone();
+        let pending = self.pending.clone();
+        tokio::task::spawn_blocking(move || -> Result<()> {
+            let mut w = writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            edit(&mut w)?;
+            pending.fetch_add(added, Ordering::Relaxed);
+            Ok(())
+        })
+        .await
+        .map_err(|e| Error::App(format!("{what} task panicked: {e}")))??;
+        if self.pending.load(Ordering::Relaxed) >= COMMIT_PENDING_THRESHOLD {
+            self.wake.notify_one();
+        }
+        Ok(())
     }
 }
 
@@ -167,7 +278,10 @@ impl Search for TantivyIndex {
             return Ok(());
         }
         let f = self.fields;
-        self.write_then_commit("index", move |w| {
+        let added = docs.len();
+        // Deferred: the background committer flushes this, so hundreds of small
+        // jobs no longer pay a full commit/fsync each.
+        self.write_deferred("index", added, move |w| {
             for d in docs {
                 // Upsert: drop any prior document with this id, then add.
                 w.delete_term(Term::from_field_text(f.id, &d.id));
@@ -185,6 +299,12 @@ impl Search for TantivyIndex {
             Ok(())
         })
         .await
+    }
+
+    async fn flush(&self) -> Result<()> {
+        // Force a commit now and make prior deferred index() writes visible.
+        // Reuses the commit epilogue with an empty edit.
+        self.write_then_commit("flush", |_w| Ok(())).await
     }
 
     async fn delete_ids(&self, ids: &[String]) -> Result<()> {

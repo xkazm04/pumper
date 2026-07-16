@@ -30,11 +30,13 @@ async fn newest_sort_and_since_filter_use_indexed_at() {
     let dir = unique_dir();
     let index = TantivyIndex::new(&SearchConfig { enabled: true, dir: dir.clone() }).unwrap();
 
-    // Three matching docs with out-of-order timestamps.
+    // Three matching docs with out-of-order timestamps. index() defers its commit,
+    // so flush to make them queryable immediately.
     index
         .index(vec![doc("a", 100), doc("b", 300), doc("c", 200)])
         .await
         .unwrap();
+    index.flush().await.unwrap();
 
     let query = |sort, since| SearchRequest {
         q: "grant".into(),
@@ -61,6 +63,38 @@ async fn newest_sort_and_since_filter_use_indexed_at() {
     // `since` past every doc yields nothing.
     let none = index.query(query(SearchSort::Score, Some(1000))).await.unwrap();
     assert!(none.hits.is_empty());
+
+    drop(index);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn index_defers_commit_and_flush_makes_it_visible() {
+    // index() no longer commits synchronously (the per-job commit-storm fix), so
+    // a doc isn't queryable until a commit — explicit flush or the background tick.
+    let dir = unique_dir();
+    let index = TantivyIndex::new(&SearchConfig { enabled: true, dir: dir.clone() }).unwrap();
+
+    index.index(vec![doc("x", 1)]).await.unwrap();
+    assert_eq!(index.doc_count().await.unwrap(), 0, "index() defers its commit");
+
+    index.flush().await.unwrap();
+    assert_eq!(index.doc_count().await.unwrap(), 1, "flush commits and makes it visible");
+
+    drop(index);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
+async fn background_committer_flushes_without_explicit_flush() {
+    // Deferred writes still land: the background committer commits within the
+    // interval even with no flush call.
+    let dir = unique_dir();
+    let index = TantivyIndex::new(&SearchConfig { enabled: true, dir: dir.clone() }).unwrap();
+
+    index.index(vec![doc("y", 1)]).await.unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(400)).await; // past COMMIT_INTERVAL
+    assert_eq!(index.doc_count().await.unwrap(), 1, "background committer made it visible");
 
     drop(index);
     std::fs::remove_dir_all(&dir).ok();

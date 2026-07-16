@@ -152,6 +152,15 @@ pub trait Search: Send + Sync {
     /// disabled index — the signal that a backfill is needed (an emptied index
     /// otherwise looks healthy: queries return 200 with fewer hits).
     async fn doc_count(&self) -> Result<u64>;
+
+    /// Forces any deferred writes to commit and become queryable. `index()` may
+    /// defer its commit for throughput, so a caller that must see its own writes
+    /// immediately (a saved-search runner, an offline backfill before it reports)
+    /// calls this. Default: no-op (implementations that commit synchronously need
+    /// nothing here).
+    async fn flush(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// Fallback used when search is disabled.

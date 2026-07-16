@@ -426,6 +426,13 @@ async fn notify_saved_searches(state: &AppState, job: &Job) {
             return;
         }
     };
+    // This job's just-indexed docs may still be uncommitted (index() defers its
+    // commit). Force one now so standing alerts see them this run instead of
+    // missing them until the next commit. Only jobs that actually have saved
+    // searches pay this — the amortization holds for the rest.
+    if let Err(e) = state.search.flush().await {
+        warn!(job = %job.id, "search flush before saved-search scan failed: {e}");
+    }
     for search in searches {
         if search.app.as_deref().is_some_and(|app| app != job.app) {
             continue;
