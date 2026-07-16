@@ -160,3 +160,11 @@
 - **Removing a full-rebuild without shipping a rebuild path.** Wave 2's delta-indexing removed the accidental "re-index whole dataset per run" safety net → a wiped index only refilled as apps ran. Any "index by delta" change must ship a backfill bin + an observable doc_count.
 - **Divergent doc builders for live vs backfill index paths.** If they build docs differently (id, fields), a re-index silently duplicates or mis-deletes. One shared `from_record` builder.
 - **Destructive retention defaulting ON.** Silently pruning a user's accrued history is data loss; the retention janitor is opt-in and no-ops when disabled.
+
+## Structural facts (search#3 + crawl-bug, 2026-07-16)
+- **2026-07-16** — Search schema gained an `indexed_at` i64 FAST|INDEXED|STORED field (unix secs). `SearchDoc.indexed_at` populated from rev.created_at (live worker), rec.updated_at (backfill bin), or now (job-result docs). `SearchRequest.{sort:SearchSort(Score|Newest),since:Option<i64>}`; GET /search takes `?sort=newest`&`?since=`. `body_is_stored`→`schema_is_current` (checks all SCHEMA_FIELDS present + body stored) so field additions trigger the rebuild path. After this change the real index was rebuilt via `search-backfill --all` (5196 docs w/ timestamps).
+- **2026-07-16** — crawl page artifacts are now named `page-<sha256(url)[..16]>.html` (was `page-{stats.kept:04}.html`). URL-addressed = stable across resume/revisit; the per-run stats.kept counter no longer determines the filename.
+
+## Anti-patterns to avoid (search#3 + crawl-bug, 2026-07-16)
+- **Per-run sequence number as a durable artifact name.** crawl `page-{stats.kept:04}.html` — stats.kept restarts at 0 on checkpoint resume, so a resumed crawl overwrote prior page-0001.html with a different URL's body while old `pages` records still pointed there (silent corruption). Content/URL-address derived artifacts so record and file can never disagree.
+- **A search-schema change without its rebuild path.** Adding `indexed_at` trips the drift check → wipes the index. Land it AFTER the backfill bin exists and re-run it, so it's a clean rebuild not silent data loss.
