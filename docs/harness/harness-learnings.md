@@ -108,3 +108,16 @@
 ## Structural facts (Wave 3 additions)
 - **2026-07-10** — Extraction rules: `RuleSet.fields` maps to `FieldRule {rule, transforms}` (serde-flattened; old plain-rule JSON still parses). Rule types: css/regex/json/xpath/const. XPath via `skyscraper` crate (pure Rust, HTML-native; heavy grammar crate, ~1min cold-build cost).
 - **2026-07-10** — Crawler checkpoints live at `data/artifacts/<app>/checkpoints/<name>.json` (beside per-job dirs, not inside them) so cross-job resume works.
+
+## Structural facts (perf-feature scan Wave 3, 2026-07-16)
+- **2026-07-16** — The politeness governor and cost/tier metering are wired PER-ENGINE, not at the tier seam: `Governor::acquire/penalize/reward` and cost recording historically lived only inside `HttpEngine::send` and `AppContext::fetch`. Any app that drives an engine raw (the `crawl` app → `pumper_core::crawl` with `ctx.engines.http`) bypassed all of it. Fixed: the browser tier is now governed from `Fetcher::fetch` (shares the HTTP engine's `Arc<Governor>`), and raw-engine apps meter via the new public `AppContext::meter` / `AppContext::learn_tier` seams.
+- **2026-07-16** — `Config::load()` now calls `Config::validate()` (core/src/config.rs) after `normalize()`, rejecting semantically-broken worker/governor combos (stale_after<=heartbeat, timeout<=stale_after, concurrency==0, penalty_cap<base). `0` remains a disable switch for heartbeat/stale/aging. A test asserts the repo's own `config.toml` passes.
+- **2026-07-16** — `costs::SpentTotal` (AtomicU64-bit-cast f64) is the job's in-memory running spend, seeded from the ledger at `AppContext` construction and advanced by `meter`. `remaining_budget_usd` reads it instead of re-`SUM`-ing `cost_events` per call. `CostLedger::job_total` stays the source of truth / seed.
+
+## Anti-patterns to avoid (perf-feature scan, 2026-07-16)
+- **Guard-at-the-wrong-seam** — a control (budget/politeness/metering/tier-learning) wired inside ONE engine method silently exempts every caller that reaches the resource another way. When auditing a shipped control, grep ALL call sites of the underlying resource, not just the blessed wrapper.
+- **Per-item DB writes on a raw high-volume path** — don't meter per fetch on the crawl path (single-writer contention). Tally in memory, flush O(distinct-hosts) after the loop.
+
+## Open follow-ups (from perf-feature scan Wave 3, 2026-07-16)
+- 59 of 63 findings still open on branch `vibeman/perf-feature-2026-07-16` (not pushed). Highest value: Wave 1 grants coverage&truth incl. the 1 Critical (eu-sedia→`grants/unified`: needs `normalize_eu_sedia`; SEDIA statuses are numeric codes that break `?status=open` if passed through `norm_status`; EUR `budgetOverview` → map money to `Null`, unified has no currency dim). Wave 2 write-amplification (full-dataset reindex per job, per-record upsert/detect_removed txns, quadratic crawl checkpoint).
+- Out-of-lens bug: crawl `artifact_name` = `format!("page-{:04}.html", stats.kept)` and `stats.kept` restarts at 0 on checkpoint resume → resumed crawl overwrites prior run's page-NNNN.html, leaving `pages.artifact_path` pointing at the wrong body. Bug-hunter shape; fix regardless of wave.
