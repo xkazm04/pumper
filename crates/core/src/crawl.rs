@@ -601,7 +601,14 @@ pub async fn crawl(
         } else {
             dedup_index.insert(hash);
             stats.kept += 1;
-            let artifact_name = format!("page-{:04}.html", stats.kept);
+            // URL-addressed, NOT the per-run `stats.kept` counter: that counter
+            // restarts at 0 on a checkpoint resume, so a resumed crawl would write
+            // page-0001.html over the prior run's page-0001.html — a different URL's
+            // body — leaving earlier `pages` records' `artifact_path` pointing at
+            // the wrong content. Keying the file on the (canonical, frontier-unique)
+            // URL makes the name stable across runs: each URL owns one file, and a
+            // revisit updates it in place.
+            let artifact_name = artifact_name(&fetched.url);
             if let Some(dir) = &output_dir {
                 let file = dir.join(&artifact_name);
                 if let Err(e) = tokio::fs::write(&file, &fetched.body).await {
@@ -715,6 +722,19 @@ pub async fn crawl(
 /// affects mid-crawl resume granularity (a few seconds of re-crawl, which the
 /// seen-set makes idempotent).
 const CHECKPOINT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Stable, filesystem-safe artifact filename for a page, addressed by its URL
+/// rather than a per-run sequence number. The frontier de-duplicates URLs, so
+/// this is unique within a crawl; being a pure function of the URL, it is also
+/// stable across resumes and revisits (the `pages` record's `artifact_path` and
+/// the file on disk can never disagree). 16 bytes of SHA-256 (128 bits) is far
+/// beyond collision range for any single crawl's URL set.
+fn artifact_name(url: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(url.as_bytes());
+    let hex: String = digest[..16].iter().map(|b| format!("{b:02x}")).collect();
+    format!("page-{hex}.html")
+}
 
 /// Cap on the per-host failure map surfaced in the result — only the worst
 /// offenders are useful; the total lives in `failed`.
@@ -1219,6 +1239,22 @@ mod tests {
     use super::*;
     use crate::engine::HttpResponse;
     use std::sync::Mutex as SyncMutex;
+
+    #[test]
+    fn artifact_name_is_url_addressed_stable_and_collision_free() {
+        // Same URL always maps to the same file — no dependence on a per-run
+        // counter, so a resumed crawl (stats.kept restarts at 0) can't overwrite a
+        // prior run's page with a different URL's body.
+        let a1 = artifact_name("https://example.com/a");
+        let a2 = artifact_name("https://example.com/a");
+        assert_eq!(a1, a2, "stable per URL");
+        // Distinct URLs get distinct names.
+        assert_ne!(a1, artifact_name("https://example.com/b"));
+        // Filesystem-safe: page-<32 hex>.html, no path separators.
+        assert!(a1.starts_with("page-") && a1.ends_with(".html"), "{a1}");
+        assert!(!a1.contains('/') && !a1.contains('\\'), "{a1}");
+        assert_eq!(a1.len(), "page-".len() + 32 + ".html".len());
+    }
 
     /// Serves canned `(status, body)` per URL; URLs in `fail` return a transport
     /// error; unknown URLs → 404 empty. Honors conditional GETs: a request whose
