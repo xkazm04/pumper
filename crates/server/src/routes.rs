@@ -111,7 +111,17 @@ fn openapi_router() -> OpenApiRouter<AppState> {
 
 pub fn router(state: AppState) -> Router {
     let (router, _api) = openapi_router().split_for_parts();
-    let router = router.layer(tower_http::trace::TraceLayer::new_for_http());
+    // gzip/br responses when the client sends accept-encoding — record JSON is
+    // highly repetitive (identical keys per row, ISO timestamps) so it compresses
+    // ~5-10x, a real win for remote consumers and the streamed export path.
+    // CompressionLayer's default predicate skips already-small and SSE
+    // (`text/event-stream`) responses, so /events and /jobs/{id}/stream keep their
+    // incremental KeepAlive delivery; it wraps the body stream (no full buffering),
+    // so the export path stays constant-memory. Localhost clients that don't send
+    // accept-encoding are unaffected.
+    let router = router
+        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(tower_http::trace::TraceLayer::new_for_http());
     // CORS is OFF by default (same-origin only). A permissive allow-all on an
     // unauthenticated, mutating, data-bearing API lets any site the operator
     // visits drive it cross-origin (DNS-rebinding defeats the localhost
