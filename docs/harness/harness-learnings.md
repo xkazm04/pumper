@@ -121,3 +121,17 @@
 ## Open follow-ups (from perf-feature scan Wave 3, 2026-07-16)
 - 59 of 63 findings still open on branch `vibeman/perf-feature-2026-07-16` (not pushed). Highest value: Wave 1 grants coverage&truth incl. the 1 Critical (eu-sedia→`grants/unified`: needs `normalize_eu_sedia`; SEDIA statuses are numeric codes that break `?status=open` if passed through `norm_status`; EUR `budgetOverview` → map money to `Null`, unified has no currency dim). Wave 2 write-amplification (full-dataset reindex per job, per-record upsert/detect_removed txns, quadratic crawl checkpoint).
 - Out-of-lens bug: crawl `artifact_name` = `format!("page-{:04}.html", stats.kept)` and `stats.kept` restarts at 0 on checkpoint resume → resumed crawl overwrites prior run's page-NNNN.html, leaving `pages.artifact_path` pointing at the wrong body. Bug-hunter shape; fix regardless of wave.
+
+## Anti-patterns to avoid (perf-feature scan Wave 1, 2026-07-16)
+- **Numeric status codes passed through a word-vocabulary normalizer.** When a source encodes status as opaque codes (SEDIA `31094502`) and `grants_common::norm_status` passes unknowns through lowercased, a naive map writes the literal code into `status` — silently breaking every `?status=open` filter and `sweep_closed`. Map codes→words explicitly; unknown→Null. See `normalize_eu_sedia`/`sedia_status`.
+- **Foreign currency in a currency-less schema → Null, never a number.** SEDIA `budgetOverview` is EUR; `grants/unified` has no currency dimension, so its money fields stay Null rather than filing euros as ca-grants dollars. (Same money-truth class as grant-writing-nonprofits' EUR-as-USD.)
+- **LIMIT before ORDER BY is a silent wrong answer.** `closing-soon` LIMITed by `updated_at DESC` then sorted `close_date` in memory, so past the cap the soonest grants were dropped. Any top-N-by-data-field must ORDER in SQL before the LIMIT — `Datasets::list_filtered_ordered`; pair with `count_filtered` so the total isn't the cap.
+- **Don't invent an upstream param to fix pagination.** SEDIA match-all has no verifiable stable sort, so instead of guessing a `sortBy` name (that may silently no-op), widen `maxPages` + flag `truncated`.
+
+## Structural facts (perf-feature scan Wave 1, 2026-07-16)
+- **2026-07-16** — eu-sedia now normalizes into `grants/unified` via `grants_common::normalize_eu_sedia` (takes the eu-sedia app's already-cleaned `opportunities` record, not the raw hit). All three grant sources (grants-gov, ca-grants, eu-sedia) call `finalize_unified` — so `sweep_closed`/`link_duplicates` now run 3× per day (grants-gov#3 deferred; cheap fix = `list_filtered` predicate on the sweep).
+- **2026-07-16** — `Datasets` gained `list_filtered_ordered` (ORDER BY a JSON path ASC + LIMIT in SQL) and `count_filtered` (true window total); both share `push_json_filters` with `list_filtered` (whose behaviour is unchanged).
+
+## Open follow-ups (from perf-feature scan Wave 1, 2026-07-16)
+- grants-gov#1 money enrichment via POST /v1/api/fetchOpportunity — DEFERRED: needs a saved fetchOpportunity response to verify field names/nesting (awardFloor/awardCeiling/estimatedTotalProgramFunding/applicantTypes/fundingActivityCategories) + a backfill-drain (re-enrich money-null unified rows over days) so a per-run cap doesn't stall. Money stays Null for grants-gov until then (status quo, no regression).
+- eu-sedia#3 CMS-fee-schedule self-baselining watcher (Med); grants-gov#3 finalize_unified once-per-sync (fold into Wave 2 write-amplification).
