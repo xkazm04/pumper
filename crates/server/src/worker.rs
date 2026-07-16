@@ -157,6 +157,18 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     };
 
     info!(job = %job.id, app = %job.app, attempt = job.attempts, "job started");
+    // Seed the running spend total from the ledger: a retried job's prior
+    // attempts already spent real money against this job's budget, and that
+    // spend must still count toward the ceiling. Fail-open per the worker
+    // convention — an unreadable ledger must not block the run, it only means
+    // this attempt starts its accounting from zero.
+    let spent_seed = match state.costs.job_total(job.id).await {
+        Ok(total) => total,
+        Err(e) => {
+            warn!(job = %job.id, "cost ledger read failed, seeding spend at 0: {e}");
+            0.0
+        }
+    };
     let ctx = AppContext {
         job_id: job.id,
         app: job.app.clone(),
@@ -165,6 +177,7 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         datasets: state.datasets.clone(),
         costs: state.costs.clone(),
         budget_usd: job.budget_usd,
+        spent_usd: std::sync::Arc::new(pumper_core::SpentTotal::new(spent_seed)),
         research_cache: state.research_cache.clone(),
         tiers: state.tiers.clone(),
         plugins: state.plugins.clone(),

@@ -35,7 +35,7 @@ pub use app::{AppContext, NoProgress, ProgressReporter, ScrapeApp};
 #[cfg(feature = "storage")]
 pub use cache::{HttpCache, ResearchCache};
 #[cfg(feature = "storage")]
-pub use costs::{CostEvent, CostLedger, CostSummary};
+pub use costs::{CostEvent, CostLedger, CostSummary, SpentTotal};
 #[cfg(feature = "storage")]
 pub use datasets::{
     diff_values, ChangeKind, Datasets, DupPair, Record, Revision, RevisionPage, UpsertSummary,

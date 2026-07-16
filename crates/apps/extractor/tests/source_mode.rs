@@ -12,7 +12,7 @@ use pumper_core::config::{FetcherConfig, StorageConfig};
 use pumper_core::{
     AppContext, Browser, CostLedger, Datasets, EngineSet, Fetcher, HttpClient, HttpRequest,
     HttpResponse, NoPlugins, NoProgress, RenderRequest, RenderedPage, ResearchCache, ResearchOutput,
-    ResearchRequest, Researcher, Result, ScrapeApp, Storage, TierMemory,
+    ResearchRequest, Researcher, Result, ScrapeApp, SpentTotal, Storage, TierMemory,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -62,6 +62,7 @@ async fn ctx_with(root: std::path::PathBuf, storage: &Storage, params: Value) ->
         datasets: Arc::new(Datasets::new(pool.clone())),
         costs: Arc::new(CostLedger::new(pool.clone())),
         budget_usd: None,
+        spent_usd: Arc::new(SpentTotal::default()),
         research_cache: Arc::new(ResearchCache::new(pool.clone(), 3600)),
         tiers: Arc::new(TierMemory::new(pool.clone(), 3600)),
         plugins: Arc::new(NoPlugins),

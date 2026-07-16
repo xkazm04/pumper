@@ -6,7 +6,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::cache::ResearchCache;
-use crate::costs::CostLedger;
+use crate::costs::{CostLedger, SpentTotal};
 use crate::datasets::{ChangeKind, Datasets, UpsertSummary};
 use crate::engine::{EngineSet, ResearchOutput, ResearchRequest};
 use crate::fetcher::{FetchOutcome, FetchRequest};
@@ -47,6 +47,10 @@ pub struct AppContext {
     pub costs: Arc<CostLedger>,
     /// Spend ceiling for the whole job (from enqueue); None = unlimited.
     pub budget_usd: Option<f64>,
+    /// This job's running spend, seeded from the ledger at construction and
+    /// advanced by each metered seam. Backs `remaining_budget_usd` so the
+    /// per-call budget check doesn't re-`SUM` the job's whole cost history.
+    pub spent_usd: Arc<SpentTotal>,
     /// Cost-aware cache for Claude research runs (TTL-bound, key = request).
     pub research_cache: Arc<ResearchCache>,
     /// Learned per-host tier routing (skip the HTTP tier where it never wins).
@@ -81,12 +85,15 @@ impl AppContext {
     }
 
     /// USD this job still may spend under its ceiling. None = unlimited.
+    ///
+    /// Reads the in-context running total rather than re-aggregating the ledger:
+    /// this is on the pre-flight path of every metered call, so a `SELECT SUM`
+    /// here costs O(spend events so far) per call and O(n²) over a job.
     pub async fn remaining_budget_usd(&self) -> Result<Option<f64>> {
         let Some(budget) = self.budget_usd else {
             return Ok(None);
         };
-        let spent = self.costs.job_total(self.job_id).await?;
-        Ok(Some((budget - spent).max(0.0)))
+        Ok(Some((budget - self.spent_usd.get()).max(0.0)))
     }
 
     /// Clamps a per-call budget ceiling to the job's remaining headroom: keep the
@@ -94,6 +101,38 @@ impl AppContext {
     /// Shared by the two metered seams, which otherwise re-typed the expression.
     fn clamp_to_headroom(ceiling: Option<f64>, remaining: f64) -> f64 {
         ceiling.map_or(remaining, |b| b.min(remaining))
+    }
+
+    /// Records one engine call against this job: writes the cost event and
+    /// advances the running spend total that governs the budget ceiling.
+    ///
+    /// [`AppContext::fetch`] calls this for you. Call it directly only when an
+    /// app must drive an engine raw — the crawler owns its own concurrency,
+    /// robots and frontier control, so it cannot route through `fetch` — and
+    /// would otherwise be invisible to the cost ledger and budget enforcement.
+    ///
+    /// Accounting never fails the caller's job: a failed write is warn-logged.
+    pub async fn meter(&self, engine: &str, url: Option<&str>, cost_usd: f64, detail: Option<&str>) {
+        self.spent_usd.add(cost_usd);
+        if let Err(e) = self
+            .costs
+            .record(self.job_id, &self.app, engine, url, cost_usd, detail)
+            .await
+        {
+            tracing::warn!(job = %self.job_id, "cost event write failed: {e}");
+        }
+    }
+
+    /// Teaches the learned tier router about one fetch outcome for `host`: an
+    /// HTTP win resets the host, an HTTP loss (thin/blocked/error) adds a strike,
+    /// and hosts that persistently lose start straight at the browser tier.
+    ///
+    /// [`AppContext::fetch`] calls this for you; raw-engine apps should call it
+    /// so their per-host outcomes still train the router. Never fails the job.
+    pub async fn learn_tier(&self, host: &str, winner: &str, http_lost: bool) {
+        if let Err(e) = self.tiers.record(host, winner, http_lost).await {
+            tracing::warn!(job = %self.job_id, "tier memory write failed: {e}");
+        }
     }
 
     /// Errors when the job's spend ceiling is already reached — the abort
@@ -204,25 +243,16 @@ impl AppContext {
                             | crate::fetcher::TierVerdict::Error
                     )
             });
-            if let Err(e) = self.tiers.record(host, outcome.engine, http_lost).await {
-                tracing::warn!(job = %self.job_id, "tier memory write failed: {e}");
-            }
+            self.learn_tier(host, outcome.engine, http_lost).await;
         }
         let detail = (!outcome.escalations.is_empty()).then(|| outcome.escalations.join("; "));
-        if let Err(e) = self
-            .costs
-            .record(
-                self.job_id,
-                &self.app,
-                outcome.engine,
-                Some(&url),
-                outcome.cost_usd.unwrap_or(0.0),
-                detail.as_deref(),
-            )
-            .await
-        {
-            tracing::warn!(job = %self.job_id, "cost event write failed: {e}");
-        }
+        self.meter(
+            outcome.engine,
+            Some(&url),
+            outcome.cost_usd.unwrap_or(0.0),
+            detail.as_deref(),
+        )
+        .await;
         Ok(outcome)
     }
 
@@ -241,13 +271,7 @@ impl AppContext {
                 let detail = saved.map_or("cache_hit".to_string(), |c| {
                     format!("cache_hit (saved ~${c:.4})")
                 });
-                if let Err(e) = self
-                    .costs
-                    .record(self.job_id, &self.app, "claude", None, 0.0, Some(&detail))
-                    .await
-                {
-                    tracing::warn!(job = %self.job_id, "cost event write failed: {e}");
-                }
+                self.meter("claude", None, 0.0, Some(&detail)).await;
                 hit.cost_usd = Some(0.0);
                 return Ok(hit);
             }
@@ -257,13 +281,7 @@ impl AppContext {
             req.max_budget_usd = Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
         }
         let out = self.engines.claude.research(req).await?;
-        if let Err(e) = self
-            .costs
-            .record(self.job_id, &self.app, "claude", None, out.cost_usd.unwrap_or(0.0), None)
-            .await
-        {
-            tracing::warn!(job = %self.job_id, "cost event write failed: {e}");
-        }
+        self.meter("claude", None, out.cost_usd.unwrap_or(0.0), None).await;
         if let Some(key) = &key {
             if let Err(e) = self.research_cache.put(key, &out).await {
                 tracing::warn!(job = %self.job_id, "research cache write failed: {e}");
