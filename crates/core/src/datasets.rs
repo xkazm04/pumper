@@ -669,69 +669,7 @@ impl Datasets {
         qb.push(" AND dataset = ");
         qb.push_bind(dataset);
 
-        for filter in filters {
-            match filter {
-                JsonFilter::Eq { path, value } => {
-                    qb.push(" AND json_extract(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") = ");
-                    qb.push_bind(value.as_str());
-                }
-                JsonFilter::Contains { path, value } => {
-                    qb.push(" AND instr(lower(COALESCE(json_extract(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push("), '')), lower(");
-                    qb.push_bind(value.as_str());
-                    qb.push(")) > 0");
-                }
-                // Compare numerically when the JSON field is a number, else as
-                // text. SQLite sorts all numbers below all text, so a plain `>=`
-                // of a numeric field against a text-bound value always fails; the
-                // text branch preserves the existing ISO-date behavior unchanged.
-                JsonFilter::Gte { path, value } => {
-                    qb.push(" AND (CASE WHEN json_type(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") IN ('integer','real') THEN json_extract(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") >= CAST(");
-                    qb.push_bind(value.as_str());
-                    qb.push(" AS REAL) ELSE json_extract(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") >= ");
-                    qb.push_bind(value.as_str());
-                    qb.push(" END)");
-                }
-                JsonFilter::Lte { path, value } => {
-                    qb.push(" AND (CASE WHEN json_type(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") IN ('integer','real') THEN json_extract(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") <= CAST(");
-                    qb.push_bind(value.as_str());
-                    qb.push(" AS REAL) ELSE json_extract(data, ");
-                    qb.push_bind(path.as_str());
-                    qb.push(") <= ");
-                    qb.push_bind(value.as_str());
-                    qb.push(" END)");
-                }
-                // `(0 OR ...)` is the honest reading of "matches any of these
-                // paths": with no paths, nothing matches. NULL never satisfies the
-                // comparison, so records missing all the money fields drop out.
-                JsonFilter::NumGteAny { paths, value } => {
-                    qb.push(" AND (0");
-                    for path in paths {
-                        qb.push(" OR (json_type(data, ");
-                        qb.push_bind(path.as_str());
-                        qb.push(") IN ('integer', 'real') AND json_extract(data, ");
-                        qb.push_bind(path.as_str());
-                        qb.push(") >= ");
-                        qb.push_bind(*value);
-                        qb.push(")");
-                    }
-                    qb.push(")");
-                }
-            }
-        }
+        push_json_filters(&mut qb, filters);
 
         if let Some((after_ts, after_key)) = &after {
             qb.push(" AND (updated_at < ");
@@ -750,6 +688,60 @@ impl Datasets {
         rows.into_iter().map(Record::try_from).collect()
     }
 
+    /// Live records matching `filters`, ordered ascending by a JSON path (then
+    /// key for determinism) with the LIMIT applied to the *sorted* rows in SQL.
+    ///
+    /// This is the correctness-critical difference from [`list_filtered`], which
+    /// orders by `updated_at DESC`: a caller that wants the N soonest-closing or
+    /// N smallest-award rows must sort in SQL *before* the LIMIT, or the LIMIT
+    /// picks an arbitrary window (by update recency) and the subsequent in-memory
+    /// sort only reorders that wrong subset. No cursor — this is a top-N view.
+    pub async fn list_filtered_ordered(
+        &self,
+        app: &str,
+        dataset: &str,
+        filters: &[JsonFilter],
+        order_by_path: &str,
+        limit: i64,
+    ) -> Result<Vec<Record>> {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT key, data, first_seen, last_seen, updated_at, removed_at \
+             FROM records WHERE removed_at IS NULL AND app = ",
+        );
+        qb.push_bind(app);
+        qb.push(" AND dataset = ");
+        qb.push_bind(dataset);
+        push_json_filters(&mut qb, filters);
+        qb.push(" ORDER BY json_extract(data, ");
+        qb.push_bind(order_by_path);
+        qb.push(") ASC, key ASC LIMIT ");
+        qb.push_bind(limit);
+
+        let rows: Vec<RecordRow> = qb.build_query_as().fetch_all(&self.pool).await?;
+        rows.into_iter().map(Record::try_from).collect()
+    }
+
+    /// Count of live records matching `filters` — the true total behind a capped
+    /// list, so a view can report the real window size instead of saturating at
+    /// its scan/return cap.
+    pub async fn count_filtered(
+        &self,
+        app: &str,
+        dataset: &str,
+        filters: &[JsonFilter],
+    ) -> Result<i64> {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT COUNT(*) FROM records WHERE removed_at IS NULL AND app = ",
+        );
+        qb.push_bind(app);
+        qb.push(" AND dataset = ");
+        qb.push_bind(dataset);
+        push_json_filters(&mut qb, filters);
+
+        let count: i64 = qb.build_query_scalar().fetch_one(&self.pool).await?;
+        Ok(count)
+    }
+
     /// Distinct dataset names for an app.
     pub async fn datasets(&self, app: &str) -> Result<Vec<String>> {
         let names: Vec<String> =
@@ -758,6 +750,75 @@ impl Datasets {
                 .fetch_all(&self.pool)
                 .await?;
         Ok(names)
+    }
+}
+
+/// Appends the ` AND …` predicate clauses for a set of [`JsonFilter`]s onto a
+/// query builder. Shared by `list_filtered`, `list_filtered_ordered`, and
+/// `count_filtered` so the three can never interpret a filter differently.
+fn push_json_filters<'a>(qb: &mut sqlx::QueryBuilder<'a, sqlx::Sqlite>, filters: &'a [JsonFilter]) {
+    for filter in filters {
+        match filter {
+            JsonFilter::Eq { path, value } => {
+                qb.push(" AND json_extract(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") = ");
+                qb.push_bind(value.as_str());
+            }
+            JsonFilter::Contains { path, value } => {
+                qb.push(" AND instr(lower(COALESCE(json_extract(data, ");
+                qb.push_bind(path.as_str());
+                qb.push("), '')), lower(");
+                qb.push_bind(value.as_str());
+                qb.push(")) > 0");
+            }
+            // Compare numerically when the JSON field is a number, else as text.
+            // SQLite sorts all numbers below all text, so a plain `>=` of a numeric
+            // field against a text-bound value always fails; the text branch
+            // preserves the existing ISO-date behavior unchanged.
+            JsonFilter::Gte { path, value } => {
+                qb.push(" AND (CASE WHEN json_type(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") IN ('integer','real') THEN json_extract(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") >= CAST(");
+                qb.push_bind(value.as_str());
+                qb.push(" AS REAL) ELSE json_extract(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") >= ");
+                qb.push_bind(value.as_str());
+                qb.push(" END)");
+            }
+            JsonFilter::Lte { path, value } => {
+                qb.push(" AND (CASE WHEN json_type(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") IN ('integer','real') THEN json_extract(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") <= CAST(");
+                qb.push_bind(value.as_str());
+                qb.push(" AS REAL) ELSE json_extract(data, ");
+                qb.push_bind(path.as_str());
+                qb.push(") <= ");
+                qb.push_bind(value.as_str());
+                qb.push(" END)");
+            }
+            // `(0 OR ...)` is the honest reading of "matches any of these paths":
+            // with no paths, nothing matches. NULL never satisfies the comparison,
+            // so records missing all the money fields drop out.
+            JsonFilter::NumGteAny { paths, value } => {
+                qb.push(" AND (0");
+                for path in paths {
+                    qb.push(" OR (json_type(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") IN ('integer', 'real') AND json_extract(data, ");
+                    qb.push_bind(path.as_str());
+                    qb.push(") >= ");
+                    qb.push_bind(*value);
+                    qb.push(")");
+                }
+                qb.push(")");
+            }
+        }
     }
 }
 

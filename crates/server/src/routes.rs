@@ -2626,11 +2626,9 @@ const GRANTS_MAX_LIMIT: i64 = 500;
 
 /// Default closing-soon window, in days, matching the grants-gov digest.
 const CLOSING_SOON_DEFAULT_DAYS: i64 = 14;
-/// Rows the closing-soon view pulls before sorting. Sorting is by `close_date`,
-/// not by the `updated_at` order the store returns, so the whole window has to be
-/// in hand before it can be truncated — this bounds that read.
-const CLOSING_SOON_SCAN: i64 = 1000;
-/// Rows the closing-soon view returns. `count` reports the full window size.
+/// Rows the closing-soon view returns, ordered soonest-first in SQL. `count`
+/// reports the full window size independently, so the cap is not a silent
+/// truncation of the total.
 const CLOSING_SOON_CAP: usize = 200;
 
 /// Filters over `grants/unified`. All optional, all ANDed; with none set the
@@ -2762,21 +2760,37 @@ async fn closing_soon(
     let today = chrono::Utc::now().date_naive();
     let until = today + chrono::Duration::days(days);
 
-    // Computed on read rather than materialized as a dataset: the corpus is small
-    // enough to scan, and a read view can never go stale between syncs — which a
-    // "closing soon" list, whose membership changes with the calendar and not with
-    // the data, absolutely would if it were snapshotted.
+    // Computed on read rather than materialized as a dataset: a read view can
+    // never go stale between syncs — which a "closing soon" list, whose membership
+    // changes with the calendar and not with the data, absolutely would if it were
+    // snapshotted.
     let filters = vec![
         JsonFilter::Eq { path: "$.status".into(), value: "open".into() },
         JsonFilter::Gte { path: "$.close_date".into(), value: today.to_string() },
         JsonFilter::Lte { path: "$.close_date".into(), value: until.to_string() },
     ];
+    // Order by close_date ASC and cap in SQL, so the returned rows are genuinely
+    // the soonest-closing across the whole corpus — not an arbitrary
+    // most-recently-updated slice that an in-memory sort would only reorder. The
+    // true window total comes from a separate COUNT, so `count` reflects every
+    // matching grant rather than saturating at the return cap.
+    let count = state
+        .datasets
+        .count_filtered(GRANTS_APP, GRANTS_DATASET, &filters)
+        .await?;
     let records = state
         .datasets
-        .list_filtered(GRANTS_APP, GRANTS_DATASET, &filters, None, CLOSING_SOON_SCAN)
+        .list_filtered_ordered(
+            GRANTS_APP,
+            GRANTS_DATASET,
+            &filters,
+            "$.close_date",
+            CLOSING_SOON_CAP as i64,
+        )
         .await?;
 
-    let mut window: Vec<(i64, Value)> = records
+    // SQL already returns these soonest-first; just attach key + days_left.
+    let grants: Vec<Value> = records
         .into_iter()
         .filter_map(|r| {
             let close = r.data.get("close_date").and_then(Value::as_str)?;
@@ -2785,14 +2799,9 @@ async fn closing_soon(
             let mut grant = r.data.as_object()?.clone();
             grant.insert("key".into(), json!(r.key));
             grant.insert("days_left".into(), json!(days_left));
-            Some((days_left, Value::Object(grant)))
+            Some(Value::Object(grant))
         })
         .collect();
-    window.sort_by_key(|(days_left, _)| *days_left);
-
-    let count = window.len();
-    let grants: Vec<Value> =
-        window.into_iter().take(CLOSING_SOON_CAP).map(|(_, grant)| grant).collect();
     Ok(Json(json!({ "days": days, "count": count, "grants": grants })))
 }
 
