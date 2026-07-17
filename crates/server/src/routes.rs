@@ -174,6 +174,7 @@ async fn openapi_json() -> Json<utoipa::openapi::OpenApi> {
     Json(openapi_router().split_for_parts().1)
 }
 
+#[derive(Debug)]
 struct ApiError(StatusCode, String);
 
 /// Stable machine-readable code derived from the HTTP status, sent alongside the
@@ -1144,6 +1145,87 @@ struct RecordsQuery {
     cursor: Option<String>,
 }
 
+/// Pulls the repeatable `filter` query params out of the raw pair list. axum's
+/// typed `Query<Struct>` (serde_urlencoded) collapses repeated keys, so the
+/// generic `?filter=…&filter=…` surface is read from the full pair vector
+/// instead.
+fn filter_specs(pairs: &[(String, String)]) -> Vec<String> {
+    pairs.iter().filter(|(k, _)| k == "filter").map(|(_, v)| v.clone()).collect()
+}
+
+/// Parses repeatable `filter` specs into store-level [`JsonFilter`]s (all ANDed).
+///
+/// Grammar, one per `?filter=` param: `<path>:<op>:<value>` where `path` is a
+/// JSON path like `$.state` and `op` is one of `eq` (exact text), `contains`
+/// (case-insensitive substring), `gte` / `lte` (text, lexicographic), or
+/// `numgte` (numeric `>=` on any of `path`'s comma-separated fields — an OR). The
+/// value keeps any `:` after the op, so timestamps/URLs pass through. Malformed
+/// specs map to `400` (the shared `Error::BadRequest` path). Example:
+/// `?filter=$.state:eq:CA&filter=$.amount:numgte:1000`.
+fn parse_filters(specs: &[String]) -> Result<Vec<pumper_core::datasets::JsonFilter>, ApiError> {
+    use pumper_core::datasets::JsonFilter;
+    let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, msg);
+    let mut out = Vec::with_capacity(specs.len());
+    for spec in specs {
+        // splitn(3): path and op never contain ':'; the value keeps the rest.
+        let mut parts = spec.splitn(3, ':');
+        let path = parts.next().unwrap_or("");
+        let (Some(op), Some(value)) = (parts.next(), parts.next()) else {
+            return Err(bad(format!(
+                "filter '{spec}' must be '<path>:<op>:<value>' (e.g. $.state:eq:CA)"
+            )));
+        };
+        let check_path = |p: &str| -> Result<(), ApiError> {
+            if p.starts_with("$.") {
+                Ok(())
+            } else {
+                Err(bad(format!(
+                    "filter path '{p}' must be a JSON path starting with '$.' (in '{spec}')"
+                )))
+            }
+        };
+        let filter = match op {
+            "eq" => {
+                check_path(path)?;
+                JsonFilter::Eq { path: path.into(), value: value.into() }
+            }
+            "contains" => {
+                check_path(path)?;
+                JsonFilter::Contains { path: path.into(), value: value.into() }
+            }
+            "gte" => {
+                check_path(path)?;
+                JsonFilter::Gte { path: path.into(), value: value.into() }
+            }
+            "lte" => {
+                check_path(path)?;
+                JsonFilter::Lte { path: path.into(), value: value.into() }
+            }
+            "numgte" => {
+                let num: f64 = value.parse().map_err(|_| {
+                    bad(format!("filter '{spec}': '{value}' is not a number for op 'numgte'"))
+                })?;
+                let paths: Vec<String> =
+                    path.split(',').map(str::trim).filter(|p| !p.is_empty()).map(String::from).collect();
+                if paths.is_empty() {
+                    return Err(bad(format!("filter '{spec}': 'numgte' needs at least one path")));
+                }
+                for p in &paths {
+                    check_path(p)?;
+                }
+                JsonFilter::NumGteAny { paths, value: num }
+            }
+            other => {
+                return Err(bad(format!(
+                    "filter '{spec}': unknown op '{other}' (eq | contains | gte | lte | numgte)"
+                )))
+            }
+        };
+        out.push(filter);
+    }
+    Ok(out)
+}
+
 #[utoipa::path(
     get,
     path = "/datasets/{app}/{dataset}",
@@ -1152,21 +1234,37 @@ struct RecordsQuery {
         ("app" = String, Path, description = "App name"),
         ("dataset" = String, Path, description = "Dataset name"),
         RecordsQuery,
+        ("filter" = Option<Vec<String>>, Query, description = "Repeatable `<path>:<op>:<value>` predicate, all ANDed (e.g. `$.state:eq:CA`, `$.amount:numgte:1000`). ops: eq | contains | gte | lte | numgte. Pushed into SQL; when present, only live records match."),
     ),
-    responses((status = 200, description = "Dual-mode: bare `[Record]` array, or `{items, next_cursor}` when `cursor` is present."))
+    responses(
+        (status = 200, description = "Dual-mode: bare `[Record]` array, or `{items, next_cursor}` when `cursor` is present."),
+        (status = 400, description = "Malformed `filter` spec", body = Object),
+    )
 )]
 async fn list_records(
     State(state): State<AppState>,
     Path((app, dataset)): Path<(String, String)>,
     Query(query): Query<RecordsQuery>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = query.limit.clamp(1, 1000);
+    let filters = parse_filters(&filter_specs(&pairs))?;
     let Some(cursor) = &query.cursor else {
-        let records = state.datasets.list(&app, &dataset, limit).await?;
+        // Unfiltered first page keeps the legacy `list` (includes removed rows);
+        // a filtered query uses the live-only keyset scan.
+        let records = if filters.is_empty() {
+            state.datasets.list(&app, &dataset, limit).await?
+        } else {
+            state.datasets.list_filtered(&app, &dataset, &filters, None, limit).await?
+        };
         return Ok(Json(json!(records)));
     };
     let after = parse_cursor(cursor);
-    let records = state.datasets.list_page(&app, &dataset, after, limit).await?;
+    let records = if filters.is_empty() {
+        state.datasets.list_page(&app, &dataset, after, limit).await?
+    } else {
+        state.datasets.list_filtered(&app, &dataset, &filters, after, limit).await?
+    };
     let next_cursor = keyset_cursor(&records, limit, |r| {
         format!("{}|{}", pumper_core::datasets::ts(r.updated_at), r.key)
     });
@@ -1270,16 +1368,18 @@ impl ExportFormat {
         ("app" = String, Path, description = "App name"),
         ("dataset" = String, Path, description = "Dataset name"),
         ExportQuery,
+        ("filter" = Option<Vec<String>>, Query, description = "Repeatable `<path>:<op>:<value>` predicate, all ANDed (same grammar as `GET /datasets/{app}/{dataset}`). Pushed into SQL, so a filtered export streams only matching live rows — a targeted export instead of the whole corpus."),
     ),
     responses(
         (status = 200, description = "Streamed export as a JSON array, NDJSON, or CSV (per `format`); constant memory, no row cap. `content-disposition: attachment`."),
-        (status = 400, description = "Unknown format", body = Object),
+        (status = 400, description = "Unknown format or malformed `filter` spec", body = Object),
     )
 )]
 async fn export_records(
     State(state): State<AppState>,
     Path((app, dataset)): Path<(String, String)>,
     Query(query): Query<ExportQuery>,
+    Query(pairs): Query<Vec<(String, String)>>,
 ) -> Result<Response, ApiError> {
     let format = match query.format.as_deref().unwrap_or("json") {
         "json" => ExportFormat::Json,
@@ -1292,14 +1392,22 @@ async fn export_records(
             ))
         }
     };
-    Ok(stream_export(state, app, dataset, format))
+    // Validate filters up front so a bad spec is a clean 400, not a mid-stream abort.
+    let filters = parse_filters(&filter_specs(&pairs))?;
+    Ok(stream_export(state, app, dataset, format, filters))
 }
 
 /// Streams the whole dataset in keyset-paged batches — constant memory
 /// regardless of dataset size, with no row cap or silent truncation. `json`
 /// frames the batches as one array (`[`, comma-separated records, `]`); `ndjson`
 /// and `csv` stream line-oriented output.
-fn stream_export(state: AppState, app: String, dataset: String, format: ExportFormat) -> Response {
+fn stream_export(
+    state: AppState,
+    app: String,
+    dataset: String,
+    format: ExportFormat,
+    filters: Vec<pumper_core::datasets::JsonFilter>,
+) -> Response {
     const BATCH: i64 = 1_000;
     let filename = format!("attachment; filename=\"{dataset}.{}\"", format.extension());
     let content_type = format.content_type();
@@ -1314,7 +1422,13 @@ fn stream_export(state: AppState, app: String, dataset: String, format: ExportFo
         let mut after: Option<(String, String)> = None;
         let mut first = true;
         loop {
-            let batch = match state.datasets.list_page(&app, &dataset, after.clone(), BATCH).await {
+            // Same keyset cursor tuple drives both paths; `list_filtered` pushes the
+            // predicates into SQL so an unmatched row is never deserialized.
+            let batch = match if filters.is_empty() {
+                state.datasets.list_page(&app, &dataset, after.clone(), BATCH).await
+            } else {
+                state.datasets.list_filtered(&app, &dataset, &filters, after.clone(), BATCH).await
+            } {
                 Ok(batch) => batch,
                 Err(e) => {
                     tracing::warn!(app = %app, dataset = %dataset, "export stream aborted: {e}");
@@ -2928,6 +3042,79 @@ async fn closing_soon(
         })
         .collect();
     Ok(Json(json!({ "days": days, "count": count, "grants": grants })))
+}
+
+#[cfg(test)]
+mod filter_tests {
+    use super::{filter_specs, parse_filters};
+    use pumper_core::datasets::JsonFilter;
+
+    #[test]
+    fn filter_specs_pulls_only_repeated_filter_keys() {
+        let pairs = vec![
+            ("limit".to_string(), "10".to_string()),
+            ("filter".to_string(), "$.state:eq:CA".to_string()),
+            ("cursor".to_string(), "x".to_string()),
+            ("filter".to_string(), "$.n:numgte:5".to_string()),
+        ];
+        assert_eq!(filter_specs(&pairs), vec!["$.state:eq:CA", "$.n:numgte:5"]);
+    }
+
+    #[test]
+    fn parses_each_op_and_preserves_colons_in_value() {
+        let specs: Vec<String> = [
+            "$.state:eq:CA",
+            "$.name:contains:health",
+            "$.close_date:gte:2026-01-01",
+            "$.close_date:lte:2026-12-31",
+            "$.seen:eq:2026-07-17T10:30:00Z", // value keeps its colons
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        let out = parse_filters(&specs).expect("valid");
+        assert!(matches!(&out[0], JsonFilter::Eq { path, value } if path == "$.state" && value == "CA"));
+        assert!(matches!(&out[1], JsonFilter::Contains { .. }));
+        assert!(matches!(&out[2], JsonFilter::Gte { .. }));
+        assert!(matches!(&out[3], JsonFilter::Lte { .. }));
+        assert!(
+            matches!(&out[4], JsonFilter::Eq { value, .. } if value == "2026-07-17T10:30:00Z"),
+            "value must keep colons after the op"
+        );
+    }
+
+    #[test]
+    fn numgte_parses_number_and_multiple_paths() {
+        let out = parse_filters(&["$.award_ceiling,$.total_funding:numgte:1000".to_string()])
+            .expect("valid");
+        match &out[0] {
+            JsonFilter::NumGteAny { paths, value } => {
+                assert_eq!(paths, &vec!["$.award_ceiling".to_string(), "$.total_funding".to_string()]);
+                assert_eq!(*value, 1000.0);
+            }
+            other => panic!("expected NumGteAny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rejects_malformed_specs() {
+        // Missing op/value.
+        assert!(parse_filters(&["$.state".to_string()]).is_err());
+        assert!(parse_filters(&["$.state:eq".to_string()]).is_err());
+        // Path not a JSON path.
+        assert!(parse_filters(&["state:eq:CA".to_string()]).is_err());
+        // Unknown op.
+        assert!(parse_filters(&["$.state:like:CA".to_string()]).is_err());
+        // numgte with a non-number.
+        assert!(parse_filters(&["$.n:numgte:lots".to_string()]).is_err());
+        // numgte with a bad sub-path.
+        assert!(parse_filters(&["$.a,bad:numgte:1".to_string()]).is_err());
+    }
+
+    #[test]
+    fn empty_specs_yield_no_filters() {
+        assert!(parse_filters(&[]).expect("ok").is_empty());
+    }
 }
 
 #[cfg(test)]
