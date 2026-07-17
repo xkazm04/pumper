@@ -338,13 +338,21 @@ pub mod unified {
     /// Virtual app namespace holding the cross-source trades dataset.
     pub const UNIFIED_APP: &str = "trades";
     pub const OPERATOR_ECONOMICS: &str = "operator_economics";
+    /// The national-roll-up locality (matches homewyse-pricing's default).
+    const NATIONAL_LOCALITY: &str = "United States";
+    /// Read cap for the pricing dataset: well past 51 localities × 5 trades × 4
+    /// jobs (≈1020) so the summary can't silently truncate once localities drive.
+    const PRICING_READ_LIMIT: i64 = 50_000;
 
     /// Rebuilds `trades/operator_economics` from the current state of the four
     /// source datasets: wage band (trade-wages), pricing summary (homewyse),
-    /// federal + illustrative-state tax context (state-tax), and valuation
-    /// multiples (valuation-multiples). One row per canonical trade, keyed
-    /// `US:<trade>`. Idempotent `upsert_many` (a join, never a full-snapshot
-    /// sync — absent source data must not mark rows removed).
+    /// tax context (state-tax), and valuation multiples (valuation-multiples).
+    /// Emits a national roll-up row `US:<trade>` **and** a per-state row
+    /// `<ST>:<trade>` for every state tax record — the per-state rows carry that
+    /// state's REAL top-marginal rate instead of a national median. Wage /
+    /// valuation stay the national roll-up on state rows (`wage_grain: national`)
+    /// until per-state OEWS lands. Idempotent `upsert_many` (a join, never a
+    /// full-snapshot sync — absent source data must not mark rows removed).
     pub async fn sync_operator_economics(ctx: &AppContext) -> Result<UpsertSummary> {
         // Federal small-business constants — national, same for every trade.
         let federal = ctx
@@ -353,58 +361,93 @@ pub mod unified {
             .await?
             .map(|r| r.data);
 
-        // Illustrative state context: the median top marginal rate across the
-        // state records we currently hold (a single representative number so the
-        // join stays compact rather than embedding 51 states per trade).
+        // Real per-state tax records (code → record) + the illustrative national
+        // median used only by the `US:{trade}` roll-up.
         let state_records = ctx.datasets.list("state-tax", "tax", 200).await?;
-        let mut state_rates: Vec<f64> = state_records
-            .iter()
-            .filter(|r| r.data.get("level").and_then(Value::as_str) == Some("state"))
-            .filter_map(|r| r.data.get("top_marginal_rate").and_then(Value::as_f64))
-            .collect();
+        let mut state_tax: Vec<(String, Value)> = Vec::new();
+        let mut state_rates: Vec<f64> = Vec::new();
+        for r in &state_records {
+            if r.data.get("level").and_then(Value::as_str) != Some("state") {
+                continue;
+            }
+            if let Some(rate) = r.data.get("top_marginal_rate").and_then(Value::as_f64) {
+                state_rates.push(rate);
+            }
+            if let Some(code) = r.data.get("state").and_then(Value::as_str) {
+                state_tax.push((code.to_string(), r.data.clone()));
+            }
+        }
         state_rates.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_state_rate = median(&state_rates);
 
-        // All priced jobs, grouped per trade below.
-        let pricing = ctx.datasets.list("homewyse-pricing", "pricing", 1000).await?;
+        // All priced jobs. Cap raised well past 51 localities × 5 trades × 4 jobs
+        // (≈1020) so the summary can't silently truncate once localities are driven.
+        let pricing_recs =
+            ctx.datasets.list("homewyse-pricing", "pricing", PRICING_READ_LIMIT).await?;
+        let pricing: Vec<&Value> = pricing_recs.iter().map(|r| &r.data).collect();
 
         let mut items: Vec<(String, Value)> = Vec::new();
         for trade in Trade::ALL {
             let label = trade.label();
-            let key = format!("US:{label}");
-
+            // Wage + valuation are national roll-ups (`US:{label}`) — per-state
+            // OEWS wages are deferred (trades#2 phase c); valuation stays national
+            // by design (per-state broker comps are too thin to be honest).
             let wage = ctx
                 .datasets
-                .get("trade-wages", "wages", &key)
+                .get("trade-wages", "wages", &format!("US:{label}"))
                 .await?
                 .map(|r| r.data);
             let valuation = ctx
                 .datasets
-                .get("valuation-multiples", "valuation", &key)
+                .get("valuation-multiples", "valuation", &format!("US:{label}"))
                 .await?
                 .map(|r| r.data);
-            let pricing_summary = summarize_pricing(&pricing, label);
 
-            // A trade with no data in ANY source isn't a real join row yet.
-            if wage.is_none()
-                && valuation.is_none()
-                && pricing_summary.is_none()
-                && federal.is_none()
+            // National roll-up row (pricing filtered to the national locality, so a
+            // Texas price no longer contaminates the national envelope).
+            let national_pricing = summarize_pricing(&pricing, label, NATIONAL_LOCALITY);
+            if wage.is_some()
+                || valuation.is_some()
+                || national_pricing.is_some()
+                || federal.is_some()
             {
-                continue;
+                items.push((
+                    format!("US:{label}"),
+                    json!({
+                        "trade": label,
+                        "state": "US",
+                        "soc_code": trade.soc_code(),
+                        "wage_band": wage.as_ref().map(wage_band),
+                        "wage_grain": "national",
+                        "pricing": national_pricing,
+                        "pricing_locality": NATIONAL_LOCALITY,
+                        "tax": tax_context(federal.as_ref(), median_state_rate),
+                        "valuation": valuation.as_ref().map(valuation_summary),
+                    }),
+                ));
             }
 
-            items.push((
-                key,
-                json!({
-                    "trade": label,
-                    "soc_code": trade.soc_code(),
-                    "wage_band": wage.as_ref().map(wage_band),
-                    "pricing": pricing_summary,
-                    "tax": tax_context(federal.as_ref(), median_state_rate),
-                    "valuation": valuation.as_ref().map(valuation_summary),
-                }),
-            ));
+            // Per-state rows carry the REAL state tax (the actionable win). Wage /
+            // valuation stay the national roll-up (labeled `wage_grain: national`);
+            // pricing is per-locality — non-null once a locality matching the state
+            // code is priced, else null (never the contaminated average).
+            for (code, trec) in &state_tax {
+                let state_pricing = summarize_pricing(&pricing, label, code);
+                items.push((
+                    format!("{code}:{label}"),
+                    json!({
+                        "trade": label,
+                        "state": code,
+                        "soc_code": trade.soc_code(),
+                        "wage_band": wage.as_ref().map(wage_band),
+                        "wage_grain": "national",
+                        "pricing": state_pricing,
+                        "pricing_locality": code,
+                        "tax": state_tax_context(federal.as_ref(), trec),
+                        "valuation": valuation.as_ref().map(valuation_summary),
+                    }),
+                ));
+            }
         }
 
         ctx.datasets
@@ -425,17 +468,42 @@ pub mod unified {
         })
     }
 
-    /// Federal constants + one illustrative state top-marginal rate.
+    /// The compact federal-constants subset, shared by the national and per-state
+    /// tax contexts.
+    fn federal_summary(federal: Option<&Value>) -> Value {
+        federal
+            .map(|f| {
+                json!({
+                    "self_employment_tax_rate": f.get("self_employment_tax_rate"),
+                    "qbi_deduction_pct": f.get("qbi_deduction_pct"),
+                    "standard_deduction_single": f.get("standard_deduction_single"),
+                    "section_179_limit": f.get("section_179_limit"),
+                    "top_marginal_rate": f.get("top_marginal_rate"),
+                })
+            })
+            .unwrap_or(Value::Null)
+    }
+
+    /// National roll-up tax context: federal constants + one illustrative median
+    /// state rate (the `US:{trade}` row only — a per-state row carries its real rate).
     fn tax_context(federal: Option<&Value>, median_state_rate: Option<f64>) -> Value {
         json!({
-            "federal": federal.map(|f| json!({
-                "self_employment_tax_rate": f.get("self_employment_tax_rate"),
-                "qbi_deduction_pct": f.get("qbi_deduction_pct"),
-                "standard_deduction_single": f.get("standard_deduction_single"),
-                "section_179_limit": f.get("section_179_limit"),
-                "top_marginal_rate": f.get("top_marginal_rate"),
-            })),
+            "federal": federal_summary(federal),
             "illustrative_state_top_marginal_rate_median": median_state_rate,
+        })
+    }
+
+    /// Per-state tax context: federal constants + the state's REAL top-marginal
+    /// rate — so a Texan (0%) and a Californian (13.3%) no longer receive the same
+    /// median middle number, which was right for neither.
+    fn state_tax_context(federal: Option<&Value>, state: &Value) -> Value {
+        json!({
+            "federal": federal_summary(federal),
+            "state": {
+                "state": state.get("state"),
+                "income_tax_type": state.get("income_tax_type"),
+                "top_marginal_rate": state.get("top_marginal_rate"),
+            },
         })
     }
 
@@ -449,23 +517,28 @@ pub mod unified {
         })
     }
 
-    /// Summarize all priced jobs for a trade into a compact band: job count and
-    /// the low/median/high envelope across jobs. Returns None if none priced.
-    fn summarize_pricing(pricing: &[pumper_core::Record], trade_label: &str) -> Option<Value> {
+    /// Summarize the priced jobs for a trade **in one locality** into a compact
+    /// band: job count and the low/median/high envelope across jobs. Filtering on
+    /// locality is what stops two localities' prices (e.g. Texas + national) from
+    /// being silently averaged into one envelope. Returns None if none priced.
+    fn summarize_pricing(pricing: &[&Value], trade_label: &str, locality: &str) -> Option<Value> {
         let mut lows = Vec::new();
         let mut medians = Vec::new();
         let mut highs = Vec::new();
         for r in pricing {
-            if r.data.get("trade").and_then(Value::as_str) != Some(trade_label) {
+            if r.get("trade").and_then(Value::as_str) != Some(trade_label) {
                 continue;
             }
-            if let Some(v) = r.data.get("low").and_then(Value::as_f64) {
+            if r.get("locality").and_then(Value::as_str) != Some(locality) {
+                continue;
+            }
+            if let Some(v) = r.get("low").and_then(Value::as_f64) {
                 lows.push(v);
             }
-            if let Some(v) = r.data.get("median").and_then(Value::as_f64) {
+            if let Some(v) = r.get("median").and_then(Value::as_f64) {
                 medians.push(v);
             }
-            if let Some(v) = r.data.get("high").and_then(Value::as_f64) {
+            if let Some(v) = r.get("high").and_then(Value::as_f64) {
                 highs.push(v);
             }
         }
@@ -510,6 +583,40 @@ pub mod unified {
             assert_eq!(median(&[1.0, 2.0, 3.0]), Some(2.0));
             assert_eq!(median(&[1.0, 2.0, 3.0, 4.0]), Some(2.5));
             assert_eq!(median(&[]), None);
+        }
+
+        #[test]
+        fn summarize_pricing_isolates_by_locality_no_contamination() {
+            let job = |trade: &str, locality: &str, med: f64| {
+                json!({ "trade": trade, "locality": locality, "low": med - 10.0, "median": med, "high": med + 10.0 })
+            };
+            let rows = [
+                job("Plumbing", "United States", 300.0),
+                job("Plumbing", "Texas", 250.0), // must NOT pollute the national envelope
+                job("Plumbing", "United States", 340.0),
+            ];
+            let refs: Vec<&Value> = rows.iter().collect();
+            let national = summarize_pricing(&refs, "Plumbing", "United States").unwrap();
+            assert_eq!(national["jobs_priced"], 2, "only the two US jobs");
+            assert_eq!(national["median"], 320.0); // (300+340)/2, Texas excluded
+            let tx = summarize_pricing(&refs, "Plumbing", "Texas").unwrap();
+            assert_eq!(tx["jobs_priced"], 1);
+            assert_eq!(tx["median"], 250.0);
+            // A locality with no priced jobs → None, never a fabricated average.
+            assert!(summarize_pricing(&refs, "Plumbing", "Ohio").is_none());
+        }
+
+        #[test]
+        fn state_tax_context_carries_the_real_rate_not_a_median() {
+            let federal = json!({ "self_employment_tax_rate": 0.153, "top_marginal_rate": 0.37 });
+            let tx = json!({ "state": "TX", "income_tax_type": "none", "top_marginal_rate": 0.0 });
+            let ca = json!({ "state": "CA", "income_tax_type": "graduated", "top_marginal_rate": 0.133 });
+            let tx_ctx = state_tax_context(Some(&federal), &tx);
+            let ca_ctx = state_tax_context(Some(&federal), &ca);
+            // Texan gets 0%, Californian gets 13.3% — not the same middle number.
+            assert_eq!(tx_ctx["state"]["top_marginal_rate"], 0.0);
+            assert_eq!(ca_ctx["state"]["top_marginal_rate"], 0.133);
+            assert_eq!(tx_ctx["federal"]["top_marginal_rate"], 0.37);
         }
     }
 }
