@@ -1004,7 +1004,7 @@ struct SchedulesQuery {
     path = "/schedules",
     tag = "schedules",
     params(SchedulesQuery),
-    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present."))
+    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `overlapping`) — so a silently-wedged schedule is visible over the API."))
 )]
 async fn list_schedules(
     State(state): State<AppState>,
@@ -1015,14 +1015,60 @@ async fn list_schedules(
         // Legacy bare-array mode is still capped: an uncursored list must not
         // stream an entire table.
         let items = state.storage.list_schedules_page(None, limit).await?;
-        return Ok(Json(json!(items)));
+        let enriched = enrich_schedules(&state, items).await?;
+        return Ok(Json(json!(enriched)));
     };
     let after = parse_cursor(cursor);
     let items = state.storage.list_schedules_page(after, limit).await?;
     let next_cursor = keyset_cursor(&items, limit, |s| {
         format!("{}|{}", pumper_core::datasets::ts(s.created_at), s.id)
     });
-    Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
+    let enriched = enrich_schedules(&state, items).await?;
+    Ok(Json(json!({ "items": enriched, "next_cursor": next_cursor })))
+}
+
+/// Enriches each schedule with the observability fields the raw row can't carry:
+/// the computed `next_run`, its most recent job (`last_job_id` / `last_status`),
+/// and a `health` reason so "why isn't this firing?" is answerable over the API
+/// instead of only in server logs. `health` is derived from the same conditions
+/// the scheduler checks, so the API and the reconcile loop can't disagree.
+async fn enrich_schedules(
+    state: &AppState,
+    schedules: Vec<Schedule>,
+) -> Result<Vec<Value>, ApiError> {
+    let mut out = Vec::with_capacity(schedules.len());
+    for schedule in schedules {
+        let next_run = crate::scheduler::project_next_run(&schedule);
+        let last = state.storage.latest_job_for_schedule(&schedule.id).await?;
+        let (last_job_id, last_status) = match &last {
+            Some((id, status)) => (Some(id.clone()), Some(status.clone())),
+            None => (None, None),
+        };
+        // Precedence mirrors the scheduler's own short-circuits: a disabled or
+        // mis-configured schedule never reaches the overlap check.
+        let last_active = matches!(last_status.as_deref(), Some("queued") | Some("running"));
+        let health = if !schedule.enabled {
+            "disabled"
+        } else if next_run.is_none() {
+            // project_next_run only returns None on an unparseable/exhausted cron.
+            "invalid_cron"
+        } else if !state.registry.contains_key(&schedule.app) {
+            "unregistered_app"
+        } else if last_active {
+            "overlapping"
+        } else {
+            "ok"
+        };
+        let mut value = serde_json::to_value(&schedule).unwrap_or_else(|_| json!({}));
+        if let Value::Object(map) = &mut value {
+            map.insert("next_run".into(), json!(next_run));
+            map.insert("last_job_id".into(), json!(last_job_id));
+            map.insert("last_status".into(), json!(last_status));
+            map.insert("health".into(), json!(health));
+        }
+        out.push(value);
+    }
+    Ok(out)
 }
 
 #[derive(Deserialize, ToSchema)]

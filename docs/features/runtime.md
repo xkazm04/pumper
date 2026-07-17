@@ -35,6 +35,11 @@ Each schedule carries three cron-maturity fields (`schedules` table cols `timezo
 - **`misfire_policy`** — how firings missed while the scheduler was down are handled once it's back. `"fire_once"` (default) runs a single catch-up job (collapsing the whole backlog into one run — the historical behaviour, now explicit); `"skip"` runs none and just advances `last_run` past the missed firings (the count is logged). A firing more than two `schedule_tick_secs` late is treated as missed; a firing detected on-time within that grace window always runs under both policies.
 - **`max_attempts`** — attempt budget for jobs this schedule enqueues; `null` = server default (**3**), so scheduled runs retry transient failures with backoff exactly like a manual job (previously cron runs were hardcoded to a single attempt).
 
+**Observability (`GET /schedules`).** Each returned schedule is enriched with computed fields so "when does this next fire?", "did the last run succeed?", and "why has this gone quiet?" are answerable over the API instead of only in server logs:
+- **`next_run`** — the next firing, projected with the scheduler's own reference rule (`cron.after(last_run ?? created_at)` in the schedule's timezone), so the API can never disagree with the reconcile loop. `null` for an unparseable cron.
+- **`last_job_id` / `last_status`** — the most recent job this schedule enqueued (joined on `schedule_id`), or `null` if it has never fired.
+- **`health`** — `ok` | `disabled` | `invalid_cron` | `unregistered_app` | `overlapping`, derived from the same conditions the scheduler checks each tick. `overlapping` means the previous run is still queued/running and the overlap guard is holding the next firing back — the one case where an ever-older `last_run` otherwise looks like a dead schedule.
+
 ## Budgets & the cost ledger
 
 - Every metered engine call (`AppContext::fetch` / `AppContext::research`) writes a `cost_events` row (job, app, engine tier, url, `cost_usd` — Claude actual, free tiers 0.0, detail incl. escalation trail / `cache_hit`).

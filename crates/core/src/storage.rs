@@ -502,6 +502,22 @@ impl Storage {
         Ok(found.is_some())
     }
 
+    /// The most recent job this schedule enqueued: `(job_id, status)`, or `None`
+    /// if it has never fired. Backs the schedule-observability API (`last_job_id`
+    /// / `last_status`); uses the same `schedule_id` index as the overlap guard.
+    pub async fn latest_job_for_schedule(
+        &self,
+        schedule_id: &str,
+    ) -> Result<Option<(String, String)>> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, status FROM jobs WHERE schedule_id = ?1 ORDER BY created_at DESC LIMIT 1",
+        )
+        .bind(schedule_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     /// Manually re-queues a failed or cancelled job: clears the terminal state
     /// and grants one more attempt. Returns the refreshed job, or None when the
     /// job doesn't exist or isn't in a retryable state.
