@@ -11,6 +11,10 @@
 //! and relaunches, so a crash no longer wedges every future render until a
 //! server restart. A holder also relaunches after
 //! `[browser] recycle_after_renders` renders to shed accumulated memory.
+//! Relaunches are serialized per profile by a launch gate, so a crash or recycle
+//! seen by several concurrent renders triggers **one** Chrome launch (not N
+//! racing the same `--user-data-dir`); the launch itself runs off the holders
+//! lock under a timeout so one slow start can't stall other profiles.
 //!
 //! ## Session profiles
 //!
@@ -63,6 +67,10 @@ const MAX_LIVE_PROFILES: usize = 4;
 /// The empty string can never collide with a real profile name — those are
 /// validated non-empty by `pumper_core::validate_profile_name`.
 const DEFAULT_PROFILE_KEY: &str = "";
+/// Hard ceiling on a single Chrome launch, kept under chromiumoxide's own ~20s
+/// `launch_timeout` so a wedged launch surfaces a typed error (and releases the
+/// per-key launch gate) rather than parking every waiter for the full 20s.
+const LAUNCH_TIMEOUT_SECS: u64 = 15;
 
 /// Whether a held Chrome instance must be relaunched before the next render.
 /// Pure so it can be unit-tested without a real browser: an instance is stale
@@ -98,6 +106,13 @@ struct Holders {
     live: HashMap<String, LiveBrowser>,
     /// Front = least-recently-used, back = most-recent.
     order: VecDeque<String>,
+    /// Per-profile launch gate: a task launching (or relaunching) Chrome for a
+    /// key holds this key's lock so concurrent stale/cold acquires for the SAME
+    /// profile await one launch instead of each racing a full Chrome against the
+    /// shared `--user-data-dir` (whose single-instance lock they'd contend for).
+    /// Entries whose only reference is this map (no in-flight launch, no waiters)
+    /// are pruned opportunistically to bound the map.
+    launching: HashMap<String, Arc<Mutex<()>>>,
 }
 
 
@@ -215,32 +230,74 @@ impl BrowserEngine {
         // lock without launching anything.
         {
             let mut holders = self.holders.lock().await;
-            let fresh = holders
-                .live
-                .get(&key)
-                .is_some_and(|l| !is_stale(l.alive.load(Ordering::Relaxed), l.renders, recycle));
-            if fresh {
+            if Self::is_fresh(&holders, &key, recycle) {
                 return Ok(Self::checkout(&mut holders, &key));
             }
         }
 
-        // Slow path: launch Chrome WITHOUT holding the global holders lock, so a
-        // cold start / crash-relaunch / recycle for one profile does not stall
-        // renders for every other profile (a launch can take up to ~20s).
-        let launched = self.launch(&user_data_dir).await?;
+        // Slow path. Take this profile's launch gate so concurrent stale/cold
+        // acquires for the SAME key collapse onto ONE launch: the 2nd..Nth caller
+        // blocks here, then finds the holder the winner installed. Other profiles
+        // are unaffected (their key, their gate). Cloned out under a brief lock;
+        // finished gates (map-only refs) are pruned to keep the map small.
+        let launch_gate = {
+            let mut holders = self.holders.lock().await;
+            Self::gate_for(&mut holders, &key)
+        };
+        let _gate = launch_gate.lock().await;
 
-        // Re-lock and install. If another task installed a fresh holder for this
-        // key while we launched, keep theirs and let our just-launched instance
-        // drop (`kill_on_drop` reaps it).
-        let mut holders = self.holders.lock().await;
-        let now_fresh = holders
-            .live
-            .get(&key)
-            .is_some_and(|l| !is_stale(l.alive.load(Ordering::Relaxed), l.renders, recycle));
-        if !now_fresh {
-            holders.live.insert(key.clone(), launched);
+        // Re-check under the gate: a task that raced us here may have already
+        // launched a fresh holder while we waited — if so, reuse it.
+        {
+            let mut holders = self.holders.lock().await;
+            if Self::is_fresh(&holders, &key, recycle) {
+                return Ok(Self::checkout(&mut holders, &key));
+            }
+            // Drop the stale/dead holder BEFORE launching so its Chrome releases
+            // the `--user-data-dir` single-instance lock the replacement needs;
+            // in-flight renders keep the outgoing browser alive via their own
+            // `Arc<ChromeBrowser>` clone from `checkout`, so this can't kill a
+            // render mid-flight.
+            if holders.live.remove(&key).is_some() {
+                info!(profile = %key, "recycling browser profile (dropped before relaunch)");
+            }
         }
+
+        // Launch WITHOUT the holders lock (a launch can take many seconds), and
+        // under an explicit timeout below chromiumoxide's own ~20s ceiling.
+        let launched = match tokio::time::timeout(
+            Duration::from_secs(LAUNCH_TIMEOUT_SECS),
+            self.launch(&user_data_dir),
+        )
+        .await
+        {
+            Ok(res) => res?,
+            Err(_) => {
+                return Err(Error::Browser(format!(
+                    "chrome launch timed out after {LAUNCH_TIMEOUT_SECS}s (profile '{key}')"
+                )))
+            }
+        };
+
+        let mut holders = self.holders.lock().await;
+        holders.live.insert(key.clone(), launched);
         Ok(Self::checkout(&mut holders, &key))
+    }
+
+    /// Get-or-create the per-key launch gate, first pruning gates that only the
+    /// map still references (no in-flight launch, no waiters) so the map can't
+    /// grow without bound across many distinct profiles. Caller holds the lock.
+    fn gate_for(holders: &mut Holders, key: &str) -> Arc<Mutex<()>> {
+        holders.launching.retain(|_, g| Arc::strong_count(g) > 1);
+        holders.launching.entry(key.to_string()).or_default().clone()
+    }
+
+    /// Whether `key` has a live, non-stale holder. Caller holds the holders lock.
+    fn is_fresh(holders: &Holders, key: &str, recycle: u64) -> bool {
+        holders
+            .live
+            .get(key)
+            .is_some_and(|l| !is_stale(l.alive.load(Ordering::Relaxed), l.renders, recycle))
     }
 
     /// Bumps the LRU order + render counter for `key` (evicting the least-recently
@@ -432,6 +489,33 @@ mod tests {
         let mut c = cfg();
         c.max_concurrent_renders = 0;
         assert!(BrowserEngine::new(&c, "data/profiles").render_slots.is_none());
+    }
+
+    #[test]
+    fn gate_for_reuses_same_key_and_separates_keys() {
+        let mut holders = Holders::default();
+        let a1 = BrowserEngine::gate_for(&mut holders, "p1");
+        let a2 = BrowserEngine::gate_for(&mut holders, "p1");
+        let b = BrowserEngine::gate_for(&mut holders, "p2");
+        // Same key → same gate (concurrent same-profile acquires collapse).
+        assert!(Arc::ptr_eq(&a1, &a2));
+        // Different key → different gate (other profiles proceed independently).
+        assert!(!Arc::ptr_eq(&a1, &b));
+    }
+
+    #[test]
+    fn gate_for_prunes_unreferenced_gates() {
+        let mut holders = Holders::default();
+        // A caller currently launching for "held" keeps its gate referenced.
+        let _held = BrowserEngine::gate_for(&mut holders, "held");
+        // "done" has no outstanding reference (its would-be caller finished).
+        BrowserEngine::gate_for(&mut holders, "done");
+        assert_eq!(holders.launching.len(), 2);
+        // Next get-or-create prunes map-only ("done") but keeps referenced ("held").
+        let _next = BrowserEngine::gate_for(&mut holders, "new");
+        assert!(holders.launching.contains_key("held"));
+        assert!(!holders.launching.contains_key("done"));
+        assert!(holders.launching.contains_key("new"));
     }
 
     #[test]

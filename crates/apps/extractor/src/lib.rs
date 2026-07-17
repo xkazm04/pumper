@@ -6,6 +6,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use futures::StreamExt;
 use pumper_core::{
     extract_batch_with_report, AppContext, CompiledRuleSet, DocReport, Error, FetchRequest,
     FetchStrategy, FieldStatus, Record, Result, RuleSet, ScrapeApp, UpsertSummary,
@@ -17,6 +18,26 @@ pub struct Extractor;
 /// Max live records pulled from a source dataset when no explicit `keys` (and no
 /// `_trigger.keys`) narrow the set — bounds the dataset read and the fan-out.
 const SOURCE_LIST_LIMIT: i64 = 10_000;
+
+/// Default in-flight fetch cap, matching `CrawlConfig.concurrency`.
+const DEFAULT_FETCH_CONCURRENCY: usize = 16;
+
+/// Read the `concurrency` param (max in-flight fetches), clamped to `>= 1` and
+/// defaulting to [`DEFAULT_FETCH_CONCURRENCY`]. Bounds the URL-list fan-out so a
+/// large `urls` list can't open one socket per URL at once.
+fn fetch_concurrency(ctx: &AppContext) -> usize {
+    parse_concurrency(&ctx.params)
+}
+
+/// Pure param parse for [`fetch_concurrency`] — clamps `concurrency` to `>= 1`,
+/// defaulting to [`DEFAULT_FETCH_CONCURRENCY`].
+fn parse_concurrency(params: &Value) -> usize {
+    params
+        .get("concurrency")
+        .and_then(Value::as_u64)
+        .map(|n| n.max(1) as usize)
+        .unwrap_or(DEFAULT_FETCH_CONCURRENCY)
+}
 
 /// Aggregate the per-document reports into a quality signal for the job result:
 /// how many field extractions matched out of the total attempted, plus the
@@ -123,7 +144,8 @@ impl ScrapeApp for Extractor {
          declarative rule set. Params: {\"urls\": [..] OR \"source\": {\"app\": .., \
          \"dataset\": .., \"keys\": [..]?}, \"rules\": {\"field\": {\"type\": \
          \"css|regex|json|xpath|const\", ..}}, \"strategy\": \"http|browser|auto\", \
-         \"dataset\": \"extracted\"}. Source mode reads each record's stored body \
+         \"concurrency\": 16 (max in-flight fetches), \"dataset\": \"extracted\"}. \
+         Source mode reads each record's stored body \
          (artifact_path under the origin job's dir) instead of re-fetching; keys default to \
          the firing trigger's _trigger.keys, else all live records."
     }
@@ -180,12 +202,15 @@ impl Extractor {
             Some("auto_with_research") => FetchStrategy::AutoWithResearch,
             _ => FetchStrategy::Http,
         };
+        let concurrency = fetch_concurrency(ctx);
 
-        // Fetch all URLs concurrently (the governor handles per-host politeness).
+        // Fetch URLs with a bounded fan-out: the governor serializes same-host
+        // requests but places no global cap, so a 5000-URL/800-host list would
+        // otherwise open thousands of sockets at once (fd exhaustion). Cap the
+        // in-flight fetches like the sibling `crawl` app does (default 16).
         let fetcher = ctx.engines.fetch.clone();
-        let fetches = urls.iter().map(|url| {
+        let fetches = urls.iter().cloned().map(|url| {
             let f = fetcher.clone();
-            let url = url.clone();
             let mut req = FetchRequest::new(&url);
             req.strategy = strategy;
             async move {
@@ -195,8 +220,10 @@ impl Extractor {
                 }
             }
         });
-        let fetched_pairs: Vec<(String, Option<String>)> =
-            futures::future::join_all(fetches).await;
+        let fetched_pairs: Vec<(String, Option<String>)> = futures::stream::iter(fetches)
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
 
         let mut keyed: Vec<(String, String)> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
@@ -367,5 +394,19 @@ mod tests {
         let (matched, total, worst) = summarize_reports(reports.iter());
         assert_eq!((matched, total), (2, 2));
         assert!(worst.is_empty());
+    }
+
+    #[test]
+    fn concurrency_defaults_clamps_and_overrides() {
+        use serde_json::json;
+        use super::{parse_concurrency, DEFAULT_FETCH_CONCURRENCY};
+        // Absent → default.
+        assert_eq!(parse_concurrency(&json!({})), DEFAULT_FETCH_CONCURRENCY);
+        // Explicit override honored.
+        assert_eq!(parse_concurrency(&json!({ "concurrency": 4 })), 4);
+        // Zero clamps up to 1 (never an unbounded/idle stream).
+        assert_eq!(parse_concurrency(&json!({ "concurrency": 0 })), 1);
+        // Non-numeric → default.
+        assert_eq!(parse_concurrency(&json!({ "concurrency": "lots" })), DEFAULT_FETCH_CONCURRENCY);
     }
 }

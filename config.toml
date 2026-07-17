@@ -97,7 +97,8 @@ effort = "xhigh"             # maximum practical reasoning
 enabled = true
 dir = "data/plugins"         # .wasm modules loaded at boot; hot-swap via POST /plugins/reload
 fuel = 200000000            # per-call CPU instruction budget (traps runaway plugins)
-max_memory_mb = 64          # hard linear-memory cap per call
+max_memory_mb = 64          # hard linear-memory cap per call (per instance)
+max_concurrent = 0          # max plugin runs at once host-wide (0 = one per CPU core); bounds aggregate wasm memory + blocking-pool use
 
 # Embedded full-text search (Tantivy) — in-process, no external service.
 [search]

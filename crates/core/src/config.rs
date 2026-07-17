@@ -519,6 +519,12 @@ pub struct PluginConfig {
     pub fuel: u64,
     /// Hard cap on a plugin instance's linear memory.
     pub max_memory_mb: usize,
+    /// Max plugin executions running at once across the whole host. Each call
+    /// builds its own `Store` (so `max_memory_mb` bounds ONE instance) and holds
+    /// a blocking-pool thread, so without a global cap a large `plugin` job admits
+    /// `max_memory_mb × concurrent_calls` of wasm memory and can saturate tokio's
+    /// blocking pool. `0` → `available_parallelism()` (fallback 4). Default: 0.
+    pub max_concurrent: usize,
 }
 
 impl Default for PluginConfig {
@@ -528,6 +534,7 @@ impl Default for PluginConfig {
             dir: "data/plugins".into(),
             fuel: 200_000_000,
             max_memory_mb: 64,
+            max_concurrent: 0,
         }
     }
 }

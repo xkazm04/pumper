@@ -5,9 +5,29 @@
 //! or read stored bodies from a crawl→dataset `source` (no re-fetch).
 
 use async_trait::async_trait;
-use futures::future::join_all;
+use futures::StreamExt;
 use pumper_core::{AppContext, Error, FetchRequest, FetchStrategy, Record, Result, ScrapeApp};
 use serde_json::{json, Value};
+
+/// Default in-flight cap for the URL/record fan-out, matching `CrawlConfig.concurrency`.
+const DEFAULT_CONCURRENCY: usize = 16;
+
+/// Read the `concurrency` param (max in-flight fetch+run tasks), clamped to `>= 1`
+/// and defaulting to [`DEFAULT_CONCURRENCY`]. Uses ordered buffering so the
+/// positional `zip` of keys against results stays correct.
+fn concurrency(ctx: &AppContext) -> usize {
+    parse_concurrency(&ctx.params)
+}
+
+/// Pure param parse for [`concurrency`] — clamps `concurrency` to `>= 1`,
+/// defaulting to [`DEFAULT_CONCURRENCY`].
+fn parse_concurrency(params: &Value) -> usize {
+    params
+        .get("concurrency")
+        .and_then(Value::as_u64)
+        .map(|n| n.max(1) as usize)
+        .unwrap_or(DEFAULT_CONCURRENCY)
+}
 
 pub struct Plugin;
 
@@ -24,7 +44,8 @@ impl ScrapeApp for Plugin {
     fn description(&self) -> &'static str {
         "Run a sandboxed WASM plugin over documents. Params: {\"plugin\": \"title\", \
          \"urls\": [..] OR \"source\": {\"app\": .., \"dataset\": .., \"keys\": [..]?}, \
-         \"strategy\": \"http|browser|auto|auto_with_research\", \"dataset\": \"plugin_out\"}. \
+         \"strategy\": \"http|browser|auto|auto_with_research\", \"concurrency\": 16 \
+         (max in-flight fetch+run tasks), \"dataset\": \"plugin_out\"}. \
          Source mode reads each record's stored body (artifact_path under the origin job's \
          dir) instead of re-fetching; keys default to the firing trigger's _trigger.keys, \
          else all live records."
@@ -71,13 +92,17 @@ impl Plugin {
             _ => FetchStrategy::Http,
         };
 
+        // Bounded fetch+run fan-out: the governor serializes same-host fetches but
+        // caps nothing globally, so a large `urls` list would open one socket per
+        // URL at once. `buffered` preserves order for the positional zip below.
+        let concurrency = concurrency(ctx);
         let fetcher = ctx.engines.fetch.clone();
         let plugins = ctx.plugins.clone();
-        let tasks = urls.iter().map(|url| {
+        let tasks = urls.iter().cloned().map(|url| {
             let f = fetcher.clone();
             let p = plugins.clone();
             let name = plugin.to_string();
-            let mut req = FetchRequest::new(url);
+            let mut req = FetchRequest::new(&url);
             req.strategy = strategy;
             async move {
                 let doc = match f.fetch(req).await {
@@ -90,7 +115,8 @@ impl Plugin {
                 p.run(&name, &doc).await.unwrap_or_else(|e| json!({ "error": e.to_string() }))
             }
         });
-        let mut results: Vec<Value> = join_all(tasks).await;
+        let mut results: Vec<Value> =
+            futures::stream::iter(tasks).buffered(concurrency).collect().await;
 
         let ran = results.iter().filter(|r| r.get("error").is_none()).count();
         let items = upsert_items(urls.iter().map(String::as_str), &mut results);
@@ -175,6 +201,7 @@ impl Plugin {
         // plugin tasks); zip the keys back against the results.
         let (keys, docs): (Vec<String>, Vec<String>) = keyed.into_iter().unzip();
         let loaded = keys.len();
+        let concurrency = concurrency(ctx);
         let plugins = ctx.plugins.clone();
         let tasks = docs.into_iter().map(|doc| {
             let p = plugins.clone();
@@ -186,7 +213,9 @@ impl Plugin {
                 p.run(&name, &doc).await.unwrap_or_else(|e| json!({ "error": e.to_string() }))
             }
         });
-        let mut results: Vec<Value> = join_all(tasks).await;
+        // Bounded run fan-out; `buffered` keeps order for the positional zip below.
+        let mut results: Vec<Value> =
+            futures::stream::iter(tasks).buffered(concurrency).collect().await;
 
         let ran = results.iter().filter(|r| r.get("error").is_none()).count();
         let items = upsert_items(keys.iter().map(String::as_str), &mut results);
@@ -227,4 +256,18 @@ fn upsert_items<'a>(
             Some((key.to_string(), rec.clone()))
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_concurrency, DEFAULT_CONCURRENCY};
+    use serde_json::json;
+
+    #[test]
+    fn concurrency_defaults_clamps_and_overrides() {
+        assert_eq!(parse_concurrency(&json!({})), DEFAULT_CONCURRENCY);
+        assert_eq!(parse_concurrency(&json!({ "concurrency": 8 })), 8);
+        assert_eq!(parse_concurrency(&json!({ "concurrency": 0 })), 1);
+        assert_eq!(parse_concurrency(&json!({ "concurrency": "lots" })), DEFAULT_CONCURRENCY);
+    }
 }
