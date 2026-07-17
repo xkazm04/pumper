@@ -23,13 +23,18 @@ use crate::{Error, Result};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Rule {
-    /// CSS selector → text (or an attribute); `all` collects every match.
+    /// CSS selector → text (or an attribute); `all` collects every match. Set
+    /// `html: true` to yield the matched element's HTML instead of its flattened
+    /// text — pair with a `to_markdown` transform to get clean scoped Markdown of
+    /// e.g. `article.content` (the plain text path fuses headings/lists/tables).
     Css {
         selector: String,
         #[serde(default)]
         attr: Option<String>,
         #[serde(default)]
         all: bool,
+        #[serde(default)]
+        html: bool,
     },
     /// Regex over the raw document; captures `group` (0 = whole match).
     Regex {
@@ -84,6 +89,8 @@ pub enum Transform {
         #[serde(default)]
         index: Option<usize>,
     },
+    /// HTML fragment → clean Markdown (pair with a `css` rule's `html: true`).
+    ToMarkdown,
     /// Replace a null result with this value.
     Default { value: Value },
 }
@@ -102,11 +109,11 @@ impl RuleSet {
         let mut fields = Vec::with_capacity(self.fields.len());
         for (name, field) in &self.fields {
             let compiled = match &field.rule {
-                Rule::Css { selector, attr, all } => {
+                Rule::Css { selector, attr, all, html } => {
                     let sel = Selector::parse(selector).map_err(|e| {
                         Error::Parse(format!("bad css selector '{selector}': {e:?}"))
                     })?;
-                    CompiledRule::Css { selector: sel, attr: attr.clone(), all: *all }
+                    CompiledRule::Css { selector: sel, attr: attr.clone(), all: *all, html: *html }
                 }
                 Rule::Regex { pattern, group } => {
                     let re = Regex::new(pattern)
@@ -144,7 +151,7 @@ impl RuleSet {
 }
 
 enum CompiledRule {
-    Css { selector: Selector, attr: Option<String>, all: bool },
+    Css { selector: Selector, attr: Option<String>, all: bool, html: bool },
     Regex { re: Regex, group: usize },
     Json { pointer: String },
     Xpath { xpath: skyscraper::xpath::Xpath, all: bool },
@@ -161,6 +168,7 @@ enum CompiledTransform {
     ToBool,
     RegexReplace { re: Regex, replacement: String },
     Split { sep: String, index: Option<usize> },
+    ToMarkdown,
     Default { value: Value },
 }
 
@@ -179,6 +187,7 @@ impl CompiledTransform {
                 replacement,
             },
             Transform::Split { sep, index } => Self::Split { sep, index },
+            Transform::ToMarkdown => Self::ToMarkdown,
             Transform::Default { value } => Self::Default { value },
         })
     }
@@ -227,6 +236,9 @@ impl CompiledTransform {
                     ),
                 }
             }),
+            Self::ToMarkdown => {
+                map_str(value, |s| Value::String(crate::markdown::html_fragment_to_markdown(s)))
+            }
             Self::Default { .. } => value, // handled in apply()
         }
     }
@@ -404,9 +416,11 @@ fn extract_one_impl(rules: &CompiledRuleSet, doc: &str, want_report: bool) -> (V
     for (name, rule, transforms) in &rules.fields {
         // (raw value, whether the rule's required parse was available, error detail)
         let (mut value, ran, detail): (Value, bool, &str) = match rule {
-            CompiledRule::Css { selector, attr, all } => {
-                (css_extract(html.as_ref().unwrap(), selector, attr.as_deref(), *all), true, "")
-            }
+            CompiledRule::Css { selector, attr, all, html: as_html } => (
+                css_extract(html.as_ref().unwrap(), selector, attr.as_deref(), *all, *as_html),
+                true,
+                "",
+            ),
             CompiledRule::Regex { re, group } => (
                 re.captures(doc)
                     .and_then(|c| c.get(*group))
@@ -484,14 +498,24 @@ fn xpath_item_value(
     }
 }
 
-fn css_extract(html: &Html, selector: &Selector, attr: Option<&str>, all: bool) -> Value {
+fn css_extract(
+    html: &Html,
+    selector: &Selector,
+    attr: Option<&str>,
+    all: bool,
+    as_html: bool,
+) -> Value {
     let render = |el: ElementRef| -> Value {
         match attr {
+            // An attribute takes precedence over the html/text mode.
             Some(a) => el
                 .value()
                 .attr(a)
                 .map(|s| Value::String(s.to_string()))
                 .unwrap_or(Value::Null),
+            // `html: true` yields the matched element's serialized HTML (for a
+            // `to_markdown` transform); otherwise its flattened text.
+            None if as_html => Value::String(el.html()),
             None => Value::String(el.text().collect::<String>().trim().to_string()),
         }
     };
@@ -509,6 +533,27 @@ mod tests {
 
     fn ruleset(v: serde_json::Value) -> super::CompiledRuleSet {
         serde_json::from_value::<RuleSet>(v).unwrap().compile().unwrap()
+    }
+
+    #[test]
+    fn css_html_mode_with_to_markdown_extracts_scoped_markdown() {
+        let rules = ruleset(json!({
+            "body": {
+                "type": "css", "selector": "article", "html": true,
+                "transforms": [{"op": "to_markdown"}]
+            }
+        }));
+        let doc = "<div><nav>menu here</nav><article><h2>Title</h2>\
+            <ul><li>one</li><li>two</li></ul></article></div>"
+            .to_string();
+        let out = &extract_batch(&rules, std::slice::from_ref(&doc))[0];
+        let md = out["body"].as_str().unwrap();
+        // Structure preserved (heading + list items), unlike the flattening text path.
+        assert!(md.contains("## Title"), "{md}");
+        assert!(md.contains("- one") && md.contains("- two"), "{md}");
+        // SKIP still applies inside the subtree (nav wasn't in <article> here, but
+        // the point is html mode gives real structure): list items are delimited.
+        assert!(!md.contains("onetwo"), "list items must not fuse: {md}");
     }
 
     #[test]
