@@ -17,7 +17,11 @@ impl ScrapeApp for Research {
     fn description(&self) -> &'static str {
         "Web research via Claude Code CLI. Params: {\"query\": \"...\", \
          \"role\": \"research|compose\", \"model\": \"claude-...\", \
-         \"effort\": \"low|medium|high|xhigh|max\", \"max_turns\": 25}"
+         \"effort\": \"low|medium|high|xhigh|max\", \"max_turns\": 25, \
+         \"session_id\": \"...\" (resume a prior run's session_id to drill down on \
+         its accumulated context instead of researching from scratch — the query \
+         is then a follow-up question), \"max_budget_usd\": 0.0 (per-run Claude \
+         spend ceiling)}"
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -27,6 +31,13 @@ impl ScrapeApp for Research {
             .get("max_turns")
             .and_then(Value::as_u64)
             .map(|turns| turns as u32);
+        // Resume a prior run's agent session so a follow-up drills down on the
+        // context it already built, instead of re-paying the full search+fetch+
+        // synthesize loop. The prior run returns `session_id` in its result.
+        let session_id =
+            ctx.params.get("session_id").and_then(Value::as_str).map(String::from);
+        let resumed = session_id.is_some();
+        let max_budget_usd = ctx.params.get("max_budget_usd").and_then(Value::as_f64);
         // Model/effort are chosen by the caller: default to the "research" role
         // (Sonnet, normal reasoning); an app can pass "compose" for Opus @ xhigh,
         // or override model/effort directly.
@@ -39,19 +50,32 @@ impl ScrapeApp for Research {
         let model = ctx.params.get("model").and_then(Value::as_str).map(String::from);
         let effort = ctx.params.get("effort").and_then(Value::as_str).map(String::from);
 
-        let prompt = format!(
-            "You are a web research agent. Research the topic below using web search and \
-             page fetches. Cross-check important claims across at least two sources.\n\n\
-             Topic: {query}\n\n\
-             Respond with ONLY a JSON object (no markdown fences, no prose) of this shape:\n\
-             {{\"summary\": string, \"key_findings\": string[], \
-             \"sources\": [{{\"url\": string, \"title\": string}}]}}"
-        );
+        // A resumed turn is a follow-up: the agent already holds the topic and its
+        // sources in session, so a full "you are a web research agent…" preamble
+        // would waste turns re-establishing context. Both prompts pin the SAME
+        // JSON shape so a resumed report is held to the same contract.
+        let shape = "Respond with ONLY a JSON object (no markdown fences, no prose) of this \
+             shape:\n{\"summary\": string, \"key_findings\": string[], \
+             \"sources\": [{\"url\": string, \"title\": string}]}";
+        let prompt = if session_id.is_some() {
+            format!(
+                "Follow-up on the research so far. Using the context you already have (search \
+                 further only if needed):\n\n{query}\n\n{shape}"
+            )
+        } else {
+            format!(
+                "You are a web research agent. Research the topic below using web search and \
+                 page fetches. Cross-check important claims across at least two sources.\n\n\
+                 Topic: {query}\n\n{shape}"
+            )
+        };
 
         let mut request = ResearchRequest::new(prompt).with_role(role);
         request.max_turns = max_turns;
         request.model = model;
         request.effort = effort;
+        request.resume_session = session_id;
+        request.max_budget_usd = max_budget_usd;
         // Actually use the json_schema guardrail so the model is steered to the
         // shape we promise downstream instead of accepting any object it returns.
         request.json_schema = Some(json!({
@@ -81,6 +105,7 @@ impl ScrapeApp for Research {
             "query": query,
             "report": report,
             "structured": structured,
+            "resumed": resumed,
             "cost_usd": output.cost_usd,
             "duration_ms": output.duration_ms,
             "num_turns": output.num_turns,

@@ -11,7 +11,7 @@ Apps are `ScrapeApp` implementations under `crates/apps/*`, registered in `crate
 | `crawl` | Broad crawler (see [crawling.md](crawling.md)) |
 | `extractor` | Fetch a URL + apply a params-supplied extraction RuleSet |
 | `plugin` | Run a named WASM extractor plugin over a fetched page |
-| `research` | Agentic web research via the Claude engine (roles: research/compose); JSON report |
+| `research` | Agentic web research via the Claude engine (roles: research/compose); JSON report. `session_id` param **resumes** a prior run to drill down on its accumulated context (the query becomes a follow-up) instead of re-paying the full agentic loop; `max_budget_usd` caps per-run spend |
 | `hackernews` | HN stories into a change-detected dataset |
 | `connector-api-watch` | Watches Anthropic API docs pages: diff + summarize + alert |
 
