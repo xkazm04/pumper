@@ -11,7 +11,7 @@
 //!     magnitudes) so a nonsensical record is rejected with per-record detail
 //!     instead of silently upserted.
 
-use pumper_core::{AppContext, Error, ResearchOutput, ResearchRequest, Result};
+use pumper_core::{salvage_json, AppContext, Error, ResearchOutput, ResearchRequest, Result};
 use serde_json::Value;
 
 /// Runs a metered research request, archives the raw answer as `research.json`,
@@ -50,70 +50,6 @@ pub async fn research_json(
         })?,
     };
     Ok((data, output))
-}
-
-/// Best-effort recovery of a JSON object the agent emitted but the engine
-/// couldn't parse into `output.json` — the common failure is a markdown
-/// ```json fence or a leading/trailing sentence. No re-run, no cost: it works
-/// on the raw text we already paid for. Returns None only when there's no
-/// parseable object at all.
-pub fn salvage_json(text: &str) -> Option<Value> {
-    let trimmed = text.trim();
-    if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
-        return Some(v);
-    }
-    let unfenced = strip_code_fence(trimmed);
-    if let Ok(v) = serde_json::from_str::<Value>(unfenced.trim()) {
-        return Some(v);
-    }
-    let span = first_balanced_object(unfenced)?;
-    serde_json::from_str::<Value>(span).ok()
-}
-
-/// Strip a leading ```json (or bare ```) fence and its closing ``` if present.
-fn strip_code_fence(text: &str) -> &str {
-    let t = text.trim();
-    let Some(rest) = t.strip_prefix("```") else {
-        return t;
-    };
-    // drop the optional language tag on the fence's first line
-    let rest = rest.split_once('\n').map(|(_, r)| r).unwrap_or(rest);
-    rest.strip_suffix("```").unwrap_or(rest).trim()
-}
-
-/// The first brace-balanced `{...}` span in `text`, respecting quoted strings
-/// and escapes so a `}` inside a string value doesn't close the object early.
-fn first_balanced_object(text: &str) -> Option<&str> {
-    let bytes = text.as_bytes();
-    let start = text.find('{')?;
-    let mut depth = 0usize;
-    let mut in_str = false;
-    let mut escaped = false;
-    for i in start..bytes.len() {
-        let c = bytes[i];
-        if in_str {
-            if escaped {
-                escaped = false;
-            } else if c == b'\\' {
-                escaped = true;
-            } else if c == b'"' {
-                in_str = false;
-            }
-            continue;
-        }
-        match c {
-            b'"' => in_str = true,
-            b'{' => depth += 1,
-            b'}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(&text[start..=i]);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// Plausibility validation for parsed trades records. These are cheap sanity
