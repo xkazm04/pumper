@@ -105,6 +105,11 @@ pub struct SearchRequest {
     pub since: Option<i64>,
     /// Skip this many ranked hits before `limit` — page 2 = `offset: limit`.
     pub offset: usize,
+    /// Compute the app/dataset facet breakdowns. **Off by default** — facets
+    /// require sampling far more docs than `limit` (decoding each), which is pure
+    /// waste for a caller that reads only hit ids (the saved-search runner) or
+    /// none at all. The `/search` HTTP route opts in; nothing else should.
+    pub facets: bool,
 }
 
 impl SearchRequest {

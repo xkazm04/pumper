@@ -62,6 +62,15 @@ const ARES_URL: &str = "https://ares.gov.cz/ekonomicke-subjekty-v-be/rest/ekonom
 const ARES_MAX_LOOKUPS_DEFAULT: u64 = 50;
 /// Cap on CZ-NACE activity codes kept per employer record.
 const ARES_NACE_CAP: usize = 12;
+/// Bulk-read cap for the trends revision scan — one `changes_since` query
+/// replaces a per-cell `history()` round-trip. Comfortably above ~10 days of
+/// `|ALL|` revisions at default cardinality; a hit is logged, since a silent
+/// truncation would shorten some cells' trend windows.
+const TRENDS_REVISION_SCAN: i64 = 50_000;
+/// Bulk-read cap for the ARES skip-set — one `list()` replaces a per-IČO `get()`.
+/// Above the `employers` dataset's realistic size; a hit is logged, since a
+/// truncated set would re-fetch already-known IČOs.
+const EMPLOYERS_SCAN: i64 = 100_000;
 
 #[async_trait]
 impl ScrapeApp for MpsvVpm {
@@ -363,15 +372,39 @@ impl ScrapeApp for MpsvVpm {
         // role_region_agg's revision history (the change-intelligence
         // substrate). Window = the cell's last 10 revisions, i.e. roughly its
         // last 10 *changed* days; unchanged days write no revision.
+        //
+        // ONE bulk `changes_since` read (newest-first, grouped by key) replaces the
+        // per-cell `history()` round-trip — ~1.5–4k sequential SQLite queries per
+        // run collapse to a single scan. Each key's window is truncated to 10 to
+        // preserve the prior `history(key, 10)` semantics exactly.
+        let all_revs = ctx
+            .datasets
+            .changes_since(&ctx.app, Some("role_region_agg"), None, TRENDS_REVISION_SCAN)
+            .await?;
+        if all_revs.len() as i64 >= TRENDS_REVISION_SCAN {
+            tracing::warn!(
+                scanned = all_revs.len(),
+                "mpsv-vpm: role_region_agg revision scan hit the cap — some trend windows may be short"
+            );
+        }
+        let mut revs_by_key: std::collections::HashMap<String, Vec<pumper_core::Revision>> =
+            std::collections::HashMap::new();
+        for rev in all_revs {
+            revs_by_key.entry(rev.key.clone()).or_default().push(rev);
+        }
+
         let mut trend_items: Vec<(String, Value)> = Vec::new();
         for (key, _) in agg_items.iter().filter(|(k, _)| k.contains("|ALL|")) {
-            let revs = ctx.datasets.history(&ctx.app, "role_region_agg", key, 10).await?;
+            // The cell's newest ≤10 revisions — the same window `history(key, 10)`
+            // returned (changes_since arrives newest-first, so no re-sort needed).
+            let window: &[pumper_core::Revision] =
+                revs_by_key.get(key).map_or(&[][..], |v| &v[..v.len().min(10)]);
             let count_of = |rev: &pumper_core::Revision| {
                 rev.data.as_ref().and_then(|d| d.get("count")).and_then(Value::as_i64)
             };
-            let Some(latest) = revs.first().and_then(count_of) else { continue };
+            let Some(latest) = window.first().and_then(count_of) else { continue };
             // Oldest snapshot within the window; None = the cell is brand new.
-            let prev = revs.iter().skip(1).filter_map(count_of).next_back();
+            let prev = window.iter().skip(1).filter_map(count_of).next_back();
             let (prev_count, delta, trend) = match prev {
                 Some(p) if latest > p => (p, latest - p, "rising"),
                 Some(p) if latest < p => (p, latest - p, "falling"),
@@ -391,7 +424,7 @@ impl ScrapeApp for MpsvVpm {
                     "delta": delta,
                     "pctChange": (prev_count > 0)
                         .then(|| (delta as f64 / prev_count as f64 * 100.0).round()),
-                    "revisions": revs.len(),
+                    "revisions": window.len(),
                     "trend": trend,
                 }),
             ));
@@ -483,6 +516,22 @@ impl ScrapeApp for MpsvVpm {
             .unwrap_or(ARES_MAX_LOOKUPS_DEFAULT)
             .min(500) as usize;
         let icos = distinct_icos(sample_items.iter().map(|(_, v)| v));
+        // ONE bulk read of the employers dataset into a skip-set, instead of a
+        // `get()` per IČO (n+1 → 1). Read before the lookup loop, so it reflects
+        // prior runs' enrichment (same as the per-key gets did).
+        let known_employers: std::collections::HashSet<String> = ctx
+            .datasets
+            .list(&ctx.app, "employers", EMPLOYERS_SCAN)
+            .await?
+            .into_iter()
+            .map(|r| r.key)
+            .collect();
+        if known_employers.len() as i64 >= EMPLOYERS_SCAN {
+            tracing::warn!(
+                known = known_employers.len(),
+                "mpsv-vpm: employers skip-set hit the cap — some known IČOs may be re-fetched"
+            );
+        }
         let mut employer_items: Vec<(String, Value)> = Vec::new();
         let mut ares_skipped = 0usize; // already enriched in a prior run
         let mut ares_failed = 0usize; // transport / 404 / malformed
@@ -490,7 +539,7 @@ impl ScrapeApp for MpsvVpm {
         let mut ares_looked_up = 0usize;
         for ico in &icos {
             // already in the employers dataset → nothing to fetch
-            if ctx.datasets.get(&ctx.app, "employers", ico).await?.is_some() {
+            if known_employers.contains(ico) {
                 ares_skipped += 1;
                 continue;
             }
