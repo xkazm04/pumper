@@ -376,11 +376,45 @@ impl ScrapeApp for CensusDensity {
                             })
                         })
                         .collect();
+                    // Persist the FULL ranking (not just the top 60) as a durable
+                    // dataset so the headline saturation metric is queryable by the
+                    // launch-ranking UI, triggers, and exports — and so
+                    // change-detection can see it — instead of living only in this
+                    // job's result JSON. Keyed by place under the shared census
+                    // namespace, alongside the blend.
+                    let sat_records: Vec<(String, Value)> = rows
+                        .iter()
+                        .map(|(p, e, base, per_10k)| {
+                            (
+                                p.clone(),
+                                json!({
+                                    "place": p,
+                                    "geo": geo,
+                                    "combined_establishments": e,
+                                    "base": base,
+                                    "denominator_kind": denom_kind,
+                                    "per_10k": (per_10k * 100.0).round() / 100.0,
+                                    "acs_dataset": acs_dataset,
+                                    "acs_year": acs_year,
+                                    "year": year,
+                                }),
+                            )
+                        })
+                        .collect();
+                    let sat_sum = ctx
+                        .datasets
+                        .upsert_many(MARKET_APP, SATURATION_DATASET, &sat_records)
+                        .await?;
                     json!({
-                        "dataset": acs_dataset,
+                        "dataset": format!("{MARKET_APP}/{SATURATION_DATASET}"),
+                        "acs_dataset": acs_dataset,
                         "acs_year": acs_year,
                         "denominator": denom_kind,
                         "places_matched": matched,
+                        "persisted": sat_records.len(),
+                        "new": sat_sum.new.len(),
+                        "changed": sat_sum.changed.len(),
+                        "unchanged": sat_sum.unchanged,
                     })
                 }
                 Err(e) => json!({ "skipped": format!("{e}") }),
@@ -440,6 +474,9 @@ impl ScrapeApp for CensusDensity {
 /// Virtual app namespace holding the cross-app blended dataset.
 pub const MARKET_APP: &str = "census";
 pub const MARKET_BLEND_DATASET: &str = "market_blend";
+/// Durable per-place saturation (establishments per 10k of an ACS base) — the
+/// app's headline metric, previously discarded into one job's result JSON.
+pub const SATURATION_DATASET: &str = "saturation";
 
 /// Well over the worst case (4 trades × 52 states employer-side; NES is
 /// smaller), while still bounding a runaway county-mode dataset read.
@@ -490,7 +527,22 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
         }));
     }
 
-    let items = blend_market(&employers, &solos);
+    // Per-capita base per place (state), read from the persisted saturation
+    // dataset — the blend itself does no ACS fetch (census-nonemp also calls this
+    // path), so the denominator join reads the base census-density stored. Empty
+    // when saturation hasn't run yet → cells emit null base (graceful).
+    let bases = live(ctx.datasets.list(MARKET_APP, SATURATION_DATASET, BLEND_READ_LIMIT).await?);
+    let base_by_place: BTreeMap<String, (i64, String)> = bases
+        .iter()
+        .filter_map(|r| {
+            let place = r.get("place").and_then(Value::as_str)?.to_string();
+            let base = r.get("base").and_then(Value::as_i64)?;
+            let kind = r.get("denominator_kind").and_then(Value::as_str).unwrap_or("").to_string();
+            Some((place, (base, kind)))
+        })
+        .collect();
+
+    let items = blend_market(&employers, &solos, &base_by_place);
     let count = |cov: &str| {
         items
             .iter()
@@ -523,7 +575,11 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
 /// on only one side is still emitted — with 0 on the missing side and a
 /// `coverage` marker — so the dataset shows WHERE the blend is partial rather
 /// than hiding it.
-pub fn blend_market(employers: &[Value], solos: &[Value]) -> Vec<(String, Value)> {
+pub fn blend_market(
+    employers: &[Value],
+    solos: &[Value],
+    base_by_place: &BTreeMap<String, (i64, String)>,
+) -> Vec<(String, Value)> {
     // (naics4, state_fips) → accumulating blend halves.
     #[derive(Default)]
     struct Cell {
@@ -591,6 +647,22 @@ pub fn blend_market(employers: &[Value], solos: &[Value]) -> Vec<(String, Value)
             } else {
                 Value::Null
             };
+            // Per-capita market density: total (employer+solo) operators per 10k of
+            // the state's ACS base — the number the launch ranking actually wants,
+            // and which didn't exist on the blend before. Null when no base is
+            // known for the place (saturation hasn't run) — never fabricated.
+            let (base, denom_kind, total_market_per_10k) = match c
+                .state
+                .as_deref()
+                .and_then(|st| base_by_place.get(st))
+            {
+                Some((b, kind)) if *b > 0 => (
+                    Value::from(*b),
+                    Value::from(kind.clone()),
+                    Value::from(((total as f64 / *b as f64) * 10_000.0 * 100.0).round() / 100.0),
+                ),
+                _ => (Value::Null, Value::Null, Value::Null),
+            };
             let value = json!({
                 "naics4": naics4,
                 "trade": c.trade,
@@ -603,6 +675,9 @@ pub fn blend_market(employers: &[Value], solos: &[Value]) -> Vec<(String, Value)
                 "solo_year": c.solo_year,
                 "total_market": total,
                 "solo_share": solo_share,
+                "base": base,
+                "denominator_kind": denom_kind,
+                "total_market_per_10k": total_market_per_10k,
                 "coverage": coverage,
             });
             (format!("{naics4}:{st_fips}"), value)
@@ -753,7 +828,7 @@ mod tests {
             emp("238210", "state", "CA", "06", 50),
         ];
         let solos = vec![solo("2382", "CA", "06", 300)];
-        let items = blend_market(&employers, &solos);
+        let items = blend_market(&employers, &solos, &BTreeMap::new());
         assert_eq!(items.len(), 1);
         let (key, v) = &items[0];
         assert_eq!(key, "2382:06");
@@ -776,7 +851,7 @@ mod tests {
             emp("238220", "state", "CA", "06", 100),
         ];
         let solos = vec![solo("2382", "CA", "06", 10)];
-        let items = blend_market(&employers, &solos);
+        let items = blend_market(&employers, &solos, &BTreeMap::new());
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].1["employer_establishments"], 100);
     }
@@ -785,7 +860,7 @@ mod tests {
     fn one_sided_groups_are_emitted_with_coverage_markers() {
         let employers = vec![emp("561730", "state", "TX", "48", 80)];
         let solos = vec![solo("2382", "FL", "12", 25)];
-        let items = blend_market(&employers, &solos);
+        let items = blend_market(&employers, &solos, &BTreeMap::new());
         assert_eq!(items.len(), 2);
         let by_key: BTreeMap<_, _> = items.into_iter().collect();
         let e = &by_key["5617:48"];
@@ -804,9 +879,28 @@ mod tests {
     fn zero_totals_yield_null_share_not_a_division_artifact() {
         let employers = vec![emp("238220", "state", "AK", "02", 0)];
         let solos = vec![solo("2382", "AK", "02", 0)];
-        let items = blend_market(&employers, &solos);
+        let items = blend_market(&employers, &solos, &BTreeMap::new());
         assert_eq!(items[0].1["solo_share"], Value::Null);
         assert_eq!(items[0].1["total_market"], 0);
+    }
+
+    #[test]
+    fn per_capita_base_joins_by_place_or_stays_null() {
+        let employers = vec![emp("238220", "state", "CA", "06", 100)];
+        let solos = vec![solo("2382", "CA", "06", 300)];
+        // Base known for CA (households = 10,000): 400 operators / 10k * 10k = 400.
+        let mut bases = BTreeMap::new();
+        bases.insert("CA".to_string(), (10_000i64, "households".to_string()));
+        let items = blend_market(&employers, &solos, &bases);
+        let v = &items[0].1;
+        assert_eq!(v["base"], 10_000);
+        assert_eq!(v["denominator_kind"], "households");
+        assert_eq!(v["total_market_per_10k"], json!(400.0));
+
+        // No base for the place → nulls, never a fabricated number.
+        let none = blend_market(&employers, &solos, &BTreeMap::new());
+        assert!(none[0].1["base"].is_null());
+        assert!(none[0].1["total_market_per_10k"].is_null());
     }
 }
 
