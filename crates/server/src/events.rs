@@ -9,12 +9,16 @@
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 use serde_json::Value;
 use tokio::sync::broadcast;
 use uuid::Uuid;
+
+/// Default byte ceiling for the replay ring (32 MiB) — bounds RSS from buffered
+/// large-result events regardless of the count capacity.
+pub const DEFAULT_MAX_RING_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct JobEvent {
@@ -41,7 +45,12 @@ impl JobEvent {
 }
 
 /// A `JobEvent` paired with its monotonic sequence id.
-pub type SeqEvent = (u64, JobEvent);
+///
+/// The event is behind an `Arc` so the ring, the broadcast slot, and every
+/// subscriber share **one** allocation instead of deep-cloning a possibly
+/// multi-MB `result` tree per copy. `recv()` on the broadcast channel then costs
+/// a refcount bump, not an O(size) clone × N receivers.
+pub type SeqEvent = (u64, Arc<JobEvent>);
 
 /// Outcome of a replay request against the ring.
 pub enum Replay {
@@ -53,24 +62,63 @@ pub enum Replay {
     Events(Vec<SeqEvent>),
 }
 
+/// One buffered event plus the approximate byte cost charged to the ring's byte
+/// budget (computed once at emit), so eviction can refund it exactly.
+struct Buffered {
+    event: SeqEvent,
+    bytes: usize,
+}
+
+/// Ring contents guarded by one mutex: the deque plus its running byte total.
+struct Ring {
+    deque: VecDeque<Buffered>,
+    bytes: usize,
+}
+
 /// Fan-out of job status transitions with a bounded replay ring.
 ///
-/// `emit` assigns the next sequence id, appends to the ring (evicting the
-/// oldest past capacity), and broadcasts `(seq, event)` to live subscribers.
+/// `emit` assigns the next sequence id, appends to the ring (evicting the oldest
+/// past **either** the count capacity **or** the byte budget), and broadcasts
+/// `(seq, Arc<event>)` to live subscribers.
 pub struct EventBus {
     seq: AtomicU64,
-    ring: Mutex<VecDeque<SeqEvent>>,
+    ring: Mutex<Ring>,
     capacity: usize,
+    /// Soft ceiling on the ring's aggregate serialized-result bytes. The ring is
+    /// otherwise bounded only by event *count*, so a burst of large-result jobs
+    /// could pin `capacity × result_size` (~1 GB at 1 MB × 1024) of RSS for the
+    /// process lifetime. Always keeps at least one event so replay stays useful.
+    max_bytes: usize,
     tx: broadcast::Sender<SeqEvent>,
+}
+
+/// Approximate an event's memory cost by its serialized `result` length (the
+/// only unbounded field); the fixed struct overhead is negligible next to a
+/// multi-MB result and not worth serializing the whole event to measure.
+fn approx_bytes(event: &JobEvent) -> usize {
+    event
+        .result
+        .as_ref()
+        .map(|v| serde_json::to_string(v).map(|s| s.len()).unwrap_or(0))
+        .unwrap_or(0)
 }
 
 impl EventBus {
     pub fn new(broadcast_capacity: usize, ring_capacity: usize) -> Self {
+        Self::with_byte_budget(broadcast_capacity, ring_capacity, DEFAULT_MAX_RING_BYTES)
+    }
+
+    pub fn with_byte_budget(
+        broadcast_capacity: usize,
+        ring_capacity: usize,
+        max_bytes: usize,
+    ) -> Self {
         let (tx, _) = broadcast::channel(broadcast_capacity);
         Self {
             seq: AtomicU64::new(0),
-            ring: Mutex::new(VecDeque::with_capacity(ring_capacity)),
+            ring: Mutex::new(Ring { deque: VecDeque::with_capacity(ring_capacity), bytes: 0 }),
             capacity: ring_capacity.max(1),
+            max_bytes,
             tx,
         }
     }
@@ -92,12 +140,21 @@ impl EventBus {
         // interleave: without this, seq assignment happened before the lock, so a
         // higher id could be buffered/sent ahead of a lower one — corrupting ring
         // and wire order and triggering false `reset` gaps for live subscribers.
+        let bytes = approx_bytes(&event);
+        let event = Arc::new(event);
         let mut ring = self.ring.lock().unwrap();
         let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
-        if ring.len() >= self.capacity {
-            ring.pop_front();
+        ring.deque.push_back(Buffered { event: (seq, Arc::clone(&event)), bytes });
+        ring.bytes += bytes;
+        // Evict oldest past the count capacity OR the byte budget, always keeping
+        // the event just pushed so the ring is never empty after an emit.
+        while ring.deque.len() > self.capacity
+            || (ring.bytes > self.max_bytes && ring.deque.len() > 1)
+        {
+            if let Some(old) = ring.deque.pop_front() {
+                ring.bytes -= old.bytes;
+            }
         }
-        ring.push_back((seq, event.clone()));
         let _ = self.tx.send((seq, event));
         seq
     }
@@ -106,21 +163,24 @@ impl EventBus {
     /// `after` has already been evicted (an unrecoverable gap).
     pub fn replay(&self, after: u64) -> Replay {
         let ring = self.ring.lock().unwrap();
-        let Some((oldest, _)) = ring.front() else {
+        let Some(front) = ring.deque.front() else {
             // Nothing buffered yet: no loss possible, just nothing to replay.
             return Replay::Events(Vec::new());
         };
+        let oldest = front.event.0;
         // The next id the caller wants is `after + 1`. If that id predates the
         // oldest buffered event, the gap was evicted and can't be replayed.
         // `saturating_add` guards an adversarial `Last-Event-ID: u64::MAX` (a
         // plain `+ 1` panics in debug / wraps to 0 in release).
-        if *oldest > after.saturating_add(1) {
+        if oldest > after.saturating_add(1) {
             return Replay::Reset;
         }
+        // Clone here is a per-event `Arc` refcount bump, not a result deep-copy.
         let events = ring
+            .deque
             .iter()
-            .filter(|(seq, _)| *seq > after)
-            .cloned()
+            .filter(|b| b.event.0 > after)
+            .map(|b| b.event.clone())
             .collect();
         Replay::Events(events)
     }
@@ -132,6 +192,38 @@ mod tests {
 
     fn ev(status: &str) -> JobEvent {
         JobEvent::new(Uuid::nil(), "test", status)
+    }
+
+    fn ev_with_result(bytes: usize) -> JobEvent {
+        let mut e = JobEvent::new(Uuid::nil(), "test", "succeeded");
+        e.result = Some(Value::String("x".repeat(bytes)));
+        e
+    }
+
+    #[test]
+    fn byte_budget_evicts_before_count_capacity() {
+        // Count capacity is large (100), but the byte budget is ~3 KB and each
+        // event carries a ~1 KB result — so the ring is held to a handful of
+        // events by bytes, not by count.
+        let bus = EventBus::with_byte_budget(256, 100, 3_000);
+        for _ in 0..50 {
+            bus.emit(ev_with_result(1_000));
+        }
+        let ring = bus.ring.lock().unwrap();
+        assert!(ring.deque.len() < 10, "byte budget should cap well under count capacity");
+        assert!(ring.bytes <= 3_000 || ring.deque.len() == 1, "bytes within budget (or the mandatory last event)");
+        // The running byte total stays consistent with the retained events.
+        let summed: usize = ring.deque.iter().map(|b| b.bytes).sum();
+        assert_eq!(summed, ring.bytes);
+    }
+
+    #[test]
+    fn byte_budget_always_keeps_at_least_one() {
+        // A single event larger than the whole budget must still be retained.
+        let bus = EventBus::with_byte_budget(16, 8, 100);
+        bus.emit(ev_with_result(10_000));
+        let ring = bus.ring.lock().unwrap();
+        assert_eq!(ring.deque.len(), 1);
     }
 
     #[test]
