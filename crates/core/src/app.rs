@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::cache::ResearchCache;
 use crate::costs::{CostLedger, SpentTotal};
-use crate::datasets::{ChangeKind, Datasets, UpsertSummary};
+use crate::datasets::{ChangeKind, Datasets, Record, UpsertSummary};
 use crate::engine::{EngineSet, ResearchOutput, ResearchRequest};
 use crate::fetcher::{FetchOutcome, FetchRequest};
 use crate::plugin::Plugins;
@@ -82,6 +82,47 @@ impl AppContext {
         let path = self.artifacts_dir.join(name);
         tokio::fs::write(&path, bytes).await?;
         Ok(path)
+    }
+
+    /// Reads the stored body of a source-dataset record — the crawl→extract/plugin
+    /// seam. Records written by the crawl carry `artifact_path` + `job_id`, and
+    /// their bodies live at `data/artifacts/<source_app>/<job_id>/<artifact_path>`,
+    /// under the shared artifacts root (this job's own dir is two levels below it).
+    /// Lets an app run over already-crawled bodies instead of re-fetching. Returns
+    /// the body, or a human reason to report per key.
+    ///
+    /// `source_app`, `job_id` and `artifact_path` all come from untrusted
+    /// record/param data, and `Path::join` lets an absolute or `..` component
+    /// escape the artifacts root (an arbitrary server-file read into job output), so
+    /// each must be a single safe path segment.
+    pub async fn read_source_artifact(
+        &self,
+        source_app: &str,
+        record: &Record,
+    ) -> std::result::Result<String, String> {
+        let artifact = record
+            .data
+            .get("artifact_path")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| "record has no artifact_path".to_string())?;
+        let job_id = record
+            .data
+            .get("job_id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "record has no job_id".to_string())?;
+        safe_path_segment(source_app, "source app")?;
+        safe_path_segment(job_id, "job_id")?;
+        safe_path_segment(artifact, "artifact_path")?;
+        let root = self
+            .artifacts_dir
+            .parent()
+            .and_then(std::path::Path::parent)
+            .ok_or_else(|| "cannot resolve artifacts root".to_string())?;
+        let path = root.join(source_app).join(job_id).join(artifact);
+        tokio::fs::read_to_string(&path)
+            .await
+            .map_err(|e| format!("unreadable artifact {}: {e}", path.display()))
     }
 
     /// USD this job still may spend under its ceiling. None = unlimited.
@@ -330,6 +371,22 @@ impl AppContext {
             .await?;
         Ok(summary)
     }
+}
+
+/// Rejects a string that is not a single safe path segment (empty, `.`/`..`,
+/// contains a separator, or absolute) — the path-traversal guard when composing a
+/// filesystem path from untrusted record/param data.
+fn safe_path_segment(s: &str, what: &str) -> std::result::Result<(), String> {
+    if s.is_empty()
+        || s == "."
+        || s == ".."
+        || s.contains('/')
+        || s.contains('\\')
+        || std::path::Path::new(s).is_absolute()
+    {
+        return Err(format!("unsafe {what}: {s:?}"));
+    }
+    Ok(())
 }
 
 /// One scraping use case. Implement this in a crate under `crates/apps/` and

@@ -112,62 +112,6 @@ async fn extract_and_upsert(
     Ok((records, matched, total, worst, summary))
 }
 
-/// Resolves the stored body for one `source`-mode record and reads it. Records
-/// written by the crawl carry `artifact_path` (basename of `page-NNNN.html`)
-/// and `job_id` (the ORIGIN crawl job). Bodies live at
-/// `data/artifacts/<source_app>/<job_id>/<artifact_path>`, so we resolve against
-/// the shared artifacts root (this job's own dir is `.../extractor/<job_id>`,
-/// two levels below the root). Returns the body, or an error reason to report.
-/// Rejects a string that is not a single safe path segment (empty, `.`/`..`,
-/// contains a separator, or absolute) — the guard against path traversal when
-/// composing an artifact path from untrusted record/param data.
-fn safe_segment(s: &str, what: &str) -> std::result::Result<(), String> {
-    if s.is_empty()
-        || s == "."
-        || s == ".."
-        || s.contains('/')
-        || s.contains('\\')
-        || std::path::Path::new(s).is_absolute()
-    {
-        return Err(format!("unsafe {what}: {s:?}"));
-    }
-    Ok(())
-}
-
-async fn read_source_body(
-    ctx: &AppContext,
-    source_app: &str,
-    record: &Record,
-) -> std::result::Result<String, String> {
-    let artifact = record
-        .data
-        .get("artifact_path")
-        .and_then(Value::as_str)
-        .filter(|s| !s.is_empty())
-        .ok_or_else(|| "record has no artifact_path".to_string())?;
-    let job_id = record
-        .data
-        .get("job_id")
-        .and_then(Value::as_str)
-        .ok_or_else(|| "record has no job_id".to_string())?;
-    // `source_app`, `job_id` and `artifact_path` all come from untrusted
-    // params/record data, and `Path::join` lets an absolute or `..` component
-    // escape the artifacts root (arbitrary server-file read into job output).
-    // Each must be a single safe path segment.
-    safe_segment(source_app, "source app")?;
-    safe_segment(job_id, "job_id")?;
-    safe_segment(artifact, "artifact_path")?;
-    let root = ctx
-        .artifacts_dir
-        .parent()
-        .and_then(std::path::Path::parent)
-        .ok_or_else(|| "cannot resolve artifacts root".to_string())?;
-    let path = root.join(source_app).join(job_id).join(artifact);
-    tokio::fs::read_to_string(&path)
-        .await
-        .map_err(|e| format!("unreadable artifact {}: {e}", path.display()))
-}
-
 #[async_trait]
 impl ScrapeApp for Extractor {
     fn name(&self) -> &'static str {
@@ -327,7 +271,7 @@ impl Extractor {
             requested = keys.len();
             for key in keys {
                 match ctx.datasets.get(&src_app, &src_dataset, &key).await? {
-                    Some(r) => match read_source_body(ctx, &src_app, &r).await {
+                    Some(r) => match ctx.read_source_artifact(&src_app, &r).await {
                         Ok(body) => keyed.push((key, body)),
                         Err(reason) => missing.push(json!({"key": key, "reason": reason})),
                     },
@@ -349,7 +293,7 @@ impl Extractor {
                 .collect();
             requested = records.len();
             for r in &records {
-                match read_source_body(ctx, &src_app, r).await {
+                match ctx.read_source_artifact(&src_app, r).await {
                     Ok(body) => keyed.push((r.key.clone(), body)),
                     Err(reason) => missing.push(json!({"key": r.key, "reason": reason})),
                 }
