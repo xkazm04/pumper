@@ -26,10 +26,11 @@ artifacts_dir = "data/artifacts"
 
 [http]
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-# Total per-request timeout. Raised from the 30s default so bulk open-data
-# downloads (e.g. mpsv-vpm's ~188 MB national vacancy feed) complete on typical
-# links; only a genuinely hung request now waits longer before failing.
-timeout_secs = 300
+# Total per-request timeout (the client-global default). Bulk sources that need
+# longer (e.g. mpsv-vpm's ~188 MB feed) set `HttpRequest.timeout_secs` per request
+# rather than degrading this global — a hung host should free its worker slot in
+# ~30s, not sit for 300s.
+timeout_secs = 30
 retries = 3
 
 # Per-domain politeness governor — spaces out requests to the same host.

@@ -389,6 +389,32 @@ fn safe_path_segment(s: &str, what: &str) -> std::result::Result<(), String> {
     Ok(())
 }
 
+/// A precondition an app needs to actually run in this deployment — declared
+/// statically so the registry can report *readiness*, not just *registration*
+/// (e.g. a credential-gated app is otherwise indistinguishable from a ready one
+/// over `GET /apps`, and only surfaces its gap via a failed job).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Requirement {
+    /// An environment variable that must be set (typically an API key/credential).
+    Env(&'static str),
+}
+
+impl Requirement {
+    /// Whether this precondition is satisfied in the current environment.
+    pub fn is_satisfied(&self) -> bool {
+        match self {
+            Requirement::Env(name) => std::env::var(name).is_ok(),
+        }
+    }
+
+    /// Stable label for the API / metrics (e.g. `env:CENSUS_API_KEY`).
+    pub fn label(&self) -> String {
+        match self {
+            Requirement::Env(name) => format!("env:{name}"),
+        }
+    }
+}
+
 /// One scraping use case. Implement this in a crate under `crates/apps/` and
 /// register it in the server's `registry.rs` — that is the whole integration.
 #[async_trait]
@@ -404,6 +430,14 @@ pub trait ScrapeApp: Send + Sync {
     /// (`"0 0 */6 * * *"` = every 6 hours). `None` = manual runs only.
     fn schedule(&self) -> Option<&'static str> {
         None
+    }
+
+    /// Preconditions that must hold for this app to actually run here (e.g. a
+    /// required API-key env var). Reported by `GET /apps` alongside a resolved
+    /// `ready` flag, so a credential-gated app is distinguishable from a ready one
+    /// before its first failed job. Default: none.
+    fn requires(&self) -> &'static [Requirement] {
+        &[]
     }
 
     /// Params used for scheduled runs and for API calls without a body.

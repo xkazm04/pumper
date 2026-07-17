@@ -24,7 +24,9 @@
 //! `profeseCzIsco.id` ("CzIsco/93291"), `mesicniMzdaOd`/`Do`,
 //! `zamestnavatel.{ico,nazev}`, `mistoVykonuPrace.pracoviste[].adresa.kraj.id`
 //! ("Kraj/108"), and the `statniSpravaSamosprava` / `souhlasAgentury*` flags used
-//! to derive org type. The full file needs a raised `[http] timeout_secs`.
+//! to derive org type. The ~188 MB full-file fetch sets a per-request
+//! `HttpRequest.timeout_secs` (the client-global `[http] timeout_secs` stays at
+//! its 30s default for the rest of the fleet).
 
 #![allow(non_snake_case)]
 
@@ -126,8 +128,12 @@ impl ScrapeApp for MpsvVpm {
             .unwrap_or(730);
 
         // Bulk download — skip the response cache (188 MB) and always hit network.
+        // Raise the timeout for THIS request only (the ~188 MB feed needs more than
+        // the 30s client-global default) instead of degrading the fleet-wide
+        // timeout, which would let any hung host hold a worker slot for 300s.
         let mut req = HttpRequest::get(&url);
         req.no_cache = true;
+        req.timeout_secs = Some(300);
         let resp = ctx.engines.http.fetch(req).await?;
         if !resp.is_success() {
             return Err(Error::App(format!(

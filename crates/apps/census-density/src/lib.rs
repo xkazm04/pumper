@@ -63,6 +63,12 @@ impl ScrapeApp for CensusDensity {
          \"api_key\": \"...\"}"
     }
 
+    // Needs a Census API key. A scheduled run uses default_params (no inline key),
+    // so the env var is the readiness signal `GET /apps` reports.
+    fn requires(&self) -> &'static [pumper_core::Requirement] {
+        &[pumper_core::Requirement::Env("CENSUS_API_KEY")]
+    }
+
     // Annual source — enable a yearly refresh once CENSUS_API_KEY is set in the
     // environment (scheduled runs use default_params and can't carry a key inline):
     // fn schedule(&self) -> Option<&'static str> { Some("0 0 6 15 3 *") } // Mar 15
@@ -217,6 +223,7 @@ impl ScrapeApp for CensusDensity {
             let mut places_reported: u32 = 0;
             let mut total_estab: i64 = 0;
             let mut total_emp: i64 = 0;
+            let mut total_pay: i64 = 0;
             let mut ranked: Vec<(String, i64)> = Vec::new();
 
 
@@ -227,8 +234,22 @@ impl ScrapeApp for CensusDensity {
                     // place — skip rather than fabricate a 0-establishment row.
                     continue;
                 };
-                let emp = i_emp.and_then(|i| census_common::census_num(row.get(i))).unwrap_or(0);
-                let pay = i_pay.and_then(|i| census_common::census_num(row.get(i))).unwrap_or(0);
+                // Keep the Option so a *suppressed* cell (None) can be told apart
+                // from a genuine 0 — a suppressed input must yield a Null derived
+                // ratio, never a fabricated $0 wage.
+                let emp_opt = i_emp.and_then(|i| census_common::census_num(row.get(i)));
+                let pay_opt = i_pay.and_then(|i| census_common::census_num(row.get(i)));
+                let emp = emp_opt.unwrap_or(0);
+                let pay = pay_opt.unwrap_or(0);
+                // PAYANN is in $1,000s (mirrors the solo side's receipts convention).
+                let avg_annual_wage = match (pay_opt, emp_opt) {
+                    (Some(p), Some(e)) if e > 0 => Value::from((p as f64 * 1000.0) / e as f64),
+                    _ => Value::Null,
+                };
+                let avg_establishment_size = match (emp_opt, estab) {
+                    (Some(e), s) if s > 0 => Value::from(e as f64 / s as f64),
+                    _ => Value::Null,
+                };
 
                 let (st_fips, county_fips) = if geo == "county" {
                     let st = i_state
@@ -251,6 +272,7 @@ impl ScrapeApp for CensusDensity {
                 places_reported += 1;
                 total_estab += estab;
                 total_emp += emp;
+                total_pay += pay;
                 ranked.push((place.clone(), estab));
                 *overall.entry(place.clone()).or_insert(0) += estab;
 
@@ -266,6 +288,8 @@ impl ScrapeApp for CensusDensity {
                         "establishments": estab,
                         "employees": emp,
                         "annual_payroll_thousands": pay,
+                        "avg_annual_wage": avg_annual_wage,
+                        "avg_establishment_size": avg_establishment_size,
                         "year": year,
                     }),
                 ));
@@ -277,12 +301,28 @@ impl ScrapeApp for CensusDensity {
                 .take(5)
                 .map(|(p, e)| json!({ "place": p, "establishments": e }))
                 .collect();
+            // National employer-side benchmarks: sum(pay)/sum(emp) and
+            // sum(emp)/sum(estab) across reported places (the solo side reports the
+            // analogous national receipts-per-operator). Suppressed cells contribute
+            // 0 to the sums, same as the raw totals, so the ratio is over reported places.
+            let national_avg_wage = if total_emp > 0 {
+                Value::from((total_pay as f64 * 1000.0) / total_emp as f64)
+            } else {
+                Value::Null
+            };
+            let national_avg_establishment_size = if total_estab > 0 {
+                Value::from(total_emp as f64 / total_estab as f64)
+            } else {
+                Value::Null
+            };
             trade_summaries.push(json!({
                 "naics": naics,
                 "label": label,
                 "places_reported": places_reported,
                 "total_establishments": total_estab,
                 "total_employees": total_emp,
+                "national_avg_wage": national_avg_wage,
+                "national_avg_establishment_size": national_avg_establishment_size,
                 "top": top,
             }));
         }

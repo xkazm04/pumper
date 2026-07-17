@@ -32,7 +32,7 @@ pub mod search;
 pub mod simhash;
 
 #[cfg(feature = "storage")]
-pub use app::{AppContext, NoProgress, ProgressReporter, ScrapeApp};
+pub use app::{AppContext, NoProgress, ProgressReporter, Requirement, ScrapeApp};
 #[cfg(feature = "storage")]
 pub use cache::{HttpCache, ResearchCache};
 #[cfg(feature = "storage")]

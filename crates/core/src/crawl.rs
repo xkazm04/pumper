@@ -1170,11 +1170,37 @@ const MAX_SITEMAPS_PER_HOST: usize = 10;
 const MAX_SITEMAP_SEEDS: usize = 2_000;
 
 /// `<loc>` values from a sitemap or sitemap-index document.
-fn parse_sitemap_locs(xml: &str) -> Vec<String> {
-    let re = regex::Regex::new(r"<loc>\s*([^<]+?)\s*</loc>").expect("valid regex");
-    re.captures_iter(xml)
-        .map(|c| c[1].replace("&amp;", "&"))
-        .collect()
+/// One sitemap entry: the URL and its optional `<lastmod>` (W3C datetime), which
+/// the crawler uses to spend a `max_pages`-capped budget on the freshest URLs.
+struct SitemapEntry {
+    loc: String,
+    lastmod: Option<String>,
+}
+
+/// Parses `<url>`/`<sitemap>` blocks, pulling each block's `<loc>` and optional
+/// `<lastmod>`. Falls back to bare `<loc>` scanning for sitemaps without wrappers.
+fn parse_sitemap_entries(xml: &str) -> Vec<SitemapEntry> {
+    let block_re =
+        regex::Regex::new(r"(?s)<(?:url|sitemap)\b[^>]*>(.*?)</(?:url|sitemap)>").expect("valid");
+    let loc_re = regex::Regex::new(r"<loc>\s*([^<]+?)\s*</loc>").expect("valid");
+    let lastmod_re = regex::Regex::new(r"<lastmod>\s*([^<]+?)\s*</lastmod>").expect("valid");
+    let mut out = Vec::new();
+    for block in block_re.captures_iter(xml) {
+        let body = &block[1];
+        if let Some(loc) = loc_re.captures(body) {
+            out.push(SitemapEntry {
+                loc: loc[1].replace("&amp;", "&"),
+                lastmod: lastmod_re.captures(body).map(|c| c[1].trim().to_string()),
+            });
+        }
+    }
+    // Fallback: bare <loc> entries with no <url> wrapper.
+    if out.is_empty() {
+        for loc in loc_re.captures_iter(xml) {
+            out.push(SitemapEntry { loc: loc[1].replace("&amp;", "&"), lastmod: None });
+        }
+    }
+    out
 }
 
 /// Seeds the frontier from a host's sitemaps (robots `Sitemap:` directives,
@@ -1193,43 +1219,41 @@ async fn seed_from_sitemaps(
     } else {
         declared.iter().take(MAX_SITEMAPS_PER_HOST).cloned().collect()
     };
-    let mut pushed = 0;
+    // Collect all in-scope URL entries first, then push the freshest by `<lastmod>`
+    // — a `max_pages`-capped crawl should spend its budget on URLs that changed most
+    // recently. Mis-ordering is harmless (self-reported lastmod), so prioritization
+    // is unconditional; `budget` still bounds how many land in the frontier.
+    let mut entries: Vec<SitemapEntry> = Vec::new();
     for root in roots {
         let Ok(resp) = http.fetch(HttpRequest::get(&root)).await else { continue };
         if !resp.is_success() {
             continue;
         }
-        let locs = parse_sitemap_locs(&resp.body);
-        // A sitemap index lists further sitemaps; follow one level.
-        let nested: Vec<String> = if resp.body.contains("<sitemapindex") {
-            locs.into_iter().take(MAX_SITEMAPS_PER_HOST).collect()
+        let parsed = parse_sitemap_entries(&resp.body);
+        if resp.body.contains("<sitemapindex") {
+            // A sitemap index lists further sitemaps; follow one level.
+            for sm in parsed.into_iter().take(MAX_SITEMAPS_PER_HOST) {
+                let Ok(resp) = http.fetch(HttpRequest::get(&sm.loc)).await else { continue };
+                if resp.is_success() {
+                    entries.extend(parse_sitemap_entries(&resp.body));
+                }
+            }
         } else {
-            for loc in locs {
-                if pushed >= budget {
-                    return pushed;
-                }
-                if filter.allows(&loc) {
-                    frontier.push(canonicalize_str(&loc), 0);
-                    pushed += 1;
-                }
-            }
-            continue;
-        };
-        for sm in nested {
-            let Ok(resp) = http.fetch(HttpRequest::get(&sm)).await else { continue };
-            if !resp.is_success() {
-                continue;
-            }
-            for loc in parse_sitemap_locs(&resp.body) {
-                if pushed >= budget {
-                    return pushed;
-                }
-                if filter.allows(&loc) {
-                    frontier.push(canonicalize_str(&loc), 0);
-                    pushed += 1;
-                }
-            }
+            entries.extend(parsed);
         }
+    }
+
+    entries.retain(|e| filter.allows(&e.loc));
+    // Newest `lastmod` first; entries without a lastmod sort last (unknown freshness).
+    entries.sort_by(|a, b| b.lastmod.cmp(&a.lastmod));
+
+    let mut pushed = 0;
+    for entry in entries {
+        if pushed >= budget {
+            break;
+        }
+        frontier.push(canonicalize_str(&entry.loc), 0);
+        pushed += 1;
     }
     pushed
 }
@@ -1658,11 +1682,20 @@ mod tests {
     }
 
     #[test]
-    fn sitemap_locs_parse_and_unescape() {
-        let xml = "<urlset><url><loc> https://x.com/a </loc></url>\
+    fn sitemap_entries_parse_unescape_and_capture_lastmod() {
+        let xml = "<urlset>\
+                   <url><loc> https://x.com/a </loc><lastmod>2026-07-16</lastmod></url>\
                    <url><loc>https://x.com/b?x=1&amp;y=2</loc></url></urlset>";
-        let locs = parse_sitemap_locs(xml);
+        let entries = parse_sitemap_entries(xml);
+        let locs: Vec<&str> = entries.iter().map(|e| e.loc.as_str()).collect();
         assert_eq!(locs, vec!["https://x.com/a", "https://x.com/b?x=1&y=2"]);
+        assert_eq!(entries[0].lastmod.as_deref(), Some("2026-07-16"));
+        assert_eq!(entries[1].lastmod, None);
+
+        // Bare-<loc> fallback (no <url> wrappers).
+        let bare = parse_sitemap_entries("<loc>https://x.com/c</loc>");
+        assert_eq!(bare.len(), 1);
+        assert_eq!(bare[0].loc, "https://x.com/c");
     }
 
     #[test]
