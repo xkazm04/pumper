@@ -73,7 +73,10 @@ impl ScrapeApp for MpsvVpm {
         "Czech national job-vacancy register (MPSV / ÚP ČR open data, key-free, CC BY 4.0). \
          Aggregates the ~300k live postings into `role_region_agg` (CZ-ISCO × kraj × orgType: \
          count + monthly-salary distribution; kraj `ALL` = national) and `vacancy_samples` \
-         (JD references). Also joins posted salaries against mpsv-ispv official ISPV \
+         (JD references). Also derives `skill_demand` (per CZ-ISCO unit group × skill id: \
+         posting count, share of the group, salary distribution) and `education_agg` \
+         (per unit group × education level: salary median + premium vs the group median). \
+         Also joins posted salaries against mpsv-ispv official ISPV \
          statistics into `cz-labour/salary_gap` (per CZ-ISCO unit group × sphere), \
          and enriches sampled employers from the key-free ARES business register \
          into `employers` (keyed by IČO: name, legal form, founded, kraj, CZ-NACE). \
@@ -177,6 +180,14 @@ impl ScrapeApp for MpsvVpm {
         // at the 4-digit unit-group level only, so posted salaries are pooled
         // there from the raw points (medians can't be recombined from finer cells).
         let mut gap_cells: HashMap<(String, String), Cell> = HashMap::new();
+        // Skills-demand + education aggregates — the two non-salary dimensions the
+        // app already parses off every posting but never persisted. Keyed by
+        // (unit group, codebook id); `group_all` is the per-group total (postings
+        // + salary distribution) that is the denominator for a skill's demand
+        // share and the baseline for an education level's salary premium.
+        let mut skill_demand: HashMap<(String, String), Cell> = HashMap::new();
+        let mut education_agg: HashMap<(String, String), Cell> = HashMap::new();
+        let mut group_all: HashMap<String, Cell> = HashMap::new();
         // gather a few extra candidates per group, then keep only the richest N
         let gather_cap = samples_per_group.saturating_mul(6).max(samples_per_group);
 
@@ -227,14 +238,31 @@ impl ScrapeApp for MpsvVpm {
                 .or_default()
                 .add(salary);
 
+            let ug = unit_group(&czisco);
+
             // gap-benchmark pool: unit group × sphere (only rows with a salary count)
             gap_cells
-                .entry((unit_group(&czisco), sphere_for_org(&org).to_string()))
+                .entry((ug.clone(), sphere_for_org(&org).to_string()))
                 .or_default()
                 .add(salary);
 
+            // Skills demand + education aggregates: zero extra fetch/parse — the ids
+            // are already deserialized on `p`. Codebook ids are opaque URIs
+            // ("Dovednost/…"); key on them as-is, never substring-match.
+            group_all.entry(ug.clone()).or_default().add(salary);
+            if let Some(skills) = &p.pozadovanaDovednost {
+                for sref in skills {
+                    if let Some(id) = &sref.id {
+                        skill_demand.entry((ug.clone(), id.clone())).or_default().add(salary);
+                    }
+                }
+            }
+            if let Some(id) = p.minPozadovaneVzdelani.as_ref().and_then(|e| e.id.clone()) {
+                education_agg.entry((ug.clone(), id)).or_default().add(salary);
+            }
+
             // sample reservoir per CZ-ISCO unit group
-            let bucket = groups.entry(unit_group(&czisco)).or_default();
+            let bucket = groups.entry(ug).or_default();
             if bucket.len() < gather_cap {
                 if let Some(s) = p.as_sample(&czisco, &org, kraj.as_deref(), salary) {
                     bucket.push(s);
@@ -301,6 +329,35 @@ impl ScrapeApp for MpsvVpm {
         let region = ctx.upsert_many("region_agg", &region_items).await?;
         let samples = ctx.upsert_many("vacancy_samples", &sample_items).await?;
         ctx.upsert("freshness", "current", &freshness).await?;
+
+        // Skills demand + education aggregates (same min-count gate as the salary
+        // cells). Persisting them turns the salary table into labour-market
+        // intelligence — and once stored, role_trends' revision technique applies
+        // verbatim to give rising/fading skills next run.
+        let mut skill_items: Vec<(String, Value)> = Vec::new();
+        for ((ug, skill_id), cell) in &skill_demand {
+            if cell.count < min_count {
+                continue;
+            }
+            let group_total = group_all.get(ug).map(|c| c.count).unwrap_or(0);
+            skill_items.push((
+                format!("{ug}|{skill_id}"),
+                cell.to_skill_value(ug, skill_id, group_total),
+            ));
+        }
+        let mut education_items: Vec<(String, Value)> = Vec::new();
+        for ((ug, edu_id), cell) in &education_agg {
+            if cell.count < min_count {
+                continue;
+            }
+            let group_median = group_all.get(ug).and_then(Cell::median);
+            education_items.push((
+                format!("{ug}|{edu_id}"),
+                cell.to_education_value(ug, edu_id, group_median),
+            ));
+        }
+        let skill = ctx.upsert_many("skill_demand", &skill_items).await?;
+        let education = ctx.upsert_many("education_agg", &education_items).await?;
 
         // Trending vs fading roles: national posting-count trajectories from
         // role_region_agg's revision history (the change-intelligence
@@ -504,6 +561,12 @@ impl ScrapeApp for MpsvVpm {
             "samples": sample_items.len(),
             "samplesNew": samples.new.len(),
             "samplesChanged": samples.changed.len(),
+            "skillCells": skill_items.len(),
+            "skillNew": skill.new.len(),
+            "skillChanged": skill.changed.len(),
+            "educationCells": education_items.len(),
+            "educationNew": education.new.len(),
+            "educationChanged": education.changed.len(),
             "trendCells": trend_items.len(),
             "trendsChanged": trends.new.len() + trends.changed.len(),
             "trendingTop": trending_top,
@@ -942,6 +1005,59 @@ impl Cell {
         })
     }
 
+    /// Nearest-rank median of this cell's salaries (`None` when no posting in the
+    /// cell reported a salary).
+    fn median(&self) -> Option<i64> {
+        let (_, pct) = self.stats();
+        pct(0.5)
+    }
+
+    /// A skill-demand row: how many postings in `unit_group` demand `skill_id`,
+    /// its share of the group's postings, and the salary distribution for those
+    /// postings.
+    fn to_skill_value(&self, unit_group: &str, skill_id: &str, group_total: usize) -> Value {
+        let (s, pct) = self.stats();
+        json!({
+            "unitGroup": unit_group,
+            "skillId": skill_id,
+            "count": self.count,
+            "groupPostings": group_total,
+            "sharePct": (group_total > 0)
+                .then(|| (self.count as f64 / group_total as f64 * 100.0).round()),
+            "salaryCount": s.len(),
+            "salaryMedian": pct(0.5),
+            "salaryP25": pct(0.25),
+            "salaryP75": pct(0.75),
+        })
+    }
+
+    /// An education-level row: the salary distribution for postings in
+    /// `unit_group` that require `education_id`, plus the group's overall median
+    /// so the premium is an honest median-vs-median read (never a fabricated
+    /// delta). `premiumVsGroup` is emitted only when BOTH medians exist.
+    fn to_education_value(
+        &self,
+        unit_group: &str,
+        education_id: &str,
+        group_median: Option<i64>,
+    ) -> Value {
+        let (s, pct) = self.stats();
+        let median = pct(0.5);
+        let premium = match (median, group_median) {
+            (Some(m), Some(g)) => Some(m - g),
+            _ => None,
+        };
+        json!({
+            "unitGroup": unit_group,
+            "educationId": education_id,
+            "count": self.count,
+            "salaryCount": s.len(),
+            "salaryMedian": median,
+            "groupMedian": group_median,
+            "premiumVsGroup": premium,
+        })
+    }
+
     fn to_region_value(&self, kraj: &str, org: &str) -> Value {
         let (s, pct) = self.stats();
         json!({
@@ -975,6 +1091,32 @@ mod tests {
             c.add(Some(s));
         }
         c
+    }
+
+    #[test]
+    fn skill_value_reports_count_share_and_salary() {
+        // 3 postings demand this skill out of a 12-posting group → 25% share.
+        let c = cell(&[40_000.0, 50_000.0, 60_000.0]);
+        let v = c.to_skill_value("2512", "Dovednost/rust", 12);
+        assert_eq!(v["unitGroup"], "2512");
+        assert_eq!(v["skillId"], "Dovednost/rust");
+        assert_eq!(v["count"], 3);
+        assert_eq!(v["groupPostings"], 12);
+        assert_eq!(v["sharePct"], 25.0);
+        assert_eq!(v["salaryMedian"], 50_000);
+    }
+
+    #[test]
+    fn education_value_premium_is_median_vs_median_never_fabricated() {
+        // A degree-required cell median 60k against the group median 45k → +15k.
+        let c = cell(&[55_000.0, 60_000.0, 65_000.0]);
+        let v = c.to_education_value("2512", "Vzdelani/vs", Some(45_000));
+        assert_eq!(v["salaryMedian"], 60_000);
+        assert_eq!(v["groupMedian"], 45_000);
+        assert_eq!(v["premiumVsGroup"], 15_000);
+        // No group median → no fabricated premium.
+        let v2 = c.to_education_value("2512", "Vzdelani/vs", None);
+        assert!(v2["premiumVsGroup"].is_null());
     }
 
     fn posted_map(entries: Vec<((&str, &str), Cell)>) -> HashMap<(String, String), Cell> {
