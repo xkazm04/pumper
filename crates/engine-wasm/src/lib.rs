@@ -14,12 +14,13 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use async_trait::async_trait;
 use pumper_core::config::PluginConfig;
 use pumper_core::{Error, Plugins, Result};
 use serde_json::Value;
+use tokio::sync::Semaphore;
 use wasmtime::{Config, Engine, Linker, Module, ResourceLimiter, Store, StoreLimits, StoreLimitsBuilder};
 
 pub struct WasmPluginHost {
@@ -27,7 +28,20 @@ pub struct WasmPluginHost {
     dir: std::path::PathBuf,
     fuel: u64,
     max_memory: usize,
+    /// Global admission gate: caps concurrent `execute` calls so aggregate wasm
+    /// memory (`max_memory × permits`) and blocking-pool usage stay bounded no
+    /// matter how wide the caller's fan-out is.
+    sem: Arc<Semaphore>,
     modules: RwLock<HashMap<String, Module>>,
+}
+
+/// Resolve the concurrency cap: `0` means "one per core" via
+/// [`std::thread::available_parallelism`], falling back to 4 if it's unavailable.
+fn resolve_max_concurrent(configured: usize) -> usize {
+    if configured > 0 {
+        return configured;
+    }
+    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
 }
 
 impl WasmPluginHost {
@@ -37,9 +51,11 @@ impl WasmPluginHost {
         let engine = Engine::new(&config).map_err(|e| Error::App(format!("wasm engine: {e}")))?;
         std::fs::create_dir_all(&cfg.dir)?;
         let modules = load_dir(&engine, &cfg.dir);
+        let max_concurrent = resolve_max_concurrent(cfg.max_concurrent);
         tracing::info!(
             count = modules.len(),
             dir = %cfg.dir.display(),
+            max_concurrent,
             "loaded wasm plugins"
         );
         Ok(Self {
@@ -47,6 +63,7 @@ impl WasmPluginHost {
             dir: cfg.dir.clone(),
             fuel: cfg.fuel,
             max_memory: cfg.max_memory_mb.saturating_mul(1024 * 1024),
+            sem: Arc::new(Semaphore::new(max_concurrent)),
             modules: RwLock::new(modules),
         })
     }
@@ -65,6 +82,17 @@ impl Plugins for WasmPluginHost {
         let engine = self.engine.clone();
         let input = input.to_string();
         let (fuel, max_memory) = (self.fuel, self.max_memory);
+        // Global admission: hold a permit for the whole execution so a wide
+        // fan-out (e.g. a 200-URL plugin job) can't spin up 200 stores at once.
+        // Acquired BEFORE spawn_blocking so excess callers wait here rather than
+        // piling onto the blocking pool. The semaphore is never closed, so the
+        // only error is impossible — map it defensively.
+        let _permit = self
+            .sem
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| Error::App(format!("plugin semaphore closed: {e}")))?;
         // Wasm execution is synchronous and CPU-bound — run it off the async
         // runtime so a busy plugin never stalls a tokio worker.
         tokio::task::spawn_blocking(move || execute(engine, module, input, fuel, max_memory))
@@ -184,4 +212,18 @@ fn execute(engine: Engine, module: Module, input: String, fuel: u64, max_memory:
         .map_err(|e| Error::App(format!("read output: {e}")))?;
 
     serde_json::from_slice(&out).map_err(|e| Error::App(format!("plugin returned invalid JSON: {e}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_max_concurrent;
+
+    #[test]
+    fn max_concurrent_honors_explicit_and_derives_default() {
+        // Explicit value passes through untouched.
+        assert_eq!(resolve_max_concurrent(8), 8);
+        // 0 → one-per-core, always at least 1 (never an empty semaphore that
+        // would deadlock every plugin run).
+        assert!(resolve_max_concurrent(0) >= 1);
+    }
 }
