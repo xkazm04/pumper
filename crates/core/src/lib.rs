@@ -35,7 +35,7 @@ pub mod simhash;
 #[cfg(feature = "storage")]
 pub use app::{AppContext, NoProgress, ProgressReporter, Requirement, ScrapeApp};
 #[cfg(feature = "storage")]
-pub use cache::{HttpCache, ResearchCache};
+pub use cache::{HttpCache, ResearchCache, StaleEntry};
 #[cfg(feature = "storage")]
 pub use costs::{CostEvent, CostLedger, CostSummary, SpentTotal};
 #[cfg(feature = "storage")]
