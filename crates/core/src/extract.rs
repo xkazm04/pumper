@@ -53,6 +53,17 @@ pub enum Rule {
     },
     /// A literal value.
     Const { value: Value },
+    /// Repeating container: for every element matching `selector`, run `fields`
+    /// **scoped to that element**, yielding one object per match. This is the
+    /// list-page shape (50 product cards → 50 objects) — unlike `css` + `all`,
+    /// which returns independent parallel arrays that mis-zip when an item is
+    /// missing a field. Inner fields may be `css` (scoped to the element),
+    /// `regex` (over the element's HTML), `const`, or a nested `each`; `json` and
+    /// `xpath` inner rules are rejected at compile.
+    Each {
+        selector: String,
+        fields: BTreeMap<String, FieldRule>,
+    },
 }
 
 /// A field's extraction rule plus an optional post-processing pipeline, e.g.
@@ -106,48 +117,75 @@ impl RuleSet {
     /// Validates and pre-compiles selectors/regexes once for reuse across the
     /// whole batch.
     pub fn compile(&self) -> Result<CompiledRuleSet> {
-        let mut fields = Vec::with_capacity(self.fields.len());
-        for (name, field) in &self.fields {
-            let compiled = match &field.rule {
-                Rule::Css { selector, attr, all, html } => {
-                    let sel = Selector::parse(selector).map_err(|e| {
-                        Error::Parse(format!("bad css selector '{selector}': {e:?}"))
-                    })?;
-                    CompiledRule::Css { selector: sel, attr: attr.clone(), all: *all, html: *html }
-                }
-                Rule::Regex { pattern, group } => {
-                    let re = Regex::new(pattern)
-                        .map_err(|e| Error::Parse(format!("bad regex '{pattern}': {e}")))?;
-                    CompiledRule::Regex { re, group: *group }
-                }
-                Rule::Json { pointer } => {
-                    // RFC 6901: a pointer is the empty string or begins with '/'.
-                    // Validate here like css/regex/xpath so a malformed pointer is
-                    // an Error at compile time, not an indistinguishable Empty miss
-                    // at extract time (which defeats the DocReport/FieldStatus signal).
-                    if !pointer.is_empty() && !pointer.starts_with('/') {
-                        return Err(Error::Parse(format!(
-                            "bad json pointer '{pointer}': must be empty or start with '/'"
-                        )));
-                    }
-                    CompiledRule::Json { pointer: pointer.clone() }
-                }
-                Rule::Xpath { xpath, all } => {
-                    let parsed = skyscraper::xpath::parse(xpath)
-                        .map_err(|e| Error::Parse(format!("bad xpath '{xpath}': {e}")))?;
-                    CompiledRule::Xpath { xpath: parsed, all: *all }
-                }
-                Rule::Const { value } => CompiledRule::Const { value: value.clone() },
-            };
-            let transforms = field
-                .transforms
-                .iter()
-                .map(|t| CompiledTransform::compile(t.clone()))
-                .collect::<Result<Vec<_>>>()?;
-            fields.push((name.clone(), compiled, transforms));
-        }
-        Ok(CompiledRuleSet { fields })
+        Ok(CompiledRuleSet { fields: compile_fields(&self.fields, false)? })
     }
+}
+
+/// Compiles a field map into `(name, CompiledRule, transforms)` tuples. `scoped`
+/// is true when compiling the inner fields of an [`Rule::Each`] — inside a
+/// container, `json`/`xpath` have no meaningful root, so they are rejected here
+/// with a clear compile error (v1 scope).
+fn compile_fields(
+    fields: &BTreeMap<String, FieldRule>,
+    scoped: bool,
+) -> Result<Vec<(String, CompiledRule, Vec<CompiledTransform>)>> {
+    let mut out = Vec::with_capacity(fields.len());
+    for (name, field) in fields {
+        let compiled = compile_rule(&field.rule, scoped)?;
+        let transforms = field
+            .transforms
+            .iter()
+            .map(|t| CompiledTransform::compile(t.clone()))
+            .collect::<Result<Vec<_>>>()?;
+        out.push((name.clone(), compiled, transforms));
+    }
+    Ok(out)
+}
+
+fn compile_rule(rule: &Rule, scoped: bool) -> Result<CompiledRule> {
+    Ok(match rule {
+        Rule::Css { selector, attr, all, html } => {
+            let sel = Selector::parse(selector)
+                .map_err(|e| Error::Parse(format!("bad css selector '{selector}': {e:?}")))?;
+            CompiledRule::Css { selector: sel, attr: attr.clone(), all: *all, html: *html }
+        }
+        Rule::Regex { pattern, group } => {
+            let re = Regex::new(pattern)
+                .map_err(|e| Error::Parse(format!("bad regex '{pattern}': {e}")))?;
+            CompiledRule::Regex { re, group: *group }
+        }
+        Rule::Json { pointer } if !scoped => {
+            // RFC 6901: a pointer is the empty string or begins with '/'.
+            // Validate here like css/regex/xpath so a malformed pointer is
+            // an Error at compile time, not an indistinguishable Empty miss
+            // at extract time (which defeats the DocReport/FieldStatus signal).
+            if !pointer.is_empty() && !pointer.starts_with('/') {
+                return Err(Error::Parse(format!(
+                    "bad json pointer '{pointer}': must be empty or start with '/'"
+                )));
+            }
+            CompiledRule::Json { pointer: pointer.clone() }
+        }
+        Rule::Xpath { xpath, all } if !scoped => {
+            let parsed = skyscraper::xpath::parse(xpath)
+                .map_err(|e| Error::Parse(format!("bad xpath '{xpath}': {e}")))?;
+            CompiledRule::Xpath { xpath: parsed, all: *all }
+        }
+        Rule::Json { .. } | Rule::Xpath { .. } => {
+            return Err(Error::Parse(
+                "'json'/'xpath' rules are not supported inside an 'each' container \
+                 (use 'css'/'regex'/'const' or a nested 'each')"
+                    .into(),
+            ))
+        }
+        Rule::Const { value } => CompiledRule::Const { value: value.clone() },
+        Rule::Each { selector, fields } => {
+            let sel = Selector::parse(selector).map_err(|e| {
+                Error::Parse(format!("bad css selector '{selector}' in 'each': {e:?}"))
+            })?;
+            CompiledRule::Each { selector: sel, fields: compile_fields(fields, true)? }
+        }
+    })
 }
 
 enum CompiledRule {
@@ -156,6 +194,7 @@ enum CompiledRule {
     Json { pointer: String },
     Xpath { xpath: skyscraper::xpath::Xpath, all: bool },
     Const { value: Value },
+    Each { selector: Selector, fields: Vec<(String, CompiledRule, Vec<CompiledTransform>)> },
 }
 
 /// A transform with its regex pre-compiled.
@@ -329,7 +368,11 @@ pub struct CompiledRuleSet {
 
 impl CompiledRuleSet {
     fn needs_html(&self) -> bool {
-        self.fields.iter().any(|(_, r, _)| matches!(r, CompiledRule::Css { .. }))
+        // `Each` always selects its container via a CSS selector on the document,
+        // so it needs the parsed HTML just like a top-level `Css` rule.
+        self.fields
+            .iter()
+            .any(|(_, r, _)| matches!(r, CompiledRule::Css { .. } | CompiledRule::Each { .. }))
     }
 
     fn needs_json(&self) -> bool {
@@ -438,6 +481,17 @@ fn extract_one_impl(rules: &CompiledRuleSet, doc: &str, want_report: bool) -> (V
                 None => (Value::Null, false, "document did not parse as HTML for xpath"),
             },
             CompiledRule::Const { value } => (value.clone(), true, ""),
+            CompiledRule::Each { selector, fields } => (
+                Value::Array(
+                    html.as_ref()
+                        .unwrap()
+                        .select(selector)
+                        .map(|el| extract_scoped(el, fields))
+                        .collect(),
+                ),
+                true,
+                "",
+            ),
         };
         if want_report {
             report.fields.insert(name.clone(), FieldStatus::classify(ran, &value, detail));
@@ -498,6 +552,35 @@ fn xpath_item_value(
     }
 }
 
+/// Renders one matched element to a value: an attribute, its serialized HTML
+/// (`as_html`), or its flattened text.
+fn render_css(el: ElementRef, attr: Option<&str>, as_html: bool) -> Value {
+    match attr {
+        // An attribute takes precedence over the html/text mode.
+        Some(a) => el.value().attr(a).map(|s| Value::String(s.to_string())).unwrap_or(Value::Null),
+        // `html: true` yields the matched element's serialized HTML (for a
+        // `to_markdown` transform); otherwise its flattened text.
+        None if as_html => Value::String(el.html()),
+        None => Value::String(el.text().collect::<String>().trim().to_string()),
+    }
+}
+
+/// Collects a CSS match iterator into a value (`all` = array of every match,
+/// else the first or `Null`). Shared by the document-level and element-scoped
+/// extractors so their semantics can't diverge.
+fn collect_css<'a>(
+    mut matches: impl Iterator<Item = ElementRef<'a>>,
+    attr: Option<&str>,
+    all: bool,
+    as_html: bool,
+) -> Value {
+    if all {
+        Value::Array(matches.map(|el| render_css(el, attr, as_html)).collect())
+    } else {
+        matches.next().map(|el| render_css(el, attr, as_html)).unwrap_or(Value::Null)
+    }
+}
+
 fn css_extract(
     html: &Html,
     selector: &Selector,
@@ -505,25 +588,42 @@ fn css_extract(
     all: bool,
     as_html: bool,
 ) -> Value {
-    let render = |el: ElementRef| -> Value {
-        match attr {
-            // An attribute takes precedence over the html/text mode.
-            Some(a) => el
-                .value()
-                .attr(a)
-                .map(|s| Value::String(s.to_string()))
+    collect_css(html.select(selector), attr, all, as_html)
+}
+
+/// Extracts one repeating-container item: runs `fields` scoped to `root` (a
+/// single matched element) and returns an object. CSS selects descendants of
+/// `root`, regex runs over the element's own HTML, and a nested `each` recurses
+/// into `root`'s subtree — so every item's fields stay bound together and a
+/// missing field is a `null` on its own item, never a mis-zipped parallel array.
+fn extract_scoped(
+    root: ElementRef,
+    fields: &[(String, CompiledRule, Vec<CompiledTransform>)],
+) -> Value {
+    let mut obj = Map::with_capacity(fields.len());
+    for (name, rule, transforms) in fields {
+        let mut value = match rule {
+            CompiledRule::Css { selector, attr, all, html: as_html } => {
+                collect_css(root.select(selector), attr.as_deref(), *all, *as_html)
+            }
+            CompiledRule::Regex { re, group } => re
+                .captures(&root.html())
+                .and_then(|c| c.get(*group))
+                .map(|m| Value::String(m.as_str().to_string()))
                 .unwrap_or(Value::Null),
-            // `html: true` yields the matched element's serialized HTML (for a
-            // `to_markdown` transform); otherwise its flattened text.
-            None if as_html => Value::String(el.html()),
-            None => Value::String(el.text().collect::<String>().trim().to_string()),
+            CompiledRule::Const { value } => value.clone(),
+            CompiledRule::Each { selector, fields } => Value::Array(
+                root.select(selector).map(|el| extract_scoped(el, fields)).collect(),
+            ),
+            // json/xpath are rejected at compile inside a container.
+            CompiledRule::Json { .. } | CompiledRule::Xpath { .. } => Value::Null,
+        };
+        for t in transforms {
+            value = t.apply(value);
         }
-    };
-    if all {
-        Value::Array(html.select(selector).map(render).collect())
-    } else {
-        html.select(selector).next().map(render).unwrap_or(Value::Null)
+        obj.insert(name.clone(), value);
     }
+    Value::Object(obj)
 }
 
 #[cfg(test)]
@@ -554,6 +654,50 @@ mod tests {
         // SKIP still applies inside the subtree (nav wasn't in <article> here, but
         // the point is html mode gives real structure): list items are delimited.
         assert!(!md.contains("onetwo"), "list items must not fuse: {md}");
+    }
+
+    #[test]
+    fn each_yields_one_object_per_item_with_missing_fields_as_null() {
+        // The list-page shape: 3 cards, the middle one missing its price. `each`
+        // keeps each item's fields bound together — the 3rd card's price is NOT
+        // silently shifted up (which parallel `all:true` arrays would do).
+        let rules = ruleset(json!({
+            "products": {
+                "type": "each",
+                "selector": ".card",
+                "fields": {
+                    "name": {"type": "css", "selector": "h3"},
+                    "price": {"type": "css", "selector": ".price",
+                              "transforms": [{"op": "to_number"}]}
+                }
+            }
+        }));
+        let doc = r#"
+            <div class="card"><h3>A</h3><span class="price">$10</span></div>
+            <div class="card"><h3>B</h3></div>
+            <div class="card"><h3>C</h3><span class="price">$30</span></div>
+        "#
+        .to_string();
+        let out = &extract_batch(&rules, std::slice::from_ref(&doc))[0];
+        assert_eq!(
+            out["products"],
+            json!([
+                {"name": "A", "price": 10.0},
+                {"name": "B", "price": null},
+                {"name": "C", "price": 30.0},
+            ])
+        );
+    }
+
+    #[test]
+    fn each_rejects_json_and_xpath_inner_rules_at_compile() {
+        let bad = serde_json::from_value::<RuleSet>(json!({
+            "rows": {"type": "each", "selector": ".r",
+                     "fields": {"x": {"type": "json", "pointer": "/a"}}}
+        }))
+        .unwrap()
+        .compile();
+        assert!(bad.is_err(), "json inner rule must be rejected inside each");
     }
 
     #[test]
