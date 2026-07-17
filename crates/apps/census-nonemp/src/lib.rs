@@ -56,6 +56,12 @@ impl ScrapeApp for CensusNonemp {
          nonemployers), \"api_key\": \"...\"}"
     }
 
+    // Needs a Census API key (shared with census-density); the env var is the
+    // readiness signal for scheduled runs, which can't carry an inline key.
+    fn requires(&self) -> &'static [pumper_core::Requirement] {
+        &[pumper_core::Requirement::Env("CENSUS_API_KEY")]
+    }
+
     fn default_params(&self) -> Value {
         json!({ "year": DEFAULT_YEAR })
     }

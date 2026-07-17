@@ -301,8 +301,20 @@ async fn metrics(State(state): State<AppState>) -> Result<Response, ApiError> {
             entry.app, entry.engine, entry.cost_usd
         ));
     }
-    out.push_str("# HELP pumper_apps Registered apps\n# TYPE pumper_apps gauge\n");
-    out.push_str(&format!("pumper_apps {}\n", state.registry.len()));
+    out.push_str(
+        "# HELP pumper_apps Registered apps (ready = all preconditions satisfied)\n\
+         # TYPE pumper_apps gauge\n",
+    );
+    let ready_apps = state
+        .registry
+        .values()
+        .filter(|a| a.requires().iter().all(|r| r.is_satisfied()))
+        .count();
+    out.push_str(&format!("pumper_apps{{ready=\"true\"}} {ready_apps}\n"));
+    out.push_str(&format!(
+        "pumper_apps{{ready=\"false\"}} {}\n",
+        state.registry.len() - ready_apps
+    ));
     out.push_str("# HELP pumper_schedules Configured schedules\n# TYPE pumper_schedules gauge\n");
     let enabled = schedules.iter().filter(|s| s.enabled).count();
     out.push_str(&format!("pumper_schedules{{enabled=\"true\"}} {enabled}\n"));
@@ -529,7 +541,7 @@ fn is_terminal(status: JobStatus) -> bool {
     get,
     path = "/apps",
     tag = "apps",
-    responses((status = 200, description = "`{apps: [{name, description, schedule}]}`"))
+    responses((status = 200, description = "`{apps: [{name, description, schedule, requires, ready}]}` — `requires` lists preconditions (e.g. `env:CENSUS_API_KEY`); `ready` is false when any is unmet here."))
 )]
 async fn list_apps(State(state): State<AppState>) -> Json<Value> {
     let mut apps: Vec<_> = state.registry.values().collect();
@@ -537,10 +549,17 @@ async fn list_apps(State(state): State<AppState>) -> Json<Value> {
     let apps: Vec<_> = apps
         .into_iter()
         .map(|app| {
+            let requires: Vec<String> = app.requires().iter().map(|r| r.label()).collect();
+            // `ready` = every declared precondition is satisfied here (e.g. the
+            // required API-key env var is set), so a credential-gated app is
+            // distinguishable from a runnable one before its first failed job.
+            let ready = app.requires().iter().all(|r| r.is_satisfied());
             json!({
                 "name": app.name(),
                 "description": app.description(),
                 "schedule": app.schedule(),
+                "requires": requires,
+                "ready": ready,
             })
         })
         .collect();

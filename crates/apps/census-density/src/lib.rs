@@ -63,6 +63,12 @@ impl ScrapeApp for CensusDensity {
          \"api_key\": \"...\"}"
     }
 
+    // Needs a Census API key. A scheduled run uses default_params (no inline key),
+    // so the env var is the readiness signal `GET /apps` reports.
+    fn requires(&self) -> &'static [pumper_core::Requirement] {
+        &[pumper_core::Requirement::Env("CENSUS_API_KEY")]
+    }
+
     // Annual source — enable a yearly refresh once CENSUS_API_KEY is set in the
     // environment (scheduled runs use default_params and can't carry a key inline):
     // fn schedule(&self) -> Option<&'static str> { Some("0 0 6 15 3 *") } // Mar 15
