@@ -235,6 +235,13 @@ impl ScrapeApp for MpsvVpm {
                 }
             }
         }
+        // Free the ~300k typed postings (100-200 MB) now that everything downstream
+        // works off the small derived collections (cells/groups/gap_cells/…). The
+        // ISPV `list` and the ARES enrichment phase below do sequential governed
+        // HTTP fetches taking minutes; without this the whole corpus stays resident
+        // across those network waits while other apps run concurrently. (Mirrors the
+        // existing `drop(resp)` — extended to the larger, longer-lived parsed side.)
+        drop(feed);
 
         // aggregate cells that clear the min-count threshold (statistically usable)
         let mut agg_items: Vec<(String, Value)> = Vec::new();
