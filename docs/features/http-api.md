@@ -13,7 +13,7 @@ Axum server (default port 8088, `[server]` config). **Local power mode: no auth,
 | Jobs | `GET /jobs?app=&status=&limit=&cursor=` (cursor ⇒ `{items,next_cursor}`) · `GET /jobs/{id}` (adds a `progress` field with the latest live snapshot while running) · `DELETE /jobs/{id}` (cancel: queued synchronously, or a `running` job via its cancellation token — response adds `running:true`; 404 no job, 409 already terminal) · `POST /jobs/{id}/retry` (404 no job, 409 wrong state) · `POST /jobs/retry` bulk (body `{status=failed\|cancelled, app?, limit≤500}` ⇒ `{retried,ids}`; 400 bad status) · `POST /jobs/{id}/reset` (re-queue a `running` job; 404 no job, 409 not running) · `GET /jobs/{id}/stream` (SSE) · `GET /jobs/{id}/costs` |
 | Costs | `GET /costs?app=&since=` |
 | Schedules | `GET /schedules?limit=&cursor=` · `POST /schedules` (`{app, cron, params?, priority?, timezone?, misfire_policy?, max_attempts?}` — `timezone` IANA/chrono-tz default UTC, `misfire_policy` `fire_once`\|`skip` default `fire_once`, `max_attempts` default server 3; unknown `timezone`/`misfire_policy` → 400) · `DELETE /schedules/{id}` · `POST /schedules/{id}/enabled` |
-| Datasets | `GET /datasets/{app}/{ds}?limit=&cursor=` · `GET .../export?format=json\|ndjson\|csv` (all stream; see below) · `GET .../duplicates?distance=` (413 above 10k records) · `GET .../changes?since=&limit=&cursor=` · `GET .../history?key=&limit=&cursor=` |
+| Datasets | `GET /datasets/{app}/{ds}?limit=&cursor=&filter=` · `GET .../export?format=json\|ndjson\|csv&filter=` (all stream; see below) · `GET .../duplicates?distance=` (413 above 10k records) · `GET .../changes?since=&limit=&cursor=` · `GET .../history?key=&limit=&cursor=` |
 | Watches | `GET /watches?app=&limit=&cursor=` · `POST /watches` · `DELETE /watches/{id}` · `POST /watches/{id}/enabled` |
 | Webhook deliveries | `GET /webhooks/deliveries?status=&limit=&cursor=` · `GET /webhooks/deliveries/{id}` · `POST /webhooks/deliveries/{id}/replay` |
 | Triggers | `GET /triggers?app=&limit=&cursor=` · `POST /triggers` · `DELETE /triggers/{id}` · `POST /triggers/{id}/enabled` · `POST /triggers/{id}/test?fire=` · `GET /triggers/{id}/runs` |
@@ -37,6 +37,11 @@ Conventions: enable/disable is always `POST …/{id}/enabled {"enabled": bool}`;
 - `format=csv`: RFC-4180 rows under a fixed `key,first_seen,last_seen,updated_at,removed_at,data` header (`text/csv`).
 
 All three send `content-disposition: attachment; filename="{ds}.{ext}"`.
+
+**Generic `filter` predicate.** Both `GET /datasets/{app}/{ds}` and `.../export` take a repeatable `filter` query param, all ANDed and pushed into SQL (so a filtered read/export never deserializes rows SQLite can skip, and a filtered export streams only matching rows instead of the whole corpus). Grammar per param — `<path>:<op>:<value>` where `path` is a JSON path (`$.state`) and `op` is one of:
+- `eq` — exact text match · `contains` — case-insensitive substring · `gte`/`lte` — text (lexicographic) `>=`/`<=` · `numgte` — numeric `>=` on **any** of `path`'s comma-separated fields (an OR).
+
+The value keeps any `:` after the op (so timestamps/URLs pass through). Example: `?filter=$.state:eq:CA&filter=$.employees:numgte:50`. A malformed spec (missing op/value, non-`$.` path, unknown op, non-numeric `numgte`) returns `400 bad_request`. This is the same `JsonFilter` engine the `/grants` route exposes with typed params — the `filter` grammar generalizes it to every app's datasets. When a filter is present on `GET /datasets/{app}/{ds}`, only **live** records match (a tombstoned row never appears); the unfiltered first page keeps the legacy behaviour (all records).
 
 `GET /datasets/{app}/{ds}/duplicates` runs an in-memory O(n²) pairwise SimHash sweep, so it is bounded: datasets over **10,000 records** return `413 too_large` (the message carries the actual count and the cap) rather than pinning a core. Narrow the dataset or run the scan offline.
 
