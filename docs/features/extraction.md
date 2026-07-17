@@ -4,13 +4,13 @@
 
 A `RuleSet` maps output fields to rules, compiled once and run over document batches across all cores (rayon; simd-json for JSON rules). Rule types:
 
-- `css` — selector → text or `attr`; `all: true` collects every match.
+- `css` — selector → text or `attr`; `all: true` collects every match. `html: true` yields the matched element's serialized HTML instead of its flattened text — pair with a `to_markdown` transform for clean scoped Markdown of e.g. `article.content` (the text path fuses headings/lists/tables; `SKIP` chrome like a nested `<form>` still drops).
 - `regex` — capture `group` over the raw document.
 - `json` — RFC 6901 JSON Pointer into a JSON body.
 - `xpath` — XPath over the HTML (pure-Rust `skyscraper`); attribute nodes yield their value, text nodes content, elements recursive text; `all` supported; invalid expressions fail at compile. Covers parent/ancestor axes CSS can't express.
 - `const` — literal value.
 
-**Transforms**: each field takes an optional `transforms` chain applied after the rule (element-wise over arrays): `trim`, `lowercase`, `uppercase`, `to_number`, `to_int`, `to_bool`, `regex_replace {pattern, replacement}`, `split {sep, index?}`, `default {value}` (on null). Backward compatible — plain rule JSON still parses (serde-flattened `FieldRule`).
+**Transforms**: each field takes an optional `transforms` chain applied after the rule (element-wise over arrays): `trim`, `lowercase`, `uppercase`, `to_number`, `to_int`, `to_bool`, `regex_replace {pattern, replacement}`, `split {sep, index?}`, `to_markdown` (HTML fragment → clean Markdown; pair with a `css` rule's `html: true`), `default {value}` (on null). Backward compatible — plain rule JSON still parses (serde-flattened `FieldRule`).
 
 `to_number`/`to_int` parse the **first valid decimal number** in the string, tolerating a leading currency symbol and `,` thousands separators — without concatenating digits across separators: `"1-2"` → `1` (a range, not `-12`), `"$1,234.50"` → `1234.5`, `"3.5%"` → `3.5`, `"2026-07-10"` → `2026`. A sign only binds when it directly precedes the digits (`"-5"` → `-5`).
 
@@ -65,7 +65,7 @@ On success (`200`): `{values, report, fields_matched, fields_total}` — the ext
 
 ## WASM plugin sandbox (`engine-wasm`, `plugin` app)
 
-Hot-swappable `.wasm` extractor modules loaded from the plugins dir (`plugins-src/` holds sources), executed under wasmtime with **fuel + memory limits**. `GET /plugins` lists, `POST /plugins/reload` rescans. The `plugin` app runs a named plugin over a fetched page.
+Hot-swappable `.wasm` extractor modules loaded from the plugins dir (`plugins-src/` holds sources), executed under wasmtime with **fuel + memory limits**. `GET /plugins` lists, `POST /plugins/reload` rescans. The `plugin` app runs a named plugin over documents in **either** input mode (like `extractor`, exactly one): `urls` (fetch each live, tiered `strategy` incl. `auto_with_research`) or `source: {app, dataset, keys?}` — run over already-crawled stored bodies with no re-fetch, keys defaulting to the firing trigger's `_trigger.keys` then all live records. The crawl→plugin seam shares `AppContext::read_source_artifact` (one hardened path-traversal guard) with the extractor. Source-mode result: `source {app, dataset}`, `requested`, `loaded`, `missing`, `missing_keys`.
 
 ## Known gaps
 

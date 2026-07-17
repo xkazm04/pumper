@@ -193,3 +193,12 @@
 - **Webhook with body-only HMAC, no id/ts.** No idempotency key + unbounded replay window. Sign "{ts}.{delivery_id}."++body; keep delivery_id stable across retries/replays.
 - **Enumerating a whole backlog for a number one branch ignores.** Scheduler counted every missed firing per tick though Fire only logs it; find the cheap discriminator (earliest firing) first, bound the diagnostic walk.
 - **Test unique-dir from a timestamp alone races under parallelism.** Same-nanosecond collision → two TantivyIndex fight the writer lock. Use an atomic counter.
+
+## Structural facts (medium-tail batch 3, 2026-07-17)
+- **2026-07-17** — `pumper_core::json_salvage::salvage_json` (moved from trades-common; re-exported) recovers a fenced/prose-wrapped JSON object; used by research + trades. `AppContext::read_source_artifact` (moved from extractor's read_source_body) + private `safe_path_segment` — the ONE crawl→extract path-traversal guard, shared by extractor and plugin. `markdown::html_fragment_to_markdown` (parse_fragment). extract: `Rule::Css.html:true` → el.html(); `Transform::ToMarkdown`. plugin app now has `source` mode (mirrors extractor: source.keys → _trigger.keys → live records) + auto_with_research. readable result compact by default (`inline:true` opt-in). mpsv-vpm drops parsed feed after aggregation.
+
+## Anti-patterns to avoid (medium-tail batch 3, 2026-07-17)
+- **Holding a big parse across a network phase.** mpsv-vpm's ~150MB typed feed stayed resident through minutes of governed ARES fetches; drop it after the last read.
+- **Writing a payload to an artifact AND inlining it into the result row.** Doubles storage (disk + SQLite), bloats job listings. Compact result + `inline` opt-in.
+- **A generic helper in a domain crate.** salvage_json in trades-common → sharing needs a backwards dep. Move to core beside the type it serves.
+- **A security guard duplicated per app.** read_source_body/safe_segment forked in extractor; a plugin copy would drift. Promote to one AppContext method.

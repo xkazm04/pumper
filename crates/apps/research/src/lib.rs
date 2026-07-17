@@ -3,7 +3,7 @@
 //! can't cut it — the agent searches, reads pages, and synthesizes.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, ResearchRequest, Result, ScrapeApp};
+use pumper_core::{salvage_json, AppContext, ResearchRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
 
 pub struct Research;
@@ -65,12 +65,15 @@ impl ScrapeApp for Research {
         }));
         let output = ctx.research(request).await?;
 
-        // `structured` must mean "matched the promised shape", not merely "some
-        // JSON came back" — otherwise a hallucinated/wrong-shape object is stamped
-        // structured:true and stored as if trustworthy.
-        let structured = output.json.as_ref().is_some_and(is_report_shaped);
+        // Before giving up on structure, salvage a fenced/prose-wrapped object from
+        // the raw text — no re-run, no extra cost, on text already paid for (the
+        // same recovery the four trades apps use via `research_json`). `structured`
+        // still means "matched the promised shape", not merely "some JSON came
+        // back", so a hallucinated/wrong-shape object isn't stamped trustworthy.
+        let parsed = output.json.clone().or_else(|| salvage_json(&output.text));
+        let structured = parsed.as_ref().is_some_and(is_report_shaped);
         let report = if structured {
-            output.json.clone().unwrap()
+            parsed.unwrap()
         } else {
             Value::String(output.text.clone())
         };

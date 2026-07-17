@@ -24,6 +24,7 @@ pub mod fetcher;
 pub mod governor;
 pub mod jitter;
 pub mod job;
+pub mod json_salvage;
 pub mod lru;
 pub mod markdown;
 pub mod plugin;
@@ -66,6 +67,7 @@ pub use engine::{
     PROFILE_NAME_MAX_LEN,
 };
 pub use error::{Error, Result};
+pub use json_salvage::salvage_json;
 pub use fetcher::{
     FetchOutcome, FetchRequest, FetchStrategy, FetchTier, Fetcher, TierTrace, TierVerdict,
 };

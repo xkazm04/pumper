@@ -22,6 +22,18 @@ pub fn html_to_markdown(html: &str) -> String {
     normalize(&out)
 }
 
+/// Converts an HTML *fragment* to Markdown — for a scoped extraction rule that
+/// yields one element's HTML (e.g. `article.content`) rather than a whole page.
+/// Uses `parse_fragment` so the input isn't wrapped in `<html><body>`; the same
+/// `SKIP` rules still apply inside the subtree (a nested `<form>` stays dropped).
+pub fn html_fragment_to_markdown(html: &str) -> String {
+    let doc = Html::parse_fragment(html);
+    let mut out = String::new();
+    let mut ctx = Ctx::default();
+    walk(doc.tree.root(), &mut out, &mut ctx);
+    normalize(&out)
+}
+
 /// Characters of visible text (SKIP subtrees dropped, whitespace collapsed the
 /// same way the Markdown conversion collapses it), counted only up to `cap` and
 /// saturating there.

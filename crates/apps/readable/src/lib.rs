@@ -15,9 +15,11 @@ impl ScrapeApp for Readable {
     }
 
     fn description(&self) -> &'static str {
-        "Fetch a URL as clean Markdown via the tiered fetcher. Params: \
+        "Fetch a URL as clean Markdown via the tiered fetcher. The document is saved \
+         to the `page.md` artifact; the result JSON is compact (set \"inline\": true \
+         to also return the Markdown in the result). Params: \
          {\"url\": \"...\", \"strategy\": \"http|browser|auto|auto_with_research\", \
-         \"wait_for_selector\": \".article\", \"min_content_chars\": 250}"
+         \"wait_for_selector\": \".article\", \"min_content_chars\": 250, \"inline\": false}"
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -43,13 +45,10 @@ impl ScrapeApp for Readable {
             .and_then(Value::as_u64)
             .map(|n| n as usize);
 
-        let outcome = ctx.fetch(req).await?;
+        let mut outcome = ctx.fetch(req).await?;
 
-        let markdown = outcome
-            .markdown
-            .clone()
-            .or_else(|| outcome.text.clone())
-            .unwrap_or_default();
+        // Move the document out of the outcome rather than cloning it twice.
+        let markdown = outcome.markdown.take().or_else(|| outcome.text.take()).unwrap_or_default();
         if markdown.trim().is_empty() {
             // A successful fetch that yields no readable content is a failed
             // extraction, not an empty-but-valid result — don't report it as OK.
@@ -59,14 +58,27 @@ impl ScrapeApp for Readable {
             )));
         }
         ctx.save_artifact("page.md", markdown.as_bytes()).await?;
+        let markdown_chars = markdown.chars().count();
 
-        Ok(json!({
+        // Compact result by default (the "big payloads to artifacts" convention the
+        // artifact pipeline demonstrates): the document lives in the `page.md`
+        // artifact, not inlined into jobs.result — which would store it a SECOND
+        // time in SQLite and bloat every job listing that hydrates results. An
+        // interactive caller can opt into inline return with `inline: true`; the
+        // scheduled path never pays.
+        let mut out = json!({
             "url": outcome.url,
             "engine": outcome.engine,
             "status": outcome.status,
             "escalations": outcome.escalations,
-            "markdown_chars": markdown.chars().count(),
-            "markdown": markdown,
-        }))
+            "markdown_chars": markdown_chars,
+            "artifact": "page.md",
+        });
+        if ctx.params.get("inline").and_then(Value::as_bool).unwrap_or(false) {
+            if let Value::Object(map) = &mut out {
+                map.insert("markdown".into(), Value::String(markdown));
+            }
+        }
+        Ok(out)
     }
 }
