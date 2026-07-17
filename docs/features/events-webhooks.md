@@ -26,8 +26,11 @@ Kinds:
 
 ## Delivery log & dead-letter queue
 
-Every delivery is recorded in `webhook_deliveries` (kind, ref, url, event, body, status `pending|delivered|failed`, attempts, last_error). `GET /webhooks/deliveries?status=failed` is the DLQ view; `GET /webhooks/deliveries/{id}` includes the body; `POST /webhooks/deliveries/{id}/replay` re-sends, re-signing with the source's **current** secret (job callback secret / watch secret).
+Every delivery is recorded in `webhook_deliveries` (kind, ref, url, event, body, status `pending|delivered|failed|dead`, attempts, retry_count, next_retry_at, last_error). `GET /webhooks/deliveries?status=failed` is the DLQ view; `GET /webhooks/deliveries/{id}` includes the body; `POST /webhooks/deliveries/{id}/replay` re-sends, re-signing with the source's **current** secret (job callback secret / watch secret).
+
+**Auto-drain (`[webhooks] auto_retry`, default on).** A failed delivery is no longer lost until a human replays it. Beyond the ~6s in-process retry loop (3 attempts), a background drain — piggybacked on the scheduler tick — re-sends `failed` deliveries whose backoff is due, with exponential backoff **30s → 1m → 5m → 30m → 2h** (mild jitter to de-sync a herd that failed during the same outage). Each retry bumps `retry_count`; past the cap (5 retries) the row becomes **`dead`** so the DLQ view stays meaningful and the drain stops re-sending. So a receiver outage longer than a few seconds recovers automatically instead of silently dropping every event that finished during it. Manual `/replay` still works and shares the same secret-resolution path. Set `auto_retry = false` to revert to manual-only replay.
 
 ## Known gaps
 
-- Delivery log has no retention/purge job yet.
+- Delivery log has no retention/purge job yet (a `delivered`/`dead` TTL sweep is the natural follow-on to the auto-drain).
+- A delivery claimed for a drain retry (`pending`) but interrupted by a process crash before its outcome is recorded stays `pending` and isn't re-scanned (same pre-existing window as the initial in-process send).

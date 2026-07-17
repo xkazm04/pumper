@@ -67,7 +67,7 @@
     },
     {
       "doc": "docs/features/http-api.md",
-      "sourceGlobs": ["crates/server/src/routes.rs"]
+      "sourceGlobs": ["crates/server/src/routes.rs", "crates/core/src/catalog.rs"]
     },
     {
       "doc": "docs/features/apps.md",

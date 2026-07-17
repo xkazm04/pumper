@@ -59,6 +59,12 @@ pub async fn run(state: AppState) {
         // running jobs whose heartbeat lease has gone stale (a hung task on a
         // live server). Cheap — one indexed scan of `running` jobs.
         crate::worker::reap_once(&state).await;
+        // Also piggyback the webhook dead-letter drain: re-send failed deliveries
+        // whose backoff is due, so a receiver outage longer than the in-process
+        // retry loop doesn't mean permanent silent event loss.
+        if state.config.webhooks.auto_retry {
+            crate::webhook::drain_due(&state).await;
+        }
         // Stop enqueuing new scheduled work as soon as shutdown is signalled.
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
@@ -165,6 +171,18 @@ fn parse_tz(name: Option<&str>) -> Tz {
     name.and_then(|n| n.parse().ok()).unwrap_or(Tz::UTC)
 }
 
+/// Projects a schedule's next firing (read-only, for the observability API),
+/// using the exact reference rule the reconcile loop does: the first cron time
+/// strictly after `last_run` (or `created_at` for a never-run schedule),
+/// evaluated in the schedule's timezone. `None` if the cron is unparseable or has
+/// no future firing — so the API can never disagree with the scheduler.
+pub fn project_next_run(schedule: &Schedule) -> Option<DateTime<Utc>> {
+    let cron = CronSchedule::from_str(&schedule.cron).ok()?;
+    let tz = parse_tz(schedule.timezone.as_deref());
+    let reference = schedule.last_run.unwrap_or(schedule.created_at);
+    cron.after(&reference.with_timezone(&tz)).next().map(|t| t.with_timezone(&Utc))
+}
+
 /// Decides a schedule's action this tick — pure (no I/O), so it is unit-testable
 /// against simulated downtime and DST boundaries.
 ///
@@ -263,6 +281,43 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 30).unwrap();
         // Next hourly firing after 12:00 is 13:00 — not yet due.
         assert_eq!(decide(&cron(HOURLY), Tz::UTC, reference, now, false, GRACE), Action::Idle);
+    }
+
+    fn schedule(cron: &str, tz: Option<&str>, last_run: Option<DateTime<Utc>>) -> Schedule {
+        Schedule {
+            id: "s1".into(),
+            app: "demo".into(),
+            cron: cron.into(),
+            params: Value::Null,
+            enabled: true,
+            priority: 0,
+            timezone: tz.map(String::from),
+            misfire_policy: "fire_once".into(),
+            max_attempts: None,
+            last_run,
+            created_at: Utc.with_ymd_and_hms(2026, 7, 13, 9, 15, 0).unwrap(),
+        }
+    }
+
+    #[test]
+    fn project_next_run_uses_last_run_reference() {
+        // Never run → projects from created_at (09:15) → next hourly is 10:00.
+        let never = schedule(HOURLY, None, None);
+        assert_eq!(
+            project_next_run(&never),
+            Some(Utc.with_ymd_and_hms(2026, 7, 13, 10, 0, 0).unwrap())
+        );
+        // Ran at 12:00 → next hourly firing after is 13:00.
+        let ran = schedule(HOURLY, None, Some(Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap()));
+        assert_eq!(
+            project_next_run(&ran),
+            Some(Utc.with_ymd_and_hms(2026, 7, 13, 13, 0, 0).unwrap())
+        );
+    }
+
+    #[test]
+    fn project_next_run_none_on_bad_cron() {
+        assert_eq!(project_next_run(&schedule("not a cron", None, None)), None);
     }
 
     #[test]

@@ -10,13 +10,24 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
-use pumper_core::{Job, Storage, Watch};
+use pumper_core::{Delivery, Job, Storage, Watch};
 use sha2::Sha256;
 use tracing::{debug, warn};
+
+use crate::state::AppState;
 
 type HmacSha256 = Hmac<Sha256>;
 
 const MAX_ATTEMPTS: u64 = 3;
+
+/// Auto-drain backoff schedule (seconds) indexed by a delivery's `retry_count`:
+/// 30s → 1m → 5m → 30m → 2h. Past the last entry the row is marked `dead`.
+const DRAIN_BACKOFF_SECS: &[i64] = &[30, 60, 300, 1800, 7200];
+/// Max background retries before a delivery is declared `dead` (= backoff len).
+const DRAIN_MAX_RETRIES: i64 = 5;
+/// Deliveries re-sent per drain tick — a small batch so one tick can't stampede
+/// a just-recovered receiver.
+const DRAIN_BATCH: i64 = 20;
 
 /// Spawns a best-effort, logged delivery of a terminal job to its callback.
 pub fn dispatch(client: reqwest::Client, storage: Arc<Storage>, job: Job) {
@@ -158,16 +169,69 @@ async fn log_outcome(
     outcome: (bool, i64, Option<String>),
 ) {
     let (delivered, attempts, last_error) = outcome;
-    if delivered {
+    let result = if delivered {
         debug!(delivery = %delivery_id, url = %url, "webhook delivered");
+        storage.finish_delivery(delivery_id, true, attempts, last_error.as_deref()).await
     } else {
-        warn!(delivery = %delivery_id, url = %url, "webhook delivery gave up after retries");
-    }
-    if let Err(e) = storage
-        .finish_delivery(delivery_id, delivered, attempts, last_error.as_deref())
-        .await
-    {
+        // Don't give up: schedule a backed-off auto-drain retry (or mark the row
+        // `dead` past the cap). A receiver outage longer than the ~6s in-process
+        // loop is exactly what this recovers, instead of silently losing events.
+        debug!(delivery = %delivery_id, url = %url, "webhook delivery failed; scheduling drain retry");
+        storage
+            .fail_delivery(delivery_id, attempts, last_error.as_deref(), DRAIN_MAX_RETRIES, DRAIN_BACKOFF_SECS)
+            .await
+    };
+    if let Err(e) = result {
         warn!(delivery = %delivery_id, "failed to record delivery outcome: {e}");
+    }
+}
+
+/// Resolves the signing secret for a delivery from its source (the job's callback
+/// secret or the watch's secret), so a replay re-signs with the current secret.
+/// Best-effort: a missing/deleted source or an unparseable job id yields `None`
+/// (the delivery is simply re-sent unsigned). Shared by the manual replay route
+/// and the auto-drain so they can't drift.
+pub async fn resolve_secret(storage: &Storage, delivery: &Delivery) -> Option<String> {
+    match delivery.kind.as_str() {
+        "job" => {
+            let job_id = uuid::Uuid::parse_str(&delivery.ref_id).ok()?;
+            storage.get(job_id).await.ok().flatten().and_then(|j| j.callback_secret)
+        }
+        _ => storage.get_watch(&delivery.ref_id).await.ok().flatten().and_then(|w| w.secret),
+    }
+}
+
+/// One auto-drain pass: re-send failed deliveries whose backoff is due. Claims
+/// each row atomically (so a concurrent tick can't double-send), resolves its
+/// secret, and hands it to [`replay`]. Piggybacked on the scheduler tick.
+pub async fn drain_due(state: &AppState) {
+    let due = match state.storage.due_deliveries(DRAIN_BATCH).await {
+        Ok(due) => due,
+        Err(e) => {
+            warn!("webhook drain: due-scan failed: {e}");
+            return;
+        }
+    };
+    for delivery in due {
+        // Atomic claim: skip if another tick already took it.
+        match state.storage.begin_delivery_retry(&delivery.id).await {
+            Ok(true) => {}
+            Ok(false) => continue,
+            Err(e) => {
+                warn!(delivery = %delivery.id, "webhook drain: claim failed: {e}");
+                continue;
+            }
+        }
+        let secret = resolve_secret(&state.storage, &delivery).await;
+        replay(
+            state.webhook_client.clone(),
+            state.storage.clone(),
+            delivery.id.clone(),
+            delivery.url.clone(),
+            delivery.event.clone(),
+            delivery.body.into_bytes(),
+            secret,
+        );
     }
 }
 

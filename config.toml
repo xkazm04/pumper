@@ -104,3 +104,9 @@ max_concurrent = 0          # max plugin runs at once host-wide (0 = one per CPU
 [search]
 enabled = true
 dir = "data/search-index"
+
+# Result delivery via webhooks (job callbacks + dataset-watch events).
+[webhooks]
+# failure_url = "https://ops.example.com/pumper/failures"  # optional job.failed firehose
+# failure_secret = "..."                                    # HMAC-SHA256 secret for failure_url
+auto_retry = true   # auto-drain the dead-letter queue: re-send failed deliveries with backoff (30s→1m→5m→30m→2h, then 'dead')

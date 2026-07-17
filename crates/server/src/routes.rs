@@ -106,6 +106,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(extract_preview))
         .routes(routes!(list_grants))
         .routes(routes!(closing_soon))
+        .routes(routes!(catalog_sources))
         .routes(routes!(openapi_json))
 }
 
@@ -542,7 +543,7 @@ fn is_terminal(status: JobStatus) -> bool {
     get,
     path = "/apps",
     tag = "apps",
-    responses((status = 200, description = "`{apps: [{name, description, schedule, requires, ready}]}` — `requires` lists preconditions (e.g. `env:CENSUS_API_KEY`); `ready` is false when any is unmet here."))
+    responses((status = 200, description = "`{apps: [{name, description, schedule, requires, ready, default_params}]}` — `requires` lists preconditions (e.g. `env:CENSUS_API_KEY`); `ready` is false when any is unmet here; `default_params` is the app's default job params (a POST body's `params` shallow-merges over these)."))
 )]
 async fn list_apps(State(state): State<AppState>) -> Json<Value> {
     let mut apps: Vec<_> = state.registry.values().collect();
@@ -561,14 +562,38 @@ async fn list_apps(State(state): State<AppState>) -> Json<Value> {
                 "schedule": app.schedule(),
                 "requires": requires,
                 "ready": ready,
+                // Machine-readable defaults so a client can see exactly which keys
+                // it is overriding — the replace-vs-merge fix below is only safe
+                // because the caller can now see what it is merging over.
+                "default_params": app.default_params(),
             })
         })
         .collect();
     Json(json!({ "apps": apps }))
 }
 
+/// Merge a request's `params` over the app's defaults. A POST that sets one key
+/// must not silently drop the rest of the defaults (which the scheduler still
+/// runs with) — so an object body **shallow-merges** over the object defaults.
+/// A non-object body (or non-object defaults) can't be merged key-wise, so it
+/// replaces, matching the prior behaviour for those shapes.
+fn merge_params(defaults: Value, over: Option<Value>) -> Value {
+    match (defaults, over) {
+        (defaults, None) => defaults,
+        (Value::Object(mut base), Some(Value::Object(top))) => {
+            base.extend(top);
+            Value::Object(base)
+        }
+        (_, Some(over)) => over,
+    }
+}
+
 #[derive(Deserialize, Default, ToSchema)]
 struct EnqueueBody {
+    /// Job params. An object here **shallow-merges over the app's
+    /// `default_params`** (see `GET /apps`), so setting one key keeps the rest of
+    /// the defaults — matching what the scheduler runs. A non-object value
+    /// replaces the defaults wholesale.
     params: Option<Value>,
     max_attempts: Option<i64>,
     delay_secs: Option<u64>,
@@ -614,7 +639,7 @@ async fn enqueue_job(
         .or(body.idempotency_key)
         .filter(|k| !k.trim().is_empty());
     let opts = EnqueueOptions {
-        params: body.params.unwrap_or_else(|| app.default_params()),
+        params: merge_params(app.default_params(), body.params),
         max_attempts: body.max_attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS_CAP),
         delay_secs: body.delay_secs.unwrap_or(0),
         priority: body.priority.unwrap_or(0),
@@ -980,7 +1005,7 @@ struct SchedulesQuery {
     path = "/schedules",
     tag = "schedules",
     params(SchedulesQuery),
-    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present."))
+    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `overlapping`) — so a silently-wedged schedule is visible over the API."))
 )]
 async fn list_schedules(
     State(state): State<AppState>,
@@ -991,14 +1016,60 @@ async fn list_schedules(
         // Legacy bare-array mode is still capped: an uncursored list must not
         // stream an entire table.
         let items = state.storage.list_schedules_page(None, limit).await?;
-        return Ok(Json(json!(items)));
+        let enriched = enrich_schedules(&state, items).await?;
+        return Ok(Json(json!(enriched)));
     };
     let after = parse_cursor(cursor);
     let items = state.storage.list_schedules_page(after, limit).await?;
     let next_cursor = keyset_cursor(&items, limit, |s| {
         format!("{}|{}", pumper_core::datasets::ts(s.created_at), s.id)
     });
-    Ok(Json(json!({ "items": items, "next_cursor": next_cursor })))
+    let enriched = enrich_schedules(&state, items).await?;
+    Ok(Json(json!({ "items": enriched, "next_cursor": next_cursor })))
+}
+
+/// Enriches each schedule with the observability fields the raw row can't carry:
+/// the computed `next_run`, its most recent job (`last_job_id` / `last_status`),
+/// and a `health` reason so "why isn't this firing?" is answerable over the API
+/// instead of only in server logs. `health` is derived from the same conditions
+/// the scheduler checks, so the API and the reconcile loop can't disagree.
+async fn enrich_schedules(
+    state: &AppState,
+    schedules: Vec<Schedule>,
+) -> Result<Vec<Value>, ApiError> {
+    let mut out = Vec::with_capacity(schedules.len());
+    for schedule in schedules {
+        let next_run = crate::scheduler::project_next_run(&schedule);
+        let last = state.storage.latest_job_for_schedule(&schedule.id).await?;
+        let (last_job_id, last_status) = match &last {
+            Some((id, status)) => (Some(id.clone()), Some(status.clone())),
+            None => (None, None),
+        };
+        // Precedence mirrors the scheduler's own short-circuits: a disabled or
+        // mis-configured schedule never reaches the overlap check.
+        let last_active = matches!(last_status.as_deref(), Some("queued") | Some("running"));
+        let health = if !schedule.enabled {
+            "disabled"
+        } else if next_run.is_none() {
+            // project_next_run only returns None on an unparseable/exhausted cron.
+            "invalid_cron"
+        } else if !state.registry.contains_key(&schedule.app) {
+            "unregistered_app"
+        } else if last_active {
+            "overlapping"
+        } else {
+            "ok"
+        };
+        let mut value = serde_json::to_value(&schedule).unwrap_or_else(|_| json!({}));
+        if let Value::Object(map) = &mut value {
+            map.insert("next_run".into(), json!(next_run));
+            map.insert("last_job_id".into(), json!(last_job_id));
+            map.insert("last_status".into(), json!(last_status));
+            map.insert("health".into(), json!(health));
+        }
+        out.push(value);
+    }
+    Ok(out)
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -2165,18 +2236,7 @@ async fn replay_delivery(
     let Some(delivery) = state.storage.get_delivery(&id).await? else {
         return Err(ApiError(StatusCode::NOT_FOUND, "delivery not found".into()));
     };
-    let secret = match delivery.kind.as_str() {
-        "job" => {
-            let job_id = Uuid::parse_str(&delivery.ref_id)
-                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            state.storage.get(job_id).await?.and_then(|j| j.callback_secret)
-        }
-        _ => state
-            .storage
-            .get_watch(&delivery.ref_id)
-            .await?
-            .and_then(|w| w.secret),
-    };
+    let secret = crate::webhook::resolve_secret(&state.storage, &delivery).await;
     crate::webhook::replay(
         state.webhook_client.clone(),
         state.storage.clone(),
@@ -3044,6 +3104,144 @@ async fn closing_soon(
     Ok(Json(json!({ "days": days, "count": count, "grants": grants })))
 }
 
+// ---- Data-source catalog --------------------------------------------------
+
+#[derive(Deserialize, IntoParams)]
+struct CatalogQuery {
+    /// Filter to one jurisdiction id (e.g. `us`, `eu`, `cz`).
+    market: Option<String>,
+    /// Filter to one status (`live` | `planned` | `blocked`).
+    status: Option<String>,
+    /// Filter to one category (e.g. `open-calls`, `labor-market`).
+    category: Option<String>,
+}
+
+/// The data-source catalog: the machine-readable list of every pipeline this
+/// service scrapes (`catalog/data-sources.toml`), so a downstream app can query
+/// "which markets are launch-grade" instead of scraping a TOML out of a sibling
+/// repo. A server-crate test cross-checks it against the live registry, so a
+/// `live` entry can't drift from what the app actually schedules.
+#[utoipa::path(
+    get,
+    path = "/catalog/sources",
+    tag = "catalog",
+    params(CatalogQuery),
+    responses(
+        (status = 200, description = "`{count, sources: [Source]}` — data pipelines, optionally filtered by `market` / `status` / `category`."),
+        (status = 500, description = "Catalog file malformed", body = Object),
+    )
+)]
+async fn catalog_sources(Query(query): Query<CatalogQuery>) -> Result<Json<Value>, ApiError> {
+    let catalog = pumper_core::Catalog::load()
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("catalog load: {e}")))?;
+    let want = |field: &str, filter: &Option<String>| -> bool {
+        filter.as_deref().map(str::trim).filter(|s| !s.is_empty()).map_or(true, |f| f == field)
+    };
+    let sources: Vec<&pumper_core::Source> = catalog
+        .sources
+        .iter()
+        .filter(|s| {
+            want(&s.market, &query.market)
+                && want(&s.status, &query.status)
+                && want(&s.category, &query.category)
+        })
+        .collect();
+    Ok(Json(json!({ "count": sources.len(), "sources": sources })))
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use pumper_core::Catalog;
+    use std::collections::BTreeSet;
+
+    /// The catalog, embedded at compile time so the check doesn't depend on the
+    /// test's working directory.
+    const CATALOG_TOML: &str = include_str!("../../../catalog/data-sources.toml");
+
+    /// Registered apps deliberately absent from the catalog, each for a documented
+    /// reason. Kept explicit so a NEW in-scope source app can't be silently omitted
+    /// — adding one that isn't listed here fails the coverage check below. Reasons:
+    ///  - generic tooling / engines, not a data *source*: `crawl`, `extractor`,
+    ///    `plugin`, `readable`, `research`, `watch`.
+    ///  - `hackernews`: an example/template app, not a production pipeline.
+    ///  - sibling-product consumers outside this catalog's grant/labor scope, same
+    ///    rationale the `census-*` docs already state ("a separate Ledgerline
+    ///    consumer from the grant pipeline"): the Ledgerline trades apps
+    ///    (`census-density`, `census-nonemp`, `homewyse-pricing`, `state-tax`,
+    ///    `trade-wages`, `valuation-multiples`) and the Counterbill medical app
+    ///    (`cms-fee-schedule`).
+    const CATALOG_EXEMPT: &[&str] = &[
+        "census-density",
+        "census-nonemp",
+        "cms-fee-schedule",
+        "crawl",
+        "extractor",
+        "hackernews",
+        "homewyse-pricing",
+        "plugin",
+        "readable",
+        "research",
+        "state-tax",
+        "trade-wages",
+        "valuation-multiples",
+        "watch",
+    ];
+
+    fn catalog() -> Catalog {
+        Catalog::parse(CATALOG_TOML).expect("catalog/data-sources.toml parses")
+    }
+
+    fn registered() -> Vec<std::sync::Arc<dyn pumper_core::ScrapeApp>> {
+        crate::registry::apps()
+    }
+
+    #[test]
+    fn live_catalog_entries_map_to_registered_apps_with_matching_cron() {
+        let catalog = catalog();
+        let apps = registered();
+        for source in catalog.live() {
+            assert!(
+                !source.app.is_empty(),
+                "live catalog source '{}' has no app — a live pipeline must name its serving app",
+                source.id
+            );
+            let app = apps.iter().find(|a| a.name() == source.app).unwrap_or_else(|| {
+                panic!("live catalog source '{}' names unregistered app '{}'", source.id, source.app)
+            });
+            // Cron must agree in BOTH directions: "" here must mean the app has no
+            // schedule, and a cron here must equal the app's schedule() exactly.
+            let app_cron = app.schedule().unwrap_or("");
+            assert_eq!(
+                source.cron.trim(),
+                app_cron,
+                "catalog cron for '{}' ({:?}) disagrees with app '{}' schedule() ({:?})",
+                source.id,
+                source.cron,
+                source.app,
+                app_cron,
+            );
+        }
+    }
+
+    #[test]
+    fn every_registered_data_source_app_is_in_the_catalog() {
+        let catalog = catalog();
+        let cataloged: BTreeSet<&str> =
+            catalog.sources.iter().map(|s| s.app.as_str()).filter(|a| !a.is_empty()).collect();
+        let exempt: BTreeSet<&str> = CATALOG_EXEMPT.iter().copied().collect();
+        let missing: Vec<&str> = registered()
+            .iter()
+            .map(|a| a.name())
+            .filter(|name| !cataloged.contains(name) && !exempt.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "registered apps missing from catalog/data-sources.toml (add an entry, or add to \
+             CATALOG_EXEMPT if it isn't a data source): {missing:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod filter_tests {
     use super::{filter_specs, parse_filters};
@@ -3118,6 +3316,35 @@ mod filter_tests {
 }
 
 #[cfg(test)]
+mod merge_tests {
+    use super::merge_params;
+    use serde_json::json;
+
+    #[test]
+    fn no_override_keeps_all_defaults() {
+        let out = merge_params(json!({ "year": "2021", "naics": ["2382"] }), None);
+        assert_eq!(out, json!({ "year": "2021", "naics": ["2382"] }));
+    }
+
+    #[test]
+    fn object_override_shallow_merges_and_preserves_other_defaults() {
+        // The bug this fixes: a one-key override used to drop `year`.
+        let out = merge_params(
+            json!({ "year": "2021", "naics": ["2382"] }),
+            Some(json!({ "naics": "23" })),
+        );
+        assert_eq!(out, json!({ "year": "2021", "naics": "23" }));
+    }
+
+    #[test]
+    fn non_object_override_replaces() {
+        // A scalar/array body can't merge key-wise, so it replaces (prior behaviour).
+        let out = merge_params(json!({ "a": 1 }), Some(json!([1, 2, 3])));
+        assert_eq!(out, json!([1, 2, 3]));
+    }
+}
+
+#[cfg(test)]
 mod api_spec_tests {
     use std::collections::BTreeSet;
 
@@ -3183,6 +3410,7 @@ mod api_spec_tests {
         "POST /extract/preview",
         "GET /grants",
         "GET /grants/closing-soon",
+        "GET /catalog/sources",
         "GET /openapi.json",
     ];
 

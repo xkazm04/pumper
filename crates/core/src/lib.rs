@@ -15,6 +15,7 @@ pub mod storage;
 #[cfg(feature = "storage")]
 pub mod tiers;
 
+pub mod catalog;
 pub mod config;
 pub mod crawl;
 pub mod engine;
@@ -50,6 +51,7 @@ pub use storage::{
 #[cfg(feature = "storage")]
 pub use tiers::{HostProfile, TierMemory};
 
+pub use catalog::{Catalog, Source};
 pub use config::Config;
 pub use crawl::{
     crawl, CrawlConfig, CrawlPageRecord, CrawlProgressSnapshot, CrawlStats, PageSink, PageSource,

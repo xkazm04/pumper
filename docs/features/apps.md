@@ -1,6 +1,6 @@
 # App fleet & domain datasets
 
-Apps are `ScrapeApp` implementations under `crates/apps/*`, registered in `crates/server/src/registry.rs` (adding one: crate + workspace dep + server dep + one registry line). `GET /apps` lists name/description/schedule; each description documents its params.
+Apps are `ScrapeApp` implementations under `crates/apps/*`, registered in `crates/server/src/registry.rs` (adding one: crate + workspace dep + server dep + one registry line). `GET /apps` lists name/description/schedule/requires/ready plus **`default_params`** (the machine-readable defaults); each description documents its params in prose too. A `POST /apps/{name}/jobs` body's `params` **shallow-merges over `default_params`** — setting one key keeps the rest of the defaults, so a manual run matches its scheduled twin (a non-object `params` replaces wholesale).
 
 ## Generic apps
 
