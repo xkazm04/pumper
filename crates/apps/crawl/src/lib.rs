@@ -197,7 +197,9 @@ impl ScrapeApp for Crawl {
 
     fn description(&self) -> &'static str {
         "High-concurrency broad crawler. Params: {\"seeds\": [..], \"max_pages\": 50, \
-         \"max_depth\": 2, \"concurrency\": 16, \"same_domain\": true, \
+         \"max_depth\": 2, \"concurrency\": 16, \
+         \"max_pages_per_host\": null (per-host page cap for host-fair multi-seed \
+         crawls; 0/absent = unlimited), \"same_domain\": true, \
          \"dedup_distance\": 3, \"respect_robots\": true, \
          \"include_patterns\": [\"regex\", ..], \"exclude_patterns\": [\"regex\", ..], \
          \"sitemap_seeds\": false, \"checkpoint\": \"name\" (resumable frontier), \
@@ -238,6 +240,14 @@ impl ScrapeApp for Crawl {
             max_pages: usize_param("max_pages", 50),
             max_depth: u32_param("max_depth", 2),
             concurrency: usize_param("concurrency", 16),
+            // Optional per-host page cap (0/absent = unlimited): keeps one big
+            // seed from consuming the whole max_pages budget across seeds.
+            max_pages_per_host: ctx
+                .params
+                .get("max_pages_per_host")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .filter(|&n| n > 0),
             same_domain: bool_param("same_domain", true),
             dedup_distance: u32_param("dedup_distance", 3),
             respect_robots: bool_param("respect_robots", true),

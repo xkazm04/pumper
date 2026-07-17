@@ -106,6 +106,11 @@ pub struct CrawlConfig {
     pub max_pages: usize,
     pub max_depth: u32,
     pub concurrency: usize,
+    /// Max pages fetched per host before the frontier stops handing out that
+    /// host's URLs (`None` = no per-host cap). With the round-robin frontier this
+    /// keeps one large seed from consuming the whole `max_pages` budget and
+    /// starving other seeds — multi-seed / off-domain crawls stay broad.
+    pub max_pages_per_host: Option<usize>,
     /// Restrict to the seed hosts.
     pub same_domain: bool,
     /// Drop pages within this SimHash distance of one already kept (0 disables).
@@ -233,6 +238,10 @@ pub struct CrawlStats {
     /// Discovered URLs refused because the frontier hit its `MAX_FRONTIER` cap —
     /// coverage was truncated (0 = the whole discovered graph fit).
     pub frontier_dropped: usize,
+    /// Queued URLs skipped because their host had already reached
+    /// `max_pages_per_host` — host-fairness truncation, reported honestly rather
+    /// than letting one big site silently consume the whole `max_pages` budget.
+    pub skipped_host_budget: usize,
     /// URLs seeded into the frontier from sitemaps.
     pub sitemap_seeded: usize,
     /// Fetches that failed at the transport layer (DNS/TLS/connection/timeout) —
@@ -264,20 +273,51 @@ pub struct CrawlStats {
     pub gone: usize,
 }
 
-/// Bounded, deduplicated URL queue.
+/// Bounded, deduplicated, **host-fair** URL frontier.
+///
+/// URLs are bucketed per host and handed out round-robin, so one large seed
+/// can't monopolize the `max_pages` budget and starve other seeds (a plain FIFO
+/// would). An optional `max_pages_per_host` caps how many a single host yields.
+/// A polite (crawl-delayed) host rotating to the back no longer sits behind a
+/// fast host's entire backlog. The `seen` set (global dedup + `MAX_FRONTIER`
+/// cap) and `dropped` counter keep their prior semantics.
 struct Frontier {
-    queue: VecDeque<(String, u32)>,
+    /// Per-host FIFO of `(url, depth)`.
+    per_host: HashMap<String, VecDeque<(String, u32)>>,
+    /// Round-robin cursor: hosts with a non-empty queue, rotated on each pop.
+    order: VecDeque<String>,
     seen: HashSet<String>,
     /// New URLs refused because the seen-set hit `MAX_FRONTIER` (coverage was
     /// truncated). Tracked so a capped crawl is reported honestly rather than
     /// silently dropping discovered URLs.
     dropped: usize,
+    /// Total queued URLs across all host buckets.
+    len: usize,
+    /// Pages handed out per host (budget accounting; a requeue is refunded).
+    taken: HashMap<String, usize>,
+    /// Per-host page cap; `None` = unlimited.
+    max_pages_per_host: Option<usize>,
+    /// Queued URLs dropped because their host hit `max_pages_per_host`.
+    skipped_host_budget: usize,
 }
 
 impl Frontier {
-    fn new() -> Self {
-        Self { queue: VecDeque::new(), seen: HashSet::new(), dropped: 0 }
+    fn new(max_pages_per_host: Option<usize>) -> Self {
+        Self {
+            per_host: HashMap::new(),
+            order: VecDeque::new(),
+            seen: HashSet::new(),
+            dropped: 0,
+            len: 0,
+            taken: HashMap::new(),
+            max_pages_per_host: max_pages_per_host.filter(|&n| n > 0),
+            skipped_host_budget: 0,
+        }
     }
+
+    /// Enqueues `(url, depth)` into its host bucket, registering the host in the
+    /// round-robin order if newly non-empty. Skips already-seen URLs and enforces
+    /// the global `MAX_FRONTIER` cap.
     fn push(&mut self, url: String, depth: u32) {
         if self.seen.contains(&url) {
             return; // already discovered — normal dedup, not a coverage drop
@@ -287,21 +327,95 @@ impl Frontier {
             return;
         }
         self.seen.insert(url.clone());
-        self.queue.push_back((url, depth));
+        self.enqueue(url, depth);
     }
+
+    /// Routes `(url, depth)` into its host bucket without touching `seen` — used
+    /// by both [`push`] (after the dedup check) and checkpoint restore.
+    fn enqueue(&mut self, url: String, depth: u32) {
+        let host = host_of(&url).unwrap_or_default();
+        let q = self.per_host.entry(host.clone()).or_default();
+        let was_empty = q.is_empty();
+        q.push_back((url, depth));
+        self.len += 1;
+        if was_empty && !self.order.contains(&host) {
+            self.order.push_back(host);
+        }
+    }
+
     /// Count of discovered URLs refused because the frontier cap was reached.
     fn dropped(&self) -> usize {
         self.dropped
     }
+
+    /// Queued URLs dropped because their host hit its per-host page budget.
+    fn skipped_host_budget(&self) -> usize {
+        self.skipped_host_budget
+    }
+
+    /// Pops the next URL round-robin across hosts. A host that has reached
+    /// `max_pages_per_host` has its remaining queue dropped (counted in
+    /// `skipped_host_budget`) and leaves the rotation.
     fn pop(&mut self) -> Option<(String, u32)> {
-        self.queue.pop_front()
+        for _ in 0..self.order.len() {
+            let Some(host) = self.order.pop_front() else { break };
+            // Over budget? Drop this host's remaining backlog, honestly counted.
+            if let Some(cap) = self.max_pages_per_host {
+                if self.taken.get(&host).copied().unwrap_or(0) >= cap {
+                    if let Some(q) = self.per_host.remove(&host) {
+                        self.skipped_host_budget += q.len();
+                        self.len -= q.len();
+                    }
+                    continue; // host left the rotation
+                }
+            }
+            let Some(q) = self.per_host.get_mut(&host) else { continue };
+            let Some(item) = q.pop_front() else {
+                self.per_host.remove(&host);
+                continue;
+            };
+            self.len -= 1;
+            *self.taken.entry(host.clone()).or_insert(0) += 1;
+            if q.is_empty() {
+                self.per_host.remove(&host); // drop empty host from rotation
+            } else {
+                self.order.push_back(host); // rotate to the back
+            }
+            return Some(item);
+        }
+        None
     }
-    /// Puts an already-seen URL back at the tail (crawl-delay rotation).
+
+    /// Puts an already-seen URL back for a later tick (crawl-delay rotation). The
+    /// budget increment from the matching [`pop`] is refunded — a requeue is not a
+    /// consumed fetch.
     fn requeue(&mut self, url: String, depth: u32) {
-        self.queue.push_back((url, depth));
+        let host = host_of(&url).unwrap_or_default();
+        if let Some(c) = self.taken.get_mut(&host) {
+            *c = c.saturating_sub(1);
+        }
+        self.enqueue(url, depth);
     }
+
     fn len(&self) -> usize {
-        self.queue.len()
+        self.len
+    }
+
+    /// Flattens the queued URLs for checkpointing (host grouping is rederived from
+    /// the URL on restore, so the persisted shape stays a flat `(url, depth)` list
+    /// — checkpoint-compatible with the pre-host-fairness format).
+    fn queued(&self) -> Vec<(String, u32)> {
+        self.per_host.values().flat_map(|q| q.iter().cloned()).collect()
+    }
+
+    /// Restores queued URLs + seen-set from a checkpoint (bypasses the dedup
+    /// check; `seen` is authoritative). Per-host `taken` counts are not persisted,
+    /// so the per-host budget restarts for the resumed run.
+    fn restore(&mut self, queue: Vec<(String, u32)>, seen: Vec<String>) {
+        self.seen = seen.into_iter().collect();
+        for (url, depth) in queue {
+            self.enqueue(url, depth);
+        }
     }
 }
 
@@ -415,7 +529,7 @@ pub async fn crawl(
     // handling; discovered URLs are absent and fetched normally.
     let mut conditional: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
     let filter = UrlFilter::compile(&cfg)?;
-    let mut frontier = Frontier::new();
+    let mut frontier = Frontier::new(cfg.max_pages_per_host);
     let mut dedup_index = SimHashIndex::new(cfg.dedup_distance);
     let mut resumed = false;
     let mut checkpoint_reset = false;
@@ -427,8 +541,7 @@ pub async fn crawl(
     if let Some(path) = &cfg.checkpoint {
         match Checkpoint::load(path).await {
             CheckpointLoad::Loaded(cp) => {
-                frontier.queue = cp.queue.into_iter().collect();
-                frontier.seen = cp.seen.into_iter().collect();
+                frontier.restore(cp.queue, cp.seen);
                 dedup_index = SimHashIndex::from_hashes(cfg.dedup_distance, cp.kept_hashes);
                 resumed = true;
             }
@@ -702,8 +815,9 @@ pub async fn crawl(
     }
 
     stats.hosts = hosts.len();
-    stats.frontier_remaining = frontier.queue.len();
+    stats.frontier_remaining = frontier.len();
     stats.frontier_dropped = frontier.dropped();
+    stats.skipped_host_budget = frontier.skipped_host_budget();
     if let Some(path) = &cfg.checkpoint {
         if !Checkpoint::save(path, &frontier, dedup_index.hashes()).await {
             stats.checkpoint_errors += 1;
@@ -799,7 +913,7 @@ impl Checkpoint {
     async fn save(path: &PathBuf, frontier: &Frontier, kept_hashes: &[u64]) -> bool {
         let cp = Checkpoint {
             version: CHECKPOINT_VERSION,
-            queue: frontier.queue.iter().cloned().collect(),
+            queue: frontier.queued(),
             seen: frontier.seen.iter().cloned().collect(),
             kept_hashes: kept_hashes.to_vec(),
         };
@@ -1344,6 +1458,7 @@ mod tests {
             max_pages: 50,
             max_depth: 3,
             concurrency: 4,
+            max_pages_per_host: None,
             same_domain: true,
             dedup_distance: 0,
             respect_robots: false,
@@ -1627,7 +1742,7 @@ mod tests {
         assert!(matches!(Checkpoint::load(&path).await, CheckpointLoad::Incompatible));
 
         // A current-version checkpoint round-trips.
-        let mut frontier = Frontier::new();
+        let mut frontier = Frontier::new(None);
         frontier.push("https://x.com/".into(), 0);
         assert!(Checkpoint::save(&path, &frontier, &[7u64]).await);
         match Checkpoint::load(&path).await {
@@ -1638,6 +1753,61 @@ mod tests {
             _ => panic!("expected a compatible checkpoint to load"),
         }
         tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[test]
+    fn frontier_round_robins_across_hosts() {
+        // Two hosts, host A pushed first with 3 URLs, then host B with 2. A FIFO
+        // would drain all of A before B; the round-robin interleaves them.
+        let mut f = Frontier::new(None);
+        for i in 0..3 {
+            f.push(format!("https://a.com/{i}"), 0);
+        }
+        for i in 0..2 {
+            f.push(format!("https://b.com/{i}"), 0);
+        }
+        let mut hosts_in_order = Vec::new();
+        while let Some((url, _)) = f.pop() {
+            hosts_in_order.push(host_of(&url).unwrap());
+        }
+        // First two pops alternate hosts (A, B), proving no single-host monopoly.
+        assert_eq!(&hosts_in_order[0], "a.com");
+        assert_eq!(&hosts_in_order[1], "b.com");
+        assert_eq!(hosts_in_order.len(), 5);
+    }
+
+    #[test]
+    fn frontier_enforces_per_host_budget_and_reports_it() {
+        // Host A has 5 URLs but a per-host cap of 2 — only 2 come out, the rest
+        // are counted as budget-skipped. Host B (under cap) is unaffected.
+        let mut f = Frontier::new(Some(2));
+        for i in 0..5 {
+            f.push(format!("https://a.com/{i}"), 0);
+        }
+        f.push("https://b.com/x".into(), 0);
+        let mut a = 0;
+        let mut b = 0;
+        while let Some((url, _)) = f.pop() {
+            match host_of(&url).unwrap().as_str() {
+                "a.com" => a += 1,
+                "b.com" => b += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(a, 2, "host A capped at 2");
+        assert_eq!(b, 1, "host B under cap, unaffected");
+        assert_eq!(f.skipped_host_budget(), 3, "the 3 over-budget A URLs are reported");
+    }
+
+    #[test]
+    fn frontier_requeue_refunds_host_budget() {
+        // A crawl-delay requeue must not burn budget: pop then requeue, and the
+        // URL is still reachable under a cap of 1.
+        let mut f = Frontier::new(Some(1));
+        f.push("https://a.com/1".into(), 0);
+        let (url, depth) = f.pop().unwrap();
+        f.requeue(url, depth);
+        assert!(f.pop().is_some(), "requeue refunded the budget so the URL pops again");
     }
 
     #[test]
@@ -1705,6 +1875,7 @@ mod tests {
             max_pages: 1,
             max_depth: 1,
             concurrency: 1,
+            max_pages_per_host: None,
             same_domain: true,
             dedup_distance: 0,
             respect_robots: false,
