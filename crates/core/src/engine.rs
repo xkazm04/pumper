@@ -176,12 +176,49 @@ impl HttpResponse {
     }
 }
 
+/// A scripted interaction run against a rendered page before capture — the
+/// escape hatch for infinite-scroll / "load more" / lazy-loaded listings that a
+/// one-shot render only captures the first viewport of. Executed in order after
+/// the settle wait and before `evaluate`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "snake_case")]
+pub enum PageAction {
+    /// Scroll to the bottom of the document (triggers most infinite-scroll).
+    ScrollBottom,
+    /// Scroll by a pixel delta (negative scrolls up).
+    ScrollBy { pixels: i64 },
+    /// Click the first element matching a CSS selector (e.g. a "Load more" button).
+    Click { selector: String },
+    /// Type text into the first element matching a selector (focus + set value).
+    Type { selector: String, text: String },
+    /// Wait until a selector appears, up to `timeout_ms` (falls back to the
+    /// nav timeout).
+    WaitForSelector { selector: String, #[serde(default)] timeout_ms: Option<u64> },
+    /// Wait a fixed number of milliseconds (a settle pause between steps).
+    WaitMs { ms: u64 },
+    /// Repeat `steps` up to `times`. When `until_selector_count_stable` is set,
+    /// stop early once that selector's match count stops growing between
+    /// iterations — the "scroll until no new rows load" loop.
+    Repeat {
+        times: u32,
+        #[serde(default)]
+        steps: Vec<PageAction>,
+        #[serde(default)]
+        until_selector_count_stable: Option<String>,
+    },
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderRequest {
     pub url: String,
     /// CSS selector to wait for before capturing the DOM.
     #[serde(default)]
     pub wait_for_selector: Option<String>,
+    /// Scripted page actions (scroll/click/type/wait) run before capture — drives
+    /// infinite-scroll and "load more" pages the one-shot render can't reach.
+    /// Empty (default) = exactly the previous one-shot behavior.
+    #[serde(default)]
+    pub actions: Vec<PageAction>,
     /// Extra settle time; falls back to the configured default.
     #[serde(default)]
     pub extra_wait_ms: Option<u64>,
@@ -211,6 +248,7 @@ impl RenderRequest {
         Self {
             url: url.into(),
             wait_for_selector: None,
+            actions: Vec::new(),
             extra_wait_ms: None,
             evaluate: None,
             load_all_resources: false,
@@ -236,6 +274,10 @@ pub struct RenderedPage {
     /// Count of subresources (images/fonts/media) dropped by request interception
     /// for this render. `0` when blocking is off or the render opted out.
     pub blocked_resources: usize,
+    /// Number of scripted [`PageAction`]s that ran before capture (a `Repeat`
+    /// counts as one). `0` when none were requested — lets a caller see that an
+    /// infinite-scroll script actually executed rather than silently no-op'd.
+    pub actions_completed: usize,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -321,6 +363,35 @@ pub struct EngineSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn render_request_actions_default_empty_and_deserialize() {
+        // Absent `actions` = one-shot render (exactly the previous behavior).
+        let r: RenderRequest = serde_json::from_str(r#"{"url":"https://x/"}"#).unwrap();
+        assert!(r.actions.is_empty());
+
+        // The documented infinite-scroll script deserializes into the enum.
+        let r: RenderRequest = serde_json::from_str(
+            r##"{"url":"https://x/","actions":[
+                {"action":"repeat","times":5,
+                 "steps":[{"action":"scroll_bottom"},{"action":"wait_ms","ms":800}],
+                 "until_selector_count_stable":".row"},
+                {"action":"click","selector":"#more"}
+            ]}"##,
+        )
+        .unwrap();
+        assert_eq!(r.actions.len(), 2);
+        match &r.actions[0] {
+            PageAction::Repeat { times, steps, until_selector_count_stable } => {
+                assert_eq!(*times, 5);
+                assert_eq!(steps.len(), 2);
+                assert!(matches!(steps[0], PageAction::ScrollBottom));
+                assert_eq!(until_selector_count_stable.as_deref(), Some(".row"));
+            }
+            other => panic!("expected Repeat, got {other:?}"),
+        }
+        assert!(matches!(&r.actions[1], PageAction::Click { selector } if selector == "#more"));
+    }
 
     #[test]
     fn http_request_conditional_validators_are_serde_defaulted() {

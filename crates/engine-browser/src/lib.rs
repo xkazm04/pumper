@@ -50,6 +50,7 @@ use chromiumoxide::cdp::browser_protocol::fetch::{
 use chromiumoxide::cdp::browser_protocol::network::{ErrorReason, ResourceType};
 use futures::StreamExt;
 use pumper_core::config::BrowserConfig;
+use pumper_core::engine::PageAction;
 use pumper_core::{
     lru_touch_evict, profile_browser_dir, Browser, Error, RenderRequest, RenderedPage, Result,
 };
@@ -404,17 +405,9 @@ impl Browser for BrowserEngine {
         let mut selector_found = None;
         if let Some(selector) = &req.wait_for_selector {
             let deadline = tokio::time::Instant::now() + nav_timeout;
-            let mut found = false;
-            loop {
-                if page.find_element(selector.as_str()).await.is_ok() {
-                    found = true;
-                    break;
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    warn!(selector = %selector, "wait_for_selector timed out");
-                    break;
-                }
-                tokio::time::sleep(Duration::from_millis(250)).await;
+            let found = wait_for_selector(&page, selector, deadline).await;
+            if !found {
+                warn!(selector = %selector, "wait_for_selector timed out");
             }
             selector_found = Some(found);
         }
@@ -423,6 +416,17 @@ impl Browser for BrowserEngine {
         if settle_ms > 0 {
             tokio::time::sleep(Duration::from_millis(settle_ms)).await;
         }
+
+        // Scripted actions (scroll/click/wait) drive infinite-scroll / "load more"
+        // pages the one-shot render can't reach. Run after the settle and before
+        // `evaluate`, under a total-time deadline of one nav timeout so a `Repeat`
+        // can't run forever.
+        let actions_completed = if req.actions.is_empty() {
+            0
+        } else {
+            let deadline = tokio::time::Instant::now() + nav_timeout;
+            execute_actions(&page, &req.actions, deadline).await
+        };
 
         let evaluated = match &req.evaluate {
             Some(js) => match page.evaluate(js.as_str()).await {
@@ -472,8 +476,111 @@ impl Browser for BrowserEngine {
             nav_timed_out,
             selector_found,
             blocked_resources,
+            actions_completed,
         })
     }
+}
+
+/// Polls for `selector` until it appears or `deadline` passes. Shared by the
+/// `wait_for_selector` render option and the `WaitForSelector` page action.
+async fn wait_for_selector(
+    page: &chromiumoxide::Page,
+    selector: &str,
+    deadline: tokio::time::Instant,
+) -> bool {
+    loop {
+        if page.find_element(selector).await.is_ok() {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
+/// Counts elements matching `selector` via the DOM (for the scroll-until-stable
+/// loop). Selector embedded as a JSON string literal so it's safely quoted.
+async fn count_matches(page: &chromiumoxide::Page, selector: &str) -> u64 {
+    let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
+    let js = format!("document.querySelectorAll({sel}).length");
+    page.evaluate(js).await.ok().and_then(|r| r.into_value::<u64>().ok()).unwrap_or(0)
+}
+
+/// Runs a scripted [`PageAction`] list in order, stopping at `deadline`. Returns
+/// the count of top-level actions that ran (a `Repeat` counts as one). Boxed so
+/// `Repeat` can recurse into its steps. Every step is best-effort — a failed
+/// click/selector is logged and skipped, never aborting the render.
+fn execute_actions<'a>(
+    page: &'a chromiumoxide::Page,
+    actions: &'a [PageAction],
+    deadline: tokio::time::Instant,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + Send + 'a>> {
+    Box::pin(async move {
+        let mut completed = 0usize;
+        for action in actions {
+            if tokio::time::Instant::now() >= deadline {
+                warn!("page actions hit the time budget; capturing current DOM");
+                break;
+            }
+            match action {
+                PageAction::ScrollBottom => {
+                    let _ = page.evaluate("window.scrollTo(0, document.body.scrollHeight)").await;
+                }
+                PageAction::ScrollBy { pixels } => {
+                    let _ = page.evaluate(format!("window.scrollBy(0, {pixels})")).await;
+                }
+                PageAction::Click { selector } => match page.find_element(selector).await {
+                    Ok(el) => {
+                        if let Err(e) = el.click().await {
+                            warn!(selector = %selector, "page action click failed: {e}");
+                        }
+                    }
+                    Err(_) => warn!(selector = %selector, "page action click: selector not found"),
+                },
+                PageAction::Type { selector, text } => {
+                    if let Ok(el) = page.find_element(selector).await {
+                        let _ = el.click().await;
+                        if let Err(e) = el.type_str(text).await {
+                            warn!(selector = %selector, "page action type failed: {e}");
+                        }
+                    } else {
+                        warn!(selector = %selector, "page action type: selector not found");
+                    }
+                }
+                PageAction::WaitForSelector { selector, timeout_ms } => {
+                    let d = timeout_ms
+                        .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms))
+                        .unwrap_or(deadline)
+                        .min(deadline);
+                    wait_for_selector(page, selector, d).await;
+                }
+                PageAction::WaitMs { ms } => {
+                    tokio::time::sleep(Duration::from_millis(*ms)).await;
+                }
+                PageAction::Repeat { times, steps, until_selector_count_stable } => {
+                    let mut last_count: Option<u64> = None;
+                    for _ in 0..*times {
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        execute_actions(page, steps, deadline).await;
+                        // Stop early once the tracked selector's match count stops
+                        // growing — "scroll until no new rows load".
+                        if let Some(sel) = until_selector_count_stable {
+                            let count = count_matches(page, sel).await;
+                            if last_count.is_some_and(|prev| count <= prev) {
+                                break;
+                            }
+                            last_count = Some(count);
+                        }
+                    }
+                }
+            }
+            completed += 1;
+        }
+        completed
+    })
 }
 
 #[cfg(test)]
