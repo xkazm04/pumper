@@ -19,6 +19,13 @@ fn concurrency(ctx: &AppContext) -> usize {
     parse_concurrency(&ctx.params)
 }
 
+/// The per-job `plugin_params` envelope forwarded to the plugin (`Null` when
+/// absent). Lets one plugin be configured per job (e.g. a different selector)
+/// instead of recompiling a module per variation.
+fn plugin_params(ctx: &AppContext) -> Value {
+    ctx.params.get("plugin_params").cloned().unwrap_or(Value::Null)
+}
+
 /// Pure param parse for [`concurrency`] — clamps `concurrency` to `>= 1`,
 /// defaulting to [`DEFAULT_CONCURRENCY`].
 fn parse_concurrency(params: &Value) -> usize {
@@ -45,7 +52,8 @@ impl ScrapeApp for Plugin {
         "Run a sandboxed WASM plugin over documents. Params: {\"plugin\": \"title\", \
          \"urls\": [..] OR \"source\": {\"app\": .., \"dataset\": .., \"keys\": [..]?}, \
          \"strategy\": \"http|browser|auto|auto_with_research\", \"concurrency\": 16 \
-         (max in-flight fetch+run tasks), \"dataset\": \"plugin_out\"}. \
+         (max in-flight fetch+run tasks), \"plugin_params\": {..} (forwarded to a \
+         params-aware plugin's extract_v2 envelope), \"dataset\": \"plugin_out\"}. \
          Source mode reads each record's stored body (artifact_path under the origin job's \
          dir) instead of re-fetching; keys default to the firing trigger's _trigger.keys, \
          else all live records."
@@ -96,12 +104,14 @@ impl Plugin {
         // caps nothing globally, so a large `urls` list would open one socket per
         // URL at once. `buffered` preserves order for the positional zip below.
         let concurrency = concurrency(ctx);
+        let plugin_params = plugin_params(ctx);
         let fetcher = ctx.engines.fetch.clone();
         let plugins = ctx.plugins.clone();
         let tasks = urls.iter().cloned().map(|url| {
             let f = fetcher.clone();
             let p = plugins.clone();
             let name = plugin.to_string();
+            let pp = plugin_params.clone();
             let mut req = FetchRequest::new(&url);
             req.strategy = strategy;
             async move {
@@ -112,7 +122,7 @@ impl Plugin {
                 if doc.is_empty() {
                     return json!({ "error": "empty document" });
                 }
-                p.run(&name, &doc).await.unwrap_or_else(|e| json!({ "error": e.to_string() }))
+                p.run(&name, &doc, &pp).await.unwrap_or_else(|e| json!({ "error": e.to_string() }))
             }
         });
         let mut results: Vec<Value> =
@@ -202,15 +212,17 @@ impl Plugin {
         let (keys, docs): (Vec<String>, Vec<String>) = keyed.into_iter().unzip();
         let loaded = keys.len();
         let concurrency = concurrency(ctx);
+        let plugin_params = plugin_params(ctx);
         let plugins = ctx.plugins.clone();
         let tasks = docs.into_iter().map(|doc| {
             let p = plugins.clone();
             let name = plugin.to_string();
+            let pp = plugin_params.clone();
             async move {
                 if doc.is_empty() {
                     return json!({ "error": "empty document" });
                 }
-                p.run(&name, &doc).await.unwrap_or_else(|e| json!({ "error": e.to_string() }))
+                p.run(&name, &doc, &pp).await.unwrap_or_else(|e| json!({ "error": e.to_string() }))
             }
         });
         // Bounded run fan-out; `buffered` keeps order for the positional zip below.

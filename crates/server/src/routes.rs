@@ -2726,10 +2726,10 @@ async fn list_profiles(State(state): State<AppState>) -> Result<Json<Value>, Api
     get,
     path = "/plugins",
     tag = "plugins",
-    responses((status = 200, description = "`{plugins: [...]}`"))
+    responses((status = 200, description = "`{plugins: [{name, ...}]}` — each entry is a plugin's self-describing manifest (name/version/description/params_schema/output_schema) when it exports `describe`, else just `{name}`."))
 )]
 async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "plugins": state.plugins.list() }))
+    Json(json!({ "plugins": state.plugins.manifests() }))
 }
 
 /// Hot-swap: rescan the plugin directory and reload every `.wasm` module.
