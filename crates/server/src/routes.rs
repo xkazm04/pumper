@@ -542,7 +542,7 @@ fn is_terminal(status: JobStatus) -> bool {
     get,
     path = "/apps",
     tag = "apps",
-    responses((status = 200, description = "`{apps: [{name, description, schedule, requires, ready}]}` — `requires` lists preconditions (e.g. `env:CENSUS_API_KEY`); `ready` is false when any is unmet here."))
+    responses((status = 200, description = "`{apps: [{name, description, schedule, requires, ready, default_params}]}` — `requires` lists preconditions (e.g. `env:CENSUS_API_KEY`); `ready` is false when any is unmet here; `default_params` is the app's default job params (a POST body's `params` shallow-merges over these)."))
 )]
 async fn list_apps(State(state): State<AppState>) -> Json<Value> {
     let mut apps: Vec<_> = state.registry.values().collect();
@@ -561,14 +561,38 @@ async fn list_apps(State(state): State<AppState>) -> Json<Value> {
                 "schedule": app.schedule(),
                 "requires": requires,
                 "ready": ready,
+                // Machine-readable defaults so a client can see exactly which keys
+                // it is overriding — the replace-vs-merge fix below is only safe
+                // because the caller can now see what it is merging over.
+                "default_params": app.default_params(),
             })
         })
         .collect();
     Json(json!({ "apps": apps }))
 }
 
+/// Merge a request's `params` over the app's defaults. A POST that sets one key
+/// must not silently drop the rest of the defaults (which the scheduler still
+/// runs with) — so an object body **shallow-merges** over the object defaults.
+/// A non-object body (or non-object defaults) can't be merged key-wise, so it
+/// replaces, matching the prior behaviour for those shapes.
+fn merge_params(defaults: Value, over: Option<Value>) -> Value {
+    match (defaults, over) {
+        (defaults, None) => defaults,
+        (Value::Object(mut base), Some(Value::Object(top))) => {
+            base.extend(top);
+            Value::Object(base)
+        }
+        (_, Some(over)) => over,
+    }
+}
+
 #[derive(Deserialize, Default, ToSchema)]
 struct EnqueueBody {
+    /// Job params. An object here **shallow-merges over the app's
+    /// `default_params`** (see `GET /apps`), so setting one key keeps the rest of
+    /// the defaults — matching what the scheduler runs. A non-object value
+    /// replaces the defaults wholesale.
     params: Option<Value>,
     max_attempts: Option<i64>,
     delay_secs: Option<u64>,
@@ -614,7 +638,7 @@ async fn enqueue_job(
         .or(body.idempotency_key)
         .filter(|k| !k.trim().is_empty());
     let opts = EnqueueOptions {
-        params: body.params.unwrap_or_else(|| app.default_params()),
+        params: merge_params(app.default_params(), body.params),
         max_attempts: body.max_attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS_CAP),
         delay_secs: body.delay_secs.unwrap_or(0),
         priority: body.priority.unwrap_or(0),
@@ -3114,6 +3138,35 @@ mod filter_tests {
     #[test]
     fn empty_specs_yield_no_filters() {
         assert!(parse_filters(&[]).expect("ok").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod merge_tests {
+    use super::merge_params;
+    use serde_json::json;
+
+    #[test]
+    fn no_override_keeps_all_defaults() {
+        let out = merge_params(json!({ "year": "2021", "naics": ["2382"] }), None);
+        assert_eq!(out, json!({ "year": "2021", "naics": ["2382"] }));
+    }
+
+    #[test]
+    fn object_override_shallow_merges_and_preserves_other_defaults() {
+        // The bug this fixes: a one-key override used to drop `year`.
+        let out = merge_params(
+            json!({ "year": "2021", "naics": ["2382"] }),
+            Some(json!({ "naics": "23" })),
+        );
+        assert_eq!(out, json!({ "year": "2021", "naics": "23" }));
+    }
+
+    #[test]
+    fn non_object_override_replaces() {
+        // A scalar/array body can't merge key-wise, so it replaces (prior behaviour).
+        let out = merge_params(json!({ "a": 1 }), Some(json!([1, 2, 3])));
+        assert_eq!(out, json!([1, 2, 3]));
     }
 }
 
