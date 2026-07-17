@@ -106,6 +106,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(extract_preview))
         .routes(routes!(list_grants))
         .routes(routes!(closing_soon))
+        .routes(routes!(catalog_sources))
         .routes(routes!(openapi_json))
 }
 
@@ -3103,6 +3104,144 @@ async fn closing_soon(
     Ok(Json(json!({ "days": days, "count": count, "grants": grants })))
 }
 
+// ---- Data-source catalog --------------------------------------------------
+
+#[derive(Deserialize, IntoParams)]
+struct CatalogQuery {
+    /// Filter to one jurisdiction id (e.g. `us`, `eu`, `cz`).
+    market: Option<String>,
+    /// Filter to one status (`live` | `planned` | `blocked`).
+    status: Option<String>,
+    /// Filter to one category (e.g. `open-calls`, `labor-market`).
+    category: Option<String>,
+}
+
+/// The data-source catalog: the machine-readable list of every pipeline this
+/// service scrapes (`catalog/data-sources.toml`), so a downstream app can query
+/// "which markets are launch-grade" instead of scraping a TOML out of a sibling
+/// repo. A server-crate test cross-checks it against the live registry, so a
+/// `live` entry can't drift from what the app actually schedules.
+#[utoipa::path(
+    get,
+    path = "/catalog/sources",
+    tag = "catalog",
+    params(CatalogQuery),
+    responses(
+        (status = 200, description = "`{count, sources: [Source]}` — data pipelines, optionally filtered by `market` / `status` / `category`."),
+        (status = 500, description = "Catalog file malformed", body = Object),
+    )
+)]
+async fn catalog_sources(Query(query): Query<CatalogQuery>) -> Result<Json<Value>, ApiError> {
+    let catalog = pumper_core::Catalog::load()
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("catalog load: {e}")))?;
+    let want = |field: &str, filter: &Option<String>| -> bool {
+        filter.as_deref().map(str::trim).filter(|s| !s.is_empty()).map_or(true, |f| f == field)
+    };
+    let sources: Vec<&pumper_core::Source> = catalog
+        .sources
+        .iter()
+        .filter(|s| {
+            want(&s.market, &query.market)
+                && want(&s.status, &query.status)
+                && want(&s.category, &query.category)
+        })
+        .collect();
+    Ok(Json(json!({ "count": sources.len(), "sources": sources })))
+}
+
+#[cfg(test)]
+mod catalog_tests {
+    use pumper_core::Catalog;
+    use std::collections::BTreeSet;
+
+    /// The catalog, embedded at compile time so the check doesn't depend on the
+    /// test's working directory.
+    const CATALOG_TOML: &str = include_str!("../../../catalog/data-sources.toml");
+
+    /// Registered apps deliberately absent from the catalog, each for a documented
+    /// reason. Kept explicit so a NEW in-scope source app can't be silently omitted
+    /// — adding one that isn't listed here fails the coverage check below. Reasons:
+    ///  - generic tooling / engines, not a data *source*: `crawl`, `extractor`,
+    ///    `plugin`, `readable`, `research`, `watch`.
+    ///  - `hackernews`: an example/template app, not a production pipeline.
+    ///  - sibling-product consumers outside this catalog's grant/labor scope, same
+    ///    rationale the `census-*` docs already state ("a separate Ledgerline
+    ///    consumer from the grant pipeline"): the Ledgerline trades apps
+    ///    (`census-density`, `census-nonemp`, `homewyse-pricing`, `state-tax`,
+    ///    `trade-wages`, `valuation-multiples`) and the Counterbill medical app
+    ///    (`cms-fee-schedule`).
+    const CATALOG_EXEMPT: &[&str] = &[
+        "census-density",
+        "census-nonemp",
+        "cms-fee-schedule",
+        "crawl",
+        "extractor",
+        "hackernews",
+        "homewyse-pricing",
+        "plugin",
+        "readable",
+        "research",
+        "state-tax",
+        "trade-wages",
+        "valuation-multiples",
+        "watch",
+    ];
+
+    fn catalog() -> Catalog {
+        Catalog::parse(CATALOG_TOML).expect("catalog/data-sources.toml parses")
+    }
+
+    fn registered() -> Vec<std::sync::Arc<dyn pumper_core::ScrapeApp>> {
+        crate::registry::apps()
+    }
+
+    #[test]
+    fn live_catalog_entries_map_to_registered_apps_with_matching_cron() {
+        let catalog = catalog();
+        let apps = registered();
+        for source in catalog.live() {
+            assert!(
+                !source.app.is_empty(),
+                "live catalog source '{}' has no app — a live pipeline must name its serving app",
+                source.id
+            );
+            let app = apps.iter().find(|a| a.name() == source.app).unwrap_or_else(|| {
+                panic!("live catalog source '{}' names unregistered app '{}'", source.id, source.app)
+            });
+            // Cron must agree in BOTH directions: "" here must mean the app has no
+            // schedule, and a cron here must equal the app's schedule() exactly.
+            let app_cron = app.schedule().unwrap_or("");
+            assert_eq!(
+                source.cron.trim(),
+                app_cron,
+                "catalog cron for '{}' ({:?}) disagrees with app '{}' schedule() ({:?})",
+                source.id,
+                source.cron,
+                source.app,
+                app_cron,
+            );
+        }
+    }
+
+    #[test]
+    fn every_registered_data_source_app_is_in_the_catalog() {
+        let catalog = catalog();
+        let cataloged: BTreeSet<&str> =
+            catalog.sources.iter().map(|s| s.app.as_str()).filter(|a| !a.is_empty()).collect();
+        let exempt: BTreeSet<&str> = CATALOG_EXEMPT.iter().copied().collect();
+        let missing: Vec<&str> = registered()
+            .iter()
+            .map(|a| a.name())
+            .filter(|name| !cataloged.contains(name) && !exempt.contains(name))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "registered apps missing from catalog/data-sources.toml (add an entry, or add to \
+             CATALOG_EXEMPT if it isn't a data source): {missing:?}"
+        );
+    }
+}
+
 #[cfg(test)]
 mod filter_tests {
     use super::{filter_specs, parse_filters};
@@ -3271,6 +3410,7 @@ mod api_spec_tests {
         "POST /extract/preview",
         "GET /grants",
         "GET /grants/closing-soon",
+        "GET /catalog/sources",
         "GET /openapi.json",
     ];
 

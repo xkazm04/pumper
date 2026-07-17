@@ -25,6 +25,7 @@ Axum server (default port 8088, `[server]` config). **Local power mode: no auth,
 | Plugins | `GET /plugins` · `POST /plugins/reload` |
 | Extraction | `POST /extract/preview` (dry-run a RuleSet against one document; see below) |
 | Grants | `GET /grants?status=&agency=&source=&closing_before=&closing_after=&min_award=&limit=&cursor=` · `GET /grants/closing-soon?days=` (see below) |
+| Catalog | `GET /catalog/sources?market=&status=&category=` (the machine-readable data-source catalog; see below) |
 | Meta | `GET /openapi.json` (OpenAPI 3.1 spec for all routes) |
 
 Conventions: enable/disable is always `POST …/{id}/enabled {"enabled": bool}`; every list endpoint is dual-mode — without `cursor=` it returns its legacy shape (bare array or `{watches|triggers|searches|changes|revisions|deliveries: [...]}`, unbounded except where a legacy `limit` already applied), and with `cursor=` present (even empty, for page 1) it returns `{items, next_cursor}` and pages by keyset. Cursors are opaque `<stored-ts>|<tiebreak>` tokens (`next_cursor` is `null` on the last page); pass the previous response's `next_cursor` back as `cursor=`. The `changes`/`history` feeds page the full revision set — the legacy no-cursor shapes still clamp at 1000/500 rows, but `cursor=` reaches everything past that. Details of each area live in the sibling feature docs.
@@ -78,6 +79,12 @@ Live **open** grants whose `close_date` falls within `days` of today, **soonest 
 This is **cross-source** — the pre-existing `closingSoon` digest in the grants-gov job artifact is federal-only and computed from raw API hits, so it never sees CA grants. It is **computed on read**, not materialized as a dataset: membership changes with the *calendar*, not with the data, so a snapshotted list would go stale between syncs even when nothing upstream changed. The corpus is small enough that a read view costs nothing to keep correct.
 
 **Performance stance:** both routes filter with SQLite `json_extract` over the `data` column, i.e. a full scan of the `(app, dataset)` partition with no index on the filtered fields. That is the right trade at current scale (the unified corpus is in the low thousands) and it keeps the record store free of any coupling to an app's record shape — new filters need no migration. If the corpus grows to where the scan hurts, the escape hatch is a generated column over the hot field plus an index on it; the query builder would not have to change.
+
+## Data-source catalog (`/catalog/sources`)
+
+`GET /catalog/sources` serves the parsed `catalog/data-sources.toml` — the machine-readable list of every data pipeline this service scrapes (id, app, market, name, url, category, engine, access, cadence, cron, status, confidence, dataset, notes). Optional `?market=`/`?status=`/`?category=` filters narrow it (e.g. `?market=eu&status=live`). Returns `{count, sources: [Source]}`. This lets a downstream app query "which markets are launch-grade" over HTTP instead of scraping a TOML out of a sibling repo.
+
+The catalog is no longer inert prose: a server-crate test cross-checks it against the live app registry — every `status = "live"` entry must name a registered app whose `schedule()` **equals** the entry's `cron` (both directions), and every registered in-scope source app must appear (a documented exempt-list covers generic tooling/engines, the `hackernews` example, and sibling-product consumers like the Ledgerline trades / Counterbill apps, mirroring the `census-*` precedent). So the catalog can't silently drift from what the apps actually do.
 
 ## Host profiles (`/hosts`)
 
