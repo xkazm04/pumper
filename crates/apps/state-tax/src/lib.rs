@@ -74,6 +74,20 @@ impl ScrapeApp for StateTax {
             .map(|t| t as u32)
             .or(Some(30));
 
+        // Vintage freshness gate: tax-year constants are frozen once published, so
+        // a re-run for a year we already hold would re-pay a 30-turn agentic run to
+        // reproduce identical facts. Skip unless `force: true`.
+        if trades_common::vintage_held(&ctx, "state-tax", "tax", "federal:US", &year).await? {
+            let held = ctx.datasets.list("state-tax", "tax", 200).await?.len();
+            return Ok(json!({
+                "source": format!("agentic/tax/{year}"),
+                "year": year,
+                "skipped": "vintage already held (pass force:true to re-run)",
+                "records": held,
+                "cost_usd": 0.0,
+            }));
+        }
+
         let prompt = format!(
             "You are a US small-business tax analyst. For tax year {year}, compile the \
              INDIVIDUAL income-tax structure each US state (all 50 states + DC) applies to \

@@ -30,6 +30,7 @@ Optional fields (`http_status`, `content_chars`, `cache_hit`, `cost_usd`, `detai
 ## Engines
 
 - **http** (`engine-http`): reqwest + cookie jar, retries w/ backoff, fronted by the content-addressed TTL `http_cache` (GET-only; `HttpRequest.no_cache` bypasses) and the governor. **Conditional GET:** `HttpRequest.etag` / `HttpRequest.if_modified_since` (serde-defaulted) are sent as `If-None-Match` / `If-Modified-Since` (explicit `headers` still win); a `304 Not Modified` is passed through with its status intact and is **never** written to the cache over the prior full response (powers the crawler's revisit mode — [crawling.md](crawling.md)).
+- **Cache revalidation.** When a cacheable GET misses because its entry **expired** (but the caller isn't running its own conditional GET), the engine reads the stale entry's stored `ETag` / `Last-Modified` and re-sends as a conditional GET instead of re-downloading the whole body. A `304` **refreshes** the entry's TTL in place (no body rewrite; `created_at` moves forward so the `max_age` read-staleness cap still measures from the last confirmed fetch) and serves the stored body as a `cache_hit`; a `200` stores and returns the changed body. This turns the `watch`/poll workload's common "unchanged page past its TTL" case from a full body transfer + parse into a few-hundred-byte round trip. The caller-owns-the-validator path (crawler revisit) is untouched — it still gets the raw `304`.
 
 #### HTTP request controls (body cap, timeout, retry policy)
 

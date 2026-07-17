@@ -11,7 +11,7 @@ Apps are `ScrapeApp` implementations under `crates/apps/*`, registered in `crate
 | `crawl` | Broad crawler (see [crawling.md](crawling.md)) |
 | `extractor` | Fetch a URL + apply a params-supplied extraction RuleSet |
 | `plugin` | Run a named WASM extractor plugin over a fetched page |
-| `research` | Agentic web research via the Claude engine (roles: research/compose); JSON report |
+| `research` | Agentic web research via the Claude engine (roles: research/compose); JSON report. `session_id` param **resumes** a prior run to drill down on its accumulated context (the query becomes a follow-up) instead of re-paying the full agentic loop; `max_budget_usd` caps per-run spend |
 | `hackernews` | HN stories into a change-detected dataset |
 | `connector-api-watch` | Watches Anthropic API docs pages: diff + summarize + alert |
 
@@ -47,6 +47,7 @@ All four trades apps (`trade-wages`, `homewyse-pricing`, `state-tax`, `valuation
 - **Salvage**: `trades_common::salvage_json` recovers a fenced or prose-wrapped object from raw text in ONE pass (no metered re-run) when the engine couldn't parse `output.json`.
 - **Plausibility** (`trades_common::validate`): bands must be monotone (low ≤ median ≤ high — wage entry/median/experienced hourly+annual, pricing low/median/high, SDE low/median/high), rates ∈ [0,100] (state top marginal, federal SE/QBI/top rates), magnitudes positive (wages, employment, prices, multiples). A record that violates any check is **rejected with per-record reasons** in the result (`rejected` array + `rejected_count`); valid siblings still upsert.
 - **Completeness** (`state-tax`): the 50 states + DC are enumerated in code (`US_JURISDICTIONS`); the result reports `states_covered`, `states_expected`, and a `missing_states` list.
+- **Freshness gate** (avoids re-paying the priciest path in the product): before the metered `ctx.research` call, each app checks what it already holds and short-circuits with `{skipped, cost_usd: 0}`. `state-tax` and `trade-wages` gate on **vintage** (`year` equality — tax-year / OEWS-vintage facts are frozen once published, so a same-year refresh is pure burn). `homewyse-pricing` and `valuation-multiples` gate on **record age** (`max_age_days`, default 90 — those figures drift within a year); homewyse's age check is scoped to the requested `locality`. `force: true` always re-runs. This lives in the apps (domain freshness), not the core cache (which is request-identity + a 24h TTL).
 
 ## Known gaps
 

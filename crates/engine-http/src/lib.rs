@@ -536,6 +536,11 @@ fn parse_http_date(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
 impl HttpClient for HttpEngine {
     async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
         let cache_key = Self::cacheable(&req).then(|| HttpCache::key(&req));
+        let ttl = req
+            .ttl_override
+            .map(Duration::from_secs)
+            .unwrap_or_else(|| self.cache.default_ttl());
+
         if let Some(key) = &cache_key {
             // ttl_override caps read staleness too, not just storage TTL: a reader
             // asking for <=N-second-old content must not be handed a longer-lived
@@ -544,6 +549,33 @@ impl HttpClient for HttpEngine {
             if let Some(hit) = self.cache.get(key, max_age).await? {
                 debug!(url = %req.url, "cache hit");
                 return Ok(hit);
+            }
+
+            // Expired-but-maybe-still-valid: revalidate with the stored ETag /
+            // Last-Modified instead of re-downloading the whole body — a 304 is a
+            // few hundred bytes where the body can be megabytes (the `watch`/poll
+            // workload's common case). Only when the CALLER isn't already running
+            // its own conditional GET (the crawler's revisit mode owns that path
+            // and wants the raw 304 passed through).
+            if req.etag.is_none() && req.if_modified_since.is_none() {
+                if let Some(stale) = self.cache.get_stale(key).await? {
+                    if stale.etag.is_some() || stale.last_modified.is_some() {
+                        let mut cond = req.clone();
+                        cond.etag = stale.etag;
+                        cond.if_modified_since = stale.last_modified;
+                        let resp = self.send(&cond).await?;
+                        if resp.status == 304 {
+                            // Still valid: extend the entry's life (no body rewrite)
+                            // and serve the stored body as a cache hit.
+                            self.cache.refresh(key, ttl).await?;
+                            debug!(url = %req.url, "cache revalidated (304)");
+                            return Ok(HttpResponse { cache_hit: true, ..stale.response });
+                        }
+                        // Changed: store and return the fresh body.
+                        self.cache.put(key, &req.url, &resp, ttl).await?;
+                        return Ok(resp);
+                    }
+                }
             }
         }
 
@@ -556,10 +588,6 @@ impl HttpClient for HttpEngine {
             if response.status == 304 {
                 return Ok(response);
             }
-            let ttl = req
-                .ttl_override
-                .map(Duration::from_secs)
-                .unwrap_or_else(|| self.cache.default_ttl());
             self.cache.put(key, &req.url, &response, ttl).await?;
         }
         Ok(response)

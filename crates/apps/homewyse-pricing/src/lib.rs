@@ -73,6 +73,25 @@ impl ScrapeApp for HomewysePricing {
             .map(|t| t as u32)
             .or(Some(20));
 
+        // Age freshness gate (scoped to THIS locality): consumer prices drift
+        // within a year, so gate on record age rather than vintage. A no-op
+        // refresh inside `max_age_days` (default 90) skips the ~20-turn agentic run
+        // unless `force: true`.
+        let max_age = trades_common::max_age_days(&ctx, 90);
+        if trades_common::fresh_by_age_where(
+            &ctx, "homewyse-pricing", "pricing", "$.locality", &locality, max_age,
+        )
+        .await?
+        {
+            return Ok(json!({
+                "source": format!("agentic/pricing/{year}"),
+                "locality": locality,
+                "year": year,
+                "skipped": format!("priced within {max_age}d (pass force:true to re-run)"),
+                "cost_usd": 0.0,
+            }));
+        }
+
         let trades = taxonomy::prompt_list();
         let prompt = format!(
             "You are a home-services pricing analyst. Using web search and page fetches, \

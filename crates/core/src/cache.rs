@@ -3,6 +3,7 @@
 //! escalation, or several apps hitting the same endpoint — are served from
 //! disk instead of the network.
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -12,6 +13,14 @@ use sqlx::SqlitePool;
 use crate::config::CacheConfig;
 use crate::engine::{HttpRequest, HttpResponse, ResearchOutput, ResearchRequest};
 use crate::Result;
+
+/// A cached entry returned by [`HttpCache::get_stale`]: the stored response plus
+/// the revalidation validators pulled from its headers.
+pub struct StaleEntry {
+    pub response: HttpResponse,
+    pub etag: Option<String>,
+    pub last_modified: Option<String>,
+}
 
 pub struct HttpCache {
     pool: SqlitePool,
@@ -96,6 +105,62 @@ impl HttpCache {
             final_url,
             cache_hit: true,
         }))
+    }
+
+    /// Returns a cached entry **regardless of expiry** plus its stored
+    /// revalidation validators (`ETag` / `Last-Modified`, read case-insensitively
+    /// out of the response headers). Used after [`get`] misses to turn an
+    /// expired-but-maybe-still-valid entry into a cheap conditional GET instead of
+    /// a full re-download. `None` when nothing is stored under `key`.
+    pub async fn get_stale(&self, key: &str) -> Result<Option<StaleEntry>> {
+        if !self.enabled {
+            return Ok(None);
+        }
+        let row: Option<(i64, String, String, String)> = sqlx::query_as(
+            "SELECT status, headers, body, final_url FROM http_cache WHERE key = ?1",
+        )
+        .bind(key)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((status, headers_json, body, final_url)) = row else {
+            return Ok(None);
+        };
+        let headers: HashMap<String, String> =
+            serde_json::from_str(&headers_json).unwrap_or_default();
+        let find = |name: &str| {
+            headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone())
+        };
+        let etag = find("etag");
+        let last_modified = find("last-modified");
+        Ok(Some(StaleEntry {
+            response: HttpResponse {
+                status: status as u16,
+                headers,
+                body,
+                final_url,
+                cache_hit: true,
+            },
+            etag,
+            last_modified,
+        }))
+    }
+
+    /// Extends a still-valid entry's life without rewriting its body — called on a
+    /// `304 Not Modified` revalidation. Moves `created_at` forward too, so the
+    /// `max_age` read-staleness cap keeps measuring from the last *confirmed* fetch.
+    pub async fn refresh(&self, key: &str, ttl: Duration) -> Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
+        let now = Utc::now();
+        let expires = now + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::hours(1));
+        sqlx::query("UPDATE http_cache SET expires_at = ?2, created_at = ?3 WHERE key = ?1")
+            .bind(key)
+            .bind(ts(expires))
+            .bind(ts(now))
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 
     /// Stores a response under `key`. Only 2xx responses are cached.
