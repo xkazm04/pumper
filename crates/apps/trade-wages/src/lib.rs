@@ -68,6 +68,21 @@ impl ScrapeApp for TradeWages {
             .map(|t| t as u32)
             .or(Some(25));
 
+        // Vintage freshness gate: a BLS OEWS vintage is frozen, so re-running for a
+        // year we already hold would re-pay a 25-turn agentic run for identical
+        // figures. Skip unless `force: true`. Sentinel = the first trade's row.
+        let sentinel = format!("US:{}", taxonomy::Trade::ALL[0].label());
+        if trades_common::vintage_held(&ctx, "trade-wages", "wages", &sentinel, &year).await? {
+            let held = ctx.datasets.list("trade-wages", "wages", 100).await?.len();
+            return Ok(json!({
+                "source": format!("agentic/wages/{year}"),
+                "year": year,
+                "skipped": "vintage already held (pass force:true to re-run)",
+                "records": held,
+                "cost_usd": 0.0,
+            }));
+        }
+
         let trades = taxonomy::prompt_list();
         let prompt = format!(
             "You are a US labor-market analyst. For BLS OEWS year {year}, compile the \

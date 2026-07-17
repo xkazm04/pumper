@@ -64,6 +64,26 @@ impl ScrapeApp for ValuationMultiples {
             .map(|t| t as u32)
             .or(Some(25));
 
+        // Age freshness gate: broker multiples drift within a year (but slowly),
+        // so gate on record age (default 90d) rather than vintage. Skips the
+        // ~25-turn agentic run for a recent refresh unless `force: true`.
+        let max_age = trades_common::max_age_days(&ctx, 90);
+        let sentinel = format!("US:{}", taxonomy::Trade::ALL[0].label());
+        if trades_common::fresh_by_age(
+            &ctx, "valuation-multiples", "valuation", &sentinel, max_age,
+        )
+        .await?
+        {
+            let held = ctx.datasets.list("valuation-multiples", "valuation", 100).await?.len();
+            return Ok(json!({
+                "source": format!("agentic/valuation/{year}"),
+                "year": year,
+                "skipped": format!("valued within {max_age}d (pass force:true to re-run)"),
+                "records": held,
+                "cost_usd": 0.0,
+            }));
+        }
+
         let trades = taxonomy::prompt_list();
         let prompt = format!(
             "You are a business-valuation analyst for small US home-services companies. \

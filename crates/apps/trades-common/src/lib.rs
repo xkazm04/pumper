@@ -52,6 +52,92 @@ pub async fn research_json(
     Ok((data, output))
 }
 
+/// The `year` param an agentic trades app was refreshed for. Central so the four
+/// apps parse the vintage identically.
+pub fn year_param<'a>(ctx: &'a AppContext, default: &'a str) -> &'a str {
+    ctx.params.get("year").and_then(Value::as_str).unwrap_or(default)
+}
+
+/// Whether a re-run is being forced (`force: true`), bypassing every freshness gate.
+pub fn forced(ctx: &AppContext) -> bool {
+    ctx.params.get("force").and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// **Vintage freshness gate** for the frozen-fact apps (`state-tax`,
+/// `trade-wages`): true when the app already holds a record at `sentinel_key`
+/// whose stored `year` equals `year` — i.e. re-deriving would re-pay a 25-30 turn
+/// agentic run to reproduce constants that were fixed when the IRS / BLS
+/// published them. `force: true` always returns false (re-run). Returns
+/// `Ok(false)` when nothing is held yet.
+pub async fn vintage_held(
+    ctx: &AppContext,
+    app: &str,
+    dataset: &str,
+    sentinel_key: &str,
+    year: &str,
+) -> Result<bool> {
+    if forced(ctx) {
+        return Ok(false);
+    }
+    let held = ctx
+        .datasets
+        .get(app, dataset, sentinel_key)
+        .await?
+        .and_then(|r| r.data.get("year").and_then(Value::as_str).map(str::to_string));
+    Ok(held.as_deref() == Some(year))
+}
+
+/// **Age freshness gate** for the apps whose figures drift within a year
+/// (`homewyse-pricing`, `valuation-multiples`): true when the app holds a record
+/// at `sentinel_key` younger than `max_age_days`. `force: true` always returns
+/// false. Returns `Ok(false)` when nothing is held yet.
+pub async fn fresh_by_age(
+    ctx: &AppContext,
+    app: &str,
+    dataset: &str,
+    sentinel_key: &str,
+    max_age_days: i64,
+) -> Result<bool> {
+    if forced(ctx) {
+        return Ok(false);
+    }
+    let age = ctx
+        .datasets
+        .get(app, dataset, sentinel_key)
+        .await?
+        .map(|r| (chrono::Utc::now() - r.updated_at).num_days().max(0));
+    Ok(age.is_some_and(|a| a < max_age_days))
+}
+
+/// Age freshness gate scoped to records matching `path == value` (e.g. one
+/// locality) — for `homewyse-pricing`, whose keys are per-locality so a whole-
+/// dataset "newest" check would let a Texas run wrongly satisfy a national one.
+/// True when the newest matching record is younger than `max_age_days`.
+pub async fn fresh_by_age_where(
+    ctx: &AppContext,
+    app: &str,
+    dataset: &str,
+    path: &str,
+    value: &str,
+    max_age_days: i64,
+) -> Result<bool> {
+    if forced(ctx) {
+        return Ok(false);
+    }
+    let filter = [pumper_core::datasets::JsonFilter::Eq {
+        path: path.to_string(),
+        value: value.to_string(),
+    }];
+    let recs = ctx.datasets.list_filtered(app, dataset, &filter, None, 1).await?;
+    let age = recs.first().map(|r| (chrono::Utc::now() - r.updated_at).num_days().max(0));
+    Ok(age.is_some_and(|a| a < max_age_days))
+}
+
+/// Reads the `max_age_days` param (default `default_days`), clamped to `>= 0`.
+pub fn max_age_days(ctx: &AppContext, default_days: i64) -> i64 {
+    ctx.params.get("max_age_days").and_then(Value::as_i64).map(|d| d.max(0)).unwrap_or(default_days)
+}
+
 /// Plausibility validation for parsed trades records. These are cheap sanity
 /// gates — NOT a re-run loop: a record that fails is rejected (with reasons)
 /// and reported in the job result; valid siblings still upsert. The agent's
