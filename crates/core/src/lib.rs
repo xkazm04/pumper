@@ -64,8 +64,8 @@ pub use extract::{
 };
 pub use engine::{
     profile_browser_dir, profile_cookies_path, profile_dir, validate_profile_name, Browser,
-    EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, RenderRequest, RenderedPage,
-    Researcher, ResearchOutput, ResearchRequest, PROFILE_BROWSER_DIR, PROFILE_COOKIES_FILE,
+    EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, PageAction, RenderRequest,
+    RenderedPage, Researcher, ResearchOutput, ResearchRequest, PROFILE_BROWSER_DIR, PROFILE_COOKIES_FILE,
     PROFILE_NAME_MAX_LEN,
 };
 pub use error::{Error, Result};

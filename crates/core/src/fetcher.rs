@@ -59,6 +59,10 @@ pub struct FetchRequest {
     /// Browser tier: CSS selector to wait for before capturing.
     #[serde(default)]
     pub wait_for_selector: Option<String>,
+    /// Browser tier: scripted page actions (scroll/click/wait) run before
+    /// capture — drives infinite-scroll / "load more" listings. Empty = one-shot.
+    #[serde(default)]
+    pub actions: Vec<crate::engine::PageAction>,
     /// Escalate when the extracted text is shorter than this. Defaults to 250.
     #[serde(default)]
     pub min_content_chars: Option<usize>,
@@ -99,6 +103,7 @@ impl FetchRequest {
             url: url.into(),
             strategy: FetchStrategy::Auto,
             wait_for_selector: None,
+            actions: Vec::new(),
             min_content_chars: None,
             research_prompt: None,
             max_budget_usd: None,
@@ -347,6 +352,7 @@ impl Fetcher {
         if matches!(req.strategy, FetchStrategy::Browser | FetchStrategy::Auto | FetchStrategy::AutoWithResearch) {
             let mut render = RenderRequest::new(&req.url);
             render.wait_for_selector = req.wait_for_selector.clone();
+            render.actions = req.actions.clone();
             render.profile = req.profile.clone();
             // Space the browser render per-host, exactly as the HTTP tier is
             // spaced inside its engine. Critical because the learned tier router
