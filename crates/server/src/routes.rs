@@ -2314,6 +2314,8 @@ async fn search(
         since: query.since,
         // Clamp like `limit`: deep Tantivy offsets get progressively costlier.
         offset: query.offset.unwrap_or(0).min(SEARCH_MAX_OFFSET),
+        // The HTTP surface is the one facet consumer — the response exposes them.
+        facets: true,
     };
     let results = state.search.query(req).await?;
     Ok(Json(json!({

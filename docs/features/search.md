@@ -11,7 +11,7 @@ An app whose result stays compact (counts, not arrays — the fleet convention) 
 `GET /search?q=&limit=&app=&dataset=&fuzzy=` →
 
 - **Hits** with highlighted `snippet` (matched terms in `<b>`, generated from the stored body; pre-snippet indexes are detected on open and rebuilt empty — the index is a derived artifact).
-- **Facets**: `apps` + `datasets` counts over the top-1000 matches (honest sample), sorted by count. `app=`/`dataset=` params filter by exact term.
+- **Facets**: `apps` + `datasets` counts over the top-1000 matches (honest sample), sorted by count. `app=`/`dataset=` params filter by exact term. **Computed only when requested** (`SearchRequest.facets`, which `GET /search` sets): facets sample ≥1000 docs and decode each, so a facet-less query (the saved-search runner, and any caller that reads only hit ids) ranks and decodes just the `offset+limit` page window — no facet-sampling overread. Hit fields are read directly off the stored doc (`get_first`), not via a full-doc JSON round-trip.
 - **Fuzzy** (`fuzzy=true`): edit-distance-1 on title+body (transposition = one edit). Quoted `"exact phrases"` parse as phrase queries in either mode.
 
 ## Maintenance

@@ -19,8 +19,10 @@ use tokio::sync::Notify;
 
 use tantivy::collector::{Count, MultiCollector, TopDocs};
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
-use tantivy::schema::{Field, IndexRecordOption, Schema, FAST, INDEXED, STORED, STRING, TEXT};
-use tantivy::{doc, Document, Index, IndexReader, IndexWriter, Order, TantivyDocument, Term};
+use tantivy::schema::{
+    Field, IndexRecordOption, Schema, Value, FAST, INDEXED, STORED, STRING, TEXT,
+};
+use tantivy::{doc, Index, IndexReader, IndexWriter, Order, TantivyDocument, Term};
 
 use pumper_core::SearchSort;
 
@@ -55,7 +57,6 @@ const COMMIT_PENDING_THRESHOLD: usize = 512;
 
 pub struct TantivyIndex {
     index: Index,
-    schema: Schema,
     fields: Fields,
     writer: Arc<Mutex<IndexWriter>>,
     reader: IndexReader,
@@ -213,7 +214,7 @@ impl TantivyIndex {
         let wake = Arc::new(Notify::new());
         let shutdown = Arc::new(Notify::new());
         spawn_committer(writer.clone(), reader.clone(), pending.clone(), wake.clone(), shutdown.clone());
-        Ok(Self { index, schema: s, fields, writer, reader, pending, wake, shutdown })
+        Ok(Self { index, fields, writer, reader, pending, wake, shutdown })
     }
 }
 
@@ -359,7 +360,6 @@ impl Search for TantivyIndex {
     async fn query(&self, req: SearchRequest) -> Result<SearchResponse> {
         let index = self.index.clone();
         let reader = self.reader.clone();
-        let schema = self.schema.clone();
         let f = self.fields;
         tokio::task::spawn_blocking(move || -> Result<SearchResponse> {
             let searcher = reader.searcher();
@@ -412,8 +412,13 @@ impl Search for TantivyIndex {
                 Box::new(BooleanQuery::new(clauses))
             };
 
-            // Rank enough docs to cover the requested page AND the facet sample.
-            let sample_size = req.offset.saturating_add(req.limit).max(FACET_SAMPLE);
+            // Rank enough docs to cover the requested page — and the facet sample
+            // ONLY when facets are wanted. Facets decode every sampled doc, so a
+            // facet-less query (the saved-search runner, the default UI page) ranks
+            // and decodes just the `offset+limit` window instead of ≥1000 docs.
+            let want_facets = req.facets;
+            let page = req.offset.saturating_add(req.limit);
+            let sample_size = if want_facets { page.max(FACET_SAMPLE) } else { page };
             // One collector pass yields both the ranked window and the EXACT match
             // total (via a Count collector) — so `total` is the real denominator
             // for paging, not the page size. Order by relevance or recency; the
@@ -460,35 +465,39 @@ impl Search for TantivyIndex {
             let mut app_counts: std::collections::BTreeMap<String, u64> = Default::default();
             let mut dataset_counts: std::collections::BTreeMap<String, u64> = Default::default();
             for (i, (score, address)) in top.iter().enumerate() {
+                let in_window = i >= req.offset && i < req.offset + req.limit;
+                // Decode only the docs we use: the page window always, plus every
+                // sampled doc when counting facets. (Without facets, sample_size ==
+                // the window, so this skips nothing — the guard just makes intent
+                // explicit and future-proofs a larger sample.)
+                if !in_window && !want_facets {
+                    continue;
+                }
                 let doc: TantivyDocument = searcher
                     .doc(*address)
                     .map_err(|e| Error::App(format!("fetch doc: {e}")))?;
-                // Stored fields serialize as {"field": ["value"], ...}.
-                let json: serde_json::Value =
-                    serde_json::from_str(&doc.to_json(&schema)).unwrap_or(serde_json::Value::Null);
-                let get = |name: &str| {
-                    json.get(name)
-                        .and_then(|a| a.get(0))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string()
+                // Read stored fields directly off the doc — no full-doc
+                // to_json/from_str round-trip (which serialized the whole body just
+                // to read a handful of short fields).
+                let get = |field| {
+                    doc.get_first(field).and_then(|v| v.as_str()).unwrap_or("").to_string()
                 };
-                let (app, dataset) = (get("app"), get("dataset"));
-                *app_counts.entry(app.clone()).or_insert(0) += 1;
-                *dataset_counts.entry(dataset.clone()).or_insert(0) += 1;
-                // Hits are the `offset..offset+limit` window; facets still sample
-                // the whole ranked set above.
-                if i >= req.offset && i < req.offset + req.limit {
+                let (app, dataset) = (get(f.app), get(f.dataset));
+                if want_facets {
+                    *app_counts.entry(app.clone()).or_insert(0) += 1;
+                    *dataset_counts.entry(dataset.clone()).or_insert(0) += 1;
+                }
+                if in_window {
                     let snippet = snippets
                         .as_ref()
                         .map(|g| g.snippet_from_doc(&doc).to_html())
                         .unwrap_or_default();
                     hits.push(SearchHit {
-                        id: get("id"),
+                        id: get(f.id),
                         app,
                         dataset,
-                        url: get("url"),
-                        title: get("title"),
+                        url: get(f.url),
+                        title: get(f.title),
                         score: *score,
                         snippet,
                     });
