@@ -26,7 +26,7 @@ pub struct Config {
 /// Global outbound-webhook subscriptions that aren't tied to a per-resource row
 /// (watches/saved-searches). A single config-level firehose is the lightest fit
 /// for a cross-app "any job failed" signal, which has no natural per-resource key.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct WebhooksConfig {
     /// If set, every job that fails *permanently* (attempts exhausted, including
@@ -35,6 +35,17 @@ pub struct WebhooksConfig {
     pub failure_url: Option<String>,
     /// Optional HMAC-SHA256 signing secret for `failure_url` deliveries.
     pub failure_secret: Option<String>,
+    /// Auto-drain the dead-letter queue: a background task (piggybacked on the
+    /// scheduler tick) re-sends `failed` deliveries with exponential backoff, so a
+    /// brief receiver outage no longer means permanent silent event loss. `false`
+    /// reverts to manual-only replay. Default: true.
+    pub auto_retry: bool,
+}
+
+impl Default for WebhooksConfig {
+    fn default() -> Self {
+        Self { failure_url: None, failure_secret: None, auto_retry: true }
+    }
 }
 
 /// Reactive-pipeline trigger evaluation limits.

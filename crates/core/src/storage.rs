@@ -1072,7 +1072,9 @@ impl Storage {
         Ok(id)
     }
 
-    /// Marks a delivery's outcome after the retry loop finishes.
+    /// Marks a delivery delivered — clears any pending retry so the drain won't
+    /// re-send it. (The failed path is [`fail_delivery`], which schedules a retry
+    /// or marks the row `dead`.)
     pub async fn finish_delivery(
         &self,
         id: &str,
@@ -1082,7 +1084,7 @@ impl Storage {
     ) -> Result<()> {
         sqlx::query(
             "UPDATE webhook_deliveries SET status = ?2, attempts = attempts + ?3, \
-             last_error = ?4, updated_at = ?5 WHERE id = ?1",
+             last_error = ?4, next_retry_at = NULL, updated_at = ?5 WHERE id = ?1",
         )
         .bind(id)
         .bind(if delivered { "delivered" } else { "failed" })
@@ -1092,6 +1094,94 @@ impl Storage {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Records a failed delivery outcome and either schedules the next auto-drain
+    /// retry (exponential backoff from the row's current `retry_count`, indexing
+    /// `backoff_secs` with mild jitter) or, once `retry_count >= max_retries`,
+    /// marks the row `dead` so the DLQ view stays meaningful and the drain stops
+    /// picking it up. No-op if the row vanished.
+    pub async fn fail_delivery(
+        &self,
+        id: &str,
+        attempts: i64,
+        last_error: Option<&str>,
+        max_retries: i64,
+        backoff_secs: &[i64],
+    ) -> Result<()> {
+        let Some(retry_count): Option<i64> =
+            sqlx::query_scalar("SELECT retry_count FROM webhook_deliveries WHERE id = ?1")
+                .bind(id)
+                .fetch_optional(&self.pool)
+                .await?
+        else {
+            return Ok(());
+        };
+        if retry_count >= max_retries || backoff_secs.is_empty() {
+            sqlx::query(
+                "UPDATE webhook_deliveries SET status = 'dead', attempts = attempts + ?2, \
+                 last_error = ?3, next_retry_at = NULL, updated_at = ?4 WHERE id = ?1",
+            )
+            .bind(id)
+            .bind(attempts)
+            .bind(last_error)
+            .bind(now())
+            .execute(&self.pool)
+            .await?;
+            return Ok(());
+        }
+        let idx = (retry_count as usize).min(backoff_secs.len() - 1);
+        let base = backoff_secs[idx].max(1);
+        // Jitter up to +25% to de-sync a herd of deliveries that all failed during
+        // the same receiver outage. Deterministic seed (no wall-clock RNG): the id
+        // bytes plus the retry count.
+        let seed = id.bytes().fold(retry_count as u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64));
+        let jitter = (crate::jitter::lcg_fraction(seed) * (base as f64) * 0.25) as i64;
+        let next = Utc::now() + chrono::Duration::seconds(base + jitter);
+        sqlx::query(
+            "UPDATE webhook_deliveries SET status = 'failed', attempts = attempts + ?2, \
+             last_error = ?3, next_retry_at = ?4, updated_at = ?5 WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(attempts)
+        .bind(last_error)
+        .bind(ts(next))
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// Failed deliveries whose scheduled retry is due (`next_retry_at <= now`),
+    /// soonest first — the auto-drain's work list. Includes the body so the drain
+    /// can re-send without a second read.
+    pub async fn due_deliveries(&self, limit: i64) -> Result<Vec<Delivery>> {
+        let rows: Vec<DeliveryRow> = sqlx::query_as(
+            "SELECT id, kind, ref_id, url, event, body, status, attempts, last_error, \
+             created_at, updated_at FROM webhook_deliveries \
+             WHERE status = 'failed' AND next_retry_at IS NOT NULL AND next_retry_at <= ?1 \
+             ORDER BY next_retry_at ASC LIMIT ?2",
+        )
+        .bind(now())
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Delivery::try_from).collect()
+    }
+
+    /// Atomically claims a due delivery for a retry: flips `failed` → `pending`
+    /// and bumps `retry_count`, so a concurrent drain tick can't double-send it.
+    /// Returns `false` if another tick already claimed it (row no longer `failed`).
+    pub async fn begin_delivery_retry(&self, id: &str) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE webhook_deliveries SET status = 'pending', retry_count = retry_count + 1, \
+             next_retry_at = NULL, updated_at = ?2 WHERE id = ?1 AND status = 'failed'",
+        )
+        .bind(id)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
     }
 
     /// Deliveries, newest first, optionally filtered by status (`failed` is the

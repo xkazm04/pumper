@@ -59,6 +59,12 @@ pub async fn run(state: AppState) {
         // running jobs whose heartbeat lease has gone stale (a hung task on a
         // live server). Cheap — one indexed scan of `running` jobs.
         crate::worker::reap_once(&state).await;
+        // Also piggyback the webhook dead-letter drain: re-send failed deliveries
+        // whose backoff is due, so a receiver outage longer than the in-process
+        // retry loop doesn't mean permanent silent event loss.
+        if state.config.webhooks.auto_retry {
+            crate::webhook::drain_due(&state).await;
+        }
         // Stop enqueuing new scheduled work as soon as shutdown is signalled.
         tokio::select! {
             _ = state.shutdown.cancelled() => break,

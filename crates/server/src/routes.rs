@@ -2235,18 +2235,7 @@ async fn replay_delivery(
     let Some(delivery) = state.storage.get_delivery(&id).await? else {
         return Err(ApiError(StatusCode::NOT_FOUND, "delivery not found".into()));
     };
-    let secret = match delivery.kind.as_str() {
-        "job" => {
-            let job_id = Uuid::parse_str(&delivery.ref_id)
-                .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
-            state.storage.get(job_id).await?.and_then(|j| j.callback_secret)
-        }
-        _ => state
-            .storage
-            .get_watch(&delivery.ref_id)
-            .await?
-            .and_then(|w| w.secret),
-    };
+    let secret = crate::webhook::resolve_secret(&state.storage, &delivery).await;
     crate::webhook::replay(
         state.webhook_client.clone(),
         state.storage.clone(),
