@@ -58,6 +58,23 @@ impl Source {
     pub fn is_scheduled(&self) -> bool {
         !self.cron.trim().is_empty()
     }
+
+    /// Max-expected age (seconds) between writes for this source's `cadence`, or
+    /// `None` for cadences that carry no freshness expectation
+    /// (`on-demand`/`one-time`, or an unknown value). Drives the freshness monitor:
+    /// a `live` source whose dataset hasn't been written within this window (times
+    /// a grace multiplier) is stale.
+    pub fn cadence_secs(&self) -> Option<i64> {
+        const DAY: i64 = 86_400;
+        match self.cadence.trim() {
+            "daily" => Some(DAY),
+            "weekly" => Some(7 * DAY),
+            "monthly" => Some(31 * DAY),
+            "quarterly" => Some(93 * DAY),
+            "annual" => Some(366 * DAY),
+            _ => None, // on-demand | one-time | unknown → no freshness expectation
+        }
+    }
 }
 
 /// The parsed catalog — a list of `[[source]]` entries.
@@ -122,5 +139,31 @@ mod tests {
         // Missing optional fields default rather than failing the parse.
         assert_eq!(cat.sources[1].app, "");
         assert!(!cat.sources[1].is_scheduled());
+    }
+
+    #[test]
+    fn cadence_secs_maps_known_cadences_and_exempts_the_rest() {
+        let src = |cadence: &str| Source {
+            id: "x".into(),
+            app: String::new(),
+            market: String::new(),
+            name: "x".into(),
+            url: String::new(),
+            category: String::new(),
+            engine: String::new(),
+            access: String::new(),
+            cadence: cadence.into(),
+            cron: String::new(),
+            status: "live".into(),
+            confidence: 0,
+            dataset: String::new(),
+            notes: String::new(),
+        };
+        assert_eq!(src("daily").cadence_secs(), Some(86_400));
+        assert_eq!(src("annual").cadence_secs(), Some(366 * 86_400));
+        // No freshness expectation for these.
+        assert_eq!(src("on-demand").cadence_secs(), None);
+        assert_eq!(src("one-time").cadence_secs(), None);
+        assert_eq!(src("").cadence_secs(), None);
     }
 }

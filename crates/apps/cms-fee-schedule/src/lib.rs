@@ -14,10 +14,13 @@
 //! stays in the Counterbill ingest script; this app only answers "is there a
 //! newer release, and where is it?".
 //!
-//! Params: `{ "schedule": "pfs", "known_release": "RVU26A" }`
+//! Params: `{ "schedule": "pfs" }`
 //!   · `schedule`      — only `"pfs"` is supported today (extensible to clfs/asp).
-//!   · `known_release` — the release Counterbill has baked, for the `is_newer`
-//!                       flag. Omit to treat any detected release as actionable.
+//!   · `known_release` — OPTIONAL explicit baseline (the release Counterbill has
+//!                       baked). Omitted by default: the watcher **self-baselines**
+//!                       off the release it stored last run, so `is_newer_than_known`
+//!                       clears itself once a release is seen (`baseline_source`
+//!                       reports `param`/`stored`/`none`).
 
 use async_trait::async_trait;
 use pumper_core::{AppContext, ChangeKind, Error, HttpRequest, Result, ScrapeApp};
@@ -129,7 +132,9 @@ impl ScrapeApp for CmsFeeSchedule {
         "Watches CMS for the latest Physician Fee Schedule (PFS) RVU release and \
          reports whether it is newer than the caller's baked release — the freshness \
          signal behind Counterbill's scripts/ingest-cms-pfs.mjs regeneration. \
-         Params: {\"schedule\":\"pfs\",\"known_release\":\"RVU26A\"}"
+         Self-baselines off the last release it stored (so the staleness flag \
+         clears itself); pass \"known_release\" to override. Params: \
+         {\"schedule\":\"pfs\", \"known_release\": null (optional explicit baseline)}"
     }
 
     fn schedule(&self) -> Option<&'static str> {
@@ -139,7 +144,11 @@ impl ScrapeApp for CmsFeeSchedule {
     }
 
     fn default_params(&self) -> Value {
-        json!({ "schedule": "pfs", "known_release": "RVU26A" })
+        // No hardcoded `known_release`: the watcher self-baselines off the last
+        // release it stored (a stale literal would keep `is_newer_than_known`
+        // permanently lit). A caller who knows what Counterbill has baked can still
+        // pass `known_release` as an explicit override.
+        json!({ "schedule": "pfs" })
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -173,6 +182,24 @@ impl ScrapeApp for CmsFeeSchedule {
             )
         })?;
 
+        // Self-baseline: read the release we stored last run BEFORE the upsert
+        // below overwrites it. Baseline precedence: explicit `known_release` param
+        // (what Counterbill has baked) > the stored release (self-baselining across
+        // scheduled runs) > none (cold start). This clears the "permanently stale"
+        // alarm — once RVU26B is stored, later runs baseline off it and stop
+        // reporting `is_newer_than_known: true` until CMS actually ships RVU26C.
+        let stored_prev = ctx
+            .datasets
+            .get(&ctx.app, "releases", schedule)
+            .await?
+            .and_then(|r| r.data.get("latest_release").and_then(Value::as_str).map(String::from));
+        let param_known = ctx.params.get("known_release").and_then(Value::as_str).map(String::from);
+        let (baseline, baseline_source) = match (&param_known, &stored_prev) {
+            (Some(k), _) => (Some(k.clone()), "param"),
+            (None, Some(s)) => (Some(s.clone()), "stored"),
+            (None, None) => (None, "none"),
+        };
+
         // Change detection across scheduled runs: keyed by `schedule`, so a run
         // reports `new`/`changed` only when CMS actually published a newer release.
         let record = json!({
@@ -184,11 +211,11 @@ impl ScrapeApp for CmsFeeSchedule {
         });
         let change: ChangeKind = ctx.upsert("releases", schedule, &record).await?;
 
-        // Is the detected latest newer than what the caller currently has baked?
-        let known = ctx.params.get("known_release").and_then(Value::as_str);
-        let is_newer = match known.and_then(parse_release) {
+        // Is the detected latest newer than the effective baseline? A cold start
+        // (no baseline) treats any detected release as actionable.
+        let is_newer = match baseline.as_deref().and_then(parse_release) {
             Some(k) => latest.ord_key() > k.ord_key(),
-            None => true, // no baseline → treat any detected release as actionable
+            None => true,
         };
 
         Ok(json!({
@@ -200,11 +227,21 @@ impl ScrapeApp for CmsFeeSchedule {
             "zip_url": latest.zip_url(),
             "source_url": latest.source_url(),
             "index_url": PFS_INDEX_URL,
-            "known_release": known,
+            "known_release": param_known,          // the explicit override, if any
+            "baseline": baseline,                  // the release we compared against
+            "baseline_source": baseline_source,    // "param" | "stored" | "none"
             "is_newer_than_known": is_newer,
             "change_since_last_run": change,      // "new" | "changed" | "unchanged"
             "is_fresh": change.is_fresh(),         // new or changed since last run
             "releases_found": releases.iter().map(Release::id).collect::<Vec<_>>(),
+            // Structured ingest target so a `dataset` trigger (on_change=fresh) can
+            // fan out to an ingest job reading these keys from `_trigger`, instead
+            // of a human reading the prose hint below.
+            "ingest": {
+                "release": latest.id(),
+                "zip_url": latest.zip_url(),
+                "source_url": latest.source_url(),
+            },
             "ingest_hint": format!(
                 "If newer: point scripts/ingest-cms-pfs.mjs at {} (update its ZIP_URL + RELEASE, \
                  or pass --zip a download of {}) and run `npm run ingest:pfs`.",

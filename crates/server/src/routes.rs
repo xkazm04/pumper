@@ -107,6 +107,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_grants))
         .routes(routes!(closing_soon))
         .routes(routes!(catalog_sources))
+        .routes(routes!(catalog_health))
         .routes(routes!(openapi_json))
 }
 
@@ -3151,6 +3152,78 @@ async fn catalog_sources(Query(query): Query<CatalogQuery>) -> Result<Json<Value
     Ok(Json(json!({ "count": sources.len(), "sources": sources })))
 }
 
+/// Grace multiplier on a source's cadence window before it is flagged stale —
+/// tolerates one missed run (e.g. a daily source is stale only past ~2 days).
+const CATALOG_STALE_GRACE: i64 = 2;
+
+/// Freshness monitor for the catalog: for every **live** source that declares a
+/// `dataset` and a cadence with a freshness expectation, report when its dataset
+/// was last written and whether that exceeds the cadence window (× a grace
+/// multiplier). Turns the catalog's `status`/`confidence`/`cadence` from
+/// aspirational documentation into a self-checking signal — the one thing
+/// ("how fresh") the catalog couldn't answer about itself.
+#[utoipa::path(
+    get,
+    path = "/catalog/health",
+    tag = "catalog",
+    responses((status = 200, description = "`{checked, stale, sources: [{id, app, dataset, cadence, expected_max_age_secs, last_write_at, age_secs, stale, monitored, reason?}]}` — per-source freshness for live sources; `monitored:false` when no dataset or a no-expectation cadence."))
+)]
+async fn catalog_health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    let catalog = pumper_core::Catalog::load()
+        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("catalog load: {e}")))?;
+    let now = chrono::Utc::now();
+    let mut out = Vec::new();
+    let mut stale_count = 0usize;
+    for s in catalog.live() {
+        let base = json!({
+            "id": s.id, "app": s.app, "dataset": s.dataset, "cadence": s.cadence,
+        });
+        let mut row = base.as_object().unwrap().clone();
+        // Not monitorable: no dataset, no app, or a cadence with no freshness window.
+        let expected = s.cadence_secs();
+        if s.dataset.is_empty() || s.app.is_empty() || expected.is_none() {
+            row.insert("monitored".into(), json!(false));
+            row.insert(
+                "reason".into(),
+                json!(if expected.is_none() {
+                    "cadence has no freshness expectation"
+                } else {
+                    "no app/dataset to check"
+                }),
+            );
+            out.push(Value::Object(row));
+            continue;
+        }
+        let expected = expected.unwrap();
+        // Newest write in this source's dataset (list is updated_at DESC).
+        let last = state.datasets.list(&s.app, &s.dataset, 1).await?.first().map(|r| r.updated_at);
+        row.insert("monitored".into(), json!(true));
+        row.insert("expected_max_age_secs".into(), json!(expected));
+        match last {
+            Some(ts) => {
+                let age = (now - ts).num_seconds().max(0);
+                let stale = age > expected * CATALOG_STALE_GRACE;
+                if stale {
+                    stale_count += 1;
+                }
+                row.insert("last_write_at".into(), json!(pumper_core::datasets::ts(ts)));
+                row.insert("age_secs".into(), json!(age));
+                row.insert("stale".into(), json!(stale));
+            }
+            None => {
+                // Live source that has never written its dataset — stale by definition.
+                stale_count += 1;
+                row.insert("last_write_at".into(), Value::Null);
+                row.insert("age_secs".into(), Value::Null);
+                row.insert("stale".into(), json!(true));
+                row.insert("reason".into(), json!("dataset has never been written"));
+            }
+        }
+        out.push(Value::Object(row));
+    }
+    Ok(Json(json!({ "checked": out.len(), "stale": stale_count, "sources": out })))
+}
+
 #[cfg(test)]
 mod catalog_tests {
     use pumper_core::Catalog;
@@ -3413,6 +3486,7 @@ mod api_spec_tests {
         "GET /grants",
         "GET /grants/closing-soon",
         "GET /catalog/sources",
+        "GET /catalog/health",
         "GET /openapi.json",
     ];
 
