@@ -173,30 +173,50 @@ async fn cache_janitor(state: AppState) {
     }
 }
 
-/// Prunes revision history older than the configured retention window (keeping
-/// the newest N per record) so `record_revisions` doesn't grow without bound.
-/// Off unless `[storage] revision_retention_days > 0` — deleting a dataset's
-/// accrued history is opt-in.
+/// Bounds the two append-only stores.
+///
+/// **Revision history** older than the configured retention window (keeping the
+/// newest N per record) — off unless `[storage] revision_retention_days > 0`,
+/// because deleting a dataset's accrued history is data loss and must be opt-in.
+///
+/// **Extraction-health sketches and run rows** beyond
+/// `[resilience] sketch_retention_runs` — on whenever detection is, because these
+/// are a derived index rather than accrued value, and the config knob is
+/// meaningless if nothing enforces it. Config validation already guarantees the
+/// retention window is at least the baseline window, so this can never prune what
+/// the detector is about to read.
 async fn retention_janitor(state: AppState) {
     let days = state.config.storage.revision_retention_days;
-    if days == 0 {
-        return; // retention disabled
-    }
     let keep_min = state.config.storage.revision_retention_keep_min;
+    let sketch_runs = state.health.enabled().then(|| state.config.resilience.sketch_retention_runs);
+    if days == 0 && sketch_runs.is_none() {
+        return; // nothing to bound
+    }
     let interval = std::time::Duration::from_secs(6 * 3600);
-    tracing::info!(days, keep_min, "revision retention janitor enabled");
+    tracing::info!(days, keep_min, ?sketch_runs, "retention janitor enabled");
     loop {
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
             _ = tokio::time::sleep(interval) => {}
         }
-        let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
-        match state.datasets.prune_revisions(cutoff, keep_min).await {
-            Ok(n) if n > 0 => {
-                tracing::info!(pruned = n, days, "retention janitor pruned old revisions")
+        if days > 0 {
+            let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
+            match state.datasets.prune_revisions(cutoff, keep_min).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(pruned = n, days, "retention janitor pruned old revisions")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("revision prune failed: {e}"),
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("revision prune failed: {e}"),
+        }
+        if let (Some(keep), Some(store)) = (sketch_runs, state.health.store()) {
+            match store.prune(keep).await {
+                Ok(n) if n > 0 => {
+                    tracing::info!(pruned = n, keep, "retention janitor pruned health sketches")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("health sketch prune failed: {e}"),
+            }
         }
     }
 }

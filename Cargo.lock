@@ -157,6 +157,7 @@ dependencies = [
  "pumper-core",
  "serde_json",
  "tokio",
+ "tracing",
  "uuid",
 ]
 
