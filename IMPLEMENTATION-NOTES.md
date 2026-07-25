@@ -12,6 +12,14 @@ reason recorded under *Deviations*: the `DocReport` wire shape, the extractor's
 `worst_fields` treatment of `container_empty`, and the `record_revisions` SELECT
 column lists.
 
+**Migration 0020 verified against the real database**, on a copy — the repo's
+`data/pumper.db` is 16 migrations behind (4 applied, 5 tables, 6,040 records), so
+it exercises the whole chain including the two `ALTER TABLE … ADD COLUMN trust`
+statements over real rows. After migrating: 20/20 applied, all five new tables
+present, **6,040 of 6,040 records intact**, and all 6,040 carrying `trust IS NULL`
+— which *means* `stable`, so the backfill-free claim holds in practice and not
+just by argument. The live database was not touched.
+
 ---
 
 ## What was built
@@ -413,13 +421,9 @@ correct answer and blurring it into the section above would not be.
   support to 10 to exercise the path at all — which is itself evidence that the
   shipped default may mine nothing for most sources.
 - **The server has not been run.** `cargo check`/`cargo test` pass; I did not
-  start `pumper-server`, did not issue a request to `/sources`, and did not run
-  migration 0020 against the real `data/pumper.db`. The migration is exercised by
-  the integration tests against fresh temp databases, which run the full
-  migration chain — but a fresh chain is not the same as a 20-migration-deep
-  production database with 5,196 records in it. In particular the two
-  `ALTER TABLE … ADD COLUMN trust` statements are additive and backfill-free by
-  design, but I have not watched them apply to the real file.
+  start `pumper-server` and did not issue a request to `/sources`. The four
+  endpoints are exercised only by the OpenAPI coverage test, which proves they are
+  registered, not that they return what their annotations claim.
 - **Whether `enforce = true` behaves well end-to-end under the worker.** The
   gating paths are unit- and integration-tested through `AppContext` and are
   read by the worker hooks, but no test drives a full job through the worker with
