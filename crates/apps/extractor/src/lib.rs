@@ -8,8 +8,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use pumper_core::{
-    extract_batch_with_report, AppContext, CompiledRuleSet, DocReport, Error, FetchRequest,
-    FetchStrategy, FieldStatus, Record, Result, RuleSet, ScrapeApp, UpsertSummary,
+    extract_batch_with_report, signals_batch, AppContext, CompiledRuleSet, DocReport, Error,
+    FetchHealth, FetchRequest, FetchStrategy, FieldStatus, ObservedDoc, Record, Result, RuleSet,
+    ScrapeApp, UpsertSummary,
 };
 use serde_json::{json, Value};
 
@@ -110,14 +111,20 @@ async fn extract_and_upsert(
     compiled: Arc<CompiledRuleSet>,
     dataset: &str,
     keyed: Vec<(String, String)>,
-) -> Result<(Vec<Value>, u64, u64, Vec<Value>, UpsertSummary)> {
+    fetch: FetchHealth,
+) -> Result<ExtractOutcome> {
     // Split keys from bodies without copying either — `keyed` is owned and dropped
     // here anyway (was: `.iter().map(|(_,d)| d.clone())`, deep-cloning every HTML
     // body and roughly doubling peak RSS over the whole batch).
     let (keys, docs): (Vec<String>, Vec<String>) = keyed.into_iter().unzip();
-    let reported = run_extraction(compiled, docs).await?;
+    let reported = run_extraction(compiled, docs.clone()).await?;
     // Borrow the reports rather than deep-cloning each into a throwaway Vec.
     let (matched, total, worst) = summarize_reports(reported.iter().map(|(_, r)| r));
+
+    // Health verdict FIRST, then the write: the state settled here is what the
+    // upsert below gates on (trust stamp, quarantine dataset, removal
+    // suppression). Judging afterwards would stamp a verdict that did not exist.
+    let verdict = observe(ctx, dataset, &keys, docs, &reported, fetch).await;
 
     let mut records: Vec<Value> = Vec::with_capacity(reported.len());
     let items: Vec<(String, Value)> = keys
@@ -132,7 +139,71 @@ async fn extract_and_upsert(
         })
         .collect();
     let summary = ctx.upsert_many(dataset, &items).await?;
-    Ok((records, matched, total, worst, summary))
+    Ok(ExtractOutcome { records, matched, total, worst, summary, health: verdict })
+}
+
+/// What one extraction pass produced: the records, the aggregate quality signal,
+/// the write summary, and the source-health verdict.
+struct ExtractOutcome {
+    records: Vec<Value>,
+    matched: u64,
+    total: u64,
+    worst: Vec<Value>,
+    summary: UpsertSummary,
+    health: Option<Value>,
+}
+
+/// Reports this run to the health detector and renders its verdict for the job
+/// result. Best-effort: a detection failure is logged and the run still succeeds,
+/// because health is a derived judgement and must never fail a working scrape.
+async fn observe(
+    ctx: &AppContext,
+    dataset: &str,
+    keys: &[String],
+    docs: Vec<String>,
+    reported: &[(Value, DocReport)],
+    fetch: FetchHealth,
+) -> Option<Value> {
+    if !ctx.health.enabled() {
+        return None;
+    }
+    let values: Vec<Value> = reported.iter().map(|(v, _)| v.clone()).collect();
+    // Fingerprinting parses each body once more, on the same rayon path the
+    // extraction ran on — off the async runtime so it can't stall the reactor.
+    let signals = tokio::task::spawn_blocking(move || signals_batch(&docs, &values))
+        .await
+        .map_err(|e| Error::App(format!("fingerprint task failed: {e}")))
+        .ok()?;
+    let observed: Vec<ObservedDoc> = keys
+        .iter()
+        .zip(reported)
+        .zip(signals)
+        .map(|((key, (values, report)), signals)| ObservedDoc {
+            key: key.clone(),
+            values: values.clone(),
+            report: report.clone(),
+            signals,
+        })
+        .collect();
+    match ctx.observe_extraction(dataset, &observed, fetch).await {
+        Ok(verdict) => verdict.map(|v| {
+            if v.state != v.previous_state {
+                tracing::warn!(
+                    source = %v.source_id,
+                    from = v.previous_state.as_str(),
+                    to = v.state.as_str(),
+                    score = v.score,
+                    diagnosis = v.diagnosis.map(|d| d.as_str()).unwrap_or("-"),
+                    "extraction health state changed"
+                );
+            }
+            json!(v)
+        }),
+        Err(e) => {
+            tracing::warn!("extraction health evaluation failed: {e}");
+            None
+        }
+    }
 }
 
 #[async_trait]
@@ -217,19 +288,30 @@ impl Extractor {
             req.strategy = strategy;
             async move {
                 match f.fetch(req).await {
-                    Ok(out) => (url, out.html.or(out.text).filter(|d| !d.is_empty())),
-                    Err(_) => (url, None),
+                    // The health gate needs to know whether the *fetch layer* was
+                    // healthy, which is the winning tier's structured verdict — not
+                    // whether a body came back non-empty. A bot wall returns plenty
+                    // of bytes.
+                    Ok(out) => {
+                        let healthy = tier_won(&out);
+                        (url, out.html.or(out.text).filter(|d| !d.is_empty()), healthy)
+                    }
+                    Err(_) => (url, None, false),
                 }
             }
         });
-        let fetched_pairs: Vec<(String, Option<String>)> = futures::stream::iter(fetches)
+        let fetched_pairs: Vec<(String, Option<String>, bool)> = futures::stream::iter(fetches)
             .buffer_unordered(concurrency)
             .collect()
             .await;
 
         let mut keyed: Vec<(String, String)> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
-        for (url, doc) in fetched_pairs {
+        let mut fetch = FetchHealth { attempted: urls.len() as u32, ok: 0 };
+        for (url, doc, healthy) in fetched_pairs {
+            if healthy {
+                fetch.ok += 1;
+            }
             match doc {
                 Some(d) => keyed.push((url, d)),
                 None => failed.push(url),
@@ -238,8 +320,7 @@ impl Extractor {
 
         let requested = urls.len();
         let fetched = keyed.len();
-        let (records, matched, total, worst, summary) =
-            extract_and_upsert(ctx, compiled, dataset, keyed).await?;
+        let out = extract_and_upsert(ctx, compiled, dataset, keyed, fetch).await?;
 
         Ok(json!({
             "mode": "urls",
@@ -247,13 +328,15 @@ impl Extractor {
             "fetched": fetched,
             "skipped": failed.len(),
             "failed": failed,
-            "new": summary.new.len(),
-            "changed": summary.changed.len(),
-            "unchanged": summary.unchanged,
-            "fields_matched": matched,
-            "fields_total": total,
-            "worst_fields": worst,
-            "records": records,
+            "fetch_ok_rate": fetch.rate(),
+            "new": out.summary.new.len(),
+            "changed": out.summary.changed.len(),
+            "unchanged": out.summary.unchanged,
+            "fields_matched": out.matched,
+            "fields_total": out.total,
+            "worst_fields": out.worst,
+            "health": out.health,
+            "records": out.records,
         }))
     }
 
@@ -330,8 +413,11 @@ impl Extractor {
         }
 
         let loaded = keyed.len();
-        let (out_records, matched, total, worst, summary) =
-            extract_and_upsert(ctx, compiled, dataset, keyed).await?;
+        // Nothing was fetched, so the fetch layer cannot explain a bad extraction
+        // and must not gate the verdict. An unreadable stored body is a corpus
+        // problem, not a fetch problem, and is reported in `missing` instead.
+        let out =
+            extract_and_upsert(ctx, compiled, dataset, keyed, FetchHealth::default()).await?;
 
         Ok(json!({
             "mode": "source",
@@ -340,15 +426,29 @@ impl Extractor {
             "loaded": loaded,
             "missing": missing.len(),
             "missing_keys": missing,
-            "new": summary.new.len(),
-            "changed": summary.changed.len(),
-            "unchanged": summary.unchanged,
-            "fields_matched": matched,
-            "fields_total": total,
-            "worst_fields": worst,
-            "records": out_records,
+            "new": out.summary.new.len(),
+            "changed": out.summary.changed.len(),
+            "unchanged": out.summary.unchanged,
+            "fields_matched": out.matched,
+            "fields_total": out.total,
+            "worst_fields": out.worst,
+            "health": out.health,
+            "records": out.records,
         }))
     }
+}
+
+/// Whether the fetch layer actually delivered: some tier won with a verdict of
+/// `ok` and, where it has an HTTP status, a 2xx.
+///
+/// Keyed on the structured `TierVerdict`, never the prose escalation trail — the
+/// trail is a rendered view, and matching on its text is how a router silently
+/// stops working after a wording change.
+fn tier_won(out: &pumper_core::FetchOutcome) -> bool {
+    out.trace.iter().any(|t| {
+        t.verdict == pumper_core::TierVerdict::Ok
+            && t.http_status.map_or(true, |s| (200..300).contains(&s))
+    })
 }
 
 #[cfg(test)]
