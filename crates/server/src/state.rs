@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use pumper_core::{
     Config, CostLedger, Datasets, EngineSet, Fetcher, Governor, HttpCache, NoPlugins, NoSearch,
-    Plugins, ResearchCache, ScrapeApp, Search, Storage, TierMemory,
+    Plugins, ResearchCache, Resilience, ScrapeApp, Search, Storage, TierMemory,
 };
 use pumper_engine_browser::BrowserEngine;
 use pumper_engine_claude::ClaudeEngine;
@@ -32,6 +32,10 @@ pub struct AppState {
     pub cache: Arc<HttpCache>,
     pub research_cache: Arc<ResearchCache>,
     pub tiers: Arc<TierMemory>,
+    /// Extraction health: per-source degradation detection. Read by the worker's
+    /// post-run hooks to suppress pushes and indexing for a source we no longer
+    /// stand behind, and by `/sources` for the health table.
+    pub health: Arc<Resilience>,
     /// Live politeness governor — exposed so the `/hosts` diagnostics can read
     /// the current learned penalty and `DELETE /hosts/{host}/memory` can clear it.
     pub governor: Arc<Governor>,
@@ -80,6 +84,18 @@ impl AppState {
             storage.pool(),
             config.fetcher.host_memory_ttl_secs,
         ));
+        let health = Arc::new(Resilience::new(storage.pool(), &config.resilience));
+        if health.enabled() {
+            tracing::info!(
+                enforce = health.enforcing(),
+                "extraction-health detection enabled ({})",
+                if health.enforcing() {
+                    "verdicts gate writes, pushes and indexing"
+                } else {
+                    "soak mode: verdicts recorded, nothing gated"
+                }
+            );
+        }
         let governor = Arc::new(Governor::new(&config.governor));
 
         // Restore the governor's learned per-host penalties from the last
@@ -174,6 +190,7 @@ impl AppState {
             cache,
             research_cache,
             tiers,
+            health,
             governor,
             engines: Arc::new(engines),
             plugins,

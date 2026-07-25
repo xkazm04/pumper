@@ -41,7 +41,8 @@ pub use cache::{HttpCache, ResearchCache, StaleEntry};
 pub use costs::{CostEvent, CostLedger, CostSummary, SpentTotal};
 #[cfg(feature = "storage")]
 pub use datasets::{
-    diff_values, ChangeKind, Datasets, DupPair, Record, Revision, RevisionPage, UpsertSummary,
+    diff_values, trust_label, ChangeKind, Datasets, DupPair, Record, Revision, RevisionPage,
+    UpsertSummary, TRUST_STABLE,
 };
 #[cfg(feature = "storage")]
 pub use storage::{

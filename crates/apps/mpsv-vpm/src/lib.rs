@@ -379,7 +379,10 @@ impl ScrapeApp for MpsvVpm {
         // preserve the prior `history(key, 10)` semantics exactly.
         let all_revs = ctx
             .datasets
-            .changes_since(&ctx.app, Some("role_region_agg"), None, TRENDS_REVISION_SCAN)
+            // Unfiltered by trust: the trend window is this app's own history and
+            // must not silently shorten because a run was written while the source
+            // was degrading — a short window is a wrong trend, not a safe one.
+            .changes_since(&ctx.app, Some("role_region_agg"), None, TRENDS_REVISION_SCAN, None)
             .await?;
         if all_revs.len() as i64 >= TRENDS_REVISION_SCAN {
             tracing::warn!(
