@@ -29,6 +29,7 @@ pub mod json_salvage;
 pub mod lru;
 pub mod markdown;
 pub mod plugin;
+pub mod resilience;
 pub mod search;
 pub mod simhash;
 
@@ -50,6 +51,12 @@ pub use storage::{
 };
 #[cfg(feature = "storage")]
 pub use tiers::{HostProfile, TierMemory};
+#[cfg(feature = "storage")]
+pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
+pub use resilience::{
+    doc_signals, signals_batch, CohortDrift, Diagnosis, DocSignals, FetchHealth, ObservedDoc,
+    RunReport, RunVerdict, SourceState, SourceVerdict,
+};
 
 pub use catalog::{Catalog, Source};
 pub use config::Config;
