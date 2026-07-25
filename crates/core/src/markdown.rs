@@ -50,49 +50,83 @@ pub fn text_len_capped(html: &str, cap: usize) -> usize {
         return 0;
     }
     let doc = Html::parse_document(html);
-    let mut count = 0usize;
-    // Mirror `push_text`: a leading whitespace at a word boundary isn't counted.
-    let mut prev_ws = true;
-    count_text(doc.tree.root(), cap, &mut count, &mut prev_ws);
-    count
+    let mut acc = TextAcc { cap, count: 0, prev_ws: true, out: None };
+    walk_visible_text(doc.tree.root(), &mut acc);
+    acc.count
 }
 
-fn count_text(node: NodeRef<Node>, cap: usize, count: &mut usize, prev_ws: &mut bool) {
-    if *count >= cap {
+/// The visible text itself, under the same rules as [`text_len_capped`] (SKIP
+/// subtrees dropped, whitespace collapsed, truncated at `cap` chars).
+///
+/// This is the input to the *content* fingerprint in the extraction-health
+/// detector: fingerprinting raw HTML would make every markup change look like a
+/// content change and destroy the text-blind/structure-blind asymmetry the
+/// detector depends on. Takes a parsed tree because the caller usually already
+/// has one (and needs it for the DOM fingerprint too).
+pub fn visible_text_capped(doc: &Html, cap: usize) -> String {
+    if cap == 0 {
+        return String::new();
+    }
+    let mut out = String::new();
+    let mut acc = TextAcc { cap, count: 0, prev_ws: true, out: Some(&mut out) };
+    walk_visible_text(doc.tree.root(), &mut acc);
+    out
+}
+
+/// Shared state for the visible-text walk: counts chars, and optionally collects
+/// them. One walker so the counting predicate and the collected text can never
+/// disagree about what "visible" means.
+struct TextAcc<'a> {
+    cap: usize,
+    count: usize,
+    /// Mirrors `push_text`: a leading whitespace at a word boundary isn't counted.
+    prev_ws: bool,
+    out: Option<&'a mut String>,
+}
+
+impl TextAcc<'_> {
+    fn done(&self) -> bool {
+        self.count >= self.cap
+    }
+
+    fn push(&mut self, ch: char) {
+        if ch.is_whitespace() {
+            if self.prev_ws {
+                return;
+            }
+            self.prev_ws = true;
+            self.count += 1;
+            if let Some(out) = self.out.as_deref_mut() {
+                out.push(' ');
+            }
+        } else {
+            self.prev_ws = false;
+            self.count += 1;
+            if let Some(out) = self.out.as_deref_mut() {
+                out.push(ch);
+            }
+        }
+    }
+}
+
+fn walk_visible_text(node: NodeRef<Node>, acc: &mut TextAcc) {
+    if acc.done() {
         return;
     }
     match node.value() {
         Node::Text(text) => {
             for ch in text.text.chars() {
-                if ch.is_whitespace() {
-                    if !*prev_ws {
-                        *count += 1;
-                        *prev_ws = true;
-                    }
-                } else {
-                    *count += 1;
-                    *prev_ws = false;
-                }
-                if *count >= cap {
+                acc.push(ch);
+                if acc.done() {
                     return;
                 }
             }
         }
-        Node::Element(el) => {
-            if SKIP.contains(&el.name()) {
-                return;
-            }
-            for child in node.children() {
-                count_text(child, cap, count, prev_ws);
-                if *count >= cap {
-                    return;
-                }
-            }
-        }
+        Node::Element(el) if SKIP.contains(&el.name()) => {}
         _ => {
             for child in node.children() {
-                count_text(child, cap, count, prev_ws);
-                if *count >= cap {
+                walk_visible_text(child, acc);
+                if acc.done() {
                     return;
                 }
             }
@@ -356,7 +390,22 @@ fn normalize(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{html_to_markdown, text_len_capped};
+    use super::{html_to_markdown, text_len_capped, visible_text_capped};
+
+    #[test]
+    fn visible_text_agrees_with_the_counter_and_drops_the_same_boilerplate() {
+        let html = "<nav>Home About</nav><p>Real content here.</p><script>var x=1;</script>";
+        let doc = scraper::Html::parse_document(html);
+        let text = visible_text_capped(&doc, 1000);
+        assert!(text.contains("Real content here."), "{text}");
+        assert!(!text.contains("Home"), "nav leaked into the content fingerprint: {text}");
+        assert!(!text.contains("var x"), "script leaked into the content fingerprint: {text}");
+        // The collector and the counter must never disagree about "visible".
+        assert_eq!(text.chars().count(), text_len_capped(html, 1000));
+        // Truncation is by the same cap.
+        assert_eq!(visible_text_capped(&doc, 4).chars().count(), 4);
+        assert!(visible_text_capped(&doc, 0).is_empty());
+    }
 
     #[test]
     fn text_len_capped_saturates_and_agrees_with_markdown_on_the_threshold() {

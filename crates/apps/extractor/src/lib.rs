@@ -56,7 +56,9 @@ fn summarize_reports<'a>(reports: impl IntoIterator<Item = &'a DocReport>) -> (u
             total += 1;
             let entry = misses.entry(field.as_str()).or_default();
             match status {
-                FieldStatus::Matched => matched += 1,
+                // A container that matched but held no items is not a miss — the
+                // listing selector still binds, the listing is just quiet.
+                FieldStatus::Matched | FieldStatus::ContainerEmpty => matched += 1,
                 FieldStatus::Empty => entry.0 += 1,
                 FieldStatus::Error { .. } => {
                     entry.0 += 1;
@@ -355,7 +357,10 @@ mod tests {
     use pumper_core::{DocReport, FieldStatus};
 
     fn report(pairs: &[(&str, FieldStatus)]) -> DocReport {
-        DocReport { fields: pairs.iter().cloned().map(|(k, v)| (k.to_string(), v)).collect() }
+        DocReport {
+            fields: pairs.iter().cloned().map(|(k, v)| (k.to_string(), v)).collect(),
+            ..DocReport::default()
+        }
     }
 
     #[test]

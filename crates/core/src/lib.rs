@@ -57,10 +57,10 @@ pub use crawl::{
     crawl, CrawlConfig, CrawlPageRecord, CrawlProgressSnapshot, CrawlStats, PageSink, PageSource,
     ProgressFn, RevisitSeed,
 };
-pub use simhash::{hamming, simhash, simhash_value};
+pub use simhash::{dom_simhash, dom_simhash_str, drift, hamming, simhash, simhash_value};
 pub use extract::{
     extract_batch, extract_batch_with_report, extract_one, extract_one_with_report,
-    CompiledRuleSet, DocReport, FieldRule, FieldStatus, Rule, RuleSet, Transform,
+    CoercionStatus, CompiledRuleSet, DocReport, FieldRule, FieldStatus, Rule, RuleSet, Transform,
 };
 pub use engine::{
     profile_browser_dir, profile_cookies_path, profile_dir, validate_profile_name, Browser,

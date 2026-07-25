@@ -2787,7 +2787,7 @@ struct PreviewBody {
     tag = "extract",
     request_body = PreviewBody,
     responses(
-        (status = 200, description = "`{values, report, fields_matched, fields_total}` — extracted values plus the per-field match report (each field `matched`|`empty`|`error`)."),
+        (status = 200, description = "`{values, report, fields_matched, fields_total}` — extracted values plus the report: `report.fields` is the per-field match status (`matched`|`empty`|`container_empty`|`error`) and `report.coercion` the post-transform outcome (`coerced`|`coercion_failed`|`no_transforms`) for fields with a transform chain."),
         (status = 400, description = "Bad request: not exactly one of html|url, non-object `rules`, non-http(s) url, fetch failure/timeout, or rule compile errors — the body then carries a `fields: [{field, error}]` list covering every bad field.", body = Object),
         (status = 413, description = "Fetched body over the preview size budget", body = Object),
     )
@@ -2864,7 +2864,12 @@ async fn extract_preview(
     let fields_matched = report
         .fields
         .values()
-        .filter(|s| matches!(s, pumper_core::FieldStatus::Matched))
+        .filter(|s| {
+            matches!(
+                s,
+                pumper_core::FieldStatus::Matched | pumper_core::FieldStatus::ContainerEmpty
+            )
+        })
         .count();
     Ok(Json(json!({
         "values": values,
