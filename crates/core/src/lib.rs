@@ -29,6 +29,7 @@ pub mod json_salvage;
 pub mod lru;
 pub mod markdown;
 pub mod plugin;
+pub mod resilience;
 pub mod search;
 pub mod simhash;
 
@@ -40,7 +41,8 @@ pub use cache::{HttpCache, ResearchCache, StaleEntry};
 pub use costs::{CostEvent, CostLedger, CostSummary, SpentTotal};
 #[cfg(feature = "storage")]
 pub use datasets::{
-    diff_values, ChangeKind, Datasets, DupPair, Record, Revision, RevisionPage, UpsertSummary,
+    diff_values, trust_label, ChangeKind, Datasets, DupPair, Record, Revision, RevisionPage,
+    UpsertSummary, TRUST_STABLE,
 };
 #[cfg(feature = "storage")]
 pub use storage::{
@@ -50,6 +52,12 @@ pub use storage::{
 };
 #[cfg(feature = "storage")]
 pub use tiers::{HostProfile, TierMemory};
+#[cfg(feature = "storage")]
+pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
+pub use resilience::{
+    doc_signals, signals_batch, CohortDrift, Diagnosis, DocSignals, FetchHealth, ObservedDoc,
+    RunReport, RunVerdict, SourceState, SourceVerdict,
+};
 
 pub use catalog::{Catalog, Source};
 pub use config::Config;
@@ -57,10 +65,10 @@ pub use crawl::{
     crawl, CrawlConfig, CrawlPageRecord, CrawlProgressSnapshot, CrawlStats, PageSink, PageSource,
     ProgressFn, RevisitSeed,
 };
-pub use simhash::{hamming, simhash, simhash_value};
+pub use simhash::{dom_simhash, dom_simhash_str, drift, hamming, simhash, simhash_value};
 pub use extract::{
     extract_batch, extract_batch_with_report, extract_one, extract_one_with_report,
-    CompiledRuleSet, DocReport, FieldRule, FieldStatus, Rule, RuleSet, Transform,
+    CoercionStatus, CompiledRuleSet, DocReport, FieldRule, FieldStatus, Rule, RuleSet, Transform,
 };
 pub use engine::{
     profile_browser_dir, profile_cookies_path, profile_dir, validate_profile_name, Browser,

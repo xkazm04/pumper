@@ -110,3 +110,29 @@ dir = "data/search-index"
 # failure_url = "https://ops.example.com/pumper/failures"  # optional job.failed firehose
 # failure_secret = "..."                                    # HMAC-SHA256 secret for failure_url
 auto_retry = true   # auto-drain the dead-letter queue: re-send failed deliveries with backoff (30s→1m→5m→30m→2h, then 'dead')
+
+# Extraction health — per-source degradation detection (see
+# docs/features/resilient-extraction.md). Detection is arithmetic over data the
+# extraction pass already produced, so it is effectively free; the only thing
+# with a cost is what it is allowed to gate.
+[resilience]
+enabled = true
+enforce = false             # false = compute and store every verdict, gate NOTHING (soak mode).
+                            # Flip to true only after `GET /sources` shows the false-positive
+                            # rate is acceptable on real data: on an unattended box a false
+                            # quarantine that silently stops a working pipeline is worse than
+                            # a detection that arrives a week late.
+min_cohort_docs = 30        # documents a run needs before distributional tests apply
+window_runs = 20            # healthy runs pooled into the rolling baseline
+degrade_score = 0.6         # score at which a run counts as tripped
+quarantine_score = 0.85     # score at which it also counts as severe
+fetch_ok_floor = 0.7        # below this the run is `inconclusive`: you cannot judge an
+                            # extractor on documents you did not receive
+mad_z = 3.5                 # robust-z flag threshold (Iglewicz-Hoaglin)
+drift_low = 0.08            # normalized fingerprint drift at/below which an input is unchanged
+drift_high = 0.20           # ...and at/above which it has moved
+invariant_refresh_days = 14
+invariant_min_support = 500      # records an invariant must hold over before it is trusted
+invariant_min_confidence = 0.99
+invariant_violation_ratio = 0.2  # fraction of a cohort that must break one to count
+sketch_retention_runs = 60       # runs of per-field sketches kept (>= window_runs)

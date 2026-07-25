@@ -60,9 +60,20 @@ pub enum Rule {
     /// missing a field. Inner fields may be `css` (scoped to the element),
     /// `regex` (over the element's HTML), `const`, or a nested `each`; `json` and
     /// `xpath` inner rules are rejected at compile.
+    ///
+    /// `container` is an optional *enclosing* selector (the listing element that
+    /// holds the items). When set, items are selected inside it and an empty
+    /// result splits into two distinguishable statuses: the container matched but
+    /// held no items ([`FieldStatus::ContainerEmpty`] — "the job board has no
+    /// postings this week") versus the container itself is gone
+    /// ([`FieldStatus::Empty`] — the listing selector broke). Without it both
+    /// collapse into `Empty`, which is the conflation the health detector cannot
+    /// undo after the fact.
     Each {
         selector: String,
         fields: BTreeMap<String, FieldRule>,
+        #[serde(default)]
+        container: Option<String>,
     },
 }
 
@@ -179,11 +190,19 @@ fn compile_rule(rule: &Rule, scoped: bool) -> Result<CompiledRule> {
             ))
         }
         Rule::Const { value } => CompiledRule::Const { value: value.clone() },
-        Rule::Each { selector, fields } => {
+        Rule::Each { selector, fields, container } => {
             let sel = Selector::parse(selector).map_err(|e| {
                 Error::Parse(format!("bad css selector '{selector}' in 'each': {e:?}"))
             })?;
-            CompiledRule::Each { selector: sel, fields: compile_fields(fields, true)? }
+            let container = container
+                .as_deref()
+                .map(|c| {
+                    Selector::parse(c).map_err(|e| {
+                        Error::Parse(format!("bad container selector '{c}' in 'each': {e:?}"))
+                    })
+                })
+                .transpose()?;
+            CompiledRule::Each { selector: sel, fields: compile_fields(fields, true)?, container }
         }
     })
 }
@@ -194,7 +213,11 @@ enum CompiledRule {
     Json { pointer: String },
     Xpath { xpath: skyscraper::xpath::Xpath, all: bool },
     Const { value: Value },
-    Each { selector: Selector, fields: Vec<(String, CompiledRule, Vec<CompiledTransform>)> },
+    Each {
+        selector: Selector,
+        fields: Vec<(String, CompiledRule, Vec<CompiledTransform>)>,
+        container: Option<Selector>,
+    },
 }
 
 /// A transform with its regex pre-compiled.
@@ -396,6 +419,11 @@ pub enum FieldStatus {
     /// The rule ran but produced nothing (`null`, empty string, or empty
     /// array) — the field is absent in this document, not mis-configured.
     Empty,
+    /// An `each` rule with a `container`: the container matched but held zero
+    /// items. Distinct from `Empty` (the container itself is missing) because a
+    /// legitimately quiet listing and a broken listing selector are otherwise
+    /// indistinguishable, and only one of them means the extractor is broken.
+    ContainerEmpty,
     /// The rule could not run: the document was not in the format the rule
     /// needs (e.g. a `json` rule over a body that is not JSON, or an `xpath`
     /// rule over unparseable HTML). Distinguishes a bad input from a real miss.
@@ -404,27 +432,75 @@ pub enum FieldStatus {
 
 impl FieldStatus {
     /// Classifies a rule's raw (pre-transform) output. `ran` is false when the
-    /// rule's required parse failed, so the rule never actually evaluated.
-    fn classify(ran: bool, raw: &Value, detail: &str) -> FieldStatus {
+    /// rule's required parse failed, so the rule never actually evaluated;
+    /// `container_matched` is true only for an `each` rule whose `container`
+    /// selector found its listing element.
+    fn classify(ran: bool, raw: &Value, detail: &str, container_matched: bool) -> FieldStatus {
         if !ran {
             return FieldStatus::Error { detail: detail.to_string() };
         }
-        match raw {
-            Value::Null => FieldStatus::Empty,
-            Value::String(s) if s.trim().is_empty() => FieldStatus::Empty,
-            Value::Array(a) if a.is_empty() => FieldStatus::Empty,
-            _ => FieldStatus::Matched,
+        if !is_blank(raw) {
+            return FieldStatus::Matched;
         }
+        if container_matched {
+            FieldStatus::ContainerEmpty
+        } else {
+            FieldStatus::Empty
+        }
+    }
+
+    /// True when the rule found nothing — the miss signal the health detector
+    /// counts. `ContainerEmpty` is deliberately NOT a miss: the container was
+    /// there, so the selector still binds.
+    pub fn is_miss(&self) -> bool {
+        matches!(self, FieldStatus::Empty | FieldStatus::Error { .. })
     }
 }
 
-/// Per-document field-status map — the report companion to an extracted record.
-/// Status reflects the rule match (before transforms), so it answers "did the
-/// selector find anything?" independent of downstream coercion.
+/// Whether a rule's output counts as "produced nothing": `null`, a
+/// whitespace-only string, or an empty array. Shared by the pre-transform status
+/// and the post-transform coercion check so the two can't disagree.
+fn is_blank(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(s) => s.trim().is_empty(),
+        Value::Array(a) => a.is_empty(),
+        _ => false,
+    }
+}
+
+/// What the transform pipeline did to a field that the selector *did* match —
+/// the orthogonal companion to [`FieldStatus`], which is computed before
+/// transforms and so cannot see this.
+///
+/// The wrong-element failure is precisely "the selector found something, and it
+/// is garbage": `to_number` on `"Add to cart"` yields null while the field still
+/// reports `matched`. A field whose coercion-failure rate jumps while its match
+/// rate stays flat has almost no explanation other than a rebound selector.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CoercionStatus {
+    /// Transforms ran and left a non-empty value.
+    Coerced,
+    /// The selector matched, but the transform chain reduced it to nothing —
+    /// the value was not of the kind the rule expects.
+    CoercionFailed,
+    /// The field has no transforms, so there is nothing to coerce.
+    NoTransforms,
+}
+
+/// Per-document extraction report — the quality companion to an extracted
+/// record. `fields` reflects the rule match (before transforms), so it answers
+/// "did the selector find anything?"; `coercion` answers "and was it the right
+/// kind of thing?" for the fields that have a transform chain.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
-#[serde(transparent)]
 pub struct DocReport {
     pub fields: BTreeMap<String, FieldStatus>,
+    /// Post-transform outcome per field, for fields the selector matched. Empty
+    /// on reports built before this existed (and on rule sets with no
+    /// transforms), so absence means "unknown", never "fine".
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub coercion: BTreeMap<String, CoercionStatus>,
 }
 
 /// Extracts one document into a JSON object. HTML is parsed at most once (only
@@ -457,12 +533,14 @@ fn extract_one_impl(rules: &CompiledRuleSet, doc: &str, want_report: bool) -> (V
     let mut obj = Map::with_capacity(rules.fields.len());
     let mut report = DocReport::default();
     for (name, rule, transforms) in &rules.fields {
-        // (raw value, whether the rule's required parse was available, error detail)
-        let (mut value, ran, detail): (Value, bool, &str) = match rule {
+        // (raw value, whether the rule's required parse was available, error
+        // detail, whether an `each` container selector matched)
+        let (mut value, ran, detail, container_matched): (Value, bool, &str, bool) = match rule {
             CompiledRule::Css { selector, attr, all, html: as_html } => (
                 css_extract(html.as_ref().unwrap(), selector, attr.as_deref(), *all, *as_html),
                 true,
                 "",
+                false,
             ),
             CompiledRule::Regex { re, group } => (
                 re.captures(doc)
@@ -471,37 +549,73 @@ fn extract_one_impl(rules: &CompiledRuleSet, doc: &str, want_report: bool) -> (V
                     .unwrap_or(Value::Null),
                 true,
                 "",
+                false,
             ),
             CompiledRule::Json { pointer } => match json.as_ref() {
-                Some(j) => (j.pointer(pointer).cloned().unwrap_or(Value::Null), true, ""),
-                None => (Value::Null, false, "body did not parse as JSON"),
+                Some(j) => (j.pointer(pointer).cloned().unwrap_or(Value::Null), true, "", false),
+                None => (Value::Null, false, "body did not parse as JSON", false),
             },
             CompiledRule::Xpath { xpath, all } => match xpath_tree.as_ref() {
-                Some(tree) => (xpath_extract(tree, xpath, *all), true, ""),
-                None => (Value::Null, false, "document did not parse as HTML for xpath"),
+                Some(tree) => (xpath_extract(tree, xpath, *all), true, "", false),
+                None => (Value::Null, false, "document did not parse as HTML for xpath", false),
             },
-            CompiledRule::Const { value } => (value.clone(), true, ""),
-            CompiledRule::Each { selector, fields } => (
-                Value::Array(
-                    html.as_ref()
-                        .unwrap()
-                        .select(selector)
-                        .map(|el| extract_scoped(el, fields))
-                        .collect(),
-                ),
-                true,
-                "",
-            ),
+            CompiledRule::Const { value } => (value.clone(), true, "", false),
+            CompiledRule::Each { selector, fields, container } => {
+                let (items, container_matched) =
+                    each_extract(html.as_ref().unwrap(), selector, fields, container.as_ref());
+                (Value::Array(items), true, "", container_matched)
+            }
         };
+        let status = FieldStatus::classify(ran, &value, detail, container_matched);
+        let matched = matches!(status, FieldStatus::Matched);
         if want_report {
-            report.fields.insert(name.clone(), FieldStatus::classify(ran, &value, detail));
+            report.fields.insert(name.clone(), status);
         }
         for t in transforms {
             value = t.apply(value);
         }
+        // Post-transform status: only meaningful where the selector matched and a
+        // transform chain then ran. A field that matched nothing has nothing to
+        // coerce, so it reports `coerced` rather than inventing a second failure.
+        if want_report {
+            let coercion = if transforms.is_empty() {
+                CoercionStatus::NoTransforms
+            } else if matched && is_blank(&value) {
+                CoercionStatus::CoercionFailed
+            } else {
+                CoercionStatus::Coerced
+            };
+            report.coercion.insert(name.clone(), coercion);
+        }
         obj.insert(name.clone(), value);
     }
     (Value::Object(obj), report)
+}
+
+/// Runs an `each` rule, returning `(items, container_matched)`. With no
+/// `container` the items are selected document-wide and `container_matched` is
+/// false (an empty result is just `Empty`, as before). With one, items are
+/// selected *inside* every matching container, and `container_matched` reports
+/// whether the listing element was found at all — the split that separates a
+/// quiet listing from a broken one.
+fn each_extract(
+    html: &Html,
+    selector: &Selector,
+    fields: &[(String, CompiledRule, Vec<CompiledTransform>)],
+    container: Option<&Selector>,
+) -> (Vec<Value>, bool) {
+    match container {
+        None => (html.select(selector).map(|el| extract_scoped(el, fields)).collect(), false),
+        Some(container) => {
+            let mut items = Vec::new();
+            let mut found = false;
+            for root in html.select(container) {
+                found = true;
+                items.extend(root.select(selector).map(|el| extract_scoped(el, fields)));
+            }
+            (items, found)
+        }
+    }
 }
 
 /// Extracts a whole batch in parallel across all cores.
@@ -612,9 +726,20 @@ fn extract_scoped(
                 .map(|m| Value::String(m.as_str().to_string()))
                 .unwrap_or(Value::Null),
             CompiledRule::Const { value } => value.clone(),
-            CompiledRule::Each { selector, fields } => Value::Array(
-                root.select(selector).map(|el| extract_scoped(el, fields)).collect(),
-            ),
+            // A nested `each`'s container (when set) is resolved inside this item,
+            // so a card's own sub-listing splits the same way the top level does.
+            CompiledRule::Each { selector, fields, container } => Value::Array(match container {
+                None => root.select(selector).map(|el| extract_scoped(el, fields)).collect(),
+                Some(container) => root
+                    .select(container)
+                    .flat_map(|inner| {
+                        inner
+                            .select(selector)
+                            .map(|el| extract_scoped(el, fields))
+                            .collect::<Vec<_>>()
+                    })
+                    .collect(),
+            }),
             // json/xpath are rejected at compile inside a container.
             CompiledRule::Json { .. } | CompiledRule::Xpath { .. } => Value::Null,
         };
@@ -837,9 +962,87 @@ mod tests {
 
         // serde round-trips the tagged status enum (preview endpoint depends on it).
         let wire = serde_json::to_value(&report).unwrap();
-        assert_eq!(wire["title"], json!({"status": "matched"}));
-        assert_eq!(wire["name"]["status"], json!("error"));
-        assert!(wire["name"]["detail"].is_string());
+        assert_eq!(wire["fields"]["title"], json!({"status": "matched"}));
+        assert_eq!(wire["fields"]["name"]["status"], json!("error"));
+        assert!(wire["fields"]["name"]["detail"].is_string());
+    }
+
+    #[test]
+    fn coercion_status_separates_a_matched_selector_from_an_uncoercible_value() {
+        use super::{extract_one_with_report, CoercionStatus, FieldStatus};
+        let rules = ruleset(json!({
+            // The wrong-element case: the selector matches, the value is prose.
+            "price":  {"type": "css", "selector": ".p", "transforms": [{"op": "to_number"}]},
+            // Same rule, a coercible value.
+            "weight": {"type": "css", "selector": ".w", "transforms": [{"op": "to_number"}]},
+            // No transforms → nothing to coerce.
+            "title":  {"type": "css", "selector": "h1"},
+            // A miss is not a coercion failure — there was nothing to coerce.
+            "absent": {"type": "css", "selector": ".nope", "transforms": [{"op": "to_number"}]}
+        }));
+        let doc = r#"<h1>Hi</h1><span class="p">Add to cart</span><span class="w">2.5kg</span>"#
+            .to_string();
+        let (values, report) = extract_one_with_report(&rules, &doc);
+        // The pre-transform status cannot see the problem: the selector matched.
+        assert_eq!(report.fields["price"], FieldStatus::Matched);
+        assert_eq!(values["price"], json!(null));
+        // The post-transform status is what makes it visible.
+        assert_eq!(report.coercion["price"], CoercionStatus::CoercionFailed);
+        assert_eq!(report.coercion["weight"], CoercionStatus::Coerced);
+        assert_eq!(report.coercion["title"], CoercionStatus::NoTransforms);
+        assert_eq!(report.coercion["absent"], CoercionStatus::Coerced);
+    }
+
+    #[test]
+    fn each_container_splits_a_quiet_listing_from_a_broken_selector() {
+        use super::{extract_one_with_report, FieldStatus};
+        let rules = ruleset(json!({
+            "jobs": {"type": "each", "selector": ".job", "container": "#listing",
+                     "fields": {"title": {"type": "css", "selector": "h3"}}}
+        }));
+        // Listing present with items → matched.
+        let (_, full) = extract_one_with_report(
+            &rules,
+            &r#"<div id="listing"><div class="job"><h3>A</h3></div></div>"#.to_string(),
+        );
+        assert_eq!(full.fields["jobs"], FieldStatus::Matched);
+
+        // Listing present, no postings this week → NOT a break.
+        let (values, quiet) = extract_one_with_report(
+            &rules,
+            &r#"<div id="listing"><p>No open roles</p></div>"#.to_string(),
+        );
+        assert_eq!(quiet.fields["jobs"], FieldStatus::ContainerEmpty);
+        assert!(!quiet.fields["jobs"].is_miss(), "a quiet listing must not count as a miss");
+        assert_eq!(values["jobs"], json!([]));
+
+        // Listing itself gone → the selector broke, and this IS a miss.
+        let (_, broken) =
+            extract_one_with_report(&rules, &"<div id=\"other\"></div>".to_string());
+        assert_eq!(broken.fields["jobs"], FieldStatus::Empty);
+        assert!(broken.fields["jobs"].is_miss());
+
+        // Without a container the two cases stay conflated (unchanged behaviour).
+        let bare = ruleset(json!({
+            "jobs": {"type": "each", "selector": ".job",
+                     "fields": {"title": {"type": "css", "selector": "h3"}}}
+        }));
+        let (_, r) = extract_one_with_report(&bare, &"<div id=\"listing\"></div>".to_string());
+        assert_eq!(r.fields["jobs"], FieldStatus::Empty);
+    }
+
+    #[test]
+    fn each_container_scopes_items_to_the_listing() {
+        // Items outside the container are not the listing's items.
+        let rules = ruleset(json!({
+            "jobs": {"type": "each", "selector": ".job", "container": "#listing",
+                     "fields": {"title": {"type": "css", "selector": "h3"}}}
+        }));
+        let doc = r#"<div id="listing"><div class="job"><h3>in</h3></div></div>
+                     <div class="job"><h3>out</h3></div>"#
+            .to_string();
+        let out = &extract_batch(&rules, std::slice::from_ref(&doc))[0];
+        assert_eq!(out["jobs"], json!([{"title": "in"}]));
     }
 
     #[test]

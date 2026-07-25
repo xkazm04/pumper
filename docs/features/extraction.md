@@ -10,6 +10,7 @@ A `RuleSet` maps output fields to rules, compiled once and run over document bat
 - `xpath` — XPath over the HTML (pure-Rust `skyscraper`); attribute nodes yield their value, text nodes content, elements recursive text; `all` supported; invalid expressions fail at compile. Covers parent/ancestor axes CSS can't express.
 - `const` — literal value.
 - `each` — **repeating container** for list pages: `{"type":"each","selector":".card","fields":{…}}` runs `fields` **scoped to each matched element**, yielding one object per match (`Value::Array` of objects). This is the correct list-page shape — unlike `css` + `all: true`, which returns independent parallel arrays that silently mis-zip the moment one item is missing a field. Inner fields may be `css` (selects descendants of the element), `regex` (over the element's own HTML), `const`, or a nested `each`; `json`/`xpath` inner rules are rejected at compile. Each item's fields stay bound together, so a missing `.price` is a `null` on *its own* item. (The extractor still upserts one dataset record per document; fanning an `each` array out into one record per item is a separable follow-on.)
+  - Optional `container` — the **enclosing listing element** (`{"type":"each","selector":".job","container":"#listing"}`). Items are then selected inside it, and an empty result splits into two distinguishable statuses: `container_empty` (the listing was found and held nothing — a job board with no postings this week) versus `empty` (the listing itself is gone — the selector broke). Without `container` both collapse into `empty`, and no later analysis can undo the conflation. A nested `each`'s own `container` resolves inside its item.
 
 **Transforms**: each field takes an optional `transforms` chain applied after the rule (element-wise over arrays): `trim`, `lowercase`, `uppercase`, `to_number`, `to_int`, `to_bool`, `regex_replace {pattern, replacement}`, `split {sep, index?}`, `to_markdown` (HTML fragment → clean Markdown; pair with a `css` rule's `html: true`), `default {value}` (on null). Backward compatible — plain rule JSON still parses (serde-flattened `FieldRule`).
 
@@ -23,14 +24,21 @@ Every field extraction carries a **status** so a broken selector no longer colla
 
 - `matched` — the rule ran and produced a non-empty value.
 - `empty` — the rule ran but produced nothing (`null`, empty string, or empty array): the field is absent in this document, not mis-configured.
+- `container_empty` — an `each` rule with a `container` whose listing matched but held zero items. **Not a miss**: the selector still binds.
 - `error` — the rule could not run because the document was the wrong format (a `json` rule over a non-JSON body, or an `xpath` rule over unparseable HTML), with a `detail` string.
 
-Status reflects the **rule match, before transforms** — it answers "did the selector find anything?" independent of downstream coercion. API (`extract.rs`):
+Status reflects the **rule match, before transforms** — it answers "did the selector find anything?" independent of downstream coercion. A second, orthogonal **coercion status** answers the rest, per field with a transform chain:
+
+- `coerced` — transforms ran and left a non-empty value.
+- `coercion_failed` — the selector matched and the transform chain reduced it to nothing. This is the wrong-element signature: `to_number` on `"Add to cart"` yields null while the field still reports `matched`, so a coercion-failure rate that rises while the match rate stays flat has almost no explanation other than a rebound selector.
+- `no_transforms` — nothing to coerce.
+
+API (`extract.rs`):
 
 - `extract_one_with_report(rules, doc) -> (Value, DocReport)`
 - `extract_batch_with_report(rules, docs) -> Vec<(Value, DocReport)>`
 
-`DocReport` is a serde-transparent map `{ field -> {status, detail?} }` (`FieldStatus` is a `status`-tagged enum). Both are serde-stable for downstream serialization.
+`DocReport` is `{fields: {field -> {status, detail?}}, coercion: {field -> status}}` (`FieldStatus` is a `status`-tagged enum; `coercion` is omitted when empty). Both are serde-stable for downstream serialization. **Wire note**: `DocReport` was a serde-*transparent* field map before the coercion status existed, so a reader of `POST /extract/preview` now finds the statuses one level down under `report.fields`.
 
 ### Input modes
 
@@ -45,7 +53,8 @@ Both modes share the extraction + quality-report path and report aggregate quali
 
 - urls mode: `requested`, `fetched`, `skipped`, `failed` (skipped URLs).
 - source mode: `source {app, dataset}`, `requested`, `loaded`, `missing`, `missing_keys` (`[{key, reason}]`).
-- both: `new` / `changed` / `unchanged` (upsert outcome), `fields_matched` / `fields_total` (matched extractions over total attempted), and `worst_fields` — fields that missed at least once, worst first: `{field, misses, errors, miss_rate}` (a miss is an `empty` or `error` status; `miss_rate` is misses ÷ docs). Records are tagged `_url` = source URL / record key.
+- both: `new` / `changed` / `unchanged` (upsert outcome), `fields_matched` / `fields_total` (matched extractions over total attempted), and `worst_fields` — fields that missed at least once, worst first: `{field, misses, errors, miss_rate}` (a miss is an `empty` or `error` status — never `container_empty`; `miss_rate` is misses ÷ docs). Records are tagged `_url` = source URL / record key.
+- both: `health` — the extraction-health verdict for this run (`{verdict, diagnosis, score, state, previous_state, statistical_coverage, reasons, drift}`), or `null` when detection is off. urls mode also reports `fetch_ok_rate`. See [resilient-extraction.md](resilient-extraction.md).
 
 **Artifact-retention caveat**: source mode depends on the origin job's bodies still being on disk. Crawl bodies live in per-job dirs (`data/artifacts/<app>/<job_id>/`) and there is **no retention/GC policy** — bodies persist until manually removed, and once removed those keys land in `missing_keys` on the next extract.
 
@@ -56,7 +65,7 @@ Test a `RuleSet` against one document **without enqueuing a job** — the fast f
 - `rules` — a bare `{field: rule}` map (the same shape apps take), e.g. `{"title": {"type":"css","selector":"h1"}}`. Rules are compiled **field-by-field** (each as a single-field `RuleSet`), so **every** bad field is reported at once, not just the first. On any failure the response is `400 bad_request` with a per-field `fields: [{field, error}]` list covering deserialize errors (unknown rule `type`, missing keys) and compile errors (bad CSS selector / regex / XPath). A non-object `rules` is `400`.
 - `url` mode fetches through the shared **HTTP tier only** (`FetchStrategy::Http` — no browser render, and never the paid Claude tier), under a modest budget: a 15s fetch timeout (exceeded → `400`) and an 8 MiB body cap (over → `413 too_large`). A non-`http(s)` url or a fetch failure is `400`.
 
-On success (`200`): `{values, report, fields_matched, fields_total}` — the extracted values plus the per-field match report (`DocReport`: each field `matched`|`empty`|`error`, see above), so a selector that silently matches nothing is visible immediately. `fields_matched`/`fields_total` are the matched-over-attempted counts.
+On success (`200`): `{values, report, fields_matched, fields_total}` — the extracted values plus the report (`report.fields`: each field `matched`|`empty`|`container_empty`|`error`; `report.coercion`: `coerced`|`coercion_failed`|`no_transforms`, see above), so a selector that silently matches nothing — or matches the wrong thing — is visible immediately. `fields_matched`/`fields_total` are the matched-over-attempted counts.
 
 ## HTML → Markdown
 
@@ -70,6 +79,10 @@ Hot-swappable `.wasm` extractor modules loaded from the plugins dir (`plugins-sr
 
 **Params envelope + manifest.** A plugin can be reused across jobs with different config instead of recompiling a module per variation. The `plugin` app forwards a `plugin_params` object; a params-aware module exports `extract_v2(ptr, len) -> u64` whose input is a `{"doc": .., "params": ..}` JSON envelope (vs the legacy `extract`, which receives just the document). The host prefers `extract_v2` and falls back to `extract` when it's absent, so **plugins built before the envelope keep working unchanged**. A module may also export `describe() -> u64` returning a self-describing manifest (`{name, version, description, params_schema, output_schema}`), read once at load; `GET /plugins` then returns real metadata per plugin (name-only when `describe` is absent). `plugins-src/title-extractor` is the reference implementation of both (`params.tag` extracts an arbitrary tag into `value`). The `plugin` app runs a named plugin over documents in **either** input mode (like `extractor`, exactly one): `urls` (fetch each live, tiered `strategy` incl. `auto_with_research`) or `source: {app, dataset, keys?}` — run over already-crawled stored bodies with no re-fetch, keys defaulting to the firing trigger's `_trigger.keys` then all live records. The crawl→plugin seam shares `AppContext::read_source_artifact` (one hardened path-traversal guard) with the extractor. Source-mode result: `source {app, dataset}`, `requested`, `loaded`, `missing`, `missing_keys`.
 
+## Extraction health
+
+Rule sets rot when sites change, and the quality report above only makes one run's misses visible — it cannot tell a broken selector from a genuinely absent field *in aggregate*. [resilient-extraction.md](resilient-extraction.md) covers the per-source degradation detector built on it: per-field sketches, a markup-shape fingerprint (`dom_simhash`) next to the existing text one, mined invariants, and a health ladder that stops a degrading source from tombstoning its dataset or pushing downstream.
+
 ## Known gaps
 
-- Plugin fuel/memory telemetry isn't surfaced per-run (backlog). No schema-less/LLM-assisted extraction yet (backlog moonshots: NL→RuleSet, self-healing selectors).
+- Plugin fuel/memory telemetry isn't surfaced per-run (backlog). No schema-less/LLM-assisted extraction yet (backlog moonshots: NL→RuleSet, self-healing selectors). Only the `extractor` app reports runs to the health detector; `plugin` and the hardcoded-Rust apps do not yet.

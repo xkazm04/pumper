@@ -180,6 +180,7 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         spent_usd: std::sync::Arc::new(pumper_core::SpentTotal::new(spent_seed)),
         research_cache: state.research_cache.clone(),
         tiers: state.tiers.clone(),
+        health: state.health.clone(),
         plugins: state.plugins.clone(),
         progress: state
             .progress
@@ -268,7 +269,12 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             // One revision batch for this run, shared by watches + triggers.
             let changes = load_run_changes(&state, &job).await;
             if !changes.is_empty() {
-                let by_dataset = group_by_dataset(&changes);
+                let mut by_dataset = group_by_dataset(&changes);
+                // A degrading source never pushes. A webhook is irreversible once
+                // sent, so a source we no longer stand behind is dropped here,
+                // before the hooks — this ordering IS the enforcement, and if it
+                // moves below them the guarantee is gone.
+                suppress_unhealthy(&state, &job.app, &mut by_dataset).await;
                 notify_watches(&state, &job, &by_dataset).await;
                 crate::triggers::fire_dataset_triggers(&state, &job, &by_dataset).await;
             }
@@ -354,8 +360,11 @@ pub async fn reap_once(state: &AppState) {
 /// (empty on error) — side effects never block the job outcome.
 async fn load_run_changes(state: &AppState, job: &Job) -> Vec<pumper_core::Revision> {
     match state
+        // Unfiltered by trust: push suppression is decided per source in
+        // `suppress_unhealthy`, not by filtering rows, so a partially-degraded
+        // app's healthy datasets still deliver.
         .datasets
-        .changes_since(&job.app, None, job.started_at, 1000)
+        .changes_since(&job.app, None, job.started_at, 1000, None)
         .await
     {
         Ok(changes) => changes,
@@ -374,6 +383,36 @@ fn group_by_dataset(
         by_dataset.entry(rev.dataset.as_str()).or_default().push(rev);
     }
     by_dataset
+}
+
+/// Drops the datasets whose source health suppresses outbound pushes, so watches
+/// and triggers never see them.
+///
+/// Per-dataset rather than per-job: one app can serve several datasets, and a
+/// break in one must not silence the others. A no-op unless
+/// `[resilience] enforce` is on.
+async fn suppress_unhealthy(
+    state: &AppState,
+    app: &str,
+    by_dataset: &mut HashMap<&str, Vec<&pumper_core::Revision>>,
+) {
+    if !state.health.enforcing() {
+        return;
+    }
+    let datasets: Vec<&str> = by_dataset.keys().copied().collect();
+    for dataset in datasets {
+        let health = state.health.enforced_state(app, dataset).await;
+        if health.suppresses_pushes() {
+            warn!(
+                %app,
+                dataset,
+                state = health.as_str(),
+                "pushes suppressed: source health is degraded, and a delivered webhook \
+                 cannot be recalled"
+            );
+            by_dataset.remove(dataset);
+        }
+    }
 }
 
 /// Fires `dataset.changed` webhooks at every enabled watch whose dataset saw
@@ -588,12 +627,20 @@ async fn dataset_search_docs(
         ) else {
             continue;
         };
+        // A degrading source never poisons the search index. Because indexing is
+        // delta-driven from the change feed, the skipped revisions are picked up
+        // by the next healthy run's window — or by `search-backfill`.
+        let health = state.health.enforced_state(app, dataset).await;
+        if health.skips_search_index() {
+            warn!(%app, %dataset, state = health.as_str(), "search indexing skipped: source health");
+            continue;
+        }
         // This dataset's revisions from this run. Scoped to `app`/`dataset`
         // explicitly because the indexed dataset (e.g. `grants/unified`) lives in a
         // different app namespace than the running app (e.g. `grants-gov`).
         let revs = match state
             .datasets
-            .changes_since(app, Some(dataset), job.started_at, 100_000)
+            .changes_since(app, Some(dataset), job.started_at, 100_000, None)
             .await
         {
             Ok(revs) => revs,

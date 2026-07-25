@@ -55,6 +55,10 @@ pub struct AppContext {
     pub research_cache: Arc<ResearchCache>,
     /// Learned per-host tier routing (skip the HTTP tier where it never wins).
     pub tiers: Arc<crate::tiers::TierMemory>,
+    /// Extraction health: judges a run against the source's own past, and gates
+    /// the write paths below when enforcement is on. [`Resilience::disabled`]
+    /// makes every consultation a no-op.
+    pub health: Arc<crate::resilience::Resilience>,
     /// Sandboxed WASM plugin host (fuel + memory limited).
     pub plugins: Arc<dyn Plugins>,
     /// Throttled live-progress seam: long-running apps report compact snapshots
@@ -340,7 +344,10 @@ impl AppContext {
 
     /// Upserts one record into `<this app>/<dataset>`, reporting new/changed/unchanged.
     pub async fn upsert(&self, dataset: &str, key: &str, value: &Value) -> Result<ChangeKind> {
-        self.datasets.upsert(&self.app, dataset, key, value).await
+        let (dataset, trust) = self.write_target(dataset).await;
+        self.datasets
+            .upsert_trusted(&self.app, &dataset, key, value, trust)
+            .await
     }
 
     /// Upserts a batch and returns a new/changed/unchanged summary — the primary
@@ -350,7 +357,10 @@ impl AppContext {
         dataset: &str,
         items: &[(String, Value)],
     ) -> Result<UpsertSummary> {
-        self.datasets.upsert_many(&self.app, dataset, items).await
+        let (dataset, trust) = self.write_target(dataset).await;
+        self.datasets
+            .upsert_many_trusted(&self.app, &dataset, items, trust)
+            .await
     }
 
     /// Full-snapshot sync: upserts the batch, then marks previously-seen keys
@@ -358,12 +368,35 @@ impl AppContext {
     /// `items` is the complete current state of the dataset (e.g. a full API
     /// listing) — the summary's `removed` keys are the disappeared-record
     /// signal (delisted grants, closed vacancies, removed listings).
+    ///
+    /// **A degrading source never tombstones its own dataset.** When the source's
+    /// health state suppresses removals this silently downgrades to
+    /// [`upsert_many`](Self::upsert_many): a half-broken run produces a
+    /// short-but-nonempty batch, and removal detection would then tombstone every
+    /// key missing from it — the single most destructive thing a degrading source
+    /// can do. `detect_removed` already refuses an *empty* batch; a partial batch
+    /// is the case that guard does not cover.
+    ///
+    /// The check lives here, in the one method every caller reaches removal
+    /// detection through, rather than in each app — a control wired into one
+    /// caller silently exempts all the others.
     pub async fn sync_many(
         &self,
         dataset: &str,
         items: &[(String, Value)],
     ) -> Result<UpsertSummary> {
-        let mut summary = self.datasets.upsert_many(&self.app, dataset, items).await?;
+        let mut summary = self.upsert_many(dataset, items).await?;
+        let state = self.health.enforced_state(&self.app, dataset).await;
+        if state.suppresses_removals() {
+            tracing::warn!(
+                job = %self.job_id,
+                dataset,
+                state = state.as_str(),
+                "removal detection suppressed: source is degrading, so a short batch \
+                 must not tombstone the keys missing from it"
+            );
+            return Ok(summary);
+        }
         let present: Vec<String> = items.iter().map(|(k, _)| k.clone()).collect();
         summary.removed = self
             .datasets
@@ -371,6 +404,53 @@ impl AppContext {
             .await?;
         Ok(summary)
     }
+
+    /// Where a write to `dataset` goes and what stamp it carries, given the
+    /// source's health. Quarantined sources write to the shadow dataset
+    /// `<dataset>@q`, which is an ordinary dataset — so every existing tool
+    /// (listing, export, changes, duplicates) already works on it.
+    ///
+    /// Returns `(dataset, trust)` unchanged when enforcement is off, which is the
+    /// shipping default: soak mode computes verdicts and gates nothing.
+    async fn write_target(&self, dataset: &str) -> (String, Option<&'static str>) {
+        let state = self.health.enforced_state(&self.app, dataset).await;
+        (crate::resilience::write_dataset(dataset, state), state.trust())
+    }
+
+    /// Judges this run's extraction against the source's own history, records the
+    /// verdict, and moves the source's state. `Ok(None)` when detection is off.
+    ///
+    /// Call this **before** upserting: the state it settles is what
+    /// [`upsert_many`](Self::upsert_many) and [`sync_many`](Self::sync_many) then
+    /// gate on, and judging afterwards would stamp trust and infer removals from
+    /// a verdict that did not exist yet.
+    pub async fn observe_extraction(
+        &self,
+        dataset: &str,
+        docs: &[crate::resilience::ObservedDoc],
+        fetch: crate::resilience::FetchHealth,
+    ) -> Result<Option<crate::resilience::SourceVerdict>> {
+        self.health
+            .observe(
+                &self.app,
+                &crate::resilience::RunReport {
+                    job_id: self.job_id,
+                    dataset,
+                    docs,
+                    fetch,
+                    build_id: build_id(),
+                },
+            )
+            .await
+    }
+}
+
+/// This build's identity, stamped on every run row so a fleet-wide break
+/// correlates with a deploy in one query instead of looking like thirty sites
+/// changing on the same day. `PUMPER_BUILD_ID` when set (a commit sha in CI),
+/// else the crate version.
+fn build_id() -> Option<String> {
+    Some(std::env::var("PUMPER_BUILD_ID").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()))
 }
 
 /// Rejects a string that is not a single safe path segment (empty, `.`/`..`,

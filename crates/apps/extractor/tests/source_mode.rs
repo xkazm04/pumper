@@ -8,11 +8,12 @@ use std::sync::Arc;
 
 use app_extractor::Extractor;
 use async_trait::async_trait;
-use pumper_core::config::{FetcherConfig, GovernorConfig, StorageConfig};
+use pumper_core::config::{FetcherConfig, GovernorConfig, ResilienceConfig, StorageConfig};
 use pumper_core::{
     AppContext, Browser, CostLedger, Datasets, EngineSet, Fetcher, Governor, HttpClient,
     HttpRequest, HttpResponse, NoPlugins, NoProgress, RenderRequest, RenderedPage, ResearchCache,
-    ResearchOutput, ResearchRequest, Researcher, Result, ScrapeApp, SpentTotal, Storage, TierMemory,
+    ResearchOutput, ResearchRequest, Researcher, Resilience, Result, ScrapeApp, SpentTotal, Storage,
+    TierMemory,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
@@ -66,6 +67,9 @@ async fn ctx_with(root: std::path::PathBuf, storage: &Storage, params: Value) ->
         spent_usd: Arc::new(SpentTotal::default()),
         research_cache: Arc::new(ResearchCache::new(pool.clone(), 3600)),
         tiers: Arc::new(TierMemory::new(pool.clone(), 3600)),
+        // Health detection on, enforcement off — the shipping default, so this
+        // test also covers that observing a run never changes what the app returns.
+        health: Arc::new(Resilience::new(pool.clone(), &ResilienceConfig::default())),
         plugins: Arc::new(NoPlugins),
         progress: Arc::new(NoProgress),
         // Must be `<root>/extractor/<job_id>` so the app resolves the shared

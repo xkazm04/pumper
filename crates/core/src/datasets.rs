@@ -40,6 +40,45 @@ pub struct Record {
     pub updated_at: DateTime<Utc>,
     /// Set when a full-snapshot sync no longer contained this key.
     pub removed_at: Option<DateTime<Utc>>,
+    /// How much this record is stood behind: `stable`, `provisional` (written
+    /// while its source was degrading) or `quarantined`. Always populated —
+    /// stored `NULL` reads back as `stable` (see [`trust_label`]).
+    pub trust: String,
+}
+
+/// The trust value a stored `NULL` means.
+///
+/// `records.trust` is `NULL`-defaulted and `NULL` *means* `stable`: a semantic
+/// default, not a sentinel, so every row written before the column existed is
+/// correct by construction and no backfill is required. (`0004_simhash.sql`
+/// added a derived column with a `DEFAULT 0` sentinel and no backfill, which
+/// silently disabled near-dup detection for 3,367 rows — this is the shape that
+/// does not repeat it.) Every reader must treat `NULL` and `"stable"` as the
+/// same value, and this is the one place that decides it.
+pub const TRUST_STABLE: &str = "stable";
+
+/// Normalizes a stored trust value: `NULL` and an empty string are `stable`.
+pub fn trust_label(stored: Option<&str>) -> String {
+    match stored {
+        Some(t) if !t.trim().is_empty() => t.to_string(),
+        _ => TRUST_STABLE.to_string(),
+    }
+}
+
+/// The `trust` predicate shared by the filtered read paths.
+///
+/// One bound parameter, no dynamic SQL: `NULL` matches everything, `'stable'`
+/// matches rows whose stamp is missing *or* literally `stable` (the `NULL`
+/// equivalence), and any other value matches exactly. Written as a single
+/// expression so the record list and the change feed cannot interpret the filter
+/// differently — the failure mode there would be a consumer that believes it
+/// filtered and did not.
+const TRUST_PREDICATE: &str =
+    "(?T IS NULL OR (CASE WHEN ?T = 'stable' THEN COALESCE(trust, 'stable') ELSE trust END) = ?T)";
+
+/// [`TRUST_PREDICATE`] with its placeholder bound to parameter index `n`.
+fn trust_predicate(n: usize) -> String {
+    TRUST_PREDICATE.replace("?T", &format!("?{n}"))
 }
 
 /// One entry in a record's revision history: what changed, when, and the
@@ -57,6 +96,9 @@ pub struct Revision {
     /// Field-level diff vs the previous revision: `{ "path": {"from": .., "to": ..} }`.
     pub diff: Option<Value>,
     pub created_at: DateTime<Utc>,
+    /// Trust of the write that produced this revision — so the era a degrading
+    /// source wrote stays exactly identifiable after the fact.
+    pub trust: String,
 }
 
 /// A keyset page of revisions plus the cursor to fetch the next page (None at
@@ -147,6 +189,20 @@ impl Datasets {
         key: &str,
         value: &Value,
     ) -> Result<ChangeKind> {
+        self.upsert_trusted(app, dataset, key, value, None).await
+    }
+
+    /// [`upsert`](Self::upsert) stamping a trust value on the record and its
+    /// revision. `None` writes `NULL`, which *means* `stable` — see
+    /// [`trust_label`].
+    pub async fn upsert_trusted(
+        &self,
+        app: &str,
+        dataset: &str,
+        key: &str,
+        value: &Value,
+        trust: Option<&str>,
+    ) -> Result<ChangeKind> {
         let hash = hash_value(value);
         let sim = crate::simhash::simhash_value(value) as i64;
         let now = Utc::now();
@@ -162,7 +218,8 @@ impl Datasets {
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         let result =
-            Self::upsert_in_tx(&mut conn, app, dataset, key, value, hash.as_str(), sim, now).await;
+            Self::upsert_in_tx(&mut conn, app, dataset, key, value, hash.as_str(), sim, now, trust)
+                .await;
         match result {
             Ok(kind) => {
                 sqlx::query("COMMIT").execute(&mut *conn).await?;
@@ -178,6 +235,7 @@ impl Datasets {
     /// Transactional body of `upsert`: the SELECT + record write + revision append
     /// run on one connection already inside a write transaction, so they commit
     /// (or roll back) as a unit.
+    #[allow(clippy::too_many_arguments)]
     async fn upsert_in_tx(
         conn: &mut sqlx::SqliteConnection,
         app: &str,
@@ -187,6 +245,7 @@ impl Datasets {
         hash: &str,
         sim: i64,
         now: DateTime<Utc>,
+        trust: Option<&str>,
     ) -> Result<ChangeKind> {
         let existing: Option<(String, String, Option<String>)> = sqlx::query_as(
             "SELECT hash, data, removed_at FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3",
@@ -199,13 +258,19 @@ impl Datasets {
 
         match existing {
             Some((prev, _, removed_at)) if prev.as_str() == hash && removed_at.is_none() => {
+                // Unchanged content, but trust still moves: a source that entered
+                // `degraded` since the last run is no longer stood behind, even for
+                // the records it re-confirmed. Leaving a stale `stable` stamp here
+                // would let a filtered read serve them as trusted.
                 sqlx::query(
-                    "UPDATE records SET last_seen = ?4 WHERE app = ?1 AND dataset = ?2 AND key = ?3",
+                    "UPDATE records SET last_seen = ?4, trust = ?5 \
+                     WHERE app = ?1 AND dataset = ?2 AND key = ?3",
                 )
                 .bind(app)
                 .bind(dataset)
                 .bind(key)
                 .bind(ts(now))
+                .bind(trust)
                 .execute(&mut *conn)
                 .await?;
                 Ok(ChangeKind::Unchanged)
@@ -213,7 +278,8 @@ impl Datasets {
             Some((_, old_data, _)) => {
                 sqlx::query(
                     "UPDATE records SET hash = ?4, data = ?5, simhash = ?6, last_seen = ?7, \
-                     updated_at = ?7, removed_at = NULL WHERE app = ?1 AND dataset = ?2 AND key = ?3",
+                     updated_at = ?7, removed_at = NULL, trust = ?8 \
+                     WHERE app = ?1 AND dataset = ?2 AND key = ?3",
                 )
                 .bind(app)
                 .bind(dataset)
@@ -222,6 +288,7 @@ impl Datasets {
                 .bind(value.to_string())
                 .bind(sim)
                 .bind(ts(now))
+                .bind(trust)
                 .execute(&mut *conn)
                 .await?;
                 let old: Value = serde_json::from_str(&old_data).unwrap_or(Value::Null);
@@ -235,14 +302,15 @@ impl Datasets {
                     Some(value),
                     Some(&diff),
                     now,
+                    trust,
                 )
                 .await?;
                 Ok(ChangeKind::Changed)
             }
             None => {
                 sqlx::query(
-                    "INSERT INTO records (app, dataset, key, hash, data, simhash, first_seen, last_seen, updated_at) \
-                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7)",
+                    "INSERT INTO records (app, dataset, key, hash, data, simhash, first_seen, last_seen, updated_at, trust) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7, ?7, ?8)",
                 )
                 .bind(app)
                 .bind(dataset)
@@ -251,10 +319,13 @@ impl Datasets {
                 .bind(value.to_string())
                 .bind(sim)
                 .bind(ts(now))
+                .bind(trust)
                 .execute(&mut *conn)
                 .await?;
-                Self::add_revision(&mut *conn, app, dataset, key, "new", Some(value), None, now)
-                    .await?;
+                Self::add_revision(
+                    &mut *conn, app, dataset, key, "new", Some(value), None, now, trust,
+                )
+                .await?;
                 Ok(ChangeKind::New)
             }
         }
@@ -264,6 +335,7 @@ impl Datasets {
     /// starting at 1). Runs on the caller-supplied executor so it can share the
     /// caller's transaction — the per-key `MAX(revision)` subquery must see the
     /// same in-flight state as the record write it accompanies.
+    #[allow(clippy::too_many_arguments)]
     async fn add_revision<'e, E>(
         executor: E,
         app: &str,
@@ -273,16 +345,17 @@ impl Datasets {
         data: Option<&Value>,
         diff: Option<&Value>,
         when: DateTime<Utc>,
+        trust: Option<&str>,
     ) -> Result<()>
     where
         E: sqlx::SqliteExecutor<'e>,
     {
         sqlx::query(
-            "INSERT INTO record_revisions (app, dataset, key, revision, change, data, diff, created_at) \
+            "INSERT INTO record_revisions (app, dataset, key, revision, change, data, diff, created_at, trust) \
              VALUES (?1, ?2, ?3, \
                      (SELECT COALESCE(MAX(revision), 0) + 1 FROM record_revisions \
                       WHERE app = ?1 AND dataset = ?2 AND key = ?3), \
-                     ?4, ?5, ?6, ?7)",
+                     ?4, ?5, ?6, ?7, ?8)",
         )
         .bind(app)
         .bind(dataset)
@@ -291,6 +364,7 @@ impl Datasets {
         .bind(data.map(Value::to_string))
         .bind(diff.map(Value::to_string))
         .bind(ts(when))
+        .bind(trust)
         .execute(executor)
         .await?;
         Ok(())
@@ -305,7 +379,7 @@ impl Datasets {
         limit: i64,
     ) -> Result<Vec<Revision>> {
         let rows: Vec<RevisionRow> = sqlx::query_as(
-            "SELECT app, dataset, key, revision, change, data, diff, created_at \
+            "SELECT app, dataset, key, revision, change, data, diff, created_at, trust \
              FROM record_revisions WHERE app = ?1 AND dataset = ?2 AND key = ?3 \
              ORDER BY revision DESC LIMIT ?4",
         )
@@ -320,23 +394,30 @@ impl Datasets {
 
     /// Change feed: revisions across a dataset (or all of an app's datasets when
     /// `dataset` is None), newest first, optionally only those after `since`.
+    /// `trust` filters as in [`changes_page`](Self::changes_page). The worker's
+    /// post-run hooks pass `None` and gate on the source's state instead: a push
+    /// is irreversible, so it is suppressed at the source rather than filtered.
     pub async fn changes_since(
         &self,
         app: &str,
         dataset: Option<&str>,
         since: Option<DateTime<Utc>>,
         limit: i64,
+        trust: Option<&str>,
     ) -> Result<Vec<Revision>> {
-        let rows: Vec<RevisionRow> = sqlx::query_as(
-            "SELECT app, dataset, key, revision, change, data, diff, created_at \
+        let rows: Vec<RevisionRow> = sqlx::query_as(&format!(
+            "SELECT app, dataset, key, revision, change, data, diff, created_at, trust \
              FROM record_revisions \
              WHERE app = ?1 AND (?2 IS NULL OR dataset = ?2) AND (?3 IS NULL OR created_at > ?3) \
+             AND {} \
              ORDER BY created_at DESC LIMIT ?4",
-        )
+            trust_predicate(5)
+        ))
         .bind(app)
         .bind(dataset)
         .bind(since.map(ts))
         .bind(limit)
+        .bind(trust)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Revision::try_from).collect()
@@ -356,7 +437,7 @@ impl Datasets {
     ) -> Result<RevisionPage> {
         let (after_ts, after_rev) = after.map(|(t, r)| (Some(t), Some(r))).unwrap_or((None, None));
         let rows: Vec<RevisionRow> = sqlx::query_as(
-            "SELECT app, dataset, key, revision, change, data, diff, created_at \
+            "SELECT app, dataset, key, revision, change, data, diff, created_at, trust \
              FROM record_revisions WHERE app = ?1 AND dataset = ?2 AND key = ?3 \
              AND (?4 IS NULL OR created_at < ?4 OR (created_at = ?4 AND revision < ?5)) \
              ORDER BY revision DESC LIMIT ?6",
@@ -381,6 +462,10 @@ impl Datasets {
     /// app's datasets when `dataset` is None), newest first, optionally only
     /// those after `since`. `after` is the previous page's last (created_at, rowid);
     /// rowid is the stable tiebreak because a batch can share a microsecond stamp.
+    /// `trust` filters the feed: `None` returns everything, `Some("stable")`
+    /// only what we stand behind (the default for the HTTP surface — a pull API
+    /// is re-readable, so it filters rather than suppressing, and a consumer that
+    /// wants everything can always ask).
     pub async fn changes_page(
         &self,
         app: &str,
@@ -388,22 +473,26 @@ impl Datasets {
         since: Option<DateTime<Utc>>,
         after: Option<(String, i64)>,
         limit: i64,
+        trust: Option<&str>,
     ) -> Result<RevisionPage> {
         let (after_ts, after_rowid) =
             after.map(|(t, r)| (Some(t), Some(r))).unwrap_or((None, None));
-        let rows: Vec<RevisionFeedRow> = sqlx::query_as(
-            "SELECT rowid AS rowid, app, dataset, key, revision, change, data, diff, created_at \
+        let rows: Vec<RevisionFeedRow> = sqlx::query_as(&format!(
+            "SELECT rowid AS rowid, app, dataset, key, revision, change, data, diff, created_at, trust \
              FROM record_revisions \
              WHERE app = ?1 AND (?2 IS NULL OR dataset = ?2) AND (?3 IS NULL OR created_at > ?3) \
              AND (?4 IS NULL OR created_at < ?4 OR (created_at = ?4 AND rowid < ?5)) \
+             AND {} \
              ORDER BY created_at DESC, rowid DESC LIMIT ?6",
-        )
+            trust_predicate(7)
+        ))
         .bind(app)
         .bind(dataset)
         .bind(since.map(ts))
         .bind(after_ts)
         .bind(after_rowid)
         .bind(limit)
+        .bind(trust)
         .fetch_all(&self.pool)
         .await?;
         let next_cursor = ((rows.len() as i64) == limit)
@@ -502,7 +591,10 @@ impl Datasets {
         .bind(ts(now))
         .execute(&mut *conn)
         .await?;
-        Self::add_revision(&mut *conn, app, dataset, key, "removed", None, None, now).await?;
+        // A tombstone carries no trust stamp: removal detection is suppressed
+        // entirely while a source is degrading, so every `removed` revision that
+        // reaches here was written by a source we stand behind.
+        Self::add_revision(&mut *conn, app, dataset, key, "removed", None, None, now, None).await?;
         Ok(())
     }
 
@@ -528,6 +620,18 @@ impl Datasets {
         dataset: &str,
         items: &[(String, Value)],
     ) -> Result<UpsertSummary> {
+        self.upsert_many_trusted(app, dataset, items, None).await
+    }
+
+    /// [`upsert_many`](Self::upsert_many) stamping every record and revision with
+    /// a trust value. `None` writes `NULL`, which *means* `stable`.
+    pub async fn upsert_many_trusted(
+        &self,
+        app: &str,
+        dataset: &str,
+        items: &[(String, Value)],
+        trust: Option<&str>,
+    ) -> Result<UpsertSummary> {
         let mut summary = UpsertSummary::default();
         if items.is_empty() {
             return Ok(summary);
@@ -543,8 +647,18 @@ impl Datasets {
                 let hash = hash_value(value);
                 let sim = crate::simhash::simhash_value(value) as i64;
                 let now = Utc::now();
-                match Self::upsert_in_tx(&mut conn, app, dataset, key, value, hash.as_str(), sim, now)
-                    .await
+                match Self::upsert_in_tx(
+                    &mut conn,
+                    app,
+                    dataset,
+                    key,
+                    value,
+                    hash.as_str(),
+                    sim,
+                    now,
+                    trust,
+                )
+                .await
                 {
                     Ok(ChangeKind::New) => chunk_summary.new.push(key.clone()),
                     Ok(ChangeKind::Changed) => chunk_summary.changed.push(key.clone()),
@@ -800,7 +914,7 @@ impl Datasets {
 
     pub async fn get(&self, app: &str, dataset: &str, key: &str) -> Result<Option<Record>> {
         let row: Option<RecordRow> = sqlx::query_as(
-            "SELECT key, data, first_seen, last_seen, updated_at, removed_at \
+            "SELECT key, data, first_seen, last_seen, updated_at, removed_at, trust \
              FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3",
         )
         .bind(app)
@@ -816,7 +930,7 @@ impl Datasets {
     /// `removed_at` for the live view.
     pub async fn list(&self, app: &str, dataset: &str, limit: i64) -> Result<Vec<Record>> {
         let rows: Vec<RecordRow> = sqlx::query_as(
-            "SELECT key, data, first_seen, last_seen, updated_at, removed_at \
+            "SELECT key, data, first_seen, last_seen, updated_at, removed_at, trust \
              FROM records WHERE app = ?1 AND dataset = ?2 ORDER BY updated_at DESC LIMIT ?3",
         )
         .bind(app)
@@ -830,25 +944,31 @@ impl Datasets {
     /// Keyset page of records ordered (updated_at DESC, key DESC). `after` is
     /// the previous page's last (updated_at-as-stored, key); None starts from
     /// the top. Stable under concurrent writes, unlike OFFSET.
+    /// `trust` filters as in [`changes_page`](Self::changes_page); `None` (the
+    /// default for this surface) returns every record with its stamp populated.
     pub async fn list_page(
         &self,
         app: &str,
         dataset: &str,
         after: Option<(String, String)>,
         limit: i64,
+        trust: Option<&str>,
     ) -> Result<Vec<Record>> {
         let (after_ts, after_key) = after.map(|(t, k)| (Some(t), Some(k))).unwrap_or((None, None));
-        let rows: Vec<RecordRow> = sqlx::query_as(
-            "SELECT key, data, first_seen, last_seen, updated_at, removed_at \
+        let rows: Vec<RecordRow> = sqlx::query_as(&format!(
+            "SELECT key, data, first_seen, last_seen, updated_at, removed_at, trust \
              FROM records WHERE app = ?1 AND dataset = ?2 \
              AND (?3 IS NULL OR updated_at < ?3 OR (updated_at = ?3 AND key < ?4)) \
+             AND {} \
              ORDER BY updated_at DESC, key DESC LIMIT ?5",
-        )
+            trust_predicate(6)
+        ))
         .bind(app)
         .bind(dataset)
         .bind(after_ts)
         .bind(after_key)
         .bind(limit)
+        .bind(trust)
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Record::try_from).collect()
@@ -874,7 +994,7 @@ impl Datasets {
         limit: i64,
     ) -> Result<Vec<Record>> {
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            "SELECT key, data, first_seen, last_seen, updated_at, removed_at \
+            "SELECT key, data, first_seen, last_seen, updated_at, removed_at, trust \
              FROM records WHERE removed_at IS NULL AND app = ",
         );
         qb.push_bind(app);
@@ -917,7 +1037,7 @@ impl Datasets {
         limit: i64,
     ) -> Result<Vec<Record>> {
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            "SELECT key, data, first_seen, last_seen, updated_at, removed_at \
+            "SELECT key, data, first_seen, last_seen, updated_at, removed_at, trust \
              FROM records WHERE removed_at IS NULL AND app = ",
         );
         qb.push_bind(app);
@@ -1054,6 +1174,7 @@ struct RecordRow {
     last_seen: String,
     updated_at: String,
     removed_at: Option<String>,
+    trust: Option<String>,
 }
 
 impl TryFrom<RecordRow> for Record {
@@ -1067,6 +1188,7 @@ impl TryFrom<RecordRow> for Record {
             last_seen: parse_ts(&r.last_seen)?,
             updated_at: parse_ts(&r.updated_at)?,
             removed_at: r.removed_at.as_deref().map(parse_ts).transpose()?,
+            trust: trust_label(r.trust.as_deref()),
         })
     }
 }
@@ -1081,6 +1203,7 @@ struct RevisionRow {
     data: Option<String>,
     diff: Option<String>,
     created_at: String,
+    trust: Option<String>,
 }
 
 /// The change feed needs a stable per-row tiebreak; `record_revisions` has no
@@ -1106,6 +1229,7 @@ impl TryFrom<RevisionRow> for Revision {
             data: r.data.as_deref().and_then(|s| serde_json::from_str(s).ok()),
             diff: r.diff.as_deref().and_then(|s| serde_json::from_str(s).ok()),
             created_at: parse_ts(&r.created_at)?,
+            trust: trust_label(r.trust.as_deref()),
         })
     }
 }
@@ -1188,6 +1312,32 @@ mod tests {
         let diff = diff_values(&old, &new);
         assert_eq!(diff["meta.agency"], json!({ "from": "DOE", "to": "DOD" }));
         assert!(diff.get("meta.codes").is_none());
+    }
+
+    #[test]
+    fn a_missing_trust_stamp_means_stable() {
+        // The whole point of the NULL-means-stable choice: every row written before
+        // the column existed is already correct, so no backfill is required. If
+        // this equivalence ever breaks, 5,000+ pre-migration records silently
+        // become untrusted and drop out of every filtered read.
+        assert_eq!(trust_label(None), TRUST_STABLE);
+        assert_eq!(trust_label(Some("")), TRUST_STABLE);
+        assert_eq!(trust_label(Some("   ")), TRUST_STABLE);
+        assert_eq!(trust_label(Some("stable")), TRUST_STABLE);
+        // Real stamps pass through unchanged.
+        assert_eq!(trust_label(Some("provisional")), "provisional");
+        assert_eq!(trust_label(Some("quarantined")), "quarantined");
+    }
+
+    #[test]
+    fn the_trust_predicate_treats_null_and_stable_alike() {
+        // `stable` must match both an unstamped row and an explicitly stable one,
+        // any other value matches exactly, and no filter matches everything.
+        let sql = trust_predicate(3);
+        assert!(sql.contains("?3"), "{sql}");
+        assert!(!sql.contains("?T"), "placeholder must be substituted: {sql}");
+        assert!(sql.contains("COALESCE(trust, 'stable')"), "{sql}");
+        assert!(sql.starts_with("(?3 IS NULL OR"), "no filter must match everything: {sql}");
     }
 
     #[test]

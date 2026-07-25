@@ -1,13 +1,39 @@
 # Resilient extraction — degradation detection, quarantine & self-repair
 
-> **Status: design, not implemented.** Nothing in this document exists in
-> `crates/` yet. It is written to be built from without asking the author
-> anything. Every other doc in `docs/features/` describes what IS; this one is
-> the exception, and says so at the top so a reader never mistakes it for
-> shipped surface. (Convention note: `docs/features/README.md` says deep design
-> rationale belongs in `docs/harness/`. The brief specified this path, so it
-> lives here; when it ships, this file becomes the descriptive feature doc and
-> the rationale sections below move to `docs/harness/`.)
+> **Status: detection and enforcement are implemented; repair is not.** Sections
+> 0–5 and 7–9 describe shipped surface. §4 (profile registry), §6 (repair), §8.1–8.3
+> (promotion/rollback) and §12's evaluation harness are **not built** — see the
+> per-section markers below and [`IMPLEMENTATION-NOTES.md`](../../IMPLEMENTATION-NOTES.md)
+> at the repo root for what was built, what was deliberately left out and why,
+> and every place the implementation deviates from this design.
+>
+> (Convention note: `docs/features/README.md` says deep design rationale belongs
+> in `docs/harness/`. The brief specified this path, so the rationale still lives
+> here rather than being split mid-flight; the sections below double as the
+> reference for the signals the shipped detector computes.)
+
+## What ships today
+
+| Capability | Status | Where |
+|---|---|---|
+| Post-transform coercion status, `each` container split, `dom_simhash` (§2.3, §2.6) | **shipped** | `core::extract`, `core::simhash` |
+| The seven detection signals, scoring, diagnosis (§2) | **shipped** | `core::resilience::detect` |
+| Per-field sketches + the statistics on them (§2.4) | **shipped** | `core::resilience::sketch` |
+| Mined invariants (§2.5) | **shipped** | `core::resilience::invariants` |
+| Health ladder with hysteresis (§2.7) | **shipped**, minus `retired` (manual only) | `core::resilience::detect::next_state` |
+| Schema + persistence (§5) | **shipped** for the tables detection needs | migration `0020` |
+| Trust stamping, `sync_many` downgrade, push suppression, index skip, quarantine dataset (§7) | **shipped**, gated on `enforce` | `core::app`, `server::worker` |
+| `GET /sources`, `/sources/{id}`, `/sources/{id}/runs`, `POST /sources/{id}/state` (§8.4) | **shipped** | `server::routes` |
+| Config surface + validation (§9) | **shipped** | `[resilience]` |
+| Golden documents (§3.2, §6.3 retention store) | **not built** |  |
+| Profile registry (§4) | **not built** |  |
+| Repair: inversion, Claude proposals, validation gates, promotion, rollback (§6, §8.1–8.3) | **not built** |  |
+| Health webhooks (§7.3), `/metrics` gauges (§8.4) | **not built** |  |
+| `resilience-eval` mutation harness, canary source (§10.9, §12) | **not built** |  |
+
+`[resilience] enforce = false` ships as the default: every verdict is computed and
+stored, nothing is gated. That is §12.6's soak mode, and it is the state the
+system is in until an operator reads `GET /sources` and decides otherwise.
 
 ---
 
@@ -389,6 +415,12 @@ regularity the source has held for its entire history.
 
 ### 3.2 Golden documents: the only exact check, and it is cheap
 
+> **Not built.** The `data/golden/` retention store and the pinned-document
+> check do not exist. The consequence is stated honestly in §10.5: sources that
+> never form a cohort (a single-URL `watch`, a handful of rows) have **no**
+> detection at all today rather than golden-doc-only detection, and
+> `GET /sources/{id}` reports `statistical_coverage: false` for them.
+
 Statistics can be argued with. A pinned document cannot. For each source, keep
 `golden_docs_per_source` (default 8) sampled documents: the **body**, copied out
 of the per-job artifact dir into `data/golden/<source>/<key>.html` so a future
@@ -432,6 +464,12 @@ otherwise would be the dishonest part of the design.
 ---
 
 ## 4. Where rules live: the profile registry (prerequisite for everything in §6)
+
+> **Not built.** Rules remain a job parameter. This section is a prerequisite
+> only for repair, which is also not built; detection keys on `(app, dataset)`
+> and needs none of it. The cost is that `source_runs` cannot stamp a
+> `profile_version`, so the `self_inflicted` diagnosis (§2.3) narrows the era by
+> `build_id` alone.
 
 Today a `RuleSet` is a **job parameter**. It has no identity, no version, and no
 home — it arrives in `POST /apps/extractor/jobs` or sits inside a `schedules`
@@ -631,6 +669,13 @@ test asserting the equivalence.
 
 ## 6. Repair
 
+> **Not built.** No candidate generation, no validation gates, no LLM call, no
+> money spent. A degrading source is detected, quarantined and reported; fixing
+> it is an operator action followed by `POST /sources/{id}/state`. §13's build
+> order puts repair last for exactly this reason: steps 1-5 deliver most of the
+> value at none of the risk, and if the evaluation numbers come back badly steps
+> 6-8 should not land at all.
+
 ### 6.1 When repair is even attempted
 
 All of these must hold:
@@ -801,6 +846,10 @@ the human reviewer: nobody approves anything, but somebody is told.
 ## 8. Promotion, rollback, and the API
 
 ### 8.1 Promotion
+
+> **Not built** (§8.1-8.3). There is nothing to promote or roll back without the
+> profile registry and repair. `POST /sources/{id}/state` is the whole operator
+> surface: it is the only way out of `quarantined`.
 
 `[resilience.repair] mode`:
 
@@ -1059,6 +1108,14 @@ least prevents a coin-flip promotion.
 ---
 
 ## 12. Evaluation plan — proving a design that detects the invisible
+
+> **Not built.** The `resilience-eval` mutation harness, the historical
+> backtest and the canary source do not exist, so the recall and
+> false-positive-rate numbers below are **targets, not measurements**. Nothing
+> in this document reports an observed FPR. That is precisely why `enforce`
+> ships `false`: §12.6's soak is the only evidence currently available, and it
+> accrues in `source_runs` as the fleet runs. Treat every threshold in §9 as a
+> starting guess.
 
 The thing this detects is by definition unobserved, so ground truth has to be
 *manufactured*. Six measurements, each with a number that would falsify part of

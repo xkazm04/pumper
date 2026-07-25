@@ -70,6 +70,10 @@
       "sourceGlobs": ["crates/server/src/routes.rs", "crates/core/src/catalog.rs"]
     },
     {
+      "doc": "docs/features/resilient-extraction.md",
+      "sourceGlobs": ["crates/core/src/resilience/**"]
+    },
+    {
       "doc": "docs/features/apps.md",
       "sourceGlobs": ["crates/apps/**"]
     }

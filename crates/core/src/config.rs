@@ -21,6 +21,82 @@ pub struct Config {
     pub search: SearchConfig,
     pub triggers: TriggersConfig,
     pub webhooks: WebhooksConfig,
+    pub resilience: ResilienceConfig,
+}
+
+/// Extraction-health detection: how a source's runs are judged against its own
+/// past, and whether that judgement is allowed to gate anything.
+///
+/// The two switches are deliberately separate. `enabled = false` is a complete
+/// no-op. `enforce = false` — the shipping default — computes and stores every
+/// verdict while gating nothing: no trust stamps, no suppressed pushes, no
+/// downgraded syncs. That is the soak mode, and enforcement is meant to be
+/// turned on only after `source_runs` shows the false-positive rate is
+/// acceptable on real data. On an unattended box a false quarantine that
+/// silently stops a working pipeline is worse than a detection a week late.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ResilienceConfig {
+    /// Master switch. `false` = no detection, no writes, no reads.
+    pub enabled: bool,
+    /// Whether verdicts gate anything (trust stamping, push suppression,
+    /// `sync_many` downgrade, quarantine datasets, search-index skip).
+    pub enforce: bool,
+    /// Documents a run needs before distributional tests apply. Below it only
+    /// the assumption-free total-collapse rule can fire.
+    pub min_cohort_docs: u32,
+    /// Healthy runs pooled into the rolling baseline.
+    pub window_runs: u32,
+    /// Degradation score at which a run counts as *tripped*.
+    pub degrade_score: f64,
+    /// Score at which a tripped run also counts as *severe*, accelerating
+    /// `degraded` → `quarantined`.
+    pub quarantine_score: f64,
+    /// Below this fraction of successful fetches a run is `inconclusive`: you
+    /// cannot judge an extractor on documents you did not receive.
+    pub fetch_ok_floor: f64,
+    /// Robust-z flag threshold (Iglewicz–Hoaglin) for distributional signals.
+    pub mad_z: f64,
+    /// Normalized fingerprint drift at or below which an input is "unchanged".
+    pub drift_low: f64,
+    /// Normalized fingerprint drift at or above which it has "moved".
+    pub drift_high: f64,
+    /// Days before mined invariants are re-derived from live records.
+    pub invariant_refresh_days: i64,
+    /// Records an invariant must hold over before it is trusted.
+    pub invariant_min_support: u32,
+    /// Fraction of sampled records an invariant must hold on.
+    pub invariant_min_confidence: f64,
+    /// Fraction of a cohort that must break an invariant to count as violated.
+    pub invariant_violation_ratio: f64,
+    /// Runs of per-field sketches kept by the retention janitor.
+    pub sketch_retention_runs: u32,
+}
+
+impl Default for ResilienceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            // Soak first. See the struct doc.
+            enforce: false,
+            min_cohort_docs: 30,
+            window_runs: 20,
+            degrade_score: 0.6,
+            quarantine_score: 0.85,
+            fetch_ok_floor: 0.7,
+            mad_z: 3.5,
+            // A near-duplicate document sits around 0.05 normalized Hamming
+            // distance and two unrelated ones around 0.5, so 0.08/0.20 brackets
+            // "the same page" against "meaningfully different".
+            drift_low: 0.08,
+            drift_high: 0.20,
+            invariant_refresh_days: 14,
+            invariant_min_support: 500,
+            invariant_min_confidence: 0.99,
+            invariant_violation_ratio: 0.2,
+            sketch_retention_runs: 60,
+        }
+    }
 }
 
 /// Global outbound-webhook subscriptions that aren't tied to a per-resource row
@@ -135,6 +211,66 @@ impl Config {
             return Err(Error::Config(
                 "[worker] concurrency must be > 0 — a worker with 0 slots claims no jobs".into(),
             ));
+        }
+
+        // Extraction health. Each rule guards a combination that parses fine and
+        // then produces either a detector that can never fire or one that fires
+        // on everything — both invisible at the config layer.
+        let r = &self.resilience;
+        if r.enabled {
+            // With the quarantine threshold at or below the degrade threshold,
+            // every tripped run is also severe: the whole hysteresis ladder
+            // collapses and one bad run walks a source to quarantine.
+            if r.degrade_score >= r.quarantine_score {
+                return Err(Error::Config(format!(
+                    "[resilience] degrade_score ({}) must be < quarantine_score ({}) — \
+                     otherwise every tripped run is severe and the hysteresis ladder collapses",
+                    r.degrade_score, r.quarantine_score
+                )));
+            }
+            // A floor outside (0,1] either gates nothing (<=0) or gates every run
+            // (>1), and the second silently disables detection entirely.
+            if !(r.fetch_ok_floor > 0.0 && r.fetch_ok_floor <= 1.0) {
+                return Err(Error::Config(format!(
+                    "[resilience] fetch_ok_floor ({}) must be in (0, 1] — \
+                     above 1 every run is inconclusive and nothing is ever judged",
+                    r.fetch_ok_floor
+                )));
+            }
+            // Below 5 documents no proportion test has the power to separate a
+            // broken run from noise, so the cohort floor would be decorative.
+            if r.min_cohort_docs < 5 {
+                return Err(Error::Config(format!(
+                    "[resilience] min_cohort_docs ({}) must be >= 5 — \
+                     no rate test can separate signal from noise below that",
+                    r.min_cohort_docs
+                )));
+            }
+            // An empty baseline window means every run is judged against nothing.
+            if r.window_runs == 0 {
+                return Err(Error::Config(
+                    "[resilience] window_runs must be > 0 — a zero-run baseline \
+                     leaves every run with nothing to be compared against"
+                        .into(),
+                ));
+            }
+            // Drift bands that cross make the divergence table unreadable: a
+            // drift could be simultaneously "unchanged" and "moved".
+            if r.drift_low >= r.drift_high {
+                return Err(Error::Config(format!(
+                    "[resilience] drift_low ({}) must be < drift_high ({})",
+                    r.drift_low, r.drift_high
+                )));
+            }
+            // Sketches are the baseline substrate; keeping fewer than the window
+            // means the baseline read silently sees a short window.
+            if r.sketch_retention_runs < r.window_runs {
+                return Err(Error::Config(format!(
+                    "[resilience] sketch_retention_runs ({}) must be >= window_runs ({}) — \
+                     otherwise retention prunes the baseline the detector reads",
+                    r.sketch_retention_runs, r.window_runs
+                )));
+            }
         }
 
         // A cap below the base means the very first penalty already exceeds it, so
@@ -622,6 +758,46 @@ mod tests {
         cfg.worker.concurrency = 0;
         let err = cfg.validate().unwrap_err().to_string();
         assert!(err.contains("concurrency"), "{err}");
+    }
+
+    #[test]
+    fn resilience_thresholds_that_collapse_the_ladder_are_rejected() {
+        let mut cfg = Config::default();
+        cfg.resilience.degrade_score = 0.9;
+        cfg.resilience.quarantine_score = 0.85;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("degrade_score"), "{err}");
+
+        // A fetch floor above 1 makes every run inconclusive — detection off.
+        let mut cfg = Config::default();
+        cfg.resilience.fetch_ok_floor = 1.5;
+        assert!(cfg.validate().unwrap_err().to_string().contains("fetch_ok_floor"));
+
+        // Retention shorter than the baseline window prunes what the detector reads.
+        let mut cfg = Config::default();
+        cfg.resilience.window_runs = 20;
+        cfg.resilience.sketch_retention_runs = 5;
+        assert!(cfg.validate().unwrap_err().to_string().contains("sketch_retention_runs"));
+    }
+
+    #[test]
+    fn disabled_resilience_skips_its_own_rules() {
+        // `enabled = false` is a complete no-op, so a nonsense threshold in a
+        // section nothing reads must not refuse the boot.
+        let mut cfg = Config::default();
+        cfg.resilience.enabled = false;
+        cfg.resilience.degrade_score = 0.99;
+        cfg.resilience.quarantine_score = 0.1;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn resilience_ships_in_soak_mode() {
+        // The shipping default detects and stores but gates nothing. If this flips
+        // by accident, a fresh install starts suppressing pushes on day one.
+        let r = ResilienceConfig::default();
+        assert!(r.enabled, "detection is on by default");
+        assert!(!r.enforce, "enforcement must be opt-in after a soak");
     }
 
     #[test]

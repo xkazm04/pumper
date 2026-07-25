@@ -44,6 +44,7 @@ use crate::state::AppState;
         (name = "plugins", description = "WASM plugin host"),
         (name = "events", description = "Server-sent event streams"),
         (name = "hosts", description = "Learned per-host tier memory and politeness"),
+        (name = "sources", description = "Extraction health: per-source degradation detection"),
         (name = "profiles", description = "Session vault: named login profiles"),
         (name = "meta", description = "The OpenAPI document itself"),
     )
@@ -108,6 +109,10 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(closing_soon))
         .routes(routes!(catalog_sources))
         .routes(routes!(catalog_health))
+        .routes(routes!(list_sources))
+        .routes(routes!(get_source))
+        .routes(routes!(source_runs))
+        .routes(routes!(set_source_state))
         .routes(routes!(openapi_json))
 }
 
@@ -1215,6 +1220,29 @@ struct RecordsQuery {
     limit: i64,
     /// Opaque keyset cursor; presence switches to `{items, next_cursor}`.
     cursor: Option<String>,
+    /// Trust filter: `all` (default here — every record carries its own `trust`
+    /// field, so the raw dataset view stays complete), `stable`, `provisional` or
+    /// `quarantined`.
+    #[serde(default = "default_trust_all")]
+    trust: String,
+}
+
+/// `GET /datasets/...` returns everything by default: the records carry their own
+/// stamp, so a consumer can see and decide.
+fn default_trust_all() -> String {
+    "all".to_string()
+}
+
+/// `GET /changes` returns only what we stand behind by default. A pull API is
+/// re-readable and therefore recoverable, so it filters rather than suppressing —
+/// and a consumer that wants everything can always ask for `trust=all`.
+fn default_trust_stable() -> String {
+    pumper_core::datasets::TRUST_STABLE.to_string()
+}
+
+/// Maps the query value to the store's filter: `all` means no predicate.
+fn trust_filter(raw: &str) -> Option<&str> {
+    (raw != "all").then_some(raw)
 }
 
 /// Pulls the repeatable `filter` query params out of the raw pair list. axum's
@@ -1333,7 +1361,10 @@ async fn list_records(
     };
     let after = parse_cursor(cursor);
     let records = if filters.is_empty() {
-        state.datasets.list_page(&app, &dataset, after, limit).await?
+        state
+            .datasets
+            .list_page(&app, &dataset, after, limit, trust_filter(&query.trust))
+            .await?
     } else {
         state.datasets.list_filtered(&app, &dataset, &filters, after, limit).await?
     };
@@ -1497,7 +1528,9 @@ fn stream_export(
             // Same keyset cursor tuple drives both paths; `list_filtered` pushes the
             // predicates into SQL so an unmatched row is never deserialized.
             let batch = match if filters.is_empty() {
-                state.datasets.list_page(&app, &dataset, after.clone(), BATCH).await
+                // An export is a complete copy by definition, so it is never trust
+                // filtered — each record carries its stamp in the payload.
+                state.datasets.list_page(&app, &dataset, after.clone(), BATCH, None).await
             } else {
                 state.datasets.list_filtered(&app, &dataset, &filters, after.clone(), BATCH).await
             } {
@@ -1631,6 +1664,12 @@ struct ChangesQuery {
     /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
     /// Pages the full feed past the legacy 1000-row clamp; `since` still applies.
     cursor: Option<String>,
+    /// Trust filter: `stable` (default), `all`, `provisional` or `quarantined`.
+    /// Revisions written while a source was degrading are held back from the
+    /// default feed; nothing written before extraction health existed is affected,
+    /// because an unstamped revision *is* stable.
+    #[serde(default = "default_trust_stable")]
+    trust: String,
 }
 
 /// Change feed for a dataset: new/changed/removed revisions, newest first,
@@ -1652,14 +1691,16 @@ async fn dataset_changes(
     Query(query): Query<ChangesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let since = parse_since(query.since.as_deref())?;
+    let trust = trust_filter(&query.trust);
     let Some(cursor) = &query.cursor else {
         let changes = state
             .datasets
-            .changes_since(&app, Some(&dataset), since, query.limit.clamp(1, 1000))
+            .changes_since(&app, Some(&dataset), since, query.limit.clamp(1, 1000), trust)
             .await?;
         return Ok(Json(json!({
             "app": app,
             "dataset": dataset,
+            "trust": query.trust,
             "count": changes.len(),
             "changes": changes,
         })));
@@ -1667,7 +1708,7 @@ async fn dataset_changes(
     let after = parse_cursor_i64(cursor);
     let page = state
         .datasets
-        .changes_page(&app, Some(&dataset), since, after, query.limit.clamp(1, 1000))
+        .changes_page(&app, Some(&dataset), since, after, query.limit.clamp(1, 1000), trust)
         .await?;
     Ok(Json(json!({ "items": page.items, "next_cursor": page.next_cursor })))
 }
@@ -2084,7 +2125,9 @@ async fn test_trigger(
     let obj = if trigger.source_kind == "dataset" {
         let changes = state
             .datasets
-            .changes_since(&trigger.source_app, None, source.started_at, 1000)
+            // Unfiltered: this is a dry-run preview of what the trigger *would*
+            // see, and the live path suppresses per source rather than by trust.
+            .changes_since(&trigger.source_app, None, source.started_at, 1000, None)
             .await?;
         let matching: Vec<&pumper_core::Revision> = changes
             .iter()
@@ -2787,7 +2830,7 @@ struct PreviewBody {
     tag = "extract",
     request_body = PreviewBody,
     responses(
-        (status = 200, description = "`{values, report, fields_matched, fields_total}` — extracted values plus the per-field match report (each field `matched`|`empty`|`error`)."),
+        (status = 200, description = "`{values, report, fields_matched, fields_total}` — extracted values plus the report: `report.fields` is the per-field match status (`matched`|`empty`|`container_empty`|`error`) and `report.coercion` the post-transform outcome (`coerced`|`coercion_failed`|`no_transforms`) for fields with a transform chain."),
         (status = 400, description = "Bad request: not exactly one of html|url, non-object `rules`, non-http(s) url, fetch failure/timeout, or rule compile errors — the body then carries a `fields: [{field, error}]` list covering every bad field.", body = Object),
         (status = 413, description = "Fetched body over the preview size budget", body = Object),
     )
@@ -2864,7 +2907,12 @@ async fn extract_preview(
     let fields_matched = report
         .fields
         .values()
-        .filter(|s| matches!(s, pumper_core::FieldStatus::Matched))
+        .filter(|s| {
+            matches!(
+                s,
+                pumper_core::FieldStatus::Matched | pumper_core::FieldStatus::ContainerEmpty
+            )
+        })
         .count();
     Ok(Json(json!({
         "values": values,
@@ -3221,7 +3269,227 @@ async fn catalog_health(State(state): State<AppState>) -> Result<Json<Value>, Ap
         }
         out.push(Value::Object(row));
     }
-    Ok(Json(json!({ "checked": out.len(), "stale": stale_count, "sources": out })))
+    Ok(Json(json!({
+        "checked": out.len(),
+        "stale": stale_count,
+        "sources": out,
+        // The two halves of source liveness: this answers "did it run recently",
+        // `/sources` answers "was what it produced right". Neither subsumes the
+        // other, so each points at the other.
+        "see_also": "/sources — extraction health (was the output right?)",
+    })))
+}
+
+// ---- extraction health ------------------------------------------------------
+
+/// Runs returned per source on the detail view — enough to see the ladder being
+/// climbed without paging.
+const SOURCE_RUN_PREVIEW: i64 = 10;
+
+#[derive(Deserialize, IntoParams)]
+struct SourcesQuery {
+    /// Only sources in this state (`healthy|suspect|degraded|quarantined|probation|retired`).
+    state: Option<String>,
+    /// Only sources served by this app.
+    app: Option<String>,
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+/// Extraction-health table: one row per `(app, dataset)` source, worst
+/// degradation score first.
+///
+/// `/catalog/health` answers "did this source run recently"; this answers "was
+/// what it produced right". A source appears here once it has reported a run.
+#[utoipa::path(
+    get,
+    path = "/sources",
+    tag = "sources",
+    params(SourcesQuery),
+    responses(
+        (status = 200, description = "`{enabled, enforcing, count, sources: [{id, app, dataset, \
+            state, degradation_score, state_since, last_verdict, tripped_of_last3, ...}]}`. \
+            `enforcing: false` means verdicts are recorded but nothing is gated."),
+        (status = 503, description = "Detection is disabled ([resilience] enabled = false)", body = Object),
+    )
+)]
+async fn list_sources(
+    State(state): State<AppState>,
+    Query(query): Query<SourcesQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let store = health_store(&state)?;
+    let sources = store
+        .list_sources(query.state.as_deref(), query.app.as_deref(), query.limit.clamp(1, 500))
+        .await?;
+    Ok(Json(json!({
+        "enabled": true,
+        "enforcing": state.health.enforcing(),
+        "count": sources.len(),
+        "sources": sources,
+    })))
+}
+
+/// One source's health in full: its state, the last runs with the tests behind
+/// each verdict, this run's per-field sketch against the baseline, and the mined
+/// invariants.
+#[utoipa::path(
+    get,
+    path = "/sources/{id}",
+    tag = "sources",
+    params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
+    responses(
+        (status = 200, description = "`{source, runs, fields, invariants, statistical_coverage}`. \
+            `fields` pairs the latest run's per-field sketch with its baseline; \
+            `statistical_coverage: false` means the source never reaches the cohort \
+            floor and is monitored only by the assumption-free rules."),
+        (status = 404, description = "Unknown source", body = Object),
+        (status = 503, description = "Detection is disabled", body = Object),
+    )
+)]
+async fn get_source(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    let store = health_store(&state)?;
+    let source = store
+        .source(&id)
+        .await?
+        .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("unknown source '{id}'")))?;
+    let runs = store.runs(&id, SOURCE_RUN_PREVIEW).await?;
+    let cfg = state.health.config();
+    let baseline = store.baseline(&id, cfg.window_runs).await?;
+    // The latest run's sketches, whatever its verdict — the point of this view is
+    // to show what the last run looked like next to what the source normally does.
+    let latest = match runs.first() {
+        Some(run) => store.run_sketches(&id, &run.job_id).await?,
+        None => Default::default(),
+    };
+    let fields: Vec<Value> = latest
+        .iter()
+        .map(|(field, sketch)| {
+            let (base_misses, base_docs) = baseline.pooled_misses(field);
+            json!({
+                "field": field,
+                "docs": sketch.n,
+                "miss_rate": sketch.miss_rate(),
+                "coercion_failure_rate": sketch.coercion_failure_rate(),
+                "distinct_ratio": sketch.distinct_ratio,
+                "mean_len": sketch.mean_len(),
+                "baseline_runs": baseline.runs(field),
+                "baseline_miss_rate":
+                    if base_docs == 0 { Value::Null } else { json!(base_misses as f64 / base_docs as f64) },
+                "baseline_distinct_ratio":
+                    pumper_core::resilience::sketch::median(&baseline.series(field, |s| s.distinct_ratio as f64)),
+            })
+        })
+        .collect();
+    let coverage = runs
+        .first()
+        .map(|r| r.docs >= cfg.min_cohort_docs as i64)
+        .unwrap_or(false);
+    Ok(Json(json!({
+        "source": source,
+        "enforcing": state.health.enforcing(),
+        "statistical_coverage": coverage,
+        "runs": runs,
+        "fields": fields,
+        "invariants": store.invariants(&id).await?,
+        "see_also": "/catalog/health — freshness (did it run?)",
+    })))
+}
+
+#[derive(Deserialize, IntoParams)]
+struct SourceRunsQuery {
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+/// A source's verdict history, newest first. Each run carries the `reasons`
+/// array: every test that ran, its value and its threshold, so a verdict explains
+/// itself without re-running anything.
+#[utoipa::path(
+    get,
+    path = "/sources/{id}/runs",
+    tag = "sources",
+    params(("id" = String, Path, description = "Source id, `<app>/<dataset>`"), SourceRunsQuery),
+    responses(
+        (status = 200, description = "`{id, count, runs: [{job_id, docs, fetch_ok_rate, d_text, \
+            d_dom, d_val, verdict, diagnosis, score, reasons, state_after, build_id, created_at}]}`"),
+        (status = 503, description = "Detection is disabled", body = Object),
+    )
+)]
+async fn source_runs(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(query): Query<SourceRunsQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let runs = health_store(&state)?.runs(&id, query.limit.clamp(1, 500)).await?;
+    Ok(Json(json!({ "id": id, "count": runs.len(), "runs": runs })))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct SourceStateBody {
+    /// `healthy|suspect|degraded|quarantined|probation|retired`.
+    state: String,
+    /// Why — recorded on the row, because the only other thing that moves state
+    /// is the detector.
+    reason: Option<String>,
+}
+
+/// Manual state override: un-quarantine a source that has been fixed, or retire a
+/// dead one.
+///
+/// This is the only way out of `quarantined`. Quarantine is deliberately terminal
+/// without an operator — a stuck source is an acceptable outcome, a source that
+/// silently un-quarantines itself and resumes pushing garbage downstream is not.
+#[utoipa::path(
+    post,
+    path = "/sources/{id}/state",
+    tag = "sources",
+    params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
+    request_body = SourceStateBody,
+    responses(
+        (status = 200, description = "`{id, state, reason}`"),
+        (status = 400, description = "Unrecognized state", body = Object),
+        (status = 404, description = "Unknown source", body = Object),
+        (status = 503, description = "Detection is disabled", body = Object),
+    )
+)]
+async fn set_source_state(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<SourceStateBody>,
+) -> Result<Json<Value>, ApiError> {
+    let store = health_store(&state)?;
+    // Parse strictly here, unlike the fail-open read path: an operator typo must
+    // not silently reset a source to healthy.
+    let parsed = pumper_core::SourceState::parse(&body.state);
+    if parsed.as_str() != body.state {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!(
+                "unknown state '{}' — expected one of healthy|suspect|degraded|quarantined|probation|retired",
+                body.state
+            ),
+        ));
+    }
+    let reason = body.reason.unwrap_or_else(|| "manual override".to_string());
+    if !store.set_state_manual(&id, parsed, &reason).await? {
+        return Err(ApiError(StatusCode::NOT_FOUND, format!("unknown source '{id}'")));
+    }
+    Ok(Json(json!({ "id": id, "state": parsed.as_str(), "reason": reason })))
+}
+
+/// The health store, or 503 when detection is switched off — a health question
+/// asked of a disabled detector has no honest answer, and returning an empty list
+/// would read as "everything is fine".
+fn health_store(state: &AppState) -> Result<&pumper_core::HealthStore, ApiError> {
+    state.health.store().ok_or_else(|| {
+        ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "extraction-health detection is disabled ([resilience] enabled = false)".into(),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -3487,6 +3755,10 @@ mod api_spec_tests {
         "GET /grants/closing-soon",
         "GET /catalog/sources",
         "GET /catalog/health",
+        "GET /sources",
+        "GET /sources/{id}",
+        "GET /sources/{id}/runs",
+        "POST /sources/{id}/state",
         "GET /openapi.json",
     ];
 
