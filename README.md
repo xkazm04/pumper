@@ -80,12 +80,20 @@ Features that lean on what Rust does well and Python can't (easily):
 ## Run
 
 ```powershell
-cargo run -p pumper-server
+cargo run -p pumper-server --bin pumper
 # listening on http://127.0.0.1:8088
 ```
 
+`--bin pumper` is required: the `pumper-server` package also ships the `reindex`
+and `search-backfill` maintenance binaries and sets no `default-run`, so a bare
+`cargo run -p pumper-server` is ambiguous and errors out.
+
+The repo-root `justfile` wraps this and the rest of the loop — `just run`,
+`just dev`, `just test`, `just ci` (`cargo install just`, then `just --list`).
+
 Configuration lives in `config.toml` (all keys optional; see
 `crates/core/src/config.rs` for defaults). `RUST_LOG=debug` for verbose logs.
+Deployment, persistent state and the auth posture: `docs/deployment.md`.
 
 ## API
 

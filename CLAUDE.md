@@ -6,41 +6,36 @@ engines. Cargo workspace, edition 2021, `resolver = "2"`.
 
 ## Commands
 
-All from the repo root (the `.env` loader and the default `config.toml` path are
-both **CWD-relative**). The same recipes are wrapped in the [`justfile`](justfile)
-(`just --list`) — keep the two in sync if you change either.
+The repo-root [`justfile`](justfile) is the **canonical task runner** — prefer it,
+and keep it in sync with anything you change here. Install once with
+`cargo install just`, then `just --list`.
 
-```bash
-cargo check                                  # fast type-check of the whole workspace
-cargo test --workspace                       # what CI runs
-cargo test -- --ignored                      # env-dependent tests (real Chrome, wasm artifact, wall-clock)
-cargo fmt --check                            # CI gate
-cargo clippy --workspace --all-targets       # CI gate
-cargo build -p pumper-server                 # produce the binary
-cargo run -p pumper-server --bin pumper      # boot it -> http://127.0.0.1:8088
-```
+Everything runs **from the repo root**: the `.env` loader and the default
+`config.toml` path are both CWD-relative.
+
+| `just` | raw cargo |
+| --- | --- |
+| `just check` | `cargo check --workspace` |
+| `just test` | `cargo test --workspace` — what CI runs |
+| `just test-ignored` | `cargo test --workspace -- --ignored` — env-dependent (real Chrome, built wasm, timing) |
+| `just lint` | `cargo clippy --workspace --all-targets` — CI gate |
+| `just fmt` / `just fmt-check` | `cargo fmt` / `cargo fmt --check` — CI gate |
+| `just ci` | `fmt-check` + `lint` + `test`, i.e. the whole CI job |
+| `just build` | `cargo build -p pumper-server` |
+| `just run` | `cargo run -p pumper-server --bin pumper` → http://127.0.0.1:8088 |
+| `just dev` | same, with `RUST_LOG=debug` |
+| `just reindex` | `cargo run -p pumper-server --bin reindex` |
+| `just search-backfill <scope>` | `cargo run -p pumper-server --bin search-backfill -- <scope>` |
+| `just plugin <crate>` | builds `plugins-src/<crate>` for `wasm32-unknown-unknown` |
 
 `--bin pumper` is **required**: the `pumper-server` package ships three binaries
 (`pumper`, `reindex`, `search-backfill`) and has no `default-run`, so a bare
-`cargo run -p pumper-server` errors out. (README.md §Run and ONBOARDING.md §8 still
-show the bare form — they are stale on this point.)
+`cargo run -p pumper-server` errors with *"could not determine which binary to
+run"*. The two maintenance binaries must run with the **server stopped** (Tantivy
+holds an exclusive writer lock; `reindex` rewrites derived columns).
 
-`RUST_LOG=debug` for verbose logs. Config is `config.toml`, or `$PUMPER_CONFIG`;
-every key is optional (defaults in `crates/core/src/config.rs`).
-
-Maintenance binaries — **run with the server stopped** (Tantivy holds an exclusive
-writer lock; `reindex` rewrites derived columns):
-
-```bash
-cargo run -p pumper-server --bin reindex                      # recompute every record's SimHash
-cargo run -p pumper-server --bin search-backfill -- --all     # rebuild the full-text index (or --app/--dataset)
-```
-
-WASM plugins build separately, to a different target:
-
-```bash
-cd plugins-src/title-extractor && cargo build --release --target wasm32-unknown-unknown
-```
+Config is `config.toml`, or `$PUMPER_CONFIG`; every key is optional (defaults in
+`crates/core/src/config.rs`).
 
 Doc-sync hook (Node, standalone-runnable; reads a hook payload on stdin):
 
