@@ -22,3 +22,11 @@ Triage:
   cheap (2.3s e2e suite); a second theme's worth would not have fit.
 - One unreproducible full-workspace test flake under compile load (280/1 then 349/0 ×4) —
   watch item; if it recurs, suspect the webhook retry backoff or drain timing under contention.
+
+## Run: 2026-07-26 (second, resume mode) — fmt-the-world
+
+Executed backlog item #2 (user pick): mechanical `cargo fmt` (95 files, +3845/-1184)
+verified behavior-neutral at exact baselines (clippy 36, tests 349/0/7), then enabled
+the CI fmt gate. Timing insight validated: a fmt-the-world commit is only safe on a
+verified-clean tree — the index-empty check before staging is the guard. 2 backlog
+items remain (guard tail, app-coverage tail).
