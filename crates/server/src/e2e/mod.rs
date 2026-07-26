@@ -8,6 +8,7 @@
 //! over `AppState::from_parts` + `pumper_core::testing` — no Chrome, no
 //! network beyond loopback, no real engines.
 
+mod body_limit;
 mod harness;
 mod router;
 mod scheduler_overlap;

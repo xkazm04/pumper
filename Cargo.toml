@@ -102,6 +102,14 @@ thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Error reporting. Default features are deliberate: the `transport` default is
+# reqwest + native-tls, the same stack the HTTP engine already uses (schannel on
+# Windows, no OpenSSL), so it introduces no new *native* dependency — it does
+# pull a second reqwest MAJOR (0.13 alongside the workspace's 0.12), which is the
+# accepted cost of a supported transport. `sentry-tracing` bridges the existing
+# `tracing::error!` sites into Sentry rather than replacing stdout logging.
+sentry = "0.48"
+sentry-tracing = "0.48"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.9"

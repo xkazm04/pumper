@@ -8,6 +8,7 @@
 //! single source the axum routing table and the OpenAPI document are both
 //! generated from — and exposes [`router`] for `main.rs`.
 
+use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
@@ -77,6 +78,45 @@ use watches::*;
 )]
 struct ApiDoc;
 
+/// Ceiling on an inbound request body, applied to every route.
+///
+/// Sized from what the POST surface actually accepts, all of which is
+/// hand-authored JSON config: job `params`, a cron string, a webhook URL + HMAC
+/// secret, a trigger definition, a saved search, a source-state flip.
+/// `POST /jobs/retry` is the widest and it carries only `{app, status, limit}` —
+/// the id list is server-generated and capped at 500. The largest realistic body
+/// on this list is a trigger with an inline payload template, measured in
+/// kilobytes; 1 MiB is three orders of magnitude of headroom, so no legitimate
+/// request can hit it, while an unbounded body can no longer make the process
+/// buffer arbitrary memory before a handler ever runs.
+///
+/// The one endpoint that genuinely takes a *document* rather than config
+/// (`POST /extract/preview`) gets a scoped override — see
+/// [`PREVIEW_BODY_LIMIT_BYTES`] — instead of this number being raised for
+/// everyone.
+pub(crate) const BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Ceiling for `POST /extract/preview`, whose `html` field is a whole web page.
+///
+/// Deliberately equal to `PREVIEW_MAX_BODY_BYTES` in `runtime.rs`, the budget the
+/// same endpoint already enforces on its `url`-fetch path: the two ways to hand
+/// a preview a document must accept the same document, or the same page would
+/// preview through `url` and 413 through `html`.
+pub(crate) const PREVIEW_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+
+/// An "override" that is not larger than the thing it overrides is a
+/// footgun that reads as protection — reject it at compile time.
+const _: () = assert!(PREVIEW_BODY_LIMIT_BYTES > BODY_LIMIT_BYTES);
+
+/// The routes that take a document-sized body, carrying their own larger limit.
+/// Kept as a separate `OpenApiRouter` so the override is scoped by construction
+/// — a route only gets the bigger ceiling by being moved into this function.
+fn large_body_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(extract_preview))
+        .layer(DefaultBodyLimit::max(PREVIEW_BODY_LIMIT_BYTES))
+}
+
 /// Builds the router with every route registered through its `#[utoipa::path]`
 /// annotation, so the axum routing table and the OpenAPI document are generated
 /// from a single source and cannot drift. Registering a route without an
@@ -130,7 +170,6 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(set_saved_search_enabled))
         .routes(routes!(delete_search_dataset))
         .routes(routes!(search_status))
-        .routes(routes!(extract_preview))
         .routes(routes!(list_grants))
         .routes(routes!(closing_soon))
         .routes(routes!(catalog_sources))
@@ -142,6 +181,8 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(datahub_status))
         .routes(routes!(datahub_sync))
         .routes(routes!(openapi_json))
+        // Document-bodied routes, with their own scoped body ceiling.
+        .merge(large_body_router())
 }
 
 pub fn router(state: AppState) -> Router {
@@ -156,7 +197,13 @@ pub fn router(state: AppState) -> Router {
     // accept-encoding are unaffected.
     let router = router
         .layer(tower_http::compression::CompressionLayer::new())
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // Outermost of the three, so it is the first thing an inbound request
+        // meets. `DefaultBodyLimit` works by putting the limit in the request
+        // extensions for `Json`/`Bytes` to read, and the *innermost* layer wins
+        // — which is precisely why `large_body_router`'s per-route override
+        // survives this global one instead of being clobbered by it.
+        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES));
     // CORS is OFF by default (same-origin only). A permissive allow-all on an
     // unauthenticated, mutating, data-bearing API lets any site the operator
     // visits drive it cross-origin (DNS-rebinding defeats the localhost
@@ -394,6 +441,33 @@ mod api_spec_tests {
         assert!(
             undocumented.is_empty(),
             "spec has operations not in the expected inventory (update EXPECTED): {undocumented:?}"
+        );
+    }
+
+    /// Routes exempted from the global [`super::BODY_LIMIT_BYTES`] ceiling by
+    /// living in `large_body_router`. Every entry is a route that takes a
+    /// *document* rather than JSON config; the EXPECTED-diff makes moving a
+    /// route into the larger ceiling a visible, deliberate edit rather than a
+    /// one-line drive-by. Raising the global limit to accommodate a new document
+    /// route is the anti-pattern this list exists to prevent.
+    const EXPECTED_LARGE_BODY: &[&str] = &["POST /extract/preview"];
+
+    #[test]
+    fn only_document_routes_get_the_larger_body_ceiling() {
+        let api = super::large_body_router().split_for_parts().1;
+        let json = serde_json::to_value(&api).expect("spec serializes");
+        let mut ops = BTreeSet::new();
+        for (path, item) in json["paths"].as_object().expect("paths object") {
+            for method in item.as_object().expect("path item object").keys() {
+                ops.insert(format!("{} {}", method.to_uppercase(), path));
+            }
+        }
+        let expected: BTreeSet<String> =
+            EXPECTED_LARGE_BODY.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            ops, expected,
+            "the body-limit override's scope changed — update EXPECTED_LARGE_BODY only if the \
+             new route genuinely accepts a document-sized body"
         );
     }
 
