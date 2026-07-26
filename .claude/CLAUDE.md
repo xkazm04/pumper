@@ -25,3 +25,7 @@ If the change is internal-only (refactor, bugfix without behavior shift, test-on
 **When you add a new feature area (new crate, new app, new server module), add a map entry and its feature doc in the same change.** Feature docs should name: what it does, the API/params surface, the data model (tables/datasets), and known gaps. Keep future-looking ideas out — the Vibeman backlog holds those; docs describe what IS.
 
 Other durable references: `docs/harness/harness-learnings.md` (structural facts + conventions + pattern catalogue — read before large changes), `docs/harness/vision-scan-2026-07-10/` (scan INDEX, wave summaries, trigger design doc).
+
+## Bug fixes ship as extracted, tested functions
+
+A bug fix buried inline in a `run()` body is an unguarded fix — this repo's guard coverage correlates almost perfectly with whether the fix was extracted into a named pure function (measured across 15 bug classes, /architect 2026-07-26). When fixing a bug: extract the predicate/transform into a named function, add a test named after the anti-pattern it defends (`x_not_y` style), and only then wire it into the call site. Conventions ("all sites use helper X") are enforced with an inventory test (EXPECTED-diff idiom in `crates/server/src/routes/mod.rs`), not with a sentence in a doc.
