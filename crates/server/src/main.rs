@@ -1,4 +1,6 @@
 mod datahub;
+#[cfg(test)]
+mod e2e;
 mod events;
 mod progress;
 mod registry;
