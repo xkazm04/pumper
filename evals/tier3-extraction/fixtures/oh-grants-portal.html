@@ -1,0 +1,676 @@
+
+
+<!DOCTYPE html>
+ 
+<html lang="en">
+<head><meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" /><title>
+	Ohio Grants Portal - Public View
+</title>
+    <script type="text/javascript">
+        var globals = {
+            ajaxSaveUrl: "../ajaxSave.ashx",
+            ajaxGetUrl: "../ajaxGet.ashx",
+            logOutUrl: ""
+        };
+    </script>
+
+    <link href="../GetWebResource?type=css" media="screen" type="text/css" rel="StyleSheet" />
+    <link href="../Content/Site.css?v=222023" media="screen" type="text/css" rel="StyleSheet" />
+    <script src="../GetWebResource?type=js" type="text/javascript"></script>
+
+
+    <link rel="icon" type="image/png" href="https://webresources.obm.ohio.gov/SharedFiles/Images/FavIcon/favicon.ico" /><link rel="shortcut icon" href="https://webresources.obm.ohio.gov/SharedFiles/Images/FavIcon/favicon.ico" type="image/png" />
+    <script type="text/javascript">
+        $(document).ready(function () {
+            // Hide the Opportunity Detail.
+            $("#MainContent_OpportunityDetail").hide();
+            // Get the Assistance Listing
+            var GetAssistanceListingBySOID = function (SOID) {
+                var callbackFunction = function () {
+                    $("#opportunityCFDAList").empty();
+                    $(this.result.rows).each(function () {
+                        if (this.IsValid) { //Only valids                            
+                            var textValue = this.AssistanceListingTitle == 0 ? "<No Listing>" : this.AssistanceListingTitle;
+                            var previousText = $("#opportunityCFDAList").text();
+                            $("#opportunityCFDAList").html(previousText + textValue + "\n");
+                        }
+                    });
+                };
+                obm.ajaxGet({ action: "GetAssistanceListingBySOID", StateOpportunityID: SOID }, callbackFunction, true).go();
+            };
+            // Get the Funding Opportunity Category Listing
+            var GetFundingOpportunityCategoryBySOID = function (SOID) {
+                var callbackFunction = function () {
+                    $("#FundingOpportunityCategories").empty();
+                    $(this.result.rows).each(function () {
+                        if (this.IsValid) { //Only valids                            
+                            var textValue = this.FundingOpportunityCategory.Code == 0 ? "<No Category>" : this.FundingOpportunityCategory.Code;
+                            var previousText = $("#FundingOpportunityCategories").text();
+                            $("#FundingOpportunityCategories").html(previousText + textValue + "\n");
+                        }
+                    });
+                };
+                obm.ajaxGet({ action: "GetFundingOpportunityCategoryBySOID", StateOpportunityID: SOID }, callbackFunction, true).go();
+            };
+            // Get the Eligible Applicants
+            var GetEligibleAplicantsBySOID = function (SOID) {
+                var callbackFunction = function () {
+                    $("#selectEligibleApplicants").empty();
+                    $(this.result.rows).each(function () {
+                        if (this.IsValid) { //Only valids                            
+                            var textValue = this.EligibleApplicants.Code == 0 ? "<No Applicant>" : this.EligibleApplicants.Code;
+                            var previousText = $("#selectEligibleApplicants").text();
+                            $("#selectEligibleApplicants").html(previousText + textValue + "\n");
+                        }
+                    });
+                };
+                obm.ajaxGet({ action: "GetEligibleApplicantsBySOID", StateOpportunityID: SOID }, callbackFunction, true).go();
+            };
+            // Get Detail Data
+            var GetStateOpporunityBySOID = function (SOID) {
+                var callbackFunction = function () {
+                    if (this.result != null) {
+                        $(this.result.rows).each(function () {
+                            // Enter Values in Wizard fields.
+                            $("#MainContent_Tid").val(this.ID);
+                            $("#OpportunityNumber").text(this.OpportunityNumber);
+                            $("#OpportunityTitle").text(this.OpportunityTitle);
+                            if (this.ApplicationStartDate != null) {
+                                var startDate = new Date(this.ApplicationStartDate);
+                                var ye = new Intl.DateTimeFormat('en', { year: 'numeric' }).format(startDate)
+                                var mo = new Intl.DateTimeFormat('en', { month: '2-digit' }).format(startDate)
+                                var da = new Intl.DateTimeFormat('en', { day: '2-digit' }).format(startDate)
+                                $("#ApplicationStartDate").text(`${ye}-${mo}-${da}`);
+                            }
+                            if (this.ApplicationDueDate != null) {
+                                var dueDate = new Date(this.ApplicationDueDate);
+                                ye = new Intl.DateTimeFormat('en', { year: 'numeric' }).format(dueDate)
+                                mo = new Intl.DateTimeFormat('en', { month: '2-digit' }).format(dueDate)
+                                da = new Intl.DateTimeFormat('en', { day: '2-digit' }).format(dueDate)
+                                $("#ApplicationDueDate").text(`${ye}-${mo}-${da}`);
+                            }
+                            if (this.ProjectStartDate != null) {
+                                var projectStartDate = new Date(this.ProjectStartDate);
+                                var ye = new Intl.DateTimeFormat('en', { year: 'numeric' }).format(projectStartDate)
+                                var mo = new Intl.DateTimeFormat('en', { month: '2-digit' }).format(projectStartDate)
+                                var da = new Intl.DateTimeFormat('en', { day: '2-digit' }).format(projectStartDate)
+                                $("#ProjectStartDate").text(`${ye}-${mo}-${da}`);
+                            }
+                            if (this.ProjectEndDate != null) {
+                                var projectEndDate = new Date(this.ProjectEndDate);
+                                ye = new Intl.DateTimeFormat('en', { year: 'numeric' }).format(projectEndDate)
+                                mo = new Intl.DateTimeFormat('en', { month: '2-digit' }).format(projectEndDate)
+                                da = new Intl.DateTimeFormat('en', { day: '2-digit' }).format(projectEndDate)
+                                $("#ProjectEndDate").text(`${ye}-${mo}-${da}`);
+                            }
+                            if (this.BudgetPeriodStartDate != null) {
+                                var budgetPeriodStartDate = new Date(this.BudgetPeriodStartDate);
+                                var ye = new Intl.DateTimeFormat('en', { year: 'numeric' }).format(budgetPeriodStartDate)
+                                var mo = new Intl.DateTimeFormat('en', { month: '2-digit' }).format(budgetPeriodStartDate)
+                                var da = new Intl.DateTimeFormat('en', { day: '2-digit' }).format(budgetPeriodStartDate)
+                                $("#budgetPeriodStartDate").text(`${ye}-${mo}-${da}`);
+                            }
+                            if (this.BudgetPeriodEndDate != null) {
+                                var budgetPeriodEndDate = new Date(this.BudgetPeriodEndDate);
+                                ye = new Intl.DateTimeFormat('en', { year: 'numeric' }).format(budgetPeriodEndDate)
+                                mo = new Intl.DateTimeFormat('en', { month: '2-digit' }).format(budgetPeriodEndDate)
+                                da = new Intl.DateTimeFormat('en', { day: '2-digit' }).format(budgetPeriodEndDate)
+                                $("#budgetPeriodEndDate").text(`${ye}-${mo}-${da}`);
+                            }
+                            $("#liquidationPeriod").text(this.LiquidationPeriod);
+                            if (this.MoreInformationURL.length > 0) {
+                                $("#MoreInformationURL").html("<a href=\"" + this.MoreInformationURL + "\" target=\"_blank\" >" + this.MoreInformationURL + "</a>");
+                            }
+                            else {
+                                $("#MoreInformationURL").html("");
+                            }
+                            $("#OverviewDetails").text(this.OverviewDetails);
+                            if (this.EstimatedFunding != 0) {
+                                var estimatedFunding = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(this.EstimatedFunding);
+                                $("#EstimatedFunding").text(estimatedFunding);
+                            }
+                            if (this.AwardFloor != 0) {
+                                var awardFloor = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(this.AwardFloor);
+                                $("#AwardFloor").text(awardFloor);
+                            }
+                            if (this.AwardCeiling != 0) {
+                                var awardCeiling = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(this.AwardCeiling);
+                                $("#AwardCeiling").text(awardCeiling);
+                            }
+                            if (this.AverageAwardSize != 0) {
+                                var averageAward = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD" }).format(this.AverageAwardSize);
+                                $("#AverageAwardSize").text(averageAward);
+                            }
+
+                            $("#MatchingRequired").text("N");
+                            if (this.MatchingRequired) {
+                                $("#MatchingRequired").text("Y");
+                            }
+                            $("#FinancialDetails").text(this.FinancialDetails);
+                            $("#FederalFundingOrganization").text(this.FederalFundingOrganization.FederalGrantorTitle);
+                            $("#AgencyCode").text(this.AgencyDivision.Agency.FullAgencyName);
+                            $("#DivisionName").text(this.AgencyDivision.DivisionName);
+                            $("#DivisionName").text((this.AgencyDivision.DivisionName == "No Division") ? "" : this.AgencyDivision.DivisionName);
+                            $("#ContactFirstName").text(this.ContactFirstName);
+                            $("#ContactLastName").text(this.ContactLastName);
+                            $("#ContactEmail").text(this.ContactEmail);
+                            $("#ContactPhone").text(this.ContactPhone);
+                            $("#contactlDetails").text(this.ContactDetails);
+                        });
+                    }
+                };
+                obm.ajaxGet({ action: "GetFundingOpportunity", Id: SOID }, callbackFunction, true).go();
+            };
+            $('[id*=opportunityList_opportunityLinkButton]').on('click', function (e) {
+                e.preventDefault();
+                //Change details tags to open/not open
+                $("#opportunityDetailOverview").attr("open", "open");
+                $("#opportunityDetailFinancial, #opportunityDetailContact").removeAttr("open");
+
+                // Get the TID
+                var id = $(this).attr('id');
+                var SOID = $('#' + id).data("tid");
+                // Show the Opportunity Details
+                $("#MainContent_OpportunityDetail").show();
+                // Load the Parts of the Detail
+                GetStateOpporunityBySOID(SOID);
+                GetFundingOpportunityCategoryBySOID(SOID);
+                GetAssistanceListingBySOID(SOID);
+                GetEligibleAplicantsBySOID(SOID);
+                // Show the popup.                
+                obm.popup({
+                    title: "State Opportunity",
+                    o: "#MainContent_OpportunityDetail",
+                    buttons: [{
+                        caption: "Register",
+                        type: "submit",
+                        onClick: function () {
+                            location.href = "eligibilityapplication.aspx?id=" + SOID;
+                        }
+                    },
+                    {
+                        caption: "Close",
+                        purpose: "close"
+                    }]
+                });
+            });
+        });
+    </script>
+    <style type="text/css">
+        label {
+        white-space: pre-wrap;
+        } 
+
+        .opporunity-table {
+            width: calc(100% - 2rem);
+            border-style: none;
+        }
+
+        .opporunity-table tr {
+            border-style: hidden;
+        }
+
+        .opporunity-table tr > td:first-child {
+            width: 15vw;
+            text-align: right;
+            border-style: hidden;
+        }
+
+        .opporunity-table tr > td:last-child {
+            width: 30vw;
+            text-align: left;
+            border-style: hidden;
+        }
+
+        .opporunity-table tr > td:before {
+            height: 0;
+        }
+
+        .funding-opportunities-list {
+            list-style: none;
+            padding-left: 0;
+        }
+
+        .funding-opportunities-list > li:not(:first-child) {
+            padding-top: 0.9rem;
+        }
+
+        .funding-opportunities-list > li:not(:last-child) {
+            border-bottom: 1px solid var(--cp-lightgray);
+        }
+
+        .funding-opportunities-list-categories {
+            margin-top: 0.5rem;
+            font-size: 0.9rem;
+        }
+
+        .funding-opportunities-list > li > p {
+            margin-left: 2rem;
+            line-height: 1.2rem;
+            color: var(--cp-black);
+        }
+
+        @media screen and (max-width: 768px) {
+            .opporunity-table tr > td:first-child {
+                width: unset;
+            }
+
+            .opporunity-table tr > td:last-child {
+                width: unset;
+            }
+
+            .opporunity-table-container {
+                max-height: 60vh;
+                overflow-y: scroll;
+            }
+
+            .funding-opportunities-list > li > p {
+                margin-left: 0;
+            }
+        }
+
+        @media screen and (max-width: 480px) {
+            .opporunity-table tr > td:first-child {
+                text-align: center;
+                border-bottom: 1px solid var(--cp-lightgray);
+                font-size: 0.8rem;
+            }
+
+            .opporunity-table tr > td:last-child {
+                font-size: 0.9rem;
+            }
+        }
+    </style>
+
+       
+<style>
+/* SNOW Ticket INC11639825 */
+section.obm-soft-alert-error {
+    display: none !important;
+    opacity: 0;
+    visibility: hidden;
+}
+</style>
+
+</head>
+<body>
+    <form method="post" action="./FundingOpportunities" id="ctl01" novalidate="">
+<div class="aspNetHidden">
+<input type="hidden" name="__VIEWSTATE" id="__VIEWSTATE" value="Xi5PKe+QtAWUCqV/LGpb7ALufLMo76XxDtWsc9VR8eA7MR9YTq0OPWY/+TN48Yaod5zY1TkgIlnA/FrhAbEvOT1fmA/QByeknDWspDpAq22vb0Gy8P+0f+r/Dd7tevM3profkhE6MmfJeIOf74otBBz+9T48QcMNuhc3W6ig1PkgBfBpTCyKDwIGlsrb9c6iYcABgKy8TLjPrzLTbbQ6mDmIUPBHQT54L6IgJB5fWolhuAZmVnWhuVM5wvtpuzEjf1pZcQ==" />
+</div>
+
+<div class="aspNetHidden">
+
+	<input type="hidden" name="__VIEWSTATEGENERATOR" id="__VIEWSTATEGENERATOR" value="3A496AEE" />
+</div>
+        
+        <header id="siteHeader" class="obm-site-header"></header>
+
+        <main class="obm-site-main">
+            <section class="obm-breadcrumb">
+                <span id="MySiteMap"><a href="#MySiteMap_SkipLink" style="position:absolute;left:-10000px;top:auto;width:1px;height:1px;overflow:hidden;">Skip Navigation Links</a><a id="MySiteMap_SkipLink"></a></span>
+            </section>
+
+            <section class="obm-mainleft">
+                
+
+            </section>
+            
+            <section class="obm-mainright">
+                
+    <section id="funding-opportunities-welcome">
+        <h1>Funding Opportunities</h1>
+
+        <section class="obm-main-content">
+                <div>
+                    <span id="MainContent_lblError" style="color:Red;">Currently, there are no funding opportunities to display. Please check back at a later time.</span>
+                </div>
+                <div id="grantSummary">
+                    <ul class="funding-opportunities-list">
+                    
+                    </ul>
+                    <div id="MainContent_OpportunityDetail" class="opporunity-table-container">                
+                        <details open="open" id="opportunityDetailOverview">
+                            <summary>Overview</summary>
+                            <table class="opporunity-table">
+                                <tbody>
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Opportunity Number</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label id="OpportunityNumber"></label>
+                                            <label id="MainContent_Tid"></label>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Opportunity Title</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label id="OpportunityTitle"></label>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Federal Funding Organization</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label id="FederalFundingOrganization"></label>
+                                        </td>
+                                    </tr>
+
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Ohio Funding Opportunity Categories</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label style="text-align: left; width: 100%;" id="FundingOpportunityCategories"></label></td>
+                                    </tr>
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Application Start Date</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label id="ApplicationStartDate"></label>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Application End Date</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label id="ApplicationDueDate"></label>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Project Start Date:</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label id="ProjectStartDate"></label>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Project End Date:</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label id="ProjectEndDate"></label>
+                                        </td>
+                                    </tr>                        
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Liquidation Period:</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label id="liquidationPeriod" />
+                                        </td>
+                                    </tr>
+
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Assistance Listing Number/CFDA</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label id="opportunityCFDAList" style="text-align: left; width: 100%;" />
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Eligible Applicants</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label style="text-align: left; width: 100%;" id="selectEligibleApplicants"></label></td>
+                                    </tr>
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>For More Information</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label id="MoreInformationURL"></label>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Opportunity Details</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label id="OverviewDetails"></label>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>                
+                        </details>
+
+                        <details id="opportunityDetailFinancial">
+                            <summary>Financial</summary>
+                            <table class="opporunity-table">
+                                <tbody>
+                                    <tr>
+                                        <td class="obm-mobile-show">
+                                            <label>Estimated Funding</label></td>
+                                        <td class="obm-mobile-show">
+                                            <label id="EstimatedFunding"></label>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td  class="obm-mobile-show">
+                                            <label>Award Floor</label></td>
+                                        <td  class="obm-mobile-show">
+                                            <label id="AwardFloor"></label>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td  class="obm-mobile-show">
+                                            <label>Award Ceiling</label></td>
+                                        <td  class="obm-mobile-show">
+                                            <label id="AwardCeiling"></label>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td  class="obm-mobile-show">
+                                            <label>Average Award Size</label></td>
+                                        <td  class="obm-mobile-show">
+                                            <label id="AverageAwardSize"></label>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td  class="obm-mobile-show">
+                                            <label>Matching Required?</label></td>
+                                        <td  class="obm-mobile-show">
+                                            <label id="MatchingRequired"></label>
+                                        </td>
+                                    </tr>
+                                    <tr>
+                                        <td  class="obm-mobile-show">
+                                            <label>Financial Details</label></td>
+                                        <td  class="obm-mobile-show">
+                                            <label id="FinancialDetails"></label>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </details>
+
+                        <details id="opportunityDetailContact">
+                            <summary>Contact</summary>
+                                <table class="opporunity-table">
+                                    <tbody>
+                                        <tr>
+                                            <td  class="obm-mobile-show">
+                                                <label>Ohio Agency</label></td>
+                                            <td  class="obm-mobile-show">
+                                                <label id="AgencyCode"></label>
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td  class="obm-mobile-show">
+                                                <label>Division</label></td>
+                                            <td  class="obm-mobile-show">
+                                                <label id="DivisionName"></label>
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td  class="obm-mobile-show">
+                                                <label>Contact Name</label></td>
+                                            <td  class="obm-mobile-show">
+                                                <label id="ContactFirstName"></label>
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td  class="obm-mobile-show">
+                                                <label>Contact Email</label></td>
+                                            <td  class="obm-mobile-show">
+                                                <label id="ContactEmail"></label>
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td  class="obm-mobile-show">
+                                                <label>Contact Phone</label></td>
+                                            <td  class="obm-mobile-show">
+                                                <label id="ContactPhone"></label>
+                                            </td>
+                                        </tr>
+                                        <tr>
+                                            <td  class="obm-mobile-show">
+                                                <label>Contact Details</label></td>
+                                            <td  class="obm-mobile-show">
+                                                <label id="ContactDetails"></label>
+                                            </td>
+                                        </tr>
+                                    </tbody>
+                                </table>
+                            </details>
+                    </div>
+                </div>
+            </section>
+    </section>
+
+    <section id="funding-opportunities-local-dist-tracking">
+        <h1>CARES Act Local Distribution Tracking</h1>
+        <p>Open Template -<i>Coming Soon</i></p>
+        <p>Submit Spreadsheet - <i>Coming Soon</i></p>             
+    </section>
+       
+    <section id="funding-opportunities-agency-programs">
+        <h1>Agency Programs</h1>
+        <p>State of Ohio Agency resources for funding opportunities:</p>       
+
+        <ul class="funding-opportunities-sites grants-site-list">
+            <li>
+                <a href="https://www.grants.gov" target="_blank">Grants.gov</a>
+            </li>
+            <li>
+                <a href="https://odh.ohio.gov/wps/portal/gov/odh/about-us/funding-opportunities/ODH-Grants/" target="_blank">Department of Health: Health</a>
+             </li>
+            <li>
+                <a href="http://ohiodnr.gov/grants" target="_blank">Department of Natural Resources</a>
+             </li>
+            <li>
+                <a href="http://www.dot.state.oh.us/Divisions/Planning/Transit/Pages/Programs.aspx" target="_blank">Department of Transportation</a>
+             </li>
+            <li>
+                <a href="https://www.development.ohio.gov/cs/cs_grantsloansbonds.htm" target="_blank">Development Services Agency</a>
+             </li>
+            <li>
+                <a href="https://www.ems.ohio.gov/grants-non-ems-opportunities.aspx" target="_blank">Emergency Medical Services of Ohio</a>
+             </li>
+            <li>
+                <a href="https://www.epa.ohio.gov/oee/#131364250-environmental-education" target="_blank">Environmental Protection Agency</a>
+             </li>
+            <li>
+                <a href="https://mha.ohio.gov/Schools-and-Communities/Funding-Opportunities" target="_blank">Mental Health and Addiction Services</a>
+             </li>
+            <li>
+                <a href="https://www.ocjs.ohio.gov/grants.stm" target="_blank">Office of Criminal Justice Services</a>
+             </li>
+            <li>
+                <a href="https://www.oac.ohio.gov/grants" target="_blank">Ohio Arts Council</a>
+             </li>
+            <li>
+                <a href="https://www.ohioattorneygeneral.gov/Individuals-and-Families/Victims/VOCA-SVAA-Grants-for-Advocates" target="_blank">Ohio Attorney General – Ohio Crime Victims</a>
+             </li>
+            <li>
+                <a href="https://www.ohioattorneygeneral.gov/Law-Enforcement/Ohio-Law-Enforcement-Gateway" target="_blank">Ohio Attorney General – Ohio Law Enforcement</a>
+             </li>
+            <li>
+                <a href="https://octf.ohio.gov/wps/portal/gov/octf/apply-for-funding/current-funding-opportunities" target="_blank">Ohio Children’s Trust Fund</a>
+             </li>
+            <li>
+                <a href="https://www.mih.ohio.gov/Home/Grant-Opportunities" target="_blank">Ohio Commission on Minority Health</a>
+             </li>
+            <li>
+                <a href="https://www.ohiohighered.org/sgs" target="_blank">Ohio Department of Higher Education</a>
+             </li>
+            <li>
+                <a href="https://www.ochla.ohio.gov/Organizations-Development/Grants-Funding" target="_blank">Ohio Hispanic - Latino Affairs Commission</a>
+             </li>
+            <li>
+                <a href="https://www.ohiohistory.org/preserve/state-historic-preservation-office/hpgrants" target="_blank">Ohio History Connection</a>
+             </li>
+            <li>
+                <a href="https://www.sconet.state.oh.us/grants/" target="_blank">Ohio Supreme Court</a>
+             </li>
+         </ul>
+    </section>
+
+            </section>
+        </main>
+
+        <footer id="siteFooter" class="obm-site-footer">
+        </footer>
+
+    </form>
+
+    <script type="text/javascript">
+
+        function showSaveMessage(sectionTitle, msgsaved) {
+            try {
+                let $savedSection = document.getElementById(sectionTitle); 
+
+                if ($savedSection) {
+                    // remove previous save msg
+                    
+                    let anyEm = $savedSection.lastElementChild;
+
+                    if ((sectionTitle == "contactTitle") && (anyEm && anyEm.innerHTML.substr(0, 8)) == " Funding")
+                    anyEm = $savedSection.lastElementChild.previousSibling;
+
+                    if (anyEm && anyEm.innerHTML.substr(0, 7) == "Section")
+                        $savedSection.removeChild(anyEm);
+                        
+
+                    let createEm = document.createElement('em');;
+                    var emText = "";
+
+                    if (msgsaved && msgsaved == "Saving") {
+                        createEm.classList.add("save-working");
+                        emText = document.createTextNode("Section Saving");
+                    }
+                    else if (msgsaved && msgsaved == "Error") {
+                        createEm.classList.add("save-error");
+                        emText = document.createTextNode("Section Saving Error");
+                    }
+                    else if (msgsaved && msgsaved == "Attachment") {
+                        createEm.classList.add("save-unable");
+                        emText = document.createTextNode("Section requires an Attachment");
+                    }
+                    else {
+                        createEm.classList.add("save-finished");
+                        emText = document.createTextNode("Section Saved " + new Date().toLocaleTimeString());
+                    }
+                    createEm.appendChild(emText);
+                    $savedSection.append(createEm);
+                }
+                else {
+                    var postsEm = document.getElementsByClassName('save-finished');  
+                    for (i in postsEm) {
+                        postsEm[i].remove();
+                    }
+                    
+                }
+            }
+            catch {
+                //Just move on
+            }
+        }
+        
+
+        //Session inspector
+        $(document).ready(function () {
+            obm.sessionManager(60);
+        });
+    </script>
+
+    <!-- Reusable overlay -->
+    <div class="obm-overlay obm-helper-hide"></div>
+</body>
+</html>

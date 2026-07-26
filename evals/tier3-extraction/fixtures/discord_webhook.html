@@ -1,0 +1,728 @@
+<!DOCTYPE html>
+<html dir="ltr" lang="en-US">
+<head>
+  <meta charset="utf-8" />
+  <!-- v27673 -->
+
+
+  <title>Intro to Webhooks &ndash; Discord</title>
+
+  
+
+  <meta name="description" content="Discord's built in Webhooks function as an easy way to get automated messages and data updates sent to a text channel in your server...." /><meta property="og:image" content="https://support.discord.com/hc/theming_assets/01JYJB58V9PVW92W0ZMXZ7WD5A" />
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="Discord" />
+<meta property="og:title" content="Intro to Webhooks" />
+<meta property="og:description" content="Discord's built in Webhooks function as an easy way to get automated messages and data updates sent to a text channel in your server.
+Think of them as one of those fancy pneumatic tube things you u..." />
+<meta property="og:url" content="https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks" />
+<link rel="canonical" href="https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks">
+<link rel="alternate" hreflang="da" href="https://support.discord.com/hc/da/articles/228383668-Introduktion-til-Webhooks">
+<link rel="alternate" hreflang="de" href="https://support.discord.com/hc/de/articles/228383668-Einf%C3%BChrung-in-Webhooks">
+<link rel="alternate" hreflang="en-us" href="https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks">
+<link rel="alternate" hreflang="es" href="https://support.discord.com/hc/es/articles/228383668-Introducci%C3%B3n-a-los-webhooks">
+<link rel="alternate" hreflang="fr" href="https://support.discord.com/hc/fr/articles/228383668-Intro-aux-Webhooks">
+<link rel="alternate" hreflang="hi-in" href="https://support.discord.com/hc/hi-in/articles/228383668-%E0%A4%B5%E0%A5%87%E0%A4%AC%E0%A4%B9%E0%A5%81%E0%A4%95-%E0%A4%95%E0%A4%BE-%E0%A4%87%E0%A4%82%E0%A4%9F-%E0%A4%B0%E0%A5%8B">
+<link rel="alternate" hreflang="it" href="https://support.discord.com/hc/it/articles/228383668-Introduzione-ai-webhook">
+<link rel="alternate" hreflang="ja" href="https://support.discord.com/hc/ja/articles/228383668-%E3%82%A6%E3%82%A7%E3%83%96%E3%83%95%E3%83%83%E3%82%AF%E3%81%AE%E3%81%94%E7%B4%B9%E4%BB%8B">
+<link rel="alternate" hreflang="ko" href="https://support.discord.com/hc/ko/articles/228383668-%EC%9B%B9%ED%9B%84%ED%81%AC-%EC%86%8C%EA%B0%9C">
+<link rel="alternate" hreflang="nl" href="https://support.discord.com/hc/nl/articles/228383668-Inleiding-tot-Webhooks">
+<link rel="alternate" hreflang="pl" href="https://support.discord.com/hc/pl/articles/228383668-Wprowadzenie-do-Webhook%C3%B3w">
+<link rel="alternate" hreflang="pt-br" href="https://support.discord.com/hc/pt-br/articles/228383668-Usando-Webhooks">
+<link rel="alternate" hreflang="ru" href="https://support.discord.com/hc/ru/articles/228383668-%D0%92%D0%B2%D0%B5%D0%B4%D0%B5%D0%BD%D0%B8%D0%B5-%D0%B2-%D0%B2%D0%B5%D0%B1%D1%85%D1%83%D0%BA%D0%B8">
+<link rel="alternate" hreflang="sv" href="https://support.discord.com/hc/sv/articles/228383668-Intro-till-Webhookar">
+<link rel="alternate" hreflang="th" href="https://support.discord.com/hc/th/articles/228383668-%E0%B8%9A%E0%B8%97%E0%B8%99%E0%B8%B3%E0%B9%80%E0%B8%81%E0%B8%B5-%E0%B8%A2%E0%B8%A7%E0%B8%81%E0%B8%B1%E0%B8%9A-Webhook">
+<link rel="alternate" hreflang="tr" href="https://support.discord.com/hc/tr/articles/228383668-Webhook-lara-Giri%C5%9F">
+<link rel="alternate" hreflang="vi" href="https://support.discord.com/hc/vi/articles/228383668-Gi%E1%BB%9Bi-thi%E1%BB%87u-v%E1%BB%81-Webhook">
+<link rel="alternate" hreflang="x-default" href="https://support.discord.com/hc/en-us/articles/228383668-Intro-to-Webhooks">
+<link rel="alternate" hreflang="zh-tw" href="https://support.discord.com/hc/zh-tw/articles/228383668-Webhook-%E5%85%A5%E9%96%80">
+
+  <link rel="stylesheet" href="//static.zdassets.com/hc/assets/application-a0388d981956f946c99f5a52a4eaf6f2.css" media="all" id="stylesheet" />
+  <link rel="stylesheet" type="text/css" href="/hc/theming_assets/678183/96508/style.css?digest=41866932687383">
+
+  <link rel="icon" type="image/x-icon" href="/hc/theming_assets/01J18JAH0XZ9WSX8W5QJAMN2FM">
+
+    <script async src="https://www.googletagmanager.com/gtag/js?id=G-YL03HBJY7E"></script>
+<script>
+  window.dataLayer = window.dataLayer || [];
+  function gtag(){dataLayer.push(arguments);}
+  gtag('js', new Date());
+  gtag('config', 'G-YL03HBJY7E');
+</script>
+
+
+  <meta content="width=device-width, initial-scale=1.0" name="viewport" />
+  
+</head>
+<body class="community-enabled">
+  
+  
+  
+
+  <!-- OneTrust Cookies Consent Notice start for discord.com -->
+<script type="text/javascript" src="https://cdn.cookielaw.org/consent/04da1d72-0626-4fff-b3c6-150c719cc115/OtAutoBlock.js" ></script>
+<script src="https://cdn.cookielaw.org/scripttemplates/otSDKStub.js"  type="text/javascript" charset="UTF-8" data-domain-script="04da1d72-0626-4fff-b3c6-150c719cc115" ></script>
+<script type="text/javascript">
+function OptanonWrapper() { }
+</script>
+<!-- OneTrust Cookies Consent Notice end for discord.com -->
+
+<!--This should be added at the very top -->
+<!--Comment out <div class="alertbox"></div>-->
+<div class="alertbox"></div>
+<header class="header">
+  <div class="logo">
+    <a title="Home" href="/hc/en-us">
+      <img src="/hc/theming_assets/01JYJB58V9PVW92W0ZMXZ7WD5A" alt="Discord Help Center home page">
+    </a>
+  </div>
+  
+  <div class="nav-wrapper">
+    <!-- Logo -->
+    <button class="menu-button" aria-controls="user-nav" aria-expanded="false" aria-label="Toggle navigation menu">
+      <svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" focusable="false" viewBox="0 0 16 16" class="icon-menu">
+        <path fill="none" stroke="currentColor" stroke-linecap="round" d="M1.5 3.5h13m-13 4h13m-13 4h13"/>
+      </svg>
+    </button>
+    <!-- Logo -->
+
+    <!-- User Nav -->
+    <nav class="user-nav" id="user-nav">
+      <!-- Feedback -->
+      <a href="//feedback.discord.com/">Feedback</a>
+      <!-- Feedback -->
+    
+      <!-- New Request Block -->
+      <a class="submit-a-request" href="/hc/en-us/requests/new">Submit a request</a>
+      <!-- New Request Block -->
+    </nav>
+    <!-- Signed in Block -->
+    
+      <a class="sign-in" rel="nofollow" data-auth-action="signin" title="Opens a dialog" role="button" href="/hc/en-us/signin?return_to=https%3A%2F%2Fsupport.discord.com%2Fhc%2Fen-us%2Farticles%2F228383668-Intro-to-Webhooks">
+        Sign in
+      </a>
+    
+    <!-- Signed in Block -->
+  </div>
+  <!-- User Nav -->
+</header>
+<!-- Status Page -->
+<script type="text/javascript" id="statuspage-widget" statuspage="https://status.discord.com" 
+src="/hc/theming_assets/01J18JA9CH3061AE69HGVM9QH5"></script>
+
+
+
+  <main role="main">
+    <div class="container-divider"></div>
+<div class="container">
+  
+
+  <div class="article-container" id="article-container">
+    <div class="hide-on-mobile">
+      <aside class="article-sidebar" aria-labelledby="section-articles-title">
+        
+          <div class="collapsible-sidebar">
+            <button type="button" class="collapsible-sidebar-toggle" aria-labelledby="section-articles-title" aria-expanded="false">
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" focusable="false" viewBox="0 0 12 12" aria-hidden="true" class="collapsible-sidebar-toggle-icon chevron-icon">
+                <path fill="none" stroke="currentColor" stroke-linecap="round" d="M3 4.5l2.6 2.6c.2.2.5.2.7 0L9 4.5"/>
+              </svg>
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" focusable="false" viewBox="0 0 12 12" aria-hidden="true" class="collapsible-sidebar-toggle-icon x-icon">
+                <path stroke="currentColor" stroke-linecap="round" d="M3 9l6-6m0 6L3 3"/>
+              </svg>
+            </button>
+            <span id="section-articles-title" class="collapsible-sidebar-title sidenav-title">
+              Articles in this section
+            </span>
+            <div class="collapsible-sidebar-body">
+              <ul>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/40248967926167-Spoiler-Channels-FAQ" class="sidenav-item ">Spoiler Channels FAQ</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/33023827550359-Discord-Server-Setup-Guide" class="sidenav-item ">Discord Server Setup Guide</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/29729107418519-Server-Member-Applications" class="sidenav-item ">Server Member Applications</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/22163184112407-Polls-FAQ" class="sidenav-item ">Polls FAQ</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/22045487931799-Members-List-Recent-Activity-FAQ" class="sidenav-item ">Members List Recent Activity FAQ</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/19583625604887-Voice-Channels-FAQs" class="sidenav-item ">Voice Channels FAQs</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/14078261239831-Clarifying-Server-Types" class="sidenav-item ">Clarifying Server Types</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/13497665141655-Server-Guide-FAQ" class="sidenav-item ">Server Guide FAQ</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/12926016807575-In-Channel-Conversation-Summaries" class="sidenav-item ">In-Channel Conversation Summaries</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/11635925354775-Audio-Bitrate-FAQ" class="sidenav-item ">Audio Bitrate FAQ</a>
+                  </li>
+                
+              </ul>
+              
+                <a href="/hc/en-us/sections/202857957-Server-Features" class="article-sidebar-item">See more</a>
+              
+            </div>
+          </div>
+        
+      </aside>
+    </div>
+
+    <article id="main-content" class="article">
+        <nav class="sub-nav">
+          <nav aria-label="Breadcrumb">
+  <ol class="breadcrumbs">
+    
+      <li>
+        
+          <a href="/hc/en-us">Discord</a>
+        
+      </li>
+    
+      <li>
+        
+          <a href="/hc/en-us/categories/200404378-Server-Settings">Server Settings</a>
+        
+      </li>
+    
+      <li>
+        
+          <a href="/hc/en-us/sections/202857957-Server-Features">Server Features</a>
+        
+      </li>
+    
+  </ol>
+</nav>
+
+          <div class="search-container">
+            <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" focusable="false" viewBox="0 0 12 12" class="search-icon">
+              <circle cx="4.5" cy="4.5" r="4" fill="none" stroke="currentColor"/>
+              <path stroke="currentColor" stroke-linecap="round" d="M11 11L7.5 7.5"/>
+            </svg>
+            <form role="search" class="search" data-search="" action="/hc/en-us/search" accept-charset="UTF-8" method="get"><input type="hidden" name="utf8" value="&#x2713;" autocomplete="off" /><input type="hidden" name="category" id="category" value="200404378" autocomplete="off" />
+<input type="search" name="query" id="query" placeholder="Search" aria-label="Search" /></form>
+          </div>
+      </nav>
+
+      <div class="hide-on-desktop">
+
+        <aside class="article-sidebar" aria-labelledby="section-articles-title">
+        
+          <div class="collapsible-sidebar">
+            <button type="button" class="collapsible-sidebar-toggle" aria-labelledby="section-articles-title" aria-expanded="false">
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" focusable="false" viewBox="0 0 12 12" aria-hidden="true" class="collapsible-sidebar-toggle-icon chevron-icon">
+                <path fill="none" stroke="currentColor" stroke-linecap="round" d="M3 4.5l2.6 2.6c.2.2.5.2.7 0L9 4.5"/>
+              </svg>
+              <svg xmlns="http://www.w3.org/2000/svg" width="20" height="20" focusable="false" viewBox="0 0 12 12" aria-hidden="true" class="collapsible-sidebar-toggle-icon x-icon">
+                <path stroke="currentColor" stroke-linecap="round" d="M3 9l6-6m0 6L3 3"/>
+              </svg>
+            </button>
+            <span id="section-articles-title" class="collapsible-sidebar-title sidenav-title">
+              Articles in this section
+            </span>
+            <div class="collapsible-sidebar-body">
+              <ul>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/40248967926167-Spoiler-Channels-FAQ" class="sidenav-item ">Spoiler Channels FAQ</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/33023827550359-Discord-Server-Setup-Guide" class="sidenav-item ">Discord Server Setup Guide</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/29729107418519-Server-Member-Applications" class="sidenav-item ">Server Member Applications</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/22163184112407-Polls-FAQ" class="sidenav-item ">Polls FAQ</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/22045487931799-Members-List-Recent-Activity-FAQ" class="sidenav-item ">Members List Recent Activity FAQ</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/19583625604887-Voice-Channels-FAQs" class="sidenav-item ">Voice Channels FAQs</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/14078261239831-Clarifying-Server-Types" class="sidenav-item ">Clarifying Server Types</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/13497665141655-Server-Guide-FAQ" class="sidenav-item ">Server Guide FAQ</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/12926016807575-In-Channel-Conversation-Summaries" class="sidenav-item ">In-Channel Conversation Summaries</a>
+                  </li>
+                
+                  <li>
+                    <a href="/hc/en-us/articles/11635925354775-Audio-Bitrate-FAQ" class="sidenav-item ">Audio Bitrate FAQ</a>
+                  </li>
+                
+              </ul>
+              
+                <a href="/hc/en-us/sections/202857957-Server-Features" class="article-sidebar-item">See more</a>
+              
+            </div>
+          </div>
+        
+      </aside>
+
+      </div>
+      <header class="article-header">
+        <h1 title="Intro to Webhooks" class="article-title">
+          Intro to Webhooks
+          
+        </h1>
+
+        <div class="article-author-container">
+          <div class="article-author">
+            
+              <div class="avatar article-avatar">
+                
+                <img src="https://support.discord.com/system/photos/360240797511/dan.png" alt="" class="article-author-avatar"/>
+              </div>
+            
+
+            <div class="article-author-name">
+            
+              
+                D
+              
+            
+            </div>
+          </div>
+
+          <div class="article-meta">
+            <ul class="meta-group">
+              
+                <li class="meta-data"><time datetime="2020-12-16T00:54:07Z" title="2020-12-16T00:54:07Z" data-datetime="relative">December 16, 2020 00:54</time></li>
+                <li class="meta-data">Updated</li>
+              
+            </ul>
+          </div>
+
+          
+          <div class="article-subscribe"><div data-helper="subscribe" data-json="{&quot;item&quot;:&quot;article&quot;,&quot;url&quot;:&quot;/hc/en-us/articles/228383668-Intro-to-Webhooks/subscription.json&quot;,&quot;follow_label&quot;:&quot;Follow&quot;,&quot;unfollow_label&quot;:&quot;Unfollow&quot;,&quot;following_label&quot;:&quot;Following&quot;,&quot;can_subscribe&quot;:true,&quot;is_subscribed&quot;:false}"></div></div>
+        
+        </div>
+      </header>
+
+      <section class="article-info">
+        <div class="article-content">
+          <div class="article-body"><p>Discord's built in <strong>Webhooks</strong> function as an easy way to get automated&nbsp;messages and data updates sent to a text channel in your server.</p>
+<p>Think of them as one of those fancy pneumatic tube things you used to love sending money into at a bank and watch disappear, but instead of never seeing your money again, you're actually sending messages into Discord from another platform.</p>
+<p>By creating a webhook endpoint in your server, you'll generate a&nbsp;Webhook URL that you can drop into a number of different other services to link the two.</p>
+<p>While everyone absolutely loves pneumatic tubes (100% true), it's important to note that&nbsp;<strong>webhooks require another website to use (though programming-inclined users can make their own tube schoomper themselves).</strong>&nbsp;</p>
+<p>Some services and websites are built to easily incorporate webhooks and send messages outwards, but some aren't. Here's a little handy reference list:</p>
+<table style="height: 109px;">
+<tbody>
+<tr>
+<td class="wysiwyg-text-align-center" style="width: 184px;">&nbsp; <span class="wysiwyg-underline"><strong><span class="wysiwyg-color-blue">Can use webhooks:</span></strong></span></td>
+<td class="wysiwyg-text-align-center" style="width: 185px;"><span class="wysiwyg-underline"><span class="wysiwyg-color-red"><strong>Can't really use webhooks:</strong></span></span></td>
+</tr>
+<tr>
+<td class="wysiwyg-text-align-center" style="width: 184px;">&nbsp; <span class="wysiwyg-underline">GitHub</span></td>
+<td class="wysiwyg-text-align-center" style="width: 185px;">&nbsp; <span class="wysiwyg-underline">Twitch / YouTube</span></td>
+</tr>
+<tr>
+<td class="wysiwyg-text-align-center" style="width: 184px;">&nbsp; <span class="wysiwyg-underline">CircleCI</span></td>
+<td class="wysiwyg-text-align-center" style="width: 185px;">&nbsp;&nbsp;<span class="wysiwyg-underline">Nelly The Hamster</span></td>
+</tr>
+<tr>
+<td class="wysiwyg-text-align-center" style="width: 184px;">&nbsp; <span class="wysiwyg-underline">DataDog</span></td>
+<td class="wysiwyg-text-align-center" style="width: 185px;">&nbsp; <span class="wysiwyg-underline">Facebook</span></td>
+</tr>
+</tbody>
+</table>
+<h1>Making a Webhook</h1>
+<p>With that in mind, if you want to&nbsp;update your Discord server with&nbsp;<strong>GitHub commits and pull requests</strong> or&nbsp;<strong>track analytics from DataDog</strong> or anything similar, here's how!</p>
+<ol>
+<li>Open your <strong>Server Settings</strong> and head into the <strong>Integrations</strong> tab:</li>
+<li>Click the "<strong>Create Webhook</strong>" button to create a new webhook!</li>
+</ol>
+<p class="wysiwyg-text-align-center"><img src="/hc/article_attachments/1500000463501" alt="Screen_Shot_2020-12-15_at_4.41.53_PM.png"></p>
+<p>You'll have a few options here. You can:</p>
+<ul>
+<li>&nbsp;<strong>Edit the avatar:&nbsp;</strong>By clicking the avatar next to the Name in the top left</li>
+<li><strong>Choose what channel the Webhook posts to:</strong>&nbsp;By selecting the desired text channel in the &nbsp;dropdown menu.</li>
+<li><strong>Name your Webhook: </strong>Good for distinguishing multiple webhooks for multiple different services.</li>
+</ul>
+<p>You now have your own&nbsp;handy URL / pneumatic tube <em>schoomp</em>-er&nbsp;that you can link to more websites to receive messages from.&nbsp;</p>
+<p class="wysiwyg-text-align-center"><img src="/hc/article_attachments/360101553853" alt="Screen_Shot_2020-12-15_at_4.51.38_PM.png" width="650" height="393"></p>
+<h1>Quick Example: GitHub Webhook Integration</h1>
+<p>Since webhooks can't really function on their own and need to be linked to another website to function as intended, I figured it'd be best to include a sample integration for any of you GitHub enthusiasts and code-pushers.</p>
+<p>You can use Discord's webhooks to send any code merge or push updates in a repository of yours into a text channel in your server.&nbsp;&nbsp;</p>
+<p><strong><span class="wysiwyg-font-size-large">1. Get the webhook URL for the server/channel you want to receive messages:</span></strong></p>
+<p>In my server, I've created a text channel labeled #general-chat and I want my repo updates to post messages here!</p>
+<p>Therefore, I'll grab the webhook URL for this channel by pressing the <strong>Copy Webhook URL</strong> button:</p>
+<p class="wysiwyg-text-align-center"><img src="/hc/article_attachments/1500000455142" alt="Screen_Shot_2020-12-15_at_4.45.52_PM.png" width="601" height="609"></p>
+<p><strong><span class="wysiwyg-font-size-large">2. Add the webhook URL into your GitHub repo settings</span></strong></p>
+<p>Choose the repository that you'd like to get updates from in your Discord server. Once you've selected the repo, go into the Settings &gt; Webhooks menu</p>
+<p>And then click the "Add webhook" button, and enter the Discord-generated URL in the "Payload URL" blank.&nbsp;</p>
+<p class="wysiwyg-text-align-center"><img src="/hc/en-us/article_attachments/214526988/findIngithub.png" alt=""></p>
+<h3>To make the webhook display messages properly, it's really really really REALLY really important that you append '/github' at the end of it. Yes, like five-reallys important.</h3>
+<p>In addition to the URL, you have some more GitHub-specific options to choose from. For&nbsp;<strong>content type</strong>, stick with application/json. Discord's webhook format really likes JSON. In the next section, you can choose to customize what kind of events trigger webhook messages.&nbsp;</p>
+<p class="wysiwyg-text-align-center"><img src="/hc/en-us/article_attachments/214602687/addStuff.png" alt=""></p>
+<p>Click the last "Add webhook" button beneath the event notifications&nbsp;customization option, and you're all set! Pushing any updates in the repo (including editing the readme file) will show up in your text channel:&nbsp;</p>
+<p class="wysiwyg-text-align-center"><img src="/hc/en-us/article_attachments/214527028/wowMuchwebhook.png" alt="">&nbsp;</p>
+<p>And you're all set! GitHub is just one example of an integration that can post messages via webhook. If you've got a knack for JSON application-building or HTTP POST requests and want to customize your own webhooks, you can dig up some more information in&nbsp;<a href="https://discord.com/developers/docs/resources/webhook" target="_self">our developer docs</a>.</p></div>
+
+          <div class="article-attachments">
+            <ul class="attachments">
+              
+            </ul>
+          </div>
+        </div>
+      </section>
+
+      <footer>
+        <div class="article-footer">
+          
+            <div class="article-share"><p>Share</p>
+  <ul class="share">
+    <li>
+      <a href="https://www.facebook.com/share.php?title=Intro+to+Webhooks&u=https%3A%2F%2Fsupport.discord.com%2Fhc%2Fen-us%2Farticles%2F228383668-Intro-to-Webhooks" class="share-facebook" aria-label="Facebook">
+        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" focusable="false" viewBox="0 0 12 12" aria-label="Share this page on Facebook">
+          <path fill="currentColor" d="M6 0a6 6 0 01.813 11.945V7.63h1.552l.244-1.585H6.812v-.867c0-.658.214-1.242.827-1.242h.985V2.55c-.173-.024-.538-.075-1.23-.075-1.444 0-2.29.767-2.29 2.513v1.055H3.618v1.585h1.484v4.304A6.001 6.001 0 016 0z"/>
+        </svg>
+      </a>
+    </li>
+    <li>
+      <a href="https://twitter.com/share?lang=en&text=Intro+to+Webhooks&url=https%3A%2F%2Fsupport.discord.com%2Fhc%2Fen-us%2Farticles%2F228383668-Intro-to-Webhooks" class="share-twitter" aria-label="X Corp">
+        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" focusable="false" viewBox="0 0 12 12" aria-label="Share this page on X Corp">
+          <path fill="currentColor" d="M.0763914 0 3.60864 0 6.75369 4.49755 10.5303 0 11.6586 0 7.18498 5.11431 12 12 8.46775 12 5.18346 7.30333 1.12825 12 0 12 4.7531 6.6879z"/>
+        </svg>
+      </a>
+    </li>
+    <li>
+      <a href="https://www.linkedin.com/shareArticle?mini=true&source=Discord+Support&title=Intro+to+Webhooks&url=https%3A%2F%2Fsupport.discord.com%2Fhc%2Fen-us%2Farticles%2F228383668-Intro-to-Webhooks" class="share-linkedin" aria-label="LinkedIn">
+        <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" focusable="false" viewBox="0 0 12 12" aria-label="Share this page on LinkedIn">
+          <path fill="currentColor" d="M10.8 0A1.2 1.2 0 0112 1.2v9.6a1.2 1.2 0 01-1.2 1.2H1.2A1.2 1.2 0 010 10.8V1.2A1.2 1.2 0 011.2 0h9.6zM8.09 4.356a1.87 1.87 0 00-1.598.792l-.085.133h-.024v-.783H4.676v5.727h1.778V7.392c0-.747.142-1.47 1.068-1.47.913 0 .925.854.925 1.518v2.785h1.778V7.084l-.005-.325c-.05-1.38-.456-2.403-2.13-2.403zm-4.531.142h-1.78v5.727h1.78V4.498zm-.89-2.846a1.032 1.032 0 100 2.064 1.032 1.032 0 000-2.064z"/>
+        </svg>
+      </a>
+    </li>
+  </ul>
+
+</div>
+          
+          
+        </div>
+        
+          <div class="article-votes">
+            <span class="article-votes-question" id="article-votes-label">Was this article helpful?</span>
+            <div class="article-votes-controls" role="group" aria-labelledby="article-votes-label">
+              <button type="button" class="button article-vote article-vote-up" data-helper="vote" data-item="article" data-type="up" data-id="228383668" data-upvote-count="33077" data-vote-count="52764" data-vote-sum="13390" data-vote-url="/hc/en-us/articles/228383668/vote" data-value="null" data-label="33077 out of 52764 found this helpful" data-selected-class="button-primary" data-as="button" aria-label="This article was helpful" aria-pressed="false">Yes</button>
+              <button type="button" class="button article-vote article-vote-down" data-helper="vote" data-item="article" data-type="down" data-id="228383668" data-upvote-count="33077" data-vote-count="52764" data-vote-sum="13390" data-vote-url="/hc/en-us/articles/228383668/vote" data-value="null" data-label="33077 out of 52764 found this helpful" data-selected-class="button-primary" data-as="button" aria-label="This article was not helpful" aria-pressed="false">No</button>
+            </div>
+            <small class="article-votes-count">
+              <span class="article-vote-label" data-helper="vote" data-item="article" data-type="label" data-id="228383668" data-upvote-count="33077" data-vote-count="52764" data-vote-sum="13390" data-vote-url="/hc/en-us/articles/228383668/vote" data-value="null" data-label="33077 out of 52764 found this helpful">33077 out of 52764 found this helpful</span>
+            </small>
+          </div>
+        
+
+        <div class="article-more-questions">
+          Have more questions? <a href="/hc/en-us/requests/new">Submit a request</a>
+        </div>
+        <div class="article-return-to-top">
+          <a href="#article-container">
+            <svg xmlns="http://www.w3.org/2000/svg" class="article-return-to-top-icon" width="20" height="20" focusable="false" viewBox="0 0 12 12" aria-hidden="true">
+              <path fill="none" stroke="currentColor" stroke-linecap="round" d="M3 4.5l2.6 2.6c.2.2.5.2.7 0L9 4.5"/>
+            </svg>
+            Return to top
+          </a>
+        </div>
+      </footer>
+
+      <div class="article-relatives">
+        
+          <div data-recent-articles></div>
+        
+        
+          
+  <section class="related-articles">
+    
+      <h2 class="related-articles-title">Related articles</h2>
+    
+    <ul>
+      
+        <li>
+          <a href="/hc/en-us/related/click?data=BAh7CjobZGVzdGluYXRpb25fYXJ0aWNsZV9pZGwrCBMtXdNTADoYcmVmZXJyZXJfYXJ0aWNsZV9pZGkEtNucDToLbG9jYWxlSSIKZW4tdXMGOgZFVDoIdXJsSSI6L2hjL2VuLXVzL2FydGljbGVzLzM2MDAyODM4NDUzMS1DaGFubmVsLUZvbGxvd2luZy1GQVEGOwhUOglyYW5raQY%3D--06ffa2f67fcbc37b7c2073538aa22a806908a89c" rel="nofollow">Channel Following FAQ</a>
+        </li>
+      
+        <li>
+          <a href="/hc/en-us/related/click?data=BAh7CjobZGVzdGluYXRpb25fYXJ0aWNsZV9pZGwrCHXNQdVTADoYcmVmZXJyZXJfYXJ0aWNsZV9pZGkEtNucDToLbG9jYWxlSSIKZW4tdXMGOgZFVDoIdXJsSSJCL2hjL2VuLXVzL2FydGljbGVzLzM2MDA2MDE0NTAxMy1XaHktaXNuLXQtbXktRE0tZ29pbmctdGhyb3VnaAY7CFQ6CXJhbmtpBw%3D%3D--274a7186f49bc75677705a5a337878a3083757b4" rel="nofollow">Why isn&#39;t my DM going through?</a>
+        </li>
+      
+        <li>
+          <a href="/hc/en-us/related/click?data=BAh7CjobZGVzdGluYXRpb25fYXJ0aWNsZV9pZGwrCJQgXNRTADoYcmVmZXJyZXJfYXJ0aWNsZV9pZGkEtNucDToLbG9jYWxlSSIKZW4tdXMGOgZFVDoIdXJsSSI9L2hjL2VuLXVzL2FydGljbGVzLzM2MDA0NTA5MzAxMi1TZXJ2ZXItSW50ZWdyYXRpb25zLVBhZ2UGOwhUOglyYW5raQg%3D--514c9fb2f55f9496eba27ed4d3446c280bda4bfd" rel="nofollow">Server Integrations Page</a>
+        </li>
+      
+        <li>
+          <a href="/hc/en-us/related/click?data=BAh7CjobZGVzdGluYXRpb25fYXJ0aWNsZV9pZGkEw68EDToYcmVmZXJyZXJfYXJ0aWNsZV9pZGkEtNucDToLbG9jYWxlSSIKZW4tdXMGOgZFVDoIdXJsSSJbL2hjL2VuLXVzL2FydGljbGVzLzIxODQxMDk0Ny1Ib3ctdG8tUmVzZXQtb3ItQ2hhbmdlLVlvdXItRm9yZ290dGVuLVBhc3N3b3JkLW9uLURpc2NvcmQGOwhUOglyYW5raQk%3D--bc36611f674625796a488b59cf2b53ffbf90ce88" rel="nofollow">How to Reset or Change Your Forgotten Password on Discord</a>
+        </li>
+      
+        <li>
+          <a href="/hc/en-us/related/click?data=BAh7CjobZGVzdGluYXRpb25fYXJ0aWNsZV9pZGwrCBehokufBToYcmVmZXJyZXJfYXJ0aWNsZV9pZGkEtNucDToLbG9jYWxlSSIKZW4tdXMGOgZFVDoIdXJsSSJIL2hjL2VuLXVzL2FydGljbGVzLzYxODE3MjY4ODgyMTUtSG93LXRvLVZlcmlmeS1Zb3VyLURpc2NvcmQtQWNjb3VudAY7CFQ6CXJhbmtpCg%3D%3D--cea6519b416eeeb7de6499ca52862be15caf59fc" rel="nofollow">How to Verify Your Discord Account</a>
+        </li>
+      
+    </ul>
+  </section>
+
+
+        
+      </div>
+      
+    </article>
+  </div>
+</div>
+
+  </main>
+
+  
+<footer id="end" class="section">
+
+  
+
+
+  <nav class="nav">
+    <div class="footer-row">
+      <div class="footer-column footer-branding">
+
+        <div class="branding">
+          <a href="//discord.com" itemprop="url">
+              <div class="footer-logo footer-logo-clyde"></div>
+          </a>
+        </div>
+
+        <div class="footer-dropdown-language">
+          
+            <div class="footer-dropdown language-selector">
+                <button class="dropdown-toggle" aria-haspopup="true">
+                  English (United States)
+                  <svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" focusable="false" viewBox="0 0 12 12" class="dropdown-chevron-icon">
+                    <path fill="none" stroke="currentColor" stroke-linecap="round" d="M3 4.5l2.6 2.6c.2.2.5.2.7 0L9 4.5"/>
+                  </svg>
+                </button>
+                <span class="dropdown-menu footer-dropdown-menu-end" role="menu">
+                  
+                    <a href="/hc/change_language/da?return_to=%2Fhc%2Fda%2Farticles%2F228383668-Introduktion-til-Webhooks" dir="ltr" rel="nofollow" role="menuitem">
+                      Dansk
+                    </a>
+                  
+                    <a href="/hc/change_language/de?return_to=%2Fhc%2Fde%2Farticles%2F228383668-Einf%25C3%25BChrung-in-Webhooks" dir="ltr" rel="nofollow" role="menuitem">
+                      Deutsch
+                    </a>
+                  
+                    <a href="/hc/change_language/es?return_to=%2Fhc%2Fes%2Farticles%2F228383668-Introducci%25C3%25B3n-a-los-webhooks" dir="ltr" rel="nofollow" role="menuitem">
+                      Español
+                    </a>
+                  
+                    <a href="/hc/change_language/fr?return_to=%2Fhc%2Ffr%2Farticles%2F228383668-Intro-aux-Webhooks" dir="ltr" rel="nofollow" role="menuitem">
+                      Français
+                    </a>
+                  
+                    <a href="/hc/change_language/hi-in?return_to=%2Fhc%2Fhi-in%2Farticles%2F228383668-%25E0%25A4%25B5%25E0%25A5%2587%25E0%25A4%25AC%25E0%25A4%25B9%25E0%25A5%2581%25E0%25A4%2595-%25E0%25A4%2595%25E0%25A4%25BE-%25E0%25A4%2587%25E0%25A4%2582%25E0%25A4%259F-%25E0%25A4%25B0%25E0%25A5%258B" dir="ltr" rel="nofollow" role="menuitem">
+                      हिन्दी (भारत)
+                    </a>
+                  
+                    <a href="/hc/change_language/it?return_to=%2Fhc%2Fit%2Farticles%2F228383668-Introduzione-ai-webhook" dir="ltr" rel="nofollow" role="menuitem">
+                      Italiano
+                    </a>
+                  
+                    <a href="/hc/change_language/ja?return_to=%2Fhc%2Fja%2Farticles%2F228383668-%25E3%2582%25A6%25E3%2582%25A7%25E3%2583%2596%25E3%2583%2595%25E3%2583%2583%25E3%2582%25AF%25E3%2581%25AE%25E3%2581%2594%25E7%25B4%25B9%25E4%25BB%258B" dir="ltr" rel="nofollow" role="menuitem">
+                      日本語
+                    </a>
+                  
+                    <a href="/hc/change_language/ko?return_to=%2Fhc%2Fko%2Farticles%2F228383668-%25EC%259B%25B9%25ED%259B%2584%25ED%2581%25AC-%25EC%2586%258C%25EA%25B0%259C" dir="ltr" rel="nofollow" role="menuitem">
+                      한국어
+                    </a>
+                  
+                    <a href="/hc/change_language/nl?return_to=%2Fhc%2Fnl%2Farticles%2F228383668-Inleiding-tot-Webhooks" dir="ltr" rel="nofollow" role="menuitem">
+                      Nederlands
+                    </a>
+                  
+                    <a href="/hc/change_language/pl?return_to=%2Fhc%2Fpl%2Farticles%2F228383668-Wprowadzenie-do-Webhook%25C3%25B3w" dir="ltr" rel="nofollow" role="menuitem">
+                      Polski
+                    </a>
+                  
+                    <a href="/hc/change_language/pt-br?return_to=%2Fhc%2Fpt-br%2Farticles%2F228383668-Usando-Webhooks" dir="ltr" rel="nofollow" role="menuitem">
+                      Português do Brasil
+                    </a>
+                  
+                    <a href="/hc/change_language/ru?return_to=%2Fhc%2Fru%2Farticles%2F228383668-%25D0%2592%25D0%25B2%25D0%25B5%25D0%25B4%25D0%25B5%25D0%25BD%25D0%25B8%25D0%25B5-%25D0%25B2-%25D0%25B2%25D0%25B5%25D0%25B1%25D1%2585%25D1%2583%25D0%25BA%25D0%25B8" dir="ltr" rel="nofollow" role="menuitem">
+                      Русский
+                    </a>
+                  
+                    <a href="/hc/change_language/sv?return_to=%2Fhc%2Fsv%2Farticles%2F228383668-Intro-till-Webhookar" dir="ltr" rel="nofollow" role="menuitem">
+                      Svenska
+                    </a>
+                  
+                    <a href="/hc/change_language/th?return_to=%2Fhc%2Fth%2Farticles%2F228383668-%25E0%25B8%259A%25E0%25B8%2597%25E0%25B8%2599%25E0%25B8%25B3%25E0%25B9%2580%25E0%25B8%2581%25E0%25B8%25B5-%25E0%25B8%25A2%25E0%25B8%25A7%25E0%25B8%2581%25E0%25B8%25B1%25E0%25B8%259A-Webhook" dir="ltr" rel="nofollow" role="menuitem">
+                      ไทย
+                    </a>
+                  
+                    <a href="/hc/change_language/tr?return_to=%2Fhc%2Ftr%2Farticles%2F228383668-Webhook-lara-Giri%25C5%259F" dir="ltr" rel="nofollow" role="menuitem">
+                      Türkçe
+                    </a>
+                  
+                    <a href="/hc/change_language/vi?return_to=%2Fhc%2Fvi%2Farticles%2F228383668-Gi%25E1%25BB%259Bi-thi%25E1%25BB%2587u-v%25E1%25BB%2581-Webhook" dir="ltr" rel="nofollow" role="menuitem">
+                      Tiếng Việt
+                    </a>
+                  
+                    <a href="/hc/change_language/zh-tw?return_to=%2Fhc%2Fzh-tw%2Farticles%2F228383668-Webhook-%25E5%2585%25A5%25E9%2596%2580" dir="ltr" rel="nofollow" role="menuitem">
+                      繁體中文
+                    </a>
+                  
+                </span>
+            </div>
+          
+        </div>
+
+
+   
+
+        <div class="social">
+          <h3 class="footer-title">Social</h3>
+          <div class="social-links">
+            <a class="social-link" href="https://x.com/discord" target="_blank">
+                            <div class="social-icon social-icon-x"></div>
+            </a>
+            <a class="social-link" href="https://www.instagram.com/discord" target="_blank">
+              <div class="social-icon social-icon-instagram"></div>
+            </a>
+            <a class="social-link" href="https://www.facebook.com/discord" target="_blank">
+              <div class="social-icon social-icon-facebook"></div>
+            </a>
+            <a class="social-link" href="https://www.youtube.com/discord" target="_blank">
+              <div class="social-icon social-icon-youtube"></div>
+            </a>
+            <a class="social-link" href="https://www.tiktok.com/discord" target="_blank">
+              <div class="social-icon social-icon-tiktok"></div>
+            </a>
+          </div>
+          
+        </div>
+      </div>
+
+      <div class="footer-links-grid">
+
+
+        <div class="links-column-spacer"></div>
+        <div class="links-column">
+          <h3 class="column-title">Product</h3>
+          <ul class="links-list">
+            <li><a href="//discord.com/download" class="link-item">Download</a></li>
+            <li><a href="//discord.com/nitro" class="link-item">Nitro</a></li>
+            <li><a href="//status.discord.com" class="link-item">Status</a></li>
+            <li><a href="//discord.com/app-directory" class="link-item">App Directory</a></li>
+          </ul>
+        </div>
+
+
+        <div class="links-column">
+          <h3 class="column-title">Company</h3>
+          <ul class="links-list">
+            <li><a href="//discord.com/company" class="link-item">About</a></li>
+            <li><a href="//discord.com/careers" class="link-item">Jobs</a></li>
+            <li><a href="//discord.com/branding" class="link-item">Brand</a></li>
+            <li><a href="//discord.com/newsroom" class="link-item">Newsroom</a></li>
+          </ul>
+        </div>
+
+
+        <div class="links-column">
+          <h3 class="column-title">Resources</h3>
+          <ul class="links-list">
+            <li><a href="//support.discord.com" class="link-item">Support</a></li>
+            <li><a href="//discord.com/safety" class="link-item">Safety</a></li>
+            <li><a href="//discord.com/blog" class="link-item">Blog</a></li>
+            <li><a href="//feedback.discord.com" class="link-item">Feedback</a></li>
+            <li><a href="//discord.com/creators" class="link-item">Creators</a></li>
+            <li><a href="//discord.com/community" class="link-item">Community</a></li>
+            <li><a href="//discord.com/developers" class="link-item">Developers</a></li>
+            <li><a href="//discord.com/quests" class="link-item">Quests</a></li>
+            <li><a href="https://discordmerch.com/evergreenfooter" class="link-item">Official 3rd Party Merch</a></li>
+          </ul>
+        </div>
+
+
+        <div class="links-column">
+          <h3 class="column-title">Policies</h3>
+          <ul class="links-list">
+            <li><a href="//discord.com/tos" class="link-item">Terms</a></li>
+            <li><a href="//discord.com/privacy" class="link-item">Privacy</a></li>
+            <li><a href="#" class="link-item">Cookie Settings</a></li>
+            <li><a href="//discord.com/guidelines" class="link-item">Guidelines</a></li>
+            <li><a href="//discord.com/acknowledgements" class="link-item">Acknowledgements</a></li>
+            <li><a href="//discord.com/licenses" class="link-item">Licenses</a></li>
+            <li><a href="//discord.com/company-information" class="link-item">Company Information</a></li>
+          </ul>
+        </div>
+      </div>
+    </div>
+  </nav>
+
+
+
+  
+
+  
+  <div class="footer-wordmark">
+    <img src='/hc/theming_assets/01JYJB54Q7NQKBMYN89G6P02NF' />
+  </div>
+</footer>
+
+
+  <!-- / -->
+
+  
+  <script src="//static.zdassets.com/hc/assets/en-us.610c6add50f51647f886.js"></script>
+  
+
+  <script type="text/javascript">
+  /*
+
+    Greetings sourcecode lurker!
+
+    This is for internal Zendesk and legacy usage,
+    we don't support or guarantee any of these values
+    so please don't build stuff on top of them.
+
+  */
+
+  HelpCenter = {};
+  HelpCenter.account = {"subdomain":"hammerandchisel","environment":"production","name":"Discord"};
+  HelpCenter.user = {"identifier":"da39a3ee5e6b4b0d3255bfef95601890afd80709","email":null,"name":"","role":"anonymous","avatar_url":"https://assets.zendesk.com/hc/assets/default_avatar.png","is_admin":false,"organizations":[],"groups":[]};
+  HelpCenter.internal = {"asset_url":"//static.zdassets.com/hc/assets/","web_widget_asset_composer_url":"https://static.zdassets.com/ekr/snippet.js","current_session":{"locale":"en-us","csrf_token":"hc:hcobject:server:BthJAGxbyaCz34rJmmtPSmdy56_8fc4AdYmSbnsWJwM4wan30tgZRmK5TCqSUtVhYB-U72aXCmsbXAcWt3HzlQ","shared_csrf_token":null},"usage_tracking":{"event":"article_viewed","data":"BAh7CDoLbG9jYWxlSSIKZW4tdXMGOgZFVDoPYXJ0aWNsZV9pZGkEtNucDToKX21ldGF7DDoPYWNjb3VudF9pZGkDJ1kKOhNoZWxwX2NlbnRlcl9pZGkEVLHsCzoNYnJhbmRfaWRpA/x4AToMdXNlcl9pZDA6E3VzZXJfcm9sZV9uYW1lSSIOQU5PTllNT1VTBjsGVDsASSIKZW4tdXMGOwZUOhphbm9ueW1vdXNfdHJhY2tpbmdfaWQw--d2977deebc5745cf2687af56b1d0a14c178fcb74","url":"https://support.discord.com/hc/activity"},"current_record_id":"228383668","current_record_url":"/hc/en-us/articles/228383668-Intro-to-Webhooks","current_record_title":"Intro to Webhooks","current_text_direction":"ltr","current_brand_id":96508,"current_brand_name":"Discord Support","current_brand_url":"https://hammerandchisel.zendesk.com","current_brand_active":true,"current_path":"/hc/en-us/articles/228383668-Intro-to-Webhooks","show_autocomplete_breadcrumbs":true,"user_info_changing_enabled":false,"has_user_profiles_enabled":true,"has_end_user_attachments":true,"user_aliases_enabled":true,"has_anonymous_kb_voting":true,"has_multi_language_help_center":true,"show_at_mentions":false,"embeddables_config":{"embeddables_web_widget":true,"embeddables_help_center_auth_enabled":false,"embeddables_connect_ipms":false},"answer_bot_subdomain":"static","gather_plan_state":"subscribed","has_article_verification":true,"has_gather":true,"has_ckeditor":true,"has_community_enabled":true,"has_community_badges":true,"has_community_post_content_tagging":false,"has_gather_content_tags":true,"has_guide_content_tags":true,"has_user_segments":true,"has_answer_bot_web_form_enabled":false,"has_garden_modals":false,"theming_cookie_key":"hc-da39a3ee5e6b4b0d3255bfef95601890afd80709-2-preview","is_preview":false,"has_search_settings_in_plan":true,"theming_api_version":3,"theming_settings":{"brand_color":"rgba(88, 101, 242, 1)","brand_text_color":"#FFFFFF","text_color":"#333333","link_color":"rgba(0, 0, 0, 1)","background_color":"#E0E3FF","heading_font":"-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif","text_font":"-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif","logo":"/hc/theming_assets/01JYJB58V9PVW92W0ZMXZ7WD5A","favicon":"/hc/theming_assets/01J18JAH0XZ9WSX8W5QJAMN2FM","community_background_image":"/hc/theming_assets/01J18JAJDWW6QD0SS43K813C7X","community_image":"/hc/theming_assets/01J18JAJDWW6QD0SS43K813C7X","instant_search":true,"scoped_kb_search":true,"scoped_community_search":false,"show_recent_activity":true,"show_articles_in_section":true,"show_article_author":true,"show_article_comments":false,"show_follow_article":true,"show_recently_viewed_articles":true,"show_related_articles":true,"show_article_sharing":true,"show_follow_section":true,"show_follow_post":true,"show_post_sharing":true,"show_follow_topic":true},"has_pci_credit_card_custom_field":true,"help_center_restricted":false,"is_assuming_someone_else":false,"flash_messages":[],"user_photo_editing_enabled":true,"user_preferred_locale":"en-us","base_locale":"en-us","login_url":"https://hammerandchisel.zendesk.com/access?locale=en-us\u0026brand_id=96508\u0026return_to=https%3A%2F%2Fsupport.discord.com%2Fhc%2Fen-us%2Farticles%2F228383668-Intro-to-Webhooks","has_alternate_templates":true,"has_custom_statuses_enabled":false,"has_hc_generative_answers_setting_enabled":true,"has_suggested_initial_questions_enabled":false,"has_contentful_eap":false,"has_contentful_eap_eligible":false,"has_pdf_ingestion_eap":true,"has_pdf_ingestion_eap_eligible":true,"has_guide_saas_management":false,"has_guide_service_catalog":true,"has_service_catalog_search_poc":true,"has_service_catalog_multibranding":false,"has_csat_reverse_2_scale_in_mobile":false,"has_trial_presumptive_setup":false,"has_unified_navigation":true,"has_unified_navigation_eap_access":true,"has_knowledge_locale_display_names":false,"has_csat_bet365_branding":false,"has_csat_theming_integration_phase_1":false,"has_help_center_gen_search_follow_up_conversation":true,"chat_page_renderable":false,"version":"v27673","dev_mode":false};
+</script>
+
+  
+  
+  <script src="//static.zdassets.com/hc/assets/hc_enduser-ecaf548e810f58e1237b832da9e68f06.js"></script>
+  <script type="text/javascript" src="/hc/theming_assets/678183/96508/script.js?digest=41866932687383"></script>
+  
+</body>
+</html>
