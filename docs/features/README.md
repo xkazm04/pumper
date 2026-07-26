@@ -20,6 +20,12 @@ These documents describe the **implemented** product surface of pumper — a loc
 | TypeScript consumer SDK (`@pumper/sync`) | [sdk-typescript.md](sdk-typescript.md) | `clients/typescript/` |
 | App fleet & domain datasets | [apps.md](apps.md) | `crates/apps/*` |
 
+## Operations
+
+| Area | Doc | Implementation roots |
+| --- | --- | --- |
+| Build artifact, local-first run, persistent state, env vars, **auth posture** | [../deployment.md](../deployment.md) | `crates/server/src/main.rs`, `crates/core/src/config.rs`, `config.toml`, `justfile`, `.github/workflows/ci.yml` |
+
 ## Maintenance notes
 
 - Feature docs should name: what the feature does, the API/params surface, the data model (tables/datasets), and known gaps. State defaults and caps explicitly.
