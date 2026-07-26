@@ -5,8 +5,8 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use pumper_core::config::{CacheConfig, StorageConfig};
-use pumper_core::{HttpCache, HttpRequest, HttpResponse, Storage};
+use pumper_core::config::CacheConfig;
+use pumper_core::{HttpCache, HttpRequest, HttpResponse};
 
 fn resp() -> HttpResponse {
     HttpResponse {
@@ -20,13 +20,8 @@ fn resp() -> HttpResponse {
 
 #[tokio::test]
 async fn put_honors_explicit_ttl() {
-    let dir = std::env::temp_dir().join(format!("pumper-cache-test-{}", uuid::Uuid::new_v4()));
-    let cfg = StorageConfig {
-        database_path: dir.join("pumper.db"),
-        artifacts_dir: dir.join("artifacts"),
-        ..StorageConfig::default()
-    };
-    let storage = Storage::connect(&cfg).await.expect("connect + migrate");
+    let store = pumper_core::testing::TempStore::new("cache-test").await;
+    let storage = &store.storage;
     let cache = HttpCache::new(storage.pool(), &CacheConfig { enabled: true, ttl_secs: 3600 });
 
     let req = HttpRequest::get("https://example.com/");
@@ -61,19 +56,12 @@ async fn put_honors_explicit_ttl() {
         "entry older than max_age must be treated as stale"
     );
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn get_stale_exposes_validators_and_refresh_revives() {
-    let dir = std::env::temp_dir().join(format!("pumper-stale-test-{}", uuid::Uuid::new_v4()));
-    let cfg = StorageConfig {
-        database_path: dir.join("pumper.db"),
-        artifacts_dir: dir.join("artifacts"),
-        ..StorageConfig::default()
-    };
-    let storage = Storage::connect(&cfg).await.expect("connect + migrate");
+    let store = pumper_core::testing::TempStore::new("stale-test").await;
+    let storage = &store.storage;
     let cache = HttpCache::new(storage.pool(), &CacheConfig { enabled: true, ttl_secs: 3600 });
 
     let req = HttpRequest::get("https://example.com/feed");
@@ -108,6 +96,4 @@ async fn get_stale_exposes_validators_and_refresh_revives() {
     // Unknown key => None.
     assert!(cache.get_stale("nope").await.unwrap().is_none());
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }

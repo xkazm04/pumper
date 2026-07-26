@@ -6,25 +6,19 @@
 
 use std::sync::Arc;
 
-use pumper_core::config::StorageConfig;
-use pumper_core::{Datasets, Storage};
+use pumper_core::Datasets;
 use serde_json::json;
-use uuid::Uuid;
 
-async fn fresh_db(tag: &str) -> (Storage, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("pumper-{tag}-{}", Uuid::new_v4()));
-    let cfg = StorageConfig {
-        database_path: dir.join("pumper.db"),
-        artifacts_dir: dir.join("artifacts"),
-        ..StorageConfig::default()
-    };
-    let storage = Storage::connect(&cfg).await.expect("connect + migrate");
-    (storage, dir)
+use pumper_core::testing::TempStore;
+
+async fn fresh_db(tag: &str) -> TempStore {
+    TempStore::new(tag).await
 }
 
 #[tokio::test]
 async fn reindex_rewrites_stale_simhashes_without_touching_content() {
-    let (storage, dir) = fresh_db("datasets-reindex").await;
+    let store = fresh_db("datasets-reindex").await;
+    let storage = &store.storage;
     let pool = storage.pool();
     let ds = Datasets::new(storage.pool());
 
@@ -60,13 +54,12 @@ async fn reindex_rewrites_stale_simhashes_without_touching_content() {
     // Idempotent: a second run finds nothing to rewrite.
     assert_eq!(ds.reindex_simhashes().await.unwrap(), 0, "reindex must be idempotent");
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn concurrent_same_key_upserts_keep_revision_chain_intact() {
-    let (storage, dir) = fresh_db("datasets-concurrency").await;
+    let store = fresh_db("datasets-concurrency").await;
+    let storage = &store.storage;
     let pool = storage.pool();
     let ds = Arc::new(Datasets::new(storage.pool()));
 
@@ -108,8 +101,6 @@ async fn concurrent_same_key_upserts_keep_revision_chain_intact() {
         "revision chain must be contiguous 1..={N} with no duplicates or gaps"
     );
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
@@ -121,7 +112,8 @@ async fn list_filtered_ordered_returns_soonest_rows_past_the_cap() {
     // insert order, and assert the cap returns the genuinely soonest ones.
     use pumper_core::datasets::JsonFilter;
 
-    let (storage, dir) = fresh_db("datasets-ordered").await;
+    let store = fresh_db("datasets-ordered").await;
+    let storage = &store.storage;
     let ds = Datasets::new(storage.pool());
 
     // Insert 10 open grants with close dates 2026-03-10 .. 2026-03-01 in an order
@@ -155,15 +147,14 @@ async fn list_filtered_ordered_returns_soonest_rows_past_the_cap() {
         .collect();
     assert_eq!(closes, vec!["2026-03-01", "2026-03-02", "2026-03-03"]);
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn upsert_many_is_correct_across_chunk_boundaries() {
     // 600 records exceeds the 500-record commit chunk, so this exercises the
     // multi-transaction batch path. Correctness must be identical to per-record.
-    let (storage, dir) = fresh_db("datasets-upsert-many").await;
+    let store = fresh_db("datasets-upsert-many").await;
+    let storage = &store.storage;
     let ds = Datasets::new(storage.pool());
 
     let items: Vec<(String, serde_json::Value)> = (0..600)
@@ -205,15 +196,14 @@ async fn upsert_many_is_correct_across_chunk_boundaries() {
     .unwrap();
     assert_eq!(revs_changed, 2, "new + changed revisions");
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn detect_removed_tombstones_with_matching_removed_revisions() {
     // Every tombstone must have its `removed` revision — the atomicity guarantee.
     // A tombstone without a revision is a permanently-lost removal signal.
-    let (storage, dir) = fresh_db("datasets-detect-removed").await;
+    let store = fresh_db("datasets-detect-removed").await;
+    let storage = &store.storage;
     let ds = Datasets::new(storage.pool());
     let pool = storage.pool();
 
@@ -253,8 +243,6 @@ async fn detect_removed_tombstones_with_matching_removed_revisions() {
     let removed2 = ds.detect_removed("app", "d", &present).await.unwrap();
     assert!(removed2.is_empty(), "already-removed keys are not re-removed");
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
@@ -262,7 +250,8 @@ async fn detect_removed_noops_on_an_empty_snapshot() {
     // A failed scrape hands sync an empty `present` set. That must be a no-op,
     // never "tombstone the whole dataset" — the empty-present guard was added
     // after exactly that bug and this test is what keeps it from reverting.
-    let (storage, dir) = fresh_db("datasets-detect-removed-empty").await;
+    let store = fresh_db("datasets-detect-removed-empty").await;
+    let storage = &store.storage;
     let ds = Datasets::new(storage.pool());
     let pool = storage.pool();
 
@@ -281,13 +270,12 @@ async fn detect_removed_noops_on_an_empty_snapshot() {
     .unwrap();
     assert_eq!(live, 5, "all records still live after an empty snapshot");
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn delete_record_and_dataset_remove_rows_and_revisions() {
-    let (storage, dir) = fresh_db("datasets-delete").await;
+    let store = fresh_db("datasets-delete").await;
+    let storage = &store.storage;
     let ds = Datasets::new(storage.pool());
     let pool = storage.pool();
 
@@ -319,13 +307,12 @@ async fn delete_record_and_dataset_remove_rows_and_revisions() {
             .fetch_one(&pool).await.unwrap();
     assert_eq!((total_recs, total_revs), (0, 0), "dataset fully gone");
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn prune_revisions_keeps_the_newest_n_and_respects_the_cutoff() {
-    let (storage, dir) = fresh_db("datasets-prune").await;
+    let store = fresh_db("datasets-prune").await;
+    let storage = &store.storage;
     let ds = Datasets::new(storage.pool());
     let pool = storage.pool();
 
@@ -362,6 +349,4 @@ async fn prune_revisions_keeps_the_newest_n_and_respects_the_cutoff() {
     ).fetch_one(&pool).await.unwrap();
     assert_eq!(kept_k2, 2);
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }

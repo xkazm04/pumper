@@ -121,6 +121,7 @@ pub struct TestContext<'a> {
     engines: Option<Arc<EngineSet>>,
     health: Option<Arc<Resilience>>,
     budget_usd: Option<f64>,
+    artifacts_dir: Option<std::path::PathBuf>,
 }
 
 impl<'a> TestContext<'a> {
@@ -132,7 +133,14 @@ impl<'a> TestContext<'a> {
             engines: None,
             health: None,
             budget_usd: None,
+            artifacts_dir: None,
         }
+    }
+
+    /// Override the per-job artifacts dir (default: `<artifacts root>/<app>/job`).
+    pub fn artifacts_dir(mut self, dir: std::path::PathBuf) -> Self {
+        self.artifacts_dir = Some(dir);
+        self
     }
 
     pub fn params(mut self, params: Value) -> Self {
@@ -173,7 +181,9 @@ impl<'a> TestContext<'a> {
             }),
             plugins: Arc::new(NoPlugins),
             progress: Arc::new(NoProgress),
-            artifacts_dir: self.storage.artifacts_dir.join(&self.app).join("job"),
+            artifacts_dir: self
+                .artifacts_dir
+                .unwrap_or_else(|| self.storage.artifacts_dir.join(&self.app).join("job")),
         }
     }
 }

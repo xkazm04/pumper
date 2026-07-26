@@ -3,19 +3,13 @@
 //! (at most once per source run), and the jobs.trigger_id lineage view.
 //! Runs against a real temp-dir SQLite with the full migration chain.
 
-use pumper_core::config::StorageConfig;
-use pumper_core::{EnqueueOptions, NewTrigger, Storage};
+use pumper_core::{EnqueueOptions, NewTrigger};
 use serde_json::json;
 
 #[tokio::test]
 async fn trigger_crud_idempotent_fire_and_lineage() {
-    let dir = std::env::temp_dir().join(format!("pumper-trigger-test-{}", uuid::Uuid::new_v4()));
-    let cfg = StorageConfig {
-        database_path: dir.join("pumper.db"),
-        artifacts_dir: dir.join("artifacts"),
-        ..StorageConfig::default()
-    };
-    let storage = Storage::connect(&cfg).await.expect("connect + migrate");
+    let store = pumper_core::testing::TempStore::new("trigger-test").await;
+    let storage = &store.storage;
 
     // Create a dataset-kind edge: grants/unified fresh changes -> research.
     let trigger = storage
@@ -69,6 +63,4 @@ async fn trigger_crud_idempotent_fire_and_lineage() {
     assert!(storage.delete_trigger(&trigger.id).await.unwrap());
     assert!(storage.get_trigger(&trigger.id).await.unwrap().is_none());
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }

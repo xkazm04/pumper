@@ -2,20 +2,13 @@
 //! real temp-dir SQLite with the full migration chain. `next_retry_at` is
 //! backdated directly so the tests are deterministic (no sleeping).
 
-use pumper_core::config::StorageConfig;
-use pumper_core::Storage;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
-async fn fresh_db(tag: &str) -> (Storage, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("pumper-{tag}-{}", Uuid::new_v4()));
-    let cfg = StorageConfig {
-        database_path: dir.join("pumper.db"),
-        artifacts_dir: dir.join("artifacts"),
-        ..StorageConfig::default()
-    };
-    let storage = Storage::connect(&cfg).await.expect("connect + migrate");
-    (storage, dir)
+use pumper_core::testing::TempStore;
+
+async fn fresh_db(tag: &str) -> TempStore {
+    TempStore::new(tag).await
 }
 
 /// Forces a failed delivery's `next_retry_at` into the past so `due_deliveries`
@@ -41,7 +34,8 @@ const MAX_RETRIES: i64 = 5;
 
 #[tokio::test]
 async fn fail_schedules_retry_then_drain_claims_it() {
-    let (storage, dir) = fresh_db("dlq-drain").await;
+    let store = fresh_db("dlq-drain").await;
+    let storage = &store.storage;
     let pool = storage.pool();
 
     let id = storage
@@ -72,12 +66,12 @@ async fn fail_schedules_retry_then_drain_claims_it() {
     // A racing second claim finds it no longer 'failed'.
     assert!(!storage.begin_delivery_retry(&id).await.unwrap());
 
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
 async fn repeated_failures_eventually_go_dead() {
-    let (storage, dir) = fresh_db("dlq-dead").await;
+    let store = fresh_db("dlq-dead").await;
+    let storage = &store.storage;
     let pool = storage.pool();
 
     let id = storage
@@ -99,12 +93,12 @@ async fn repeated_failures_eventually_go_dead() {
     make_due(&pool, &id).await;
     assert!(storage.due_deliveries(10).await.unwrap().is_empty());
 
-    let _ = std::fs::remove_dir_all(dir);
 }
 
 #[tokio::test]
 async fn delivered_clears_the_retry_schedule() {
-    let (storage, dir) = fresh_db("dlq-ok").await;
+    let store = fresh_db("dlq-ok").await;
+    let storage = &store.storage;
     let pool = storage.pool();
 
     let id = storage
@@ -119,5 +113,4 @@ async fn delivered_clears_the_retry_schedule() {
     make_due(&pool, &id).await; // even if forced due, status='delivered' is not scanned
     assert!(storage.due_deliveries(10).await.unwrap().is_empty());
 
-    let _ = std::fs::remove_dir_all(dir);
 }

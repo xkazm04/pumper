@@ -4,22 +4,16 @@
 //! deterministic (no sleeping).
 
 use chrono::{Duration, SecondsFormat, Utc};
-use pumper_core::config::StorageConfig;
-use pumper_core::{EnqueueOptions, JobStatus, Storage};
+use pumper_core::{EnqueueOptions, JobStatus};
 use serde_json::json;
 use sqlx::SqlitePool;
 use uuid::Uuid;
 
 /// Fresh temp-dir SQLite with the full migration chain.
-async fn fresh_db(tag: &str) -> (Storage, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("pumper-{tag}-{}", Uuid::new_v4()));
-    let cfg = StorageConfig {
-        database_path: dir.join("pumper.db"),
-        artifacts_dir: dir.join("artifacts"),
-        ..StorageConfig::default()
-    };
-    let storage = Storage::connect(&cfg).await.expect("connect + migrate");
-    (storage, dir)
+use pumper_core::testing::TempStore;
+
+async fn fresh_db(tag: &str) -> TempStore {
+    TempStore::new(tag).await
 }
 
 /// Inserts a queued job with an explicit priority and queue-wait: `waited_secs`
@@ -45,7 +39,8 @@ async fn insert_queued(pool: &SqlitePool, app: &str, priority: i64, waited_secs:
 
 #[tokio::test]
 async fn priority_aging_lets_a_starved_low_priority_job_claim() {
-    let (storage, dir) = fresh_db("aging").await;
+    let store = fresh_db("aging").await;
+    let storage = &store.storage;
     let pool = storage.pool();
 
     // A low-priority job that has already waited an hour...
@@ -64,13 +59,12 @@ async fn priority_aging_lets_a_starved_low_priority_job_claim() {
         .expect("a job");
     assert_eq!(claimed.id, starved, "aged low-priority job should overtake fresh high-priority work");
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn aging_disabled_keeps_strict_priority_order() {
-    let (storage, dir) = fresh_db("aging-off").await;
+    let store = fresh_db("aging-off").await;
+    let storage = &store.storage;
     let pool = storage.pool();
 
     // Same setup as above, but with aging disabled the starved job stays behind.
@@ -90,13 +84,12 @@ async fn aging_disabled_keeps_strict_priority_order() {
         "with aging off a high-priority job must claim before the aged low-priority one"
     );
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn equal_priority_claims_fifo() {
-    let (storage, dir) = fresh_db("fifo").await;
+    let store = fresh_db("fifo").await;
+    let storage = &store.storage;
     let pool = storage.pool();
 
     // Three equal-priority jobs at different ages; FIFO = oldest first, whether
@@ -112,8 +105,6 @@ async fn equal_priority_claims_fifo() {
     let third = storage.claim_next(&[], 900.0).await.unwrap().unwrap();
     assert_eq!(third.id, newest);
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Inserts a job already in a terminal `failed` state.
@@ -136,7 +127,8 @@ async fn insert_failed(pool: &SqlitePool, app: &str) -> Uuid {
 
 #[tokio::test]
 async fn reset_requeues_running_and_fences_stale_completion() {
-    let (storage, dir) = fresh_db("reset").await;
+    let store = fresh_db("reset").await;
+    let storage = &store.storage;
 
     let job = storage
         .enqueue("a", EnqueueOptions { max_attempts: 3, ..Default::default() })
@@ -171,13 +163,12 @@ async fn reset_requeues_running_and_fences_stale_completion() {
     assert_eq!(done.status, JobStatus::Succeeded);
     assert_eq!(done.result, Some(json!({"ok": true})));
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn cancel_running_is_attempt_guarded() {
-    let (storage, dir) = fresh_db("cancel-running").await;
+    let store = fresh_db("cancel-running").await;
+    let storage = &store.storage;
     let job = storage.enqueue("a", EnqueueOptions::default()).await.unwrap();
     let claimed = storage.claim_next(&[], 0.0).await.unwrap().unwrap();
     assert_eq!(claimed.attempts, 1);
@@ -190,13 +181,12 @@ async fn cancel_running_is_attempt_guarded() {
     // Idempotent: already terminal.
     assert!(!storage.cancel_running(job.id, 1).await.unwrap());
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn retry_bulk_requeues_filtered_batch() {
-    let (storage, dir) = fresh_db("bulk").await;
+    let store = fresh_db("bulk").await;
+    let storage = &store.storage;
     let pool = storage.pool();
 
     let a1 = insert_failed(&pool, "a").await;
@@ -221,8 +211,6 @@ async fn retry_bulk_requeues_filtered_batch() {
     let capped = storage.retry_bulk(JobStatus::Failed, None, 1).await.unwrap();
     assert_eq!(capped.len(), 1);
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 /// Inserts a `running` job with an explicit heartbeat age (seconds ago).
@@ -257,7 +245,8 @@ async fn insert_running(
 
 #[tokio::test]
 async fn reaper_requeues_stale_but_leaves_fresh_running_jobs() {
-    let (storage, dir) = fresh_db("reap").await;
+    let store = fresh_db("reap").await;
+    let storage = &store.storage;
     let pool = storage.pool();
 
     // Hung: last heartbeat 300s ago, attempts remain -> re-queued.
@@ -277,13 +266,12 @@ async fn reaper_requeues_stale_but_leaves_fresh_running_jobs() {
         "a slow-but-alive job must survive the reaper"
     );
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn reaper_fails_permanently_when_attempts_exhausted() {
-    let (storage, dir) = fresh_db("reap-exhausted").await;
+    let store = fresh_db("reap-exhausted").await;
+    let storage = &store.storage;
     let pool = storage.pool();
 
     // Stale AND out of attempts (attempts == max) -> permanent failure.
@@ -296,13 +284,12 @@ async fn reaper_fails_permanently_when_attempts_exhausted() {
     assert_eq!(job.status, JobStatus::Failed);
     assert!(job.error.unwrap().contains("lease expired"));
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn heartbeat_refresh_keeps_a_job_off_the_reaper() {
-    let (storage, dir) = fresh_db("heartbeat").await;
+    let store = fresh_db("heartbeat").await;
+    let storage = &store.storage;
     let pool = storage.pool();
 
     let running = insert_running(&pool, "a", 1, 1, 300).await;
@@ -315,6 +302,4 @@ async fn heartbeat_refresh_keeps_a_job_off_the_reaper() {
     // Attempt-guarded: a stale task can't refresh a row it no longer owns.
     assert!(!storage.heartbeat(running, 2).await.unwrap());
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }

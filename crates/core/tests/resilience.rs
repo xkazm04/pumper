@@ -11,28 +11,20 @@
 
 use std::sync::Arc;
 
-use async_trait::async_trait;
-use pumper_core::config::{FetcherConfig, GovernorConfig, ResilienceConfig, StorageConfig};
+use pumper_core::config::ResilienceConfig;
 use pumper_core::extract::{CoercionStatus, DocReport, FieldStatus};
 use pumper_core::resilience::store::Resilience;
 use pumper_core::{
-    doc_signals, AppContext, Browser, CostLedger, Datasets, EngineSet, FetchHealth, Fetcher,
-    Governor, HttpClient, HttpRequest, HttpResponse, NoPlugins, NoProgress, ObservedDoc,
-    RenderRequest, RenderedPage, ResearchCache, ResearchOutput, ResearchRequest, Researcher,
-    Result as CoreResult, RunReport, RunVerdict, SourceState, SpentTotal, Storage, TierMemory,
+    doc_signals, AppContext, Datasets, FetchHealth, ObservedDoc, RunReport, RunVerdict,
+    SourceState, Storage,
 };
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-async fn fresh_db(tag: &str) -> (Storage, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("pumper-{tag}-{}", Uuid::new_v4()));
-    let cfg = StorageConfig {
-        database_path: dir.join("pumper.db"),
-        artifacts_dir: dir.join("artifacts"),
-        ..StorageConfig::default()
-    };
-    let storage = Storage::connect(&cfg).await.expect("connect + migrate");
-    (storage, dir)
+use pumper_core::testing::TempStore;
+
+async fn fresh_db(tag: &str) -> TempStore {
+    TempStore::new(tag).await
 }
 
 /// Detection on, thresholds scaled down so a test cohort is a real cohort.
@@ -123,7 +115,8 @@ async fn observe(
 
 #[tokio::test]
 async fn a_redesign_walks_the_source_down_the_ladder_and_a_fix_walks_it_back() {
-    let (storage, dir) = fresh_db("resilience-ladder").await;
+    let store = fresh_db("resilience-ladder").await;
+    let storage = &store.storage;
     let health = Resilience::new(storage.pool(), &cfg());
 
     // Three healthy runs build the baseline. The first can never trip — there is
@@ -186,13 +179,12 @@ async fn a_redesign_walks_the_source_down_the_ladder_and_a_fix_walks_it_back() {
     assert!(runs.iter().all(|r| r.reasons.is_some()), "a verdict must explain itself");
     assert!(runs.iter().all(|r| r.build_id.as_deref() == Some("test")));
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn a_content_change_is_not_a_break() {
-    let (storage, dir) = fresh_db("resilience-content").await;
+    let store = fresh_db("resilience-content").await;
+    let storage = &store.storage;
     let health = Resilience::new(storage.pool(), &cfg());
 
     for _ in 0..4 {
@@ -208,13 +200,12 @@ async fn a_content_change_is_not_a_break() {
     assert_eq!(v.verdict, RunVerdict::Ok, "a content change must not read as a break: {:?}", v.reasons);
     assert_eq!(v.state, SourceState::Healthy);
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn a_bot_wall_run_changes_nothing_at_all() {
-    let (storage, dir) = fresh_db("resilience-gate").await;
+    let store = fresh_db("resilience-gate").await;
+    let storage = &store.storage;
     let health = Resilience::new(storage.pool(), &cfg());
     for _ in 0..3 {
         observe(&health, &cohort(30, "price", ".price", "sturdy")).await;
@@ -256,13 +247,12 @@ async fn a_bot_wall_run_changes_nothing_at_all() {
     assert_eq!(runs[0].verdict, "inconclusive");
     assert!((runs[0].fetch_ok_rate - 0.1).abs() < 1e-9);
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn invariants_are_mined_from_live_records_and_then_checked() {
-    let (storage, dir) = fresh_db("resilience-invariants").await;
+    let store = fresh_db("resilience-invariants").await;
+    let storage = &store.storage;
     let datasets = Datasets::new(storage.pool());
     let health = Resilience::new(storage.pool(), &cfg());
 
@@ -290,62 +280,13 @@ async fn invariants_are_mined_from_live_records_and_then_checked() {
     assert!(price_kinds.contains(&"regex"), "mined for price: {price_kinds:?}");
     assert!(price_kinds.contains(&"nonnull"), "mined for price: {price_kinds:?}");
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 // ---- enforcement: what a degrading source must never do --------------------
 
-/// Engines that must never be called — these tests only exercise the write paths.
-struct Dead;
-#[async_trait]
-impl HttpClient for Dead {
-    async fn fetch(&self, _: HttpRequest) -> CoreResult<HttpResponse> {
-        panic!("no fetching in a write-path test")
-    }
-}
-#[async_trait]
-impl Browser for Dead {
-    async fn render(&self, _: RenderRequest) -> CoreResult<RenderedPage> {
-        panic!("no rendering in a write-path test")
-    }
-}
-#[async_trait]
-impl Researcher for Dead {
-    async fn research(&self, _: ResearchRequest) -> CoreResult<ResearchOutput> {
-        panic!("no research in a write-path test")
-    }
-}
-
+/// Write-path AppContext over the shared harness (Dead engines, no budget).
 fn ctx(storage: &Storage, health: Arc<Resilience>) -> AppContext {
-    let pool = storage.pool();
-    AppContext {
-        job_id: Uuid::new_v4(),
-        app: "extractor".into(),
-        params: json!({}),
-        engines: Arc::new(EngineSet {
-            http: Arc::new(Dead),
-            browser: Arc::new(Dead),
-            claude: Arc::new(Dead),
-            fetch: Fetcher::new(
-                Arc::new(Dead),
-                Arc::new(Dead),
-                Arc::new(Dead),
-                Arc::new(Governor::new(&GovernorConfig::default())),
-                &FetcherConfig::default(),
-            ),
-        }),
-        datasets: Arc::new(Datasets::new(pool.clone())),
-        costs: Arc::new(CostLedger::new(pool.clone())),
-        budget_usd: None,
-        spent_usd: Arc::new(SpentTotal::default()),
-        research_cache: Arc::new(ResearchCache::new(pool.clone(), 0)),
-        tiers: Arc::new(TierMemory::new(pool.clone(), 0)),
-        health,
-        plugins: Arc::new(NoPlugins),
-        progress: Arc::new(NoProgress),
-        artifacts_dir: storage.artifacts_dir.join("extractor").join("job"),
-    }
+    pumper_core::testing::TestContext::new(storage, "extractor").health(health).build()
 }
 
 fn items(keys: &[&str]) -> Vec<(String, Value)> {
@@ -354,7 +295,8 @@ fn items(keys: &[&str]) -> Vec<(String, Value)> {
 
 #[tokio::test]
 async fn a_degrading_source_cannot_tombstone_its_own_dataset() {
-    let (storage, dir) = fresh_db("resilience-tombstone").await;
+    let store = fresh_db("resilience-tombstone").await;
+    let storage = &store.storage;
     let enforcing = ResilienceConfig { enforce: true, ..cfg() };
     let health = Arc::new(Resilience::new(storage.pool(), &enforcing));
     let ctx = ctx(&storage, health.clone());
@@ -393,13 +335,12 @@ async fn a_degrading_source_cannot_tombstone_its_own_dataset() {
     let a = datasets.get("extractor", "products", "a").await.unwrap().unwrap();
     assert_eq!(a.trust, "provisional");
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn a_quarantined_source_writes_to_the_shadow_dataset() {
-    let (storage, dir) = fresh_db("resilience-quarantine").await;
+    let store = fresh_db("resilience-quarantine").await;
+    let storage = &store.storage;
     let health = Arc::new(Resilience::new(
         storage.pool(),
         &ResilienceConfig { enforce: true, ..cfg() },
@@ -426,13 +367,12 @@ async fn a_quarantined_source_writes_to_the_shadow_dataset() {
     // The pre-quarantine record keeps its stamp.
     assert_eq!(datasets.get("extractor", "products", "a").await.unwrap().unwrap().trust, "stable");
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn soak_mode_records_the_verdict_and_gates_nothing() {
-    let (storage, dir) = fresh_db("resilience-soak").await;
+    let store = fresh_db("resilience-soak").await;
+    let storage = &store.storage;
     // The shipping default: detection on, enforcement off.
     let health = Arc::new(Resilience::new(storage.pool(), &cfg()));
     assert!(health.enabled() && !health.enforcing());
@@ -454,13 +394,12 @@ async fn soak_mode_records_the_verdict_and_gates_nothing() {
     assert!(datasets.get("extractor", "products@q", "a").await.unwrap().is_none());
     assert_eq!(datasets.get("extractor", "products", "a").await.unwrap().unwrap().trust, "stable");
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn the_change_feed_holds_back_provisional_revisions_by_default() {
-    let (storage, dir) = fresh_db("resilience-feed").await;
+    let store = fresh_db("resilience-feed").await;
+    let storage = &store.storage;
     let health = Arc::new(Resilience::new(
         storage.pool(),
         &ResilienceConfig { enforce: true, ..cfg() },
@@ -497,13 +436,12 @@ async fn the_change_feed_holds_back_provisional_revisions_by_default() {
     let doubtful = all.items.iter().find(|r| r.key == "doubtful").unwrap();
     assert_eq!(doubtful.trust, "provisional");
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn retention_keeps_the_baseline_window_and_prunes_behind_it() {
-    let (storage, dir) = fresh_db("resilience-prune").await;
+    let store = fresh_db("resilience-prune").await;
+    let storage = &store.storage;
     let health = Resilience::new(
         storage.pool(),
         &ResilienceConfig { window_runs: 3, sketch_retention_runs: 3, ..cfg() },
@@ -523,6 +461,4 @@ async fn retention_keeps_the_baseline_window_and_prunes_behind_it() {
     let baseline = store.baseline("extractor/products", 3).await.unwrap();
     assert_eq!(baseline.runs("price"), 3);
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }

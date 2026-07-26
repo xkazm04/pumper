@@ -1,30 +1,19 @@
 //! Integration test for the self-learning tier router memory against a real
 //! temp-dir SQLite with the full migration chain.
 
-use pumper_core::config::StorageConfig;
-use pumper_core::{Storage, TierMemory};
+use pumper_core::TierMemory;
 
 /// Fresh temp-dir SQLite with the full migration chain.
-async fn fresh_db(tag: &str) -> (Storage, std::path::PathBuf) {
-    let dir = std::env::temp_dir().join(format!("pumper-{tag}-{}", uuid::Uuid::new_v4()));
-    let cfg = StorageConfig {
-        database_path: dir.join("pumper.db"),
-        artifacts_dir: dir.join("artifacts"),
-        ..StorageConfig::default()
-    };
-    let storage = Storage::connect(&cfg).await.expect("connect + migrate");
-    (storage, dir)
+use pumper_core::testing::TempStore;
+
+async fn fresh_db(tag: &str) -> TempStore {
+    TempStore::new(tag).await
 }
 
 #[tokio::test]
 async fn learns_browser_after_three_strikes_and_resets_on_http_win() {
-    let dir = std::env::temp_dir().join(format!("pumper-tier-test-{}", uuid::Uuid::new_v4()));
-    let cfg = StorageConfig {
-        database_path: dir.join("pumper.db"),
-        artifacts_dir: dir.join("artifacts"),
-        ..StorageConfig::default()
-    };
-    let storage = Storage::connect(&cfg).await.expect("connect + migrate");
+    let store = pumper_core::testing::TempStore::new("tier-test").await;
+    let storage = &store.storage;
     // ttl 0 disables aging — this test covers the classic strike/reset path.
     let tiers = TierMemory::new(storage.pool(), 0);
 
@@ -54,13 +43,12 @@ async fn learns_browser_after_three_strikes_and_resets_on_http_win() {
     // Unrelated hosts are untouched.
     assert_eq!(tiers.preferred("plain.example").await.unwrap(), None);
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn aged_out_pin_lapses_and_earns_a_fresh_strike_count() {
-    let (storage, dir) = fresh_db("tier-age").await;
+    let store = fresh_db("tier-age").await;
+    let storage = &store.storage;
     // 1-second aging horizon: strikes written "now" are already considered
     // stale by an in-the-future check the moment we advance past the TTL.
     let tiers = TierMemory::new(storage.pool(), 1);
@@ -93,13 +81,12 @@ async fn aged_out_pin_lapses_and_earns_a_fresh_strike_count() {
     let profile = tiers.get("aged.example").await.unwrap().unwrap();
     assert_eq!(profile.http_strikes, 1, "stale strikes reset to a single fresh strike");
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }
 
 #[tokio::test]
 async fn penalties_persist_and_reload_and_forget_resets() {
-    let (storage, dir) = fresh_db("tier-penalty").await;
+    let store = fresh_db("tier-penalty").await;
+    let storage = &store.storage;
     let tiers = TierMemory::new(storage.pool(), 0);
 
     // A strike host plus a penalty-only host.
@@ -137,6 +124,4 @@ async fn penalties_persist_and_reload_and_forget_resets() {
     assert!(!tiers.forget("pin.example").await.unwrap());
     assert!(tiers.get("pin.example").await.unwrap().is_none());
 
-    drop(storage);
-    std::fs::remove_dir_all(&dir).ok();
 }

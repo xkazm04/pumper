@@ -2,93 +2,33 @@
 //! Builds a real temp-dir SQLite + `Datasets`, seeds `pages`-style records with
 //! `artifact_path` + `job_id`, writes a body to the origin job's artifacts dir,
 //! then runs the app and asserts it extracts from the stored body (never
-//! fetching) and reports missing/unreadable artifacts per key.
+//! fetching — the harness engines panic on any fetch) and reports
+//! missing/unreadable artifacts per key.
 
-use std::sync::Arc;
+use std::path::Path;
 
 use app_extractor::Extractor;
-use async_trait::async_trait;
-use pumper_core::config::{FetcherConfig, GovernorConfig, ResilienceConfig, StorageConfig};
-use pumper_core::{
-    AppContext, Browser, CostLedger, Datasets, EngineSet, Fetcher, Governor, HttpClient,
-    HttpRequest, HttpResponse, NoPlugins, NoProgress, RenderRequest, RenderedPage, ResearchCache,
-    ResearchOutput, ResearchRequest, Researcher, Resilience, Result, ScrapeApp, SpentTotal, Storage,
-    TierMemory,
-};
+use pumper_core::testing::{TempStore, TestContext};
+use pumper_core::{AppContext, ScrapeApp};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-// Source mode never fetches, so the engines are stubs that must never be called.
-struct DeadHttp;
-#[async_trait]
-impl HttpClient for DeadHttp {
-    async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
-        panic!("source mode must not fetch over HTTP")
-    }
-}
-struct DeadBrowser;
-#[async_trait]
-impl Browser for DeadBrowser {
-    async fn render(&self, _req: RenderRequest) -> Result<RenderedPage> {
-        panic!("source mode must not render")
-    }
-}
-struct DeadResearcher;
-#[async_trait]
-impl Researcher for DeadResearcher {
-    async fn research(&self, _req: ResearchRequest) -> Result<ResearchOutput> {
-        panic!("source mode must not research")
-    }
-}
-
-async fn ctx_with(root: std::path::PathBuf, storage: &Storage, params: Value) -> AppContext {
-    let pool = storage.pool();
-    let engines = Arc::new(EngineSet {
-        http: Arc::new(DeadHttp),
-        browser: Arc::new(DeadBrowser),
-        claude: Arc::new(DeadResearcher),
-        fetch: Fetcher::new(
-            Arc::new(DeadHttp),
-            Arc::new(DeadBrowser),
-            Arc::new(DeadResearcher),
-            Arc::new(Governor::new(&GovernorConfig::default())),
-            &FetcherConfig::default(),
-        ),
-    });
-    let job_id = Uuid::new_v4();
-    AppContext {
-        job_id,
-        app: "extractor".into(),
-        params,
-        engines,
-        datasets: Arc::new(Datasets::new(pool.clone())),
-        costs: Arc::new(CostLedger::new(pool.clone())),
-        budget_usd: None,
-        spent_usd: Arc::new(SpentTotal::default()),
-        research_cache: Arc::new(ResearchCache::new(pool.clone(), 3600)),
-        tiers: Arc::new(TierMemory::new(pool.clone(), 3600)),
-        // Health detection on, enforcement off — the shipping default, so this
-        // test also covers that observing a run never changes what the app returns.
-        health: Arc::new(Resilience::new(pool.clone(), &ResilienceConfig::default())),
-        plugins: Arc::new(NoPlugins),
-        progress: Arc::new(NoProgress),
-        // Must be `<root>/extractor/<job_id>` so the app resolves the shared
-        // artifacts root two levels up.
-        artifacts_dir: root.join("extractor").join(job_id.to_string()),
-    }
+/// Health detection on, enforcement off — the shipping default, so these tests
+/// also cover that observing a run never changes what the app returns. The
+/// artifacts dir must be `<root>/extractor/<job>` so the app resolves the
+/// shared artifacts root two levels up.
+fn ctx_with(root: &Path, store: &TempStore, params: Value) -> AppContext {
+    TestContext::new(&store.storage, "extractor")
+        .params(params)
+        .artifacts_dir(root.join("extractor").join("job"))
+        .build()
 }
 
 #[tokio::test]
 async fn source_mode_extracts_stored_bodies_and_reports_missing() {
-    let root = std::env::temp_dir().join(format!("pumper-extract-{}", Uuid::new_v4()));
-    let cfg = StorageConfig {
-        database_path: root.join("pumper.db"),
-        artifacts_dir: root.join("artifacts-unused"),
-        ..StorageConfig::default()
-    };
-    let storage = Storage::connect(&cfg).await.expect("connect + migrate");
-    let pool = storage.pool();
-    let datasets = Datasets::new(pool.clone());
+    let store = TempStore::new("extract-source").await;
+    let root = store.path().to_path_buf();
+    let datasets = store.datasets();
 
     // The origin crawl job wrote one body to disk under its per-job dir.
     let crawl_job = Uuid::new_v4().to_string();
@@ -125,7 +65,7 @@ async fn source_mode_extracts_stored_bodies_and_reports_missing() {
                    "keys":["http://a","http://b","http://c","http://d"]},
         "rules": {"headline": {"type":"css","selector":"h1"}}
     });
-    let out = Extractor.run(ctx_with(root.clone(), &storage, params).await).await.unwrap();
+    let out = Extractor.run(ctx_with(&root, &store, params)).await.unwrap();
 
     assert_eq!(out["mode"], "source");
     assert_eq!(out["requested"], 4);
@@ -151,15 +91,9 @@ async fn source_mode_extracts_stored_bodies_and_reports_missing() {
 
 #[tokio::test]
 async fn source_mode_without_keys_sweeps_live_records() {
-    let root = std::env::temp_dir().join(format!("pumper-extract-{}", Uuid::new_v4()));
-    let cfg = StorageConfig {
-        database_path: root.join("pumper.db"),
-        artifacts_dir: root.join("artifacts-unused"),
-        ..StorageConfig::default()
-    };
-    let storage = Storage::connect(&cfg).await.expect("connect + migrate");
-    let pool = storage.pool();
-    let datasets = Datasets::new(pool.clone());
+    let store = TempStore::new("extract-sweep").await;
+    let root = store.path().to_path_buf();
+    let datasets = store.datasets();
 
     let crawl_job = Uuid::new_v4().to_string();
     let crawl_dir = root.join("crawl").join(&crawl_job);
@@ -183,7 +117,7 @@ async fn source_mode_without_keys_sweeps_live_records() {
         "source": {"app":"crawl","dataset":"pages"},
         "rules": {"h": {"type":"css","selector":"h1"}}
     });
-    let out = Extractor.run(ctx_with(root, &storage, params).await).await.unwrap();
+    let out = Extractor.run(ctx_with(&root, &store, params)).await.unwrap();
     assert_eq!(out["requested"], 1);
     assert_eq!(out["loaded"], 1);
     assert_eq!(out["records"][0]["h"], "Only");
