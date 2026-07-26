@@ -32,7 +32,10 @@ pub trait Plugins: Send + Sync {
     /// (`{name, version, description, params_schema, output_schema}`) when it
     /// exports `describe`. Default: name-only entries from [`list`].
     fn manifests(&self) -> Vec<Value> {
-        self.list().into_iter().map(|name| serde_json::json!({ "name": name })).collect()
+        self.list()
+            .into_iter()
+            .map(|name| serde_json::json!({ "name": name }))
+            .collect()
     }
 
     /// Rescans the plugin directory (hot-swap); returns the loaded count.
@@ -45,7 +48,9 @@ pub struct NoPlugins;
 #[async_trait]
 impl Plugins for NoPlugins {
     async fn run(&self, name: &str, _input: &str, _params: &Value) -> Result<Value> {
-        Err(Error::App(format!("plugins are disabled; cannot run '{name}'")))
+        Err(Error::App(format!(
+            "plugins are disabled; cannot run '{name}'"
+        )))
     }
     fn list(&self) -> Vec<String> {
         Vec::new()

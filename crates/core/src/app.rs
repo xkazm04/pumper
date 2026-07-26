@@ -157,7 +157,13 @@ impl AppContext {
     /// would otherwise be invisible to the cost ledger and budget enforcement.
     ///
     /// Accounting never fails the caller's job: a failed write is warn-logged.
-    pub async fn meter(&self, engine: &str, url: Option<&str>, cost_usd: f64, detail: Option<&str>) {
+    pub async fn meter(
+        &self,
+        engine: &str,
+        url: Option<&str>,
+        cost_usd: f64,
+        detail: Option<&str>,
+    ) {
         self.spent_usd.add(cost_usd);
         if let Err(e) = self
             .costs
@@ -229,7 +235,10 @@ impl AppContext {
         // headroom, clamp the tier's per-call ceiling to what's left; with none,
         // downgrade to the free tiers instead of failing the whole fetch.
         let mut budget_note = None;
-        if matches!(req.strategy, crate::fetcher::FetchStrategy::AutoWithResearch) {
+        if matches!(
+            req.strategy,
+            crate::fetcher::FetchStrategy::AutoWithResearch
+        ) {
             match self.remaining_budget_usd().await? {
                 Some(remaining) if remaining <= 0.0 => {
                     req.strategy = crate::fetcher::FetchStrategy::Auto;
@@ -326,7 +335,8 @@ impl AppContext {
             req.max_budget_usd = Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
         }
         let out = self.engines.claude.research(req).await?;
-        self.meter("claude", None, out.cost_usd.unwrap_or(0.0), None).await;
+        self.meter("claude", None, out.cost_usd.unwrap_or(0.0), None)
+            .await;
         if let Some(key) = &key {
             if let Err(e) = self.research_cache.put(key, &out).await {
                 tracing::warn!(job = %self.job_id, "research cache write failed: {e}");
@@ -414,7 +424,10 @@ impl AppContext {
     /// shipping default: soak mode computes verdicts and gates nothing.
     async fn write_target(&self, dataset: &str) -> (String, Option<&'static str>) {
         let state = self.health.enforced_state(&self.app, dataset).await;
-        (crate::resilience::write_dataset(dataset, state), state.trust())
+        (
+            crate::resilience::write_dataset(dataset, state),
+            state.trust(),
+        )
     }
 
     /// Judges this run's extraction against the source's own history, records the
@@ -539,8 +552,21 @@ mod tests {
     /// filesystem path outside the artifacts root.
     #[test]
     fn safe_path_segment_rejects_every_escape_shape() {
-        for bad in ["", ".", "..", "a/b", "a\\b", "/etc/passwd", "..\\up", "C:\\x", "/"] {
-            assert!(safe_path_segment(bad, "test").is_err(), "must reject {bad:?}");
+        for bad in [
+            "",
+            ".",
+            "..",
+            "a/b",
+            "a\\b",
+            "/etc/passwd",
+            "..\\up",
+            "C:\\x",
+            "/",
+        ] {
+            assert!(
+                safe_path_segment(bad, "test").is_err(),
+                "must reject {bad:?}"
+            );
         }
     }
 

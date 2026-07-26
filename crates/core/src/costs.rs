@@ -55,7 +55,9 @@ pub struct SpentTotal(std::sync::atomic::AtomicU64);
 impl SpentTotal {
     /// Seeds the total, normally from [`CostLedger::job_total`].
     pub fn new(seed_usd: f64) -> Self {
-        Self(std::sync::atomic::AtomicU64::new(seed_usd.max(0.0).to_bits()))
+        Self(std::sync::atomic::AtomicU64::new(
+            seed_usd.max(0.0).to_bits(),
+        ))
     }
 
     /// USD recorded against this job so far.
@@ -162,7 +164,12 @@ impl CostLedger {
         .await?;
         Ok(rows
             .into_iter()
-            .map(|(app, engine, calls, cost_usd)| CostSummary { app, engine, calls, cost_usd })
+            .map(|(app, engine, calls, cost_usd)| CostSummary {
+                app,
+                engine,
+                calls,
+                cost_usd,
+            })
             .collect())
     }
 }

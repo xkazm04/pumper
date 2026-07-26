@@ -77,7 +77,9 @@ pub(crate) fn parse_cursor(cursor: &str) -> Option<(String, String)> {
     if trimmed.is_empty() {
         return None; // first page
     }
-    trimmed.split_once('|').map(|(t, k)| (t.to_string(), k.to_string()))
+    trimmed
+        .split_once('|')
+        .map(|(t, k)| (t.to_string(), k.to_string()))
 }
 
 /// Next-page cursor for a keyset page: `Some` only when the page came back full

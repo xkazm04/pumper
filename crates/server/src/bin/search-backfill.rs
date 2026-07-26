@@ -100,7 +100,10 @@ async fn resolve_targets(datasets: &Datasets) -> anyhow::Result<Vec<(String, Str
     let args: Vec<String> = std::env::args().collect();
     let has = |name: &str| args.iter().any(|a| a == name);
     let flag = |name: &str| {
-        args.iter().position(|a| a == name).and_then(|i| args.get(i + 1)).cloned()
+        args.iter()
+            .position(|a| a == name)
+            .and_then(|i| args.get(i + 1))
+            .cloned()
     };
     match (flag("--app"), flag("--dataset"), has("--all")) {
         (Some(app), Some(dataset), _) => Ok(vec![(app, dataset)]),

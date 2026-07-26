@@ -108,7 +108,11 @@ pub(crate) async fn run_one(state: &AppState) -> bool {
     match state.storage.claim_next(&[], aging).await {
         Ok(Some(job)) => {
             let cancel = tokio_util::sync::CancellationToken::new();
-            state.job_cancels.lock().unwrap().insert(job.id, (job.attempts, cancel.clone()));
+            state
+                .job_cancels
+                .lock()
+                .unwrap()
+                .insert(job.id, (job.attempts, cancel.clone()));
             publish(state, JobEvent::new(job.id, job.app.clone(), "running"));
             execute(state.clone(), job.clone(), cancel).await;
             let mut m = state.job_cancels.lock().unwrap();
@@ -128,19 +132,28 @@ pub(crate) async fn run_one(state: &AppState) -> bool {
 /// instead of being stranded in `running`.
 async fn drain(state: &AppState, semaphore: &Arc<Semaphore>, concurrency: usize) {
     let deadline = Duration::from_secs(state.config.worker.shutdown_drain_secs);
-    info!(deadline_secs = deadline.as_secs(), "worker draining in-flight jobs");
+    info!(
+        deadline_secs = deadline.as_secs(),
+        "worker draining in-flight jobs"
+    );
     let acquire = semaphore.clone().acquire_many_owned(concurrency as u32);
     match tokio::time::timeout(deadline, acquire).await {
         Ok(_) => info!("worker drained cleanly; no jobs left running"),
         Err(_) => match state.storage.recover_stuck().await {
-            Ok(n) => warn!(requeued = n, "drain deadline reached; re-queued still-running jobs"),
+            Ok(n) => warn!(
+                requeued = n,
+                "drain deadline reached; re-queued still-running jobs"
+            ),
             Err(e) => error!("drain re-queue failed: {e}"),
         },
     }
 }
 
 /// Apps currently at or above their concurrency limit (0 = unlimited).
-async fn blocked_apps(state: &AppState, running: &Arc<Mutex<HashMap<String, usize>>>) -> Vec<String> {
+async fn blocked_apps(
+    state: &AppState,
+    running: &Arc<Mutex<HashMap<String, usize>>>,
+) -> Vec<String> {
     let counts = running.lock().await;
     counts
         .iter()
@@ -310,7 +323,11 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         }
         Outcome::Finished(Err(e)) => {
             warn!(job = %job.id, error = %e, "job failed");
-            match state.storage.fail(job.id, job.attempts, &e.to_string()).await {
+            match state
+                .storage
+                .fail(job.id, job.attempts, &e.to_string())
+                .await
+            {
                 Ok(Some(JobStatus::Queued)) => {
                     // Not terminal — retry pending; wake the worker and return.
                     state.notify.notify_one();
@@ -326,7 +343,11 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             warn!(job = %job.id, timeout_secs = timeout.as_secs(), "job timed out");
             match state
                 .storage
-                .fail(job.id, job.attempts, &format!("timed out after {}s", timeout.as_secs()))
+                .fail(
+                    job.id,
+                    job.attempts,
+                    &format!("timed out after {}s", timeout.as_secs()),
+                )
                 .await
             {
                 Ok(Some(JobStatus::Queued)) => {
@@ -408,7 +429,10 @@ fn group_by_dataset(
 ) -> HashMap<&str, Vec<&pumper_core::Revision>> {
     let mut by_dataset: HashMap<&str, Vec<&pumper_core::Revision>> = HashMap::new();
     for rev in changes {
-        by_dataset.entry(rev.dataset.as_str()).or_default().push(rev);
+        by_dataset
+            .entry(rev.dataset.as_str())
+            .or_default()
+            .push(rev);
     }
     by_dataset
 }
@@ -567,7 +591,11 @@ async fn finalize(state: &AppState, id: uuid::Uuid) {
     event.result = job.result.clone();
     event.error = job.error.clone();
     publish(state, event);
-    webhook::dispatch(state.webhook_client.clone(), state.storage.clone(), job.clone());
+    webhook::dispatch(
+        state.webhook_client.clone(),
+        state.storage.clone(),
+        job.clone(),
+    );
     // Permanent-failure firehose: a job that exhausted its attempts (app error,
     // timeout, or a reaped stale lease — all land here via `finalize`) notifies
     // the global `[webhooks] failure_url` subscriber, if configured. Retryable

@@ -34,7 +34,10 @@ async fn learns_browser_after_three_strikes_and_resets_on_http_win() {
 
     // A browser win with no HTTP attempt teaches nothing (skip path).
     tiers.record("spa.example", "browser", false).await.unwrap();
-    assert_eq!(tiers.preferred("spa.example").await.unwrap().as_deref(), Some("browser"));
+    assert_eq!(
+        tiers.preferred("spa.example").await.unwrap().as_deref(),
+        Some("browser")
+    );
 
     // One HTTP win fully resets the record.
     tiers.record("spa.example", "http", false).await.unwrap();
@@ -42,7 +45,6 @@ async fn learns_browser_after_three_strikes_and_resets_on_http_win() {
 
     // Unrelated hosts are untouched.
     assert_eq!(tiers.preferred("plain.example").await.unwrap(), None);
-
 }
 
 #[tokio::test]
@@ -79,8 +81,10 @@ async fn aged_out_pin_lapses_and_earns_a_fresh_strike_count() {
         "one fresh loss after aging out must not re-pin"
     );
     let profile = tiers.get("aged.example").await.unwrap().unwrap();
-    assert_eq!(profile.http_strikes, 1, "stale strikes reset to a single fresh strike");
-
+    assert_eq!(
+        profile.http_strikes, 1,
+        "stale strikes reset to a single fresh strike"
+    );
 }
 
 #[tokio::test]
@@ -101,7 +105,10 @@ async fn penalties_persist_and_reload_and_forget_resets() {
     // load_penalties returns every non-zero learned penalty for boot restore.
     let mut loaded = tiers.load_penalties().await.unwrap();
     loaded.sort();
-    assert_eq!(loaded, vec![("pin.example".into(), 2000), ("slow.example".into(), 5000)]);
+    assert_eq!(
+        loaded,
+        vec![("pin.example".into(), 2000), ("slow.example".into(), 5000)]
+    );
 
     // The penalty-only host has a profile row but no strikes/pin.
     let slow = tiers.get("slow.example").await.unwrap().unwrap();
@@ -123,5 +130,4 @@ async fn penalties_persist_and_reload_and_forget_resets() {
     assert!(tiers.forget("pin.example").await.unwrap());
     assert!(!tiers.forget("pin.example").await.unwrap());
     assert!(tiers.get("pin.example").await.unwrap().is_none());
-
 }

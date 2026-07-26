@@ -76,9 +76,15 @@ mod tests {
         // Fenced with a language tag.
         assert_eq!(salvage_json("```json\n{\"a\":2}\n```").unwrap()["a"], 2);
         // Leading prose, then the object.
-        assert_eq!(salvage_json("Here you go: {\"a\":3} — hope that helps").unwrap()["a"], 3);
+        assert_eq!(
+            salvage_json("Here you go: {\"a\":3} — hope that helps").unwrap()["a"],
+            3
+        );
         // A brace inside a string doesn't confuse the balancer.
-        assert_eq!(salvage_json(r#"prefix {"a":"has } brace"} tail"#).unwrap()["a"], "has } brace");
+        assert_eq!(
+            salvage_json(r#"prefix {"a":"has } brace"} tail"#).unwrap()["a"],
+            "has } brace"
+        );
     }
 
     #[test]

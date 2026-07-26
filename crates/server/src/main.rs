@@ -191,7 +191,10 @@ async fn cache_janitor(state: AppState) {
 async fn retention_janitor(state: AppState) {
     let days = state.config.storage.revision_retention_days;
     let keep_min = state.config.storage.revision_retention_keep_min;
-    let sketch_runs = state.health.enabled().then(|| state.config.resilience.sketch_retention_runs);
+    let sketch_runs = state
+        .health
+        .enabled()
+        .then(|| state.config.resilience.sketch_retention_runs);
     if days == 0 && sketch_runs.is_none() {
         return; // nothing to bound
     }

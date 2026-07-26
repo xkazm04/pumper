@@ -80,7 +80,9 @@ impl Baseline {
 
     /// Pooled `(coercion failures, coercible documents)` across the window.
     pub fn pooled_coercion(&self, field: &str) -> (u32, u32) {
-        self.fold(field, |s| (s.coercion_failed, s.coerced + s.coercion_failed))
+        self.fold(field, |s| {
+            (s.coercion_failed, s.coerced + s.coercion_failed)
+        })
     }
 
     fn fold(&self, field: &str, f: impl Fn(&FieldSketch) -> (u32, u32)) -> (u32, u32) {
@@ -94,7 +96,9 @@ impl Baseline {
 
     /// A per-run series of some scalar, for the robust-z comparisons.
     pub fn series(&self, field: &str, f: impl Fn(&FieldSketch) -> f64) -> Vec<f64> {
-        self.fields.get(field).map_or_else(Vec::new, |runs| runs.iter().map(f).collect())
+        self.fields
+            .get(field)
+            .map_or_else(Vec::new, |runs| runs.iter().map(f).collect())
     }
 
     /// Whether this field has enough history for a distributional test.
@@ -210,7 +214,12 @@ pub fn evaluate(cfg: &ResilienceConfig, input: &RunInput) -> RunEvaluation {
 
     // ---- gate: fetch first, always ----------------------------------------
     let fetch_rate = input.fetch.rate();
-    reasons.push(Reason::new("fetch_ok_rate", None, fetch_rate, cfg.fetch_ok_floor));
+    reasons.push(Reason::new(
+        "fetch_ok_rate",
+        None,
+        fetch_rate,
+        cfg.fetch_ok_floor,
+    ));
     if fetch_rate < cfg.fetch_ok_floor {
         return RunEvaluation {
             verdict: RunVerdict::Inconclusive,
@@ -224,7 +233,12 @@ pub fn evaluate(cfg: &ResilienceConfig, input: &RunInput) -> RunEvaluation {
 
     // ---- conclusive: a field that simply vanished --------------------------
     if let Some((field, run_rate, base_rate)) = total_collapse(input) {
-        reasons.push(Reason::new("total_collapse", Some(&field), run_rate, base_rate));
+        reasons.push(Reason::new(
+            "total_collapse",
+            Some(&field),
+            run_rate,
+            base_rate,
+        ));
         return RunEvaluation {
             verdict: RunVerdict::Broken,
             diagnosis: Some(Diagnosis::FieldLoss),
@@ -254,7 +268,12 @@ pub fn evaluate(cfg: &ResilienceConfig, input: &RunInput) -> RunEvaluation {
     // ---- below the cohort floor, no distributional claim is honest ---------
     let statistical_coverage = input.docs >= cfg.min_cohort_docs;
     if !statistical_coverage {
-        reasons.push(Reason::new("cohort_docs", None, input.docs as f64, cfg.min_cohort_docs as f64));
+        reasons.push(Reason::new(
+            "cohort_docs",
+            None,
+            input.docs as f64,
+            cfg.min_cohort_docs as f64,
+        ));
         return RunEvaluation {
             verdict: RunVerdict::Ok,
             diagnosis: None,
@@ -283,7 +302,12 @@ pub fn evaluate(cfg: &ResilienceConfig, input: &RunInput) -> RunEvaluation {
     // which would leave the design's own highest-precision silent-corruption
     // signal unable to act. See `conclusive_rebind`.
     let score = if let Some((field, base, run)) = conclusive_rebind(cfg, input) {
-        reasons.push(Reason::new("distinctness_collapse", Some(&field), run, base));
+        reasons.push(Reason::new(
+            "distinctness_collapse",
+            Some(&field),
+            run,
+            base,
+        ));
         1.0
     } else {
         weighted.clamp(0.0, 1.0)
@@ -303,7 +327,14 @@ pub fn evaluate(cfg: &ResilienceConfig, input: &RunInput) -> RunEvaluation {
         (true, _) => RunVerdict::Broken,
     };
 
-    RunEvaluation { verdict, diagnosis, score: round4(score), reasons, drift: input.drift, statistical_coverage }
+    RunEvaluation {
+        verdict,
+        diagnosis,
+        score: round4(score),
+        reasons,
+        drift: input.drift,
+        statistical_coverage,
+    }
 }
 
 /// The assumption-free rule: a field that used to match and now never does.
@@ -323,8 +354,7 @@ fn total_collapse(input: &RunInput) -> Option<(String, f64, f64)> {
             return None;
         }
         let base_rate = base_misses as f64 / base_n as f64;
-        (base_rate <= COLLAPSE_BASE_RATE)
-            .then(|| (field.clone(), sketch.miss_rate(), base_rate))
+        (base_rate <= COLLAPSE_BASE_RATE).then(|| (field.clone(), sketch.miss_rate(), base_rate))
     })
 }
 
@@ -346,7 +376,10 @@ fn conclusive_rebind(cfg: &ResilienceConfig, input: &RunInput) -> Option<(String
     if input.docs < cfg.min_cohort_docs {
         return None;
     }
-    if matches!(explain_divergence(cfg, input.drift), Some(Diagnosis::ContentChanged)) {
+    if matches!(
+        explain_divergence(cfg, input.drift),
+        Some(Diagnosis::ContentChanged)
+    ) {
         return None;
     }
     input.sketches.iter().find_map(|(field, sketch)| {
@@ -393,7 +426,10 @@ fn score_missrate(input: &RunInput, reasons: &mut Vec<Reason>) -> f64 {
             ),
             (
                 "coercion_failure_rate",
-                (sketch.coercion_failed, sketch.coerced + sketch.coercion_failed),
+                (
+                    sketch.coercion_failed,
+                    sketch.coerced + sketch.coercion_failed,
+                ),
                 input.baseline.pooled_coercion(field),
             ),
         ] {
@@ -406,7 +442,11 @@ fn score_missrate(input: &RunInput, reasons: &mut Vec<Reason>) -> f64 {
                 continue;
             }
             let headroom = 1.0 - base_rate;
-            let s = if headroom <= 0.0 { 0.0 } else { ((run_rate - base_rate) / headroom).clamp(0.0, 1.0) };
+            let s = if headroom <= 0.0 {
+                0.0
+            } else {
+                ((run_rate - base_rate) / headroom).clamp(0.0, 1.0)
+            };
             if s > worst {
                 worst = s;
             }
@@ -428,12 +468,16 @@ fn score_distinctness(cfg: &ResilienceConfig, input: &RunInput, reasons: &mut Ve
             continue;
         }
         let series = input.baseline.series(field, |s| s.distinct_ratio as f64);
-        let Some(base) = median(&series) else { continue };
+        let Some(base) = median(&series) else {
+            continue;
+        };
         if base < PER_RECORD_DISTINCT {
             continue; // legitimately repetitive; a collapse says nothing
         }
         let run = sketch.distinct_ratio as f64;
-        let Some(z) = robust_z(run, &series, RATIO_TOL) else { continue };
+        let Some(z) = robust_z(run, &series, RATIO_TOL) else {
+            continue;
+        };
         if z > -cfg.mad_z {
             continue;
         }
@@ -484,24 +528,36 @@ fn score_shape(cfg: &ResilienceConfig, input: &RunInput, reasons: &mut Vec<Reaso
         if !input.baseline.distributional(field) {
             continue;
         }
-        let Some(runs) = input.baseline.fields.get(field) else { continue };
+        let Some(runs) = input.baseline.fields.get(field) else {
+            continue;
+        };
         // Two distributions per field, over different supports (16 length buckets
         // vs 4 character classes), so they are compared separately rather than
         // zipped into one loop.
         let len = shape_drift(
             &sketch.len_distribution(),
-            &runs.iter().map(|s| s.len_distribution()).collect::<Vec<_>>(),
+            &runs
+                .iter()
+                .map(|s| s.len_distribution())
+                .collect::<Vec<_>>(),
         );
         let cls = shape_drift(
             &cls_f64(&sketch.cls),
             &runs.iter().map(|s| cls_f64(&s.cls)).collect::<Vec<_>>(),
         );
         for (test, (tv, history)) in [("len_shape", len), ("char_class_shape", cls)] {
-            let Some(z) = robust_z(tv, &history, SHAPE_TOL) else { continue };
+            let Some(z) = robust_z(tv, &history, SHAPE_TOL) else {
+                continue;
+            };
             if z < cfg.mad_z || tv < SHAPE_TOL {
                 continue;
             }
-            reasons.push(Reason::new(test, Some(field), tv, median(&history).unwrap_or(0.0)));
+            reasons.push(Reason::new(
+                test,
+                Some(field),
+                tv,
+                median(&history).unwrap_or(0.0),
+            ));
             if tv > worst {
                 worst = tv;
             }
@@ -516,7 +572,10 @@ fn score_shape(cfg: &ResilienceConfig, input: &RunInput, reasons: &mut Vec<Reaso
 fn shape_drift<const N: usize>(run: &[f64; N], baseline: &[[f64; N]]) -> (f64, Vec<f64>) {
     let centre = median_distribution(baseline);
     let tv = sketch::total_variation(run, &centre);
-    let history = baseline.iter().map(|d| sketch::total_variation(d, &centre)).collect();
+    let history = baseline
+        .iter()
+        .map(|d| sketch::total_variation(d, &centre))
+        .collect();
     (tv, history)
 }
 
@@ -684,7 +743,10 @@ mod tests {
     use crate::resilience::sketch::SketchBuilder;
 
     fn cfg() -> ResilienceConfig {
-        ResilienceConfig { min_cohort_docs: 10, ..ResilienceConfig::default() }
+        ResilienceConfig {
+            min_cohort_docs: 10,
+            ..ResilienceConfig::default()
+        }
     }
 
     /// `n` documents where the first `misses` missed and the rest carry a
@@ -726,7 +788,11 @@ mod tests {
         let mut b = SketchBuilder::new();
         for i in 0..n {
             let v = format!("Add item {i} to your shopping cart today");
-            b.push(&FieldStatus::Matched, Some(CoercionStatus::NoTransforms), &serde_json::json!(v));
+            b.push(
+                &FieldStatus::Matched,
+                Some(CoercionStatus::NoTransforms),
+                &serde_json::json!(v),
+            );
         }
         b.finish()
     }
@@ -734,7 +800,10 @@ mod tests {
     /// A healthy history: `runs` clean 30-document cohorts of a per-record field.
     fn healthy_baseline(field: &str, runs: usize) -> Baseline {
         let mut b = Baseline::default();
-        b.fields.insert(field.to_string(), (0..runs).map(|_| prices(30, 0)).collect());
+        b.fields.insert(
+            field.to_string(),
+            (0..runs).map(|_| prices(30, 0)).collect(),
+        );
         b
     }
 
@@ -751,7 +820,10 @@ mod tests {
     ) -> RunInput<'a> {
         RunInput {
             docs,
-            fetch: FetchHealth { attempted: docs, ok: docs },
+            fetch: FetchHealth {
+                attempted: docs,
+                ok: docs,
+            },
             sketches,
             baseline,
             invariants,
@@ -776,26 +848,42 @@ mod tests {
         let gated = evaluate(
             &cfg(),
             &RunInput {
-                fetch: FetchHealth { attempted: 30, ok: 9 },
+                fetch: FetchHealth {
+                    attempted: 30,
+                    ok: 9,
+                },
                 ..input(&broken, &base, &[], None, 30)
             },
         );
         assert_eq!(gated.verdict, RunVerdict::Inconclusive);
         assert_eq!(gated.score, 0.0);
-        assert!(!gated.tripped(&cfg()), "an inconclusive run must not count against the source");
+        assert!(
+            !gated.tripped(&cfg()),
+            "an inconclusive run must not count against the source"
+        );
 
         // Just above the floor it is judged again.
         let ok_fetch = evaluate(
             &cfg(),
             &RunInput {
-                fetch: FetchHealth { attempted: 30, ok: 24 },
+                fetch: FetchHealth {
+                    attempted: 30,
+                    ok: 24,
+                },
                 ..input(&broken, &base, &[], None, 30)
             },
         );
         assert_eq!(ok_fetch.verdict, RunVerdict::Broken);
 
         // A run that fetched nothing at all (stored bodies) is not gated.
-        assert_eq!(FetchHealth { attempted: 0, ok: 0 }.rate(), 1.0);
+        assert_eq!(
+            FetchHealth {
+                attempted: 0,
+                ok: 0
+            }
+            .rate(),
+            1.0
+        );
     }
 
     // ---- signal 2: total collapse ------------------------------------------
@@ -810,7 +898,10 @@ mod tests {
         let e = evaluate(&cfg(), &input(&gone, &base, &[], None, 6));
         assert_eq!(e.verdict, RunVerdict::Broken);
         assert_eq!(e.diagnosis, Some(Diagnosis::FieldLoss));
-        assert!(!e.statistical_coverage, "still honest about the cohort size");
+        assert!(
+            !e.statistical_coverage,
+            "still honest about the cohort size"
+        );
 
         // Without a history there is nothing it stopped doing — a source's first
         // run must never trip.
@@ -819,12 +910,17 @@ mod tests {
 
         // A field that always missed did not collapse.
         let mut always_missing = Baseline::default();
-        always_missing.fields.insert("price".into(), (0..3).map(|_| prices(30, 30)).collect());
+        always_missing
+            .fields
+            .insert("price".into(), (0..3).map(|_| prices(30, 30)).collect());
         let e = evaluate(&cfg(), &input(&gone, &always_missing, &[], None, 6));
         assert_eq!(e.verdict, RunVerdict::Ok);
 
         // Four documents is too few for even this rule.
-        let e = evaluate(&cfg(), &input(&one("price", prices(4, 4)), &base, &[], None, 4));
+        let e = evaluate(
+            &cfg(),
+            &input(&one("price", prices(4, 4)), &base, &[], None, 4),
+        );
         assert_eq!(e.verdict, RunVerdict::Ok);
     }
 
@@ -908,18 +1004,31 @@ mod tests {
         let base = healthy_baseline("price", 5);
         let rebound = one("price", constant(30, "Free shipping"));
         let e = evaluate(&cfg(), &input(&rebound, &base, &[], None, 30));
-        assert!(e.reasons.iter().any(|r| r.test == "distinctness_collapse"), "{:?}", e.reasons);
+        assert!(
+            e.reasons.iter().any(|r| r.test == "distinctness_collapse"),
+            "{:?}",
+            e.reasons
+        );
         assert_eq!(e.verdict, RunVerdict::Broken);
         assert_eq!(e.diagnosis, Some(Diagnosis::SilentRebind));
-        assert_eq!(e.score, 1.0, "a total collapse of a per-record field is conclusive");
+        assert_eq!(
+            e.score, 1.0,
+            "a total collapse of a per-record field is conclusive"
+        );
 
         // A field that has ALWAYS been constant (a currency, a category) has a
         // low baseline distinctness, so its constancy says nothing.
         let mut const_base = Baseline::default();
-        const_base.fields.insert("currency".into(), (0..5).map(|_| constant(30, "USD")).collect());
+        const_base.fields.insert(
+            "currency".into(),
+            (0..5).map(|_| constant(30, "USD")).collect(),
+        );
         let still_const = one("currency", constant(30, "USD"));
         let e = evaluate(&cfg(), &input(&still_const, &const_base, &[], None, 30));
-        assert_eq!(e.score, 0.0, "a legitimately constant field must never trip");
+        assert_eq!(
+            e.score, 0.0,
+            "a legitimately constant field must never trip"
+        );
 
         // Below the cohort floor the conclusive rule does not apply.
         let small = one("price", constant(6, "Free shipping"));
@@ -934,11 +1043,19 @@ mod tests {
                 &rebound,
                 &base,
                 &[],
-                Some(CohortDrift { text: 0.4, dom: 0.0, value: 0.4, compared: 30 }),
+                Some(CohortDrift {
+                    text: 0.4,
+                    dom: 0.0,
+                    value: 0.4,
+                    compared: 30,
+                }),
                 30,
             ),
         );
-        assert!(e.score < 1.0, "a content-change explanation blocks the conclusive rule");
+        assert!(
+            e.score < 1.0,
+            "a content-change explanation blocks the conclusive rule"
+        );
     }
 
     // ---- signal 5: mined invariants ----------------------------------------
@@ -979,9 +1096,14 @@ mod tests {
     #[test]
     fn shape_drift_fires_when_a_price_field_turns_into_prose() {
         let base = healthy_baseline("price", 6);
-        let e = evaluate(&cfg(), &input(&one("price", prose(30)), &base, &[], None, 30));
+        let e = evaluate(
+            &cfg(),
+            &input(&one("price", prose(30)), &base, &[], None, 30),
+        );
         assert!(
-            e.reasons.iter().any(|r| r.test == "char_class_shape" || r.test == "len_shape"),
+            e.reasons
+                .iter()
+                .any(|r| r.test == "char_class_shape" || r.test == "len_shape"),
             "{:?}",
             e.reasons
         );
@@ -996,7 +1118,10 @@ mod tests {
                 &serde_json::json!(format!("${}.{:02}", 90 + i, (i * 3) % 100)),
             );
         }
-        let e = evaluate(&cfg(), &input(&one("price", later.finish()), &base, &[], None, 30));
+        let e = evaluate(
+            &cfg(),
+            &input(&one("price", later.finish()), &base, &[], None, 30),
+        );
         assert!(
             !e.reasons.iter().any(|r| r.test == "char_class_shape"),
             "new values of the same shape are not drift: {:?}",
@@ -1015,7 +1140,12 @@ mod tests {
 
         // Text still, markup moved, output moved: the site was redesigned and the
         // extractor followed the markup somewhere else.
-        let redesign = ev(CohortDrift { text: 0.02, dom: 0.35, value: 0.40, compared: 30 });
+        let redesign = ev(CohortDrift {
+            text: 0.02,
+            dom: 0.35,
+            value: 0.40,
+            compared: 30,
+        });
         assert_eq!(redesign.diagnosis, Some(Diagnosis::MarkupDrift));
         assert!(redesign.score > 0.0);
         // Corroborative, not conclusive: every field still matches, stays distinct
@@ -1025,17 +1155,32 @@ mod tests {
 
         // Words moved, markup held: a healthy source reporting new content. This
         // is the negative control the whole design turns on.
-        let content = ev(CohortDrift { text: 0.40, dom: 0.01, value: 0.40, compared: 30 });
+        let content = ev(CohortDrift {
+            text: 0.40,
+            dom: 0.01,
+            value: 0.40,
+            compared: 30,
+        });
         assert_eq!(content.diagnosis, Some(Diagnosis::ContentChanged));
         assert_eq!(content.score, 0.0, "a content change must never score");
 
         // Neither input moved and the output did: the change is ours.
-        let ours = ev(CohortDrift { text: 0.01, dom: 0.01, value: 0.45, compared: 30 });
+        let ours = ev(CohortDrift {
+            text: 0.01,
+            dom: 0.01,
+            value: 0.45,
+            compared: 30,
+        });
         assert_eq!(ours.diagnosis, Some(Diagnosis::SelfInflicted));
         assert!(ours.score > 0.0);
 
         // The output held still: whatever the inputs did, extraction tracked it.
-        let tracking = ev(CohortDrift { text: 0.40, dom: 0.40, value: 0.01, compared: 30 });
+        let tracking = ev(CohortDrift {
+            text: 0.40,
+            dom: 0.40,
+            value: 0.01,
+            compared: 30,
+        });
         assert_eq!(tracking.score, 0.0);
         assert_eq!(tracking.diagnosis, None);
 
@@ -1056,14 +1201,22 @@ mod tests {
                 &one("price", constant(30, "Free shipping")),
                 &base,
                 &[],
-                Some(CohortDrift { text: 0.01, dom: 0.01, value: 0.5, compared: 30 }),
+                Some(CohortDrift {
+                    text: 0.01,
+                    dom: 0.01,
+                    value: 0.5,
+                    compared: 30,
+                }),
                 30,
             ),
         );
         assert_eq!(e.diagnosis, Some(Diagnosis::SelfInflicted));
         assert_eq!(e.verdict, RunVerdict::SelfInflicted);
         assert!(e.tripped(&cfg()));
-        assert!(!e.verdict.baselines(), "a broken run must not become its own baseline");
+        assert!(
+            !e.verdict.baselines(),
+            "a broken run must not become its own baseline"
+        );
     }
 
     // ---- the quiet-listing carve-out ---------------------------------------
@@ -1076,16 +1229,23 @@ mod tests {
         }
         let run = one("jobs", quiet.finish());
         let mut base = Baseline::default();
-        base.fields.insert("jobs".into(), (0..5).map(|_| prices(30, 0)).collect());
+        base.fields
+            .insert("jobs".into(), (0..5).map(|_| prices(30, 0)).collect());
 
         let e = evaluate(&cfg(), &input(&run, &base, &[], None, 30));
         assert_eq!(e.verdict, RunVerdict::ContentEmpty);
-        assert!(!e.verdict.judged(), "a quiet week must not move the source's state");
+        assert!(
+            !e.verdict.judged(),
+            "a quiet week must not move the source's state"
+        );
         assert!(!e.verdict.baselines(), "nor teach it that zero is normal");
         assert!(!e.tripped(&cfg()));
 
         // The same field going *missing* (container gone) is a break.
-        let e = evaluate(&cfg(), &input(&one("jobs", prices(30, 30)), &base, &[], None, 30));
+        let e = evaluate(
+            &cfg(),
+            &input(&one("jobs", prices(30, 30)), &base, &[], None, 30),
+        );
         assert_eq!(e.verdict, RunVerdict::Broken);
     }
 

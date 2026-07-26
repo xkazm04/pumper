@@ -22,15 +22,15 @@ use crate::{Error, ResearchRequest, Result};
 /// to rarely fire on genuine articles; only the page's leading window is
 /// scanned (challenge markup lives at the top). Extend deliberately + with a test.
 const CHALLENGE_MARKERS: &[&str] = &[
-    "checking your browser",       // Cloudflare IUAM
-    "cf-browser-verification",     // Cloudflare challenge widget
-    "just a moment",               // Cloudflare interstitial title
-    "attention required",          // Cloudflare block page
-    "enable javascript",           // JS-gate interstitials
-    "please enable cookies",       // Cloudflare cookie gate
-    "verify you are human",        // generic challenge prompt
-    "captcha",                     // hCaptcha / reCAPTCHA gates
-    "ddos protection by",          // anti-DDoS interstitials
+    "checking your browser",   // Cloudflare IUAM
+    "cf-browser-verification", // Cloudflare challenge widget
+    "just a moment",           // Cloudflare interstitial title
+    "attention required",      // Cloudflare block page
+    "enable javascript",       // JS-gate interstitials
+    "please enable cookies",   // Cloudflare cookie gate
+    "verify you are human",    // generic challenge prompt
+    "captcha",                 // hCaptcha / reCAPTCHA gates
+    "ddos protection by",      // anti-DDoS interstitials
 ];
 
 /// Only the first N chars are scanned for challenge markers — cheap, and
@@ -237,7 +237,13 @@ impl Fetcher {
         governor: Arc<Governor>,
         cfg: &FetcherConfig,
     ) -> Self {
-        Self { http, browser, claude, governor, min_content_chars: cfg.min_content_chars }
+        Self {
+            http,
+            browser,
+            claude,
+            governor,
+            min_content_chars: cfg.min_content_chars,
+        }
     }
 
     pub async fn fetch(&self, req: FetchRequest) -> Result<FetchOutcome> {
@@ -249,7 +255,10 @@ impl Fetcher {
         // an explicit Http strategy is the caller's call.)
         let try_http = req.strategy == FetchStrategy::Http
             || (!req.skip_http
-                && matches!(req.strategy, FetchStrategy::Auto | FetchStrategy::AutoWithResearch));
+                && matches!(
+                    req.strategy,
+                    FetchStrategy::Auto | FetchStrategy::AutoWithResearch
+                ));
         if try_http {
             let mut http_req = HttpRequest::get(&req.url);
             http_req.no_cache = req.no_cache;
@@ -349,7 +358,10 @@ impl Fetcher {
         }
 
         // --- Browser tier ---
-        if matches!(req.strategy, FetchStrategy::Browser | FetchStrategy::Auto | FetchStrategy::AutoWithResearch) {
+        if matches!(
+            req.strategy,
+            FetchStrategy::Browser | FetchStrategy::Auto | FetchStrategy::AutoWithResearch
+        ) {
             let mut render = RenderRequest::new(&req.url);
             render.wait_for_selector = req.wait_for_selector.clone();
             render.actions = req.actions.clone();
@@ -582,7 +594,11 @@ pub(crate) fn http_bot_wall(status: u16, body: &str) -> Option<String> {
 /// marker. Shared by the HTTP and browser tiers (the browser has no status, so
 /// markers are its only bot-wall signal).
 fn challenge_marker(body: &str) -> Option<String> {
-    let head: String = body.chars().take(CHALLENGE_SCAN_CHARS).collect::<String>().to_lowercase();
+    let head: String = body
+        .chars()
+        .take(CHALLENGE_SCAN_CHARS)
+        .collect::<String>()
+        .to_lowercase();
     CHALLENGE_MARKERS
         .iter()
         .find(|m| head.contains(**m))
@@ -614,13 +630,19 @@ mod tests {
         let cf = "<html><head><title>Just a moment...</title></head><body>\
             <div class=\"cf-browser-verification\">Checking your browser before accessing.</div>\
             </body></html>";
-        assert!(http_bot_wall(200, cf).is_some(), "cloudflare interstitial must escalate");
+        assert!(
+            http_bot_wall(200, cf).is_some(),
+            "cloudflare interstitial must escalate"
+        );
 
         let js = "<html><body><noscript>Please enable JavaScript to view this page.</noscript></body></html>";
         assert!(http_bot_wall(200, js).is_some(), "js-gate must escalate");
 
         let captcha = "<html><body>Please complete the CAPTCHA to continue.</body></html>";
-        assert!(http_bot_wall(200, captcha).is_some(), "captcha gate must escalate");
+        assert!(
+            http_bot_wall(200, captcha).is_some(),
+            "captcha gate must escalate"
+        );
     }
 
     #[test]
@@ -641,7 +663,10 @@ mod tests {
             "\"skipped_by_router\""
         );
         assert_eq!(serde_json::to_string(&TierVerdict::Ok).unwrap(), "\"ok\"");
-        assert_eq!(serde_json::to_string(&FetchTier::Claude).unwrap(), "\"claude\"");
+        assert_eq!(
+            serde_json::to_string(&FetchTier::Claude).unwrap(),
+            "\"claude\""
+        );
         assert_eq!(FetchTier::Http.as_str(), "http");
         assert_eq!(FetchTier::Browser.as_str(), "browser");
         assert_eq!(FetchTier::Claude.as_str(), "claude");
@@ -712,7 +737,10 @@ mod tests {
     #[async_trait]
     impl Browser for StubBrowser {
         async fn render(&self, _req: RenderRequest) -> Result<RenderedPage> {
-            Ok(RenderedPage { html: self.html.clone(), ..Default::default() })
+            Ok(RenderedPage {
+                html: self.html.clone(),
+                ..Default::default()
+            })
         }
     }
 
@@ -747,7 +775,10 @@ mod tests {
             Arc::new(browser),
             Arc::new(StubResearcher),
             governor,
-            &FetcherConfig { min_content_chars: 100, ..FetcherConfig::default() },
+            &FetcherConfig {
+                min_content_chars: 100,
+                ..FetcherConfig::default()
+            },
         )
     }
 
@@ -783,8 +814,10 @@ mod tests {
 
         // The wall drove escalation to the Claude tier...
         assert_eq!(outcome.engine, "claude");
-        assert!(outcome.trace.iter().any(|t| t.tier == FetchTier::Browser
-            && t.verdict == TierVerdict::Blocked));
+        assert!(outcome
+            .trace
+            .iter()
+            .any(|t| t.tier == FetchTier::Browser && t.verdict == TierVerdict::Blocked));
         // ...and the governor learned a penalty for the host.
         assert!(
             governor.penalty("blocked.example").await > Duration::ZERO,
@@ -797,8 +830,13 @@ mod tests {
         // A clean browser fetch decays a pre-existing learned penalty (the
         // recovery half of the loop), mirroring the HTTP tier's reward-on-success.
         let governor = enabled_governor();
-        governor.penalize("recovering.example", Some(Duration::from_secs(4))).await;
-        assert_eq!(governor.penalty("recovering.example").await, Duration::from_secs(4));
+        governor
+            .penalize("recovering.example", Some(Duration::from_secs(4)))
+            .await;
+        assert_eq!(
+            governor.penalty("recovering.example").await,
+            Duration::from_secs(4)
+        );
 
         let good = "<html><body><article>A perfectly ordinary page with plenty of \
             real readable content, well past the hundred-character threshold used \

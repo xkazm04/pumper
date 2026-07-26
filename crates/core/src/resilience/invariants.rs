@@ -110,8 +110,7 @@ pub struct Invariant {
 pub fn mine(cfg: &ResilienceConfig, records: &[Value], fields: &[String]) -> Vec<Invariant> {
     let mut out = Vec::new();
     for field in fields {
-        let values: Vec<&Value> =
-            records.iter().filter_map(|r| r.get(field)).collect();
+        let values: Vec<&Value> = records.iter().filter_map(|r| r.get(field)).collect();
         if (values.len() as u32) < cfg.invariant_min_support {
             continue;
         }
@@ -171,7 +170,9 @@ pub fn mine(cfg: &ResilienceConfig, records: &[Value], fields: &[String]) -> Vec
         if distinct >= PER_RECORD_DISTINCT {
             out.push(Invariant {
                 field: field.clone(),
-                kind: InvariantKind::Distinctness { min: PER_RECORD_DISTINCT },
+                kind: InvariantKind::Distinctness {
+                    min: PER_RECORD_DISTINCT,
+                },
                 support: present.len() as u32,
                 confidence: distinct,
             });
@@ -195,8 +196,14 @@ pub fn check<'a>(
         // Cohort-level: the run's distinctness against the mined floor. Counted
         // over the whole cohort so its weight matches a per-document check.
         if let InvariantKind::Distinctness { min } = inv.kind {
-            let Some(sketch) = sketches.get(&inv.field) else { continue };
-            let broke = if (sketch.distinct_ratio as f64) < min { sketch.n } else { 0 };
+            let Some(sketch) = sketches.get(&inv.field) else {
+                continue;
+            };
+            let broke = if (sketch.distinct_ratio as f64) < min {
+                sketch.n
+            } else {
+                0
+            };
             out.push(InvariantCheck {
                 field: inv.field.clone(),
                 kind: inv.kind.name().to_string(),
@@ -218,7 +225,9 @@ pub fn check<'a>(
         let mut checked = 0u32;
         let mut broke = 0u32;
         for values in docs.clone() {
-            let Some(value) = values.get(&inv.field) else { continue };
+            let Some(value) = values.get(&inv.field) else {
+                continue;
+            };
             match holds(&inv.kind, value, regex.as_ref()) {
                 None => {}
                 Some(true) => checked += 1,
@@ -521,13 +530,18 @@ mod tests {
         let invs = vec![
             Invariant {
                 field: "date".into(),
-                kind: InvariantKind::Regex { pattern: r"^\d{4}-\d{2}-\d{2}$".into() },
+                kind: InvariantKind::Regex {
+                    pattern: r"^\d{4}-\d{2}-\d{2}$".into(),
+                },
                 support: 900,
                 confidence: 1.0,
             },
             Invariant {
                 field: "price".into(),
-                kind: InvariantKind::Range { min: 1.0, max: 100.0 },
+                kind: InvariantKind::Range {
+                    min: 1.0,
+                    max: 100.0,
+                },
                 support: 900,
                 confidence: 1.0,
             },
@@ -559,7 +573,8 @@ mod tests {
         for _ in 0..10 {
             collapsed.push(&FieldStatus::Matched, None, &json!("Free shipping"));
         }
-        let sketches = std::collections::BTreeMap::from([("price".to_string(), collapsed.finish())]);
+        let sketches =
+            std::collections::BTreeMap::from([("price".to_string(), collapsed.finish())]);
         let checks = check(&invs, [].iter(), &sketches);
         assert_eq!((checks[0].checked, checks[0].broke), (10, 10));
 

@@ -49,7 +49,11 @@ pub(crate) async fn list_sources(
 ) -> Result<Json<Value>, ApiError> {
     let store = health_store(&state)?;
     let sources = store
-        .list_sources(query.state.as_deref(), query.app.as_deref(), query.limit.clamp(1, 500))
+        .list_sources(
+            query.state.as_deref(),
+            query.app.as_deref(),
+            query.limit.clamp(1, 500),
+        )
         .await?;
     Ok(Json(json!({
         "enabled": true,
@@ -153,7 +157,9 @@ pub(crate) async fn source_runs(
     Path(id): Path<String>,
     Query(query): Query<SourceRunsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let runs = health_store(&state)?.runs(&id, query.limit.clamp(1, 500)).await?;
+    let runs = health_store(&state)?
+        .runs(&id, query.limit.clamp(1, 500))
+        .await?;
     Ok(Json(json!({ "id": id, "count": runs.len(), "runs": runs })))
 }
 
@@ -205,9 +211,14 @@ pub(crate) async fn set_source_state(
     }
     let reason = body.reason.unwrap_or_else(|| "manual override".to_string());
     if !store.set_state_manual(&id, parsed, &reason).await? {
-        return Err(ApiError(StatusCode::NOT_FOUND, format!("unknown source '{id}'")));
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("unknown source '{id}'"),
+        ));
     }
-    Ok(Json(json!({ "id": id, "state": parsed.as_str(), "reason": reason })))
+    Ok(Json(
+        json!({ "id": id, "state": parsed.as_str(), "reason": reason }),
+    ))
 }
 
 /// The health store, or 503 when detection is switched off — a health question

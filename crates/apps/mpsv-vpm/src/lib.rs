@@ -120,7 +120,11 @@ impl ScrapeApp for MpsvVpm {
             .and_then(Value::as_str)
             .unwrap_or(FULL_URL)
             .to_string();
-        let max_records = ctx.params.get("maxRecords").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let max_records = ctx
+            .params
+            .get("maxRecords")
+            .and_then(Value::as_u64)
+            .unwrap_or(0) as usize;
         let min_count = ctx
             .params
             .get("minCount")
@@ -160,7 +164,11 @@ impl ScrapeApp for MpsvVpm {
         drop(resp); // free the ~188 MB source string before aggregating
 
         let total = feed.polozky.len();
-        let considered = if max_records == 0 { total } else { total.min(max_records) };
+        let considered = if max_records == 0 {
+            total
+        } else {
+            total.min(max_records)
+        };
 
         // Reference "today" = the most recent change date in the feed (≈ its
         // publish date); posting age and the recency cutoff are measured from it.
@@ -238,10 +246,19 @@ impl ScrapeApp for MpsvVpm {
             // region rollups (all occupations): per (kraj, orgType), per (kraj, all),
             // and national (ALL, orgType) + (ALL, all).
             if let Some(k) = &kraj {
-                regions.entry((k.clone(), org.clone())).or_default().add(salary);
-                regions.entry((k.clone(), "all".to_string())).or_default().add(salary);
+                regions
+                    .entry((k.clone(), org.clone()))
+                    .or_default()
+                    .add(salary);
+                regions
+                    .entry((k.clone(), "all".to_string()))
+                    .or_default()
+                    .add(salary);
             }
-            regions.entry(("ALL".to_string(), org.clone())).or_default().add(salary);
+            regions
+                .entry(("ALL".to_string(), org.clone()))
+                .or_default()
+                .add(salary);
             regions
                 .entry(("ALL".to_string(), "all".to_string()))
                 .or_default()
@@ -262,12 +279,18 @@ impl ScrapeApp for MpsvVpm {
             if let Some(skills) = &p.pozadovanaDovednost {
                 for sref in skills {
                     if let Some(id) = &sref.id {
-                        skill_demand.entry((ug.clone(), id.clone())).or_default().add(salary);
+                        skill_demand
+                            .entry((ug.clone(), id.clone()))
+                            .or_default()
+                            .add(salary);
                     }
                 }
             }
             if let Some(id) = p.minPozadovaneVzdelani.as_ref().and_then(|e| e.id.clone()) {
-                education_agg.entry((ug.clone(), id)).or_default().add(salary);
+                education_agg
+                    .entry((ug.clone(), id))
+                    .or_default()
+                    .add(salary);
             }
 
             // sample reservoir per CZ-ISCO unit group
@@ -311,7 +334,11 @@ impl ScrapeApp for MpsvVpm {
         let mut sample_items: Vec<(String, Value)> = Vec::new();
         for (group, mut list) in groups {
             // richest first, then most-recently posted (undated last)
-            list.sort_by(|a, b| b.richness.cmp(&a.richness).then_with(|| b.posted.cmp(&a.posted)));
+            list.sort_by(|a, b| {
+                b.richness
+                    .cmp(&a.richness)
+                    .then_with(|| b.posted.cmp(&a.posted))
+            });
             for (i, s) in list.into_iter().take(samples_per_group).enumerate() {
                 sample_items.push((format!("{group}|{i}"), s.value));
             }
@@ -382,7 +409,13 @@ impl ScrapeApp for MpsvVpm {
             // Unfiltered by trust: the trend window is this app's own history and
             // must not silently shorten because a run was written while the source
             // was degrading — a short window is a wrong trend, not a safe one.
-            .changes_since(&ctx.app, Some("role_region_agg"), None, TRENDS_REVISION_SCAN, None)
+            .changes_since(
+                &ctx.app,
+                Some("role_region_agg"),
+                None,
+                TRENDS_REVISION_SCAN,
+                None,
+            )
             .await?;
         if all_revs.len() as i64 >= TRENDS_REVISION_SCAN {
             tracing::warn!(
@@ -400,12 +433,18 @@ impl ScrapeApp for MpsvVpm {
         for (key, _) in agg_items.iter().filter(|(k, _)| k.contains("|ALL|")) {
             // The cell's newest ≤10 revisions — the same window `history(key, 10)`
             // returned (changes_since arrives newest-first, so no re-sort needed).
-            let window: &[pumper_core::Revision] =
-                revs_by_key.get(key).map_or(&[][..], |v| &v[..v.len().min(10)]);
+            let window: &[pumper_core::Revision] = revs_by_key
+                .get(key)
+                .map_or(&[][..], |v| &v[..v.len().min(10)]);
             let count_of = |rev: &pumper_core::Revision| {
-                rev.data.as_ref().and_then(|d| d.get("count")).and_then(Value::as_i64)
+                rev.data
+                    .as_ref()
+                    .and_then(|d| d.get("count"))
+                    .and_then(Value::as_i64)
             };
-            let Some(latest) = window.first().and_then(count_of) else { continue };
+            let Some(latest) = window.first().and_then(count_of) else {
+                continue;
+            };
             // Oldest snapshot within the window; None = the cell is brand new.
             let prev = window.iter().skip(1).filter_map(count_of).next_back();
             let (prev_count, delta, trend) = match prev {
@@ -637,7 +676,11 @@ impl ScrapeApp for MpsvVpm {
 /// bare code). Buckets JD samples at the ISCO unit-group level.
 fn unit_group(czisco: &str) -> String {
     let code = czisco.rsplit('/').next().unwrap_or(czisco);
-    let digits: String = code.chars().filter(|c| c.is_ascii_digit()).take(4).collect();
+    let digits: String = code
+        .chars()
+        .filter(|c| c.is_ascii_digit())
+        .take(4)
+        .collect();
     if digits.is_empty() {
         czisco.to_string()
     } else {
@@ -682,8 +725,14 @@ fn official_wage_index<'a>(
 ) -> HashMap<(String, String), (f64, Option<f64>)> {
     let mut index = HashMap::new();
     for r in rows {
-        let Some(czisco) = r.get("czIsco").and_then(Value::as_str) else { continue };
-        let sfera = r.get("sfera").and_then(Value::as_str).unwrap_or("").to_string();
+        let Some(czisco) = r.get("czIsco").and_then(Value::as_str) else {
+            continue;
+        };
+        let sfera = r
+            .get("sfera")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
         let Some(median) = wage_num(r, "medianMzda").filter(|m| *m > 0.0) else {
             continue;
         };
@@ -714,10 +763,15 @@ fn compute_salary_gaps(
             continue; // no official row at this granularity — skip, don't fabricate
         };
         let (_, pct) = cell.stats();
-        let Some(posted_median) = pct(0.5) else { continue };
+        let Some(posted_median) = pct(0.5) else {
+            continue;
+        };
         let gap = |official: f64| -> (i64, f64) {
             let abs = posted_median as f64 - official;
-            (abs.round() as i64, (abs / official * 100.0 * 10.0).round() / 10.0)
+            (
+                abs.round() as i64,
+                (abs / official * 100.0 * 10.0).round() / 10.0,
+            )
         };
         let (gap_abs, gap_pct) = gap(*official_median);
         let vs_mean = official_mean.map(gap);
@@ -749,7 +803,9 @@ fn distinct_icos<'a>(samples: impl Iterator<Item = &'a Value>) -> Vec<String> {
     let mut seen = std::collections::HashSet::new();
     let mut icos = Vec::new();
     for v in samples {
-        let Some(raw) = v.get("employerIco").and_then(Value::as_str) else { continue };
+        let Some(raw) = v.get("employerIco").and_then(Value::as_str) else {
+            continue;
+        };
         let raw = raw.trim();
         if raw.is_empty() || raw.len() > 8 || !raw.chars().all(|c| c.is_ascii_digit()) {
             continue;
@@ -925,7 +981,8 @@ impl Posting {
         if self.statniSpravaSamosprava == Some(true) {
             return "public".to_string();
         }
-        if self.souhlasAgenturyAgentura == Some(true) || self.souhlasAgenturyUzivatel == Some(true) {
+        if self.souhlasAgenturyAgentura == Some(true) || self.souhlasAgenturyUzivatel == Some(true)
+        {
             return "agency".to_string();
         }
         "private".to_string()
@@ -985,7 +1042,10 @@ impl Posting {
         let employer = self.zamestnavatel.as_ref().and_then(|z| z.nazev.clone());
         // IČO → the join key for the ARES enrichment into the `employers` dataset.
         let employer_ico = self.zamestnavatel.as_ref().and_then(|z| z.ico.clone());
-        let education = self.minPozadovaneVzdelani.as_ref().and_then(|e| e.id.clone());
+        let education = self
+            .minPozadovaneVzdelani
+            .as_ref()
+            .and_then(|e| e.id.clone());
         // richer postings (salary + skills + a descriptive title) make better refs
         let richness = (salary.is_some() as u32) * 2
             + ((!skills.is_empty()) as u32)
@@ -1007,7 +1067,11 @@ impl Posting {
             "postedAt": posted,
             "url": self.urlAdresa,
         });
-        Some(Sample { richness, posted, value })
+        Some(Sample {
+            richness,
+            posted,
+            value,
+        })
     }
 }
 
@@ -1219,7 +1283,9 @@ mod tests {
     #[test]
     fn official_index_reads_string_encoded_stats() {
         // Regression: as_f64-only dropped rows whose stats arrived as strings.
-        let rows = vec![json!({"czIsco": "CzIsco/1120", "sfera": "MZDOVA", "medianMzda": "111959", "mzdaPrumer": "190185"})];
+        let rows = vec![
+            json!({"czIsco": "CzIsco/1120", "sfera": "MZDOVA", "medianMzda": "111959", "mzdaPrumer": "190185"}),
+        ];
         let idx = official_wage_index(rows.iter());
         assert_eq!(idx.len(), 1);
         let (median, mean) = idx[&("1120".to_string(), "MZDOVA".to_string())];
@@ -1245,7 +1311,10 @@ mod tests {
     #[test]
     fn gap_joins_at_unit_group_and_computes_abs_and_pct() {
         // posted median of [40k, 50k, 60k] = 50k vs official 40k → +10k = +25%
-        let posted = posted_map(vec![(("5223", "MZDOVA"), cell(&[40_000.0, 50_000.0, 60_000.0]))]);
+        let posted = posted_map(vec![(
+            ("5223", "MZDOVA"),
+            cell(&[40_000.0, 50_000.0, 60_000.0]),
+        )]);
         let mut official = HashMap::new();
         official.insert(
             ("5223".to_string(), "MZDOVA".to_string()),
@@ -1276,16 +1345,25 @@ mod tests {
             (("5223", "MZDOVA"), cell(&[40_000.0, 42_000.0])),
         ]);
         let mut official = HashMap::new();
-        official.insert(("2433".to_string(), "PLATOVA".to_string()), (45_000.0, None));
+        official.insert(
+            ("2433".to_string(), "PLATOVA".to_string()),
+            (45_000.0, None),
+        );
         official.insert(("5223".to_string(), "MZDOVA".to_string()), (40_000.0, None));
         assert!(compute_salary_gaps(&posted, &official, 3).is_empty());
     }
 
     #[test]
     fn gap_handles_negative_gap_and_missing_official_mean() {
-        let posted = posted_map(vec![(("5223", "PLATOVA"), cell(&[30_000.0, 30_000.0, 30_000.0]))]);
+        let posted = posted_map(vec![(
+            ("5223", "PLATOVA"),
+            cell(&[30_000.0, 30_000.0, 30_000.0]),
+        )]);
         let mut official = HashMap::new();
-        official.insert(("5223".to_string(), "PLATOVA".to_string()), (40_000.0, None));
+        official.insert(
+            ("5223".to_string(), "PLATOVA".to_string()),
+            (40_000.0, None),
+        );
         let items = compute_salary_gaps(&posted, &official, 1);
         assert_eq!(items.len(), 1);
         let v = &items[0].1;

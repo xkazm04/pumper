@@ -34,8 +34,11 @@ impl ScrapeApp for Research {
         // Resume a prior run's agent session so a follow-up drills down on the
         // context it already built, instead of re-paying the full search+fetch+
         // synthesize loop. The prior run returns `session_id` in its result.
-        let session_id =
-            ctx.params.get("session_id").and_then(Value::as_str).map(String::from);
+        let session_id = ctx
+            .params
+            .get("session_id")
+            .and_then(Value::as_str)
+            .map(String::from);
         let resumed = session_id.is_some();
         let max_budget_usd = ctx.params.get("max_budget_usd").and_then(Value::as_f64);
         // Model/effort are chosen by the caller: default to the "research" role
@@ -47,8 +50,16 @@ impl ScrapeApp for Research {
             .and_then(Value::as_str)
             .unwrap_or("research")
             .to_string();
-        let model = ctx.params.get("model").and_then(Value::as_str).map(String::from);
-        let effort = ctx.params.get("effort").and_then(Value::as_str).map(String::from);
+        let model = ctx
+            .params
+            .get("model")
+            .and_then(Value::as_str)
+            .map(String::from);
+        let effort = ctx
+            .params
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(String::from);
 
         // A resumed turn is a follow-up: the agent already holds the topic and its
         // sources in session, so a full "you are a web research agent…" preamble

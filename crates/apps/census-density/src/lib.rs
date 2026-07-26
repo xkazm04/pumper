@@ -42,7 +42,10 @@ const DEFAULT_TRADES: &[(&str, &str)] = &[
     ("238220", "Plumbing, heating & A/C contractors"),
     ("238210", "Electrical contractors"),
     ("561730", "Landscaping services"),
-    ("561790", "Other services to buildings & dwellings (incl. pool service)"),
+    (
+        "561790",
+        "Other services to buildings & dwellings (incl. pool service)",
+    ),
 ];
 
 #[async_trait]
@@ -132,25 +135,25 @@ impl ScrapeApp for CensusDensity {
 
         // Trades: params.naics (array of codes) overrides the defaults; a custom
         // code keeps its own string as the label.
-        let trades: Vec<(String, String)> =
-            match ctx.params.get("naics").and_then(Value::as_array) {
-                Some(arr) => arr
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|c| {
-                        let label = DEFAULT_TRADES
-                            .iter()
-                            .find(|(k, _)| *k == c)
-                            .map(|(_, l)| l.to_string())
-                            .unwrap_or_else(|| c.to_string());
-                        (c.to_string(), label)
-                    })
-                    .collect(),
-                None => DEFAULT_TRADES
-                    .iter()
-                    .map(|(c, l)| (c.to_string(), l.to_string()))
-                    .collect(),
-            };
+        let trades: Vec<(String, String)> = match ctx.params.get("naics").and_then(Value::as_array)
+        {
+            Some(arr) => arr
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|c| {
+                    let label = DEFAULT_TRADES
+                        .iter()
+                        .find(|(k, _)| *k == c)
+                        .map(|(_, l)| l.to_string())
+                        .unwrap_or_else(|| c.to_string());
+                    (c.to_string(), label)
+                })
+                .collect(),
+            None => DEFAULT_TRADES
+                .iter()
+                .map(|(c, l)| (c.to_string(), l.to_string()))
+                .collect(),
+        };
 
         // Key: param → env. Census requires it (keyless 302 → missing_key.html).
         let api_key = census_common::api_key(&ctx, "census-density")?;
@@ -193,10 +196,15 @@ impl ScrapeApp for CensusDensity {
                 )));
             }
             let rows: Vec<Vec<String>> = serde_json::from_str(&resp.body).map_err(|e| {
-                Error::App(format!("Census CBP {year} NAICS {naics}: bad JSON rows: {e}"))
+                Error::App(format!(
+                    "Census CBP {year} NAICS {naics}: bad JSON rows: {e}"
+                ))
             })?;
-            ctx.save_artifact(&format!("cbp-{naics}.json"), &serde_json::to_vec_pretty(&rows)?)
-                .await?;
+            ctx.save_artifact(
+                &format!("cbp-{naics}.json"),
+                &serde_json::to_vec_pretty(&rows)?,
+            )
+            .await?;
 
             let header = rows.first().cloned().unwrap_or_default();
             let idx = |name: &str| header.iter().position(|h| h.as_str() == name);
@@ -225,7 +233,6 @@ impl ScrapeApp for CensusDensity {
             let mut total_emp: i64 = 0;
             let mut total_pay: i64 = 0;
             let mut ranked: Vec<(String, i64)> = Vec::new();
-
 
             for row in rows.iter().skip(1) {
                 let geo_code = row.get(i_geo).cloned().unwrap_or_default();
@@ -520,7 +527,11 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
             .await?,
     );
     if employers.is_empty() || solos.is_empty() {
-        let missing = if employers.is_empty() { "census-density" } else { "census-nonemp" };
+        let missing = if employers.is_empty() {
+            "census-density"
+        } else {
+            "census-nonemp"
+        };
         return Ok(json!({
             "blended": 0,
             "note": format!("no live records from {missing} yet — run it to enable the blend"),
@@ -531,24 +542,27 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
     // dataset — the blend itself does no ACS fetch (census-nonemp also calls this
     // path), so the denominator join reads the base census-density stored. Empty
     // when saturation hasn't run yet → cells emit null base (graceful).
-    let bases = live(ctx.datasets.list(MARKET_APP, SATURATION_DATASET, BLEND_READ_LIMIT).await?);
+    let bases = live(
+        ctx.datasets
+            .list(MARKET_APP, SATURATION_DATASET, BLEND_READ_LIMIT)
+            .await?,
+    );
     let base_by_place: BTreeMap<String, (i64, String)> = bases
         .iter()
         .filter_map(|r| {
             let place = r.get("place").and_then(Value::as_str)?.to_string();
             let base = r.get("base").and_then(Value::as_i64)?;
-            let kind = r.get("denominator_kind").and_then(Value::as_str).unwrap_or("").to_string();
+            let kind = r
+                .get("denominator_kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
             Some((place, (base, kind)))
         })
         .collect();
 
     let items = blend_market(&employers, &solos, &base_by_place);
-    let count = |cov: &str| {
-        items
-            .iter()
-            .filter(|(_, v)| v["coverage"] == cov)
-            .count()
-    };
+    let count = |cov: &str| items.iter().filter(|(_, v)| v["coverage"] == cov).count();
     let (both, employer_only, solo_only) =
         (count("both"), count("employer_only"), count("solo_only"));
     let summary = ctx
@@ -610,9 +624,8 @@ pub fn blend_market(
         *cell.employer_estab.get_or_insert(0) += num_field(e, "establishments");
         cell.employer_naics.insert(naics);
         cell.employer_year = cell.employer_year.take().or_else(|| str_field(e, "year"));
-        cell.state.get_or_insert_with(|| {
-            str_field(e, "place").unwrap_or_default()
-        });
+        cell.state
+            .get_or_insert_with(|| str_field(e, "place").unwrap_or_default());
     }
 
     for s in solos {
@@ -651,18 +664,17 @@ pub fn blend_market(
             // the state's ACS base — the number the launch ranking actually wants,
             // and which didn't exist on the blend before. Null when no base is
             // known for the place (saturation hasn't run) — never fabricated.
-            let (base, denom_kind, total_market_per_10k) = match c
-                .state
-                .as_deref()
-                .and_then(|st| base_by_place.get(st))
-            {
-                Some((b, kind)) if *b > 0 => (
-                    Value::from(*b),
-                    Value::from(kind.clone()),
-                    Value::from(((total as f64 / *b as f64) * 10_000.0 * 100.0).round() / 100.0),
-                ),
-                _ => (Value::Null, Value::Null, Value::Null),
-            };
+            let (base, denom_kind, total_market_per_10k) =
+                match c.state.as_deref().and_then(|st| base_by_place.get(st)) {
+                    Some((b, kind)) if *b > 0 => (
+                        Value::from(*b),
+                        Value::from(kind.clone()),
+                        Value::from(
+                            ((total as f64 / *b as f64) * 10_000.0 * 100.0).round() / 100.0,
+                        ),
+                    ),
+                    _ => (Value::Null, Value::Null, Value::Null),
+                };
             let value = json!({
                 "naics4": naics4,
                 "trade": c.trade,
@@ -784,7 +796,10 @@ async fn fetch_denominator(
     for row in rows.iter().skip(1) {
         let geo_code = row.get(i_geo).cloned().unwrap_or_default();
         let (st_fips, county_fips) = if geo == "county" {
-            let st = i_state.and_then(|i| row.get(i)).cloned().unwrap_or_default();
+            let st = i_state
+                .and_then(|i| row.get(i))
+                .cloned()
+                .unwrap_or_default();
             (st, Some(geo_code))
         } else {
             (geo_code, None)
@@ -903,4 +918,3 @@ mod tests {
         assert!(none[0].1["total_market_per_10k"].is_null());
     }
 }
-

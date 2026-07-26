@@ -27,7 +27,7 @@ use crate::costs::{CostLedger, SpentTotal};
 use crate::datasets::Datasets;
 use crate::engine::{
     Browser, EngineSet, HttpClient, HttpRequest, HttpResponse, RenderRequest, RenderedPage,
-    Researcher, ResearchOutput, ResearchRequest,
+    ResearchOutput, ResearchRequest, Researcher,
 };
 use crate::error::Result;
 use crate::fetcher::Fetcher;

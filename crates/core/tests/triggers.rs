@@ -33,9 +33,24 @@ async fn trigger_crud_idempotent_fire_and_lineage() {
     assert_eq!(trigger.params["mode"], "batch");
 
     // Evaluation set is scoped by (kind, app) and enabled.
-    assert_eq!(storage.enabled_triggers("dataset", "grants").await.unwrap().len(), 1);
-    assert!(storage.enabled_triggers("job", "grants").await.unwrap().is_empty());
-    assert!(storage.enabled_triggers("dataset", "other").await.unwrap().is_empty());
+    assert_eq!(
+        storage
+            .enabled_triggers("dataset", "grants")
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(storage
+        .enabled_triggers("job", "grants")
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(storage
+        .enabled_triggers("dataset", "other")
+        .await
+        .unwrap()
+        .is_empty());
 
     // A hop fires at most once per source run: same idempotency key dedupes.
     let opts = || EnqueueOptions {
@@ -58,9 +73,15 @@ async fn trigger_crud_idempotent_fire_and_lineage() {
     assert_eq!(runs[0].id, first.id);
 
     // Disable removes it from the evaluation set; delete removes the row.
-    assert!(storage.set_trigger_enabled(&trigger.id, false).await.unwrap());
-    assert!(storage.enabled_triggers("dataset", "grants").await.unwrap().is_empty());
+    assert!(storage
+        .set_trigger_enabled(&trigger.id, false)
+        .await
+        .unwrap());
+    assert!(storage
+        .enabled_triggers("dataset", "grants")
+        .await
+        .unwrap()
+        .is_empty());
     assert!(storage.delete_trigger(&trigger.id).await.unwrap());
     assert!(storage.get_trigger(&trigger.id).await.unwrap().is_none());
-
 }

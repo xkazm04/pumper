@@ -42,8 +42,10 @@ fn now_ms() -> i64 {
 /// `datasetProperties`: display name, description, and Pumper's run metadata as
 /// custom properties (string map per the aspect model).
 fn dataset_properties(app: &str, dataset: &str, custom: &[(&str, String)]) -> Value {
-    let props: Map<String, Value> =
-        custom.iter().map(|(k, v)| (k.to_string(), Value::String(v.clone()))).collect();
+    let props: Map<String, Value> = custom
+        .iter()
+        .map(|(k, v)| (k.to_string(), Value::String(v.clone())))
+        .collect();
     json!({
         "__type": "DatasetProperties",
         "name": format!("{app}/{dataset}"),
@@ -177,8 +179,12 @@ async fn post_entities(state: &AppState, entities: Vec<Value>) -> Result<usize, 
 /// Records the outcome of the most recent emission for `GET /datahub/status`.
 fn record_status(state: &AppState, kind: &str, outcome: Result<usize, String>) -> Value {
     let entry = match &outcome {
-        Ok(n) => json!({ "kind": kind, "at": pumper_core::datasets::ts(chrono::Utc::now()), "ok": true, "entities": n }),
-        Err(e) => json!({ "kind": kind, "at": pumper_core::datasets::ts(chrono::Utc::now()), "ok": false, "error": e }),
+        Ok(n) => {
+            json!({ "kind": kind, "at": pumper_core::datasets::ts(chrono::Utc::now()), "ok": true, "entities": n })
+        }
+        Err(e) => {
+            json!({ "kind": kind, "at": pumper_core::datasets::ts(chrono::Utc::now()), "ok": false, "error": e })
+        }
     };
     *state.datahub_last.lock().unwrap() = Some(entry.clone());
     entry
@@ -261,7 +267,11 @@ async fn run_counts(
 ) -> Vec<(String, usize, usize, usize)> {
     // Unfiltered: this counts everything the run produced for the emission
     // summary, not just what a consumer would be shown by trust.
-    let revs = match state.datasets.changes_since(app, dataset, job.started_at, 100_000, None).await {
+    let revs = match state
+        .datasets
+        .changes_since(app, dataset, job.started_at, 100_000, None)
+        .await
+    {
         Ok(revs) => revs,
         Err(e) => {
             warn!("datahub: changes for {app} failed: {e}");
@@ -278,7 +288,9 @@ async fn run_counts(
             _ => {}
         }
     }
-    by.into_iter().map(|(ds, (n, c, r))| (ds, n, c, r)).collect()
+    by.into_iter()
+        .map(|(ds, (n, c, r))| (ds, n, c, r))
+        .collect()
 }
 
 /// Existing upstream URNs of a dataset, read back from GMS so a multi-source
@@ -305,8 +317,12 @@ async fn existing_upstreams(state: &AppState, urn: &str) -> Vec<String> {
     if let Some(t) = cfg.resolve_token() {
         req = req.bearer_auth(t);
     }
-    let Ok(resp) = req.send().await else { return Vec::new() };
-    let Ok(body) = resp.json::<Value>().await else { return Vec::new() };
+    let Ok(resp) = req.send().await else {
+        return Vec::new();
+    };
+    let Ok(body) = resp.json::<Value>().await else {
+        return Vec::new();
+    };
     body["upstreamLineage"]["value"]["upstreams"]
         .as_array()
         .map(|ups| {
@@ -349,8 +365,10 @@ pub fn on_job_success(state: AppState, job: Job, index_specs: Vec<(String, Strin
                 .unwrap_or_default();
             entities.extend(dataset_entities(&state, &job.app, ds, Some((&job, n, c, r))).await);
         }
-        let own_urns: Vec<String> =
-            own.iter().map(|ds| dataset_urn(&env, &job.app, ds)).collect();
+        let own_urns: Vec<String> = own
+            .iter()
+            .map(|ds| dataset_urn(&env, &job.app, ds))
+            .collect();
 
         // Cross-namespace outputs (e.g. grants-gov → grants/unified).
         for (app, ds) in &index_specs {
@@ -358,7 +376,10 @@ pub fn on_job_success(state: AppState, job: Job, index_specs: Vec<(String, Strin
                 continue; // already covered above
             }
             let counts = run_counts(&state, app, Some(ds), &job).await;
-            let (n, c, r) = counts.first().map(|(_, n, c, r)| (*n, *c, *r)).unwrap_or_default();
+            let (n, c, r) = counts
+                .first()
+                .map(|(_, n, c, r)| (*n, *c, *r))
+                .unwrap_or_default();
             entities.extend(dataset_entities(&state, app, ds, Some((&job, n, c, r))).await);
             if !own_urns.is_empty() {
                 let urn = dataset_urn(&env, app, ds);
@@ -403,7 +424,11 @@ pub async fn full_sync(state: &AppState) -> Value {
     }
     let count = entities.len();
     let outcome = post_entities(state, entities).await;
-    let mut summary = record_status(state, "sync", outcome.map_err(|e| format!("({count} entities) {e}")));
+    let mut summary = record_status(
+        state,
+        "sync",
+        outcome.map_err(|e| format!("({count} entities) {e}")),
+    );
     if let Some(obj) = summary.as_object_mut() {
         obj.insert("datasets".into(), json!(all.len()));
     }
@@ -492,7 +517,10 @@ mod tests {
                 "nonsense"
             ]
         });
-        assert_eq!(index_dataset_specs(&result), vec![("grants".into(), "unified".into())]);
+        assert_eq!(
+            index_dataset_specs(&result),
+            vec![("grants".into(), "unified".into())]
+        );
         assert!(index_dataset_specs(&json!({})).is_empty());
     }
 

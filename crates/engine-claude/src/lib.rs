@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pumper_core::config::ClaudeConfig;
-use pumper_core::{Error, Researcher, ResearchOutput, ResearchRequest, Result};
+use pumper_core::{Error, ResearchOutput, ResearchRequest, Researcher, Result};
 use serde_json::Value;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
@@ -46,8 +46,7 @@ impl ClaudeEngine {
     }
 
     fn command(&self, req: &ResearchRequest, resolved: &Resolved) -> Command {
-        let mut args: Vec<String> =
-            vec!["-p".into(), "--output-format".into(), "json".into()];
+        let mut args: Vec<String> = vec!["-p".into(), "--output-format".into(), "json".into()];
         if let Some(model) = &resolved.model {
             args.push("--model".into());
             args.push(model.clone());
@@ -153,10 +152,16 @@ impl Researcher for ClaudeEngine {
         }
 
         let envelope: Value = serde_json::from_str(stdout.trim()).map_err(|e| {
-            Error::Claude(format!("unparseable cli output: {e}: {}", truncate(&stdout, 500)))
+            Error::Claude(format!(
+                "unparseable cli output: {e}: {}",
+                truncate(&stdout, 500)
+            ))
         })?;
         if envelope["is_error"].as_bool() == Some(true) {
-            return Err(Error::Claude(format!("cli reported error: {}", envelope["result"])));
+            return Err(Error::Claude(format!(
+                "cli reported error: {}",
+                envelope["result"]
+            )));
         }
 
         let text = envelope["result"].as_str().unwrap_or_default().to_string();

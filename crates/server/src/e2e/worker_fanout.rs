@@ -63,7 +63,10 @@ async fn a_job_run_fans_out_to_events_watches_and_trigger_hops() {
         .await
         .expect("enqueue");
 
-    assert!(worker::run_one(&state).await, "one queued job must be claimed");
+    assert!(
+        worker::run_one(&state).await,
+        "one queued job must be claimed"
+    );
 
     // Terminal state, attempt-fenced.
     let done = state.storage.get(job.id).await.unwrap().expect("job row");
@@ -85,7 +88,10 @@ async fn a_job_run_fans_out_to_events_watches_and_trigger_hops() {
     let hits = rx.wait_hits(1, Duration::from_secs(5)).await;
     let (headers, body) = &hits[0];
     assert_eq!(headers["x-pumper-event"], "dataset.changed");
-    assert!(headers.contains_key("x-pumper-signature"), "watch has a secret → must be signed");
+    assert!(
+        headers.contains_key("x-pumper-signature"),
+        "watch has a secret → must be signed"
+    );
     let payload: serde_json::Value = serde_json::from_slice(body).unwrap();
     assert_eq!(payload["app"], "fake");
     assert_eq!(payload["dataset"], "d");
@@ -94,22 +100,28 @@ async fn a_job_run_fans_out_to_events_watches_and_trigger_hops() {
     // The trigger enqueued exactly one hop job carrying `_trigger` provenance.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     let hop = loop {
-        let jobs: Vec<(String,)> = sqlx::query_as(
-            "SELECT params FROM jobs WHERE app = 'fake' AND id != ?1",
-        )
-        .bind(job.id.to_string())
-        .fetch_all(&state.storage.pool())
-        .await
-        .unwrap();
+        let jobs: Vec<(String,)> =
+            sqlx::query_as("SELECT params FROM jobs WHERE app = 'fake' AND id != ?1")
+                .bind(job.id.to_string())
+                .fetch_all(&state.storage.pool())
+                .await
+                .unwrap();
         if let Some((params,)) = jobs.first() {
             break serde_json::from_str::<serde_json::Value>(params).unwrap();
         }
-        assert!(tokio::time::Instant::now() < deadline, "trigger hop job never enqueued");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "trigger hop job never enqueued"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     };
     assert_eq!(hop["hop"], true, "trigger params merged into the hop job");
     let trig = &hop["_trigger"];
     assert_eq!(trig["trigger_id"], json!(trigger.id));
     assert_eq!(trig["source_job_id"], json!(job.id.to_string()));
-    assert_eq!(trig["chain"].as_array().map(Vec::len), Some(1), "one-hop chain");
+    assert_eq!(
+        trig["chain"].as_array().map(Vec::len),
+        Some(1),
+        "one-hop chain"
+    );
 }

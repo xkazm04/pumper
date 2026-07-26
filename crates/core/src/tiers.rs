@@ -207,7 +207,10 @@ impl TierMemory {
             sqlx::query_as("SELECT host, penalty_ms FROM tier_memory WHERE penalty_ms > 0")
                 .fetch_all(&self.pool)
                 .await?;
-        Ok(rows.into_iter().map(|(h, ms)| (h, ms.max(0) as u64)).collect())
+        Ok(rows
+            .into_iter()
+            .map(|(h, ms)| (h, ms.max(0) as u64))
+            .collect())
     }
 }
 

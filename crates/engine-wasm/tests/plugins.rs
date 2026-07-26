@@ -12,7 +12,11 @@ use serde_json::json;
 fn host() -> WasmPluginHost {
     // data/plugins lives at the repo root, two levels above this crate.
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../data/plugins");
-    WasmPluginHost::new(&PluginConfig { dir, ..Default::default() }).expect("host")
+    WasmPluginHost::new(&PluginConfig {
+        dir,
+        ..Default::default()
+    })
+    .expect("host")
 }
 
 /// The built `title.wasm` is a local runtime artifact (`data/` is gitignored;
@@ -32,7 +36,10 @@ fn title_present(host: &WasmPluginHost) -> bool {
 #[ignore = "requires data/plugins/title.wasm (build plugins-src/title-extractor); run with `cargo test -- --ignored`"]
 async fn extract_v2_envelope_forwards_params() {
     let host = host();
-    assert!(title_present(&host), "data/plugins/title.wasm missing — build plugins-src/title-extractor");
+    assert!(
+        title_present(&host),
+        "data/plugins/title.wasm missing — build plugins-src/title-extractor"
+    );
     // params.tag = "h2" makes the reference plugin extract the <h2> into `value`
     // — proving the params envelope reaches the plugin via extract_v2.
     let out = host
@@ -45,7 +52,11 @@ async fn extract_v2_envelope_forwards_params() {
         .expect("run");
     assert_eq!(out["title"], json!("Home"));
     assert_eq!(out["h1"], json!("Big"));
-    assert_eq!(out["value"], json!("Sub"), "params.tag drove the extra field");
+    assert_eq!(
+        out["value"],
+        json!("Sub"),
+        "params.tag drove the extra field"
+    );
     assert_eq!(out["tag"], json!("h2"));
 }
 
@@ -53,7 +64,10 @@ async fn extract_v2_envelope_forwards_params() {
 #[ignore = "requires data/plugins/title.wasm (build plugins-src/title-extractor); run with `cargo test -- --ignored`"]
 async fn describe_manifest_surfaces_in_metadata() {
     let host = host();
-    assert!(title_present(&host), "data/plugins/title.wasm missing — build plugins-src/title-extractor");
+    assert!(
+        title_present(&host),
+        "data/plugins/title.wasm missing — build plugins-src/title-extractor"
+    );
     let manifests = host.manifests();
     let title = manifests
         .iter()

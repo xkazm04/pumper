@@ -35,8 +35,14 @@ const DEFAULT_YEAR: &str = "2021";
 /// (4-digit NAICS 2017 code, friendly label) for the solo trades Ledgerline serves.
 /// 4-digit because nonemployer data at 6-digit × state is disclosure-suppressed.
 const DEFAULT_TRADES: &[(&str, &str)] = &[
-    ("2382", "Building equipment contractors (plumbing, HVAC, electrical)"),
-    ("5617", "Services to buildings & dwellings (landscaping, pool)"),
+    (
+        "2382",
+        "Building equipment contractors (plumbing, HVAC, electrical)",
+    ),
+    (
+        "5617",
+        "Services to buildings & dwellings (landscaping, pool)",
+    ),
 ];
 
 #[async_trait]
@@ -81,25 +87,25 @@ impl ScrapeApp for CensusNonemp {
             .trim()
             .to_string();
 
-        let trades: Vec<(String, String)> =
-            match ctx.params.get("naics").and_then(Value::as_array) {
-                Some(arr) => arr
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|c| {
-                        let label = DEFAULT_TRADES
-                            .iter()
-                            .find(|(k, _)| *k == c)
-                            .map(|(_, l)| l.to_string())
-                            .unwrap_or_else(|| c.to_string());
-                        (c.to_string(), label)
-                    })
-                    .collect(),
-                None => DEFAULT_TRADES
-                    .iter()
-                    .map(|(c, l)| (c.to_string(), l.to_string()))
-                    .collect(),
-            };
+        let trades: Vec<(String, String)> = match ctx.params.get("naics").and_then(Value::as_array)
+        {
+            Some(arr) => arr
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|c| {
+                    let label = DEFAULT_TRADES
+                        .iter()
+                        .find(|(k, _)| *k == c)
+                        .map(|(_, l)| l.to_string())
+                        .unwrap_or_else(|| c.to_string());
+                    (c.to_string(), label)
+                })
+                .collect(),
+            None => DEFAULT_TRADES
+                .iter()
+                .map(|(c, l)| (c.to_string(), l.to_string()))
+                .collect(),
+        };
 
         let api_key = census_common::api_key(&ctx, "census-nonemp")?;
 
@@ -155,7 +161,9 @@ impl ScrapeApp for CensusNonemp {
                 )));
             }
             let rows: Vec<Vec<String>> = serde_json::from_str(&resp.body).map_err(|e| {
-                Error::App(format!("Census NES {year} NAICS {naics}: bad JSON rows: {e}"))
+                Error::App(format!(
+                    "Census NES {year} NAICS {naics}: bad JSON rows: {e}"
+                ))
             })?;
             ctx.save_artifact(
                 &format!("nonemp-{naics}.json"),
@@ -166,13 +174,19 @@ impl ScrapeApp for CensusNonemp {
             let header = rows.first().cloned().unwrap_or_default();
             let idx = |name: &str| header.iter().position(|h| h.as_str() == name);
             let i_estab = idx("NESTAB").ok_or_else(|| {
-                Error::App(format!("Census NES NAICS {naics}: no NESTAB column in {header:?}"))
+                Error::App(format!(
+                    "Census NES NAICS {naics}: no NESTAB column in {header:?}"
+                ))
             })?;
             let i_rcpt = idx("NRCPTOT").ok_or_else(|| {
-                Error::App(format!("Census NES NAICS {naics}: no NRCPTOT column in {header:?}"))
+                Error::App(format!(
+                    "Census NES NAICS {naics}: no NRCPTOT column in {header:?}"
+                ))
             })?;
             let i_state = idx("state").ok_or_else(|| {
-                Error::App(format!("Census NES NAICS {naics}: no state column in {header:?}"))
+                Error::App(format!(
+                    "Census NES NAICS {naics}: no state column in {header:?}"
+                ))
             })?;
 
             // (state label, nonemployers, avg receipts $/operator)
@@ -214,7 +228,11 @@ impl ScrapeApp for CensusNonemp {
             by_density.sort_by(|a, b| b.1.cmp(&a.1));
             let mut by_avg = ranked.clone();
             by_avg.sort_by(|a, b| b.2.cmp(&a.2));
-            let national_avg = if total_estab > 0 { (total_rcpt * 1000) / total_estab } else { 0 };
+            let national_avg = if total_estab > 0 {
+                (total_rcpt * 1000) / total_estab
+            } else {
+                0
+            };
 
             trade_summaries.push(json!({
                 "naics": naics,
@@ -255,4 +273,3 @@ impl ScrapeApp for CensusNonemp {
         }))
     }
 }
-

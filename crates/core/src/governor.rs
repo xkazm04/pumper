@@ -97,12 +97,20 @@ impl Governor {
             return;
         }
         let host = host.to_lowercase();
-        let base = self.per_domain.get(&host).copied().unwrap_or(self.default_interval);
+        let base = self
+            .per_domain
+            .get(&host)
+            .copied()
+            .unwrap_or(self.default_interval);
 
         // Fast path: unlimited + unpenalized + no jitter needs no spacing and no
         // state churn. Only a live penalty on this host forces the slow path.
         if base.is_zero() && self.max_jitter.is_zero() {
-            let penalized = self.hosts.get(&host).map(|s| !s.penalty.is_zero()).unwrap_or(false);
+            let penalized = self
+                .hosts
+                .get(&host)
+                .map(|s| !s.penalty.is_zero())
+                .unwrap_or(false);
             if !penalized {
                 return;
             }
@@ -152,7 +160,9 @@ impl Governor {
         } else {
             entry.penalty.saturating_mul(2)
         };
-        let next = doubled.max(retry_after.unwrap_or(Duration::ZERO)).min(self.penalty_cap);
+        let next = doubled
+            .max(retry_after.unwrap_or(Duration::ZERO))
+            .min(self.penalty_cap);
         entry.penalty = next;
         entry.next_slot = entry.next_slot.max(now + next);
         drop(entry);
@@ -205,7 +215,11 @@ impl Governor {
         let now = Instant::now();
         self.hosts
             .entry(host.to_lowercase())
-            .or_insert_with(|| HostState { next_slot: now, penalty: Duration::ZERO, last_seen: now })
+            .or_insert_with(|| HostState {
+                next_slot: now,
+                penalty: Duration::ZERO,
+                last_seen: now,
+            })
             .penalty = penalty;
     }
 
@@ -286,9 +300,15 @@ mod tests {
         let elapsed = start.elapsed();
 
         // Lower bound: same-host spacing was enforced (two 200ms gaps).
-        assert!(elapsed >= Duration::from_millis(350), "per-host spacing lost: {elapsed:?}");
+        assert!(
+            elapsed >= Duration::from_millis(350),
+            "per-host spacing lost: {elapsed:?}"
+        );
         // Upper bound: 32 hosts ran concurrently, not serialized into ~12.8s.
-        assert!(elapsed < Duration::from_secs(3), "distinct hosts serialized: {elapsed:?}");
+        assert!(
+            elapsed < Duration::from_secs(3),
+            "distinct hosts serialized: {elapsed:?}"
+        );
     }
 
     #[tokio::test]
@@ -322,7 +342,11 @@ mod tests {
         for _ in 0..8 {
             g.reward("x.com").await;
         }
-        assert_eq!(g.penalty("x.com").await, Duration::ZERO, "dropped below the floor");
+        assert_eq!(
+            g.penalty("x.com").await,
+            Duration::ZERO,
+            "dropped below the floor"
+        );
         // Reward on an unpenalized host is a no-op.
         g.reward("y.com").await;
         assert_eq!(g.penalty("y.com").await, Duration::ZERO);

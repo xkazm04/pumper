@@ -116,7 +116,6 @@ struct Holders {
     launching: HashMap<String, Arc<Mutex<()>>>,
 }
 
-
 pub struct BrowserEngine {
     cfg: BrowserConfig,
     /// Root of the session vault (`[fetcher] profiles_dir`); a profile renders
@@ -214,7 +213,11 @@ impl BrowserEngine {
             warn!("browser handler loop ended (chrome exited?)");
         });
 
-        Ok(LiveBrowser { browser: Arc::new(browser), alive, renders: 0 })
+        Ok(LiveBrowser {
+            browser: Arc::new(browser),
+            alive,
+            renders: 0,
+        })
     }
 
     /// Returns a handle to a live Chrome **bound to `profile`'s user-data-dir**
@@ -290,7 +293,11 @@ impl BrowserEngine {
     /// grow without bound across many distinct profiles. Caller holds the lock.
     fn gate_for(holders: &mut Holders, key: &str) -> Arc<Mutex<()>> {
         holders.launching.retain(|_, g| Arc::strong_count(g) > 1);
-        holders.launching.entry(key.to_string()).or_default().clone()
+        holders
+            .launching
+            .entry(key.to_string())
+            .or_default()
+            .clone()
     }
 
     /// Whether `key` has a live, non-stale holder. Caller holds the holders lock.
@@ -504,7 +511,11 @@ async fn wait_for_selector(
 async fn count_matches(page: &chromiumoxide::Page, selector: &str) -> u64 {
     let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
     let js = format!("document.querySelectorAll({sel}).length");
-    page.evaluate(js).await.ok().and_then(|r| r.into_value::<u64>().ok()).unwrap_or(0)
+    page.evaluate(js)
+        .await
+        .ok()
+        .and_then(|r| r.into_value::<u64>().ok())
+        .unwrap_or(0)
 }
 
 /// Runs a scripted [`PageAction`] list in order, stopping at `deadline`. Returns
@@ -525,7 +536,9 @@ fn execute_actions<'a>(
             }
             match action {
                 PageAction::ScrollBottom => {
-                    let _ = page.evaluate("window.scrollTo(0, document.body.scrollHeight)").await;
+                    let _ = page
+                        .evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                        .await;
                 }
                 PageAction::ScrollBy { pixels } => {
                     let _ = page.evaluate(format!("window.scrollBy(0, {pixels})")).await;
@@ -548,7 +561,10 @@ fn execute_actions<'a>(
                         warn!(selector = %selector, "page action type: selector not found");
                     }
                 }
-                PageAction::WaitForSelector { selector, timeout_ms } => {
+                PageAction::WaitForSelector {
+                    selector,
+                    timeout_ms,
+                } => {
                     let d = timeout_ms
                         .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms))
                         .unwrap_or(deadline)
@@ -558,7 +574,11 @@ fn execute_actions<'a>(
                 PageAction::WaitMs { ms } => {
                     tokio::time::sleep(Duration::from_millis(*ms)).await;
                 }
-                PageAction::Repeat { times, steps, until_selector_count_stable } => {
+                PageAction::Repeat {
+                    times,
+                    steps,
+                    until_selector_count_stable,
+                } => {
                     let mut last_count: Option<u64> = None;
                     for _ in 0..*times {
                         if tokio::time::Instant::now() >= deadline {
@@ -595,7 +615,9 @@ mod tests {
     fn semaphore_absent_when_unlimited() {
         let mut c = cfg();
         c.max_concurrent_renders = 0;
-        assert!(BrowserEngine::new(&c, "data/profiles").render_slots.is_none());
+        assert!(BrowserEngine::new(&c, "data/profiles")
+            .render_slots
+            .is_none());
     }
 
     #[test]
@@ -647,7 +669,9 @@ mod tests {
         // A profile renders under its own Chrome user-data-dir in the vault.
         assert_eq!(
             engine.user_data_dir(Some("acme")).unwrap(),
-            std::path::Path::new("data/profiles").join("acme").join("browser")
+            std::path::Path::new("data/profiles")
+                .join("acme")
+                .join("browser")
         );
         // An unsafe name is rejected before any path exists.
         let err = engine.user_data_dir(Some("../../etc")).unwrap_err();
@@ -666,9 +690,16 @@ mod tests {
         // profile pushes past the cap.
         assert!(lru_touch_evict(&mut order, "p0", MAX_LIVE_PROFILES).is_empty());
         let evicted = lru_touch_evict(&mut order, "pN", MAX_LIVE_PROFILES);
-        assert_eq!(evicted, vec!["p1".to_string()], "least-recently-used closed");
+        assert_eq!(
+            evicted,
+            vec!["p1".to_string()],
+            "least-recently-used closed"
+        );
         assert_eq!(order.len(), MAX_LIVE_PROFILES);
-        assert!(order.contains(&"p0".to_string()), "recently used kept alive");
+        assert!(
+            order.contains(&"p0".to_string()),
+            "recently used kept alive"
+        );
         assert!(order.contains(&"pN".to_string()), "newest is live");
         // The key just acquired is never itself evicted.
         let mut tight = VecDeque::from(vec!["a".to_string()]);

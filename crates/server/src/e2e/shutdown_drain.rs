@@ -19,7 +19,10 @@ async fn shutdown_drains_then_requeues_the_straggler() {
         .storage
         .enqueue(
             "fake",
-            EnqueueOptions { params: json!({ "sleep_ms": 60_000 }), ..Default::default() },
+            EnqueueOptions {
+                params: json!({ "sleep_ms": 60_000 }),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
@@ -33,7 +36,10 @@ async fn shutdown_drains_then_requeues_the_straggler() {
         if row.status == JobStatus::Running {
             break;
         }
-        assert!(tokio::time::Instant::now() < deadline, "worker never claimed the job");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "worker never claimed the job"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 
@@ -46,5 +52,9 @@ async fn shutdown_drains_then_requeues_the_straggler() {
     // The straggler went back to the queue with its attempt intact — the
     // recover_stuck path, not a failure and not a stranded `running` row.
     let row = state.storage.get(job.id).await.unwrap().unwrap();
-    assert_eq!(row.status, JobStatus::Queued, "straggler re-queued for the next boot");
+    assert_eq!(
+        row.status,
+        JobStatus::Queued,
+        "straggler re-queued for the next boot"
+    );
 }

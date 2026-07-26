@@ -22,9 +22,14 @@ async fn reindex_rewrites_stale_simhashes_without_touching_content() {
     let pool = storage.pool();
     let ds = Datasets::new(storage.pool());
 
-    ds.upsert("app", "d", "k", &json!({ "title": "hello world simhash reindex" }))
-        .await
-        .unwrap();
+    ds.upsert(
+        "app",
+        "d",
+        "k",
+        &json!({ "title": "hello world simhash reindex" }),
+    )
+    .await
+    .unwrap();
 
     // What the current hash should produce, plus the content fields that must NOT move.
     let (correct_sim, hash_before, updated_before): (i64, String, String) =
@@ -39,21 +44,31 @@ async fn reindex_rewrites_stale_simhashes_without_touching_content() {
         .await
         .unwrap();
 
-    assert_eq!(ds.reindex_simhashes().await.unwrap(), 1, "stale row must be rewritten");
+    assert_eq!(
+        ds.reindex_simhashes().await.unwrap(),
+        1,
+        "stale row must be rewritten"
+    );
 
     let (sim_after, hash_after, updated_after): (i64, String, String) =
         sqlx::query_as("SELECT simhash, hash, updated_at FROM records WHERE key = 'k'")
             .fetch_one(&pool)
             .await
             .unwrap();
-    assert_eq!(sim_after, correct_sim, "simhash recomputed from the stored data");
+    assert_eq!(
+        sim_after, correct_sim,
+        "simhash recomputed from the stored data"
+    );
     // Content hash + timestamps untouched → the change-feed sees no fake revision.
     assert_eq!(hash_after, hash_before, "content hash must not move");
     assert_eq!(updated_after, updated_before, "updated_at must not move");
 
     // Idempotent: a second run finds nothing to rewrite.
-    assert_eq!(ds.reindex_simhashes().await.unwrap(), 0, "reindex must be idempotent");
-
+    assert_eq!(
+        ds.reindex_simhashes().await.unwrap(),
+        0,
+        "reindex must be idempotent"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -80,11 +95,12 @@ async fn concurrent_same_key_upserts_keep_revision_chain_intact() {
     }
 
     // Exactly one record for the key.
-    let record_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE app = 'app' AND dataset = 'd' AND key = 'k'")
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+    let record_count: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM records WHERE app = 'app' AND dataset = 'd' AND key = 'k'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(record_count, 1, "the key must resolve to a single record");
 
     // Revision numbers are exactly 1..=N — contiguous, unique, none lost.
@@ -100,7 +116,6 @@ async fn concurrent_same_key_upserts_keep_revision_chain_intact() {
         revisions, expected,
         "revision chain must be contiguous 1..={N} with no duplicates or gaps"
     );
-
 }
 
 #[tokio::test]
@@ -122,18 +137,32 @@ async fn list_filtered_ordered_returns_soonest_rows_past_the_cap() {
     for day in order {
         let key = format!("g{day:02}");
         let close = format!("2026-03-{day:02}");
-        ds.upsert("grants", "unified", &key, &json!({ "status": "open", "close_date": close }))
-            .await
-            .unwrap();
+        ds.upsert(
+            "grants",
+            "unified",
+            &key,
+            &json!({ "status": "open", "close_date": close }),
+        )
+        .await
+        .unwrap();
     }
 
     let filters = vec![
-        JsonFilter::Eq { path: "$.status".into(), value: "open".into() },
-        JsonFilter::Gte { path: "$.close_date".into(), value: "2026-01-01".into() },
+        JsonFilter::Eq {
+            path: "$.status".into(),
+            value: "open".into(),
+        },
+        JsonFilter::Gte {
+            path: "$.close_date".into(),
+            value: "2026-01-01".into(),
+        },
     ];
 
     // count_filtered reports the true total, independent of any cap.
-    let count = ds.count_filtered("grants", "unified", &filters).await.unwrap();
+    let count = ds
+        .count_filtered("grants", "unified", &filters)
+        .await
+        .unwrap();
     assert_eq!(count, 10, "count is the full window, not the return cap");
 
     // A cap of 3 must return the three SOONEST (01, 02, 03), not an arbitrary slice.
@@ -143,10 +172,15 @@ async fn list_filtered_ordered_returns_soonest_rows_past_the_cap() {
         .unwrap();
     let closes: Vec<String> = top
         .iter()
-        .map(|r| r.data.get("close_date").and_then(|v| v.as_str()).unwrap().to_string())
+        .map(|r| {
+            r.data
+                .get("close_date")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string()
+        })
         .collect();
     assert_eq!(closes, vec!["2026-03-01", "2026-03-02", "2026-03-03"]);
-
 }
 
 #[tokio::test]
@@ -183,10 +217,11 @@ async fn upsert_many_is_correct_across_chunk_boundaries() {
     // Every record resolves to exactly one row; the two changed keys have 2
     // revisions (new + changed), the rest have 1 — the chain stayed intact.
     let pool = storage.pool();
-    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE app='app' AND dataset='d'")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let total: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE app='app' AND dataset='d'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(total, 600);
     let revs_changed: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM record_revisions WHERE app='app' AND dataset='d' AND key='k0512'",
@@ -195,7 +230,6 @@ async fn upsert_many_is_correct_across_chunk_boundaries() {
     .await
     .unwrap();
     assert_eq!(revs_changed, 2, "new + changed revisions");
-
 }
 
 #[tokio::test]
@@ -236,13 +270,19 @@ async fn detect_removed_tombstones_with_matching_removed_revisions() {
         .fetch_all(&pool)
         .await
         .unwrap();
-        assert_eq!(rev_changes, vec!["new", "removed"], "{key} revision chain: new then removed");
+        assert_eq!(
+            rev_changes,
+            vec!["new", "removed"],
+            "{key} revision chain: new then removed"
+        );
     }
 
     // Idempotent: a second identical snapshot re-removes nothing (already tombstoned).
     let removed2 = ds.detect_removed("app", "d", &present).await.unwrap();
-    assert!(removed2.is_empty(), "already-removed keys are not re-removed");
-
+    assert!(
+        removed2.is_empty(),
+        "already-removed keys are not re-removed"
+    );
 }
 
 #[tokio::test]
@@ -255,8 +295,9 @@ async fn detect_removed_noops_on_an_empty_snapshot() {
     let ds = Datasets::new(storage.pool());
     let pool = storage.pool();
 
-    let items: Vec<(String, serde_json::Value)> =
-        (0..5).map(|i| (format!("k{i}"), json!({ "n": i }))).collect();
+    let items: Vec<(String, serde_json::Value)> = (0..5)
+        .map(|i| (format!("k{i}"), json!({ "n": i })))
+        .collect();
     ds.upsert_many("app", "d", &items).await.unwrap();
 
     let removed = ds.detect_removed("app", "d", &[]).await.unwrap();
@@ -269,7 +310,6 @@ async fn detect_removed_noops_on_an_empty_snapshot() {
     .await
     .unwrap();
     assert_eq!(live, 5, "all records still live after an empty snapshot");
-
 }
 
 #[tokio::test]
@@ -280,33 +320,58 @@ async fn delete_record_and_dataset_remove_rows_and_revisions() {
     let pool = storage.pool();
 
     // Seed 3 records, changing one so it has 2 revisions.
-    ds.upsert("app", "d", "k1", &json!({ "n": 1 })).await.unwrap();
-    ds.upsert("app", "d", "k2", &json!({ "n": 2 })).await.unwrap();
-    ds.upsert("app", "d", "k2", &json!({ "n": 22 })).await.unwrap();
-    ds.upsert("app", "d", "k3", &json!({ "n": 3 })).await.unwrap();
+    ds.upsert("app", "d", "k1", &json!({ "n": 1 }))
+        .await
+        .unwrap();
+    ds.upsert("app", "d", "k2", &json!({ "n": 2 }))
+        .await
+        .unwrap();
+    ds.upsert("app", "d", "k2", &json!({ "n": 22 }))
+        .await
+        .unwrap();
+    ds.upsert("app", "d", "k3", &json!({ "n": 3 }))
+        .await
+        .unwrap();
 
     // delete_record removes the row AND its whole revision history.
     assert!(ds.delete_record("app", "d", "k2").await.unwrap(), "existed");
-    let rec_rows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE app='app' AND dataset='d' AND key='k2'")
-            .fetch_one(&pool).await.unwrap();
+    let rec_rows: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM records WHERE app='app' AND dataset='d' AND key='k2'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     let rev_rows: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM record_revisions WHERE app='app' AND dataset='d' AND key='k2'",
-    ).fetch_one(&pool).await.unwrap();
-    assert_eq!((rec_rows, rev_rows), (0, 0), "record and its 2 revisions gone");
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        (rec_rows, rev_rows),
+        (0, 0),
+        "record and its 2 revisions gone"
+    );
     // Deleting a missing record reports false, doesn't error.
-    assert!(!ds.delete_record("app", "d", "k2").await.unwrap(), "already gone");
+    assert!(
+        !ds.delete_record("app", "d", "k2").await.unwrap(),
+        "already gone"
+    );
 
     // delete_dataset removes the remaining records + all revisions, returns count.
     let removed = ds.delete_dataset("app", "d").await.unwrap();
     assert_eq!(removed, 2, "k1 + k3 removed");
-    let total_recs: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE app='app' AND dataset='d'")
-        .fetch_one(&pool).await.unwrap();
+    let total_recs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE app='app' AND dataset='d'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     let total_revs: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM record_revisions WHERE app='app' AND dataset='d'")
-            .fetch_one(&pool).await.unwrap();
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!((total_recs, total_revs), (0, 0), "dataset fully gone");
-
 }
 
 #[tokio::test]
@@ -318,10 +383,14 @@ async fn prune_revisions_keeps_the_newest_n_and_respects_the_cutoff() {
 
     // 5 revisions for k (1 new + 4 changed), 3 for k2.
     for v in 1..=5 {
-        ds.upsert("app", "d", "k", &json!({ "n": v })).await.unwrap();
+        ds.upsert("app", "d", "k", &json!({ "n": v }))
+            .await
+            .unwrap();
     }
     for v in 1..=3 {
-        ds.upsert("app", "d", "k2", &json!({ "n": v })).await.unwrap();
+        ds.upsert("app", "d", "k2", &json!({ "n": v }))
+            .await
+            .unwrap();
     }
 
     // Cutoff in the past: nothing is older, so nothing is pruned.
@@ -346,7 +415,9 @@ async fn prune_revisions_keeps_the_newest_n_and_respects_the_cutoff() {
     assert_eq!(kept_k, vec![4, 5], "newest 2 of k survive");
     let kept_k2: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM record_revisions WHERE app='app' AND dataset='d' AND key='k2'",
-    ).fetch_one(&pool).await.unwrap();
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
     assert_eq!(kept_k2, 2);
-
 }

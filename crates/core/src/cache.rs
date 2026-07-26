@@ -128,7 +128,10 @@ impl HttpCache {
         let headers: HashMap<String, String> =
             serde_json::from_str(&headers_json).unwrap_or_default();
         let find = |name: &str| {
-            headers.iter().find(|(k, _)| k.eq_ignore_ascii_case(name)).map(|(_, v)| v.clone())
+            headers
+                .iter()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+                .map(|(_, v)| v.clone())
         };
         let etag = find("etag");
         let last_modified = find("last-modified");
@@ -164,7 +167,13 @@ impl HttpCache {
     }
 
     /// Stores a response under `key`. Only 2xx responses are cached.
-    pub async fn put(&self, key: &str, url: &str, resp: &HttpResponse, ttl: Duration) -> Result<()> {
+    pub async fn put(
+        &self,
+        key: &str,
+        url: &str,
+        resp: &HttpResponse,
+        ttl: Duration,
+    ) -> Result<()> {
         if !self.enabled || !resp.is_success() {
             return Ok(());
         }
@@ -221,7 +230,9 @@ mod tests {
         assert_eq!(k, HttpCache::key(&req("https://x.test/a")));
         // Content-negotiation headers change the response → change the identity.
         let mut with_lang = base.clone();
-        with_lang.headers.insert("Accept-Language".into(), "cs".into());
+        with_lang
+            .headers
+            .insert("Accept-Language".into(), "cs".into());
         assert_ne!(k, HttpCache::key(&with_lang));
         // Proxy (geo-variant egress) changes the identity.
         let mut with_proxy = base.clone();
@@ -241,7 +252,10 @@ pub struct ResearchCache {
 
 impl ResearchCache {
     pub fn new(pool: SqlitePool, ttl_secs: u64) -> Self {
-        Self { pool, ttl: Duration::from_secs(ttl_secs) }
+        Self {
+            pool,
+            ttl: Duration::from_secs(ttl_secs),
+        }
     }
 
     pub fn enabled(&self) -> bool {
@@ -261,7 +275,12 @@ impl ResearchCache {
             hasher.update(part.as_bytes());
             hasher.update([0]);
         }
-        hasher.update(req.max_turns.map(|t| t.to_string()).unwrap_or_default().as_bytes());
+        hasher.update(
+            req.max_turns
+                .map(|t| t.to_string())
+                .unwrap_or_default()
+                .as_bytes(),
+        );
         hasher.update([0]);
         if let Some(schema) = &req.json_schema {
             hasher.update(schema.to_string().as_bytes());

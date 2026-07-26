@@ -104,13 +104,20 @@ impl ScrapeApp for TradeWages {
 
         let mut request = ResearchRequest::new(prompt).with_role(role);
         request.max_turns = max_turns;
-        request.model = ctx.params.get("model").and_then(Value::as_str).map(String::from);
-        request.effort = ctx.params.get("effort").and_then(Value::as_str).map(String::from);
+        request.model = ctx
+            .params
+            .get("model")
+            .and_then(Value::as_str)
+            .map(String::from);
+        request.effort = ctx
+            .params
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(String::from);
         // Constrain the final answer to the wage schema (`claude --json-schema`) so the
         // CLI validates structure; salvage_json below still catches anything it misses.
         request.json_schema = Some(wages_schema());
-        let (data, output) =
-            trades_common::research_json(&ctx, "trade-wages", request).await?;
+        let (data, output) = trades_common::research_json(&ctx, "trade-wages", request).await?;
 
         let mut all_records: Vec<(String, Value)> = Vec::new();
         // Plausibility guards: wage bands must be ordered (entry ≤ median ≤

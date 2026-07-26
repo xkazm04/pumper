@@ -52,7 +52,9 @@ fn resolve_max_concurrent(configured: usize) -> usize {
     if configured > 0 {
         return configured;
     }
-    std::thread::available_parallelism().map(|n| n.get()).unwrap_or(4)
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
 }
 
 impl WasmPluginHost {
@@ -107,9 +109,11 @@ impl Plugins for WasmPluginHost {
             .map_err(|e| Error::App(format!("plugin semaphore closed: {e}")))?;
         // Wasm execution is synchronous and CPU-bound — run it off the async
         // runtime so a busy plugin never stalls a tokio worker.
-        tokio::task::spawn_blocking(move || execute(engine, module, input, params, fuel, max_memory))
-            .await
-            .map_err(|e| Error::App(format!("plugin task panicked: {e}")))?
+        tokio::task::spawn_blocking(move || {
+            execute(engine, module, input, params, fuel, max_memory)
+        })
+        .await
+        .map_err(|e| Error::App(format!("plugin task panicked: {e}")))?
     }
 
     fn list(&self) -> Vec<String> {
@@ -204,7 +208,9 @@ fn instantiate(
         .build();
     let mut store = Store::new(engine, limits);
     store.limiter(|l| l as &mut dyn ResourceLimiter);
-    store.set_fuel(fuel).map_err(|e| Error::App(format!("set fuel: {e}")))?;
+    store
+        .set_fuel(fuel)
+        .map_err(|e| Error::App(format!("set fuel: {e}")))?;
     let linker: Linker<StoreLimits> = Linker::new(engine);
     let instance = linker
         .instantiate(&mut store, module)
@@ -220,7 +226,10 @@ fn read_packed(store: &mut Store<StoreLimits>, memory: &Memory, packed: u64) -> 
     let out_ptr = (packed >> 32) as usize;
     let out_len = (packed & 0xffff_ffff) as usize;
     let mem_size = memory.data_size(&*store);
-    if out_ptr.checked_add(out_len).map_or(true, |end| end > mem_size) {
+    if out_ptr
+        .checked_add(out_len)
+        .map_or(true, |end| end > mem_size)
+    {
         return Err(Error::App(format!(
             "plugin output range out of bounds: ptr={out_ptr} len={out_len} mem={mem_size}"
         )));
@@ -235,9 +244,12 @@ fn read_packed(store: &mut Store<StoreLimits>, memory: &Memory, packed: u64) -> 
 /// Best-effort read of a plugin's `describe() -> u64` manifest at load time.
 /// Any miss (no export, trap, non-JSON) → `None`, degrading to name-only.
 fn describe_manifest(engine: &Engine, module: &Module) -> Option<Value> {
-    let (mut store, instance) = instantiate(engine, module, DESCRIBE_FUEL, 16 * 1024 * 1024).ok()?;
+    let (mut store, instance) =
+        instantiate(engine, module, DESCRIBE_FUEL, 16 * 1024 * 1024).ok()?;
     let memory = instance.get_memory(&mut store, "memory")?;
-    let describe = instance.get_typed_func::<(), u64>(&mut store, "describe").ok()?;
+    let describe = instance
+        .get_typed_func::<(), u64>(&mut store, "describe")
+        .ok()?;
     let packed = describe.call(&mut store, ()).ok()?;
     let bytes = read_packed(&mut store, &memory, packed).ok()?;
     serde_json::from_slice(&bytes).ok()
@@ -262,19 +274,20 @@ fn execute(
     // Prefer the params-aware `extract_v2` ABI (input is a `{doc, params}`
     // envelope); fall back to the legacy `extract` (raw document, params ignored)
     // so plugins built before the envelope keep working unchanged.
-    let (func, input_bytes): (TypedFunc<(u32, u32), u64>, Vec<u8>) =
-        match instance.get_typed_func::<(u32, u32), u64>(&mut store, "extract_v2") {
-            Ok(f) => {
-                let envelope = serde_json::json!({ "doc": input, "params": params }).to_string();
-                (f, envelope.into_bytes())
-            }
-            Err(_) => {
-                let f = instance
-                    .get_typed_func::<(u32, u32), u64>(&mut store, "extract")
-                    .map_err(|e| Error::App(format!("plugin missing extract(u32,u32)->u64: {e}")))?;
-                (f, input.into_bytes())
-            }
-        };
+    let (func, input_bytes): (TypedFunc<(u32, u32), u64>, Vec<u8>) = match instance
+        .get_typed_func::<(u32, u32), u64>(&mut store, "extract_v2")
+    {
+        Ok(f) => {
+            let envelope = serde_json::json!({ "doc": input, "params": params }).to_string();
+            (f, envelope.into_bytes())
+        }
+        Err(_) => {
+            let f = instance
+                .get_typed_func::<(u32, u32), u64>(&mut store, "extract")
+                .map_err(|e| Error::App(format!("plugin missing extract(u32,u32)->u64: {e}")))?;
+            (f, input.into_bytes())
+        }
+    };
 
     let len = input_bytes.len() as u32;
     let in_ptr = alloc
@@ -290,7 +303,8 @@ fn execute(
         .map_err(|e| Error::App(format!("plugin trapped (fuel/memory/panic): {e}")))?;
 
     let out = read_packed(&mut store, &memory, packed)?;
-    serde_json::from_slice(&out).map_err(|e| Error::App(format!("plugin returned invalid JSON: {e}")))
+    serde_json::from_slice(&out)
+        .map_err(|e| Error::App(format!("plugin returned invalid JSON: {e}")))
 }
 
 #[cfg(test)]

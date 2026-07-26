@@ -116,7 +116,10 @@ impl EventBus {
         let (tx, _) = broadcast::channel(broadcast_capacity);
         Self {
             seq: AtomicU64::new(0),
-            ring: Mutex::new(Ring { deque: VecDeque::with_capacity(ring_capacity), bytes: 0 }),
+            ring: Mutex::new(Ring {
+                deque: VecDeque::with_capacity(ring_capacity),
+                bytes: 0,
+            }),
             capacity: ring_capacity.max(1),
             max_bytes,
             tx,
@@ -144,7 +147,10 @@ impl EventBus {
         let event = Arc::new(event);
         let mut ring = self.ring.lock().unwrap();
         let seq = self.seq.fetch_add(1, Ordering::AcqRel) + 1;
-        ring.deque.push_back(Buffered { event: (seq, Arc::clone(&event)), bytes });
+        ring.deque.push_back(Buffered {
+            event: (seq, Arc::clone(&event)),
+            bytes,
+        });
         ring.bytes += bytes;
         // Evict oldest past the count capacity OR the byte budget, always keeping
         // the event just pushed so the ring is never empty after an emit.
@@ -210,8 +216,14 @@ mod tests {
             bus.emit(ev_with_result(1_000));
         }
         let ring = bus.ring.lock().unwrap();
-        assert!(ring.deque.len() < 10, "byte budget should cap well under count capacity");
-        assert!(ring.bytes <= 3_000 || ring.deque.len() == 1, "bytes within budget (or the mandatory last event)");
+        assert!(
+            ring.deque.len() < 10,
+            "byte budget should cap well under count capacity"
+        );
+        assert!(
+            ring.bytes <= 3_000 || ring.deque.len() == 1,
+            "bytes within budget (or the mandatory last event)"
+        );
         // The running byte total stays consistent with the retained events.
         let summed: usize = ring.deque.iter().map(|b| b.bytes).sum();
         assert_eq!(summed, ring.bytes);

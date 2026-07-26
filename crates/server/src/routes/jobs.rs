@@ -73,7 +73,10 @@ pub(crate) async fn enqueue_job(
     body: Option<Json<EnqueueBody>>,
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
     let Some(app) = state.registry.get(&name) else {
-        return Err(ApiError(StatusCode::NOT_FOUND, format!("unknown app '{name}'")));
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("unknown app '{name}'"),
+        ));
     };
     let body = body.map(|Json(b)| b).unwrap_or_default();
     let idempotency_key = headers
@@ -136,7 +139,10 @@ pub(crate) async fn list_jobs(
         .transpose()?;
     let limit = query.limit.clamp(1, 500);
     let Some(cursor) = &query.cursor else {
-        let jobs = state.storage.list(query.app.as_deref(), status, limit).await?;
+        let jobs = state
+            .storage
+            .list(query.app.as_deref(), status, limit)
+            .await?;
         return Ok(Json(json!(jobs)));
     };
     let after = parse_cursor(cursor);
@@ -197,7 +203,9 @@ pub(crate) async fn retry_job(
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
     match state.storage.retry(id).await? {
         Some(job) => {
-            state.events.emit(JobEvent::new(job.id, job.app.clone(), "queued"));
+            state
+                .events
+                .emit(JobEvent::new(job.id, job.app.clone(), "queued"));
             state.notify.notify_one();
             Ok((StatusCode::ACCEPTED, Json(job)))
         }
@@ -249,7 +257,10 @@ pub(crate) async fn bulk_retry_jobs(
         }
     };
     let cap = body.limit.unwrap_or(500).clamp(1, 500);
-    let ids = state.storage.retry_bulk(status, body.app.as_deref(), cap).await?;
+    let ids = state
+        .storage
+        .retry_bulk(status, body.app.as_deref(), cap)
+        .await?;
     for id in &ids {
         state.events.emit(JobEvent::new(*id, "", "queued"));
     }
@@ -279,7 +290,9 @@ pub(crate) async fn reset_job(
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
     match state.storage.reset(id).await? {
         Some(job) => {
-            state.events.emit(JobEvent::new(job.id, job.app.clone(), "queued"));
+            state
+                .events
+                .emit(JobEvent::new(job.id, job.app.clone(), "queued"));
             state.notify.notify_one();
             Ok((StatusCode::ACCEPTED, Json(job)))
         }
@@ -335,7 +348,12 @@ pub(crate) async fn cancel_job(
         token.cancel();
         return Ok(Json(json!({ "cancelled": true, "running": true })));
     }
-    Err(job_state_error(&state, id, "job is already terminal (succeeded/failed/cancelled)").await)
+    Err(job_state_error(
+        &state,
+        id,
+        "job is already terminal (succeeded/failed/cancelled)",
+    )
+    .await)
 }
 
 // ---- Costs ------------------------------------------------------------------
@@ -402,7 +420,9 @@ pub(crate) async fn cost_summary(
     let since = parse_since(query.since.as_deref())?;
     let summary = state.costs.summary(query.app.as_deref(), since).await?;
     let total: f64 = summary.iter().map(|s| s.cost_usd).sum();
-    Ok(Json(json!({ "total_usd": total, "by_app_engine": summary })))
+    Ok(Json(
+        json!({ "total_usd": total, "by_app_engine": summary }),
+    ))
 }
 
 #[cfg(test)]

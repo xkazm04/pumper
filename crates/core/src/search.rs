@@ -114,7 +114,11 @@ pub struct SearchRequest {
 
 impl SearchRequest {
     pub fn new(q: impl Into<String>, limit: usize) -> Self {
-        Self { q: q.into(), limit, ..Default::default() }
+        Self {
+            q: q.into(),
+            limit,
+            ..Default::default()
+        }
     }
 }
 

@@ -37,7 +37,11 @@ async fn signature_and_headers_match_the_documented_contract() {
     let hits = rx.wait_hits(1, Duration::from_secs(5)).await;
     let (headers, body) = &hits[0];
 
-    assert_eq!(body, &serde_json::to_vec(&payload).unwrap(), "body is the raw payload JSON");
+    assert_eq!(
+        body,
+        &serde_json::to_vec(&payload).unwrap(),
+        "body is the raw payload JSON"
+    );
     assert_eq!(headers["x-pumper-event"], "test.event");
     assert_eq!(headers["content-type"], "application/json");
     let delivery_id = &headers["x-pumper-delivery-id"];
@@ -59,7 +63,10 @@ async fn signature_and_headers_match_the_documented_contract() {
                 break;
             }
         }
-        assert!(tokio::time::Instant::now() < deadline, "delivery row never became delivered");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "delivery row never became delivered"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }
@@ -85,7 +92,10 @@ async fn retry_keeps_the_delivery_id_stable_and_lands_on_the_second_attempt() {
     let hits = rx.wait_hits(2, Duration::from_secs(10)).await;
     let id0 = &hits[0].0["x-pumper-delivery-id"];
     let id1 = &hits[1].0["x-pumper-delivery-id"];
-    assert_eq!(id0, id1, "delivery id must be stable across retries (idempotency key)");
+    assert_eq!(
+        id0, id1,
+        "delivery id must be stable across retries (idempotency key)"
+    );
 
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
@@ -95,7 +105,10 @@ async fn retry_keeps_the_delivery_id_stable_and_lands_on_the_second_attempt() {
                 break;
             }
         }
-        assert!(tokio::time::Instant::now() < deadline, "retried delivery never delivered");
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "retried delivery never delivered"
+        );
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
 }

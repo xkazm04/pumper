@@ -198,7 +198,10 @@ struct ClientPool {
 
 impl ClientPool {
     fn new() -> Self {
-        Self { clients: HashMap::new(), order: VecDeque::new() }
+        Self {
+            clients: HashMap::new(),
+            order: VecDeque::new(),
+        }
     }
 
     /// LRU lookup: returns a cached client for `key`, touching it as most-recent.
@@ -424,7 +427,10 @@ impl HttpEngine {
                         .headers()
                         .iter()
                         .map(|(k, v)| {
-                            (k.to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())
+                            (
+                                k.to_string(),
+                                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+                            )
                         })
                         .collect::<HashMap<_, _>>();
                     // Charset from the Content-Type header (e.g. `charset=windows-1250`),
@@ -439,8 +445,15 @@ impl HttpEngine {
                     // want to inspect 404/403 pages; apps decide via is_success().
                     // Streamed with a hard size cap so one huge/hostile body can't
                     // balloon memory (over-limit => a typed error naming cap + URL).
-                    let body = read_body_capped(response, cap, &req.url, header_charset.as_deref()).await?;
-                    return Ok(HttpResponse { status, headers, body, final_url, cache_hit: false });
+                    let body = read_body_capped(response, cap, &req.url, header_charset.as_deref())
+                        .await?;
+                    return Ok(HttpResponse {
+                        status,
+                        headers,
+                        body,
+                        final_url,
+                        cache_hit: false,
+                    });
                 }
                 Err(e) => {
                     last_error = e.to_string();
@@ -469,7 +482,11 @@ async fn read_body_capped(
     header_charset: Option<&str>,
 ) -> Result<String> {
     let mut buf: Vec<u8> = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|e| Error::Http(e.to_string()))? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|e| Error::Http(e.to_string()))?
+    {
         if would_exceed_cap(buf.len() as u64, chunk.len() as u64, cap) {
             return Err(Error::Http(format!(
                 "response body from {url} exceeds max_body_bytes cap of {cap} bytes"
@@ -486,7 +503,8 @@ async fn read_body_capped(
 fn charset_from_content_type(content_type: &str) -> Option<&str> {
     content_type.split(';').skip(1).find_map(|param| {
         let (k, v) = param.split_once('=')?;
-        k.trim().eq_ignore_ascii_case("charset")
+        k.trim()
+            .eq_ignore_ascii_case("charset")
             .then(|| v.trim().trim_matches(['"', '\'']))
             .filter(|s| !s.is_empty())
     })
@@ -499,7 +517,11 @@ fn charset_from_content_type(content_type: &str) -> Option<&str> {
 fn charset_from_meta(head: &[u8]) -> Option<String> {
     let prefix = &head[..head.len().min(1024)];
     // Latin-1 view is safe for sniffing ASCII meta syntax out of any byte soup.
-    let text = prefix.iter().map(|&b| b as char).collect::<String>().to_ascii_lowercase();
+    let text = prefix
+        .iter()
+        .map(|&b| b as char)
+        .collect::<String>()
+        .to_ascii_lowercase();
     let at = text.find("charset")?;
     let after = &text[at + "charset".len()..];
     let after = after.trim_start().strip_prefix('=')?.trim_start();
@@ -594,7 +616,10 @@ fn retry_after_value(raw: &str, now: chrono::DateTime<chrono::Utc>) -> Option<Du
 /// accepted as a fallback.
 fn parse_http_date(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
     if let Ok(naive) = chrono::NaiveDateTime::parse_from_str(raw, "%a, %d %b %Y %H:%M:%S GMT") {
-        return Some(chrono::DateTime::from_naive_utc_and_offset(naive, chrono::Utc));
+        return Some(chrono::DateTime::from_naive_utc_and_offset(
+            naive,
+            chrono::Utc,
+        ));
     }
     chrono::DateTime::parse_from_rfc2822(raw)
         .ok()
@@ -638,7 +663,10 @@ impl HttpClient for HttpEngine {
                             // and serve the stored body as a cache hit.
                             self.cache.refresh(key, ttl).await?;
                             debug!(url = %req.url, "cache revalidated (304)");
-                            return Ok(HttpResponse { cache_hit: true, ..stale.response });
+                            return Ok(HttpResponse {
+                                cache_hit: true,
+                                ..stale.response
+                            });
                         }
                         // Changed: store and return the fresh body.
                         self.cache.put(key, &req.url, &resp, ttl).await?;
@@ -674,7 +702,10 @@ mod tests {
         let mut req = HttpRequest::get("https://example.com/");
         assert!(HttpEngine::cacheable(&req), "plain GET should be cacheable");
         req.no_cache = true;
-        assert!(!HttpEngine::cacheable(&req), "no_cache must bypass the cache");
+        assert!(
+            !HttpEngine::cacheable(&req),
+            "no_cache must bypass the cache"
+        );
     }
 
     #[test]
@@ -688,9 +719,15 @@ mod tests {
     #[test]
     fn retry_after_delta_seconds() {
         let now = chrono::Utc::now();
-        assert_eq!(retry_after_value("120", now), Some(Duration::from_secs(120)));
+        assert_eq!(
+            retry_after_value("120", now),
+            Some(Duration::from_secs(120))
+        );
         // Clamped to 10 minutes.
-        assert_eq!(retry_after_value("99999", now), Some(Duration::from_secs(600)));
+        assert_eq!(
+            retry_after_value("99999", now),
+            Some(Duration::from_secs(600))
+        );
     }
 
     #[test]
@@ -731,9 +768,15 @@ mod tests {
 
     #[test]
     fn charset_parsed_from_content_type() {
-        assert_eq!(charset_from_content_type("text/html; charset=windows-1250"), Some("windows-1250"));
+        assert_eq!(
+            charset_from_content_type("text/html; charset=windows-1250"),
+            Some("windows-1250")
+        );
         // Case- and space-insensitive, quote-stripping.
-        assert_eq!(charset_from_content_type("text/html;  CharSet = \"UTF-8\""), Some("UTF-8"));
+        assert_eq!(
+            charset_from_content_type("text/html;  CharSet = \"UTF-8\""),
+            Some("UTF-8")
+        );
         // No charset param → None (falls through to meta/BOM/UTF-8).
         assert_eq!(charset_from_content_type("text/html"), None);
         assert_eq!(charset_from_content_type("application/json"), None);
@@ -792,7 +835,10 @@ mod tests {
     fn retry_delay_honors_retry_after_over_backoff() {
         // Attempt 1 backoff floor is 500ms; a 5s Retry-After must win.
         let d = retry_delay(1, Some(Duration::from_secs(5)), 500, 12345);
-        assert!(d >= Duration::from_secs(5), "Retry-After should dominate: {d:?}");
+        assert!(
+            d >= Duration::from_secs(5),
+            "Retry-After should dominate: {d:?}"
+        );
         assert!(d <= Duration::from_millis(5000).mul_f64(1.0 + RETRY_JITTER_FRAC));
         // When backoff exceeds a tiny Retry-After, backoff wins.
         let d2 = retry_delay(4, Some(Duration::from_millis(10)), 500, 12345);
@@ -854,12 +900,21 @@ mod tests {
     fn pool_key_separates_proxy_and_profile_dimensions() {
         // The same proxy under two profiles => two clients; the same profile
         // behind two proxies => two clients; and no cross-field collision.
-        assert_ne!(pool_key(Some("http://gw"), None), pool_key(Some("http://gw"), Some("a")));
-        assert_ne!(pool_key(None, Some("a")), pool_key(Some("http://gw"), Some("a")));
+        assert_ne!(
+            pool_key(Some("http://gw"), None),
+            pool_key(Some("http://gw"), Some("a"))
+        );
+        assert_ne!(
+            pool_key(None, Some("a")),
+            pool_key(Some("http://gw"), Some("a"))
+        );
         assert_ne!(pool_key(Some("a"), Some("b")), pool_key(Some("ab"), None));
         assert_ne!(pool_key(None, None), pool_key(None, Some("a")));
         // Stable for the same pair (a pooled client is actually reused).
-        assert_eq!(pool_key(Some("p"), Some("a")), pool_key(Some("p"), Some("a")));
+        assert_eq!(
+            pool_key(Some("p"), Some("a")),
+            pool_key(Some("p"), Some("a"))
+        );
     }
 
     #[test]
@@ -869,7 +924,10 @@ mod tests {
         let mut req = HttpRequest::get("https://example.com/");
         assert!(HttpEngine::cacheable(&req));
         req.profile = Some("acme".into());
-        assert!(!HttpEngine::cacheable(&req), "profiled fetches must bypass the cache");
+        assert!(
+            !HttpEngine::cacheable(&req),
+            "profiled fetches must bypass the cache"
+        );
     }
 
     /// The jar round-trips through disk: a cookie stored from a response is
@@ -916,7 +974,10 @@ mod tests {
         // A separate profile has a separate jar (no cross-profile bleed).
         let other_path = profile_cookies_path(&dir, "beta").expect("valid name");
         let beta = ProfileJar::load("beta", other_path).expect("fresh jar");
-        assert!(beta.cookies(&url).is_none(), "profiles do not share cookies");
+        assert!(
+            beta.cookies(&url).is_none(),
+            "profiles do not share cookies"
+        );
 
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -924,8 +985,8 @@ mod tests {
     #[test]
     fn jar_load_rejects_an_unsafe_profile_name() {
         // Validation happens before any path is built (typed Profile error).
-        let err = profile_cookies_path(std::path::Path::new("data/profiles"), "../etc")
-            .unwrap_err();
+        let err =
+            profile_cookies_path(std::path::Path::new("data/profiles"), "../etc").unwrap_err();
         assert!(matches!(err, Error::Profile(_)));
     }
 }

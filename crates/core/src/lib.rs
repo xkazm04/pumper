@@ -12,10 +12,10 @@ pub mod costs;
 pub mod datasets;
 #[cfg(feature = "storage")]
 pub mod storage;
-#[cfg(feature = "storage")]
-pub mod tiers;
 #[cfg(feature = "test-support")]
 pub mod testing;
+#[cfg(feature = "storage")]
+pub mod tiers;
 
 pub mod catalog;
 pub mod config;
@@ -46,20 +46,19 @@ pub use datasets::{
     diff_values, trust_label, ChangeKind, Datasets, DupPair, Record, Revision, RevisionPage,
     UpsertSummary, TRUST_STABLE,
 };
-#[cfg(feature = "storage")]
-pub use storage::{
-    Delivery, EnqueueOptions, JobTimingStats, NewSchedule, NewTrigger, SavedSearch, Schedule,
-    Storage, Trigger,
-    Watch,
-};
-#[cfg(feature = "storage")]
-pub use tiers::{HostProfile, TierMemory};
-#[cfg(feature = "storage")]
-pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
 pub use resilience::{
     doc_signals, signals_batch, CohortDrift, Diagnosis, DocSignals, FetchHealth, ObservedDoc,
     RunReport, RunVerdict, SourceState, SourceVerdict,
 };
+#[cfg(feature = "storage")]
+pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
+#[cfg(feature = "storage")]
+pub use storage::{
+    Delivery, EnqueueOptions, JobTimingStats, NewSchedule, NewTrigger, SavedSearch, Schedule,
+    Storage, Trigger, Watch,
+};
+#[cfg(feature = "storage")]
+pub use tiers::{HostProfile, TierMemory};
 
 pub use catalog::{Catalog, Source};
 pub use config::Config;
@@ -67,25 +66,24 @@ pub use crawl::{
     crawl, CrawlConfig, CrawlPageRecord, CrawlProgressSnapshot, CrawlStats, PageSink, PageSource,
     ProgressFn, RevisitSeed,
 };
-pub use simhash::{dom_simhash, dom_simhash_str, drift, hamming, simhash, simhash_value};
-pub use extract::{
-    extract_batch, extract_batch_with_report, extract_one, extract_one_with_report,
-    CoercionStatus, CompiledRuleSet, DocReport, FieldRule, FieldStatus, Rule, RuleSet, Transform,
-};
 pub use engine::{
     profile_browser_dir, profile_cookies_path, profile_dir, validate_profile_name, Browser,
     EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, PageAction, RenderRequest,
-    RenderedPage, Researcher, ResearchOutput, ResearchRequest, PROFILE_BROWSER_DIR, PROFILE_COOKIES_FILE,
-    PROFILE_NAME_MAX_LEN,
+    RenderedPage, ResearchOutput, ResearchRequest, Researcher, PROFILE_BROWSER_DIR,
+    PROFILE_COOKIES_FILE, PROFILE_NAME_MAX_LEN,
 };
 pub use error::{Error, Result};
-pub use json_salvage::salvage_json;
+pub use extract::{
+    extract_batch, extract_batch_with_report, extract_one, extract_one_with_report, CoercionStatus,
+    CompiledRuleSet, DocReport, FieldRule, FieldStatus, Rule, RuleSet, Transform,
+};
 pub use fetcher::{
     FetchOutcome, FetchRequest, FetchStrategy, FetchTier, Fetcher, TierTrace, TierVerdict,
 };
 pub use governor::Governor;
-pub use job::{Job, JobStatus};
 pub use jitter::lcg_fraction;
+pub use job::{Job, JobStatus};
+pub use json_salvage::salvage_json;
 pub use lru::{lru_touch, lru_touch_evict};
 pub use markdown::html_to_markdown;
 pub use plugin::{NoPlugins, Plugins};
@@ -93,3 +91,4 @@ pub use search::{
     FacetCount, NoSearch, Search, SearchDoc, SearchFacets, SearchHit, SearchRequest,
     SearchResponse, SearchSort,
 };
+pub use simhash::{dom_simhash, dom_simhash_str, drift, hamming, simhash, simhash_value};

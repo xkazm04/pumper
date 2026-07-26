@@ -9,8 +9,25 @@ use scraper::Html;
 
 /// Tags whose entire subtree is dropped.
 const SKIP: &[&str] = &[
-    "script", "style", "noscript", "template", "svg", "canvas", "iframe", "head", "nav", "header",
-    "footer", "aside", "form", "button", "input", "select", "textarea", "figure", "figcaption",
+    "script",
+    "style",
+    "noscript",
+    "template",
+    "svg",
+    "canvas",
+    "iframe",
+    "head",
+    "nav",
+    "header",
+    "footer",
+    "aside",
+    "form",
+    "button",
+    "input",
+    "select",
+    "textarea",
+    "figure",
+    "figcaption",
 ];
 
 /// Converts an HTML document to Markdown.
@@ -50,7 +67,12 @@ pub fn text_len_capped(html: &str, cap: usize) -> usize {
         return 0;
     }
     let doc = Html::parse_document(html);
-    let mut acc = TextAcc { cap, count: 0, prev_ws: true, out: None };
+    let mut acc = TextAcc {
+        cap,
+        count: 0,
+        prev_ws: true,
+        out: None,
+    };
     walk_visible_text(doc.tree.root(), &mut acc);
     acc.count
 }
@@ -68,7 +90,12 @@ pub fn visible_text_capped(doc: &Html, cap: usize) -> String {
         return String::new();
     }
     let mut out = String::new();
-    let mut acc = TextAcc { cap, count: 0, prev_ws: true, out: Some(&mut out) };
+    let mut acc = TextAcc {
+        cap,
+        count: 0,
+        prev_ws: true,
+        out: Some(&mut out),
+    };
     walk_visible_text(doc.tree.root(), &mut acc);
     out
 }
@@ -175,7 +202,8 @@ fn walk(node: NodeRef<Node>, out: &mut String, ctx: &mut Ctx) {
                 "table" => render_table(node, out, ctx),
                 "ul" | "ol" => {
                     block(out);
-                    ctx.list_stack.push(if name == "ol" { Some(1) } else { None });
+                    ctx.list_stack
+                        .push(if name == "ol" { Some(1) } else { None });
                     walk_children(node, out, ctx);
                     ctx.list_stack.pop();
                     block(out);
@@ -307,7 +335,10 @@ fn cell_text(cell: NodeRef<Node>, ctx: &Ctx) -> String {
     let mut buf = String::new();
     let mut c = ctx.clone();
     walk_children(cell, &mut buf, &mut c);
-    buf.split_whitespace().collect::<Vec<_>>().join(" ").replace('|', "\\|")
+    buf.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .replace('|', "\\|")
 }
 
 /// Emits one `| a | b |` table row, padding short rows to `cols` cells.
@@ -398,8 +429,14 @@ mod tests {
         let doc = scraper::Html::parse_document(html);
         let text = visible_text_capped(&doc, 1000);
         assert!(text.contains("Real content here."), "{text}");
-        assert!(!text.contains("Home"), "nav leaked into the content fingerprint: {text}");
-        assert!(!text.contains("var x"), "script leaked into the content fingerprint: {text}");
+        assert!(
+            !text.contains("Home"),
+            "nav leaked into the content fingerprint: {text}"
+        );
+        assert!(
+            !text.contains("var x"),
+            "script leaked into the content fingerprint: {text}"
+        );
         // The collector and the counter must never disagree about "visible".
         assert_eq!(text.chars().count(), text_len_capped(html, 1000));
         // Truncation is by the same cap.
@@ -419,12 +456,20 @@ mod tests {
         // exact (un-saturated) length.
         let thin = "<main><p>just a little</p></main>";
         let n = text_len_capped(thin, 250);
-        assert!(n < 250 && n == "just a little".len(), "exact when below cap: {n}");
+        assert!(
+            n < 250 && n == "just a little".len(),
+            "exact when below cap: {n}"
+        );
         assert!(html_to_markdown(thin).chars().count() < 250);
 
         // Boilerplate is dropped, same as the markdown conversion.
-        let boiler = "<nav>Home About Contact Services</nav><footer>copyright notice here</footer><p>hi</p>";
-        assert_eq!(text_len_capped(boiler, 250), "hi".len(), "nav/footer skipped");
+        let boiler =
+            "<nav>Home About Contact Services</nav><footer>copyright notice here</footer><p>hi</p>";
+        assert_eq!(
+            text_len_capped(boiler, 250),
+            "hi".len(),
+            "nav/footer skipped"
+        );
     }
 
     #[test]
@@ -491,9 +536,13 @@ mod tests {
         </table>"#;
         let md = html_to_markdown(html);
         // Nested block content collapses to one inline line; pipe is escaped.
-        assert!(md.contains("| **Big** box | line one line two \\| with pipe |"), "{md}");
+        assert!(
+            md.contains("| **Big** box | line one line two \\| with pipe |"),
+            "{md}"
+        );
         // Ragged rows are padded so the grid stays rectangular.
-        let ragged = html_to_markdown("<table><tr><th>a</th><th>b</th></tr><tr><td>x</td></tr></table>");
+        let ragged =
+            html_to_markdown("<table><tr><th>a</th><th>b</th></tr><tr><td>x</td></tr></table>");
         assert!(ragged.contains("| x |  |"), "{ragged}");
     }
 }

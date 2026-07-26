@@ -34,9 +34,12 @@ async fn source_mode_extracts_stored_bodies_and_reports_missing() {
     let crawl_job = Uuid::new_v4().to_string();
     let crawl_dir = root.join("crawl").join(&crawl_job);
     tokio::fs::create_dir_all(&crawl_dir).await.unwrap();
-    tokio::fs::write(crawl_dir.join("page-0001.html"), b"<html><h1>Hello World</h1></html>")
-        .await
-        .unwrap();
+    tokio::fs::write(
+        crawl_dir.join("page-0001.html"),
+        b"<html><h1>Hello World</h1></html>",
+    )
+    .await
+    .unwrap();
 
     // Seed pages: (a) present body, (b) body path points at a missing file,
     // (c) record has no artifact_path. Key = canonical URL, as the crawl writes.
@@ -53,7 +56,10 @@ async fn source_mode_extracts_stored_bodies_and_reports_missing() {
                     "http://b".into(),
                     json!({"url":"http://b","artifact_path":"page-9999.html","job_id":crawl_job}),
                 ),
-                ("http://c".into(), json!({"url":"http://c","job_id":crawl_job})),
+                (
+                    "http://c".into(),
+                    json!({"url":"http://c","job_id":crawl_job}),
+                ),
             ],
         )
         .await
@@ -65,12 +71,18 @@ async fn source_mode_extracts_stored_bodies_and_reports_missing() {
                    "keys":["http://a","http://b","http://c","http://d"]},
         "rules": {"headline": {"type":"css","selector":"h1"}}
     });
-    let out = Extractor.run(ctx_with(&root, &store, params)).await.unwrap();
+    let out = Extractor
+        .run(ctx_with(&root, &store, params))
+        .await
+        .unwrap();
 
     assert_eq!(out["mode"], "source");
     assert_eq!(out["requested"], 4);
     assert_eq!(out["loaded"], 1, "only http://a has a readable body: {out}");
-    assert_eq!(out["missing"], 3, "b unreadable, c no artifact_path, d no record: {out}");
+    assert_eq!(
+        out["missing"], 3,
+        "b unreadable, c no artifact_path, d no record: {out}"
+    );
     // The one loaded doc extracted from the STORED body (engines would panic).
     assert_eq!(out["records"][0]["headline"], "Hello World");
     assert_eq!(out["records"][0]["_url"], "http://a");
@@ -78,14 +90,22 @@ async fn source_mode_extracts_stored_bodies_and_reports_missing() {
     assert_eq!(out["fields_matched"], 1);
     assert_eq!(out["fields_total"], 1);
     // Missing reasons are attributed per key.
-    let missing: Vec<String> =
-        out["missing_keys"].as_array().unwrap().iter().map(|m| m["key"].as_str().unwrap().into()).collect();
+    let missing: Vec<String> = out["missing_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| m["key"].as_str().unwrap().into())
+        .collect();
     assert!(missing.contains(&"http://b".to_string()));
     assert!(missing.contains(&"http://c".to_string()));
     assert!(missing.contains(&"http://d".to_string()));
 
     // The extracted fields landed in the `extracted` dataset under the extractor app.
-    let stored = datasets.get("extractor", "extracted", "http://a").await.unwrap().unwrap();
+    let stored = datasets
+        .get("extractor", "extracted", "http://a")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(stored.data["headline"], "Hello World");
 }
 
@@ -98,7 +118,9 @@ async fn source_mode_without_keys_sweeps_live_records() {
     let crawl_job = Uuid::new_v4().to_string();
     let crawl_dir = root.join("crawl").join(&crawl_job);
     tokio::fs::create_dir_all(&crawl_dir).await.unwrap();
-    tokio::fs::write(crawl_dir.join("p.html"), b"<h1>Only</h1>").await.unwrap();
+    tokio::fs::write(crawl_dir.join("p.html"), b"<h1>Only</h1>")
+        .await
+        .unwrap();
 
     datasets
         .upsert_many(
@@ -117,7 +139,10 @@ async fn source_mode_without_keys_sweeps_live_records() {
         "source": {"app":"crawl","dataset":"pages"},
         "rules": {"h": {"type":"css","selector":"h1"}}
     });
-    let out = Extractor.run(ctx_with(&root, &store, params)).await.unwrap();
+    let out = Extractor
+        .run(ctx_with(&root, &store, params))
+        .await
+        .unwrap();
     assert_eq!(out["requested"], 1);
     assert_eq!(out["loaded"], 1);
     assert_eq!(out["records"][0]["h"], "Only");

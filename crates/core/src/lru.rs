@@ -40,7 +40,10 @@ mod tests {
         lru_touch(&mut order, "a");
         lru_touch(&mut order, "b");
         lru_touch(&mut order, "a"); // re-touch: moves to the back, no duplicate
-        assert_eq!(order, VecDeque::from(vec!["b".to_string(), "a".to_string()]));
+        assert_eq!(
+            order,
+            VecDeque::from(vec!["b".to_string(), "a".to_string()])
+        );
     }
 
     #[test]

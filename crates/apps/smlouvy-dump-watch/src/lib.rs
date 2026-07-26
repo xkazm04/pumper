@@ -85,7 +85,9 @@ fn parse_dumps(xml: &str) -> Vec<Dump> {
     let mut i = 0usize;
     while let Some(rel) = xml[i..].find("<dump>") {
         let start = i + rel + "<dump>".len();
-        let Some(rel_end) = xml[start..].find("</dump>") else { break };
+        let Some(rel_end) = xml[start..].find("</dump>") else {
+            break;
+        };
         let block = &xml[start..start + rel_end];
         i = start + rel_end + "</dump>".len();
 
@@ -147,7 +149,11 @@ impl ScrapeApp for SmlouvyDumpWatch {
             .and_then(Value::as_str)
             .unwrap_or(DEFAULT_INDEX_URL)
             .to_string();
-        let year_from = ctx.params.get("year_from").and_then(Value::as_u64).map(|y| y as u32);
+        let year_from = ctx
+            .params
+            .get("year_from")
+            .and_then(Value::as_u64)
+            .map(|y| y as u32);
 
         let response = ctx.engines.http.fetch(HttpRequest::get(&index_url)).await?;
         if !response.is_success() {
@@ -156,7 +162,8 @@ impl ScrapeApp for SmlouvyDumpWatch {
                 response.status
             )));
         }
-        ctx.save_artifact("index.xml", response.body.as_bytes()).await?;
+        ctx.save_artifact("index.xml", response.body.as_bytes())
+            .await?;
 
         let mut dumps = parse_dumps(&response.body);
         if dumps.is_empty() {

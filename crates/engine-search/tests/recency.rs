@@ -28,7 +28,11 @@ fn doc(id: &str, indexed_at: i64) -> SearchDoc {
 #[tokio::test]
 async fn newest_sort_and_since_filter_use_indexed_at() {
     let dir = unique_dir();
-    let index = TantivyIndex::new(&SearchConfig { enabled: true, dir: dir.clone() }).unwrap();
+    let index = TantivyIndex::new(&SearchConfig {
+        enabled: true,
+        dir: dir.clone(),
+    })
+    .unwrap();
 
     // Three matching docs with out-of-order timestamps. index() defers its commit,
     // so flush to make them queryable immediately.
@@ -56,12 +60,22 @@ async fn newest_sort_and_since_filter_use_indexed_at() {
     assert_eq!(ids, vec!["b", "c", "a"], "newest first by indexed_at");
 
     // `since` is an inclusive floor: since=200 keeps c(200) and b(300), drops a(100).
-    let recent = index.query(query(SearchSort::Newest, Some(200))).await.unwrap();
+    let recent = index
+        .query(query(SearchSort::Newest, Some(200)))
+        .await
+        .unwrap();
     let recent_ids: Vec<&str> = recent.hits.iter().map(|h| h.id.as_str()).collect();
-    assert_eq!(recent_ids, vec!["b", "c"], "since floor excludes older docs");
+    assert_eq!(
+        recent_ids,
+        vec!["b", "c"],
+        "since floor excludes older docs"
+    );
 
     // `since` past every doc yields nothing.
-    let none = index.query(query(SearchSort::Score, Some(1000))).await.unwrap();
+    let none = index
+        .query(query(SearchSort::Score, Some(1000)))
+        .await
+        .unwrap();
     assert!(none.hits.is_empty());
 
     drop(index);
@@ -73,13 +87,25 @@ async fn index_defers_commit_and_flush_makes_it_visible() {
     // index() no longer commits synchronously (the per-job commit-storm fix), so
     // a doc isn't queryable until a commit — explicit flush or the background tick.
     let dir = unique_dir();
-    let index = TantivyIndex::new(&SearchConfig { enabled: true, dir: dir.clone() }).unwrap();
+    let index = TantivyIndex::new(&SearchConfig {
+        enabled: true,
+        dir: dir.clone(),
+    })
+    .unwrap();
 
     index.index(vec![doc("x", 1)]).await.unwrap();
-    assert_eq!(index.doc_count().await.unwrap(), 0, "index() defers its commit");
+    assert_eq!(
+        index.doc_count().await.unwrap(),
+        0,
+        "index() defers its commit"
+    );
 
     index.flush().await.unwrap();
-    assert_eq!(index.doc_count().await.unwrap(), 1, "flush commits and makes it visible");
+    assert_eq!(
+        index.doc_count().await.unwrap(),
+        1,
+        "flush commits and makes it visible"
+    );
 
     drop(index);
     std::fs::remove_dir_all(&dir).ok();
@@ -90,11 +116,19 @@ async fn background_committer_flushes_without_explicit_flush() {
     // Deferred writes still land: the background committer commits within the
     // interval even with no flush call.
     let dir = unique_dir();
-    let index = TantivyIndex::new(&SearchConfig { enabled: true, dir: dir.clone() }).unwrap();
+    let index = TantivyIndex::new(&SearchConfig {
+        enabled: true,
+        dir: dir.clone(),
+    })
+    .unwrap();
 
     index.index(vec![doc("y", 1)]).await.unwrap();
     tokio::time::sleep(std::time::Duration::from_millis(400)).await; // past COMMIT_INTERVAL
-    assert_eq!(index.doc_count().await.unwrap(), 1, "background committer made it visible");
+    assert_eq!(
+        index.doc_count().await.unwrap(),
+        1,
+        "background committer made it visible"
+    );
 
     drop(index);
     std::fs::remove_dir_all(&dir).ok();
@@ -103,10 +137,20 @@ async fn background_committer_flushes_without_explicit_flush() {
 #[tokio::test]
 async fn offset_pages_and_total_is_the_match_count() {
     let dir = unique_dir();
-    let index = TantivyIndex::new(&SearchConfig { enabled: true, dir: dir.clone() }).unwrap();
+    let index = TantivyIndex::new(&SearchConfig {
+        enabled: true,
+        dir: dir.clone(),
+    })
+    .unwrap();
     // 5 matching docs, newest-first ids e(500)..a(100).
     index
-        .index(vec![doc("a", 100), doc("b", 200), doc("c", 300), doc("d", 400), doc("e", 500)])
+        .index(vec![
+            doc("a", 100),
+            doc("b", 200),
+            doc("c", 300),
+            doc("d", 400),
+            doc("e", 500),
+        ])
         .await
         .unwrap();
     index.flush().await.unwrap();
@@ -121,17 +165,29 @@ async fn offset_pages_and_total_is_the_match_count() {
 
     // Page 1 (newest 2): e, d. total is the full match count, not the page size.
     let p1 = index.query(page(0, 2)).await.unwrap();
-    assert_eq!(p1.total, 5, "total is the match count, not the returned page size");
-    assert_eq!(p1.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["e", "d"]);
+    assert_eq!(
+        p1.total, 5,
+        "total is the match count, not the returned page size"
+    );
+    assert_eq!(
+        p1.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["e", "d"]
+    );
 
     // Page 2 (offset 2): c, b — distinct from page 1.
     let p2 = index.query(page(2, 2)).await.unwrap();
     assert_eq!(p2.total, 5);
-    assert_eq!(p2.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["c", "b"]);
+    assert_eq!(
+        p2.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["c", "b"]
+    );
 
     // Page 3 (offset 4): just a.
     let p3 = index.query(page(4, 2)).await.unwrap();
-    assert_eq!(p3.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(), vec!["a"]);
+    assert_eq!(
+        p3.hits.iter().map(|h| h.id.as_str()).collect::<Vec<_>>(),
+        vec!["a"]
+    );
 
     drop(index);
     std::fs::remove_dir_all(&dir).ok();

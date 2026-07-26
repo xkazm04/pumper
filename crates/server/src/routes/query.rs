@@ -84,21 +84,36 @@ fn grant_filters(query: &GrantsQuery) -> Result<Vec<pumper_core::datasets::JsonF
     use pumper_core::datasets::JsonFilter;
     let mut filters = Vec::new();
     if let Some(status) = filter_value(&query.status) {
-        filters.push(JsonFilter::Eq { path: "$.status".into(), value: status.into() });
+        filters.push(JsonFilter::Eq {
+            path: "$.status".into(),
+            value: status.into(),
+        });
     }
     if let Some(source) = filter_value(&query.source) {
-        filters.push(JsonFilter::Eq { path: "$.source".into(), value: source.into() });
+        filters.push(JsonFilter::Eq {
+            path: "$.source".into(),
+            value: source.into(),
+        });
     }
     if let Some(agency) = filter_value(&query.agency) {
-        filters.push(JsonFilter::Contains { path: "$.agency".into(), value: agency.into() });
+        filters.push(JsonFilter::Contains {
+            path: "$.agency".into(),
+            value: agency.into(),
+        });
     }
     if let Some(before) = filter_value(&query.closing_before) {
         parse_grant_date(before, "closing_before")?;
-        filters.push(JsonFilter::Lte { path: "$.close_date".into(), value: before.into() });
+        filters.push(JsonFilter::Lte {
+            path: "$.close_date".into(),
+            value: before.into(),
+        });
     }
     if let Some(after) = filter_value(&query.closing_after) {
         parse_grant_date(after, "closing_after")?;
-        filters.push(JsonFilter::Gte { path: "$.close_date".into(), value: after.into() });
+        filters.push(JsonFilter::Gte {
+            path: "$.close_date".into(),
+            value: after.into(),
+        });
     }
     // A grant's "size" is reported inconsistently across sources: some publish a
     // per-award ceiling, some only a program total. Matching either keeps a
@@ -164,7 +179,10 @@ pub(crate) async fn closing_soon(
     Query(query): Query<ClosingSoonQuery>,
 ) -> Result<Json<Value>, ApiError> {
     use pumper_core::datasets::JsonFilter;
-    let days = query.days.unwrap_or(CLOSING_SOON_DEFAULT_DAYS).clamp(1, 365);
+    let days = query
+        .days
+        .unwrap_or(CLOSING_SOON_DEFAULT_DAYS)
+        .clamp(1, 365);
     let today = chrono::Utc::now().date_naive();
     let until = today + chrono::Duration::days(days);
 
@@ -173,9 +191,18 @@ pub(crate) async fn closing_soon(
     // changes with the calendar and not with the data, absolutely would if it were
     // snapshotted.
     let filters = vec![
-        JsonFilter::Eq { path: "$.status".into(), value: "open".into() },
-        JsonFilter::Gte { path: "$.close_date".into(), value: today.to_string() },
-        JsonFilter::Lte { path: "$.close_date".into(), value: until.to_string() },
+        JsonFilter::Eq {
+            path: "$.status".into(),
+            value: "open".into(),
+        },
+        JsonFilter::Gte {
+            path: "$.close_date".into(),
+            value: today.to_string(),
+        },
+        JsonFilter::Lte {
+            path: "$.close_date".into(),
+            value: until.to_string(),
+        },
     ];
     // Order by close_date ASC and cap in SQL, so the returned rows are genuinely
     // the soonest-closing across the whole corpus — not an arbitrary
@@ -210,7 +237,9 @@ pub(crate) async fn closing_soon(
             Some(Value::Object(grant))
         })
         .collect();
-    Ok(Json(json!({ "days": days, "count": count, "grants": grants })))
+    Ok(Json(
+        json!({ "days": days, "count": count, "grants": grants }),
+    ))
 }
 
 // ---- Data-source catalog --------------------------------------------------
@@ -240,11 +269,21 @@ pub(crate) struct CatalogQuery {
         (status = 500, description = "Catalog file malformed", body = Object),
     )
 )]
-pub(crate) async fn catalog_sources(Query(query): Query<CatalogQuery>) -> Result<Json<Value>, ApiError> {
-    let catalog = pumper_core::Catalog::load()
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("catalog load: {e}")))?;
+pub(crate) async fn catalog_sources(
+    Query(query): Query<CatalogQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let catalog = pumper_core::Catalog::load().map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("catalog load: {e}"),
+        )
+    })?;
     let want = |field: &str, filter: &Option<String>| -> bool {
-        filter.as_deref().map(str::trim).filter(|s| !s.is_empty()).map_or(true, |f| f == field)
+        filter
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map_or(true, |f| f == field)
     };
     let sources: Vec<&pumper_core::Source> = catalog
         .sources
@@ -275,8 +314,12 @@ const CATALOG_STALE_GRACE: i64 = 2;
     responses((status = 200, description = "`{checked, stale, sources: [{id, app, dataset, cadence, expected_max_age_secs, last_write_at, age_secs, stale, monitored, reason?}]}` — per-source freshness for live sources; `monitored:false` when no dataset or a no-expectation cadence."))
 )]
 pub(crate) async fn catalog_health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
-    let catalog = pumper_core::Catalog::load()
-        .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("catalog load: {e}")))?;
+    let catalog = pumper_core::Catalog::load().map_err(|e| {
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("catalog load: {e}"),
+        )
+    })?;
     let now = chrono::Utc::now();
     let mut out = Vec::new();
     let mut stale_count = 0usize;
@@ -302,7 +345,12 @@ pub(crate) async fn catalog_health(State(state): State<AppState>) -> Result<Json
         }
         let expected = expected.unwrap();
         // Newest write in this source's dataset (list is updated_at DESC).
-        let last = state.datasets.list(&s.app, &s.dataset, 1).await?.first().map(|r| r.updated_at);
+        let last = state
+            .datasets
+            .list(&s.app, &s.dataset, 1)
+            .await?
+            .first()
+            .map(|r| r.updated_at);
         row.insert("monitored".into(), json!(true));
         row.insert("expected_max_age_secs".into(), json!(expected));
         match last {

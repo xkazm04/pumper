@@ -42,6 +42,9 @@ mod tests {
                 high += 1;
             }
         }
-        assert!(low > 20 && high > 20, "poor spread: {low} low / {high} high");
+        assert!(
+            low > 20 && high > 20,
+            "poor spread: {low} low / {high} high"
+        );
     }
 }

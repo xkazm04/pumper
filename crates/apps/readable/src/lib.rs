@@ -48,7 +48,11 @@ impl ScrapeApp for Readable {
         let mut outcome = ctx.fetch(req).await?;
 
         // Move the document out of the outcome rather than cloning it twice.
-        let markdown = outcome.markdown.take().or_else(|| outcome.text.take()).unwrap_or_default();
+        let markdown = outcome
+            .markdown
+            .take()
+            .or_else(|| outcome.text.take())
+            .unwrap_or_default();
         if markdown.trim().is_empty() {
             // A successful fetch that yields no readable content is a failed
             // extraction, not an empty-but-valid result — don't report it as OK.
@@ -74,7 +78,12 @@ impl ScrapeApp for Readable {
             "markdown_chars": markdown_chars,
             "artifact": "page.md",
         });
-        if ctx.params.get("inline").and_then(Value::as_bool).unwrap_or(false) {
+        if ctx
+            .params
+            .get("inline")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
             if let Value::Object(map) = &mut out {
                 map.insert("markdown".into(), Value::String(markdown));
             }

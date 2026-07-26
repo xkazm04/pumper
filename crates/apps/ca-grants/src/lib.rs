@@ -95,10 +95,17 @@ impl ScrapeApp for CaGrants {
 
             let parsed: Value = serde_json::from_str(&resp.body)
                 .map_err(|e| Error::App(format!("ca-grants: response was not JSON: {e}")))?;
-            if !parsed.get("success").and_then(Value::as_bool).unwrap_or(false) {
+            if !parsed
+                .get("success")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
                 return Err(Error::App(format!(
                     "ca-grants: CKAN reported failure: {}",
-                    parsed.get("error").map(|e| e.to_string()).unwrap_or_default()
+                    parsed
+                        .get("error")
+                        .map(|e| e.to_string())
+                        .unwrap_or_default()
                 )));
             }
 

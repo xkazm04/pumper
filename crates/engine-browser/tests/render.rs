@@ -46,7 +46,10 @@ async fn renders_example_dot_com() {
         .as_ref()
         .and_then(|value| value.as_str())
         .unwrap_or_default();
-    assert!(title.contains("Example"), "unexpected evaluated title: {title:?}");
+    assert!(
+        title.contains("Example"),
+        "unexpected evaluated title: {title:?}"
+    );
     // A clean load reports honest wait outcomes.
     assert!(!page.nav_timed_out, "example.com should not time out");
     assert_eq!(page.selector_found, None, "no selector requested");
@@ -124,16 +127,26 @@ async fn renders_under_named_profiles_with_separate_user_data_dirs() {
             .render(req)
             .await
             .unwrap_or_else(|e| panic!("render under profile {name} failed: {e}"));
-        assert!(page.html.contains("Example Domain"), "profile {name} rendered the page");
+        assert!(
+            page.html.contains("Example Domain"),
+            "profile {name} rendered the page"
+        );
     }
 
     for name in ["alpha", "beta"] {
         let dir = root.join(name).join("browser");
-        assert!(dir.is_dir(), "profile chrome dir missing: {}", dir.display());
+        assert!(
+            dir.is_dir(),
+            "profile chrome dir missing: {}",
+            dir.display()
+        );
     }
 
     // An unsafe profile name is rejected before Chrome is ever launched.
     let mut bad = RenderRequest::new("https://example.com");
     bad.profile = Some("../escape".into());
-    assert!(engine.render(bad).await.is_err(), "unsafe profile name must be rejected");
+    assert!(
+        engine.render(bad).await.is_err(),
+        "unsafe profile name must be rejected"
+    );
 }

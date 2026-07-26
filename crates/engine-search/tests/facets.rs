@@ -27,7 +27,11 @@ fn doc(id: &str, app: &str, dataset: &str) -> SearchDoc {
 #[tokio::test]
 async fn facets_are_computed_only_when_requested() {
     let dir = unique_dir();
-    let index = TantivyIndex::new(&SearchConfig { enabled: true, dir: dir.clone() }).unwrap();
+    let index = TantivyIndex::new(&SearchConfig {
+        enabled: true,
+        dir: dir.clone(),
+    })
+    .unwrap();
     index
         .index(vec![
             doc("a", "grants", "unified"),
@@ -41,19 +45,29 @@ async fn facets_are_computed_only_when_requested() {
     // Default (facets off): hits + total are correct, but no facet breakdown is
     // computed — the saved-search runner's shape.
     let off = index.query(SearchRequest::new("grant", 10)).await.unwrap();
-    assert_eq!(off.total, 3, "total is the real match count regardless of facets");
+    assert_eq!(
+        off.total, 3,
+        "total is the real match count regardless of facets"
+    );
     assert_eq!(off.hits.len(), 3);
     assert!(off.facets.apps.is_empty(), "facets are off by default");
     assert!(off.facets.datasets.is_empty());
 
     // Opt in (the /search route): facets are populated over the matching set.
     let on = index
-        .query(SearchRequest { facets: true, ..SearchRequest::new("grant", 10) })
+        .query(SearchRequest {
+            facets: true,
+            ..SearchRequest::new("grant", 10)
+        })
         .await
         .unwrap();
     assert_eq!(on.total, 3);
-    let apps: std::collections::BTreeMap<&str, u64> =
-        on.facets.apps.iter().map(|f| (f.value.as_str(), f.count)).collect();
+    let apps: std::collections::BTreeMap<&str, u64> = on
+        .facets
+        .apps
+        .iter()
+        .map(|f| (f.value.as_str(), f.count))
+        .collect();
     assert_eq!(apps.get("grants"), Some(&2));
     assert_eq!(apps.get("census"), Some(&1));
     // Hit fields still read correctly with the direct get_first path (no to_json).

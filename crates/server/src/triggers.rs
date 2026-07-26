@@ -55,7 +55,10 @@ pub fn decide(trigger_id: &str, source_params: &Value, cfg: &TriggersConfig) -> 
         return FireDecision::SkipDepth;
     }
     chain.push(trigger_id.to_string());
-    FireDecision::Fire { depth: depth + 1, chain }
+    FireDecision::Fire {
+        depth: depth + 1,
+        chain,
+    }
 }
 
 /// True when a revision's change kind passes the trigger's `on_change` filter.
@@ -154,7 +157,10 @@ mod tests {
     use super::*;
 
     fn cfg() -> TriggersConfig {
-        TriggersConfig { max_depth: 3, key_cap: 2 }
+        TriggersConfig {
+            max_depth: 3,
+            key_cap: 2,
+        }
     }
 
     #[test]
@@ -162,7 +168,10 @@ mod tests {
         // Fresh source (no provenance): fires at depth 1.
         assert_eq!(
             decide("T1", &json!({}), &cfg()),
-            FireDecision::Fire { depth: 1, chain: vec!["T1".into()] }
+            FireDecision::Fire {
+                depth: 1,
+                chain: vec!["T1".into()]
+            }
         );
         // Same trigger already in the chain: cycle skip.
         let looped = json!({ "_trigger": { "depth": 1, "chain": ["T1"] } });
@@ -170,7 +179,10 @@ mod tests {
         // Different trigger continues the chain.
         assert_eq!(
             decide("T2", &looped, &cfg()),
-            FireDecision::Fire { depth: 2, chain: vec!["T1".into(), "T2".into()] }
+            FireDecision::Fire {
+                depth: 2,
+                chain: vec!["T1".into(), "T2".into()]
+            }
         );
         // Depth backstop.
         let deep = json!({ "_trigger": { "depth": 3, "chain": ["A", "B", "C"] } });
@@ -183,7 +195,7 @@ mod tests {
         let merged = merged_params(&template, json!({ "count": 5 }));
         assert_eq!(merged["mode"], "batch");
         assert_eq!(merged["_trigger"]["count"], 5); // injected wins
-        // Non-object template is replaced, not merged into.
+                                                    // Non-object template is replaced, not merged into.
         let merged = merged_params(&Value::Null, json!({ "count": 1 }));
         assert_eq!(merged["_trigger"]["count"], 1);
     }
@@ -263,7 +275,13 @@ pub async fn fire_dataset_triggers(
                 }
             };
             let obj = dataset_trigger_obj(
-                trigger, job, dataset, &matching, depth, &chain, &state.config.triggers,
+                trigger,
+                job,
+                dataset,
+                &matching,
+                depth,
+                &chain,
+                &state.config.triggers,
             );
             fired += enqueue_hop(state, trigger, job, obj).await;
         }

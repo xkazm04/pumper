@@ -86,9 +86,13 @@ async fn commit_and_reload(
     pending: Arc<AtomicUsize>,
 ) -> Result<()> {
     tokio::task::spawn_blocking(move || -> Result<()> {
-        let mut w = writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut w = writer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         w.commit().map_err(|e| Error::App(format!("commit: {e}")))?;
-        reader.reload().map_err(|e| Error::App(format!("reader reload: {e}")))?;
+        reader
+            .reload()
+            .map_err(|e| Error::App(format!("reader reload: {e}")))?;
         // Safe under the writer lock: no `index()` can add between the commit and
         // this reset, so it can't clear a doc that wasn't just committed.
         pending.store(0, Ordering::Relaxed);
@@ -125,7 +129,8 @@ fn spawn_committer(
             if pending.load(Ordering::Relaxed) == 0 {
                 continue;
             }
-            if let Err(e) = commit_and_reload(writer.clone(), reader.clone(), pending.clone()).await {
+            if let Err(e) = commit_and_reload(writer.clone(), reader.clone(), pending.clone()).await
+            {
                 tracing::warn!("background search commit failed: {e}");
             }
         }
@@ -139,7 +144,9 @@ fn spawn_committer(
 /// deliberate schema versions rather than silent incompatibilities.
 fn schema_is_current(index: &Index) -> bool {
     let schema = index.schema();
-    let all_present = SCHEMA_FIELDS.iter().all(|name| schema.get_field(name).is_ok());
+    let all_present = SCHEMA_FIELDS
+        .iter()
+        .all(|name| schema.get_field(name).is_ok());
     let body_stored = schema
         .get_field("body")
         .map(|f| schema.get_field_entry(f).is_stored())
@@ -213,8 +220,22 @@ impl TantivyIndex {
         let pending = Arc::new(AtomicUsize::new(0));
         let wake = Arc::new(Notify::new());
         let shutdown = Arc::new(Notify::new());
-        spawn_committer(writer.clone(), reader.clone(), pending.clone(), wake.clone(), shutdown.clone());
-        Ok(Self { index, fields, writer, reader, pending, wake, shutdown })
+        spawn_committer(
+            writer.clone(),
+            reader.clone(),
+            pending.clone(),
+            wake.clone(),
+            shutdown.clone(),
+        );
+        Ok(Self {
+            index,
+            fields,
+            writer,
+            reader,
+            pending,
+            wake,
+            shutdown,
+        })
     }
 }
 
@@ -234,10 +255,14 @@ impl TantivyIndex {
         let reader = self.reader.clone();
         let pending = self.pending.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut w = writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut w = writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             edit(&mut w)?;
             w.commit().map_err(|e| Error::App(format!("commit: {e}")))?;
-            reader.reload().map_err(|e| Error::App(format!("reader reload: {e}")))?;
+            reader
+                .reload()
+                .map_err(|e| Error::App(format!("reader reload: {e}")))?;
             // This commit flushed every uncommitted write, incl. deferred index()s.
             pending.store(0, Ordering::Relaxed);
             Ok(())
@@ -258,7 +283,9 @@ impl TantivyIndex {
         let writer = self.writer.clone();
         let pending = self.pending.clone();
         tokio::task::spawn_blocking(move || -> Result<()> {
-            let mut w = writer.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut w = writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             edit(&mut w)?;
             pending.fetch_add(added, Ordering::Relaxed);
             Ok(())
@@ -418,7 +445,11 @@ impl Search for TantivyIndex {
             // and decodes just the `offset+limit` window instead of ≥1000 docs.
             let want_facets = req.facets;
             let page = req.offset.saturating_add(req.limit);
-            let sample_size = if want_facets { page.max(FACET_SAMPLE) } else { page };
+            let sample_size = if want_facets {
+                page.max(FACET_SAMPLE)
+            } else {
+                page
+            };
             // One collector pass yields both the ranked window and the EXACT match
             // total (via a Count collector) — so `total` is the real denominator
             // for paging, not the page size. Order by relevance or recency; the
@@ -480,7 +511,10 @@ impl Search for TantivyIndex {
                 // to_json/from_str round-trip (which serialized the whole body just
                 // to read a handful of short fields).
                 let get = |field| {
-                    doc.get_first(field).and_then(|v| v.as_str()).unwrap_or("").to_string()
+                    doc.get_first(field)
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string()
                 };
                 let (app, dataset) = (get(f.app), get(f.dataset));
                 if want_facets {

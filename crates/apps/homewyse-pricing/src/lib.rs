@@ -79,7 +79,12 @@ impl ScrapeApp for HomewysePricing {
         // unless `force: true`.
         let max_age = trades_common::max_age_days(&ctx, 90);
         if trades_common::fresh_by_age_where(
-            &ctx, "homewyse-pricing", "pricing", "$.locality", &locality, max_age,
+            &ctx,
+            "homewyse-pricing",
+            "pricing",
+            "$.locality",
+            &locality,
+            max_age,
         )
         .await?
         {
@@ -108,8 +113,16 @@ impl ScrapeApp for HomewysePricing {
 
         let mut request = ResearchRequest::new(prompt).with_role(role);
         request.max_turns = max_turns;
-        request.model = ctx.params.get("model").and_then(Value::as_str).map(String::from);
-        request.effort = ctx.params.get("effort").and_then(Value::as_str).map(String::from);
+        request.model = ctx
+            .params
+            .get("model")
+            .and_then(Value::as_str)
+            .map(String::from);
+        request.effort = ctx
+            .params
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(String::from);
         // Constrain the final answer to the pricing schema (`claude --json-schema`): the
         // CLI validates the structured output, so the agent can't emit the malformed JSON
         // that failed ~1/3 of runs (e.g. a dropped key, `"low":150,"300,"high":500`). The
@@ -127,7 +140,12 @@ impl ScrapeApp for HomewysePricing {
         let mut unknown_trades: Vec<String> = Vec::new();
         if let Some(trades) = data.get("trades").and_then(Value::as_array) {
             for t in trades {
-                let raw = t.get("trade").and_then(Value::as_str).unwrap_or("").trim().to_string();
+                let raw = t
+                    .get("trade")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .trim()
+                    .to_string();
                 // Normalize to a canonical label so the pricing rows join to the
                 // unified layer by the same trade string; unknown labels flagged.
                 let (trade, known) = taxonomy::canonicalize(&raw);
@@ -137,7 +155,11 @@ impl ScrapeApp for HomewysePricing {
                 let mut job_count = 0;
                 if let Some(jobs) = t.get("jobs").and_then(Value::as_array) {
                     for j in jobs {
-                        let job = j.get("job").and_then(Value::as_str).unwrap_or("").to_string();
+                        let job = j
+                            .get("job")
+                            .and_then(Value::as_str)
+                            .unwrap_or("")
+                            .to_string();
                         if trade.is_empty() || job.is_empty() {
                             continue;
                         }
@@ -280,9 +302,15 @@ mod tests {
 
     #[test]
     fn slugify_stabilizes_phrasing_drift() {
-        assert_eq!(slugify("Install 30-gal water heater"), "install-30-gal-water-heater");
+        assert_eq!(
+            slugify("Install 30-gal water heater"),
+            "install-30-gal-water-heater"
+        );
         // Case / spacing / punctuation drift collapses to the same key.
-        assert_eq!(slugify("install 30 gal water heater"), slugify("Install 30-gal  water heater"));
+        assert_eq!(
+            slugify("install 30 gal water heater"),
+            slugify("Install 30-gal  water heater")
+        );
         // Meaningful differences are preserved.
         assert_ne!(slugify("30-gal heater"), slugify("40-gal heater"));
         assert_eq!(slugify("  --Trim--  "), "trim");

@@ -36,7 +36,16 @@ pub fn dispatch(client: reqwest::Client, storage: Arc<Storage>, job: Job) {
     };
     let secret = job.callback_secret.clone();
     let id = job.id.to_string();
-    dispatch_event(client, storage, "job", &id, &url, "job.terminal", &job, secret);
+    dispatch_event(
+        client,
+        storage,
+        "job",
+        &id,
+        &url,
+        "job.terminal",
+        &job,
+        secret,
+    );
 }
 
 /// Spawns a best-effort, logged delivery of a `dataset.changed` event.
@@ -108,7 +117,16 @@ pub fn dispatch_failure(
         "attempts": job.attempts,
         "schedule_id": job.schedule_id,
     });
-    dispatch_event(client, storage, "failure", &job.id.to_string(), url, "job.failed", &payload, secret);
+    dispatch_event(
+        client,
+        storage,
+        "failure",
+        &job.id.to_string(),
+        url,
+        "job.failed",
+        &payload,
+        secret,
+    );
 }
 
 /// Re-sends a logged delivery (the dead-letter replay path). The caller has
@@ -123,7 +141,15 @@ pub fn replay(
     secret: Option<String>,
 ) {
     tokio::spawn(async move {
-        let outcome = deliver(&client, &url, &event, &delivery_id, &body, secret.as_deref()).await;
+        let outcome = deliver(
+            &client,
+            &url,
+            &event,
+            &delivery_id,
+            &body,
+            secret.as_deref(),
+        )
+        .await;
         log_outcome(&storage, &delivery_id, &url, outcome).await;
     });
 }
@@ -142,7 +168,13 @@ fn spawn_logged(
 ) {
     tokio::spawn(async move {
         let delivery_id = match storage
-            .create_delivery(&kind, &ref_id, &url, &event, &String::from_utf8_lossy(&body))
+            .create_delivery(
+                &kind,
+                &ref_id,
+                &url,
+                &event,
+                &String::from_utf8_lossy(&body),
+            )
             .await
         {
             Ok(id) => id,
@@ -151,13 +183,27 @@ fn spawn_logged(
                 // No persisted id — send with a generated one so the receiver still
                 // gets an idempotency key (this delivery just isn't in the log/DLQ).
                 let fallback_id = uuid::Uuid::new_v4().to_string();
-                let _ =
-                    deliver(&client, &url, &event, &fallback_id, &body, secret.as_deref()).await;
+                let _ = deliver(
+                    &client,
+                    &url,
+                    &event,
+                    &fallback_id,
+                    &body,
+                    secret.as_deref(),
+                )
+                .await;
                 return;
             }
         };
-        let outcome =
-            deliver(&client, &url, &event, &delivery_id, &body, secret.as_deref()).await;
+        let outcome = deliver(
+            &client,
+            &url,
+            &event,
+            &delivery_id,
+            &body,
+            secret.as_deref(),
+        )
+        .await;
         log_outcome(&storage, &delivery_id, &url, outcome).await;
     });
 }
@@ -171,14 +217,22 @@ async fn log_outcome(
     let (delivered, attempts, last_error) = outcome;
     let result = if delivered {
         debug!(delivery = %delivery_id, url = %url, "webhook delivered");
-        storage.finish_delivery(delivery_id, true, attempts, last_error.as_deref()).await
+        storage
+            .finish_delivery(delivery_id, true, attempts, last_error.as_deref())
+            .await
     } else {
         // Don't give up: schedule a backed-off auto-drain retry (or mark the row
         // `dead` past the cap). A receiver outage longer than the ~6s in-process
         // loop is exactly what this recovers, instead of silently losing events.
         debug!(delivery = %delivery_id, url = %url, "webhook delivery failed; scheduling drain retry");
         storage
-            .fail_delivery(delivery_id, attempts, last_error.as_deref(), DRAIN_MAX_RETRIES, DRAIN_BACKOFF_SECS)
+            .fail_delivery(
+                delivery_id,
+                attempts,
+                last_error.as_deref(),
+                DRAIN_MAX_RETRIES,
+                DRAIN_BACKOFF_SECS,
+            )
             .await
     };
     if let Err(e) = result {
@@ -195,9 +249,19 @@ pub async fn resolve_secret(storage: &Storage, delivery: &Delivery) -> Option<St
     match delivery.kind.as_str() {
         "job" => {
             let job_id = uuid::Uuid::parse_str(&delivery.ref_id).ok()?;
-            storage.get(job_id).await.ok().flatten().and_then(|j| j.callback_secret)
+            storage
+                .get(job_id)
+                .await
+                .ok()
+                .flatten()
+                .and_then(|j| j.callback_secret)
         }
-        _ => storage.get_watch(&delivery.ref_id).await.ok().flatten().and_then(|w| w.secret),
+        _ => storage
+            .get_watch(&delivery.ref_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|w| w.secret),
     }
 }
 

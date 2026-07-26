@@ -108,13 +108,20 @@ impl ScrapeApp for StateTax {
 
         let mut request = ResearchRequest::new(prompt).with_role(role);
         request.max_turns = max_turns;
-        request.model = ctx.params.get("model").and_then(Value::as_str).map(String::from);
-        request.effort = ctx.params.get("effort").and_then(Value::as_str).map(String::from);
+        request.model = ctx
+            .params
+            .get("model")
+            .and_then(Value::as_str)
+            .map(String::from);
+        request.effort = ctx
+            .params
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(String::from);
         // Constrain the final answer to the tax schema (`claude --json-schema`);
         // salvage_json below still catches anything the schema path misses.
         request.json_schema = Some(tax_schema());
-        let (data, output) =
-            trades_common::research_json(&ctx, "state-tax", request).await?;
+        let (data, output) = trades_common::research_json(&ctx, "state-tax", request).await?;
 
         let mut all_records: Vec<(String, Value)> = Vec::new();
         let mut rejected: Vec<Rejection> = Vec::new();
@@ -123,7 +130,11 @@ impl ScrapeApp for StateTax {
         // ingest lifts market = "US"). Rate fields must fall in [0,100].
         if let Some(fed) = data.get("federal").filter(|v| v.is_object()) {
             let mut reasons = Vec::new();
-            for f in ["self_employment_tax_rate", "qbi_deduction_pct", "top_marginal_rate"] {
+            for f in [
+                "self_employment_tax_rate",
+                "qbi_deduction_pct",
+                "top_marginal_rate",
+            ] {
                 validate::require_rate(&mut reasons, f, validate::num(fed, f));
             }
             if reasons.is_empty() {
@@ -134,7 +145,10 @@ impl ScrapeApp for StateTax {
                 rec["year"] = json!(year);
                 all_records.push(("federal:US".to_string(), rec));
             } else {
-                rejected.push(Rejection { key: "federal:US".to_string(), reasons });
+                rejected.push(Rejection {
+                    key: "federal:US".to_string(),
+                    reasons,
+                });
             }
         }
 
@@ -152,9 +166,16 @@ impl ScrapeApp for StateTax {
                     continue;
                 }
                 let mut reasons = Vec::new();
-                validate::require_rate(&mut reasons, "top_marginal_rate", validate::num(s, "top_marginal_rate"));
+                validate::require_rate(
+                    &mut reasons,
+                    "top_marginal_rate",
+                    validate::num(s, "top_marginal_rate"),
+                );
                 if !reasons.is_empty() {
-                    rejected.push(Rejection { key: format!("state:{st}"), reasons });
+                    rejected.push(Rejection {
+                        key: format!("state:{st}"),
+                        reasons,
+                    });
                     continue;
                 }
                 let mut rec = s.clone();

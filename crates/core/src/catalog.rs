@@ -94,7 +94,10 @@ impl Catalog {
                 .unwrap_or_else(|_| "catalog/data-sources.toml".to_string()),
         );
         if !path.exists() {
-            tracing::warn!("catalog file {} not found, using empty catalog", path.display());
+            tracing::warn!(
+                "catalog file {} not found, using empty catalog",
+                path.display()
+            );
             return Ok(Catalog::default());
         }
         let raw = std::fs::read_to_string(&path)?;

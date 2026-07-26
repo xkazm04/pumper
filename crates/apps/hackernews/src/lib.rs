@@ -46,10 +46,15 @@ impl ScrapeApp for HackerNews {
             let response = ctx
                 .engines
                 .http
-                .fetch(HttpRequest::get(format!("https://news.ycombinator.com/news?p={page}")))
+                .fetch(HttpRequest::get(format!(
+                    "https://news.ycombinator.com/news?p={page}"
+                )))
                 .await?;
             if !response.is_success() {
-                return Err(Error::App(format!("HN returned status {}", response.status)));
+                return Err(Error::App(format!(
+                    "HN returned status {}",
+                    response.status
+                )));
             }
             let offset = stories.len() as u32;
             stories.extend(parse_front_page(&response.body, offset));
@@ -197,7 +202,10 @@ mod tests {
 
         // Internal links get the site prefix; "discuss" (no comment count) is None.
         let s = &stories[1];
-        assert_eq!(s.url.as_deref(), Some("https://news.ycombinator.com/item?id=1002"));
+        assert_eq!(
+            s.url.as_deref(),
+            Some("https://news.ycombinator.com/item?id=1002")
+        );
         assert_eq!(s.comments, None);
     }
 
@@ -206,7 +214,8 @@ mod tests {
     /// garbage rows — zero is what trips the silent-success guard.
     #[test]
     fn drifted_markup_parses_to_zero_stories_not_garbage() {
-        let drifted = r#"<table><tr class="story"><td><a href="/x">Not the real shape</a></td></tr></table>"#;
+        let drifted =
+            r#"<table><tr class="story"><td><a href="/x">Not the real shape</a></td></tr></table>"#;
         assert!(parse_front_page(drifted, 0).is_empty());
         assert!(parse_front_page("", 0).is_empty());
     }

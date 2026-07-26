@@ -23,7 +23,10 @@ fn concurrency(ctx: &AppContext) -> usize {
 /// absent). Lets one plugin be configured per job (e.g. a different selector)
 /// instead of recompiling a module per variation.
 fn plugin_params(ctx: &AppContext) -> Value {
-    ctx.params.get("plugin_params").cloned().unwrap_or(Value::Null)
+    ctx.params
+        .get("plugin_params")
+        .cloned()
+        .unwrap_or(Value::Null)
 }
 
 /// Pure param parse for [`concurrency`] — clamps `concurrency` to `>= 1`,
@@ -86,7 +89,11 @@ impl Plugin {
             .params
             .get("urls")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         if urls.is_empty() {
             return Err(Error::App(
@@ -122,11 +129,15 @@ impl Plugin {
                 if doc.is_empty() {
                     return json!({ "error": "empty document" });
                 }
-                p.run(&name, &doc, &pp).await.unwrap_or_else(|e| json!({ "error": e.to_string() }))
+                p.run(&name, &doc, &pp)
+                    .await
+                    .unwrap_or_else(|e| json!({ "error": e.to_string() }))
             }
         });
-        let mut results: Vec<Value> =
-            futures::stream::iter(tasks).buffered(concurrency).collect().await;
+        let mut results: Vec<Value> = futures::stream::iter(tasks)
+            .buffered(concurrency)
+            .collect()
+            .await;
 
         let ran = results.iter().filter(|r| r.get("error").is_none()).count();
         let items = upsert_items(urls.iter().map(String::as_str), &mut results);
@@ -147,10 +158,19 @@ impl Plugin {
     /// Source mode: run the plugin over already-crawled bodies (no re-fetch).
     /// Key precedence mirrors `extractor`: explicit `source.keys` → the firing
     /// trigger's `_trigger.keys` → all live records in the source dataset.
-    async fn run_source_mode(&self, ctx: &AppContext, plugin: &str, dataset: &str) -> Result<Value> {
-        let source = ctx.params.get("source").and_then(Value::as_object).ok_or_else(|| {
-            Error::App("param 'source' must be an object {app, dataset, keys?}".into())
-        })?;
+    async fn run_source_mode(
+        &self,
+        ctx: &AppContext,
+        plugin: &str,
+        dataset: &str,
+    ) -> Result<Value> {
+        let source = ctx
+            .params
+            .get("source")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                Error::App("param 'source' must be an object {app, dataset, keys?}".into())
+            })?;
         let src_app = source
             .get("app")
             .and_then(Value::as_str)
@@ -163,8 +183,11 @@ impl Plugin {
             .to_string();
 
         let str_array = |v: Option<&Value>| -> Option<Vec<String>> {
-            v.and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            v.and_then(Value::as_array).map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
         };
         let explicit_keys = str_array(source.get("keys"))
             .or_else(|| str_array(ctx.params.pointer("/_trigger/keys")));
@@ -183,8 +206,9 @@ impl Plugin {
                         Ok(body) => keyed.push((key, body)),
                         Err(reason) => missing.push(json!({ "key": key, "reason": reason })),
                     },
-                    None => missing
-                        .push(json!({ "key": key, "reason": "no record in source dataset" })),
+                    None => {
+                        missing.push(json!({ "key": key, "reason": "no record in source dataset" }))
+                    }
                 }
             }
         } else {
@@ -222,12 +246,16 @@ impl Plugin {
                 if doc.is_empty() {
                     return json!({ "error": "empty document" });
                 }
-                p.run(&name, &doc, &pp).await.unwrap_or_else(|e| json!({ "error": e.to_string() }))
+                p.run(&name, &doc, &pp)
+                    .await
+                    .unwrap_or_else(|e| json!({ "error": e.to_string() }))
             }
         });
         // Bounded run fan-out; `buffered` keeps order for the positional zip below.
-        let mut results: Vec<Value> =
-            futures::stream::iter(tasks).buffered(concurrency).collect().await;
+        let mut results: Vec<Value> = futures::stream::iter(tasks)
+            .buffered(concurrency)
+            .collect()
+            .await;
 
         let ran = results.iter().filter(|r| r.get("error").is_none()).count();
         let items = upsert_items(keys.iter().map(String::as_str), &mut results);
@@ -280,6 +308,9 @@ mod tests {
         assert_eq!(parse_concurrency(&json!({})), DEFAULT_CONCURRENCY);
         assert_eq!(parse_concurrency(&json!({ "concurrency": 8 })), 8);
         assert_eq!(parse_concurrency(&json!({ "concurrency": 0 })), 1);
-        assert_eq!(parse_concurrency(&json!({ "concurrency": "lots" })), DEFAULT_CONCURRENCY);
+        assert_eq!(
+            parse_concurrency(&json!({ "concurrency": "lots" })),
+            DEFAULT_CONCURRENCY
+        );
     }
 }

@@ -57,8 +57,10 @@ async fn priority_aging_lets_a_starved_low_priority_job_claim() {
         .await
         .expect("claim")
         .expect("a job");
-    assert_eq!(claimed.id, starved, "aged low-priority job should overtake fresh high-priority work");
-
+    assert_eq!(
+        claimed.id, starved,
+        "aged low-priority job should overtake fresh high-priority work"
+    );
 }
 
 #[tokio::test]
@@ -83,7 +85,6 @@ async fn aging_disabled_keeps_strict_priority_order() {
         high.contains(&claimed.id),
         "with aging off a high-priority job must claim before the aged low-priority one"
     );
-
 }
 
 #[tokio::test]
@@ -104,7 +105,6 @@ async fn equal_priority_claims_fifo() {
     assert_eq!(second.id, middle);
     let third = storage.claim_next(&[], 900.0).await.unwrap().unwrap();
     assert_eq!(third.id, newest);
-
 }
 
 /// Inserts a job already in a terminal `failed` state.
@@ -131,12 +131,21 @@ async fn reset_requeues_running_and_fences_stale_completion() {
     let storage = &store.storage;
 
     let job = storage
-        .enqueue("a", EnqueueOptions { max_attempts: 3, ..Default::default() })
+        .enqueue(
+            "a",
+            EnqueueOptions {
+                max_attempts: 3,
+                ..Default::default()
+            },
+        )
         .await
         .unwrap();
 
     // Reset only applies to running jobs.
-    assert!(storage.reset(job.id).await.unwrap().is_none(), "queued job is not resettable");
+    assert!(
+        storage.reset(job.id).await.unwrap().is_none(),
+        "queued job is not resettable"
+    );
 
     // Claim -> running, attempts = 1.
     let claimed = storage.claim_next(&[], 0.0).await.unwrap().unwrap();
@@ -149,27 +158,38 @@ async fn reset_requeues_running_and_fences_stale_completion() {
     assert_eq!(after.attempts, 1);
 
     // Stale attempt-1 completion is discarded: the row is queued, not running.
-    assert!(!storage.complete(job.id, 1, json!({"stale": true})).await.unwrap());
+    assert!(!storage
+        .complete(job.id, 1, json!({"stale": true}))
+        .await
+        .unwrap());
 
     // Re-claim -> attempts = 2 (fence advances past the orphan).
     let reclaimed = storage.claim_next(&[], 0.0).await.unwrap().unwrap();
     assert_eq!(reclaimed.attempts, 2);
 
     // Orphan's attempt-1 write still discarded; the live attempt-2 write lands.
-    assert!(!storage.complete(job.id, 1, json!({"stale": true})).await.unwrap());
-    assert!(storage.complete(job.id, 2, json!({"ok": true})).await.unwrap());
+    assert!(!storage
+        .complete(job.id, 1, json!({"stale": true}))
+        .await
+        .unwrap());
+    assert!(storage
+        .complete(job.id, 2, json!({"ok": true}))
+        .await
+        .unwrap());
 
     let done = storage.get(job.id).await.unwrap().unwrap();
     assert_eq!(done.status, JobStatus::Succeeded);
     assert_eq!(done.result, Some(json!({"ok": true})));
-
 }
 
 #[tokio::test]
 async fn cancel_running_is_attempt_guarded() {
     let store = fresh_db("cancel-running").await;
     let storage = &store.storage;
-    let job = storage.enqueue("a", EnqueueOptions::default()).await.unwrap();
+    let job = storage
+        .enqueue("a", EnqueueOptions::default())
+        .await
+        .unwrap();
     let claimed = storage.claim_next(&[], 0.0).await.unwrap().unwrap();
     assert_eq!(claimed.attempts, 1);
 
@@ -177,10 +197,12 @@ async fn cancel_running_is_attempt_guarded() {
     assert!(!storage.cancel_running(job.id, 2).await.unwrap());
     // Correct attempt cancels the in-flight job.
     assert!(storage.cancel_running(job.id, 1).await.unwrap());
-    assert_eq!(storage.get(job.id).await.unwrap().unwrap().status, JobStatus::Cancelled);
+    assert_eq!(
+        storage.get(job.id).await.unwrap().unwrap().status,
+        JobStatus::Cancelled
+    );
     // Idempotent: already terminal.
     assert!(!storage.cancel_running(job.id, 1).await.unwrap());
-
 }
 
 #[tokio::test]
@@ -194,7 +216,10 @@ async fn retry_bulk_requeues_filtered_batch() {
     let b1 = insert_failed(&pool, "b").await;
 
     // Scoped to app "a": only its two failed jobs re-queue.
-    let ids = storage.retry_bulk(JobStatus::Failed, Some("a"), 500).await.unwrap();
+    let ids = storage
+        .retry_bulk(JobStatus::Failed, Some("a"), 500)
+        .await
+        .unwrap();
     assert_eq!(ids.len(), 2);
     assert!(ids.contains(&a1) && ids.contains(&a2));
     for id in [a1, a2] {
@@ -203,14 +228,19 @@ async fn retry_bulk_requeues_filtered_batch() {
         assert_eq!(j.max_attempts, 2, "one more attempt granted");
     }
     // app "b" untouched.
-    assert_eq!(storage.get(b1).await.unwrap().unwrap().status, JobStatus::Failed);
+    assert_eq!(
+        storage.get(b1).await.unwrap().unwrap().status,
+        JobStatus::Failed
+    );
 
     // Cap is respected.
     insert_failed(&pool, "c").await;
     insert_failed(&pool, "c").await;
-    let capped = storage.retry_bulk(JobStatus::Failed, None, 1).await.unwrap();
+    let capped = storage
+        .retry_bulk(JobStatus::Failed, None, 1)
+        .await
+        .unwrap();
     assert_eq!(capped.len(), 1);
-
 }
 
 /// Inserts a `running` job with an explicit heartbeat age (seconds ago).
@@ -225,7 +255,8 @@ async fn insert_running(
     let now = Utc::now();
     let started = (now - Duration::seconds(heartbeat_secs_ago + 1))
         .to_rfc3339_opts(SecondsFormat::Micros, true);
-    let hb = (now - Duration::seconds(heartbeat_secs_ago)).to_rfc3339_opts(SecondsFormat::Micros, true);
+    let hb =
+        (now - Duration::seconds(heartbeat_secs_ago)).to_rfc3339_opts(SecondsFormat::Micros, true);
     sqlx::query(
         "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
          created_at, available_at, started_at, heartbeat_at) \
@@ -259,13 +290,15 @@ async fn reaper_requeues_stale_but_leaves_fresh_running_jobs() {
     assert_eq!(reaped[0].0, stale);
     assert_eq!(reaped[0].2, JobStatus::Queued);
 
-    assert_eq!(storage.get(stale).await.unwrap().unwrap().status, JobStatus::Queued);
+    assert_eq!(
+        storage.get(stale).await.unwrap().unwrap().status,
+        JobStatus::Queued
+    );
     assert_eq!(
         storage.get(fresh).await.unwrap().unwrap().status,
         JobStatus::Running,
         "a slow-but-alive job must survive the reaper"
     );
-
 }
 
 #[tokio::test]
@@ -283,7 +316,6 @@ async fn reaper_fails_permanently_when_attempts_exhausted() {
     let job = storage.get(stale).await.unwrap().unwrap();
     assert_eq!(job.status, JobStatus::Failed);
     assert!(job.error.unwrap().contains("lease expired"));
-
 }
 
 #[tokio::test]
@@ -301,5 +333,4 @@ async fn heartbeat_refresh_keeps_a_job_off_the_reaper() {
     );
     // Attempt-guarded: a stale task can't refresh a row it no longer owns.
     assert!(!storage.heartbeat(running, 2).await.unwrap());
-
 }

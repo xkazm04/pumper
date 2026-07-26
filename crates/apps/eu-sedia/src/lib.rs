@@ -18,7 +18,9 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use pumper_core::{html_to_markdown, AppContext, Error, HttpMethod, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    html_to_markdown, AppContext, Error, HttpMethod, HttpRequest, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 
 pub struct EuSedia;
@@ -90,10 +92,13 @@ impl ScrapeApp for EuSedia {
         let mut pages_fetched: u64 = 0;
 
         loop {
-            let url = format!(
-                "{SEDIA_URL}?apiKey=SEDIA&text=***&pageSize={page_size}&pageNumber={page}"
-            );
-            let resp = ctx.engines.http.fetch(sedia_request(url, body.clone())).await?;
+            let url =
+                format!("{SEDIA_URL}?apiKey=SEDIA&text=***&pageSize={page_size}&pageNumber={page}");
+            let resp = ctx
+                .engines
+                .http
+                .fetch(sedia_request(url, body.clone()))
+                .await?;
             if !resp.is_success() {
                 return Err(Error::App(format!(
                     "SEDIA returned status {} (body starts: {})",
@@ -105,7 +110,10 @@ impl ScrapeApp for EuSedia {
             let parsed: Value = serde_json::from_str(&resp.body)
                 .map_err(|e| Error::App(format!("eu-sedia: response was not JSON: {e}")))?;
             if pages_fetched == 0 {
-                total = parsed.get("totalResults").and_then(Value::as_u64).unwrap_or(0);
+                total = parsed
+                    .get("totalResults")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
                 ctx.save_artifact("page1.json", &serde_json::to_vec_pretty(&parsed)?)
                     .await?;
             }
@@ -275,7 +283,10 @@ fn clean_text(html: &str) -> Option<String> {
 /// Single-line variant for titles: entity-escaped fragments -> decoded text
 /// with all whitespace collapsed to single spaces.
 fn clean_inline(s: &str) -> String {
-    strip_md(&html_to_markdown(s)).split_whitespace().collect::<Vec<_>>().join(" ")
+    strip_md(&html_to_markdown(s))
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Removes the Markdown decoration `html_to_markdown` emits (headings `#`,
@@ -284,7 +295,11 @@ fn clean_inline(s: &str) -> String {
 /// (HORIZON-CL4-…), so prose underscores don't occur.
 fn strip_md(md: &str) -> String {
     md.lines()
-        .map(|l| l.trim_start_matches('#').trim_start().replace(['*', '`', '_'], ""))
+        .map(|l| {
+            l.trim_start_matches('#')
+                .trim_start()
+                .replace(['*', '`', '_'], "")
+        })
         .collect::<Vec<_>>()
         .join("\n")
         .trim()
@@ -295,7 +310,9 @@ fn multipart_body(query: &str, languages: &str) -> String {
     let mut s = String::new();
     for (name, val) in [("query", query), ("languages", languages)] {
         s.push_str(&format!("--{BOUNDARY}\r\n"));
-        s.push_str(&format!("Content-Disposition: form-data; name=\"{name}\"\r\n"));
+        s.push_str(&format!(
+            "Content-Disposition: form-data; name=\"{name}\"\r\n"
+        ));
         s.push_str("Content-Type: application/json\r\n\r\n");
         s.push_str(val);
         s.push_str("\r\n");
@@ -321,11 +338,26 @@ mod tests {
     fn cleans_sedia_html_to_plain_text() {
         let text = clean_text(SEDIA_HTML).expect("non-empty");
         // Entities decoded, tags gone, markdown decoration stripped.
-        assert!(text.contains("Expected Outcome: Projects are expected"), "{text}");
-        assert!(text.contains("Improved R&I capacity – including SMEs;"), "{text}");
-        assert!(text.contains("Uptake of <trustworthy> AI across the EU’s single market."), "{text}");
-        assert!(text.contains("Scope: proposals should address interoperability."), "{text}");
-        assert!(!text.contains('<') || text.contains("<trustworthy>"), "tag soup leaked: {text}");
+        assert!(
+            text.contains("Expected Outcome: Projects are expected"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Improved R&I capacity – including SMEs;"),
+            "{text}"
+        );
+        assert!(
+            text.contains("Uptake of <trustworthy> AI across the EU’s single market."),
+            "{text}"
+        );
+        assert!(
+            text.contains("Scope: proposals should address interoperability."),
+            "{text}"
+        );
+        assert!(
+            !text.contains('<') || text.contains("<trustworthy>"),
+            "tag soup leaked: {text}"
+        );
         assert!(!text.contains("**") && !text.contains("&amp;"), "{text}");
     }
 
@@ -333,9 +365,16 @@ mod tests {
     fn caps_long_descriptions() {
         let html = format!("<p>{}</p>", "grant ".repeat(1000));
         let text = clean_text(&html).expect("non-empty");
-        assert!(text.chars().count() <= DESCRIPTION_TEXT_CAP + 1, "len {}", text.chars().count());
+        assert!(
+            text.chars().count() <= DESCRIPTION_TEXT_CAP + 1,
+            "len {}",
+            text.chars().count()
+        );
         assert!(text.ends_with('…'), "missing truncation marker: {text}");
-        assert!(clean_text("  <p> </p> ").is_none(), "blank HTML should yield None");
+        assert!(
+            clean_text("  <p> </p> ").is_none(),
+            "blank HTML should yield None"
+        );
     }
 
     #[test]
@@ -355,7 +394,10 @@ mod tests {
         assert_eq!(key, "HORIZON-CL4-2026-DATA-01");
         // Raw HTML preserved, clean text added alongside.
         assert_eq!(rec["descriptionByte"].as_str().unwrap(), SEDIA_HTML);
-        assert!(rec["description_text"].as_str().unwrap().contains("Improved R&I capacity"));
+        assert!(rec["description_text"]
+            .as_str()
+            .unwrap()
+            .contains("Improved R&I capacity"));
         // Entity-escaped titles normalized.
         assert_eq!(rec["title"], "AI & Robotics – Phase II");
         assert_eq!(rec["callTitle"], "Digital & Industry");

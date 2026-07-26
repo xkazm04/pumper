@@ -58,21 +58,31 @@ fn extract(doc: &str, price_selector: &str) -> (Value, DocReport) {
     let html = scraper::Html::parse_document(doc);
     let pick = |selector: &str| -> Option<String> {
         let sel = scraper::Selector::parse(selector).unwrap();
-        html.select(&sel).next().map(|el| el.text().collect::<String>().trim().to_string())
+        html.select(&sel)
+            .next()
+            .map(|el| el.text().collect::<String>().trim().to_string())
     };
     let title = pick(".title");
     let price = pick(price_selector);
     let mut report = DocReport::default();
     report.fields.insert(
         "title".into(),
-        title.as_ref().map_or(FieldStatus::Empty, |_| FieldStatus::Matched),
+        title
+            .as_ref()
+            .map_or(FieldStatus::Empty, |_| FieldStatus::Matched),
     );
     report.fields.insert(
         "price".into(),
-        price.as_ref().map_or(FieldStatus::Empty, |_| FieldStatus::Matched),
+        price
+            .as_ref()
+            .map_or(FieldStatus::Empty, |_| FieldStatus::Matched),
     );
-    report.coercion.insert("title".into(), CoercionStatus::NoTransforms);
-    report.coercion.insert("price".into(), CoercionStatus::NoTransforms);
+    report
+        .coercion
+        .insert("title".into(), CoercionStatus::NoTransforms);
+    report
+        .coercion
+        .insert("price".into(), CoercionStatus::NoTransforms);
     (json!({ "title": title, "price": price }), report)
 }
 
@@ -81,7 +91,12 @@ fn extract(doc: &str, price_selector: &str) -> (Value, DocReport) {
 fn cohort(n: usize, price_class: &str, price_selector: &str, words: &str) -> Vec<ObservedDoc> {
     (0..n)
         .map(|i| {
-            let doc = page(i, price_class, &format!("${}.{:02}", 10 + i, (i * 7) % 100), words);
+            let doc = page(
+                i,
+                price_class,
+                &format!("${}.{:02}", 10 + i, (i * 7) % 100),
+                words,
+            );
             let (values, report) = extract(&doc, price_selector);
             ObservedDoc {
                 key: format!("http://shop.example/p/{i}"),
@@ -93,10 +108,7 @@ fn cohort(n: usize, price_class: &str, price_selector: &str, words: &str) -> Vec
         .collect()
 }
 
-async fn observe(
-    health: &Resilience,
-    docs: &[ObservedDoc],
-) -> pumper_core::SourceVerdict {
+async fn observe(health: &Resilience, docs: &[ObservedDoc]) -> pumper_core::SourceVerdict {
     health
         .observe(
             "extractor",
@@ -104,7 +116,10 @@ async fn observe(
                 job_id: Uuid::new_v4(),
                 dataset: "products",
                 docs,
-                fetch: FetchHealth { attempted: docs.len() as u32, ok: docs.len() as u32 },
+                fetch: FetchHealth {
+                    attempted: docs.len() as u32,
+                    ok: docs.len() as u32,
+                },
                 build_id: Some("test".into()),
             },
         )
@@ -123,16 +138,27 @@ async fn a_redesign_walks_the_source_down_the_ladder_and_a_fix_walks_it_back() {
     // nothing it stopped doing.
     for run in 0..3 {
         let v = observe(&health, &cohort(30, "price", ".price", "sturdy")).await;
-        assert_eq!(v.verdict, RunVerdict::Ok, "healthy run {run}: {:?}", v.reasons);
+        assert_eq!(
+            v.verdict,
+            RunVerdict::Ok,
+            "healthy run {run}: {:?}",
+            v.reasons
+        );
         assert_eq!(v.state, SourceState::Healthy);
         assert!(v.statistical_coverage);
     }
     // Run 2 onwards has a previous run to compare against.
     let baseline_drift = observe(&health, &cohort(30, "price", ".price", "sturdy")).await;
-    assert!(baseline_drift.drift.is_some(), "fingerprints must make drift computable");
+    assert!(
+        baseline_drift.drift.is_some(),
+        "fingerprints must make drift computable"
+    );
     let d = baseline_drift.drift.unwrap();
     assert_eq!(d.compared, 30);
-    assert!(d.text < 0.05 && d.dom < 0.05, "a repeat of the same pages must not drift: {d:?}");
+    assert!(
+        d.text < 0.05 && d.dom < 0.05,
+        "a repeat of the same pages must not drift: {d:?}"
+    );
 
     // The redesign: `.price` becomes `.amount`, the words are untouched. The old
     // selector now matches nothing.
@@ -145,15 +171,27 @@ async fn a_redesign_walks_the_source_down_the_ladder_and_a_fix_walks_it_back() {
     assert_eq!(first.state, SourceState::Suspect);
 
     let second = observe(&health, &broken()).await;
-    assert_eq!(second.state, SourceState::Degraded, "two of the last three trips it");
+    assert_eq!(
+        second.state,
+        SourceState::Degraded,
+        "two of the last three trips it"
+    );
 
     let third = observe(&health, &broken()).await;
-    assert_eq!(third.state, SourceState::Quarantined, "three consecutive earns quarantine");
+    assert_eq!(
+        third.state,
+        SourceState::Quarantined,
+        "three consecutive earns quarantine"
+    );
 
     // The broken runs must NOT have entered the baseline they were judged against.
     let store = health.store().unwrap();
     let baseline = store.baseline("extractor/products", 10).await.unwrap();
-    assert_eq!(baseline.runs("price"), 4, "only the four ok runs are baseline material");
+    assert_eq!(
+        baseline.runs("price"),
+        4,
+        "only the four ok runs are baseline material"
+    );
     assert!(
         baseline.pooled_misses("price").0 == 0,
         "a broken run leaked into the baseline: {:?}",
@@ -163,7 +201,11 @@ async fn a_redesign_walks_the_source_down_the_ladder_and_a_fix_walks_it_back() {
     // Quarantine is terminal without an operator: a clean run does not release it.
     let fixed = observe(&health, &cohort(30, "amount", ".amount", "sturdy")).await;
     assert_eq!(fixed.verdict, RunVerdict::Ok);
-    assert_eq!(fixed.state, SourceState::Quarantined, "quarantine must not self-release");
+    assert_eq!(
+        fixed.state,
+        SourceState::Quarantined,
+        "quarantine must not self-release"
+    );
 
     // The operator releases it, and only then does the ladder resume.
     store
@@ -176,9 +218,11 @@ async fn a_redesign_walks_the_source_down_the_ladder_and_a_fix_walks_it_back() {
     // Every run is on the record with the tests that produced it.
     let runs = store.runs("extractor/products", 50).await.unwrap();
     assert_eq!(runs.len(), 9);
-    assert!(runs.iter().all(|r| r.reasons.is_some()), "a verdict must explain itself");
+    assert!(
+        runs.iter().all(|r| r.reasons.is_some()),
+        "a verdict must explain itself"
+    );
     assert!(runs.iter().all(|r| r.build_id.as_deref() == Some("test")));
-
 }
 
 #[tokio::test]
@@ -197,9 +241,13 @@ async fn a_content_change_is_not_a_break() {
     let d = v.drift.expect("comparable keys");
     assert!(d.text > 0.05, "the words really did move: {d:?}");
     assert!(d.dom < 0.05, "the markup really did not: {d:?}");
-    assert_eq!(v.verdict, RunVerdict::Ok, "a content change must not read as a break: {:?}", v.reasons);
+    assert_eq!(
+        v.verdict,
+        RunVerdict::Ok,
+        "a content change must not read as a break: {:?}",
+        v.reasons
+    );
     assert_eq!(v.state, SourceState::Healthy);
-
 }
 
 #[tokio::test]
@@ -211,7 +259,8 @@ async fn a_bot_wall_run_changes_nothing_at_all() {
         observe(&health, &cohort(30, "price", ".price", "sturdy")).await;
     }
     let store = health.store().unwrap();
-    let before = store.fingerprints("extractor/products", &["http://shop.example/p/0".into()])
+    let before = store
+        .fingerprints("extractor/products", &["http://shop.example/p/0".into()])
         .await
         .unwrap();
 
@@ -223,7 +272,10 @@ async fn a_bot_wall_run_changes_nothing_at_all() {
                 job_id: Uuid::new_v4(),
                 dataset: "products",
                 docs: &cohort(30, "amount", ".price", "bot wall challenge page"),
-                fetch: FetchHealth { attempted: 30, ok: 3 },
+                fetch: FetchHealth {
+                    attempted: 30,
+                    ok: 3,
+                },
                 build_id: None,
             },
         )
@@ -240,13 +292,15 @@ async fn a_bot_wall_run_changes_nothing_at_all() {
         .fingerprints("extractor/products", &["http://shop.example/p/0".into()])
         .await
         .unwrap();
-    assert_eq!(before, after, "an unjudged run must not become the next run's reference");
+    assert_eq!(
+        before, after,
+        "an unjudged run must not become the next run's reference"
+    );
 
     // The run is still recorded — soak mode's whole value is the record.
     let runs = store.runs("extractor/products", 10).await.unwrap();
     assert_eq!(runs[0].verdict, "inconclusive");
     assert!((runs[0].fetch_ok_rate - 0.1).abs() < 1e-9);
-
 }
 
 #[tokio::test]
@@ -265,7 +319,10 @@ async fn invariants_are_mined_from_live_records_and_then_checked() {
             )
         })
         .collect();
-    datasets.upsert_many("extractor", "products", &items).await.unwrap();
+    datasets
+        .upsert_many("extractor", "products", &items)
+        .await
+        .unwrap();
 
     // A healthy run triggers mining (none have ever been mined for this source).
     observe(&health, &cohort(30, "price", ".price", "sturdy")).await;
@@ -277,38 +334,59 @@ async fn invariants_are_mined_from_live_records_and_then_checked() {
         .filter(|i| i.field == "price")
         .map(|i| i.kind.name())
         .collect();
-    assert!(price_kinds.contains(&"regex"), "mined for price: {price_kinds:?}");
-    assert!(price_kinds.contains(&"nonnull"), "mined for price: {price_kinds:?}");
-
+    assert!(
+        price_kinds.contains(&"regex"),
+        "mined for price: {price_kinds:?}"
+    );
+    assert!(
+        price_kinds.contains(&"nonnull"),
+        "mined for price: {price_kinds:?}"
+    );
 }
 
 // ---- enforcement: what a degrading source must never do --------------------
 
 /// Write-path AppContext over the shared harness (Dead engines, no budget).
 fn ctx(storage: &Storage, health: Arc<Resilience>) -> AppContext {
-    pumper_core::testing::TestContext::new(storage, "extractor").health(health).build()
+    pumper_core::testing::TestContext::new(storage, "extractor")
+        .health(health)
+        .build()
 }
 
 fn items(keys: &[&str]) -> Vec<(String, Value)> {
-    keys.iter().map(|k| (k.to_string(), json!({ "id": k, "price": 10 }))).collect()
+    keys.iter()
+        .map(|k| (k.to_string(), json!({ "id": k, "price": 10 })))
+        .collect()
 }
 
 #[tokio::test]
 async fn a_degrading_source_cannot_tombstone_its_own_dataset() {
     let store = fresh_db("resilience-tombstone").await;
     let storage = &store.storage;
-    let enforcing = ResilienceConfig { enforce: true, ..cfg() };
+    let enforcing = ResilienceConfig {
+        enforce: true,
+        ..cfg()
+    };
     let health = Arc::new(Resilience::new(storage.pool(), &enforcing));
     let ctx = ctx(&storage, health.clone());
     let datasets = Datasets::new(storage.pool());
 
     // A healthy full snapshot of three keys.
-    ctx.sync_many("products", &items(&["a", "b", "c"])).await.unwrap();
+    ctx.sync_many("products", &items(&["a", "b", "c"]))
+        .await
+        .unwrap();
 
     // Still healthy: a genuine disappearance IS detected. Without this half the
     // test would pass on a system that never tombstones anything.
-    let summary = ctx.sync_many("products", &items(&["a", "b"])).await.unwrap();
-    assert_eq!(summary.removed, vec!["c".to_string()], "a healthy source must still detect removals");
+    let summary = ctx
+        .sync_many("products", &items(&["a", "b"]))
+        .await
+        .unwrap();
+    assert_eq!(
+        summary.removed,
+        vec!["c".to_string()],
+        "a healthy source must still detect removals"
+    );
 
     // The source degrades.
     health
@@ -327,14 +405,27 @@ async fn a_degrading_source_cannot_tombstone_its_own_dataset() {
     // A half-broken run returns a SHORT but non-empty batch. The empty-batch guard
     // does not cover this, and tombstoning `b` here would be silent data loss.
     let summary = ctx.sync_many("products", &items(&["a"])).await.unwrap();
-    assert!(summary.removed.is_empty(), "a degrading source must not tombstone: {summary:?}");
-    let b = datasets.get("extractor", "products", "b").await.unwrap().unwrap();
-    assert!(b.removed_at.is_none(), "key b was tombstoned by a short broken batch");
+    assert!(
+        summary.removed.is_empty(),
+        "a degrading source must not tombstone: {summary:?}"
+    );
+    let b = datasets
+        .get("extractor", "products", "b")
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(
+        b.removed_at.is_none(),
+        "key b was tombstoned by a short broken batch"
+    );
 
     // And what it did write is stamped as not-stood-behind.
-    let a = datasets.get("extractor", "products", "a").await.unwrap().unwrap();
+    let a = datasets
+        .get("extractor", "products", "a")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(a.trust, "provisional");
-
 }
 
 #[tokio::test]
@@ -343,7 +434,10 @@ async fn a_quarantined_source_writes_to_the_shadow_dataset() {
     let storage = &store.storage;
     let health = Arc::new(Resilience::new(
         storage.pool(),
-        &ResilienceConfig { enforce: true, ..cfg() },
+        &ResilienceConfig {
+            enforce: true,
+            ..cfg()
+        },
     ));
     let ctx = ctx(&storage, health.clone());
     let datasets = Datasets::new(storage.pool());
@@ -359,14 +453,29 @@ async fn a_quarantined_source_writes_to_the_shadow_dataset() {
     ctx.upsert_many("products", &items(&["b"])).await.unwrap();
 
     // The live dataset is untouched by the quarantined run...
-    assert!(datasets.get("extractor", "products", "b").await.unwrap().is_none());
+    assert!(datasets
+        .get("extractor", "products", "b")
+        .await
+        .unwrap()
+        .is_none());
     // ...and the write landed in the shadow dataset, which is an ordinary dataset
     // so every existing tool already works on it.
-    let shadow = datasets.get("extractor", "products@q", "b").await.unwrap().unwrap();
+    let shadow = datasets
+        .get("extractor", "products@q", "b")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(shadow.trust, "quarantined");
     // The pre-quarantine record keeps its stamp.
-    assert_eq!(datasets.get("extractor", "products", "a").await.unwrap().unwrap().trust, "stable");
-
+    assert_eq!(
+        datasets
+            .get("extractor", "products", "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .trust,
+        "stable"
+    );
 }
 
 #[tokio::test]
@@ -379,7 +488,9 @@ async fn soak_mode_records_the_verdict_and_gates_nothing() {
     let ctx = ctx(&storage, health.clone());
     let datasets = Datasets::new(storage.pool());
 
-    ctx.sync_many("products", &items(&["a", "b", "c"])).await.unwrap();
+    ctx.sync_many("products", &items(&["a", "b", "c"]))
+        .await
+        .unwrap();
     let store = health.store().unwrap();
     store.ensure_source("extractor", "products").await.unwrap();
     store
@@ -390,10 +501,25 @@ async fn soak_mode_records_the_verdict_and_gates_nothing() {
     // Quarantined, but enforcement is off: writes stay in the live dataset,
     // carry no stamp, and removal detection still runs. Nothing is gated.
     let summary = ctx.sync_many("products", &items(&["a"])).await.unwrap();
-    assert_eq!(summary.removed.len(), 2, "soak mode must not suppress removals");
-    assert!(datasets.get("extractor", "products@q", "a").await.unwrap().is_none());
-    assert_eq!(datasets.get("extractor", "products", "a").await.unwrap().unwrap().trust, "stable");
-
+    assert_eq!(
+        summary.removed.len(),
+        2,
+        "soak mode must not suppress removals"
+    );
+    assert!(datasets
+        .get("extractor", "products@q", "a")
+        .await
+        .unwrap()
+        .is_none());
+    assert_eq!(
+        datasets
+            .get("extractor", "products", "a")
+            .await
+            .unwrap()
+            .unwrap()
+            .trust,
+        "stable"
+    );
 }
 
 #[tokio::test]
@@ -402,29 +528,47 @@ async fn the_change_feed_holds_back_provisional_revisions_by_default() {
     let storage = &store.storage;
     let health = Arc::new(Resilience::new(
         storage.pool(),
-        &ResilienceConfig { enforce: true, ..cfg() },
+        &ResilienceConfig {
+            enforce: true,
+            ..cfg()
+        },
     ));
     let ctx = ctx(&storage, health.clone());
     let datasets = Datasets::new(storage.pool());
 
-    ctx.upsert_many("products", &items(&["trusted"])).await.unwrap();
+    ctx.upsert_many("products", &items(&["trusted"]))
+        .await
+        .unwrap();
     let store = health.store().unwrap();
     store.ensure_source("extractor", "products").await.unwrap();
     store
         .set_state_manual("extractor/products", SourceState::Degraded, "test")
         .await
         .unwrap();
-    ctx.upsert_many("products", &items(&["doubtful"])).await.unwrap();
+    ctx.upsert_many("products", &items(&["doubtful"]))
+        .await
+        .unwrap();
 
     // Default: only what we stand behind. The pre-degradation revision has no
     // stamp at all and must still be included — that is the NULL-means-stable
     // equivalence, and without it every historical revision would vanish.
     let stable = datasets
-        .changes_page("extractor", Some("products"), None, None, 100, Some("stable"))
+        .changes_page(
+            "extractor",
+            Some("products"),
+            None,
+            None,
+            100,
+            Some("stable"),
+        )
         .await
         .unwrap();
     let keys: Vec<&str> = stable.items.iter().map(|r| r.key.as_str()).collect();
-    assert_eq!(keys, vec!["trusted"], "provisional revision leaked into the default feed");
+    assert_eq!(
+        keys,
+        vec!["trusted"],
+        "provisional revision leaked into the default feed"
+    );
 
     // A consumer that wants everything can always ask, and each revision says
     // which era it came from.
@@ -435,7 +579,6 @@ async fn the_change_feed_holds_back_provisional_revisions_by_default() {
     assert_eq!(all.items.len(), 2);
     let doubtful = all.items.iter().find(|r| r.key == "doubtful").unwrap();
     assert_eq!(doubtful.trust, "provisional");
-
 }
 
 #[tokio::test]
@@ -444,7 +587,11 @@ async fn retention_keeps_the_baseline_window_and_prunes_behind_it() {
     let storage = &store.storage;
     let health = Resilience::new(
         storage.pool(),
-        &ResilienceConfig { window_runs: 3, sketch_retention_runs: 3, ..cfg() },
+        &ResilienceConfig {
+            window_runs: 3,
+            sketch_retention_runs: 3,
+            ..cfg()
+        },
     );
     for _ in 0..8 {
         observe(&health, &cohort(12, "price", ".price", "sturdy")).await;
@@ -460,5 +607,4 @@ async fn retention_keeps_the_baseline_window_and_prunes_behind_it() {
     // is about to compare against.
     let baseline = store.baseline("extractor/products", 3).await.unwrap();
     assert_eq!(baseline.runs("price"), 3);
-
 }

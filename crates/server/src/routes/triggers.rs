@@ -94,7 +94,10 @@ pub(crate) async fn create_trigger(
 ) -> Result<(StatusCode, Json<pumper_core::Trigger>), ApiError> {
     let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, msg);
     if !state.registry.contains_key(&body.target_app) {
-        return Err(ApiError(StatusCode::NOT_FOUND, format!("unknown target app '{}'", body.target_app)));
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("unknown target app '{}'", body.target_app),
+        ));
     }
     // source_app may be a virtual namespace (e.g. cross-source 'grants'), so
     // only the target is required to be a registered app.
@@ -119,11 +122,17 @@ pub(crate) async fn create_trigger(
                 return Err(bad(format!("invalid on_status '{on_status}'")));
             }
             if body.source_dataset.is_some() || body.on_change.is_some() {
-                return Err(bad("source_dataset/on_change are only valid for source_kind 'dataset'".into()));
+                return Err(bad(
+                    "source_dataset/on_change are only valid for source_kind 'dataset'".into(),
+                ));
             }
             (None, None, Some(on_status))
         }
-        other => return Err(bad(format!("invalid source_kind '{other}' (dataset | job)"))),
+        other => {
+            return Err(bad(format!(
+                "invalid source_kind '{other}' (dataset | job)"
+            )))
+        }
     };
     let params = body.params.unwrap_or_else(|| json!({}));
     let trigger = state
@@ -235,7 +244,9 @@ pub(crate) async fn test_trigger(
     let (depth, chain) = match decision {
         crate::triggers::FireDecision::Fire { depth, chain } => (depth, chain),
         crate::triggers::FireDecision::SkipCycle => {
-            return Ok(Json(no_fire("cycle: trigger already in the source job's chain")))
+            return Ok(Json(no_fire(
+                "cycle: trigger already in the source job's chain",
+            )))
         }
         crate::triggers::FireDecision::SkipDepth => {
             return Ok(Json(no_fire("max chain depth reached")))
@@ -255,15 +266,25 @@ pub(crate) async fn test_trigger(
             .filter(|r| crate::triggers::change_matches(trigger.on_change.as_deref(), &r.change))
             .collect();
         if matching.is_empty() {
-            return Ok(Json(no_fire("latest source run produced no matching changes")));
+            return Ok(Json(no_fire(
+                "latest source run produced no matching changes",
+            )));
         }
         let dataset = matching[0].dataset.clone();
         crate::triggers::dataset_trigger_obj(
-            &trigger, &source, &dataset, &matching, depth, &chain, &state.config.triggers,
+            &trigger,
+            &source,
+            &dataset,
+            &matching,
+            depth,
+            &chain,
+            &state.config.triggers,
         )
     } else {
         if !crate::triggers::status_matches(trigger.on_status.as_deref(), source.status.as_str()) {
-            return Ok(Json(no_fire("latest source job's status does not match on_status")));
+            return Ok(Json(no_fire(
+                "latest source job's status does not match on_status",
+            )));
         }
         crate::triggers::terminal_trigger_obj(&trigger, &source, depth, &chain)
     };
@@ -314,7 +335,9 @@ pub(crate) async fn trigger_runs(
         .storage
         .jobs_by_trigger(&id, query.limit.clamp(1, 500))
         .await?;
-    Ok(Json(json!({ "trigger_id": id, "count": jobs.len(), "runs": jobs })))
+    Ok(Json(
+        json!({ "trigger_id": id, "count": jobs.len(), "runs": jobs }),
+    ))
 }
 
 // ---- Webhook delivery log ----------------------------------------------------
@@ -346,7 +369,9 @@ pub(crate) async fn list_deliveries(
             .storage
             .list_deliveries(query.status.as_deref(), limit)
             .await?;
-        return Ok(Json(json!({ "count": deliveries.len(), "deliveries": deliveries })));
+        return Ok(Json(
+            json!({ "count": deliveries.len(), "deliveries": deliveries }),
+        ));
     };
     let after = parse_cursor(cursor);
     let items = state
@@ -410,5 +435,8 @@ pub(crate) async fn replay_delivery(
         delivery.body.into_bytes(),
         secret,
     );
-    Ok((StatusCode::ACCEPTED, Json(json!({ "id": id, "replaying": true }))))
+    Ok((
+        StatusCode::ACCEPTED,
+        Json(json!({ "id": id, "replaying": true })),
+    ))
 }

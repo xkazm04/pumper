@@ -127,7 +127,10 @@ impl HealthStore {
             .bind(source_id(app, dataset))
             .fetch_optional(&self.pool)
             .await?;
-        Ok(state.as_deref().map(SourceState::parse).unwrap_or(SourceState::Healthy))
+        Ok(state
+            .as_deref()
+            .map(SourceState::parse)
+            .unwrap_or(SourceState::Healthy))
     }
 
     /// Health rows, optionally filtered by state or app, worst state first.
@@ -219,8 +222,11 @@ impl HealthStore {
         }
         // Newest-first ordering comes from the job_id list, not from a second
         // ORDER BY: the sketch rows carry no run timestamp of their own.
-        let order: BTreeMap<&str, usize> =
-            job_ids.iter().enumerate().map(|(i, j)| (j.as_str(), i)).collect();
+        let order: BTreeMap<&str, usize> = job_ids
+            .iter()
+            .enumerate()
+            .map(|(i, j)| (j.as_str(), i))
+            .collect();
 
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             "SELECT job_id, field, n, matched, empty, error, container_empty, coerced, \
@@ -238,19 +244,31 @@ impl HealthStore {
 
         let mut per_field: BTreeMap<String, Vec<(usize, FieldSketch)>> = BTreeMap::new();
         for row in rows {
-            let rank = order.get(row.job_id.as_str()).copied().unwrap_or(usize::MAX);
-            per_field.entry(row.field.clone()).or_default().push((rank, row.into()));
+            let rank = order
+                .get(row.job_id.as_str())
+                .copied()
+                .unwrap_or(usize::MAX);
+            per_field
+                .entry(row.field.clone())
+                .or_default()
+                .push((rank, row.into()));
         }
         let mut baseline = Baseline::default();
         for (field, mut runs) in per_field {
             runs.sort_by_key(|(rank, _)| *rank);
-            baseline.fields.insert(field, runs.into_iter().map(|(_, s)| s).collect());
+            baseline
+                .fields
+                .insert(field, runs.into_iter().map(|(_, s)| s).collect());
         }
         Ok(baseline)
     }
 
     /// This run's per-field sketches, for the API's "run vs baseline" view.
-    pub async fn run_sketches(&self, id: &str, job_id: &str) -> Result<BTreeMap<String, FieldSketch>> {
+    pub async fn run_sketches(
+        &self,
+        id: &str,
+        job_id: &str,
+    ) -> Result<BTreeMap<String, FieldSketch>> {
         let rows: Vec<SketchRow> = sqlx::query_as(
             "SELECT job_id, field, n, matched, empty, error, container_empty, coerced, \
                     coercion_failed, len_sum, len_sumsq, len_hist, cls, distinct_ratio, minhash \
@@ -260,7 +278,10 @@ impl HealthStore {
         .bind(job_id)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.into_iter().map(|r| (r.field.clone(), r.into())).collect())
+        Ok(rows
+            .into_iter()
+            .map(|r| (r.field.clone(), r.into()))
+            .collect())
     }
 
     /// Stored fingerprints for the keys this run saw. Chunked because the key set
@@ -464,7 +485,12 @@ impl HealthStore {
                 // A spec that no longer deserializes (an older shape) is dropped
                 // rather than failing the run — it will be re-mined.
                 let kind = serde_json::from_str(&spec).ok()?;
-                Some(Invariant { field, kind, support: support as u32, confidence })
+                Some(Invariant {
+                    field,
+                    kind,
+                    support: support as u32,
+                    confidence,
+                })
             })
             .collect())
     }
@@ -536,7 +562,10 @@ impl HealthStore {
         .bind(MINE_SAMPLE)
         .fetch_all(&self.pool)
         .await?;
-        Ok(rows.iter().filter_map(|d| serde_json::from_str(d).ok()).collect())
+        Ok(rows
+            .iter()
+            .filter_map(|d| serde_json::from_str(d).ok())
+            .collect())
     }
 
     /// Drops sketches and run rows beyond the newest `keep` runs per source — the
@@ -590,7 +619,13 @@ impl Resilience {
 
     /// A service that detects nothing and gates nothing.
     pub fn disabled() -> Self {
-        Self { cfg: ResilienceConfig { enabled: false, ..ResilienceConfig::default() }, store: None }
+        Self {
+            cfg: ResilienceConfig {
+                enabled: false,
+                ..ResilienceConfig::default()
+            },
+            store: None,
+        }
     }
 
     pub fn config(&self) -> &ResilienceConfig {
@@ -625,7 +660,9 @@ impl Resilience {
         match store.state(app, dataset).await {
             Ok(state) => state,
             Err(e) => {
-                tracing::warn!("health state read failed for {app}/{dataset}, assuming healthy: {e}");
+                tracing::warn!(
+                    "health state read failed for {app}/{dataset}, assuming healthy: {e}"
+                );
                 SourceState::Healthy
             }
         }
@@ -658,11 +695,8 @@ impl Resilience {
         let drift = self.cohort_drift(store, &id, run.docs).await?;
         let baseline = store.baseline(&id, self.cfg.window_runs).await?;
         let invariants = store.invariants(&id).await?;
-        let checks: Vec<InvariantCheck> = invariants::check(
-            &invariants,
-            run.docs.iter().map(|d| &d.values),
-            &sketches,
-        );
+        let checks: Vec<InvariantCheck> =
+            invariants::check(&invariants, run.docs.iter().map(|d| &d.values), &sketches);
 
         let eval = detect::evaluate(
             &self.cfg,
@@ -681,7 +715,10 @@ impl Resilience {
             let tripped = eval.tripped(&self.cfg);
             let prior = store.recent_trips(&id, 2, self.cfg.degrade_score).await?;
             let trips = prior + u32::from(tripped);
-            (detect::next_state(previous_state, tripped, eval.severe(&self.cfg), trips), trips)
+            (
+                detect::next_state(previous_state, tripped, eval.severe(&self.cfg), trips),
+                trips,
+            )
         } else {
             (previous_state, source.tripped_of_last3 as u32)
         };
@@ -707,7 +744,8 @@ impl Resilience {
         }
 
         if eval.verdict.baselines() {
-            self.maybe_mine(store, &id, app, run.dataset, &sketches).await;
+            self.maybe_mine(store, &id, app, run.dataset, &sketches)
+                .await;
         }
 
         Ok(Some(SourceVerdict {
@@ -741,10 +779,21 @@ impl Resilience {
         }
         let (mut text, mut dom, mut value) = (Vec::new(), Vec::new(), Vec::new());
         for doc in docs {
-            let Some(before) = prior.get(&doc.key) else { continue };
-            text.push(crate::simhash::drift(before.text_simhash, doc.signals.text_simhash));
-            dom.push(crate::simhash::drift(before.dom_simhash, doc.signals.dom_simhash));
-            value.push(crate::simhash::drift(before.val_simhash, doc.signals.val_simhash));
+            let Some(before) = prior.get(&doc.key) else {
+                continue;
+            };
+            text.push(crate::simhash::drift(
+                before.text_simhash,
+                doc.signals.text_simhash,
+            ));
+            dom.push(crate::simhash::drift(
+                before.dom_simhash,
+                doc.signals.dom_simhash,
+            ));
+            value.push(crate::simhash::drift(
+                before.val_simhash,
+                doc.signals.val_simhash,
+            ));
         }
         if text.is_empty() {
             return Ok(None);
@@ -874,7 +923,10 @@ impl From<RunRow> for SourceRun {
             verdict: r.verdict,
             diagnosis: r.diagnosis,
             score: r.score,
-            reasons: r.reasons.as_deref().and_then(|s| serde_json::from_str(s).ok()),
+            reasons: r
+                .reasons
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok()),
             state_after: r.state_after,
             build_id: r.build_id,
             created_at: r.created_at,
@@ -972,7 +1024,11 @@ mod tests {
     fn sketch_blobs_round_trip_exactly() {
         let mut b = SketchBuilder::new();
         for i in 0..40 {
-            b.push(&FieldStatus::Matched, None, &serde_json::json!(format!("${i}.99")));
+            b.push(
+                &FieldStatus::Matched,
+                None,
+                &serde_json::json!(format!("${i}.99")),
+            );
         }
         let sketch = b.finish();
         assert_eq!(decode_u16(&encode_u16(&sketch.len_hist)), sketch.len_hist);

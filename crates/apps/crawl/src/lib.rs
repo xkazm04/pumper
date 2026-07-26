@@ -66,7 +66,9 @@ impl HttpClient for MeteringHttpClient {
 fn host_of(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = after_scheme.split(['/', '?', '#']).next()?;
-    let authority = authority.rsplit_once('@').map_or(authority, |(_, host)| host);
+    let authority = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, host)| host);
     let host = authority.split(':').next()?;
     (!host.is_empty()).then(|| host.to_lowercase())
 }
@@ -136,9 +138,15 @@ impl PageSink for DatasetPageSink {
         if !live.is_empty() {
             match self.datasets.upsert_many(&self.app, "pages", &live).await {
                 Ok(summary) => {
-                    self.counts.new.fetch_add(summary.new.len(), Ordering::Relaxed);
-                    self.counts.changed.fetch_add(summary.changed.len(), Ordering::Relaxed);
-                    self.counts.unchanged.fetch_add(summary.unchanged, Ordering::Relaxed);
+                    self.counts
+                        .new
+                        .fetch_add(summary.new.len(), Ordering::Relaxed);
+                    self.counts
+                        .changed
+                        .fetch_add(summary.changed.len(), Ordering::Relaxed);
+                    self.counts
+                        .unchanged
+                        .fetch_add(summary.unchanged, Ordering::Relaxed);
                 }
                 Err(e) => tracing::warn!(job = %self.job_id, "crawl pages upsert failed: {e}"),
             }
@@ -212,7 +220,11 @@ impl ScrapeApp for Crawl {
             ctx.params
                 .get(key)
                 .and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(String::from))
+                        .collect()
+                })
                 .unwrap_or_default()
         };
         // Revisit mode seeds the frontier from the `pages` dataset, so `seeds` is
@@ -226,13 +238,24 @@ impl ScrapeApp for Crawl {
         }
 
         let usize_param = |key: &str, default: usize| {
-            ctx.params.get(key).and_then(Value::as_u64).map(|n| n as usize).unwrap_or(default)
+            ctx.params
+                .get(key)
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(default)
         };
         let u32_param = |key: &str, default: u32| {
-            ctx.params.get(key).and_then(Value::as_u64).map(|n| n as u32).unwrap_or(default)
+            ctx.params
+                .get(key)
+                .and_then(Value::as_u64)
+                .map(|n| n as u32)
+                .unwrap_or(default)
         };
         let bool_param = |key: &str, default: bool| {
-            ctx.params.get(key).and_then(Value::as_bool).unwrap_or(default)
+            ctx.params
+                .get(key)
+                .and_then(Value::as_bool)
+                .unwrap_or(default)
         };
 
         let cfg = CrawlConfig {
@@ -263,7 +286,13 @@ impl ScrapeApp for Crawl {
                 .map(|name| {
                     let safe: String = name
                         .chars()
-                        .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                        .map(|c| {
+                            if c.is_alphanumeric() || c == '-' || c == '_' {
+                                c
+                            } else {
+                                '-'
+                            }
+                        })
                         .collect();
                     ctx.artifacts_dir
                         .parent()
@@ -378,15 +407,27 @@ mod tests {
 
     #[test]
     fn extracts_lowercased_host() {
-        assert_eq!(host_of("https://Example.COM/path?q=1"), Some("example.com".into()));
+        assert_eq!(
+            host_of("https://Example.COM/path?q=1"),
+            Some("example.com".into())
+        );
         assert_eq!(host_of("http://example.com"), Some("example.com".into()));
     }
 
     #[test]
     fn strips_port_userinfo_and_path() {
-        assert_eq!(host_of("https://user:pw@host.example:8443/a/b"), Some("host.example".into()));
-        assert_eq!(host_of("https://host.example:443/"), Some("host.example".into()));
-        assert_eq!(host_of("https://host.example/a?x#y"), Some("host.example".into()));
+        assert_eq!(
+            host_of("https://user:pw@host.example:8443/a/b"),
+            Some("host.example".into())
+        );
+        assert_eq!(
+            host_of("https://host.example:443/"),
+            Some("host.example".into())
+        );
+        assert_eq!(
+            host_of("https://host.example/a?x#y"),
+            Some("host.example".into())
+        );
     }
 
     #[test]

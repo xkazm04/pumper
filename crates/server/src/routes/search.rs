@@ -53,7 +53,10 @@ pub(crate) async fn search(
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Value>, ApiError> {
     if query.q.trim().is_empty() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "query 'q' is required".into()));
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "query 'q' is required".into(),
+        ));
     }
     let sort = match query.sort.as_deref() {
         None | Some("score") => pumper_core::SearchSort::Score,
@@ -176,10 +179,16 @@ pub(crate) async fn create_saved_search(
     Json(body): Json<CreateSavedSearchBody>,
 ) -> Result<(StatusCode, Json<pumper_core::SavedSearch>), ApiError> {
     if body.query.trim().is_empty() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "'query' is required".into()));
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "'query' is required".into(),
+        ));
     }
     if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "url must be http(s)".into()));
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "url must be http(s)".into(),
+        ));
     }
     let search = state
         .storage
@@ -211,7 +220,10 @@ pub(crate) async fn delete_saved_search(
     if state.storage.delete_saved_search(&id).await? {
         Ok(Json(json!({ "deleted": true })))
     } else {
-        Err(ApiError(StatusCode::NOT_FOUND, "saved search not found".into()))
+        Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "saved search not found".into(),
+        ))
     }
 }
 
@@ -231,10 +243,17 @@ pub(crate) async fn set_saved_search_enabled(
     Path(id): Path<String>,
     Json(body): Json<EnabledBody>,
 ) -> Result<Json<Value>, ApiError> {
-    if state.storage.set_saved_search_enabled(&id, body.enabled).await? {
+    if state
+        .storage
+        .set_saved_search_enabled(&id, body.enabled)
+        .await?
+    {
         Ok(Json(json!({ "id": id, "enabled": body.enabled })))
     } else {
-        Err(ApiError(StatusCode::NOT_FOUND, "saved search not found".into()))
+        Err(ApiError(
+            StatusCode::NOT_FOUND,
+            "saved search not found".into(),
+        ))
     }
 }
 
@@ -259,7 +278,10 @@ pub(crate) async fn delete_search_docs(
     Json(body): Json<DeleteDocsBody>,
 ) -> Result<Json<Value>, ApiError> {
     if body.ids.is_empty() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "'ids' must be non-empty".into()));
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "'ids' must be non-empty".into(),
+        ));
     }
     let count = body.ids.len();
     state.search.delete_ids(&body.ids).await?;
@@ -282,5 +304,7 @@ pub(crate) async fn delete_search_dataset(
     Path((app, dataset)): Path<(String, String)>,
 ) -> Result<Json<Value>, ApiError> {
     state.search.delete_dataset(&app, &dataset).await?;
-    Ok(Json(json!({ "app": app, "dataset": dataset, "deleted": true })))
+    Ok(Json(
+        json!({ "app": app, "dataset": dataset, "deleted": true }),
+    ))
 }

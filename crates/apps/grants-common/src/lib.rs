@@ -66,7 +66,12 @@ pub async fn finalize_unified(
     let swept = sweep_closed(ctx).await?;
     let cross_source_dups = link_duplicates(ctx, DUP_DISTANCE).await?;
     let warnings = drift_warnings(unified_items);
-    Ok(UnifiedOutcome { unified, swept, cross_source_dups, warnings })
+    Ok(UnifiedOutcome {
+        unified,
+        swept,
+        cross_source_dups,
+        warnings,
+    })
 }
 
 /// Normalizes a grants.gov Search2 `oppHits[]` entry. Award amounts are not
@@ -181,7 +186,10 @@ pub fn normalize_eu_sedia(rec: &Value) -> Option<(String, Value)> {
 /// SEDIA has no agency column; the framework programme (e.g. "Horizon Europe")
 /// is the honest analogue, qualified by the call identifier when present.
 fn sedia_agency(rec: &Value) -> Value {
-    match (str_of(rec, &["frameworkProgramme"]), str_of(rec, &["callIdentifier"])) {
+    match (
+        str_of(rec, &["frameworkProgramme"]),
+        str_of(rec, &["callIdentifier"]),
+    ) {
         (Some(fp), Some(call)) => Value::String(format!("{fp} — {call}")),
         (Some(fp), None) => Value::String(fp),
         (None, Some(call)) => Value::String(call),
@@ -221,7 +229,11 @@ fn sedia_status(code: Option<&str>) -> Value {
 /// passes. Accepts an array or a lone value; unparseable/absent → `None`.
 fn sedia_close_date(deadline: &Value, today: chrono::NaiveDate) -> Option<String> {
     let mut dates: Vec<chrono::NaiveDate> = match deadline {
-        Value::Array(a) => a.iter().filter_map(Value::as_str).filter_map(parse_date).collect(),
+        Value::Array(a) => a
+            .iter()
+            .filter_map(Value::as_str)
+            .filter_map(parse_date)
+            .collect(),
         Value::String(s) => parse_date(s).into_iter().collect(),
         _ => Vec::new(),
     };
@@ -238,11 +250,10 @@ fn sedia_close_date(deadline: &Value, today: chrono::NaiveDate) -> Option<String
 }
 
 /// Upserts normalized grants into the cross-source unified dataset.
-pub async fn sync_unified(
-    ctx: &AppContext,
-    items: &[(String, Value)],
-) -> Result<UpsertSummary> {
-    ctx.datasets.upsert_many(UNIFIED_APP, UNIFIED_DATASET, items).await
+pub async fn sync_unified(ctx: &AppContext, items: &[(String, Value)]) -> Result<UpsertSummary> {
+    ctx.datasets
+        .upsert_many(UNIFIED_APP, UNIFIED_DATASET, items)
+        .await
 }
 
 /// Lifecycle sweep for the upsert-only unified dataset: these sources only
@@ -266,7 +277,10 @@ pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
     // pragmatic win.)
     let mut rows = Vec::new();
     for status in ["open", "forecasted"] {
-        let filter = [JsonFilter::Eq { path: "$.status".into(), value: status.into() }];
+        let filter = [JsonFilter::Eq {
+            path: "$.status".into(),
+            value: status.into(),
+        }];
         rows.extend(
             ctx.datasets
                 .list_filtered(UNIFIED_APP, UNIFIED_DATASET, &filter, None, 1_000_000)
@@ -285,7 +299,9 @@ pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
         updates.push((rec.key, updated));
     }
     if !updates.is_empty() {
-        ctx.datasets.upsert_many(UNIFIED_APP, UNIFIED_DATASET, &updates).await?;
+        ctx.datasets
+            .upsert_many(UNIFIED_APP, UNIFIED_DATASET, &updates)
+            .await?;
     }
     Ok(updates.len())
 }
@@ -294,7 +310,11 @@ pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
 /// `close_date` parses and is strictly before `today` should flip to `closed`.
 /// A missing/unparseable close date, a future/today date, or any other status
 /// is left untouched (a deadline that is exactly today has not passed).
-fn is_past_due_open(status: Option<&str>, close_date: Option<&str>, today: chrono::NaiveDate) -> bool {
+fn is_past_due_open(
+    status: Option<&str>,
+    close_date: Option<&str>,
+    today: chrono::NaiveDate,
+) -> bool {
     matches!(status, Some("open") | Some("forecasted"))
         && close_date.and_then(parse_date).is_some_and(|d| d < today)
 }
@@ -351,7 +371,9 @@ pub async fn link_duplicates(ctx: &AppContext, max_distance: u32) -> Result<usiz
         })
         .collect();
     if !items.is_empty() {
-        ctx.datasets.upsert_many(UNIFIED_APP, DUP_DATASET, &items).await?;
+        ctx.datasets
+            .upsert_many(UNIFIED_APP, DUP_DATASET, &items)
+            .await?;
     }
     Ok(items.len())
 }
@@ -421,7 +443,8 @@ fn scan_amounts(s: &str) -> Vec<f64> {
             continue;
         }
         let start = i;
-        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b',' || bytes[i] == b'.') {
+        while i < bytes.len() && (bytes[i].is_ascii_digit() || bytes[i] == b',' || bytes[i] == b'.')
+        {
             i += 1;
         }
         let digits: String = s[start..i].chars().filter(|c| *c != ',').collect();
@@ -481,7 +504,11 @@ fn money_range(rec: &Value, fields: &[&str]) -> (Value, Value) {
         let amounts = match rec.get(*f) {
             Some(Value::Number(n)) => {
                 let v = n.as_f64().unwrap_or(0.0);
-                if v > 0.0 { vec![v] } else { vec![] }
+                if v > 0.0 {
+                    vec![v]
+                } else {
+                    vec![]
+                }
             }
             Some(Value::String(s)) => scan_amounts(s),
             _ => vec![],
@@ -585,8 +612,14 @@ mod tests {
         assert_eq!(v["award_floor"], json!(100_000.0));
         assert_eq!(v["award_ceiling"], json!(10_000_000.0));
         // "; "-split taxonomies; CA has no ALN.
-        assert_eq!(v["categories"], json!(["Environment & Water", "Disadvantaged Communities"]));
-        assert_eq!(v["eligibilities"], json!(["Public Agency", "Tribal Government"]));
+        assert_eq!(
+            v["categories"],
+            json!(["Environment & Water", "Disadvantaged Communities"])
+        );
+        assert_eq!(
+            v["eligibilities"],
+            json!(["Public Agency", "Tribal Government"])
+        );
         assert_eq!(v["aln"], Value::Null);
     }
 
@@ -607,7 +640,10 @@ mod tests {
 
         // Ranges (real EstAmounts strings).
         let r = |s: &str| money_range(&json!({ "v": s }), &["v"]);
-        assert_eq!(r("Between $100,000 and $10,000,000"), (json!(100_000.0), json!(10_000_000.0)));
+        assert_eq!(
+            r("Between $100,000 and $10,000,000"),
+            (json!(100_000.0), json!(10_000_000.0))
+        );
         assert_eq!(r("$100k-$500k"), (json!(100_000.0), json!(500_000.0)));
         // Lone value collapses to (v, v).
         assert_eq!(r("$250,000"), (json!(250_000.0), json!(250_000.0)));
@@ -629,8 +665,14 @@ mod tests {
         // ISO date.
         assert_eq!(parse_date("2026-09-30").unwrap().to_string(), "2026-09-30");
         // CA portal space-separated datetime + ISO 'T' datetime → date prefix.
-        assert_eq!(parse_date("2026-11-02 23:59:00").unwrap().to_string(), "2026-11-02");
-        assert_eq!(parse_date("2026-11-02T23:59:00Z").unwrap().to_string(), "2026-11-02");
+        assert_eq!(
+            parse_date("2026-11-02 23:59:00").unwrap().to_string(),
+            "2026-11-02"
+        );
+        assert_eq!(
+            parse_date("2026-11-02T23:59:00Z").unwrap().to_string(),
+            "2026-11-02"
+        );
         // Empty / unparseable → None.
         assert!(parse_date("").is_none());
         assert!(parse_date("   ").is_none());
@@ -646,7 +688,11 @@ mod tests {
         let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
         // Past-due open / forecasted → flip.
         assert!(is_past_due_open(Some("open"), Some("2026-07-12"), today));
-        assert!(is_past_due_open(Some("forecasted"), Some("07/12/2026"), today));
+        assert!(is_past_due_open(
+            Some("forecasted"),
+            Some("07/12/2026"),
+            today
+        ));
         // Deadline exactly today has not passed → leave.
         assert!(!is_past_due_open(Some("open"), Some("2026-07-13"), today));
         // Future, already-closed, missing/unparseable date → leave.
@@ -714,13 +760,22 @@ mod tests {
         let d = |s: &str| Value::String(s.to_string());
         // All future → earliest.
         let all_future = json!([d("2026-09-01"), d("2026-08-01")]);
-        assert_eq!(sedia_close_date(&all_future, today).as_deref(), Some("2026-08-01"));
+        assert_eq!(
+            sedia_close_date(&all_future, today).as_deref(),
+            Some("2026-08-01")
+        );
         // Mixed → earliest that is >= today (a passed first cutoff is skipped).
         let mixed = json!([d("2026-03-01"), d("2026-09-01")]);
-        assert_eq!(sedia_close_date(&mixed, today).as_deref(), Some("2026-09-01"));
+        assert_eq!(
+            sedia_close_date(&mixed, today).as_deref(),
+            Some("2026-09-01")
+        );
         // All past → latest (so the sweep can retire it).
         let all_past = json!([d("2026-01-01"), d("2026-05-01")]);
-        assert_eq!(sedia_close_date(&all_past, today).as_deref(), Some("2026-05-01"));
+        assert_eq!(
+            sedia_close_date(&all_past, today).as_deref(),
+            Some("2026-05-01")
+        );
         // Absent / unparseable → None (forecasted topics legitimately lack one).
         assert_eq!(sedia_close_date(&Value::Null, today), None);
         assert_eq!(sedia_close_date(&json!([d("n/a")]), today), None);
@@ -733,11 +788,13 @@ mod tests {
 
     #[test]
     fn drift_warnings_fire_only_on_majority_null_titles() {
-        let with_title = |t: Option<&str>| {
-            ("k".to_string(), json!({ "title": t }))
-        };
+        let with_title = |t: Option<&str>| ("k".to_string(), json!({ "title": t }));
         // Mostly-present titles: no warning.
-        let ok = vec![with_title(Some("A")), with_title(Some("B")), with_title(None)];
+        let ok = vec![
+            with_title(Some("A")),
+            with_title(Some("B")),
+            with_title(None),
+        ];
         assert!(drift_warnings(&ok).is_empty());
         // Majority null: warning.
         let bad = vec![with_title(None), with_title(None), with_title(Some("C"))];

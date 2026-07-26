@@ -55,12 +55,18 @@ pub async fn research_json(
 /// The `year` param an agentic trades app was refreshed for. Central so the four
 /// apps parse the vintage identically.
 pub fn year_param<'a>(ctx: &'a AppContext, default: &'a str) -> &'a str {
-    ctx.params.get("year").and_then(Value::as_str).unwrap_or(default)
+    ctx.params
+        .get("year")
+        .and_then(Value::as_str)
+        .unwrap_or(default)
 }
 
 /// Whether a re-run is being forced (`force: true`), bypassing every freshness gate.
 pub fn forced(ctx: &AppContext) -> bool {
-    ctx.params.get("force").and_then(Value::as_bool).unwrap_or(false)
+    ctx.params
+        .get("force")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// **Vintage freshness gate** for the frozen-fact apps (`state-tax`,
@@ -83,7 +89,12 @@ pub async fn vintage_held(
         .datasets
         .get(app, dataset, sentinel_key)
         .await?
-        .and_then(|r| r.data.get("year").and_then(Value::as_str).map(str::to_string));
+        .and_then(|r| {
+            r.data
+                .get("year")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
     Ok(held.as_deref() == Some(year))
 }
 
@@ -128,14 +139,23 @@ pub async fn fresh_by_age_where(
         path: path.to_string(),
         value: value.to_string(),
     }];
-    let recs = ctx.datasets.list_filtered(app, dataset, &filter, None, 1).await?;
-    let age = recs.first().map(|r| (chrono::Utc::now() - r.updated_at).num_days().max(0));
+    let recs = ctx
+        .datasets
+        .list_filtered(app, dataset, &filter, None, 1)
+        .await?;
+    let age = recs
+        .first()
+        .map(|r| (chrono::Utc::now() - r.updated_at).num_days().max(0));
     Ok(age.is_some_and(|a| a < max_age_days))
 }
 
 /// Reads the `max_age_days` param (default `default_days`), clamped to `>= 0`.
 pub fn max_age_days(ctx: &AppContext, default_days: i64) -> i64 {
-    ctx.params.get("max_age_days").and_then(Value::as_i64).map(|d| d.max(0)).unwrap_or(default_days)
+    ctx.params
+        .get("max_age_days")
+        .and_then(Value::as_i64)
+        .map(|d| d.max(0))
+        .unwrap_or(default_days)
 }
 
 /// Plausibility validation for parsed trades records. These are cheap sanity
@@ -379,10 +399,16 @@ pub mod taxonomy {
         fn normalizes_common_variants() {
             assert_eq!(Trade::from_label("Plumbing"), Some(Trade::Plumbing));
             assert_eq!(Trade::from_label("plumber"), Some(Trade::Plumbing));
-            assert_eq!(Trade::from_label("Electrical services"), Some(Trade::Electrical));
+            assert_eq!(
+                Trade::from_label("Electrical services"),
+                Some(Trade::Electrical)
+            );
             assert_eq!(Trade::from_label("HVAC/R"), Some(Trade::Hvac));
             assert_eq!(Trade::from_label("Heating & Cooling"), Some(Trade::Hvac));
-            assert_eq!(Trade::from_label("Pool maintenance"), Some(Trade::PoolService));
+            assert_eq!(
+                Trade::from_label("Pool maintenance"),
+                Some(Trade::PoolService)
+            );
             assert_eq!(Trade::from_label("Lawn care"), Some(Trade::Landscaping));
             assert_eq!(Trade::from_label("Landscaping"), Some(Trade::Landscaping));
         }
@@ -401,7 +427,10 @@ pub mod taxonomy {
 
         #[test]
         fn prompt_list_is_the_five_canonical_labels() {
-            assert_eq!(prompt_list(), "Plumbing, Electrical, HVAC, Landscaping, Pool service");
+            assert_eq!(
+                prompt_list(),
+                "Plumbing, Electrical, HVAC, Landscaping, Pool service"
+            );
         }
 
         #[test]
@@ -468,8 +497,10 @@ pub mod unified {
 
         // All priced jobs. Cap raised well past 51 localities × 5 trades × 4 jobs
         // (≈1020) so the summary can't silently truncate once localities are driven.
-        let pricing_recs =
-            ctx.datasets.list("homewyse-pricing", "pricing", PRICING_READ_LIMIT).await?;
+        let pricing_recs = ctx
+            .datasets
+            .list("homewyse-pricing", "pricing", PRICING_READ_LIMIT)
+            .await?;
         let pricing: Vec<&Value> = pricing_recs.iter().map(|r| &r.data).collect();
 
         let mut items: Vec<(String, Value)> = Vec::new();
@@ -673,9 +704,7 @@ pub mod unified {
 
         #[test]
         fn summarize_pricing_isolates_by_locality_no_contamination() {
-            let job = |trade: &str, locality: &str, med: f64| {
-                json!({ "trade": trade, "locality": locality, "low": med - 10.0, "median": med, "high": med + 10.0 })
-            };
+            let job = |trade: &str, locality: &str, med: f64| json!({ "trade": trade, "locality": locality, "low": med - 10.0, "median": med, "high": med + 10.0 });
             let rows = [
                 job("Plumbing", "United States", 300.0),
                 job("Plumbing", "Texas", 250.0), // must NOT pollute the national envelope

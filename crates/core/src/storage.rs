@@ -128,7 +128,10 @@ impl Storage {
             .await
             .map_err(|e| Error::Storage(sqlx::Error::Migrate(Box::new(e))))?;
 
-        Ok(Self { pool, artifacts_dir: cfg.artifacts_dir.clone() })
+        Ok(Self {
+            pool,
+            artifacts_dir: cfg.artifacts_dir.clone(),
+        })
     }
 
     /// Shares the underlying pool with sibling stores (cache, datasets) so they
@@ -427,7 +430,9 @@ impl Storage {
         after: Option<(String, String)>,
         limit: i64,
     ) -> Result<Vec<Job>> {
-        let (after_ts, after_id) = after.map(|(t, i)| (Some(t), Some(i))).unwrap_or((None, None));
+        let (after_ts, after_id) = after
+            .map(|(t, i)| (Some(t), Some(i)))
+            .unwrap_or((None, None));
         let sql = format!(
             "SELECT {JOB_COLUMNS} FROM jobs \
              WHERE (?1 IS NULL OR app = ?1) AND (?2 IS NULL OR status = ?2) \
@@ -459,11 +464,10 @@ impl Storage {
     /// rows in the `failed` state (a job later retried leaves the set), so it is
     /// not a strictly monotonic process counter.
     pub async fn failure_counts(&self) -> Result<Vec<(String, i64)>> {
-        let rows: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT app, COUNT(*) FROM jobs WHERE status = 'failed' GROUP BY app",
-        )
-        .fetch_all(&self.pool)
-        .await?;
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT app, COUNT(*) FROM jobs WHERE status = 'failed' GROUP BY app")
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows)
     }
 
@@ -540,11 +544,12 @@ impl Storage {
 
     /// Re-queues jobs left in `running` by a previous crash/shutdown.
     pub async fn recover_stuck(&self) -> Result<u64> {
-        let result =
-            sqlx::query("UPDATE jobs SET status = 'queued', available_at = ?1 WHERE status = 'running'")
-                .bind(now())
-                .execute(&self.pool)
-                .await?;
+        let result = sqlx::query(
+            "UPDATE jobs SET status = 'queued', available_at = ?1 WHERE status = 'running'",
+        )
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected())
     }
 
@@ -578,7 +583,10 @@ impl Storage {
             "SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'running' \
              AND COALESCE(heartbeat_at, started_at, created_at) < ?1"
         );
-        let rows: Vec<JobRow> = sqlx::query_as(&sql).bind(&cutoff).fetch_all(&self.pool).await?;
+        let rows: Vec<JobRow> = sqlx::query_as(&sql)
+            .bind(&cutoff)
+            .fetch_all(&self.pool)
+            .await?;
         let mut reaped = Vec::new();
         for row in rows {
             let job = Job::try_from(row)?;
@@ -884,7 +892,11 @@ impl Storage {
     }
 
     /// Enabled triggers of one source kind for an app — the evaluation set.
-    pub async fn enabled_triggers(&self, source_kind: &str, source_app: &str) -> Result<Vec<Trigger>> {
+    pub async fn enabled_triggers(
+        &self,
+        source_kind: &str,
+        source_app: &str,
+    ) -> Result<Vec<Trigger>> {
         let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
             "SELECT {TRIGGER_COLUMNS} FROM triggers \
              WHERE source_kind = ?1 AND source_app = ?2 AND enabled = 1"
@@ -1136,7 +1148,9 @@ impl Storage {
         // Jitter up to +25% to de-sync a herd of deliveries that all failed during
         // the same receiver outage. Deterministic seed (no wall-clock RNG): the id
         // bytes plus the retry count.
-        let seed = id.bytes().fold(retry_count as u64, |a, b| a.wrapping_mul(31).wrapping_add(b as u64));
+        let seed = id.bytes().fold(retry_count as u64, |a, b| {
+            a.wrapping_mul(31).wrapping_add(b as u64)
+        });
         let jitter = (crate::jitter::lcg_fraction(seed) * (base as f64) * 0.25) as i64;
         let next = Utc::now() + chrono::Duration::seconds(base + jitter);
         sqlx::query(
@@ -1187,11 +1201,7 @@ impl Storage {
 
     /// Deliveries, newest first, optionally filtered by status (`failed` is the
     /// dead-letter view). Bodies excluded — fetch one by id for the payload.
-    pub async fn list_deliveries(
-        &self,
-        status: Option<&str>,
-        limit: i64,
-    ) -> Result<Vec<Delivery>> {
+    pub async fn list_deliveries(&self, status: Option<&str>, limit: i64) -> Result<Vec<Delivery>> {
         let rows: Vec<DeliveryRow> = sqlx::query_as(
             "SELECT id, kind, ref_id, url, event, '' AS body, status, attempts, last_error, \
              created_at, updated_at FROM webhook_deliveries \
@@ -1561,7 +1571,9 @@ impl TryFrom<ScheduleRow> for Schedule {
 /// Splits an optional keyset cursor pair into two bind-ready Options, so a
 /// single SQL `WHERE (?1 IS NULL OR ...)` clause covers the first-page case.
 fn split_after(after: Option<(String, String)>) -> (Option<String>, Option<String>) {
-    after.map(|(t, i)| (Some(t), Some(i))).unwrap_or((None, None))
+    after
+        .map(|(t, i)| (Some(t), Some(i)))
+        .unwrap_or((None, None))
 }
 
 /// Fixed-width RFC 3339 UTC ("...Z", µs precision) so that lexicographic

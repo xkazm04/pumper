@@ -47,7 +47,9 @@ pub(crate) async fn list_schedules(
         format!("{}|{}", pumper_core::datasets::ts(s.created_at), s.id)
     });
     let enriched = enrich_schedules(&state, items).await?;
-    Ok(Json(json!({ "items": enriched, "next_cursor": next_cursor })))
+    Ok(Json(
+        json!({ "items": enriched, "next_cursor": next_cursor }),
+    ))
 }
 
 /// Enriches each schedule with the observability fields the raw row can't carry:
@@ -127,7 +129,10 @@ pub(crate) async fn create_schedule(
     Json(body): Json<CreateScheduleBody>,
 ) -> Result<(StatusCode, Json<Schedule>), ApiError> {
     if !state.registry.contains_key(&body.app) {
-        return Err(ApiError(StatusCode::NOT_FOUND, format!("unknown app '{}'", body.app)));
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("unknown app '{}'", body.app),
+        ));
     }
     // Validate the cron expression up front.
     use std::str::FromStr;
@@ -201,7 +206,11 @@ pub(crate) async fn set_schedule_enabled(
     Path(id): Path<String>,
     Json(body): Json<EnabledBody>,
 ) -> Result<Json<Value>, ApiError> {
-    if state.storage.set_schedule_enabled(&id, body.enabled).await? {
+    if state
+        .storage
+        .set_schedule_enabled(&id, body.enabled)
+        .await?
+    {
         Ok(Json(json!({ "id": id, "enabled": body.enabled })))
     } else {
         Err(ApiError(StatusCode::NOT_FOUND, "schedule not found".into()))

@@ -84,8 +84,7 @@ pub(crate) async fn reconcile(
     // A firing more than two ticks late was missed while the scheduler was down
     // (a healthy tick catches a due firing within one interval). This is the
     // grace window that separates an on-time run from a backlog misfire.
-    let grace =
-        chrono::Duration::seconds(state.config.worker.schedule_tick_secs.max(1) as i64 * 2);
+    let grace = chrono::Duration::seconds(state.config.worker.schedule_tick_secs.max(1) as i64 * 2);
     for schedule in state.storage.list_schedules().await? {
         if !schedule.enabled {
             continue;
@@ -129,7 +128,9 @@ pub(crate) async fn reconcile(
                 }
 
                 let params = resolve_params(state, &schedule);
-                let max_attempts = schedule.max_attempts.unwrap_or(DEFAULT_SCHEDULE_MAX_ATTEMPTS);
+                let max_attempts = schedule
+                    .max_attempts
+                    .unwrap_or(DEFAULT_SCHEDULE_MAX_ATTEMPTS);
                 let opts = EnqueueOptions {
                     params,
                     max_attempts,
@@ -182,7 +183,9 @@ pub fn project_next_run(schedule: &Schedule) -> Option<DateTime<Utc>> {
     let cron = CronSchedule::from_str(&schedule.cron).ok()?;
     let tz = parse_tz(schedule.timezone.as_deref());
     let reference = schedule.last_run.unwrap_or(schedule.created_at);
-    cron.after(&reference.with_timezone(&tz)).next().map(|t| t.with_timezone(&Utc))
+    cron.after(&reference.with_timezone(&tz))
+        .next()
+        .map(|t| t.with_timezone(&Utc))
 }
 
 /// Decides a schedule's action this tick — pure (no I/O), so it is unit-testable
@@ -282,7 +285,10 @@ mod tests {
         let reference = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 30).unwrap();
         // Next hourly firing after 12:00 is 13:00 — not yet due.
-        assert_eq!(decide(&cron(HOURLY), Tz::UTC, reference, now, false, GRACE), Action::Idle);
+        assert_eq!(
+            decide(&cron(HOURLY), Tz::UTC, reference, now, false, GRACE),
+            Action::Idle
+        );
     }
 
     fn schedule(cron: &str, tz: Option<&str>, last_run: Option<DateTime<Utc>>) -> Schedule {
@@ -310,7 +316,11 @@ mod tests {
             Some(Utc.with_ymd_and_hms(2026, 7, 13, 10, 0, 0).unwrap())
         );
         // Ran at 12:00 → next hourly firing after is 13:00.
-        let ran = schedule(HOURLY, None, Some(Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap()));
+        let ran = schedule(
+            HOURLY,
+            None,
+            Some(Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap()),
+        );
         assert_eq!(
             project_next_run(&ran),
             Some(Utc.with_ymd_and_hms(2026, 7, 13, 13, 0, 0).unwrap())

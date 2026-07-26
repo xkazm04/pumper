@@ -67,7 +67,10 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
     let mut out = String::new();
     out.push_str("# HELP pumper_jobs Jobs by status\n# TYPE pumper_jobs gauge\n");
     for status in ["queued", "running", "succeeded", "failed", "cancelled"] {
-        let n = counts.iter().find(|(s, _)| s == status).map_or(0, |(_, n)| *n);
+        let n = counts
+            .iter()
+            .find(|(s, _)| s == status)
+            .map_or(0, |(_, n)| *n);
         out.push_str(&format!("pumper_jobs{{status=\"{status}\"}} {n}\n"));
     }
     // Permanent failures per app. DB-derived (current `failed` row count per app),
@@ -91,7 +94,10 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
         "# HELP pumper_job_duration_seconds_max Longest job execution time\n\
          # TYPE pumper_job_duration_seconds_max gauge\n",
     );
-    out.push_str(&format!("pumper_job_duration_seconds_max {}\n", timing.duration_max));
+    out.push_str(&format!(
+        "pumper_job_duration_seconds_max {}\n",
+        timing.duration_max
+    ));
     out.push_str(
         "# HELP pumper_job_queue_wait_seconds Queue wait (created -> started)\n\
          # TYPE pumper_job_queue_wait_seconds summary\n",
@@ -104,8 +110,13 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
         "# HELP pumper_job_queue_wait_seconds_max Longest queue wait\n\
          # TYPE pumper_job_queue_wait_seconds_max gauge\n",
     );
-    out.push_str(&format!("pumper_job_queue_wait_seconds_max {}\n", timing.wait_max));
-    out.push_str("# HELP pumper_cost_usd Total engine spend by app\n# TYPE pumper_cost_usd gauge\n");
+    out.push_str(&format!(
+        "pumper_job_queue_wait_seconds_max {}\n",
+        timing.wait_max
+    ));
+    out.push_str(
+        "# HELP pumper_cost_usd Total engine spend by app\n# TYPE pumper_cost_usd gauge\n",
+    );
     for entry in state.costs.summary(None, None).await? {
         out.push_str(&format!(
             "pumper_cost_usd{{app=\"{}\",engine=\"{}\"}} {}\n",

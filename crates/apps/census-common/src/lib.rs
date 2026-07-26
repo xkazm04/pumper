@@ -15,7 +15,8 @@ use serde_json::Value;
 /// values as negative sentinels (e.g. `-666666666`), so parsing them as real
 /// numbers corrupts every total they reach.
 pub fn census_num(cell: Option<&String>) -> Option<i64> {
-    cell.and_then(|s| s.trim().parse::<i64>().ok()).filter(|v| *v >= 0)
+    cell.and_then(|s| s.trim().parse::<i64>().ok())
+        .filter(|v| *v >= 0)
 }
 
 /// Resolves the free Census API key: `params.api_key`, else env
@@ -41,17 +42,58 @@ pub fn api_key(ctx: &AppContext, app: &str) -> Result<String> {
 /// unchanged so unexpected geographies stay traceable rather than becoming "??".
 pub fn state_abbr(fips: &str) -> &str {
     match fips {
-        "01" => "AL", "02" => "AK", "04" => "AZ", "05" => "AR", "06" => "CA",
-        "08" => "CO", "09" => "CT", "10" => "DE", "11" => "DC", "12" => "FL",
-        "13" => "GA", "15" => "HI", "16" => "ID", "17" => "IL", "18" => "IN",
-        "19" => "IA", "20" => "KS", "21" => "KY", "22" => "LA", "23" => "ME",
-        "24" => "MD", "25" => "MA", "26" => "MI", "27" => "MN", "28" => "MS",
-        "29" => "MO", "30" => "MT", "31" => "NE", "32" => "NV", "33" => "NH",
-        "34" => "NJ", "35" => "NM", "36" => "NY", "37" => "NC", "38" => "ND",
-        "39" => "OH", "40" => "OK", "41" => "OR", "42" => "PA", "44" => "RI",
-        "45" => "SC", "46" => "SD", "47" => "TN", "48" => "TX", "49" => "UT",
-        "50" => "VT", "51" => "VA", "53" => "WA", "54" => "WV", "55" => "WI",
-        "56" => "WY", "72" => "PR",
+        "01" => "AL",
+        "02" => "AK",
+        "04" => "AZ",
+        "05" => "AR",
+        "06" => "CA",
+        "08" => "CO",
+        "09" => "CT",
+        "10" => "DE",
+        "11" => "DC",
+        "12" => "FL",
+        "13" => "GA",
+        "15" => "HI",
+        "16" => "ID",
+        "17" => "IL",
+        "18" => "IN",
+        "19" => "IA",
+        "20" => "KS",
+        "21" => "KY",
+        "22" => "LA",
+        "23" => "ME",
+        "24" => "MD",
+        "25" => "MA",
+        "26" => "MI",
+        "27" => "MN",
+        "28" => "MS",
+        "29" => "MO",
+        "30" => "MT",
+        "31" => "NE",
+        "32" => "NV",
+        "33" => "NH",
+        "34" => "NJ",
+        "35" => "NM",
+        "36" => "NY",
+        "37" => "NC",
+        "38" => "ND",
+        "39" => "OH",
+        "40" => "OK",
+        "41" => "OR",
+        "42" => "PA",
+        "44" => "RI",
+        "45" => "SC",
+        "46" => "SD",
+        "47" => "TN",
+        "48" => "TX",
+        "49" => "UT",
+        "50" => "VT",
+        "51" => "VA",
+        "53" => "WA",
+        "54" => "WV",
+        "55" => "WI",
+        "56" => "WY",
+        "72" => "PR",
         other => other,
     }
 }

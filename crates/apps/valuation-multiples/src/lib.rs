@@ -69,12 +69,14 @@ impl ScrapeApp for ValuationMultiples {
         // ~25-turn agentic run for a recent refresh unless `force: true`.
         let max_age = trades_common::max_age_days(&ctx, 90);
         let sentinel = format!("US:{}", taxonomy::Trade::ALL[0].label());
-        if trades_common::fresh_by_age(
-            &ctx, "valuation-multiples", "valuation", &sentinel, max_age,
-        )
-        .await?
+        if trades_common::fresh_by_age(&ctx, "valuation-multiples", "valuation", &sentinel, max_age)
+            .await?
         {
-            let held = ctx.datasets.list("valuation-multiples", "valuation", 100).await?.len();
+            let held = ctx
+                .datasets
+                .list("valuation-multiples", "valuation", 100)
+                .await?
+                .len();
             return Ok(json!({
                 "source": format!("agentic/valuation/{year}"),
                 "year": year,
@@ -102,8 +104,16 @@ impl ScrapeApp for ValuationMultiples {
 
         let mut request = ResearchRequest::new(prompt).with_role(role);
         request.max_turns = max_turns;
-        request.model = ctx.params.get("model").and_then(Value::as_str).map(String::from);
-        request.effort = ctx.params.get("effort").and_then(Value::as_str).map(String::from);
+        request.model = ctx
+            .params
+            .get("model")
+            .and_then(Value::as_str)
+            .map(String::from);
+        request.effort = ctx
+            .params
+            .get("effort")
+            .and_then(Value::as_str)
+            .map(String::from);
         // Constrain the final answer to the multiples schema (`claude --json-schema`);
         // salvage_json below still catches anything the schema path misses.
         request.json_schema = Some(multiples_schema());

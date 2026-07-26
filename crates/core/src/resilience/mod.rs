@@ -408,25 +408,44 @@ mod tests {
     fn quarantine_write_target_is_idempotent() {
         assert_eq!(write_dataset("products", SourceState::Healthy), "products");
         assert_eq!(write_dataset("products", SourceState::Degraded), "products");
-        assert_eq!(write_dataset("products", SourceState::Quarantined), "products@q");
+        assert_eq!(
+            write_dataset("products", SourceState::Quarantined),
+            "products@q"
+        );
         // Never double-suffixed: the shadow dataset's own runs stay in place.
-        assert_eq!(write_dataset("products@q", SourceState::Quarantined), "products@q");
+        assert_eq!(
+            write_dataset("products@q", SourceState::Quarantined),
+            "products@q"
+        );
     }
 
     #[test]
     fn doc_signals_move_independently_for_content_and_markup() {
         let values = serde_json::json!({ "title": "A" });
-        let a = doc_signals("<div class=\"card\"><h1>Hello world here</h1></div>", &values);
+        let a = doc_signals(
+            "<div class=\"card\"><h1>Hello world here</h1></div>",
+            &values,
+        );
         // Same markup, different words.
-        let text_changed =
-            doc_signals("<div class=\"card\"><h1>Totally other words</h1></div>", &values);
+        let text_changed = doc_signals(
+            "<div class=\"card\"><h1>Totally other words</h1></div>",
+            &values,
+        );
         // Same words, different markup.
-        let dom_changed =
-            doc_signals("<section class=\"tile\"><h1>Hello world here</h1></section>", &values);
+        let dom_changed = doc_signals(
+            "<section class=\"tile\"><h1>Hello world here</h1></section>",
+            &values,
+        );
 
-        assert_eq!(a.dom_simhash, text_changed.dom_simhash, "markup fingerprint is text-blind");
+        assert_eq!(
+            a.dom_simhash, text_changed.dom_simhash,
+            "markup fingerprint is text-blind"
+        );
         assert_ne!(a.text_simhash, text_changed.text_simhash);
         assert_ne!(a.dom_simhash, dom_changed.dom_simhash);
-        assert_eq!(a.text_simhash, dom_changed.text_simhash, "text fingerprint is structure-blind");
+        assert_eq!(
+            a.text_simhash, dom_changed.text_simhash,
+            "text fingerprint is structure-blind"
+        );
     }
 }

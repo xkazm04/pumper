@@ -104,7 +104,10 @@ pub enum Transform {
     /// `true/yes/y/1` → true, `false/no/n/0` → false (case-insensitive).
     ToBool,
     /// Regex find/replace over string values ($1-style capture references).
-    RegexReplace { pattern: String, replacement: String },
+    RegexReplace {
+        pattern: String,
+        replacement: String,
+    },
     /// Split a string by `sep`; `index` picks one part (else keeps the array).
     Split {
         sep: String,
@@ -114,7 +117,9 @@ pub enum Transform {
     /// HTML fragment → clean Markdown (pair with a `css` rule's `html: true`).
     ToMarkdown,
     /// Replace a null result with this value.
-    Default { value: Value },
+    Default {
+        value: Value,
+    },
 }
 
 /// A set of fields to extract from each document.
@@ -128,7 +133,9 @@ impl RuleSet {
     /// Validates and pre-compiles selectors/regexes once for reuse across the
     /// whole batch.
     pub fn compile(&self) -> Result<CompiledRuleSet> {
-        Ok(CompiledRuleSet { fields: compile_fields(&self.fields, false)? })
+        Ok(CompiledRuleSet {
+            fields: compile_fields(&self.fields, false)?,
+        })
     }
 }
 
@@ -155,10 +162,20 @@ fn compile_fields(
 
 fn compile_rule(rule: &Rule, scoped: bool) -> Result<CompiledRule> {
     Ok(match rule {
-        Rule::Css { selector, attr, all, html } => {
+        Rule::Css {
+            selector,
+            attr,
+            all,
+            html,
+        } => {
             let sel = Selector::parse(selector)
                 .map_err(|e| Error::Parse(format!("bad css selector '{selector}': {e:?}")))?;
-            CompiledRule::Css { selector: sel, attr: attr.clone(), all: *all, html: *html }
+            CompiledRule::Css {
+                selector: sel,
+                attr: attr.clone(),
+                all: *all,
+                html: *html,
+            }
         }
         Rule::Regex { pattern, group } => {
             let re = Regex::new(pattern)
@@ -175,12 +192,17 @@ fn compile_rule(rule: &Rule, scoped: bool) -> Result<CompiledRule> {
                     "bad json pointer '{pointer}': must be empty or start with '/'"
                 )));
             }
-            CompiledRule::Json { pointer: pointer.clone() }
+            CompiledRule::Json {
+                pointer: pointer.clone(),
+            }
         }
         Rule::Xpath { xpath, all } if !scoped => {
             let parsed = skyscraper::xpath::parse(xpath)
                 .map_err(|e| Error::Parse(format!("bad xpath '{xpath}': {e}")))?;
-            CompiledRule::Xpath { xpath: parsed, all: *all }
+            CompiledRule::Xpath {
+                xpath: parsed,
+                all: *all,
+            }
         }
         Rule::Json { .. } | Rule::Xpath { .. } => {
             return Err(Error::Parse(
@@ -189,8 +211,14 @@ fn compile_rule(rule: &Rule, scoped: bool) -> Result<CompiledRule> {
                     .into(),
             ))
         }
-        Rule::Const { value } => CompiledRule::Const { value: value.clone() },
-        Rule::Each { selector, fields, container } => {
+        Rule::Const { value } => CompiledRule::Const {
+            value: value.clone(),
+        },
+        Rule::Each {
+            selector,
+            fields,
+            container,
+        } => {
             let sel = Selector::parse(selector).map_err(|e| {
                 Error::Parse(format!("bad css selector '{selector}' in 'each': {e:?}"))
             })?;
@@ -202,17 +230,36 @@ fn compile_rule(rule: &Rule, scoped: bool) -> Result<CompiledRule> {
                     })
                 })
                 .transpose()?;
-            CompiledRule::Each { selector: sel, fields: compile_fields(fields, true)?, container }
+            CompiledRule::Each {
+                selector: sel,
+                fields: compile_fields(fields, true)?,
+                container,
+            }
         }
     })
 }
 
 enum CompiledRule {
-    Css { selector: Selector, attr: Option<String>, all: bool, html: bool },
-    Regex { re: Regex, group: usize },
-    Json { pointer: String },
-    Xpath { xpath: skyscraper::xpath::Xpath, all: bool },
-    Const { value: Value },
+    Css {
+        selector: Selector,
+        attr: Option<String>,
+        all: bool,
+        html: bool,
+    },
+    Regex {
+        re: Regex,
+        group: usize,
+    },
+    Json {
+        pointer: String,
+    },
+    Xpath {
+        xpath: skyscraper::xpath::Xpath,
+        all: bool,
+    },
+    Const {
+        value: Value,
+    },
     Each {
         selector: Selector,
         fields: Vec<(String, CompiledRule, Vec<CompiledTransform>)>,
@@ -243,7 +290,10 @@ impl CompiledTransform {
             Transform::ToNumber => Self::ToNumber,
             Transform::ToInt => Self::ToInt,
             Transform::ToBool => Self::ToBool,
-            Transform::RegexReplace { pattern, replacement } => Self::RegexReplace {
+            Transform::RegexReplace {
+                pattern,
+                replacement,
+            } => Self::RegexReplace {
                 re: Regex::new(&pattern)
                     .map_err(|e| Error::Parse(format!("bad transform regex '{pattern}': {e}")))?,
                 replacement,
@@ -294,13 +344,16 @@ impl CompiledTransform {
                         .map(|p| Value::String(p.trim().to_string()))
                         .unwrap_or(Value::Null),
                     None => Value::Array(
-                        parts.into_iter().map(|p| Value::String(p.trim().to_string())).collect(),
+                        parts
+                            .into_iter()
+                            .map(|p| Value::String(p.trim().to_string()))
+                            .collect(),
                     ),
                 }
             }),
-            Self::ToMarkdown => {
-                map_str(value, |s| Value::String(crate::markdown::html_fragment_to_markdown(s)))
-            }
+            Self::ToMarkdown => map_str(value, |s| {
+                Value::String(crate::markdown::html_fragment_to_markdown(s))
+            }),
             Self::Default { .. } => value, // handled in apply()
         }
     }
@@ -324,7 +377,9 @@ fn coerce_number(value: Value, int: bool) -> Value {
     };
     match num {
         Some(n) if int => Value::from(n.trunc() as i64),
-        Some(n) => serde_json::Number::from_f64(n).map(Value::Number).unwrap_or(Value::Null),
+        Some(n) => serde_json::Number::from_f64(n)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         None => Value::Null,
     }
 }
@@ -399,11 +454,15 @@ impl CompiledRuleSet {
     }
 
     fn needs_json(&self) -> bool {
-        self.fields.iter().any(|(_, r, _)| matches!(r, CompiledRule::Json { .. }))
+        self.fields
+            .iter()
+            .any(|(_, r, _)| matches!(r, CompiledRule::Json { .. }))
     }
 
     fn needs_xpath(&self) -> bool {
-        self.fields.iter().any(|(_, r, _)| matches!(r, CompiledRule::Xpath { .. }))
+        self.fields
+            .iter()
+            .any(|(_, r, _)| matches!(r, CompiledRule::Xpath { .. }))
     }
 }
 
@@ -437,7 +496,9 @@ impl FieldStatus {
     /// selector found its listing element.
     fn classify(ran: bool, raw: &Value, detail: &str, container_matched: bool) -> FieldStatus {
         if !ran {
-            return FieldStatus::Error { detail: detail.to_string() };
+            return FieldStatus::Error {
+                detail: detail.to_string(),
+            };
         }
         if !is_blank(raw) {
             return FieldStatus::Matched;
@@ -536,8 +597,19 @@ fn extract_one_impl(rules: &CompiledRuleSet, doc: &str, want_report: bool) -> (V
         // (raw value, whether the rule's required parse was available, error
         // detail, whether an `each` container selector matched)
         let (mut value, ran, detail, container_matched): (Value, bool, &str, bool) = match rule {
-            CompiledRule::Css { selector, attr, all, html: as_html } => (
-                css_extract(html.as_ref().unwrap(), selector, attr.as_deref(), *all, *as_html),
+            CompiledRule::Css {
+                selector,
+                attr,
+                all,
+                html: as_html,
+            } => (
+                css_extract(
+                    html.as_ref().unwrap(),
+                    selector,
+                    attr.as_deref(),
+                    *all,
+                    *as_html,
+                ),
                 true,
                 "",
                 false,
@@ -552,15 +624,29 @@ fn extract_one_impl(rules: &CompiledRuleSet, doc: &str, want_report: bool) -> (V
                 false,
             ),
             CompiledRule::Json { pointer } => match json.as_ref() {
-                Some(j) => (j.pointer(pointer).cloned().unwrap_or(Value::Null), true, "", false),
+                Some(j) => (
+                    j.pointer(pointer).cloned().unwrap_or(Value::Null),
+                    true,
+                    "",
+                    false,
+                ),
                 None => (Value::Null, false, "body did not parse as JSON", false),
             },
             CompiledRule::Xpath { xpath, all } => match xpath_tree.as_ref() {
                 Some(tree) => (xpath_extract(tree, xpath, *all), true, "", false),
-                None => (Value::Null, false, "document did not parse as HTML for xpath", false),
+                None => (
+                    Value::Null,
+                    false,
+                    "document did not parse as HTML for xpath",
+                    false,
+                ),
             },
             CompiledRule::Const { value } => (value.clone(), true, "", false),
-            CompiledRule::Each { selector, fields, container } => {
+            CompiledRule::Each {
+                selector,
+                fields,
+                container,
+            } => {
                 let (items, container_matched) =
                     each_extract(html.as_ref().unwrap(), selector, fields, container.as_ref());
                 (Value::Array(items), true, "", container_matched)
@@ -605,7 +691,12 @@ fn each_extract(
     container: Option<&Selector>,
 ) -> (Vec<Value>, bool) {
     match container {
-        None => (html.select(selector).map(|el| extract_scoped(el, fields)).collect(), false),
+        None => (
+            html.select(selector)
+                .map(|el| extract_scoped(el, fields))
+                .collect(),
+            false,
+        ),
         Some(container) => {
             let mut items = Vec::new();
             let mut found = false;
@@ -629,7 +720,9 @@ pub fn extract_batch_with_report(
     rules: &CompiledRuleSet,
     docs: &[String],
 ) -> Vec<(Value, DocReport)> {
-    docs.par_iter().map(|doc| extract_one_with_report(rules, doc)).collect()
+    docs.par_iter()
+        .map(|doc| extract_one_with_report(rules, doc))
+        .collect()
 }
 
 fn xpath_extract(
@@ -671,7 +764,11 @@ fn xpath_item_value(
 fn render_css(el: ElementRef, attr: Option<&str>, as_html: bool) -> Value {
     match attr {
         // An attribute takes precedence over the html/text mode.
-        Some(a) => el.value().attr(a).map(|s| Value::String(s.to_string())).unwrap_or(Value::Null),
+        Some(a) => el
+            .value()
+            .attr(a)
+            .map(|s| Value::String(s.to_string()))
+            .unwrap_or(Value::Null),
         // `html: true` yields the matched element's serialized HTML (for a
         // `to_markdown` transform); otherwise its flattened text.
         None if as_html => Value::String(el.html()),
@@ -691,7 +788,10 @@ fn collect_css<'a>(
     if all {
         Value::Array(matches.map(|el| render_css(el, attr, as_html)).collect())
     } else {
-        matches.next().map(|el| render_css(el, attr, as_html)).unwrap_or(Value::Null)
+        matches
+            .next()
+            .map(|el| render_css(el, attr, as_html))
+            .unwrap_or(Value::Null)
     }
 }
 
@@ -717,9 +817,12 @@ fn extract_scoped(
     let mut obj = Map::with_capacity(fields.len());
     for (name, rule, transforms) in fields {
         let mut value = match rule {
-            CompiledRule::Css { selector, attr, all, html: as_html } => {
-                collect_css(root.select(selector), attr.as_deref(), *all, *as_html)
-            }
+            CompiledRule::Css {
+                selector,
+                attr,
+                all,
+                html: as_html,
+            } => collect_css(root.select(selector), attr.as_deref(), *all, *as_html),
             CompiledRule::Regex { re, group } => re
                 .captures(&root.html())
                 .and_then(|c| c.get(*group))
@@ -728,8 +831,15 @@ fn extract_scoped(
             CompiledRule::Const { value } => value.clone(),
             // A nested `each`'s container (when set) is resolved inside this item,
             // so a card's own sub-listing splits the same way the top level does.
-            CompiledRule::Each { selector, fields, container } => Value::Array(match container {
-                None => root.select(selector).map(|el| extract_scoped(el, fields)).collect(),
+            CompiledRule::Each {
+                selector,
+                fields,
+                container,
+            } => Value::Array(match container {
+                None => root
+                    .select(selector)
+                    .map(|el| extract_scoped(el, fields))
+                    .collect(),
                 Some(container) => root
                     .select(container)
                     .flat_map(|inner| {
@@ -757,7 +867,10 @@ mod tests {
     use serde_json::json;
 
     fn ruleset(v: serde_json::Value) -> super::CompiledRuleSet {
-        serde_json::from_value::<RuleSet>(v).unwrap().compile().unwrap()
+        serde_json::from_value::<RuleSet>(v)
+            .unwrap()
+            .compile()
+            .unwrap()
     }
 
     #[test]
@@ -834,8 +947,8 @@ mod tests {
             "price": {"type": "regex", "pattern": "\\$([0-9]+)", "group": 1},
             "src":   {"type": "const", "value": "unit"}
         }));
-        let doc = r#"<h1>Hi</h1><a href="/x">l</a><ul><li>a</li><li>b</li></ul> costs $42"#
-            .to_string();
+        let doc =
+            r#"<h1>Hi</h1><a href="/x">l</a><ul><li>a</li><li>b</li></ul> costs $42"#.to_string();
         let out = &extract_batch(&rules, std::slice::from_ref(&doc))[0];
         assert_eq!(out["title"], json!("Hi"));
         assert_eq!(out["link"], json!("/x"));
@@ -910,13 +1023,13 @@ mod tests {
     fn to_number_parses_first_valid_number() {
         // Drive coerce_number through a const rule + to_number transform.
         let cases = [
-            ("1-2", json!(1.0)),          // range: not -12
-            ("$1,234.50", json!(1234.5)), // currency + thousands
-            ("3.5%", json!(3.5)),        // trailing percent
-            ("-5.5", json!(-5.5)),       // real negative
-            ("2026-07-10", json!(2026.0)), // date: first component only
-            ("abc", json!(null)),        // no number -> null
-            ("  42 ", json!(42.0)),      // surrounding whitespace
+            ("1-2", json!(1.0)),              // range: not -12
+            ("$1,234.50", json!(1234.5)),     // currency + thousands
+            ("3.5%", json!(3.5)),             // trailing percent
+            ("-5.5", json!(-5.5)),            // real negative
+            ("2026-07-10", json!(2026.0)),    // date: first component only
+            ("abc", json!(null)),             // no number -> null
+            ("  42 ", json!(42.0)),           // surrounding whitespace
             ("Price: 9.99 USD", json!(9.99)), // embedded
         ];
         for (input, want) in cases {
@@ -1013,12 +1126,14 @@ mod tests {
             &r#"<div id="listing"><p>No open roles</p></div>"#.to_string(),
         );
         assert_eq!(quiet.fields["jobs"], FieldStatus::ContainerEmpty);
-        assert!(!quiet.fields["jobs"].is_miss(), "a quiet listing must not count as a miss");
+        assert!(
+            !quiet.fields["jobs"].is_miss(),
+            "a quiet listing must not count as a miss"
+        );
         assert_eq!(values["jobs"], json!([]));
 
         // Listing itself gone → the selector broke, and this IS a miss.
-        let (_, broken) =
-            extract_one_with_report(&rules, &"<div id=\"other\"></div>".to_string());
+        let (_, broken) = extract_one_with_report(&rules, &"<div id=\"other\"></div>".to_string());
         assert_eq!(broken.fields["jobs"], FieldStatus::Empty);
         assert!(broken.fields["jobs"].is_miss());
 
@@ -1068,7 +1183,10 @@ mod tests {
         // compile time, not become a silent Empty miss at extract time.
         let bad: RuleSet =
             serde_json::from_value(json!({ "bad": {"type": "json", "pointer": "a/b"} })).unwrap();
-        assert!(bad.compile().is_err(), "malformed json pointer must fail compile");
+        assert!(
+            bad.compile().is_err(),
+            "malformed json pointer must fail compile"
+        );
         // Valid pointers (empty or '/'-prefixed) still compile.
         let ok: RuleSet = serde_json::from_value(json!({
             "root": {"type": "json", "pointer": ""},

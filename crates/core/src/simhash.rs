@@ -201,7 +201,14 @@ mod tests {
         html
     }
 
-    const ITEMS: &[&str] = &["Widget", "Gadget", "Doohickey", "Sprocket", "Flange", "Gizmo"];
+    const ITEMS: &[&str] = &[
+        "Widget",
+        "Gadget",
+        "Doohickey",
+        "Sprocket",
+        "Flange",
+        "Gizmo",
+    ];
 
     #[test]
     fn dom_fingerprint_moves_on_a_class_rename_and_not_on_a_text_change() {
@@ -209,8 +216,11 @@ mod tests {
         // Negative control: same markup, entirely different words. The DOM
         // fingerprint MUST NOT move — this is the "genuine content change" case
         // that must never read as a broken extractor.
-        let text_only =
-            dom_simhash_str(&page("card", "price", &["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"]));
+        let text_only = dom_simhash_str(&page(
+            "card",
+            "price",
+            &["Alpha", "Beta", "Gamma", "Delta", "Epsilon", "Zeta"],
+        ));
         assert_eq!(before, text_only, "dom fingerprint must be text-blind");
 
         // The redesign: class names changed, words identical.
@@ -271,14 +281,22 @@ mod tests {
         let a = simhash("The quick brown fox jumps over the lazy dog in the yard");
         // One word changed → should stay within a small Hamming radius.
         let b = simhash("The quick brown fox jumps over the lazy cat in the yard");
-        assert!(hamming(a, b) <= 6, "near-dup distance too large: {}", hamming(a, b));
+        assert!(
+            hamming(a, b) <= 6,
+            "near-dup distance too large: {}",
+            hamming(a, b)
+        );
     }
 
     #[test]
     fn different_texts_are_far() {
         let a = simhash("annual budget report for the finance department fiscal year");
         let b = simhash("photographs of tropical birds migrating across the ocean at dawn");
-        assert!(hamming(a, b) >= 18, "unrelated distance too small: {}", hamming(a, b));
+        assert!(
+            hamming(a, b) >= 18,
+            "unrelated distance too small: {}",
+            hamming(a, b)
+        );
     }
 
     #[test]

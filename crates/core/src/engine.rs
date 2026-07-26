@@ -193,7 +193,11 @@ pub enum PageAction {
     Type { selector: String, text: String },
     /// Wait until a selector appears, up to `timeout_ms` (falls back to the
     /// nav timeout).
-    WaitForSelector { selector: String, #[serde(default)] timeout_ms: Option<u64> },
+    WaitForSelector {
+        selector: String,
+        #[serde(default)]
+        timeout_ms: Option<u64>,
+    },
     /// Wait a fixed number of milliseconds (a settle pause between steps).
     WaitMs { ms: u64 },
     /// Repeat `steps` up to `times`. When `until_selector_count_stable` is set,
@@ -311,7 +315,10 @@ pub struct ResearchRequest {
 
 impl ResearchRequest {
     pub fn new(prompt: impl Into<String>) -> Self {
-        Self { prompt: prompt.into(), ..Default::default() }
+        Self {
+            prompt: prompt.into(),
+            ..Default::default()
+        }
     }
 
     /// Selects a named role preset (e.g. "research", "compose").
@@ -382,7 +389,11 @@ mod tests {
         .unwrap();
         assert_eq!(r.actions.len(), 2);
         match &r.actions[0] {
-            PageAction::Repeat { times, steps, until_selector_count_stable } => {
+            PageAction::Repeat {
+                times,
+                steps,
+                until_selector_count_stable,
+            } => {
                 assert_eq!(*times, 5);
                 assert_eq!(steps.len(), 2);
                 assert!(matches!(steps[0], PageAction::ScrollBottom));
@@ -405,7 +416,10 @@ mod tests {
         )
         .unwrap();
         assert_eq!(req2.etag.as_deref(), Some("\"abc\""));
-        assert_eq!(req2.if_modified_since.as_deref(), Some("Wed, 21 Oct 2025 07:28:00 GMT"));
+        assert_eq!(
+            req2.if_modified_since.as_deref(),
+            Some("Wed, 21 Oct 2025 07:28:00 GMT")
+        );
         // The convenience constructor leaves them unset.
         assert!(HttpRequest::get("https://x/").etag.is_none());
     }
@@ -430,12 +444,32 @@ mod tests {
 
     #[test]
     fn profile_names_accept_only_the_path_safe_alphabet() {
-        for ok in ["a", "acme", "acme-login", "acme_login_2", "A1", &"x".repeat(64)] {
-            assert!(validate_profile_name(ok).is_ok(), "{ok:?} should be accepted");
+        for ok in [
+            "a",
+            "acme",
+            "acme-login",
+            "acme_login_2",
+            "A1",
+            &"x".repeat(64),
+        ] {
+            assert!(
+                validate_profile_name(ok).is_ok(),
+                "{ok:?} should be accepted"
+            );
         }
         // Traversal, separators, and anything else are typed errors.
         for bad in [
-            "", "..", ".", "a/b", "a\\b", "a.b", "C:", "a b", "naïve", "a:b", "-*-",
+            "",
+            "..",
+            ".",
+            "a/b",
+            "a\\b",
+            "a.b",
+            "C:",
+            "a b",
+            "naïve",
+            "a:b",
+            "-*-",
             &"x".repeat(65),
         ] {
             let err = validate_profile_name(bad).unwrap_err();

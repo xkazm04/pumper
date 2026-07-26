@@ -93,8 +93,15 @@ impl AppState {
     /// the supplied parts. Spawns nothing; performs no IO beyond building a
     /// reqwest client. `init` layers the real environment on top.
     pub fn from_parts(parts: AppStateParts) -> anyhow::Result<Self> {
-        let AppStateParts { config, storage, governor, engines, plugins, search, registry } =
-            parts;
+        let AppStateParts {
+            config,
+            storage,
+            governor,
+            engines,
+            plugins,
+            search,
+            registry,
+        } = parts;
         let datasets = Arc::new(Datasets::new(storage.pool()));
         let costs = Arc::new(CostLedger::new(storage.pool()));
         let cache = Arc::new(HttpCache::new(storage.pool(), &config.cache));
@@ -157,9 +164,19 @@ impl AppState {
         )?);
         let browser = Arc::new(BrowserEngine::new(&config.browser, profiles_dir));
         let claude = Arc::new(ClaudeEngine::new(&config.claude));
-        let fetch =
-            Fetcher::new(http.clone(), browser.clone(), claude.clone(), governor.clone(), &config.fetcher);
-        let engines = Arc::new(EngineSet { http, browser, claude, fetch });
+        let fetch = Fetcher::new(
+            http.clone(),
+            browser.clone(),
+            claude.clone(),
+            governor.clone(),
+            &config.fetcher,
+        );
+        let engines = Arc::new(EngineSet {
+            http,
+            browser,
+            claude,
+            fetch,
+        });
 
         let plugins: Arc<dyn Plugins> = if config.plugins.enabled {
             Arc::new(WasmPluginHost::new(&config.plugins)?)
@@ -218,7 +235,9 @@ impl AppState {
         match state.tiers.load_penalties().await {
             Ok(saved) => {
                 for (host, penalty_ms) in saved {
-                    state.governor.restore_penalty(&host, Duration::from_millis(penalty_ms));
+                    state
+                        .governor
+                        .restore_penalty(&host, Duration::from_millis(penalty_ms));
                 }
             }
             Err(e) => tracing::warn!("failed to restore host penalties: {e}"),
@@ -238,7 +257,9 @@ impl AppState {
                     let snapshot: Vec<(String, u64)> = governor
                         .snapshot_penalties()
                         .into_iter()
-                        .map(|(host, penalty)| (host, penalty.as_millis().min(u64::MAX as u128) as u64))
+                        .map(|(host, penalty)| {
+                            (host, penalty.as_millis().min(u64::MAX as u128) as u64)
+                        })
                         .collect();
                     if let Err(e) = tiers.save_penalties(&snapshot).await {
                         tracing::warn!("host penalty write-behind failed: {e}");

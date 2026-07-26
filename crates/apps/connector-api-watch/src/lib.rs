@@ -87,19 +87,14 @@ impl ScrapeApp for ConnectorApiWatch {
             .get("summarize")
             .and_then(Value::as_bool)
             .unwrap_or(true);
-        let limit = ctx
-            .params
-            .get("limit")
-            .and_then(Value::as_u64)
-            .unwrap_or(0) as usize;
-        let only: Option<BTreeSet<String>> = ctx.params.get("only").and_then(Value::as_array).map(
-            |a| {
+        let limit = ctx.params.get("limit").and_then(Value::as_u64).unwrap_or(0) as usize;
+        let only: Option<BTreeSet<String>> =
+            ctx.params.get("only").and_then(Value::as_array).map(|a| {
                 a.iter()
                     .filter_map(Value::as_str)
                     .map(|s| s.to_string())
                     .collect()
-            },
-        );
+            });
 
         let raw = std::fs::read_to_string(&manifest_path)
             .map_err(|e| Error::App(format!("read manifest {manifest_path}: {e}")))?;
@@ -185,10 +180,18 @@ impl ScrapeApp for ConnectorApiWatch {
                     .await
                     .unwrap_or_else(|e| {
                         tracing::warn!(slug = %entry.slug, "summarize failed: {e}");
-                        (fallback_summary(&added, &removed), Vec::new(), "minor".into())
+                        (
+                            fallback_summary(&added, &removed),
+                            Vec::new(),
+                            "minor".into(),
+                        )
                     })
             } else {
-                (fallback_summary(&added, &removed), Vec::new(), "minor".into())
+                (
+                    fallback_summary(&added, &removed),
+                    Vec::new(),
+                    "minor".into(),
+                )
             };
 
             changes.push(json!({

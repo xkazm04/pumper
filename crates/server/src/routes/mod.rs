@@ -239,9 +239,15 @@ mod catalog_tests {
                 "live catalog source '{}' has no app — a live pipeline must name its serving app",
                 source.id
             );
-            let app = apps.iter().find(|a| a.name() == source.app).unwrap_or_else(|| {
-                panic!("live catalog source '{}' names unregistered app '{}'", source.id, source.app)
-            });
+            let app = apps
+                .iter()
+                .find(|a| a.name() == source.app)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "live catalog source '{}' names unregistered app '{}'",
+                        source.id, source.app
+                    )
+                });
             // Cron must agree in BOTH directions: "" here must mean the app has no
             // schedule, and a cron here must equal the app's schedule() exactly.
             let app_cron = app.schedule().unwrap_or("");
@@ -260,8 +266,12 @@ mod catalog_tests {
     #[test]
     fn every_registered_data_source_app_is_in_the_catalog() {
         let catalog = catalog();
-        let cataloged: BTreeSet<&str> =
-            catalog.sources.iter().map(|s| s.app.as_str()).filter(|a| !a.is_empty()).collect();
+        let cataloged: BTreeSet<&str> = catalog
+            .sources
+            .iter()
+            .map(|s| s.app.as_str())
+            .filter(|a| !a.is_empty())
+            .collect();
         let exempt: BTreeSet<&str> = CATALOG_EXEMPT.iter().copied().collect();
         let missing: Vec<&str> = registered()
             .iter()
@@ -357,7 +367,9 @@ mod api_spec_tests {
     fn spec_operations() -> BTreeSet<String> {
         let api = super::openapi_router().split_for_parts().1;
         let json = serde_json::to_value(&api).expect("spec serializes");
-        let methods = ["get", "post", "put", "delete", "patch", "head", "options", "trace"];
+        let methods = [
+            "get", "post", "put", "delete", "patch", "head", "options", "trace",
+        ];
         let mut ops = BTreeSet::new();
         for (path, item) in json["paths"].as_object().expect("paths object") {
             for method in item.as_object().expect("path item object").keys() {
@@ -427,7 +439,9 @@ mod filter_tests {
         .map(|s| s.to_string())
         .collect();
         let out = parse_filters(&specs).expect("valid");
-        assert!(matches!(&out[0], JsonFilter::Eq { path, value } if path == "$.state" && value == "CA"));
+        assert!(
+            matches!(&out[0], JsonFilter::Eq { path, value } if path == "$.state" && value == "CA")
+        );
         assert!(matches!(&out[1], JsonFilter::Contains { .. }));
         assert!(matches!(&out[2], JsonFilter::Gte { .. }));
         assert!(matches!(&out[3], JsonFilter::Lte { .. }));
@@ -443,7 +457,10 @@ mod filter_tests {
             .expect("valid");
         match &out[0] {
             JsonFilter::NumGteAny { paths, value } => {
-                assert_eq!(paths, &vec!["$.award_ceiling".to_string(), "$.total_funding".to_string()]);
+                assert_eq!(
+                    paths,
+                    &vec!["$.award_ceiling".to_string(), "$.total_funding".to_string()]
+                );
                 assert_eq!(*value, 1000.0);
             }
             other => panic!("expected NumGteAny, got {other:?}"),

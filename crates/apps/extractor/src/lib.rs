@@ -45,12 +45,15 @@ fn parse_concurrency(params: &Value) -> usize {
 /// fields with the highest miss rate (an empty or errored extraction is a miss).
 /// Returns `(matched, total, worst_fields)`; `worst_fields` lists only fields
 /// that missed at least once, worst first.
-fn summarize_reports<'a>(reports: impl IntoIterator<Item = &'a DocReport>) -> (u64, u64, Vec<Value>) {
+fn summarize_reports<'a>(
+    reports: impl IntoIterator<Item = &'a DocReport>,
+) -> (u64, u64, Vec<Value>) {
     let mut matched: u64 = 0;
     let mut total: u64 = 0;
     let mut doc_count: u64 = 0;
     // field -> (misses, errors)
-    let mut misses: std::collections::BTreeMap<&str, (u64, u64)> = std::collections::BTreeMap::new();
+    let mut misses: std::collections::BTreeMap<&str, (u64, u64)> =
+        std::collections::BTreeMap::new();
     for report in reports {
         doc_count += 1;
         for (field, status) in &report.fields {
@@ -83,9 +86,10 @@ fn summarize_reports<'a>(reports: impl IntoIterator<Item = &'a DocReport>) -> (u
         .collect();
     // Highest miss count first; ties broken by field name for stable output.
     worst.sort_by(|a, b| {
-        b["misses"].as_u64().cmp(&a["misses"].as_u64()).then_with(|| {
-            a["field"].as_str().cmp(&b["field"].as_str())
-        })
+        b["misses"]
+            .as_u64()
+            .cmp(&a["misses"].as_u64())
+            .then_with(|| a["field"].as_str().cmp(&b["field"].as_str()))
     });
     (matched, total, worst)
 }
@@ -139,7 +143,14 @@ async fn extract_and_upsert(
         })
         .collect();
     let summary = ctx.upsert_many(dataset, &items).await?;
-    Ok(ExtractOutcome { records, matched, total, worst, summary, health: verdict })
+    Ok(ExtractOutcome {
+        records,
+        matched,
+        total,
+        worst,
+        summary,
+        health: verdict,
+    })
 }
 
 /// What one extraction pass produced: the records, the aggregate quality signal,
@@ -229,7 +240,9 @@ impl ScrapeApp for Extractor {
             .get("rules")
             .cloned()
             .ok_or_else(|| Error::App("param 'rules' is required".into()))
-            .and_then(|v| serde_json::from_value(v).map_err(|e| Error::App(format!("bad rules: {e}"))))?;
+            .and_then(|v| {
+                serde_json::from_value(v).map_err(|e| Error::App(format!("bad rules: {e}")))
+            })?;
         // Compile (and validate selectors/regex) once, before the fan-out.
         let compiled = Arc::new(rules.compile()?);
         let dataset = ctx
@@ -262,7 +275,11 @@ impl Extractor {
             .params
             .get("urls")
             .and_then(Value::as_array)
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         if urls.is_empty() {
             return Err(Error::App(
@@ -294,7 +311,11 @@ impl Extractor {
                     // of bytes.
                     Ok(out) => {
                         let healthy = tier_won(&out);
-                        (url, out.html.or(out.text).filter(|d| !d.is_empty()), healthy)
+                        (
+                            url,
+                            out.html.or(out.text).filter(|d| !d.is_empty()),
+                            healthy,
+                        )
                     }
                     Err(_) => (url, None, false),
                 }
@@ -307,7 +328,10 @@ impl Extractor {
 
         let mut keyed: Vec<(String, String)> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
-        let mut fetch = FetchHealth { attempted: urls.len() as u32, ok: 0 };
+        let mut fetch = FetchHealth {
+            attempted: urls.len() as u32,
+            ok: 0,
+        };
         for (url, doc, healthy) in fetched_pairs {
             if healthy {
                 fetch.ok += 1;
@@ -350,9 +374,13 @@ impl Extractor {
         compiled: Arc<CompiledRuleSet>,
         dataset: &str,
     ) -> Result<Value> {
-        let source = ctx.params.get("source").and_then(Value::as_object).ok_or_else(|| {
-            Error::App("param 'source' must be an object {app, dataset, keys?}".into())
-        })?;
+        let source = ctx
+            .params
+            .get("source")
+            .and_then(Value::as_object)
+            .ok_or_else(|| {
+                Error::App("param 'source' must be an object {app, dataset, keys?}".into())
+            })?;
         let src_app = source
             .get("app")
             .and_then(Value::as_str)
@@ -367,8 +395,11 @@ impl Extractor {
         // Key precedence: explicit source.keys > _trigger.keys (crawl→extract via
         // a dataset trigger) > all live records in the source dataset.
         let str_array = |v: Option<&Value>| -> Option<Vec<String>> {
-            v.and_then(Value::as_array)
-                .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            v.and_then(Value::as_array).map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
         };
         let explicit_keys = str_array(source.get("keys"))
             .or_else(|| str_array(ctx.params.pointer("/_trigger/keys")));
@@ -387,8 +418,9 @@ impl Extractor {
                         Ok(body) => keyed.push((key, body)),
                         Err(reason) => missing.push(json!({"key": key, "reason": reason})),
                     },
-                    None => missing
-                        .push(json!({"key": key, "reason": "no record in source dataset"})),
+                    None => {
+                        missing.push(json!({"key": key, "reason": "no record in source dataset"}))
+                    }
                 }
             }
         } else {
@@ -416,8 +448,7 @@ impl Extractor {
         // Nothing was fetched, so the fetch layer cannot explain a bad extraction
         // and must not gate the verdict. An unreadable stored body is a corpus
         // problem, not a fetch problem, and is reported in `missing` instead.
-        let out =
-            extract_and_upsert(ctx, compiled, dataset, keyed, FetchHealth::default()).await?;
+        let out = extract_and_upsert(ctx, compiled, dataset, keyed, FetchHealth::default()).await?;
 
         Ok(json!({
             "mode": "source",
@@ -458,7 +489,11 @@ mod tests {
 
     fn report(pairs: &[(&str, FieldStatus)]) -> DocReport {
         DocReport {
-            fields: pairs.iter().cloned().map(|(k, v)| (k.to_string(), v)).collect(),
+            fields: pairs
+                .iter()
+                .cloned()
+                .map(|(k, v)| (k.to_string(), v))
+                .collect(),
             ..DocReport::default()
         }
     }
@@ -481,7 +516,7 @@ mod tests {
         let (matched, total, worst) = summarize_reports(reports.iter());
         assert_eq!(total, 6);
         assert_eq!(matched, 3); // 2 titles + 1 sku
-        // price misses twice (worst), sku misses once with one error; title never misses.
+                                // price misses twice (worst), sku misses once with one error; title never misses.
         assert_eq!(worst.len(), 2);
         assert_eq!(worst[0]["field"], "price");
         assert_eq!(worst[0]["misses"], 2);
@@ -495,7 +530,10 @@ mod tests {
 
     #[test]
     fn all_matched_has_no_worst_fields() {
-        let reports = vec![report(&[("a", FieldStatus::Matched), ("b", FieldStatus::Matched)])];
+        let reports = vec![report(&[
+            ("a", FieldStatus::Matched),
+            ("b", FieldStatus::Matched),
+        ])];
         let (matched, total, worst) = summarize_reports(reports.iter());
         assert_eq!((matched, total), (2, 2));
         assert!(worst.is_empty());
@@ -503,8 +541,8 @@ mod tests {
 
     #[test]
     fn concurrency_defaults_clamps_and_overrides() {
-        use serde_json::json;
         use super::{parse_concurrency, DEFAULT_FETCH_CONCURRENCY};
+        use serde_json::json;
         // Absent → default.
         assert_eq!(parse_concurrency(&json!({})), DEFAULT_FETCH_CONCURRENCY);
         // Explicit override honored.
@@ -512,6 +550,9 @@ mod tests {
         // Zero clamps up to 1 (never an unbounded/idle stream).
         assert_eq!(parse_concurrency(&json!({ "concurrency": 0 })), 1);
         // Non-numeric → default.
-        assert_eq!(parse_concurrency(&json!({ "concurrency": "lots" })), DEFAULT_FETCH_CONCURRENCY);
+        assert_eq!(
+            parse_concurrency(&json!({ "concurrency": "lots" })),
+            DEFAULT_FETCH_CONCURRENCY
+        );
     }
 }

@@ -217,9 +217,18 @@ impl Datasets {
         // SQLITE_BUSY_SNAPSHOT under WAL.
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-        let result =
-            Self::upsert_in_tx(&mut conn, app, dataset, key, value, hash.as_str(), sim, now, trust)
-                .await;
+        let result = Self::upsert_in_tx(
+            &mut conn,
+            app,
+            dataset,
+            key,
+            value,
+            hash.as_str(),
+            sim,
+            now,
+            trust,
+        )
+        .await;
         match result {
             Ok(kind) => {
                 sqlx::query("COMMIT").execute(&mut *conn).await?;
@@ -323,7 +332,15 @@ impl Datasets {
                 .execute(&mut *conn)
                 .await?;
                 Self::add_revision(
-                    &mut *conn, app, dataset, key, "new", Some(value), None, now, trust,
+                    &mut *conn,
+                    app,
+                    dataset,
+                    key,
+                    "new",
+                    Some(value),
+                    None,
+                    now,
+                    trust,
                 )
                 .await?;
                 Ok(ChangeKind::New)
@@ -435,7 +452,9 @@ impl Datasets {
         after: Option<(String, i64)>,
         limit: i64,
     ) -> Result<RevisionPage> {
-        let (after_ts, after_rev) = after.map(|(t, r)| (Some(t), Some(r))).unwrap_or((None, None));
+        let (after_ts, after_rev) = after
+            .map(|(t, r)| (Some(t), Some(r)))
+            .unwrap_or((None, None));
         let rows: Vec<RevisionRow> = sqlx::query_as(
             "SELECT app, dataset, key, revision, change, data, diff, created_at, trust \
              FROM record_revisions WHERE app = ?1 AND dataset = ?2 AND key = ?3 \
@@ -450,7 +469,10 @@ impl Datasets {
         .bind(limit)
         .fetch_all(&self.pool)
         .await?;
-        let items: Vec<Revision> = rows.into_iter().map(Revision::try_from).collect::<Result<_>>()?;
+        let items: Vec<Revision> = rows
+            .into_iter()
+            .map(Revision::try_from)
+            .collect::<Result<_>>()?;
         let next_cursor = ((items.len() as i64) == limit)
             .then(|| items.last())
             .flatten()
@@ -475,8 +497,9 @@ impl Datasets {
         limit: i64,
         trust: Option<&str>,
     ) -> Result<RevisionPage> {
-        let (after_ts, after_rowid) =
-            after.map(|(t, r)| (Some(t), Some(r))).unwrap_or((None, None));
+        let (after_ts, after_rowid) = after
+            .map(|(t, r)| (Some(t), Some(r)))
+            .unwrap_or((None, None));
         let rows: Vec<RevisionFeedRow> = sqlx::query_as(&format!(
             "SELECT rowid AS rowid, app, dataset, key, revision, change, data, diff, created_at, trust \
              FROM record_revisions \
@@ -529,10 +552,11 @@ impl Datasets {
         .bind(dataset)
         .fetch_all(&self.pool)
         .await?;
-        let present: std::collections::HashSet<&str> =
-            present.iter().map(String::as_str).collect();
-        let to_remove: Vec<String> =
-            live.into_iter().filter(|k| !present.contains(k.as_str())).collect();
+        let present: std::collections::HashSet<&str> = present.iter().map(String::as_str).collect();
+        let to_remove: Vec<String> = live
+            .into_iter()
+            .filter(|k| !present.contains(k.as_str()))
+            .collect();
         if to_remove.is_empty() {
             return Ok(Vec::new());
         }
@@ -594,7 +618,10 @@ impl Datasets {
         // A tombstone carries no trust stamp: removal detection is suppressed
         // entirely while a source is degrading, so every `removed` revision that
         // reaches here was written by a source we stand behind.
-        Self::add_revision(&mut *conn, app, dataset, key, "removed", None, None, now, None).await?;
+        Self::add_revision(
+            &mut *conn, app, dataset, key, "removed", None, None, now, None,
+        )
+        .await?;
         Ok(())
     }
 
@@ -715,14 +742,15 @@ impl Datasets {
         dataset: &str,
         key: &str,
     ) -> Result<bool> {
-        let existed = sqlx::query("DELETE FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3")
-            .bind(app)
-            .bind(dataset)
-            .bind(key)
-            .execute(&mut *conn)
-            .await?
-            .rows_affected()
-            > 0;
+        let existed =
+            sqlx::query("DELETE FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3")
+                .bind(app)
+                .bind(dataset)
+                .bind(key)
+                .execute(&mut *conn)
+                .await?
+                .rows_affected()
+                > 0;
         sqlx::query("DELETE FROM record_revisions WHERE app = ?1 AND dataset = ?2 AND key = ?3")
             .bind(app)
             .bind(dataset)
@@ -954,7 +982,9 @@ impl Datasets {
         limit: i64,
         trust: Option<&str>,
     ) -> Result<Vec<Record>> {
-        let (after_ts, after_key) = after.map(|(t, k)| (Some(t), Some(k))).unwrap_or((None, None));
+        let (after_ts, after_key) = after
+            .map(|(t, k)| (Some(t), Some(k)))
+            .unwrap_or((None, None));
         let rows: Vec<RecordRow> = sqlx::query_as(&format!(
             "SELECT key, data, first_seen, last_seen, updated_at, removed_at, trust \
              FROM records WHERE app = ?1 AND dataset = ?2 \
@@ -1088,11 +1118,12 @@ impl Datasets {
 
     /// Distinct dataset names for an app.
     pub async fn datasets(&self, app: &str) -> Result<Vec<String>> {
-        let names: Vec<String> =
-            sqlx::query_scalar("SELECT DISTINCT dataset FROM records WHERE app = ?1 ORDER BY dataset")
-                .bind(app)
-                .fetch_all(&self.pool)
-                .await?;
+        let names: Vec<String> = sqlx::query_scalar(
+            "SELECT DISTINCT dataset FROM records WHERE app = ?1 ORDER BY dataset",
+        )
+        .bind(app)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(names)
     }
 }
@@ -1249,7 +1280,11 @@ fn diff_into(path: &str, old: &Value, new: &Value, out: &mut serde_json::Map<Str
         (Value::Object(a), Value::Object(b)) => {
             let keys: std::collections::BTreeSet<&String> = a.keys().chain(b.keys()).collect();
             for k in keys {
-                let p = if path.is_empty() { k.clone() } else { format!("{path}.{k}") };
+                let p = if path.is_empty() {
+                    k.clone()
+                } else {
+                    format!("{path}.{k}")
+                };
                 diff_into(
                     &p,
                     a.get(k).unwrap_or(&Value::Null),
@@ -1261,10 +1296,7 @@ fn diff_into(path: &str, old: &Value, new: &Value, out: &mut serde_json::Map<Str
         (a, b) if a == b => {}
         (a, b) => {
             let p = if path.is_empty() { "$" } else { path };
-            out.insert(
-                p.to_string(),
-                serde_json::json!({ "from": a, "to": b }),
-            );
+            out.insert(p.to_string(), serde_json::json!({ "from": a, "to": b }));
         }
     }
 }
@@ -1299,7 +1331,10 @@ mod tests {
         let old = json!({ "title": "A", "close": "2026-01-01", "amount": 100 });
         let new = json!({ "title": "A", "close": "2026-02-01", "status": "open" });
         let diff = diff_values(&old, &new);
-        assert_eq!(diff["close"], json!({ "from": "2026-01-01", "to": "2026-02-01" }));
+        assert_eq!(
+            diff["close"],
+            json!({ "from": "2026-01-01", "to": "2026-02-01" })
+        );
         assert_eq!(diff["amount"], json!({ "from": 100, "to": null }));
         assert_eq!(diff["status"], json!({ "from": null, "to": "open" }));
         assert!(diff.get("title").is_none(), "unchanged fields are omitted");
@@ -1335,9 +1370,15 @@ mod tests {
         // any other value matches exactly, and no filter matches everything.
         let sql = trust_predicate(3);
         assert!(sql.contains("?3"), "{sql}");
-        assert!(!sql.contains("?T"), "placeholder must be substituted: {sql}");
+        assert!(
+            !sql.contains("?T"),
+            "placeholder must be substituted: {sql}"
+        );
         assert!(sql.contains("COALESCE(trust, 'stable')"), "{sql}");
-        assert!(sql.starts_with("(?3 IS NULL OR"), "no filter must match everything: {sql}");
+        assert!(
+            sql.starts_with("(?3 IS NULL OR"),
+            "no filter must match everything: {sql}"
+        );
     }
 
     #[test]

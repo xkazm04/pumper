@@ -14,11 +14,13 @@ async fn fresh_db(tag: &str) -> TempStore {
 /// Forces a failed delivery's `next_retry_at` into the past so `due_deliveries`
 /// returns it without waiting out the real backoff.
 async fn make_due(pool: &SqlitePool, id: &str) {
-    sqlx::query("UPDATE webhook_deliveries SET next_retry_at = '2000-01-01T00:00:00.000000Z' WHERE id = ?1")
-        .bind(id)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE webhook_deliveries SET next_retry_at = '2000-01-01T00:00:00.000000Z' WHERE id = ?1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn status_and_retry(pool: &SqlitePool, id: &str) -> (String, i64) {
@@ -39,12 +41,21 @@ async fn fail_schedules_retry_then_drain_claims_it() {
     let pool = storage.pool();
 
     let id = storage
-        .create_delivery("job", &Uuid::new_v4().to_string(), "https://x/hook", "job.terminal", "{}")
+        .create_delivery(
+            "job",
+            &Uuid::new_v4().to_string(),
+            "https://x/hook",
+            "job.terminal",
+            "{}",
+        )
         .await
         .unwrap();
 
     // First failure schedules a retry (status stays 'failed', next_retry_at set).
-    storage.fail_delivery(&id, 3, Some("boom"), MAX_RETRIES, BACKOFF).await.unwrap();
+    storage
+        .fail_delivery(&id, 3, Some("boom"), MAX_RETRIES, BACKOFF)
+        .await
+        .unwrap();
     let (status, rc) = status_and_retry(&pool, &id).await;
     assert_eq!(status, "failed");
     assert_eq!(rc, 0, "initial failure hasn't consumed a drain retry yet");
@@ -65,7 +76,6 @@ async fn fail_schedules_retry_then_drain_claims_it() {
     assert_eq!(rc, 1);
     // A racing second claim finds it no longer 'failed'.
     assert!(!storage.begin_delivery_retry(&id).await.unwrap());
-
 }
 
 #[tokio::test]
@@ -75,24 +85,38 @@ async fn repeated_failures_eventually_go_dead() {
     let pool = storage.pool();
 
     let id = storage
-        .create_delivery("job", &Uuid::new_v4().to_string(), "https://x/hook", "e", "{}")
+        .create_delivery(
+            "job",
+            &Uuid::new_v4().to_string(),
+            "https://x/hook",
+            "e",
+            "{}",
+        )
         .await
         .unwrap();
 
     // Walk the full retry ladder: fail → claim → fail → … until 'dead'.
-    storage.fail_delivery(&id, 3, Some("e"), MAX_RETRIES, BACKOFF).await.unwrap();
+    storage
+        .fail_delivery(&id, 3, Some("e"), MAX_RETRIES, BACKOFF)
+        .await
+        .unwrap();
     for _ in 0..MAX_RETRIES {
         make_due(&pool, &id).await;
         assert!(storage.begin_delivery_retry(&id).await.unwrap());
-        storage.fail_delivery(&id, 1, Some("e"), MAX_RETRIES, BACKOFF).await.unwrap();
+        storage
+            .fail_delivery(&id, 1, Some("e"), MAX_RETRIES, BACKOFF)
+            .await
+            .unwrap();
     }
     let (status, rc) = status_and_retry(&pool, &id).await;
-    assert_eq!(status, "dead", "past the retry cap the row is dead, not endlessly retried");
+    assert_eq!(
+        status, "dead",
+        "past the retry cap the row is dead, not endlessly retried"
+    );
     assert_eq!(rc, MAX_RETRIES);
     // A dead row is never due again.
     make_due(&pool, &id).await;
     assert!(storage.due_deliveries(10).await.unwrap().is_empty());
-
 }
 
 #[tokio::test]
@@ -102,15 +126,23 @@ async fn delivered_clears_the_retry_schedule() {
     let pool = storage.pool();
 
     let id = storage
-        .create_delivery("change", "watch-1", "https://x/hook", "dataset.changed", "{}")
+        .create_delivery(
+            "change",
+            "watch-1",
+            "https://x/hook",
+            "dataset.changed",
+            "{}",
+        )
         .await
         .unwrap();
-    storage.fail_delivery(&id, 3, Some("e"), MAX_RETRIES, BACKOFF).await.unwrap();
+    storage
+        .fail_delivery(&id, 3, Some("e"), MAX_RETRIES, BACKOFF)
+        .await
+        .unwrap();
     // A later successful (re)delivery clears next_retry_at so the drain won't re-send.
     storage.finish_delivery(&id, true, 1, None).await.unwrap();
     let (status, _) = status_and_retry(&pool, &id).await;
     assert_eq!(status, "delivered");
     make_due(&pool, &id).await; // even if forced due, status='delivered' is not scanned
     assert!(storage.due_deliveries(10).await.unwrap().is_empty());
-
 }

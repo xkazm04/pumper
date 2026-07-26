@@ -50,9 +50,7 @@ pub(crate) async fn list_hosts(
     let limit = query.limit.clamp(1, 500);
     let after = query.cursor.as_deref().and_then(parse_cursor);
     let profiles = state.tiers.list_page(after, limit).await?;
-    let next_cursor = keyset_cursor(&profiles, limit, |p| {
-        format!("{}|{}", p.updated_at, p.host)
-    });
+    let next_cursor = keyset_cursor(&profiles, limit, |p| format!("{}|{}", p.updated_at, p.host));
     let mut items = Vec::with_capacity(profiles.len());
     for p in profiles {
         items.push(host_json(&state, p).await);
@@ -178,9 +176,14 @@ pub(crate) async fn list_profiles(State(state): State<AppState>) -> Result<Json<
 
     let mut profiles: Vec<ProfileInfo> = Vec::new();
     while let Some(entry) = entries.next_entry().await.map_err(|e| {
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, format!("reading {}: {e}", root.display()))
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("reading {}: {e}", root.display()),
+        )
     })? {
-        let Ok(name) = entry.file_name().into_string() else { continue };
+        let Ok(name) = entry.file_name().into_string() else {
+            continue;
+        };
         // Only directories whose names are valid profiles — anything else in the
         // vault dir isn't ours and can't be named by a request anyway.
         if pumper_core::validate_profile_name(&name).is_err() {
@@ -192,9 +195,14 @@ pub(crate) async fn list_profiles(State(state): State<AppState>) -> Result<Json<
         let dir = entry.path();
         let cookies = dir.join(pumper_core::PROFILE_COOKIES_FILE);
         let browser = dir.join(pumper_core::PROFILE_BROWSER_DIR);
-        let has_cookies = tokio::fs::metadata(&cookies).await.map(|m| m.is_file()).unwrap_or(false);
-        let has_browser_dir =
-            tokio::fs::metadata(&browser).await.map(|m| m.is_dir()).unwrap_or(false);
+        let has_cookies = tokio::fs::metadata(&cookies)
+            .await
+            .map(|m| m.is_file())
+            .unwrap_or(false);
+        let has_browser_dir = tokio::fs::metadata(&browser)
+            .await
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
         // Last use ≈ the newest mtime among the profile dir and its artifacts:
         // the jar is rewritten after cookie-setting responses, and Chrome churns
         // its user-data-dir on every render.
@@ -205,7 +213,12 @@ pub(crate) async fn list_profiles(State(state): State<AppState>) -> Result<Json<
             }
         }
         let last_used = newest.map(|t| chrono::DateTime::<chrono::Utc>::from(t).to_rfc3339());
-        profiles.push(ProfileInfo { name, has_cookies, has_browser_dir, last_used });
+        profiles.push(ProfileInfo {
+            name,
+            has_cookies,
+            has_browser_dir,
+            last_used,
+        });
     }
     profiles.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(Json(json!({ "profiles": profiles })))
@@ -373,7 +386,10 @@ pub(crate) async fn extract_preview(
 /// cheap and never spend money.
 async fn fetch_preview_doc(state: &AppState, url: &str) -> Result<String, ApiError> {
     if !url.starts_with("http://") && !url.starts_with("https://") {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "'url' must be http(s)".into()));
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "'url' must be http(s)".into(),
+        ));
     }
     let mut req = pumper_core::FetchRequest::new(url);
     req.strategy = pumper_core::FetchStrategy::Http;
@@ -382,7 +398,10 @@ async fn fetch_preview_doc(state: &AppState, url: &str) -> Result<String, ApiErr
         .map_err(|_| {
             ApiError(
                 StatusCode::BAD_REQUEST,
-                format!("fetch exceeded the {}s preview budget", PREVIEW_FETCH_TIMEOUT.as_secs()),
+                format!(
+                    "fetch exceeded the {}s preview budget",
+                    PREVIEW_FETCH_TIMEOUT.as_secs()
+                ),
             )
         })?
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("failed to fetch url: {e}")))?;

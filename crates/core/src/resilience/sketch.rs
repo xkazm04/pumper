@@ -145,7 +145,10 @@ pub struct SketchBuilder {
 
 impl SketchBuilder {
     pub fn new() -> Self {
-        Self { sketch: FieldSketch::default(), ..Default::default() }
+        Self {
+            sketch: FieldSketch::default(),
+            ..Default::default()
+        }
     }
 
     /// Folds one document's outcome for this field.
@@ -308,7 +311,10 @@ pub fn wilson(successes: u32, n: u32) -> (f64, f64) {
     let denom = 1.0 + z2 / n;
     let centre = p + z2 / (2.0 * n);
     let margin = Z * ((p * (1.0 - p) / n) + z2 / (4.0 * n * n)).sqrt();
-    (((centre - margin) / denom).max(0.0), ((centre + margin) / denom).min(1.0))
+    (
+        ((centre - margin) / denom).max(0.0),
+        ((centre + margin) / denom).min(1.0),
+    )
 }
 
 /// True when `run`'s rate is separated *upward* from `baseline`'s — the run's
@@ -329,7 +335,11 @@ pub fn median(values: &[f64]) -> Option<f64> {
     let mut sorted = values.to_vec();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let mid = sorted.len() / 2;
-    Some(if sorted.len() % 2 == 0 { (sorted[mid - 1] + sorted[mid]) / 2.0 } else { sorted[mid] })
+    Some(if sorted.len() % 2 == 0 {
+        (sorted[mid - 1] + sorted[mid]) / 2.0
+    } else {
+        sorted[mid]
+    })
 }
 
 /// Modified z-score against a baseline sample (Iglewicz–Hoaglin):
@@ -397,7 +407,11 @@ mod tests {
 
     fn push_values(b: &mut SketchBuilder, values: &[&str]) {
         for v in values {
-            b.push(&FieldStatus::Matched, Some(CoercionStatus::NoTransforms), &json!(v));
+            b.push(
+                &FieldStatus::Matched,
+                Some(CoercionStatus::NoTransforms),
+                &json!(v),
+            );
         }
     }
 
@@ -435,7 +449,11 @@ mod tests {
         let mut b = SketchBuilder::new();
         b.push(&FieldStatus::Empty, None, &Value::Null);
         b.push(&FieldStatus::ContainerEmpty, None, &json!([]));
-        b.push(&FieldStatus::Error { detail: "x".into() }, None, &Value::Null);
+        b.push(
+            &FieldStatus::Error { detail: "x".into() },
+            None,
+            &Value::Null,
+        );
         b.push(&FieldStatus::Matched, None, &json!("v"));
         let s = b.finish();
         assert_eq!(s.n, 4);
@@ -447,9 +465,21 @@ mod tests {
     #[test]
     fn coercion_failure_rate_is_over_matched_docs_not_all_docs() {
         let mut b = SketchBuilder::new();
-        b.push(&FieldStatus::Matched, Some(CoercionStatus::CoercionFailed), &Value::Null);
-        b.push(&FieldStatus::Matched, Some(CoercionStatus::Coerced), &json!(10));
-        b.push(&FieldStatus::Empty, Some(CoercionStatus::Coerced), &Value::Null);
+        b.push(
+            &FieldStatus::Matched,
+            Some(CoercionStatus::CoercionFailed),
+            &Value::Null,
+        );
+        b.push(
+            &FieldStatus::Matched,
+            Some(CoercionStatus::Coerced),
+            &json!(10),
+        );
+        b.push(
+            &FieldStatus::Empty,
+            Some(CoercionStatus::Coerced),
+            &Value::Null,
+        );
         let s = b.finish();
         // 1 of the 2 documents that had something to coerce.
         assert!((s.coercion_failure_rate() - 0.5).abs() < 1e-9);
@@ -459,7 +489,10 @@ mod tests {
     fn wilson_separation_needs_evidence_not_just_a_big_ratio() {
         // One miss out of 3 is a 33% rate against a 5% baseline — a dramatic
         // ratio, and no evidence at all. The interval swallows it.
-        assert!(!rate_rose((1, 3), (15, 300)), "a 1-of-3 miss must not separate");
+        assert!(
+            !rate_rose((1, 3), (15, 300)),
+            "a 1-of-3 miss must not separate"
+        );
         // The same rate over 60 documents is real evidence.
         assert!(rate_rose((20, 60), (15, 300)));
         // A rate that did not actually rise never separates, at any size.

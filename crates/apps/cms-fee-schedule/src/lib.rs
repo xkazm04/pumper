@@ -89,7 +89,10 @@ fn parse_release(s: &str) -> Option<Release> {
         return None;
     }
     let yy = ((d1 - b'0') as u32) * 10 + (d2 - b'0') as u32;
-    Some(Release { year: 2000 + yy, quarter: q as char })
+    Some(Release {
+        year: 2000 + yy,
+        quarter: q as char,
+    })
 }
 
 /// Scan an HTML/text blob for every distinct `rvuYYq` release token (in hrefs or
@@ -163,7 +166,11 @@ impl ScrapeApp for CmsFeeSchedule {
             )));
         }
 
-        let response = ctx.engines.http.fetch(HttpRequest::get(PFS_INDEX_URL)).await?;
+        let response = ctx
+            .engines
+            .http
+            .fetch(HttpRequest::get(PFS_INDEX_URL))
+            .await?;
         if !response.is_success() {
             return Err(Error::App(format!(
                 "CMS PFS index returned status {}",
@@ -192,8 +199,17 @@ impl ScrapeApp for CmsFeeSchedule {
             .datasets
             .get(&ctx.app, "releases", schedule)
             .await?
-            .and_then(|r| r.data.get("latest_release").and_then(Value::as_str).map(String::from));
-        let param_known = ctx.params.get("known_release").and_then(Value::as_str).map(String::from);
+            .and_then(|r| {
+                r.data
+                    .get("latest_release")
+                    .and_then(Value::as_str)
+                    .map(String::from)
+            });
+        let param_known = ctx
+            .params
+            .get("known_release")
+            .and_then(Value::as_str)
+            .map(String::from);
         let (baseline, baseline_source) = match (&param_known, &stored_prev) {
             (Some(k), _) => (Some(k.clone()), "param"),
             (None, Some(s)) => (Some(s.clone()), "stored"),

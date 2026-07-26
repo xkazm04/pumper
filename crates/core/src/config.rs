@@ -140,10 +140,11 @@ impl Default for DatahubConfig {
 impl DatahubConfig {
     /// Config token, else `DATAHUB_TOKEN` from the environment.
     pub fn resolve_token(&self) -> Option<String> {
-        self.token
-            .clone()
-            .filter(|t| !t.is_empty())
-            .or_else(|| std::env::var("DATAHUB_TOKEN").ok().filter(|t| !t.is_empty()))
+        self.token.clone().filter(|t| !t.is_empty()).or_else(|| {
+            std::env::var("DATAHUB_TOKEN")
+                .ok()
+                .filter(|t| !t.is_empty())
+        })
     }
 }
 
@@ -168,7 +169,11 @@ pub struct WebhooksConfig {
 
 impl Default for WebhooksConfig {
     fn default() -> Self {
-        Self { failure_url: None, failure_secret: None, auto_retry: true }
+        Self {
+            failure_url: None,
+            failure_secret: None,
+            auto_retry: true,
+        }
     }
 }
 
@@ -184,7 +189,10 @@ pub struct TriggersConfig {
 
 impl Default for TriggersConfig {
     fn default() -> Self {
-        Self { max_depth: 8, key_cap: 200 }
+        Self {
+            max_depth: 8,
+            key_cap: 200,
+        }
     }
 }
 
@@ -196,8 +204,8 @@ impl Config {
         );
         if path.exists() {
             let raw = std::fs::read_to_string(&path)?;
-            let mut cfg: Config =
-                toml::from_str(&raw).map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
+            let mut cfg: Config = toml::from_str(&raw)
+                .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
             cfg.normalize();
             cfg.validate()
                 .map_err(|e| Error::Config(format!("{}: {e}", path.display())))?;
@@ -233,7 +241,8 @@ impl Config {
         // `stale_after_secs`. If beats are rarer than the threshold, every healthy
         // in-flight job looks hung: re-queued mid-run, restarted, reaped again,
         // until `max_attempts` is exhausted. No job ever completes.
-        if w.heartbeat_secs > 0 && w.stale_after_secs > 0 && w.stale_after_secs <= w.heartbeat_secs {
+        if w.heartbeat_secs > 0 && w.stale_after_secs > 0 && w.stale_after_secs <= w.heartbeat_secs
+        {
             return Err(Error::Config(format!(
                 "[worker] stale_after_secs ({}) must exceed heartbeat_secs ({}) — \
                  otherwise every healthy job is reaped as hung",
@@ -244,7 +253,9 @@ impl Config {
         // Both the reaper and the timeout terminate a job. If the reaper fires
         // first it re-queues with attempt semantics, racing the timeout that was
         // meant to be the job's hard wall.
-        if w.stale_after_secs > 0 && w.job_timeout_secs > 0 && w.job_timeout_secs <= w.stale_after_secs
+        if w.stale_after_secs > 0
+            && w.job_timeout_secs > 0
+            && w.job_timeout_secs <= w.stale_after_secs
         {
             return Err(Error::Config(format!(
                 "[worker] job_timeout_secs ({}) must exceed stale_after_secs ({}) — \
@@ -351,7 +362,11 @@ pub struct ServerConfig {
 
 impl Default for ServerConfig {
     fn default() -> Self {
-        Self { host: "127.0.0.1".into(), port: 8088, cors_allowed_origins: Vec::new() }
+        Self {
+            host: "127.0.0.1".into(),
+            port: 8088,
+            cors_allowed_origins: Vec::new(),
+        }
     }
 }
 
@@ -700,7 +715,10 @@ pub struct CacheConfig {
 
 impl Default for CacheConfig {
     fn default() -> Self {
-        Self { enabled: true, ttl_secs: 3600 }
+        Self {
+            enabled: true,
+            ttl_secs: 3600,
+        }
     }
 }
 
@@ -744,7 +762,10 @@ pub struct SearchConfig {
 
 impl Default for SearchConfig {
     fn default() -> Self {
-        Self { enabled: true, dir: "data/search-index".into() }
+        Self {
+            enabled: true,
+            dir: "data/search-index".into(),
+        }
     }
 }
 
@@ -754,7 +775,9 @@ mod tests {
 
     #[test]
     fn shipped_defaults_are_valid() {
-        Config::default().validate().expect("shipped defaults must satisfy their own invariants");
+        Config::default()
+            .validate()
+            .expect("shipped defaults must satisfy their own invariants");
     }
 
     #[test]
@@ -819,13 +842,21 @@ mod tests {
         // A fetch floor above 1 makes every run inconclusive — detection off.
         let mut cfg = Config::default();
         cfg.resilience.fetch_ok_floor = 1.5;
-        assert!(cfg.validate().unwrap_err().to_string().contains("fetch_ok_floor"));
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("fetch_ok_floor"));
 
         // Retention shorter than the baseline window prunes what the detector reads.
         let mut cfg = Config::default();
         cfg.resilience.window_runs = 20;
         cfg.resilience.sketch_retention_runs = 5;
-        assert!(cfg.validate().unwrap_err().to_string().contains("sketch_retention_runs"));
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("sketch_retention_runs"));
     }
 
     #[test]
@@ -870,11 +901,13 @@ mod tests {
     fn the_shipped_config_file_is_valid() {
         // Guards against the repo's own config.toml drifting into a state that
         // would refuse to boot.
-        let raw = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.toml"))
-            .expect("repo config.toml must be readable from the core crate");
+        let raw =
+            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../config.toml"))
+                .expect("repo config.toml must be readable from the core crate");
         let mut cfg: Config = toml::from_str(&raw).expect("repo config.toml must parse");
         cfg.normalize();
-        cfg.validate().expect("repo config.toml must satisfy the invariants");
+        cfg.validate()
+            .expect("repo config.toml must satisfy the invariants");
     }
 
     #[test]
@@ -908,10 +941,12 @@ mod tests {
     #[test]
     fn browser_proxy_falls_back_to_http_proxy_on_normalize() {
         // Unset browser proxy inherits [http] proxy.
-        let mut cfg: Config = toml::from_str(r#"
+        let mut cfg: Config = toml::from_str(
+            r#"
             [http]
             proxy = "http://gw:8080"
-        "#)
+        "#,
+        )
         .unwrap();
         assert!(cfg.browser.proxy.is_none(), "not yet normalized");
         cfg.normalize();
@@ -920,7 +955,10 @@ mod tests {
 
     #[test]
     fn fetcher_profiles_dir_defaults_and_overrides() {
-        assert_eq!(FetcherConfig::default().profiles_dir, PathBuf::from("data/profiles"));
+        assert_eq!(
+            FetcherConfig::default().profiles_dir,
+            PathBuf::from("data/profiles")
+        );
         let cfg: Config = toml::from_str(
             r#"
             [fetcher]
@@ -928,19 +966,24 @@ mod tests {
             "#,
         )
         .unwrap();
-        assert_eq!(cfg.fetcher.profiles_dir, PathBuf::from("/var/lib/pumper/profiles"));
+        assert_eq!(
+            cfg.fetcher.profiles_dir,
+            PathBuf::from("/var/lib/pumper/profiles")
+        );
         // Untouched sibling keys keep their defaults.
         assert_eq!(cfg.fetcher.min_content_chars, 250);
     }
 
     #[test]
     fn explicit_browser_proxy_wins_over_http_proxy() {
-        let mut cfg: Config = toml::from_str(r#"
+        let mut cfg: Config = toml::from_str(
+            r#"
             [http]
             proxy = "http://gw:8080"
             [browser]
             proxy = "http://browser-gw:9090"
-        "#)
+        "#,
+        )
         .unwrap();
         cfg.normalize();
         assert_eq!(cfg.browser.proxy.as_deref(), Some("http://browser-gw:9090"));

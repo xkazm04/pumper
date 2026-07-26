@@ -114,7 +114,10 @@ impl ScrapeApp for GrantsGov {
             if parsed.get("errorcode").and_then(Value::as_i64).unwrap_or(0) != 0 {
                 return Err(Error::App(format!(
                     "grants.gov error: {}",
-                    parsed.get("msg").and_then(Value::as_str).unwrap_or("unknown")
+                    parsed
+                        .get("msg")
+                        .and_then(Value::as_str)
+                        .unwrap_or("unknown")
                 )));
             }
 
@@ -197,8 +200,11 @@ impl ScrapeApp for GrantsGov {
             .unwrap_or(14)
             .clamp(1, 365) as i64;
         let closing_soon = closing_soon_digest(&hits, digest_days);
-        ctx.save_artifact("closing_soon.json", &serde_json::to_vec_pretty(&closing_soon)?)
-            .await?;
+        ctx.save_artifact(
+            "closing_soon.json",
+            &serde_json::to_vec_pretty(&closing_soon)?,
+        )
+        .await?;
 
         let mut out = json!({
             "source": "grants.gov/search2",
@@ -308,9 +314,15 @@ mod tests {
     #[test]
     fn digest_keeps_only_posted_opps_closing_within_window() {
         let today = chrono::Utc::now().date_naive();
-        let soon = (today + chrono::Duration::days(3)).format("%m/%d/%Y").to_string();
-        let far = (today + chrono::Duration::days(90)).format("%m/%d/%Y").to_string();
-        let past = (today - chrono::Duration::days(1)).format("%m/%d/%Y").to_string();
+        let soon = (today + chrono::Duration::days(3))
+            .format("%m/%d/%Y")
+            .to_string();
+        let far = (today + chrono::Duration::days(90))
+            .format("%m/%d/%Y")
+            .to_string();
+        let past = (today - chrono::Duration::days(1))
+            .format("%m/%d/%Y")
+            .to_string();
         let hits = vec![
             json!({ "id": "1", "title": "in window", "oppStatus": "posted", "closeDate": soon }),
             json!({ "id": "2", "title": "too far", "oppStatus": "posted", "closeDate": far }),
@@ -329,7 +341,11 @@ mod tests {
         let today = chrono::Utc::now().date_naive();
         let d = |n: i64, iso: bool| {
             let date = today + chrono::Duration::days(n);
-            if iso { date.format("%Y-%m-%d").to_string() } else { date.format("%m/%d/%Y").to_string() }
+            if iso {
+                date.format("%Y-%m-%d").to_string()
+            } else {
+                date.format("%m/%d/%Y").to_string()
+            }
         };
         let hits = vec![
             json!({ "id": "a", "closeDate": d(10, false) }),

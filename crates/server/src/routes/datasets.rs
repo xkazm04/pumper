@@ -12,9 +12,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use utoipa::IntoParams;
 
-use crate::routes::error::{
-    default_limit, keyset_cursor, parse_cursor, parse_since, ApiError,
-};
+use crate::routes::error::{default_limit, keyset_cursor, parse_cursor, parse_since, ApiError};
 use crate::state::AppState;
 
 /// Cursor variant for revision feeds whose tiebreak is numeric (a rowid or a
@@ -74,7 +72,11 @@ pub(crate) fn trust_filter(raw: &str) -> Option<&str> {
 /// generic `?filter=…&filter=…` surface is read from the full pair vector
 /// instead.
 pub(crate) fn filter_specs(pairs: &[(String, String)]) -> Vec<String> {
-    pairs.iter().filter(|(k, _)| k == "filter").map(|(_, v)| v.clone()).collect()
+    pairs
+        .iter()
+        .filter(|(k, _)| k == "filter")
+        .map(|(_, v)| v.clone())
+        .collect()
 }
 
 /// Parses repeatable `filter` specs into store-level [`JsonFilter`]s (all ANDed).
@@ -86,7 +88,9 @@ pub(crate) fn filter_specs(pairs: &[(String, String)]) -> Vec<String> {
 /// value keeps any `:` after the op, so timestamps/URLs pass through. Malformed
 /// specs map to `400` (the shared `Error::BadRequest` path). Example:
 /// `?filter=$.state:eq:CA&filter=$.amount:numgte:1000`.
-pub(crate) fn parse_filters(specs: &[String]) -> Result<Vec<pumper_core::datasets::JsonFilter>, ApiError> {
+pub(crate) fn parse_filters(
+    specs: &[String],
+) -> Result<Vec<pumper_core::datasets::JsonFilter>, ApiError> {
     use pumper_core::datasets::JsonFilter;
     let bad = |msg: String| ApiError(StatusCode::BAD_REQUEST, msg);
     let mut out = Vec::with_capacity(specs.len());
@@ -111,28 +115,48 @@ pub(crate) fn parse_filters(specs: &[String]) -> Result<Vec<pumper_core::dataset
         let filter = match op {
             "eq" => {
                 check_path(path)?;
-                JsonFilter::Eq { path: path.into(), value: value.into() }
+                JsonFilter::Eq {
+                    path: path.into(),
+                    value: value.into(),
+                }
             }
             "contains" => {
                 check_path(path)?;
-                JsonFilter::Contains { path: path.into(), value: value.into() }
+                JsonFilter::Contains {
+                    path: path.into(),
+                    value: value.into(),
+                }
             }
             "gte" => {
                 check_path(path)?;
-                JsonFilter::Gte { path: path.into(), value: value.into() }
+                JsonFilter::Gte {
+                    path: path.into(),
+                    value: value.into(),
+                }
             }
             "lte" => {
                 check_path(path)?;
-                JsonFilter::Lte { path: path.into(), value: value.into() }
+                JsonFilter::Lte {
+                    path: path.into(),
+                    value: value.into(),
+                }
             }
             "numgte" => {
                 let num: f64 = value.parse().map_err(|_| {
-                    bad(format!("filter '{spec}': '{value}' is not a number for op 'numgte'"))
+                    bad(format!(
+                        "filter '{spec}': '{value}' is not a number for op 'numgte'"
+                    ))
                 })?;
-                let paths: Vec<String> =
-                    path.split(',').map(str::trim).filter(|p| !p.is_empty()).map(String::from).collect();
+                let paths: Vec<String> = path
+                    .split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(String::from)
+                    .collect();
                 if paths.is_empty() {
-                    return Err(bad(format!("filter '{spec}': 'numgte' needs at least one path")));
+                    return Err(bad(format!(
+                        "filter '{spec}': 'numgte' needs at least one path"
+                    )));
                 }
                 for p in &paths {
                     check_path(p)?;
@@ -179,20 +203,31 @@ pub(crate) async fn list_records(
         let records = if filters.is_empty() {
             state.datasets.list(&app, &dataset, limit).await?
         } else {
-            state.datasets.list_filtered(&app, &dataset, &filters, None, limit).await?
+            state
+                .datasets
+                .list_filtered(&app, &dataset, &filters, None, limit)
+                .await?
         };
         return Ok(Json(json!(records)));
     };
     let after = parse_cursor(cursor);
     let records = if filters.is_empty() {
-        state.datasets.list_page(&app, &dataset, after, limit, trust_filter(&query.trust)).await?
+        state
+            .datasets
+            .list_page(&app, &dataset, after, limit, trust_filter(&query.trust))
+            .await?
     } else {
-        state.datasets.list_filtered(&app, &dataset, &filters, after, limit).await?
+        state
+            .datasets
+            .list_filtered(&app, &dataset, &filters, after, limit)
+            .await?
     };
     let next_cursor = keyset_cursor(&records, limit, |r| {
         format!("{}|{}", pumper_core::datasets::ts(r.updated_at), r.key)
     });
-    Ok(Json(json!({ "items": records, "next_cursor": next_cursor })))
+    Ok(Json(
+        json!({ "items": records, "next_cursor": next_cursor }),
+    ))
 }
 
 #[utoipa::path(
@@ -215,7 +250,9 @@ pub(crate) async fn delete_dataset_route(
     if let Err(e) = state.search.delete_dataset(&app, &dataset).await {
         tracing::warn!(%app, %dataset, "dataset deleted but search cleanup failed: {e}");
     }
-    Ok(Json(json!({ "app": app, "dataset": dataset, "deleted": deleted })))
+    Ok(Json(
+        json!({ "app": app, "dataset": dataset, "deleted": deleted }),
+    ))
 }
 
 #[utoipa::path(
@@ -413,7 +450,10 @@ fn csv_row(out: &mut String, record: &pumper_core::Record) {
         record.first_seen.to_rfc3339(),
         record.last_seen.to_rfc3339(),
         record.updated_at.to_rfc3339(),
-        record.removed_at.map(|d| d.to_rfc3339()).unwrap_or_default(),
+        record
+            .removed_at
+            .map(|d| d.to_rfc3339())
+            .unwrap_or_default(),
         quote(&record.data.to_string()),
     ));
 }
@@ -465,7 +505,10 @@ pub(crate) async fn dataset_duplicates(
         ));
     }
     let distance = query.distance.min(20);
-    let pairs = state.datasets.duplicate_pairs(&app, &dataset, distance).await?;
+    let pairs = state
+        .datasets
+        .duplicate_pairs(&app, &dataset, distance)
+        .await?;
     Ok(Json(json!({
         "app": app,
         "dataset": dataset,
@@ -516,7 +559,13 @@ pub(crate) async fn dataset_changes(
     let Some(cursor) = &query.cursor else {
         let changes = state
             .datasets
-            .changes_since(&app, Some(&dataset), since, query.limit.clamp(1, 1000), trust)
+            .changes_since(
+                &app,
+                Some(&dataset),
+                since,
+                query.limit.clamp(1, 1000),
+                trust,
+            )
             .await?;
         return Ok(Json(json!({
             "app": app,
@@ -529,9 +578,18 @@ pub(crate) async fn dataset_changes(
     let after = parse_cursor_i64(cursor);
     let page = state
         .datasets
-        .changes_page(&app, Some(&dataset), since, after, query.limit.clamp(1, 1000), trust)
+        .changes_page(
+            &app,
+            Some(&dataset),
+            since,
+            after,
+            query.limit.clamp(1, 1000),
+            trust,
+        )
         .await?;
-    Ok(Json(json!({ "items": page.items, "next_cursor": page.next_cursor })))
+    Ok(Json(
+        json!({ "items": page.items, "next_cursor": page.next_cursor }),
+    ))
 }
 
 #[derive(Deserialize, IntoParams)]
@@ -580,5 +638,7 @@ pub(crate) async fn record_history(
         .datasets
         .history_page(&app, &dataset, &query.key, after, query.limit.clamp(1, 500))
         .await?;
-    Ok(Json(json!({ "items": page.items, "next_cursor": page.next_cursor })))
+    Ok(Json(
+        json!({ "items": page.items, "next_cursor": page.next_cursor }),
+    ))
 }

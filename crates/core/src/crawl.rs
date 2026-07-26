@@ -358,7 +358,9 @@ impl Frontier {
     /// `skipped_host_budget`) and leaves the rotation.
     fn pop(&mut self) -> Option<(String, u32)> {
         for _ in 0..self.order.len() {
-            let Some(host) = self.order.pop_front() else { break };
+            let Some(host) = self.order.pop_front() else {
+                break;
+            };
             // Over budget? Drop this host's remaining backlog, honestly counted.
             if let Some(cap) = self.max_pages_per_host {
                 if self.taken.get(&host).copied().unwrap_or(0) >= cap {
@@ -369,7 +371,9 @@ impl Frontier {
                     continue; // host left the rotation
                 }
             }
-            let Some(q) = self.per_host.get_mut(&host) else { continue };
+            let Some(q) = self.per_host.get_mut(&host) else {
+                continue;
+            };
             let Some(item) = q.pop_front() else {
                 self.per_host.remove(&host);
                 continue;
@@ -405,7 +409,10 @@ impl Frontier {
     /// the URL on restore, so the persisted shape stays a flat `(url, depth)` list
     /// — checkpoint-compatible with the pre-host-fairness format).
     fn queued(&self) -> Vec<(String, u32)> {
-        self.per_host.values().flat_map(|q| q.iter().cloned()).collect()
+        self.per_host
+            .values()
+            .flat_map(|q| q.iter().cloned())
+            .collect()
     }
 
     /// Restores queued URLs + seen-set from a checkpoint (bypasses the dedup
@@ -450,11 +457,20 @@ impl SimHashIndex {
         let mut shift = 0u32;
         for i in 0..bands {
             let width = base + if i < rem { 1 } else { 0 };
-            let mask = if width == 64 { u64::MAX } else { (1u64 << width) - 1 };
+            let mask = if width == 64 {
+                u64::MAX
+            } else {
+                (1u64 << width) - 1
+            };
             segs.push((shift, mask));
             shift += width as u32;
         }
-        Self { distance, segs, buckets: vec![HashMap::new(); bands], all: Vec::new() }
+        Self {
+            distance,
+            segs,
+            buckets: vec![HashMap::new(); bands],
+            all: Vec::new(),
+        }
     }
 
     /// Rebuilds an index (e.g. after a checkpoint resume) from kept hashes.
@@ -617,7 +633,9 @@ pub async fn crawl(
         // every remaining URL is still inside its host's delay window.
         let mut rotations = 0;
         while in_flight.len() < concurrency && rotations <= frontier.len() {
-            let Some((url, depth)) = frontier.pop() else { break };
+            let Some((url, depth)) = frontier.pop() else {
+                break;
+            };
             let host = host_of(&url).unwrap_or_default();
             let mut crawl_delay = None;
             if cfg.respect_robots && !host.is_empty() {
@@ -644,7 +662,11 @@ pub async fn crawl(
             let http = http.clone();
             let same_domain = cfg.same_domain;
             // A known page (in `conditional`) gets a revalidating conditional GET.
-            let cond = if cfg.revisit { conditional.get(&url).cloned() } else { None };
+            let cond = if cfg.revisit {
+                conditional.get(&url).cloned()
+            } else {
+                None
+            };
             in_flight.push(async move { fetch_one(http, url, depth, same_domain, cond).await });
         }
 
@@ -1043,7 +1065,12 @@ fn parse_page(html: &str, base: &str, same_domain: bool) -> ParsedPage {
     let text = extract_text(&doc);
     let content_chars = text.chars().count();
     let excerpt: String = text.chars().take(EXCERPT_CHARS).collect();
-    ParsedPage { links, title, content_chars, excerpt }
+    ParsedPage {
+        links,
+        title,
+        content_chars,
+        excerpt,
+    }
 }
 
 fn extract_links(doc: &Html, base: &str, same_domain: bool) -> Vec<String> {
@@ -1054,8 +1081,12 @@ fn extract_links(doc: &Html, base: &str, same_domain: bool) -> Vec<String> {
     let selector = Selector::parse("a[href]").expect("valid selector");
     let mut out = Vec::new();
     for el in doc.select(&selector) {
-        let Some(href) = el.value().attr("href") else { continue };
-        let Ok(joined) = base_url.join(href) else { continue };
+        let Some(href) = el.value().attr("href") else {
+            continue;
+        };
+        let Ok(joined) = base_url.join(href) else {
+            continue;
+        };
         if !matches!(joined.scheme(), "http" | "https") {
             continue;
         }
@@ -1080,7 +1111,9 @@ fn extract_title(doc: &Html) -> Option<String> {
 fn extract_text(doc: &Html) -> String {
     let mut out = String::new();
     for node in doc.tree.nodes() {
-        let Some(text) = node.value().as_text() else { continue };
+        let Some(text) = node.value().as_text() else {
+            continue;
+        };
         let in_non_content = node.ancestors().any(|a| {
             a.value().as_element().is_some_and(|e| {
                 matches!(
@@ -1105,8 +1138,18 @@ fn extract_text(doc: &Html) -> String {
 /// Query parameters that never change page content — dropped so the frontier's
 /// seen-set doesn't treat `?utm_source=x` variants as distinct pages.
 const TRACKING_PARAMS: &[&str] = &[
-    "utm_source", "utm_medium", "utm_campaign", "utm_term", "utm_content",
-    "gclid", "fbclid", "msclkid", "mc_cid", "mc_eid", "ref", "ref_src",
+    "utm_source",
+    "utm_medium",
+    "utm_campaign",
+    "utm_term",
+    "utm_content",
+    "gclid",
+    "fbclid",
+    "msclkid",
+    "mc_cid",
+    "mc_eid",
+    "ref",
+    "ref_src",
 ];
 
 /// Canonical form of a URL for frontier dedup: fragment stripped, tracking
@@ -1139,7 +1182,9 @@ fn canonicalize(mut url: Url) -> String {
 
 /// Canonicalizes a raw URL string; passes through unparseable input unchanged.
 fn canonicalize_str(url: &str) -> String {
-    Url::parse(url).map(canonicalize).unwrap_or_else(|_| url.to_string())
+    Url::parse(url)
+        .map(canonicalize)
+        .unwrap_or_else(|_| url.to_string())
 }
 
 fn host_of(url: &str) -> Option<String> {
@@ -1185,7 +1230,11 @@ struct RobotRules {
 
 impl RobotRules {
     fn allow_all() -> Self {
-        Self { rules: Vec::new(), crawl_delay: None, sitemaps: Vec::new() }
+        Self {
+            rules: Vec::new(),
+            crawl_delay: None,
+            sitemaps: Vec::new(),
+        }
     }
 
     fn parse(text: &str) -> Self {
@@ -1193,7 +1242,9 @@ impl RobotRules {
         let mut in_star_group = false;
         for raw in text.lines() {
             let line = raw.split('#').next().unwrap_or("").trim();
-            let Some((key, value)) = line.split_once(':') else { continue };
+            let Some((key, value)) = line.split_once(':') else {
+                continue;
+            };
             let key = key.trim().to_ascii_lowercase();
             // `Sitemap:` values are absolute URLs — re-join the split colon.
             let value = if key == "sitemap" {
@@ -1251,7 +1302,11 @@ impl RobotRules {
 /// (including empty) and a trailing `$` anchors the match to the path end.
 fn robots_match_len(pattern: &str, path: &str) -> Option<usize> {
     let anchored = pattern.ends_with('$');
-    let pat = if anchored { &pattern[..pattern.len() - 1] } else { pattern };
+    let pat = if anchored {
+        &pattern[..pattern.len() - 1]
+    } else {
+        pattern
+    };
     let mut pos = 0usize;
     for (i, seg) in pat.split('*').enumerate() {
         if seg.is_empty() {
@@ -1311,7 +1366,10 @@ fn parse_sitemap_entries(xml: &str) -> Vec<SitemapEntry> {
     // Fallback: bare <loc> entries with no <url> wrapper.
     if out.is_empty() {
         for loc in loc_re.captures_iter(xml) {
-            out.push(SitemapEntry { loc: loc[1].replace("&amp;", "&"), lastmod: None });
+            out.push(SitemapEntry {
+                loc: loc[1].replace("&amp;", "&"),
+                lastmod: None,
+            });
         }
     }
     out
@@ -1331,7 +1389,11 @@ async fn seed_from_sitemaps(
     let roots: Vec<String> = if declared.is_empty() {
         vec![format!("https://{host}/sitemap.xml")]
     } else {
-        declared.iter().take(MAX_SITEMAPS_PER_HOST).cloned().collect()
+        declared
+            .iter()
+            .take(MAX_SITEMAPS_PER_HOST)
+            .cloned()
+            .collect()
     };
     // Collect all in-scope URL entries first, then push the freshest by `<lastmod>`
     // — a `max_pages`-capped crawl should spend its budget on URLs that changed most
@@ -1339,7 +1401,9 @@ async fn seed_from_sitemaps(
     // is unconditional; `budget` still bounds how many land in the frontier.
     let mut entries: Vec<SitemapEntry> = Vec::new();
     for root in roots {
-        let Ok(resp) = http.fetch(HttpRequest::get(&root)).await else { continue };
+        let Ok(resp) = http.fetch(HttpRequest::get(&root)).await else {
+            continue;
+        };
         if !resp.is_success() {
             continue;
         }
@@ -1347,7 +1411,9 @@ async fn seed_from_sitemaps(
         if resp.body.contains("<sitemapindex") {
             // A sitemap index lists further sitemaps; follow one level.
             for sm in parsed.into_iter().take(MAX_SITEMAPS_PER_HOST) {
-                let Ok(resp) = http.fetch(HttpRequest::get(&sm.loc)).await else { continue };
+                let Ok(resp) = http.fetch(HttpRequest::get(&sm.loc)).await else {
+                    continue;
+                };
                 if resp.is_success() {
                     entries.extend(parse_sitemap_entries(&resp.body));
                 }
@@ -1413,7 +1479,10 @@ mod tests {
     impl HttpClient for MockHttp {
         async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
             if self.fail.contains(&req.url) {
-                return Err(crate::Error::App(format!("simulated transport failure: {}", req.url)));
+                return Err(crate::Error::App(format!(
+                    "simulated transport failure: {}",
+                    req.url
+                )));
             }
             // Conditional GET: matching validator ⇒ 304 Not Modified, empty body.
             if let Some(sent) = &req.etag {
@@ -1427,15 +1496,24 @@ mod tests {
                     });
                 }
             }
-            let (status, body) =
-                self.pages.get(&req.url).cloned().unwrap_or((404, String::new()));
+            let (status, body) = self
+                .pages
+                .get(&req.url)
+                .cloned()
+                .unwrap_or((404, String::new()));
             let mut headers = HashMap::new();
             if status == 200 {
                 if let Some(tag) = self.resp_etags.get(&req.url) {
                     headers.insert("ETag".to_string(), tag.clone());
                 }
             }
-            Ok(HttpResponse { status, headers, body, final_url: req.url, cache_hit: false })
+            Ok(HttpResponse {
+                status,
+                headers,
+                body,
+                final_url: req.url,
+                cache_hit: false,
+            })
         }
     }
 
@@ -1476,34 +1554,57 @@ mod tests {
         let mut pages = HashMap::new();
         pages.insert(
             "https://ex.com/".to_string(),
-            (200, "<html><head><title>Home</title></head><body><h1>Hi</h1>\
+            (
+                200,
+                "<html><head><title>Home</title></head><body><h1>Hi</h1>\
                    <a href=\"/about\">about</a></body></html>"
-                .to_string()),
+                    .to_string(),
+            ),
         );
         pages.insert(
             "https://ex.com/about".to_string(),
-            (200, "<html><head><title>About</title></head><body>\
+            (
+                200,
+                "<html><head><title>About</title></head><body>\
                    <p>About us page content.</p></body></html>"
-                .to_string()),
+                    .to_string(),
+            ),
         );
-        let http = Arc::new(MockHttp { pages, ..Default::default() });
+        let http = Arc::new(MockHttp {
+            pages,
+            ..Default::default()
+        });
         let records = Arc::new(SyncMutex::new(Vec::new()));
-        let sink = Box::new(CollectSink { records: records.clone() });
+        let sink = Box::new(CollectSink {
+            records: records.clone(),
+        });
 
-        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, Some(sink), None, None)
-            .await
-            .unwrap();
+        let stats = crawl(
+            http,
+            test_cfg(&["https://ex.com/"]),
+            None,
+            Some(sink),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(stats.kept, 2, "both distinct pages kept");
         let recs = records.lock().unwrap();
-        assert_eq!(recs.len(), 2, "each kept page streamed to the sink exactly once");
+        assert_eq!(
+            recs.len(),
+            2,
+            "each kept page streamed to the sink exactly once"
+        );
         let home = recs.iter().find(|r| r.url == "https://ex.com/").unwrap();
         assert_eq!(home.title.as_deref(), Some("Home"));
         assert_eq!(home.status, 200);
         assert!(home.content_chars > 0);
         assert_ne!(home.simhash, 0, "body simhash recorded");
-        assert!(recs.iter().any(|r| r.url == "https://ex.com/about"
-            && r.title.as_deref() == Some("About")));
+        assert!(recs
+            .iter()
+            .any(|r| r.url == "https://ex.com/about" && r.title.as_deref() == Some("About")));
     }
 
     #[tokio::test]
@@ -1511,25 +1612,48 @@ mod tests {
         let mut pages = HashMap::new();
         pages.insert(
             "https://ex.com/".to_string(),
-            (200, "<html><body><a href=\"/a\">a</a></body></html>".to_string()),
+            (
+                200,
+                "<html><body><a href=\"/a\">a</a></body></html>".to_string(),
+            ),
         );
         pages.insert(
             "https://ex.com/a".to_string(),
-            (200, "<html><body><p>distinct content</p></body></html>".to_string()),
+            (
+                200,
+                "<html><body><p>distinct content</p></body></html>".to_string(),
+            ),
         );
-        let http = Arc::new(MockHttp { pages, ..Default::default() });
+        let http = Arc::new(MockHttp {
+            pages,
+            ..Default::default()
+        });
         let seen: Arc<SyncMutex<Vec<CrawlProgressSnapshot>>> = Arc::new(SyncMutex::new(Vec::new()));
         let sink_seen = seen.clone();
-        let progress: ProgressFn = Arc::new(move |snap| sink_seen.lock().unwrap().push(snap.clone()));
+        let progress: ProgressFn =
+            Arc::new(move |snap| sink_seen.lock().unwrap().push(snap.clone()));
 
-        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, None, Some(progress))
-            .await
-            .unwrap();
+        let stats = crawl(
+            http,
+            test_cfg(&["https://ex.com/"]),
+            None,
+            None,
+            None,
+            Some(progress),
+        )
+        .await
+        .unwrap();
 
         let snaps = seen.lock().unwrap();
-        assert!(!snaps.is_empty(), "at least the final progress snapshot is emitted");
+        assert!(
+            !snaps.is_empty(),
+            "at least the final progress snapshot is emitted"
+        );
         let last = snaps.last().unwrap();
-        assert_eq!(last.crawled, stats.crawled, "final snapshot mirrors end stats");
+        assert_eq!(
+            last.crawled, stats.crawled,
+            "final snapshot mirrors end stats"
+        );
         assert_eq!(last.kept, stats.kept);
         assert_eq!(last.hosts, stats.hosts);
     }
@@ -1551,14 +1675,22 @@ mod tests {
         let mut pages = HashMap::new();
         pages.insert(
             "https://ex.com/changed".to_string(),
-            (200, "<html><body><p>brand new content this run</p></body></html>".to_string()),
+            (
+                200,
+                "<html><body><p>brand new content this run</p></body></html>".to_string(),
+            ),
         );
         // /stable is 304 (validator matches); /gone is unknown → 404.
         let mut etags = HashMap::new();
         etags.insert("https://ex.com/stable".to_string(), "v1".to_string());
         let mut resp_etags = HashMap::new();
         resp_etags.insert("https://ex.com/changed".to_string(), "new-tag".to_string());
-        let http = Arc::new(MockHttp { pages, etags, resp_etags, ..Default::default() });
+        let http = Arc::new(MockHttp {
+            pages,
+            etags,
+            resp_etags,
+            ..Default::default()
+        });
 
         let source = Box::new(SeedSource(vec![
             RevisitSeed {
@@ -1571,21 +1703,35 @@ mod tests {
                 etag: Some("stale".into()),
                 last_modified: None,
             },
-            RevisitSeed { url: "https://ex.com/gone".into(), etag: None, last_modified: None },
+            RevisitSeed {
+                url: "https://ex.com/gone".into(),
+                etag: None,
+                last_modified: None,
+            },
         ]));
 
         let records = Arc::new(SyncMutex::new(Vec::new()));
-        let sink = Box::new(CollectSink { records: records.clone() });
+        let sink = Box::new(CollectSink {
+            records: records.clone(),
+        });
 
         let mut cfg = test_cfg(&[]);
         cfg.revisit = true;
 
-        let stats = crawl(http, cfg, None, Some(sink), Some(source), None).await.unwrap();
+        let stats = crawl(http, cfg, None, Some(sink), Some(source), None)
+            .await
+            .unwrap();
 
         assert_eq!(stats.revisited, 3, "all three known pages revisited");
-        assert_eq!(stats.unchanged_304, 1, "the matching-validator page is a cheap 304");
+        assert_eq!(
+            stats.unchanged_304, 1,
+            "the matching-validator page is a cheap 304"
+        );
         assert_eq!(stats.gone, 1, "the 404 page is flagged gone");
-        assert_eq!(stats.kept, 1, "only the changed page is re-fingerprinted/kept");
+        assert_eq!(
+            stats.kept, 1,
+            "only the changed page is re-fingerprinted/kept"
+        );
         assert_eq!(stats.crawled, 1, "only the 200 counts as crawled");
 
         let recs = records.lock().unwrap();
@@ -1593,7 +1739,11 @@ mod tests {
         let gone: Vec<_> = recs.iter().filter(|r| r.gone).collect();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].url, "https://ex.com/changed");
-        assert_eq!(live[0].etag.as_deref(), Some("new-tag"), "response ETag stored");
+        assert_eq!(
+            live[0].etag.as_deref(),
+            Some("new-tag"),
+            "response ETag stored"
+        );
         assert_eq!(gone.len(), 1);
         assert_eq!(gone[0].url, "https://ex.com/gone");
         assert_eq!(gone[0].status, 404);
@@ -1606,13 +1756,22 @@ mod tests {
         let mut pages = HashMap::new();
         pages.insert(
             "https://ex.com/hub".to_string(),
-            (200, "<html><body><a href=\"/newly-linked\">new</a></body></html>".to_string()),
+            (
+                200,
+                "<html><body><a href=\"/newly-linked\">new</a></body></html>".to_string(),
+            ),
         );
         pages.insert(
             "https://ex.com/newly-linked".to_string(),
-            (200, "<html><body><p>should not be crawled</p></body></html>".to_string()),
+            (
+                200,
+                "<html><body><p>should not be crawled</p></body></html>".to_string(),
+            ),
         );
-        let http = Arc::new(MockHttp { pages, ..Default::default() });
+        let http = Arc::new(MockHttp {
+            pages,
+            ..Default::default()
+        });
         let source = Box::new(SeedSource(vec![RevisitSeed {
             url: "https://ex.com/hub".into(),
             etag: None,
@@ -1621,8 +1780,13 @@ mod tests {
         let mut cfg = test_cfg(&[]);
         cfg.revisit = true; // discover stays false
 
-        let stats = crawl(http, cfg, None, None, Some(source), None).await.unwrap();
-        assert_eq!(stats.crawled, 1, "only the seeded hub is fetched; no link-following");
+        let stats = crawl(http, cfg, None, None, Some(source), None)
+            .await
+            .unwrap();
+        assert_eq!(
+            stats.crawled, 1,
+            "only the seeded hub is fetched; no link-following"
+        );
         assert_eq!(stats.revisited, 1);
     }
 
@@ -1637,30 +1801,48 @@ mod tests {
         pages.insert("https://ex.com/".to_string(), (200, seed.to_string()));
         pages.insert(
             "https://ex.com/ok".to_string(),
-            (200, "<html><body><p>real content here</p></body></html>".to_string()),
+            (
+                200,
+                "<html><body><p>real content here</p></body></html>".to_string(),
+            ),
         );
         // 403 hard block.
-        pages.insert("https://ex.com/blocked".to_string(), (403, "denied".to_string()));
+        pages.insert(
+            "https://ex.com/blocked".to_string(),
+            (403, "denied".to_string()),
+        );
         // 200 with a Cloudflare interstitial marker — must classify as bot-wall.
         pages.insert(
             "https://ex.com/cf".to_string(),
-            (200, "<html><head><title>Just a moment...</title></head><body>\
+            (
+                200,
+                "<html><head><title>Just a moment...</title></head><body>\
                    <div class=\"cf-browser-verification\">Checking your browser\
                    </div></body></html>"
-                .to_string()),
+                    .to_string(),
+            ),
         );
         let mut fail = HashSet::new();
         fail.insert("https://ex.com/dead".to_string());
 
-        let http = Arc::new(MockHttp { pages, fail, ..Default::default() });
-        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, None, None).await.unwrap();
+        let http = Arc::new(MockHttp {
+            pages,
+            fail,
+            ..Default::default()
+        });
+        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, None, None)
+            .await
+            .unwrap();
 
         // Kept: seed + /ok. /dead failed, /blocked + /cf are bot-walls.
         assert_eq!(stats.kept, 2, "only real-content pages kept");
         assert_eq!(stats.crawled, 2, "crawled counts only real responses");
         assert_eq!(stats.failed, 1, "transport failure counted, not swallowed");
         assert_eq!(stats.failed_by_host.get("ex.com").copied(), Some(1));
-        assert_eq!(stats.skipped_botwall, 2, "403 block + CF challenge both bot-walls");
+        assert_eq!(
+            stats.skipped_botwall, 2,
+            "403 block + CF challenge both bot-walls"
+        );
     }
 
     #[test]
@@ -1729,7 +1911,10 @@ mod tests {
         let path = dir.join("cp.json");
 
         // A missing file is a fresh start, not a reset.
-        assert!(matches!(Checkpoint::load(&path).await, CheckpointLoad::None));
+        assert!(matches!(
+            Checkpoint::load(&path).await,
+            CheckpointLoad::None
+        ));
 
         // A pre-versioning file (no `version` field) parses as version 0 and is
         // rejected as incompatible rather than resumed silently-wrong.
@@ -1739,7 +1924,10 @@ mod tests {
         )
         .await
         .unwrap();
-        assert!(matches!(Checkpoint::load(&path).await, CheckpointLoad::Incompatible));
+        assert!(matches!(
+            Checkpoint::load(&path).await,
+            CheckpointLoad::Incompatible
+        ));
 
         // A current-version checkpoint round-trips.
         let mut frontier = Frontier::new(None);
@@ -1796,7 +1984,11 @@ mod tests {
         }
         assert_eq!(a, 2, "host A capped at 2");
         assert_eq!(b, 1, "host B under cap, unaffected");
-        assert_eq!(f.skipped_host_budget(), 3, "the 3 over-budget A URLs are reported");
+        assert_eq!(
+            f.skipped_host_budget(),
+            3,
+            "the 3 over-budget A URLs are reported"
+        );
     }
 
     #[test]
@@ -1807,7 +1999,10 @@ mod tests {
         f.push("https://a.com/1".into(), 0);
         let (url, depth) = f.pop().unwrap();
         f.requeue(url, depth);
-        assert!(f.pop().is_some(), "requeue refunded the budget so the URL pops again");
+        assert!(
+            f.pop().is_some(),
+            "requeue refunded the budget so the URL pops again"
+        );
     }
 
     #[test]
@@ -1890,8 +2085,11 @@ mod tests {
         assert!(f.allows("https://x.com/blog/post"));
         assert!(!f.allows("https://x.com/shop/item"));
         assert!(!f.allows("https://x.com/blog/file.pdf"));
-        assert!(UrlFilter::compile(&CrawlConfig { include_patterns: vec!["(".into()], ..cfg })
-            .is_err());
+        assert!(UrlFilter::compile(&CrawlConfig {
+            include_patterns: vec!["(".into()],
+            ..cfg
+        })
+        .is_err());
     }
 
     #[test]
@@ -1927,7 +2125,10 @@ mod tests {
             "https://x.com/a?a=1&b=2"
         );
         assert_eq!(canonicalize_str("https://x.com/"), "https://x.com/");
-        assert_eq!(canonicalize_str("https://x.com/p/?fbclid=abc"), "https://x.com/p");
+        assert_eq!(
+            canonicalize_str("https://x.com/p/?fbclid=abc"),
+            "https://x.com/p"
+        );
         assert_eq!(canonicalize_str("not a url"), "not a url");
     }
 }

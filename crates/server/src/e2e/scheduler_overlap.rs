@@ -42,7 +42,9 @@ async fn overlap_guard_holds_a_due_firing_and_releases_it_after_completion() {
     let mut cron_cache = HashMap::new();
 
     // First reconcile: due → exactly one job enqueued, last_run advanced.
-    scheduler::reconcile(&state, &mut cron_cache, Utc::now()).await.unwrap();
+    scheduler::reconcile(&state, &mut cron_cache, Utc::now())
+        .await
+        .unwrap();
     let count = jobs_for(&state, "fake").await;
     assert_eq!(count, 1, "due schedule fires once");
     let last_run_1 = last_run(&state, &schedule.id).await.expect("last_run set");
@@ -50,8 +52,14 @@ async fn overlap_guard_holds_a_due_firing_and_releases_it_after_completion() {
     // Second reconcile a minute later, previous job still queued (active):
     // the guard holds the firing AND leaves last_run untouched.
     let later = Utc::now() + chrono::Duration::minutes(2);
-    scheduler::reconcile(&state, &mut cron_cache, later).await.unwrap();
-    assert_eq!(jobs_for(&state, "fake").await, 1, "no stacked run while one is active");
+    scheduler::reconcile(&state, &mut cron_cache, later)
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs_for(&state, "fake").await,
+        1,
+        "no stacked run while one is active"
+    );
     assert_eq!(
         last_run(&state, &schedule.id).await.expect("last_run"),
         last_run_1,
@@ -63,18 +71,37 @@ async fn overlap_guard_holds_a_due_firing_and_releases_it_after_completion() {
         .fetch_one(&state.storage.pool())
         .await
         .unwrap();
-    let job = state.storage.get(job_id.parse().unwrap()).await.unwrap().unwrap();
-    let claimed = state.storage.claim_next(&[], 0.0).await.unwrap().expect("claim");
+    let job = state
+        .storage
+        .get(job_id.parse().unwrap())
+        .await
+        .unwrap()
+        .unwrap();
+    let claimed = state
+        .storage
+        .claim_next(&[], 0.0)
+        .await
+        .unwrap()
+        .expect("claim");
     assert_eq!(claimed.id, job.id);
     assert!(state
         .storage
         .complete(claimed.id, claimed.attempts, json!({ "ok": true }))
         .await
         .unwrap());
-    assert_eq!(state.storage.get(job.id).await.unwrap().unwrap().status, JobStatus::Succeeded);
+    assert_eq!(
+        state.storage.get(job.id).await.unwrap().unwrap().status,
+        JobStatus::Succeeded
+    );
 
-    scheduler::reconcile(&state, &mut cron_cache, later).await.unwrap();
-    assert_eq!(jobs_for(&state, "fake").await, 2, "released firing fires after completion");
+    scheduler::reconcile(&state, &mut cron_cache, later)
+        .await
+        .unwrap();
+    assert_eq!(
+        jobs_for(&state, "fake").await,
+        2,
+        "released firing fires after completion"
+    );
 }
 
 async fn jobs_for(state: &crate::state::AppState, app: &str) -> i64 {

@@ -79,10 +79,16 @@ pub(crate) async fn create_watch(
     Json(body): Json<CreateWatchBody>,
 ) -> Result<(StatusCode, Json<pumper_core::Watch>), ApiError> {
     if !state.registry.contains_key(&body.app) {
-        return Err(ApiError(StatusCode::NOT_FOUND, format!("unknown app '{}'", body.app)));
+        return Err(ApiError(
+            StatusCode::NOT_FOUND,
+            format!("unknown app '{}'", body.app),
+        ));
     }
     if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "url must be http(s)".into()));
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "url must be http(s)".into(),
+        ));
     }
     let watch = state
         .storage

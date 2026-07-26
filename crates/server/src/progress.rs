@@ -133,8 +133,16 @@ mod tests {
         for n in 2..10 {
             reporter.report(json!({ "crawled": n }));
         }
-        assert_eq!(store.snapshot(&id), Some(json!({ "crawled": 1 })), "coalesced");
-        assert_eq!(events.latest_seq(), 1, "no extra events emitted mid-interval");
+        assert_eq!(
+            store.snapshot(&id),
+            Some(json!({ "crawled": 1 })),
+            "coalesced"
+        );
+        assert_eq!(
+            events.latest_seq(),
+            1,
+            "no extra events emitted mid-interval"
+        );
 
         // Clearing drops the buffered snapshot (finalize path).
         store.clear(&id);

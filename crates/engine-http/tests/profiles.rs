@@ -34,8 +34,12 @@ async fn echo(headers: HeaderMap) -> String {
 }
 
 async fn spawn_server() -> String {
-    let app = Router::new().route("/login", get(login)).route("/echo", get(echo));
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind");
+    let app = Router::new()
+        .route("/login", get(login))
+        .route("/echo", get(echo));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind");
     let addr = listener.local_addr().expect("addr");
     tokio::spawn(async move {
         let _ = axum::serve(listener, app).await;
@@ -91,24 +95,44 @@ async fn profiles_keep_separate_persistent_cookie_jars_across_a_restart() {
         .expect("beta login");
 
     // Each profile replays only its own cookie...
-    let alpha = engine.fetch(profiled(&format!("{base}/echo"), "alpha")).await.expect("alpha echo");
+    let alpha = engine
+        .fetch(profiled(&format!("{base}/echo"), "alpha"))
+        .await
+        .expect("alpha echo");
     assert_eq!(alpha.body, "sid=alpha-1", "alpha replays its own session");
-    let beta = engine.fetch(profiled(&format!("{base}/echo"), "beta")).await.expect("beta echo");
-    assert_eq!(beta.body, "sid=beta-1", "beta replays its own session (no bleed from alpha)");
+    let beta = engine
+        .fetch(profiled(&format!("{base}/echo"), "beta"))
+        .await
+        .expect("beta echo");
+    assert_eq!(
+        beta.body, "sid=beta-1",
+        "beta replays its own session (no bleed from alpha)"
+    );
 
     // ...and a profile-less request stays anonymous (the default in-memory jar).
     let anon = engine
         .fetch(HttpRequest::get(format!("{base}/echo")))
         .await
         .expect("anonymous echo");
-    assert_eq!(anon.body, "none", "profile-less requests carry no profile cookies");
+    assert_eq!(
+        anon.body, "none",
+        "profile-less requests carry no profile cookies"
+    );
 
     // The debounced write-behind flushes both jars (trailing edge).
     tokio::time::sleep(Duration::from_millis(1_500)).await;
     let alpha_jar = vault.join("alpha").join("cookies.json");
     let beta_jar = vault.join("beta").join("cookies.json");
-    assert!(alpha_jar.is_file(), "alpha jar written to {}", alpha_jar.display());
-    assert!(beta_jar.is_file(), "beta jar written to {}", beta_jar.display());
+    assert!(
+        alpha_jar.is_file(),
+        "alpha jar written to {}",
+        alpha_jar.display()
+    );
+    assert!(
+        beta_jar.is_file(),
+        "beta jar written to {}",
+        beta_jar.display()
+    );
     let alpha_json = std::fs::read_to_string(&alpha_jar).unwrap();
     let beta_json = std::fs::read_to_string(&beta_jar).unwrap();
     assert!(alpha_json.contains("alpha-1") && !alpha_json.contains("beta-1"));

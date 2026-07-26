@@ -69,13 +69,20 @@ impl ScrapeApp for FakeApp {
         }
         let mut synced = 0;
         if let Some(items) = ctx.params.get("sync").and_then(Value::as_array) {
-            let dataset =
-                ctx.params.get("dataset").and_then(Value::as_str).unwrap_or("d").to_string();
+            let dataset = ctx
+                .params
+                .get("dataset")
+                .and_then(Value::as_str)
+                .unwrap_or("d")
+                .to_string();
             let items: Vec<(String, Value)> = items
                 .iter()
                 .map(|it| {
                     (
-                        it.get("key").and_then(Value::as_str).expect("sync item key").to_string(),
+                        it.get("key")
+                            .and_then(Value::as_str)
+                            .expect("sync item key")
+                            .to_string(),
                         it.get("data").cloned().unwrap_or(json!({})),
                     )
                 })
@@ -111,7 +118,10 @@ impl TestReceiver {
                     .headers()
                     .iter()
                     .map(|(k, v)| {
-                        (k.as_str().to_lowercase(), v.to_str().unwrap_or("").to_string())
+                        (
+                            k.as_str().to_lowercase(),
+                            v.to_str().unwrap_or("").to_string(),
+                        )
                     })
                     .collect();
                 let body = axum::body::to_bytes(req.into_body(), 1 << 20)
@@ -124,7 +134,9 @@ impl TestReceiver {
             }
         };
         let app = axum::Router::new().fallback(axum::routing::any(handler));
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.expect("bind loopback");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
         let addr = listener.local_addr().expect("local addr");
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;

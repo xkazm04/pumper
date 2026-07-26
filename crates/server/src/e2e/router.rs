@@ -32,7 +32,13 @@ async fn jobs_cursor_paging_returns_every_row_exactly_once() {
     for i in 0..5 {
         state
             .storage
-            .enqueue("fake", EnqueueOptions { params: json!({ "i": i }), ..Default::default() })
+            .enqueue(
+                "fake",
+                EnqueueOptions {
+                    params: json!({ "i": i }),
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
     }
@@ -44,7 +50,9 @@ async fn jobs_cursor_paging_returns_every_row_exactly_once() {
         let uri = format!("/jobs?cursor={cursor}&limit=2");
         let (status, body) = get_json(&router, &uri).await;
         assert_eq!(status, StatusCode::OK);
-        let items = body["items"].as_array().expect("cursor mode returns {items, next_cursor}");
+        let items = body["items"]
+            .as_array()
+            .expect("cursor mode returns {items, next_cursor}");
         assert!(items.len() <= 2, "page size respects the limit");
         seen.extend(items.iter().map(|j| j["id"].as_str().unwrap().to_string()));
         match body["next_cursor"].as_str() {
@@ -68,10 +76,12 @@ fn urlencoding_encode(s: &str) -> String {
 async fn missing_job_returns_the_error_envelope_not_a_bare_status() {
     let (state, _store) = test_state(vec![]).await;
     let router = routes::router(state);
-    let (status, body) =
-        get_json(&router, "/jobs/00000000-0000-0000-0000-000000000000").await;
+    let (status, body) = get_json(&router, "/jobs/00000000-0000-0000-0000-000000000000").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    assert!(body["error"].is_string(), "error envelope carries a message: {body}");
+    assert!(
+        body["error"].is_string(),
+        "error envelope carries a message: {body}"
+    );
 }
 
 #[tokio::test]
