@@ -17,8 +17,8 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      # NOTE: no `cargo fmt --check` gate yet — the tree is not fmt-clean.
-      # Add it after a dedicated fmt-the-world commit.
+      - name: Format
+        run: cargo fmt --check
       - name: Clippy
         run: cargo clippy --workspace --all-targets
       - name: Test
