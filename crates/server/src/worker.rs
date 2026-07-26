@@ -97,6 +97,30 @@ pub async fn run(state: AppState) {
     drain(&state, &semaphore, concurrency).await;
 }
 
+/// One claim→execute→finalize pass with no loop, semaphore, or per-app caps —
+/// the deterministic seam the e2e tests drive. Mirrors the spawn body in
+/// `run()`: cancel-token registration, the `running` event, execution with all
+/// side effects, and attempt-matched token cleanup. Returns whether a job was
+/// claimed.
+#[cfg(test)]
+pub(crate) async fn run_one(state: &AppState) -> bool {
+    let aging = state.config.worker.priority_aging_coefficient_secs;
+    match state.storage.claim_next(&[], aging).await {
+        Ok(Some(job)) => {
+            let cancel = tokio_util::sync::CancellationToken::new();
+            state.job_cancels.lock().unwrap().insert(job.id, (job.attempts, cancel.clone()));
+            publish(state, JobEvent::new(job.id, job.app.clone(), "running"));
+            execute(state.clone(), job.clone(), cancel).await;
+            let mut m = state.job_cancels.lock().unwrap();
+            if m.get(&job.id).map(|(a, _)| *a) == Some(job.attempts) {
+                m.remove(&job.id);
+            }
+            true
+        }
+        _ => false,
+    }
+}
+
 /// Graceful-shutdown drain: waits up to `shutdown_drain_secs` for in-flight jobs
 /// to finish (each holds a semaphore permit, so reacquiring all of them means the
 /// queue is idle). Jobs still running when the deadline passes are re-queued —

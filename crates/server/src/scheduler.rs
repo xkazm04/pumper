@@ -52,7 +52,7 @@ pub async fn run(state: AppState) {
         if state.shutdown.is_cancelled() {
             break;
         }
-        if let Err(e) = reconcile(&state, &mut cron_cache).await {
+        if let Err(e) = reconcile(&state, &mut cron_cache, Utc::now()).await {
             error!("scheduler reconcile failed: {e}");
         }
         // Piggyback the scheduler tick to run the stuck-job reaper: re-queue
@@ -74,11 +74,13 @@ pub async fn run(state: AppState) {
     info!("scheduler stopped");
 }
 
-async fn reconcile(
+/// `now` is a parameter (the same rule `decide` follows) so a test can drive a
+/// reconcile pass deterministically without waiting for wall-clock time.
+pub(crate) async fn reconcile(
     state: &AppState,
     cron_cache: &mut HashMap<String, CronSchedule>,
+    now: chrono::DateTime<Utc>,
 ) -> anyhow::Result<()> {
-    let now = Utc::now();
     // A firing more than two ticks late was missed while the scheduler was down
     // (a healthy tick catches a due firing within one interval). This is the
     // grace window that separates an on-time run from a backlog misfire.

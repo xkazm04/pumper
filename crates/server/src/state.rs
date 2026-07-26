@@ -73,9 +73,28 @@ pub struct AppState {
     pub datahub_last: crate::datahub::StatusCell,
 }
 
+/// The externally-supplied inputs of an [`AppState`]: the pieces `init` builds
+/// from the real environment (storage connection, engines, plugin host, search
+/// index, app registry). [`AppState::from_parts`] derives everything else
+/// (stores, buses, tokens) purely from these — no IO, no spawned tasks — so a
+/// test can assemble a headless state over a temp store with fake engines.
+pub struct AppStateParts {
+    pub config: Config,
+    pub storage: Arc<Storage>,
+    pub governor: Arc<Governor>,
+    pub engines: Arc<EngineSet>,
+    pub plugins: Arc<dyn Plugins>,
+    pub search: Arc<dyn Search>,
+    pub registry: HashMap<String, Arc<dyn ScrapeApp>>,
+}
+
 impl AppState {
-    pub async fn init(config: Config) -> anyhow::Result<Self> {
-        let storage = Arc::new(Storage::connect(&config.storage).await?);
+    /// Pure assembly: derives the SQLite-backed stores and in-memory buses from
+    /// the supplied parts. Spawns nothing; performs no IO beyond building a
+    /// reqwest client. `init` layers the real environment on top.
+    pub fn from_parts(parts: AppStateParts) -> anyhow::Result<Self> {
+        let AppStateParts { config, storage, governor, engines, plugins, search, registry } =
+            parts;
         let datasets = Arc::new(Datasets::new(storage.pool()));
         let costs = Arc::new(CostLedger::new(storage.pool()));
         let cache = Arc::new(HttpCache::new(storage.pool(), &config.cache));
@@ -88,52 +107,44 @@ impl AppState {
             config.fetcher.host_memory_ttl_secs,
         ));
         let health = Arc::new(Resilience::new(storage.pool(), &config.resilience));
-        if health.enabled() {
-            tracing::info!(
-                enforce = health.enforcing(),
-                "extraction-health detection enabled ({})",
-                if health.enforcing() {
-                    "verdicts gate writes, pushes and indexing"
-                } else {
-                    "soak mode: verdicts recorded, nothing gated"
-                }
-            );
-        }
+        let webhook_client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(15))
+            .build()?;
+        let events = Arc::new(EventBus::new(EVENT_BROADCAST_CAPACITY, EVENT_RING_CAPACITY));
+
+        Ok(Self {
+            config: Arc::new(config),
+            storage,
+            datasets,
+            costs,
+            cache,
+            research_cache,
+            tiers,
+            health,
+            governor,
+            engines,
+            plugins,
+            search,
+            registry: Arc::new(registry),
+            notify: Arc::new(Notify::new()),
+            webhook_client,
+            events,
+            progress: Arc::new(ProgressStore::new()),
+            shutdown: CancellationToken::new(),
+            job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            datahub_last: Arc::new(std::sync::Mutex::new(None)),
+        })
+    }
+
+    pub async fn init(config: Config) -> anyhow::Result<Self> {
+        let storage = Arc::new(Storage::connect(&config.storage).await?);
         let governor = Arc::new(Governor::new(&config.governor));
-
-        // Restore the governor's learned per-host penalties from the last
-        // write-behind snapshot so politeness survives a restart.
-        match tiers.load_penalties().await {
-            Ok(saved) => {
-                for (host, penalty_ms) in saved {
-                    governor.restore_penalty(&host, Duration::from_millis(penalty_ms));
-                }
-            }
-            Err(e) => tracing::warn!("failed to restore host penalties: {e}"),
-        }
-
-        // Write-behind: periodically snapshot the governor's learned penalties
-        // into the host-profile table so they persist across restarts.
-        let persist_secs = config.fetcher.host_penalty_persist_secs;
-        if persist_secs > 0 {
-            let governor = governor.clone();
-            let tiers = tiers.clone();
-            tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(persist_secs));
-                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                loop {
-                    tick.tick().await;
-                    let snapshot: Vec<(String, u64)> = governor
-                        .snapshot_penalties()
-                        .into_iter()
-                        .map(|(host, penalty)| (host, penalty.as_millis().min(u64::MAX as u128) as u64))
-                        .collect();
-                    if let Err(e) = tiers.save_penalties(&snapshot).await {
-                        tracing::warn!("host penalty write-behind failed: {e}");
-                    }
-                }
-            });
-        }
+        // The HTTP engine shares the cache the state will own; build it here and
+        // hand the same instance to from_parts via config-derived construction
+        // order (HttpCache::new is cheap and pool-backed, so two handles over the
+        // same pool are equivalent — the cache table is the state).
+        let cache = Arc::new(HttpCache::new(storage.pool(), &config.cache));
 
         // Session vault: both tiers resolve named profiles under the same root
         // (`[fetcher] profiles_dir`) — cookies.json for HTTP, browser/ for Chrome.
@@ -148,7 +159,7 @@ impl AppState {
         let claude = Arc::new(ClaudeEngine::new(&config.claude));
         let fetch =
             Fetcher::new(http.clone(), browser.clone(), claude.clone(), governor.clone(), &config.fetcher);
-        let engines = EngineSet { http, browser, claude, fetch };
+        let engines = Arc::new(EngineSet { http, browser, claude, fetch });
 
         let plugins: Arc<dyn Plugins> = if config.plugins.enabled {
             Arc::new(WasmPluginHost::new(&config.plugins)?)
@@ -180,33 +191,62 @@ impl AppState {
             "registered scraping apps"
         );
 
-        let webhook_client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(15))
-            .build()?;
-        let events = Arc::new(EventBus::new(EVENT_BROADCAST_CAPACITY, EVENT_RING_CAPACITY));
-
-        Ok(Self {
-            config: Arc::new(config),
+        let state = Self::from_parts(AppStateParts {
+            config,
             storage,
-            datasets,
-            costs,
-            cache,
-            research_cache,
-            tiers,
-            health,
             governor,
-            engines: Arc::new(engines),
+            engines,
             plugins,
             search,
-            registry: Arc::new(registry),
-            notify: Arc::new(Notify::new()),
-            webhook_client,
-            events,
-            progress: Arc::new(ProgressStore::new()),
-            shutdown: CancellationToken::new(),
-            job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
-            metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            datahub_last: Arc::new(std::sync::Mutex::new(None)),
-        })
+            registry,
+        })?;
+
+        if state.health.enabled() {
+            tracing::info!(
+                enforce = state.health.enforcing(),
+                "extraction-health detection enabled ({})",
+                if state.health.enforcing() {
+                    "verdicts gate writes, pushes and indexing"
+                } else {
+                    "soak mode: verdicts recorded, nothing gated"
+                }
+            );
+        }
+
+        // Restore the governor's learned per-host penalties from the last
+        // write-behind snapshot so politeness survives a restart.
+        match state.tiers.load_penalties().await {
+            Ok(saved) => {
+                for (host, penalty_ms) in saved {
+                    state.governor.restore_penalty(&host, Duration::from_millis(penalty_ms));
+                }
+            }
+            Err(e) => tracing::warn!("failed to restore host penalties: {e}"),
+        }
+
+        // Write-behind: periodically snapshot the governor's learned penalties
+        // into the host-profile table so they persist across restarts.
+        let persist_secs = state.config.fetcher.host_penalty_persist_secs;
+        if persist_secs > 0 {
+            let governor = state.governor.clone();
+            let tiers = state.tiers.clone();
+            tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(persist_secs));
+                tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                loop {
+                    tick.tick().await;
+                    let snapshot: Vec<(String, u64)> = governor
+                        .snapshot_penalties()
+                        .into_iter()
+                        .map(|(host, penalty)| (host, penalty.as_millis().min(u64::MAX as u128) as u64))
+                        .collect();
+                    if let Err(e) = tiers.save_penalties(&snapshot).await {
+                        tracing::warn!("host penalty write-behind failed: {e}");
+                    }
+                }
+            });
+        }
+
+        Ok(state)
     }
 }

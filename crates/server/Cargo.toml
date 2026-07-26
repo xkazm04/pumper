@@ -57,3 +57,10 @@ uuid.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true
 cron.workspace = true
+
+[dev-dependencies]
+pumper-core = { workspace = true, features = ["test-support"] }
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+async-trait.workspace = true
+sqlx.workspace = true

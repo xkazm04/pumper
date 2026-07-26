@@ -101,6 +101,7 @@ pub struct NewSchedule<'a> {
 
 /// Durable job store on SQLite (WAL). Jobs survive restarts; `recover_stuck`
 /// re-queues anything that was mid-flight when the process died.
+#[derive(Clone)]
 pub struct Storage {
     pool: SqlitePool,
     pub artifacts_dir: PathBuf,
