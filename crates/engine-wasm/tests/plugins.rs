@@ -16,10 +16,10 @@ fn host() -> WasmPluginHost {
 }
 
 /// The built `title.wasm` is a local runtime artifact (`data/` is gitignored;
-/// `plugins-src/title-extractor` is the tracked source). Skip when it isn't
-/// present — a fresh checkout hasn't run the wasm build — so CI stays green while
-/// the test still verifies the real module locally after `cargo build
-/// --target wasm32-unknown-unknown`.
+/// `plugins-src/title-extractor` is the tracked source). The tests are
+/// `#[ignore]`d so a default run never depends on it; when run explicitly
+/// (`cargo test -- --ignored`) a missing artifact is a loud failure, not a
+/// silent green.
 fn title_present(host: &WasmPluginHost) -> bool {
     let present = host.list().iter().any(|n| n == "title");
     if !present {
@@ -29,11 +29,10 @@ fn title_present(host: &WasmPluginHost) -> bool {
 }
 
 #[tokio::test]
+#[ignore = "requires data/plugins/title.wasm (build plugins-src/title-extractor); run with `cargo test -- --ignored`"]
 async fn extract_v2_envelope_forwards_params() {
     let host = host();
-    if !title_present(&host) {
-        return;
-    }
+    assert!(title_present(&host), "data/plugins/title.wasm missing — build plugins-src/title-extractor");
     // params.tag = "h2" makes the reference plugin extract the <h2> into `value`
     // — proving the params envelope reaches the plugin via extract_v2.
     let out = host
@@ -51,11 +50,10 @@ async fn extract_v2_envelope_forwards_params() {
 }
 
 #[tokio::test]
+#[ignore = "requires data/plugins/title.wasm (build plugins-src/title-extractor); run with `cargo test -- --ignored`"]
 async fn describe_manifest_surfaces_in_metadata() {
     let host = host();
-    if !title_present(&host) {
-        return;
-    }
+    assert!(title_present(&host), "data/plugins/title.wasm missing — build plugins-src/title-extractor");
     let manifests = host.manifests();
     let title = manifests
         .iter()

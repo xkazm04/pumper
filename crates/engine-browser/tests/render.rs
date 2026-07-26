@@ -25,6 +25,7 @@ fn vault(name: &str) -> std::path::PathBuf {
 }
 
 #[tokio::test]
+#[ignore = "requires local Chrome + live network; run with `cargo test -- --ignored`"]
 async fn renders_example_dot_com() {
     let engine = BrowserEngine::new(
         &test_cfg("pumper-browser-test-profile"),
@@ -54,6 +55,7 @@ async fn renders_example_dot_com() {
 /// Direction 2: request interception drops images/fonts/media by default, and
 /// `load_all_resources` opts a single render back into loading everything.
 #[tokio::test]
+#[ignore = "requires local Chrome + live network; run with `cargo test -- --ignored`"]
 async fn blocks_heavy_resources_and_opt_out_loads_them() {
     let engine = BrowserEngine::new(
         &test_cfg("pumper-browser-test-blocking"),
@@ -87,6 +89,7 @@ async fn blocks_heavy_resources_and_opt_out_loads_them() {
 /// Direction 1: the relaunchable holder is reused across sequential renders
 /// (the shared-instance path) — two renders on one engine both succeed.
 #[tokio::test]
+#[ignore = "requires local Chrome + live network; run with `cargo test -- --ignored`"]
 async fn reuses_browser_across_renders() {
     let engine = BrowserEngine::new(
         &test_cfg("pumper-browser-test-reuse"),
@@ -106,6 +109,7 @@ async fn reuses_browser_across_renders() {
 /// not thrash — the per-profile holders stay live. Also asserts the on-disk
 /// layout the `/profiles` endpoint reports (`<vault>/<name>/browser`).
 #[tokio::test]
+#[ignore = "requires local Chrome + live network; run with `cargo test -- --ignored`"]
 async fn renders_under_named_profiles_with_separate_user_data_dirs() {
     let root = vault("pumper-vault-profiles");
     let _ = std::fs::remove_dir_all(&root);
