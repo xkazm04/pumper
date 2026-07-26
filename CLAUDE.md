@@ -7,7 +7,8 @@ engines. Cargo workspace, edition 2021, `resolver = "2"`.
 ## Commands
 
 All from the repo root (the `.env` loader and the default `config.toml` path are
-both **CWD-relative**).
+both **CWD-relative**). The same recipes are wrapped in the [`justfile`](justfile)
+(`just --list`) — keep the two in sync if you change either.
 
 ```bash
 cargo check                                  # fast type-check of the whole workspace
@@ -100,5 +101,7 @@ Do not let a hard-won fact live only in the transcript.
 - **[docs/features/](docs/features/README.md)** — what each feature actually does
   today (API/params, data model, known gaps). `docs/harness/harness-learnings.md`
   holds structural facts and the pattern catalogue.
+- **[docs/deployment.md](docs/deployment.md)** — build artifact, persistent state
+  layout, environment variables, and the auth posture.
 
 When docs disagree with each other, trust the code, then fix whichever doc is stale.
