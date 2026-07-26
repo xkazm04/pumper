@@ -264,3 +264,56 @@ fn tax_schema() -> Value {
         "required": ["year", "federal", "states"]
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn roster_is_51_unique_uppercase_jurisdictions_including_dc() {
+        // Completeness is checked against this fixed roster, not a run count —
+        // a duplicate or lowercase entry would silently mask a missing state
+        // (the agent's codes are uppercased before the contains() check).
+        let set: std::collections::HashSet<&str> = US_JURISDICTIONS.iter().copied().collect();
+        assert_eq!(US_JURISDICTIONS.len(), 51);
+        assert_eq!(set.len(), 51);
+        assert!(set.contains("DC"));
+        assert!(US_JURISDICTIONS
+            .iter()
+            .all(|j| j.len() == 2 && j.chars().all(|c| c.is_ascii_uppercase())));
+    }
+
+    #[test]
+    fn tax_schema_requires_the_fields_the_validators_key_on() {
+        // The downstream loop rejects states on top_marginal_rate and keys on
+        // `state`; the schema must force both to exist so `claude --json-schema`
+        // catches shape drift before the salvage path does.
+        let s = tax_schema();
+        assert_eq!(s["required"], json!(["year", "federal", "states"]));
+        assert_eq!(
+            s["properties"]["states"]["items"]["required"],
+            json!(["state", "income_tax_type", "top_marginal_rate"])
+        );
+        assert_eq!(
+            s["properties"]["states"]["items"]["properties"]["top_marginal_rate"]["type"],
+            "number"
+        );
+    }
+
+    #[test]
+    fn tax_schema_declares_every_federal_constant_as_a_number() {
+        // The federal record feeds require_rate() on three of these; a string
+        // type here would pass the schema but fail validation downstream.
+        let s = tax_schema();
+        let fed = &s["properties"]["federal"]["properties"];
+        for f in [
+            "self_employment_tax_rate",
+            "qbi_deduction_pct",
+            "standard_deduction_single",
+            "section_179_limit",
+            "top_marginal_rate",
+        ] {
+            assert_eq!(fed[f]["type"], "number", "federal field {f}");
+        }
+    }
+}

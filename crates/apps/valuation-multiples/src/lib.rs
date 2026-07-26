@@ -120,57 +120,7 @@ impl ScrapeApp for ValuationMultiples {
         let (data, output) =
             trades_common::research_json(&ctx, "valuation-multiples", request).await?;
 
-        let mut all_records: Vec<(String, Value)> = Vec::new();
-        // Plausibility guards: the SDE band must be ordered (low ≤ median ≤ high)
-        // and all multiples positive. Violators rejected with reasons.
-        let mut rejected: Vec<Rejection> = Vec::new();
-        let mut unknown_trades: Vec<String> = Vec::new();
-        if let Some(trades) = data.get("trades").and_then(Value::as_array) {
-            for t in trades {
-                let raw = t
-                    .get("trade")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if raw.is_empty() {
-                    continue;
-                }
-                // Normalize to a canonical label; unknown labels keep raw + flag.
-                let (trade, known) = taxonomy::canonicalize(&raw);
-                if !known {
-                    unknown_trades.push(raw.clone());
-                }
-                let key = format!("US:{trade}");
-                let mut reasons = Vec::new();
-                for f in [
-                    "sde_multiple_low",
-                    "sde_multiple_median",
-                    "sde_multiple_high",
-                    "revenue_multiple",
-                ] {
-                    validate::require_positive(&mut reasons, f, validate::num(t, f));
-                }
-                validate::require_monotone(
-                    &mut reasons,
-                    "sde_multiple",
-                    validate::num(t, "sde_multiple_low"),
-                    validate::num(t, "sde_multiple_median"),
-                    validate::num(t, "sde_multiple_high"),
-                );
-                if !reasons.is_empty() {
-                    rejected.push(Rejection { key, reasons });
-                    continue;
-                }
-                let mut rec = t.clone();
-                // Store the canonical label so key and `trade` field agree.
-                rec["trade"] = json!(trade);
-                // National by trade — state = "US" so the ingest lifts market = "US".
-                rec["state"] = json!("US");
-                rec["year"] = json!(year);
-                all_records.push((key, rec));
-            }
-        }
+        let (all_records, rejected, unknown_trades) = collect_valuation_records(&data, &year);
 
         if all_records.is_empty() {
             return Err(Error::App(
@@ -202,6 +152,67 @@ impl ScrapeApp for ValuationMultiples {
     }
 }
 
+/// Validate + normalize the agent's `trades` array into upsertable records.
+/// Returns `(records, rejected, unknown_trades)`:
+/// - Plausibility guards: the SDE band must be ordered (low ≤ median ≤ high)
+///   and all multiples positive. Violators rejected with reasons.
+/// - Unknown trade labels keep the raw string and are flagged, not dropped.
+fn collect_valuation_records(
+    data: &Value,
+    year: &str,
+) -> (Vec<(String, Value)>, Vec<Rejection>, Vec<String>) {
+    let mut all_records: Vec<(String, Value)> = Vec::new();
+    let mut rejected: Vec<Rejection> = Vec::new();
+    let mut unknown_trades: Vec<String> = Vec::new();
+    if let Some(trades) = data.get("trades").and_then(Value::as_array) {
+        for t in trades {
+            let raw = t
+                .get("trade")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if raw.is_empty() {
+                continue;
+            }
+            // Normalize to a canonical label; unknown labels keep raw + flag.
+            let (trade, known) = taxonomy::canonicalize(&raw);
+            if !known {
+                unknown_trades.push(raw.clone());
+            }
+            let key = format!("US:{trade}");
+            let mut reasons = Vec::new();
+            for f in [
+                "sde_multiple_low",
+                "sde_multiple_median",
+                "sde_multiple_high",
+                "revenue_multiple",
+            ] {
+                validate::require_positive(&mut reasons, f, validate::num(t, f));
+            }
+            validate::require_monotone(
+                &mut reasons,
+                "sde_multiple",
+                validate::num(t, "sde_multiple_low"),
+                validate::num(t, "sde_multiple_median"),
+                validate::num(t, "sde_multiple_high"),
+            );
+            if !reasons.is_empty() {
+                rejected.push(Rejection { key, reasons });
+                continue;
+            }
+            let mut rec = t.clone();
+            // Store the canonical label so key and `trade` field agree.
+            rec["trade"] = json!(trade);
+            // National by trade — state = "US" so the ingest lifts market = "US".
+            rec["state"] = json!("US");
+            rec["year"] = json!(year);
+            all_records.push((key, rec));
+        }
+    }
+    (all_records, rejected, unknown_trades)
+}
+
 /// Structured-output contract for `claude --json-schema`. Lenient (extra fields
 /// tolerated) so a valid answer is never rejected, but pins the multiples shape.
 fn multiples_schema() -> Value {
@@ -229,4 +240,67 @@ fn multiples_schema() -> Value {
         },
         "required": ["year", "trades"]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A multiples entry shaped like the agent's structured answer for one trade.
+    fn multiples_entry(trade: &str) -> Value {
+        json!({
+            "trade": trade,
+            "sde_multiple_low": 2.0, "sde_multiple_median": 2.8, "sde_multiple_high": 3.5,
+            "revenue_multiple": 0.65,
+            "notes": "BizBuySell Insight, 2025 broker reports",
+        })
+    }
+
+    #[test]
+    fn inverted_sde_band_is_rejected_with_reasons_not_upserted() {
+        let mut bad = multiples_entry("HVAC");
+        // Median above the high end of the band: implausible, must not upsert.
+        bad["sde_multiple_median"] = json!(4.0);
+        let data = json!({ "trades": [bad, multiples_entry("Plumbing")] });
+        let (records, rejected, _) = collect_valuation_records(&data, "2025");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, "US:Plumbing");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].key, "US:HVAC");
+        assert!(rejected[0]
+            .reasons
+            .iter()
+            .any(|r| r.contains("sde_multiple")));
+    }
+
+    #[test]
+    fn model_phrasing_lands_on_the_canonical_key_and_national_stamp() {
+        // "HVAC/R" must key as US:HVAC with the stored `trade` field agreeing,
+        // stamped state=US + year so the ingest lifts market = "US".
+        let data = json!({ "trades": [multiples_entry("HVAC/R")] });
+        let (records, rejected, unknown) = collect_valuation_records(&data, "2025");
+        assert!(rejected.is_empty());
+        assert!(unknown.is_empty());
+        let (key, rec) = &records[0];
+        assert_eq!(key, "US:HVAC");
+        assert_eq!(rec["trade"], "HVAC");
+        assert_eq!(rec["state"], "US");
+        assert_eq!(rec["year"], "2025");
+    }
+
+    #[test]
+    fn non_positive_multiple_is_rejected_and_unknown_trade_flagged() {
+        let mut bad = multiples_entry("Roofing");
+        bad["revenue_multiple"] = json!(-0.5);
+        let data = json!({ "trades": [bad] });
+        let (records, rejected, unknown) = collect_valuation_records(&data, "2025");
+        // Unknown label is flagged even when the record is rejected on values.
+        assert!(records.is_empty());
+        assert_eq!(rejected[0].key, "US:Roofing");
+        assert!(rejected[0]
+            .reasons
+            .iter()
+            .any(|r| r.contains("revenue_multiple")));
+        assert_eq!(unknown, vec!["Roofing".to_string()]);
+    }
 }

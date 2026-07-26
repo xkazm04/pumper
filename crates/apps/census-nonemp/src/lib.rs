@@ -189,40 +189,13 @@ impl ScrapeApp for CensusNonemp {
                 ))
             })?;
 
-            // (state label, nonemployers, avg receipts $/operator)
-            let mut ranked: Vec<(String, i64, i64)> = Vec::new();
-            let mut total_estab: i64 = 0;
-            let mut total_rcpt: i64 = 0;
-
-            for row in rows.iter().skip(1) {
-                let Some(estab) = census_common::census_num(row.get(i_estab)) else {
-                    // Suppressed/jammed primary cell → not a reported operator place.
-                    continue;
-                };
-                // NRCPTOT is in $1,000s.
-                let rcpt = census_common::census_num(row.get(i_rcpt)).unwrap_or(0);
-                let st_fips = row.get(i_state).cloned().unwrap_or_default();
-                let state = census_common::state_abbr(&st_fips).to_string();
-                let avg = if estab > 0 { (rcpt * 1000) / estab } else { 0 };
-
-                total_estab += estab;
-                total_rcpt += rcpt;
-                ranked.push((state.clone(), estab, avg));
-
-                all_records.push((
-                    format!("{naics}:{st_fips}"),
-                    json!({
-                        "naics": naics,
-                        "trade": label,
-                        "state": state,
-                        "state_fips": st_fips,
-                        "nonemployers": estab,
-                        "receipts_thousands": rcpt,
-                        "avg_receipts_per_operator": avg,
-                        "year": year,
-                    }),
-                ));
-            }
+            let TradeRollup {
+                records,
+                ranked,
+                total_estab,
+                total_rcpt,
+            } = map_trade_rows(&rows, i_estab, i_rcpt, i_state, naics, label, &year);
+            all_records.extend(records);
 
             let mut by_density = ranked.clone();
             by_density.sort_by(|a, b| b.1.cmp(&a.1));
@@ -271,5 +244,145 @@ impl ScrapeApp for CensusNonemp {
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
         }))
+    }
+}
+
+/// Per-trade rollup of the parsed NES rows: dataset records keyed
+/// `{naics}:{state_fips}` plus the ranking rows and totals the trade
+/// summary is built from.
+struct TradeRollup {
+    records: Vec<(String, Value)>,
+    /// (state label, nonemployers, avg receipts $/operator)
+    ranked: Vec<(String, i64, i64)>,
+    total_estab: i64,
+    total_rcpt: i64,
+}
+
+/// Map the Census array-of-arrays payload (row 0 = header, addressed by the
+/// pre-resolved column indices) into per-state records for one trade NAICS.
+fn map_trade_rows(
+    rows: &[Vec<String>],
+    i_estab: usize,
+    i_rcpt: usize,
+    i_state: usize,
+    naics: &str,
+    label: &str,
+    year: &str,
+) -> TradeRollup {
+    let mut records: Vec<(String, Value)> = Vec::new();
+    let mut ranked: Vec<(String, i64, i64)> = Vec::new();
+    let mut total_estab: i64 = 0;
+    let mut total_rcpt: i64 = 0;
+
+    for row in rows.iter().skip(1) {
+        let Some(estab) = census_common::census_num(row.get(i_estab)) else {
+            // Suppressed/jammed primary cell → not a reported operator place.
+            continue;
+        };
+        // NRCPTOT is in $1,000s.
+        let rcpt = census_common::census_num(row.get(i_rcpt)).unwrap_or(0);
+        let st_fips = row.get(i_state).cloned().unwrap_or_default();
+        let state = census_common::state_abbr(&st_fips).to_string();
+        let avg = if estab > 0 { (rcpt * 1000) / estab } else { 0 };
+
+        total_estab += estab;
+        total_rcpt += rcpt;
+        ranked.push((state.clone(), estab, avg));
+
+        records.push((
+            format!("{naics}:{st_fips}"),
+            json!({
+                "naics": naics,
+                "trade": label,
+                "state": state,
+                "state_fips": st_fips,
+                "nonemployers": estab,
+                "receipts_thousands": rcpt,
+                "avg_receipts_per_operator": avg,
+                "year": year,
+            }),
+        ));
+    }
+
+    TradeRollup {
+        records,
+        ranked,
+        total_estab,
+        total_rcpt,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Rows shaped like the real NES array-of-arrays payload: row 0 is the
+    // header ["NAME","NESTAB","NRCPTOT","state"], data rows follow.
+    // "-666666666" is the Census disclosure-suppression sentinel.
+    fn nes_rows(data: &[[&str; 4]]) -> Vec<Vec<String>> {
+        let mut rows = vec![vec![
+            "NAME".to_string(),
+            "NESTAB".to_string(),
+            "NRCPTOT".to_string(),
+            "state".to_string(),
+        ]];
+        rows.extend(
+            data.iter()
+                .map(|r| r.iter().map(|c| c.to_string()).collect::<Vec<_>>()),
+        );
+        rows
+    }
+
+    fn rollup(data: &[[&str; 4]]) -> TradeRollup {
+        map_trade_rows(
+            &nes_rows(data),
+            1,
+            2,
+            3,
+            "2382",
+            "Building equipment",
+            "2021",
+        )
+    }
+
+    #[test]
+    fn suppressed_establishment_rows_are_dropped_not_counted_as_zero() {
+        let r = rollup(&[
+            ["California", "100", "5000", "06"],
+            ["Wyoming", "-666666666", "5000", "56"],
+        ]);
+        // The jammed NESTAB cell drops the whole row: it must not appear as a
+        // zero-operator state, and its receipts must not leak into the totals.
+        assert_eq!(r.records.len(), 1);
+        assert_eq!(r.records[0].0, "2382:06");
+        assert_eq!(r.total_estab, 100);
+        assert_eq!(r.total_rcpt, 5000);
+        assert_eq!(r.ranked.len(), 1);
+    }
+
+    #[test]
+    fn suppressed_receipts_currently_sum_as_zero_not_null() {
+        // CURRENT behavior (unwrap_or(0)): a suppressed NRCPTOT cell keeps the
+        // row but records $0 receipts, indistinguishable from a genuine zero —
+        // it also drags avg and the national average down. Flagged, not fixed:
+        // behavior changes are out of scope for this test pass.
+        let r = rollup(&[["California", "100", "-666666666", "06"]]);
+        assert_eq!(r.records.len(), 1);
+        let v = &r.records[0].1;
+        assert_eq!(v["receipts_thousands"], 0);
+        assert_eq!(v["avg_receipts_per_operator"], 0);
+        assert_eq!(r.total_rcpt, 0);
+    }
+
+    #[test]
+    fn avg_receipts_converts_thousands_to_dollars_per_operator() {
+        // NRCPTOT is $1,000s: 500 → $500,000 across 10 operators = $50,000 each.
+        let r = rollup(&[["California", "10", "500", "06"]]);
+        let (key, v) = &r.records[0];
+        assert_eq!(key, "2382:06");
+        assert_eq!(v["avg_receipts_per_operator"], 50_000);
+        assert_eq!(v["state"], "CA");
+        assert_eq!(v["state_fips"], "06");
+        assert_eq!(v["nonemployers"], 10);
     }
 }

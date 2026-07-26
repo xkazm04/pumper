@@ -119,80 +119,13 @@ impl ScrapeApp for TradeWages {
         request.json_schema = Some(wages_schema());
         let (data, output) = trades_common::research_json(&ctx, "trade-wages", request).await?;
 
-        let mut all_records: Vec<(String, Value)> = Vec::new();
-        // Plausibility guards: wage bands must be ordered (entry ≤ median ≤
-        // experienced, hourly + annual) and all magnitudes positive. Violators
-        // are rejected with reasons; valid trades still upsert.
-        let mut rejected: Vec<Rejection> = Vec::new();
-        // Trade labels the model returned that don't map to a canonical trade —
-        // kept raw (not dropped) but surfaced so drift is visible.
-        let mut unknown_trades: Vec<String> = Vec::new();
-        if let Some(trades) = data.get("trades").and_then(Value::as_array) {
-            for t in trades {
-                let raw = t
-                    .get("trade")
-                    .and_then(Value::as_str)
-                    .unwrap_or("")
-                    .trim()
-                    .to_string();
-                if raw.is_empty() {
-                    continue;
-                }
-                // Normalize to a canonical label so phrasing drift can't mint a
-                // duplicate key; unknown labels keep the raw string and are flagged.
-                let (trade, known) = taxonomy::canonicalize(&raw);
-                if !known {
-                    unknown_trades.push(raw.clone());
-                }
-                let key = format!("US:{trade}");
-                let mut reasons = Vec::new();
-                for f in [
-                    "entry_hourly",
-                    "median_hourly",
-                    "experienced_hourly",
-                    "entry_annual",
-                    "median_annual",
-                    "experienced_annual",
-                    "employment",
-                ] {
-                    validate::require_positive(&mut reasons, f, validate::num(t, f));
-                }
-                validate::require_monotone(
-                    &mut reasons,
-                    "hourly",
-                    validate::num(t, "entry_hourly"),
-                    validate::num(t, "median_hourly"),
-                    validate::num(t, "experienced_hourly"),
-                );
-                validate::require_monotone(
-                    &mut reasons,
-                    "annual",
-                    validate::num(t, "entry_annual"),
-                    validate::num(t, "median_annual"),
-                    validate::num(t, "experienced_annual"),
-                );
-                if !reasons.is_empty() {
-                    rejected.push(Rejection { key, reasons });
-                    continue;
-                }
-                let mut rec = t.clone();
-                // Store the canonical label so the record key and its `trade`
-                // field agree, regardless of the model's phrasing.
-                rec["trade"] = json!(trade);
-                // National by trade — state = "US" so the ingest lifts market = "US".
-                rec["state"] = json!("US");
-                rec["year"] = json!(year);
-                rec["source"] = json!("BLS OEWS (agentic)");
-                all_records.push((key, rec));
-            }
-        }
+        let (all_records, rejected, unknown_trades) = collect_wage_records(&data, &year);
 
         if all_records.is_empty() {
             return Err(Error::App(
                 "trade-wages: agent JSON contained no plausible trades".into(),
             ));
         }
-
         let summary = ctx.upsert_many("wages", &all_records).await?;
 
         // Cross-source layer: rebuild trades/operator_economics from the current
@@ -215,6 +148,82 @@ impl ScrapeApp for TradeWages {
             "num_turns": output.num_turns,
         }))
     }
+}
+
+/// Validate + normalize the agent's `trades` array into upsertable records.
+/// Returns `(records, rejected, unknown_trades)`:
+/// - Plausibility guards: wage bands must be ordered (entry ≤ median ≤
+///   experienced, hourly + annual) and all magnitudes positive. Violators
+///   are rejected with reasons; valid trades still upsert.
+/// - Trade labels the model returned that don't map to a canonical trade are
+///   kept raw (not dropped) but surfaced so drift is visible.
+fn collect_wage_records(
+    data: &Value,
+    year: &str,
+) -> (Vec<(String, Value)>, Vec<Rejection>, Vec<String>) {
+    let mut all_records: Vec<(String, Value)> = Vec::new();
+    let mut rejected: Vec<Rejection> = Vec::new();
+    let mut unknown_trades: Vec<String> = Vec::new();
+    if let Some(trades) = data.get("trades").and_then(Value::as_array) {
+        for t in trades {
+            let raw = t
+                .get("trade")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if raw.is_empty() {
+                continue;
+            }
+            // Normalize to a canonical label so phrasing drift can't mint a
+            // duplicate key; unknown labels keep the raw string and are flagged.
+            let (trade, known) = taxonomy::canonicalize(&raw);
+            if !known {
+                unknown_trades.push(raw.clone());
+            }
+            let key = format!("US:{trade}");
+            let mut reasons = Vec::new();
+            for f in [
+                "entry_hourly",
+                "median_hourly",
+                "experienced_hourly",
+                "entry_annual",
+                "median_annual",
+                "experienced_annual",
+                "employment",
+            ] {
+                validate::require_positive(&mut reasons, f, validate::num(t, f));
+            }
+            validate::require_monotone(
+                &mut reasons,
+                "hourly",
+                validate::num(t, "entry_hourly"),
+                validate::num(t, "median_hourly"),
+                validate::num(t, "experienced_hourly"),
+            );
+            validate::require_monotone(
+                &mut reasons,
+                "annual",
+                validate::num(t, "entry_annual"),
+                validate::num(t, "median_annual"),
+                validate::num(t, "experienced_annual"),
+            );
+            if !reasons.is_empty() {
+                rejected.push(Rejection { key, reasons });
+                continue;
+            }
+            let mut rec = t.clone();
+            // Store the canonical label so the record key and its `trade`
+            // field agree, regardless of the model's phrasing.
+            rec["trade"] = json!(trade);
+            // National by trade — state = "US" so the ingest lifts market = "US".
+            rec["state"] = json!("US");
+            rec["year"] = json!(year);
+            rec["source"] = json!("BLS OEWS (agentic)");
+            all_records.push((key, rec));
+        }
+    }
+    (all_records, rejected, unknown_trades)
 }
 
 /// Structured-output contract for `claude --json-schema`. Lenient (extra fields
@@ -249,4 +258,70 @@ fn wages_schema() -> Value {
         },
         "required": ["year", "trades"]
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // A wage entry shaped like the agent's structured answer (BLS OEWS national
+    // figures for one trade).
+    fn wage_entry(trade: &str) -> Value {
+        json!({
+            "trade": trade, "soc_code": "47-2152",
+            "occupation": "Plumbers, Pipefitters & Steamfitters",
+            "entry_hourly": 18.4, "median_hourly": 30.1, "experienced_hourly": 50.0,
+            "entry_annual": 38_300, "median_annual": 62_600, "experienced_annual": 104_000,
+            "employment": 469_000,
+        })
+    }
+
+    #[test]
+    fn out_of_order_wage_band_is_rejected_with_reasons_not_upserted() {
+        let mut bad = wage_entry("Electrical");
+        // Median above the 90th percentile: implausible, must not upsert.
+        bad["median_hourly"] = json!(60.0);
+        let data = json!({ "trades": [bad, wage_entry("Plumbing")] });
+        let (records, rejected, _) = collect_wage_records(&data, "2024");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, "US:Plumbing");
+        assert_eq!(rejected.len(), 1);
+        assert_eq!(rejected[0].key, "US:Electrical");
+        assert!(rejected[0].reasons.iter().any(|r| r.contains("hourly")));
+    }
+
+    #[test]
+    fn phrasing_drift_canonicalizes_the_key_so_duplicates_cannot_mint() {
+        // "Plumbers" (a model phrasing) must land on the same key as "Plumbing"
+        // and the stored `trade` field must agree with the key.
+        let data = json!({ "trades": [wage_entry("Plumbers")] });
+        let (records, rejected, unknown) = collect_wage_records(&data, "2024");
+        assert!(rejected.is_empty());
+        assert!(unknown.is_empty());
+        let (key, rec) = &records[0];
+        assert_eq!(key, "US:Plumbing");
+        assert_eq!(rec["trade"], "Plumbing");
+        assert_eq!(rec["state"], "US");
+        assert_eq!(rec["year"], "2024");
+        assert_eq!(rec["source"], "BLS OEWS (agentic)");
+    }
+
+    #[test]
+    fn unknown_trade_labels_are_kept_and_flagged_not_dropped() {
+        let data = json!({ "trades": [wage_entry("Roofing")] });
+        let (records, _, unknown) = collect_wage_records(&data, "2024");
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].0, "US:Roofing");
+        assert_eq!(unknown, vec!["Roofing".to_string()]);
+    }
+
+    #[test]
+    fn non_positive_magnitudes_are_rejected_even_when_ordered() {
+        let mut bad = wage_entry("HVAC");
+        bad["employment"] = json!(0);
+        let data = json!({ "trades": [bad] });
+        let (records, rejected, _) = collect_wage_records(&data, "2024");
+        assert!(records.is_empty());
+        assert!(rejected[0].reasons.iter().any(|r| r.contains("employment")));
+    }
 }

@@ -232,3 +232,35 @@ fn post_json(url: &str, body: String) -> HttpRequest {
         profile: None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Records shaped like real CKAN `opportunities` rows (see the page1.json
+    // artifact): PortalID/GrantID are strings, `_id` is CKAN's row number.
+    #[test]
+    fn portal_id_wins_over_grant_id_and_the_ckan_row_number() {
+        let rec = json!({ "PortalID": "P0501", "GrantID": "G-77", "_id": 42 });
+        assert_eq!(record_key(&rec, 0), "P0501");
+    }
+
+    #[test]
+    fn key_falls_back_through_the_ladder_skipping_empty_strings() {
+        let rec = json!({ "PortalID": "", "GrantID": "G-77", "_id": 42 });
+        assert_eq!(record_key(&rec, 0), "G-77");
+        let rec = json!({ "PortalID": "", "GrantID": "", "_id": 42 });
+        assert_eq!(record_key(&rec, 0), "_id-42");
+    }
+
+    #[test]
+    fn renumbering_ckan_row_id_is_prefixed_never_the_bare_key() {
+        // A numeric `_id` renumbers on dataset reload, so it is namespaced —
+        // it must never collide with a portal-issued id like "42".
+        let rec = json!({ "_id": 42 });
+        assert_eq!(record_key(&rec, 3), "_id-42");
+        // Non-string PortalID and an empty `_id` fall through to the row index.
+        let rec = json!({ "PortalID": 123, "_id": "" });
+        assert_eq!(record_key(&rec, 3), "row-3");
+    }
+}
