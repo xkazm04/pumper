@@ -5,6 +5,8 @@
 #[cfg(feature = "storage")]
 pub mod app;
 #[cfg(feature = "storage")]
+pub mod backup;
+#[cfg(feature = "storage")]
 pub mod cache;
 #[cfg(feature = "storage")]
 pub mod costs;

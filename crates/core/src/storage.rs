@@ -99,6 +99,13 @@ pub struct NewSchedule<'a> {
     pub max_attempts: Option<i64>,
 }
 
+/// The compile-time-embedded migration chain (`crates/core/migrations`,
+/// `0001_init.sql` …). Exposed so the pre-migration backup can count pending
+/// versions and the replay test can assert the chain's shape.
+pub fn migrator() -> sqlx::migrate::Migrator {
+    sqlx::migrate!("./migrations")
+}
+
 /// Durable job store on SQLite (WAL). Jobs survive restarts; `recover_stuck`
 /// re-queues anything that was mid-flight when the process died.
 #[derive(Clone)]
@@ -123,7 +130,13 @@ impl Storage {
             .max_connections(8)
             .connect_with(options)
             .await?;
-        sqlx::migrate!("./migrations")
+        // Codified operator ritual: snapshot the database before advancing the
+        // schema. No-ops for fresh/up-to-date/in-memory databases, so the test
+        // harness (`testing::TempStore`) never writes a backup — see
+        // `backup::backup_decision`.
+        let migrator = migrator();
+        crate::backup::backup_before_migrations(&pool, &cfg.database_path, &migrator).await;
+        migrator
             .run(&pool)
             .await
             .map_err(|e| Error::Storage(sqlx::Error::Migrate(Box::new(e))))?;
