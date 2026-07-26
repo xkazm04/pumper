@@ -10,14 +10,9 @@ Status values: `proposed | approved | in-progress | shipped | abandoned | blocke
   (f) `sync_many` allowlist inventory test (EXPECTED-diff style over app sources);
   (a) extract + test the remaining silent-success predicates (8 apps still inline them).
   Status: proposed
-- **[2026-07-26] App-coverage tail: 11 zero-test app crates** — type: weak-pattern, risk: 1, effort: m, payoff: 3, reach: 11 crates
-  ca-grants, census-nonemp (near-clone of tested census-density), connector-api-watch (331 lines),
-  state-tax, trade-wages, valuation-multiples, research, watch, readable, mpsv-ispv. Pure parse
-  fns sit untested (`ca_grants::record_key`, `watch::first_heading`). Follow extract-then-test;
-  `TestContext` makes run-level tests ~3 lines of setup.
-  Status: proposed
 
 ## Shipped
+- **[2026-07-26] App-coverage tail: 10 zero-test app crates** — [[Architect/decisions/2026-07-26-app-coverage-tail]] (commits 31799a0, 9ee77c4; resume run; 32 tests, 5 extractions)
 - **[2026-07-26] fmt-the-world + CI fmt gate** — [[Architect/decisions/2026-07-26-fmt-the-world]] (commits a1afbf5, 6c5b4d3; resume run)
 - **[2026-07-26] CI + honest env-gated tests** — [[Architect/decisions/2026-07-26-ci-and-honest-test-gates]] (commits 60b8650, c9bf2fd)
 - **[2026-07-26] Tier-1 prose-only bug-class guards** — [[Architect/decisions/2026-07-26-prose-only-bug-class-guards]] (commit 8885c96; keyset tests rode a217596)

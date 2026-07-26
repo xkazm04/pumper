@@ -30,3 +30,14 @@ verified behavior-neutral at exact baselines (clippy 36, tests 349/0/7), then en
 the CI fmt gate. Timing insight validated: a fmt-the-world commit is only safe on a
 verified-clean tree — the index-empty check before staging is the guard. 2 backlog
 items remain (guard tail, app-coverage tail).
+
+## Run: 2026-07-26 (third, resume mode) — app-coverage tail
+
+Executed backlog item (user pick): 32 tests across all 10 zero-test app crates via two
+parallel builder agents (5 crates each), Director-reviewed diffs, one commit per batch.
+5 extract-then-test extractions, all verbatim moves. Suite 349 -> 381, baselines held.
+Delegation shape worked well: precise per-crate targets + house-style pointers in the
+brief; both agents independently honored the doc-sync dismissal and X-not-Y naming.
+One test deliberately pins current-but-questionable behavior (census-nonemp suppressed
+receipts sum as zero) with an in-test flag comment — the honest move when behavior
+changes are out of scope. 1 backlog item remains (guard tail).
