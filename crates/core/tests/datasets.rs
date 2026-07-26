@@ -258,6 +258,34 @@ async fn detect_removed_tombstones_with_matching_removed_revisions() {
 }
 
 #[tokio::test]
+async fn detect_removed_noops_on_an_empty_snapshot() {
+    // A failed scrape hands sync an empty `present` set. That must be a no-op,
+    // never "tombstone the whole dataset" — the empty-present guard was added
+    // after exactly that bug and this test is what keeps it from reverting.
+    let (storage, dir) = fresh_db("datasets-detect-removed-empty").await;
+    let ds = Datasets::new(storage.pool());
+    let pool = storage.pool();
+
+    let items: Vec<(String, serde_json::Value)> =
+        (0..5).map(|i| (format!("k{i}"), json!({ "n": i }))).collect();
+    ds.upsert_many("app", "d", &items).await.unwrap();
+
+    let removed = ds.detect_removed("app", "d", &[]).await.unwrap();
+    assert!(removed.is_empty(), "empty snapshot must remove nothing");
+
+    let live: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM records WHERE app='app' AND dataset='d' AND removed_at IS NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(live, 5, "all records still live after an empty snapshot");
+
+    drop(storage);
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+#[tokio::test]
 async fn delete_record_and_dataset_remove_rows_and_revisions() {
     let (storage, dir) = fresh_db("datasets-delete").await;
     let ds = Datasets::new(storage.pool());

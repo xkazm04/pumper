@@ -155,3 +155,59 @@ fn parse_front_page(html: &str, rank_offset: u32) -> Vec<Story> {
         })
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::parse_front_page;
+
+    /// A realistic slice of the front page: story row + subtext row pairs,
+    /// one external link and one internal `item?` link, points/author/comments
+    /// in the real markup shapes (nbsp in "12 comments", score span).
+    const SAMPLE: &str = r#"
+        <table>
+          <tr class="athing" id="1001"><td>
+            <span class="titleline"><a href="https://example.com/post">Big News</a></span>
+          </td></tr>
+          <tr><td class="subtext">
+            <span class="score">55 points</span> by <a class="hnuser">alice</a>
+            <a href="item?id=1001">12&#160;comments</a>
+          </td></tr>
+          <tr class="athing" id="1002"><td>
+            <span class="titleline"><a href="item?id=1002">Ask HN: Question</a></span>
+          </td></tr>
+          <tr><td class="subtext">
+            <span class="score">7 points</span> by <a class="hnuser">bob</a>
+            <a href="item?id=1002">discuss</a>
+          </td></tr>
+        </table>"#;
+
+    #[test]
+    fn parses_story_rows_with_ranks_links_and_metadata() {
+        let stories = parse_front_page(SAMPLE, 30);
+        assert_eq!(stories.len(), 2);
+
+        let s = &stories[0];
+        assert_eq!(s.rank, 31, "rank continues from the page offset");
+        assert_eq!(s.id.as_deref(), Some("1001"));
+        assert_eq!(s.title, "Big News");
+        assert_eq!(s.url.as_deref(), Some("https://example.com/post"));
+        assert_eq!(s.points, Some(55));
+        assert_eq!(s.author.as_deref(), Some("alice"));
+        assert_eq!(s.comments, Some(12));
+
+        // Internal links get the site prefix; "discuss" (no comment count) is None.
+        let s = &stories[1];
+        assert_eq!(s.url.as_deref(), Some("https://news.ycombinator.com/item?id=1002"));
+        assert_eq!(s.comments, None);
+    }
+
+    /// The empty-parse-is-an-error guard in `run()` depends on this: markup
+    /// drift (or a soft rate-limit page) must parse to ZERO stories, not to
+    /// garbage rows — zero is what trips the silent-success guard.
+    #[test]
+    fn drifted_markup_parses_to_zero_stories_not_garbage() {
+        let drifted = r#"<table><tr class="story"><td><a href="/x">Not the real shape</a></td></tr></table>"#;
+        assert!(parse_front_page(drifted, 0).is_empty());
+        assert!(parse_front_page("", 0).is_empty());
+    }
+}

@@ -528,3 +528,26 @@ pub trait ScrapeApp: Send + Sync {
     /// Executes one job. The returned JSON is stored as the job result.
     async fn run(&self, ctx: AppContext) -> Result<Value>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::safe_path_segment;
+
+    /// The ONE artifact path-traversal guard shared by extractor + plugin
+    /// (`read_source_artifact`). Gutting it to `Ok(())` must turn this red —
+    /// it is the only thing between untrusted record/param data and a
+    /// filesystem path outside the artifacts root.
+    #[test]
+    fn safe_path_segment_rejects_every_escape_shape() {
+        for bad in ["", ".", "..", "a/b", "a\\b", "/etc/passwd", "..\\up", "C:\\x", "/"] {
+            assert!(safe_path_segment(bad, "test").is_err(), "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn safe_path_segment_accepts_plain_segments() {
+        for ok in ["page-0001.html", "grants-gov", "a.b_c-d", "café", ".hidden"] {
+            assert!(safe_path_segment(ok, "test").is_ok(), "must accept {ok:?}");
+        }
+    }
+}
