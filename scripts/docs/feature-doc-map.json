@@ -19,6 +19,10 @@
       ]
     },
     {
+      "doc": "docs/features/observability.md",
+      "sourceGlobs": ["crates/server/src/main.rs"]
+    },
+    {
       "doc": "docs/features/datasets.md",
       "sourceGlobs": [
         "crates/core/src/datasets.rs",

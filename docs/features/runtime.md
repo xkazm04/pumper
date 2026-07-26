@@ -57,6 +57,12 @@ Each schedule carries three cron-maturity fields (`schedules` table cols `timezo
 
 `config.toml` (or `$PUMPER_CONFIG`; both resolved **relative to the process CWD**), `#[serde(default)]` throughout — sections: `server, worker, storage, http, browser, claude, fetcher, governor, cache, plugins, search, triggers, webhooks, resilience, datahub`. New fields need both the serde default and the manual `Default` impl. `[fetcher]` holds the tiered-fetch and host-memory knobs (see [fetching.md](fetching.md)); `[resilience]` the extraction-health detector (see [resilient-extraction.md](resilient-extraction.md)); `[datahub]` the metadata emitter (see [datahub.md](datahub.md)). `[webhooks]` holds `failure_url`/`failure_secret` — the optional global `job.failed` firehose (see [events-webhooks.md](events-webhooks.md)).
 
+## Process startup & error reporting
+
+`main` (`crates/server/src/main.rs`) is **synchronous**: it loads `.env`, initializes error reporting, installs the tracing subscriber, and only then builds the tokio runtime and enters `run()`. The Sentry transport owns a background thread that must not be born inside a runtime about to be torn down, which is what forces that order.
+
+**Error reporting is optional and off by default.** `SENTRY_DSN` unset, empty, or whitespace-only ⇒ reporting is disabled silently and the process boots identically to before; a malformed DSN ⇒ one `warn!` at boot, then reporting off — a bad DSN never stops the service. `SENTRY_ENVIRONMENT` tags events (default `local`), and `PUMPER_BUILD_ID` doubles as the Sentry release so a release and an extraction-health run row name the same build. stdout logging is unchanged either way — the Sentry layer is composed *beside* the `fmt` layer, so `error!` becomes an event and `warn!`/`info!` become breadcrumbs. `traces_sample_rate = 0.0`, `send_default_pii = false`. Full surface: [observability.md](observability.md).
+
 ## Metrics
 
 `GET /metrics` (Prometheus text, cached ~5s): `pumper_jobs{status}` gauges, `pumper_job_failures_total{app}` (permanently-failed jobs per app — **DB-derived** from the current `failed` row count, so it resets/decreases if failed jobs are retried or purged rather than being a strictly monotonic process counter), `pumper_job_duration_seconds` + `pumper_job_queue_wait_seconds` summaries (`_sum`/`_count`/`_max`), `pumper_cost_usd{app,engine}`, `pumper_apps`, `pumper_schedules{enabled}`.

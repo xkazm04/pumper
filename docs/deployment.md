@@ -88,8 +88,10 @@ environment: local `.env` / CI secrets / host dashboard.
 | `DATAHUB_TOKEN` | Bearer token for the DataHub GMS emitter, when `[datahub] token` is unset. |
 | `PUMPER_CONFIG` | Override the config path (default `config.toml`). |
 | `PUMPER_CATALOG` | Override the catalog path (default `catalog/data-sources.toml`). |
-| `PUMPER_BUILD_ID` | Build identity stamped on extraction-health run rows; set to the commit sha in CI. Defaults to the crate version. |
+| `PUMPER_BUILD_ID` | Build identity stamped on extraction-health run rows **and reused as the Sentry release**, so both name the same build; set to the commit sha in CI. Defaults to the crate version. |
 | `RUST_LOG` | `tracing` filter directive. Defaults to `info`. |
+| `SENTRY_DSN` | Sentry DSN for error reporting. **Unset/blank ⇒ reporting off** and the process boots identically; a malformed value logs one warning at boot and stays off. Errors only (`traces_sample_rate = 0.0`, `send_default_pii = false`). |
+| `SENTRY_ENVIRONMENT` | Deployment tag on reported events (`production`, `staging`, …). Defaults to `local`. |
 
 `.env` loading is **hand-rolled and non-clobbering** (`load_dotenv` in
 `crates/server/src/main.rs`): plain `KEY=VALUE` lines, `#` comments skipped,
@@ -121,6 +123,11 @@ The plugin sandbox (wasmtime fuel budget + memory cap, no ambient authority) bou
 what a *module* can do; it does not authenticate the *caller* who triggers the
 reload.
 
+Inbound bodies are bounded — **1 MiB on every route, 8 MiB on `POST /extract/preview`**,
+over-limit ⇒ `413` before the handler runs (`docs/features/http-api.md` →
+"Request body limits"). That caps how much memory one unauthenticated request can
+make the process buffer; it is not a substitute for auth or rate limiting.
+
 **This is defensible only while the bind stays on loopback.** The entire safety
 argument is `[server] host = "127.0.0.1"` — the network, not the application, is
 the access control.
@@ -135,7 +142,7 @@ pumper listener on loopback, or add auth to the server first.
 
 CORS is **off by default** (`[server] cors_allowed_origins` empty → no CORS layer
 is installed, so browsers enforce same-origin). The rationale is in the code at
-`crates/server/src/routes/mod.rs:160-163`: a permissive allow-all on an
+`crates/server/src/routes/mod.rs` (the `router` builder): a permissive allow-all on an
 unauthenticated, mutating, data-bearing API would let any site the operator merely
 *visits* drive it cross-origin, and DNS-rebinding defeats the "it's only localhost"
 assumption. A trusted local UI opts in by listing its exact origin (e.g.
