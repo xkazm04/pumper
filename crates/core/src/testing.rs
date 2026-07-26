@@ -95,20 +95,109 @@ impl Researcher for Dead {
     }
 }
 
+/// A `Researcher` that **replays recorded transcripts** instead of spawning the
+/// `claude` CLI — the offline stand-in for the model in tests and evals.
+///
+/// Each script entry is keyed by a substring that must appear in the request
+/// prompt (the URL, the fixture id, …). A prompt matching no entry is a *panic*,
+/// not a default: that is how a regression in what we **send** (a dropped URL, a
+/// mangled prompt template) fails the eval, while the replayed output is how a
+/// regression in how we **handle** the answer fails it. Requests are recorded so
+/// a test can assert on the budget clamp, turn caps and call count.
+#[derive(Default)]
+pub struct ScriptedResearcher {
+    script: Vec<(String, ResearchOutput)>,
+    calls: std::sync::Mutex<Vec<ResearchRequest>>,
+}
+
+impl ScriptedResearcher {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Replays `out` for any prompt containing `key` (first match wins).
+    /// An empty `key` matches every prompt.
+    #[must_use]
+    pub fn on(mut self, key: impl Into<String>, out: ResearchOutput) -> Self {
+        self.script.push((key.into(), out));
+        self
+    }
+
+    /// Replays plain text (no JSON body, no cost) for any prompt.
+    #[must_use]
+    pub fn always_text(self, text: impl Into<String>) -> Self {
+        self.on("", research_output(text))
+    }
+
+    /// Every request this researcher was handed, in order.
+    pub fn calls(&self) -> Vec<ResearchRequest> {
+        self.calls.lock().expect("scripted researcher lock").clone()
+    }
+
+    pub fn call_count(&self) -> usize {
+        self.calls.lock().expect("scripted researcher lock").len()
+    }
+}
+
+#[async_trait]
+impl Researcher for ScriptedResearcher {
+    async fn research(&self, req: ResearchRequest) -> Result<ResearchOutput> {
+        let hit = self
+            .script
+            .iter()
+            .find(|(key, _)| key.is_empty() || req.prompt.contains(key.as_str()))
+            .map(|(_, out)| out.clone());
+        self.calls
+            .lock()
+            .expect("scripted researcher lock")
+            .push(req.clone());
+        hit.ok_or_else(|| {
+            crate::Error::App(format!(
+                "no recorded transcript matches this prompt — the request changed. \
+                 Scripted keys: {:?}. Prompt began: {:?}",
+                self.script.iter().map(|(k, _)| k).collect::<Vec<_>>(),
+                req.prompt.chars().take(200).collect::<String>(),
+            ))
+        })
+    }
+}
+
+/// A [`ResearchOutput`] carrying `text` (and its parsed JSON when it parses),
+/// so a test or eval fixture doesn't restate the six telemetry fields.
+pub fn research_output(text: impl Into<String>) -> ResearchOutput {
+    let text = text.into();
+    let json = serde_json::from_str::<Value>(&text).ok();
+    ResearchOutput {
+        text,
+        json,
+        cost_usd: Some(0.0),
+        duration_ms: Some(0),
+        num_turns: Some(1),
+        session_id: None,
+    }
+}
+
 /// A full `EngineSet` of [`Dead`] engines (governor + fetcher at defaults).
 pub fn dead_engines() -> Arc<EngineSet> {
-    Arc::new(EngineSet {
-        http: Arc::new(Dead),
-        browser: Arc::new(Dead),
-        claude: Arc::new(Dead),
-        fetch: Fetcher::new(
-            Arc::new(Dead),
-            Arc::new(Dead),
-            Arc::new(Dead),
-            Arc::new(Governor::new(&GovernorConfig::default())),
-            &FetcherConfig::default(),
-        ),
-    })
+    engines_with(Arc::new(Dead), Arc::new(Dead), Arc::new(Dead))
+}
+
+/// An `EngineSet` wired from the three engines you care about, with a `Fetcher`
+/// over the same trio at default config. The single place test code builds an
+/// engine set, so `EngineSet`'s private researcher field stays private.
+pub fn engines_with(
+    http: Arc<dyn HttpClient>,
+    browser: Arc<dyn Browser>,
+    claude: Arc<dyn Researcher>,
+) -> Arc<EngineSet> {
+    let fetch = Fetcher::new(
+        http.clone(),
+        browser.clone(),
+        claude.clone(),
+        Arc::new(Governor::new(&GovernorConfig::default())),
+        &FetcherConfig::default(),
+    );
+    Arc::new(EngineSet::new(http, browser, claude, fetch))
 }
 
 /// Builder for a test `AppContext`. Defaults: empty params, [`Dead`] engines,
@@ -122,6 +211,7 @@ pub struct TestContext<'a> {
     health: Option<Arc<Resilience>>,
     budget_usd: Option<f64>,
     artifacts_dir: Option<std::path::PathBuf>,
+    research_cache_ttl_secs: u64,
 }
 
 impl<'a> TestContext<'a> {
@@ -134,7 +224,16 @@ impl<'a> TestContext<'a> {
             health: None,
             budget_usd: None,
             artifacts_dir: None,
+            research_cache_ttl_secs: 0,
         }
+    }
+
+    /// Enables the research cache behind [`AppContext::research`] (default: off,
+    /// matching `ResearchCache`'s "ttl 0 = disabled"). Set it to exercise the
+    /// chokepoint's dedupe path.
+    pub fn research_cache_ttl_secs(mut self, ttl: u64) -> Self {
+        self.research_cache_ttl_secs = ttl;
+        self
     }
 
     /// Override the per-job artifacts dir (default: `<artifacts root>/<app>/job`).
@@ -174,7 +273,10 @@ impl<'a> TestContext<'a> {
             costs: Arc::new(CostLedger::new(pool.clone())),
             budget_usd: self.budget_usd,
             spent_usd: Arc::new(SpentTotal::default()),
-            research_cache: Arc::new(ResearchCache::new(pool.clone(), 0)),
+            research_cache: Arc::new(ResearchCache::new(
+                pool.clone(),
+                self.research_cache_ttl_secs,
+            )),
             tiers: Arc::new(TierMemory::new(pool.clone(), 0)),
             health: self.health.unwrap_or_else(|| {
                 Arc::new(Resilience::new(pool.clone(), &ResilienceConfig::default()))

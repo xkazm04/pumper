@@ -310,8 +310,10 @@ impl AppContext {
         Ok(outcome)
     }
 
-    /// Metered Claude research: same as `engines.claude.research(...)` but
-    /// cache-aware and budget-governed. Identical requests within the cache
+    /// Metered Claude research — **the only way to reach the model.** The
+    /// researcher behind [`EngineSet`] is `pub(crate)` precisely so this is not
+    /// a convention an app can forget: it is cache-aware and budget-governed,
+    /// and a direct call loses all of it. Identical requests within the cache
     /// TTL are served from disk at zero cost (recorded as a `cache_hit`
     /// event); misses refuse to start once the job budget is exhausted, clamp
     /// the per-call ceiling to the remaining headroom, and store their output
@@ -334,7 +336,7 @@ impl AppContext {
         if let Some(remaining) = self.require_budget().await? {
             req.max_budget_usd = Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
         }
-        let out = self.engines.claude.research(req).await?;
+        let out = self.engines.researcher().research(req).await?;
         self.meter("claude", None, out.cost_usd.unwrap_or(0.0), None)
             .await;
         if let Some(key) = &key {

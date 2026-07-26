@@ -171,12 +171,7 @@ impl AppState {
             governor.clone(),
             &config.fetcher,
         );
-        let engines = Arc::new(EngineSet {
-            http,
-            browser,
-            claude,
-            fetch,
-        });
+        let engines = Arc::new(EngineSet::new(http, browser, claude, fetch));
 
         let plugins: Arc<dyn Plugins> = if config.plugins.enabled {
             Arc::new(WasmPluginHost::new(&config.plugins)?)

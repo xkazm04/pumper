@@ -25,7 +25,7 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use pumper_core::datasets::ChangeKind;
 use pumper_core::fetcher::FetchRequest;
-use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
+use pumper_core::{AppContext, Error, ResearchOutput, ResearchRequest, Result, ScrapeApp};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -267,18 +267,14 @@ fn fallback_summary(added: &[String], removed: &[String]) -> String {
     )
 }
 
-/// Claude-summarize a doc diff into { summary, tags[], severity }.
-async fn summarize_change(
-    ctx: &AppContext,
-    entry: &ManifestEntry,
-    added: &[String],
-    removed: &[String],
-) -> Result<(String, Vec<String>, String)> {
-    let label = if entry.label.is_empty() {
-        entry.slug.as_str()
-    } else {
-        entry.label.as_str()
-    };
+/// Builds the diff-summary request.
+///
+/// Extracted so the request's *cacheability* is a testable property, not an
+/// accident of the call site: it carries no `resume_session`, so
+/// [`AppContext::research`]'s disk cache keys on the (label, diff) content and a
+/// re-run over an unchanged diff costs nothing. `max_turns = 1` keeps a
+/// summarizer from turning into an agent loop.
+fn change_summary_request(label: &str, added: &[String], removed: &[String]) -> ResearchRequest {
     let prompt = format!(
         "You are reviewing a diff of the public API documentation for the '{label}' \
          service. Below are lines ADDED and REMOVED since the last check. Summarize, \
@@ -298,7 +294,20 @@ async fn summarize_change(
 
     let mut req = ResearchRequest::new(prompt).with_role("research");
     req.max_turns = Some(1);
-    let out = ctx.engines.claude.research(req).await?;
+    req
+}
+
+/// Parses the summarizer's answer into `{ summary, tags[], severity }`.
+///
+/// Extracted from the `research` call so the "model said nothing material" and
+/// "model returned prose instead of JSON" paths are directly testable without a
+/// model. Anything unparseable degrades to the deterministic
+/// [`fallback_summary`] rather than emitting an empty change event.
+fn parse_summary_response(
+    out: &ResearchOutput,
+    added: &[String],
+    removed: &[String],
+) -> (String, Vec<String>, String) {
     let v = out
         .json
         .clone()
@@ -313,7 +322,7 @@ async fn summarize_change(
     if summary.is_empty() {
         // Model judged the diff immaterial — surface a neutral fallback so the
         // firing still carries something, but tag it low severity.
-        return Ok((fallback_summary(added, removed), vec![], "patch".into()));
+        return (fallback_summary(added, removed), vec![], "patch".into());
     }
     let tags: Vec<String> = v
         .get("tags")
@@ -330,7 +339,33 @@ async fn summarize_change(
         .and_then(Value::as_str)
         .unwrap_or("minor")
         .to_string();
-    Ok((summary, tags, severity))
+    (summary, tags, severity)
+}
+
+/// Claude-summarize a doc diff into `{ summary, tags[], severity }`.
+///
+/// Goes through [`AppContext::research`] — the metered chokepoint — **not**
+/// `engines.claude`: this call site used to reach the engine directly, so every
+/// doc-diff summary ran uncached, unbudgeted and invisible to the cost ledger.
+/// Through the wrapper an unchanged diff is served from the research cache at
+/// zero cost, the per-call ceiling is clamped to the job's remaining headroom,
+/// and a budget-exhausted job returns `Err` here — which the caller already
+/// degrades to [`fallback_summary`] rather than failing the whole watch run.
+async fn summarize_change(
+    ctx: &AppContext,
+    entry: &ManifestEntry,
+    added: &[String],
+    removed: &[String],
+) -> Result<(String, Vec<String>, String)> {
+    let label = if entry.label.is_empty() {
+        entry.slug.as_str()
+    } else {
+        entry.label.as_str()
+    };
+    let out = ctx
+        .research(change_summary_request(label, added, removed))
+        .await?;
+    Ok(parse_summary_response(&out, added, removed))
 }
 
 #[cfg(test)]
@@ -381,5 +416,102 @@ mod tests {
         // Every emitted line is complete — no truncated mid-line fragment.
         assert!(out.ends_with('\n'));
         assert!(out.lines().all(|l| lines.iter().any(|src| src == l)));
+    }
+
+    fn diff() -> (Vec<String>, Vec<String>) {
+        line_diff(OLD_DOC, NEW_DOC)
+    }
+
+    /// A `ResearchOutput` carrying `text`, with `json` populated exactly the way
+    /// the real engine populates it (present only when the answer parses).
+    fn answer(text: &str) -> ResearchOutput {
+        ResearchOutput {
+            text: text.to_string(),
+            json: serde_json::from_str(text).ok(),
+            cost_usd: Some(0.0),
+            duration_ms: Some(0),
+            num_turns: Some(1),
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn summary_request_is_cacheable_not_a_resumed_session() {
+        // `AppContext::research` deliberately bypasses its disk cache for
+        // resumed sessions. This is a one-shot summarizer, so leaving
+        // `resume_session` unset is what makes a re-run over an unchanged diff
+        // free — the whole point of routing it through the chokepoint.
+        let (added, removed) = diff();
+        let req = change_summary_request("Stripe", &added, &removed);
+        assert!(
+            req.resume_session.is_none(),
+            "a resumed session opts out of the research cache"
+        );
+        // A summarizer must not become an agent loop, and it must run on the
+        // cheap preset rather than the compose one.
+        assert_eq!(req.max_turns, Some(1));
+        assert_eq!(req.role.as_deref(), Some("research"));
+    }
+
+    #[test]
+    fn summary_request_carries_the_diff_not_just_the_connector_name() {
+        // Grounding: the model must see the actual changed lines. A prompt that
+        // only names the connector produces a plausible, invented summary.
+        let (added, removed) = diff();
+        let req = change_summary_request("Stripe", &added, &removed);
+        assert!(req.prompt.contains("Stripe"));
+        assert!(req.prompt.contains("- POST /v1/payment_intents"));
+        assert!(req.prompt.contains("- POST /v1/charges"));
+    }
+
+    #[test]
+    fn identical_diffs_build_identical_requests_so_the_cache_can_hit() {
+        // `ResearchCache::key` hashes the request; a prompt carrying anything
+        // per-run (a timestamp, a job id) would make every call a cache miss.
+        let (added, removed) = diff();
+        assert_eq!(
+            change_summary_request("Stripe", &added, &removed).prompt,
+            change_summary_request("Stripe", &added, &removed).prompt,
+        );
+    }
+
+    #[test]
+    fn prose_answer_degrades_to_the_fallback_not_an_empty_summary() {
+        // The model ignored "JSON only" and answered in prose: no `summary`
+        // key, so the deterministic fallback carries the event instead of an
+        // empty string reaching the changes.json hand-off.
+        let (added, removed) = diff();
+        let out = answer("Sure! Here is what changed: ...");
+        let (summary, tags, severity) = parse_summary_response(&out, &added, &removed);
+        assert!(summary.contains("1 line(s) added"));
+        assert!(tags.is_empty());
+        assert_eq!(severity, "patch");
+    }
+
+    #[test]
+    fn immaterial_change_is_tagged_patch_not_dropped() {
+        let (added, removed) = diff();
+        let out = answer(r#"{"summary":"  ","tags":["breaking"],"severity":"breaking"}"#);
+        let (summary, tags, severity) = parse_summary_response(&out, &added, &removed);
+        assert!(summary.contains("API documentation changed"));
+        assert!(tags.is_empty(), "an empty summary keeps no severity tags");
+        assert_eq!(severity, "patch");
+    }
+
+    #[test]
+    fn structured_answer_is_passed_through_intact() {
+        let (added, removed) = diff();
+        let out = answer(
+            r#"{"summary":"POST /v1/charges replaced by POST /v1/payment_intents.",
+                "tags":["new_endpoint","removed_endpoint","breaking"],
+                "severity":"breaking"}"#,
+        );
+        let (summary, tags, severity) = parse_summary_response(&out, &added, &removed);
+        assert_eq!(
+            summary,
+            "POST /v1/charges replaced by POST /v1/payment_intents."
+        );
+        assert_eq!(tags, ["new_endpoint", "removed_endpoint", "breaking"]);
+        assert_eq!(severity, "breaking");
     }
 }

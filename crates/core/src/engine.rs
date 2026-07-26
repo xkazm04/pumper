@@ -359,12 +359,46 @@ pub trait Researcher: Send + Sync {
 }
 
 /// Everything an app can scrape with, handed over via [`crate::AppContext`].
+///
+/// **The `claude` engine is deliberately not public.** Every model call must go
+/// through [`crate::AppContext::research`], which adds the research cache, the
+/// per-job budget governor and cost metering; a direct
+/// `ctx.engines.claude.research(...)` silently loses all three (it happened —
+/// `connector-api-watch` summarized every doc diff off-ledger). Field privacy is
+/// what makes the chokepoint structural rather than conventional: an app crate
+/// cannot name the researcher, so it cannot bypass the wrapper. Construct with
+/// [`EngineSet::new`]; core-internal consumers use [`EngineSet::researcher`].
 pub struct EngineSet {
     pub http: Arc<dyn HttpClient>,
     pub browser: Arc<dyn Browser>,
-    pub claude: Arc<dyn Researcher>,
+    pub(crate) claude: Arc<dyn Researcher>,
     /// Tiered fetcher that picks/escalates engines automatically.
     pub fetch: crate::fetcher::Fetcher,
+}
+
+impl EngineSet {
+    /// Assembles the engine set. The researcher is moved in and thereafter
+    /// reachable only through the metered chokepoint.
+    pub fn new(
+        http: Arc<dyn HttpClient>,
+        browser: Arc<dyn Browser>,
+        claude: Arc<dyn Researcher>,
+        fetch: crate::fetcher::Fetcher,
+    ) -> Self {
+        Self {
+            http,
+            browser,
+            claude,
+            fetch,
+        }
+    }
+
+    /// The raw researcher — **core-internal**, for the one caller that is itself
+    /// the chokepoint ([`crate::AppContext::research`]). Named rather than
+    /// field-public so the bypass surface is a single greppable symbol.
+    pub(crate) fn researcher(&self) -> &Arc<dyn Researcher> {
+        &self.claude
+    }
 }
 
 #[cfg(test)]
