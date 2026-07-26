@@ -14,6 +14,8 @@ pub mod datasets;
 pub mod storage;
 #[cfg(feature = "storage")]
 pub mod tiers;
+#[cfg(feature = "test-support")]
+pub mod testing;
 
 pub mod catalog;
 pub mod config;

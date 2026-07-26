@@ -11,6 +11,9 @@ edition.workspace = true
 # (avoids a duplicate libsqlite3 link against a bundled rusqlite).
 default = ["storage"]
 storage = ["dep:sqlx"]
+# Shared test harness (`pumper_core::testing`): TempStore RAII fixture, Dead
+# engines, AppContext builder. Enable from [dev-dependencies] ONLY.
+test-support = ["storage", "dep:tempfile"]
 
 [dependencies]
 tokio.workspace = true
@@ -34,3 +37,8 @@ tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 skyscraper = "0.7"
+tempfile = { version = "3", optional = true }
+
+[dev-dependencies]
+# Self-referential: core's own integration tests get the harness.
+pumper-core = { path = ".", features = ["test-support"] }
