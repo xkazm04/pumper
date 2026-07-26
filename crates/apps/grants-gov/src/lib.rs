@@ -259,7 +259,7 @@ fn closing_soon_digest(hits: &[Value], days: i64) -> Vec<Value> {
         .filter(|h| {
             h.get("oppStatus")
                 .and_then(Value::as_str)
-                .map_or(true, |s| s.eq_ignore_ascii_case("posted"))
+                .is_none_or(|s| s.eq_ignore_ascii_case("posted"))
         })
         .filter_map(|h| {
             let close = h.get("closeDate").and_then(Value::as_str)?;

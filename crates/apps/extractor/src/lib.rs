@@ -478,7 +478,7 @@ impl Extractor {
 fn tier_won(out: &pumper_core::FetchOutcome) -> bool {
     out.trace.iter().any(|t| {
         t.verdict == pumper_core::TierVerdict::Ok
-            && t.http_status.map_or(true, |s| (200..300).contains(&s))
+            && t.http_status.is_none_or(|s| (200..300).contains(&s))
     })
 }
 
@@ -501,7 +501,7 @@ mod tests {
     #[test]
     fn aggregate_matched_total_and_worst_fields() {
         let err = FieldStatus::Error { detail: "x".into() };
-        let reports = vec![
+        let reports = [
             report(&[
                 ("title", FieldStatus::Matched),
                 ("price", FieldStatus::Empty),
@@ -530,7 +530,7 @@ mod tests {
 
     #[test]
     fn all_matched_has_no_worst_fields() {
-        let reports = vec![report(&[
+        let reports = [report(&[
             ("a", FieldStatus::Matched),
             ("b", FieldStatus::Matched),
         ])];

@@ -198,9 +198,9 @@ impl ScrapeApp for CensusNonemp {
             all_records.extend(records);
 
             let mut by_density = ranked.clone();
-            by_density.sort_by(|a, b| b.1.cmp(&a.1));
+            by_density.sort_by_key(|(_, estab, _)| std::cmp::Reverse(*estab));
             let mut by_avg = ranked.clone();
-            by_avg.sort_by(|a, b| b.2.cmp(&a.2));
+            by_avg.sort_by_key(|(_, _, avg)| std::cmp::Reverse(*avg));
             let national_avg = if total_estab > 0 {
                 (total_rcpt * 1000) / total_estab
             } else {

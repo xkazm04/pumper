@@ -234,7 +234,11 @@ impl Governor {
     /// has grown past the cap, and keeps hosts touched recently or still under
     /// a penalty. Holds no entry ref (avoids a shard self-deadlock).
     fn maybe_evict(&self) {
-        if self.ops.fetch_add(1, Ordering::Relaxed) % EVICT_CHECK_EVERY != 0 {
+        if !self
+            .ops
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(EVICT_CHECK_EVERY)
+        {
             return;
         }
         if self.hosts.len() <= MAX_HOSTS {

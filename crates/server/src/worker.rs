@@ -730,7 +730,6 @@ async fn dataset_search_docs(
 
 /// One search document for a stored dataset record (stable id, app+dataset
 /// preserved for facets). Mirrors `record_doc`'s title/url field picking.
-
 fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
     let url = ["_url", "url"]
         .iter()

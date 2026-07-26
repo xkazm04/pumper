@@ -1283,7 +1283,7 @@ mod tests {
     #[test]
     fn official_index_reads_string_encoded_stats() {
         // Regression: as_f64-only dropped rows whose stats arrived as strings.
-        let rows = vec![
+        let rows = [
             json!({"czIsco": "CzIsco/1120", "sfera": "MZDOVA", "medianMzda": "111959", "mzdaPrumer": "190185"}),
         ];
         let idx = official_wage_index(rows.iter());
@@ -1295,7 +1295,7 @@ mod tests {
 
     #[test]
     fn official_index_keys_by_unit_group_and_drops_medianless_rows() {
-        let rows = vec![
+        let rows = [
             json!({"czIsco": "CzIsco/1120", "sfera": "MZDOVA", "medianMzda": 111959.0, "mzdaPrumer": 190185.0}),
             json!({"czIsco": "CzIsco/2433", "sfera": "PLATOVA"}), // no median → dropped
             json!({"sfera": "MZDOVA", "medianMzda": 40000.0}),    // no code → dropped
@@ -1457,7 +1457,7 @@ mod tests {
 
     #[test]
     fn distinct_icos_dedupes_pads_and_drops_invalid() {
-        let samples = vec![
+        let samples = [
             json!({"employerIco": "27074358"}),
             json!({"employerIco": "27074358"}),  // duplicate
             json!({"employerIco": "45274649 "}), // trimmed

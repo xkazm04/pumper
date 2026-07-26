@@ -295,7 +295,7 @@ impl Fetcher {
                     let cache_hit = Some(resp.cache_hit);
                     let enough = wall.is_none()
                         && resp.is_success()
-                        && text_len.map_or(true, |n| n >= min_chars);
+                        && text_len.is_none_or(|n| n >= min_chars);
                     if enough || req.strategy == FetchStrategy::Http {
                         trace.push(TierTrace {
                             tier: FetchTier::Http,
@@ -398,7 +398,7 @@ impl Fetcher {
                         None if needs_count => Some(text_len_capped(&page.html, min_chars)),
                         None => None,
                     };
-                    let enough = wall.is_none() && text_len.map_or(true, |n| n >= min_chars);
+                    let enough = wall.is_none() && text_len.is_none_or(|n| n >= min_chars);
                     if enough || req.strategy != FetchStrategy::AutoWithResearch {
                         // A healthy browser fetch decays any learned penalty on the
                         // host (no-op when unpenalized) — the recovery half of the

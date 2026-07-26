@@ -368,7 +368,7 @@ async fn a_degrading_source_cannot_tombstone_its_own_dataset() {
         ..cfg()
     };
     let health = Arc::new(Resilience::new(storage.pool(), &enforcing));
-    let ctx = ctx(&storage, health.clone());
+    let ctx = ctx(storage, health.clone());
     let datasets = Datasets::new(storage.pool());
 
     // A healthy full snapshot of three keys.
@@ -439,7 +439,7 @@ async fn a_quarantined_source_writes_to_the_shadow_dataset() {
             ..cfg()
         },
     ));
-    let ctx = ctx(&storage, health.clone());
+    let ctx = ctx(storage, health.clone());
     let datasets = Datasets::new(storage.pool());
 
     ctx.upsert_many("products", &items(&["a"])).await.unwrap();
@@ -485,7 +485,7 @@ async fn soak_mode_records_the_verdict_and_gates_nothing() {
     // The shipping default: detection on, enforcement off.
     let health = Arc::new(Resilience::new(storage.pool(), &cfg()));
     assert!(health.enabled() && !health.enforcing());
-    let ctx = ctx(&storage, health.clone());
+    let ctx = ctx(storage, health.clone());
     let datasets = Datasets::new(storage.pool());
 
     ctx.sync_many("products", &items(&["a", "b", "c"]))
@@ -533,7 +533,7 @@ async fn the_change_feed_holds_back_provisional_revisions_by_default() {
             ..cfg()
         },
     ));
-    let ctx = ctx(&storage, health.clone());
+    let ctx = ctx(storage, health.clone());
     let datasets = Datasets::new(storage.pool());
 
     ctx.upsert_many("products", &items(&["trusted"]))

@@ -302,7 +302,7 @@ impl ScrapeApp for CensusDensity {
                 ));
             }
 
-            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            ranked.sort_by_key(|(_, e)| std::cmp::Reverse(*e));
             let top: Vec<Value> = ranked
                 .iter()
                 .take(5)
@@ -338,7 +338,7 @@ impl ScrapeApp for CensusDensity {
 
         let mut overall_vec: Vec<(String, i64)> =
             overall.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        overall_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        overall_vec.sort_by_key(|(_, e)| std::cmp::Reverse(*e));
         let top_overall: Vec<Value> = overall_vec
             .iter()
             .take(10)

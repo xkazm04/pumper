@@ -1,0 +1,37 @@
+version: 2
+
+updates:
+  # Rust dependencies. Weekly so the lockfile keeps moving without a PR per day.
+  # Grouping keeps routine patch/minor churn to a single reviewable PR while
+  # leaving majors as their own PRs, since those are the ones that need thought.
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "deps"
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # The workflow's own actions (checkout, rust-toolchain, rust-cache,
+  # cargo-deny-action). These are third-party code running with repo credentials,
+  # so keeping them current is part of the same supply-chain surface deny.toml
+  # covers for crates.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+    commit-message:
+      prefix: "ci"
+    groups:
+      actions:
+        patterns:
+          - "*"

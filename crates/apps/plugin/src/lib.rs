@@ -114,6 +114,14 @@ impl Plugin {
         let plugin_params = plugin_params(ctx);
         let fetcher = ctx.engines.fetch.clone();
         let plugins = ctx.plugins.clone();
+        // clippy::redundant_iter_cloned — the `cloned()` looks redundant (the body
+        // only ever takes `&url`), but it is load-bearing for inference: with
+        // `Item = &String`/`&str` the closure must implement `FnOnce` for ANY
+        // lifetime to satisfy the `buffered()` Send bound, and rustc rejects it
+        // with "implementation of FnOnce is not general enough". Owning the item
+        // removes the lifetime from the closure signature. Verified: both
+        // `.iter()` and `.iter().map(String::as_str)` fail to compile.
+        #[allow(clippy::redundant_iter_cloned)]
         let tasks = urls.iter().cloned().map(|url| {
             let f = fetcher.clone();
             let p = plugins.clone();

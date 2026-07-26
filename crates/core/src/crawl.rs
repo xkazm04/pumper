@@ -601,9 +601,11 @@ pub async fn crawl(
 
     let mut robots: HashMap<String, RobotRules> = HashMap::new();
     let mut hosts: HashSet<String> = HashSet::new();
-    let mut stats = CrawlStats::default();
-    stats.resumed = resumed;
-    stats.checkpoint_reset = checkpoint_reset;
+    let mut stats = CrawlStats {
+        resumed,
+        checkpoint_reset,
+        ..Default::default()
+    };
     let mut in_flight = FuturesUnordered::new();
     // Per-host earliest-next-fetch, driven by robots.txt Crawl-delay.
     let mut next_allowed: HashMap<String, tokio::time::Instant> = HashMap::new();
@@ -820,7 +822,7 @@ pub async fn crawl(
 
         // Live progress: cheap seam call every stride; the runtime throttles the
         // actual persist/emit so a huge crawl stays observable without spamming.
-        if stats.crawled % PROGRESS_STRIDE == 0 {
+        if stats.crawled.is_multiple_of(PROGRESS_STRIDE) {
             emit_progress(&progress, &stats, frontier.len(), hosts.len());
         }
 
@@ -1248,7 +1250,7 @@ impl RobotRules {
             let key = key.trim().to_ascii_lowercase();
             // `Sitemap:` values are absolute URLs — re-join the split colon.
             let value = if key == "sitemap" {
-                line.splitn(2, ':').nth(1).unwrap_or("").trim()
+                line.split_once(':').map(|x| x.1).unwrap_or("").trim()
             } else {
                 value.trim()
             };

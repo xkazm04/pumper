@@ -9,8 +9,10 @@ use pumper_engine_browser::BrowserEngine;
 /// Base config pointing at the standard Windows Chrome install when present
 /// (Chrome isn't reliably on PATH on Windows), else auto-detect.
 fn test_cfg(profile: &str) -> BrowserConfig {
-    let mut cfg = BrowserConfig::default();
-    cfg.user_data_dir = std::env::temp_dir().join(profile);
+    let mut cfg = BrowserConfig {
+        user_data_dir: std::env::temp_dir().join(profile),
+        ..Default::default()
+    };
     let default_chrome =
         std::path::PathBuf::from(r"C:\Program Files\Google\Chrome\Application\chrome.exe");
     if default_chrome.exists() {

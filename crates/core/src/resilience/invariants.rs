@@ -546,7 +546,7 @@ mod tests {
                 confidence: 1.0,
             },
         ];
-        let docs = vec![
+        let docs = [
             json!({ "date": "2026-07-25", "price": 10.0 }),
             json!({ "date": "17 reviews", "price": 5000.0 }),
             // A blank value is a miss, not a violation — the miss-rate signal

@@ -13,9 +13,9 @@
 //! fingerprint. A `dataset` trigger on `on_change=fresh` can fan a re-download of
 //! exactly the changed dumps.
 //!
-//! It deliberately does NOT download the (large, ~100 MB) dumps — the heavy fetch
-//! + parse belongs in the consuming app; this only answers "what dumps exist and
-//! which changed?".
+//! It deliberately does NOT download the (large, ~100 MB) dumps — the heavy
+//! fetch + parse belongs in the consuming app; this only answers "what dumps
+//! exist and which changed?".
 //!
 //! Params: `{ "index_url": "https://data.smlouvy.gov.cz/index.xml", "year_from": null }`
 //!   · `index_url` — override the index location (default is the production URL).

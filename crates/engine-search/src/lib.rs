@@ -542,7 +542,7 @@ impl Search for TantivyIndex {
                     .into_iter()
                     .map(|(value, count)| FacetCount { value, count })
                     .collect();
-                list.sort_by(|a, b| b.count.cmp(&a.count));
+                list.sort_by_key(|f| std::cmp::Reverse(f.count));
                 list
             };
             Ok(SearchResponse {

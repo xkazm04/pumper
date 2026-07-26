@@ -321,6 +321,29 @@ fn multipart_body(query: &str, languages: &str) -> String {
     s
 }
 
+fn sedia_request(url: String, body: String) -> HttpRequest {
+    let mut headers = HashMap::new();
+    headers.insert(
+        "Content-Type".to_string(),
+        format!("multipart/form-data; boundary={BOUNDARY}"),
+    );
+    headers.insert("Accept".to_string(), "application/json".to_string());
+    HttpRequest {
+        url,
+        method: HttpMethod::Post,
+        headers,
+        body: Some(body),
+        no_cache: false,
+        ttl_override: None,
+        etag: None,
+        if_modified_since: None,
+        max_body_bytes: None,
+        timeout_secs: None,
+        proxy: None,
+        profile: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{clean_inline, clean_text, normalize, DESCRIPTION_TEXT_CAP};
@@ -413,28 +436,5 @@ mod tests {
         let (_, rec) = normalize(&hit);
         assert!(rec["description_text"].is_null());
         assert!(rec["descriptionByte"].is_null());
-    }
-}
-
-fn sedia_request(url: String, body: String) -> HttpRequest {
-    let mut headers = HashMap::new();
-    headers.insert(
-        "Content-Type".to_string(),
-        format!("multipart/form-data; boundary={BOUNDARY}"),
-    );
-    headers.insert("Accept".to_string(), "application/json".to_string());
-    HttpRequest {
-        url,
-        method: HttpMethod::Post,
-        headers,
-        body: Some(body),
-        no_cache: false,
-        ttl_override: None,
-        etag: None,
-        if_modified_since: None,
-        max_body_bytes: None,
-        timeout_secs: None,
-        proxy: None,
-        profile: None,
     }
 }

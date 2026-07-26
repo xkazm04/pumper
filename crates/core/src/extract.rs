@@ -1116,15 +1116,13 @@ mod tests {
         // Listing present with items → matched.
         let (_, full) = extract_one_with_report(
             &rules,
-            &r#"<div id="listing"><div class="job"><h3>A</h3></div></div>"#.to_string(),
+            r#"<div id="listing"><div class="job"><h3>A</h3></div></div>"#,
         );
         assert_eq!(full.fields["jobs"], FieldStatus::Matched);
 
         // Listing present, no postings this week → NOT a break.
-        let (values, quiet) = extract_one_with_report(
-            &rules,
-            &r#"<div id="listing"><p>No open roles</p></div>"#.to_string(),
-        );
+        let (values, quiet) =
+            extract_one_with_report(&rules, r#"<div id="listing"><p>No open roles</p></div>"#);
         assert_eq!(quiet.fields["jobs"], FieldStatus::ContainerEmpty);
         assert!(
             !quiet.fields["jobs"].is_miss(),
@@ -1133,7 +1131,7 @@ mod tests {
         assert_eq!(values["jobs"], json!([]));
 
         // Listing itself gone → the selector broke, and this IS a miss.
-        let (_, broken) = extract_one_with_report(&rules, &"<div id=\"other\"></div>".to_string());
+        let (_, broken) = extract_one_with_report(&rules, "<div id=\"other\"></div>");
         assert_eq!(broken.fields["jobs"], FieldStatus::Empty);
         assert!(broken.fields["jobs"].is_miss());
 
@@ -1142,7 +1140,7 @@ mod tests {
             "jobs": {"type": "each", "selector": ".job",
                      "fields": {"title": {"type": "css", "selector": "h3"}}}
         }));
-        let (_, r) = extract_one_with_report(&bare, &"<div id=\"listing\"></div>".to_string());
+        let (_, r) = extract_one_with_report(&bare, "<div id=\"listing\"></div>");
         assert_eq!(r.fields["jobs"], FieldStatus::Empty);
     }
 
@@ -1168,11 +1166,11 @@ mod tests {
             "absent":  {"type": "json", "pointer": "/missing"}
         }));
         // Valid JSON body: present matches, absent is a real miss (Empty, not Error).
-        let (_, ok) = extract_one_with_report(&rules, &r#"{"a": 1}"#.to_string());
+        let (_, ok) = extract_one_with_report(&rules, r#"{"a": 1}"#);
         assert_eq!(ok.fields["present"], FieldStatus::Matched);
         assert_eq!(ok.fields["absent"], FieldStatus::Empty);
         // Non-JSON body: every json field is Error (bad input), not a silent miss.
-        let (_, bad) = extract_one_with_report(&rules, &"<html>not json</html>".to_string());
+        let (_, bad) = extract_one_with_report(&rules, "<html>not json</html>");
         assert!(matches!(bad.fields["present"], FieldStatus::Error { .. }));
         assert!(matches!(bad.fields["absent"], FieldStatus::Error { .. }));
     }

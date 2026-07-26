@@ -152,77 +152,6 @@ pub fn idempotency_key(trigger_id: &str, source_job_id: &str) -> String {
     format!("trig:{trigger_id}:{source_job_id}")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn cfg() -> TriggersConfig {
-        TriggersConfig {
-            max_depth: 3,
-            key_cap: 2,
-        }
-    }
-
-    #[test]
-    fn decide_fires_extends_chain_and_guards_cycles_and_depth() {
-        // Fresh source (no provenance): fires at depth 1.
-        assert_eq!(
-            decide("T1", &json!({}), &cfg()),
-            FireDecision::Fire {
-                depth: 1,
-                chain: vec!["T1".into()]
-            }
-        );
-        // Same trigger already in the chain: cycle skip.
-        let looped = json!({ "_trigger": { "depth": 1, "chain": ["T1"] } });
-        assert_eq!(decide("T1", &looped, &cfg()), FireDecision::SkipCycle);
-        // Different trigger continues the chain.
-        assert_eq!(
-            decide("T2", &looped, &cfg()),
-            FireDecision::Fire {
-                depth: 2,
-                chain: vec!["T1".into(), "T2".into()]
-            }
-        );
-        // Depth backstop.
-        let deep = json!({ "_trigger": { "depth": 3, "chain": ["A", "B", "C"] } });
-        assert_eq!(decide("T9", &deep, &cfg()), FireDecision::SkipDepth);
-    }
-
-    #[test]
-    fn merged_params_injects_trigger_over_template() {
-        let template = json!({ "mode": "batch", "_trigger": "stale" });
-        let merged = merged_params(&template, json!({ "count": 5 }));
-        assert_eq!(merged["mode"], "batch");
-        assert_eq!(merged["_trigger"]["count"], 5); // injected wins
-                                                    // Non-object template is replaced, not merged into.
-        let merged = merged_params(&Value::Null, json!({ "count": 1 }));
-        assert_eq!(merged["_trigger"]["count"], 1);
-    }
-
-    #[test]
-    fn change_and_status_filters() {
-        assert!(change_matches(Some("fresh"), "new"));
-        assert!(change_matches(Some("fresh"), "changed"));
-        assert!(!change_matches(Some("fresh"), "removed"));
-        assert!(change_matches(Some("any"), "removed"));
-        assert!(change_matches(None, "removed"));
-        assert!(!change_matches(Some("new"), "changed"));
-
-        assert!(status_matches(None, "succeeded"));
-        assert!(!status_matches(None, "failed"));
-        assert!(status_matches(Some("failed"), "failed"));
-        assert!(status_matches(Some("any"), "cancelled"));
-    }
-
-    #[test]
-    fn idempotency_key_is_per_trigger_per_source_run() {
-        assert_eq!(idempotency_key("T1", "J1"), "trig:T1:J1");
-        assert_ne!(idempotency_key("T1", "J1"), idempotency_key("T1", "J2"));
-        assert_ne!(idempotency_key("T1", "J1"), idempotency_key("T2", "J1"));
-    }
-}
-
 // ── worker hooks (IO around the pure helpers) ────────────────────────────────
 
 use std::collections::HashMap;
@@ -356,5 +285,76 @@ async fn enqueue_hop(state: &AppState, trigger: &Trigger, source: &Job, obj: Val
             warn!(trigger = %trigger.id, source = %source.id, "trigger enqueue failed: {e}");
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> TriggersConfig {
+        TriggersConfig {
+            max_depth: 3,
+            key_cap: 2,
+        }
+    }
+
+    #[test]
+    fn decide_fires_extends_chain_and_guards_cycles_and_depth() {
+        // Fresh source (no provenance): fires at depth 1.
+        assert_eq!(
+            decide("T1", &json!({}), &cfg()),
+            FireDecision::Fire {
+                depth: 1,
+                chain: vec!["T1".into()]
+            }
+        );
+        // Same trigger already in the chain: cycle skip.
+        let looped = json!({ "_trigger": { "depth": 1, "chain": ["T1"] } });
+        assert_eq!(decide("T1", &looped, &cfg()), FireDecision::SkipCycle);
+        // Different trigger continues the chain.
+        assert_eq!(
+            decide("T2", &looped, &cfg()),
+            FireDecision::Fire {
+                depth: 2,
+                chain: vec!["T1".into(), "T2".into()]
+            }
+        );
+        // Depth backstop.
+        let deep = json!({ "_trigger": { "depth": 3, "chain": ["A", "B", "C"] } });
+        assert_eq!(decide("T9", &deep, &cfg()), FireDecision::SkipDepth);
+    }
+
+    #[test]
+    fn merged_params_injects_trigger_over_template() {
+        let template = json!({ "mode": "batch", "_trigger": "stale" });
+        let merged = merged_params(&template, json!({ "count": 5 }));
+        assert_eq!(merged["mode"], "batch");
+        assert_eq!(merged["_trigger"]["count"], 5); // injected wins
+                                                    // Non-object template is replaced, not merged into.
+        let merged = merged_params(&Value::Null, json!({ "count": 1 }));
+        assert_eq!(merged["_trigger"]["count"], 1);
+    }
+
+    #[test]
+    fn change_and_status_filters() {
+        assert!(change_matches(Some("fresh"), "new"));
+        assert!(change_matches(Some("fresh"), "changed"));
+        assert!(!change_matches(Some("fresh"), "removed"));
+        assert!(change_matches(Some("any"), "removed"));
+        assert!(change_matches(None, "removed"));
+        assert!(!change_matches(Some("new"), "changed"));
+
+        assert!(status_matches(None, "succeeded"));
+        assert!(!status_matches(None, "failed"));
+        assert!(status_matches(Some("failed"), "failed"));
+        assert!(status_matches(Some("any"), "cancelled"));
+    }
+
+    #[test]
+    fn idempotency_key_is_per_trigger_per_source_run() {
+        assert_eq!(idempotency_key("T1", "J1"), "trig:T1:J1");
+        assert_ne!(idempotency_key("T1", "J1"), idempotency_key("T1", "J2"));
+        assert_ne!(idempotency_key("T1", "J1"), idempotency_key("T2", "J1"));
     }
 }

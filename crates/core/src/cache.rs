@@ -214,33 +214,6 @@ fn ts(dt: DateTime<Utc>) -> String {
     dt.to_rfc3339_opts(SecondsFormat::Micros, true)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn req(url: &str) -> HttpRequest {
-        serde_json::from_value(serde_json::json!({ "url": url })).unwrap()
-    }
-
-    #[test]
-    fn cache_key_varies_on_headers_and_proxy_and_is_stable() {
-        let base = req("https://x.test/a");
-        let k = HttpCache::key(&base);
-        // Stable across identical requests (and across HashMap orderings).
-        assert_eq!(k, HttpCache::key(&req("https://x.test/a")));
-        // Content-negotiation headers change the response → change the identity.
-        let mut with_lang = base.clone();
-        with_lang
-            .headers
-            .insert("Accept-Language".into(), "cs".into());
-        assert_ne!(k, HttpCache::key(&with_lang));
-        // Proxy (geo-variant egress) changes the identity.
-        let mut with_proxy = base.clone();
-        with_proxy.proxy = Some("http://eu.proxy:8080".into());
-        assert_ne!(k, HttpCache::key(&with_proxy));
-    }
-}
-
 /// Cost-aware cache for Claude research runs. Research spends real money, so
 /// identical requests within the TTL are served from disk. Keyed by every
 /// answer-shaping field of the request; `resume_session` requests bypass the
@@ -334,5 +307,32 @@ impl ResearchCache {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn req(url: &str) -> HttpRequest {
+        serde_json::from_value(serde_json::json!({ "url": url })).unwrap()
+    }
+
+    #[test]
+    fn cache_key_varies_on_headers_and_proxy_and_is_stable() {
+        let base = req("https://x.test/a");
+        let k = HttpCache::key(&base);
+        // Stable across identical requests (and across HashMap orderings).
+        assert_eq!(k, HttpCache::key(&req("https://x.test/a")));
+        // Content-negotiation headers change the response → change the identity.
+        let mut with_lang = base.clone();
+        with_lang
+            .headers
+            .insert("Accept-Language".into(), "cs".into());
+        assert_ne!(k, HttpCache::key(&with_lang));
+        // Proxy (geo-variant egress) changes the identity.
+        let mut with_proxy = base.clone();
+        with_proxy.proxy = Some("http://eu.proxy:8080".into());
+        assert_ne!(k, HttpCache::key(&with_proxy));
     }
 }

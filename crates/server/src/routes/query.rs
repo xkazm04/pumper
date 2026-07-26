@@ -283,7 +283,7 @@ pub(crate) async fn catalog_sources(
             .as_deref()
             .map(str::trim)
             .filter(|s| !s.is_empty())
-            .map_or(true, |f| f == field)
+            .is_none_or(|f| f == field)
     };
     let sources: Vec<&pumper_core::Source> = catalog
         .sources

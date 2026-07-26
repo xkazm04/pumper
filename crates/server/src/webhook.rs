@@ -69,6 +69,15 @@ pub fn dispatch_change(
 
 /// Spawns a best-effort, logged delivery of an arbitrary event — the generic
 /// entry point for new event kinds (e.g. saved-search matches).
+//
+// clippy::too_many_arguments (8/7) — the eight are the webhook wire contract
+// itself (transport, storage, kind, ref_id, url, event, payload, secret); every
+// one is independently supplied by the caller, so collapsing them behind a
+// default-able struct would let a caller silently omit `secret` (unsigned
+// delivery) or `ref_id` (unattributable log line). Allowed at this one site
+// rather than bulk-suppressed. FOLLOW-UP: introduce a `DispatchEvent` builder
+// with `secret`/`ref_id` as required constructor args, then drop this allow.
+#[allow(clippy::too_many_arguments)]
 pub fn dispatch_event(
     client: reqwest::Client,
     storage: Arc<Storage>,
