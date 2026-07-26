@@ -1,0 +1,417 @@
+{
+  "$schema": "https://vibeman.dev/schemas/context-map.json",
+  "projectId": "51ed5294-46d2-4a0e-9d7e-502b5e9b8be1",
+  "projectName": "pumper",
+  "projectPath": "C:\\Users\\mkdol\\dolla\\pumper",
+  "version": "2.0.0",
+  "groups": [
+    {
+      "name": "Scraping Runtime Core",
+      "domain": "shared",
+      "type": null,
+      "color": "#3B82F6",
+      "icon": null,
+      "contexts": [
+        {
+          "name": "Tiered Fetcher & Politeness",
+          "description": "Fetches a URL on the cheapest engine that works and escalates (http -> browser -> claude) when content looks thin, fronted by a per-domain politeness governor and a content-addressed TTL cache.",
+          "businessFeature": "Tiered Fetcher & Politeness",
+          "category": "lib",
+          "filePaths": [
+            "crates/core/src/fetcher.rs",
+            "crates/core/src/governor.rs",
+            "crates/core/src/cache.rs",
+            "crates/core/src/tiers.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "App & Job Model",
+          "description": "The contract a scraping app implements and the job lifecycle it runs in � job params, status, per-run context (engines, dataset store, artifacts dir), plus global config and error types.",
+          "businessFeature": "App & Job Model",
+          "category": "lib",
+          "filePaths": [
+            "crates/core/src/app.rs",
+            "crates/core/src/job.rs",
+            "crates/core/src/lib.rs",
+            "crates/core/src/config.rs",
+            "crates/core/src/error.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Engine Capability Traits",
+          "description": "Defines the capability interfaces every scraping app programs against � fetch, plugin execution, and search � so apps stay decoupled from concrete engine implementations.",
+          "businessFeature": "Engine Capability Traits",
+          "category": "lib",
+          "filePaths": [
+            "crates/core/src/engine.rs",
+            "crates/core/src/plugin.rs",
+            "crates/core/src/search.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        }
+      ]
+    },
+    {
+      "name": "Data Extraction & Storage",
+      "domain": "data",
+      "type": null,
+      "color": "#F97316",
+      "icon": null,
+      "contexts": [
+        {
+          "name": "Broad Crawler",
+          "description": "Seed a set of URLs and crawl outward with a bounded, deduplicated frontier and thousands of concurrent fetch tasks, streaming page bodies to disk with robots.txt politeness and SimHash near-duplicate dropping.",
+          "businessFeature": "Broad Crawler",
+          "category": "lib",
+          "filePaths": [
+            "crates/core/src/crawl.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Declarative Extraction Engine",
+          "description": "Turn raw HTML/JSON documents into structured fields with a compiled rule set (CSS / regex / JSON pointer / constant) run in parallel across CPU cores, plus HTML-to-clean-Markdown preprocessing.",
+          "businessFeature": "Declarative Extraction Engine",
+          "category": "lib",
+          "filePaths": [
+            "crates/core/src/extract.rs",
+            "crates/core/src/markdown.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Dataset Store & Change Detection",
+          "description": "Upsert typed records keyed by a stable id and learn whether each is new, changed, or unchanged since last run � the substrate for dedup and diff-based monitoring, with SimHash near-duplicate detection.",
+          "businessFeature": "Dataset Store & Change Detection",
+          "category": "data",
+          "filePaths": [
+            "crates/core/src/datasets.rs",
+            "crates/core/src/storage.rs",
+            "crates/core/src/simhash.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        }
+      ]
+    },
+    {
+      "name": "Scraping Engines",
+      "domain": "integration",
+      "type": null,
+      "color": "#8B5CF6",
+      "icon": null,
+      "contexts": [
+        {
+          "name": "Full-Text Search Index",
+          "description": "Embedded BM25 full-text search over scraped records using a memory-mapped Tantivy index � no external service; re-indexing an id replaces the prior document.",
+          "businessFeature": "Full-Text Search Index",
+          "category": "lib",
+          "filePaths": [
+            "crates/engine-search/src/lib.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "WASM Plugin Sandbox",
+          "description": "Run untrusted, hot-swappable WebAssembly extraction/transform modules over documents with a CPU-fuel budget and hard memory cap (wasmtime), plus the bundled sample plugins.",
+          "businessFeature": "WASM Plugin Sandbox",
+          "category": "lib",
+          "filePaths": [
+            "crates/engine-wasm/src/lib.rs",
+            "plugins-src/busyloop/src/lib.rs",
+            "plugins-src/title-extractor/src/lib.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Fetch Engines (HTTP / Browser / Claude)",
+          "description": "The three fetch tiers: fast reqwest HTTP with cookie jar and backoff, a headless Chrome (chromiumoxide) engine with a persistent session for JS-heavy or gated pages, and the Claude Code CLI as an agentic research engine.",
+          "businessFeature": "Fetch Engines",
+          "category": "lib",
+          "filePaths": [
+            "crates/engine-http/src/lib.rs",
+            "crates/engine-browser/src/lib.rs",
+            "crates/engine-browser/tests/render.rs",
+            "crates/engine-claude/src/lib.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        }
+      ]
+    },
+    {
+      "name": "Job Server & API",
+      "domain": "infrastructure",
+      "type": null,
+      "color": "#EF4444",
+      "icon": null,
+      "contexts": [
+        {
+          "name": "Configuration & Data Source Catalog",
+          "description": "Service configuration and the curated catalog of data sources and connector API docs the apps and watchers operate against.",
+          "businessFeature": "Configuration & Data Source Catalog",
+          "category": "config",
+          "filePaths": [
+            "config.toml",
+            "catalog/data-sources.toml",
+            "catalog/connector-docs.json"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Live Events & Webhooks",
+          "description": "Streams live job events to SSE subscribers and delivers finished job results to a caller-supplied callback URL with optional HMAC signing, so consumers never have to poll.",
+          "businessFeature": "Live Events & Webhooks",
+          "category": "api",
+          "filePaths": [
+            "crates/server/src/events.rs",
+            "crates/server/src/webhook.rs"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/events",
+            "/jobs/{id}/stream"
+          ]
+        },
+        {
+          "name": "Job Worker & Cron Scheduler",
+          "description": "Executes queued jobs against the right app and reconciles a DB-backed cron table each tick, enqueuing scheduled runs whose next firing is due.",
+          "businessFeature": "Job Worker & Cron Scheduler",
+          "category": "lib",
+          "filePaths": [
+            "crates/server/src/worker.rs",
+            "crates/server/src/scheduler.rs",
+            "crates/server/src/progress.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "DataHub Metadata Emitter",
+          "description": "Pushes a metadata-only shadow of the dataset store (entities, inferred schema, run-derived lineage, freshness operations) to a DataHub GMS over its OpenAPI ingestion surface; fail-open on job success plus a one-shot backfill endpoint.",
+          "businessFeature": "DataHub Metadata Emitter",
+          "category": "api",
+          "filePaths": [
+            "crates/server/src/datahub.rs"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/datahub/status",
+            "/datahub/sync"
+          ]
+        },
+        {
+          "name": "App Registry",
+          "description": "The catalog of every scraping app the service can run, mapping app names to their implementations so new use cases become available by registering a crate.",
+          "businessFeature": "App Registry",
+          "category": "lib",
+          "filePaths": [
+            "crates/server/src/registry.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "HTTP API & Routes",
+          "description": "The axum HTTP surface for the service � enqueue jobs, list apps/jobs/datasets, export records, search, and manage plugins � wired together with shared application state at startup.",
+          "businessFeature": "HTTP API & Routes",
+          "category": "api",
+          "filePaths": [
+            "crates/server/src/routes.rs",
+            "crates/server/src/main.rs",
+            "crates/server/src/state.rs"
+          ],
+          "target": null,
+          "apiRoutes": [
+            "/apps",
+            "/jobs",
+            "/datasets",
+            "/search",
+            "/plugins",
+            "/metrics",
+            "/health"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "Public Funding & Grants Apps",
+      "domain": "feature",
+      "type": null,
+      "color": "#F59E0B",
+      "icon": null,
+      "contexts": [
+        {
+          "name": "EU & Regulatory Funding Watchers",
+          "description": "Watches pan-EU open calls on the SEDIA Funding & Tenders Portal and CMS fee-schedule releases, capturing new/changed items over time for monitoring.",
+          "businessFeature": "EU & Regulatory Funding Watchers",
+          "category": "lib",
+          "filePaths": [
+            "crates/apps/eu-sedia/src/lib.rs",
+            "crates/apps/cms-fee-schedule/src/lib.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "US Grant Opportunities",
+          "description": "Pulls open grant opportunities from Grants.gov (federal Search2 API) and the California Grants Portal into queryable, deduplicated datasets.",
+          "businessFeature": "US Grant Opportunities",
+          "category": "lib",
+          "filePaths": [
+            "crates/apps/grants-gov/src/lib.rs",
+            "crates/apps/ca-grants/src/lib.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        }
+      ]
+    },
+    {
+      "name": "Economic & Labor Market Data Apps",
+      "domain": "feature",
+      "type": null,
+      "color": "#10B981",
+      "icon": null,
+      "contexts": [
+        {
+          "name": "US Trades Wages, Tax & Valuation",
+          "description": "Claude-research-driven reference datasets for US home-services trades: wage bands, service pricing, state/federal income tax, and small-business valuation multiples.",
+          "businessFeature": "US Trades Wages, Tax & Valuation",
+          "category": "lib",
+          "filePaths": [
+            "crates/apps/trade-wages/src/lib.rs",
+            "crates/apps/homewyse-pricing/src/lib.rs",
+            "crates/apps/state-tax/src/lib.rs",
+            "crates/apps/valuation-multiples/src/lib.rs",
+            "crates/apps/trades-common/src/lib.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Czech Labour Market (MPSV)",
+          "description": "Builds Czech labour-market datasets: open vacancy aggregates from MPSV / �rad pr�ce CR and average-earnings benchmarks by CZ-ISCO from ISPV.",
+          "businessFeature": "Czech Labour Market",
+          "category": "lib",
+          "filePaths": [
+            "crates/apps/mpsv-vpm/src/lib.rs",
+            "crates/apps/mpsv-ispv/src/lib.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "US Trades Business Density (Census)",
+          "description": "Measures US trades-business density and self-employed receipts from the Census County Business Patterns and Nonemployer Statistics APIs.",
+          "businessFeature": "US Trades Business Density",
+          "category": "lib",
+          "filePaths": [
+            "crates/apps/census-density/src/lib.rs",
+            "crates/apps/census-nonemp/src/lib.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        }
+      ]
+    },
+    {
+      "name": "Content & Research Apps",
+      "domain": "feature",
+      "type": null,
+      "color": "#EC4899",
+      "icon": null,
+      "contexts": [
+        {
+          "name": "Extraction, Crawl & API Watch",
+          "description": "General-purpose tooling apps: declarative extraction over a URL list, broad outward crawling, running WASM plugins over pages, and monitoring connector API docs for changes.",
+          "businessFeature": "Extraction, Crawl & API Watch",
+          "category": "lib",
+          "filePaths": [
+            "crates/apps/extractor/src/lib.rs",
+            "crates/apps/crawl/src/lib.rs",
+            "crates/apps/plugin/src/lib.rs",
+            "crates/apps/connector-api-watch/src/lib.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        },
+        {
+          "name": "Web Research & Readable Content",
+          "description": "Example content apps: agentic web research via the Claude engine, fetching any URL as clean Markdown, and scraping the Hacker News front page.",
+          "businessFeature": "Web Research & Readable Content",
+          "category": "lib",
+          "filePaths": [
+            "crates/apps/research/src/lib.rs",
+            "crates/apps/readable/src/lib.rs",
+            "crates/apps/hackernews/src/lib.rs"
+          ],
+          "target": null,
+          "apiRoutes": []
+        }
+      ]
+    }
+  ],
+  "ungrouped": [],
+  "relationships": [],
+  "index": [
+    "Scraping Runtime Core › Tiered Fetcher & Politeness [lib] — 3 files",
+    "Scraping Runtime Core › App & Job Model [lib] — 5 files",
+    "Scraping Runtime Core › Engine Capability Traits [lib] — 3 files",
+    "Data Extraction & Storage › Broad Crawler [lib] — 1 files",
+    "Data Extraction & Storage › Declarative Extraction Engine [lib] — 2 files",
+    "Data Extraction & Storage › Dataset Store & Change Detection [data] — 3 files",
+    "Scraping Engines › Full-Text Search Index [lib] — 1 files",
+    "Scraping Engines › WASM Plugin Sandbox [lib] — 3 files",
+    "Scraping Engines › Fetch Engines (HTTP / Browser / Claude) [lib] — 4 files",
+    "Job Server & API › Configuration & Data Source Catalog [config] — 3 files",
+    "Job Server & API › Live Events & Webhooks [api] — 2 files",
+    "Job Server & API › Job Worker & Cron Scheduler [lib] — 2 files",
+    "Job Server & API › DataHub Metadata Emitter [api] — 1 files",
+    "Job Server & API › App Registry [lib] — 1 files",
+    "Job Server & API › HTTP API & Routes [api] — 3 files",
+    "Public Funding & Grants Apps › EU & Regulatory Funding Watchers [lib] — 2 files",
+    "Public Funding & Grants Apps › US Grant Opportunities [lib] — 2 files",
+    "Economic & Labor Market Data Apps › US Trades Wages, Tax & Valuation [lib] — 4 files",
+    "Economic & Labor Market Data Apps › Czech Labour Market (MPSV) [lib] — 2 files",
+    "Economic & Labor Market Data Apps › US Trades Business Density (Census) [lib] — 2 files",
+    "Content & Research Apps › Extraction, Crawl & API Watch [lib] — 4 files",
+    "Content & Research Apps › Web Research & Readable Content [lib] — 3 files"
+  ],
+  "summary": {
+    "totalGroups": 7,
+    "totalContexts": 22,
+    "totalFiles": 56,
+    "categories": {
+      "lib": 17,
+      "data": 1,
+      "config": 1,
+      "api": 3
+    },
+    "domains": {
+      "shared": 1,
+      "data": 1,
+      "integration": 1,
+      "infrastructure": 1,
+      "feature": 3
+    }
+  },
+  "audit": {
+    "ok": true,
+    "tier": "medium",
+    "warnings": 0
+  },
+  "instructions": "Context map for pumper. Each group is a business domain (domain field); each context is a feature with its files (filePaths) + a technical category. Read this to learn which files belong to which feature BEFORE editing. When you change a context's files, update them here (or run Vibeman's refresh) to keep this fresh.",
+  "generatedAt": "2026-07-10T06:19:16.246Z",
+  "revision": "4a136526d6d3"
+}

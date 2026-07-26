@@ -68,6 +68,9 @@ pub struct AppState {
     /// Short-TTL cache of the fully-rendered `/metrics` body, so a burst of
     /// Prometheus scrapes doesn't re-run the aggregate queries every time.
     pub metrics_cache: Arc<tokio::sync::Mutex<Option<(std::time::Instant, String)>>>,
+    /// Outcome of the most recent DataHub emission (job or sync), surfaced on
+    /// `GET /datahub/status`. In-memory only — emission is best-effort telemetry.
+    pub datahub_last: crate::datahub::StatusCell,
 }
 
 impl AppState {
@@ -203,6 +206,7 @@ impl AppState {
             shutdown: CancellationToken::new(),
             job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
+            datahub_last: Arc::new(std::sync::Mutex::new(None)),
         })
     }
 }

@@ -243,6 +243,7 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             // name datasets to index per-record via `index_datasets` — see
             // `dataset_search_docs`.
             let mut docs = search_docs(&job.app, job.id, &result);
+            let index_specs = crate::datahub::index_dataset_specs(&result);
             let (dataset_docs, dataset_deletes) = dataset_search_docs(&state, &job, &result).await;
             docs.extend(dataset_docs);
             if let Err(e) = state.search.index(docs).await {
@@ -279,6 +280,9 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                 crate::triggers::fire_dataset_triggers(&state, &job, &by_dataset).await;
             }
             notify_saved_searches(&state, &job).await;
+            // Metadata shadow: push this run's dataset entities/lineage/freshness
+            // to DataHub. Detached and fail-open — a down GMS never touches jobs.
+            crate::datahub::on_job_success(state.clone(), job.clone(), index_specs);
         }
         Outcome::Finished(Err(e)) => {
             warn!(job = %job.id, error = %e, "job failed");

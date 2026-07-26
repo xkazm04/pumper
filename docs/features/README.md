@@ -16,6 +16,8 @@ These documents describe the **implemented** product surface of pumper — a loc
 | Events & webhooks | [events-webhooks.md](events-webhooks.md) | `crates/server/src/{webhook,events}.rs` |
 | Reactive pipelines (triggers) | [triggers.md](triggers.md) | `crates/server/src/triggers.rs`, migration 0014 |
 | HTTP API | [http-api.md](http-api.md) | `crates/server/src/routes.rs` |
+| DataHub metadata emitter | [datahub.md](datahub.md) | `crates/server/src/datahub.rs` |
+| TypeScript consumer SDK (`@pumper/sync`) | [sdk-typescript.md](sdk-typescript.md) | `clients/typescript/` |
 | App fleet & domain datasets | [apps.md](apps.md) | `crates/apps/*` |
 
 ## Maintenance notes

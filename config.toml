@@ -136,3 +136,14 @@ invariant_min_support = 500      # records an invariant must hold over before it
 invariant_min_confidence = 0.99
 invariant_violation_ratio = 0.2  # fraction of a cohort that must break one to count
 sketch_retention_runs = 60       # runs of per-field sketches kept (>= window_runs)
+
+# DataHub metadata shadow — pushes dataset entities, inferred schema, lineage,
+# and per-run freshness (operation) events to a DataHub GMS. Metadata only;
+# record data never leaves the local store. See docs/features/datahub.md.
+[datahub]
+enabled = true
+gms_url = "http://localhost:8080"             # local docker quickstart (Cloud: https://<tenant>.acryl.io/gms)
+# token = "..."                               # or put DATAHUB_TOKEN in .env (quickstart needs none)
+# env = "PROD"                                # URN fabric segment
+# emit_schema = true                          # infer schemaMetadata from each dataset's newest record
+# emit_profile = true                         # emit row-count datasetProfile

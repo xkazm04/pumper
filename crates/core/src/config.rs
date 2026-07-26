@@ -22,6 +22,7 @@ pub struct Config {
     pub triggers: TriggersConfig,
     pub webhooks: WebhooksConfig,
     pub resilience: ResilienceConfig,
+    pub datahub: DatahubConfig,
 }
 
 /// Extraction-health detection: how a source's runs are judged against its own
@@ -96,6 +97,53 @@ impl Default for ResilienceConfig {
             invariant_violation_ratio: 0.2,
             sketch_retention_runs: 60,
         }
+    }
+}
+
+/// DataHub metadata emission. Pumper pushes *metadata only* (dataset entities,
+/// schema, lineage, per-run operation events) to a DataHub instance over its
+/// plain OpenAPI surface — record data never leaves the local store. Disabled
+/// by default; when disabled the emitter is never constructed and job execution
+/// is byte-for-byte unchanged.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DatahubConfig {
+    /// Master switch. `POST /datahub/sync` returns 409 while disabled.
+    pub enabled: bool,
+    /// GMS base URL, e.g. `http://localhost:8080` (quickstart) or
+    /// `https://<tenant>.acryl.io/gms` (DataHub Cloud).
+    pub gms_url: String,
+    /// Personal access token. Falls back to the `DATAHUB_TOKEN` env var so the
+    /// secret can live in `.env` instead of the checked-in config.
+    pub token: Option<String>,
+    /// DataHub fabric/environment segment of every dataset URN (`PROD`/`DEV`/…).
+    pub env: String,
+    /// Emit `schemaMetadata` inferred from each dataset's newest record.
+    pub emit_schema: bool,
+    /// Emit `datasetProfile` (row counts) on sync and job completion.
+    pub emit_profile: bool,
+}
+
+impl Default for DatahubConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            gms_url: "http://localhost:8080".into(),
+            token: None,
+            env: "PROD".into(),
+            emit_schema: true,
+            emit_profile: true,
+        }
+    }
+}
+
+impl DatahubConfig {
+    /// Config token, else `DATAHUB_TOKEN` from the environment.
+    pub fn resolve_token(&self) -> Option<String> {
+        self.token
+            .clone()
+            .filter(|t| !t.is_empty())
+            .or_else(|| std::env::var("DATAHUB_TOKEN").ok().filter(|t| !t.is_empty()))
     }
 }
 

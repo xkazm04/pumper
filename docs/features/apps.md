@@ -14,6 +14,7 @@ Apps are `ScrapeApp` implementations under `crates/apps/*`, registered in `crate
 | `research` | Agentic web research via the Claude engine (roles: research/compose); JSON report. `session_id` param **resumes** a prior run to drill down on its accumulated context (the query becomes a follow-up) instead of re-paying the full agentic loop; `max_budget_usd` caps per-run spend |
 | `hackernews` | HN stories into a change-detected dataset |
 | `connector-api-watch` | Watches Anthropic API docs pages: diff + summarize + alert |
+| `smlouvy-dump-watch` | Watches the Czech **Registr smluv** bulk-dump index (`data.smlouvy.gov.cz/index.xml`) → one change-detected record per monthly dump (year/month/sha1/size/URL) in `dumps`, keyed by dump URL and **full-snapshot synced** so a re-generated month surfaces as `changed`. Does not download the ~100 MB dumps; `year_from` trims the ~100-dump history. A `dataset` trigger on `fresh` fans a targeted re-download. Daily 05:30. Serves tender-radar (a sibling product), so it's outside Pumper's grant/labor catalog |
 
 ## Domain apps & their cross-source datasets
 

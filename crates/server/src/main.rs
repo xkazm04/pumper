@@ -1,3 +1,4 @@
+mod datahub;
 mod events;
 mod progress;
 mod registry;

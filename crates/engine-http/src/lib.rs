@@ -427,11 +427,19 @@ impl HttpEngine {
                             (k.to_string(), String::from_utf8_lossy(v.as_bytes()).into_owned())
                         })
                         .collect::<HashMap<_, _>>();
+                    // Charset from the Content-Type header (e.g. `charset=windows-1250`),
+                    // captured before the response is consumed by the streamed reader.
+                    let header_charset = response
+                        .headers()
+                        .get(reqwest::header::CONTENT_TYPE)
+                        .and_then(|v| v.to_str().ok())
+                        .and_then(charset_from_content_type)
+                        .map(str::to_owned);
                     // Non-2xx bodies are returned, not raised — scrapers often
                     // want to inspect 404/403 pages; apps decide via is_success().
                     // Streamed with a hard size cap so one huge/hostile body can't
                     // balloon memory (over-limit => a typed error naming cap + URL).
-                    let body = read_body_capped(response, cap, &req.url).await?;
+                    let body = read_body_capped(response, cap, &req.url, header_charset.as_deref()).await?;
                     return Ok(HttpResponse { status, headers, body, final_url, cache_hit: false });
                 }
                 Err(e) => {
@@ -450,9 +458,16 @@ impl HttpEngine {
 
 /// Reads a response body in streamed chunks, aborting the instant the cumulative
 /// size would exceed `cap`. Returns a typed error naming the cap and URL on
-/// overflow. Decoded lossily as UTF-8 (matches the prior `.text()` fallback for
-/// non-UTF-8 bytes; charset-from-header detection is not performed).
-async fn read_body_capped(mut response: reqwest::Response, cap: u64, url: &str) -> Result<String> {
+/// overflow. Decodes to a `String` honouring the source charset (`header_charset`
+/// from the Content-Type, else an HTML `<meta charset>` sniff, else a BOM, else
+/// UTF-8) — so a windows-1250 Czech page is not mangled into U+FFFD replacement
+/// characters the way a blind UTF-8 decode does.
+async fn read_body_capped(
+    mut response: reqwest::Response,
+    cap: u64,
+    url: &str,
+    header_charset: Option<&str>,
+) -> Result<String> {
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|e| Error::Http(e.to_string()))? {
         if would_exceed_cap(buf.len() as u64, chunk.len() as u64, cap) {
@@ -462,7 +477,61 @@ async fn read_body_capped(mut response: reqwest::Response, cap: u64, url: &str) 
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(String::from_utf8_lossy(&buf).into_owned())
+    Ok(decode_body(&buf, header_charset))
+}
+
+/// The `charset` token of a `Content-Type` value (`text/html; charset=windows-1250`
+/// → `windows-1250`). Case/space tolerant; strips surrounding quotes. `None` when
+/// absent.
+fn charset_from_content_type(content_type: &str) -> Option<&str> {
+    content_type.split(';').skip(1).find_map(|param| {
+        let (k, v) = param.split_once('=')?;
+        k.trim().eq_ignore_ascii_case("charset")
+            .then(|| v.trim().trim_matches(['"', '\'']))
+            .filter(|s| !s.is_empty())
+    })
+}
+
+/// A `<meta charset=…>` or `<meta http-equiv="Content-Type" content="…charset=…">`
+/// label sniffed from the first 1 KiB of an HTML body — the fallback when the
+/// transport header declared no charset. Scans a bounded prefix so a hostile
+/// document can't make this expensive.
+fn charset_from_meta(head: &[u8]) -> Option<String> {
+    let prefix = &head[..head.len().min(1024)];
+    // Latin-1 view is safe for sniffing ASCII meta syntax out of any byte soup.
+    let text = prefix.iter().map(|&b| b as char).collect::<String>().to_ascii_lowercase();
+    let at = text.find("charset")?;
+    let after = &text[at + "charset".len()..];
+    let after = after.trim_start().strip_prefix('=')?.trim_start();
+    // A quoted value (`charset="windows-1250"`) — drop the opening quote so the
+    // delimiter scan below stops at the CLOSING quote, not the opening one.
+    let after = after.strip_prefix(['"', '\'']).unwrap_or(after);
+    let end = after
+        .find(|c: char| c == '"' || c == '\'' || c == ' ' || c == ';' || c == '/' || c == '>')
+        .unwrap_or(after.len());
+    let label = after[..end].trim();
+    (!label.is_empty()).then(|| label.to_string())
+}
+
+/// Decodes raw body bytes to a `String`, resolving the encoding in priority
+/// order: explicit `header_charset` → HTML `<meta charset>` → BOM → UTF-8. An
+/// unrecognized label falls through to the next source rather than erroring, and
+/// the final UTF-8 decode is lossy (never fails), preserving the old contract
+/// that a body is always returned.
+fn decode_body(buf: &[u8], header_charset: Option<&str>) -> String {
+    let encoding = header_charset
+        .and_then(|c| encoding_rs::Encoding::for_label(c.as_bytes()))
+        .or_else(|| {
+            charset_from_meta(buf).and_then(|c| encoding_rs::Encoding::for_label(c.as_bytes()))
+        });
+    match encoding {
+        Some(enc) => enc.decode(buf).0.into_owned(),
+        // No declared charset: encoding_rs still honours a UTF-8/UTF-16 BOM here,
+        // and otherwise decodes as UTF-8 lossily — matching the prior behaviour.
+        None => encoding_rs::Encoding::for_bom(buf)
+            .map(|(enc, _)| enc.decode(buf).0.into_owned())
+            .unwrap_or_else(|| String::from_utf8_lossy(buf).into_owned()),
+    }
 }
 
 /// Whether appending `chunk_len` bytes to a `current_len`-byte buffer would
@@ -658,6 +727,49 @@ mod tests {
         assert!(would_exceed_cap(100, 1, 100));
         // A single oversized first chunk trips immediately.
         assert!(would_exceed_cap(0, 101, 100));
+    }
+
+    #[test]
+    fn charset_parsed_from_content_type() {
+        assert_eq!(charset_from_content_type("text/html; charset=windows-1250"), Some("windows-1250"));
+        // Case- and space-insensitive, quote-stripping.
+        assert_eq!(charset_from_content_type("text/html;  CharSet = \"UTF-8\""), Some("UTF-8"));
+        // No charset param → None (falls through to meta/BOM/UTF-8).
+        assert_eq!(charset_from_content_type("text/html"), None);
+        assert_eq!(charset_from_content_type("application/json"), None);
+    }
+
+    #[test]
+    fn charset_sniffed_from_meta_tag() {
+        let html = br#"<!doctype html><html><head><meta charset="windows-1250"><title>x"#;
+        assert_eq!(charset_from_meta(html).as_deref(), Some("windows-1250"));
+        let legacy = br#"<meta http-equiv="Content-Type" content="text/html; charset=iso-8859-2">"#;
+        assert_eq!(charset_from_meta(legacy).as_deref(), Some("iso-8859-2"));
+        assert_eq!(charset_from_meta(b"<html><head><title>no charset"), None);
+    }
+
+    #[test]
+    fn decode_body_honours_windows_1250() {
+        // "Řehoř" — the Czech letters Ř/ř are 0xD8/0xF8 in windows-1250, bytes that
+        // are NOT valid UTF-8 and would each become U+FFFD under a blind decode.
+        let cp1250: &[u8] = &[0xD8, 0x65, 0x68, 0x6F, 0xF8];
+        // Header-declared charset wins.
+        assert_eq!(decode_body(cp1250, Some("windows-1250")), "Řehoř");
+        // The old lossy path would have mangled it — prove the fix changed behaviour.
+        assert_ne!(String::from_utf8_lossy(cp1250), "Řehoř");
+        assert!(String::from_utf8_lossy(cp1250).contains('\u{FFFD}'));
+    }
+
+    #[test]
+    fn decode_body_falls_back_to_meta_then_utf8() {
+        // No header charset, but the HTML declares windows-1250 in a meta tag.
+        let mut body = br#"<meta charset="windows-1250">"#.to_vec();
+        body.extend_from_slice(&[0xC8, 0x65, 0x73, 0x6B, 0x6F]); // "Česko" (È=0xC8)
+        assert!(decode_body(&body, None).ends_with("Česko"));
+        // Plain UTF-8 with no declaration decodes cleanly.
+        assert_eq!(decode_body("čau".as_bytes(), None), "čau");
+        // An unknown label falls through to UTF-8 rather than erroring.
+        assert_eq!(decode_body("hi".as_bytes(), Some("x-bogus-charset")), "hi");
     }
 
     #[test]

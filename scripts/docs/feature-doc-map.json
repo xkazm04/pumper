@@ -76,6 +76,14 @@
     {
       "doc": "docs/features/apps.md",
       "sourceGlobs": ["crates/apps/**"]
+    },
+    {
+      "doc": "docs/features/datahub.md",
+      "sourceGlobs": ["crates/server/src/datahub.rs"]
+    },
+    {
+      "doc": "docs/features/sdk-typescript.md",
+      "sourceGlobs": ["clients/typescript/src/**"]
     }
   ]
 }

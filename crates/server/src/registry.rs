@@ -28,5 +28,6 @@ pub fn apps() -> Vec<Arc<dyn ScrapeApp>> {
         Arc::new(app_extractor::Extractor),
         Arc::new(app_plugin::Plugin),
         Arc::new(app_crawl::Crawl),
+        Arc::new(app_smlouvy_dump_watch::SmlouvyDumpWatch),
     ]
 }

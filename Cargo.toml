@@ -45,6 +45,7 @@ app-mpsv-vpm = { path = "crates/apps/mpsv-vpm" }
 app-mpsv-ispv = { path = "crates/apps/mpsv-ispv" }
 app-extractor = { path = "crates/apps/extractor" }
 app-plugin = { path = "crates/apps/plugin" }
+app-smlouvy-dump-watch = { path = "crates/apps/smlouvy-dump-watch" }
 app-crawl = { path = "crates/apps/crawl" }
 
 # async runtime + web
@@ -67,6 +68,10 @@ reqwest = { version = "0.12", features = ["json", "cookies", "gzip", "brotli", "
 # a new dependency.
 cookie_store = "0.22"
 scraper = "0.23"
+# HTML/text charset decoding (windows-1250 etc.). Already in the tree as
+# reqwest's own body decoder — this promotes it to a direct edge for the
+# streamed-body path, which bypasses reqwest's `.text()` charset handling.
+encoding_rs = "0.8"
 ego-tree = "0.10"
 chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
 futures = "0.3"

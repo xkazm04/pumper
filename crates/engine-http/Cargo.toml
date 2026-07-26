@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 pumper-core.workspace = true
 reqwest.workspace = true
+encoding_rs.workspace = true
 cookie_store.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
