@@ -4,24 +4,40 @@ Embedded Tantivy index (no external service), BM25-ranked over `title` + `body`.
 
 ### Indexing a dataset from a compact result (`index_datasets`)
 
-An app whose result stays compact (counts, not arrays — the fleet convention) can still emit one search document per stored record by adding `"index_datasets": [{ "app", "dataset" }]` to its result. After indexing the result itself, the worker loads each named dataset's **live** records (removed rows skipped) and indexes one doc per record, id `"<app>:<dataset>:<key>"` — stable, so re-runs replace rather than duplicate. Load/index failures are logged, never fatal (search is a derived artifact). The grants apps use this to make every opportunity in `grants/unified` individually searchable (title/agency/status/url) without inlining thousands of records into the job result. These docs carry app `grants` (the virtual unified namespace), not the producing job's app — so a saved-search alert on them should scope by `dataset:"unified"` and leave `app` unset (saved-search notification skips searches whose `app` filter differs from the finished job's app, which is `grants-gov`/`ca-grants`).
+An app whose result stays compact (counts, not arrays — the fleet convention) can still emit one search document per stored record by adding `"index_datasets": [{ "app", "dataset" }]` to its result. After indexing the result itself, the worker reads each named dataset's **revisions since the job started** (the change feed) and indexes only the records this run actually touched — `new`/`changed` keys are indexed from their revision snapshot, `removed` keys are deleted from the index. Doc id `"<app>:<dataset>:<key>"` — stable, so re-runs replace rather than duplicate; a key changed twice in one run is written once, from its final state. This is **delta-driven, cost O(changes) not O(corpus)**: the earlier version re-read and re-indexed the whole named dataset on every job completion. The trade-off is that a wiped index is refilled only as rows change — see [Maintenance](#maintenance). Load/index failures are logged, never fatal (search is a derived artifact). A dataset whose source health suppresses indexing is skipped for that run (see [resilient-extraction.md](resilient-extraction.md); inert while `[resilience] enforce = false`, the default). The grants apps use this to make every opportunity in `grants/unified` individually searchable (title/agency/status/url) without inlining thousands of records into the job result. These docs carry app `grants` (the virtual unified namespace), not the producing job's app — so a saved-search alert on them should scope by `dataset:"unified"` and leave `app` unset (saved-search notification skips searches whose `app` filter differs from the finished job's app, which is `grants-gov`/`ca-grants`).
 
 ## Query surface
 
-`GET /search?q=&limit=&app=&dataset=&fuzzy=` →
+`GET /search?q=&limit=&offset=&app=&dataset=&fuzzy=&sort=&since=` → `{query, total, count, hits, facets}`.
 
-- **Hits** with highlighted `snippet` (matched terms in `<b>`, generated from the stored body; pre-snippet indexes are detected on open and rebuilt empty — the index is a derived artifact).
-- **Facets**: `apps` + `datasets` counts over the top-1000 matches (honest sample), sorted by count. `app=`/`dataset=` params filter by exact term. **Computed only when requested** (`SearchRequest.facets`, which `GET /search` sets): facets sample ≥1000 docs and decode each, so a facet-less query (the saved-search runner, and any caller that reads only hit ids) ranks and decodes just the `offset+limit` page window — no facet-sampling overread. Hit fields are read directly off the stored doc (`get_first`), not via a full-doc JSON round-trip.
+- **Params.** `q` required (400 on empty). `limit` default 20, clamped 1–100. `offset` skips ranked hits before `limit` (page 2 = `offset=limit`), clamped to **10 000** — deep Tantivy offsets get progressively costlier. `sort` = `score` (BM25 relevance, the default) or `newest` (most recently indexed first — recency over relevance on a changing corpus); any other value is a 400. `since=<unix-seconds>` keeps only hits indexed at/after that instant (a "what's new" feed), backed by the `indexed_at` fast field.
+- **Counts.** `total` is the **exact** number of matching documents, independent of `limit`/`offset` — the denominator for paging (it was previously the page size). `count` is the returned page size.
+- **Hits** with highlighted `snippet` (matched terms in `<b>`, generated from the stored body). Hit fields are read directly off the stored doc (`get_first`), not via a full-doc JSON round-trip.
+- **Facets**: `apps` + `datasets` counts over the top-1000 matches (honest sample), sorted by count. `app=`/`dataset=` params filter by exact term. **Computed only when requested** (`SearchRequest.facets`, which `GET /search` sets): facets sample ≥1000 docs and decode each, so a facet-less query (the saved-search runner, and any caller that reads only hit ids) ranks and decodes just the `offset+limit` page window — no facet-sampling overread.
 - **Fuzzy** (`fuzzy=true`): edit-distance-1 on title+body (transposition = one edit). Quoted `"exact phrases"` parse as phrase queries in either mode.
+
+`GET /search/status` → `{enabled, doc_count}` — the number of documents currently in the index.
 
 ## Maintenance
 
-`DELETE /search/docs {ids}` removes documents by id; `DELETE /search/datasets/{app}/{dataset}` removes an app's dataset (app AND dataset conjunction — dataset names repeat across apps). Trait: `Search::{index, query, delete_ids, delete_dataset}`; `NoSearch` when `[search] enabled=false`.
+`DELETE /search/docs {ids}` removes documents by id; `DELETE /search/datasets/{app}/{dataset}` removes an app's dataset (app AND dataset conjunction — dataset names repeat across apps). Trait: `Search::{index, query, delete_ids, delete_dataset, doc_count, flush}`; `NoSearch` when `[search] enabled=false`. `index()` may defer its commit for throughput (a background committer flushes it), so a caller that must see its own writes — the saved-search runner, an offline backfill — calls `flush()` first.
+
+**The index can go silently empty, and it does not self-heal.** On open, an index whose on-disk schema doesn't match this build's (a field was added, or `body` isn't stored) is **rebuilt EMPTY**; a lost/corrupt index dir or a spell of `[search] enabled = false` has the same effect. Queries keep returning `200` with fewer hits, so nothing looks broken. `GET /search/status` reporting `doc_count: 0` on an enabled index is the signal. Rebuild from the stored dataset records — **with the server stopped**, since Tantivy holds an exclusive writer lock on the index directory:
+
+```bash
+cargo run -p pumper-server --bin search-backfill -- --app grants --dataset unified
+cargo run -p pumper-server --bin search-backfill -- --app grants   # all of an app's datasets
+cargo run -p pumper-server --bin search-backfill -- --all          # every dataset
+```
+
+A scope is required so a broad rebuild is always deliberate. The backfill uses the same `SearchDoc::from_dataset_record` builder as the live path, so ids are stable and it upserts rather than duplicates — safe against a partially-populated index. Note that backfilling a dataset no app names in `index_datasets` makes it searchable but nothing keeps it current.
 
 ## Saved searches (standing alerts)
 
-`saved_searches` + `saved_search_seen` tables. `GET/POST /searches`, `DELETE /searches/{id}`, `POST /searches/{id}/enabled`. Body: `{query, app?, dataset?, url, secret?}`. After each job's results are indexed, the worker runs enabled saved searches (scoped by their filters) and webhooks a **`search.matched`** event containing only never-before-seen matches — `INSERT OR IGNORE` claim on `(search_id, doc_id)` guarantees exactly-once alerting. Deliveries flow through the logged webhook path (DLQ + replay — see [events-webhooks.md](events-webhooks.md)).
+`saved_searches` + `saved_search_seen` tables. `GET/POST /searches`, `DELETE /searches/{id}`, `POST /searches/{id}/enabled`. Body: `{query, app?, dataset?, url, secret?}` (400 on an empty `query` or a non-`http(s)` `url`). `GET /searches` is **dual-mode**: bare `{searches: [...]}` by default, or `{items, next_cursor}` when a `cursor` param is present (even empty) — an opaque keyset cursor. `limit` is clamped 1–500 in **both** modes, so an uncursored list can never stream the whole table. After each job's results are indexed, the worker runs enabled saved searches (scoped by their filters) and webhooks a **`search.matched`** event containing only never-before-seen matches — `INSERT OR IGNORE` claim on `(search_id, doc_id)` guarantees exactly-once alerting. Deliveries flow through the logged webhook path (DLQ + replay — see [events-webhooks.md](events-webhooks.md)).
 
 ## Known gaps
 
-- No semantic/hybrid search, autocomplete, or Last-Event-ID SSE replay (backlog). Facets are a top-1000 sample, not exact counts.
+- No semantic/hybrid search and no autocomplete (backlog). Facets are a top-1000 sample, not exact counts (`total` is exact).
+- `offset` paging is capped at 10 000; there is no deep-paging cursor over search hits.
+- A wiped index refills only as records change — recovery is the manual `search-backfill` bin, not an automatic rebuild.

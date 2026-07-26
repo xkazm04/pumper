@@ -1,5 +1,6 @@
 {
-  "_comment": "Source -> feature-doc map used by scripts/docs/check-doc-sync.mjs (Stop hook). Each entry: `doc` (path under docs/features/, required) + `sourceGlobs` (repo-relative globs). When a turn edits matching source without touching docs/features/*, the hook exits 2 with a reminder. Add an entry here in the same change that adds a new feature area. Skip patterns (tests, docs, catalog, scripts) live inside the script.",
+  "_comment": "Source -> feature-doc map used by scripts/docs/check-doc-sync.mjs (Stop hook). Each entry: `doc` (path under docs/features/, required) + `sourceGlobs` (repo-relative globs). When a turn edits matching source without touching docs/features/*, the hook exits 2 with a reminder. Add an entry here in the same change that adds a new feature area. Skip patterns (tests, docs, catalog, plugins-src, scripts) live inside the script.",
+  "_inert": "The `catalog/**` and `plugins-src/**` globs below are recorded couplings but currently never fire: both directories are in the script's SKIP_PATTERNS, which is applied before the map lookup. Remove those two patterns from check-doc-sync.mjs to activate them.",
   "entries": [
     {
       "doc": "docs/features/runtime.md",
@@ -50,12 +51,18 @@
         "crates/core/src/plugin.rs",
         "crates/engine-wasm/**",
         "crates/apps/extractor/**",
-        "crates/apps/plugin/**"
+        "crates/apps/plugin/**",
+        "plugins-src/**"
       ]
     },
     {
       "doc": "docs/features/search.md",
-      "sourceGlobs": ["crates/core/src/search.rs", "crates/engine-search/**"]
+      "sourceGlobs": [
+        "crates/core/src/search.rs",
+        "crates/engine-search/**",
+        "crates/server/src/routes/search.rs",
+        "crates/server/src/bin/search-backfill.rs"
+      ]
     },
     {
       "doc": "docs/features/events-webhooks.md",
@@ -63,11 +70,22 @@
     },
     {
       "doc": "docs/features/triggers.md",
-      "sourceGlobs": ["crates/server/src/triggers.rs"]
+      "sourceGlobs": [
+        "crates/server/src/triggers.rs",
+        "crates/server/src/routes/triggers.rs"
+      ]
     },
     {
       "doc": "docs/features/http-api.md",
-      "sourceGlobs": ["crates/server/src/routes.rs", "crates/core/src/catalog.rs"]
+      "sourceGlobs": ["crates/server/src/routes/**"]
+    },
+    {
+      "doc": "docs/features/catalog.md",
+      "sourceGlobs": [
+        "catalog/**",
+        "crates/core/src/catalog.rs",
+        "crates/server/src/routes/query.rs"
+      ]
     },
     {
       "doc": "docs/features/resilient-extraction.md",
