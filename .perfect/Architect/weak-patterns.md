@@ -17,8 +17,3 @@ Anti-patterns identified by `/architect`, with reach data.
 - First seen: 2026-07-26 — RESOLVED same day by [[Architect/decisions/2026-07-26-shared-test-harness]]
 - Was: fresh_db ×11, engine-stub trios ×4, AppContext literals ×3, 41 leak-prone teardowns.
 - Residual: engine-search's `unique_dir`/`doc` builders still duplicated ×2 (minor; fold in when those files are next touched).
-
-
-- Reach: 11 of 24 app crates at zero tests, uncorrelated with size or parse risk
-- Reach trend: stable (hackernews moved off the list this run)
-- Backlog item: [[Architect/backlog]] → "App-coverage tail"
