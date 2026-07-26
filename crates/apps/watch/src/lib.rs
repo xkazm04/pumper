@@ -118,3 +118,42 @@ fn hex_sha256(bytes: &[u8]) -> String {
     hasher.update(bytes);
     format!("{:x}", hasher.finalize())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Realistic slice of a page fetched as markdown: nav/preamble text before
+    // the first real heading, which is not an h1.
+    const PAGE: &str =
+        "Skip to content\n\nSign in | Register\n\n## Release Notes\n\nv2.1 shipped today.\n";
+
+    #[test]
+    fn first_heading_is_the_stripped_title_not_the_preamble() {
+        assert_eq!(first_heading(PAGE).as_deref(), Some("Release Notes"));
+    }
+
+    #[test]
+    fn hashes_only_line_yields_none_not_an_empty_title() {
+        assert_eq!(first_heading("body text\n##\nmore body"), None);
+    }
+
+    #[test]
+    fn page_without_headings_has_no_title() {
+        assert_eq!(first_heading("just a paragraph of text"), None);
+    }
+
+    #[test]
+    fn hex_sha256_matches_the_nist_vector_not_a_double_hash() {
+        // NIST test vectors — guard against double-hashing or hex-casing drift,
+        // which would flip every stored fingerprint into a false "changed".
+        assert_eq!(
+            hex_sha256(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        assert_eq!(
+            hex_sha256(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+    }
+}

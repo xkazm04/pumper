@@ -60,16 +60,7 @@ impl ScrapeApp for MpsvIspv {
         ctx.save_artifact("page1.json", &serde_json::to_vec_pretty(&parsed)?)
             .await?;
 
-        // Key by occupation + sphere; both are needed to disambiguate a CZ-ISCO
-        // row (wage vs salary sphere have different distributions).
-        let items: Vec<(String, Value)> = rows
-            .iter()
-            .filter_map(|r| {
-                let czisco = r.get("czIsco").and_then(Value::as_str)?;
-                let sfera = r.get("sfera").and_then(Value::as_str).unwrap_or("");
-                Some((format!("{czisco}|{sfera}"), r.clone()))
-            })
-            .collect();
+        let items = keyed_rows(&rows);
 
         let summary = ctx.upsert_many("wages", &items).await?;
 
@@ -81,5 +72,69 @@ impl ScrapeApp for MpsvIspv {
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
         }))
+    }
+}
+
+/// Key each ISPV row by occupation + sphere; both are needed to disambiguate a
+/// CZ-ISCO row (wage vs salary sphere have different distributions). Rows
+/// without a `czIsco` cannot be keyed and are dropped.
+fn keyed_rows(rows: &[Value]) -> Vec<(String, Value)> {
+    rows.iter()
+        .filter_map(|r| {
+            let czisco = r.get("czIsco").and_then(Value::as_str)?;
+            let sfera = r.get("sfera").and_then(Value::as_str).unwrap_or("");
+            Some((format!("{czisco}|{sfera}"), r.clone()))
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Realistic slice of the ispv-zamestnani.json `polozky` array (source
+    // contract verified 2026-07-05): same CZ-ISCO in both spheres, one row
+    // without `sfera`, one malformed row without `czIsco`.
+    const SAMPLE: &str = r#"[
+        { "czIsco": "CzIsco/1120", "sfera": "MZDOVA",
+          "medianMzda": 118706, "mzdaPrumer": 145861,
+          "diferenciaceD1M": 55444, "diferenciaceD9M": 262714 },
+        { "czIsco": "CzIsco/1120", "sfera": "PLATOVA",
+          "medianMzda": 102371, "mzdaPrumer": 108990 },
+        { "czIsco": "CzIsco/2512", "medianMzda": 75210 },
+        { "sfera": "MZDOVA", "medianMzda": 41000 }
+    ]"#;
+
+    fn sample_rows() -> Vec<Value> {
+        serde_json::from_str(SAMPLE).expect("sample parses")
+    }
+
+    #[test]
+    fn wage_and_salary_spheres_of_one_occupation_get_distinct_keys_not_a_collision() {
+        let keys: Vec<String> = keyed_rows(&sample_rows())
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert!(keys.contains(&"CzIsco/1120|MZDOVA".to_string()));
+        assert!(keys.contains(&"CzIsco/1120|PLATOVA".to_string()));
+    }
+
+    #[test]
+    fn row_without_czisco_is_dropped_not_stored_under_an_empty_key() {
+        let items = keyed_rows(&sample_rows());
+        assert_eq!(items.len(), 3); // 4 rows, 1 unkeyable
+        assert!(items.iter().all(|(k, _)| !k.starts_with('|')));
+    }
+
+    #[test]
+    fn missing_sfera_still_keys_the_row_with_an_empty_suffix() {
+        let items = keyed_rows(&sample_rows());
+        let (key, row) = items
+            .iter()
+            .find(|(k, _)| k.starts_with("CzIsco/2512"))
+            .expect("row kept");
+        assert_eq!(key, "CzIsco/2512|");
+        // The whole row is kept as the record value, not a projection.
+        assert_eq!(row.get("medianMzda").and_then(Value::as_u64), Some(75210));
     }
 }

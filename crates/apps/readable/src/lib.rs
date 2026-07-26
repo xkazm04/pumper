@@ -53,7 +53,7 @@ impl ScrapeApp for Readable {
             .take()
             .or_else(|| outcome.text.take())
             .unwrap_or_default();
-        if markdown.trim().is_empty() {
+        if extracted_nothing(&markdown) {
             // A successful fetch that yields no readable content is a failed
             // extraction, not an empty-but-valid result — don't report it as OK.
             return Err(Error::App(format!(
@@ -89,5 +89,29 @@ impl ScrapeApp for Readable {
             }
         }
         Ok(out)
+    }
+}
+
+/// True when a "successful" fetch produced no readable content — a failed
+/// extraction that must surface as an error, never as an empty-but-OK result.
+fn extracted_nothing(markdown: &str) -> bool {
+    markdown.trim().is_empty()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn whitespace_only_extraction_is_a_failure_not_an_empty_success() {
+        assert!(extracted_nothing(""));
+        // Realistic failure mode: the markdown converter reduces a JS-only
+        // page to bare whitespace/newlines.
+        assert!(extracted_nothing("  \n\t\n   \n"));
+    }
+
+    #[test]
+    fn real_content_is_not_flagged_as_failed_extraction() {
+        assert!(!extracted_nothing("# Title\n\nBody paragraph."));
     }
 }

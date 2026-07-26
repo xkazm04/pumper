@@ -332,3 +332,54 @@ async fn summarize_change(
         .to_string();
     Ok((summary, tags, severity))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Realistic slices of an API docs page fetched as markdown, before and
+    // after an endpoint was replaced (Stripe-style endpoint listing).
+    const OLD_DOC: &str = "# Payments API\n\n## Endpoints\n\n- POST /v1/charges\n- GET /v1/charges/:id\n\nRate limit: 100 req/min\n";
+    const NEW_DOC: &str = "# Payments API\n\n## Endpoints\n\n- POST /v1/payment_intents\n- GET /v1/charges/:id\n\nRate limit: 100 req/min\n";
+
+    #[test]
+    fn line_diff_reports_appeared_and_disappeared_lines_not_the_whole_doc() {
+        let (added, removed) = line_diff(OLD_DOC, NEW_DOC);
+        assert_eq!(added, vec!["- POST /v1/payment_intents"]);
+        assert_eq!(removed, vec!["- POST /v1/charges"]);
+    }
+
+    #[test]
+    fn whitespace_reflow_and_reorder_is_noise_not_a_change() {
+        // Same lines re-indented and reordered: the content hash flips, but the
+        // diff must come back empty so no change event fires.
+        let reflowed = "  # Payments API\n## Endpoints\n- GET /v1/charges/:id\n- POST /v1/charges\n\nRate limit: 100 req/min\n";
+        let (added, removed) = line_diff(OLD_DOC, reflowed);
+        assert!(added.is_empty(), "reflow produced added lines: {added:?}");
+        assert!(
+            removed.is_empty(),
+            "reflow produced removed lines: {removed:?}"
+        );
+    }
+
+    #[test]
+    fn full_rewrite_diff_is_bounded_not_unbounded() {
+        // A large doc rewrite must not blow up the summarizer prompt.
+        let new: String = (0..500).map(|i| format!("line {i}\n")).collect();
+        let (added, removed) = line_diff("", &new);
+        assert_eq!(added.len(), MAX_DIFF_LINES);
+        assert!(removed.is_empty());
+    }
+
+    #[test]
+    fn clamp_cuts_at_whole_lines_within_the_char_budget() {
+        let lines: Vec<String> = (0..500)
+            .map(|i| format!("added endpoint number {i} with a longer description"))
+            .collect();
+        let out = clamp(&lines);
+        assert!(out.len() <= MAX_DIFF_CHARS);
+        // Every emitted line is complete — no truncated mid-line fragment.
+        assert!(out.ends_with('\n'));
+        assert!(out.lines().all(|l| lines.iter().any(|src| src == l)));
+    }
+}

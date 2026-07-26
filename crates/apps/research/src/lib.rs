@@ -136,3 +136,40 @@ fn is_report_shaped(v: &Value) -> bool {
         && v.get("key_findings").is_some_and(Value::is_array)
         && v.get("sources").is_some_and(Value::is_array)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_matching_the_promised_shape_is_structured() {
+        // Realistic slice of what the research agent returns on a good run.
+        let v = json!({
+            "summary": "Rust 1.80 stabilized LazyLock, replacing most lazy_static uses.",
+            "key_findings": ["LazyLock is in std::sync as of 1.80"],
+            "sources": [{"url": "https://blog.rust-lang.org/2024/07/25/Rust-1.80.0.html",
+                         "title": "Announcing Rust 1.80.0"}]
+        });
+        assert!(is_report_shaped(&v));
+    }
+
+    #[test]
+    fn some_json_came_back_is_not_the_same_as_structured() {
+        // A hallucinated or wrong-shape object must not be stamped trustworthy.
+        assert!(!is_report_shaped(&json!({"answer": "42"})));
+        // Right keys, wrong types.
+        assert!(!is_report_shaped(&json!({
+            "summary": ["not", "a", "string"], "key_findings": [], "sources": []
+        })));
+        // One promised key missing.
+        assert!(!is_report_shaped(
+            &json!({"summary": "s", "key_findings": []})
+        ));
+    }
+
+    #[test]
+    fn bare_prose_or_null_is_not_structured() {
+        assert!(!is_report_shaped(&Value::String("a prose report".into())));
+        assert!(!is_report_shaped(&Value::Null));
+    }
+}
