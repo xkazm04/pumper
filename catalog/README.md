@@ -77,3 +77,38 @@ Australia → EU SEDIA → UK, then the browser/LLM scrapers.
 3. Add its row to the snapshot table above.
 4. If it isn't a Pumper app yet (a source you've only researched), still add it with
    `status = "planned"` and `app = ""` — the catalog is the roadmap too.
+
+## GitOps reconciler (the catalog as control plane)
+
+The TOML is not just documentation — the server treats it as **desired state**
+for the `schedules` table. Editing this file (or merging a PR that touches it)
+*is* deploying a pipeline.
+
+**Semantics** (diff of catalog vs `schedules`, computed by
+`pumper_core::Catalog::reconcile_plan`):
+
+- **create** — a `live` source with an `app` + `cron` that no schedule serves →
+  a schedule `catalog-<app>` is created, tagged `managed_by = "catalog"`.
+- **update** — a catalog-managed schedule whose cron drifted (or was disabled)
+  while the source stays `live` → cron corrected / re-enabled.
+- **disable** — a catalog-managed schedule whose source flipped to
+  `planned`/`blocked` or dropped its `cron` → `enabled = false`.
+- **orphan** — a catalog-managed schedule with **no catalog row at all**
+  (row deleted?). Reported loudly, **never auto-touched** — a human call.
+- **covered_by_untagged** — a source already served by an untagged schedule
+  with the exact app+cron (hand-made via the API, or the code-seeded
+  `static-<app>` row). Satisfied; nothing is created or edited.
+
+**The tag is the safety boundary.** Only rows with `managed_by = "catalog"`
+are ever written, and every SQL write is fenced on that tag — hand-made
+schedules stay sacred no matter what the plan says.
+
+**Surfaces**:
+
+- Boot: dry-run always, drift logged loudly (`CATALOG DRIFT: …`).
+- `GET /catalog/reconcile` — the plan, as JSON. Never writes.
+- `POST /catalog/reconcile` — applies it. A plan disabling more than 3
+  schedules is refused with 409 unless `?force=true` (blast-radius guard
+  against a bad mass edit).
+- `[catalog] auto_reconcile = true` in `config.toml` — apply the boot plan
+  automatically. Default **false**.

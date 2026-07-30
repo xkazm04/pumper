@@ -386,6 +386,99 @@ pub(crate) async fn catalog_health(State(state): State<AppState>) -> Result<Json
     })))
 }
 
+// ---- Catalog GitOps reconciler (M19) --------------------------------------
+
+/// Guardrail on unforced applies: a plan disabling more schedules than this is
+/// probably a bad TOML edit (mass status-flip), so `POST /catalog/reconcile`
+/// refuses it unless `?force=true`. Creates/updates are additive and carry no
+/// such blast radius.
+const MAX_UNFORCED_DISABLES: usize = 3;
+
+/// The catalog as control plane, read side: diff `catalog/data-sources.toml`
+/// (desired state) against the live schedules table (actual state). Pure
+/// dry-run — never writes. Hand-made and code-seeded schedules (no
+/// `managed_by` tag) are only ever *read*: an exact app+cron match counts as
+/// coverage, anything else is left alone.
+#[utoipa::path(
+    get,
+    path = "/catalog/reconcile",
+    tag = "catalog",
+    responses(
+        (status = 200, description = "`{empty, create, update, disable, orphan, covered_by_untagged, in_sync, auto_reconcile}` — the reconciliation plan. `orphan` is report-only (never applied)."),
+        (status = 500, description = "Catalog file malformed", body = Object),
+    )
+)]
+pub(crate) async fn catalog_reconcile(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    let plan = crate::scheduler::catalog_reconcile_plan(&state)
+        .await
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("catalog reconcile: {e}"),
+            )
+        })?;
+    let mut body = serde_json::to_value(&plan).expect("plan serializes");
+    let obj = body.as_object_mut().expect("plan is an object");
+    obj.insert("empty".into(), json!(plan.is_empty()));
+    obj.insert(
+        "auto_reconcile".into(),
+        json!(state.config.catalog.auto_reconcile),
+    );
+    Ok(Json(body))
+}
+
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct ReconcileApplyQuery {
+    /// Required when the plan disables more than 3 schedules — a blast-radius
+    /// guard against a bad TOML edit mass-disabling pipelines.
+    force: Option<bool>,
+}
+
+/// Applies the current reconcile plan: creates missing catalog-managed
+/// schedules, corrects drifted crons, disables schedules for sources flipped
+/// away from `live`. Every write is SQL-fenced on `managed_by = "catalog"` so
+/// untagged (hand-made / code-seeded) schedules can never be touched; orphans
+/// are reported but never applied. Idempotent — re-applying a clean state is a
+/// no-op.
+#[utoipa::path(
+    post,
+    path = "/catalog/reconcile",
+    tag = "catalog",
+    params(ReconcileApplyQuery),
+    responses(
+        (status = 200, description = "`{applied: {created, updated, disabled, orphans_untouched, errors}, plan}` — what was done, plus the plan it executed."),
+        (status = 409, description = "Plan disables too many schedules; retry with `?force=true`", body = Object),
+        (status = 500, description = "Catalog file malformed", body = Object),
+    )
+)]
+pub(crate) async fn catalog_reconcile_apply(
+    State(state): State<AppState>,
+    Query(query): Query<ReconcileApplyQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let plan = crate::scheduler::catalog_reconcile_plan(&state)
+        .await
+        .map_err(|e| {
+            ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("catalog reconcile: {e}"),
+            )
+        })?;
+    if plan.disable.len() > MAX_UNFORCED_DISABLES && !query.force.unwrap_or(false) {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            format!(
+                "plan disables {} schedules (> {MAX_UNFORCED_DISABLES}) — likely a bad catalog \
+                 edit; review GET /catalog/reconcile and re-POST with ?force=true to proceed",
+                plan.disable.len()
+            ),
+        ));
+    }
+    let applied = crate::scheduler::apply_reconcile_plan(&state, &plan).await;
+    Ok(Json(json!({ "applied": applied, "plan": plan })))
+}
+
 /// DataHub emitter configuration and the most recent emission outcome.
 #[utoipa::path(
     get,

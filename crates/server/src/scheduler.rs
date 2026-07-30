@@ -18,7 +18,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use chrono_tz::Tz;
 use cron::Schedule as CronSchedule;
-use pumper_core::{EnqueueOptions, Schedule};
+use pumper_core::{Catalog, EnqueueOptions, ReconcilePlan, Schedule, CATALOG_MANAGED_BY};
 use serde_json::Value;
 use tracing::{error, info, warn};
 
@@ -44,6 +44,10 @@ const COLLAPSE_LOG_CAP: usize = 64;
 pub async fn run(state: AppState) {
     let tick = Duration::from_secs(state.config.worker.schedule_tick_secs.max(1));
     info!(tick_secs = tick.as_secs(), "scheduler started");
+    // Boot-time catalog reconcile: always plan and log drift loudly; only apply
+    // when [catalog] auto_reconcile = true (default OFF). Failures are non-fatal
+    // — a broken catalog must not stop the scheduler from serving existing rows.
+    boot_reconcile(&state).await;
     // Parsed crons cached across ticks, keyed by expression string, so we don't
     // re-parse every schedule's cron on every tick (an edited cron is a new key and
     // re-parses). Lives here so it outlives a single reconcile.
@@ -154,6 +158,135 @@ pub(crate) async fn reconcile(
         }
     }
     Ok(())
+}
+
+// ---- Catalog reconcile (M19) ----------------------------------------------
+// The catalog (`catalog/data-sources.toml`) is desired state; the schedules
+// table is actual state. The pure diff lives in `pumper_core::Catalog::
+// reconcile_plan`; this section is the I/O around it: load + list (plan), and
+// the tag-fenced writes (apply). Shared by boot and the /catalog/reconcile
+// routes so all three paths cannot disagree.
+
+/// Loads the catalog and diffs it against the schedules table. Dry-run: no writes.
+pub(crate) async fn catalog_reconcile_plan(state: &AppState) -> anyhow::Result<ReconcilePlan> {
+    let catalog = Catalog::load()?;
+    let schedules = state.storage.list_schedules().await?;
+    Ok(catalog.reconcile_plan(&schedules))
+}
+
+/// Applies a plan: creates/updates/disables **catalog-managed** schedules only
+/// (every storage write is SQL-fenced on `managed_by = "catalog"`). Orphans are
+/// never touched. Returns per-section applied counts plus any per-row errors —
+/// a partial apply is reported honestly rather than rolled into one failure,
+/// since re-running reconcile is idempotent and finishes the remainder.
+pub(crate) async fn apply_reconcile_plan(
+    state: &AppState,
+    plan: &ReconcilePlan,
+) -> serde_json::Value {
+    let mut created = 0usize;
+    let mut updated = 0usize;
+    let mut disabled = 0usize;
+    let mut errors: Vec<String> = Vec::new();
+    for c in &plan.create {
+        match state
+            .storage
+            .create_managed_schedule(&c.app, &c.cron, CATALOG_MANAGED_BY)
+            .await
+        {
+            Ok(s) => {
+                info!(id = %s.id, app = %c.app, cron = %c.cron, "catalog reconcile: schedule created");
+                created += 1;
+            }
+            Err(e) => errors.push(format!("create {}: {e}", c.app)),
+        }
+    }
+    for u in &plan.update {
+        match state
+            .storage
+            .set_managed_schedule_cron(&u.schedule_id, &u.to_cron, CATALOG_MANAGED_BY)
+            .await
+        {
+            Ok(true) => {
+                info!(id = %u.schedule_id, app = %u.app, from = %u.from_cron, to = %u.to_cron,
+                      re_enable = u.re_enable, "catalog reconcile: schedule updated");
+                updated += 1;
+            }
+            Ok(false) => errors.push(format!(
+                "update {}: row missing or not catalog-managed (fence)",
+                u.schedule_id
+            )),
+            Err(e) => errors.push(format!("update {}: {e}", u.schedule_id)),
+        }
+    }
+    for d in &plan.disable {
+        match state
+            .storage
+            .set_managed_schedule_enabled(&d.schedule_id, false, CATALOG_MANAGED_BY)
+            .await
+        {
+            Ok(true) => {
+                warn!(id = %d.schedule_id, app = %d.app, reason = %d.reason,
+                      "catalog reconcile: schedule DISABLED");
+                disabled += 1;
+            }
+            Ok(false) => errors.push(format!(
+                "disable {}: row missing or not catalog-managed (fence)",
+                d.schedule_id
+            )),
+            Err(e) => errors.push(format!("disable {}: {e}", d.schedule_id)),
+        }
+    }
+    serde_json::json!({
+        "created": created,
+        "updated": updated,
+        "disabled": disabled,
+        "orphans_untouched": plan.orphan.len(),
+        "errors": errors,
+    })
+}
+
+/// Boot pass: dry-run always; loud drift log; apply only under
+/// `[catalog] auto_reconcile = true`.
+async fn boot_reconcile(state: &AppState) {
+    let plan = match catalog_reconcile_plan(state).await {
+        Ok(plan) => plan,
+        Err(e) => {
+            warn!("catalog reconcile skipped (catalog unreadable): {e}");
+            return;
+        }
+    };
+    if plan.is_empty() {
+        info!(
+            covered_by_untagged = plan.covered_by_untagged,
+            in_sync = plan.in_sync,
+            "catalog reconcile: schedules in sync with catalog/data-sources.toml"
+        );
+        return;
+    }
+    // Loud on purpose: drift between the TOML and the live schedules table is
+    // the exact condition this feature exists to surface.
+    warn!(
+        "CATALOG DRIFT: schedules disagree with catalog/data-sources.toml — {} \
+         (dry-run: GET /catalog/reconcile; apply: POST /catalog/reconcile, or set \
+         [catalog] auto_reconcile = true)",
+        plan.summary()
+    );
+    for c in &plan.create {
+        warn!(app = %c.app, cron = %c.cron, source = %c.source_id, "catalog drift: schedule missing");
+    }
+    for u in &plan.update {
+        warn!(id = %u.schedule_id, app = %u.app, from = %u.from_cron, to = %u.to_cron, "catalog drift: cron/enabled mismatch");
+    }
+    for d in &plan.disable {
+        warn!(id = %d.schedule_id, app = %d.app, reason = %d.reason, "catalog drift: schedule should be disabled");
+    }
+    for o in &plan.orphan {
+        warn!(id = %o.schedule_id, app = %o.app, reason = %o.reason, "catalog drift: ORPHAN catalog-managed schedule (never auto-touched)");
+    }
+    if state.config.catalog.auto_reconcile {
+        let applied = apply_reconcile_plan(state, &plan).await;
+        info!(%applied, "catalog reconcile: auto-applied boot plan");
+    }
 }
 
 /// What a tick should do with one schedule.
@@ -302,6 +435,7 @@ mod tests {
             timezone: tz.map(String::from),
             misfire_policy: "fire_once".into(),
             max_attempts: None,
+            managed_by: None,
             last_run,
             created_at: Utc.with_ymd_and_hms(2026, 7, 13, 9, 15, 0).unwrap(),
         }
