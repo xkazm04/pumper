@@ -24,6 +24,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "doc_fingerprints",
     "field_invariants",
     "field_sketches",
+    "job_yield",
     "http_cache",
     "ingress_sources",
     "jobs",

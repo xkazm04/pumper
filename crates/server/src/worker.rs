@@ -403,6 +403,10 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                     warn!(job = %job.id, "search delete failed: {e}");
                 }
             }
+            // Information economics (M04): parse the result's UpsertSummary-shaped
+            // counts BEFORE `complete` consumes it. Recorded only if the
+            // completion lands (below) — a stale attempt's numbers are not yield.
+            let yields = pumper_core::extract_yields(&result);
             match state.storage.complete(job.id, job.attempts, result).await {
                 Ok(true) => {
                     info!(job = %job.id, "job succeeded");
@@ -410,6 +414,16 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                     // the table only holds resumable (in-progress) work.
                     if let Err(e) = state.storage.clear_checkpoint(job.id).await {
                         warn!(job = %job.id, "checkpoint clear failed: {e}");
+                    }
+                    // Persist this run's yield next to its cost, so /economics
+                    // can price the records. Best-effort telemetry, fail-open —
+                    // accounting never touches a job's outcome.
+                    if !yields.is_empty() {
+                        if let Err(e) =
+                            state.storage.record_job_yield(job.id, &job.app, &yields).await
+                        {
+                            warn!(job = %job.id, "job-yield record failed: {e}");
+                        }
                     }
                 }
                 Ok(false) => {

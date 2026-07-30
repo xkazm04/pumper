@@ -166,6 +166,16 @@ sketch_retention_runs = 60       # runs of per-field sketches kept (>= window_ru
 [catalog]
 auto_reconcile = false   # true = apply the boot plan automatically (orphans are still never touched)
 
+# MCP server — mounts POST /mcp (streamable-HTTP JSON-RPC) exposing the app
+# registry, datasets, and search as native agent tools, plus catalog + app
+# manifests as resources. Read-mostly by design: the enqueue tool (the one that
+# spends money and loads targets) has its own switch AND a hard budget ceiling.
+# See docs/features/mcp.md for the .mcp.json client snippet.
+[mcp]
+enabled = false
+# allow_enqueue = false      # second opt-in: offer the enqueue_job tool at all
+# max_job_budget_usd = 1.0   # hard clamp on any MCP-enqueued job's budget_usd (0 = free tiers only)
+
 # DataHub metadata shadow — pushes dataset entities, inferred schema, lineage,
 # and per-run freshness (operation) events to a DataHub GMS. Metadata only;
 # record data never leaves the local store. See docs/features/datahub.md.
@@ -176,3 +186,17 @@ gms_url = "http://localhost:8080"             # local docker quickstart (Cloud: 
 # env = "PROD"                                # URN fabric segment
 # emit_schema = true                          # infer schemaMetadata from each dataset's newest record
 # emit_profile = true                         # emit row-count datasetProfile
+
+# Information economics (M04) — GET /economics joins the cost ledger with
+# per-job yield (job_yield) into $/new-record and $/changed-record per app over
+# trailing 7d/30d windows, plus an ADVISORY budget/cadence recommendation per
+# app. Advisory only: enforce is a stub for the deferred enforcement mode
+# (scheduler reads the planner's budgets) and nothing acts on it yet.
+[economics]
+enforce = false          # DEFERRED seam — inert today, ships OFF so landing enforcement can't silently start moving money
+# Per-app value weights: how much one fresh (new/changed) record from an app is
+# worth relative to the fleet baseline 1.0 (a rare grant >> one HN row).
+# Unlisted apps weigh 1.0.
+[economics.weights]
+# grants-gov = 5.0
+# hackernews = 0.2

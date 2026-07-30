@@ -1494,12 +1494,83 @@ impl Storage {
             .await?;
         Ok(())
     }
+
+    // ── job yield ────────────────────────────────────────────────────────────
+
+    /// Persists the yield entries parsed from one completed job's result
+    /// ([`crate::costs::extract_yields`]) — one row per summary the result
+    /// carried. `None` counts store as NULL (the result didn't report that
+    /// number), never 0. Best-effort telemetry: callers log-and-continue on
+    /// error, a job's outcome must never hinge on its accounting.
+    pub async fn record_job_yield(
+        &self,
+        job_id: Uuid,
+        app: &str,
+        entries: &[crate::costs::YieldEntry],
+    ) -> Result<()> {
+        let at = now();
+        for e in entries {
+            sqlx::query(
+                "INSERT INTO job_yield (job_id, app, dataset, new_count, changed_count, \
+                 unchanged_count, removed_count, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )
+            .bind(job_id.to_string())
+            .bind(app)
+            .bind(&e.dataset)
+            .bind(e.new)
+            .bind(e.changed)
+            .bind(e.unchanged)
+            .bind(e.removed)
+            .bind(&at)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Yield grouped by (app, dataset) since a cutoff — the economics window
+    /// query. `SUM` over SQL NULLs stays NULL, so an app whose results never
+    /// reported a count comes back `None` ("unknown"), distinct from `Some(0)`
+    /// ("reported zero") — the /economics math turns `None` into JSON null, not
+    /// $0 or a division.
+    pub async fn yield_summary(&self, since: DateTime<Utc>) -> Result<Vec<YieldSummary>> {
+        let rows = sqlx::query_as::<_, YieldSummary>(
+            "SELECT app, dataset, COUNT(DISTINCT job_id) AS jobs, \
+                    SUM(new_count) AS new, SUM(changed_count) AS changed, \
+                    SUM(unchanged_count) AS unchanged, SUM(removed_count) AS removed \
+             FROM job_yield WHERE created_at > ?1 \
+             GROUP BY app, dataset ORDER BY app, dataset",
+        )
+        .bind(crate::datasets::ts(since))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
 }
 
 /// Hard cap on one checkpoint blob (bytes). Generous enough for a 100k-URL
 /// crawl frontier (~a few MB) while keeping a runaway app from turning the jobs
 /// database into a blob store.
 pub const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
+
+/// One (app, dataset) group of the trailing-window yield rollup
+/// ([`Storage::yield_summary`]). Counts are `Option`: `None` means no result in
+/// the window reported that number — unknown, not zero.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct YieldSummary {
+    pub app: String,
+    /// `""` = the result-root summary; else the result's key path
+    /// (`"unified"`, `"datasets.velocity"`) — the closest thing the job-result
+    /// convention has to a dataset name.
+    pub dataset: String,
+    /// Distinct jobs that contributed rows to this group in the window.
+    pub jobs: i64,
+    pub new: Option<i64>,
+    pub changed: Option<i64>,
+    pub unchanged: Option<i64>,
+    pub removed: Option<i64>,
+}
 
 /// Job timing aggregates (seconds) for the metrics endpoint: execution duration
 /// (started→finished) and queue wait (created→started), each as sum/count/max so

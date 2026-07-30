@@ -26,6 +26,73 @@ pub struct Config {
     pub archive: ArchiveConfig,
     pub catalog: CatalogConfig,
     pub ingress: IngressConfig,
+    pub mcp: McpConfig,
+    pub economics: EconomicsConfig,
+}
+
+/// Information economics (M04): joining the cost ledger with per-job yield
+/// (`job_yield`) into $/new-record telemetry and an ADVISORY budget/cadence
+/// planner (`GET /economics`).
+///
+/// Advisory-only today: `enforce = false` is a stub for the deferred
+/// enforcement mode, where the scheduler would read the planner's recommended
+/// `budget_usd` for scheduled runs. Nothing reads it as `true` yet — flipping
+/// it changes no behavior until that seam lands, and it ships default-OFF so
+/// landing the seam can't silently start moving money.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct EconomicsConfig {
+    /// DEFERRED enforcement seam (see above). Default false; currently inert
+    /// beyond being surfaced in the /economics payload.
+    pub enforce: bool,
+    /// Per-app value weights for the planner: how much one fresh (new/changed)
+    /// record from this app is worth relative to the fleet baseline of 1.0.
+    /// Record counts are not value — a rare grant record may be worth 10k HN
+    /// rows — and this is the human-settable dial that encodes that. Apps not
+    /// listed weigh 1.0.
+    pub weights: HashMap<String, f64>,
+}
+
+impl EconomicsConfig {
+    /// The planner weight for one app (default 1.0; non-finite or negative
+    /// configured values are treated as unset rather than poisoning the math).
+    pub fn weight(&self, app: &str) -> f64 {
+        match self.weights.get(app) {
+            Some(w) if w.is_finite() && *w >= 0.0 => *w,
+            _ => 1.0,
+        }
+    }
+}
+
+/// MCP server (`/mcp`): the registry, datasets, and search exposed as native
+/// agent tools over the Model Context Protocol's streamable-HTTP transport.
+///
+/// Default-OFF, and read-mostly even when on: the enqueue tool — the one that
+/// can spend money and load targets — has its own switch plus a hard per-call
+/// budget ceiling, so a connected agent can browse everything but actuate
+/// nothing until the operator opts in twice.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// Master switch. `false` = `/mcp` is not mounted at all.
+    pub enabled: bool,
+    /// Whether the `enqueue_job` tool is offered. `false` (default) = the MCP
+    /// surface is read-only: list/query/search but no job creation.
+    pub allow_enqueue: bool,
+    /// Hard ceiling (USD) on the `budget_usd` any MCP enqueue may carry; a
+    /// larger requested budget is clamped, an absent one defaults to this.
+    /// `0` = MCP-enqueued jobs run with a zero budget (free tiers only).
+    pub max_job_budget_usd: f64,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_enqueue: false,
+            max_job_budget_usd: 1.0,
+        }
+    }
 }
 
 /// Inbound event ingress (`POST /ingest/{id}`): HMAC-verified external webhooks
@@ -444,6 +511,16 @@ impl Config {
                         .into(),
                 ));
             }
+        }
+
+        // MCP: a negative budget ceiling parses fine and then makes every
+        // clamped enqueue budget negative — which `filter(|b| *b > 0.0)`-style
+        // guards downstream silently turn into "unlimited". Reject at the door.
+        if self.mcp.enabled && !(self.mcp.max_job_budget_usd >= 0.0) {
+            return Err(Error::Config(format!(
+                "[mcp] max_job_budget_usd ({}) must be >= 0 when mcp is enabled",
+                self.mcp.max_job_budget_usd
+            )));
         }
 
         // A cap below the base means the very first penalty already exceeds it, so
@@ -1053,6 +1130,31 @@ mod tests {
         // Disabled => the rules don't bind (nothing reaches the surface).
         let mut cfg = Config::default();
         cfg.ingress.max_body_bytes = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn mcp_ships_disabled_and_read_only() {
+        // An agent-actuatable surface must be double opt-in: mount, then enqueue.
+        let m = McpConfig::default();
+        assert!(!m.enabled, "mcp must be opt-in");
+        assert!(!m.allow_enqueue, "enqueue must be a second, separate opt-in");
+        assert!(m.max_job_budget_usd >= 0.0);
+    }
+
+    #[test]
+    fn enabled_mcp_rejects_negative_budget_ceiling() {
+        let mut cfg = Config::default();
+        cfg.mcp.enabled = true;
+        cfg.mcp.max_job_budget_usd = -1.0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("[mcp] max_job_budget_usd"), "{err}");
+        // Disabled => the rule doesn't bind.
+        cfg.mcp.enabled = false;
+        assert!(cfg.validate().is_ok());
+        // Enabled with zero (free-tiers-only) is allowed.
+        cfg.mcp.enabled = true;
+        cfg.mcp.max_job_budget_usd = 0.0;
         assert!(cfg.validate().is_ok());
     }
 
