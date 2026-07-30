@@ -302,6 +302,7 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         research_cache: state.research_cache.clone(),
         tiers: state.tiers.clone(),
         health: state.health.clone(),
+        recipes: Arc::new(state.storage.recipes()),
         plugins: state.plugins.clone(),
         progress: state
             .progress

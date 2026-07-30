@@ -6,6 +6,7 @@ edition.workspace = true
 [dependencies]
 pumper-core.workspace = true
 chromiumoxide.workspace = true
+url.workspace = true
 futures.workspace = true
 tokio.workspace = true
 async-trait.workspace = true

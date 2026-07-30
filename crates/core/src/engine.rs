@@ -229,6 +229,27 @@ pub enum PageAction {
     },
 }
 
+/// One same-origin JSON response observed by the browser tier while rendering a
+/// page with [`RenderRequest::capture_network`] set — the raw material of the
+/// API X-ray (discovering the data API behind a SPA). Bodies are size-capped by
+/// the engine (per response and in total), so a capture can never balloon a
+/// render's memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapturedCall {
+    /// Full request URL (with query string) as the page issued it.
+    pub url: String,
+    /// HTTP method (`GET`, `POST`, ...).
+    pub method: String,
+    /// Response status code.
+    pub status: u16,
+    /// Response `Content-Type` / MIME type as reported by CDP.
+    pub content_type: String,
+    /// Parsed JSON response body. Responses that fail to parse as JSON, exceed
+    /// the per-body cap, or arrive after the total budget is spent are dropped
+    /// (never truncated into invalid JSON).
+    pub body: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderRequest {
     pub url: String,
@@ -262,6 +283,12 @@ pub struct RenderRequest {
     /// — the browser-tier mirror of `HttpRequest.max_body_bytes`.
     #[serde(default)]
     pub max_body_bytes: Option<u64>,
+    /// Capture same-origin JSON network responses observed during the render
+    /// into [`RenderedPage::network`] (per-request opt-in; the API X-ray seam).
+    /// `false` (default) = no CDP network capture — exactly the previous
+    /// behavior.
+    #[serde(default)]
+    pub capture_network: bool,
 }
 
 impl RenderRequest {
@@ -275,6 +302,7 @@ impl RenderRequest {
             load_all_resources: false,
             profile: None,
             max_body_bytes: None,
+            capture_network: false,
         }
     }
 }
@@ -299,6 +327,9 @@ pub struct RenderedPage {
     /// counts as one). `0` when none were requested — lets a caller see that an
     /// infinite-scroll script actually executed rather than silently no-op'd.
     pub actions_completed: usize,
+    /// Same-origin JSON responses captured during the render. Empty unless the
+    /// request set [`RenderRequest::capture_network`]; size-capped by the engine.
+    pub network: Vec<CapturedCall>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -453,6 +484,27 @@ mod tests {
             other => panic!("expected Repeat, got {other:?}"),
         }
         assert!(matches!(&r.actions[1], PageAction::Click { selector } if selector == "#more"));
+    }
+
+    #[test]
+    fn capture_network_is_serde_defaulted_and_round_trips() {
+        // Older payloads omit it => false => no capture (previous behavior).
+        let r: RenderRequest = serde_json::from_str(r#"{"url":"https://x/"}"#).unwrap();
+        assert!(!r.capture_network);
+        assert!(!RenderRequest::new("https://x/").capture_network);
+        // Present => round-trips; a captured call deserializes.
+        let r: RenderRequest =
+            serde_json::from_str(r#"{"url":"https://x/","capture_network":true}"#).unwrap();
+        assert!(r.capture_network);
+        let call: CapturedCall = serde_json::from_str(
+            r#"{"url":"https://x/api?q=1","method":"GET","status":200,
+                "content_type":"application/json","body":{"items":[1,2]}}"#,
+        )
+        .unwrap();
+        assert_eq!(call.status, 200);
+        assert_eq!(call.body["items"][0], 1);
+        // RenderedPage default carries no captures.
+        assert!(RenderedPage::default().network.is_empty());
     }
 
     #[test]

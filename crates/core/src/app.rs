@@ -84,6 +84,9 @@ pub struct AppContext {
     /// the write paths below when enforcement is on. [`Resilience::disabled`]
     /// makes every consultation a no-op.
     pub health: Arc<crate::resilience::Resilience>,
+    /// API X-ray recipe store: discovered JSON-API endpoints behind rendered
+    /// pages (see [`AppContext::xray`] and [`crate::recipes`]).
+    pub recipes: Arc<crate::recipes::RecipeStore>,
     /// Sandboxed WASM plugin host (fuel + memory limited).
     pub plugins: Arc<dyn Plugins>,
     /// Throttled live-progress seam: long-running apps report compact snapshots
@@ -398,6 +401,41 @@ impl AppContext {
             }
         }
         Ok(out)
+    }
+
+    /// API X-ray post-render pass: persists a `capture_network` render's
+    /// observed JSON calls as a job artifact and runs the discovery heuristic
+    /// against the fields this job extracted from the same page, upserting
+    /// high-overlap candidates as unvalidated [`crate::recipes::ApiRecipe`]s.
+    ///
+    /// Call after a render that set `RenderRequest.capture_network` (per-request
+    /// opt-in), handing it the record values extracted from that page. Returns
+    /// `(captured_calls, recipes_discovered)`. Best-effort like the other
+    /// telemetry seams: a recipe write failure is warn-logged, never fails the
+    /// job; an empty capture is a cheap no-op.
+    pub async fn xray(
+        &self,
+        page: &crate::engine::RenderedPage,
+        extracted: &[Value],
+    ) -> Result<(usize, usize)> {
+        if page.network.is_empty() {
+            return Ok((0, 0));
+        }
+        // Raw captures land beside the job's other artifacts for inspection.
+        let bytes = serde_json::to_vec_pretty(&page.network)?;
+        self.save_artifact("network-capture.json", &bytes).await?;
+
+        let candidates = crate::recipes::discover_recipes(&page.network, extracted);
+        let mut stored = 0usize;
+        for recipe in &candidates {
+            match self.recipes.upsert(recipe).await {
+                Ok(_) => stored += 1,
+                Err(e) => {
+                    tracing::warn!(job = %self.job_id, host = %recipe.host, "api recipe write failed: {e}")
+                }
+            }
+        }
+        Ok((page.network.len(), stored))
     }
 
     pub fn require_str(&self, key: &str) -> Result<&str> {
