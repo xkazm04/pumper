@@ -77,6 +77,43 @@ pub struct SearchHit {
     pub snippet: String,
 }
 
+impl SearchHit {
+    /// The hit's source-record key inside its own dataset: the doc id minus its
+    /// `<app>:<dataset>:` prefix (see [`SearchDoc::dataset_id`]). Falls back to
+    /// the whole id for non-dataset docs (job-result docs).
+    pub fn source_key(&self) -> &str {
+        let prefix_len = self.app.len() + self.dataset.len() + 2;
+        if self.id.len() > prefix_len
+            && self.id.starts_with(&self.app)
+            && self.id[self.app.len()..].starts_with(':')
+            && self.id[self.app.len() + 1..].starts_with(&self.dataset)
+            && self.id[prefix_len - 1..].starts_with(':')
+        {
+            &self.id[prefix_len..]
+        } else {
+            &self.id
+        }
+    }
+
+    /// The dataset-record value this hit materializes to (M13 "queries as
+    /// datasets"): stable display fields plus source provenance. The BM25 score
+    /// is bucketed to one decimal so per-run ranking jitter does not churn fake
+    /// `changed` revisions out of the view's change feed.
+    pub fn materialize_value(&self) -> serde_json::Value {
+        serde_json::json!({
+            "title": self.title,
+            "snippet": self.snippet,
+            "url": self.url,
+            "score": (f64::from(self.score) * 10.0).round() / 10.0,
+            "source": {
+                "app": self.app,
+                "dataset": self.dataset,
+                "key": self.source_key(),
+            },
+        })
+    }
+}
+
 /// Result ordering for a search.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum SearchSort {
