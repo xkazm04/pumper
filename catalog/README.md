@@ -30,6 +30,7 @@ Every `[[source]]` has these fields:
 | `confidence` | int 1–5 | how much this source makes downstream outputs valid/trustworthy |
 | `dataset` | string | the `Datasets` dataset it writes via `ctx.upsert` (e.g. `opportunities`); `""` if n/a |
 | `notes` | string | freeform flags / gotchas |
+| `contract` | table (opt) | declared data contract enforced at publish time — see below |
 
 The three `category` values encode the key insight from the market research: **open-call
 feeds are scarce**, awarded-history and registry data are abundant. A market is
@@ -77,6 +78,41 @@ Australia → EU SEDIA → UK, then the browser/LLM scrapers.
 3. Add its row to the snapshot table above.
 4. If it isn't a Pumper app yet (a source you've only researched), still add it with
    `status = "planned"` and `app = ""` — the catalog is the roadmap too.
+
+## Declared data contracts (`[source.contract]`)
+
+A `live` source may declare the **floor its output must clear** — the declared
+complement to the resilience system's *inferred* health. Evaluated by the
+worker over each run's revisions at the same choke point where unhealthy
+sources are suppressed, before any webhook/trigger fires.
+
+```toml
+[source.contract]
+required_fields = ["id", "title"]   # present and non-null on every new/changed record
+max_row_delta_pct = 50.0            # max % of a run's revisions allowed to be removals
+max_staleness_hours = 48            # tightens /catalog/health's cadence-derived window
+
+[source.contract.types]             # checked only when the field is present & non-null
+title = "string"                    # string | number | bool | array | object
+
+[source.contract.ranges]            # inclusive bounds, checked only on numeric values
+award_ceiling = { min = 0.0 }
+```
+
+**Verdicts**: `pass` (no violations) · `warn` (violations recorded, nothing
+gated — the default) · `block` (violations with `[contracts] enforce = true`
+in `config.toml`: the dataset's pushes/triggers are suppressed for that run;
+the data itself is still stored and queryable). Start every contract in warn
+mode and watch it, exactly like resilience soaked before enforcing.
+
+**Surfaces**: `/catalog/health` (declaration + last verdict per source, and
+`max_staleness_hours` tightening the stale threshold), `/sources` +
+`/sources/{id}` (`contract` key next to the inferred health), and
+`/catalog/sources` (the declaration itself, verbatim).
+
+**Honesty rules**: `types`/`ranges` never punish absence — requiring presence
+is exclusively `required_fields`' job (honest-Null fields like a suppressed
+`applications` count stay legal). Pin only what was live-verified.
 
 ## GitOps reconciler (the catalog as control plane)
 

@@ -60,6 +60,11 @@ pub struct Source {
     pub dataset: String,
     #[serde(default)]
     pub notes: String,
+    /// Declared data contract (`[source.contract]`) — the producer-side floor
+    /// this source's output must clear at publish time. `None` = no contract,
+    /// nothing checked. See [`Contract`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contract: Option<Contract>,
 }
 
 impl Source {
@@ -83,6 +88,165 @@ impl Source {
             "annual" => Some(366 * DAY),
             _ => None, // on-demand | one-time | unknown → no freshness expectation
         }
+    }
+}
+
+/// A declared data contract for one source (`[source.contract]` in the catalog
+/// TOML): the explicit, human/LLM-authored floor the source's output must clear
+/// at publish time. The resilience system *infers* degradation statistically;
+/// this is the *declared* complement — Great Expectations built into the
+/// catalog. Evaluated in the worker at the same choke point where
+/// `suppress_unhealthy` gates pushes; verdicts surface on `/catalog/health` and
+/// `/sources`.
+///
+/// All checks are honest about absence: a field named only in `types`/`ranges`
+/// is checked *when present and non-null* — requiring presence is exclusively
+/// `required_fields`' job. Field names are top-level record keys (no nested
+/// paths in v1).
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Contract {
+    /// Fields that must be present and non-null on every new/changed record.
+    pub required_fields: Vec<String>,
+    /// `field -> expected JSON type` (`string` | `number` | `bool` | `array` |
+    /// `object`), checked only when the field is present and non-null.
+    pub types: BTreeMap<String, String>,
+    /// `field -> inclusive numeric bounds`, checked only when the field is
+    /// present and numeric (a wrong *type* is `types`' job).
+    pub ranges: BTreeMap<String, ContractRange>,
+    /// Max share (0–100) of this run's revisions allowed to be removals — a
+    /// mass-delete tripwire (a source suddenly dropping half its rows is a
+    /// break, not a refresh).
+    pub max_row_delta_pct: Option<f64>,
+    /// Max age of the newest dataset write, in hours. Not evaluated at publish
+    /// time (the run just wrote); it *tightens* the cadence-derived freshness
+    /// window on `/catalog/health`.
+    pub max_staleness_hours: Option<i64>,
+}
+
+/// Inclusive numeric bounds for one field in a [`Contract`].
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct ContractRange {
+    pub min: Option<f64>,
+    pub max: Option<f64>,
+}
+
+/// What a contract evaluation concluded, given the enforcement flag.
+/// `Pass` = no violations. `Warn` = violations recorded, nothing gated
+/// (`[contracts] enforce = false`, the default — soak mode, like resilience
+/// started). `Block` = violations and enforcement on: the dataset's pushes are
+/// suppressed at the worker seam before any webhook/trigger fires.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ContractVerdict {
+    Pass,
+    Warn,
+    Block,
+}
+
+impl ContractVerdict {
+    /// Maps an evaluation outcome to its verdict under the given enforce flag.
+    pub fn from_violations(violations: &[String], enforce: bool) -> Self {
+        match (violations.is_empty(), enforce) {
+            (true, _) => ContractVerdict::Pass,
+            (false, true) => ContractVerdict::Block,
+            (false, false) => ContractVerdict::Warn,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ContractVerdict::Pass => "pass",
+            ContractVerdict::Warn => "warn",
+            ContractVerdict::Block => "block",
+        }
+    }
+}
+
+impl Contract {
+    /// Evaluates one run's output against the contract. Pure — no clock, no IO —
+    /// so the worker seam, tests, and any future backfill audit share it.
+    ///
+    /// `records` are the run's surviving (new/changed) record snapshots;
+    /// `removed` is how many revisions in the run were removals. Returns the
+    /// violation list — empty means the contract holds. Staleness is
+    /// deliberately not checked here (see [`Contract::max_staleness_hours`]).
+    pub fn evaluate(&self, records: &[&serde_json::Value], removed: usize) -> Vec<String> {
+        let mut violations = Vec::new();
+
+        for field in &self.required_fields {
+            let missing = records
+                .iter()
+                .filter(|r| r.get(field).is_none_or(serde_json::Value::is_null))
+                .count();
+            if missing > 0 {
+                violations.push(format!(
+                    "required field '{field}' missing or null on {missing}/{} records",
+                    records.len()
+                ));
+            }
+        }
+
+        for (field, expected) in &self.types {
+            let bad = records
+                .iter()
+                .filter_map(|r| r.get(field))
+                .filter(|v| !v.is_null() && !json_type_matches(v, expected))
+                .count();
+            if bad > 0 {
+                violations.push(format!(
+                    "field '{field}' is not of type '{expected}' on {bad}/{} records",
+                    records.len()
+                ));
+            }
+        }
+
+        for (field, range) in &self.ranges {
+            let out = records
+                .iter()
+                .filter_map(|r| r.get(field).and_then(serde_json::Value::as_f64))
+                .filter(|n| {
+                    range.min.is_some_and(|min| *n < min) || range.max.is_some_and(|max| *n > max)
+                })
+                .count();
+            if out > 0 {
+                violations.push(format!(
+                    "field '{field}' out of range [{:?}, {:?}] on {out}/{} records",
+                    range.min,
+                    range.max,
+                    records.len()
+                ));
+            }
+        }
+
+        if let Some(max_pct) = self.max_row_delta_pct {
+            let total = records.len() + removed;
+            if removed > 0 && total > 0 {
+                let pct = removed as f64 / total as f64 * 100.0;
+                if pct > max_pct {
+                    violations.push(format!(
+                        "removals are {pct:.1}% of this run's {total} revisions \
+                         (max {max_pct}%) — possible mass-delete"
+                    ));
+                }
+            }
+        }
+
+        violations
+    }
+}
+
+/// `serde_json` type check for a contract's declared type name. Unknown names
+/// match nothing — a typo'd contract fails loudly rather than silently passing.
+fn json_type_matches(v: &serde_json::Value, expected: &str) -> bool {
+    match expected {
+        "string" => v.is_string(),
+        "number" => v.is_number(),
+        "bool" | "boolean" => v.is_boolean(),
+        "array" => v.is_array(),
+        "object" => v.is_object(),
+        _ => false,
     }
 }
 
@@ -121,6 +285,14 @@ impl Catalog {
     /// Sources with `status == "live"` — the pipelines actually running.
     pub fn live(&self) -> impl Iterator<Item = &Source> {
         self.sources.iter().filter(|s| s.status == "live")
+    }
+
+    /// The declared contract covering `(app, dataset)`, if any live source
+    /// declares one. First match wins (app+dataset pairs are expected unique).
+    pub fn contract_for(&self, app: &str, dataset: &str) -> Option<(&Source, &Contract)> {
+        self.live()
+            .filter(|s| s.app == app && s.dataset == dataset)
+            .find_map(|s| s.contract.as_ref().map(|c| (s, c)))
     }
 }
 
@@ -368,6 +540,7 @@ mod tests {
             confidence: 0,
             dataset: String::new(),
             notes: String::new(),
+            contract: None,
         };
         assert_eq!(src("daily").cadence_secs(), Some(86_400));
         assert_eq!(src("annual").cadence_secs(), Some(366 * 86_400));
@@ -375,6 +548,118 @@ mod tests {
         assert_eq!(src("on-demand").cadence_secs(), None);
         assert_eq!(src("one-time").cadence_secs(), None);
         assert_eq!(src("").cadence_secs(), None);
+    }
+
+    // ---- data contracts ---------------------------------------------------
+
+    #[test]
+    fn parses_contract_block_and_absence_means_none() {
+        let toml = r#"
+            [[source]]
+            id = "grants-gov"
+            app = "grants-gov"
+            name = "Grants.gov"
+            status = "live"
+            dataset = "opportunities"
+
+            [source.contract]
+            required_fields = ["id", "title"]
+            max_row_delta_pct = 50.0
+            max_staleness_hours = 48
+
+            [source.contract.types]
+            title = "string"
+
+            [source.contract.ranges]
+            award = { min = 0.0 }
+
+            [[source]]
+            id = "plain"
+            name = "No contract"
+            status = "live"
+        "#;
+        let cat = Catalog::parse(toml).expect("valid");
+        let c = cat.sources[0].contract.as_ref().expect("contract parsed");
+        assert_eq!(c.required_fields, vec!["id", "title"]);
+        assert_eq!(c.types.get("title").map(String::as_str), Some("string"));
+        assert_eq!(c.ranges["award"].min, Some(0.0));
+        assert_eq!(c.max_row_delta_pct, Some(50.0));
+        assert_eq!(c.max_staleness_hours, Some(48));
+        assert!(cat.sources[1].contract.is_none());
+        // Lookup goes through (app, dataset), live-only.
+        assert!(cat.contract_for("grants-gov", "opportunities").is_some());
+        assert!(cat.contract_for("grants-gov", "other").is_none());
+    }
+
+    fn contract(toml: &str) -> Contract {
+        toml::from_str(toml).expect("valid contract")
+    }
+
+    #[test]
+    fn evaluate_flags_missing_required_fields() {
+        let c = contract(r#"required_fields = ["id", "title"]"#);
+        let good = serde_json::json!({ "id": "1", "title": "ok" });
+        let null_title = serde_json::json!({ "id": "2", "title": null });
+        let missing = serde_json::json!({ "id": "3" });
+        let v = c.evaluate(&[&good, &null_title, &missing], 0);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].contains("'title'") && v[0].contains("2/3"), "{v:?}");
+        assert!(c.evaluate(&[&good], 0).is_empty());
+    }
+
+    #[test]
+    fn evaluate_checks_types_only_when_present_and_nonnull() {
+        let c = contract(r#"[types]
+            title = "string""#);
+        let absent = serde_json::json!({ "id": "1" });
+        let null = serde_json::json!({ "title": null });
+        let wrong = serde_json::json!({ "title": 42 });
+        // Absence and null are required_fields' job, not a type violation.
+        assert!(c.evaluate(&[&absent, &null], 0).is_empty());
+        let v = c.evaluate(&[&wrong], 0);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].contains("'title'"), "{v:?}");
+        // Unknown type names never match — a typo'd contract fails loudly.
+        let typo = contract(r#"[types]
+            title = "strnig""#);
+        assert_eq!(typo.evaluate(&[&serde_json::json!({"title": "x"})], 0).len(), 1);
+    }
+
+    #[test]
+    fn evaluate_checks_ranges_only_on_numeric_values() {
+        let c = contract(r#"[ranges]
+            applications = { min = 0.0, max = 100.0 }"#);
+        let ok = serde_json::json!({ "applications": 50 });
+        let non_numeric = serde_json::json!({ "applications": "n/a" });
+        let low = serde_json::json!({ "applications": -1 });
+        let high = serde_json::json!({ "applications": 200 });
+        assert!(c.evaluate(&[&ok, &non_numeric], 0).is_empty());
+        let v = c.evaluate(&[&low, &high], 0);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].contains("2/2"), "{v:?}");
+    }
+
+    #[test]
+    fn evaluate_trips_row_delta_on_mass_removal() {
+        let c = contract("max_row_delta_pct = 50.0");
+        let r = serde_json::json!({ "id": "1" });
+        // 3 removed of 4 revisions = 75% > 50% — tripped.
+        let v = c.evaluate(&[&r], 3);
+        assert_eq!(v.len(), 1);
+        assert!(v[0].contains("mass-delete"), "{v:?}");
+        // 1 of 4 = 25% — fine; zero removals never trip.
+        assert!(c.evaluate(&[&r, &r, &r], 1).is_empty());
+        assert!(c.evaluate(&[], 0).is_empty());
+    }
+
+    #[test]
+    fn verdict_maps_violations_and_enforce_flag() {
+        assert_eq!(ContractVerdict::from_violations(&[], true), ContractVerdict::Pass);
+        assert_eq!(ContractVerdict::from_violations(&[], false), ContractVerdict::Pass);
+        let v = vec!["boom".to_string()];
+        assert_eq!(ContractVerdict::from_violations(&v, false), ContractVerdict::Warn);
+        assert_eq!(ContractVerdict::from_violations(&v, true), ContractVerdict::Block);
+        assert_eq!(ContractVerdict::Block.as_str(), "block");
     }
 
     // ---- reconcile plan ---------------------------------------------------
