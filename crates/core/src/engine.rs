@@ -392,6 +392,22 @@ pub struct ResearchOutput {
 #[async_trait]
 pub trait HttpClient: Send + Sync {
     async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse>;
+
+    /// Fetches a **raw binary body** (ZIP/PDF/…) as bytes, hard-capped by the
+    /// same `max_body_bytes` machinery as [`fetch`](Self::fetch).
+    ///
+    /// This is the deliberately minimal engine-traits#2-LITE seam: no charset
+    /// decoding, no response cache (the cache stores decoded text), buffered in
+    /// memory (NOT streamed to disk — the full streaming binary-body design
+    /// stays deferred). Default: unsupported, so only engines that opt in
+    /// (currently `pumper-engine-http`) carry binary fetching; wrappers/mocks
+    /// keep compiling and fail loudly if a binary fetch reaches them.
+    async fn fetch_bytes(&self, req: HttpRequest) -> Result<Vec<u8>> {
+        Err(Error::Http(format!(
+            "this engine does not support binary fetch_bytes ({})",
+            req.url
+        )))
+    }
 }
 
 /// Headless-browser rendering — JS-heavy pages, logged-in sessions.
