@@ -303,6 +303,7 @@ fn search2_request(body: String) -> HttpRequest {
         timeout_secs: None,
         proxy: None,
         profile: None,
+        archive_max_age: None,
     }
 }
 

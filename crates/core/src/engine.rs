@@ -72,6 +72,14 @@ pub fn profile_browser_dir(profiles_dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(profile_dir(profiles_dir, name)?.join(PROFILE_BROWSER_DIR))
 }
 
+/// Provenance response header set by the archive engine: `"archive"` when the
+/// body was served from a web archive snapshot rather than the live site.
+/// Stored with the response's header map, so provenance survives into records.
+pub const FETCHED_VIA_HEADER: &str = "x-pumper-fetched-via";
+/// Provenance response header set by the archive engine: the snapshot's capture
+/// timestamp (RFC 3339 UTC). Present only alongside [`FETCHED_VIA_HEADER`].
+pub const SNAPSHOT_TS_HEADER: &str = "x-pumper-snapshot-ts";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum HttpMethod {
@@ -137,6 +145,14 @@ pub struct HttpRequest {
     /// yields a typed [`Error::Profile`].
     #[serde(default)]
     pub profile: Option<String>,
+    /// Archive freshness window (seconds). When set, an archive-capable client
+    /// (the tier-zero archive engine) may serve a stored web-archive snapshot of
+    /// this URL captured no longer than this many seconds ago; an older-only (or
+    /// absent) snapshot is a typed miss, and the tiered fetcher falls through to
+    /// the live ladder. Ignored by the plain HTTP engine. `None` = live-only,
+    /// exactly the previous behavior.
+    #[serde(default)]
+    pub archive_max_age: Option<u64>,
 }
 
 impl HttpRequest {
@@ -154,6 +170,7 @@ impl HttpRequest {
             timeout_secs: None,
             proxy: None,
             profile: None,
+            archive_max_age: None,
         }
     }
 }
@@ -474,6 +491,18 @@ mod tests {
         assert_eq!(r2.profile.as_deref(), Some("acme_login"));
         assert!(HttpRequest::get("https://x/").profile.is_none());
         assert!(RenderRequest::new("https://x/").profile.is_none());
+    }
+
+    #[test]
+    fn archive_max_age_is_serde_defaulted_and_round_trips() {
+        // Older payloads omit it => None => live-only (previous behavior).
+        let req: HttpRequest = serde_json::from_str(r#"{"url":"https://x/"}"#).unwrap();
+        assert!(req.archive_max_age.is_none());
+        assert!(HttpRequest::get("https://x/").archive_max_age.is_none());
+        // Present => round-trips.
+        let req: HttpRequest =
+            serde_json::from_str(r#"{"url":"https://x/","archive_max_age":86400}"#).unwrap();
+        assert_eq!(req.archive_max_age, Some(86_400));
     }
 
     #[test]

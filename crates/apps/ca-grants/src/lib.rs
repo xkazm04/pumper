@@ -230,6 +230,7 @@ fn post_json(url: &str, body: String) -> HttpRequest {
         timeout_secs: None,
         proxy: None,
         profile: None,
+        archive_max_age: None,
     }
 }
 

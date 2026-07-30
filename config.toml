@@ -62,6 +62,16 @@ profiles_dir = "data/profiles"
 enabled = true
 ttl_secs = 3600
 
+# Tier-zero archive engine (Wayback Machine CDX, v1). When enabled AND a fetch
+# sets `archive_max_age` (seconds), the tiered fetcher tries a stored
+# web.archive.org snapshot BEFORE touching the live site — zero load on the
+# target, zero ban risk. A missing/older-than-window/thin snapshot always falls
+# through to the live ladder. Archive requests run through the normal HTTP
+# engine, so archive.org gets the same politeness governor as any host.
+[archive]
+enabled = false
+# base_url = "https://web.archive.org"   # override for a self-hosted pywb
+
 [browser]
 chrome_executable = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 headless = true

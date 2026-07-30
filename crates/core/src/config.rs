@@ -23,6 +23,33 @@ pub struct Config {
     pub webhooks: WebhooksConfig,
     pub resilience: ResilienceConfig,
     pub datahub: DatahubConfig,
+    pub archive: ArchiveConfig,
+}
+
+/// Tier-zero archive engine (Wayback Machine CDX, v1). When enabled, the server
+/// wires an archive engine into the tiered fetcher; a fetch that sets
+/// `archive_max_age` then tries a stored snapshot BEFORE touching the live site
+/// (zero load on the target, zero ban risk). Disabled by default — when off the
+/// engine is never constructed and `archive_max_age` is inert.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ArchiveConfig {
+    /// Master switch. `false` = the archive engine is never built.
+    pub enabled: bool,
+    /// Base URL of the Wayback deployment: both the CDX index
+    /// (`<base>/cdx/search/cdx`) and raw snapshot bodies
+    /// (`<base>/web/<ts>id_/<url>`) are served under it. Overridable for a
+    /// self-hosted pywb instance.
+    pub base_url: String,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: "https://web.archive.org".into(),
+        }
+    }
 }
 
 /// Extraction-health detection: how a source's runs are judged against its own
@@ -330,6 +357,22 @@ impl Config {
                     r.sketch_retention_runs, r.window_runs
                 )));
             }
+        }
+
+        // The archive engine builds every CDX/snapshot URL off base_url; a value
+        // that isn't an absolute http(s) URL yields requests that fail far from
+        // here with an unhelpful reqwest parse error on every single fetch.
+        let a = &self.archive;
+        if a.enabled
+            && !matches!(
+                url::Url::parse(&a.base_url).as_ref().map(|u| u.scheme()),
+                Ok("http") | Ok("https")
+            )
+        {
+            return Err(Error::Config(format!(
+                "[archive] base_url ('{}') must be an absolute http(s) URL",
+                a.base_url
+            )));
         }
 
         // A cap below the base means the very first penalty already exceeds it, so
@@ -877,6 +920,30 @@ mod tests {
         let r = ResilienceConfig::default();
         assert!(r.enabled, "detection is on by default");
         assert!(!r.enforce, "enforcement must be opt-in after a soak");
+    }
+
+    #[test]
+    fn archive_ships_disabled_with_a_valid_base() {
+        let a = ArchiveConfig::default();
+        assert!(!a.enabled, "the archive tier must be opt-in");
+        assert_eq!(a.base_url, "https://web.archive.org");
+        Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn enabled_archive_rejects_a_broken_base_url() {
+        let mut cfg = Config::default();
+        cfg.archive.enabled = true;
+        cfg.archive.base_url = "not a url".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("[archive] base_url"), "{err}");
+        // Disabled => the rule doesn't bind (nothing reads the section).
+        cfg.archive.enabled = false;
+        assert!(cfg.validate().is_ok());
+        // Enabled with a sane base passes.
+        cfg.archive.enabled = true;
+        cfg.archive.base_url = "http://localhost:8090".into();
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

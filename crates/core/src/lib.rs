@@ -71,8 +71,8 @@ pub use crawl::{
 pub use engine::{
     profile_browser_dir, profile_cookies_path, profile_dir, validate_profile_name, Browser,
     EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, PageAction, RenderRequest,
-    RenderedPage, ResearchOutput, ResearchRequest, Researcher, PROFILE_BROWSER_DIR,
-    PROFILE_COOKIES_FILE, PROFILE_NAME_MAX_LEN,
+    RenderedPage, ResearchOutput, ResearchRequest, Researcher, FETCHED_VIA_HEADER,
+    PROFILE_BROWSER_DIR, PROFILE_COOKIES_FILE, PROFILE_NAME_MAX_LEN, SNAPSHOT_TS_HEADER,
 };
 pub use error::{Error, Result};
 pub use extract::{
