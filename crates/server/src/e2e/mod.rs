@@ -9,6 +9,7 @@
 //! network beyond loopback, no real engines.
 
 mod body_limit;
+mod durable;
 mod harness;
 mod router;
 mod scheduler_overlap;
