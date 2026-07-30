@@ -23,6 +23,7 @@ pub fn apps() -> Vec<Arc<dyn ScrapeApp>> {
         Arc::new(app_cordis::Cordis),
         Arc::new(app_homewyse_pricing::HomewysePricing),
         Arc::new(app_state_tax::StateTax),
+        Arc::new(app_state_licensing::StateLicensing),
         Arc::new(app_valuation_multiples::ValuationMultiples),
         Arc::new(app_trade_wages::TradeWages),
         Arc::new(app_ca_grants::CaGrants),
