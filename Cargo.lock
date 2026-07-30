@@ -325,6 +325,7 @@ name = "app-crawl"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "pumper-core",
  "serde_json",
  "tokio",
@@ -345,6 +346,7 @@ dependencies = [
 name = "app-extractor"
 version = "0.1.0"
 dependencies = [
+ "app-crawl",
  "async-trait",
  "chrono",
  "futures",
@@ -460,6 +462,16 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+]
+
+[[package]]
+name = "app-state-licensing"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pumper-core",
+ "serde_json",
+ "trades-common",
 ]
 
 [[package]]
@@ -3678,7 +3690,9 @@ name = "pumper-engine-search"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "pumper-core",
+ "regex",
  "serde_json",
  "tantivy",
  "tokio",
@@ -3723,6 +3737,7 @@ dependencies = [
  "app-readable",
  "app-research",
  "app-smlouvy-dump-watch",
+ "app-state-licensing",
  "app-state-tax",
  "app-trade-wages",
  "app-valuation-multiples",
