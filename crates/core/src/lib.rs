@@ -63,7 +63,8 @@ pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
 #[cfg(feature = "storage")]
 pub use storage::{
     Delivery, EnqueueOptions, IngressSource, JobTimingStats, NewDerivedSpec, NewSchedule,
-    NewTrigger, SavedSearch, Schedule, Storage, Trigger, Watch, YieldSummary, MAX_CHECKPOINT_BYTES,
+    NewTrigger, SavedSearch, Schedule, SearchMaterialize, Storage, Trigger, Watch, YieldSummary,
+    MAX_CHECKPOINT_BYTES,
 };
 #[cfg(feature = "storage")]
 pub use tiers::{HostProfile, TierMemory};

@@ -139,6 +139,9 @@ max_concurrent = 0          # max plugin runs at once host-wide (0 = one per CPU
 [search]
 enabled = true
 dir = "data/search-index"
+# Per-run cap on hits a materialized saved search (POST /searches with
+# `materialize: {app, dataset}`) snapshots into its view dataset.
+max_materialize_results = 500
 
 # Result delivery via webhooks (job callbacks + dataset-watch events).
 [webhooks]
