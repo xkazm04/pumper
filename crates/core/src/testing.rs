@@ -289,6 +289,7 @@ impl<'a> TestContext<'a> {
             health: self.health.unwrap_or_else(|| {
                 Arc::new(Resilience::new(pool.clone(), &ResilienceConfig::default()))
             }),
+            recipes: Arc::new(crate::recipes::RecipeStore::new(pool.clone())),
             plugins: Arc::new(NoPlugins),
             progress: Arc::new(NoProgress),
             checkpoints: Arc::new(NoCheckpoints),

@@ -9,6 +9,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::config::StorageConfig;
+use crate::datasets::DerivedSpec;
 use crate::job::{Job, JobStatus};
 use crate::{Error, Result};
 
@@ -1495,6 +1496,16 @@ impl Storage {
         Ok(())
     }
 
+    // ── api recipes ──────────────────────────────────────────────────────────
+
+    /// Handle to the API X-ray recipe store (`api_recipes`, migration 0025) on
+    /// this database. The SQL lives on [`crate::recipes::RecipeStore`] (the
+    /// `TierMemory` pattern: a small pool-wrapping handle shared on
+    /// `AppContext`); this is the one constructor the server/routes reach it by.
+    pub fn recipes(&self) -> crate::recipes::RecipeStore {
+        crate::recipes::RecipeStore::new(self.pool.clone())
+    }
+
     // ── job yield ────────────────────────────────────────────────────────────
 
     /// Persists the yield entries parsed from one completed job's result
@@ -1547,6 +1558,103 @@ impl Storage {
         .await?;
         Ok(rows)
     }
+
+    // ── derived ──────────────────────────────────────────────────────────────
+    // CRUD for derived-dataset specs (M11). The hot-path read (enabled specs
+    // for one source) and the recompute/backfill mechanics live on `Datasets`;
+    // this is the management surface. Cycle rejection happens at create time
+    // here — the one write path a spec can enter through.
+
+    /// Creates a derived spec, assigning its id. Rejects a spec that would
+    /// close a cycle through the existing specs of the same app (including the
+    /// self-loop `source == target`) — acyclic chains stay bounded at runtime
+    /// by the depth cap, cycles never terminate and are refused at the door.
+    pub async fn create_derived_spec(&self, n: &NewDerivedSpec<'_>) -> Result<DerivedSpec> {
+        let existing = self.list_derived_specs(Some(n.source_app)).await?;
+        if crate::datasets::derived_would_cycle(&existing, n.source_dataset, n.target_dataset) {
+            return Err(Error::BadRequest(format!(
+                "derived spec '{}' -> '{}' would create a cycle",
+                n.source_dataset, n.target_dataset
+            )));
+        }
+        let id = Uuid::new_v4().to_string();
+        let lookup_json = n
+            .lookup
+            .map(|l| serde_json::to_string(l).unwrap_or_else(|_| "null".into()));
+        sqlx::query(
+            "INSERT INTO derived (id, source_app, source_dataset, target_dataset, filters, \
+             project, lookup, enabled, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8)",
+        )
+        .bind(&id)
+        .bind(n.source_app)
+        .bind(n.source_dataset)
+        .bind(n.target_dataset)
+        .bind(serde_json::to_string(n.filters).unwrap_or_else(|_| "[]".into()))
+        .bind(serde_json::to_string(n.project).unwrap_or_else(|_| "{}".into()))
+        .bind(lookup_json)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_derived_spec(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_derived_spec(&self, id: &str) -> Result<Option<DerivedSpec>> {
+        let row: Option<crate::datasets::DerivedRow> = sqlx::query_as(&format!(
+            "SELECT {} FROM derived WHERE id = ?1",
+            crate::datasets::DERIVED_COLUMNS
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(DerivedSpec::try_from).transpose()
+    }
+
+    /// All derived specs, optionally filtered by source app.
+    pub async fn list_derived_specs(&self, app: Option<&str>) -> Result<Vec<DerivedSpec>> {
+        let rows: Vec<crate::datasets::DerivedRow> = sqlx::query_as(&format!(
+            "SELECT {} FROM derived WHERE (?1 IS NULL OR source_app = ?1) \
+             ORDER BY created_at, id",
+            crate::datasets::DERIVED_COLUMNS
+        ))
+        .bind(app)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(DerivedSpec::try_from).collect()
+    }
+
+    /// Per-spec kill-switch.
+    pub async fn set_derived_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE derived SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_derived_spec(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM derived WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+/// Create-time fields for a derived spec (borrowed; storage assigns
+/// id/enabled/time). Filters are `$.path:op:value` specs (validated by the
+/// caller via `datasets::parse_filter_specs`); `project` maps
+/// `out_field -> "$.path"`.
+pub struct NewDerivedSpec<'a> {
+    pub source_app: &'a str,
+    pub source_dataset: &'a str,
+    pub target_dataset: &'a str,
+    pub filters: &'a [String],
+    pub project: &'a std::collections::BTreeMap<String, String>,
+    pub lookup: Option<&'a crate::datasets::DerivedLookup>,
 }
 
 /// Hard cap on one checkpoint blob (bytes). Generous enough for a 100k-URL

@@ -103,7 +103,9 @@ impl AppState {
             search,
             registry,
         } = parts;
-        let datasets = Arc::new(Datasets::new(storage.pool()));
+        let datasets = Arc::new(
+            Datasets::new(storage.pool()).with_derived_max_depth(config.derived.max_depth),
+        );
         let costs = Arc::new(CostLedger::new(storage.pool()));
         let cache = Arc::new(HttpCache::new(storage.pool(), &config.cache));
         let research_cache = Arc::new(ResearchCache::new(

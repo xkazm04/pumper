@@ -20,6 +20,7 @@ pub struct Config {
     pub plugins: PluginConfig,
     pub search: SearchConfig,
     pub triggers: TriggersConfig,
+    pub derived: DerivedConfig,
     pub webhooks: WebhooksConfig,
     pub resilience: ResilienceConfig,
     pub datahub: DatahubConfig,
@@ -317,6 +318,22 @@ impl Default for WebhooksConfig {
             failure_secret: None,
             auto_retry: true,
         }
+    }
+}
+
+/// Derived-dataset (M11) recompute limits.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DerivedConfig {
+    /// Max derived-spec chain depth (a derived dataset feeding another spec);
+    /// hops past this are skipped (warn-logged). Cycles are rejected at
+    /// spec-create time; this cap bounds the acyclic chains.
+    pub max_depth: u32,
+}
+
+impl Default for DerivedConfig {
+    fn default() -> Self {
+        Self { max_depth: 3 }
     }
 }
 

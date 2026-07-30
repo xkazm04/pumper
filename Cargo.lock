@@ -327,6 +327,7 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 
@@ -345,8 +346,10 @@ name = "app-extractor"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
  "pumper-core",
+ "regex",
  "serde_json",
  "tokio",
  "tracing",
@@ -411,8 +414,10 @@ name = "app-plugin"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "chrono",
  "futures",
  "pumper-core",
+ "regex",
  "serde_json",
 ]
 
@@ -3625,6 +3630,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

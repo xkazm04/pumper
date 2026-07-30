@@ -25,6 +25,7 @@ pub(crate) use datasets::parse_filters;
 pub(crate) use jobs::merge_params;
 
 mod datasets;
+mod derived;
 mod error;
 mod events;
 mod health;
@@ -33,6 +34,7 @@ mod ingress;
 mod jobs;
 mod meta;
 mod query;
+mod recipes;
 mod runtime;
 mod schedules;
 mod search;
@@ -43,6 +45,7 @@ mod watches;
 // module so the `routes!(...)` registrations below resolve. Each submodule
 // exposes only its handlers as `pub(crate)`; DTOs and helpers stay private.
 use datasets::*;
+use derived::*;
 use events::*;
 use health::*;
 use economics::*;
@@ -50,6 +53,7 @@ use ingress::*;
 use jobs::*;
 use meta::*;
 use query::*;
+use recipes::*;
 use runtime::*;
 use schedules::*;
 use search::*;
@@ -75,6 +79,7 @@ use watches::*;
         (name = "schedules", description = "Cron schedules"),
         (name = "datasets", description = "Change-detected dataset records, export, history"),
         (name = "grants", description = "Filtered query surface over the cross-source grants corpus"),
+        (name = "derived", description = "Derived datasets: filter/project/lookup specs recomputed on upstream deltas"),
         (name = "watches", description = "Dataset change webhooks"),
         (name = "triggers", description = "Reactive pipelines"),
         (name = "ingress", description = "Inbound event ingress: signed external webhooks as trigger inputs"),
@@ -85,6 +90,7 @@ use watches::*;
         (name = "events", description = "Server-sent event streams"),
         (name = "hosts", description = "Learned per-host tier memory and politeness"),
         (name = "profiles", description = "Session vault: named login profiles"),
+        (name = "recipes", description = "API X-ray: discovered JSON-API endpoints behind rendered pages"),
         (name = "meta", description = "The OpenAPI document itself"),
         (name = "sources", description = "Extraction health: per-source degradation detection"),
     )
@@ -160,6 +166,10 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(dataset_duplicates))
         .routes(routes!(dataset_changes))
         .routes(routes!(record_history))
+        .routes(routes!(list_derived, create_derived))
+        .routes(routes!(get_derived, delete_derived))
+        .routes(routes!(set_derived_enabled))
+        .routes(routes!(backfill_derived))
         .routes(routes!(list_watches, create_watch))
         .routes(routes!(delete_watch))
         .routes(routes!(set_watch_enabled))
@@ -179,6 +189,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(get_host))
         .routes(routes!(delete_host_memory))
         .routes(routes!(list_profiles))
+        .routes(routes!(list_recipes))
         .routes(routes!(list_plugins))
         .routes(routes!(reload_plugins))
         .routes(routes!(search))
@@ -398,6 +409,12 @@ mod api_spec_tests {
         "DELETE /datasets/{app}/{dataset}/records/{key}",
         "GET /datasets/{app}/{dataset}/changes",
         "GET /datasets/{app}/{dataset}/history",
+        "GET /derived",
+        "POST /derived",
+        "GET /derived/{id}",
+        "DELETE /derived/{id}",
+        "POST /derived/{id}/enabled",
+        "POST /derived/{id}/backfill",
         "GET /watches",
         "POST /watches",
         "DELETE /watches/{id}",
@@ -420,6 +437,7 @@ mod api_spec_tests {
         "GET /hosts/{host}",
         "DELETE /hosts/{host}/memory",
         "GET /profiles",
+        "GET /recipes",
         "GET /plugins",
         "POST /plugins/reload",
         "GET /search",

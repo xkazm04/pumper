@@ -33,6 +33,7 @@ pub mod json_salvage;
 pub mod lru;
 pub mod markdown;
 pub mod plugin;
+pub mod recipes;
 pub mod resilience;
 pub mod search;
 pub mod simhash;
@@ -48,8 +49,9 @@ pub use cache::{HttpCache, ResearchCache, StaleEntry};
 pub use costs::{extract_yields, CostEvent, CostLedger, CostSummary, SpentTotal, YieldEntry};
 #[cfg(feature = "storage")]
 pub use datasets::{
-    diff_values, trust_label, ChangeKind, Datasets, DupPair, Record, Revision, RevisionPage,
-    UpsertSummary, TRUST_STABLE,
+    derived_would_cycle, diff_values, filters_match, parse_filter_spec, parse_filter_specs,
+    project_value, trust_label, ChangeKind, Datasets, DerivedBackfill, DerivedLookup, DerivedSpec,
+    DupPair, Record, Revision, RevisionPage, UpsertSummary, TRUST_STABLE,
 };
 pub use resilience::{
     doc_signals, signals_batch, CohortDrift, Diagnosis, DocSignals, FetchHealth, ObservedDoc,
@@ -59,8 +61,8 @@ pub use resilience::{
 pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
 #[cfg(feature = "storage")]
 pub use storage::{
-    Delivery, EnqueueOptions, IngressSource, JobTimingStats, NewSchedule, NewTrigger, SavedSearch,
-    Schedule, Storage, Trigger, Watch, YieldSummary, MAX_CHECKPOINT_BYTES,
+    Delivery, EnqueueOptions, IngressSource, JobTimingStats, NewDerivedSpec, NewSchedule,
+    NewTrigger, SavedSearch, Schedule, Storage, Trigger, Watch, YieldSummary, MAX_CHECKPOINT_BYTES,
 };
 #[cfg(feature = "storage")]
 pub use tiers::{HostProfile, TierMemory};
@@ -76,7 +78,8 @@ pub use crawl::{
 };
 pub use engine::{
     profile_browser_dir, profile_cookies_path, profile_dir, validate_profile_name, Browser,
-    EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, PageAction, RenderRequest,
+    CapturedCall, EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, PageAction,
+    RenderRequest,
     RenderedPage, ResearchOutput, ResearchRequest, Researcher, FETCHED_VIA_HEADER,
     PROFILE_BROWSER_DIR, PROFILE_COOKIES_FILE, PROFILE_NAME_MAX_LEN, SNAPSHOT_TS_HEADER,
 };
@@ -95,6 +98,9 @@ pub use json_salvage::salvage_json;
 pub use lru::{lru_touch, lru_touch_evict};
 pub use markdown::html_to_markdown;
 pub use plugin::{NoPlugins, Plugins};
+pub use recipes::{discover_recipes, ApiRecipe};
+#[cfg(feature = "storage")]
+pub use recipes::RecipeStore;
 pub use search::{
     FacetCount, NoSearch, Search, SearchDoc, SearchFacets, SearchHit, SearchRequest,
     SearchResponse, SearchSort,
