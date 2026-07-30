@@ -135,24 +135,36 @@ impl ScrapeApp for CensusDensity {
 
         // Trades: params.naics (array of codes) overrides the defaults; a custom
         // code keeps its own string as the label.
+        // A human-enabled `trades/taxonomy` registry trade is covered on the
+        // next run with zero code change; when the registry dataset is
+        // absent/empty the compile-time DEFAULT_TRADES behave exactly as before.
+        let label_for = |c: &str| -> String {
+            DEFAULT_TRADES
+                .iter()
+                .find(|(k, _)| *k == c)
+                .map(|(_, l)| l.to_string())
+                .unwrap_or_else(|| c.to_string())
+        };
         let trades: Vec<(String, String)> = match ctx.params.get("naics").and_then(Value::as_array)
         {
             Some(arr) => arr
                 .iter()
                 .filter_map(Value::as_str)
-                .map(|c| {
-                    let label = DEFAULT_TRADES
-                        .iter()
-                        .find(|(k, _)| *k == c)
-                        .map(|(_, l)| l.to_string())
-                        .unwrap_or_else(|| c.to_string());
-                    (c.to_string(), label)
-                })
+                .map(|c| (c.to_string(), label_for(c)))
                 .collect(),
-            None => DEFAULT_TRADES
-                .iter()
-                .map(|(c, l)| (c.to_string(), l.to_string()))
-                .collect(),
+            None => match trades_common::taxonomy::registry_naics(&ctx, 6).await? {
+                Some(codes) => codes
+                    .into_iter()
+                    .map(|c| {
+                        let l = label_for(&c);
+                        (c, l)
+                    })
+                    .collect(),
+                None => DEFAULT_TRADES
+                    .iter()
+                    .map(|(c, l)| (c.to_string(), l.to_string()))
+                    .collect(),
+            },
         };
 
         // Key: param → env. Census requires it (keyless 302 → missing_key.html).

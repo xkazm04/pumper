@@ -29,6 +29,7 @@ pub mod error;
 pub mod extract;
 pub mod fetcher;
 pub mod governor;
+pub mod induce;
 pub mod jitter;
 pub mod job;
 pub mod json_salvage;
@@ -97,6 +98,7 @@ pub use fetcher::{
     FetchOutcome, FetchRequest, FetchStrategy, FetchTier, Fetcher, TierTrace, TierVerdict,
 };
 pub use governor::Governor;
+pub use induce::{induce, ContainerStats, FieldSupport, InduceOptions, Induction};
 pub use jitter::lcg_fraction;
 pub use job::{Job, JobStatus};
 pub use json_salvage::salvage_json;

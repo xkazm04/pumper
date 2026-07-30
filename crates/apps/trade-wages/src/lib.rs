@@ -16,6 +16,14 @@
 //! tax pipeline pulled live rates. National by trade in ONE call; per-state wage detail
 //! can layer on later (census-density already carries a per-state payroll signal).
 //! Params: {"year": "2024", "role": "research|compose", "max_turns": 25}.
+//!
+//! The trade universe comes from the governed `trades/taxonomy` registry
+//! (compile-time enum as fallback — identical behavior while the registry is
+//! absent). This app also hosts the TAXONOMY PROPOSER mode: `{"propose_trade":
+//! "roofing"}` runs ONE metered research call that maps the candidate trade to
+//! its SOC code / NAICS codes / aliases and upserts a `trades/taxonomy` record
+//! with `source: "proposed", enabled: false`. Nothing consumes it until a
+//! human flips `enabled` — there is NO auto-enable.
 
 use async_trait::async_trait;
 use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
@@ -40,8 +48,11 @@ impl ScrapeApp for TradeWages {
          entry (10th pct) / median / experienced (90th pct) hourly + annual wage per \
          trade, with the SOC code + national employment. Upserted into the `wages` \
          dataset; grounds a 'what to pay your first hire' read. No API key (local Claude \
-         CLI; costs money per run). Params: {\"year\": \"2024\", \"role\": \
-         \"research|compose\", \"max_turns\": 25}."
+         CLI; costs money per run). Trade universe comes from the governed \
+         `trades/taxonomy` registry (compile-time enum as fallback). Params: \
+         {\"year\": \"2024\", \"role\": \"research|compose\", \"max_turns\": 25, \
+         \"propose_trade\": \"roofing\" (taxonomy-proposer mode: one metered call \
+         drafts a trades/taxonomy record with enabled:false — a human flips it)}."
     }
 
     fn default_params(&self) -> Value {
@@ -68,6 +79,12 @@ impl ScrapeApp for TradeWages {
             .map(|t| t as u32)
             .or(Some(25));
 
+        // Taxonomy-proposer mode: one metered call that DRAFTS a registry
+        // record for a candidate trade (enabled: false — a human flips it).
+        if let Some(candidate) = ctx.params.get("propose_trade").and_then(Value::as_str) {
+            return propose_trade(&ctx, candidate, role, max_turns).await;
+        }
+
         // Vintage freshness gate: a BLS OEWS vintage is frozen, so re-running for a
         // year we already hold would re-pay a 25-turn agentic run for identical
         // figures. Skip unless `force: true`. Sentinel = the first trade's row.
@@ -83,7 +100,11 @@ impl ScrapeApp for TradeWages {
             }));
         }
 
-        let trades = taxonomy::prompt_list();
+        // Trade universe = governed registry, enum fallback (identical list —
+        // and prompt — while the registry dataset is absent).
+        let entries = taxonomy::taxonomy(&ctx).await?;
+        let trades = taxonomy::prompt_list_of(&entries);
+        let n_trades = entries.len();
         let prompt = format!(
             "You are a US labor-market analyst. For BLS OEWS year {year}, compile the \
              national wage band for the tradesperson occupation behind each of these \
@@ -99,7 +120,7 @@ impl ScrapeApp for TradeWages {
              \"entry_hourly\": number, \"entry_annual\": number, \"experienced_hourly\": number, \
              \"experienced_annual\": number, \"employment\": number}}]}}\n\
              entry = 10th percentile, experienced = 90th percentile. Hourly in dollars \
-             (e.g. 30.10), annual in whole dollars. Include all 5 trades."
+             (e.g. 30.10), annual in whole dollars. Include all {n_trades} trades."
         );
 
         let mut request = ResearchRequest::new(prompt).with_role(role);
@@ -119,7 +140,7 @@ impl ScrapeApp for TradeWages {
         request.json_schema = Some(wages_schema());
         let (data, output) = trades_common::research_json(&ctx, "trade-wages", request).await?;
 
-        let (all_records, rejected, unknown_trades) = collect_wage_records(&data, &year);
+        let (all_records, rejected, unknown_trades) = collect_wage_records(&entries, &data, &year);
 
         if all_records.is_empty() {
             return Err(Error::App(
@@ -158,6 +179,7 @@ impl ScrapeApp for TradeWages {
 /// - Trade labels the model returned that don't map to a canonical trade are
 ///   kept raw (not dropped) but surfaced so drift is visible.
 fn collect_wage_records(
+    entries: &[taxonomy::TradeEntry],
     data: &Value,
     year: &str,
 ) -> (Vec<(String, Value)>, Vec<Rejection>, Vec<String>) {
@@ -177,7 +199,9 @@ fn collect_wage_records(
             }
             // Normalize to a canonical label so phrasing drift can't mint a
             // duplicate key; unknown labels keep the raw string and are flagged.
-            let (trade, known) = taxonomy::canonicalize(&raw);
+            // Registry-aware: enum matcher first (legacy semantics), then
+            // enabled registry trades' aliases.
+            let (trade, known) = taxonomy::canonicalize_in(entries, &raw);
             if !known {
                 unknown_trades.push(raw.clone());
             }
@@ -260,6 +284,285 @@ fn wages_schema() -> Value {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Taxonomy proposer mode
+// ---------------------------------------------------------------------------
+
+/// One metered research call that maps a candidate trade (e.g. "roofing") to a
+/// DRAFT `trades/taxonomy` registry record: canonical label, SOC code, 6-digit
+/// NAICS codes, keyword aliases. Upserted with `source: "proposed",
+/// enabled: false` — a human flips `enabled` to make the trade live across the
+/// research + census apps. NEVER auto-enabled, never expands scheduled runs.
+async fn propose_trade(
+    ctx: &AppContext,
+    candidate: &str,
+    role: String,
+    max_turns: Option<u32>,
+) -> Result<Value> {
+    let candidate = candidate.trim();
+    if candidate.is_empty() {
+        return Err(Error::App("trade-wages: propose_trade is empty".into()));
+    }
+
+    // Materialize the seed rows the first time the registry is touched, WITHOUT
+    // overwriting rows a human may already have edited (get-before-upsert).
+    let mut seeded = 0usize;
+    for t in taxonomy::Trade::ALL {
+        let (key, rec) = taxonomy::seed_record(t);
+        if ctx
+            .datasets
+            .get(taxonomy::TAXONOMY_APP, taxonomy::TAXONOMY_DATASET, &key)
+            .await?
+            .is_none()
+        {
+            ctx.datasets
+                .upsert_many(
+                    taxonomy::TAXONOMY_APP,
+                    taxonomy::TAXONOMY_DATASET,
+                    &[(key, rec)],
+                )
+                .await?;
+            seeded += 1;
+        }
+    }
+
+    // Already covered? Then the metered call would buy nothing.
+    let entries = taxonomy::taxonomy(ctx).await?;
+    let (canonical, known) = taxonomy::canonicalize_in(&entries, candidate);
+    if known {
+        return Ok(json!({
+            "source": "agentic/taxonomy-propose",
+            "candidate": candidate,
+            "skipped": format!("already covered by canonical trade {canonical:?}"),
+            "seeded": seeded,
+            "cost_usd": 0.0,
+        }));
+    }
+
+    let existing = taxonomy::prompt_list_of(&entries);
+    let prompt = format!(
+        "You are a US labor-market taxonomist for home-services trades. Map the \
+         candidate trade **{candidate}** onto the reference classifications, using web \
+         search to verify (bls.gov SOC/OEWS for the occupation, census.gov NAICS 2017 \
+         for the industry codes).\n\n\
+         Respond with ONLY a JSON object (no markdown fences, no prose) of this shape:\n\
+         {{\"trade\": string (canonical short display label, e.g. \"Roofing\"), \
+         \"soc_code\": string (best-fit BLS SOC, format NN-NNNN), \
+         \"occupation\": string (the SOC occupation title), \
+         \"naics\": [string] (the 6-digit NAICS 2017 code(s) these businesses file \
+         under), \
+         \"aliases\": [string] (3-8 lowercase keyword stems that identify this trade in \
+         free text, e.g. \"roof\", \"shingle\" — stems, so \"roof\" also matches \
+         \"roofer\"/\"roofing\"), \
+         \"notes\": string (one sentence on the mapping and any ambiguity)}}\n\
+         The label must NOT duplicate an existing trade ({existing})."
+    );
+    let mut request = ResearchRequest::new(prompt).with_role(role);
+    request.max_turns = max_turns;
+    request.model = ctx
+        .params
+        .get("model")
+        .and_then(Value::as_str)
+        .map(String::from);
+    request.effort = ctx
+        .params
+        .get("effort")
+        .and_then(Value::as_str)
+        .map(String::from);
+    request.json_schema = Some(propose_schema());
+    let artifact = format!("propose-{}.json", propose_slug(candidate));
+    let (data, output) =
+        trades_common::research_json_named(ctx, "trade-wages", request, &artifact).await?;
+
+    // Validate. A failed proposal reports its reasons (the answer is already
+    // paid for) and upserts NOTHING — bad mappings must not enter the registry
+    // even in a disabled state a human might flip half-read.
+    match parse_proposed_entry(&data, candidate) {
+        Err(reasons) => Ok(json!({
+            "source": "agentic/taxonomy-propose",
+            "candidate": candidate,
+            "proposed": Value::Null,
+            "rejected": reasons,
+            "seeded": seeded,
+            "cost_usd": output.cost_usd,
+            "duration_ms": output.duration_ms,
+            "num_turns": output.num_turns,
+        })),
+        Ok((key, record)) => {
+            // The agent's canonical label must not collide with a live trade,
+            // and a seed/approved row is never overwritten by a proposal.
+            let (resolved, dup) = taxonomy::canonicalize_in(&entries, &key);
+            if dup {
+                return Ok(json!({
+                    "source": "agentic/taxonomy-propose",
+                    "candidate": candidate,
+                    "proposed": Value::Null,
+                    "rejected": [format!(
+                        "proposed label {key:?} resolves to existing trade {resolved:?}"
+                    )],
+                    "seeded": seeded,
+                    "cost_usd": output.cost_usd,
+                }));
+            }
+            if let Some(prior) = ctx
+                .datasets
+                .get(taxonomy::TAXONOMY_APP, taxonomy::TAXONOMY_DATASET, &key)
+                .await?
+            {
+                let src = prior.data.get("source").and_then(Value::as_str).unwrap_or("");
+                if src != "proposed" {
+                    return Ok(json!({
+                        "source": "agentic/taxonomy-propose",
+                        "candidate": candidate,
+                        "proposed": Value::Null,
+                        "rejected": [format!(
+                            "registry already holds a {src:?} record for {key:?} — not overwritten"
+                        )],
+                        "seeded": seeded,
+                        "cost_usd": output.cost_usd,
+                    }));
+                }
+            }
+            let summary = ctx
+                .datasets
+                .upsert_many(
+                    taxonomy::TAXONOMY_APP,
+                    taxonomy::TAXONOMY_DATASET,
+                    &[(key.clone(), record.clone())],
+                )
+                .await?;
+            Ok(json!({
+                "source": "agentic/taxonomy-propose",
+                "candidate": candidate,
+                "proposed": record,
+                "key": key,
+                "enabled": false,
+                "next_step": "review the record, then set enabled:true on trades/taxonomy \
+                              to make every trades + census app cover it on its next run",
+                "seeded": seeded,
+                "new": summary.new.len(),
+                "changed": summary.changed.len(),
+                "cost_usd": output.cost_usd,
+                "duration_ms": output.duration_ms,
+                "num_turns": output.num_turns,
+            }))
+        }
+    }
+}
+
+/// Validate the proposer's answer into a `(key, record)` registry upsert.
+/// Pure so the guards are testable. Errors carry per-field reasons.
+fn parse_proposed_entry(
+    data: &Value,
+    candidate: &str,
+) -> std::result::Result<(String, Value), Vec<String>> {
+    let mut reasons = Vec::new();
+
+    let label = data
+        .get("trade")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if label.is_empty() {
+        reasons.push("trade: missing canonical label".into());
+    }
+
+    let soc = data
+        .get("soc_code")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .unwrap_or("");
+    if !is_soc_code(soc) {
+        reasons.push(format!("soc_code: {soc:?} not NN-NNNN"));
+    }
+
+    let naics: Vec<String> = data
+        .get("naics")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(|s| s.trim().to_string())
+                .collect()
+        })
+        .unwrap_or_default();
+    if naics.is_empty() {
+        reasons.push("naics: no codes".into());
+    }
+    for c in &naics {
+        if c.len() != 6 || !c.chars().all(|ch| ch.is_ascii_digit()) {
+            reasons.push(format!("naics: {c:?} not a 6-digit code"));
+        }
+    }
+
+    let aliases: Vec<String> = data
+        .get("aliases")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(|s| s.trim().to_lowercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    if aliases.is_empty() {
+        reasons.push("aliases: none".into());
+    }
+
+    if !reasons.is_empty() {
+        return Err(reasons);
+    }
+    Ok((
+        label.to_string(),
+        serde_json::json!({
+            "trade": label,
+            "soc_code": soc,
+            "occupation": data.get("occupation").cloned().unwrap_or(Value::Null),
+            "naics": naics,
+            "aliases": aliases,
+            "notes": data.get("notes").cloned().unwrap_or(Value::Null),
+            "proposed_from": candidate,
+            // Governance: proposals are born DISABLED. A human flips this.
+            "enabled": false,
+            "source": "proposed",
+        }),
+    ))
+}
+
+/// `NN-NNNN` SOC-code shape check (e.g. `47-2181`).
+fn is_soc_code(s: &str) -> bool {
+    let b = s.as_bytes();
+    b.len() == 7
+        && b[2] == b'-'
+        && b[..2].iter().all(u8::is_ascii_digit)
+        && b[3..].iter().all(u8::is_ascii_digit)
+}
+
+/// Artifact-name-safe slug for a candidate trade ("Pest control" → "pest-control").
+fn propose_slug(s: &str) -> String {
+    s.to_lowercase()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+/// Structured-output contract for the proposer (`claude --json-schema`).
+fn propose_schema() -> Value {
+    json!({
+        "type": "object",
+        "properties": {
+            "trade": { "type": "string" },
+            "soc_code": { "type": "string" },
+            "occupation": { "type": "string" },
+            "naics": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+            "aliases": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
+            "notes": { "type": "string" }
+        },
+        "required": ["trade", "soc_code", "naics", "aliases"]
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -282,7 +585,7 @@ mod tests {
         // Median above the 90th percentile: implausible, must not upsert.
         bad["median_hourly"] = json!(60.0);
         let data = json!({ "trades": [bad, wage_entry("Plumbing")] });
-        let (records, rejected, _) = collect_wage_records(&data, "2024");
+        let (records, rejected, _) = collect_wage_records(&taxonomy::seed_entries(), &data, "2024");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].0, "US:Plumbing");
         assert_eq!(rejected.len(), 1);
@@ -295,7 +598,7 @@ mod tests {
         // "Plumbers" (a model phrasing) must land on the same key as "Plumbing"
         // and the stored `trade` field must agree with the key.
         let data = json!({ "trades": [wage_entry("Plumbers")] });
-        let (records, rejected, unknown) = collect_wage_records(&data, "2024");
+        let (records, rejected, unknown) = collect_wage_records(&taxonomy::seed_entries(), &data, "2024");
         assert!(rejected.is_empty());
         assert!(unknown.is_empty());
         let (key, rec) = &records[0];
@@ -309,10 +612,69 @@ mod tests {
     #[test]
     fn unknown_trade_labels_are_kept_and_flagged_not_dropped() {
         let data = json!({ "trades": [wage_entry("Roofing")] });
-        let (records, _, unknown) = collect_wage_records(&data, "2024");
+        let (records, _, unknown) = collect_wage_records(&taxonomy::seed_entries(), &data, "2024");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].0, "US:Roofing");
         assert_eq!(unknown, vec!["Roofing".to_string()]);
+    }
+
+    #[test]
+    fn registry_trade_resolves_in_wage_records_when_enabled() {
+        // A registry-enabled trade must key + canonicalize like a seed trade.
+        let mut entries = taxonomy::seed_entries();
+        entries.push(taxonomy::TradeEntry {
+            label: "Roofing".into(),
+            soc_code: "47-2181".into(),
+            naics: vec!["238160".into()],
+            aliases: vec!["roof".into()],
+            source: "approved".into(),
+        });
+        let data = json!({ "trades": [wage_entry("Roofing contractors")] });
+        let (records, _, unknown) = collect_wage_records(&entries, &data, "2024");
+        assert_eq!(records[0].0, "US:Roofing");
+        assert!(unknown.is_empty());
+    }
+
+    #[test]
+    fn proposed_entry_is_born_disabled_with_source_proposed() {
+        let data = json!({
+            "trade": "Roofing", "soc_code": "47-2181",
+            "occupation": "Roofers",
+            "naics": ["238160"], "aliases": ["Roof", "shingle"],
+            "notes": "clean mapping",
+        });
+        let (key, rec) = parse_proposed_entry(&data, "roofing").unwrap();
+        assert_eq!(key, "Roofing");
+        assert_eq!(rec["enabled"], false, "NEVER auto-enabled");
+        assert_eq!(rec["source"], "proposed");
+        assert_eq!(rec["proposed_from"], "roofing");
+        assert_eq!(rec["aliases"][0], "roof", "aliases lowercased");
+        // The record must merge into the taxonomy ONLY once a human flips enabled.
+        assert_eq!(taxonomy::merge_taxonomy(&[rec.clone()]).len(), 5);
+        let mut flipped = rec.clone();
+        flipped["enabled"] = json!(true);
+        assert_eq!(taxonomy::merge_taxonomy(&[flipped]).len(), 6);
+    }
+
+    #[test]
+    fn proposed_entry_rejects_bad_soc_naics_and_missing_aliases() {
+        let bad = json!({
+            "trade": "Roofing", "soc_code": "472181",
+            "naics": ["23816"], "aliases": [],
+        });
+        let reasons = parse_proposed_entry(&bad, "roofing").unwrap_err();
+        assert!(reasons.iter().any(|r| r.contains("soc_code")));
+        assert!(reasons.iter().any(|r| r.contains("6-digit")));
+        assert!(reasons.iter().any(|r| r.contains("aliases")));
+        assert!(parse_proposed_entry(&json!({}), "roofing").is_err());
+    }
+
+    #[test]
+    fn soc_code_shape_check() {
+        assert!(is_soc_code("47-2181"));
+        assert!(!is_soc_code("47-218"));
+        assert!(!is_soc_code("4a-2181"));
+        assert!(!is_soc_code(""));
     }
 
     #[test]
@@ -320,7 +682,7 @@ mod tests {
         let mut bad = wage_entry("HVAC");
         bad["employment"] = json!(0);
         let data = json!({ "trades": [bad] });
-        let (records, rejected, _) = collect_wage_records(&data, "2024");
+        let (records, rejected, _) = collect_wage_records(&taxonomy::seed_entries(), &data, "2024");
         assert!(records.is_empty());
         assert!(rejected[0].reasons.iter().any(|r| r.contains("employment")));
     }

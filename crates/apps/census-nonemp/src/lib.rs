@@ -87,24 +87,37 @@ impl ScrapeApp for CensusNonemp {
             .trim()
             .to_string();
 
+        // params.naics overrides everything; otherwise the governed
+        // `trades/taxonomy` registry drives the code list at this app's
+        // 4-digit grain (a human-enabled trade is covered on the next run).
+        // Registry absent/empty ⇒ compile-time DEFAULT_TRADES, exactly as before.
+        let label_for = |c: &str| -> String {
+            DEFAULT_TRADES
+                .iter()
+                .find(|(k, _)| *k == c)
+                .map(|(_, l)| l.to_string())
+                .unwrap_or_else(|| c.to_string())
+        };
         let trades: Vec<(String, String)> = match ctx.params.get("naics").and_then(Value::as_array)
         {
             Some(arr) => arr
                 .iter()
                 .filter_map(Value::as_str)
-                .map(|c| {
-                    let label = DEFAULT_TRADES
-                        .iter()
-                        .find(|(k, _)| *k == c)
-                        .map(|(_, l)| l.to_string())
-                        .unwrap_or_else(|| c.to_string());
-                    (c.to_string(), label)
-                })
+                .map(|c| (c.to_string(), label_for(c)))
                 .collect(),
-            None => DEFAULT_TRADES
-                .iter()
-                .map(|(c, l)| (c.to_string(), l.to_string()))
-                .collect(),
+            None => match trades_common::taxonomy::registry_naics(&ctx, 4).await? {
+                Some(codes) => codes
+                    .into_iter()
+                    .map(|c| {
+                        let l = label_for(&c);
+                        (c, l)
+                    })
+                    .collect(),
+                None => DEFAULT_TRADES
+                    .iter()
+                    .map(|(c, l)| (c.to_string(), l.to_string()))
+                    .collect(),
+            },
         };
 
         let api_key = census_common::api_key(&ctx, "census-nonemp")?;

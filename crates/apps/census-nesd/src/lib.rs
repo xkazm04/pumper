@@ -117,24 +117,37 @@ impl ScrapeApp for CensusNesd {
             .unwrap_or(DEFAULT_AGE_QUESTION)
             .to_string();
 
+        // params.naics overrides everything; otherwise the governed
+        // `trades/taxonomy` registry drives the list at NES-D's 2-digit sector
+        // grain (an enabled trade's sector joins on the next run). Registry
+        // absent/empty ⇒ compile-time DEFAULT_SECTORS, exactly as before.
+        let label_for = |c: &str| -> String {
+            DEFAULT_SECTORS
+                .iter()
+                .find(|(k, _)| *k == c)
+                .map(|(_, l)| l.to_string())
+                .unwrap_or_else(|| c.to_string())
+        };
         let sectors: Vec<(String, String)> =
             match ctx.params.get("naics").and_then(Value::as_array) {
                 Some(arr) => arr
                     .iter()
                     .filter_map(Value::as_str)
-                    .map(|c| {
-                        let label = DEFAULT_SECTORS
-                            .iter()
-                            .find(|(k, _)| *k == c)
-                            .map(|(_, l)| l.to_string())
-                            .unwrap_or_else(|| c.to_string());
-                        (c.to_string(), label)
-                    })
+                    .map(|c| (c.to_string(), label_for(c)))
                     .collect(),
-                None => DEFAULT_SECTORS
-                    .iter()
-                    .map(|(c, l)| (c.to_string(), l.to_string()))
-                    .collect(),
+                None => match trades_common::taxonomy::registry_naics(&ctx, 2).await? {
+                    Some(codes) => codes
+                        .into_iter()
+                        .map(|c| {
+                            let l = label_for(&c);
+                            (c, l)
+                        })
+                        .collect(),
+                    None => DEFAULT_SECTORS
+                        .iter()
+                        .map(|(c, l)| (c.to_string(), l.to_string()))
+                        .collect(),
+                },
             };
 
         let api_key = census_common::api_key(&ctx, "census-nesd")?;

@@ -361,6 +361,20 @@ pub struct DatahubConfig {
     pub emit_schema: bool,
     /// Emit `datasetProfile` (row counts) on sync and job completion.
     pub emit_profile: bool,
+    /// Emit pipeline topology (M25): schedules as `dataFlow` entities, job runs
+    /// as `dataJob` entities with input/output dataset edges, triggers as
+    /// dataset-level lineage edges, and column-level `fineGrainedLineage` where
+    /// a declarative RuleSet makes field provenance mechanical.
+    pub emit_flows: bool,
+    /// Governance pull loop (M26): periodically read DataHub state for Pumper
+    /// URNs and act on it — deprecation disables catalog-managed schedules,
+    /// a `cost:pause` tag zeroes the Claude-tier budget for that app's jobs,
+    /// failing assertions enqueue an immediate sync. Default OFF: remote
+    /// state driving an unattended box is opt-in, every action is loud-logged
+    /// and surfaced on `GET /datahub/status`, and all actions are reversible.
+    pub govern: bool,
+    /// Seconds between governance polls (min 30; only meaningful with `govern`).
+    pub govern_interval_secs: u64,
 }
 
 impl Default for DatahubConfig {
@@ -372,6 +386,9 @@ impl Default for DatahubConfig {
             env: "PROD".into(),
             emit_schema: true,
             emit_profile: true,
+            emit_flows: true,
+            govern: false,
+            govern_interval_secs: 300,
         }
     }
 }

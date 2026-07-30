@@ -20,6 +20,15 @@
 //!     band reappearing within `repostWindowDays`) partially de-noises it. A
 //!     run gap larger than `maxGapDays` closes nothing (carry-forward), so one
 //!     outage can't mark ~300k postings closed.
+//!   * `cz-labour/salary_nowcast` — a deterministic RATIO-CARRY nowcast (NOT a
+//!     model): per CZ-ISCO unit group × sphere, the median posted-vs-official
+//!     ratio from `salary_gap`'s stored revision history (newest
+//!     `nowcastWindow` observations, default 6) is applied to today's posted
+//!     median to project the current official-grade median, closing the
+//!     quarterly-to-annual ISPV publication lag. Each row carries the ratio
+//!     used, observation count, dispersion, a high|med|low confidence, and the
+//!     ISPV anchor date + staleness. A group with no stored gap history emits
+//!     no row — never extrapolated from nothing.
 //!
 //! The raw 188 MB feed is parsed into a typed subset (bounded memory) and
 //! aggregated in-process; only the small aggregates are persisted. A full
@@ -43,7 +52,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use chrono::{Duration, NaiveDate};
+use chrono::{Duration, NaiveDate, Utc};
 use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -63,6 +72,28 @@ const ISPV_DATASET: &str = "wages";
 /// pattern: cross-source products live in a namespace no single app owns).
 const GAP_APP: &str = "cz-labour";
 const GAP_DATASET: &str = "salary_gap";
+/// Salary nowcast — a deterministic RATIO-CARRY projection, not a model: per
+/// (CZ-ISCO unit group × sphere), the median posted-vs-official ratio observed
+/// in `salary_gap`'s stored revision history is carried onto today's posted
+/// median to project the current official-grade (ISPV-quality) median. Groups
+/// with no stored gap history emit NO row — never extrapolated from nothing.
+const NOWCAST_DATASET: &str = "salary_nowcast";
+/// Default ratio window: the newest N stored `salary_gap` revisions per cell.
+const NOWCAST_WINDOW_DEFAULT: u64 = 6;
+/// Bulk-read cap for the salary_gap revision scan (same posture as
+/// [`TRENDS_REVISION_SCAN`]); a hit is logged, since silent truncation would
+/// shorten some cells' ratio windows.
+const NOWCAST_REVISION_SCAN: i64 = 50_000;
+/// Confidence thresholds (documented contract):
+///   high — ≥ [`NOWCAST_HIGH_MIN_OBS`] ratio observations AND relative ratio
+///          spread (max−min)/median ≤ [`NOWCAST_HIGH_MAX_SPREAD`] (10%);
+///   med  — ≥ [`NOWCAST_MED_MIN_OBS`] observations AND spread ≤
+///          [`NOWCAST_MED_MAX_SPREAD`] (25%);
+///   low  — everything else that still has ≥ 1 observation.
+const NOWCAST_HIGH_MIN_OBS: usize = 6;
+const NOWCAST_HIGH_MAX_SPREAD: f64 = 0.10;
+const NOWCAST_MED_MIN_OBS: usize = 3;
+const NOWCAST_MED_MAX_SPREAD: f64 = 0.25;
 
 /// ARES business register — key-free JSON REST lookup of one economic subject
 /// by IČO. Enriches the employers behind this run's vacancy samples.
@@ -113,6 +144,11 @@ impl ScrapeApp for MpsvVpm {
          (per unit group × education level: salary median + premium vs the group median). \
          Also joins posted salaries against mpsv-ispv official ISPV \
          statistics into `cz-labour/salary_gap` (per CZ-ISCO unit group × sphere), \
+         and nowcasts the current official-grade median into \
+         `cz-labour/salary_nowcast` (deterministic ratio-carry: median \
+         posted-vs-ISPV ratio over the last `nowcastWindow` stored gap \
+         observations applied to today's posted median, with confidence \
+         high|med|low and ISPV-anchor staleness; no gap history = no row), \
          and enriches sampled employers from the key-free ARES business register \
          into `employers` (keyed by IČO: name, legal form, founded, kraj, CZ-NACE). \
          Keeps a per-posting survival ledger diffed daily into \
@@ -126,7 +162,8 @@ impl ScrapeApp for MpsvVpm {
          \"maxPostedAgeDays\": 730 (0 = keep all ages), \
          \"aresMaxLookups\": 50 (new ARES lookups per run, 0 = disable), \
          \"maxGapDays\": 3 (run gap beyond which the ledger closes nothing), \
-         \"repostWindowDays\": 30 (repost matching window)}"
+         \"repostWindowDays\": 30 (repost matching window), \
+         \"nowcastWindow\": 6 (newest salary_gap observations per cell for the ratio)}"
     }
 
     /// Daily full sync at 06:00 UTC. Change detection makes the output meaningful
@@ -144,6 +181,7 @@ impl ScrapeApp for MpsvVpm {
             "aresMaxLookups": ARES_MAX_LOOKUPS_DEFAULT,
             "maxGapDays": MAX_GAP_DAYS_DEFAULT,
             "repostWindowDays": REPOST_WINDOW_DAYS_DEFAULT,
+            "nowcastWindow": NOWCAST_WINDOW_DEFAULT,
         })
     }
 
@@ -600,6 +638,80 @@ impl ScrapeApp for MpsvVpm {
             })
         };
 
+        // ── Salary nowcast (deterministic ratio-carry, NOT a model) ─────────
+        // Per (unit group × sphere): median posted-vs-official ratio over the
+        // newest `nowcastWindow` stored `salary_gap` revisions (this run's just
+        // written revision included), applied to today's posted median →
+        // projected official-grade median. Runs AFTER the gap upsert so the
+        // freshest observed ratio participates. No stored history ⇒ no row.
+        let salary_nowcast = if official.is_empty() {
+            json!({ "skipped": "no official ISPV wages in store (run mpsv-ispv first)" })
+        } else {
+            let nowcast_window = ctx
+                .params
+                .get("nowcastWindow")
+                .and_then(Value::as_u64)
+                .unwrap_or(NOWCAST_WINDOW_DEFAULT)
+                .clamp(1, 24) as usize;
+            let gap_revs = ctx
+                .datasets
+                // Unfiltered by trust — same posture as the trends scan: a
+                // silently shortened ratio window is a wrong nowcast, not a
+                // safe one.
+                .changes_since(GAP_APP, Some(GAP_DATASET), None, NOWCAST_REVISION_SCAN, None)
+                .await?;
+            if gap_revs.len() as i64 >= NOWCAST_REVISION_SCAN {
+                tracing::warn!(
+                    scanned = gap_revs.len(),
+                    "mpsv-vpm: salary_gap revision scan hit the cap — some nowcast ratio windows may be short"
+                );
+            }
+            // Group newest-first (changes_since order) per cell key, then
+            // reduce each cell to its windowed ratio observations.
+            let mut revs_by_key: HashMap<String, Vec<pumper_core::Revision>> = HashMap::new();
+            for rev in gap_revs {
+                revs_by_key.entry(rev.key.clone()).or_default().push(rev);
+            }
+            let ratios_by_key: HashMap<String, Vec<f64>> = revs_by_key
+                .iter()
+                .map(|(k, revs)| {
+                    (
+                        k.clone(),
+                        ratio_observations(revs.iter().map(|r| r.data.as_ref()), nowcast_window),
+                    )
+                })
+                .collect();
+            let anchors = ispv_anchor_dates(&official_rows);
+            let nowcast_items = compute_salary_nowcast(
+                &gap_cells,
+                &ratios_by_key,
+                &anchors,
+                Utc::now().date_naive(),
+                min_count,
+            );
+            let nc_sum = ctx
+                .datasets
+                .upsert_many(GAP_APP, NOWCAST_DATASET, &nowcast_items)
+                .await?;
+            let confidence_count = |level: &str| {
+                nowcast_items
+                    .iter()
+                    .filter(|(_, v)| v["confidence"] == level)
+                    .count()
+            };
+            json!({
+                "method": "ratio_carry",
+                "cells": nowcast_items.len(),
+                "new": nc_sum.new.len(),
+                "changed": nc_sum.changed.len(),
+                "unchanged": nc_sum.unchanged,
+                "window": nowcast_window,
+                "confidenceHigh": confidence_count("high"),
+                "confidenceMed": confidence_count("med"),
+                "confidenceLow": confidence_count("low"),
+            })
+        };
+
         // ── ARES employer enrichment ────────────────────────────────────────
         // The persisted vacancy samples carry the employer IČO; look the new
         // ones up in the key-free ARES business register and persist a compact
@@ -827,6 +939,7 @@ impl ScrapeApp for MpsvVpm {
             "trendingTop": trending_top,
             "fadingTop": fading_top,
             "salaryGap": salary_gap,
+            "salaryNowcast": salary_nowcast,
             "employers": employer_summary,
             "vacancyLedger": vacancy_ledger,
             "freshness": freshness,
@@ -954,6 +1067,139 @@ fn compute_salary_gaps(
                 "gapPct": gap_pct,
                 "gapVsMeanAbs": vs_mean.map(|(a, _)| a),
                 "gapVsMeanPct": vs_mean.map(|(_, p)| p),
+            }),
+        ));
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
+}
+
+/// Posted-vs-official ratio observations for one `salary_gap` cell, from its
+/// revision snapshots (newest-first, as `changes_since` delivers them),
+/// windowed to the newest `n`. A snapshot missing either median (or carrying a
+/// non-positive one, or a 'removed' revision with no data) contributes nothing
+/// — it is skipped, never guessed.
+fn ratio_observations<'a>(datas: impl Iterator<Item = Option<&'a Value>>, n: usize) -> Vec<f64> {
+    datas
+        .filter_map(|d| {
+            let d = d?;
+            let posted = d.get("postedMedian").and_then(Value::as_f64).filter(|v| *v > 0.0)?;
+            let official = d
+                .get("officialMedian")
+                .and_then(Value::as_f64)
+                .filter(|v| *v > 0.0)?;
+            Some(posted / official)
+        })
+        .take(n)
+        .collect()
+}
+
+/// Median of a pre-sorted slice (even counts average the middle pair).
+fn median_f64(sorted: &[f64]) -> f64 {
+    let n = sorted.len();
+    if n % 2 == 1 {
+        sorted[n / 2]
+    } else {
+        (sorted[n / 2 - 1] + sorted[n / 2]) / 2.0
+    }
+}
+
+/// Confidence of a ratio-carry nowcast, from observation count + dispersion.
+/// `spread` = (max − min) / median of the ratio observations. Thresholds (the
+/// documented contract — see the `NOWCAST_*` constants):
+///   high: ≥ 6 observations and spread ≤ 0.10
+///   med:  ≥ 3 observations and spread ≤ 0.25
+///   low:  anything else with ≥ 1 observation.
+fn nowcast_confidence(observations: usize, spread: f64) -> &'static str {
+    if observations >= NOWCAST_HIGH_MIN_OBS && spread <= NOWCAST_HIGH_MAX_SPREAD {
+        "high"
+    } else if observations >= NOWCAST_MED_MIN_OBS && spread <= NOWCAST_MED_MAX_SPREAD {
+        "med"
+    } else {
+        "low"
+    }
+}
+
+/// Newest ISPV anchor date per (unit group × sphere): when the official row the
+/// nowcast leans on was last (re)written to the store — the vintage whose
+/// staleness the nowcast record must disclose.
+fn ispv_anchor_dates(rows: &[pumper_core::Record]) -> HashMap<(String, String), NaiveDate> {
+    let mut anchors: HashMap<(String, String), NaiveDate> = HashMap::new();
+    for r in rows {
+        let Some(cz) = r.data.get("czIsco").and_then(Value::as_str) else {
+            continue;
+        };
+        let sfera = r
+            .data
+            .get("sfera")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let d = r.updated_at.date_naive();
+        anchors
+            .entry((unit_group(cz), sfera))
+            .and_modify(|e| *e = (*e).max(d))
+            .or_insert(d);
+    }
+    anchors
+}
+
+/// Deterministic RATIO-CARRY salary nowcast — explicitly NOT a model: per
+/// (CZ-ISCO unit group × sphere), `ratio_used` = median of the stored
+/// posted-vs-official ratio observations, and
+/// `nowcast_median` = today's posted median ÷ `ratio_used` — i.e. today's
+/// posted signal deflated/inflated by the historically observed posted-vs-ISPV
+/// relationship for that exact cell. Emits NO row when the cell has no stored
+/// ratio history, no ISPV anchor row, or fewer than `min_salaries` posted
+/// points today — a missing nowcast is honest; a fabricated one is not.
+/// Keys `{unitGroup}|{sfera}`, sorted for deterministic upserts.
+fn compute_salary_nowcast(
+    posted: &HashMap<(String, String), Cell>,
+    ratios_by_key: &HashMap<String, Vec<f64>>,
+    anchors: &HashMap<(String, String), NaiveDate>,
+    today: NaiveDate,
+    min_salaries: usize,
+) -> Vec<(String, Value)> {
+    let mut items: Vec<(String, Value)> = Vec::new();
+    for ((group, sfera), cell) in posted {
+        if cell.salaries.len() < min_salaries.max(1) {
+            continue;
+        }
+        let key = format!("{group}|{sfera}");
+        // No stored gap history ⇒ no row — never extrapolate from nothing.
+        let Some(ratios) = ratios_by_key.get(&key).filter(|r| !r.is_empty()) else {
+            continue;
+        };
+        // No official anchor row ⇒ the staleness disclosure can't be made
+        // honestly ⇒ no row.
+        let Some(anchor) = anchors.get(&(group.clone(), sfera.clone())) else {
+            continue;
+        };
+        let (_, pct) = cell.stats();
+        let Some(posted_median) = pct(0.5) else {
+            continue;
+        };
+        let mut sorted = ratios.clone();
+        sorted.sort_by(f64::total_cmp);
+        let ratio_used = median_f64(&sorted);
+        if ratio_used <= 0.0 {
+            continue;
+        }
+        let spread = (sorted[sorted.len() - 1] - sorted[0]) / ratio_used;
+        items.push((
+            key,
+            json!({
+                "isco4": group,
+                "sfera": sfera,
+                "posted_median": posted_median,
+                "nowcast_median": (posted_median as f64 / ratio_used).round() as i64,
+                "ratio_used": (ratio_used * 10_000.0).round() / 10_000.0,
+                "observations": ratios.len(),
+                "dispersion": (spread * 1_000.0).round() / 1_000.0,
+                "confidence": nowcast_confidence(ratios.len(), spread),
+                "ispv_anchor_date": anchor.to_string(),
+                "staleness_days": (today - *anchor).num_days(),
+                "method": "ratio_carry",
             }),
         ));
     }
@@ -1884,6 +2130,144 @@ mod tests {
             .map(|(k, _)| k)
             .collect();
         assert_eq!(keys, vec!["1120|MZDOVA", "5223|MZDOVA", "9329|MZDOVA"]);
+    }
+
+    // ── salary nowcast (ratio-carry) ────────────────────────────────────────
+
+    fn anchor_map(entries: &[((&str, &str), (i32, u32, u32))]) -> HashMap<(String, String), NaiveDate> {
+        entries
+            .iter()
+            .map(|((g, s), (y, m, d))| {
+                (
+                    (g.to_string(), s.to_string()),
+                    NaiveDate::from_ymd_opt(*y, *m, *d).unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    fn ratios_map(entries: &[(&str, &[f64])]) -> HashMap<String, Vec<f64>> {
+        entries
+            .iter()
+            .map(|(k, r)| (k.to_string(), r.to_vec()))
+            .collect()
+    }
+
+    #[test]
+    fn nowcast_carries_the_median_ratio_onto_todays_posted_median() {
+        // posted median 50k; observed posted/official ratios median = 1.25
+        // → nowcast official-grade median = 50k / 1.25 = 40k.
+        let posted = posted_map(vec![(
+            ("5223", "MZDOVA"),
+            cell(&[40_000.0, 50_000.0, 60_000.0]),
+        )]);
+        let ratios = ratios_map(&[("5223|MZDOVA", &[1.30, 1.25, 1.20])]);
+        let anchors = anchor_map(&[(("5223", "MZDOVA"), (2026, 7, 1))]);
+        let today = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let items = compute_salary_nowcast(&posted, &ratios, &anchors, today, 3);
+        assert_eq!(items.len(), 1);
+        let (key, v) = &items[0];
+        assert_eq!(key, "5223|MZDOVA");
+        assert_eq!(v["isco4"], "5223");
+        assert_eq!(v["sfera"], "MZDOVA");
+        assert_eq!(v["posted_median"], 50_000);
+        assert_eq!(v["nowcast_median"], 40_000);
+        assert_eq!(v["ratio_used"], 1.25);
+        assert_eq!(v["observations"], 3);
+        assert_eq!(v["ispv_anchor_date"], "2026-07-01");
+        assert_eq!(v["staleness_days"], 30);
+        assert_eq!(v["method"], "ratio_carry");
+        // spread = (1.30 − 1.20) / 1.25 = 0.08 ≤ 0.25 with 3 obs → med
+        assert_eq!(v["dispersion"], 0.08);
+        assert_eq!(v["confidence"], "med");
+    }
+
+    #[test]
+    fn nowcast_without_history_or_anchor_emits_no_row_never_extrapolates() {
+        let posted = posted_map(vec![
+            (("5223", "MZDOVA"), cell(&[40_000.0, 50_000.0, 60_000.0])), // no ratio history
+            (("2433", "MZDOVA"), cell(&[50_000.0, 52_000.0, 54_000.0])), // history, no anchor
+            (("9329", "MZDOVA"), cell(&[30_000.0, 31_000.0])),           // thin: 2 < min 3
+        ]);
+        let ratios = ratios_map(&[
+            ("2433|MZDOVA", &[1.1, 1.1]),
+            ("9329|MZDOVA", &[1.0, 1.0, 1.0]),
+        ]);
+        let anchors = anchor_map(&[(("9329", "MZDOVA"), (2026, 7, 1))]);
+        let today = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        assert!(compute_salary_nowcast(&posted, &ratios, &anchors, today, 3).is_empty());
+    }
+
+    #[test]
+    fn nowcast_confidence_thresholds_by_count_and_dispersion() {
+        // high: ≥6 obs, spread ≤ 0.10
+        assert_eq!(nowcast_confidence(6, 0.10), "high");
+        // 6 obs but too dispersed → falls through; ≤0.25 keeps med
+        assert_eq!(nowcast_confidence(6, 0.11), "med");
+        // med: ≥3 obs, spread ≤ 0.25
+        assert_eq!(nowcast_confidence(3, 0.25), "med");
+        // wide dispersion → low regardless of count
+        assert_eq!(nowcast_confidence(8, 0.26), "low");
+        // thin history → low even when perfectly tight
+        assert_eq!(nowcast_confidence(2, 0.0), "low");
+        assert_eq!(nowcast_confidence(1, 0.0), "low");
+    }
+
+    #[test]
+    fn ratio_observations_window_and_skip_unparseable_snapshots() {
+        // Newest-first snapshots, as changes_since delivers them.
+        let snaps = [
+            Some(json!({"postedMedian": 50_000, "officialMedian": 40_000})), // 1.25
+            None,                                                            // removed revision
+            Some(json!({"postedMedian": 48_000})),                           // no official → skip
+            Some(json!({"postedMedian": 0, "officialMedian": 40_000})),      // non-positive → skip
+            Some(json!({"postedMedian": 44_000, "officialMedian": 40_000})), // 1.10
+            Some(json!({"postedMedian": 42_000, "officialMedian": 40_000})), // 1.05 — beyond window
+        ];
+        let ratios = ratio_observations(snaps.iter().map(|s| s.as_ref()), 2);
+        assert_eq!(ratios, vec![1.25, 1.10]);
+        // window larger than the parseable set keeps everything parseable
+        let all = ratio_observations(snaps.iter().map(|s| s.as_ref()), 10);
+        assert_eq!(all, vec![1.25, 1.10, 1.05]);
+    }
+
+    #[test]
+    fn nowcast_even_observation_count_uses_middle_pair_average() {
+        let posted = posted_map(vec![(("5223", "MZDOVA"), cell(&[44_000.0]))]);
+        // sorted ratios [1.0, 1.1] → median 1.05; 44k / 1.05 ≈ 41_905
+        let ratios = ratios_map(&[("5223|MZDOVA", &[1.1, 1.0])]);
+        let anchors = anchor_map(&[(("5223", "MZDOVA"), (2026, 6, 30))]);
+        let today = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let items = compute_salary_nowcast(&posted, &ratios, &anchors, today, 1);
+        assert_eq!(items.len(), 1);
+        let v = &items[0].1;
+        assert_eq!(v["ratio_used"], 1.05);
+        assert_eq!(v["nowcast_median"], 41_905);
+        assert_eq!(v["observations"], 2);
+        assert_eq!(v["confidence"], "low"); // 2 obs, however tight
+        assert_eq!(v["staleness_days"], 31);
+    }
+
+    #[test]
+    fn nowcast_output_is_sorted_by_key_for_deterministic_upserts() {
+        let posted = posted_map(vec![
+            (("9329", "MZDOVA"), cell(&[30_000.0])),
+            (("1120", "MZDOVA"), cell(&[100_000.0])),
+        ]);
+        let ratios = ratios_map(&[
+            ("9329|MZDOVA", &[1.0, 1.0, 1.0]),
+            ("1120|MZDOVA", &[1.2, 1.2, 1.2]),
+        ]);
+        let anchors = anchor_map(&[
+            (("9329", "MZDOVA"), (2026, 7, 1)),
+            (("1120", "MZDOVA"), (2026, 7, 1)),
+        ]);
+        let today = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let keys: Vec<String> = compute_salary_nowcast(&posted, &ratios, &anchors, today, 1)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, vec!["1120|MZDOVA", "9329|MZDOVA"]);
     }
 
     #[test]

@@ -19,6 +19,7 @@ use serde_json::{json, Value};
 
 pub struct Extractor;
 
+mod induce;
 mod replay;
 
 /// Default per-run snapshot cap for the Wayback backfill mode
@@ -475,7 +476,11 @@ impl ScrapeApp for Extractor {
          bisect_field?} is the read-only CI mode: run candidate rules over stored bodies, \
          diff against a baseline rule set field by field (match-rate deltas, \
          added/lost/changed samples, per-URL regressions), write replay-report.json — \
-         never a dataset record."
+         never a dataset record. induce: {urls|url_pattern, app?, dataset?, min_support \
+         0.6, min_instances 3} is the read-only zero-shot wrapper-induction mode: \
+         statistically mine a CANDIDATE each-shaped rule set (no LLM) from stored \
+         same-template pages, emitting the rules + per-field support stats as result and \
+         induced-ruleset.json artifact for human review; validate via replay before use."
     }
 
     fn manifest(&self) -> AppManifest {
@@ -485,7 +490,8 @@ impl ScrapeApp for Extractor {
                 "type": "object",
                 "anyOf": [
                     { "required": ["rules"] },
-                    { "required": ["replay"] }
+                    { "required": ["replay"] },
+                    { "required": ["induce"] }
                 ],
                 "properties": {
                     "rules": {
@@ -532,6 +538,41 @@ impl ScrapeApp for Extractor {
                             }
                         },
                         "description": "Replay-CI: STRICTLY read-only — runs rules over stored bodies, emits result JSON + a replay-report.json artifact, never writes a dataset record. Mutually exclusive with urls/source."
+                    },
+                    "induce": {
+                        "type": "object",
+                        "oneOf": [
+                            { "required": ["urls"] },
+                            { "required": ["url_pattern"] }
+                        ],
+                        "properties": {
+                            "urls": {
+                                "type": "array",
+                                "items": { "type": "string" },
+                                "minItems": 1,
+                                "description": "Explicit stored-page keys (crawl keys ARE canonical URLs) forming the same-template page set. Mutually exclusive with url_pattern."
+                            },
+                            "url_pattern": {
+                                "type": "string",
+                                "description": "Regex a stored record key (URL) must match to join the page set. Mutually exclusive with urls."
+                            },
+                            "app": { "type": "string", "description": "Source app of the stored bodies (default \"crawl\")." },
+                            "dataset": { "type": "string", "description": "Source dataset (default \"pages\")." },
+                            "min_support": {
+                                "type": "number",
+                                "minimum": 0.05,
+                                "maximum": 1.0,
+                                "description": "Support threshold (default 0.6): the container must repeat on this fraction of pages; a field slot must be present on this fraction of instances."
+                            },
+                            "min_instances": {
+                                "type": "integer",
+                                "minimum": 2,
+                                "description": "Minimum repeats of the container signature per page (default 3)."
+                            },
+                            "max_fields": { "type": "integer", "minimum": 1, "maximum": 32, "description": "Cap on emitted field slots (default 12)." },
+                            "max_pages": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Page cap per induction run (default 50)." }
+                        },
+                        "description": "Zero-shot wrapper induction: STRICTLY read-only — statistically mines a CANDIDATE each-shaped rule set (repeating tag+class container, field slots whose text varies while structure stays fixed) from stored same-template pages. No LLM. Emits result JSON + an induced-ruleset.json artifact for human review; chain to `replay` for validation. Never writes a dataset record. Mutually exclusive with rules/urls/source."
                     },
                     "urls": {
                         "type": "array",
@@ -677,12 +718,27 @@ impl ScrapeApp for Extractor {
                         }
                     }),
                 },
+                ManifestExample {
+                    description: "Zero-shot wrapper induction: mine a candidate each-shaped \
+                                  rule set from stored same-template listing pages — \
+                                  read-only, review then validate with replay",
+                    params: json!({
+                        "induce": {
+                            "url_pattern": "^https://example\\.com/search\\?page=",
+                            "min_support": 0.6,
+                            "min_instances": 3
+                        }
+                    }),
+                },
             ],
             output_shape: Some(
                 "{extracted, errors, dataset, new, changed, unchanged, removed?} — an upsert \
                  summary plus per-document extraction error counts. Replay mode instead \
                  returns {fields: [per-field match-rate deltas + added/lost/changed samples], \
-                 regressions, bisect?, artifact: \"replay-report.json\"} and writes nothing.",
+                 regressions, bisect?, artifact: \"replay-report.json\"} and writes nothing. \
+                 Induce mode returns {induced, rules (candidate RuleSet), container, fields: \
+                 [per-field support stats], next, artifact: \"induced-ruleset.json\"} and \
+                 writes nothing.",
             ),
             cost_class: CostClass::Free,
         }
@@ -694,6 +750,13 @@ impl ScrapeApp for Extractor {
         if let Some(replay) = ctx.params.get("replay").and_then(Value::as_object) {
             let replay = replay.clone();
             return replay::run_replay(&ctx, &replay).await;
+        }
+        // Induce mode: statistically mine a CANDIDATE rule set from stored
+        // same-template pages — read-only (result + artifact, no dataset
+        // writes) — its own param root, its own runner.
+        if let Some(induce) = ctx.params.get("induce").and_then(Value::as_object) {
+            let induce = induce.clone();
+            return induce::run_induce(&ctx, &induce).await;
         }
         let rules: RuleSet = ctx
             .params

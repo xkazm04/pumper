@@ -97,7 +97,10 @@ impl ScrapeApp for HomewysePricing {
             }));
         }
 
-        let trades = taxonomy::prompt_list();
+        // Trade universe = governed registry, enum fallback (identical list
+        // while the registry dataset is absent).
+        let entries = taxonomy::taxonomy(&ctx).await?;
+        let trades = taxonomy::prompt_list_of(&entries);
         let prompt = format!(
             "You are a home-services pricing analyst. Using web search and page fetches, \
              research the TYPICAL PRICE A CUSTOMER PAYS in {locality} ({year}) for common \
@@ -148,7 +151,7 @@ impl ScrapeApp for HomewysePricing {
                     .to_string();
                 // Normalize to a canonical label so the pricing rows join to the
                 // unified layer by the same trade string; unknown labels flagged.
-                let (trade, known) = taxonomy::canonicalize(&raw);
+                let (trade, known) = taxonomy::canonicalize_in(&entries, &raw);
                 if !raw.is_empty() && !known {
                     unknown_trades.push(raw.clone());
                 }

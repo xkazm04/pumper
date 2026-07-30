@@ -7,6 +7,12 @@
 //! the trustworthy anchor used to derive seniority bands and to flag posted
 //! salaries that fall outside the official distribution.
 //!
+//! ISPV publishes with a quarterly-to-annual LAG. mpsv-vpm reads this `wages`
+//! dataset as the anchor for `cz-labour/salary_gap` (posted-vs-official) and
+//! the derived `cz-labour/salary_nowcast` (deterministic ratio-carry
+//! projection of the current official-grade median); each stored record's
+//! `updated_at` is the anchor vintage those products disclose as staleness.
+//!
 //! Data type: LABOR-MARKET open data. Access: key-free, CC BY 4.0. Small file
 //! (~320 KB), whole rows are kept as the record value. See
 //! `catalog/data-sources.toml` (id `mpsv-ispv`).

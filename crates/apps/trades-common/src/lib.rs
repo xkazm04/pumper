@@ -353,6 +353,20 @@ pub mod validate {
 /// and record keys so phrasing drift can't mint duplicate keys or defeat
 /// change detection.
 pub mod taxonomy {
+    use pumper_core::{AppContext, Result};
+    use serde_json::{json, Value};
+
+    /// Virtual app namespace + dataset holding the governed taxonomy registry.
+    /// Records are keyed by canonical label (`Plumbing`), shape:
+    /// `{trade, soc_code, naics: [..], aliases: [..], enabled, source}` where
+    /// `source` is `"seed" | "proposed" | "approved"`. The compile-time enum
+    /// below stays the FALLBACK: when this dataset is absent or empty, every
+    /// accessor behaves exactly as the enum always has.
+    pub const TAXONOMY_APP: &str = "trades";
+    pub const TAXONOMY_DATASET: &str = "taxonomy";
+    /// Read cap for the registry — far past any plausible trade count (~25-50).
+    const TAXONOMY_READ_LIMIT: i64 = 1_000;
+
     /// A canonical home-services trade.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     pub enum Trade {
@@ -393,6 +407,31 @@ pub mod taxonomy {
                 Trade::Hvac => "49-9021",
                 Trade::Landscaping => "37-3011",
                 Trade::PoolService => "37-3011",
+            }
+        }
+
+        /// The 6-digit NAICS 2017 codes the trade's businesses file under.
+        /// Plumbing & HVAC are fused in 238220 (Census cannot split them);
+        /// pool service falls under the broader 561790.
+        pub fn naics(self) -> &'static [&'static str] {
+            match self {
+                Trade::Plumbing => &["238220"],
+                Trade::Electrical => &["238210"],
+                Trade::Hvac => &["238220"],
+                Trade::Landscaping => &["561730"],
+                Trade::PoolService => &["561790"],
+            }
+        }
+
+        /// Lowercase keyword aliases — the same keywords [`Trade::from_label`]
+        /// matches on, exposed as data so seed registry records carry them.
+        pub fn aliases(self) -> &'static [&'static str] {
+            match self {
+                Trade::Plumbing => &["plumb"],
+                Trade::Electrical => &["electric"],
+                Trade::Hvac => &["hvac", "heating", "air condition", "cooling"],
+                Trade::Landscaping => &["landscap", "lawn", "groundskeep", "yard"],
+                Trade::PoolService => &["pool"],
             }
         }
 
@@ -448,6 +487,246 @@ pub mod taxonomy {
             .join(", ")
     }
 
+    /// One entry of the governed trade taxonomy — either a compile-time seed
+    /// (mirroring [`Trade`]) or a registry record a human enabled.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct TradeEntry {
+        /// Canonical display label — the stable string used in record keys.
+        pub label: String,
+        /// Best-fit BLS SOC occupation code.
+        pub soc_code: String,
+        /// 6-digit NAICS 2017 codes for the trade's businesses.
+        pub naics: Vec<String>,
+        /// Lowercase keyword aliases for canonicalization.
+        pub aliases: Vec<String>,
+        /// `"seed" | "proposed" | "approved"`.
+        pub source: String,
+    }
+
+    impl TradeEntry {
+        fn from_trade(t: Trade) -> TradeEntry {
+            TradeEntry {
+                label: t.label().to_string(),
+                soc_code: t.soc_code().to_string(),
+                naics: t.naics().iter().map(|s| s.to_string()).collect(),
+                aliases: t.aliases().iter().map(|s| s.to_string()).collect(),
+                source: "seed".to_string(),
+            }
+        }
+    }
+
+    /// The compile-time fallback taxonomy: the five enum trades as entries, in
+    /// canonical prompt order.
+    pub fn seed_entries() -> Vec<TradeEntry> {
+        Trade::ALL.iter().copied().map(TradeEntry::from_trade).collect()
+    }
+
+    /// The seed entry as a `trades/taxonomy` dataset record (enabled, source
+    /// `"seed"`). Used to materialize the registry the first time a proposer
+    /// run touches it.
+    pub fn seed_record(t: Trade) -> (String, Value) {
+        let e = TradeEntry::from_trade(t);
+        (
+            e.label.clone(),
+            json!({
+                "trade": e.label,
+                "soc_code": e.soc_code,
+                "naics": e.naics,
+                "aliases": e.aliases,
+                "enabled": true,
+                "source": "seed",
+            }),
+        )
+    }
+
+    /// Parse one registry record into an entry. `None` when the record is
+    /// unusable (no label) — a malformed row must degrade to "ignored", never
+    /// poison the whole taxonomy.
+    fn parse_entry(data: &Value) -> Option<(TradeEntry, bool)> {
+        let label = data.get("trade").and_then(Value::as_str)?.trim().to_string();
+        if label.is_empty() {
+            return None;
+        }
+        let strings = |field: &str| -> Vec<String> {
+            data.get(field)
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.trim().to_lowercase())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let entry = TradeEntry {
+            label: label.clone(),
+            soc_code: data
+                .get("soc_code")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            naics: data
+                .get("naics")
+                .and_then(Value::as_array)
+                .map(|a| {
+                    a.iter()
+                        .filter_map(Value::as_str)
+                        .map(|s| s.trim().to_string())
+                        .filter(|s| !s.is_empty())
+                        .collect()
+                })
+                .unwrap_or_default(),
+            aliases: strings("aliases"),
+            source: data
+                .get("source")
+                .and_then(Value::as_str)
+                .unwrap_or("proposed")
+                .to_string(),
+        };
+        // Governance default: a record must OPT IN with enabled:true. Absent
+        // or false ⇒ not part of the live taxonomy (proposer writes false).
+        let enabled = data.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        Some((entry, enabled))
+    }
+
+    /// Pure merge of registry records over the compile-time seeds:
+    /// - dataset ABSENT/EMPTY ⇒ exactly [`seed_entries`] (zero behavior change);
+    /// - a record matching a seed label overrides that seed's fields when
+    ///   enabled, and REMOVES the trade when explicitly `enabled: false`
+    ///   (governed off-switch);
+    /// - enabled records for new trades are appended, sorted by label;
+    /// - disabled/malformed extra records are ignored.
+    pub fn merge_taxonomy(records: &[Value]) -> Vec<TradeEntry> {
+        let mut seeds = seed_entries();
+        if records.is_empty() {
+            return seeds;
+        }
+        let parsed: Vec<(TradeEntry, bool)> =
+            records.iter().filter_map(parse_entry).collect();
+        // Override / remove seeds by label.
+        let mut out: Vec<TradeEntry> = Vec::new();
+        for seed in seeds.drain(..) {
+            match parsed.iter().find(|(e, _)| e.label == seed.label) {
+                Some((e, true)) => {
+                    // Enabled override: registry fields win, but empty fields
+                    // fall back to the seed's (a sparse row must not erase
+                    // the SOC/NAICS the enum already knows).
+                    out.push(TradeEntry {
+                        label: seed.label.clone(),
+                        soc_code: if e.soc_code.is_empty() {
+                            seed.soc_code.clone()
+                        } else {
+                            e.soc_code.clone()
+                        },
+                        naics: if e.naics.is_empty() {
+                            seed.naics.clone()
+                        } else {
+                            e.naics.clone()
+                        },
+                        aliases: if e.aliases.is_empty() {
+                            seed.aliases.clone()
+                        } else {
+                            e.aliases.clone()
+                        },
+                        source: e.source.clone(),
+                    });
+                }
+                Some((_, false)) => {} // governed off-switch
+                None => out.push(seed),
+            }
+        }
+        // Append enabled NEW trades, deterministic order.
+        let mut extra: Vec<TradeEntry> = parsed
+            .into_iter()
+            .filter(|(e, enabled)| *enabled && !out.iter().any(|s| s.label == e.label))
+            .filter(|(e, _)| !Trade::ALL.iter().any(|t| t.label() == e.label))
+            .map(|(e, _)| e)
+            .collect();
+        extra.sort_by(|a, b| a.label.cmp(&b.label));
+        out.extend(extra);
+        out
+    }
+
+    /// The live trade taxonomy: the `trades/taxonomy` registry merged over the
+    /// compile-time enum seeds. When the registry dataset is absent or empty
+    /// this returns exactly the five enum trades — the enum is the permanent
+    /// fallback, so existing callers see zero behavior change until a human
+    /// enables registry records.
+    pub async fn taxonomy(ctx: &AppContext) -> Result<Vec<TradeEntry>> {
+        let recs = ctx
+            .datasets
+            .list(TAXONOMY_APP, TAXONOMY_DATASET, TAXONOMY_READ_LIMIT)
+            .await?;
+        let data: Vec<Value> = recs.into_iter().map(|r| r.data).collect();
+        Ok(merge_taxonomy(&data))
+    }
+
+    /// Comma-joined labels of a taxonomy slice — the registry-aware
+    /// counterpart of [`prompt_list`]. Identical output when only seeds exist.
+    pub fn prompt_list_of(entries: &[TradeEntry]) -> String {
+        entries
+            .iter()
+            .map(|e| e.label.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+
+    /// Registry-aware [`canonicalize`]: the enum matcher runs FIRST (exact
+    /// legacy semantics for the five seeds, including its keyword precedence),
+    /// then enabled registry entries' aliases catch new trades. Unknown labels
+    /// keep the raw string, flagged.
+    pub fn canonicalize_in(entries: &[TradeEntry], raw: &str) -> (String, bool) {
+        if let Some(t) = Trade::from_label(raw) {
+            return (t.label().to_string(), true);
+        }
+        let l = raw.trim().to_lowercase();
+        if !l.is_empty() {
+            for e in entries {
+                if e.aliases.iter().any(|a| l.contains(a.as_str())) {
+                    return (e.label.clone(), true);
+                }
+            }
+        }
+        (raw.trim().to_string(), false)
+    }
+
+    /// Deduped NAICS code list of a taxonomy slice, truncated to `prefix_len`
+    /// digits (6 = CBP grain, 4 = nonemployer grain, 2 = sector grain), in
+    /// entry order. With only seeds this reproduces each census app's
+    /// compile-time default code set.
+    pub fn naics_prefixes(entries: &[TradeEntry], prefix_len: usize) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        for e in entries {
+            for code in &e.naics {
+                let p: String = code.chars().take(prefix_len).collect();
+                if !p.is_empty() && !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        out
+    }
+
+    /// NAICS codes from the REGISTRY for the census apps: `None` when the
+    /// registry dataset is absent/empty (caller keeps its compile-time
+    /// defaults — zero behavior change), `Some(codes)` otherwise.
+    pub async fn registry_naics(
+        ctx: &AppContext,
+        prefix_len: usize,
+    ) -> Result<Option<Vec<String>>> {
+        let recs = ctx
+            .datasets
+            .list(TAXONOMY_APP, TAXONOMY_DATASET, TAXONOMY_READ_LIMIT)
+            .await?;
+        if recs.is_empty() {
+            return Ok(None);
+        }
+        let data: Vec<Value> = recs.into_iter().map(|r| r.data).collect();
+        let codes = naics_prefixes(&merge_taxonomy(&data), prefix_len);
+        Ok(if codes.is_empty() { None } else { Some(codes) })
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -495,6 +774,109 @@ pub mod taxonomy {
             assert_eq!(Trade::Plumbing.soc_code(), "47-2152");
             assert_eq!(Trade::PoolService.soc_code(), "37-3011");
         }
+
+        #[test]
+        fn empty_registry_merges_to_exactly_the_enum_seeds() {
+            let entries = merge_taxonomy(&[]);
+            assert_eq!(entries.len(), 5);
+            assert_eq!(prompt_list_of(&entries), prompt_list());
+            assert!(entries.iter().all(|e| e.source == "seed"));
+            assert_eq!(entries[0].soc_code, "47-2152");
+            assert_eq!(entries[0].naics, vec!["238220".to_string()]);
+        }
+
+        #[test]
+        fn seed_records_round_trip_to_the_same_taxonomy() {
+            // A registry materialized purely from seed_record rows must merge
+            // to the identical taxonomy — the "dataset present but only seeds"
+            // state changes nothing.
+            let recs: Vec<serde_json::Value> = Trade::ALL
+                .iter()
+                .map(|t| seed_record(*t).1)
+                .collect();
+            assert_eq!(merge_taxonomy(&recs), seed_entries());
+        }
+
+        #[test]
+        fn enabled_new_trade_is_appended_disabled_is_not() {
+            let roofing = json!({
+                "trade": "Roofing", "soc_code": "47-2181",
+                "naics": ["238160"], "aliases": ["roof"],
+                "enabled": true, "source": "approved",
+            });
+            let pest = json!({
+                "trade": "Pest control", "soc_code": "37-2021",
+                "naics": ["561710"], "aliases": ["pest", "extermin"],
+                "enabled": false, "source": "proposed",
+            });
+            let entries = merge_taxonomy(&[roofing, pest]);
+            assert_eq!(entries.len(), 6, "5 seeds + enabled Roofing");
+            assert_eq!(entries[5].label, "Roofing");
+            assert_eq!(
+                prompt_list_of(&entries),
+                "Plumbing, Electrical, HVAC, Landscaping, Pool service, Roofing"
+            );
+            assert!(!entries.iter().any(|e| e.label == "Pest control"));
+        }
+
+        #[test]
+        fn enabled_absent_defaults_to_disabled_governance() {
+            // Proposer writes enabled:false; a row missing the flag entirely
+            // must ALSO stay out — enabling is an explicit human act.
+            let row = json!({ "trade": "Roofing", "naics": ["238160"], "aliases": ["roof"] });
+            assert_eq!(merge_taxonomy(&[row]).len(), 5);
+        }
+
+        #[test]
+        fn seed_can_be_governed_off_or_overridden() {
+            let off = json!({ "trade": "Pool service", "enabled": false, "source": "seed" });
+            let entries = merge_taxonomy(&[off]);
+            assert_eq!(entries.len(), 4);
+            assert!(!entries.iter().any(|e| e.label == "Pool service"));
+
+            // Sparse enabled override keeps the seed's SOC/NAICS (never erased).
+            let sparse = json!({ "trade": "Plumbing", "enabled": true, "source": "approved" });
+            let entries = merge_taxonomy(&[sparse]);
+            let p = entries.iter().find(|e| e.label == "Plumbing").unwrap();
+            assert_eq!(p.soc_code, "47-2152");
+            assert_eq!(p.naics, vec!["238220".to_string()]);
+            assert_eq!(p.source, "approved");
+        }
+
+        #[test]
+        fn canonicalize_in_matches_enum_first_then_registry_aliases() {
+            let mut entries = seed_entries();
+            entries.push(TradeEntry {
+                label: "Roofing".into(),
+                soc_code: "47-2181".into(),
+                naics: vec!["238160".into()],
+                aliases: vec!["roof".into(), "shingle".into()],
+                source: "approved".into(),
+            });
+            // Legacy inputs behave exactly as canonicalize() always has.
+            assert_eq!(canonicalize_in(&entries, "plumber"), ("Plumbing".into(), true));
+            assert_eq!(
+                canonicalize_in(&entries, "pool landscaping"),
+                canonicalize("pool landscaping"),
+                "enum keyword precedence preserved"
+            );
+            // New registry trade now resolves.
+            assert_eq!(canonicalize_in(&entries, "Roof repair"), ("Roofing".into(), true));
+            assert_eq!(canonicalize_in(&entries, "Chimneys"), ("Chimneys".into(), false));
+        }
+
+        #[test]
+        fn naics_prefixes_reproduce_the_census_apps_default_code_sets() {
+            let seeds = seed_entries();
+            // census-density (6-digit CBP set — same codes, order irrelevant to fetch).
+            let six = naics_prefixes(&seeds, 6);
+            let mut sorted = six.clone();
+            sorted.sort();
+            assert_eq!(sorted, vec!["238210", "238220", "561730", "561790"]);
+            // census-nonemp (4-digit) and sector (2-digit) grains.
+            assert_eq!(naics_prefixes(&seeds, 4), vec!["2382", "5617"]);
+            assert_eq!(naics_prefixes(&seeds, 2), vec!["23", "56"]);
+        }
     }
 }
 
@@ -503,7 +885,7 @@ pub mod taxonomy {
 /// run, which JOINS the four source datasets into one row per canonical trade in
 /// the virtual `trades/operator_economics` dataset (key `US:<trade>`).
 pub mod unified {
-    use super::taxonomy::Trade;
+    use super::taxonomy;
     use pumper_core::{AppContext, Result, UpsertSummary};
     use serde_json::{json, Value};
 
@@ -580,8 +962,11 @@ pub mod unified {
             .collect();
 
         let mut items: Vec<(String, Value)> = Vec::new();
-        for trade in Trade::ALL {
-            let label = trade.label();
+        // Trade universe = the governed taxonomy registry, enum as fallback —
+        // an enabled registry trade gets its unified rows on the next sync
+        // with zero new per-trade code.
+        for entry in taxonomy::taxonomy(ctx).await? {
+            let label = entry.label.as_str();
             // Wage + valuation are national roll-ups (`US:{label}`) — per-state
             // OEWS wages are deferred (trades#2 phase c); valuation stays national
             // by design (per-state broker comps are too thin to be honest).
@@ -609,7 +994,7 @@ pub mod unified {
                     json!({
                         "trade": label,
                         "state": "US",
-                        "soc_code": trade.soc_code(),
+                        "soc_code": entry.soc_code,
                         "wage_band": wage.as_ref().map(wage_band),
                         "wage_grain": "national",
                         "pricing": national_pricing,
@@ -634,7 +1019,7 @@ pub mod unified {
                     json!({
                         "trade": label,
                         "state": code,
-                        "soc_code": trade.soc_code(),
+                        "soc_code": entry.soc_code,
                         "wage_band": wage.as_ref().map(wage_band),
                         "wage_grain": "national",
                         "pricing": state_pricing,

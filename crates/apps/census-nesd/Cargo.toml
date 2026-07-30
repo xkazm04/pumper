@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 pumper-core.workspace = true
 census-common.workspace = true
+# Governed trade taxonomy registry (trades/taxonomy) - NAICS list derivation.
+trades-common.workspace = true
 # For the shared employer+solo `census/market_blend` derivation — like
 # census-nonemp, this app re-blends after its own upserts so the succession
 # fields track whichever Census run happened last.
