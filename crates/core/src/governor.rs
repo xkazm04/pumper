@@ -256,6 +256,35 @@ impl Governor {
             .penalty = penalty;
     }
 
+    /// Raises a host's learned penalty to `penalty` if that is stricter than
+    /// the current value — never lowers, never touches the next slot. Returns
+    /// whether anything changed. Built for host-weather imports (M01): unlike
+    /// [`restore_penalty`](Self::restore_penalty), which is an authoritative
+    /// boot-time overwrite of our own snapshot, imported intel is a prior that
+    /// must not erase stronger locally-earned spacing. Capped at the
+    /// configured penalty cap like every locally-learned penalty.
+    pub fn raise_penalty(&self, host: &str, penalty: Duration) -> bool {
+        let penalty = penalty.min(self.penalty_cap);
+        if penalty.is_zero() {
+            return false;
+        }
+        let now = Instant::now();
+        let mut entry = self
+            .hosts
+            .entry(host.to_lowercase())
+            .or_insert_with(|| HostState {
+                next_slot: now,
+                penalty: Duration::ZERO,
+                last_seen: now,
+            });
+        if entry.penalty >= penalty {
+            return false;
+        }
+        entry.last_seen = now;
+        entry.penalty = penalty;
+        true
+    }
+
     /// Forgets a host's live politeness state (learned penalty + slot). Returns
     /// whether any state existed. Used by `DELETE /hosts/{host}/memory` to reset
     /// the learned penalty alongside the tier memory.
@@ -418,6 +447,28 @@ mod tests {
         let g = Governor::new(&cfg);
         assert!(g.try_acquire("x.com"));
         assert!(g.try_acquire("x.com"));
+    }
+
+    #[tokio::test]
+    async fn raise_penalty_only_raises_and_honors_the_cap() {
+        let g = governor();
+        // Raises from nothing (case-insensitive host).
+        assert!(g.raise_penalty("X.com", Duration::from_secs(5)));
+        assert_eq!(g.penalty("x.com").await, Duration::from_secs(5));
+        // Never lowers: a weaker value is refused, state unchanged.
+        assert!(!g.raise_penalty("x.com", Duration::from_secs(2)));
+        assert_eq!(g.penalty("x.com").await, Duration::from_secs(5));
+        // Equal is a no-op too.
+        assert!(!g.raise_penalty("x.com", Duration::from_secs(5)));
+        // Capped at the governor's learned-penalty ceiling.
+        assert!(g.raise_penalty("x.com", Duration::from_secs(9999)));
+        assert_eq!(
+            g.penalty("x.com").await,
+            Duration::from_secs(DEFAULT_PENALTY_CAP_SECS)
+        );
+        // A zero raise never creates state.
+        assert!(!g.raise_penalty("y.com", Duration::ZERO));
+        assert!(!g.clear("y.com"), "zero raise must not insert state");
     }
 
     #[tokio::test]
