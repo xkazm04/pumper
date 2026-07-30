@@ -391,7 +391,10 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].dataset, "");
         assert_eq!(out[1].dataset, "unified");
-        assert_eq!(out[1].unchanged, None, "unified reports no unchanged — stays None");
+        assert_eq!(
+            out[1].unchanged, None,
+            "unified reports no unchanged — stays None"
+        );
     }
 
     #[test]
@@ -423,12 +426,16 @@ mod tests {
         // 100 summary-shaped children must not become 100 rows.
         let mut children = serde_json::Map::new();
         for i in 0..100 {
-            children.insert(format!("d{i:03}"), serde_json::json!({ "new": 1, "changed": 0 }));
+            children.insert(
+                format!("d{i:03}"),
+                serde_json::json!({ "new": 1, "changed": 0 }),
+            );
         }
         let out = extract_yields(&serde_json::Value::Object(children));
         assert_eq!(out.len(), 16);
         // A summary buried past the depth cap is record data, not telemetry.
-        let deep = serde_json::json!({ "a": { "b": { "c": { "d": { "new": 1, "changed": 0 } } } } });
+        let deep =
+            serde_json::json!({ "a": { "b": { "c": { "d": { "new": 1, "changed": 0 } } } } });
         assert!(extract_yields(&deep).is_empty());
     }
 

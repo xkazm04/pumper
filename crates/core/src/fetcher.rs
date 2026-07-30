@@ -340,10 +340,7 @@ impl Fetcher {
         // browser-only strategy is excluded — the caller explicitly wants a JS
         // render, which an API payload cannot be.
         if (req.use_recipes || self.recipes_enabled) && req.strategy != FetchStrategy::Browser {
-            if let Some(out) = self
-                .try_recipe(&req, &mut escalations, &mut trace)
-                .await
-            {
+            if let Some(out) = self.try_recipe(&req, &mut escalations, &mut trace).await {
                 return Ok(out);
             }
         }
@@ -374,8 +371,7 @@ impl Fetcher {
                             Some(md) => md.chars().count(),
                             None => text_len_capped(&resp.body, min_chars),
                         };
-                        let enough =
-                            wall.is_none() && resp.is_success() && text_len >= min_chars;
+                        let enough = wall.is_none() && resp.is_success() && text_len >= min_chars;
                         if enough {
                             trace.push(TierTrace {
                                 tier: FetchTier::Archive,
@@ -746,8 +742,7 @@ impl Fetcher {
                     // and — under auto_validate — proves an unvalidated recipe.
                     let validate = self.recipes_auto_validate && !recipe.validated;
                     if let Err(e) = source.record_success(&recipe.id, validate).await {
-                        escalations
-                            .push(format!("api_recipe tier: recording success failed: {e}"));
+                        escalations.push(format!("api_recipe tier: recording success failed: {e}"));
                     }
                     trace.push(TierTrace {
                         tier: FetchTier::ApiRecipe,
@@ -788,7 +783,11 @@ impl Fetcher {
                 escalations.push(format!(
                     "api_recipe tier thin: status {}, {why}{}",
                     resp.status,
-                    if demoted { " (recipe un-validated)" } else { "" }
+                    if demoted {
+                        " (recipe un-validated)"
+                    } else {
+                        ""
+                    }
                 ));
                 trace.push(TierTrace {
                     tier: FetchTier::ApiRecipe,
@@ -808,7 +807,14 @@ impl Fetcher {
                 let _ = source
                     .record_failure(&recipe.id, self.recipes_max_failures)
                     .await;
-                trace_tier_error(escalations, trace, FetchTier::ApiRecipe, "api_recipe", &e, started);
+                trace_tier_error(
+                    escalations,
+                    trace,
+                    FetchTier::ApiRecipe,
+                    "api_recipe",
+                    &e,
+                    started,
+                );
                 None
             }
         }
@@ -1164,10 +1170,7 @@ mod tests {
         }
     }
 
-    fn archive_fetcher(
-        http: Arc<dyn HttpClient>,
-        archive: Option<Arc<dyn HttpClient>>,
-    ) -> Fetcher {
+    fn archive_fetcher(http: Arc<dyn HttpClient>, archive: Option<Arc<dyn HttpClient>>) -> Fetcher {
         Fetcher::new(
             http,
             Arc::new(DeadBrowser),
@@ -1402,7 +1405,10 @@ mod tests {
                 .filter(|r| r.host == host && (r.validated || include_unvalidated)))
         }
         async fn record_success(&self, id: &str, validate: bool) -> Result<()> {
-            self.successes.lock().unwrap().push((id.to_string(), validate));
+            self.successes
+                .lock()
+                .unwrap()
+                .push((id.to_string(), validate));
             Ok(())
         }
         async fn record_failure(&self, id: &str, unvalidate_after: u32) -> Result<bool> {

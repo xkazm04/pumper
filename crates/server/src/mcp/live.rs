@@ -120,11 +120,7 @@ fn last_event_id(headers: &HeaderMap) -> Option<u64> {
 /// Connect-time replay for a resuming client: buffered events it missed
 /// (post-filter), preceded by a reset notification when the gap is too old.
 /// Returns the events plus the highest sequence id now delivered.
-fn replay_backlog(
-    state: &AppState,
-    after: Option<u64>,
-    filter: &LiveFilter,
-) -> (Vec<Event>, u64) {
+fn replay_backlog(state: &AppState, after: Option<u64>, filter: &LiveFilter) -> (Vec<Event>, u64) {
     let Some(after) = after else {
         return (Vec::new(), 0);
     };
@@ -190,7 +186,9 @@ fn reset_event(latest: u64) -> Event {
             "reason": "replay gap: reconnect point too old, resync state",
         },
     });
-    Event::default().id(latest.to_string()).data(msg.to_string())
+    Event::default()
+        .id(latest.to_string())
+        .data(msg.to_string())
 }
 
 // ---- wait_job ----------------------------------------------------------------

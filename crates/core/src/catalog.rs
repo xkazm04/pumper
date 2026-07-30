@@ -609,8 +609,10 @@ mod tests {
 
     #[test]
     fn evaluate_checks_types_only_when_present_and_nonnull() {
-        let c = contract(r#"[types]
-            title = "string""#);
+        let c = contract(
+            r#"[types]
+            title = "string""#,
+        );
         let absent = serde_json::json!({ "id": "1" });
         let null = serde_json::json!({ "title": null });
         let wrong = serde_json::json!({ "title": 42 });
@@ -620,15 +622,23 @@ mod tests {
         assert_eq!(v.len(), 1);
         assert!(v[0].contains("'title'"), "{v:?}");
         // Unknown type names never match — a typo'd contract fails loudly.
-        let typo = contract(r#"[types]
-            title = "strnig""#);
-        assert_eq!(typo.evaluate(&[&serde_json::json!({"title": "x"})], 0).len(), 1);
+        let typo = contract(
+            r#"[types]
+            title = "strnig""#,
+        );
+        assert_eq!(
+            typo.evaluate(&[&serde_json::json!({"title": "x"})], 0)
+                .len(),
+            1
+        );
     }
 
     #[test]
     fn evaluate_checks_ranges_only_on_numeric_values() {
-        let c = contract(r#"[ranges]
-            applications = { min = 0.0, max = 100.0 }"#);
+        let c = contract(
+            r#"[ranges]
+            applications = { min = 0.0, max = 100.0 }"#,
+        );
         let ok = serde_json::json!({ "applications": 50 });
         let non_numeric = serde_json::json!({ "applications": "n/a" });
         let low = serde_json::json!({ "applications": -1 });
@@ -654,11 +664,23 @@ mod tests {
 
     #[test]
     fn verdict_maps_violations_and_enforce_flag() {
-        assert_eq!(ContractVerdict::from_violations(&[], true), ContractVerdict::Pass);
-        assert_eq!(ContractVerdict::from_violations(&[], false), ContractVerdict::Pass);
+        assert_eq!(
+            ContractVerdict::from_violations(&[], true),
+            ContractVerdict::Pass
+        );
+        assert_eq!(
+            ContractVerdict::from_violations(&[], false),
+            ContractVerdict::Pass
+        );
         let v = vec!["boom".to_string()];
-        assert_eq!(ContractVerdict::from_violations(&v, false), ContractVerdict::Warn);
-        assert_eq!(ContractVerdict::from_violations(&v, true), ContractVerdict::Block);
+        assert_eq!(
+            ContractVerdict::from_violations(&v, false),
+            ContractVerdict::Warn
+        );
+        assert_eq!(
+            ContractVerdict::from_violations(&v, true),
+            ContractVerdict::Block
+        );
         assert_eq!(ContractVerdict::Block.as_str(), "block");
     }
 
@@ -705,18 +727,37 @@ mod tests {
 
     #[test]
     fn plan_is_empty_when_managed_schedule_matches() {
-        let s = sched("catalog-grants-gov", "grants-gov", "0 0 9 * * *", true, true);
+        let s = sched(
+            "catalog-grants-gov",
+            "grants-gov",
+            "0 0 9 * * *",
+            true,
+            true,
+        );
         let plan = cat(LIVE_DAILY).reconcile_plan(&[s]);
-        assert!(plan.is_empty(), "expected empty plan, got: {}", plan.summary());
+        assert!(
+            plan.is_empty(),
+            "expected empty plan, got: {}",
+            plan.summary()
+        );
         assert_eq!(plan.in_sync, 1);
     }
 
     #[test]
     fn untagged_schedule_covers_the_source_and_is_never_touched() {
         // The code-seeded static row already serves this source exactly.
-        let s = sched("static-grants-gov", "grants-gov", "0 0 9 * * *", true, false);
+        let s = sched(
+            "static-grants-gov",
+            "grants-gov",
+            "0 0 9 * * *",
+            true,
+            false,
+        );
         let plan = cat(LIVE_DAILY).reconcile_plan(&[s]);
-        assert!(plan.is_empty(), "untagged coverage must not produce actions");
+        assert!(
+            plan.is_empty(),
+            "untagged coverage must not produce actions"
+        );
         assert_eq!(plan.covered_by_untagged, 1);
     }
 
@@ -732,13 +773,25 @@ mod tests {
 
     #[test]
     fn managed_cron_drift_and_disabled_row_yield_update() {
-        let drifted = sched("catalog-grants-gov", "grants-gov", "0 0 4 * * *", true, true);
+        let drifted = sched(
+            "catalog-grants-gov",
+            "grants-gov",
+            "0 0 4 * * *",
+            true,
+            true,
+        );
         let plan = cat(LIVE_DAILY).reconcile_plan(&[drifted]);
         assert_eq!(plan.update.len(), 1);
         assert_eq!(plan.update[0].to_cron, "0 0 9 * * *");
         assert!(!plan.update[0].re_enable);
 
-        let off = sched("catalog-grants-gov", "grants-gov", "0 0 9 * * *", false, true);
+        let off = sched(
+            "catalog-grants-gov",
+            "grants-gov",
+            "0 0 9 * * *",
+            false,
+            true,
+        );
         let plan = cat(LIVE_DAILY).reconcile_plan(&[off]);
         assert_eq!(plan.update.len(), 1);
         assert!(plan.update[0].re_enable);
@@ -768,7 +821,10 @@ mod tests {
         let s = sched("catalog-gone", "gone-app", "0 0 9 * * *", true, true);
         let plan = cat(LIVE_DAILY).reconcile_plan(&[s]);
         assert_eq!(plan.orphan.len(), 1);
-        assert!(plan.disable.is_empty(), "orphans are report-only, never disabled");
+        assert!(
+            plan.disable.is_empty(),
+            "orphans are report-only, never disabled"
+        );
         // The live source is still unserved, so a create is also planned.
         assert_eq!(plan.create.len(), 1);
     }

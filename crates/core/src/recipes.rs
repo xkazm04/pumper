@@ -86,7 +86,8 @@ impl ApiRecipe {
                     Value::String(s) => s.clone(),
                     other => other.to_string(),
                 };
-                let encoded: String = url::form_urlencoded::byte_serialize(raw.as_bytes()).collect();
+                let encoded: String =
+                    url::form_urlencoded::byte_serialize(raw.as_bytes()).collect();
                 url = url.replace(&format!("{{{k}}}"), &encoded);
             }
         }
@@ -280,7 +281,11 @@ pub fn discover_recipes(network: &[CapturedCall], extracted: &[Value]) -> Vec<Ap
         });
     }
     // Best candidate first; ties keep capture order (stable sort).
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| {
+        b.score
+            .partial_cmp(&a.score)
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     // One recipe per (host, template): keep the best-scoring occurrence.
     let mut seen: BTreeMap<(String, String), ()> = BTreeMap::new();
     out.retain(|r| {
@@ -310,8 +315,7 @@ impl RecipeStore {
 
     /// Inserts or refreshes one discovered recipe. Returns the stored id.
     pub async fn upsert(&self, recipe: &ApiRecipe) -> crate::Result<String> {
-        let now = chrono::Utc::now()
-            .to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
         let id = if recipe.id.is_empty() {
             uuid::Uuid::new_v4().to_string()
         } else {
@@ -347,19 +351,28 @@ impl RecipeStore {
 
     /// Lists recipes, best score first, optionally filtered by host.
     pub async fn list(&self, host: Option<&str>, limit: i64) -> crate::Result<Vec<Value>> {
-        let rows: Vec<(String, String, String, String, String, f64, i64, String, String)> =
-            sqlx::query_as(
-                "SELECT id, host, url_template, params, json_paths, score, validated, \
+        let rows: Vec<(
+            String,
+            String,
+            String,
+            String,
+            String,
+            f64,
+            i64,
+            String,
+            String,
+        )> = sqlx::query_as(
+            "SELECT id, host, url_template, params, json_paths, score, validated, \
                         discovered_at, last_seen_at \
                  FROM api_recipes \
                  WHERE (?1 IS NULL OR host = ?1) \
                  ORDER BY score DESC, host, url_template \
                  LIMIT ?2",
-            )
-            .bind(host)
-            .bind(limit)
-            .fetch_all(&self.pool)
-            .await?;
+        )
+        .bind(host)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
             .map(
@@ -539,7 +552,10 @@ mod tests {
         assert_eq!(recipes.len(), 1, "only the overlapping call qualifies");
         let r = &recipes[0];
         assert_eq!(r.host, "example.com");
-        assert_eq!(r.url_template, "https://example.com/api/search?q={q}&page={page}");
+        assert_eq!(
+            r.url_template,
+            "https://example.com/api/search?q={q}&page={page}"
+        );
         assert_eq!(r.params, json!({"q": "grants", "page": "1"}));
         assert!(r.json_paths.contains(&"$.results[*].title".to_string()));
         assert!(r.json_paths.contains(&"$.results[*].amount".to_string()));
@@ -567,22 +583,34 @@ mod tests {
         assert_eq!(normalize_leaf(&json!("  Alpha  ")), Some("alpha".into()));
         assert_eq!(normalize_leaf(&json!(50000)), Some("50000".into()));
         assert_eq!(normalize_leaf(&json!("ok")), None, "too short");
-        assert_eq!(normalize_leaf(&json!(true)), None, "booleans match anything");
+        assert_eq!(
+            normalize_leaf(&json!(true)),
+            None,
+            "booleans match anything"
+        );
         assert_eq!(normalize_leaf(&json!(null)), None);
     }
 
     #[test]
     fn duplicate_templates_keep_the_best_scoring_occurrence() {
         let extracted = vec![json!({"a": "alpha grant", "b": "beta grant", "c": "gamma grant"})];
-        let full = json!({"rows": [{"v": "alpha grant"}, {"v": "beta grant"}, {"v": "gamma grant"}]});
+        let full =
+            json!({"rows": [{"v": "alpha grant"}, {"v": "beta grant"}, {"v": "gamma grant"}]});
         let partial = json!({"rows": [{"v": "alpha grant"}, {"v": "beta grant"}, {"v": "gamma grant"}, {"x": "noise value"}]});
         let network = vec![
             call("https://example.com/api/list?page=1", partial),
             call("https://example.com/api/list?page=2", full),
         ];
         let recipes = discover_recipes(&network, &extracted);
-        assert_eq!(recipes.len(), 1, "same (host, template) folds to one recipe");
-        assert_eq!(recipes[0].url_template, "https://example.com/api/list?page={page}");
+        assert_eq!(
+            recipes.len(),
+            1,
+            "same (host, template) folds to one recipe"
+        );
+        assert_eq!(
+            recipes[0].url_template,
+            "https://example.com/api/list?page={page}"
+        );
     }
 
     fn recipe_fixture() -> ApiRecipe {
@@ -698,7 +726,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(r.id, low_id, "validated outranks score even opportunistically");
+        assert_eq!(
+            r.id, low_id,
+            "validated outranks score even opportunistically"
+        );
         // Host filter must hold.
         assert!(recipes
             .best_for_host("other.example", true)

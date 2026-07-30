@@ -1564,7 +1564,14 @@ impl Datasets {
             report.matched += items.len() as u64;
             if !items.is_empty() {
                 let s = self
-                    .upsert_many_at_depth(&spec.source_app, &spec.target_dataset, &items, None, None, 1)
+                    .upsert_many_at_depth(
+                        &spec.source_app,
+                        &spec.target_dataset,
+                        &items,
+                        None,
+                        None,
+                        1,
+                    )
                     .await?;
                 report.new += s.new.len() as u64;
                 report.changed += s.changed.len() as u64;
@@ -1677,7 +1684,10 @@ impl Datasets {
         }
         let mut out: Vec<(String, Value)> = Vec::new();
         for tuple in tuples {
-            match self.recompute_group_row(spec, group, filters, aggs, &tuple).await {
+            match self
+                .recompute_group_row(spec, group, filters, aggs, &tuple)
+                .await
+            {
                 Ok(row) => out.push(row),
                 Err(e) => {
                     tracing::warn!(spec = %spec.id, "derived: group row skipped: {e}");
@@ -1687,8 +1697,15 @@ impl Datasets {
         if out.is_empty() {
             return Ok(());
         }
-        self.upsert_many_at_depth(&spec.source_app, &spec.target_dataset, &out, None, None, depth + 1)
-            .await?;
+        self.upsert_many_at_depth(
+            &spec.source_app,
+            &spec.target_dataset,
+            &out,
+            None,
+            None,
+            depth + 1,
+        )
+        .await?;
         Ok(())
     }
 
@@ -1717,7 +1734,10 @@ impl Datasets {
             .await?;
         let mut data = serde_json::Map::new();
         for (path, value) in group.group_by.iter().zip(tuple) {
-            data.insert(group_field_name(path).to_string(), Value::String(value.clone()));
+            data.insert(
+                group_field_name(path).to_string(),
+                Value::String(value.clone()),
+            );
         }
         if rows.len() as i64 > self.max_group_scan {
             data.insert("stale".into(), Value::Bool(true));
@@ -1829,7 +1849,10 @@ impl Datasets {
                     }
                 }
             }
-            if let Err(e) = self.recompute_groups(spec, group, &filters, &aggs, tuples, 0).await {
+            if let Err(e) = self
+                .recompute_groups(spec, group, &filters, &aggs, tuples, 0)
+                .await
+            {
                 tracing::warn!(spec = %spec.id, "derived: removal recompute failed: {e}");
             }
         }
@@ -1852,8 +1875,10 @@ impl Datasets {
         let aggs = parse_aggregates(&group.aggregates)?;
         let mut report = DerivedBackfill::default();
         // tuple -> (count, per-aggregate sums keyed like `aggs`)
-        let mut groups: std::collections::HashMap<Vec<String>, (u64, std::collections::BTreeMap<String, f64>)> =
-            Default::default();
+        let mut groups: std::collections::HashMap<
+            Vec<String>,
+            (u64, std::collections::BTreeMap<String, f64>),
+        > = Default::default();
         let mut after: Option<(String, String)> = None;
         loop {
             let page = self
@@ -1890,7 +1915,10 @@ impl Datasets {
         for (tuple, (count, sums)) in &groups {
             let mut data = serde_json::Map::new();
             for (path, value) in group.group_by.iter().zip(tuple) {
-                data.insert(group_field_name(path).to_string(), Value::String(value.clone()));
+                data.insert(
+                    group_field_name(path).to_string(),
+                    Value::String(value.clone()),
+                );
             }
             data.insert("stale".into(), Value::Bool(false));
             for (name, agg) in &aggs {
@@ -2108,7 +2136,10 @@ pub fn validate_group(group: &DerivedGroup) -> Result<()> {
 /// The derived-row field a group path lands under: its last segment
 /// (`$.meta.state` → `state`).
 pub(crate) fn group_field_name(path: &str) -> &str {
-    path.trim_start_matches("$.").rsplit('.').next().unwrap_or(path)
+    path.trim_start_matches("$.")
+        .rsplit('.')
+        .next()
+        .unwrap_or(path)
 }
 
 /// A group value's canonical text: strings bare, numbers rendered — the
@@ -2694,7 +2725,10 @@ mod tests {
         );
         // v2 scope is count + sum; everything else is refused loudly.
         assert!(parse_aggregate("avg($.x)").is_err());
-        assert!(parse_aggregate("sum(amount)").is_err(), "path must be $.-rooted");
+        assert!(
+            parse_aggregate("sum(amount)").is_err(),
+            "path must be $.-rooted"
+        );
         assert!(parse_aggregate("sum($.x").is_err(), "unbalanced parens");
         assert!(parse_aggregate("").is_err());
     }

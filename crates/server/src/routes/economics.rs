@@ -72,9 +72,7 @@ fn per_record(cost_usd: f64, count: Option<i64>) -> Option<f64> {
 /// the spend is zero (free records have no per-dollar rate) or yield is unknown.
 fn value_per_dollar(weight: f64, fresh: Option<i64>, cost_usd: f64) -> Option<f64> {
     match fresh {
-        Some(f) if cost_usd > 0.0 && cost_usd.is_finite() => {
-            Some(weight * f as f64 / cost_usd)
-        }
+        Some(f) if cost_usd > 0.0 && cost_usd.is_finite() => Some(weight * f as f64 / cost_usd),
         _ => None,
     }
 }
@@ -281,7 +279,11 @@ fn app_json(app: &str, w: &AppWindow, weight: f64) -> Value {
 pub(crate) async fn economics_report(
     State(state): State<AppState>,
 ) -> Result<Json<Value>, ApiError> {
-    debug_assert_eq!(WINDOWS.len(), 2, "advice compares exactly recent vs baseline");
+    debug_assert_eq!(
+        WINDOWS.len(),
+        2,
+        "advice compares exactly recent vs baseline"
+    );
     let recent = window(&state, WINDOWS[0].1).await?;
     let baseline = window(&state, WINDOWS[1].1).await?;
 
@@ -330,8 +332,16 @@ mod tests {
     #[test]
     fn per_record_divides_and_refuses_zero_or_unknown_counts() {
         assert_eq!(per_record(4.0, Some(8)), Some(0.5));
-        assert_eq!(per_record(0.0, Some(8)), Some(0.0), "free records genuinely cost $0");
-        assert_eq!(per_record(4.0, Some(0)), None, "zero records: undefined, not infinity");
+        assert_eq!(
+            per_record(0.0, Some(8)),
+            Some(0.0),
+            "free records genuinely cost $0"
+        );
+        assert_eq!(
+            per_record(4.0, Some(0)),
+            None,
+            "zero records: undefined, not infinity"
+        );
         assert_eq!(per_record(4.0, None), None, "unknown count: unknown price");
         assert_eq!(per_record(f64::NAN, Some(8)), None);
         assert_eq!(per_record(-1.0, Some(8)), None);
@@ -348,8 +358,16 @@ mod tests {
     #[test]
     fn value_per_dollar_needs_spend_and_yield() {
         assert_eq!(value_per_dollar(1.0, Some(10), 2.0), Some(5.0));
-        assert_eq!(value_per_dollar(2.0, Some(10), 2.0), Some(10.0), "weight scales value");
-        assert_eq!(value_per_dollar(1.0, Some(10), 0.0), None, "no spend: no per-dollar rate");
+        assert_eq!(
+            value_per_dollar(2.0, Some(10), 2.0),
+            Some(10.0),
+            "weight scales value"
+        );
+        assert_eq!(
+            value_per_dollar(1.0, Some(10), 0.0),
+            None,
+            "no spend: no per-dollar rate"
+        );
         assert_eq!(value_per_dollar(1.0, None, 2.0), None);
     }
 

@@ -1331,7 +1331,10 @@ mod tests {
         // An agent-actuatable surface must be double opt-in: mount, then enqueue.
         let m = McpConfig::default();
         assert!(!m.enabled, "mcp must be opt-in");
-        assert!(!m.allow_enqueue, "enqueue must be a second, separate opt-in");
+        assert!(
+            !m.allow_enqueue,
+            "enqueue must be a second, separate opt-in"
+        );
         assert!(m.max_job_budget_usd >= 0.0);
     }
 

@@ -47,10 +47,6 @@ pub(crate) async fn list_recipes(
 ) -> Result<Json<Value>, ApiError> {
     let limit = query.limit.clamp(1, 500);
     let host = query.host.as_deref().map(str::to_lowercase);
-    let recipes = state
-        .storage
-        .recipes()
-        .list(host.as_deref(), limit)
-        .await?;
+    let recipes = state.storage.recipes().list(host.as_deref(), limit).await?;
     Ok(Json(json!({ "recipes": recipes })))
 }
