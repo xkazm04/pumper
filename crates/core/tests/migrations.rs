@@ -140,6 +140,23 @@ async fn replay_keeps_columns_added_by_later_migrations() {
         );
     }
 
+    let triggers = column_names(&pool, "triggers").await;
+    for col in [
+        "filters",      // 0021 external triggers
+        "plugin_hooks", // 0032 trigger plugin hooks (M15)
+    ] {
+        assert!(
+            triggers.contains(col),
+            "triggers lost column `{col}`: {triggers:?}"
+        );
+    }
+
+    let watches = column_names(&pool, "watches").await;
+    assert!(
+        watches.contains("sink"), // 0031 watch sinks
+        "watches lost column `sink`: {watches:?}"
+    );
+
     let recipes = column_names(&pool, "api_recipes").await;
     assert!(
         recipes.contains("consecutive_failures"), // 0028 recipe strikes

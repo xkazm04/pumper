@@ -276,14 +276,31 @@ pub(crate) async fn list_profiles(State(state): State<AppState>) -> Result<Json<
 
 // ---- WASM plugins ---------------------------------------------------------
 
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+pub(crate) struct PluginsQuery {
+    /// Filter by a manifest's self-declared `kind` (convention:
+    /// `extractor` | `predicate` | `transform`), so UIs offer the right
+    /// plugins per hook. A plugin without `describe()` (or without a `kind`
+    /// field) only appears in the unfiltered list.
+    kind: Option<String>,
+}
+
 #[utoipa::path(
     get,
     path = "/plugins",
     tag = "plugins",
-    responses((status = 200, description = "`{plugins: [{name, ...}]}` — each entry is a plugin's self-describing manifest (name/version/description/params_schema/output_schema) when it exports `describe`, else just `{name}`."))
+    params(PluginsQuery),
+    responses((status = 200, description = "`{plugins: [{name, ...}]}` — each entry is a plugin's self-describing manifest (name/version/description/kind/params_schema/output_schema) when it exports `describe`, else just `{name}`. `?kind=` filters by the manifest's declared kind."))
 )]
-pub(crate) async fn list_plugins(State(state): State<AppState>) -> Json<Value> {
-    Json(json!({ "plugins": state.plugins.manifests() }))
+pub(crate) async fn list_plugins(
+    State(state): State<AppState>,
+    Query(query): Query<PluginsQuery>,
+) -> Json<Value> {
+    let mut manifests = state.plugins.manifests();
+    if let Some(kind) = &query.kind {
+        manifests.retain(|m| m.get("kind").and_then(Value::as_str) == Some(kind.as_str()));
+    }
+    Json(json!({ "plugins": manifests }))
 }
 
 /// Hot-swap: rescan the plugin directory and reload every `.wasm` module.

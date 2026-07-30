@@ -147,6 +147,128 @@ pub fn terminal_trigger_obj(
     })
 }
 
+// ── plugin hooks (M15 "WASM everywhere" v1) ──────────────────────────────────
+
+/// Interprets a predicate plugin's output: the contract is `{"pass": bool}`,
+/// with a bare `true`/`false` accepted as shorthand. Anything else is a
+/// malformed verdict (`None`) and the hook's fail-open default applies.
+pub fn predicate_verdict(out: &Value) -> Option<bool> {
+    match out {
+        Value::Bool(b) => Some(*b),
+        Value::Object(m) => m.get("pass").and_then(Value::as_bool),
+        _ => None,
+    }
+}
+
+/// What a failed/malformed predicate falls back to: `"skip"` → don't fire,
+/// anything else (including absent) → fire. Fail-OPEN is the default — a
+/// broken plugin must never silently wedge a pipeline edge.
+pub fn predicate_fail_default(on_error: Option<&str>) -> bool {
+    on_error != Some("skip")
+}
+
+/// Provenance/identity keys the host owns on a `_trigger` object. A transform
+/// plugin may shape everything else, but these are re-stamped from the
+/// original after it runs — lineage (`depth`/`chain` cycle guards, delivery
+/// idempotency, the fired-runs view) must not be forgeable or losable from
+/// inside the sandbox.
+const PROVENANCE_KEYS: &[&str] = &[
+    "trigger_id",
+    "source_kind",
+    "source_job_id",
+    "event_id",
+    "source_id",
+    "depth",
+    "chain",
+];
+
+/// Merges a transform plugin's output over the original `_trigger` object,
+/// re-stamping the host-owned provenance keys. Non-object output violates the
+/// contract → the original object is kept unchanged.
+pub fn restamp_provenance(original: &Value, transformed: Value) -> Value {
+    let Value::Object(mut out) = transformed else {
+        return original.clone();
+    };
+    if let Value::Object(orig) = original {
+        for key in PROVENANCE_KEYS {
+            match orig.get(*key) {
+                Some(v) => {
+                    out.insert((*key).to_string(), v.clone());
+                }
+                None => {
+                    out.remove(*key);
+                }
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// Runs a trigger's plugin hooks over the built `_trigger` object.
+/// `None` = the predicate said skip; `Some(obj)` = the (possibly transformed)
+/// object to merge into target params. Every failure path is fail-open with a
+/// loud log: predicate errors fall back to the hook's `on_error` default
+/// (fire), transform errors keep the untransformed object.
+pub async fn apply_plugin_hooks(
+    plugins: &dyn pumper_core::Plugins,
+    trigger: &Trigger,
+    obj: Value,
+) -> Option<Value> {
+    let Some(hooks) = &trigger.plugin_hooks else {
+        return Some(obj);
+    };
+    if let Some(hook) = &hooks.predicate {
+        let input = obj.to_string();
+        match plugins.run(&hook.plugin, &input, &hook.params).await {
+            Ok(out) => match predicate_verdict(&out) {
+                Some(true) => {}
+                Some(false) => {
+                    info!(trigger = %trigger.id, plugin = %hook.plugin,
+                          "trigger skipped: predicate plugin returned pass=false");
+                    return None;
+                }
+                None => {
+                    let fire = predicate_fail_default(hook.on_error.as_deref());
+                    warn!(trigger = %trigger.id, plugin = %hook.plugin,
+                          fallback = if fire { "fire" } else { "skip" },
+                          "predicate plugin returned a malformed verdict (want {{\"pass\": bool}}): {out}");
+                    if !fire {
+                        return None;
+                    }
+                }
+            },
+            Err(e) => {
+                let fire = predicate_fail_default(hook.on_error.as_deref());
+                warn!(trigger = %trigger.id, plugin = %hook.plugin,
+                      fallback = if fire { "fire" } else { "skip" },
+                      "predicate plugin failed (trap/fuel/missing): {e}");
+                if !fire {
+                    return None;
+                }
+            }
+        }
+    }
+    let obj = if let Some(hook) = &hooks.transform {
+        let input = obj.to_string();
+        match plugins.run(&hook.plugin, &input, &hook.params).await {
+            Ok(out @ Value::Object(_)) => restamp_provenance(&obj, out),
+            Ok(other) => {
+                warn!(trigger = %trigger.id, plugin = %hook.plugin,
+                      "transform plugin returned non-object output; keeping the original envelope: {other}");
+                obj
+            }
+            Err(e) => {
+                warn!(trigger = %trigger.id, plugin = %hook.plugin,
+                      "transform plugin failed (trap/fuel/missing); keeping the original envelope: {e}");
+                obj
+            }
+        }
+    } else {
+        obj
+    };
+    Some(obj)
+}
+
 /// At-most-once-per-source-run dedup key (existing partial unique index).
 /// External triggers reuse it with the inbound event id as the source, so a
 /// redelivered webhook (same `x-pumper-delivery-id`) fires each trigger once.
@@ -394,6 +516,10 @@ pub async fn fire_external_triggers(
             depth,
             &chain,
         );
+        // Plugin predicate/transform hooks (fail-open, see `apply_plugin_hooks`).
+        let Some(obj) = apply_plugin_hooks(state.plugins.as_ref(), trigger, obj).await else {
+            continue;
+        };
         if !state.registry.contains_key(&trigger.target_app) {
             warn!(trigger = %trigger.id, app = %trigger.target_app,
                   "external trigger skipped: target app not registered");
@@ -429,6 +555,11 @@ pub async fn fire_external_triggers(
 /// Enqueues one triggered hop (dedup-guarded). Returns 1 when a job was
 /// actually created, 0 when skipped/deduped/failed.
 async fn enqueue_hop(state: &AppState, trigger: &Trigger, source: &Job, obj: Value) -> usize {
+    // Plugin hooks first: a predicate may veto the hop, a transform may shape
+    // the `_trigger` envelope. Both fail open (see `apply_plugin_hooks`).
+    let Some(obj) = apply_plugin_hooks(state.plugins.as_ref(), trigger, obj).await else {
+        return 0;
+    };
     if !state.registry.contains_key(&trigger.target_app) {
         warn!(trigger = %trigger.id, app = %trigger.target_app,
               "trigger skipped: target app not registered");
@@ -638,6 +769,7 @@ mod tests {
             enabled: true,
             created_at: chrono::Utc::now(),
             filters: None,
+            plugin_hooks: None,
         };
         let obj = external_trigger_obj(
             &trigger,
@@ -653,5 +785,252 @@ mod tests {
         assert_eq!(obj["event_id"], "ev-9");
         assert_eq!(obj["payload"]["ref"], "refs/heads/main");
         assert_eq!(obj["depth"], 1);
+    }
+
+    // ── plugin hooks (M15) ───────────────────────────────────────────────────
+
+    use pumper_core::{PluginHook, TriggerPluginHooks};
+
+    /// Canned in-memory host standing in for the WASM runtime — the same
+    /// stubbing move the plugin app tests use when the .wasm artifact is
+    /// absent. Records the envelope each plugin received.
+    struct StubPlugins {
+        outputs: std::collections::HashMap<String, std::result::Result<Value, String>>,
+        calls: std::sync::Mutex<Vec<(String, String, Value)>>,
+    }
+
+    impl StubPlugins {
+        fn new(outputs: Vec<(&str, std::result::Result<Value, String>)>) -> Self {
+            Self {
+                outputs: outputs
+                    .into_iter()
+                    .map(|(n, o)| (n.to_string(), o))
+                    .collect(),
+                calls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl pumper_core::Plugins for StubPlugins {
+        async fn run(&self, name: &str, input: &str, params: &Value) -> pumper_core::Result<Value> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((name.to_string(), input.to_string(), params.clone()));
+            match self.outputs.get(name) {
+                Some(Ok(v)) => Ok(v.clone()),
+                Some(Err(e)) => Err(pumper_core::Error::App(e.clone())),
+                None => Err(pumper_core::Error::App(format!("unknown plugin '{name}'"))),
+            }
+        }
+        fn list(&self) -> Vec<String> {
+            self.outputs.keys().cloned().collect()
+        }
+        async fn reload(&self) -> pumper_core::Result<usize> {
+            Ok(0)
+        }
+    }
+
+    fn hook(plugin: &str, params: Value, on_error: Option<&str>) -> PluginHook {
+        PluginHook {
+            plugin: plugin.into(),
+            params,
+            on_error: on_error.map(String::from),
+        }
+    }
+
+    fn trigger_with_hooks(hooks: TriggerPluginHooks) -> pumper_core::Trigger {
+        pumper_core::Trigger {
+            id: "T1".into(),
+            name: None,
+            source_kind: "dataset".into(),
+            source_app: "src".into(),
+            source_dataset: Some("*".into()),
+            on_change: None,
+            on_status: None,
+            target_app: "crawl".into(),
+            params: json!({}),
+            budget_usd: None,
+            priority: 0,
+            max_attempts: 1,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            filters: None,
+            plugin_hooks: Some(hooks),
+        }
+    }
+
+    fn delta() -> Value {
+        json!({
+            "trigger_id": "T1",
+            "source_kind": "dataset",
+            "source_job_id": "J1",
+            "dataset": "d",
+            "count": 3,
+            "keys": ["k1", "k2"],
+            "depth": 1,
+            "chain": ["T1"],
+        })
+    }
+
+    #[test]
+    fn predicate_verdict_accepts_pass_object_and_bare_bool_only() {
+        assert_eq!(predicate_verdict(&json!({ "pass": true })), Some(true));
+        assert_eq!(predicate_verdict(&json!({ "pass": false })), Some(false));
+        assert_eq!(predicate_verdict(&json!(true)), Some(true));
+        assert_eq!(predicate_verdict(&json!(false)), Some(false));
+        // Malformed: wrong type, missing key, non-bool pass.
+        assert_eq!(predicate_verdict(&json!({ "pass": "yes" })), None);
+        assert_eq!(predicate_verdict(&json!({ "ok": true })), None);
+        assert_eq!(predicate_verdict(&json!("fire")), None);
+        assert_eq!(predicate_verdict(&json!(1)), None);
+    }
+
+    #[test]
+    fn predicate_fail_default_is_fail_open_unless_skip() {
+        assert!(predicate_fail_default(None)); // absent → fire
+        assert!(predicate_fail_default(Some("fire")));
+        assert!(predicate_fail_default(Some("bogus"))); // unknown → still open
+        assert!(!predicate_fail_default(Some("skip")));
+    }
+
+    #[test]
+    fn restamp_provenance_pins_host_keys_and_rejects_non_objects() {
+        let original = delta();
+        // A transform that reshapes payload AND tries to forge lineage.
+        let shaped = restamp_provenance(
+            &original,
+            json!({ "summary": "3 fresh", "depth": 99, "chain": [], "trigger_id": "EVIL", "event_id": "forged" }),
+        );
+        assert_eq!(shaped["summary"], "3 fresh"); // plugin's shaping kept
+        assert_eq!(shaped["depth"], 1); // host keys re-stamped…
+        assert_eq!(shaped["chain"], json!(["T1"]));
+        assert_eq!(shaped["trigger_id"], "T1");
+        assert!(shaped.get("event_id").is_none()); // …and unforgeable when absent
+        assert!(
+            shaped.get("count").is_none(),
+            "non-provenance keys are the plugin's to drop"
+        );
+        // Contract violation: non-object output keeps the original untouched.
+        assert_eq!(restamp_provenance(&original, json!("nope")), original);
+        assert_eq!(restamp_provenance(&original, json!([1, 2])), original);
+    }
+
+    #[tokio::test]
+    async fn hooks_absent_is_a_passthrough() {
+        let plugins = StubPlugins::new(vec![]);
+        let mut trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: None,
+            transform: None,
+        });
+        trigger.plugin_hooks = None;
+        let out = apply_plugin_hooks(&plugins, &trigger, delta()).await;
+        assert_eq!(out, Some(delta()));
+        assert!(plugins.calls.lock().unwrap().is_empty(), "no plugin runs");
+    }
+
+    #[tokio::test]
+    async fn predicate_pass_false_skips_and_pass_true_fires() {
+        let plugins = StubPlugins::new(vec![("gate", Ok(json!({ "pass": false })))]);
+        let trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: Some(hook("gate", json!({ "min_count": 5 }), None)),
+            transform: None,
+        });
+        assert_eq!(apply_plugin_hooks(&plugins, &trigger, delta()).await, None);
+        // The plugin saw the delta envelope as input and its own params.
+        let calls = plugins.calls.lock().unwrap();
+        assert_eq!(calls[0].0, "gate");
+        assert_eq!(
+            serde_json::from_str::<Value>(&calls[0].1).unwrap()["count"],
+            3
+        );
+        assert_eq!(calls[0].2, json!({ "min_count": 5 }));
+        drop(calls);
+
+        let plugins = StubPlugins::new(vec![("gate", Ok(json!({ "pass": true })))]);
+        assert_eq!(
+            apply_plugin_hooks(&plugins, &trigger, delta()).await,
+            Some(delta())
+        );
+    }
+
+    #[tokio::test]
+    async fn predicate_failure_is_fail_open_by_default_and_skip_when_configured() {
+        // Trap/error → default fail-open: the hop still fires, envelope intact.
+        let plugins = StubPlugins::new(vec![("gate", Err("fuel exhausted".into()))]);
+        let trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: Some(hook("gate", json!({}), None)),
+            transform: None,
+        });
+        assert_eq!(
+            apply_plugin_hooks(&plugins, &trigger, delta()).await,
+            Some(delta())
+        );
+        // Unknown plugin (not loaded) is the same failure class.
+        let plugins = StubPlugins::new(vec![]);
+        assert_eq!(
+            apply_plugin_hooks(&plugins, &trigger, delta()).await,
+            Some(delta())
+        );
+        // Malformed verdict → same fail-open path.
+        let plugins = StubPlugins::new(vec![("gate", Ok(json!({ "verdict": "yes" })))]);
+        assert_eq!(
+            apply_plugin_hooks(&plugins, &trigger, delta()).await,
+            Some(delta())
+        );
+        // on_error: "skip" flips the default.
+        let plugins = StubPlugins::new(vec![("gate", Err("trap".into()))]);
+        let trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: Some(hook("gate", json!({}), Some("skip"))),
+            transform: None,
+        });
+        assert_eq!(apply_plugin_hooks(&plugins, &trigger, delta()).await, None);
+    }
+
+    #[tokio::test]
+    async fn transform_shapes_the_envelope_and_fails_open_to_the_original() {
+        let plugins = StubPlugins::new(vec![(
+            "slim",
+            Ok(json!({ "summary": "3 fresh in d", "depth": 42 })),
+        )]);
+        let trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: None,
+            transform: Some(hook("slim", json!({}), None)),
+        });
+        let out = apply_plugin_hooks(&plugins, &trigger, delta())
+            .await
+            .expect("transform never skips");
+        assert_eq!(out["summary"], "3 fresh in d");
+        assert_eq!(out["depth"], 1, "provenance re-stamped over the transform");
+        assert_eq!(out["trigger_id"], "T1");
+
+        // Error / non-object output → the untransformed envelope, loudly.
+        let plugins = StubPlugins::new(vec![("slim", Err("trap".into()))]);
+        assert_eq!(
+            apply_plugin_hooks(&plugins, &trigger, delta()).await,
+            Some(delta())
+        );
+        let plugins = StubPlugins::new(vec![("slim", Ok(json!([1, 2, 3])))]);
+        assert_eq!(
+            apply_plugin_hooks(&plugins, &trigger, delta()).await,
+            Some(delta())
+        );
+    }
+
+    #[tokio::test]
+    async fn predicate_runs_before_transform_and_veto_short_circuits() {
+        let plugins = StubPlugins::new(vec![
+            ("gate", Ok(json!({ "pass": false }))),
+            ("slim", Ok(json!({ "summary": "never" }))),
+        ]);
+        let trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: Some(hook("gate", json!({}), None)),
+            transform: Some(hook("slim", json!({}), None)),
+        });
+        assert_eq!(apply_plugin_hooks(&plugins, &trigger, delta()).await, None);
+        let calls = plugins.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "veto must short-circuit the transform");
+        assert_eq!(calls[0].0, "gate");
     }
 }

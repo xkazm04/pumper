@@ -1,0 +1,13 @@
+-- M15 "WASM everywhere" v1: triggers may name sandboxed WASM plugin hooks.
+--
+-- One nullable JSON column (the `filters` pattern from 0016): NULL means "no
+-- hooks", so every pre-existing trigger keeps its exact behavior and no
+-- backfill runs. The JSON is a serialized `TriggerPluginHooks`:
+--   { "predicate": { "plugin", "params"?, "on_error"? ("fire"|"skip") },
+--     "transform": { "plugin", "params"? } }
+-- predicate = fire/skip decision over the delta (`_trigger`) envelope;
+-- transform = shapes the `_trigger` object before target-job params.
+-- Both fail OPEN at fire time (loud log) — a broken plugin never wedges the
+-- pipeline: predicate falls back to its `on_error` default (fire), transform
+-- falls back to the untransformed envelope.
+ALTER TABLE triggers ADD COLUMN plugin_hooks TEXT;

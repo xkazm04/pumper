@@ -80,6 +80,33 @@ pub(crate) struct CreateTriggerBody {
     /// External kind only: `$.path:op:value` predicate specs (the `?filter=`
     /// grammar) ANDed against the inbound payload.
     filters: Option<Vec<String>>,
+    /// Sandboxed WASM hooks (M15): `predicate` returns fire/skip over the
+    /// `_trigger` delta envelope (`{"pass": bool}`, fail-open per `on_error`),
+    /// `transform` shapes the `_trigger` object before target params. Any
+    /// source kind. The named plugin need not be loaded yet (hot reload);
+    /// a missing plugin at fire time takes the fail-open path, loudly.
+    #[schema(value_type = Object)]
+    plugins: Option<pumper_core::TriggerPluginHooks>,
+}
+
+/// Create-time validation for one plugin hook: a non-empty plugin name, and
+/// `on_error` (predicate only) limited to `fire` | `skip`.
+fn validate_hook(
+    hook: &pumper_core::PluginHook,
+    kind: &str,
+    allow_on_error: bool,
+) -> Result<(), String> {
+    if hook.plugin.trim().is_empty() {
+        return Err(format!("{kind} hook needs a non-empty plugin name"));
+    }
+    match hook.on_error.as_deref() {
+        None => Ok(()),
+        Some(_) if !allow_on_error => Err(format!(
+            "on_error is only valid on the predicate hook, not {kind}"
+        )),
+        Some("fire" | "skip") => Ok(()),
+        Some(other) => Err(format!("invalid on_error '{other}' (fire | skip)")),
+    }
 }
 
 #[utoipa::path(
@@ -158,12 +185,27 @@ pub(crate) async fn create_trigger(
         (Some(f), _) if f.is_empty() => None,
         (Some(_), kind) if kind != "external" => {
             return Err(bad(
-                "filters are only valid for source_kind 'external'".into(),
+                "filters are only valid for source_kind 'external'".into()
             ))
         }
         (Some(f), _) => {
             super::datasets::parse_filters(f)?; // 400 with the malformed spec
             Some(f.as_slice())
+        }
+    };
+    // Plugin hooks: validate shape now so an accepted trigger can always be
+    // evaluated; an all-empty hooks object stores as no hooks.
+    let plugin_hooks = match &body.plugins {
+        None => None,
+        Some(h) if h.predicate.is_none() && h.transform.is_none() => None,
+        Some(h) => {
+            if let Some(p) = &h.predicate {
+                validate_hook(p, "predicate", true).map_err(bad)?;
+            }
+            if let Some(t) = &h.transform {
+                validate_hook(t, "transform", false).map_err(bad)?;
+            }
+            Some(h)
         }
     };
     let params = body.params.unwrap_or_else(|| json!({}));
@@ -182,6 +224,7 @@ pub(crate) async fn create_trigger(
             priority: body.priority.unwrap_or(0),
             max_attempts: body.max_attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS_CAP),
             filters,
+            plugin_hooks,
         })
         .await?;
     Ok((StatusCode::CREATED, Json(trigger)))
@@ -328,6 +371,13 @@ pub(crate) async fn test_trigger(
             )));
         }
         crate::triggers::terminal_trigger_obj(&trigger, &source, depth, &chain)
+    };
+    // Run the plugin hooks the live fire path would, so the dry-run decision
+    // and the previewed params are honest about predicate/transform effects.
+    let Some(obj) =
+        crate::triggers::apply_plugin_hooks(state.plugins.as_ref(), &trigger, obj).await
+    else {
+        return Ok(Json(no_fire("predicate plugin returned pass=false")));
     };
     let resolved_params = crate::triggers::merged_params(&trigger.params, obj);
 

@@ -37,8 +37,10 @@ pub struct EnqueueOptions {
     pub trigger_id: Option<String>,
 }
 
-/// A standing subscription: POST a webhook whenever a job leaves fresh
-/// revisions in the watched dataset (`"*"` = all datasets of the app).
+/// A standing subscription: deliver a `dataset.changed` event whenever a job
+/// leaves fresh revisions in the watched dataset (`"*"` = all datasets of the
+/// app). `sink` selects the delivery connector; `"webhook"` (POST at `url`)
+/// is the default and the original behavior.
 #[derive(Debug, Clone, Serialize)]
 pub struct Watch {
     pub id: String,
@@ -48,6 +50,8 @@ pub struct Watch {
     /// HMAC-SHA256 signing secret for delivery bodies (never serialized).
     #[serde(skip_serializing)]
     pub secret: Option<String>,
+    /// Delivery connector: `"webhook"` | `"file"` | `"slack"` (0031).
+    pub sink: String,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
 }
@@ -733,23 +737,27 @@ impl Storage {
 
     // ---- Dataset watches ---------------------------------------------------
 
+    /// `sink` is the delivery connector (`"webhook"` | `"file"` | `"slack"`);
+    /// callers validate the value — storage stores it verbatim.
     pub async fn create_watch(
         &self,
         app: &str,
         dataset: &str,
         url: &str,
         secret: Option<&str>,
+        sink: &str,
     ) -> Result<Watch> {
         let id = Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO watches (id, app, dataset, url, secret, enabled, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, 1, ?6)",
+            "INSERT INTO watches (id, app, dataset, url, secret, sink, enabled, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
         )
         .bind(&id)
         .bind(app)
         .bind(dataset)
         .bind(url)
         .bind(secret)
+        .bind(sink)
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -760,7 +768,7 @@ impl Storage {
 
     pub async fn get_watch(&self, id: &str) -> Result<Option<Watch>> {
         let row: Option<WatchRow> = sqlx::query_as(
-            "SELECT id, app, dataset, url, secret, enabled, created_at FROM watches WHERE id = ?1",
+            "SELECT id, app, dataset, url, secret, sink, enabled, created_at FROM watches WHERE id = ?1",
         )
         .bind(id)
         .fetch_optional(&self.pool)
@@ -771,7 +779,7 @@ impl Storage {
     /// Watches for an app (all watches when `app` is None).
     pub async fn list_watches(&self, app: Option<&str>) -> Result<Vec<Watch>> {
         let rows: Vec<WatchRow> = sqlx::query_as(
-            "SELECT id, app, dataset, url, secret, enabled, created_at FROM watches \
+            "SELECT id, app, dataset, url, secret, sink, enabled, created_at FROM watches \
              WHERE (?1 IS NULL OR app = ?1) ORDER BY app, dataset",
         )
         .bind(app)
@@ -790,7 +798,7 @@ impl Storage {
     ) -> Result<Vec<Watch>> {
         let (after_ts, after_id) = split_after(after);
         let rows: Vec<WatchRow> = sqlx::query_as(
-            "SELECT id, app, dataset, url, secret, enabled, created_at FROM watches \
+            "SELECT id, app, dataset, url, secret, sink, enabled, created_at FROM watches \
              WHERE (?1 IS NULL OR app = ?1) \
              AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
              ORDER BY created_at DESC, id DESC LIMIT ?4",
@@ -807,7 +815,7 @@ impl Storage {
     /// Enabled watches for an app — the delivery set for change webhooks.
     pub async fn enabled_watches(&self, app: &str) -> Result<Vec<Watch>> {
         let rows: Vec<WatchRow> = sqlx::query_as(
-            "SELECT id, app, dataset, url, secret, enabled, created_at FROM watches \
+            "SELECT id, app, dataset, url, secret, sink, enabled, created_at FROM watches \
              WHERE app = ?1 AND enabled = 1",
         )
         .bind(app)
@@ -842,11 +850,16 @@ impl Storage {
             .filters
             .filter(|f| !f.is_empty())
             .map(|f| serde_json::to_string(f).unwrap_or_else(|_| "[]".into()));
+        // NULL when neither hook is set — an all-empty hooks object is no hooks.
+        let hooks_json = t
+            .plugin_hooks
+            .filter(|h| h.predicate.is_some() || h.transform.is_some())
+            .map(|h| serde_json::to_string(h).unwrap_or_else(|_| "{}".into()));
         sqlx::query(
             "INSERT INTO triggers (id, name, source_kind, source_app, source_dataset, on_change, \
              on_status, target_app, params, budget_usd, priority, max_attempts, enabled, created_at, \
-             filters) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14)",
+             filters, plugin_hooks) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14, ?15)",
         )
         .bind(&id)
         .bind(t.name)
@@ -862,6 +875,7 @@ impl Storage {
         .bind(t.max_attempts.max(1))
         .bind(now())
         .bind(filters_json)
+        .bind(hooks_json)
         .execute(&self.pool)
         .await?;
         self.get_trigger(&id)
@@ -1390,19 +1404,15 @@ impl Storage {
     /// Updates the cron of a schedule owned by `tag` (and re-enables it, since
     /// the desired state of a cron-bearing catalog row is "running"). Returns
     /// `false` when the row doesn't exist *or isn't owned by `tag`* — the fence.
-    pub async fn set_managed_schedule_cron(
-        &self,
-        id: &str,
-        cron: &str,
-        tag: &str,
-    ) -> Result<bool> {
-        let result =
-            sqlx::query("UPDATE schedules SET cron = ?2, enabled = 1 WHERE id = ?1 AND managed_by = ?3")
-                .bind(id)
-                .bind(cron)
-                .bind(tag)
-                .execute(&self.pool)
-                .await?;
+    pub async fn set_managed_schedule_cron(&self, id: &str, cron: &str, tag: &str) -> Result<bool> {
+        let result = sqlx::query(
+            "UPDATE schedules SET cron = ?2, enabled = 1 WHERE id = ?1 AND managed_by = ?3",
+        )
+        .bind(id)
+        .bind(cron)
+        .bind(tag)
+        .execute(&self.pool)
+        .await?;
         Ok(result.rows_affected() > 0)
     }
 
@@ -1778,7 +1788,42 @@ impl TryFrom<JobRow> for Job {
 
 const TRIGGER_COLUMNS: &str = "id, name, source_kind, source_app, source_dataset, on_change, \
                                on_status, target_app, params, budget_usd, priority, \
-                               max_attempts, enabled, created_at, filters";
+                               max_attempts, enabled, created_at, filters, plugin_hooks";
+
+/// One sandboxed WASM hook on a trigger: the plugin to run plus the `params`
+/// half of the `extract_v2` envelope it receives (so one module serves many
+/// triggers with different config, exactly like extraction plugins).
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct PluginHook {
+    /// Loaded plugin name (file stem under the plugins dir).
+    pub plugin: String,
+    /// Params envelope passed to the plugin (default `{}`).
+    #[serde(default = "default_hook_params")]
+    pub params: Value,
+    /// Predicate hook only — what to do when the plugin errors/traps/returns
+    /// garbage: `"fire"` (default; fail-open) or `"skip"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub on_error: Option<String>,
+}
+
+fn default_hook_params() -> Value {
+    Value::Object(serde_json::Map::new())
+}
+
+/// M15 "WASM everywhere" v1 — a trigger's optional plugin hooks, stored as one
+/// JSON column (`plugin_hooks`, migration 0032). Both hooks receive the delta
+/// (`_trigger`) object as the envelope's `doc` and BOTH fail open with a loud
+/// log — a broken plugin never wedges the pipeline.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct TriggerPluginHooks {
+    /// Decides fire/skip: must return `{"pass": bool}` (or a bare bool).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predicate: Option<PluginHook>,
+    /// Shapes the `_trigger` object before it is merged into target params.
+    /// Must return a JSON object; provenance keys are re-stamped by the host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transform: Option<PluginHook>,
+}
 
 /// A reactive-pipeline edge: (source event) → (enqueue target app). The set of
 /// triggers is the pipeline DAG.
@@ -1807,6 +1852,9 @@ pub struct Trigger {
     /// ANDed against the inbound payload. External kind only.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub filters: Option<Vec<String>>,
+    /// Sandboxed WASM predicate/transform hooks (M15 v1). All source kinds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub plugin_hooks: Option<TriggerPluginHooks>,
 }
 
 impl Trigger {
@@ -1832,6 +1880,8 @@ pub struct NewTrigger<'a> {
     pub max_attempts: i64,
     /// External kind only: `$.path:op:value` predicate specs (ANDed).
     pub filters: Option<&'a [String]>,
+    /// Sandboxed WASM predicate/transform hooks (M15 v1).
+    pub plugin_hooks: Option<&'a TriggerPluginHooks>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1851,6 +1901,7 @@ struct TriggerRow {
     enabled: i64,
     created_at: String,
     filters: Option<String>,
+    plugin_hooks: Option<String>,
 }
 
 impl TryFrom<TriggerRow> for Trigger {
@@ -1874,6 +1925,10 @@ impl TryFrom<TriggerRow> for Trigger {
             created_at: parse_ts(&r.created_at)?,
             filters: r
                 .filters
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok()),
+            plugin_hooks: r
+                .plugin_hooks
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
         })
@@ -2002,6 +2057,7 @@ struct WatchRow {
     dataset: String,
     url: String,
     secret: Option<String>,
+    sink: String,
     enabled: i64,
     created_at: String,
 }
@@ -2016,6 +2072,7 @@ impl TryFrom<WatchRow> for Watch {
             dataset: r.dataset,
             url: r.url,
             secret: r.secret,
+            sink: r.sink,
             enabled: r.enabled != 0,
             created_at: parse_ts(&r.created_at)?,
         })
