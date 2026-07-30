@@ -191,8 +191,7 @@ pub(crate) async fn list_apps(
             let apps: Vec<_> = apps
                 .into_iter()
                 .map(|app| {
-                    let requires: Vec<String> =
-                        app.requires().iter().map(|r| r.label()).collect();
+                    let requires: Vec<String> = app.requires().iter().map(|r| r.label()).collect();
                     // `ready` = every declared precondition is satisfied here (e.g. the
                     // required API-key env var is set), so a credential-gated app is
                     // distinguishable from a runnable one before its first failed job.

@@ -184,10 +184,9 @@ pub(crate) async fn rederive_provenance(
             .iter()
             .find(|r| r.revision == n)
             .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, format!("no revision {n}")))?,
-        None => chain
-            .iter()
-            .find(|r| r.data.is_some())
-            .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "record has no data revisions".into()))?,
+        None => chain.iter().find(|r| r.data.is_some()).ok_or_else(|| {
+            ApiError(StatusCode::NOT_FOUND, "record has no data revisions".into())
+        })?,
     };
     let stored = rev.data.as_ref().ok_or_else(|| {
         not_replayable(format!(
@@ -283,7 +282,11 @@ fn load_artifact(state: &AppState, app: &str, data: &Value) -> Result<String, St
         .get("job_id")
         .and_then(Value::as_str)
         .ok_or_else(|| "record carries no job_id to locate its artifact dir".to_string())?;
-    for (what, s) in [("app", app), ("job_id", job_id), ("artifact_path", artifact)] {
+    for (what, s) in [
+        ("app", app),
+        ("job_id", job_id),
+        ("artifact_path", artifact),
+    ] {
         if s.is_empty()
             || s == "."
             || s == ".."
@@ -342,7 +345,10 @@ mod tests {
             kept,
             json!({ "title": "A", "price": 3, "nested": { "_inner": "stays" } })
         );
-        assert_eq!(ignored, vec!["_observed_at".to_string(), "_url".to_string()]);
+        assert_eq!(
+            ignored,
+            vec!["_observed_at".to_string(), "_url".to_string()]
+        );
         // Non-objects pass through untouched.
         let (kept, ignored) = strip_meta(&json!([1, 2]));
         assert_eq!(kept, json!([1, 2]));

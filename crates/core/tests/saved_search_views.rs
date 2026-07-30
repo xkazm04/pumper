@@ -42,13 +42,15 @@ async fn materialize_round_trip_writes_view_records_keyed_by_doc_id() {
     assert_eq!(summary.new, vec!["grants:opportunities:k1"]);
     assert!(removed.is_empty());
 
-    let (key, data): (String, String) = sqlx::query_as(
-        "SELECT key, data FROM records WHERE app = 'search' AND dataset = 'view'",
-    )
-    .fetch_one(&store.storage.pool())
-    .await
-    .unwrap();
-    assert_eq!(key, "grants:opportunities:k1", "key must be the search doc id");
+    let (key, data): (String, String) =
+        sqlx::query_as("SELECT key, data FROM records WHERE app = 'search' AND dataset = 'view'")
+            .fetch_one(&store.storage.pool())
+            .await
+            .unwrap();
+    assert_eq!(
+        key, "grants:opportunities:k1",
+        "key must be the search doc id"
+    );
     let v: serde_json::Value = serde_json::from_str(&data).unwrap();
     assert_eq!(v["title"], "Alpha grant");
     assert_eq!(v["snippet"], "...Alpha grant...");
@@ -56,7 +58,10 @@ async fn materialize_round_trip_writes_view_records_keyed_by_doc_id() {
     assert_eq!(v["score"], 1.2, "score must be bucketed to one decimal");
     assert_eq!(v["source"]["app"], "grants");
     assert_eq!(v["source"]["dataset"], "opportunities");
-    assert_eq!(v["source"]["key"], "k1", "source key = doc id minus app:dataset:");
+    assert_eq!(
+        v["source"]["key"], "k1",
+        "source key = doc id minus app:dataset:"
+    );
 }
 
 #[tokio::test]
@@ -84,7 +89,10 @@ async fn saved_search_materialize_field_survives_storage_round_trip() {
         .unwrap()
         .expect("created search must be readable");
     let mat = got.materialize.expect("materialize must round-trip");
-    assert_eq!((mat.app.as_str(), mat.dataset.as_str()), ("search", "view-ai"));
+    assert_eq!(
+        (mat.app.as_str(), mat.dataset.as_str()),
+        ("search", "view-ai")
+    );
 
     // A plain search stays plain.
     let plain = store

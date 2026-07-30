@@ -16,6 +16,7 @@ use pumper_core::{
 };
 use serde_json::{json, Value};
 
+pub mod link_graph;
 pub mod reliability;
 
 pub struct Crawl;
@@ -133,6 +134,9 @@ struct PageCounts {
     /// Cadence-only counter merges written for `304` check markers (M07). Kept
     /// separate from `changed` — a cadence bump is bookkeeping, not content.
     cadence_updates: AtomicUsize,
+    /// Link-graph edges successfully upserted into the `edges` dataset (M08).
+    /// Counted on write success, like `versions_archived`.
+    edges_written: AtomicUsize,
 }
 
 /// Full stored `pages` record per URL, captured at revisit-seed load so the
@@ -181,6 +185,10 @@ struct DatasetPageSink {
     /// Stored record data per seeded URL (revisit runs; empty otherwise) — the
     /// merge base for 304 cadence markers.
     seed_data: SeedData,
+    /// Within-run link-graph state (M08): `(from, to)` dedup + in-degree tally
+    /// shared with the app for the `top_linked` result summary. std Mutex —
+    /// quick map ops only, never held across an `.await`.
+    edges: Arc<Mutex<link_graph::EdgeGraph>>,
 }
 
 impl DatasetPageSink {
@@ -265,6 +273,8 @@ impl PageSink for DatasetPageSink {
         // url → (artifact_path, simhash) for this batch's live pages, kept so the
         // version archive can copy the just-written body of any CHANGED key.
         let mut live_meta: HashMap<String, (String, u64)> = HashMap::new();
+        // Link-graph edge records for this batch (M08): capped, run-dedup'd.
+        let mut edge_rows: Vec<(String, Value)> = Vec::new();
         for p in batch {
             if p.unchanged {
                 // Merge the bumped cadence into the record as loaded at seed
@@ -292,6 +302,17 @@ impl PageSink for DatasetPageSink {
                     json!({ "url": p.url, "status": p.status, "gone": true, "job_id": self.job_id }),
                 ));
             } else {
+                // Persist the link graph (M08): this kept page's outbound links
+                // (canonicalized/filtered by core exactly as the frontier saw
+                // them) become `edges` records. Lock scope is synchronous.
+                if !p.links.is_empty() {
+                    edge_rows.extend(
+                        self.edges
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .page_edges(&p.url, p.depth, &p.links, &self.job_id),
+                    );
+                }
                 live_meta.insert(p.url.clone(), (p.artifact_path.clone(), p.simhash));
                 live.push((
                     p.url.clone(),
@@ -355,6 +376,23 @@ impl PageSink for DatasetPageSink {
                 Err(e) => {
                     tracing::warn!(job = %self.job_id, "crawl cadence-marker upsert failed: {e}")
                 }
+            }
+        }
+        if !edge_rows.is_empty() {
+            // Same partial-batch upsert semantics as `pages`: an edge absent
+            // this run is NOT removed (a crawl is a partial view). Best-effort
+            // like the rest of the sink — a failure warns, never fails the crawl.
+            match self
+                .datasets
+                .upsert_many(&self.app, link_graph::EDGES_DATASET, &edge_rows)
+                .await
+            {
+                Ok(_) => {
+                    self.counts
+                        .edges_written
+                        .fetch_add(edge_rows.len(), Ordering::Relaxed);
+                }
+                Err(e) => tracing::warn!(job = %self.job_id, "crawl edges upsert failed: {e}"),
             }
         }
     }
@@ -440,7 +478,10 @@ impl ScrapeApp for Crawl {
          or shutdown-suspended crawl resumes where it left off on its next attempt. \
          Changed pages are archived into the `page_versions` dataset (key \
          `{url}#{revision}`, revision-suffixed artifact copy) — retention is the \
-         existing dataset prune API / janitor, no separate knob."
+         existing dataset prune API / janitor, no separate knob. Each kept \
+         page's outbound links are persisted into the `edges` dataset (key \
+         `{from_url}|{to_url}`; per-page out-degree cap 200, dropped counted) — \
+         the run's most-linked-to pages are echoed as `top_linked`."
     }
 
     fn manifest(&self) -> AppManifest {
@@ -504,10 +545,11 @@ impl ScrapeApp for Crawl {
                 },
             ],
             output_shape: Some(
-                "{pages, new, changed, unchanged, skipped, hosts, versions_archived} — crawl \
-                 tallies plus the `pages` dataset upsert summary; bodies land in the job's \
-                 artifact dir, changed revisions also as revision-suffixed copies recorded in \
-                 `page_versions`",
+                "{pages, new, changed, unchanged, skipped, hosts, versions_archived, \
+                 edges_written, edges_dropped_out_degree, top_linked} — crawl tallies plus the \
+                 `pages` dataset upsert summary; bodies land in the job's artifact dir, changed \
+                 revisions also as revision-suffixed copies recorded in `page_versions`, and the \
+                 link graph streams into the `edges` dataset (key `{from_url}|{to_url}`)",
             ),
             cost_class: CostClass::Free,
         }
@@ -607,6 +649,9 @@ impl ScrapeApp for Crawl {
         // Shared between source (writer, at seed load) and sink (reader, on 304
         // markers): the stored record data per seeded URL.
         let seed_data: SeedData = Arc::new(Mutex::new(HashMap::new()));
+        // Link-graph state (M08), shared with the sink so the run result can
+        // report the within-run `top_linked` summary + drop/dedup tallies.
+        let edges = Arc::new(Mutex::new(link_graph::EdgeGraph::default()));
         let sink: Box<dyn PageSink> = Box::new(DatasetPageSink {
             datasets: ctx.datasets.clone(),
             app: ctx.app.clone(),
@@ -614,6 +659,7 @@ impl ScrapeApp for Crawl {
             artifacts_dir: ctx.artifacts_dir.clone(),
             counts: counts.clone(),
             seed_data: seed_data.clone(),
+            edges: edges.clone(),
         });
 
         // Revisit mode reads existing page records to seed the frontier.
@@ -691,6 +737,13 @@ impl ScrapeApp for Crawl {
         )
         .await;
 
+        // Snapshot the link-graph run state (dropped, deduped, top_linked). The
+        // crawl has returned, so the sink holds no lock.
+        let edge_summary = {
+            let g = edges.lock().unwrap_or_else(|e| e.into_inner());
+            (g.dropped_out_degree, g.deduped, g.top_linked())
+        };
+
         let pages_new = counts.new.load(Ordering::Relaxed);
         let pages_changed = counts.changed.load(Ordering::Relaxed);
         let pages_unchanged = counts.unchanged.load(Ordering::Relaxed);
@@ -735,6 +788,14 @@ impl ScrapeApp for Crawl {
             // Web Reliability Index: hosts whose fetch telemetry was folded into
             // `web-reliability/host_observations` + `host_index` this run.
             "reliability_hosts": reliability_hosts,
+            // Persisted link graph (M08): edges upserted into the `edges`
+            // dataset (key `{from}|{to}`), plus honest cap/dedup accounting and
+            // the within-run most-linked-to pages.
+            "edges_dataset": link_graph::EDGES_DATASET,
+            "edges_written": counts.edges_written.load(Ordering::Relaxed),
+            "edges_dropped_out_degree": edge_summary.0,
+            "edges_deduped": edge_summary.1,
+            "top_linked": edge_summary.2,
         }))
     }
 }

@@ -91,7 +91,12 @@ async fn checkpoint_restores_on_reclaim_and_clears_on_complete() {
         "app saw the restored state"
     );
     assert!(
-        state.storage.load_checkpoint(job.id).await.unwrap().is_none(),
+        state
+            .storage
+            .load_checkpoint(job.id)
+            .await
+            .unwrap()
+            .is_none(),
         "completion clears the checkpoint"
     );
 }

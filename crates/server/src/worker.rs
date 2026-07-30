@@ -155,7 +155,10 @@ async fn drain(state: &AppState, semaphore: &Arc<Semaphore>, concurrency: usize)
     );
     let acquire = semaphore.clone().acquire_many_owned(concurrency as u32);
     tokio::pin!(acquire);
-    if tokio::time::timeout(clean_window, &mut acquire).await.is_ok() {
+    if tokio::time::timeout(clean_window, &mut acquire)
+        .await
+        .is_ok()
+    {
         info!("worker drained cleanly; no jobs left running");
         return;
     }
@@ -272,6 +275,63 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         return;
     };
 
+    // VCR (M24): `record: true` / `replay_of: <job_id>` params. Parsed and
+    // resolved before anything runs — a replay whose cassette is missing (or a
+    // contradictory record+replay combination) fails the job immediately with
+    // the typed reason instead of half-running live.
+    let (vcr_record, replay_of) = match vcr_params(&job.params) {
+        Ok(parsed) => parsed,
+        Err(msg) => {
+            warn!(job = %job.id, "invalid vcr params: {msg}");
+            let _ = state
+                .storage
+                .fail_permanently(job.id, job.attempts, &msg)
+                .await;
+            finalize(&state, job.id).await;
+            return;
+        }
+    };
+    let artifacts_dir = state
+        .storage
+        .artifacts_dir
+        .join(&job.app)
+        .join(job.id.to_string());
+    let vcr = if let Some(replay_id) = replay_of {
+        // Cassettes live beside the recorded job's other artifacts, under the
+        // SAME app (a job can only replay a run of its own app — the fetches
+        // it makes are the ones that app's code makes).
+        let recorded_dir = state
+            .storage
+            .artifacts_dir
+            .join(&job.app)
+            .join(replay_id.to_string());
+        match pumper_core::Cassette::load(&recorded_dir, replay_id).await {
+            Ok(cassette) => {
+                info!(
+                    job = %job.id,
+                    replay_of = %replay_id,
+                    entries = cassette.len(),
+                    "vcr replay: serving fetches from recorded cassette ($0, no network)"
+                );
+                pumper_core::Vcr::Replay(Arc::new(cassette))
+            }
+            Err(e) => {
+                warn!(job = %job.id, replay_of = %replay_id, "vcr replay unavailable: {e}");
+                let _ = state
+                    .storage
+                    .fail_permanently(job.id, job.attempts, &e.to_string())
+                    .await;
+                finalize(&state, job.id).await;
+                return;
+            }
+        }
+    } else if vcr_record {
+        info!(job = %job.id, "vcr record: persisting fetches to this job's cassette");
+        pumper_core::Vcr::Record(Arc::new(pumper_core::Recorder::new(artifacts_dir.clone())))
+    } else {
+        pumper_core::Vcr::Off
+    };
+
     info!(job = %job.id, app = %job.app, attempt = job.attempts, "job started");
     // Seed the running spend total from the ledger: a retried job's prior
     // attempts already spent real money against this job's budget, and that
@@ -313,11 +373,8 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             state.storage.clone(),
         )),
         restored,
-        artifacts_dir: state
-            .storage
-            .artifacts_dir
-            .join(&job.app)
-            .join(job.id.to_string()),
+        vcr,
+        artifacts_dir,
     };
 
     let timeout = Duration::from_secs(state.config.worker.job_timeout_secs);
@@ -385,7 +442,13 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             }
             return;
         }
-        Outcome::Finished(Ok(result)) => {
+        Outcome::Finished(Ok(mut result)) => {
+            // Mark replay runs on the stored result: a replayed job's output is
+            // derived from recorded bytes, not the live web, and anyone reading
+            // it later must be able to tell.
+            if let (Some(replay_id), Value::Object(map)) = (replay_of, &mut result) {
+                map.insert("vcr_replay_of".into(), Value::String(replay_id.to_string()));
+            }
             // Index the result into full-text search before persisting it. Apps
             // whose result stays compact (counts, not arrays) can additionally
             // name datasets to index per-record via `index_datasets` — see
@@ -420,8 +483,10 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                     // can price the records. Best-effort telemetry, fail-open —
                     // accounting never touches a job's outcome.
                     if !yields.is_empty() {
-                        if let Err(e) =
-                            state.storage.record_job_yield(job.id, &job.app, &yields).await
+                        if let Err(e) = state
+                            .storage
+                            .record_job_yield(job.id, &job.app, &yields)
+                            .await
                         {
                             warn!(job = %job.id, "job-yield record failed: {e}");
                         }
@@ -497,6 +562,36 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         }
     }
     finalize(&state, job.id).await;
+}
+
+/// Parses the VCR enqueue params out of a job's params object:
+/// `record: true` and/or `replay_of: "<job uuid>"`. Pure so it's unit-testable.
+/// Errors (a malformed uuid, or both modes at once) are permanent-fail
+/// messages — a job with contradictory or unusable VCR intent must not run.
+fn vcr_params(params: &Value) -> Result<(bool, Option<Uuid>), String> {
+    let record = params
+        .get("record")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let replay_of = match params.get("replay_of") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(
+            Uuid::parse_str(s)
+                .map_err(|e| format!("vcr: replay_of is not a job uuid ({s:?}): {e}"))?,
+        ),
+        Some(other) => {
+            return Err(format!(
+                "vcr: replay_of must be a job-id string, got {other}"
+            ))
+        }
+    };
+    if record && replay_of.is_some() {
+        return Err(
+            "vcr: a job cannot both record and replay — a replay's cassette IS the record"
+                .to_string(),
+        );
+    }
+    Ok((record, replay_of))
 }
 
 /// Ticks the heartbeat interval when enabled, or waits forever when it isn't —
@@ -847,7 +942,13 @@ async fn materialize_saved_search(
     }
     let changes = match state
         .datasets
-        .changes_since(&mat.app, Some(&mat.dataset), Some(mark), cap as i64 * 2, None)
+        .changes_since(
+            &mat.app,
+            Some(&mat.dataset),
+            Some(mark),
+            cap as i64 * 2,
+            None,
+        )
         .await
     {
         Ok(changes) => changes,
@@ -1052,5 +1153,42 @@ fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
         body: rec.to_string(),
         // Job-result docs carry no record timestamp — index at completion time.
         indexed_at: chrono::Utc::now().timestamp(),
+    }
+}
+
+#[cfg(test)]
+mod vcr_param_tests {
+    use super::vcr_params;
+    use serde_json::json;
+
+    #[test]
+    fn absent_params_mean_vcr_off() {
+        assert_eq!(vcr_params(&json!({})).unwrap(), (false, None));
+        assert_eq!(
+            vcr_params(&json!({"url": "https://x/", "record": false})).unwrap(),
+            (false, None)
+        );
+    }
+
+    #[test]
+    fn record_flag_and_replay_uuid_parse() {
+        assert_eq!(vcr_params(&json!({"record": true})).unwrap(), (true, None));
+        let id = uuid::Uuid::new_v4();
+        assert_eq!(
+            vcr_params(&json!({"replay_of": id.to_string()})).unwrap(),
+            (false, Some(id))
+        );
+    }
+
+    #[test]
+    fn malformed_replay_of_is_an_error_not_a_silent_live_run() {
+        assert!(vcr_params(&json!({"replay_of": "not-a-uuid"})).is_err());
+        assert!(vcr_params(&json!({"replay_of": 42})).is_err());
+    }
+
+    #[test]
+    fn record_plus_replay_is_contradictory() {
+        let id = uuid::Uuid::new_v4().to_string();
+        assert!(vcr_params(&json!({"record": true, "replay_of": id})).is_err());
     }
 }

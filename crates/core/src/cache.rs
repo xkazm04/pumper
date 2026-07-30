@@ -535,7 +535,11 @@ mod tests {
         // One observed gap: EWMA seeds at 7200s — the prior is NOT used.
         assert_eq!(out.interval_secs, Some(7200.0));
         assert_eq!(out.predicted_next_change, t(4));
-        assert!((out.due_in_secs - 3600.0).abs() < 1.0, "{}", out.due_in_secs);
+        assert!(
+            (out.due_in_secs - 3600.0).abs() < 1.0,
+            "{}",
+            out.due_in_secs
+        );
     }
 
     #[test]

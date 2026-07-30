@@ -22,7 +22,7 @@ async fn a_job_run_fans_out_to_events_watches_and_trigger_hops() {
     // fake/d --fresh--> fake (the hop job just queues; we assert its shape).
     state
         .storage
-        .create_watch("fake", "d", &rx.url(), Some("s3cr3t"))
+        .create_watch("fake", "d", &rx.url(), Some("s3cr3t"), "webhook")
         .await
         .expect("create watch");
     let trigger = state
@@ -40,6 +40,7 @@ async fn a_job_run_fans_out_to_events_watches_and_trigger_hops() {
             priority: 0,
             max_attempts: 1,
             filters: None,
+            plugin_hooks: None,
         })
         .await
         .expect("create trigger");

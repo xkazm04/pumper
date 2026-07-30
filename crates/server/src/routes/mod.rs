@@ -26,10 +26,10 @@ pub(crate) use jobs::merge_params;
 
 mod datasets;
 mod derived;
+mod economics;
 mod error;
 mod events;
 mod health;
-mod economics;
 mod ingress;
 mod jobs;
 mod meta;
@@ -47,9 +47,9 @@ mod watches;
 // exposes only its handlers as `pub(crate)`; DTOs and helpers stay private.
 use datasets::*;
 use derived::*;
+use economics::*;
 use events::*;
 use health::*;
-use economics::*;
 use ingress::*;
 use jobs::*;
 use meta::*;

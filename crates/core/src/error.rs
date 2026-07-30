@@ -20,6 +20,12 @@ pub enum Error {
     Config(String),
     #[error("app: {0}")]
     App(String),
+    /// A VCR replay could not be served from the recorded cassette (missing
+    /// cassette, unrecorded request, or a body truncated at record time).
+    /// Typed so a replay MISS is distinguishable from an app failure — and so
+    /// it can never be confused with (or silently downgraded to) a live fetch.
+    #[error("vcr replay miss: {0}")]
+    ReplayMiss(String),
     /// Client-supplied input the server understood but rejected (a malformed
     /// query, filter, or rule). Maps to HTTP 400 at the request boundary — unlike
     /// `Parse`, which also covers server-internal decode failures (HTTP 500).

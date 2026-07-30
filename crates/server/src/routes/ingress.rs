@@ -260,7 +260,10 @@ pub(crate) async fn ingest(
     if body.len() > cfg.max_body_bytes {
         return Err(ApiError(
             StatusCode::PAYLOAD_TOO_LARGE,
-            format!("body exceeds [ingress] max_body_bytes ({})", cfg.max_body_bytes),
+            format!(
+                "body exceeds [ingress] max_body_bytes ({})",
+                cfg.max_body_bytes
+            ),
         ));
     }
 
@@ -322,12 +325,19 @@ pub(crate) async fn ingest(
         }
     });
     let event_id = event_uuid.to_string();
-    let seq = state
-        .events
-        .emit(JobEvent::external(event_uuid, &source.name, payload.clone()));
-    let fired =
-        crate::triggers::fire_external_triggers(&state, &source.id, &source.name, &event_id, &payload)
-            .await;
+    let seq = state.events.emit(JobEvent::external(
+        event_uuid,
+        &source.name,
+        payload.clone(),
+    ));
+    let fired = crate::triggers::fire_external_triggers(
+        &state,
+        &source.id,
+        &source.name,
+        &event_id,
+        &payload,
+    )
+    .await;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({ "event_id": event_id, "seq": seq, "triggers_fired": fired })),

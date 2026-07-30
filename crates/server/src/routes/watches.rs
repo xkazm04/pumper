@@ -57,10 +57,15 @@ pub(crate) struct CreateWatchBody {
     app: String,
     /// Dataset to watch; "*" (default) watches every dataset of the app.
     dataset: Option<String>,
-    /// URL that receives `dataset.changed` POSTs.
-    url: String,
-    /// If set, delivery bodies are HMAC-SHA256 signed with this secret.
+    /// Delivery target. `webhook`/`slack` sinks: required, the URL POSTed at.
+    /// `file` sink: ignored — the file is always `data/sinks/<watch_id>.ndjson`.
+    url: Option<String>,
+    /// If set, delivery bodies are HMAC-SHA256 signed with this secret
+    /// (webhook sink; Slack ignores the signature header, file sinks are local).
     secret: Option<String>,
+    /// Delivery connector: "webhook" (default), "file" (NDJSON append under
+    /// data/sinks/), or "slack" (incoming-webhook message at `url`).
+    sink: Option<String>,
 }
 
 #[utoipa::path(
@@ -70,7 +75,7 @@ pub(crate) struct CreateWatchBody {
     request_body = CreateWatchBody,
     responses(
         (status = 201, description = "Created watch", body = Object),
-        (status = 400, description = "url must be http(s)", body = Object),
+        (status = 400, description = "Invalid sink, or url missing/not http(s)", body = Object),
         (status = 404, description = "Unknown app", body = Object),
     )
 )]
@@ -84,19 +89,36 @@ pub(crate) async fn create_watch(
             format!("unknown app '{}'", body.app),
         ));
     }
-    if !body.url.starts_with("http://") && !body.url.starts_with("https://") {
-        return Err(ApiError(
-            StatusCode::BAD_REQUEST,
-            "url must be http(s)".into(),
-        ));
-    }
+    let sink = body.sink.as_deref().unwrap_or("webhook");
+    let url = match sink {
+        // The file path derives from the watch id only (path-traversal guard
+        // lives in the delivery layer); any supplied url is ignored.
+        "file" => "",
+        "webhook" | "slack" => {
+            let url = body.url.as_deref().unwrap_or("");
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "url must be http(s)".into(),
+                ));
+            }
+            url
+        }
+        other => {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                format!("unknown sink '{other}' (expected webhook, file, or slack)"),
+            ));
+        }
+    };
     let watch = state
         .storage
         .create_watch(
             &body.app,
             body.dataset.as_deref().unwrap_or("*"),
-            &body.url,
+            url,
             body.secret.as_deref(),
+            sink,
         )
         .await?;
     Ok((StatusCode::CREATED, Json(watch)))

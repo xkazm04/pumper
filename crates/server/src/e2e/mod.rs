@@ -16,5 +16,6 @@ mod mcp_live;
 mod router;
 mod scheduler_overlap;
 mod shutdown_drain;
+mod sink_delivery;
 mod webhook_contract;
 mod worker_fanout;

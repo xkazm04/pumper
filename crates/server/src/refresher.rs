@@ -73,7 +73,10 @@ async fn run_pass(state: &AppState) -> anyhow::Result<()> {
     let horizon = cfg.horizon_secs as f64;
     let candidates = state
         .cache
-        .freshness(now, cfg.global_per_tick.saturating_mul(CANDIDATE_OVERSAMPLE))
+        .freshness(
+            now,
+            cfg.global_per_tick.saturating_mul(CANDIDATE_OVERSAMPLE),
+        )
         .await?;
 
     let mut refreshed = 0usize;

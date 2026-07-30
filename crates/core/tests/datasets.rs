@@ -576,7 +576,10 @@ async fn derived_lookup_merges_the_sibling_dataset_record() {
         "app",
         "grants",
         &[
-            ("g1".to_string(), json!({ "title": "Solar", "agency": "doe" })),
+            (
+                "g1".to_string(),
+                json!({ "title": "Solar", "agency": "doe" }),
+            ),
             (
                 "g2".to_string(),
                 json!({ "title": "Wind", "agency": "unknown" }),
@@ -781,12 +784,20 @@ async fn derived_group_counts_and_sums_track_add_change_remove() {
     .await
     .unwrap();
 
-    let ca = ds.get("app", "sales_by_state", "CA").await.unwrap().unwrap();
+    let ca = ds
+        .get("app", "sales_by_state", "CA")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(
         ca.data,
         json!({ "state": "CA", "stale": false, "n": 2, "total": 15 })
     );
-    let ny = ds.get("app", "sales_by_state", "NY").await.unwrap().unwrap();
+    let ny = ds
+        .get("app", "sales_by_state", "NY")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(ny.data["n"], json!(1));
     assert_eq!(ny.data["total"], json!(7));
 
@@ -798,10 +809,18 @@ async fn derived_group_counts_and_sums_track_add_change_remove() {
     )
     .await
     .unwrap();
-    let ca = ds.get("app", "sales_by_state", "CA").await.unwrap().unwrap();
+    let ca = ds
+        .get("app", "sales_by_state", "CA")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(ca.data["n"], json!(1), "CA lost the moved row");
     assert_eq!(ca.data["total"], json!(10));
-    let ny = ds.get("app", "sales_by_state", "NY").await.unwrap().unwrap();
+    let ny = ds
+        .get("app", "sales_by_state", "NY")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(ny.data["n"], json!(2), "NY gained the moved row");
     assert_eq!(ny.data["total"], json!(12));
 
@@ -811,7 +830,11 @@ async fn derived_group_counts_and_sums_track_add_change_remove() {
         .await
         .unwrap();
     assert_eq!(removed, vec!["s3".to_string()]);
-    let ny = ds.get("app", "sales_by_state", "NY").await.unwrap().unwrap();
+    let ny = ds
+        .get("app", "sales_by_state", "NY")
+        .await
+        .unwrap()
+        .unwrap();
     assert_eq!(ny.data["n"], json!(1));
     assert_eq!(ny.data["total"], json!(5));
 }
@@ -843,9 +866,13 @@ async fn derived_group_recompute_touches_only_affected_groups() {
     .unwrap();
 
     // A new CA row must recompute CA only: NY's derived row gains no revision.
-    ds.upsert_many("app", "sales", &[("c".to_string(), json!({ "state": "CA" }))])
-        .await
-        .unwrap();
+    ds.upsert_many(
+        "app",
+        "sales",
+        &[("c".to_string(), json!({ "state": "CA" }))],
+    )
+    .await
+    .unwrap();
     let ca = ds.get("app", "by_state", "CA").await.unwrap().unwrap();
     assert_eq!(ca.data["n"], json!(2));
     let ny_history = ds.history("app", "by_state", "NY", 10).await.unwrap();
@@ -972,7 +999,9 @@ async fn derived_group_validation_rejects_unsupported_shapes() {
     // record to resolve a key_expr against).
     let group = pumper_core::DerivedGroup {
         group_by: vec!["$.state".into()],
-        aggregates: [("n".to_string(), "count".to_string())].into_iter().collect(),
+        aggregates: [("n".to_string(), "count".to_string())]
+            .into_iter()
+            .collect(),
     };
     let lookup = DerivedLookup {
         dataset: "other".into(),
@@ -1012,11 +1041,27 @@ async fn derived_group_validation_rejects_unsupported_shapes() {
 
     // Malformed group content: bad aggregate expr, non-$. path, empty halves,
     // and a collision with the reserved `stale` field.
-    err(make_group_spec(&store.storage, "s", "t", &[], &["$.state"], &[("n", "avg($.x)")]).await);
+    err(make_group_spec(
+        &store.storage,
+        "s",
+        "t",
+        &[],
+        &["$.state"],
+        &[("n", "avg($.x)")],
+    )
+    .await);
     err(make_group_spec(&store.storage, "s", "t", &[], &["state"], &[("n", "count")]).await);
     err(make_group_spec(&store.storage, "s", "t", &[], &[], &[("n", "count")]).await);
     err(make_group_spec(&store.storage, "s", "t", &[], &["$.state"], &[]).await);
-    err(make_group_spec(&store.storage, "s", "t", &[], &["$.state"], &[("stale", "count")]).await);
+    err(make_group_spec(
+        &store.storage,
+        "s",
+        "t",
+        &[],
+        &["$.state"],
+        &[("stale", "count")],
+    )
+    .await);
 
     // A well-formed aggregate spec is accepted and round-trips its group half.
     let spec = make_group_spec(
@@ -1066,9 +1111,14 @@ async fn provenance_stamps_round_trip_and_unstamped_writes_stay_honest_null() {
     assert!(rev.provenance.replayable());
 
     // Legacy/unstamped write: every field NULL = unknown, nothing invented.
-    ds.upsert("app", "d", "k2", &json!({ "v": 2 })).await.unwrap();
+    ds.upsert("app", "d", "k2", &json!({ "v": 2 }))
+        .await
+        .unwrap();
     let rev = &ds.history("app", "d", "k2", 10).await.unwrap()[0];
-    assert!(rev.provenance.is_empty(), "unstamped write must stamp nothing");
+    assert!(
+        rev.provenance.is_empty(),
+        "unstamped write must stamp nothing"
+    );
     assert!(!rev.provenance.replayable());
 
     // Batch-level stamp lands on every revision of the batch.
@@ -1131,8 +1181,13 @@ async fn provenance_coverage_counts_whole_chain() {
     let ds = Datasets::new(store.storage.pool());
 
     // rev 1: unstamped; rev 2: job only; rev 3: fully replayable.
-    ds.upsert("app", "d", "k", &json!({ "v": 1 })).await.unwrap();
-    let job_only = Provenance { job_id: Some("j".into()), ..Default::default() };
+    ds.upsert("app", "d", "k", &json!({ "v": 1 }))
+        .await
+        .unwrap();
+    let job_only = Provenance {
+        job_id: Some("j".into()),
+        ..Default::default()
+    };
     ds.upsert_stamped("app", "d", "k", &json!({ "v": 2 }), None, Some(&job_only))
         .await
         .unwrap();

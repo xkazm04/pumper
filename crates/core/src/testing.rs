@@ -213,6 +213,7 @@ pub struct TestContext<'a> {
     artifacts_dir: Option<std::path::PathBuf>,
     research_cache_ttl_secs: u64,
     restored: Option<Value>,
+    vcr: crate::vcr::Vcr,
 }
 
 impl<'a> TestContext<'a> {
@@ -227,7 +228,14 @@ impl<'a> TestContext<'a> {
             artifacts_dir: None,
             research_cache_ttl_secs: 0,
             restored: None,
+            vcr: crate::vcr::Vcr::Off,
         }
+    }
+
+    /// Runs the context in a VCR mode (default: `Off`).
+    pub fn vcr(mut self, vcr: crate::vcr::Vcr) -> Self {
+        self.vcr = vcr;
+        self
     }
 
     /// Hands the context a restored checkpoint, as the worker does on re-claim.
@@ -294,6 +302,7 @@ impl<'a> TestContext<'a> {
             progress: Arc::new(NoProgress),
             checkpoints: Arc::new(NoCheckpoints),
             restored: self.restored,
+            vcr: self.vcr,
             artifacts_dir: self
                 .artifacts_dir
                 .unwrap_or_else(|| self.storage.artifacts_dir.join(&self.app).join("job")),

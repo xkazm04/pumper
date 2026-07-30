@@ -12,6 +12,19 @@
 //!     packed as `(out_ptr << 32) | out_len`
 //!
 //! The output bytes must be UTF-8 JSON.
+//!
+//! The host is a general UDF runtime, not just an extraction sandbox (M15
+//! "WASM everywhere"): `run(name, input, params)` wraps the call in the
+//! `extract_v2` `{doc, params}` envelope regardless of what `doc` holds. The
+//! same ABI therefore serves extraction plugins (doc = fetched document),
+//! trigger PREDICATE plugins (doc = the `_trigger` delta object, output
+//! `{"pass": bool}`), and trigger TRANSFORM plugins (doc = the `_trigger`
+//! object, output = the shaped object; provenance re-stamped by the caller).
+//! Convention: a plugin declares its hook class in its `describe()` manifest
+//! via `"kind": "extractor" | "predicate" | "transform"` so `GET
+//! /plugins?kind=` can offer the right plugins per hook. Callers own their
+//! failure semantics — trigger hooks fail OPEN (a trap/malformed output never
+//! wedges the pipeline), extraction propagates the error.
 
 use std::collections::HashMap;
 use std::path::Path;

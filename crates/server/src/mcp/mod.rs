@@ -272,7 +272,10 @@ async fn tools_call(state: &AppState, id: Value, params: &Value) -> Value {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return rpc_error(id, -32602, "tools/call needs a 'name'");
     };
-    let args = params.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    let args = params
+        .get("arguments")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     let outcome = match name {
         "list_apps" => Ok(tool_list_apps(state)),
         "query_dataset" => tool_query_dataset(state, &args).await,
@@ -534,8 +537,8 @@ fn resources_read(state: &AppState, params: &Value) -> Result<Value, (i64, Strin
         return Err((-32602, "resources/read needs a 'uri'".into()));
     };
     let text = if uri == CATALOG_URI {
-        let catalog = pumper_core::Catalog::load()
-            .map_err(|e| (-32603_i64, format!("catalog load: {e}")))?;
+        let catalog =
+            pumper_core::Catalog::load().map_err(|e| (-32603_i64, format!("catalog load: {e}")))?;
         json!({ "sources": catalog.sources }).to_string()
     } else if let Some(app) = uri
         .strip_prefix("pumper://apps/")
@@ -600,8 +603,14 @@ mod tests {
         // Missing required + nested violation, both named by pointer.
         let err = validate_params(&schema, &json!({ "rows": 5000 })).unwrap_err();
         assert!(err.contains("params:") || err.contains("params/"), "{err}");
-        assert!(err.contains("query"), "missing-required names the field: {err}");
-        assert!(err.contains("params/rows"), "violation carries its pointer: {err}");
+        assert!(
+            err.contains("query"),
+            "missing-required names the field: {err}"
+        );
+        assert!(
+            err.contains("params/rows"),
+            "violation carries its pointer: {err}"
+        );
         // Valid params pass.
         validate_params(&schema, &json!({ "query": "x", "rows": 10 })).unwrap();
     }

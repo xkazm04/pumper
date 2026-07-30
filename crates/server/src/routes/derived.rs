@@ -119,7 +119,9 @@ pub(crate) async fn create_derived(
     }
     if let Some(lookup) = &body.lookup {
         if lookup.dataset.trim().is_empty() || lookup.merge_as.trim().is_empty() {
-            return Err(bad("lookup.dataset and lookup.merge_as must not be empty".into()));
+            return Err(bad(
+                "lookup.dataset and lookup.merge_as must not be empty".into()
+            ));
         }
         if !lookup.key_expr.starts_with("$.") {
             return Err(bad(format!(
@@ -139,7 +141,7 @@ pub(crate) async fn create_derived(
         (None, None) => None,
         _ => {
             return Err(bad(
-                "group_by and aggregates must be provided together".into(),
+                "group_by and aggregates must be provided together".into()
             ))
         }
     };

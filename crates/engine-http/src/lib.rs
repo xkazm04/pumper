@@ -476,11 +476,18 @@ impl HttpEngine {
 /// UTF-8) — so a windows-1250 Czech page is not mangled into U+FFFD replacement
 /// characters the way a blind UTF-8 decode does.
 async fn read_body_capped(
-    mut response: reqwest::Response,
+    response: reqwest::Response,
     cap: u64,
     url: &str,
     header_charset: Option<&str>,
 ) -> Result<String> {
+    let buf = read_bytes_capped(response, cap, url).await?;
+    Ok(decode_body(&buf, header_charset))
+}
+
+/// The raw-bytes half of [`read_body_capped`]: chunked read with the same hard
+/// size cap, no decoding. Shared by the text path and [`HttpEngine::fetch_bytes`].
+async fn read_bytes_capped(mut response: reqwest::Response, cap: u64, url: &str) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = response
         .chunk()
@@ -494,7 +501,7 @@ async fn read_body_capped(
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(decode_body(&buf, header_charset))
+    Ok(buf)
 }
 
 /// The `charset` token of a `Content-Type` value (`text/html; charset=windows-1250`
@@ -695,6 +702,58 @@ impl HttpClient for HttpEngine {
             self.cache.put(key, &req.url, &response, ttl).await?;
         }
         Ok(response)
+    }
+
+    /// Binary fetch — the deliberately minimal **engine-traits#2-LITE** seam
+    /// (first paying customer: the CMS RVU ZIP in `app-cms-fee-schedule`).
+    ///
+    /// Contract, and what is deliberately NOT here:
+    /// - **Hard size cap**: the existing `max_body_bytes` machinery
+    ///   (`req.max_body_bytes` else `[http] max_body_bytes`), enforced per chunk
+    ///   while reading; over-cap is a typed error naming cap + URL.
+    /// - **No streaming**: the body is buffered in memory — callers size their
+    ///   cap accordingly. The full streaming/spill-to-artifact binary-body
+    ///   design (engine-traits#2) stays deferred.
+    /// - **Cache bypass**: the response cache stores charset-decoded text
+    ///   bodies, so binary fetches never read or write it.
+    /// - **Governor applies**: per-host politeness spacing + 429/503 penalties
+    ///   are identical to `fetch` — a ZIP download is not a license to hammer.
+    /// - **No retries, 2xx only**: a single attempt; a non-2xx status is an
+    ///   error (binary callers want the file, not an error page's bytes).
+    ///   Profiles/proxies work via the same client pool as `fetch`.
+    async fn fetch_bytes(&self, req: HttpRequest) -> Result<Vec<u8>> {
+        let host = reqwest::Url::parse(&req.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_owned));
+        let (client, jar) = self.client_for(&req)?;
+        let cap = req.max_body_bytes.unwrap_or(self.cfg.max_body_bytes);
+        if let Some(host) = &host {
+            self.governor.acquire(host).await;
+        }
+        let response = self
+            .build(&client, &req)
+            .send()
+            .await
+            .map_err(|e| Error::Http(e.to_string()))?;
+        if let Some(jar) = &jar {
+            jar.touch();
+        }
+        let status = response.status().as_u16();
+        // Teach the governor exactly like `send` does.
+        if let Some(host) = &host {
+            if matches!(status, 429 | 503) {
+                self.governor.penalize(host, retry_after(&response)).await;
+            } else if (200..300).contains(&status) {
+                self.governor.reward(host).await;
+            }
+        }
+        if !(200..300).contains(&status) {
+            return Err(Error::Http(format!(
+                "{} returned status {status} (fetch_bytes requires a 2xx body)",
+                req.url
+            )));
+        }
+        read_bytes_capped(response, cap, &req.url).await
     }
 }
 

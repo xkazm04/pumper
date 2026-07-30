@@ -109,7 +109,11 @@ async fn get_mcp_bridges_live_events_and_kind_filter_applies() {
     let router = crate::mcp::router().with_state(state.clone());
     // Connect first (no resume point): the handler subscribes when it runs.
     let resp = router
-        .oneshot(Request::get("/mcp?kind=succeeded,failed").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/mcp?kind=succeeded,failed")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), 200);
@@ -129,16 +133,22 @@ async fn get_mcp_bridges_live_events_and_kind_filter_applies() {
 async fn research_tools_are_gated_and_enqueue_through_the_clamped_path() {
     // Gated: without allow_enqueue the tools are withheld and calls name the switch.
     let (state, _store) = mcp_state(false).await;
-    let resp = handle_rpc(&state, &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
-        .await
-        .unwrap();
+    let resp = handle_rpc(
+        &state,
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    )
+    .await
+    .unwrap();
     let names: Vec<&str> = resp["result"]["tools"]
         .as_array()
         .unwrap()
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert!(names.contains(&"wait_job"), "wait_job is read-only: always offered");
+    assert!(
+        names.contains(&"wait_job"),
+        "wait_job is read-only: always offered"
+    );
     assert!(!names.contains(&"fetch_readable"));
     assert!(!names.contains(&"deep_research"));
     for tool in ["fetch_readable", "deep_research"] {
@@ -184,7 +194,9 @@ async fn research_tools_are_gated_and_enqueue_through_the_clamped_path() {
     assert_eq!(job.params["max_budget_usd"], 1.0);
 
     // A missing required arg is a readable tool error, not a job.
-    let resp = handle_rpc(&state, &call("deep_research", json!({}))).await.unwrap();
+    let resp = handle_rpc(&state, &call("deep_research", json!({})))
+        .await
+        .unwrap();
     assert_eq!(resp["result"]["isError"], true);
 }
 
@@ -198,7 +210,10 @@ async fn wait_job_times_out_at_the_config_cap_and_resolves_on_terminal_event() {
     // A job that will never run (no worker): a 999s ask is clamped to the cap.
     let resp = handle_rpc(
         &state,
-        &call("fetch_readable", json!({ "url": "https://example.com/slow" })),
+        &call(
+            "fetch_readable",
+            json!({ "url": "https://example.com/slow" }),
+        ),
     )
     .await
     .unwrap();
@@ -227,9 +242,12 @@ async fn wait_job_times_out_at_the_config_cap_and_resolves_on_terminal_event() {
         tokio::time::sleep(Duration::from_millis(50)).await;
         events.emit(JobEvent::new(id, "readable", "succeeded"));
     });
-    let resp = handle_rpc(&state, &call("wait_job", json!({ "job_id": id.to_string() })))
-        .await
-        .unwrap();
+    let resp = handle_rpc(
+        &state,
+        &call("wait_job", json!({ "job_id": id.to_string() })),
+    )
+    .await
+    .unwrap();
     let out = structured(&resp);
     assert_eq!(out["timed_out"], false);
     assert_eq!(out["status"], "succeeded");
@@ -237,7 +255,10 @@ async fn wait_job_times_out_at_the_config_cap_and_resolves_on_terminal_event() {
     // Unknown ids and garbage ids are tool errors.
     let resp = handle_rpc(
         &state,
-        &call("wait_job", json!({ "job_id": uuid::Uuid::new_v4().to_string() })),
+        &call(
+            "wait_job",
+            json!({ "job_id": uuid::Uuid::new_v4().to_string() }),
+        ),
     )
     .await
     .unwrap();

@@ -18,6 +18,8 @@ pub mod storage;
 pub mod testing;
 #[cfg(feature = "storage")]
 pub mod tiers;
+#[cfg(feature = "storage")]
+pub mod vcr;
 
 pub mod catalog;
 pub mod config;
@@ -51,8 +53,8 @@ pub use costs::{extract_yields, CostEvent, CostLedger, CostSummary, SpentTotal, 
 pub use datasets::{
     derived_would_cycle, diff_values, filters_match, parse_aggregate, parse_aggregates,
     parse_filter_spec, parse_filter_specs, project_value, trust_label, validate_group, Aggregate,
-    ChangeKind, Datasets, DerivedBackfill, DerivedGroup, DerivedLookup, DerivedSpec,
-    DupPair, Provenance, Record, Revision, RevisionPage, UpsertSummary, TRUST_STABLE,
+    ChangeKind, Datasets, DerivedBackfill, DerivedGroup, DerivedLookup, DerivedSpec, DupPair,
+    Provenance, Record, Revision, RevisionPage, UpsertSummary, TRUST_STABLE,
 };
 pub use resilience::{
     doc_signals, signals_batch, CohortDrift, Diagnosis, DocSignals, FetchHealth, ObservedDoc,
@@ -63,11 +65,13 @@ pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
 #[cfg(feature = "storage")]
 pub use storage::{
     Delivery, EnqueueOptions, IngressSource, JobTimingStats, NewDerivedSpec, NewSchedule,
-    NewTrigger, SavedSearch, Schedule, SearchMaterialize, Storage, Trigger, Watch, YieldSummary,
-    MAX_CHECKPOINT_BYTES,
+    NewTrigger, PluginHook, SavedSearch, Schedule, SearchMaterialize, Storage, Trigger,
+    TriggerPluginHooks, Watch, YieldSummary, MAX_CHECKPOINT_BYTES,
 };
 #[cfg(feature = "storage")]
 pub use tiers::{HostProfile, TierMemory};
+#[cfg(feature = "storage")]
+pub use vcr::{Cassette, CassetteEntry, Recorder, Vcr};
 
 pub use catalog::{
     Catalog, Contract, ContractRange, ContractVerdict, PlanCreate, PlanDisable, PlanOrphan,
@@ -81,8 +85,7 @@ pub use crawl::{
 pub use engine::{
     profile_browser_dir, profile_cookies_path, profile_dir, validate_profile_name, Browser,
     CapturedCall, EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, PageAction,
-    RenderRequest,
-    RenderedPage, ResearchOutput, ResearchRequest, Researcher, FETCHED_VIA_HEADER,
+    RenderRequest, RenderedPage, ResearchOutput, ResearchRequest, Researcher, FETCHED_VIA_HEADER,
     PROFILE_BROWSER_DIR, PROFILE_COOKIES_FILE, PROFILE_NAME_MAX_LEN, SNAPSHOT_TS_HEADER,
 };
 pub use error::{Error, Result};
@@ -100,9 +103,9 @@ pub use json_salvage::salvage_json;
 pub use lru::{lru_touch, lru_touch_evict};
 pub use markdown::html_to_markdown;
 pub use plugin::{NoPlugins, Plugins};
-pub use recipes::{discover_recipes, payload_overlaps, ApiRecipe, RecipeSource};
 #[cfg(feature = "storage")]
 pub use recipes::RecipeStore;
+pub use recipes::{discover_recipes, payload_overlaps, ApiRecipe, RecipeSource};
 pub use search::{
     FacetCount, NoSearch, Search, SearchDoc, SearchFacets, SearchHit, SearchRequest,
     SearchResponse, SearchSort,

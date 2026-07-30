@@ -77,6 +77,13 @@ pub struct CrawlPageRecord {
     /// Learned change-cadence counters for this URL, updated every revisit (and
     /// initialized on first sighting). `None` outside revisit bookkeeping.
     pub cadence: Option<RevisitCadence>,
+    /// Outbound links extracted from this page — canonicalized and already
+    /// scheme/`same_domain`/robots-independent filtered exactly as the frontier
+    /// saw them (a `same_domain` crawl therefore carries a truncated,
+    /// same-host-only view). Surfaced so a sink can persist the link graph the
+    /// crawler otherwise computes and discards. Empty on `gone`/`unchanged`
+    /// markers (no body was parsed).
+    pub links: Vec<String>,
 }
 
 /// Per-URL change-cadence counters, persisted ON the page record (M07 — no new
@@ -192,11 +199,13 @@ pub fn due_score(cadence: &RevisitCadence, now_epoch: i64, prior_interval_secs: 
     let interval = cadence
         .interval_secs
         .filter(|t| t.is_finite() && *t > 0.0)
-        .unwrap_or(if prior_interval_secs.is_finite() && prior_interval_secs > 0.0 {
-            prior_interval_secs
-        } else {
-            DEFAULT_CADENCE_PRIOR_SECS
-        });
+        .unwrap_or(
+            if prior_interval_secs.is_finite() && prior_interval_secs > 0.0 {
+                prior_interval_secs
+            } else {
+                DEFAULT_CADENCE_PRIOR_SECS
+            },
+        );
     let elapsed = (now_epoch - last_checked).max(0) as f64;
     1.0 - (-elapsed / interval).exp()
 }
@@ -207,7 +216,11 @@ pub fn due_score(cadence: &RevisitCadence, now_epoch: i64, prior_interval_secs: 
 fn host_cadence_priors(seeds: &[RevisitSeed]) -> HashMap<String, f64> {
     let mut sums: HashMap<String, (f64, usize)> = HashMap::new();
     for seed in seeds {
-        if let Some(interval) = seed.cadence.interval_secs.filter(|t| t.is_finite() && *t > 0.0) {
+        if let Some(interval) = seed
+            .cadence
+            .interval_secs
+            .filter(|t| t.is_finite() && *t > 0.0)
+        {
             if let Some(host) = host_of(&seed.url) {
                 let entry = sums.entry(host).or_insert((0.0, 0));
                 entry.0 += interval;
@@ -237,7 +250,11 @@ pub struct RevisitSeed {
 
 impl RevisitSeed {
     /// A seed carrying only validators (pre-cadence records, tests).
-    pub fn bare(url: impl Into<String>, etag: Option<String>, last_modified: Option<String>) -> Self {
+    pub fn bare(
+        url: impl Into<String>,
+        etag: Option<String>,
+        last_modified: Option<String>,
+    ) -> Self {
         Self {
             url: url.into(),
             etag,
@@ -393,6 +410,7 @@ fn gone_record(url: String, status: u16) -> CrawlPageRecord {
         gone: true,
         unchanged: false,
         cadence: None,
+        links: Vec::new(),
     }
 }
 
@@ -414,6 +432,7 @@ fn unchanged_record(url: String, cadence: RevisitCadence) -> CrawlPageRecord {
         gone: false,
         unchanged: true,
         cadence: Some(cadence),
+        links: Vec::new(),
     }
 }
 
@@ -1071,6 +1090,7 @@ pub async fn crawl(
                     gone: false,
                     unchanged: false,
                     cadence: Some(cadence),
+                    links: fetched.links.clone(),
                 });
                 if sink_buf.len() >= PAGE_SINK_STRIDE {
                     if let Some(s) = sink.as_mut() {
@@ -2129,9 +2149,17 @@ mod tests {
             fail,
             ..Default::default()
         });
-        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, None, None, None)
-            .await
-            .unwrap();
+        let stats = crawl(
+            http,
+            test_cfg(&["https://ex.com/"]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Kept: seed + /ok. /dead failed, /blocked + /cf are bot-walls.
         assert_eq!(stats.kept, 2, "only real-content pages kept");
@@ -2238,8 +2266,7 @@ mod tests {
         let mut frontier = Frontier::new(None);
         frontier.push("https://x.com/".into(), 0);
         let saved = Arc::new(SyncMutex::new(Vec::new()));
-        let sink: Arc<dyn crate::app::CheckpointSink> =
-            Arc::new(CollectCheckpoints(saved.clone()));
+        let sink: Arc<dyn crate::app::CheckpointSink> = Arc::new(CollectCheckpoints(saved.clone()));
         assert!(save_checkpoint(&sink, &frontier, &[7u64], true).await);
         let state = saved.lock().unwrap().pop().expect("one checkpoint saved");
         match Checkpoint::from_value(&state) {
@@ -2266,11 +2293,17 @@ mod tests {
         );
         pages.insert(
             "https://ex.com/a".to_string(),
-            (200, "<html><body><p>page a body</p></body></html>".to_string()),
+            (
+                200,
+                "<html><body><p>page a body</p></body></html>".to_string(),
+            ),
         );
         pages.insert(
             "https://ex.com/b".to_string(),
-            (200, "<html><body><p>page b body</p></body></html>".to_string()),
+            (
+                200,
+                "<html><body><p>page b body</p></body></html>".to_string(),
+            ),
         );
         let http = Arc::new(MockHttp {
             pages,
@@ -2280,8 +2313,7 @@ mod tests {
         cfg.max_pages = 1;
         cfg.concurrency = 1;
         let saved = Arc::new(SyncMutex::new(Vec::new()));
-        let sink: Arc<dyn crate::app::CheckpointSink> =
-            Arc::new(CollectCheckpoints(saved.clone()));
+        let sink: Arc<dyn crate::app::CheckpointSink> = Arc::new(CollectCheckpoints(saved.clone()));
         let stats = crawl(http.clone(), cfg, None, None, None, None, Some(sink))
             .await
             .unwrap();
@@ -2294,7 +2326,9 @@ mod tests {
         let mut cfg = test_cfg(&["https://ex.com/"]);
         cfg.concurrency = 1;
         cfg.resume_state = Some(state);
-        let stats = crawl(http, cfg, None, None, None, None, None).await.unwrap();
+        let stats = crawl(http, cfg, None, None, None, None, None)
+            .await
+            .unwrap();
         assert!(stats.resumed, "restored state marks the run resumed");
         assert!(!stats.checkpoint_reset);
         assert_eq!(

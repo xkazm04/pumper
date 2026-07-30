@@ -26,6 +26,7 @@ async fn trigger_crud_idempotent_fire_and_lineage() {
             priority: 5,
             max_attempts: 1,
             filters: None,
+            plugin_hooks: None,
         })
         .await
         .expect("create trigger");
@@ -120,6 +121,7 @@ async fn ingress_sources_and_external_triggers_roundtrip() {
             priority: 0,
             max_attempts: 1,
             filters: Some(&["$.ref:eq:refs/heads/main".to_string()]),
+            plugin_hooks: None,
         })
         .await
         .expect("create external trigger");
@@ -143,6 +145,7 @@ async fn ingress_sources_and_external_triggers_roundtrip() {
             priority: 0,
             max_attempts: 1,
             filters: None,
+            plugin_hooks: None,
         })
         .await
         .expect("create wildcard trigger");
@@ -150,7 +153,11 @@ async fn ingress_sources_and_external_triggers_roundtrip() {
     assert_eq!(set.len(), 2, "exact + wildcard both evaluate");
     // A different source only sees the wildcard.
     assert_eq!(
-        storage.enabled_external_triggers("other").await.unwrap().len(),
+        storage
+            .enabled_external_triggers("other")
+            .await
+            .unwrap()
+            .len(),
         1
     );
 
@@ -159,12 +166,98 @@ async fn ingress_sources_and_external_triggers_roundtrip() {
         .set_ingress_source_enabled(&src.id, false)
         .await
         .unwrap());
-    assert!(!storage
-        .get_ingress_source(&src.id)
+    assert!(
+        !storage
+            .get_ingress_source(&src.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled
+    );
+    assert!(storage.delete_ingress_source(&src.id).await.unwrap());
+    assert!(storage.get_ingress_source(&src.id).await.unwrap().is_none());
+}
+
+/// M15: plugin_hooks JSON column round-trips through create/get, and an
+/// all-empty hooks object stores as NULL (no hooks).
+#[tokio::test]
+async fn trigger_plugin_hooks_roundtrip() {
+    use pumper_core::{PluginHook, TriggerPluginHooks};
+    let store = pumper_core::testing::TempStore::new("trigger-hooks-test").await;
+    let storage = &store.storage;
+
+    let hooks = TriggerPluginHooks {
+        predicate: Some(PluginHook {
+            plugin: "trigger-gate".into(),
+            params: json!({ "min_count": 5 }),
+            on_error: Some("skip".into()),
+        }),
+        transform: Some(PluginHook {
+            plugin: "delta-slim".into(),
+            params: json!({ "keep": ["dataset", "count"] }),
+            on_error: None,
+        }),
+    };
+    let trigger = storage
+        .create_trigger(&NewTrigger {
+            name: Some("hooked"),
+            source_kind: "dataset",
+            source_app: "grants",
+            source_dataset: Some("*"),
+            on_change: Some("fresh"),
+            on_status: None,
+            target_app: "research",
+            params: &json!({}),
+            budget_usd: None,
+            priority: 0,
+            max_attempts: 1,
+            filters: None,
+            plugin_hooks: Some(&hooks),
+        })
+        .await
+        .expect("create trigger with hooks");
+    let read = storage
+        .get_trigger(&trigger.id)
+        .await
+        .unwrap()
+        .expect("trigger row");
+    let h = read.plugin_hooks.expect("hooks persisted");
+    let p = h.predicate.expect("predicate hook");
+    assert_eq!(p.plugin, "trigger-gate");
+    assert_eq!(p.params, json!({ "min_count": 5 }));
+    assert_eq!(p.on_error.as_deref(), Some("skip"));
+    let t = h.transform.expect("transform hook");
+    assert_eq!(t.plugin, "delta-slim");
+    assert!(t.on_error.is_none());
+
+    // All-empty hooks object → stored as NULL, read back as None.
+    let empty = TriggerPluginHooks {
+        predicate: None,
+        transform: None,
+    };
+    let bare = storage
+        .create_trigger(&NewTrigger {
+            name: Some("bare"),
+            source_kind: "dataset",
+            source_app: "grants",
+            source_dataset: Some("*"),
+            on_change: Some("fresh"),
+            on_status: None,
+            target_app: "research",
+            params: &json!({}),
+            budget_usd: None,
+            priority: 0,
+            max_attempts: 1,
+            filters: None,
+            plugin_hooks: Some(&empty),
+        })
+        .await
+        .expect("create trigger with empty hooks");
+    assert!(storage
+        .get_trigger(&bare.id)
         .await
         .unwrap()
         .unwrap()
-        .enabled);
-    assert!(storage.delete_ingress_source(&src.id).await.unwrap());
-    assert!(storage.get_ingress_source(&src.id).await.unwrap().is_none());
+        .plugin_hooks
+        .is_none());
 }
