@@ -24,7 +24,7 @@ pub const DEFAULT_MAX_RING_BYTES: usize = 32 * 1024 * 1024;
 pub struct JobEvent {
     pub job_id: Uuid,
     pub app: String,
-    /// queued | running | succeeded | failed | cancelled
+    /// queued | running | succeeded | failed | cancelled | external
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<Value>,
@@ -39,6 +39,21 @@ impl JobEvent {
             app: app.into(),
             status: status.into(),
             result: None,
+            error: None,
+        }
+    }
+
+    /// An inbound-ingress event (`POST /ingest/{id}`), stamped onto the same
+    /// bus as job transitions so it rides SSE + the replay ring for free.
+    /// `event_id` is the per-delivery id (doubles as the trigger idempotency
+    /// scope), `source` is the ingress source name, and the verified payload
+    /// travels in `result`.
+    pub fn external(event_id: Uuid, source: impl Into<String>, payload: Value) -> Self {
+        Self {
+            job_id: event_id,
+            app: source.into(),
+            status: "external".into(),
+            result: Some(payload),
             error: None,
         }
     }

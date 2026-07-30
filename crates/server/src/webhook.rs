@@ -352,9 +352,100 @@ async fn deliver(
 /// Signature base `HMAC(secret, "{ts}.{delivery_id}." ++ body)` — the timestamp
 /// and delivery id are covered so a captured request can't be replayed with a
 /// fresh timestamp, and the receiver can bind the signature to the idempotency key.
-fn sign(secret: &[u8], ts: i64, delivery_id: &str, body: &[u8]) -> String {
+/// `pub(crate)`: the inbound ingress surface verifies with the exact same base
+/// (inverted), so the two directions cannot drift.
+pub(crate) fn sign(secret: &[u8], ts: i64, delivery_id: &str, body: &[u8]) -> String {
     let mut mac = HmacSha256::new_from_slice(secret).expect("hmac accepts any key length");
     mac.update(format!("{ts}.{delivery_id}.").as_bytes());
     mac.update(body);
     hex::encode(mac.finalize().into_bytes())
+}
+
+/// Inbound verification: the inverse of [`sign`]. `provided` is the hex digest
+/// from `x-pumper-signature` (any `sha256=` prefix already stripped).
+///
+/// Two bases, one scheme:
+/// - `context = Some((ts, delivery_id))` — the full pumper scheme
+///   (`"{ts}.{id}." ++ body`), used when the sender supplied
+///   `x-pumper-timestamp` (pumper-to-pumper federation).
+/// - `context = None` — bare `HMAC(secret, body)`, byte-for-byte the scheme
+///   GitHub uses for `x-hub-signature-256`, so a GitHub webhook can point
+///   straight at `/ingest/{id}` with a shared secret.
+///
+/// The comparison is constant-time (`Mac::verify_slice`), so the digest can't
+/// be recovered byte-by-byte through timing. A malformed hex digest fails.
+pub(crate) fn verify_signature(
+    secret: &[u8],
+    context: Option<(i64, &str)>,
+    body: &[u8],
+    provided: &str,
+) -> bool {
+    let Ok(provided) = hex::decode(provided) else {
+        return false;
+    };
+    let mut mac = HmacSha256::new_from_slice(secret).expect("hmac accepts any key length");
+    if let Some((ts, delivery_id)) = context {
+        mac.update(format!("{ts}.{delivery_id}.").as_bytes());
+    }
+    mac.update(body);
+    mac.verify_slice(&provided).is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verify_inverts_sign() {
+        let secret = b"s3cr3t";
+        let body = br#"{"ok":true}"#;
+        let sig = sign(secret, 1_700_000_000, "d-1", body);
+        assert!(verify_signature(
+            secret,
+            Some((1_700_000_000, "d-1")),
+            body,
+            &sig
+        ));
+        // Any covered component changing must fail: ts, id, body, secret.
+        assert!(!verify_signature(
+            secret,
+            Some((1_700_000_001, "d-1")),
+            body,
+            &sig
+        ));
+        assert!(!verify_signature(
+            secret,
+            Some((1_700_000_000, "d-2")),
+            body,
+            &sig
+        ));
+        assert!(!verify_signature(
+            secret,
+            Some((1_700_000_000, "d-1")),
+            b"tampered",
+            &sig
+        ));
+        assert!(!verify_signature(
+            b"wrong",
+            Some((1_700_000_000, "d-1")),
+            body,
+            &sig
+        ));
+    }
+
+    #[test]
+    fn bare_mode_matches_github_hub_signature_scheme() {
+        // GitHub signs exactly HMAC-SHA256(secret, body) — bare mode must
+        // accept that digest and reject the timestamped one, and vice versa.
+        use hmac::Mac;
+        let secret = b"gh-secret";
+        let body = br#"{"ref":"refs/heads/main"}"#;
+        let mut mac = HmacSha256::new_from_slice(secret).unwrap();
+        mac.update(body);
+        let github_hex = hex::encode(mac.finalize().into_bytes());
+        assert!(verify_signature(secret, None, body, &github_hex));
+        assert!(!verify_signature(secret, Some((0, "x")), body, &github_hex));
+        // Garbage hex never verifies (and never panics).
+        assert!(!verify_signature(secret, None, body, "not-hex"));
+    }
 }
