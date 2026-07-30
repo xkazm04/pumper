@@ -5,7 +5,29 @@
 //! sent as `X-Pumper-Signature: sha256=<hex>` so the receiver can verify
 //! authenticity. Every delivery is logged to `webhook_deliveries` — failed
 //! rows are the dead-letter queue, replayable via the API.
+//!
+//! ## Sinks (M22)
+//!
+//! A watch's `sink` column selects the delivery connector; the body is shaped
+//! at dispatch time and the *transport* branches inside [`deliver`] so every
+//! sink rides the exact same machinery — delivery log, in-process retries,
+//! backed-off DLQ drain, and manual replay:
+//!
+//! - `webhook` (default): POST the payload at the watch URL, HMAC-signed.
+//! - `slack`: POST a compact incoming-webhook message (`{"text": ...}`
+//!   summarizing the delta + count) at the watch URL. Same HTTP transport, so
+//!   retries/DLQ are identical; Slack ignores the extra `x-pumper-*` headers.
+//! - `file`: append the payload as one NDJSON line to
+//!   `data/sinks/<watch_id>.ndjson`. The delivery row's `url` is the
+//!   `file://<watch_id>.ndjson` pseudo-URL, which the transport re-validates
+//!   (filename chars only) so nothing in the log can escape the sinks dir.
+//!
+//! WASM sinks are deliberately OUT of v1. The seam for them is the transport
+//! branch in [`deliver`]: a future `plugin:<name>` sink value would resolve
+//! through the plugin host with the same `(delivery_id, event, body)` contract
+//! and report `(delivered, attempts, last_error)` like the built-ins.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -48,23 +70,107 @@ pub fn dispatch(client: reqwest::Client, storage: Arc<Storage>, job: Job) {
     );
 }
 
-/// Spawns a best-effort, logged delivery of a `dataset.changed` event.
+/// Spawns a best-effort, logged delivery of a `dataset.changed` event through
+/// the watch's configured sink. Body shaping happens here (once, so the logged
+/// body is exactly what the DLQ drain re-sends); transport branching happens
+/// in [`deliver`].
 pub fn dispatch_change(
     client: reqwest::Client,
     storage: Arc<Storage>,
     watch: Watch,
     payload: serde_json::Value,
 ) {
-    dispatch_event(
-        client,
-        storage,
-        "change",
-        &watch.id.clone(),
-        &watch.url.clone(),
-        "dataset.changed",
-        &payload,
-        watch.secret.clone(),
-    );
+    match watch.sink.as_str() {
+        "file" => {
+            // The pseudo-URL names the file from the watch id ONLY — never
+            // user input — and the transport re-validates it before writing.
+            let url = file_sink_url(&watch.id);
+            dispatch_event(
+                client,
+                storage,
+                "change",
+                &watch.id,
+                &url,
+                "dataset.changed",
+                &payload,
+                None,
+            );
+        }
+        "slack" => {
+            let body = slack_summary(&payload);
+            dispatch_event(
+                client,
+                storage,
+                "change",
+                &watch.id.clone(),
+                &watch.url.clone(),
+                "dataset.changed",
+                &body,
+                watch.secret.clone(),
+            );
+        }
+        // "webhook" and anything unrecognized (fail toward the original,
+        // most-informative behavior rather than dropping the event).
+        _ => {
+            dispatch_event(
+                client,
+                storage,
+                "change",
+                &watch.id.clone(),
+                &watch.url.clone(),
+                "dataset.changed",
+                &payload,
+                watch.secret.clone(),
+            );
+        }
+    }
+}
+
+// ---- Sink helpers ---------------------------------------------------------
+
+const FILE_SINK_SCHEME: &str = "file://";
+
+/// `data/sinks/` — a sibling of the artifacts dir so all on-disk output lives
+/// under the same data root (`data/artifacts` → `data/sinks`).
+fn sinks_dir(storage: &Storage) -> PathBuf {
+    storage
+        .artifacts_dir
+        .parent()
+        .unwrap_or_else(|| Path::new("data"))
+        .join("sinks")
+}
+
+/// The pseudo-URL logged for a file-sink delivery: `file://<watch_id>.ndjson`.
+fn file_sink_url(watch_id: &str) -> String {
+    format!("{FILE_SINK_SCHEME}{watch_id}.ndjson")
+}
+
+/// Resolves a logged file-sink URL to a filename inside `dir`. The name must
+/// be a bare filename of `[A-Za-z0-9._-]` with no `..` — anything else (path
+/// separators, traversal, a tampered log row) is rejected, so a delivery row
+/// can never write outside the sinks dir.
+fn file_sink_path(dir: &Path, url: &str) -> Option<PathBuf> {
+    let name = url.strip_prefix(FILE_SINK_SCHEME)?;
+    let valid = !name.is_empty()
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    valid.then(|| dir.join(name))
+}
+
+/// Compact Slack incoming-webhook message summarizing a dataset delta. Built
+/// once at dispatch so the logged body (and any DLQ replay) is exactly what
+/// Slack accepts.
+fn slack_summary(payload: &serde_json::Value) -> serde_json::Value {
+    let app = payload["app"].as_str().unwrap_or("?");
+    let dataset = payload["dataset"].as_str().unwrap_or("?");
+    let count = payload["count"].as_u64().unwrap_or(0);
+    let job = payload["job_id"].as_str().unwrap_or("-");
+    let noun = if count == 1 { "revision" } else { "revisions" };
+    serde_json::json!({
+        "text": format!("pumper: `{app}/{dataset}` changed — {count} {noun} (job {job})"),
+    })
 }
 
 /// Spawns a best-effort, logged delivery of an arbitrary event — the generic
@@ -151,6 +257,7 @@ pub fn replay(
 ) {
     tokio::spawn(async move {
         let outcome = deliver(
+            &storage,
             &client,
             &url,
             &event,
@@ -193,6 +300,7 @@ fn spawn_logged(
                 // gets an idempotency key (this delivery just isn't in the log/DLQ).
                 let fallback_id = uuid::Uuid::new_v4().to_string();
                 let _ = deliver(
+                    &storage,
                     &client,
                     &url,
                     &event,
@@ -205,6 +313,7 @@ fn spawn_logged(
             }
         };
         let outcome = deliver(
+            &storage,
             &client,
             &url,
             &event,
@@ -308,9 +417,15 @@ pub async fn drain_due(state: &AppState) {
     }
 }
 
-/// The retry loop: up to MAX_ATTEMPTS sends with linear backoff. Returns
-/// (delivered, attempts_made, last_error).
+/// The sink transport. `file://` pseudo-URLs append to the local sinks dir;
+/// everything else (webhook + slack) is the HTTP retry loop: up to
+/// MAX_ATTEMPTS sends with linear backoff. Returns
+/// (delivered, attempts_made, last_error). This is the single branch point
+/// every path (fresh dispatch, DLQ drain, manual replay) funnels through —
+/// and the seam where a future WASM `plugin:` sink would hook in.
+#[allow(clippy::too_many_arguments)]
 async fn deliver(
+    storage: &Storage,
     client: &reqwest::Client,
     url: &str,
     event: &str,
@@ -318,6 +433,9 @@ async fn deliver(
     body: &[u8],
     secret: Option<&str>,
 ) -> (bool, i64, Option<String>) {
+    if url.starts_with(FILE_SINK_SCHEME) {
+        return deliver_file(&sinks_dir(storage), url, event, delivery_id, body).await;
+    }
     let mut last_error = None;
     for attempt in 0..MAX_ATTEMPTS {
         if attempt > 0 {
@@ -347,6 +465,55 @@ async fn deliver(
         }
     }
     (false, MAX_ATTEMPTS as i64, last_error)
+}
+
+/// File-sink transport: append one NDJSON envelope line. The envelope carries
+/// the stable delivery id so a consumer can dedup lines re-appended by the
+/// DLQ drain or a manual replay — the same idempotency contract webhooks get
+/// via the `x-pumper-delivery-id` header. Single attempt: a local append that
+/// fails (disk full, permissions) fails identically on an immediate retry, so
+/// recovery is left to the backed-off DLQ drain.
+async fn deliver_file(
+    dir: &Path,
+    url: &str,
+    event: &str,
+    delivery_id: &str,
+    body: &[u8],
+) -> (bool, i64, Option<String>) {
+    let Some(path) = file_sink_path(dir, url) else {
+        return (false, 1, Some(format!("invalid file-sink url '{url}'")));
+    };
+    // serde_json output is single-line; a body that fails to parse (shouldn't
+    // happen — we serialized it) is embedded as a JSON string, keeping every
+    // line valid NDJSON.
+    let payload = serde_json::from_slice::<serde_json::Value>(body)
+        .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(body).into_owned()));
+    let line = serde_json::json!({
+        "delivery_id": delivery_id,
+        "event": event,
+        "delivered_at": chrono::Utc::now().to_rfc3339(),
+        "payload": payload,
+    });
+    match append_line(&path, &line).await {
+        Ok(()) => (true, 1, None),
+        Err(e) => (false, 1, Some(format!("file sink append: {e}"))),
+    }
+}
+
+async fn append_line(path: &Path, line: &serde_json::Value) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    if let Some(parent) = path.parent() {
+        tokio::fs::create_dir_all(parent).await?;
+    }
+    let mut bytes = serde_json::to_vec(line)?;
+    bytes.push(b'\n');
+    let mut file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    file.write_all(&bytes).await?;
+    file.flush().await
 }
 
 /// Signature base `HMAC(secret, "{ts}.{delivery_id}." ++ body)` — the timestamp
@@ -431,6 +598,53 @@ mod tests {
             body,
             &sig
         ));
+    }
+
+    #[test]
+    fn file_sink_path_accepts_only_bare_safe_filenames() {
+        let dir = Path::new("data/sinks");
+        // The URL our own dispatch builds resolves inside the dir.
+        let url = file_sink_url("0b6a9de1-2f7e-4d3c-9d59-000000000000");
+        let path = file_sink_path(dir, &url).expect("watch-id filename is valid");
+        assert!(path.starts_with(dir));
+        assert!(path.to_string_lossy().ends_with(".ndjson"));
+
+        // Anything a tampered delivery row could try is rejected.
+        for bad in [
+            "file://../escape.ndjson",
+            "file://..",
+            "file://a/b.ndjson",
+            "file://a\\b.ndjson",
+            "file://",
+            "file://C:evil.ndjson",
+            "https://example.test/hook",
+        ] {
+            assert!(file_sink_path(dir, bad).is_none(), "must reject {bad:?}");
+        }
+    }
+
+    #[test]
+    fn slack_summary_is_a_compact_text_message() {
+        let payload = serde_json::json!({
+            "event": "dataset.changed",
+            "app": "grants",
+            "dataset": "grants/opportunities",
+            "count": 3,
+            "job_id": "j-1",
+            "changes": [{"k": 1}, {"k": 2}, {"k": 3}],
+        });
+        let msg = slack_summary(&payload);
+        let text = msg["text"].as_str().expect("incoming-webhook `text` field");
+        assert!(text.contains("grants/opportunities"), "names the dataset");
+        assert!(text.contains('3'), "carries the delta count");
+        assert!(text.contains("j-1"), "carries the job id");
+        assert!(
+            msg.get("changes").is_none(),
+            "summary only — full revisions never leave for Slack"
+        );
+        // Singular form for one revision.
+        let one = slack_summary(&serde_json::json!({"count": 1}));
+        assert!(one["text"].as_str().unwrap().contains("1 revision ("));
     }
 
     #[test]

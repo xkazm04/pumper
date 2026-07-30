@@ -110,9 +110,12 @@ async fn initialize_negotiates_a_supported_protocol_version() {
 #[tokio::test]
 async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
     let (state, _store) = mcp_state(false).await;
-    let resp = handle_rpc(&state, &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
-        .await
-        .unwrap();
+    let resp = handle_rpc(
+        &state,
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    )
+    .await
+    .unwrap();
     let names: Vec<&str> = resp["result"]["tools"]
         .as_array()
         .unwrap()
@@ -121,7 +124,10 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
         .collect();
     // wait_job is read-only (awaits status, spends nothing) so it is always
     // offered; the actuating tools are not.
-    assert_eq!(names, vec!["list_apps", "query_dataset", "search", "wait_job"]);
+    assert_eq!(
+        names,
+        vec!["list_apps", "query_dataset", "search", "wait_job"]
+    );
 
     // Calling the withheld tool is a readable tool error naming the switch.
     let resp = handle_rpc(&state, &call("enqueue_job", json!({ "app": "fake" })))
@@ -133,9 +139,12 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
 
     // Opted in, the tool appears.
     let (state, _store2) = mcp_state(true).await;
-    let resp = handle_rpc(&state, &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }))
-        .await
-        .unwrap();
+    let resp = handle_rpc(
+        &state,
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    )
+    .await
+    .unwrap();
     let tools = resp["result"]["tools"].as_array().unwrap();
     assert!(tools.iter().any(|t| t["name"] == "enqueue_job"));
 }
@@ -163,7 +172,10 @@ async fn enqueue_tool_validates_clamps_and_enqueues() {
     // with pointer-path detail, and no job row.
     let resp = handle_rpc(
         &state,
-        &call("enqueue_job", json!({ "app": "schematic", "params": { "rows": 500 } })),
+        &call(
+            "enqueue_job",
+            json!({ "app": "schematic", "params": { "rows": 500 } }),
+        ),
     )
     .await
     .unwrap();
@@ -191,7 +203,10 @@ async fn enqueue_tool_validates_clamps_and_enqueues() {
     let job = state.storage.get(job_id).await.unwrap().unwrap();
     assert_eq!(job.budget_usd, Some(1.0));
     assert_eq!(job.params["query"], "grants");
-    assert_eq!(job.params["rows"], 10, "defaults shallow-merge under overrides");
+    assert_eq!(
+        job.params["rows"], 10,
+        "defaults shallow-merge under overrides"
+    );
 }
 
 #[tokio::test]
@@ -232,9 +247,12 @@ async fn query_dataset_tool_reuses_the_filter_grammar() {
     assert_eq!(resp["result"]["isError"], true);
 
     // Unknown methods and unknown tools are protocol errors, not tool results.
-    let resp = handle_rpc(&state, &json!({ "jsonrpc": "2.0", "id": 9, "method": "nope" }))
-        .await
-        .unwrap();
+    let resp = handle_rpc(
+        &state,
+        &json!({ "jsonrpc": "2.0", "id": 9, "method": "nope" }),
+    )
+    .await
+    .unwrap();
     assert_eq!(resp["error"]["code"], -32601);
     let resp = handle_rpc(&state, &call("nope", json!({}))).await.unwrap();
     assert_eq!(resp["error"]["code"], -32602);
