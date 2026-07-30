@@ -52,7 +52,7 @@ pub use datasets::{
     derived_would_cycle, diff_values, filters_match, parse_aggregate, parse_aggregates,
     parse_filter_spec, parse_filter_specs, project_value, trust_label, validate_group, Aggregate,
     ChangeKind, Datasets, DerivedBackfill, DerivedGroup, DerivedLookup, DerivedSpec,
-    DupPair, Record, Revision, RevisionPage, UpsertSummary, TRUST_STABLE,
+    DupPair, Provenance, Record, Revision, RevisionPage, UpsertSummary, TRUST_STABLE,
 };
 pub use resilience::{
     doc_signals, signals_batch, CohortDrift, Diagnosis, DocSignals, FetchHealth, ObservedDoc,
@@ -70,8 +70,8 @@ pub use storage::{
 pub use tiers::{HostProfile, TierMemory};
 
 pub use catalog::{
-    Catalog, PlanCreate, PlanDisable, PlanOrphan, PlanUpdate, ReconcilePlan, Source,
-    CATALOG_MANAGED_BY,
+    Catalog, Contract, ContractRange, ContractVerdict, PlanCreate, PlanDisable, PlanOrphan,
+    PlanUpdate, ReconcilePlan, Source, CATALOG_MANAGED_BY,
 };
 pub use config::Config;
 pub use crawl::{

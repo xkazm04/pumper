@@ -34,6 +34,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "records",
     "research_cache",
     "revalidations",
+    "rules_versions",
     "saved_search_seen",
     "saved_searches",
     "schedules",
@@ -113,6 +114,20 @@ async fn replay_keeps_columns_added_by_later_migrations() {
         assert!(
             records.contains(col),
             "records lost column `{col}`: {records:?}"
+        );
+    }
+
+    let revisions = column_names(&pool, "record_revisions").await;
+    for col in [
+        "trust",        // 0020 resilient extraction
+        "job_id",       // 0030 provenance
+        "source_url",   // 0030 provenance
+        "artifact_sha", // 0030 provenance
+        "rules_hash",   // 0030 provenance
+    ] {
+        assert!(
+            revisions.contains(col),
+            "record_revisions lost column `{col}`: {revisions:?}"
         );
     }
 
