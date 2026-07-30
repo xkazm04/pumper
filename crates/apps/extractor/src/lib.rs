@@ -18,6 +18,8 @@ use serde_json::{json, Value};
 
 pub struct Extractor;
 
+mod replay;
+
 /// Default per-run snapshot cap for the Wayback backfill mode
 /// (`source.archive.max_snapshots`), and the hard ceiling it clamps to — one
 /// run never fans over more than [`ARCHIVE_SNAPSHOT_CEILING`] captures; wider
@@ -405,7 +407,12 @@ impl ScrapeApp for Extractor {
          {url}@{date} and tagged _url + _observed_at. source.archive: {url|url_pattern, \
          from, to, max_snapshots} backfills from the Wayback Machine instead — snapshots \
          are digest-deduped, fetched via the governed engine, and upserted with the same \
-         {url}@{date} keys plus _fetched_via: \"wayback\"."
+         {url}@{date} keys plus _fetched_via: \"wayback\". replay: {rules, baseline_rules?, \
+         against: {app, dataset, url_pattern?, versions: \"all\"|\"latest\", max_pages}, \
+         bisect_field?} is the read-only CI mode: run candidate rules over stored bodies, \
+         diff against a baseline rule set field by field (match-rate deltas, \
+         added/lost/changed samples, per-URL regressions), write replay-report.json — \
+         never a dataset record."
     }
 
     fn manifest(&self) -> AppManifest {
@@ -413,12 +420,55 @@ impl ScrapeApp for Extractor {
             params_schema: Some(json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "required": ["rules"],
+                "anyOf": [
+                    { "required": ["rules"] },
+                    { "required": ["replay"] }
+                ],
                 "properties": {
                     "rules": {
                         "type": "object",
                         "minProperties": 1,
                         "description": "field -> rule; each rule is {\"type\": \"css|regex|json|xpath|const\", ...type-specific keys}"
+                    },
+                    "replay": {
+                        "type": "object",
+                        "required": ["rules"],
+                        "properties": {
+                            "rules": {
+                                "type": "object",
+                                "minProperties": 1,
+                                "description": "The CANDIDATE rule set to validate against the stored corpus."
+                            },
+                            "baseline_rules": {
+                                "type": "object",
+                                "minProperties": 1,
+                                "description": "Optional baseline (e.g. the currently deployed rules); when given the report carries per-field deltas + added/lost/changed value diffs."
+                            },
+                            "against": {
+                                "type": "object",
+                                "properties": {
+                                    "app": { "type": "string", "description": "Source app of the stored bodies (default \"crawl\")." },
+                                    "dataset": { "type": "string", "description": "Source dataset (default \"pages\")." },
+                                    "url_pattern": { "type": "string", "description": "Regex a record key (URL) must match to be replayed." },
+                                    "versions": {
+                                        "type": "string",
+                                        "enum": ["all", "latest"],
+                                        "description": "\"latest\" (default): current body per URL. \"all\": every archived page_versions revision + current."
+                                    },
+                                    "max_pages": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 5000,
+                                        "description": "URL cap per replay run (default 500); the report sets truncated: true when more matched."
+                                    }
+                                }
+                            },
+                            "bisect_field": {
+                                "type": "string",
+                                "description": "Walk each URL's version series and report every boundary observation pair where this field's match flipped. Requires against.versions: \"all\"."
+                            }
+                        },
+                        "description": "Replay-CI: STRICTLY read-only — runs rules over stored bodies, emits result JSON + a replay-report.json artifact, never writes a dataset record. Mutually exclusive with urls/source."
                     },
                     "urls": {
                         "type": "array",
@@ -547,16 +597,41 @@ impl ScrapeApp for Extractor {
                         "dataset": "price_history"
                     }),
                 },
+                ManifestExample {
+                    description: "Replay-CI: validate a candidate rule edit against the \
+                                  stored corpus, diffed field-by-field against the deployed \
+                                  baseline — read-only, no dataset writes",
+                    params: json!({
+                        "replay": {
+                            "rules": { "price": { "type": "css", "selector": ".price-v2" } },
+                            "baseline_rules": { "price": { "type": "css", "selector": ".price" } },
+                            "against": {
+                                "url_pattern": "^https://example\\.com/products/",
+                                "versions": "all",
+                                "max_pages": 200
+                            },
+                            "bisect_field": "price"
+                        }
+                    }),
+                },
             ],
             output_shape: Some(
                 "{extracted, errors, dataset, new, changed, unchanged, removed?} — an upsert \
-                 summary plus per-document extraction error counts",
+                 summary plus per-document extraction error counts. Replay mode instead \
+                 returns {fields: [per-field match-rate deltas + added/lost/changed samples], \
+                 regressions, bisect?, artifact: \"replay-report.json\"} and writes nothing.",
             ),
             cost_class: CostClass::Free,
         }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
+        // Replay-CI mode: candidate rules over stored bodies, read-only diff
+        // report (no dataset writes) — its own param root, its own runner.
+        if let Some(replay) = ctx.params.get("replay").and_then(Value::as_object) {
+            let replay = replay.clone();
+            return replay::run_replay(&ctx, &replay).await;
+        }
         let rules: RuleSet = ctx
             .params
             .get("rules")
