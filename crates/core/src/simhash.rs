@@ -81,7 +81,7 @@ pub fn dom_simhash_str(doc: &str) -> u64 {
 /// signal thrown away to suppress noise. Keeping the stem suppresses exactly the
 /// digest churn and nothing else. Deliberately narrow: `text-gray-500` and
 /// `col-md-6` are hand-written and must keep their identity.
-fn build_hash_stem(class: &str) -> Option<&str> {
+pub(crate) fn build_hash_stem(class: &str) -> Option<&str> {
     let sep = class.rfind(['-', '_'])?;
     let (stem, digest) = (&class[..sep], &class[sep + 1..]);
     let looks_generated = !stem.is_empty()
