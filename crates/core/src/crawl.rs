@@ -77,6 +77,13 @@ pub struct CrawlPageRecord {
     /// Learned change-cadence counters for this URL, updated every revisit (and
     /// initialized on first sighting). `None` outside revisit bookkeeping.
     pub cadence: Option<RevisitCadence>,
+    /// Outbound links extracted from this page — canonicalized and already
+    /// scheme/`same_domain`/robots-independent filtered exactly as the frontier
+    /// saw them (a `same_domain` crawl therefore carries a truncated,
+    /// same-host-only view). Surfaced so a sink can persist the link graph the
+    /// crawler otherwise computes and discards. Empty on `gone`/`unchanged`
+    /// markers (no body was parsed).
+    pub links: Vec<String>,
 }
 
 /// Per-URL change-cadence counters, persisted ON the page record (M07 — no new
@@ -393,6 +400,7 @@ fn gone_record(url: String, status: u16) -> CrawlPageRecord {
         gone: true,
         unchanged: false,
         cadence: None,
+        links: Vec::new(),
     }
 }
 
@@ -414,6 +422,7 @@ fn unchanged_record(url: String, cadence: RevisitCadence) -> CrawlPageRecord {
         gone: false,
         unchanged: true,
         cadence: Some(cadence),
+        links: Vec::new(),
     }
 }
 
@@ -1071,6 +1080,7 @@ pub async fn crawl(
                     gone: false,
                     unchanged: false,
                     cadence: Some(cadence),
+                    links: fetched.links.clone(),
                 });
                 if sink_buf.len() >= PAGE_SINK_STRIDE {
                     if let Some(s) = sink.as_mut() {
