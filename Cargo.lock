@@ -242,9 +242,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-census-bfs"
+version = "0.1.0"
+dependencies = [
+ "app-census-density",
+ "async-trait",
+ "census-common",
+ "pumper-core",
+ "serde_json",
+]
+
+[[package]]
 name = "app-census-density"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "census-common",
+ "pumper-core",
+ "serde_json",
+]
+
+[[package]]
+name = "app-census-nesd"
+version = "0.1.0"
+dependencies = [
+ "app-census-density",
  "async-trait",
  "census-common",
  "pumper-core",
@@ -283,6 +305,17 @@ dependencies = [
  "serde_json",
  "sha2",
  "tracing",
+]
+
+[[package]]
+name = "app-cordis"
+version = "0.1.0"
+dependencies = [
+ "app-eu-sedia",
+ "async-trait",
+ "pumper-core",
+ "serde_json",
+ "url",
 ]
 
 [[package]]
@@ -3417,6 +3450,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "pumper-engine-archive"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "pumper-core",
+ "reqwest 0.12.28",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "pumper-engine-browser"
 version = "0.1.0"
 dependencies = [
@@ -3485,10 +3531,13 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "app-ca-grants",
+ "app-census-bfs",
  "app-census-density",
+ "app-census-nesd",
  "app-census-nonemp",
  "app-cms-fee-schedule",
  "app-connector-api-watch",
+ "app-cordis",
  "app-crawl",
  "app-eu-sedia",
  "app-extractor",
@@ -3516,6 +3565,7 @@ dependencies = [
  "hmac",
  "http-body-util",
  "pumper-core",
+ "pumper-engine-archive",
  "pumper-engine-browser",
  "pumper-engine-claude",
  "pumper-engine-http",
