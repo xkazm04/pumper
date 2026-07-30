@@ -151,6 +151,17 @@ async fn replay_keeps_columns_added_by_later_migrations() {
         );
     }
 
+    let tier_memory = column_names(&pool, "tier_memory").await;
+    for col in [
+        "penalty_ms",   // 0016 host profiles
+        "observations", // 0033 host weather (M01)
+    ] {
+        assert!(
+            tier_memory.contains(col),
+            "tier_memory lost column `{col}`: {tier_memory:?}"
+        );
+    }
+
     let watches = column_names(&pool, "watches").await;
     assert!(
         watches.contains("sink"), // 0031 watch sinks

@@ -229,6 +229,183 @@ pub enum PageAction {
     },
 }
 
+// ---- Transact (M06, v1 slice: dry-run ONLY) --------------------------------
+//
+// A *transact flow* is a declarative multi-step interaction (navigate → fill →
+// click → wait) executed by the browser engine up to — and never past — the
+// final irreversible action. The steps reuse [`PageAction`] verbatim; the
+// irreversible action lives in its OWN field (`submit_action`), which the v1
+// executor has no code path to run: stop-before-submit is structural, not a
+// flag check. `submit: true` is rejected with a typed [`Error::Transact`]
+// because live submission requires the human-approval design (pending-approval
+// jobs + `POST /transactions/{id}/approve`) documented as the next slice.
+
+/// A declarative browser transaction, executed **dry-run only** in this slice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransactRequest {
+    /// Page the flow starts on.
+    pub url: String,
+    /// Session-vault profile to act under (logins/cookies). Same contract as
+    /// [`RenderRequest::profile`]; validated by [`validate_profile_name`].
+    #[serde(default)]
+    pub profile: Option<String>,
+    /// The reversible steps (fill/click/wait/scroll), executed in order up to
+    /// the final confirmation state. Reuses [`PageAction`] verbatim.
+    #[serde(default)]
+    pub steps: Vec<PageAction>,
+    /// The exact irreversible action the flow would perform (e.g. clicking the
+    /// real submit button). **Never executed in v1** — it is captured verbatim
+    /// into the evidence bundle as `would_submit` so a human can review it.
+    pub submit_action: PageAction,
+    /// Request live submission. `false` (default) = dry-run. `true` is
+    /// REJECTED with a typed [`Error::Transact`]: releasing a live submit needs
+    /// the human-approval slice (pending-approval jobs + an explicit approve
+    /// endpoint), which does not exist yet.
+    #[serde(default)]
+    pub submit: bool,
+    /// Caller-chosen idempotency key. Required non-empty; recorded in the
+    /// evidence bundle now, and the dedup key of the future `transactions`
+    /// table that will block double-submission once live submits exist.
+    pub idempotency_key: String,
+    /// Wait for this selector after navigation, before running steps.
+    #[serde(default)]
+    pub wait_for_selector: Option<String>,
+    /// Extra settle time before steps; engine default when `None`.
+    #[serde(default)]
+    pub extra_wait_ms: Option<u64>,
+    /// Cap on the captured DOM-snapshot size (bytes); engine default when `None`.
+    #[serde(default)]
+    pub max_body_bytes: Option<u64>,
+}
+
+impl TransactRequest {
+    /// Rejects flows this slice must not run: `submit: true` (typed
+    /// [`Error::Transact`] pointing at the human-approval design), an empty
+    /// idempotency key, and an invalid profile name. Engines call this before
+    /// touching a browser; apps call it before touching an engine.
+    pub fn validate(&self) -> Result<()> {
+        if self.submit {
+            return Err(Error::Transact(
+                "live submission (submit: true) is not available: this slice executes flows \
+                 dry-run only, stopping before the irreversible action. Releasing a live submit \
+                 requires the human-approval design (pending-approval transactions + an explicit \
+                 approve endpoint) — the documented next slice. Re-run with submit: false to get \
+                 the evidence bundle for review."
+                    .into(),
+            ));
+        }
+        if self.idempotency_key.trim().is_empty() {
+            return Err(Error::Transact(
+                "idempotency_key must be a non-empty caller-chosen key: it is recorded with the \
+                 evidence bundle and will dedup live submissions in the next slice"
+                    .into(),
+            ));
+        }
+        if let Some(profile) = &self.profile {
+            validate_profile_name(profile)?;
+        }
+        Ok(())
+    }
+
+    /// Every selector the flow types into (recursing through `Repeat`), in
+    /// order, deduplicated — the fields whose live DOM values the evidence
+    /// bundle summarizes.
+    pub fn fill_selectors(&self) -> Vec<String> {
+        fn walk(steps: &[PageAction], out: &mut Vec<String>) {
+            for step in steps {
+                match step {
+                    PageAction::Type { selector, .. } => {
+                        if !out.iter().any(|s| s == selector) {
+                            out.push(selector.clone());
+                        }
+                    }
+                    PageAction::Repeat { steps, .. } => walk(steps, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.steps, &mut out);
+        out
+    }
+}
+
+/// The live DOM value of one filled field at the moment the flow stopped —
+/// what a reviewer checks before ever approving a live submit.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FilledField {
+    /// The `Type` step's selector.
+    pub selector: String,
+    /// The element's current value (`.value`, falling back to text content).
+    /// `None` when the element was not found at capture time.
+    pub value: Option<String>,
+    /// Whether the element existed in the DOM at capture time.
+    pub found: bool,
+}
+
+/// The evidence bundle a dry-run transact emits instead of acting: everything
+/// a human needs to decide whether the flow, run again with approval, would do
+/// the right thing.
+#[derive(Debug, Clone, Serialize)]
+pub struct TransactEvidence {
+    /// Always `true` in this slice — no code path produces a live receipt.
+    pub dry_run: bool,
+    /// The caller's idempotency key, threaded through verbatim.
+    pub idempotency_key: String,
+    /// Flow start URL and where the page actually ended up.
+    pub url: String,
+    pub final_url: Option<String>,
+    /// How many reversible steps executed (a `Repeat` counts as one).
+    pub steps_completed: usize,
+    /// Live DOM values of every field the flow typed into.
+    pub filled_fields: Vec<FilledField>,
+    /// The exact irreversible action that was NOT performed.
+    pub would_submit: PageAction,
+    /// Full DOM snapshot at the stop point (size-capped by the engine).
+    pub dom_html: String,
+    /// Path to a screenshot of the stop state, when the engine can produce
+    /// one. The current browser engine does not yet expose screenshot capture
+    /// through its render path, so this is `None` — an honest gap, not a stub.
+    pub screenshot_path: Option<String>,
+    /// `true` when navigation timed out and the DOM was captured mid-load —
+    /// the evidence may show a partial page.
+    pub nav_timed_out: bool,
+}
+
+/// JS expression that reads the live values of `selectors` — the evidence
+/// bundle's filled-field summary. Selectors are JSON-encoded into the script,
+/// so quotes/backslashes in a CSS selector cannot break out of the literal.
+pub fn filled_fields_js(selectors: &[String]) -> String {
+    let sels = serde_json::to_string(selectors).unwrap_or_else(|_| "[]".into());
+    format!(
+        "(() => {{ const sels = {sels}; return sels.map(s => {{ \
+           const el = document.querySelector(s); \
+           if (!el) return {{selector: s, value: null, found: false}}; \
+           const v = ('value' in el && el.value !== undefined && el.value !== '') \
+             ? String(el.value) : (el.textContent || null); \
+           return {{selector: s, value: v, found: true}}; }}); }})()"
+    )
+}
+
+/// Decodes the result of [`filled_fields_js`] back into typed fields. A missing
+/// or malformed result (evaluate failed, page navigated away) degrades to
+/// "nothing found" rows rather than failing the whole evidence bundle.
+pub fn parse_filled_fields(selectors: &[String], evaluated: Option<&Value>) -> Vec<FilledField> {
+    if let Some(v) = evaluated {
+        if let Ok(fields) = serde_json::from_value::<Vec<FilledField>>(v.clone()) {
+            return fields;
+        }
+    }
+    selectors
+        .iter()
+        .map(|s| FilledField {
+            selector: s.clone(),
+            value: None,
+            found: false,
+        })
+        .collect()
+}
+
 /// One same-origin JSON response observed by the browser tier while rendering a
 /// page with [`RenderRequest::capture_network`] set — the raw material of the
 /// API X-ray (discovering the data API behind a SPA). Bodies are size-capped by
@@ -414,6 +591,19 @@ pub trait HttpClient: Send + Sync {
 #[async_trait]
 pub trait Browser: Send + Sync {
     async fn render(&self, req: RenderRequest) -> Result<RenderedPage>;
+
+    /// Executes a declarative [`TransactRequest`] **dry-run only**: the
+    /// reversible steps run to the final confirmation state, the flow STOPS
+    /// before the irreversible `submit_action`, and an evidence bundle comes
+    /// back for human review. Default: unsupported — only engines that opt in
+    /// (currently `pumper-engine-browser`) can execute flows; wrappers/mocks
+    /// keep compiling and fail loudly if a transact reaches them.
+    async fn transact(&self, req: TransactRequest) -> Result<TransactEvidence> {
+        Err(Error::Browser(format!(
+            "this engine does not support transact flows ({})",
+            req.url
+        )))
+    }
 }
 
 /// Agentic web research via Claude Code CLI.
@@ -606,6 +796,98 @@ mod tests {
             let err = validate_profile_name(bad).unwrap_err();
             assert!(matches!(err, Error::Profile(_)), "{bad:?} => {err:?}");
         }
+    }
+
+    fn dry_run_flow() -> TransactRequest {
+        serde_json::from_str(
+            r##"{"url":"https://portal.example/signup",
+                 "idempotency_key":"signup-2026-07-31",
+                 "steps":[
+                   {"action":"type","selector":"#email","text":"a@b.c"},
+                   {"action":"click","selector":"#next"},
+                   {"action":"wait_for_selector","selector":"#confirm"}],
+                 "submit_action":{"action":"click","selector":"#confirm-submit"}}"##,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn transact_request_defaults_to_dry_run_and_validates() {
+        let req = dry_run_flow();
+        // Omitted `submit` => false => dry-run: the ONLY mode this slice runs.
+        assert!(!req.submit);
+        assert!(req.validate().is_ok());
+        assert_eq!(req.steps.len(), 3);
+        assert!(matches!(&req.submit_action, PageAction::Click { selector } if selector == "#confirm-submit"));
+    }
+
+    #[test]
+    fn submit_true_is_rejected_with_a_typed_error_naming_the_next_slice() {
+        let mut req = dry_run_flow();
+        req.submit = true;
+        let err = req.validate().unwrap_err();
+        // Typed (not a generic App/Browser error), and the message points the
+        // caller at the human-approval design rather than a dead end.
+        assert!(matches!(err, Error::Transact(_)), "got {err:?}");
+        let msg = err.to_string();
+        assert!(msg.contains("human-approval"), "message must name the next slice: {msg}");
+        assert!(msg.contains("dry-run"), "message must explain what v1 does: {msg}");
+    }
+
+    #[test]
+    fn empty_idempotency_key_and_bad_profile_are_typed_rejections() {
+        let mut req = dry_run_flow();
+        req.idempotency_key = "  ".into();
+        assert!(matches!(req.validate().unwrap_err(), Error::Transact(_)));
+        let mut req = dry_run_flow();
+        req.profile = Some("../escape".into());
+        assert!(matches!(req.validate().unwrap_err(), Error::Profile(_)));
+        // A valid profile threads through fine.
+        let mut req = dry_run_flow();
+        req.profile = Some("acme_login".into());
+        assert!(req.validate().is_ok());
+    }
+
+    #[test]
+    fn fill_selectors_recurse_through_repeat_and_dedupe() {
+        let mut req = dry_run_flow();
+        req.steps.push(PageAction::Repeat {
+            times: 2,
+            steps: vec![
+                PageAction::Type {
+                    selector: "#email".into(), // duplicate of the top-level fill
+                    text: "x".into(),
+                },
+                PageAction::Type {
+                    selector: "#org".into(),
+                    text: "Acme".into(),
+                },
+            ],
+            until_selector_count_stable: None,
+        });
+        assert_eq!(req.fill_selectors(), vec!["#email".to_string(), "#org".to_string()]);
+    }
+
+    #[test]
+    fn filled_fields_js_json_encodes_selectors_and_parse_round_trips() {
+        // A hostile selector's quotes/backslashes stay inside the JSON literal.
+        let sels = vec![r#"input[name="a\"b"]"#.to_string()];
+        let js = filled_fields_js(&sels);
+        assert!(js.contains(r#"\"a\\\"b\""#), "selector must be JSON-escaped: {js}");
+        // The evaluate result decodes into typed fields.
+        let evaluated = serde_json::json!([
+            {"selector": "#email", "value": "a@b.c", "found": true},
+            {"selector": "#gone", "value": null, "found": false}
+        ]);
+        let fields = parse_filled_fields(&["#email".into(), "#gone".into()], Some(&evaluated));
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].value.as_deref(), Some("a@b.c"));
+        assert!(!fields[1].found);
+        // A failed/malformed evaluate degrades to not-found rows, never an error.
+        let fields = parse_filled_fields(&["#email".into()], None);
+        assert_eq!(fields, vec![FilledField { selector: "#email".into(), value: None, found: false }]);
+        let fields = parse_filled_fields(&["#email".into()], Some(&serde_json::json!("nonsense")));
+        assert!(!fields[0].found);
     }
 
     #[test]

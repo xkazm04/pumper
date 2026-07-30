@@ -270,6 +270,14 @@ pub struct Fetcher {
     recipes_auto_validate: bool,
     /// `[recipes] max_failures`: consecutive strikes that un-validate.
     recipes_max_failures: u32,
+    /// Remote fetch fabric (M17, `[remote]`, default OFF => `None`). When
+    /// wired, the **live-HTTP tier** routes through this client instead of the
+    /// plain local engine: the remote engine round-robins the configured peer
+    /// nodes' `/fetch-proxy` endpoints and internally falls back to the local
+    /// engine on any node error — so this substitution can change *where* a
+    /// fetch egresses from, never whether it succeeds. The recipe tier and the
+    /// archive engine's inner transport deliberately stay local.
+    remote: Option<Arc<dyn HttpClient>>,
     /// The same per-host politeness governor the HTTP engine uses. The HTTP tier
     /// is governed inside `HttpEngine::send` (so raw-HTTP callers like the crawler
     /// are still spaced); the browser tier has no such internal seam, so the
@@ -294,6 +302,7 @@ impl Fetcher {
             browser,
             claude,
             archive: None,
+            remote: None,
             recipes: None,
             recipes_enabled: false,
             recipes_auto_validate: false,
@@ -325,6 +334,23 @@ impl Fetcher {
     pub fn with_archive(mut self, archive: Option<Arc<dyn HttpClient>>) -> Self {
         self.archive = archive;
         self
+    }
+
+    /// Wires the (optional) remote fetch-fabric client (M17, `[remote]`) into
+    /// the **live-HTTP tier position**. `None` — the default — leaves the
+    /// ladder exactly as it was. The wired client is expected to fall back to
+    /// the local engine itself on node failure (see `pumper-engine-remote`),
+    /// so from the ladder's perspective it is just an HTTP tier that may
+    /// egress elsewhere.
+    pub fn with_remote(mut self, remote: Option<Arc<dyn HttpClient>>) -> Self {
+        self.remote = remote;
+        self
+    }
+
+    /// The client serving the live-HTTP tier: the remote fabric when wired,
+    /// the plain local engine otherwise.
+    fn live_http(&self) -> &Arc<dyn HttpClient> {
+        self.remote.as_ref().unwrap_or(&self.http)
     }
 
     pub async fn fetch(&self, req: FetchRequest) -> Result<FetchOutcome> {
@@ -447,7 +473,7 @@ impl Fetcher {
             http_req.ttl_override = req.ttl_override;
             http_req.profile = req.profile.clone();
             let started = Instant::now();
-            match self.http.fetch(http_req).await {
+            match self.live_http().fetch(http_req).await {
                 Ok(resp) => {
                     let latency_ms = elapsed_ms(started);
                     // Convert to Markdown at most once, and only when a decision
@@ -1266,6 +1292,46 @@ mod tests {
         let out = fetcher.fetch(req).await.unwrap();
         assert_eq!(out.engine, "http");
         assert!(out.trace.iter().all(|t| t.tier != FetchTier::Archive));
+    }
+
+    // --- Remote fabric at the live-HTTP position (M17) ---
+
+    #[tokio::test]
+    async fn wired_remote_client_serves_the_live_http_tier() {
+        // With a remote client wired, the plain local engine is never touched
+        // at the live-HTTP position (DeadHttp panics if called); the outcome
+        // still reports plain tier "http" — remote is a *where*, not a tier.
+        struct StubRemote;
+        #[async_trait]
+        impl HttpClient for StubRemote {
+            async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: std::collections::HashMap::new(),
+                    body: GOOD_PAGE.into(),
+                    final_url: req.url,
+                    cache_hit: false,
+                })
+            }
+        }
+        let fetcher = Fetcher::new(
+            Arc::new(DeadHttp),
+            Arc::new(DeadBrowser),
+            Arc::new(StubResearcher),
+            enabled_governor(),
+            &FetcherConfig {
+                min_content_chars: 100,
+                ..FetcherConfig::default()
+            },
+        )
+        .with_remote(Some(Arc::new(StubRemote)));
+        let out = fetcher
+            .fetch(FetchRequest::new("https://example.test/page"))
+            .await
+            .unwrap();
+        assert_eq!(out.engine, "http");
+        assert_eq!(out.trace[0].tier, FetchTier::Http);
+        assert_eq!(out.trace[0].verdict, TierVerdict::Ok);
     }
 
     #[tokio::test]

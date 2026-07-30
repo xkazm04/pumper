@@ -70,7 +70,10 @@ pub use storage::{
     TriggerPluginHooks, Watch, YieldSummary, MAX_CHECKPOINT_BYTES,
 };
 #[cfg(feature = "storage")]
-pub use tiers::{HostProfile, TierMemory};
+pub use tiers::{
+    plan_weather_import, HostProfile, TierMemory, WeatherEntry, WeatherPlan,
+    WEATHER_IMPORT_PENALTY_CAP_MS,
+};
 #[cfg(feature = "storage")]
 pub use vcr::{Cassette, CassetteEntry, Recorder, Vcr};
 
@@ -84,9 +87,10 @@ pub use crawl::{
     CrawlStats, PageSink, PageSource, ProgressFn, RevisitCadence, RevisitSeed,
 };
 pub use engine::{
-    profile_browser_dir, profile_cookies_path, profile_dir, validate_profile_name, Browser,
-    CapturedCall, EngineSet, HttpClient, HttpMethod, HttpRequest, HttpResponse, PageAction,
-    RenderRequest, RenderedPage, ResearchOutput, ResearchRequest, Researcher, FETCHED_VIA_HEADER,
+    filled_fields_js, parse_filled_fields, profile_browser_dir, profile_cookies_path, profile_dir,
+    validate_profile_name, Browser, CapturedCall, EngineSet, FilledField, HttpClient, HttpMethod,
+    HttpRequest, HttpResponse, PageAction, RenderRequest, RenderedPage, ResearchOutput,
+    ResearchRequest, Researcher, TransactEvidence, TransactRequest, FETCHED_VIA_HEADER,
     PROFILE_BROWSER_DIR, PROFILE_COOKIES_FILE, PROFILE_NAME_MAX_LEN, SNAPSHOT_TS_HEADER,
 };
 pub use error::{Error, Result};

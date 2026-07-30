@@ -30,12 +30,14 @@ mod economics;
 mod error;
 mod events;
 mod health;
+mod host_weather;
 mod ingress;
 mod jobs;
 mod meta;
 mod provenance;
 mod query;
 mod recipes;
+mod remote;
 mod runtime;
 mod schedules;
 mod search;
@@ -50,12 +52,14 @@ use derived::*;
 use economics::*;
 use events::*;
 use health::*;
+use host_weather::*;
 use ingress::*;
 use jobs::*;
 use meta::*;
 use provenance::*;
 use query::*;
 use recipes::*;
+use remote::*;
 use runtime::*;
 use schedules::*;
 use search::*;
@@ -94,6 +98,7 @@ use watches::*;
         (name = "cache", description = "HTTP cache freshness model (learned change cadence)"),
         (name = "profiles", description = "Session vault: named login profiles"),
         (name = "recipes", description = "API X-ray: discovered JSON-API endpoints behind rendered pages"),
+        (name = "remote", description = "Distributed fetch fabric: peer nodes proxy fetches through this node's local stack"),
         (name = "provenance", description = "Record-level derivation chains (M12): who wrote each revision from what, plus read-only re-derivation"),
         (name = "meta", description = "The OpenAPI document itself"),
         (name = "sources", description = "Extraction health: per-source degradation detection"),
@@ -195,8 +200,11 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_hosts))
         .routes(routes!(get_host))
         .routes(routes!(delete_host_memory))
+        .routes(routes!(export_host_weather))
+        .routes(routes!(import_host_weather))
         .routes(routes!(list_profiles))
         .routes(routes!(list_recipes))
+        .routes(routes!(fetch_proxy))
         .routes(routes!(list_plugins))
         .routes(routes!(reload_plugins))
         .routes(routes!(search))
@@ -287,7 +295,8 @@ mod catalog_tests {
     /// reason. Kept explicit so a NEW in-scope source app can't be silently omitted
     /// — adding one that isn't listed here fails the coverage check below. Reasons:
     ///  - generic tooling / engines, not a data *source*: `crawl`, `extractor`,
-    ///    `plugin`, `readable`, `research`, `watch`, and `provisioner` (an
+    ///    `plugin`, `readable`, `research`, `watch`, `transact` (an on-demand
+    ///    dry-run browser-flow executor, not a data source), and `provisioner` (an
     ///    on-demand compiler that *proposes* catalog rows for human review —
     ///    it deliberately never appears in the catalog it writes proposals for,
     ///    has no schedule, and its output is always `status = "planned"`).
@@ -314,6 +323,8 @@ mod catalog_tests {
         "smlouvy-dump-watch",
         "state-tax",
         "trade-wages",
+        "transact",
+        "peer",
         "valuation-multiples",
         "watch",
     ];
@@ -450,8 +461,11 @@ mod api_spec_tests {
         "GET /hosts",
         "GET /hosts/{host}",
         "DELETE /hosts/{host}/memory",
+        "GET /host-weather/export",
+        "POST /host-weather/import",
         "GET /profiles",
         "GET /recipes",
+        "POST /fetch-proxy",
         "GET /plugins",
         "POST /plugins/reload",
         "GET /search",

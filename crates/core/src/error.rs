@@ -14,6 +14,12 @@ pub enum Error {
     /// is distinguishable from a transport failure.
     #[error("profile: {0}")]
     Profile(String),
+    /// A transact-flow rejection: the request asked for something the current
+    /// slice deliberately refuses (live `submit: true` before the human-approval
+    /// design exists) or the flow itself is malformed (empty idempotency key).
+    /// Typed so "we refused to act" is never confused with "the browser broke".
+    #[error("transact: {0}")]
+    Transact(String),
     #[error("parse: {0}")]
     Parse(String),
     #[error("config: {0}")]

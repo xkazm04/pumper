@@ -165,7 +165,7 @@ pub(crate) struct AppsQuery {
     tag = "apps",
     params(AppsQuery),
     responses(
-        (status = 200, description = "`{apps: [{name, description, schedule, requires, ready, default_params, cost_class, output_shape, has_params_schema}]}` — `requires` lists preconditions (e.g. `env:CENSUS_API_KEY`); `ready` is false when any is unmet here; `default_params` is the app's default job params (a POST body's `params` shallow-merges over these); `cost_class` is free|metered|claude. With `?format=tools`: `{tools: [..]}` — each app as an MCP tool definition (`inputSchema` = the app's params JSON Schema, permissive `{type: object}` when undeclared), directly consumable as agent tool definitions."),
+        (status = 200, description = "`{apps: [{name, description, schedule, requires, ready, default_params, cost_class, output_shape, has_params_schema}]}` — `requires` lists preconditions (e.g. `env:CENSUS_API_KEY`); `ready` is false when any is unmet here; `default_params` is the app's default job params (a POST body's `params` shallow-merges over these); `cost_class` is free|metered|claude. When `[plugins] app_dir` is set, discovered dynamic WASM apps are appended with `dynamic: true, runnable: false` and a `reason` string — read-only manifests, not enqueueable. With `?format=tools`: `{tools: [..]}` — each app as an MCP tool definition (`inputSchema` = the app's params JSON Schema, permissive `{type: object}` when undeclared), directly consumable as agent tool definitions; dynamic apps are excluded there because a tool an agent cannot call is a trap."),
         (status = 400, description = "Unknown `format`", body = Object),
     )
 )]
@@ -215,6 +215,12 @@ pub(crate) async fn list_apps(
                     })
                 })
                 .collect();
+            // Dynamic WASM apps (M28 v1): appended after the compiled-in apps,
+            // carrying `dynamic: true, runnable: false` + a reason — visible so
+            // an operator can see what `[plugins] app_dir` picked up, but never
+            // enqueueable (the enqueue handler rejects them with the same reason).
+            let mut apps = apps;
+            apps.extend(state.dynamic_apps.iter().cloned());
             Ok(Json(json!({ "apps": apps })))
         }
     }

@@ -85,6 +85,21 @@ enabled = false
 enabled = false
 # base_url = "https://web.archive.org"   # override for a self-hosted pywb
 
+# Distributed fetch fabric (M17 v1). One switch drives both sides: when enabled
+# this node SERVES `POST /fetch-proxy` (peers run fetches through this node's
+# local stack — governor, cache, caps included; shared-secret auth), and when
+# `nodes` is also non-empty the tiered fetcher's live-HTTP tier DISPATCHES to
+# those peers round-robin, falling back to the local engine on any node error.
+# `secret` MUST be set when enabled (an unauthenticated /fetch-proxy would be an
+# open proxy); use the same value on every node of the cluster. Cluster-wide
+# governor state is a later slice — each node stays individually polite.
+[remote]
+enabled = false
+# nodes = ["http://10.0.0.2:8088"]  # peers to dispatch to; empty = serve-only
+# secret = ""                       # REQUIRED when enabled; shared across the cluster
+# timeout_secs = 60                 # per proxy call, end to end
+# max_body_bytes = 16777216         # cap on a proxied response body (16 MiB)
+
 # Learned API-recipe replay (M05, see GET /recipes). When enabled (or a fetch
 # sets `use_recipes`), a VALIDATED recipe for the request's host replays the
 # page's discovered JSON API ahead of the archive and live tiers — one governed
@@ -134,6 +149,9 @@ dir = "data/plugins"         # .wasm modules loaded at boot; hot-swap via POST /
 fuel = 200000000            # per-call CPU instruction budget (traps runaway plugins)
 max_memory_mb = 64          # hard linear-memory cap per call (per instance)
 max_concurrent = 0          # max plugin runs at once host-wide (0 = one per CPU core); bounds aggregate wasm memory + blocking-pool use
+# app_dir = "data/apps"     # OPTIONAL (M28 v1): dir scanned at boot for dynamic-app .wasm modules exporting describe().
+#                           # Discovered apps are LISTED read-only in GET /apps (dynamic: true, runnable: false) and
+#                           # enqueue rejects them with 409 — running them needs the component-model host (next slice).
 
 # Embedded full-text search (Tantivy) — in-process, no external service.
 [search]
