@@ -115,6 +115,12 @@ async fn replay_keeps_columns_added_by_later_migrations() {
             "records lost column `{col}`: {records:?}"
         );
     }
+
+    let recipes = column_names(&pool, "api_recipes").await;
+    assert!(
+        recipes.contains("consecutive_failures"), // 0028 recipe strikes
+        "api_recipes lost column `consecutive_failures`: {recipes:?}"
+    );
 }
 
 /// Versions must be strictly increasing and unique — a duplicated `0007_` pair
