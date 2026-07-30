@@ -162,6 +162,20 @@ pub(crate) struct CreateSavedSearchBody {
     url: String,
     /// If set, delivery bodies are HMAC-SHA256 signed with this secret.
     secret: Option<String>,
+    /// If set, each run also snapshots the query's result set into this dataset
+    /// (M13 "queries as datasets"): one record per hit keyed by search doc id,
+    /// hits that fall out of the results tombstoned — so the view's deltas feed
+    /// watches/triggers/`?filter=`/export. Capped by `[search]
+    /// max_materialize_results`.
+    materialize: Option<MaterializeBody>,
+}
+
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct MaterializeBody {
+    /// App namespace the view dataset lives under (e.g. `search`).
+    app: String,
+    /// View dataset name (e.g. `view-ai-grants`).
+    dataset: String,
 }
 
 #[utoipa::path(
@@ -190,6 +204,31 @@ pub(crate) async fn create_saved_search(
             "url must be http(s)".into(),
         ));
     }
+    let materialize = match &body.materialize {
+        None => None,
+        Some(m) => {
+            let (app, dataset) = (m.app.trim(), m.dataset.trim());
+            if app.is_empty() || dataset.is_empty() {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "materialize requires non-empty 'app' and 'dataset'".into(),
+                ));
+            }
+            // Feedback-loop guard: a view materializing into the very dataset
+            // its query is scoped to would re-materialize its own records if
+            // that dataset ever gets (back)indexed — refuse the shape outright.
+            if body.app.as_deref() == Some(app) && body.dataset.as_deref() == Some(dataset) {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "materialize target must differ from the search's own app/dataset scope".into(),
+                ));
+            }
+            Some(pumper_core::SearchMaterialize {
+                app: app.to_string(),
+                dataset: dataset.to_string(),
+            })
+        }
+    };
     let search = state
         .storage
         .create_saved_search(
@@ -198,6 +237,7 @@ pub(crate) async fn create_saved_search(
             body.dataset.as_deref(),
             &body.url,
             body.secret.as_deref(),
+            materialize.as_ref(),
         )
         .await?;
     Ok((StatusCode::CREATED, Json(search)))

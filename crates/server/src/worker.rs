@@ -660,6 +660,12 @@ async fn notify_saved_searches(state: &AppState, job: &Job) {
         if search.app.as_deref().is_some_and(|app| app != job.app) {
             continue;
         }
+        // Materialization (M13 "queries as datasets") runs regardless of whether
+        // the alert path below finds anything NEW — an unchanged-but-reordered
+        // or shrunken result set still has to refresh (and tombstone) the view.
+        if let Some(mat) = search.materialize.clone() {
+            materialize_saved_search(state, job, &search, &mat).await;
+        }
         let req = pumper_core::SearchRequest {
             q: search.query.clone(),
             limit: 50,
@@ -709,6 +715,78 @@ async fn notify_saved_searches(state: &AppState, job: &Job) {
             search.secret.clone(),
         );
     }
+}
+
+/// Materializes one saved search's current result set into its target dataset
+/// (M13 "queries as datasets"): runs the query (facets OFF — the runner reads
+/// hits, not breakdowns; capped by `[search] max_materialize_results`), upserts
+/// the hits as view records, and tombstones records that fell out of the result
+/// set (`detect_removed` semantics — an EMPTY result set never wipes the view).
+/// The view's deltas then feed the same push machinery as any dataset: watches
+/// and dataset triggers fire here under the VIEW's app, because the run-scoped
+/// pass in `execute` only covers `job.app`. Best-effort throughout — a broken
+/// view never touches the job outcome or the alert path.
+async fn materialize_saved_search(
+    state: &AppState,
+    job: &Job,
+    search: &pumper_core::SavedSearch,
+    mat: &pumper_core::SearchMaterialize,
+) {
+    let cap = state.config.search.max_materialize_results.max(1);
+    let req = pumper_core::SearchRequest {
+        q: search.query.clone(),
+        limit: cap,
+        app: search.app.clone(),
+        dataset: search.dataset.clone(),
+        ..Default::default()
+    };
+    // Everything the materialization writes is strictly after this instant;
+    // `changes_since` below replays exactly this run's view deltas.
+    let mark = chrono::Utc::now();
+    let results = match state.search.query(req).await {
+        Ok(results) => results,
+        Err(e) => {
+            warn!(search = %search.id, "materialize query failed: {e}");
+            return;
+        }
+    };
+    match state
+        .datasets
+        .materialize_search_hits(&mat.app, &mat.dataset, &results.hits, cap)
+        .await
+    {
+        Ok((summary, removed)) => info!(
+            search = %search.id, app = %mat.app, dataset = %mat.dataset,
+            new = summary.new.len(), changed = summary.changed.len(),
+            unchanged = summary.unchanged, removed = removed.len(),
+            "saved search materialized"
+        ),
+        Err(e) => {
+            warn!(search = %search.id, "saved search materialization failed: {e}");
+            return;
+        }
+    }
+    let changes = match state
+        .datasets
+        .changes_since(&mat.app, Some(&mat.dataset), Some(mark), cap as i64 * 2, None)
+        .await
+    {
+        Ok(changes) => changes,
+        Err(e) => {
+            warn!(search = %search.id, "failed to load view deltas: {e}");
+            return;
+        }
+    };
+    if changes.is_empty() {
+        return;
+    }
+    // Watches and dataset triggers are looked up per app; re-badge the job so
+    // the lookups target the view's app while provenance keeps the real job id.
+    let mut view_job = job.clone();
+    view_job.app = mat.app.clone();
+    let by_dataset = group_by_dataset(&changes);
+    notify_watches(state, &view_job, &by_dataset).await;
+    crate::triggers::fire_dataset_triggers(state, &view_job, &by_dataset).await;
 }
 
 /// Emits the terminal event and fires the result webhook, if configured.

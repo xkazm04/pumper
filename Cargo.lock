@@ -423,6 +423,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-provisioner"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pumper-core",
+ "serde",
+ "serde_json",
+ "toml 0.8.23",
+ "tracing",
+]
+
+[[package]]
 name = "app-readable"
 version = "0.1.0"
 dependencies = [
@@ -3707,6 +3719,7 @@ dependencies = [
  "app-mpsv-ispv",
  "app-mpsv-vpm",
  "app-plugin",
+ "app-provisioner",
  "app-readable",
  "app-research",
  "app-smlouvy-dump-watch",

@@ -1,0 +1,36 @@
+# Batch 5 Design — Deferred Tier-1s (2026-07-30, user-directed)
+
+> Branch: `vibeman/moonshot-batch5-2026-07-30` off merged master `0945c04` (PR #23). Baseline: tests 626/0.
+> Five deferred moonshots promoted by the user: M33, M13, M44, M10, M16. All file-disjoint → one wave of 5 agents. Shared rules = DESIGN-BATCH-1.md §Shared rules (no git; orchestrator gates + commits). Full finding entries: funding-grants.md (M33), scraping-engines.md (M13, M16), content-research.md (M44), extraction-storage.md (M10).
+
+## File-scope partition (HARD boundaries)
+
+| Agent | Item | Owns | Notes |
+|---|---|---|---|
+| U | M33 NOFO intelligence | `crates/apps/grants-gov/**`, `crates/apps/grants-common/**` (additive) | no registration needed |
+| V | M13 queries-as-datasets | `crates/server/src/worker.rs` (saved-search runner section), storage saved-search methods (own marker), server routes for the view CRUD if separate from saved-searches | engine-search read-only |
+| W | M44 source compiler | NEW `crates/apps/provisioner/**` + ALL shared registration files (registry.rs, server+root Cargo.toml, catalog row if scheduled — likely NOT scheduled) | only agent touching shared files |
+| X | M10 extraction time machine | `crates/apps/extractor/**` (replay/diff mode) | builds on page_versions + M42 machinery |
+| Y | M16 plugin observatory | `crates/apps/plugin/**` | builds on page_versions + stored corpus |
+
+Config additive edits allowed (distinct sections). Migrations: 0029+ free — claim in reply, update inventory test yourself.
+
+## Item specs
+
+### U — M33 NOFO document intelligence
+Per the finding: Search2 gives listing stubs; the substance lives in the key-free POST-JSON `fetchOpportunity` detail endpoint + attached NOFO documents. Build the detail-harvest stage as a MODE of grants-gov (`detail_harvest: true` param or a follow-on pass in the scheduled run gated by `harvest_details` default-false + `max_details_per_run` cap default 50): for each NEW/CHANGED opportunity from the sync, call fetchOpportunity, store full synopsis + attachment manifest into `grants/opportunity_details` keyed by opportunity id; extract a structured requirements block (cost_share, award_floor/ceiling, eligibility text, deadlines) from the SYNOPSIS FIELDS ONLY in v1 — PDF pulls and PDF-text extraction are OUT of scope (no PDF parser in the workspace; store attachment URLs + metadata so a later pass can fetch). ⚠ CONTRACT UNVERIFIED: the fetchOpportunity response shape must be pinned cordis-style — doc-header assumption, defensive parse, loud drift error, never silent-empty; first live run is the verification. Money fields: honest-Null when absent (prior campaign deferred money-enrichment for exactly this reason — this item ships the plumbing with the honesty rules). Update manifest schema/examples. Tests: requirements-block extraction from representative synopsis JSON, cap honesty, drift error path.
+
+### V — M13 queries as datasets
+Materialize saved searches into datasets. Extend the existing saved-search machinery (worker runner + storage): a saved search gains `materialize: Option<{app, dataset}>` — when set, each run executes the search (existing runner path, facets off) and upserts the result set into that dataset (key = search doc id; fields: title/body-snippet/source app+dataset+key/score/indexed_at), so change detection emits deltas → shipped triggers/watches/`?filter=`/export fire for free. Removed-from-results handling: v1 = results are upserted, disappearance detected via `detect_removed` against the current result set per run (bounded: only for materialized searches, cap result size `max_materialize_results` default 500). CRUD: extend the existing saved-search routes with the materialize field. Storage: additive column via migration 0029 (+ inventory if new table — prefer column on saved_searches, no new table). Tests: materialize round-trip, delta on changed results, removal detection, cap.
+
+### W — M44 speak a data source into existence (v1: research → provisioning proposal)
+Per the finding, but v1 scope = PROPOSAL COMPILER, not auto-deploy: new `provisioner` ScrapeApp (params: `{prompt, budget_usd, max_iterations default 2}`) that (1) runs a research session (reuse app-research's core seams or ctx research access — read how research invokes the Claude engine; reuse, don't fork) to identify 1–3 candidate source URLs for the prompt; (2) samples each via the readable/tiered-fetch path; (3) drafts a declarative RuleSet against the sampled body and DRY-RUNS it through the existing extraction engine, iterating up to max_iterations until the per-field match report is clean-enough (majority fields matched); (4) emits a complete **provision proposal** record into `provisioner/proposals`: {catalog_row (TOML-shaped), rule_set, seeds, cadence, budget, sample_stats, confidence} — human reviews and applies via the existing catalog reconciler; the app NEVER writes data-sources.toml or creates schedules itself. Cost class: Claude (metered; respect budget ceiling). Registration: registry.rs + Cargo.tomls; NO catalog row (on-demand app, no schedule → catalog-exempt list if the drift-gate demands it — read how CATALOG_EXEMPT works). Tests: rule-draft dry-run loop with a fixture body (no live Claude — stub the research/LLM boundary the way research's own tests do), proposal shape, never-writes-catalog invariant.
+
+### X — M10 extraction time machine (replay-CI)
+Per the finding: extractor gains `replay: {rules: <candidate RuleSet>, against: {url_pattern?, versions: "all"|"latest", max_pages default 500}}` mode — runs the CANDIDATE rules over stored bodies (page_versions + latest artifacts via the shipped as_of/versions machinery), and if `baseline_rules` given (or a stored ruleset id) runs both and emits a field-by-field DIFF report: per-field match-rate deltas, added/lost/changed values (bounded samples ≤20 per field), per-URL regressions. Output = job result JSON + artifact `replay-report.json`; NO dataset writes (read-only CI mode — enforce it). Bisect mode (v1.5, include if cheap): `bisect_field: <name>` walks versions of URLs where the field's match flipped and reports the boundary revision pair. Update manifest. Tests: diff math, bounded samples, read-only invariant, bisect boundary on fixture versions.
+
+### Y — M16 corpus-scale extraction observatory
+Per the finding: plugin app gains `observatory: true` mode (or dedicated param block): replays EACH configured/available plugin against N sampled stored pages per dataset/site (`sample_per_site` default 25; sample = newest + random from page_versions/latest artifacts), records per-page outcome (ok / trap / empty / schema-invalid), fuel consumed, output-shape stats; upserts per (plugin, site) rows into `plugin/observatory` with a drift score vs the previous observatory run (rising empty-rate flags). Change detection on that dataset makes drift alerts free via triggers. Honest sampling: report sampled/total; sites with <5 stored pages marked low-confidence. Tests: outcome classification, drift-score math, sampling honesty (fixtures, no live fetch).
+
+## Orchestrator protocol
+Dispatch U–Y parallel → per-return gate + commit per item → full sweep → FIXES-BATCH-5.md → vault (deferred rows → Fixed, note user-directed promotion) → report + merge decision.

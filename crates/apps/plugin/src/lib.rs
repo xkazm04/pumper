@@ -12,6 +12,8 @@ use pumper_core::{
 };
 use serde_json::{json, Value};
 
+mod observatory;
+
 /// Default in-flight cap for the URL/record fan-out, matching `CrawlConfig.concurrency`.
 const DEFAULT_CONCURRENCY: usize = 16;
 
@@ -47,14 +49,14 @@ pub struct Plugin;
 /// Max live records pulled from a source dataset when no explicit `keys` (and no
 /// `_trigger.keys`) narrow the set — bounds the dataset read and the fan-out.
 /// Backfill mode also pages through `page_versions` in batches of this size.
-const SOURCE_LIST_LIMIT: i64 = 10_000;
+pub(crate) const SOURCE_LIST_LIMIT: i64 = 10_000;
 
 /// The crawl app's versioned archive dataset (see the crawl app): one record per
 /// CHANGED revision of a page, keyed `{url}#{revision}`, carrying
 /// `{url, revision, artifact_path, job_id, simhash, fetched_at}` — the same
 /// artifact contract as `pages`, so `read_source_artifact` resolves historical
 /// bodies unchanged.
-const VERSIONS_DATASET: &str = "page_versions";
+pub(crate) const VERSIONS_DATASET: &str = "page_versions";
 
 /// Cap on the per-key `missing_keys` echo in a backfill result — a large archive
 /// could otherwise blow up the stored job result; `missing` keeps the full count.
@@ -140,7 +142,12 @@ impl ScrapeApp for Plugin {
          source.as_of (RFC3339 snapshot), source.versions: \"all\" (every archived revision \
          + current), or source.backfill: true + url_pattern (batched fan over the whole \
          page_versions archive); historical records are keyed {url}@{date} and tagged \
-         _url + _observed_at."
+         _url + _observed_at. Observatory mode: {\"observatory\": true | {\"plugins\": \
+         [..]?, \"sample_per_site\": 25}} replays each plugin (default all loaded) over \
+         sampled stored pages per site (newest + seeded-random across the live dataset + \
+         page_versions), classifies outcomes (ok/trap/empty/schema_invalid) and upserts \
+         per (plugin, site) drift rows into the `observatory` dataset (sampled/total \
+         reported; <5 stored pages => low_confidence; rising empty-rate flagged)."
     }
 
     fn manifest(&self) -> AppManifest {
@@ -148,7 +155,10 @@ impl ScrapeApp for Plugin {
             params_schema: Some(json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "required": ["plugin"],
+                "anyOf": [
+                    { "required": ["plugin"] },
+                    { "required": ["observatory"] }
+                ],
                 "properties": {
                     "plugin": { "type": "string", "minLength": 1, "description": "Registered WASM plugin name (see GET /plugins)." },
                     "urls": {
@@ -187,7 +197,30 @@ impl ScrapeApp for Plugin {
                     "strategy": { "type": "string", "enum": ["http", "browser", "auto", "auto_with_research"] },
                     "concurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
                     "plugin_params": { "type": "object", "description": "Forwarded to a params-aware plugin's extract_v2 envelope." },
-                    "dataset": { "type": "string", "description": "Output dataset name (default \"plugin_out\")." }
+                    "dataset": { "type": "string", "description": "Output dataset name (default \"plugin_out\"; observatory mode defaults to \"observatory\")." },
+                    "observatory": {
+                        "description": "Observatory mode: replay plugins against sampled stored pages per site and upsert per (plugin, site) drift rows into the `observatory` dataset. `true` audits all loaded plugins with defaults; an object narrows/tunes it. `plugin` is not required in this mode; `source` defaults to {app: \"crawl\", dataset: \"pages\"}.",
+                        "oneOf": [
+                            { "type": "boolean" },
+                            {
+                                "type": "object",
+                                "properties": {
+                                    "plugins": {
+                                        "type": "array",
+                                        "items": { "type": "string", "minLength": 1 },
+                                        "minItems": 1,
+                                        "description": "Plugins to audit (default: all loaded)."
+                                    },
+                                    "sample_per_site": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "description": "Stored pages sampled per site: newest half + seeded-random rest (default 25). Rows report sampled/total; sites with <5 stored pages are marked low_confidence."
+                                    }
+                                },
+                                "additionalProperties": false
+                            }
+                        ]
+                    }
                 },
                 "additionalProperties": true
             })),
@@ -222,16 +255,40 @@ impl ScrapeApp for Plugin {
                         "dataset": "title_history"
                     }),
                 },
+                ManifestExample {
+                    description: "Observatory: replay every loaded plugin against sampled \
+                                  stored pages per site and record per-(plugin, site) drift rows",
+                    params: json!({ "observatory": true }),
+                },
+                ManifestExample {
+                    description: "Observatory over two plugins with a larger per-site sample",
+                    params: json!({
+                        "observatory": { "plugins": ["title"], "sample_per_site": 50 },
+                        "source": { "app": "crawl", "dataset": "pages" }
+                    }),
+                },
             ],
             output_shape: Some(
                 "{ran, errors, dataset, new, changed, unchanged} — per-document plugin results \
-                 deduped into the output dataset",
+                 deduped into the output dataset. Observatory mode: {sites, rows, \
+                 pages_replayed, low_confidence_sites, flagged_empty_rising, new, changed, \
+                 unchanged} with per-(plugin, site) drift rows in the observatory dataset",
             ),
             cost_class: CostClass::Metered,
         }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
+        // Observatory mode (M16): corpus-scale replay of plugins against stored
+        // pages with per-(plugin, site) drift scoring — no `plugin` param needed
+        // (it audits a plugin LIST, default all loaded).
+        if ctx
+            .params
+            .get("observatory")
+            .is_some_and(|v| v.as_bool().unwrap_or(true))
+        {
+            return observatory::run_observatory(&ctx).await;
+        }
         let plugin = ctx.require_str("plugin")?.to_string();
         let dataset = ctx
             .params

@@ -1095,6 +1095,11 @@ pub struct SearchConfig {
     pub enabled: bool,
     /// Directory for the embedded Tantivy index.
     pub dir: PathBuf,
+    /// Cap on hits a materialized saved search (`materialize` set) writes into
+    /// its target dataset per run. Bounds both the query and the per-run removal
+    /// detection over the view — a broad query stays a bounded view, not an
+    /// unbounded dataset copy.
+    pub max_materialize_results: usize,
 }
 
 impl Default for SearchConfig {
@@ -1102,6 +1107,7 @@ impl Default for SearchConfig {
         Self {
             enabled: true,
             dir: "data/search-index".into(),
+            max_materialize_results: 500,
         }
     }
 }

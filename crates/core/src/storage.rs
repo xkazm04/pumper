@@ -972,11 +972,13 @@ impl Storage {
         dataset: Option<&str>,
         url: &str,
         secret: Option<&str>,
+        materialize: Option<&SearchMaterialize>,
     ) -> Result<SavedSearch> {
         let id = Uuid::new_v4().to_string();
         sqlx::query(
-            "INSERT INTO saved_searches (id, query, app, dataset, url, secret, enabled, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7)",
+            "INSERT INTO saved_searches (id, query, app, dataset, url, secret, enabled, \
+             materialize_app, materialize_dataset, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1, ?7, ?8, ?9)",
         )
         .bind(&id)
         .bind(query)
@@ -984,6 +986,8 @@ impl Storage {
         .bind(dataset)
         .bind(url)
         .bind(secret)
+        .bind(materialize.map(|m| m.app.as_str()))
+        .bind(materialize.map(|m| m.dataset.as_str()))
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -994,7 +998,8 @@ impl Storage {
 
     pub async fn get_saved_search(&self, id: &str) -> Result<Option<SavedSearch>> {
         let row: Option<SavedSearchRow> = sqlx::query_as(
-            "SELECT id, query, app, dataset, url, secret, enabled, created_at \
+            "SELECT id, query, app, dataset, url, secret, enabled, \
+             materialize_app, materialize_dataset, created_at \
              FROM saved_searches WHERE id = ?1",
         )
         .bind(id)
@@ -1005,7 +1010,8 @@ impl Storage {
 
     pub async fn list_saved_searches(&self, enabled_only: bool) -> Result<Vec<SavedSearch>> {
         let rows: Vec<SavedSearchRow> = sqlx::query_as(
-            "SELECT id, query, app, dataset, url, secret, enabled, created_at \
+            "SELECT id, query, app, dataset, url, secret, enabled, \
+             materialize_app, materialize_dataset, created_at \
              FROM saved_searches WHERE (?1 = 0 OR enabled = 1) ORDER BY created_at",
         )
         .bind(enabled_only as i64)
@@ -1024,7 +1030,8 @@ impl Storage {
     ) -> Result<Vec<SavedSearch>> {
         let (after_ts, after_id) = split_after(after);
         let rows: Vec<SavedSearchRow> = sqlx::query_as(
-            "SELECT id, query, app, dataset, url, secret, enabled, created_at \
+            "SELECT id, query, app, dataset, url, secret, enabled, \
+             materialize_app, materialize_dataset, created_at \
              FROM saved_searches WHERE (?1 = 0 OR enabled = 1) \
              AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
              ORDER BY created_at DESC, id DESC LIMIT ?4",
@@ -1874,6 +1881,9 @@ impl TryFrom<TriggerRow> for Trigger {
 }
 
 /// A standing full-text query that webhooks NEW matches exactly once each.
+/// With `materialize` set, each run also snapshots the result set into that
+/// dataset (M13 "queries as datasets") so the change feed / watches / triggers /
+/// `?filter=` / export compose over full-text semantics.
 #[derive(Debug, Clone, Serialize)]
 pub struct SavedSearch {
     pub id: String,
@@ -1884,7 +1894,16 @@ pub struct SavedSearch {
     #[serde(skip_serializing)]
     pub secret: Option<String>,
     pub enabled: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub materialize: Option<SearchMaterialize>,
     pub created_at: DateTime<Utc>,
+}
+
+/// Target dataset a saved search materializes its result set into.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct SearchMaterialize {
+    pub app: String,
+    pub dataset: String,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1896,6 +1915,8 @@ struct SavedSearchRow {
     url: String,
     secret: Option<String>,
     enabled: i64,
+    materialize_app: Option<String>,
+    materialize_dataset: Option<String>,
     created_at: String,
 }
 
@@ -1911,6 +1932,12 @@ impl TryFrom<SavedSearchRow> for SavedSearch {
             url: r.url,
             secret: r.secret,
             enabled: r.enabled != 0,
+            // Half-set columns (hand-edited DB) degrade to "not materialized"
+            // rather than a phantom target with an empty app or dataset.
+            materialize: match (r.materialize_app, r.materialize_dataset) {
+                (Some(app), Some(dataset)) => Some(SearchMaterialize { app, dataset }),
+                _ => None,
+            },
             created_at: parse_ts(&r.created_at)?,
         })
     }

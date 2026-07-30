@@ -637,6 +637,38 @@ impl Datasets {
         Ok(to_remove)
     }
 
+    /// Materializes a saved search's current result set into a dataset (M13
+    /// "queries as datasets"): upserts one record per hit — key = the search doc
+    /// id (globally unique `<app>:<dataset>:<key>`), value =
+    /// [`SearchHit::materialize_value`](crate::SearchHit::materialize_value) —
+    /// then tombstones previously-live view records absent from the result set
+    /// via [`detect_removed`](Self::detect_removed). The capped result set IS
+    /// the full snapshot of the view, so falling out of the results is the
+    /// removal signal. `cap` bounds both the writes and the removal scan
+    /// (`[search] max_materialize_results`); hits past it are dropped, never
+    /// silently widened. An EMPTY result set upserts nothing and — per the
+    /// `detect_removed` guard — tombstones nothing: a query gone quiet (or an
+    /// index wipe) must not erase the view.
+    ///
+    /// Returns the upsert summary and the removed keys.
+    pub async fn materialize_search_hits(
+        &self,
+        app: &str,
+        dataset: &str,
+        hits: &[crate::SearchHit],
+        cap: usize,
+    ) -> Result<(UpsertSummary, Vec<String>)> {
+        let hits = &hits[..hits.len().min(cap.max(1))];
+        let items: Vec<(String, Value)> = hits
+            .iter()
+            .map(|h| (h.id.clone(), h.materialize_value()))
+            .collect();
+        let summary = self.upsert_many(app, dataset, &items).await?;
+        let present: Vec<String> = items.into_iter().map(|(k, _)| k).collect();
+        let removed = self.detect_removed(app, dataset, &present).await?;
+        Ok((summary, removed))
+    }
+
     /// Transactional body of one removal: tombstone the record and append its
     /// `removed` revision on one connection inside a write transaction, so the two
     /// commit as a unit (mirrors `upsert_in_tx`).

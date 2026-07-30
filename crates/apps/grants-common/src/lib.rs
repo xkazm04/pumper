@@ -30,6 +30,14 @@ pub const DUP_DATASET: &str = "duplicate_links";
 /// prior revision is safe for this feature.
 pub const EVENTS_DATASET: &str = "events";
 
+/// Per-opportunity detail corpus (`grants/opportunity_details`), keyed by the
+/// opportunity id — full synopsis + attachment manifest + structured
+/// requirements block harvested by a source app's detail stage (grants-gov
+/// `harvestDetails` today; other sources may join). Lives in the shared
+/// namespace so downstream consumers (search, `?filter=`, a future
+/// application-drafting layer) see one dataset regardless of origin.
+pub const DETAILS_DATASET: &str = "opportunity_details";
+
 /// SimHash Hamming distance for cross-source near-duplicate linking. One
 /// constant so every source links identically — a per-app literal drifts.
 pub const DUP_DISTANCE: u32 = 3;
@@ -687,8 +695,11 @@ fn scan_amounts(s: &str) -> Vec<f64> {
 }
 
 /// Single money value for a scalar field: the first parseable amount among the
-/// candidate columns (JSON numbers pass through). Null when none is found.
-fn money_scalar(rec: &Value, fields: &[&str]) -> Value {
+/// candidate columns (JSON numbers pass through). Null when none is found —
+/// the shared honest-Null rule: `$0`, prose ("see NOFO"), and absent fields all
+/// yield `Null`, never a fabricated zero. Public so source apps (e.g. the
+/// grants-gov detail harvest) parse money identically to normalization.
+pub fn money_scalar(rec: &Value, fields: &[&str]) -> Value {
     for f in fields {
         match rec.get(*f) {
             Some(Value::Number(n)) => {

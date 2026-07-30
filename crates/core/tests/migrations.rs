@@ -116,6 +116,15 @@ async fn replay_keeps_columns_added_by_later_migrations() {
         );
     }
 
+    let saved = column_names(&pool, "saved_searches").await;
+    for col in ["materialize_app", "materialize_dataset"] {
+        // 0029 queries-as-datasets
+        assert!(
+            saved.contains(col),
+            "saved_searches lost column `{col}`: {saved:?}"
+        );
+    }
+
     let recipes = column_names(&pool, "api_recipes").await;
     assert!(
         recipes.contains("consecutive_failures"), // 0028 recipe strikes
