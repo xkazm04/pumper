@@ -11,6 +11,7 @@
 mod body_limit;
 mod durable;
 mod harness;
+mod mcp;
 mod router;
 mod scheduler_overlap;
 mod shutdown_drain;

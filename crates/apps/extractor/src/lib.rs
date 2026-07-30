@@ -8,9 +8,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use pumper_core::{
-    extract_batch_with_report, signals_batch, AppContext, CompiledRuleSet, DocReport, Error,
-    FetchHealth, FetchRequest, FetchStrategy, FieldStatus, ObservedDoc, Record, Result, RuleSet,
-    ScrapeApp, UpsertSummary,
+    extract_batch_with_report, signals_batch, AppContext, AppManifest, CompiledRuleSet, CostClass,
+    DocReport, Error, FetchHealth, FetchRequest, FetchStrategy, FieldStatus, ManifestExample,
+    ObservedDoc, Record, Result, RuleSet, ScrapeApp, UpsertSummary,
 };
 use serde_json::{json, Value};
 
@@ -232,6 +232,69 @@ impl ScrapeApp for Extractor {
          Source mode reads each record's stored body \
          (artifact_path under the origin job's dir) instead of re-fetching; keys default to \
          the firing trigger's _trigger.keys, else all live records."
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "required": ["rules"],
+                "properties": {
+                    "rules": {
+                        "type": "object",
+                        "minProperties": 1,
+                        "description": "field -> rule; each rule is {\"type\": \"css|regex|json|xpath|const\", ...type-specific keys}"
+                    },
+                    "urls": {
+                        "type": "array",
+                        "items": { "type": "string", "pattern": "^https?://" },
+                        "minItems": 1,
+                        "description": "URL mode: fetch these and extract. Mutually exclusive with `source`."
+                    },
+                    "source": {
+                        "type": "object",
+                        "required": ["app", "dataset"],
+                        "properties": {
+                            "app": { "type": "string" },
+                            "dataset": { "type": "string" },
+                            "keys": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "description": "Source mode: read stored bodies of these records (no re-fetch)."
+                    },
+                    "strategy": { "type": "string", "enum": ["http", "browser", "auto"] },
+                    "concurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
+                    "dataset": { "type": "string", "description": "Output dataset name (default \"extracted\")." }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Extract title + first heading from two live pages via CSS rules",
+                    params: json!({
+                        "urls": ["https://example.com/a", "https://example.com/b"],
+                        "rules": {
+                            "title": { "type": "css", "selector": "title" },
+                            "heading": { "type": "css", "selector": "h1" }
+                        },
+                        "dataset": "extracted"
+                    }),
+                },
+                ManifestExample {
+                    description: "Re-extract stored crawl bodies (crawl/pages) without re-fetching",
+                    params: json!({
+                        "source": { "app": "crawl", "dataset": "pages" },
+                        "rules": { "title": { "type": "css", "selector": "title" } },
+                        "concurrency": 8
+                    }),
+                },
+            ],
+            output_shape: Some(
+                "{extracted, errors, dataset, new, changed, unchanged, removed?} — an upsert \
+                 summary plus per-document extraction error counts",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {

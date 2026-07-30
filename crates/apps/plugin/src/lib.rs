@@ -6,7 +6,10 @@
 
 use async_trait::async_trait;
 use futures::StreamExt;
-use pumper_core::{AppContext, Error, FetchRequest, FetchStrategy, Record, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, FetchRequest, FetchStrategy, ManifestExample,
+    Record, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 
 /// Default in-flight cap for the URL/record fan-out, matching `CrawlConfig.concurrency`.
@@ -60,6 +63,63 @@ impl ScrapeApp for Plugin {
          Source mode reads each record's stored body (artifact_path under the origin job's \
          dir) instead of re-fetching; keys default to the firing trigger's _trigger.keys, \
          else all live records."
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "required": ["plugin"],
+                "properties": {
+                    "plugin": { "type": "string", "minLength": 1, "description": "Registered WASM plugin name (see GET /plugins)." },
+                    "urls": {
+                        "type": "array",
+                        "items": { "type": "string", "pattern": "^https?://" },
+                        "minItems": 1,
+                        "description": "URL mode: fetch these and run the plugin. Mutually exclusive with `source`."
+                    },
+                    "source": {
+                        "type": "object",
+                        "required": ["app", "dataset"],
+                        "properties": {
+                            "app": { "type": "string" },
+                            "dataset": { "type": "string" },
+                            "keys": { "type": "array", "items": { "type": "string" } }
+                        },
+                        "description": "Source mode: run over stored record bodies (no re-fetch)."
+                    },
+                    "strategy": { "type": "string", "enum": ["http", "browser", "auto", "auto_with_research"] },
+                    "concurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
+                    "plugin_params": { "type": "object", "description": "Forwarded to a params-aware plugin's extract_v2 envelope." },
+                    "dataset": { "type": "string", "description": "Output dataset name (default \"plugin_out\")." }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Run the `title` plugin over two live URLs",
+                    params: json!({
+                        "plugin": "title",
+                        "urls": ["https://example.com/a", "https://example.com/b"]
+                    }),
+                },
+                ManifestExample {
+                    description: "Run a configured plugin over stored crawl bodies",
+                    params: json!({
+                        "plugin": "title",
+                        "source": { "app": "crawl", "dataset": "pages" },
+                        "plugin_params": { "selector": "h1" },
+                        "concurrency": 8
+                    }),
+                },
+            ],
+            output_shape: Some(
+                "{ran, errors, dataset, new, changed, unchanged} — per-document plugin results \
+                 deduped into the output dataset",
+            ),
+            cost_class: CostClass::Metered,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {

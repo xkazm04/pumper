@@ -9,8 +9,9 @@ use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use pumper_core::{
-    crawl, AppContext, CrawlConfig, CrawlPageRecord, Datasets, Error, HttpClient, HttpRequest,
-    HttpResponse, PageSink, PageSource, Result, RevisitSeed, ScrapeApp,
+    crawl, AppContext, AppManifest, CostClass, CrawlConfig, CrawlPageRecord, Datasets, Error,
+    HttpClient, HttpRequest, HttpResponse, ManifestExample, PageSink, PageSource, Result,
+    RevisitSeed, ScrapeApp,
 };
 use serde_json::{json, Value};
 
@@ -215,6 +216,63 @@ impl ScrapeApp for Crawl {
          conditional GETs; \"discover\": true opts into link-following)}. \
          Frontier state is checkpointed durably per job: an interrupted, reaped, \
          or shutdown-suspended crawl resumes where it left off on its next attempt."
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "seeds": {
+                        "type": "array",
+                        "items": { "type": "string", "pattern": "^https?://" },
+                        "description": "Start URLs. Required for a fresh crawl; `mode: revisit` runs need none."
+                    },
+                    "max_pages": { "type": "integer", "minimum": 1 },
+                    "max_depth": { "type": "integer", "minimum": 0 },
+                    "concurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
+                    "max_pages_per_host": {
+                        "type": ["integer", "null"],
+                        "minimum": 0,
+                        "description": "Per-host page cap for host-fair multi-seed crawls; 0/null = unlimited."
+                    },
+                    "same_domain": { "type": "boolean" },
+                    "dedup_distance": { "type": "integer", "minimum": 0, "maximum": 20 },
+                    "respect_robots": { "type": "boolean" },
+                    "include_patterns": { "type": "array", "items": { "type": "string" } },
+                    "exclude_patterns": { "type": "array", "items": { "type": "string" } },
+                    "sitemap_seeds": { "type": "boolean" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["revisit"],
+                        "description": "Incremental recrawl of the existing `pages` dataset via conditional GETs."
+                    },
+                    "discover": { "type": "boolean" }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Shallow same-domain crawl of one site, robots-respecting",
+                    params: json!({
+                        "seeds": ["https://example.com/"],
+                        "max_pages": 50,
+                        "max_depth": 2,
+                        "same_domain": true
+                    }),
+                },
+                ManifestExample {
+                    description: "Incremental revisit of already-crawled pages (conditional GETs)",
+                    params: json!({ "mode": "revisit", "max_pages": 200 }),
+                },
+            ],
+            output_shape: Some(
+                "{pages, new, changed, unchanged, skipped, hosts} — crawl tallies plus the \
+                 `pages` dataset upsert summary; bodies land in the job's artifact dir",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {

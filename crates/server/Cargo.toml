@@ -54,6 +54,7 @@ futures.workspace = true
 async-stream.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+jsonschema.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 hex.workspace = true

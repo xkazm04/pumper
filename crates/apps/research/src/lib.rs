@@ -3,7 +3,10 @@
 //! can't cut it — the agent searches, reads pages, and synthesizes.
 
 use async_trait::async_trait;
-use pumper_core::{salvage_json, AppContext, ResearchRequest, Result, ScrapeApp};
+use pumper_core::{
+    salvage_json, AppContext, AppManifest, CostClass, ManifestExample, ResearchRequest, Result,
+    ScrapeApp,
+};
 use serde_json::{json, Value};
 
 pub struct Research;
@@ -22,6 +25,53 @@ impl ScrapeApp for Research {
          its accumulated context instead of researching from scratch — the query \
          is then a follow-up question), \"max_budget_usd\": 0.0 (per-run Claude \
          spend ceiling)}"
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string", "minLength": 1 },
+                    "role": { "type": "string", "enum": ["research", "compose"] },
+                    "model": { "type": "string" },
+                    "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
+                    "max_turns": { "type": "integer", "minimum": 1 },
+                    "session_id": {
+                        "type": "string",
+                        "description": "Resume a prior run's session to drill down; the query becomes a follow-up."
+                    },
+                    "max_budget_usd": { "type": "number", "minimum": 0 }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Bounded web research run with a hard spend ceiling",
+                    params: json!({
+                        "query": "Current Czech VAT registration thresholds for sole traders, with sources",
+                        "effort": "medium",
+                        "max_turns": 15,
+                        "max_budget_usd": 0.5
+                    }),
+                },
+                ManifestExample {
+                    description: "Follow-up question against a prior run's accumulated session context",
+                    params: json!({
+                        "query": "And how did those thresholds change in the last 3 years?",
+                        "session_id": "prior-run-session-id",
+                        "max_budget_usd": 0.25
+                    }),
+                },
+            ],
+            output_shape: Some(
+                "{summary, key_findings: [..], sources: [..], session_id, cost_usd} — \
+                 structured research output; `session_id` is resumable",
+            ),
+            cost_class: CostClass::Claude,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {

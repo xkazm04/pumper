@@ -20,11 +20,15 @@ use crate::state::AppState;
 // (`crate::triggers` sits outside `routes` and cannot reach the private
 // `datasets` submodule directly). One parser, both surfaces — no drift.
 pub(crate) use datasets::parse_filters;
+// The defaults-merge, re-exported for the MCP enqueue tool (`crate::mcp`) so a
+// job enqueued by an agent gets byte-identical params to one POSTed over HTTP.
+pub(crate) use jobs::merge_params;
 
 mod datasets;
 mod error;
 mod events;
 mod health;
+mod economics;
 mod ingress;
 mod jobs;
 mod meta;
@@ -41,6 +45,7 @@ mod watches;
 use datasets::*;
 use events::*;
 use health::*;
+use economics::*;
 use ingress::*;
 use jobs::*;
 use meta::*;
@@ -145,6 +150,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(stream_job))
         .routes(routes!(job_costs))
         .routes(routes!(cost_summary))
+        .routes(routes!(economics_report))
         .routes(routes!(list_schedules, create_schedule))
         .routes(routes!(delete_schedule))
         .routes(routes!(set_schedule_enabled))
@@ -200,6 +206,15 @@ fn openapi_router() -> OpenApiRouter<AppState> {
 
 pub fn router(state: AppState) -> Router {
     let (router, _api) = openapi_router().split_for_parts();
+    // MCP endpoint (`[mcp] enabled`, default OFF). Merged here — inside the
+    // layer stack below (body limit, compression, trace) but deliberately
+    // OUTSIDE the OpenAPI document: /mcp speaks JSON-RPC, not REST, and the
+    // spec-coverage test's EXPECTED inventory documents the REST surface only.
+    let router = if state.config.mcp.enabled {
+        router.merge(crate::mcp::router())
+    } else {
+        router
+    };
     // gzip/br responses when the client sends accept-encoding — record JSON is
     // highly repetitive (identical keys per row, ISO timestamps) so it compresses
     // ~5-10x, a real win for remote consumers and the streamed export path.
@@ -371,6 +386,7 @@ mod api_spec_tests {
         "GET /jobs/{id}/stream",
         "GET /jobs/{id}/costs",
         "GET /costs",
+        "GET /economics",
         "GET /schedules",
         "POST /schedules",
         "DELETE /schedules/{id}",

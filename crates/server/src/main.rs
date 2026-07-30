@@ -2,6 +2,7 @@ mod datahub;
 #[cfg(test)]
 mod e2e;
 mod events;
+mod mcp;
 mod progress;
 mod registry;
 mod routes;

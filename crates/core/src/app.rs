@@ -563,6 +563,76 @@ impl Requirement {
     }
 }
 
+// ── App manifest (agent-ready registry) ─────────────────────────────────────
+
+/// How a run of this app spends money — coarse, static, and honest, so an
+/// agent (or a human) can tell a free API sync from a Claude-driven job
+/// before enqueueing anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostClass {
+    /// Free engines only (HTTP/browser); a run never produces spend events.
+    Free,
+    /// May spend via metered escalation (e.g. a fetch strategy that can reach
+    /// the Claude tier), but doesn't drive the model by design.
+    Metered,
+    /// Drives Claude by design — every meaningful run costs real money and
+    /// should carry a `budget_usd`.
+    Claude,
+}
+
+impl CostClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CostClass::Free => "free",
+            CostClass::Metered => "metered",
+            CostClass::Claude => "claude",
+        }
+    }
+}
+
+/// One worked example invocation: params that are known-good against the
+/// app's `params_schema`. The server's manifest test validates every example
+/// against its own schema, so examples can't drift into lies.
+#[derive(Debug, Clone)]
+pub struct ManifestExample {
+    /// What this invocation does, phrased for an agent picking between examples.
+    pub description: &'static str,
+    /// The `params` object to POST.
+    pub params: Value,
+}
+
+/// Rich machine-operable self-description of a [`ScrapeApp`]: a JSON Schema
+/// for its params, worked examples, the shape of its result, and its cost
+/// class. Served by `GET /apps` (and as MCP tool definitions via
+/// `GET /apps?format=tools` and the `/mcp` endpoint); enqueue validates params
+/// against `params_schema` when one is declared.
+///
+/// The default ([`AppManifest::default`]) declares nothing: no schema (params
+/// accepted as before), no examples, `Free`. Every existing app therefore
+/// compiles and behaves untouched; apps opt into richer manifests by
+/// overriding [`ScrapeApp::manifest`].
+#[derive(Debug, Clone, Default)]
+pub struct AppManifest {
+    /// JSON Schema (draft 2020-12) for the job `params` object. When `Some`,
+    /// the server rejects an enqueue whose merged params fail it (422 with
+    /// JSON-pointer paths). Keep `additionalProperties` permissive unless a
+    /// stray key is genuinely an error — the schema is a contract for agents,
+    /// not a straitjacket for humans.
+    pub params_schema: Option<Value>,
+    /// Worked invocations, each guaranteed (by test) to pass `params_schema`.
+    pub examples: Vec<ManifestExample>,
+    /// Human/agent description of the job-result JSON shape. Advisory.
+    pub output_shape: Option<&'static str>,
+    /// How runs of this app spend money.
+    pub cost_class: CostClass,
+}
+
+impl Default for CostClass {
+    fn default() -> Self {
+        CostClass::Free
+    }
+}
+
 /// One scraping use case. Implement this in a crate under `crates/apps/` and
 /// register it in the server's `registry.rs` — that is the whole integration.
 #[async_trait]
@@ -591,6 +661,15 @@ pub trait ScrapeApp: Send + Sync {
     /// Params used for scheduled runs and for API calls without a body.
     fn default_params(&self) -> Value {
         Value::Object(Default::default())
+    }
+
+    /// The app's agent-ready manifest: params JSON Schema, worked examples,
+    /// output shape, cost class. The default declares nothing — `name()` +
+    /// `default_params()` already describe the app well enough to list it —
+    /// so every app compiles untouched; the most-used apps override this with
+    /// rich manifests. When a schema is declared, enqueue enforces it (422).
+    fn manifest(&self) -> AppManifest {
+        AppManifest::default()
     }
 
     /// Executes one job. The returned JSON is stored as the job result.

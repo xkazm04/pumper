@@ -39,12 +39,13 @@ pub mod simhash;
 
 #[cfg(feature = "storage")]
 pub use app::{
-    AppContext, CheckpointSink, NoCheckpoints, NoProgress, ProgressReporter, Requirement, ScrapeApp,
+    AppContext, AppManifest, CheckpointSink, CostClass, ManifestExample, NoCheckpoints, NoProgress,
+    ProgressReporter, Requirement, ScrapeApp,
 };
 #[cfg(feature = "storage")]
 pub use cache::{HttpCache, ResearchCache, StaleEntry};
 #[cfg(feature = "storage")]
-pub use costs::{CostEvent, CostLedger, CostSummary, SpentTotal};
+pub use costs::{extract_yields, CostEvent, CostLedger, CostSummary, SpentTotal, YieldEntry};
 #[cfg(feature = "storage")]
 pub use datasets::{
     diff_values, trust_label, ChangeKind, Datasets, DupPair, Record, Revision, RevisionPage,
@@ -59,7 +60,7 @@ pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
 #[cfg(feature = "storage")]
 pub use storage::{
     Delivery, EnqueueOptions, IngressSource, JobTimingStats, NewSchedule, NewTrigger, SavedSearch,
-    Schedule, Storage, Trigger, Watch, MAX_CHECKPOINT_BYTES,
+    Schedule, Storage, Trigger, Watch, YieldSummary, MAX_CHECKPOINT_BYTES,
 };
 #[cfg(feature = "storage")]
 pub use tiers::{HostProfile, TierMemory};
