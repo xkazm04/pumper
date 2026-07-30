@@ -231,6 +231,14 @@ fn extract_embedded_json(text: &str, open: char, close: char) -> Option<Value> {
     }
 }
 
+fn truncate(s: &str, max_chars: usize) -> String {
+    if s.chars().count() <= max_chars {
+        s.to_string()
+    } else {
+        s.chars().take(max_chars).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_loose_json;
@@ -276,13 +284,5 @@ mod tests {
     #[test]
     fn plain_prose_is_none() {
         assert_eq!(parse_loose_json("No structured data here."), None);
-    }
-}
-
-fn truncate(s: &str, max_chars: usize) -> String {
-    if s.chars().count() <= max_chars {
-        s.to_string()
-    } else {
-        s.chars().take(max_chars).collect()
     }
 }

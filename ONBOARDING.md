@@ -133,8 +133,9 @@ stop — you want the trait from `core`, handed to you via `AppContext.engines`.
 
 ## 4. Path A — Just consume the service (you're scraping for another app)
 
-Start it (from this directory): `cargo run -p pumper-server` → listens on
-`http://127.0.0.1:8088` (configurable in `config.toml`).
+Start it (from this directory): `cargo run -p pumper-server --bin pumper` (or
+`just run`) → listens on `http://127.0.0.1:8088` (configurable in `config.toml`).
+Naming the binary is required — see [§8](#8-verification-loop--do-this-before-you-finish).
 
 | Method & path              | Purpose                                                        |
 |----------------------------|----------------------------------------------------------------|
@@ -296,8 +297,9 @@ pub fn apps() -> Vec<Arc<dyn ScrapeApp>> {
 }
 ```
 
-That's the whole integration. `cargo run -p pumper-server`, confirm your app
-appears in `GET /apps`, enqueue a job, verify the result.
+That's the whole integration. `cargo run -p pumper-server --bin pumper` (or
+`just run`), confirm your app appears in `GET /apps`, enqueue a job, verify the
+result.
 
 **Cron note:** `schedule()` returns a 6-field expression *with seconds*:
 `sec min hour day month weekday`. `"0 0 */6 * * *"` = every 6 hours. Scheduled
@@ -405,11 +407,26 @@ it to the Claude engine.
 ## 8. Verification loop — do this before you finish
 
 ```powershell
-cargo check                       # fast type-check of the whole workspace
-cargo test                        # unit + integration tests (browser test launches real Chrome)
-cargo build -p pumper-server      # produce the binary
-cargo run  -p pumper-server       # boot it; RUST_LOG=debug for verbose logs
+cargo check                             # fast type-check of the whole workspace
+cargo test --workspace                  # unit + integration tests (what CI runs)
+cargo test --workspace -- --ignored     # the env-dependent tests (real Chrome, built wasm, timing)
+cargo fmt --check                       # CI gate
+cargo clippy --workspace --all-targets  # CI gate
+cargo build -p pumper-server            # produce the binary
+cargo run -p pumper-server --bin pumper # boot it; RUST_LOG=debug for verbose logs
 ```
+
+**`--bin pumper` is required.** The `pumper-server` package ships three binaries
+(`pumper`, `reindex`, `search-backfill`) and sets no `default-run`, so a bare
+`cargo run -p pumper-server` fails with *"could not determine which binary to
+run"*. The two maintenance binaries must be run with the **server stopped**.
+
+The repo-root `justfile` is the canonical task runner and wraps every command
+above — `just check`, `just test`, `just test-ignored`, `just lint`, `just fmt`,
+`just fmt-check`, `just build`, `just run`, `just dev`, plus `just ci` (the whole
+CI job), `just reindex`, `just search-backfill <scope>` and `just plugin <crate>`.
+Install once with `cargo install just`; `just --list` shows them all. Keep the
+recipes and this section in sync.
 
 Then exercise your change against the running server:
 

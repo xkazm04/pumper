@@ -98,9 +98,76 @@ pub fn state_abbr(fips: &str) -> &str {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Owner-age band helpers (NES-D succession math), shared between the
+// census-nesd ingester and the census-density blend so the 55+ classification
+// can't drift between the app that stores bands and the join that reads them.
+// ---------------------------------------------------------------------------
+
+/// Whether an NES-D `OWNCHAR_LABEL` names a *reported* age band — i.e. a band
+/// that belongs in the share denominator. "Total reporting" / "Item not
+/// reported" / "Don't know"-style rows are structural, not age data.
+pub fn is_reported_age_band(label: &str) -> bool {
+    let l = label.to_lowercase();
+    !(l.is_empty()
+        || l.contains("total")
+        || l.contains("not report")
+        || l.contains("don't know")
+        || l.contains("dont know")
+        || l.contains("unknown")
+        || l.contains("all owners"))
+}
+
+/// Whether an age-band label is 55-or-older. Label-driven (the first integer in
+/// the label, e.g. "55 to 64" → 55, "65 or over" → 65, "Under 25" → 25) so a
+/// vintage that reshuffles band *codes* can't silently misclassify.
+pub fn is_55_plus_age_band(label: &str) -> bool {
+    let mut digits = String::new();
+    for c in label.chars() {
+        if c.is_ascii_digit() {
+            digits.push(c);
+        } else if !digits.is_empty() {
+            break;
+        }
+    }
+    digits.parse::<u32>().map(|n| n >= 55).unwrap_or(false)
+}
+
+/// Share of owners aged 55+ across the *reported* age bands: `(band label,
+/// owner count)` pairs in, raw fraction out. `None` (never a fabricated 0)
+/// when no reported band carries a positive total — suppression must yield an
+/// absent share, not a 0% wave.
+pub fn owner_age_share_55plus(bands: &[(String, i64)]) -> Option<f64> {
+    let mut total: i64 = 0;
+    let mut older: i64 = 0;
+    for (label, owners) in bands {
+        if !is_reported_age_band(label) {
+            continue;
+        }
+        total += owners;
+        if is_55_plus_age_band(label) {
+            older += owners;
+        }
+    }
+    (total > 0).then(|| older as f64 / total as f64)
+}
+
+/// BFS `category_code` for a NAICS trade-group code: the 2-digit sector prefix
+/// (`"2382"` → `"NAICS23"`). `None` when the code doesn't start with two
+/// digits. BFS publishes at NAICS *sector* grain only — callers must label
+/// anything joined through this as sector-grain, never trade-level.
+pub fn bfs_sector_category(naics: &str) -> Option<String> {
+    let prefix: String = naics.chars().take(2).collect();
+    (prefix.len() == 2 && prefix.chars().all(|c| c.is_ascii_digit()))
+        .then(|| format!("NAICS{prefix}"))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{census_num, state_abbr};
+    use super::{
+        bfs_sector_category, census_num, is_55_plus_age_band, is_reported_age_band,
+        owner_age_share_55plus, state_abbr,
+    };
 
     #[test]
     fn census_num_rejects_suppression_sentinels() {
@@ -120,5 +187,56 @@ mod tests {
         assert_eq!(state_abbr("06"), "CA");
         assert_eq!(state_abbr("72"), "PR");
         assert_eq!(state_abbr("99"), "99");
+    }
+
+    #[test]
+    fn age_band_classifier_reads_the_first_integer_in_the_label() {
+        assert!(is_55_plus_age_band("55 to 64"));
+        assert!(is_55_plus_age_band("65 or over"));
+        assert!(is_55_plus_age_band("Owners aged 65 years and older"));
+        assert!(!is_55_plus_age_band("Under 25"));
+        assert!(!is_55_plus_age_band("25 to 34"));
+        assert!(!is_55_plus_age_band("45 to 54"));
+        assert!(!is_55_plus_age_band("no digits here"));
+    }
+
+    #[test]
+    fn structural_bands_are_not_reported_age_bands() {
+        assert!(is_reported_age_band("55 to 64"));
+        assert!(!is_reported_age_band("Total reporting"));
+        assert!(!is_reported_age_band("Item not reported"));
+        assert!(!is_reported_age_band("Don't know"));
+        assert!(!is_reported_age_band(""));
+    }
+
+    #[test]
+    fn share_55plus_sums_reported_bands_only_and_never_fabricates_zero() {
+        let bands = |v: &[(&str, i64)]| -> Vec<(String, i64)> {
+            v.iter().map(|(l, n)| (l.to_string(), *n)).collect()
+        };
+        // 30 + 10 of 100 reported owners are 55+; the "Total reporting" row and
+        // the unreported row must not enter the denominator.
+        let share = owner_age_share_55plus(&bands(&[
+            ("Under 25", 5),
+            ("25 to 54", 55),
+            ("55 to 64", 30),
+            ("65 or over", 10),
+            ("Total reporting", 100),
+            ("Item not reported", 40),
+        ]))
+        .expect("share");
+        assert!((share - 0.4).abs() < 1e-9);
+        // All bands suppressed/structural → None, not 0.0.
+        assert_eq!(owner_age_share_55plus(&bands(&[("Total reporting", 90)])), None);
+        assert_eq!(owner_age_share_55plus(&[]), None);
+    }
+
+    #[test]
+    fn bfs_sector_category_takes_the_two_digit_sector_prefix() {
+        assert_eq!(bfs_sector_category("2382"), Some("NAICS23".into()));
+        assert_eq!(bfs_sector_category("5617"), Some("NAICS56".into()));
+        assert_eq!(bfs_sector_category("56"), Some("NAICS56".into()));
+        assert_eq!(bfs_sector_category("5"), None);
+        assert_eq!(bfs_sector_category("ab12"), None);
     }
 }

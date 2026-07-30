@@ -164,7 +164,16 @@ impl UpsertSummary {
 
 pub struct Datasets {
     pool: SqlitePool,
+    /// Max derived-spec chain depth (a derived dataset that is itself the
+    /// source of another spec). Depth 1 is the first derived hop; writes past
+    /// the cap are skipped with a warning, never an error — the source ingest
+    /// must not fail because a spec chain is too deep. See `[derived] max_depth`.
+    derived_max_depth: u32,
 }
+
+/// Default for [`Datasets::derived_max_depth`] — mirrors
+/// `config::DerivedConfig::default()`.
+const DERIVED_MAX_DEPTH_DEFAULT: u32 = 3;
 
 /// Records committed per write transaction in the batch write paths
 /// (`upsert_many`, `detect_removed`). Trades throughput (fewer commits/fsyncs and
@@ -175,7 +184,16 @@ const UPSERT_CHUNK: usize = 500;
 
 impl Datasets {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            derived_max_depth: DERIVED_MAX_DEPTH_DEFAULT,
+        }
+    }
+
+    /// Overrides the derived-chain depth cap (from `[derived] max_depth`).
+    pub fn with_derived_max_depth(mut self, max_depth: u32) -> Self {
+        self.derived_max_depth = max_depth;
+        self
     }
 
     /// Upserts one record; returns whether it was new, changed, or unchanged.
@@ -659,6 +677,43 @@ impl Datasets {
         items: &[(String, Value)],
         trust: Option<&str>,
     ) -> Result<UpsertSummary> {
+        self.upsert_many_at_depth(app, dataset, items, trust, 0)
+            .await
+    }
+
+    /// [`upsert_many_trusted`] carrying the derived-chain depth: 0 for a source
+    /// ingest, +1 per derived hop. Boxed because the derived hook recurses
+    /// (derived writes are themselves upserts that can match further specs);
+    /// the recursion is bounded by `derived_max_depth`.
+    fn upsert_many_at_depth<'a>(
+        &'a self,
+        app: &'a str,
+        dataset: &'a str,
+        items: &'a [(String, Value)],
+        trust: Option<&'a str>,
+        depth: u32,
+    ) -> futures::future::BoxFuture<'a, Result<UpsertSummary>> {
+        Box::pin(async move {
+            let summary = self.upsert_many_inner(app, dataset, items, trust).await?;
+            // Fresh keys flow through matching enabled derived specs in the
+            // same flow. Fail-open: a broken spec must never fail the source
+            // ingest, so derived errors are logged, not propagated.
+            if summary.new.len() + summary.changed.len() > 0 {
+                self.apply_derived(app, dataset, items, &summary, depth)
+                    .await;
+            }
+            Ok(summary)
+        })
+    }
+
+    /// The chunked write loop shared by every batch upsert (no derived hook).
+    async fn upsert_many_inner(
+        &self,
+        app: &str,
+        dataset: &str,
+        items: &[(String, Value)],
+        trust: Option<&str>,
+    ) -> Result<UpsertSummary> {
         let mut summary = UpsertSummary::default();
         if items.is_empty() {
             return Ok(summary);
@@ -1126,6 +1181,165 @@ impl Datasets {
         .await?;
         Ok(names)
     }
+
+    // ── derived ──────────────────────────────────────────────────────────────
+    // Derived datasets (M11 v1): filter/project(/single-key lookup) specs that
+    // recompute incrementally on each upstream delta, riding the upsert flow
+    // itself. CRUD lives on `Storage`; the store owns the hot-path read
+    // (enabled specs for one source) and the recompute/backfill mechanics.
+
+    /// Enabled specs whose source is `(app, dataset)` — the recompute set.
+    async fn enabled_derived(&self, app: &str, dataset: &str) -> Result<Vec<DerivedSpec>> {
+        let rows: Vec<DerivedRow> = sqlx::query_as(&format!(
+            "SELECT {DERIVED_COLUMNS} FROM derived \
+             WHERE source_app = ?1 AND source_dataset = ?2 AND enabled = 1 \
+             ORDER BY created_at, id"
+        ))
+        .bind(app)
+        .bind(dataset)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(DerivedSpec::try_from).collect()
+    }
+
+    /// Feeds a batch's fresh keys through the matching enabled specs, upserting
+    /// the shaped rows into each spec's target dataset at `depth + 1`.
+    ///
+    /// Fail-open by design: every error path here logs and continues — a
+    /// misconfigured spec must degrade the *derived* dataset, never the source
+    /// ingest that triggered it. The depth cap is what prevents an unbounded
+    /// cascade: derived writes recurse through `upsert_many_at_depth`, and a
+    /// hop that would exceed `derived_max_depth` is skipped loudly.
+    async fn apply_derived(
+        &self,
+        app: &str,
+        dataset: &str,
+        items: &[(String, Value)],
+        summary: &UpsertSummary,
+        depth: u32,
+    ) {
+        let specs = match self.enabled_derived(app, dataset).await {
+            Ok(s) if !s.is_empty() => s,
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!(app, dataset, "derived: failed to load specs: {e}");
+                return;
+            }
+        };
+        if depth + 1 > self.derived_max_depth {
+            tracing::warn!(
+                app,
+                dataset,
+                max_depth = self.derived_max_depth,
+                "derived: chain depth cap reached; downstream specs skipped"
+            );
+            return;
+        }
+        // Fresh keys only — unchanged records were already propagated by the
+        // run that made them fresh, and the target's own change detection
+        // dedups any no-op recompute for free.
+        let by_key: std::collections::HashMap<&str, &Value> =
+            items.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        for spec in &specs {
+            let mut out: Vec<(String, Value)> = Vec::new();
+            for key in summary.fresh_keys() {
+                let Some(data) = by_key.get(key.as_str()) else {
+                    continue;
+                };
+                match self.derive_row(spec, key, data).await {
+                    Ok(Some(row)) => out.push(row),
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(spec = %spec.id, key = %key, "derived: row skipped: {e}");
+                    }
+                }
+            }
+            if out.is_empty() {
+                continue;
+            }
+            if let Err(e) = self
+                .upsert_many_at_depth(app, &spec.target_dataset, &out, None, depth + 1)
+                .await
+            {
+                tracing::warn!(spec = %spec.id, target = %spec.target_dataset,
+                               "derived: target upsert failed: {e}");
+            }
+        }
+    }
+
+    /// Applies one spec to one source record: filter → project → lookup-merge.
+    /// `Ok(None)` = filtered out; the derived key is the source key (1:1).
+    async fn derive_row(
+        &self,
+        spec: &DerivedSpec,
+        key: &str,
+        data: &Value,
+    ) -> Result<Option<(String, Value)>> {
+        let filters = parse_filter_specs(&spec.filters)?;
+        if !filters_match(&filters, data) {
+            return Ok(None);
+        }
+        let mut value = project_value(&spec.project, data);
+        if let Some(lookup) = &spec.lookup {
+            // Single-key join: resolve the key expression against the SOURCE
+            // record, fetch from the sibling dataset, merge under `merge_as`.
+            // A missing key/record merges nothing — the row still lands, so a
+            // late-arriving lookup side fills in on the next source delta.
+            if let Some(lk) = lookup_json_path(data, &lookup.key_expr).and_then(value_text) {
+                if let Some(rec) = self.get(&spec.source_app, &lookup.dataset, &lk).await? {
+                    if rec.removed_at.is_none() {
+                        if let Value::Object(map) = &mut value {
+                            map.insert(lookup.merge_as.clone(), rec.data);
+                        }
+                    }
+                }
+            }
+        }
+        Ok(Some((key.to_string(), value)))
+    }
+
+    /// Materializes one spec over the existing live source rows in bounded
+    /// keyset batches (`POST /derived/{id}/backfill`). Runs at depth 1, so a
+    /// backfill's downstream cascade obeys the same cap as the live path.
+    pub async fn backfill_derived(
+        &self,
+        spec: &DerivedSpec,
+        batch: i64,
+    ) -> Result<DerivedBackfill> {
+        let batch = batch.clamp(1, MAX_BACKFILL_BATCH);
+        let mut report = DerivedBackfill::default();
+        let mut after: Option<(String, String)> = None;
+        loop {
+            let page = self
+                .list_page(&spec.source_app, &spec.source_dataset, after, batch, None)
+                .await?;
+            let n = page.len() as i64;
+            let mut items: Vec<(String, Value)> = Vec::new();
+            for rec in &page {
+                if rec.removed_at.is_some() {
+                    continue;
+                }
+                report.scanned += 1;
+                if let Some(row) = self.derive_row(spec, &rec.key, &rec.data).await? {
+                    items.push(row);
+                }
+            }
+            report.matched += items.len() as u64;
+            if !items.is_empty() {
+                let s = self
+                    .upsert_many_at_depth(&spec.source_app, &spec.target_dataset, &items, None, 1)
+                    .await?;
+                report.new += s.new.len() as u64;
+                report.changed += s.changed.len() as u64;
+                report.unchanged += s.unchanged as u64;
+            }
+            if n < batch {
+                break;
+            }
+            after = page.last().map(|r| (ts(r.updated_at), r.key.clone()));
+        }
+        Ok(report)
+    }
 }
 
 /// Appends the ` AND …` predicate clauses for a set of [`JsonFilter`]s onto a
@@ -1195,6 +1409,257 @@ fn push_json_filters<'a>(qb: &mut sqlx::QueryBuilder<'a, sqlx::Sqlite>, filters:
             }
         }
     }
+}
+
+// ── derived: types + pure helpers ────────────────────────────────────────────
+
+/// Ceiling on one backfill batch (rows read per keyset page / write chunk).
+pub const MAX_BACKFILL_BATCH: i64 = 1000;
+
+/// Single-key join half of a derived spec: resolve `key_expr` (a `$.path` into
+/// the SOURCE record) to a key, fetch that record from `dataset` (same app),
+/// and merge its data under the `merge_as` field of the derived row.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct DerivedLookup {
+    pub dataset: String,
+    pub key_expr: String,
+    pub merge_as: String,
+}
+
+/// A dataset declared as a transformation of another dataset in the same app:
+/// filter (ANDed `$.path:op:value` specs, the `?filter=` grammar) → project
+/// (`{out_field: "$.path"}`; empty = passthrough) → optional single-key lookup.
+/// Derived rows key 1:1 by the source key and land in
+/// `(source_app, target_dataset)`.
+#[derive(Debug, Clone, Serialize)]
+pub struct DerivedSpec {
+    pub id: String,
+    pub source_app: String,
+    pub source_dataset: String,
+    pub target_dataset: String,
+    pub filters: Vec<String>,
+    /// `{out_field: "$.path"}` — order-stable via BTreeMap so projection is
+    /// deterministic (and hashing/change detection with it).
+    pub project: std::collections::BTreeMap<String, String>,
+    pub lookup: Option<DerivedLookup>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Outcome of a backfill run over the existing source rows.
+#[derive(Debug, Default, Serialize)]
+pub struct DerivedBackfill {
+    /// Live source rows examined.
+    pub scanned: u64,
+    /// Rows that passed the spec's filters and were upserted.
+    pub matched: u64,
+    pub new: u64,
+    pub changed: u64,
+    pub unchanged: u64,
+}
+
+pub(crate) const DERIVED_COLUMNS: &str =
+    "id, source_app, source_dataset, target_dataset, filters, project, lookup, enabled, created_at";
+
+#[derive(sqlx::FromRow)]
+pub(crate) struct DerivedRow {
+    pub(crate) id: String,
+    pub(crate) source_app: String,
+    pub(crate) source_dataset: String,
+    pub(crate) target_dataset: String,
+    pub(crate) filters: String,
+    pub(crate) project: String,
+    pub(crate) lookup: Option<String>,
+    pub(crate) enabled: i64,
+    pub(crate) created_at: String,
+}
+
+impl TryFrom<DerivedRow> for DerivedSpec {
+    type Error = Error;
+
+    fn try_from(r: DerivedRow) -> Result<DerivedSpec> {
+        Ok(DerivedSpec {
+            id: r.id,
+            source_app: r.source_app,
+            source_dataset: r.source_dataset,
+            target_dataset: r.target_dataset,
+            filters: serde_json::from_str(&r.filters).unwrap_or_default(),
+            project: serde_json::from_str(&r.project).unwrap_or_default(),
+            lookup: r
+                .lookup
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok()),
+            enabled: r.enabled != 0,
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+/// Parses one `<path>:<op>:<value>` filter spec (the `?filter=` grammar) into a
+/// [`JsonFilter`]. Core-level twin of the HTTP layer's parser so stored derived
+/// specs evaluate without the server crate; same grammar, same ops
+/// (`eq|contains|gte|lte|numgte`), value keeps any `:` after the op.
+pub fn parse_filter_spec(spec: &str) -> Result<JsonFilter> {
+    let bad = |msg: String| Error::BadRequest(msg);
+    let mut parts = spec.splitn(3, ':');
+    let path = parts.next().unwrap_or("");
+    let (Some(op), Some(value)) = (parts.next(), parts.next()) else {
+        return Err(bad(format!(
+            "filter '{spec}' must be '<path>:<op>:<value>' (e.g. $.state:eq:CA)"
+        )));
+    };
+    let check_path = |p: &str| -> Result<()> {
+        if p.starts_with("$.") {
+            Ok(())
+        } else {
+            Err(bad(format!(
+                "filter path '{p}' must be a JSON path starting with '$.' (in '{spec}')"
+            )))
+        }
+    };
+    Ok(match op {
+        "eq" => {
+            check_path(path)?;
+            JsonFilter::Eq {
+                path: path.into(),
+                value: value.into(),
+            }
+        }
+        "contains" => {
+            check_path(path)?;
+            JsonFilter::Contains {
+                path: path.into(),
+                value: value.into(),
+            }
+        }
+        "gte" => {
+            check_path(path)?;
+            JsonFilter::Gte {
+                path: path.into(),
+                value: value.into(),
+            }
+        }
+        "lte" => {
+            check_path(path)?;
+            JsonFilter::Lte {
+                path: path.into(),
+                value: value.into(),
+            }
+        }
+        "numgte" => {
+            let paths: Vec<String> = path.split(',').map(|p| p.trim().to_string()).collect();
+            for p in &paths {
+                check_path(p)?;
+            }
+            let value: f64 = value
+                .parse()
+                .map_err(|_| bad(format!("numgte value '{value}' is not a number")))?;
+            JsonFilter::NumGteAny { paths, value }
+        }
+        other => return Err(bad(format!("unknown filter op '{other}' (in '{spec}')"))),
+    })
+}
+
+/// Parses a whole spec list ([`parse_filter_spec`] per entry, ANDed by callers).
+pub fn parse_filter_specs(specs: &[String]) -> Result<Vec<JsonFilter>> {
+    specs.iter().map(|s| parse_filter_spec(s)).collect()
+}
+
+/// Resolves a `$.a.b` JSON path against `data` (objects only — the `?filter=`
+/// grammar has no array indexing, matching the store-level SQL semantics).
+fn lookup_json_path<'a>(data: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut cur = data;
+    for seg in path.trim_start_matches("$.").split('.') {
+        cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
+
+/// Scalar-to-text projection mirroring SQLite's `->>`: strings stay bare,
+/// numbers/bools render, null/objects/arrays don't participate.
+fn value_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// True when one filter holds against a record's JSON. Semantics mirror the SQL
+/// `push_json_filters` mapping (and the ingress payload matcher): `Eq` exact
+/// text, `Contains` case-insensitive substring, `Gte`/`Lte` lexicographic text,
+/// `NumGteAny` numeric `>=` on any of its paths (non-numbers never match).
+fn filter_matches_value(filter: &JsonFilter, data: &Value) -> bool {
+    match filter {
+        JsonFilter::Eq { path, value } => {
+            lookup_json_path(data, path).and_then(value_text).as_deref() == Some(value.as_str())
+        }
+        JsonFilter::Contains { path, value } => lookup_json_path(data, path)
+            .and_then(value_text)
+            .is_some_and(|t| t.to_lowercase().contains(&value.to_lowercase())),
+        JsonFilter::Gte { path, value } => lookup_json_path(data, path)
+            .and_then(value_text)
+            .is_some_and(|t| t.as_str() >= value.as_str()),
+        JsonFilter::Lte { path, value } => lookup_json_path(data, path)
+            .and_then(value_text)
+            .is_some_and(|t| t.as_str() <= value.as_str()),
+        JsonFilter::NumGteAny { paths, value } => paths.iter().any(|p| {
+            lookup_json_path(data, p)
+                .and_then(Value::as_f64)
+                .is_some_and(|n| n >= *value)
+        }),
+    }
+}
+
+/// True when EVERY filter holds (AND). Empty = match everything.
+pub fn filters_match(filters: &[JsonFilter], data: &Value) -> bool {
+    filters.iter().all(|f| filter_matches_value(f, data))
+}
+
+/// Applies a projection map to a source record: `{out_field: "$.path"}` builds
+/// a fresh object of the extracted values (missing/unresolvable paths are
+/// omitted, so absent fields don't materialize as nulls). An empty map is a
+/// passthrough of the whole record.
+pub fn project_value(project: &std::collections::BTreeMap<String, String>, data: &Value) -> Value {
+    if project.is_empty() {
+        return data.clone();
+    }
+    let mut out = serde_json::Map::new();
+    for (field, path) in project {
+        if let Some(v) = lookup_json_path(data, path) {
+            if !v.is_null() {
+                out.insert(field.clone(), v.clone());
+            }
+        }
+    }
+    Value::Object(out)
+}
+
+/// Spec-create-time cycle guard (the trigger DAG guard's approach, applied to
+/// datasets instead of trigger ids): adding `source → target` closes a cycle
+/// iff `target` already reaches `source` through existing spec edges within
+/// the same app — including the self-loop `source == target`. Chains that stay
+/// acyclic remain bounded at runtime by the depth cap regardless.
+pub fn derived_would_cycle(existing: &[DerivedSpec], source: &str, target: &str) -> bool {
+    if source == target {
+        return true;
+    }
+    // DFS over target-reachable datasets.
+    let mut stack: Vec<&str> = vec![target];
+    let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    while let Some(node) = stack.pop() {
+        if !seen.insert(node) {
+            continue;
+        }
+        for spec in existing.iter().filter(|s| s.source_dataset == node) {
+            if spec.target_dataset == source {
+                return true;
+            }
+            stack.push(&spec.target_dataset);
+        }
+    }
+    false
 }
 
 #[derive(sqlx::FromRow)]
@@ -1379,6 +1844,94 @@ mod tests {
             sql.starts_with("(?3 IS NULL OR"),
             "no filter must match everything: {sql}"
         );
+    }
+
+    // ── derived: pure helpers ────────────────────────────────────────────────
+
+    fn spec(source: &str, target: &str) -> DerivedSpec {
+        DerivedSpec {
+            id: format!("{source}->{target}"),
+            source_app: "app".into(),
+            source_dataset: source.into(),
+            target_dataset: target.into(),
+            filters: Vec::new(),
+            project: Default::default(),
+            lookup: None,
+            enabled: true,
+            created_at: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn derived_cycle_guard_rejects_self_direct_and_transitive_loops() {
+        // Self-loop: a dataset can never derive from itself.
+        assert!(derived_would_cycle(&[], "a", "a"));
+        // Direct: a→b exists; adding b→a closes the loop.
+        let specs = vec![spec("a", "b")];
+        assert!(derived_would_cycle(&specs, "b", "a"));
+        // Transitive: a→b→c exists; adding c→a closes it.
+        let specs = vec![spec("a", "b"), spec("b", "c")];
+        assert!(derived_would_cycle(&specs, "c", "a"));
+        // Acyclic extensions are allowed: a fan-out and a longer chain.
+        assert!(!derived_would_cycle(&specs, "a", "d"));
+        assert!(!derived_would_cycle(&specs, "c", "d"));
+    }
+
+    #[test]
+    fn filter_spec_parser_mirrors_the_http_grammar() {
+        assert!(matches!(
+            parse_filter_spec("$.state:eq:CA").unwrap(),
+            JsonFilter::Eq { path, value } if path == "$.state" && value == "CA"
+        ));
+        // Value keeps its colons after the op.
+        assert!(matches!(
+            parse_filter_spec("$.seen:eq:2026-07-17T10:30:00Z").unwrap(),
+            JsonFilter::Eq { value, .. } if value == "2026-07-17T10:30:00Z"
+        ));
+        assert!(matches!(
+            parse_filter_spec("$.a,$.b:numgte:5").unwrap(),
+            JsonFilter::NumGteAny { paths, value } if paths.len() == 2 && value == 5.0
+        ));
+        // Malformed shapes are rejected, not silently ignored.
+        assert!(parse_filter_spec("$.state").is_err());
+        assert!(parse_filter_spec("state:eq:CA").is_err());
+        assert!(parse_filter_spec("$.state:like:CA").is_err());
+        assert!(parse_filter_spec("$.n:numgte:lots").is_err());
+    }
+
+    #[test]
+    fn filters_match_evaluates_in_memory_with_sql_parity() {
+        let data = json!({ "state": "CA", "meta": { "amount": 42 }, "title": "Solar Grant" });
+        let f = |s: &str| vec![parse_filter_spec(s).unwrap()];
+        assert!(filters_match(&f("$.state:eq:CA"), &data));
+        assert!(!filters_match(&f("$.state:eq:NY"), &data));
+        assert!(filters_match(&f("$.title:contains:solar"), &data));
+        assert!(filters_match(&f("$.meta.amount:numgte:40"), &data));
+        assert!(!filters_match(&f("$.meta.amount:numgte:50"), &data));
+        // Missing paths never match (NULL-rejecting, like the SQL).
+        assert!(!filters_match(&f("$.nope:eq:x"), &data));
+        // AND semantics; empty set matches everything.
+        let both = vec![
+            parse_filter_spec("$.state:eq:CA").unwrap(),
+            parse_filter_spec("$.meta.amount:numgte:50").unwrap(),
+        ];
+        assert!(!filters_match(&both, &data));
+        assert!(filters_match(&[], &data));
+    }
+
+    #[test]
+    fn projection_extracts_paths_and_empty_map_is_passthrough() {
+        let data = json!({ "title": "A", "meta": { "state": "CA" }, "noise": true });
+        let mut project = std::collections::BTreeMap::new();
+        project.insert("name".to_string(), "$.title".to_string());
+        project.insert("state".to_string(), "$.meta.state".to_string());
+        project.insert("missing".to_string(), "$.not.there".to_string());
+        assert_eq!(
+            project_value(&project, &data),
+            json!({ "name": "A", "state": "CA" }),
+            "resolved paths land; missing paths are omitted, not null"
+        );
+        assert_eq!(project_value(&Default::default(), &data), data);
     }
 
     #[test]

@@ -21,7 +21,7 @@ use crate::state::AppState;
 /// runs with) — so an object body **shallow-merges** over the object defaults.
 /// A non-object body (or non-object defaults) can't be merged key-wise, so it
 /// replaces, matching the prior behaviour for those shapes.
-fn merge_params(defaults: Value, over: Option<Value>) -> Value {
+pub(crate) fn merge_params(defaults: Value, over: Option<Value>) -> Value {
     match (defaults, over) {
         (defaults, None) => defaults,
         (Value::Object(mut base), Some(Value::Object(top))) => {
@@ -64,6 +64,7 @@ pub(crate) struct EnqueueBody {
         (status = 202, description = "Job enqueued", body = Object),
         (status = 200, description = "Idempotency-Key replay: the original job", body = Object),
         (status = 404, description = "Unknown app", body = Object),
+        (status = 422, description = "Merged params fail the app's declared JSON Schema (message carries JSON-pointer paths)", body = Object),
     )
 )]
 pub(crate) async fn enqueue_job(
@@ -85,8 +86,18 @@ pub(crate) async fn enqueue_job(
         .map(String::from)
         .or(body.idempotency_key)
         .filter(|k| !k.trim().is_empty());
+    let params = merge_params(app.default_params(), body.params);
+    // Manifest enforcement: an app that declares a params schema gets it
+    // enforced at the door — the silent wrong-params job that fails (or worse,
+    // half-runs) minutes later becomes an immediate 422 with pointer paths.
+    // Validated on the MERGED params, i.e. exactly what the job would run with.
+    if let Some(schema) = &app.manifest().params_schema {
+        if let Err(msg) = crate::mcp::validate_params(schema, &params) {
+            return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg));
+        }
+    }
     let opts = EnqueueOptions {
-        params: merge_params(app.default_params(), body.params),
+        params,
         max_attempts: body.max_attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS_CAP),
         delay_secs: body.delay_secs.unwrap_or(0),
         priority: body.priority.unwrap_or(0),

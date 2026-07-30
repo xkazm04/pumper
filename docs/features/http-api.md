@@ -1,10 +1,23 @@
 # HTTP API
 
-Axum server (default port 8088, `[server]` config). **Local power mode: no auth, permissive CORS** — any localhost app may call it (API-key auth is a parked decision).
+Axum server (default port 8088, `[server]` config). **Local power mode: no auth** — any process that can reach the loopback listener may call it (API-key auth is a parked decision). CORS is **off by default**; a browser UI opts in by listing its exact origin in `[server] cors_allowed_origins` (see [../deployment.md](../deployment.md#cors)). Every route carries a request-body ceiling — see [Request body limits](#request-body-limits).
 
 **Canonical machine-readable surface: `GET /openapi.json`** — a generated OpenAPI 3.1 document covering every route below, with typed request bodies and query params (response bodies are described inline; the ad-hoc JSON envelopes are documented in prose per endpoint). The spec and the router are generated from the same source (`utoipa` `#[utoipa::path]` annotations + `OpenApiRouter`), so a route cannot be added without appearing in the spec; a path-coverage test fails CI if the two ever diverge. Use it for client codegen and CLI agents; the table below is the human summary.
 
-**Errors:** `{"error": "<message>", "code": "<code>"}` with the matching HTTP status. `code` is a stable machine-readable string derived from the status — branch on it instead of the human message: `bad_request` (400, validation), `not_found` (404), `conflict` (409, wrong state), `too_large` (413), `internal` (500). Not-found, wrong-state, and bad-input are raised explicitly by handlers; unexpected engine/storage failures are `internal`/500.
+**Errors:** `{"error": "<message>", "code": "<code>"}` with the matching HTTP status. `code` is a stable machine-readable string derived from the status — branch on it instead of the human message: `bad_request` (400, validation), `not_found` (404), `conflict` (409, wrong state), `too_large` (413), `internal` (500). Not-found, wrong-state, and bad-input are raised explicitly by handlers; unexpected engine/storage failures are `internal`/500. The one 413 that is **not** in this envelope is the request-body ceiling below — it is refused by the extractor before any handler runs, so it comes back as axum's own plain-text rejection with status `413`. Branch on the status, not the body, if you need to catch both.
+
+## Request body limits
+
+Every route carries a body ceiling (`DefaultBodyLimit`, installed in `crates/server/src/routes/mod.rs`). An over-limit body is **rejected with `413 Payload Too Large`, never truncated** — the handler does not run and no partial request is acted on.
+
+| Scope | Limit | Constant |
+| --- | --- | --- |
+| Every route (global default) | **1 MiB** | `BODY_LIMIT_BYTES` |
+| `POST /extract/preview` | **8 MiB** | `PREVIEW_BODY_LIMIT_BYTES` |
+
+The global 1 MiB is sized from what the POST surface actually accepts — all hand-authored JSON config (job `params`, a cron string, a webhook URL + secret, a trigger definition, a saved search, a source-state flip). The widest, `POST /jobs/retry`, carries only `{app, status, limit}`. Legitimate bodies are kilobytes, so the ceiling is headroom, not a quota.
+
+`POST /extract/preview` is the only route that takes a **document** rather than config, so it carries a scoped 8 MiB override — deliberately equal to the 8 MiB budget the same endpoint already enforces on its `url`-fetch path, so a page cannot preview through `url` and 413 through `html`. The override is scoped by construction (a separate sub-router) and pinned by an EXPECTED-diff inventory test: adding a route to the larger ceiling is a visible, deliberate edit, and raising the *global* limit for a new document route is the anti-pattern that test exists to prevent. The override is still a ceiling — past 8 MiB, preview 413s too.
 
 | Area | Routes |
 | --- | --- |
@@ -52,6 +65,8 @@ The value keeps any `:` after the op (so timestamps/URLs pass through). Example:
 Dry-run a declarative `RuleSet` against one document without enqueuing a job — the authoring loop for selectors. Body `{rules, html}` **or** `{rules, url}` (exactly one of `html`/`url`; both or neither → `400 bad_request`). `rules` is a bare `{field: rule}` map (same shape apps take).
 
 Rules compile **field-by-field**, so a bad set returns `400 bad_request` with a per-field `fields: [{field, error}]` list naming **every** bad field (deserialize errors like an unknown rule `type`, and compile errors like a bad CSS selector / regex / XPath) — not just the first. A non-object `rules` is `400`.
+
+This route carries the larger **8 MiB** request-body ceiling (see [Request body limits](#request-body-limits)) because `html` is a whole web page; a request body past 8 MiB is `413` before the handler runs.
 
 `url` mode fetches through the **HTTP tier only** (no browser, never the paid Claude tier), bounded by a 15s timeout (exceeded → `400`) and an 8 MiB body cap (over → `413 too_large`); a non-`http(s)` url or fetch failure is `400`. Success (`200`) returns `{values, report, fields_matched, fields_total}` — extracted values plus the per-field match report (each field `matched`|`empty`|`error`; see [extraction.md](extraction.md)). No job, dataset write, or cost is incurred. Full detail in [extraction.md](extraction.md).
 

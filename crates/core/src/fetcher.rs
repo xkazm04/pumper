@@ -5,6 +5,14 @@
 //!
 //! Apps call `ctx.engines.fetch.fetch(...)` and get back whichever tier
 //! succeeded, plus a trail of why each escalation happened.
+//!
+//! **Tier zero (opt-in): the archive tier.** When a request declares an
+//! `archive_max_age` freshness window AND an archive engine is wired
+//! ([`Fetcher::with_archive`], `[archive] enabled`), a stored web-archive
+//! snapshot is tried BEFORE any live tier — zero load on the target site, zero
+//! politeness budget, zero ban risk. Archive coverage is patchy by nature, so
+//! the archive tier is strictly opportunistic: a miss, a stale-only snapshot, a
+//! thin body, or an engine error always falls through to the live ladder.
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -95,6 +103,13 @@ pub struct FetchRequest {
     /// (in-memory jar + the shared default browser profile).
     #[serde(default)]
     pub profile: Option<String>,
+    /// Archive freshness window (seconds): when set (and an archive engine is
+    /// wired), a stored web-archive snapshot captured no longer than this many
+    /// seconds ago is tried BEFORE the live tiers. An absent/older/thin snapshot
+    /// falls through to the live ladder — the archive tier is never terminal.
+    /// `None` = live-only, exactly the previous behavior.
+    #[serde(default)]
+    pub archive_max_age: Option<u64>,
 }
 
 impl FetchRequest {
@@ -112,15 +127,20 @@ impl FetchRequest {
             no_cache: false,
             ttl_override: None,
             profile: None,
+            archive_max_age: None,
         }
     }
 }
 
-/// The three fetch tiers, cheapest first. Serializes to `http`/`browser`/`claude`
-/// — the same strings the winning `FetchOutcome.engine` uses.
+/// The fetch tiers, cheapest first. Serializes to
+/// `archive`/`http`/`browser`/`claude` — the same strings the winning
+/// `FetchOutcome.engine` uses. `Archive` is tier zero: opt-in (only attempted
+/// when `archive_max_age` is set and an archive engine is wired) and strictly
+/// opportunistic — it can win but never terminate the ladder.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FetchTier {
+    Archive,
     Http,
     Browser,
     Claude,
@@ -130,6 +150,7 @@ impl FetchTier {
     /// The `&'static str` tier name (matches `FetchOutcome.engine`).
     pub fn as_str(self) -> &'static str {
         match self {
+            FetchTier::Archive => "archive",
             FetchTier::Http => "http",
             FetchTier::Browser => "browser",
             FetchTier::Claude => "claude",
@@ -164,7 +185,7 @@ pub enum TierVerdict {
 pub struct TierTrace {
     pub tier: FetchTier,
     pub verdict: TierVerdict,
-    /// HTTP status (http tier only; the browser/claude tiers have none).
+    /// HTTP status (archive/http tiers only; the browser/claude tiers have none).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub http_status: Option<u16>,
     /// Extracted-text length in chars when it was measured (escalation
@@ -218,6 +239,12 @@ pub struct Fetcher {
     http: Arc<dyn HttpClient>,
     browser: Arc<dyn Browser>,
     claude: Arc<dyn Researcher>,
+    /// Tier-zero archive engine (`[archive]`, default OFF => `None`). Attempted
+    /// before the live ladder only when a request sets `archive_max_age`. It is
+    /// an `HttpClient` like the http tier, but serves stored web-archive
+    /// snapshots; its own outbound requests (CDX + snapshot body) run through
+    /// the real HTTP engine, so archive.org is governed like any host.
+    archive: Option<Arc<dyn HttpClient>>,
     /// The same per-host politeness governor the HTTP engine uses. The HTTP tier
     /// is governed inside `HttpEngine::send` (so raw-HTTP callers like the crawler
     /// are still spaced); the browser tier has no such internal seam, so the
@@ -241,15 +268,113 @@ impl Fetcher {
             http,
             browser,
             claude,
+            archive: None,
             governor,
             min_content_chars: cfg.min_content_chars,
         }
+    }
+
+    /// Wires the (optional) tier-zero archive engine. `None` — the default —
+    /// leaves the ladder exactly as it was; requests that set `archive_max_age`
+    /// then simply skip straight to the live tiers.
+    pub fn with_archive(mut self, archive: Option<Arc<dyn HttpClient>>) -> Self {
+        self.archive = archive;
+        self
     }
 
     pub async fn fetch(&self, req: FetchRequest) -> Result<FetchOutcome> {
         let min_chars = req.min_content_chars.unwrap_or(self.min_content_chars);
         let mut escalations: Vec<String> = Vec::new();
         let mut trace: Vec<TierTrace> = Vec::new();
+
+        // --- Archive tier (tier zero, opt-in) --- tried BEFORE any live tier,
+        // but only when the caller declared a freshness window and an archive
+        // engine is wired. Strictly opportunistic: every failure mode (no
+        // snapshot, snapshot older than the window, thin body, archived
+        // challenge page, engine error) falls through to the live ladder. The
+        // browser-only strategy is excluded — the caller explicitly wants a
+        // JS render, which an archived static body cannot be.
+        if req.archive_max_age.is_some() && req.strategy != FetchStrategy::Browser {
+            if let Some(archive) = &self.archive {
+                let mut arch_req = HttpRequest::get(&req.url);
+                arch_req.archive_max_age = req.archive_max_age;
+                arch_req.no_cache = req.no_cache;
+                arch_req.ttl_override = req.ttl_override;
+                let started = Instant::now();
+                match archive.fetch(arch_req).await {
+                    Ok(resp) => {
+                        let latency_ms = elapsed_ms(started);
+                        // Same acceptance bar as the http tier: a snapshot can be
+                        // an archived bot-wall or a thin shell page, and serving
+                        // that as content would be worse than a live fetch.
+                        let wall = http_bot_wall(resp.status, &resp.body);
+                        let markdown = req.to_markdown.then(|| html_to_markdown(&resp.body));
+                        let text_len = match &markdown {
+                            Some(md) => md.chars().count(),
+                            None => text_len_capped(&resp.body, min_chars),
+                        };
+                        let enough =
+                            wall.is_none() && resp.is_success() && text_len >= min_chars;
+                        if enough {
+                            trace.push(TierTrace {
+                                tier: FetchTier::Archive,
+                                verdict: TierVerdict::Ok,
+                                http_status: Some(resp.status),
+                                content_chars: Some(text_len),
+                                cache_hit: Some(resp.cache_hit),
+                                latency_ms,
+                                cost_usd: None,
+                                detail: None,
+                            });
+                            return Ok(outcome(
+                                "archive",
+                                &req,
+                                Some(resp.status),
+                                resp.body,
+                                markdown,
+                                escalations,
+                                trace,
+                            ));
+                        }
+                        let (verdict, detail) = match wall {
+                            Some(reason) => {
+                                escalations.push(format!(
+                                    "archive tier blocked: archived challenge page ({reason})"
+                                ));
+                                (TierVerdict::Blocked, Some(reason))
+                            }
+                            None => {
+                                escalations.push(format!(
+                                    "archive tier thin: status {}, {} chars of text",
+                                    resp.status, text_len
+                                ));
+                                (TierVerdict::Thin, None)
+                            }
+                        };
+                        trace.push(TierTrace {
+                            tier: FetchTier::Archive,
+                            verdict,
+                            http_status: Some(resp.status),
+                            content_chars: Some(text_len),
+                            cache_hit: Some(resp.cache_hit),
+                            latency_ms,
+                            cost_usd: None,
+                            detail,
+                        });
+                    }
+                    // A miss (no snapshot / stale-only) surfaces as an engine
+                    // error here — never terminal, always fall through to live.
+                    Err(e) => trace_tier_error(
+                        &mut escalations,
+                        &mut trace,
+                        FetchTier::Archive,
+                        "archive",
+                        &e,
+                        started,
+                    ),
+                }
+            }
+        }
 
         // --- HTTP tier --- (skip_http only applies to escalating strategies;
         // an explicit Http strategy is the caller's call.)
@@ -295,7 +420,7 @@ impl Fetcher {
                     let cache_hit = Some(resp.cache_hit);
                     let enough = wall.is_none()
                         && resp.is_success()
-                        && text_len.map_or(true, |n| n >= min_chars);
+                        && text_len.is_none_or(|n| n >= min_chars);
                     if enough || req.strategy == FetchStrategy::Http {
                         trace.push(TierTrace {
                             tier: FetchTier::Http,
@@ -398,7 +523,7 @@ impl Fetcher {
                         None if needs_count => Some(text_len_capped(&page.html, min_chars)),
                         None => None,
                     };
-                    let enough = wall.is_none() && text_len.map_or(true, |n| n >= min_chars);
+                    let enough = wall.is_none() && text_len.is_none_or(|n| n >= min_chars);
                     if enough || req.strategy != FetchStrategy::AutoWithResearch {
                         // A healthy browser fetch decays any learned penalty on the
                         // host (no-op when unpenalized) — the recovery half of the
@@ -667,6 +792,11 @@ mod tests {
             serde_json::to_string(&FetchTier::Claude).unwrap(),
             "\"claude\""
         );
+        assert_eq!(
+            serde_json::to_string(&FetchTier::Archive).unwrap(),
+            "\"archive\""
+        );
+        assert_eq!(FetchTier::Archive.as_str(), "archive");
         assert_eq!(FetchTier::Http.as_str(), "http");
         assert_eq!(FetchTier::Browser.as_str(), "browser");
         assert_eq!(FetchTier::Claude.as_str(), "claude");
@@ -792,6 +922,194 @@ mod tests {
             ..GovernorConfig::default()
         };
         Arc::new(Governor::new(&cfg))
+    }
+
+    // --- Archive tier (tier zero) ---
+
+    const GOOD_PAGE: &str = "<html><body><article>A perfectly ordinary page with plenty of \
+        real readable content, well past the hundred-character threshold used \
+        for escalation decisions in these tests.</article></body></html>";
+
+    /// Archive stub that always serves a snapshot body.
+    struct StubArchive {
+        body: String,
+    }
+    #[async_trait]
+    impl HttpClient for StubArchive {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            assert!(
+                req.archive_max_age.is_some(),
+                "the fetcher must thread archive_max_age to the archive engine"
+            );
+            Ok(HttpResponse {
+                status: 200,
+                headers: std::collections::HashMap::new(),
+                body: self.body.clone(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    /// Archive stub that always misses (no snapshot within the window).
+    struct MissArchive;
+    #[async_trait]
+    impl HttpClient for MissArchive {
+        async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
+            Err(Error::Http("no archive snapshot within window".into()))
+        }
+    }
+
+    /// HTTP stub that serves a healthy live page.
+    struct StubHttp;
+    #[async_trait]
+    impl HttpClient for StubHttp {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status: 200,
+                headers: std::collections::HashMap::new(),
+                body: GOOD_PAGE.into(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    struct DeadBrowser;
+    #[async_trait]
+    impl Browser for DeadBrowser {
+        async fn render(&self, _req: RenderRequest) -> Result<RenderedPage> {
+            panic!("browser tier must not be reached in these tests");
+        }
+    }
+
+    fn archive_fetcher(
+        http: Arc<dyn HttpClient>,
+        archive: Option<Arc<dyn HttpClient>>,
+    ) -> Fetcher {
+        Fetcher::new(
+            http,
+            Arc::new(DeadBrowser),
+            Arc::new(StubResearcher),
+            enabled_governor(),
+            &FetcherConfig {
+                min_content_chars: 100,
+                ..FetcherConfig::default()
+            },
+        )
+        .with_archive(archive)
+    }
+
+    #[tokio::test]
+    async fn archive_tier_wins_before_live_http_when_window_set() {
+        // With a snapshot available, the live HTTP tier is never touched
+        // (DeadHttp panics if called) — the whole point of tier zero.
+        let fetcher = archive_fetcher(
+            Arc::new(DeadHttp),
+            Some(Arc::new(StubArchive {
+                body: GOOD_PAGE.into(),
+            })),
+        );
+        let mut req = FetchRequest::new("https://example.test/page");
+        req.archive_max_age = Some(86_400);
+        let out = fetcher.fetch(req).await.unwrap();
+        assert_eq!(out.engine, "archive");
+        assert_eq!(out.trace.len(), 1);
+        assert_eq!(out.trace[0].tier, FetchTier::Archive);
+        assert_eq!(out.trace[0].verdict, TierVerdict::Ok);
+        assert_eq!(out.trace[0].http_status, Some(200));
+    }
+
+    #[tokio::test]
+    async fn archive_miss_falls_through_to_live_http() {
+        let fetcher = archive_fetcher(Arc::new(StubHttp), Some(Arc::new(MissArchive)));
+        let mut req = FetchRequest::new("https://example.test/page");
+        req.archive_max_age = Some(3600);
+        let out = fetcher.fetch(req).await.unwrap();
+        assert_eq!(out.engine, "http", "a miss must fall through to live");
+        assert!(out
+            .trace
+            .iter()
+            .any(|t| t.tier == FetchTier::Archive && t.verdict == TierVerdict::Error));
+        assert!(out.escalations.iter().any(|e| e.contains("archive tier")));
+    }
+
+    #[tokio::test]
+    async fn archive_thin_snapshot_falls_through_to_live_http() {
+        // A snapshot that exists but is a thin shell must not be served.
+        let fetcher = archive_fetcher(
+            Arc::new(StubHttp),
+            Some(Arc::new(StubArchive {
+                body: "<html><body>tiny</body></html>".into(),
+            })),
+        );
+        let mut req = FetchRequest::new("https://example.test/page");
+        req.archive_max_age = Some(3600);
+        let out = fetcher.fetch(req).await.unwrap();
+        assert_eq!(out.engine, "http");
+        assert!(out
+            .trace
+            .iter()
+            .any(|t| t.tier == FetchTier::Archive && t.verdict == TierVerdict::Thin));
+    }
+
+    #[tokio::test]
+    async fn archive_tier_requires_opt_in_window() {
+        // No archive_max_age => the archive engine is never called, even when
+        // wired (StubArchive's assert would fire on a None window; instead the
+        // live tier serves as before).
+        struct PanicArchive;
+        #[async_trait]
+        impl HttpClient for PanicArchive {
+            async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
+                panic!("archive engine must not be called without archive_max_age");
+            }
+        }
+        let fetcher = archive_fetcher(Arc::new(StubHttp), Some(Arc::new(PanicArchive)));
+        let out = fetcher
+            .fetch(FetchRequest::new("https://example.test/page"))
+            .await
+            .unwrap();
+        assert_eq!(out.engine, "http");
+    }
+
+    #[tokio::test]
+    async fn archive_window_without_wired_engine_is_a_noop() {
+        // [archive] disabled => Fetcher.archive is None => the window is inert.
+        let fetcher = archive_fetcher(Arc::new(StubHttp), None);
+        let mut req = FetchRequest::new("https://example.test/page");
+        req.archive_max_age = Some(3600);
+        let out = fetcher.fetch(req).await.unwrap();
+        assert_eq!(out.engine, "http");
+        assert!(out.trace.iter().all(|t| t.tier != FetchTier::Archive));
+    }
+
+    #[tokio::test]
+    async fn browser_strategy_skips_the_archive_tier() {
+        // An explicit Browser strategy wants a JS render; an archived static
+        // body can't be that, so tier zero is skipped even with a window set.
+        let governor = enabled_governor();
+        let fetcher = Fetcher::new(
+            Arc::new(DeadHttp),
+            Arc::new(StubBrowser {
+                html: GOOD_PAGE.into(),
+            }),
+            Arc::new(StubResearcher),
+            governor,
+            &FetcherConfig {
+                min_content_chars: 100,
+                ..FetcherConfig::default()
+            },
+        )
+        .with_archive(Some(Arc::new(StubArchive {
+            body: GOOD_PAGE.into(),
+        })));
+        let mut req = FetchRequest::new("https://example.test/page");
+        req.strategy = FetchStrategy::Browser;
+        req.archive_max_age = Some(3600);
+        let out = fetcher.fetch(req).await.unwrap();
+        assert_eq!(out.engine, "browser");
+        assert!(out.trace.iter().all(|t| t.tier != FetchTier::Archive));
     }
 
     #[tokio::test]

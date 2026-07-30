@@ -1,0 +1,16 @@
+[package]
+name = "pumper-engine-archive"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pumper-core.workspace = true
+async-trait.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+# Real transport for the #[ignore] live smoke test only.
+reqwest.workspace = true

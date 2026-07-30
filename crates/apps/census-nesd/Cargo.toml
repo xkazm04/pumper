@@ -1,0 +1,14 @@
+[package]
+name = "app-census-nesd"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pumper-core.workspace = true
+census-common.workspace = true
+# For the shared employer+solo `census/market_blend` derivation — like
+# census-nonemp, this app re-blends after its own upserts so the succession
+# fields track whichever Census run happened last.
+app-census-density.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true

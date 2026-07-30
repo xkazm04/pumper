@@ -8,8 +8,12 @@ name = "pumper"
 path = "src/main.rs"
 
 [dependencies]
+# Needed at build time (not just dev): the worker's JobCheckpointer implements
+# pumper-core's async CheckpointSink trait.
+async-trait.workspace = true
 pumper-core.workspace = true
 pumper-engine-http.workspace = true
+pumper-engine-archive.workspace = true
 pumper-engine-browser.workspace = true
 pumper-engine-claude.workspace = true
 pumper-engine-wasm.workspace = true
@@ -23,6 +27,9 @@ app-grants-gov.workspace = true
 app-cms-fee-schedule.workspace = true
 app-census-density.workspace = true
 app-census-nonemp.workspace = true
+app-census-nesd.workspace = true
+app-census-bfs.workspace = true
+app-cordis.workspace = true
 app-homewyse-pricing.workspace = true
 app-state-tax.workspace = true
 app-valuation-multiples.workspace = true
@@ -47,12 +54,15 @@ futures.workspace = true
 async-stream.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+jsonschema.workspace = true
 sha2.workspace = true
 hmac.workspace = true
 hex.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+sentry.workspace = true
+sentry-tracing.workspace = true
 uuid.workspace = true
 chrono.workspace = true
 chrono-tz.workspace = true

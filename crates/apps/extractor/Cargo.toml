@@ -10,6 +10,9 @@ serde_json.workspace = true
 tokio.workspace = true
 futures.workspace = true
 tracing.workspace = true
+# Versioned-archive source mode: `as_of` timestamp comparison + backfill URL patterns.
+chrono.workspace = true
+regex.workspace = true
 
 [dev-dependencies]
 uuid.workspace = true

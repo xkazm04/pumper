@@ -1,0 +1,11 @@
+-- Catalog GitOps reconciler (M19): which controller owns a schedule row.
+--
+-- managed_by: NULL  = hand-made (API) or code-seeded (`static-<app>`) — the
+--                     reconciler NEVER touches these;
+--             'catalog' = created/driven by the catalog reconciler; desired
+--                     state is the matching [[source]] row in
+--                     catalog/data-sources.toml.
+--
+-- Every reconciler write is fenced with `AND managed_by = 'catalog'` in SQL, so
+-- even a buggy plan cannot mutate an untagged row.
+ALTER TABLE schedules ADD COLUMN managed_by TEXT;

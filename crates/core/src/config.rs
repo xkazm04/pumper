@@ -20,9 +20,194 @@ pub struct Config {
     pub plugins: PluginConfig,
     pub search: SearchConfig,
     pub triggers: TriggersConfig,
+    pub derived: DerivedConfig,
     pub webhooks: WebhooksConfig,
     pub resilience: ResilienceConfig,
     pub datahub: DatahubConfig,
+    pub archive: ArchiveConfig,
+    pub catalog: CatalogConfig,
+    pub ingress: IngressConfig,
+    pub mcp: McpConfig,
+    pub economics: EconomicsConfig,
+    pub refresher: RefresherConfig,
+}
+
+/// Background cache refresher (M02 self-refreshing mirror): a scheduler-tick
+/// piggyback that conditionally revalidates `http_cache` entries just before
+/// their predicted next change (learned from the revalidation log's EWMA
+/// inter-change intervals), so app-facing fetches find warm, provably-fresh
+/// entries instead of paying live-network latency.
+///
+/// Strictly opportunistic and strictly polite: every request first takes
+/// `Governor::try_acquire` — an idle-slot-only, non-blocking claim — so
+/// background refreshes can never queue behind or delay live jobs, and per-tick
+/// budgets bound total background traffic. Default OFF.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RefresherConfig {
+    /// Master switch. `false` = no background revalidation at all (the
+    /// revalidation log still accrues from demand-path revalidations).
+    pub enabled: bool,
+    /// How close (seconds) a key's predicted next change must be before the
+    /// refresher considers it near-due.
+    pub horizon_secs: u64,
+    /// Max background revalidations per scheduler tick across all hosts.
+    pub global_per_tick: usize,
+    /// Max background revalidations per host per tick.
+    pub per_host_per_tick: usize,
+    /// Revalidation-log retention (days); older observations are pruned by the
+    /// tick so the append-only log stays bounded.
+    pub retention_days: u32,
+}
+
+impl Default for RefresherConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            horizon_secs: 300,
+            global_per_tick: 10,
+            per_host_per_tick: 2,
+            retention_days: 30,
+        }
+    }
+}
+
+/// Information economics (M04): joining the cost ledger with per-job yield
+/// (`job_yield`) into $/new-record telemetry and an ADVISORY budget/cadence
+/// planner (`GET /economics`).
+///
+/// Advisory-only today: `enforce = false` is a stub for the deferred
+/// enforcement mode, where the scheduler would read the planner's recommended
+/// `budget_usd` for scheduled runs. Nothing reads it as `true` yet — flipping
+/// it changes no behavior until that seam lands, and it ships default-OFF so
+/// landing the seam can't silently start moving money.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct EconomicsConfig {
+    /// DEFERRED enforcement seam (see above). Default false; currently inert
+    /// beyond being surfaced in the /economics payload.
+    pub enforce: bool,
+    /// Per-app value weights for the planner: how much one fresh (new/changed)
+    /// record from this app is worth relative to the fleet baseline of 1.0.
+    /// Record counts are not value — a rare grant record may be worth 10k HN
+    /// rows — and this is the human-settable dial that encodes that. Apps not
+    /// listed weigh 1.0.
+    pub weights: HashMap<String, f64>,
+}
+
+impl EconomicsConfig {
+    /// The planner weight for one app (default 1.0; non-finite or negative
+    /// configured values are treated as unset rather than poisoning the math).
+    pub fn weight(&self, app: &str) -> f64 {
+        match self.weights.get(app) {
+            Some(w) if w.is_finite() && *w >= 0.0 => *w,
+            _ => 1.0,
+        }
+    }
+}
+
+/// MCP server (`/mcp`): the registry, datasets, and search exposed as native
+/// agent tools over the Model Context Protocol's streamable-HTTP transport.
+///
+/// Default-OFF, and read-mostly even when on: the enqueue tool — the one that
+/// can spend money and load targets — has its own switch plus a hard per-call
+/// budget ceiling, so a connected agent can browse everything but actuate
+/// nothing until the operator opts in twice.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct McpConfig {
+    /// Master switch. `false` = `/mcp` is not mounted at all.
+    pub enabled: bool,
+    /// Whether the `enqueue_job` tool is offered. `false` (default) = the MCP
+    /// surface is read-only: list/query/search but no job creation.
+    pub allow_enqueue: bool,
+    /// Hard ceiling (USD) on the `budget_usd` any MCP enqueue may carry; a
+    /// larger requested budget is clamped, an absent one defaults to this.
+    /// `0` = MCP-enqueued jobs run with a zero budget (free tiers only).
+    pub max_job_budget_usd: f64,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            allow_enqueue: false,
+            max_job_budget_usd: 1.0,
+        }
+    }
+}
+
+/// Inbound event ingress (`POST /ingest/{id}`): HMAC-verified external webhooks
+/// stamped onto the event bus as `external` events that triggers can match.
+///
+/// This is the FIRST write surface designed for non-localhost callers, so it is
+/// disabled by default and every source carries its own signing secret. When
+/// disabled the routes still mount but every ingest returns 409; the CRUD
+/// surface still works, so sources can be staged before the flip.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct IngressConfig {
+    /// Master switch. `false` = every `POST /ingest/{id}` is refused (409).
+    pub enabled: bool,
+    /// Hard cap on an inbound event body (bytes). Inbound payloads are event
+    /// notifications, not documents; anything bigger should arrive as a fetch
+    /// by the triggered job, not as the trigger itself.
+    pub max_body_bytes: usize,
+    /// Per-source token-bucket rate limit (events/minute; also the burst size).
+    pub rate_limit_per_min: u32,
+    /// Max accepted clock skew (seconds) for timestamped signatures
+    /// (`x-pumper-timestamp` present). Bounds replay of a captured request.
+    pub max_skew_secs: i64,
+}
+
+impl Default for IngressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_body_bytes: 256 * 1024,
+            rate_limit_per_min: 60,
+            max_skew_secs: 300,
+        }
+    }
+}
+
+/// Catalog GitOps reconciler (`catalog/data-sources.toml` as desired state for
+/// the schedules table). The reconciler always *plans* at boot and logs drift
+/// loudly; this only controls whether it is allowed to APPLY that plan on its
+/// own. Manual applies go through `POST /catalog/reconcile` either way.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CatalogConfig {
+    /// Apply the boot-time reconcile plan automatically (create/update/disable
+    /// catalog-managed schedules; orphans are never auto-touched). Default OFF:
+    /// a bad TOML edit should be a loud log, not a silent mass-disable.
+    pub auto_reconcile: bool,
+}
+
+/// Tier-zero archive engine (Wayback Machine CDX, v1). When enabled, the server
+/// wires an archive engine into the tiered fetcher; a fetch that sets
+/// `archive_max_age` then tries a stored snapshot BEFORE touching the live site
+/// (zero load on the target, zero ban risk). Disabled by default — when off the
+/// engine is never constructed and `archive_max_age` is inert.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ArchiveConfig {
+    /// Master switch. `false` = the archive engine is never built.
+    pub enabled: bool,
+    /// Base URL of the Wayback deployment: both the CDX index
+    /// (`<base>/cdx/search/cdx`) and raw snapshot bodies
+    /// (`<base>/web/<ts>id_/<url>`) are served under it. Overridable for a
+    /// self-hosted pywb instance.
+    pub base_url: String,
+}
+
+impl Default for ArchiveConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            base_url: "https://web.archive.org".into(),
+        }
+    }
 }
 
 /// Extraction-health detection: how a source's runs are judged against its own
@@ -174,6 +359,22 @@ impl Default for WebhooksConfig {
             failure_secret: None,
             auto_retry: true,
         }
+    }
+}
+
+/// Derived-dataset (M11) recompute limits.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct DerivedConfig {
+    /// Max derived-spec chain depth (a derived dataset feeding another spec);
+    /// hops past this are skipped (warn-logged). Cycles are rejected at
+    /// spec-create time; this cap bounds the acyclic chains.
+    pub max_depth: u32,
+}
+
+impl Default for DerivedConfig {
+    fn default() -> Self {
+        Self { max_depth: 3 }
     }
 }
 
@@ -332,6 +533,76 @@ impl Config {
             }
         }
 
+        // The archive engine builds every CDX/snapshot URL off base_url; a value
+        // that isn't an absolute http(s) URL yields requests that fail far from
+        // here with an unhelpful reqwest parse error on every single fetch.
+        let a = &self.archive;
+        if a.enabled
+            && !matches!(
+                url::Url::parse(&a.base_url).as_ref().map(|u| u.scheme()),
+                Ok("http") | Ok("https")
+            )
+        {
+            return Err(Error::Config(format!(
+                "[archive] base_url ('{}') must be an absolute http(s) URL",
+                a.base_url
+            )));
+        }
+
+        // Ingress guards only bind when the surface is actually reachable. A
+        // zero body cap or zero rate limit parses fine and then rejects every
+        // single inbound event — an enabled surface that silently drops 100% of
+        // traffic is a misconfiguration, not a policy.
+        let i = &self.ingress;
+        if i.enabled {
+            if i.max_body_bytes == 0 {
+                return Err(Error::Config(
+                    "[ingress] max_body_bytes must be > 0 when ingress is enabled — \
+                     a zero cap rejects every inbound event"
+                        .into(),
+                ));
+            }
+            if i.rate_limit_per_min == 0 {
+                return Err(Error::Config(
+                    "[ingress] rate_limit_per_min must be > 0 when ingress is enabled — \
+                     a zero bucket admits no events"
+                        .into(),
+                ));
+            }
+        }
+
+        // MCP: a negative budget ceiling parses fine and then makes every
+        // clamped enqueue budget negative — which `filter(|b| *b > 0.0)`-style
+        // guards downstream silently turn into "unlimited". Reject at the door.
+        if self.mcp.enabled && !(self.mcp.max_job_budget_usd >= 0.0) {
+            return Err(Error::Config(format!(
+                "[mcp] max_job_budget_usd ({}) must be >= 0 when mcp is enabled",
+                self.mcp.max_job_budget_usd
+            )));
+        }
+
+        // Refresher guards only bind when the loop actually runs. Zero budgets
+        // or a zero horizon parse fine and then produce a tick that scans the
+        // freshness model every interval while refreshing nothing — an enabled
+        // feature that silently does no work.
+        let rf = &self.refresher;
+        if rf.enabled {
+            if rf.global_per_tick == 0 || rf.per_host_per_tick == 0 {
+                return Err(Error::Config(format!(
+                    "[refresher] global_per_tick ({}) and per_host_per_tick ({}) must be > 0 \
+                     when the refresher is enabled — zero budgets refresh nothing",
+                    rf.global_per_tick, rf.per_host_per_tick
+                )));
+            }
+            if rf.horizon_secs == 0 {
+                return Err(Error::Config(
+                    "[refresher] horizon_secs must be > 0 when the refresher is enabled — \
+                     a zero window never finds a near-due key"
+                        .into(),
+                ));
+            }
+        }
+
         // A cap below the base means the very first penalty already exceeds it, so
         // the cap silently stops being a cap.
         let g = &self.governor;
@@ -407,6 +678,12 @@ pub struct WorkerConfig {
     /// starving forever. `0` disables aging — claim order is then exactly
     /// `priority DESC, created_at` (the historical behaviour).
     pub priority_aging_coefficient_secs: f64,
+    /// Poisoned-checkpoint escape: after this many attempts have started from a
+    /// job's durable checkpoint without any of them completing, the checkpoint
+    /// is discarded and the next attempt starts fresh — restored state is
+    /// advisory, and a blob that reliably kills its consumer must not retry
+    /// forever. `0` disables restores entirely (checkpoints still persist).
+    pub max_resume_failures: i64,
 }
 
 impl Default for WorkerConfig {
@@ -429,6 +706,9 @@ impl Default for WorkerConfig {
             // higher-priority stream escalates past it within the hour rather
             // than never. Matches the job-timeout / schedule scale.
             priority_aging_coefficient_secs: 900.0,
+            // Three strikes: enough to ride out an unlucky crash/reap streak,
+            // few enough that a genuinely poisoned blob stops burning attempts.
+            max_resume_failures: 3,
         }
     }
 }
@@ -781,6 +1061,27 @@ mod tests {
     }
 
     #[test]
+    fn enabled_refresher_with_zero_budget_or_horizon_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.refresher.enabled = true;
+        cfg.refresher.global_per_tick = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("global_per_tick"), "{err}");
+
+        let mut cfg = Config::default();
+        cfg.refresher.enabled = true;
+        cfg.refresher.horizon_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("horizon_secs"), "{err}");
+
+        // Disabled: the same zeros are inert (the feature is off).
+        let mut cfg = Config::default();
+        cfg.refresher.global_per_tick = 0;
+        cfg.refresher.horizon_secs = 0;
+        cfg.validate().expect("disabled refresher never binds");
+    }
+
+    #[test]
     fn stale_after_below_heartbeat_is_rejected() {
         let mut cfg = Config::default();
         cfg.worker.heartbeat_secs = 300;
@@ -877,6 +1178,85 @@ mod tests {
         let r = ResilienceConfig::default();
         assert!(r.enabled, "detection is on by default");
         assert!(!r.enforce, "enforcement must be opt-in after a soak");
+    }
+
+    #[test]
+    fn archive_ships_disabled_with_a_valid_base() {
+        let a = ArchiveConfig::default();
+        assert!(!a.enabled, "the archive tier must be opt-in");
+        assert_eq!(a.base_url, "https://web.archive.org");
+        Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn enabled_archive_rejects_a_broken_base_url() {
+        let mut cfg = Config::default();
+        cfg.archive.enabled = true;
+        cfg.archive.base_url = "not a url".into();
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("[archive] base_url"), "{err}");
+        // Disabled => the rule doesn't bind (nothing reads the section).
+        cfg.archive.enabled = false;
+        assert!(cfg.validate().is_ok());
+        // Enabled with a sane base passes.
+        cfg.archive.enabled = true;
+        cfg.archive.base_url = "http://localhost:8090".into();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn ingress_ships_disabled_with_sane_limits() {
+        // The first non-localhost write surface MUST be opt-in.
+        let i = IngressConfig::default();
+        assert!(!i.enabled, "ingress must be opt-in");
+        assert!(i.max_body_bytes > 0);
+        assert!(i.rate_limit_per_min > 0);
+        assert!(i.max_skew_secs > 0);
+    }
+
+    #[test]
+    fn enabled_ingress_rejects_zero_caps() {
+        let mut cfg = Config::default();
+        cfg.ingress.enabled = true;
+        cfg.ingress.max_body_bytes = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("[ingress] max_body_bytes"), "{err}");
+
+        let mut cfg = Config::default();
+        cfg.ingress.enabled = true;
+        cfg.ingress.rate_limit_per_min = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("[ingress] rate_limit_per_min"), "{err}");
+
+        // Disabled => the rules don't bind (nothing reaches the surface).
+        let mut cfg = Config::default();
+        cfg.ingress.max_body_bytes = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn mcp_ships_disabled_and_read_only() {
+        // An agent-actuatable surface must be double opt-in: mount, then enqueue.
+        let m = McpConfig::default();
+        assert!(!m.enabled, "mcp must be opt-in");
+        assert!(!m.allow_enqueue, "enqueue must be a second, separate opt-in");
+        assert!(m.max_job_budget_usd >= 0.0);
+    }
+
+    #[test]
+    fn enabled_mcp_rejects_negative_budget_ceiling() {
+        let mut cfg = Config::default();
+        cfg.mcp.enabled = true;
+        cfg.mcp.max_job_budget_usd = -1.0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("[mcp] max_job_budget_usd"), "{err}");
+        // Disabled => the rule doesn't bind.
+        cfg.mcp.enabled = false;
+        assert!(cfg.validate().is_ok());
+        // Enabled with zero (free-tiers-only) is allowed.
+        cfg.mcp.enabled = true;
+        cfg.mcp.max_job_budget_usd = 0.0;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]

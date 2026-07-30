@@ -59,8 +59,10 @@ pub(crate) async fn list_triggers(
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct CreateTriggerBody {
     name: Option<String>,
-    /// 'dataset' (change-feed events) | 'job' (terminal events).
+    /// 'dataset' (change-feed events) | 'job' (terminal events) |
+    /// 'external' (inbound ingress events).
     source_kind: String,
+    /// External kind: an ingress source id or '*' (any source).
     source_app: String,
     /// Dataset kind only: dataset name or '*' (default).
     source_dataset: Option<String>,
@@ -75,6 +77,9 @@ pub(crate) struct CreateTriggerBody {
     budget_usd: Option<f64>,
     priority: Option<i64>,
     max_attempts: Option<i64>,
+    /// External kind only: `$.path:op:value` predicate specs (the `?filter=`
+    /// grammar) ANDed against the inbound payload.
+    filters: Option<Vec<String>>,
 }
 
 #[utoipa::path(
@@ -128,10 +133,37 @@ pub(crate) async fn create_trigger(
             }
             (None, None, Some(on_status))
         }
+        "external" => {
+            // source_app = ingress source id or '*'; the dataset/job-only
+            // fields have no meaning here and are rejected rather than ignored.
+            if body.source_dataset.is_some() || body.on_change.is_some() || body.on_status.is_some()
+            {
+                return Err(bad(
+                    "source_dataset/on_change/on_status are not valid for source_kind 'external'"
+                        .into(),
+                ));
+            }
+            (None, None, None)
+        }
         other => {
             return Err(bad(format!(
-                "invalid source_kind '{other}' (dataset | job)"
+                "invalid source_kind '{other}' (dataset | job | external)"
             )))
+        }
+    };
+    // Payload predicates: external kind only, validated with the same parser
+    // the fire path uses so an accepted trigger can always be evaluated.
+    let filters = match (&body.filters, body.source_kind.as_str()) {
+        (None, _) => None,
+        (Some(f), _) if f.is_empty() => None,
+        (Some(_), kind) if kind != "external" => {
+            return Err(bad(
+                "filters are only valid for source_kind 'external'".into(),
+            ))
+        }
+        (Some(f), _) => {
+            super::datasets::parse_filters(f)?; // 400 with the malformed spec
+            Some(f.as_slice())
         }
     };
     let params = body.params.unwrap_or_else(|| json!({}));
@@ -149,6 +181,7 @@ pub(crate) async fn create_trigger(
             budget_usd: body.budget_usd.filter(|b| *b > 0.0),
             priority: body.priority.unwrap_or(0),
             max_attempts: body.max_attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS_CAP),
+            filters,
         })
         .await?;
     Ok((StatusCode::CREATED, Json(trigger)))
@@ -228,6 +261,14 @@ pub(crate) async fn test_trigger(
         return Err(ApiError(StatusCode::NOT_FOUND, "trigger not found".into()));
     };
     let no_fire = |reason: &str| json!({ "would_fire": false, "reason": reason });
+
+    // External triggers have no source *job* to dry-run against — their input
+    // is an inbound event; exercise them by POSTing a signed body to /ingest.
+    if trigger.source_kind == "external" {
+        return Ok(Json(no_fire(
+            "external triggers are exercised by POSTing a signed event to /ingest/{source}",
+        )));
+    }
 
     // Most recent source job of the trigger's source app.
     let Some(source) = state

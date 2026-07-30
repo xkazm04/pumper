@@ -85,7 +85,7 @@ fn parse_release(s: &str) -> Option<Release> {
         return None;
     }
     let (d1, d2, q) = (b[3], b[4], b[5]);
-    if !(d1.is_ascii_digit() && d2.is_ascii_digit()) || !(b'A'..=b'D').contains(&q) {
+    if !(d1.is_ascii_digit() && d2.is_ascii_digit() && (b'A'..=b'D').contains(&q)) {
         return None;
     }
     let yy = ((d1 - b'0') as u32) * 10 + (d2 - b'0') as u32;

@@ -39,6 +39,7 @@ async fn a_job_run_fans_out_to_events_watches_and_trigger_hops() {
             budget_usd: None,
             priority: 0,
             max_attempts: 1,
+            filters: None,
         })
         .await
         .expect("create trigger");

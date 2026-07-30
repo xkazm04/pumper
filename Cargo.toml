@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/engine-http",
+    "crates/engine-archive",
     "crates/engine-browser",
     "crates/engine-claude",
     "crates/engine-wasm",
@@ -19,6 +20,7 @@ edition = "2021"
 # internal
 pumper-core = { path = "crates/core" }
 pumper-engine-http = { path = "crates/engine-http" }
+pumper-engine-archive = { path = "crates/engine-archive" }
 pumper-engine-browser = { path = "crates/engine-browser" }
 pumper-engine-claude = { path = "crates/engine-claude" }
 pumper-engine-wasm = { path = "crates/engine-wasm" }
@@ -34,6 +36,9 @@ app-cms-fee-schedule = { path = "crates/apps/cms-fee-schedule" }
 census-common = { path = "crates/apps/census-common" }
 app-census-density = { path = "crates/apps/census-density" }
 app-census-nonemp = { path = "crates/apps/census-nonemp" }
+app-census-nesd = { path = "crates/apps/census-nesd" }
+app-census-bfs = { path = "crates/apps/census-bfs" }
+app-cordis = { path = "crates/apps/cordis" }
 app-homewyse-pricing = { path = "crates/apps/homewyse-pricing" }
 app-state-tax = { path = "crates/apps/state-tax" }
 app-valuation-multiples = { path = "crates/apps/valuation-multiples" }
@@ -97,11 +102,21 @@ hmac = "0.12"
 hex = "0.4"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Params-schema validation for app manifests (enqueue 422s + the MCP surface).
+jsonschema = { version = "0.30", default-features = false }
 toml = "0.8"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Error reporting. Default features are deliberate: the `transport` default is
+# reqwest + native-tls, the same stack the HTTP engine already uses (schannel on
+# Windows, no OpenSSL), so it introduces no new *native* dependency — it does
+# pull a second reqwest MAJOR (0.13 alongside the workspace's 0.12), which is the
+# accepted cost of a supported transport. `sentry-tracing` bridges the existing
+# `tracing::error!` sites into Sentry rather than replacing stdout logging.
+sentry = "0.48"
+sentry-tracing = "0.48"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.9"

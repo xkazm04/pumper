@@ -16,7 +16,10 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, HttpMethod, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, HttpMethod, HttpRequest, ManifestExample, Result,
+    ScrapeApp,
+};
 use serde_json::{json, Value};
 
 pub struct GrantsGov;
@@ -46,6 +49,51 @@ impl ScrapeApp for GrantsGov {
 
     fn default_params(&self) -> Value {
         json!({ "oppStatuses": "posted|forecasted", "rows": 1000, "maxPages": 25 })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "oppStatuses": {
+                        "type": "string",
+                        "description": "Pipe-separated grants.gov statuses, e.g. \"posted|forecasted\"."
+                    },
+                    "keyword": { "type": "string" },
+                    "eligibilities": {
+                        "type": "string",
+                        "description": "Pipe-separated grants.gov eligibility codes, e.g. \"12|13|25|99\" for nonprofits."
+                    },
+                    "rows": { "type": "integer", "minimum": 1, "maximum": 1000 },
+                    "maxPages": { "type": "integer", "minimum": 1, "maximum": 100 },
+                    "digestDays": { "type": "integer", "minimum": 1 }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Full daily sync: every posted + forecasted opportunity (the scheduled default)",
+                    params: json!({ "oppStatuses": "posted|forecasted", "rows": 1000, "maxPages": 25 }),
+                },
+                ManifestExample {
+                    description: "Targeted pull: posted nonprofit-eligible opportunities matching a keyword",
+                    params: json!({
+                        "oppStatuses": "posted",
+                        "keyword": "rural health",
+                        "eligibilities": "12|13|25|99",
+                        "rows": 500,
+                        "maxPages": 5
+                    }),
+                },
+            ],
+            output_shape: Some(
+                "{hit_count, fetched, new, changed, unchanged, removed?} — Search2 sync tallies \
+                 over the `opportunities` dataset (keyed by opportunity id)",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -259,7 +307,7 @@ fn closing_soon_digest(hits: &[Value], days: i64) -> Vec<Value> {
         .filter(|h| {
             h.get("oppStatus")
                 .and_then(Value::as_str)
-                .map_or(true, |s| s.eq_ignore_ascii_case("posted"))
+                .is_none_or(|s| s.eq_ignore_ascii_case("posted"))
         })
         .filter_map(|h| {
             let close = h.get("closeDate").and_then(Value::as_str)?;
@@ -303,6 +351,7 @@ fn search2_request(body: String) -> HttpRequest {
         timeout_secs: None,
         proxy: None,
         profile: None,
+        archive_max_age: None,
     }
 }
 

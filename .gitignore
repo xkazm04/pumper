@@ -13,10 +13,16 @@ plugins-src/*/Cargo.lock
 .claude/*
 !.claude/CLAUDE.md
 !.claude/settings.json
+# Skills are shared method, not local state — they travel with the repo so a
+# fresh checkout (or another machine) gets the same workflows.
+!.claude/skills/
 
 # Secrets / local environment overrides
 .env
 *.local
+
+# Personal cost ledger — read locally by the Personas passport, never shared.
+app-cost.json
 
 # Editor / IDE
 .idea/

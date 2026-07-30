@@ -92,12 +92,13 @@ documentation): [`docs/data-analysis/ab-datahub-2026-07-23.md`](../grant-writing
 #      DATAHUB_TOKEN=<personal access token>
 
 # 2. Run Pumper and backfill the catalog
-cargo run -p pumper-server
-curl -X POST http://localhost:8080/datahub/sync
+#    (--bin pumper is required: the package also ships reindex + search-backfill)
+cargo run -p pumper-server --bin pumper      # or: just run
+curl -X POST http://localhost:8088/datahub/sync
 
 # 3. Run any app — its run emits fresh metadata + lineage automatically
-curl -X POST http://localhost:8080/apps/grants-gov/jobs -d '{}'
-curl http://localhost:8080/datahub/status
+curl -X POST http://localhost:8088/apps/grants-gov/jobs -d '{}'
+curl http://localhost:8088/datahub/status
 ```
 
 Then in DataHub: search `grants` → open `grants.unified` → Lineage tab shows the three source apps' datasets feeding it; the Properties tab carries last-run new/changed/removed counts; Operations feed the freshness signal.

@@ -9,7 +9,8 @@
 //!   - `memory`                          (linear memory, default export)
 //!   - `alloc(len: u32) -> u32`          reserve `len` bytes, return the pointer
 //!   - `extract(ptr: u32, len: u32) -> u64`  read the input, return the output
-//!                                        packed as `(out_ptr << 32) | out_len`
+//!     packed as `(out_ptr << 32) | out_len`
+//!
 //! The output bytes must be UTF-8 JSON.
 
 use std::collections::HashMap;
@@ -228,7 +229,7 @@ fn read_packed(store: &mut Store<StoreLimits>, memory: &Memory, packed: u64) -> 
     let mem_size = memory.data_size(&*store);
     if out_ptr
         .checked_add(out_len)
-        .map_or(true, |end| end > mem_size)
+        .is_none_or(|end| end > mem_size)
     {
         return Err(Error::App(format!(
             "plugin output range out of bounds: ptr={out_ptr} len={out_len} mem={mem_size}"

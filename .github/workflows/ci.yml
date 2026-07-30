@@ -4,6 +4,11 @@ on:
   push:
     branches: [master]
   pull_request:
+  # The RUSTSEC advisory database changes independently of this repo, so a crate
+  # we already depend on can become vulnerable with no commit of ours. The weekly
+  # run surfaces that instead of waiting for the next PR.
+  schedule:
+    - cron: "17 6 * * 1"
 
 env:
   CARGO_TERM_COLOR: always
@@ -20,8 +25,30 @@ jobs:
       - name: Format
         run: cargo fmt --check
       - name: Clippy
-        run: cargo clippy --workspace --all-targets
+        # `-D warnings` makes lints gate the build rather than scroll past in the
+        # log. The workspace is clippy-clean as of the commit that added this;
+        # the two intentional exceptions are narrow, per-site `#[allow]`s with a
+        # comment naming the reason (crates/apps/plugin/src/lib.rs — a `cloned()`
+        # required for closure lifetime inference; crates/server/src/webhook.rs —
+        # the 8-argument webhook wire contract).
+        run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
         # Environment-dependent tests (real Chrome, wasm artifact, wall-clock
         # timing) are #[ignore]d; run them locally with `cargo test -- --ignored`.
         run: cargo test --workspace
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # cargo-deny over cargo-audit: this service fetches untrusted web content
+      # and executes operator-supplied WASM, so "is there a CVE" (advisories) is
+      # only part of the question — `sources` proves every crate still comes from
+      # crates.io, and `bans` keeps a vulnerable copy from hiding behind a second
+      # major. Policy and every waiver live in ./deny.toml.
+      # `licenses` is deliberately absent from this list; see deny.toml for the
+      # one-step follow-up that turns it on.
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check advisories bans sources

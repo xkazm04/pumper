@@ -4,13 +4,15 @@
 //! job's artifact directory.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use pumper_core::{
-    crawl, AppContext, CrawlConfig, CrawlPageRecord, Datasets, Error, HttpClient, HttpRequest,
-    HttpResponse, PageSink, PageSource, Result, RevisitSeed, ScrapeApp,
+    crawl, AppContext, AppManifest, CostClass, CrawlConfig, CrawlPageRecord, Datasets, Error,
+    HttpClient, HttpRequest, HttpResponse, ManifestExample, PageSink, PageSource, Result,
+    RevisitCadence, RevisitSeed, ScrapeApp,
 };
 use serde_json::{json, Value};
 
@@ -86,6 +88,41 @@ struct PageCounts {
     new: AtomicUsize,
     changed: AtomicUsize,
     unchanged: AtomicUsize,
+    /// Page revisions archived into `page_versions` (with a revision-suffixed
+    /// artifact copy) because a revisit found the body CHANGED.
+    versions_archived: AtomicUsize,
+    /// Cadence-only counter merges written for `304` check markers (M07). Kept
+    /// separate from `changed` — a cadence bump is bookkeeping, not content.
+    cadence_updates: AtomicUsize,
+}
+
+/// Full stored `pages` record per URL, captured at revisit-seed load so the
+/// sink can merge a 304's cadence bump into the record WITHOUT re-reading the
+/// dataset (the read already happened to build the seeds). std Mutex — quick
+/// map ops only, never held across an `.await`.
+type SeedData = Arc<Mutex<HashMap<String, Value>>>;
+
+/// Dataset holding the versioned crawl archive: one record per CHANGED revision
+/// of a page, keyed `{url}#{revision}`. Each record carries `artifact_path` +
+/// `job_id` in the exact shape `AppContext::read_source_artifact` expects, so
+/// extractor/plugin `source` mode can read historical bodies unchanged.
+///
+/// Retention: the archive is capped by the EXISTING dataset retention seams, no
+/// new janitor — `Datasets::prune_revisions` / the dataset prune API bounds the
+/// `page_versions` revision history like any other dataset, and the janitor
+/// (OFF by default) plus per-job artifact cleanup bound the on-disk copies.
+/// Storage grows only with real change (unchanged revisits archive nothing).
+const VERSIONS_DATASET: &str = "page_versions";
+
+/// Inserts a `.r{revision}` suffix before the artifact's `.html` extension
+/// (`page-<hex>.html` → `page-<hex>.r3.html`), so each archived revision owns a
+/// distinct file while the un-suffixed name keeps meaning "latest". Falls back
+/// to appending for non-`.html` names. Stays a single safe path segment.
+fn versioned_artifact_name(artifact_path: &str, revision: i64) -> String {
+    match artifact_path.strip_suffix(".html") {
+        Some(stem) => format!("{stem}.r{revision}.html"),
+        None => format!("{artifact_path}.r{revision}"),
+    }
 }
 
 /// [`PageSink`] that upserts each batch of kept-page fingerprints into the
@@ -97,7 +134,83 @@ struct DatasetPageSink {
     datasets: Arc<Datasets>,
     app: String,
     job_id: String,
+    /// This job's artifact dir — where core wrote each kept page's latest body
+    /// (URL-hash name). On `changed` the sink copies that body to a
+    /// revision-suffixed file and records it in [`VERSIONS_DATASET`].
+    artifacts_dir: PathBuf,
     counts: Arc<PageCounts>,
+    /// Stored record data per seeded URL (revisit runs; empty otherwise) — the
+    /// merge base for 304 cadence markers.
+    seed_data: SeedData,
+}
+
+impl DatasetPageSink {
+    /// Archives the CHANGED keys of one upsert batch into the versioned crawl
+    /// archive: copy `page-<hex>.html` → `page-<hex>.r{revision}.html` and upsert
+    /// a `page_versions` record keyed `{url}#{revision}` (artifact path, simhash,
+    /// fetched_at). New first-sightings and unchanged revisits archive nothing —
+    /// the un-suffixed artifact already IS the latest body, so the archive grows
+    /// only when a page actually changes. Best-effort like the rest of the sink:
+    /// an archive failure warns and skips, never fails the crawl.
+    async fn archive_changed(&self, changed: &[String], meta: &HashMap<String, (String, u64)>) {
+        let mut versions: Vec<(String, Value)> = Vec::new();
+        for url in changed {
+            let Some((artifact_path, simhash)) = meta.get(url) else {
+                continue; // not in this batch (shouldn't happen) — nothing to copy
+            };
+            if artifact_path.is_empty() {
+                continue; // crawl ran without an output dir — no body to archive
+            }
+            // The revision number (and its authoritative timestamp) of the write
+            // that just happened comes from the record's revision history.
+            let rev = match self.datasets.history(&self.app, "pages", url, 1).await {
+                Ok(revs) => match revs.into_iter().next() {
+                    Some(r) => r,
+                    None => continue, // changed key with no revision row — skip
+                },
+                Err(e) => {
+                    tracing::warn!(url = %url, "crawl version archive: history read failed: {e}");
+                    continue;
+                }
+            };
+            let versioned = versioned_artifact_name(artifact_path, rev.revision);
+            let src = self.artifacts_dir.join(artifact_path);
+            let dst = self.artifacts_dir.join(&versioned);
+            if let Err(e) = tokio::fs::copy(&src, &dst).await {
+                tracing::warn!(url = %url, path = %src.display(),
+                    "crawl version archive: artifact copy failed: {e}");
+                continue;
+            }
+            versions.push((
+                format!("{url}#{}", rev.revision),
+                json!({
+                    "url": url,
+                    "revision": rev.revision,
+                    // Same {artifact_path, job_id} contract as `pages` records, so
+                    // read_source_artifact resolves historical bodies unchanged.
+                    "artifact_path": versioned,
+                    "job_id": self.job_id,
+                    "simhash": simhash,
+                    "fetched_at": rev.created_at.to_rfc3339(),
+                }),
+            ));
+        }
+        if versions.is_empty() {
+            return;
+        }
+        match self
+            .datasets
+            .upsert_many(&self.app, VERSIONS_DATASET, &versions)
+            .await
+        {
+            Ok(_) => {
+                self.counts
+                    .versions_archived
+                    .fetch_add(versions.len(), Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!(job = %self.job_id, "crawl page_versions upsert failed: {e}"),
+        }
+    }
 }
 
 #[async_trait]
@@ -108,13 +221,39 @@ impl PageSink for DatasetPageSink {
         // revision that triggers/watches fire on) and are NOT counted as changed.
         let mut live: Vec<(String, Value)> = Vec::new();
         let mut gone: Vec<(String, Value)> = Vec::new();
+        // 304 check markers: cadence counters merged onto the stored record.
+        let mut checks: Vec<(String, Value)> = Vec::new();
+        // url → (artifact_path, simhash) for this batch's live pages, kept so the
+        // version archive can copy the just-written body of any CHANGED key.
+        let mut live_meta: HashMap<String, (String, u64)> = HashMap::new();
         for p in batch {
-            if p.gone {
+            if p.unchanged {
+                // Merge the bumped cadence into the record as loaded at seed
+                // time — everything else about the page is by definition
+                // unchanged (the origin said 304). NOTE: this UPSERT is a
+                // changed revision (the cadence moved), so watches/triggers on
+                // `pages` see check bookkeeping; bounded per URL per run.
+                let mut base = self
+                    .seed_data
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&p.url)
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "url": p.url }));
+                if let Value::Object(map) = &mut base {
+                    map.insert(
+                        "cadence".into(),
+                        serde_json::to_value(&p.cadence).unwrap_or(Value::Null),
+                    );
+                }
+                checks.push((p.url.clone(), base));
+            } else if p.gone {
                 gone.push((
                     p.url.clone(),
                     json!({ "url": p.url, "status": p.status, "gone": true, "job_id": self.job_id }),
                 ));
             } else {
+                live_meta.insert(p.url.clone(), (p.artifact_path.clone(), p.simhash));
                 live.push((
                     p.url.clone(),
                     json!({
@@ -130,6 +269,10 @@ impl PageSink for DatasetPageSink {
                         // can send If-None-Match / If-Modified-Since.
                         "etag": p.etag,
                         "last_modified": p.last_modified,
+                        // Learned change-cadence counters (M07): checks/changes/
+                        // last_change_at + EWMA interval, read back as revisit
+                        // seeds to drive the due-score frontier.
+                        "cadence": p.cadence,
                         "job_id": self.job_id,
                     }),
                 ));
@@ -147,6 +290,11 @@ impl PageSink for DatasetPageSink {
                     self.counts
                         .unchanged
                         .fetch_add(summary.unchanged, Ordering::Relaxed);
+                    // Versioned crawl archive: every CHANGED key gets its new body
+                    // copied to a revision-suffixed artifact + a page_versions row.
+                    if !summary.changed.is_empty() {
+                        self.archive_changed(&summary.changed, &live_meta).await;
+                    }
                 }
                 Err(e) => tracing::warn!(job = %self.job_id, "crawl pages upsert failed: {e}"),
             }
@@ -154,6 +302,20 @@ impl PageSink for DatasetPageSink {
         if !gone.is_empty() {
             if let Err(e) = self.datasets.upsert_many(&self.app, "pages", &gone).await {
                 tracing::warn!(job = %self.job_id, "crawl gone-marker upsert failed: {e}");
+            }
+        }
+        if !checks.is_empty() {
+            // Deliberately NOT folded into new/changed counts: a cadence bump is
+            // estimator bookkeeping, not observed content change.
+            match self.datasets.upsert_many(&self.app, "pages", &checks).await {
+                Ok(_) => {
+                    self.counts
+                        .cadence_updates
+                        .fetch_add(checks.len(), Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!(job = %self.job_id, "crawl cadence-marker upsert failed: {e}")
+                }
             }
         }
     }
@@ -166,29 +328,49 @@ struct DatasetPageSource {
     datasets: Arc<Datasets>,
     app: String,
     limit: i64,
+    /// Populated during `seeds()` with each seeded URL's full record data — the
+    /// sink's merge base for 304 cadence markers (no second dataset read).
+    seed_data: SeedData,
 }
 
 #[async_trait]
 impl PageSource for DatasetPageSource {
     async fn seeds(&self) -> Vec<RevisitSeed> {
         match self.datasets.list(&self.app, "pages", self.limit).await {
-            Ok(records) => records
-                .into_iter()
-                .filter(|r| {
-                    r.removed_at.is_none()
-                        && !r.data.get("gone").and_then(Value::as_bool).unwrap_or(false)
-                })
-                .map(|r| RevisitSeed {
-                    etag: r.data.get("etag").and_then(Value::as_str).map(String::from),
-                    last_modified: r
+            Ok(records) => {
+                let mut seeds = Vec::new();
+                let mut data_map = HashMap::new();
+                for r in records {
+                    if r.removed_at.is_some()
+                        || r.data.get("gone").and_then(Value::as_bool).unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    // Learned cadence counters written by DatasetPageSink;
+                    // records that predate them default to a cold-start seed.
+                    let cadence = r
                         .data
-                        .get("last_modified")
-                        .and_then(Value::as_str)
-                        .map(String::from),
-                    // The record key is the canonical URL (see DatasetPageSink).
-                    url: r.key,
-                })
-                .collect(),
+                        .get("cadence")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value::<RevisitCadence>(v).ok())
+                        .unwrap_or_default();
+                    data_map.insert(r.key.clone(), r.data.clone());
+                    seeds.push(RevisitSeed {
+                        etag: r.data.get("etag").and_then(Value::as_str).map(String::from),
+                        last_modified: r
+                            .data
+                            .get("last_modified")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        simhash: r.data.get("simhash").and_then(Value::as_u64).unwrap_or(0),
+                        cadence,
+                        // The record key is the canonical URL (see DatasetPageSink).
+                        url: r.key,
+                    });
+                }
+                *self.seed_data.lock().unwrap_or_else(|e| e.into_inner()) = data_map;
+                seeds
+            }
             Err(e) => {
                 tracing::warn!(app = %self.app, "crawl revisit seed load failed: {e}");
                 Vec::new()
@@ -210,9 +392,86 @@ impl ScrapeApp for Crawl {
          crawls; 0/absent = unlimited), \"same_domain\": true, \
          \"dedup_distance\": 3, \"respect_robots\": true, \
          \"include_patterns\": [\"regex\", ..], \"exclude_patterns\": [\"regex\", ..], \
-         \"sitemap_seeds\": false, \"checkpoint\": \"name\" (resumable frontier), \
+         \"sitemap_seeds\": false, \
          \"mode\": \"revisit\" (incremental recrawl of the `pages` dataset via \
-         conditional GETs; \"discover\": true opts into link-following)}"
+         conditional GETs; \"discover\": true opts into link-following; \
+         \"revisit_budget\" + \"min_due_score\" spend the budget on the URLs \
+         most likely changed, per learned per-URL change cadence)}. \
+         Frontier state is checkpointed durably per job: an interrupted, reaped, \
+         or shutdown-suspended crawl resumes where it left off on its next attempt. \
+         Changed pages are archived into the `page_versions` dataset (key \
+         `{url}#{revision}`, revision-suffixed artifact copy) — retention is the \
+         existing dataset prune API / janitor, no separate knob."
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "seeds": {
+                        "type": "array",
+                        "items": { "type": "string", "pattern": "^https?://" },
+                        "description": "Start URLs. Required for a fresh crawl; `mode: revisit` runs need none."
+                    },
+                    "max_pages": { "type": "integer", "minimum": 1 },
+                    "max_depth": { "type": "integer", "minimum": 0 },
+                    "concurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
+                    "max_pages_per_host": {
+                        "type": ["integer", "null"],
+                        "minimum": 0,
+                        "description": "Per-host page cap for host-fair multi-seed crawls; 0/null = unlimited."
+                    },
+                    "same_domain": { "type": "boolean" },
+                    "dedup_distance": { "type": "integer", "minimum": 0, "maximum": 20 },
+                    "respect_robots": { "type": "boolean" },
+                    "include_patterns": { "type": "array", "items": { "type": "string" } },
+                    "exclude_patterns": { "type": "array", "items": { "type": "string" } },
+                    "sitemap_seeds": { "type": "boolean" },
+                    "mode": {
+                        "type": "string",
+                        "enum": ["revisit"],
+                        "description": "Incremental recrawl of the existing `pages` dataset via conditional GETs."
+                    },
+                    "discover": { "type": "boolean" },
+                    "revisit_budget": {
+                        "type": ["integer", "null"],
+                        "minimum": 1,
+                        "description": "Revisit mode: max known pages fetched this run, spent on the highest due-score URLs (learned change cadence). Absent/0 = all seeds."
+                    },
+                    "min_due_score": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "Revisit mode: skip seeds whose probability-changed-since-last-check falls below this (0 = fetch all; skipped seeds are counted in skipped_not_due)."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Shallow same-domain crawl of one site, robots-respecting",
+                    params: json!({
+                        "seeds": ["https://example.com/"],
+                        "max_pages": 50,
+                        "max_depth": 2,
+                        "same_domain": true
+                    }),
+                },
+                ManifestExample {
+                    description: "Incremental revisit of already-crawled pages (conditional GETs)",
+                    params: json!({ "mode": "revisit", "max_pages": 200 }),
+                },
+            ],
+            output_shape: Some(
+                "{pages, new, changed, unchanged, skipped, hosts, versions_archived} — crawl \
+                 tallies plus the `pages` dataset upsert summary; bodies land in the job's \
+                 artifact dir, changed revisions also as revision-suffixed copies recorded in \
+                 `page_versions`",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -277,42 +536,45 @@ impl ScrapeApp for Crawl {
             include_patterns: str_array("include_patterns"),
             exclude_patterns: str_array("exclude_patterns"),
             sitemap_seeds: bool_param("sitemap_seeds", false),
-            // Named checkpoints live beside (not inside) the per-job artifacts
-            // dir, so a later job with the same name resumes the crawl.
-            checkpoint: ctx
-                .params
-                .get("checkpoint")
-                .and_then(Value::as_str)
-                .map(|name| {
-                    let safe: String = name
-                        .chars()
-                        .map(|c| {
-                            if c.is_alphanumeric() || c == '-' || c == '_' {
-                                c
-                            } else {
-                                '-'
-                            }
-                        })
-                        .collect();
-                    ctx.artifacts_dir
-                        .parent()
-                        .unwrap_or(&ctx.artifacts_dir)
-                        .join("checkpoints")
-                        .join(format!("{safe}.json"))
-                }),
+            // Durable execution: a prior attempt's frontier checkpoint (persisted
+            // through `ctx.checkpoint` below) comes back here on re-claim, so a
+            // crashed/reaped/suspended crawl resumes instead of restarting. The
+            // old app-private named-file checkpoint path is gone — the platform
+            // seam owns persistence, lineage-guarding, and the poisoned-blob
+            // escape now.
+            resume_state: ctx.restore().cloned(),
             revisit,
             discover: bool_param("discover", false),
+            // Learned change-cadence frontier (M07): spend the revisit budget on
+            // the URLs most likely to have changed since last check.
+            revisit_budget: ctx
+                .params
+                .get("revisit_budget")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .filter(|&n| n > 0),
+            min_due_score: ctx
+                .params
+                .get("min_due_score")
+                .and_then(Value::as_f64)
+                .map(|s| s.clamp(0.0, 1.0))
+                .unwrap_or(0.0),
         };
 
         // Per-page fingerprints stream into the `pages` dataset as the crawl
         // runs (key = canonical URL), so crawled pages become queryable/diffable
         // and dataset triggers + watches fire per-page.
         let counts = Arc::new(PageCounts::default());
+        // Shared between source (writer, at seed load) and sink (reader, on 304
+        // markers): the stored record data per seeded URL.
+        let seed_data: SeedData = Arc::new(Mutex::new(HashMap::new()));
         let sink: Box<dyn PageSink> = Box::new(DatasetPageSink {
             datasets: ctx.datasets.clone(),
             app: ctx.app.clone(),
             job_id: ctx.job_id.to_string(),
+            artifacts_dir: ctx.artifacts_dir.clone(),
             counts: counts.clone(),
+            seed_data: seed_data.clone(),
         });
 
         // Revisit mode reads existing page records to seed the frontier.
@@ -321,6 +583,7 @@ impl ScrapeApp for Crawl {
                 datasets: ctx.datasets.clone(),
                 app: ctx.app.clone(),
                 limit: REVISIT_SEED_LIMIT,
+                seed_data: seed_data.clone(),
             }) as Box<dyn PageSource>
         });
 
@@ -348,6 +611,10 @@ impl ScrapeApp for Crawl {
             Some(sink),
             source,
             Some(progress),
+            // Durable-execution seam: the crawler streams its frontier state
+            // through the job's checkpoint sink (runtime-throttled, lineage-
+            // guarded), which is what `resume_state` restores on re-claim.
+            Some(ctx.checkpoints.clone()),
         )
         .await?;
 
@@ -393,17 +660,41 @@ impl ScrapeApp for Crawl {
             "revisit": revisit,
             "revisited": stats.revisited,
             "unchanged_304": stats.unchanged_304,
+            // Learned-cadence frontier accounting (M07): seeds skipped as
+            // not-due / over-budget, and 304 cadence-counter merges written.
+            "skipped_not_due": stats.skipped_not_due,
+            "cadence_updates": counts.cadence_updates.load(Ordering::Relaxed),
             // `changed`/`new` = live pages re-fingerprinted / first-seen this run.
             "changed": pages_changed,
             "new": pages_new,
             "gone": stats.gone,
+            // Versioned crawl archive: changed revisions copied to
+            // revision-suffixed artifacts + `page_versions` records.
+            "versions_archived": counts.versions_archived.load(Ordering::Relaxed),
         }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::host_of;
+    use super::{host_of, versioned_artifact_name};
+
+    #[test]
+    fn versioned_name_inserts_revision_before_html_suffix() {
+        assert_eq!(
+            versioned_artifact_name("page-ab12.html", 3),
+            "page-ab12.r3.html"
+        );
+        assert_eq!(
+            versioned_artifact_name("page-ab12.html", 1),
+            "page-ab12.r1.html"
+        );
+    }
+
+    #[test]
+    fn versioned_name_appends_for_non_html_names() {
+        assert_eq!(versioned_artifact_name("body.bin", 2), "body.bin.r2");
+    }
 
     #[test]
     fn extracts_lowercased_host() {

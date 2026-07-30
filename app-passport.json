@@ -1,0 +1,97 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-07-27",
+  "generatedBy": "personas passport-onboard",
+  "dimensions": {
+    "context-coverage": {
+      "level": "full",
+      "tool": "Vibeman context map",
+      "skippedByChoice": false,
+      "note": "22 contexts across 7 groups in context-map.json; audit.ok true. No in-repo work needed — the scan is the app's job."
+    },
+    "agent-instructions": {
+      "level": "present",
+      "tool": "CLAUDE.md",
+      "skippedByChoice": false,
+      "note": "Root CLAUDE.md carries verified commands, crate-tree sketch and the dependency rule; .claude/CLAUDE.md remains the policy file."
+    },
+    "documentation": {
+      "level": "source-synced",
+      "tool": "feature-doc-map + Stop hook",
+      "skippedByChoice": false,
+      "note": "15 feature docs coupled to source globs and enforced per-session. catalog/ and plugins-src/ entries are inert pending a SKIP_PATTERNS change in the checker."
+    },
+    "agent-memory": {
+      "level": "curated",
+      "tool": "MEMORY.md",
+      "skippedByChoice": false,
+      "note": "Root MEMORY.md now indexes the .perfect/ vault plus five verified invariants, so memory survives outside one machine."
+    },
+    "skills": {
+      "level": "present",
+      "tool": "Claude Code skills",
+      "skippedByChoice": false,
+      "note": "Seven skills tracked in-repo: architect, perfect, passport-onboard, explorer, tiger, ship-loop, research. UI/desktop-specific skills deliberately not adopted."
+    },
+    "hosting": {
+      "level": "local",
+      "tool": "just",
+      "skippedByChoice": false,
+      "note": "Local-first by design: loopback bind, single-file SQLite, real Chrome and a browser profile with login cookies. Containerization deliberately declined."
+    },
+    "database": {
+      "level": "versioned",
+      "tool": "sqlx migrate",
+      "skippedByChoice": false,
+      "note": "20 ordered migrations applied at startup, now preceded by an automatic VACUUM INTO backup with keep-3 retention and guarded by a replay test."
+    },
+    "auth": {
+      "level": "none",
+      "tool": null,
+      "skippedByChoice": true,
+      "note": "No inbound auth; posture documented explicitly with the loopback precondition. Binding to a non-loopback interface without adding auth is unsafe."
+    },
+    "ci": {
+      "level": "gated",
+      "tool": "GitHub Actions",
+      "skippedByChoice": false,
+      "note": "fmt, clippy -D warnings and the full test suite now fail the build; a weekly cargo-deny audit runs alongside. Branch protection is a server-side setting still to be enabled."
+    },
+    "tests": {
+      "level": "partial",
+      "tool": "cargo test",
+      "skippedByChoice": false,
+      "note": "Roughly 390 tests across all workspace crates plus an in-crate e2e suite; env-dependent tests stay behind #[ignore] and do not run in CI."
+    },
+    "evals": {
+      "level": "partial",
+      "tool": "cargo test",
+      "skippedByChoice": false,
+      "note": "Golden-fixture eval over the tier-3 extraction path: 10 real frozen pages with recorded transcripts, scored offline, with adversarial-mutation tests proving it can fail."
+    },
+    "observability": {
+      "level": "errors",
+      "tool": "Sentry",
+      "skippedByChoice": false,
+      "note": "SDK wired at the server entry point, env-tagged, release-stamped, degrading silently without a DSN. Errors only; no performance tracing, no PII. Credential binding still outstanding."
+    },
+    "llm-tracking": {
+      "level": "present",
+      "tool": "in-repo cost meter",
+      "skippedByChoice": false,
+      "note": "All model calls funnel through one chokepoint carrying cache, budget clamp and cost metering; enforced structurally by visibility plus an inventory guard. No vendor tracing tool."
+    },
+    "security": {
+      "level": "audited",
+      "tool": "cargo-deny",
+      "skippedByChoice": false,
+      "note": "Supply-chain audit in CI with two advisories fixed and two waived explicitly with stated exposure; request bodies now bounded. License gate written but not yet enforced."
+    },
+    "app-cost": {
+      "level": "known",
+      "tool": null,
+      "skippedByChoice": false,
+      "note": "Ledger composed from this run's connector decisions; kept local and untracked by design."
+    }
+  }
+}

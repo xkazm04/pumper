@@ -1,0 +1,163 @@
+# cargo-deny — supply-chain gate for the Pumper workspace.
+#
+# Why cargo-deny rather than cargo-audit: this workspace fetches untrusted web
+# content (crawler/fetcher), renders it in a headless browser, and executes
+# operator-supplied WASM plugins. cargo-audit covers ONLY the RUSTSEC advisory
+# DB. cargo-deny covers that same DB *plus* the three other supply-chain
+# questions that actually matter for a binary in that position:
+#   · sources  — is every crate coming from crates.io, or did a git/unknown
+#                registry dependency sneak in? (the highest-leverage check for a
+#                service that ships a single binary)
+#   · bans     — duplicate/wildcard versions, so a vulnerable copy can't linger
+#                behind a second major
+#   · licenses — the binary is redistributable; copyleft has to be a decision,
+#                not an accident
+# One tool, one config, one CI step.
+#
+# Run locally: `cargo deny check`
+
+[graph]
+# Check the dependency graph as it resolves on the platforms we actually ship
+# and develop on. Leaving this empty would evaluate every target triple in the
+# lockfile (including ones we never build), producing findings we cannot act on.
+targets = [
+    { triple = "x86_64-unknown-linux-gnu" },
+    { triple = "x86_64-pc-windows-msvc" },
+    { triple = "aarch64-apple-darwin" },
+]
+all-features = true
+
+[output]
+feature-depth = 1
+
+# ---------------------------------------------------------------------------
+# Advisories (RUSTSEC)
+# ---------------------------------------------------------------------------
+[advisories]
+# Anything with a real CVE/RUSTSEC vulnerability fails the build. No exceptions
+# are configured on purpose: a vulnerability with an available upgrade must be
+# fixed by bumping Cargo.lock, not waived here.
+yanked = "deny"
+unmaintained = "all"
+
+# Every entry below is an EXPLICIT, reasoned waiver. Adding one without a
+# `reason` naming the exposure is a review failure.
+ignore = [
+    # fxhash 0.2.1 — unmaintained (repo stale, owner inactive).
+    #   Path: pumper-core / app-hackernews -> scraper 0.23 -> selectors 0.26 -> fxhash
+    #   Upgrade path: NONE. `cargo update -p fxhash` resolves nothing newer;
+    #   the crate is dead upstream and `selectors` pins it. Fixing it requires
+    #   scraper/selectors to migrate to rustc-hash — out of our control.
+    #   Exposure: fxhash is used purely as a HashMap hasher inside the CSS
+    #   selector matcher. It is NOT a cryptographic hash and is not DoS-resistant,
+    #   so the theoretical risk is hash-collision CPU burn. Reaching it requires
+    #   attacker control of the *selector set*, which is operator-supplied config
+    #   in this workspace (extract rules / app code), not crawled content. The
+    #   crawled HTML side is bounded by the fetcher's body limits. Judged low.
+    #   Follow-up: drop this waiver when scraper ships a selectors release using
+    #   rustc-hash.
+    { id = "RUSTSEC-2025-0057", reason = "fxhash unmaintained; transitive-only via scraper->selectors with no upgrade available; hasher for operator-supplied CSS selectors, not attacker-controlled input" },
+
+    # paste 1.0.15 — unmaintained (author archived the repository).
+    #   Path: pumper-server -> utoipa-axum 0.2 -> paste
+    #   Upgrade path: NONE. The crate is archived at its final version; the
+    #   suggested replacements (`pastey`, `with_builtin_macros`) would have to be
+    #   adopted by utoipa-axum, not by us.
+    #   Exposure: NONE at runtime. `paste` is a proc-macro — it runs at compile
+    #   time on our own build machines and contributes zero bytes to the shipped
+    #   binary. An unmaintained proc-macro is a build-reproducibility concern,
+    #   not an attack surface for the crawler or the WASM sandbox.
+    #   Follow-up: drop this waiver when utoipa-axum releases without paste.
+    { id = "RUSTSEC-2024-0436", reason = "paste unmaintained; compile-time proc-macro only via utoipa-axum, contributes no runtime code to the binary; no upgrade available" },
+]
+
+# ---------------------------------------------------------------------------
+# Licenses
+# ---------------------------------------------------------------------------
+#
+# STATUS: this section is complete and correct for every THIRD-PARTY crate in the
+# tree (verified 2026-07-26: zero third-party rejections against the allow list
+# below). It is NOT yet in the CI `cargo deny check` step, because the 31
+# workspace member crates carry no `license` field and cargo-deny reports each as
+# `unlicensed`. `[licenses.private] ignore = true` only skips members marked
+# `publish = false`, which none of them are.
+# FOLLOW-UP to turn this on: add `publish = false` to each `crates/*/Cargo.toml`
+# (they are path-only members and are never published), then add `licenses` to
+# the CI step in .github/workflows/ci.yml. Run `cargo deny check licenses`
+# locally to confirm it goes green.
+[licenses]
+# Permissive licenses compatible with shipping a closed or open binary.
+allow = [
+    "MIT",
+    "MIT-0",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "zlib-acknowledgement",
+    "Unlicense",
+    "CC0-1.0",
+    "BSL-1.0",
+    # Unicode-3.0 — the ICU4X / zerovec family (idna, unicode normalization)
+    # pulled in by the URL and HTTP stacks. Permissive, data-license style.
+    "Unicode-3.0",
+    # MPL-2.0 — weak, FILE-level copyleft. Reached only via the CSS/HTML parsing
+    # stack (cssparser, cssparser-macros, dtoa-short, selectors <- scraper). We
+    # link these unmodified, so the MPL obligation is satisfied by leaving their
+    # source available upstream; it does not reach Pumper's own sources.
+    # Deliberate allow, not an accident.
+    "MPL-2.0",
+]
+confidence-threshold = 0.8
+
+# Per-crate exceptions: licenses we accept for ONE named crate only.
+exceptions = [
+    # ittapi / ittapi-sys are "GPL-2.0-only OR BSD-3-Clause" — we take the
+    # BSD-3-Clause arm. They arrive via wasmtime's VTune profiling support and
+    # are not enabled in our release profile. Listed explicitly so the GPL arm
+    # can never be silently selected elsewhere.
+    { allow = ["BSD-3-Clause"], crate = "ittapi" },
+    { allow = ["BSD-3-Clause"], crate = "ittapi-sys" },
+]
+
+[licenses.private]
+# The workspace crates are unpublished; don't demand a license expression of them.
+ignore = true
+
+# ---------------------------------------------------------------------------
+# Bans / duplicate versions
+# ---------------------------------------------------------------------------
+[bans]
+# Duplicates warn rather than fail: the tree currently carries two majors of the
+# windows-sys target shims and of winnow, which are transitive and not ours to
+# unify. Warning keeps them visible without blocking every unrelated PR.
+multiple-versions = "warn"
+# Wildcard version requirements defeat the point of auditing a lockfile, but
+# cargo-deny counts intra-workspace `path` dependencies as wildcards for any
+# member it considers publishable — and none of our members set
+# `publish = false`, so every `pumper-core.workspace = true` is flagged.
+# `allow-wildcard-paths` explicitly does not apply to "public" crates, so it
+# cannot rescue this. Left as "allow" until the same `publish = false` follow-up
+# noted in [licenses] lands, at which point this should become "deny".
+wildcards = "allow"
+highlight = "all"
+
+[bans.workspace-dependencies]
+duplicates = "warn"
+include-path-dependencies = true
+unused = "warn"
+
+# ---------------------------------------------------------------------------
+# Sources
+# ---------------------------------------------------------------------------
+[sources]
+# The strictest and most valuable check here: every crate must come from
+# crates.io. A git dependency or a private registry is the cheapest way to slip
+# code into a binary that crawls the web and runs WASM, so both are hard errors
+# and adding one requires editing this file.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

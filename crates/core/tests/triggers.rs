@@ -25,6 +25,7 @@ async fn trigger_crud_idempotent_fire_and_lineage() {
             budget_usd: Some(2.0),
             priority: 5,
             max_attempts: 1,
+            filters: None,
         })
         .await
         .expect("create trigger");
@@ -84,4 +85,86 @@ async fn trigger_crud_idempotent_fire_and_lineage() {
         .is_empty());
     assert!(storage.delete_trigger(&trigger.id).await.unwrap());
     assert!(storage.get_trigger(&trigger.id).await.unwrap().is_none());
+}
+
+#[tokio::test]
+async fn ingress_sources_and_external_triggers_roundtrip() {
+    let store = pumper_core::testing::TempStore::new("ingress-test").await;
+    let storage = &store.storage;
+
+    // Ingress source CRUD.
+    let src = storage
+        .create_ingress_source("github", "hush")
+        .await
+        .expect("create ingress source");
+    assert!(src.enabled);
+    assert_eq!(src.name, "github");
+    assert_eq!(src.secret, "hush");
+    // The secret never serializes (list/read responses must not leak it).
+    let json = serde_json::to_value(&src).unwrap();
+    assert!(json.get("secret").is_none(), "secret must not serialize");
+    assert_eq!(storage.list_ingress_sources().await.unwrap().len(), 1);
+
+    // External trigger with payload predicates persists filters verbatim.
+    let trig = storage
+        .create_trigger(&NewTrigger {
+            name: Some("push-to-crawl"),
+            source_kind: "external",
+            source_app: &src.id,
+            source_dataset: None,
+            on_change: None,
+            on_status: None,
+            target_app: "crawl",
+            params: &json!({ "url": "https://acme.dev/docs" }),
+            budget_usd: None,
+            priority: 0,
+            max_attempts: 1,
+            filters: Some(&["$.ref:eq:refs/heads/main".to_string()]),
+        })
+        .await
+        .expect("create external trigger");
+    assert_eq!(
+        trig.filters.as_deref(),
+        Some(&["$.ref:eq:refs/heads/main".to_string()][..])
+    );
+
+    // Wildcard trigger matches every source; the evaluation set carries both.
+    storage
+        .create_trigger(&NewTrigger {
+            name: Some("any-source"),
+            source_kind: "external",
+            source_app: "*",
+            source_dataset: None,
+            on_change: None,
+            on_status: None,
+            target_app: "crawl",
+            params: &json!({}),
+            budget_usd: None,
+            priority: 0,
+            max_attempts: 1,
+            filters: None,
+        })
+        .await
+        .expect("create wildcard trigger");
+    let set = storage.enabled_external_triggers(&src.id).await.unwrap();
+    assert_eq!(set.len(), 2, "exact + wildcard both evaluate");
+    // A different source only sees the wildcard.
+    assert_eq!(
+        storage.enabled_external_triggers("other").await.unwrap().len(),
+        1
+    );
+
+    // Disable/delete round-trip.
+    assert!(storage
+        .set_ingress_source_enabled(&src.id, false)
+        .await
+        .unwrap());
+    assert!(!storage
+        .get_ingress_source(&src.id)
+        .await
+        .unwrap()
+        .unwrap()
+        .enabled);
+    assert!(storage.delete_ingress_source(&src.id).await.unwrap());
+    assert!(storage.get_ingress_source(&src.id).await.unwrap().is_none());
 }

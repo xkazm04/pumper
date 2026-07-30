@@ -27,7 +27,7 @@ A long-running app reports compact progress snapshots through `AppContext::progr
 
 ## Scheduler
 
-DB-backed cron (6-field, with seconds) reconciled every `schedule_tick_secs`. Apps can declare a static schedule (`ScrapeApp::schedule`, seeded idempotently); runtime CRUD via `GET/POST /schedules`, `DELETE /schedules/{id}`, `POST /schedules/{id}/enabled`. **Overlap guard:** a schedule whose previous job is still queued/running skips the tick without touching `last_run`, so exactly one catch-up run fires when it frees up.
+DB-backed cron (6-field, with seconds) reconciled every `schedule_tick_secs`. Two other periodic jobs ride the same tick rather than owning a timer: the **stuck-job reaper** (above) and the **webhook dead-letter drain** (`[webhooks] auto_retry`, see [events-webhooks.md](events-webhooks.md)). Apps can declare a static schedule (`ScrapeApp::schedule`, seeded idempotently); runtime CRUD via `GET/POST /schedules`, `DELETE /schedules/{id}`, `POST /schedules/{id}/enabled`. **Overlap guard:** a schedule whose previous job is still queued/running skips the tick without touching `last_run`, so exactly one catch-up run fires when it frees up.
 
 Each schedule carries three cron-maturity fields (`schedules` table cols `timezone`, `misfire_policy`, `max_attempts`; all set at `POST /schedules` and returned by `GET /schedules`):
 
@@ -49,11 +49,19 @@ Each schedule carries three cron-maturity fields (`schedules` table cols `timezo
 
 ## AppContext (what a running app gets)
 
-`job_id`, `app`, `params`, `engines`, `datasets`, `costs`, `budget_usd`, `research_cache`, `tiers`, `plugins`, `progress` (throttled live-progress seam — see [Live progress](#live-progress)), `artifacts_dir` + helpers: `fetch` (metered, budget-governed, tier-routed), `research` (metered, cached), `upsert`/`upsert_many`/`sync_many`, `save_artifact`, `require_str`, `remaining_budget_usd`.
+`job_id`, `app`, `params`, `engines`, `datasets`, `costs`, `budget_usd`, `research_cache`, `tiers`, `plugins`, `progress` (throttled live-progress seam — see [Live progress](#live-progress)), `health` (extraction-health judge — see below), `artifacts_dir` + helpers: `fetch` (metered, budget-governed, tier-routed), `research` (metered, cached), `upsert`/`upsert_many`/`sync_many`, `observe_extraction`, `save_artifact`, `require_str`, `remaining_budget_usd`.
+
+**Health-gated writes.** `upsert`/`upsert_many`/`sync_many` consult the source's extraction-health state before writing: a quarantined source's writes are redirected to the shadow dataset `<dataset>@q` (an ordinary dataset, so every existing tool works on it) and stamped with a trust marker, and `sync_many` silently **downgrades to `upsert_many`** when the state suppresses removals — a half-broken run returns a short-but-nonempty batch, and removal detection would then tombstone every key missing from it. The check lives in `AppContext`, the one method every caller reaches removal detection through, not in each app. `observe_extraction(dataset, docs, fetch)` records the run's verdict and must be called **before** the upserts it is meant to gate. All of this is inert while `[resilience] enforce = false` (the shipping default — verdicts are computed and stored, nothing is gated). Full surface: [resilient-extraction.md](resilient-extraction.md).
 
 ## Config
 
-`config.toml` (or `$PUMPER_CONFIG`), `#[serde(default)]` throughout — sections: `server, worker, storage, http, browser, claude, governor, cache, plugins, search, triggers, webhooks`. New fields need both the serde default and the manual `Default` impl. `[webhooks]` holds `failure_url`/`failure_secret` — the optional global `job.failed` firehose (see [events-webhooks.md](events-webhooks.md)).
+`config.toml` (or `$PUMPER_CONFIG`; both resolved **relative to the process CWD**), `#[serde(default)]` throughout — sections: `server, worker, storage, http, browser, claude, fetcher, governor, cache, plugins, search, triggers, webhooks, resilience, datahub`. New fields need both the serde default and the manual `Default` impl. `[fetcher]` holds the tiered-fetch and host-memory knobs (see [fetching.md](fetching.md)); `[resilience]` the extraction-health detector (see [resilient-extraction.md](resilient-extraction.md)); `[datahub]` the metadata emitter (see [datahub.md](datahub.md)). `[webhooks]` holds `failure_url`/`failure_secret` — the optional global `job.failed` firehose (see [events-webhooks.md](events-webhooks.md)).
+
+## Process startup & error reporting
+
+`main` (`crates/server/src/main.rs`) is **synchronous**: it loads `.env`, initializes error reporting, installs the tracing subscriber, and only then builds the tokio runtime and enters `run()`. The Sentry transport owns a background thread that must not be born inside a runtime about to be torn down, which is what forces that order.
+
+**Error reporting is optional and off by default.** `SENTRY_DSN` unset, empty, or whitespace-only ⇒ reporting is disabled silently and the process boots identically to before; a malformed DSN ⇒ one `warn!` at boot, then reporting off — a bad DSN never stops the service. `SENTRY_ENVIRONMENT` tags events (default `local`), and `PUMPER_BUILD_ID` doubles as the Sentry release so a release and an extraction-health run row name the same build. stdout logging is unchanged either way — the Sentry layer is composed *beside* the `fmt` layer, so `error!` becomes an event and `warn!`/`info!` become breadcrumbs. `traces_sample_rate = 0.0`, `send_default_pii = false`. Full surface: [observability.md](observability.md).
 
 ## Metrics
 

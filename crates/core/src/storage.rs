@@ -9,6 +9,7 @@ use sqlx::SqlitePool;
 use uuid::Uuid;
 
 use crate::config::StorageConfig;
+use crate::datasets::DerivedSpec;
 use crate::job::{Job, JobStatus};
 use crate::{Error, Result};
 
@@ -75,6 +76,10 @@ pub struct Schedule {
     pub misfire_policy: String,
     /// Attempt budget for jobs this schedule enqueues; `None` = server default.
     pub max_attempts: Option<i64>,
+    /// Which controller owns this row: `None` = hand-made / code-seeded (sacred —
+    /// the catalog reconciler never touches these); `Some("catalog")` = driven by
+    /// `catalog/data-sources.toml` via the reconciler.
+    pub managed_by: Option<String>,
     pub last_run: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
@@ -82,7 +87,7 @@ pub struct Schedule {
 /// Column list shared by every `schedules` SELECT (kept in sync with `ScheduleRow`).
 const SCHEDULE_COLUMNS: &str =
     "id, app, cron, params, enabled, priority, timezone, misfire_policy, max_attempts, \
-     last_run, created_at";
+     managed_by, last_run, created_at";
 
 /// Create-time fields for a schedule (borrowed; storage assigns id/enabled/time).
 #[derive(Debug, Clone)]
@@ -97,6 +102,13 @@ pub struct NewSchedule<'a> {
     pub misfire_policy: &'a str,
     /// `None` = server default attempt budget.
     pub max_attempts: Option<i64>,
+}
+
+/// The compile-time-embedded migration chain (`crates/core/migrations`,
+/// `0001_init.sql` …). Exposed so the pre-migration backup can count pending
+/// versions and the replay test can assert the chain's shape.
+pub fn migrator() -> sqlx::migrate::Migrator {
+    sqlx::migrate!("./migrations")
 }
 
 /// Durable job store on SQLite (WAL). Jobs survive restarts; `recover_stuck`
@@ -123,7 +135,13 @@ impl Storage {
             .max_connections(8)
             .connect_with(options)
             .await?;
-        sqlx::migrate!("./migrations")
+        // Codified operator ritual: snapshot the database before advancing the
+        // schema. No-ops for fresh/up-to-date/in-memory databases, so the test
+        // harness (`testing::TempStore`) never writes a backup — see
+        // `backup::backup_decision`.
+        let migrator = migrator();
+        crate::backup::backup_before_migrations(&pool, &cfg.database_path, &migrator).await;
+        migrator
             .run(&pool)
             .await
             .map_err(|e| Error::Storage(sqlx::Error::Migrate(Box::new(e))))?;
@@ -820,10 +838,15 @@ impl Storage {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_trigger(&self, t: &NewTrigger<'_>) -> Result<Trigger> {
         let id = Uuid::new_v4().to_string();
+        let filters_json = t
+            .filters
+            .filter(|f| !f.is_empty())
+            .map(|f| serde_json::to_string(f).unwrap_or_else(|_| "[]".into()));
         sqlx::query(
             "INSERT INTO triggers (id, name, source_kind, source_app, source_dataset, on_change, \
-             on_status, target_app, params, budget_usd, priority, max_attempts, enabled, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13)",
+             on_status, target_app, params, budget_usd, priority, max_attempts, enabled, created_at, \
+             filters) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14)",
         )
         .bind(&id)
         .bind(t.name)
@@ -838,6 +861,7 @@ impl Storage {
         .bind(t.priority)
         .bind(t.max_attempts.max(1))
         .bind(now())
+        .bind(filters_json)
         .execute(&self.pool)
         .await?;
         self.get_trigger(&id)
@@ -1250,6 +1274,410 @@ impl Storage {
         .await?;
         row.map(Delivery::try_from).transpose()
     }
+
+    // ── ingress ──────────────────────────────────────────────────────────────
+    // Inbound event ingress sources: per-caller credentials for POST /ingest/{id}.
+
+    pub async fn create_ingress_source(&self, name: &str, secret: &str) -> Result<IngressSource> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO ingress_sources (id, name, secret, enabled, created_at) \
+             VALUES (?1, ?2, ?3, 1, ?4)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(secret)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_ingress_source(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_ingress_source(&self, id: &str) -> Result<Option<IngressSource>> {
+        let row: Option<IngressSourceRow> = sqlx::query_as(
+            "SELECT id, name, secret, enabled, created_at FROM ingress_sources WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(IngressSource::try_from).transpose()
+    }
+
+    pub async fn list_ingress_sources(&self) -> Result<Vec<IngressSource>> {
+        let rows: Vec<IngressSourceRow> = sqlx::query_as(
+            "SELECT id, name, secret, enabled, created_at FROM ingress_sources ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(IngressSource::try_from).collect()
+    }
+
+    pub async fn set_ingress_source_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE ingress_sources SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_ingress_source(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM ingress_sources WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Enabled external-kind triggers for one ingress source — the evaluation
+    /// set for an inbound event. `source_app = '*'` triggers match every source.
+    pub async fn enabled_external_triggers(&self, source_id: &str) -> Result<Vec<Trigger>> {
+        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+            "SELECT {TRIGGER_COLUMNS} FROM triggers \
+             WHERE source_kind = 'external' AND (source_app = ?1 OR source_app = '*') \
+             AND enabled = 1"
+        ))
+        .bind(source_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Trigger::try_from).collect()
+    }
+
+    // ── reconcile ───────────────────────────────────────────────────────────
+    // Catalog GitOps reconciler (M19). Every mutating method here is fenced
+    // with `AND managed_by = ?tag` in SQL so an untagged (hand-made or
+    // code-seeded) schedule can never be touched, even by a buggy plan.
+
+    /// Creates (or re-syncs) the catalog-managed schedule for `app`, tagged
+    /// `managed_by = tag`. Id is the stable `catalog-<app>` so re-applying a plan
+    /// is idempotent; a conflicting re-apply updates cron and re-enables rather
+    /// than duplicating. Params stay `{}` — the scheduler falls back to the
+    /// app's `default_params()` at fire time.
+    pub async fn create_managed_schedule(
+        &self,
+        app: &str,
+        cron: &str,
+        tag: &str,
+    ) -> Result<Schedule> {
+        let id = format!("catalog-{app}");
+        sqlx::query(
+            "INSERT INTO schedules (id, app, cron, params, enabled, priority, managed_by, created_at) \
+             VALUES (?1, ?2, ?3, '{}', 1, 0, ?4, ?5) \
+             ON CONFLICT(id) DO UPDATE SET cron = excluded.cron, enabled = 1 \
+             WHERE schedules.managed_by = excluded.managed_by",
+        )
+        .bind(&id)
+        .bind(app)
+        .bind(cron)
+        .bind(tag)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_schedule(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    /// Updates the cron of a schedule owned by `tag` (and re-enables it, since
+    /// the desired state of a cron-bearing catalog row is "running"). Returns
+    /// `false` when the row doesn't exist *or isn't owned by `tag`* — the fence.
+    pub async fn set_managed_schedule_cron(
+        &self,
+        id: &str,
+        cron: &str,
+        tag: &str,
+    ) -> Result<bool> {
+        let result =
+            sqlx::query("UPDATE schedules SET cron = ?2, enabled = 1 WHERE id = ?1 AND managed_by = ?3")
+                .bind(id)
+                .bind(cron)
+                .bind(tag)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Enables/disables a schedule owned by `tag`. Returns `false` when the row
+    /// doesn't exist *or isn't owned by `tag`* — the fence.
+    pub async fn set_managed_schedule_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        tag: &str,
+    ) -> Result<bool> {
+        let result =
+            sqlx::query("UPDATE schedules SET enabled = ?2 WHERE id = ?1 AND managed_by = ?3")
+                .bind(id)
+                .bind(enabled as i64)
+                .bind(tag)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    // ── checkpoints ──────────────────────────────────────────────────────────
+
+    /// Persists a job's durable-execution checkpoint, guarded by the same
+    /// attempts-lineage rule as [`complete`](Self::complete): the write only
+    /// lands while `(id, attempt)` still owns the `running` row, so a stale task
+    /// whose job was reset/reaped and re-claimed can never overwrite the live
+    /// attempt's checkpoint. Returns whether the write landed (`false` = stale,
+    /// discarded). Oversized blobs (> [`MAX_CHECKPOINT_BYTES`]) are rejected
+    /// with an error — a checkpoint that big is a bug, not state.
+    pub async fn save_checkpoint(&self, id: Uuid, attempt: i64, state: &Value) -> Result<bool> {
+        let blob = state.to_string();
+        if blob.len() > MAX_CHECKPOINT_BYTES {
+            return Err(Error::App(format!(
+                "checkpoint too large: {} bytes (cap {MAX_CHECKPOINT_BYTES})",
+                blob.len()
+            )));
+        }
+        // INSERT..SELECT so the lineage guard and the upsert are one atomic
+        // statement; `resume_failures` is preserved across overwrites (it counts
+        // restores handed out, not writes). The SELECT's WHERE clause also
+        // disambiguates the UPSERT grammar for SQLite's parser.
+        let r = sqlx::query(
+            "INSERT INTO checkpoints (job_id, state, attempt, resume_failures, updated_at) \
+             SELECT ?1, ?2, ?3, 0, ?4 FROM jobs \
+             WHERE id = ?1 AND status = 'running' AND attempts = ?3 \
+             ON CONFLICT(job_id) DO UPDATE SET \
+               state = excluded.state, attempt = excluded.attempt, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(id.to_string())
+        .bind(blob)
+        .bind(attempt)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// A job's stored checkpoint as `(state, resume_failures)`, or `None`. A
+    /// blob that no longer parses is treated as absent (never resumed from
+    /// silently) — the caller decides whether to clear it.
+    pub async fn load_checkpoint(&self, id: Uuid) -> Result<Option<(Value, i64)>> {
+        let row: Option<(String, i64)> =
+            sqlx::query_as("SELECT state, resume_failures FROM checkpoints WHERE job_id = ?1")
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|(state, failures)| {
+            serde_json::from_str(&state)
+                .ok()
+                .map(|v: Value| (v, failures))
+        }))
+    }
+
+    /// Counts one restore handed out from a job's checkpoint (called at claim
+    /// time, before the attempt runs) and returns the new count. The counter is
+    /// the poisoned-checkpoint escape: attempts that *complete* clear the row,
+    /// so a count that keeps growing means every restored attempt has failed.
+    pub async fn bump_checkpoint_resumes(&self, id: Uuid) -> Result<i64> {
+        let n: Option<i64> = sqlx::query_scalar(
+            "UPDATE checkpoints SET resume_failures = resume_failures + 1 \
+             WHERE job_id = ?1 RETURNING resume_failures",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(n.unwrap_or(0))
+    }
+
+    /// Drops a job's checkpoint (on terminal completion, or when the blob is
+    /// judged poisoned). Idempotent.
+    pub async fn clear_checkpoint(&self, id: Uuid) -> Result<()> {
+        sqlx::query("DELETE FROM checkpoints WHERE job_id = ?1")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // ── api recipes ──────────────────────────────────────────────────────────
+
+    /// Handle to the API X-ray recipe store (`api_recipes`, migration 0025) on
+    /// this database. The SQL lives on [`crate::recipes::RecipeStore`] (the
+    /// `TierMemory` pattern: a small pool-wrapping handle shared on
+    /// `AppContext`); this is the one constructor the server/routes reach it by.
+    pub fn recipes(&self) -> crate::recipes::RecipeStore {
+        crate::recipes::RecipeStore::new(self.pool.clone())
+    }
+
+    // ── job yield ────────────────────────────────────────────────────────────
+
+    /// Persists the yield entries parsed from one completed job's result
+    /// ([`crate::costs::extract_yields`]) — one row per summary the result
+    /// carried. `None` counts store as NULL (the result didn't report that
+    /// number), never 0. Best-effort telemetry: callers log-and-continue on
+    /// error, a job's outcome must never hinge on its accounting.
+    pub async fn record_job_yield(
+        &self,
+        job_id: Uuid,
+        app: &str,
+        entries: &[crate::costs::YieldEntry],
+    ) -> Result<()> {
+        let at = now();
+        for e in entries {
+            sqlx::query(
+                "INSERT INTO job_yield (job_id, app, dataset, new_count, changed_count, \
+                 unchanged_count, removed_count, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            )
+            .bind(job_id.to_string())
+            .bind(app)
+            .bind(&e.dataset)
+            .bind(e.new)
+            .bind(e.changed)
+            .bind(e.unchanged)
+            .bind(e.removed)
+            .bind(&at)
+            .execute(&self.pool)
+            .await?;
+        }
+        Ok(())
+    }
+
+    /// Yield grouped by (app, dataset) since a cutoff — the economics window
+    /// query. `SUM` over SQL NULLs stays NULL, so an app whose results never
+    /// reported a count comes back `None` ("unknown"), distinct from `Some(0)`
+    /// ("reported zero") — the /economics math turns `None` into JSON null, not
+    /// $0 or a division.
+    pub async fn yield_summary(&self, since: DateTime<Utc>) -> Result<Vec<YieldSummary>> {
+        let rows = sqlx::query_as::<_, YieldSummary>(
+            "SELECT app, dataset, COUNT(DISTINCT job_id) AS jobs, \
+                    SUM(new_count) AS new, SUM(changed_count) AS changed, \
+                    SUM(unchanged_count) AS unchanged, SUM(removed_count) AS removed \
+             FROM job_yield WHERE created_at > ?1 \
+             GROUP BY app, dataset ORDER BY app, dataset",
+        )
+        .bind(crate::datasets::ts(since))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    // ── derived ──────────────────────────────────────────────────────────────
+    // CRUD for derived-dataset specs (M11). The hot-path read (enabled specs
+    // for one source) and the recompute/backfill mechanics live on `Datasets`;
+    // this is the management surface. Cycle rejection happens at create time
+    // here — the one write path a spec can enter through.
+
+    /// Creates a derived spec, assigning its id. Rejects a spec that would
+    /// close a cycle through the existing specs of the same app (including the
+    /// self-loop `source == target`) — acyclic chains stay bounded at runtime
+    /// by the depth cap, cycles never terminate and are refused at the door.
+    pub async fn create_derived_spec(&self, n: &NewDerivedSpec<'_>) -> Result<DerivedSpec> {
+        let existing = self.list_derived_specs(Some(n.source_app)).await?;
+        if crate::datasets::derived_would_cycle(&existing, n.source_dataset, n.target_dataset) {
+            return Err(Error::BadRequest(format!(
+                "derived spec '{}' -> '{}' would create a cycle",
+                n.source_dataset, n.target_dataset
+            )));
+        }
+        let id = Uuid::new_v4().to_string();
+        let lookup_json = n
+            .lookup
+            .map(|l| serde_json::to_string(l).unwrap_or_else(|_| "null".into()));
+        sqlx::query(
+            "INSERT INTO derived (id, source_app, source_dataset, target_dataset, filters, \
+             project, lookup, enabled, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 1, ?8)",
+        )
+        .bind(&id)
+        .bind(n.source_app)
+        .bind(n.source_dataset)
+        .bind(n.target_dataset)
+        .bind(serde_json::to_string(n.filters).unwrap_or_else(|_| "[]".into()))
+        .bind(serde_json::to_string(n.project).unwrap_or_else(|_| "{}".into()))
+        .bind(lookup_json)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_derived_spec(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_derived_spec(&self, id: &str) -> Result<Option<DerivedSpec>> {
+        let row: Option<crate::datasets::DerivedRow> = sqlx::query_as(&format!(
+            "SELECT {} FROM derived WHERE id = ?1",
+            crate::datasets::DERIVED_COLUMNS
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(DerivedSpec::try_from).transpose()
+    }
+
+    /// All derived specs, optionally filtered by source app.
+    pub async fn list_derived_specs(&self, app: Option<&str>) -> Result<Vec<DerivedSpec>> {
+        let rows: Vec<crate::datasets::DerivedRow> = sqlx::query_as(&format!(
+            "SELECT {} FROM derived WHERE (?1 IS NULL OR source_app = ?1) \
+             ORDER BY created_at, id",
+            crate::datasets::DERIVED_COLUMNS
+        ))
+        .bind(app)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(DerivedSpec::try_from).collect()
+    }
+
+    /// Per-spec kill-switch.
+    pub async fn set_derived_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE derived SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_derived_spec(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM derived WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+}
+
+/// Create-time fields for a derived spec (borrowed; storage assigns
+/// id/enabled/time). Filters are `$.path:op:value` specs (validated by the
+/// caller via `datasets::parse_filter_specs`); `project` maps
+/// `out_field -> "$.path"`.
+pub struct NewDerivedSpec<'a> {
+    pub source_app: &'a str,
+    pub source_dataset: &'a str,
+    pub target_dataset: &'a str,
+    pub filters: &'a [String],
+    pub project: &'a std::collections::BTreeMap<String, String>,
+    pub lookup: Option<&'a crate::datasets::DerivedLookup>,
+}
+
+/// Hard cap on one checkpoint blob (bytes). Generous enough for a 100k-URL
+/// crawl frontier (~a few MB) while keeping a runaway app from turning the jobs
+/// database into a blob store.
+pub const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
+
+/// One (app, dataset) group of the trailing-window yield rollup
+/// ([`Storage::yield_summary`]). Counts are `Option`: `None` means no result in
+/// the window reported that number — unknown, not zero.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct YieldSummary {
+    pub app: String,
+    /// `""` = the result-root summary; else the result's key path
+    /// (`"unified"`, `"datasets.velocity"`) — the closest thing the job-result
+    /// convention has to a dataset name.
+    pub dataset: String,
+    /// Distinct jobs that contributed rows to this group in the window.
+    pub jobs: i64,
+    pub new: Option<i64>,
+    pub changed: Option<i64>,
+    pub unchanged: Option<i64>,
+    pub removed: Option<i64>,
 }
 
 /// Job timing aggregates (seconds) for the metrics endpoint: execution duration
@@ -1320,7 +1748,7 @@ impl TryFrom<JobRow> for Job {
 
 const TRIGGER_COLUMNS: &str = "id, name, source_kind, source_app, source_dataset, on_change, \
                                on_status, target_app, params, budget_usd, priority, \
-                               max_attempts, enabled, created_at";
+                               max_attempts, enabled, created_at, filters";
 
 /// A reactive-pipeline edge: (source event) → (enqueue target app). The set of
 /// triggers is the pipeline DAG.
@@ -1345,6 +1773,10 @@ pub struct Trigger {
     pub max_attempts: i64,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
+    /// JSON-path predicate specs (`$.path:op:value`, the `?filter=` grammar)
+    /// ANDed against the inbound payload. External kind only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<Vec<String>>,
 }
 
 impl Trigger {
@@ -1368,6 +1800,8 @@ pub struct NewTrigger<'a> {
     pub budget_usd: Option<f64>,
     pub priority: i64,
     pub max_attempts: i64,
+    /// External kind only: `$.path:op:value` predicate specs (ANDed).
+    pub filters: Option<&'a [String]>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1386,6 +1820,7 @@ struct TriggerRow {
     max_attempts: i64,
     enabled: i64,
     created_at: String,
+    filters: Option<String>,
 }
 
 impl TryFrom<TriggerRow> for Trigger {
@@ -1407,6 +1842,10 @@ impl TryFrom<TriggerRow> for Trigger {
             max_attempts: r.max_attempts,
             enabled: r.enabled != 0,
             created_at: parse_ts(&r.created_at)?,
+            filters: r
+                .filters
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok()),
         })
     }
 }
@@ -1544,6 +1983,7 @@ struct ScheduleRow {
     timezone: Option<String>,
     misfire_policy: String,
     max_attempts: Option<i64>,
+    managed_by: Option<String>,
     last_run: Option<String>,
     created_at: String,
 }
@@ -1562,7 +2002,44 @@ impl TryFrom<ScheduleRow> for Schedule {
             timezone: r.timezone,
             misfire_policy: r.misfire_policy,
             max_attempts: r.max_attempts,
+            managed_by: r.managed_by,
             last_run: r.last_run.as_deref().map(parse_ts).transpose()?,
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+/// An inbound-event ingress source: the per-caller credential for
+/// `POST /ingest/{id}`. The secret signs every inbound body (HMAC-SHA256) and
+/// is never serialized into list/read responses.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngressSource {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing)]
+    pub secret: String,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct IngressSourceRow {
+    id: String,
+    name: String,
+    secret: String,
+    enabled: i64,
+    created_at: String,
+}
+
+impl TryFrom<IngressSourceRow> for IngressSource {
+    type Error = Error;
+
+    fn try_from(r: IngressSourceRow) -> Result<IngressSource> {
+        Ok(IngressSource {
+            id: r.id,
+            name: r.name,
+            secret: r.secret,
+            enabled: r.enabled != 0,
             created_at: parse_ts(&r.created_at)?,
         })
     }

@@ -62,6 +62,29 @@ profiles_dir = "data/profiles"
 enabled = true
 ttl_secs = 3600
 
+# Background cache refresher (M02 self-refreshing mirror) — piggybacks on the
+# scheduler tick to conditionally revalidate cached entries just before their
+# PREDICTED next change (an EWMA over the observed change gaps in the
+# `revalidations` log; GET /cache/freshness shows the model). Strictly polite:
+# each request is admitted only through the governor's non-blocking idle-slot
+# try_acquire, and hard per-tick budgets bound total background traffic.
+[refresher]
+enabled = false
+# horizon_secs = 300        # revalidate keys whose predicted change is within this window
+# global_per_tick = 10      # max background revalidations per scheduler tick
+# per_host_per_tick = 2     # max per host per tick
+# retention_days = 30       # revalidation-log retention
+
+# Tier-zero archive engine (Wayback Machine CDX, v1). When enabled AND a fetch
+# sets `archive_max_age` (seconds), the tiered fetcher tries a stored
+# web.archive.org snapshot BEFORE touching the live site — zero load on the
+# target, zero ban risk. A missing/older-than-window/thin snapshot always falls
+# through to the live ladder. Archive requests run through the normal HTTP
+# engine, so archive.org gets the same politeness governor as any host.
+[archive]
+enabled = false
+# base_url = "https://web.archive.org"   # override for a self-hosted pywb
+
 [browser]
 chrome_executable = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 headless = true
@@ -111,6 +134,17 @@ dir = "data/search-index"
 # failure_secret = "..."                                    # HMAC-SHA256 secret for failure_url
 auto_retry = true   # auto-drain the dead-letter queue: re-send failed deliveries with backoff (30s→1m→5m→30m→2h, then 'dead')
 
+# Inbound event ingress (POST /ingest/{id}) — HMAC-verified external webhooks
+# become `external` events on the bus that triggers can match (on 'external' +
+# source filter + $.path predicates). This is the FIRST write surface designed
+# for non-localhost callers, so it ships OFF; every source carries its own
+# signing secret. See docs/features/ingress.md for the GitHub worked example.
+[ingress]
+enabled = false
+# max_body_bytes = 262144    # hard cap per inbound event body (256 KiB)
+# rate_limit_per_min = 60    # per-source token bucket (also the burst size)
+# max_skew_secs = 300        # accepted clock skew for timestamped signatures
+
 # Extraction health — per-source degradation detection (see
 # docs/features/resilient-extraction.md). Detection is arithmetic over data the
 # extraction pass already produced, so it is effectively free; the only thing
@@ -137,6 +171,24 @@ invariant_min_confidence = 0.99
 invariant_violation_ratio = 0.2  # fraction of a cohort that must break one to count
 sketch_retention_runs = 60       # runs of per-field sketches kept (>= window_runs)
 
+# Catalog GitOps reconciler — treats catalog/data-sources.toml as desired state
+# for the schedules table. Boot always runs a DRY-RUN and logs drift loudly;
+# review with GET /catalog/reconcile, apply with POST /catalog/reconcile.
+# Only schedules tagged managed_by = "catalog" are ever written; hand-made and
+# code-seeded rows are sacred.
+[catalog]
+auto_reconcile = false   # true = apply the boot plan automatically (orphans are still never touched)
+
+# MCP server — mounts POST /mcp (streamable-HTTP JSON-RPC) exposing the app
+# registry, datasets, and search as native agent tools, plus catalog + app
+# manifests as resources. Read-mostly by design: the enqueue tool (the one that
+# spends money and loads targets) has its own switch AND a hard budget ceiling.
+# See docs/features/mcp.md for the .mcp.json client snippet.
+[mcp]
+enabled = false
+# allow_enqueue = false      # second opt-in: offer the enqueue_job tool at all
+# max_job_budget_usd = 1.0   # hard clamp on any MCP-enqueued job's budget_usd (0 = free tiers only)
+
 # DataHub metadata shadow — pushes dataset entities, inferred schema, lineage,
 # and per-run freshness (operation) events to a DataHub GMS. Metadata only;
 # record data never leaves the local store. See docs/features/datahub.md.
@@ -147,3 +199,17 @@ gms_url = "http://localhost:8080"             # local docker quickstart (Cloud: 
 # env = "PROD"                                # URN fabric segment
 # emit_schema = true                          # infer schemaMetadata from each dataset's newest record
 # emit_profile = true                         # emit row-count datasetProfile
+
+# Information economics (M04) — GET /economics joins the cost ledger with
+# per-job yield (job_yield) into $/new-record and $/changed-record per app over
+# trailing 7d/30d windows, plus an ADVISORY budget/cadence recommendation per
+# app. Advisory only: enforce is a stub for the deferred enforcement mode
+# (scheduler reads the planner's budgets) and nothing acts on it yet.
+[economics]
+enforce = false          # DEFERRED seam — inert today, ships OFF so landing enforcement can't silently start moving money
+# Per-app value weights: how much one fresh (new/changed) record from an app is
+# worth relative to the fleet baseline 1.0 (a rare grant >> one HN row).
+# Unlisted apps weigh 1.0.
+[economics.weights]
+# grants-gov = 5.0
+# hackernews = 0.2

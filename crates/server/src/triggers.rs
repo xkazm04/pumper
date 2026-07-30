@@ -148,79 +148,92 @@ pub fn terminal_trigger_obj(
 }
 
 /// At-most-once-per-source-run dedup key (existing partial unique index).
+/// External triggers reuse it with the inbound event id as the source, so a
+/// redelivered webhook (same `x-pumper-delivery-id`) fires each trigger once.
 pub fn idempotency_key(trigger_id: &str, source_job_id: &str) -> String {
     format!("trig:{trigger_id}:{source_job_id}")
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+// ── external (ingress) matching ──────────────────────────────────────────────
 
-    fn cfg() -> TriggersConfig {
-        TriggersConfig {
-            max_depth: 3,
-            key_cap: 2,
+/// Resolves a `$.a.b` JSON path against `payload` (objects only — the `?filter=`
+/// grammar has no array indexing, matching the store-level SQL semantics).
+fn lookup_path<'a>(payload: &'a Value, path: &str) -> Option<&'a Value> {
+    let mut cur = payload;
+    for seg in path.trim_start_matches("$.").split('.') {
+        cur = cur.get(seg)?;
+    }
+    Some(cur)
+}
+
+/// Scalar-to-text projection mirroring SQLite's `->>` used by the store-level
+/// filters: strings stay bare, numbers/bools render, null/objects/arrays don't
+/// participate in text comparisons.
+fn value_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
+/// True when ONE filter holds against the payload. Semantics mirror the SQL
+/// `push_json_filters` mapping: `Eq` exact text, `Contains` case-insensitive
+/// substring, `Gte`/`Lte` lexicographic text, `NumGteAny` numeric `>=` on any
+/// of its paths (non-numbers never match, like the SQL `json_type` guard).
+fn filter_matches(filter: &pumper_core::datasets::JsonFilter, payload: &Value) -> bool {
+    use pumper_core::datasets::JsonFilter;
+    match filter {
+        JsonFilter::Eq { path, value } => {
+            lookup_path(payload, path).and_then(value_text).as_deref() == Some(value.as_str())
         }
+        JsonFilter::Contains { path, value } => lookup_path(payload, path)
+            .and_then(value_text)
+            .is_some_and(|t| t.to_lowercase().contains(&value.to_lowercase())),
+        JsonFilter::Gte { path, value } => lookup_path(payload, path)
+            .and_then(value_text)
+            .is_some_and(|t| t.as_str() >= value.as_str()),
+        JsonFilter::Lte { path, value } => lookup_path(payload, path)
+            .and_then(value_text)
+            .is_some_and(|t| t.as_str() <= value.as_str()),
+        JsonFilter::NumGteAny { paths, value } => paths.iter().any(|p| {
+            lookup_path(payload, p)
+                .and_then(Value::as_f64)
+                .is_some_and(|n| n >= *value)
+        }),
     }
+}
 
-    #[test]
-    fn decide_fires_extends_chain_and_guards_cycles_and_depth() {
-        // Fresh source (no provenance): fires at depth 1.
-        assert_eq!(
-            decide("T1", &json!({}), &cfg()),
-            FireDecision::Fire {
-                depth: 1,
-                chain: vec!["T1".into()]
-            }
-        );
-        // Same trigger already in the chain: cycle skip.
-        let looped = json!({ "_trigger": { "depth": 1, "chain": ["T1"] } });
-        assert_eq!(decide("T1", &looped, &cfg()), FireDecision::SkipCycle);
-        // Different trigger continues the chain.
-        assert_eq!(
-            decide("T2", &looped, &cfg()),
-            FireDecision::Fire {
-                depth: 2,
-                chain: vec!["T1".into(), "T2".into()]
-            }
-        );
-        // Depth backstop.
-        let deep = json!({ "_trigger": { "depth": 3, "chain": ["A", "B", "C"] } });
-        assert_eq!(decide("T9", &deep, &cfg()), FireDecision::SkipDepth);
-    }
+/// True when EVERY filter holds (AND, like the `?filter=` surface). An empty
+/// set matches everything — an external trigger without predicates is a
+/// source-level subscription.
+pub fn payload_matches(filters: &[pumper_core::datasets::JsonFilter], payload: &Value) -> bool {
+    filters.iter().all(|f| filter_matches(f, payload))
+}
 
-    #[test]
-    fn merged_params_injects_trigger_over_template() {
-        let template = json!({ "mode": "batch", "_trigger": "stale" });
-        let merged = merged_params(&template, json!({ "count": 5 }));
-        assert_eq!(merged["mode"], "batch");
-        assert_eq!(merged["_trigger"]["count"], 5); // injected wins
-                                                    // Non-object template is replaced, not merged into.
-        let merged = merged_params(&Value::Null, json!({ "count": 1 }));
-        assert_eq!(merged["_trigger"]["count"], 1);
-    }
-
-    #[test]
-    fn change_and_status_filters() {
-        assert!(change_matches(Some("fresh"), "new"));
-        assert!(change_matches(Some("fresh"), "changed"));
-        assert!(!change_matches(Some("fresh"), "removed"));
-        assert!(change_matches(Some("any"), "removed"));
-        assert!(change_matches(None, "removed"));
-        assert!(!change_matches(Some("new"), "changed"));
-
-        assert!(status_matches(None, "succeeded"));
-        assert!(!status_matches(None, "failed"));
-        assert!(status_matches(Some("failed"), "failed"));
-        assert!(status_matches(Some("any"), "cancelled"));
-    }
-
-    #[test]
-    fn idempotency_key_is_per_trigger_per_source_run() {
-        assert_eq!(idempotency_key("T1", "J1"), "trig:T1:J1");
-        assert_ne!(idempotency_key("T1", "J1"), idempotency_key("T1", "J2"));
-        assert_ne!(idempotency_key("T1", "J1"), idempotency_key("T2", "J1"));
-    }
+/// The `_trigger` object for an inbound-ingress hop. Carries the verified
+/// payload itself — inbound events are size-capped at the door
+/// (`[ingress] max_body_bytes`), so unlike job results it is safe to inline.
+pub fn external_trigger_obj(
+    trigger: &Trigger,
+    source_id: &str,
+    source_name: &str,
+    event_id: &str,
+    payload: &Value,
+    depth: u32,
+    chain: &[String],
+) -> Value {
+    json!({
+        "trigger_id": trigger.id,
+        "source_kind": "external",
+        "source_id": source_id,
+        "source_name": source_name,
+        "event_id": event_id,
+        "payload": payload,
+        "depth": depth,
+        "chain": chain,
+    })
 }
 
 // ── worker hooks (IO around the pure helpers) ────────────────────────────────
@@ -328,6 +341,91 @@ pub async fn fire_terminal_triggers(state: &AppState, job: &Job) {
     }
 }
 
+/// Fires enabled external-kind triggers for one verified inbound event
+/// (`POST /ingest/{id}`). Source filter is the trigger's `source_app` (an
+/// ingress source id or `'*'`); JSON-path predicate filters are ANDed against
+/// the payload. One target job per trigger per event id (idempotency-keyed, so
+/// a redelivered webhook can't double-fire). Fail-open like the other hooks:
+/// evaluation errors are logged, never surfaced to the sender.
+pub async fn fire_external_triggers(
+    state: &AppState,
+    source_id: &str,
+    source_name: &str,
+    event_id: &str,
+    payload: &Value,
+) -> usize {
+    let trigs = match state.storage.enabled_external_triggers(source_id).await {
+        Ok(t) if !t.is_empty() => t,
+        Ok(_) => return 0,
+        Err(e) => {
+            warn!(source = %source_id, "failed to load external triggers: {e}");
+            return 0;
+        }
+    };
+    let mut fired = 0;
+    for trigger in &trigs {
+        // Predicates were validated at create time; a spec that no longer
+        // parses (defensive) skips the trigger loudly rather than firing wide.
+        let filters = match trigger.filters.as_deref() {
+            Some(specs) => match crate::routes::parse_filters(specs) {
+                Ok(f) => f,
+                Err(_) => {
+                    warn!(trigger = %trigger.id, "external trigger has unparseable filters; skipped");
+                    continue;
+                }
+            },
+            None => Vec::new(),
+        };
+        if !payload_matches(&filters, payload) {
+            continue;
+        }
+        // Inbound events carry no provenance — every chain starts here.
+        let (depth, chain) = match decide(&trigger.id, &Value::Null, &state.config.triggers) {
+            FireDecision::Fire { depth, chain } => (depth, chain),
+            // Unreachable from a fresh chain, but keep the guards uniform.
+            FireDecision::SkipCycle | FireDecision::SkipDepth => continue,
+        };
+        let obj = external_trigger_obj(
+            trigger,
+            source_id,
+            source_name,
+            event_id,
+            payload,
+            depth,
+            &chain,
+        );
+        if !state.registry.contains_key(&trigger.target_app) {
+            warn!(trigger = %trigger.id, app = %trigger.target_app,
+                  "external trigger skipped: target app not registered");
+            continue;
+        }
+        let opts = EnqueueOptions {
+            params: merged_params(&trigger.params, obj),
+            max_attempts: trigger.max_attempts,
+            priority: trigger.priority,
+            budget_usd: trigger.budget_usd,
+            idempotency_key: Some(idempotency_key(&trigger.id, event_id)),
+            trigger_id: Some(trigger.id.clone()),
+            ..Default::default()
+        };
+        match state.storage.enqueue_dedup(&trigger.target_app, opts).await {
+            Ok((hop, true)) => {
+                info!(trigger = %trigger.id, event = %event_id, target = %hop.id,
+                      app = %trigger.target_app, "external trigger fired");
+                fired += 1;
+            }
+            Ok((_, false)) => {} // already fired for this event id (redelivery)
+            Err(e) => {
+                warn!(trigger = %trigger.id, event = %event_id, "external trigger enqueue failed: {e}");
+            }
+        }
+    }
+    if fired > 0 {
+        state.notify.notify_one();
+    }
+    fired
+}
+
 /// Enqueues one triggered hop (dedup-guarded). Returns 1 when a job was
 /// actually created, 0 when skipped/deduped/failed.
 async fn enqueue_hop(state: &AppState, trigger: &Trigger, source: &Job, obj: Value) -> usize {
@@ -356,5 +454,204 @@ async fn enqueue_hop(state: &AppState, trigger: &Trigger, source: &Job, obj: Val
             warn!(trigger = %trigger.id, source = %source.id, "trigger enqueue failed: {e}");
             0
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn cfg() -> TriggersConfig {
+        TriggersConfig {
+            max_depth: 3,
+            key_cap: 2,
+        }
+    }
+
+    #[test]
+    fn decide_fires_extends_chain_and_guards_cycles_and_depth() {
+        // Fresh source (no provenance): fires at depth 1.
+        assert_eq!(
+            decide("T1", &json!({}), &cfg()),
+            FireDecision::Fire {
+                depth: 1,
+                chain: vec!["T1".into()]
+            }
+        );
+        // Same trigger already in the chain: cycle skip.
+        let looped = json!({ "_trigger": { "depth": 1, "chain": ["T1"] } });
+        assert_eq!(decide("T1", &looped, &cfg()), FireDecision::SkipCycle);
+        // Different trigger continues the chain.
+        assert_eq!(
+            decide("T2", &looped, &cfg()),
+            FireDecision::Fire {
+                depth: 2,
+                chain: vec!["T1".into(), "T2".into()]
+            }
+        );
+        // Depth backstop.
+        let deep = json!({ "_trigger": { "depth": 3, "chain": ["A", "B", "C"] } });
+        assert_eq!(decide("T9", &deep, &cfg()), FireDecision::SkipDepth);
+    }
+
+    #[test]
+    fn merged_params_injects_trigger_over_template() {
+        let template = json!({ "mode": "batch", "_trigger": "stale" });
+        let merged = merged_params(&template, json!({ "count": 5 }));
+        assert_eq!(merged["mode"], "batch");
+        assert_eq!(merged["_trigger"]["count"], 5); // injected wins
+                                                    // Non-object template is replaced, not merged into.
+        let merged = merged_params(&Value::Null, json!({ "count": 1 }));
+        assert_eq!(merged["_trigger"]["count"], 1);
+    }
+
+    #[test]
+    fn change_and_status_filters() {
+        assert!(change_matches(Some("fresh"), "new"));
+        assert!(change_matches(Some("fresh"), "changed"));
+        assert!(!change_matches(Some("fresh"), "removed"));
+        assert!(change_matches(Some("any"), "removed"));
+        assert!(change_matches(None, "removed"));
+        assert!(!change_matches(Some("new"), "changed"));
+
+        assert!(status_matches(None, "succeeded"));
+        assert!(!status_matches(None, "failed"));
+        assert!(status_matches(Some("failed"), "failed"));
+        assert!(status_matches(Some("any"), "cancelled"));
+    }
+
+    #[test]
+    fn idempotency_key_is_per_trigger_per_source_run() {
+        assert_eq!(idempotency_key("T1", "J1"), "trig:T1:J1");
+        assert_ne!(idempotency_key("T1", "J1"), idempotency_key("T1", "J2"));
+        assert_ne!(idempotency_key("T1", "J1"), idempotency_key("T2", "J1"));
+    }
+
+    // ── external (ingress) matching ──────────────────────────────────────────
+
+    use pumper_core::datasets::JsonFilter;
+
+    fn payload() -> Value {
+        json!({
+            "ref": "refs/heads/main",
+            "repository": { "full_name": "acme/docs", "stargazers_count": 42 },
+            "forced": false,
+        })
+    }
+
+    #[test]
+    fn payload_eq_matches_nested_paths_and_exact_text() {
+        let f = vec![JsonFilter::Eq {
+            path: "$.ref".into(),
+            value: "refs/heads/main".into(),
+        }];
+        assert!(payload_matches(&f, &payload()));
+        let f = vec![JsonFilter::Eq {
+            path: "$.repository.full_name".into(),
+            value: "acme/docs".into(),
+        }];
+        assert!(payload_matches(&f, &payload()));
+        // Exact text: a different branch does not match; a missing path never does.
+        let f = vec![JsonFilter::Eq {
+            path: "$.ref".into(),
+            value: "refs/heads/dev".into(),
+        }];
+        assert!(!payload_matches(&f, &payload()));
+        let f = vec![JsonFilter::Eq {
+            path: "$.nope.deep".into(),
+            value: "x".into(),
+        }];
+        assert!(!payload_matches(&f, &payload()));
+        // Bools and numbers compare via their text projection (SQL ->> parity).
+        let f = vec![JsonFilter::Eq {
+            path: "$.forced".into(),
+            value: "false".into(),
+        }];
+        assert!(payload_matches(&f, &payload()));
+    }
+
+    #[test]
+    fn payload_contains_is_case_insensitive_substring() {
+        let f = vec![JsonFilter::Contains {
+            path: "$.repository.full_name".into(),
+            value: "ACME".into(),
+        }];
+        assert!(payload_matches(&f, &payload()));
+        let f = vec![JsonFilter::Contains {
+            path: "$.ref".into(),
+            value: "release".into(),
+        }];
+        assert!(!payload_matches(&f, &payload()));
+    }
+
+    #[test]
+    fn payload_numgte_is_numeric_and_ignores_non_numbers() {
+        let f = vec![JsonFilter::NumGteAny {
+            paths: vec!["$.repository.stargazers_count".into()],
+            value: 40.0,
+        }];
+        assert!(payload_matches(&f, &payload()));
+        let f = vec![JsonFilter::NumGteAny {
+            paths: vec!["$.repository.stargazers_count".into()],
+            value: 100.0,
+        }];
+        assert!(!payload_matches(&f, &payload()));
+        // A string field never satisfies a numeric filter (json_type guard parity).
+        let f = vec![JsonFilter::NumGteAny {
+            paths: vec!["$.ref".into()],
+            value: 0.0,
+        }];
+        assert!(!payload_matches(&f, &payload()));
+    }
+
+    #[test]
+    fn payload_filters_are_anded_and_empty_matches_all() {
+        assert!(payload_matches(&[], &payload()));
+        let f = vec![
+            JsonFilter::Eq {
+                path: "$.ref".into(),
+                value: "refs/heads/main".into(),
+            },
+            JsonFilter::NumGteAny {
+                paths: vec!["$.repository.stargazers_count".into()],
+                value: 100.0, // fails -> whole set fails
+            },
+        ];
+        assert!(!payload_matches(&f, &payload()));
+    }
+
+    #[test]
+    fn external_trigger_obj_carries_payload_and_provenance() {
+        let trigger = pumper_core::Trigger {
+            id: "T1".into(),
+            name: None,
+            source_kind: "external".into(),
+            source_app: "src-1".into(),
+            source_dataset: None,
+            on_change: None,
+            on_status: None,
+            target_app: "crawl".into(),
+            params: json!({}),
+            budget_usd: None,
+            priority: 0,
+            max_attempts: 1,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            filters: None,
+        };
+        let obj = external_trigger_obj(
+            &trigger,
+            "src-1",
+            "github",
+            "ev-9",
+            &payload(),
+            1,
+            &["T1".into()],
+        );
+        assert_eq!(obj["source_kind"], "external");
+        assert_eq!(obj["source_id"], "src-1");
+        assert_eq!(obj["event_id"], "ev-9");
+        assert_eq!(obj["payload"]["ref"], "refs/heads/main");
+        assert_eq!(obj["depth"], 1);
     }
 }

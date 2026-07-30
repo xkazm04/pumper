@@ -151,35 +151,72 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
 
 // ---- Apps -----------------------------------------------------------------
 
+#[derive(serde::Deserialize, utoipa::IntoParams)]
+pub(crate) struct AppsQuery {
+    /// Output shape: absent = the classic `{apps: [..]}` listing; `tools` =
+    /// `{tools: [..]}` MCP tool-definition JSON (name/description/inputSchema
+    /// per app, plus cost_class/examples/output_shape metadata).
+    format: Option<String>,
+}
+
 #[utoipa::path(
     get,
     path = "/apps",
     tag = "apps",
-    responses((status = 200, description = "`{apps: [{name, description, schedule, requires, ready, default_params}]}` — `requires` lists preconditions (e.g. `env:CENSUS_API_KEY`); `ready` is false when any is unmet here; `default_params` is the app's default job params (a POST body's `params` shallow-merges over these)."))
+    params(AppsQuery),
+    responses(
+        (status = 200, description = "`{apps: [{name, description, schedule, requires, ready, default_params, cost_class, output_shape, has_params_schema}]}` — `requires` lists preconditions (e.g. `env:CENSUS_API_KEY`); `ready` is false when any is unmet here; `default_params` is the app's default job params (a POST body's `params` shallow-merges over these); `cost_class` is free|metered|claude. With `?format=tools`: `{tools: [..]}` — each app as an MCP tool definition (`inputSchema` = the app's params JSON Schema, permissive `{type: object}` when undeclared), directly consumable as agent tool definitions."),
+        (status = 400, description = "Unknown `format`", body = Object),
+    )
 )]
-pub(crate) async fn list_apps(State(state): State<AppState>) -> Json<Value> {
+pub(crate) async fn list_apps(
+    State(state): State<AppState>,
+    axum::extract::Query(query): axum::extract::Query<AppsQuery>,
+) -> Result<Json<Value>, ApiError> {
     let mut apps: Vec<_> = state.registry.values().collect();
     apps.sort_by_key(|app| app.name());
-    let apps: Vec<_> = apps
-        .into_iter()
-        .map(|app| {
-            let requires: Vec<String> = app.requires().iter().map(|r| r.label()).collect();
-            // `ready` = every declared precondition is satisfied here (e.g. the
-            // required API-key env var is set), so a credential-gated app is
-            // distinguishable from a runnable one before its first failed job.
-            let ready = app.requires().iter().all(|r| r.is_satisfied());
-            json!({
-                "name": app.name(),
-                "description": app.description(),
-                "schedule": app.schedule(),
-                "requires": requires,
-                "ready": ready,
-                // Machine-readable defaults so a client can see exactly which keys
-                // it is overriding — the replace-vs-merge fix below is only safe
-                // because the caller can now see what it is merging over.
-                "default_params": app.default_params(),
-            })
-        })
-        .collect();
-    Json(json!({ "apps": apps }))
+    match query.format.as_deref() {
+        Some("tools") => {
+            let tools: Vec<Value> = apps
+                .into_iter()
+                .map(|app| crate::registry::tool_definition(app.as_ref()))
+                .collect();
+            Ok(Json(json!({ "tools": tools })))
+        }
+        Some(other) => Err(ApiError(
+            axum::http::StatusCode::BAD_REQUEST,
+            format!("unknown format '{other}' (omit for the app listing, or 'tools')"),
+        )),
+        None => {
+            let apps: Vec<_> = apps
+                .into_iter()
+                .map(|app| {
+                    let requires: Vec<String> =
+                        app.requires().iter().map(|r| r.label()).collect();
+                    // `ready` = every declared precondition is satisfied here (e.g. the
+                    // required API-key env var is set), so a credential-gated app is
+                    // distinguishable from a runnable one before its first failed job.
+                    let ready = app.requires().iter().all(|r| r.is_satisfied());
+                    let manifest = app.manifest();
+                    json!({
+                        "name": app.name(),
+                        "description": app.description(),
+                        "schedule": app.schedule(),
+                        "requires": requires,
+                        "ready": ready,
+                        // Machine-readable defaults so a client can see exactly which keys
+                        // it is overriding — the replace-vs-merge fix below is only safe
+                        // because the caller can now see what it is merging over.
+                        "default_params": app.default_params(),
+                        // Manifest highlights; the full tool definition (schema +
+                        // examples) lives under `?format=tools`.
+                        "cost_class": manifest.cost_class.as_str(),
+                        "output_shape": manifest.output_shape,
+                        "has_params_schema": manifest.params_schema.is_some(),
+                    })
+                })
+                .collect();
+            Ok(Json(json!({ "apps": apps })))
+        }
+    }
 }

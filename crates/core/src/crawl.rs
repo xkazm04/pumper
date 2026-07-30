@@ -69,6 +69,155 @@ pub struct CrawlPageRecord {
     /// Normal kept pages carry `false`. Gone markers carry only `url`, `status`
     /// and this flag; the rest is empty.
     pub gone: bool,
+    /// Set on a revisit when the conditional GET answered `304 Not Modified`:
+    /// a check-only marker carrying just `url` + the bumped `cadence` (no body
+    /// was downloaded). The sink merges the cadence into the stored record so
+    /// the estimator improves every run — without a new table.
+    pub unchanged: bool,
+    /// Learned change-cadence counters for this URL, updated every revisit (and
+    /// initialized on first sighting). `None` outside revisit bookkeeping.
+    pub cadence: Option<RevisitCadence>,
+}
+
+/// Per-URL change-cadence counters, persisted ON the page record (M07 — no new
+/// table). Every revisit is a labeled observation: a `304` bumps `checks`; a
+/// changed body bumps `changes` by a SimHash-distance-graded weight (boilerplate
+/// churn — rotating ads, timestamps — must not make a page look hot) and feeds
+/// the EWMA inter-change interval. `due_score` turns these into "probability
+/// this page changed since we last looked".
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct RevisitCadence {
+    /// Revisit checks observed (304s and changed bodies alike).
+    #[serde(default)]
+    pub checks: u64,
+    /// Graded change mass: each changed body adds its `change_weight` (0..=1),
+    /// so ad-rotation noise accumulates slowly while real edits count fully.
+    #[serde(default)]
+    pub changes: f64,
+    /// Epoch seconds of the last check (any outcome). The due clock.
+    #[serde(default)]
+    pub last_checked_at: Option<i64>,
+    /// Epoch seconds of the last WEIGHTED change (first sighting counts as the
+    /// baseline). Anchors the inter-change gap measurement.
+    #[serde(default)]
+    pub last_change_at: Option<i64>,
+    /// EWMA of observed inter-change gaps (seconds). `None` until the second
+    /// weighted change — the host-level prior fills in for scoring.
+    #[serde(default)]
+    pub interval_secs: Option<f64>,
+}
+
+impl RevisitCadence {
+    /// First sighting of a page: one check, change baseline anchored at `now`.
+    fn first_seen(now: i64) -> Self {
+        Self {
+            checks: 1,
+            changes: 0.0,
+            last_checked_at: Some(now),
+            last_change_at: Some(now),
+            interval_secs: None,
+        }
+    }
+
+    /// A revisit answered `304` (or an unweighted near-identical body): count
+    /// the check, move the due clock, leave the change model untouched.
+    fn observe_unchanged(&self, now: i64) -> Self {
+        let mut next = self.clone();
+        next.checks += 1;
+        next.last_checked_at = Some(now);
+        next
+    }
+
+    /// A revisit found a changed body with `weight` (0..=1, SimHash-graded).
+    /// Zero weight degrades to an unchanged observation.
+    fn observe_changed(&self, now: i64, weight: f64) -> Self {
+        if weight <= 0.0 {
+            return self.observe_unchanged(now);
+        }
+        let mut next = self.observe_unchanged(now);
+        next.changes += weight;
+        if let Some(prev) = self.last_change_at {
+            let gap = (now - prev).max(1) as f64;
+            next.interval_secs = Some(match self.interval_secs {
+                None => gap,
+                Some(p) => CADENCE_EWMA_ALPHA * gap + (1.0 - CADENCE_EWMA_ALPHA) * p,
+            });
+        }
+        next.last_change_at = Some(now);
+        next
+    }
+}
+
+/// EWMA smoothing for observed inter-change gaps (mirrors the cache mirror's
+/// estimator): newest gap weighs 0.3 so a cadence shift tracks within a few
+/// observations without one outlier whipsawing the estimate.
+const CADENCE_EWMA_ALPHA: f64 = 0.3;
+
+/// Cold-start prior for a URL (and host) with no learned interval: one week.
+/// Deliberately long — an unknown page starts "cool" and earns a hotter cadence
+/// only by actually changing; the never-checked case bypasses the prior with a
+/// due score of 1.0 (a baseline must be established).
+const DEFAULT_CADENCE_PRIOR_SECS: f64 = 7.0 * 86_400.0;
+
+/// SimHash Hamming distances at or below this are boilerplate churn (rotating
+/// ads, counters, timestamps) — same scale as the crawler's default
+/// `dedup_distance = 3` for "near-identical page".
+const BOILERPLATE_DISTANCE: u32 = 3;
+
+/// Grades how much a page really changed from the SimHash Hamming distance
+/// between the old and new body fingerprints: `0.0` at or below
+/// [`BOILERPLATE_DISTANCE`] (cosmetic churn must not look hot), ramping
+/// linearly to `1.0` at distance 16 (a solidly different document). An unknown
+/// old fingerprint (0) grades as a full change — no evidence to discount it.
+pub fn change_weight(old_simhash: u64, new_simhash: u64) -> f64 {
+    if old_simhash == 0 {
+        return 1.0;
+    }
+    let d = hamming(old_simhash, new_simhash);
+    if d <= BOILERPLATE_DISTANCE {
+        return 0.0;
+    }
+    (f64::from(d - BOILERPLATE_DISTANCE) / f64::from(16 - BOILERPLATE_DISTANCE)).min(1.0)
+}
+
+/// Probability this URL has changed since its last check, under a Poisson
+/// change process with the learned (or prior) inter-change interval:
+/// `1 - exp(-elapsed / T̂)`. A never-checked URL scores `1.0` — the estimator
+/// has no baseline and must establish one. Monotonic in elapsed time, so a
+/// stale page always eventually becomes due no matter how long its interval.
+pub fn due_score(cadence: &RevisitCadence, now_epoch: i64, prior_interval_secs: f64) -> f64 {
+    let Some(last_checked) = cadence.last_checked_at else {
+        return 1.0;
+    };
+    let interval = cadence
+        .interval_secs
+        .filter(|t| t.is_finite() && *t > 0.0)
+        .unwrap_or(if prior_interval_secs.is_finite() && prior_interval_secs > 0.0 {
+            prior_interval_secs
+        } else {
+            DEFAULT_CADENCE_PRIOR_SECS
+        });
+    let elapsed = (now_epoch - last_checked).max(0) as f64;
+    1.0 - (-elapsed / interval).exp()
+}
+
+/// Host-level cadence priors for cold-start seeds: the mean learned interval of
+/// this host's URLs that HAVE one, so a new URL inherits its host's rhythm
+/// instead of the global one-week default.
+fn host_cadence_priors(seeds: &[RevisitSeed]) -> HashMap<String, f64> {
+    let mut sums: HashMap<String, (f64, usize)> = HashMap::new();
+    for seed in seeds {
+        if let Some(interval) = seed.cadence.interval_secs.filter(|t| t.is_finite() && *t > 0.0) {
+            if let Some(host) = host_of(&seed.url) {
+                let entry = sums.entry(host).or_insert((0.0, 0));
+                entry.0 += interval;
+                entry.1 += 1;
+            }
+        }
+    }
+    sums.into_iter()
+        .map(|(host, (sum, n))| (host, sum / n as f64))
+        .collect()
 }
 
 /// One existing page handed back by a [`PageSource`] to seed a revisit: the
@@ -78,6 +227,25 @@ pub struct RevisitSeed {
     pub url: String,
     pub etag: Option<String>,
     pub last_modified: Option<String>,
+    /// Stored body SimHash from the last kept fetch (0 = unknown) — grades how
+    /// much a changed revisit really changed.
+    pub simhash: u64,
+    /// Learned change-cadence counters read back off the stored page record
+    /// (default for records that predate the counters).
+    pub cadence: RevisitCadence,
+}
+
+impl RevisitSeed {
+    /// A seed carrying only validators (pre-cadence records, tests).
+    pub fn bare(url: impl Into<String>, etag: Option<String>, last_modified: Option<String>) -> Self {
+        Self {
+            url: url.into(),
+            etag,
+            last_modified,
+            simhash: 0,
+            cadence: RevisitCadence::default(),
+        }
+    }
 }
 
 /// Reads existing page records to seed an incremental recrawl. The app layer
@@ -124,10 +292,12 @@ pub struct CrawlConfig {
     /// Expand seeds from each seed host's sitemaps (robots.txt `Sitemap:`
     /// directives, falling back to /sitemap.xml).
     pub sitemap_seeds: bool,
-    /// Persist frontier state here (JSON): loaded at start when present, saved
-    /// periodically and at the end — so an interrupted or page-capped crawl
-    /// resumes where it left off instead of refetching everything.
-    pub checkpoint: Option<PathBuf>,
+    /// Frontier state persisted by a prior run (the JSON a checkpoint sink was
+    /// handed), restored at start — so an interrupted or page-capped crawl
+    /// resumes where it left off instead of refetching everything. Advisory: an
+    /// incompatible/unparseable value is discarded for a clean fresh start
+    /// (surfaced as `checkpoint_reset`), never resumed silently-wrong.
+    pub resume_state: Option<serde_json::Value>,
     /// Incremental recrawl / site-change sentinel mode. When true the frontier is
     /// seeded from existing `pages` records (via the [`PageSource`] seam) and each
     /// known page is fetched with a conditional GET using its stored
@@ -139,6 +309,15 @@ pub struct CrawlConfig {
     /// discovered URLs). Ignored outside revisit mode (normal crawls always
     /// follow links within the depth budget).
     pub discover: bool,
+    /// Revisit mode: max known pages fetched this run, spent on the URLs with
+    /// the highest [`due_score`] — the learned-cadence frontier. Seeds beyond
+    /// the budget are counted `skipped_not_due`. `None` = revisit every seed
+    /// (the flat pre-M07 schedule).
+    pub revisit_budget: Option<usize>,
+    /// Revisit mode: seeds scoring below this due probability (0..=1) are
+    /// skipped this run and counted `skipped_not_due`. `0.0` disables the
+    /// filter (every seed is at least eligible; the budget still ranks).
+    pub min_due_score: f64,
 }
 
 /// Compiled include/exclude filter.
@@ -212,7 +391,38 @@ fn gone_record(url: String, status: u16) -> CrawlPageRecord {
         etag: None,
         last_modified: None,
         gone: true,
+        unchanged: false,
+        cadence: None,
     }
+}
+
+/// A check-only marker for a revisit answered `304 Not Modified`: carries the
+/// URL and the bumped cadence counters, nothing else (no body was downloaded).
+/// The sink merges the cadence into the stored record.
+fn unchanged_record(url: String, cadence: RevisitCadence) -> CrawlPageRecord {
+    CrawlPageRecord {
+        url,
+        title: None,
+        status: 304,
+        content_chars: 0,
+        simhash: 0,
+        excerpt: String::new(),
+        artifact_path: String::new(),
+        depth: 0,
+        etag: None,
+        last_modified: None,
+        gone: false,
+        unchanged: true,
+        cadence: Some(cadence),
+    }
+}
+
+/// Epoch seconds now — the cadence clock (core stays chrono-free).
+fn epoch_now() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs().min(i64::MAX as u64) as i64)
+        .unwrap_or(0)
 }
 
 fn emit_progress(progress: &Option<ProgressFn>, stats: &CrawlStats, frontier: usize, hosts: usize) {
@@ -271,6 +481,10 @@ pub struct CrawlStats {
     pub unchanged_304: usize,
     /// Revisit mode: known pages that returned `404`/`410` and were flagged gone.
     pub gone: usize,
+    /// Revisit mode: known pages NOT fetched this run because their due score
+    /// fell below `min_due_score` or they ranked past `revisit_budget` — honest
+    /// coverage accounting for the learned-cadence frontier.
+    pub skipped_not_due: usize,
 }
 
 /// Bounded, deduplicated, **host-fair** URL frontier.
@@ -509,6 +723,16 @@ impl SimHashIndex {
     }
 }
 
+/// Stored state of one known page during a revisit: the conditional-GET
+/// validators plus the fingerprint + cadence the change grading needs.
+#[derive(Debug, Clone)]
+struct KnownPage {
+    etag: Option<String>,
+    last_modified: Option<String>,
+    simhash: u64,
+    cadence: RevisitCadence,
+}
+
 struct Fetched {
     url: String,
     depth: u32,
@@ -529,6 +753,11 @@ struct Fetched {
 /// `sink`, when provided, receives batches of [`CrawlPageRecord`] for KEPT pages
 /// during the crawl — the seam the app layer uses to upsert per-page
 /// fingerprints into the `pages` dataset without core knowing about storage.
+///
+/// `checkpointer`, when provided, receives the serialized frontier state
+/// (queue + seen-set + kept hashes) periodically and at the end — the durable
+/// -execution seam (`AppContext::checkpoints`). The same JSON comes back as
+/// `cfg.resume_state` on a resumed attempt.
 pub async fn crawl(
     http: Arc<dyn HttpClient>,
     cfg: CrawlConfig,
@@ -536,14 +765,15 @@ pub async fn crawl(
     mut sink: Option<Box<dyn PageSink>>,
     source: Option<Box<dyn PageSource>>,
     progress: Option<ProgressFn>,
+    checkpointer: Option<Arc<dyn crate::app::CheckpointSink>>,
 ) -> Result<CrawlStats> {
     let concurrency = cfg.concurrency.clamp(1, 256);
     // Buffer of kept-page fingerprints awaiting the next batched sink flush.
     let mut sink_buf: Vec<CrawlPageRecord> = Vec::new();
-    // Revisit: per-known-URL stored validators (etag, last_modified). Presence in
-    // this map marks a URL as "known" — it gets a conditional GET and 304/gone
-    // handling; discovered URLs are absent and fetched normally.
-    let mut conditional: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+    // Revisit: per-known-URL stored state (validators + fingerprint + cadence).
+    // Presence in this map marks a URL as "known" — it gets a conditional GET
+    // and 304/gone handling; discovered URLs are absent and fetched normally.
+    let mut conditional: HashMap<String, KnownPage> = HashMap::new();
     let filter = UrlFilter::compile(&cfg)?;
     let mut frontier = Frontier::new(cfg.max_pages_per_host);
     let mut dedup_index = SimHashIndex::new(cfg.dedup_distance);
@@ -554,8 +784,8 @@ pub async fn crawl(
     // -seen URLs (including the seeds) aren't re-enqueued. An incompatible
     // (older-format) checkpoint is discarded for a clean fresh start — never a
     // silently-wrong partial resume.
-    if let Some(path) = &cfg.checkpoint {
-        match Checkpoint::load(path).await {
+    if let Some(state) = &cfg.resume_state {
+        match Checkpoint::from_value(state) {
             CheckpointLoad::Loaded(cp) => {
                 frontier.restore(cp.queue, cp.seen);
                 dedup_index = SimHashIndex::from_hashes(cfg.dedup_distance, cp.kept_hashes);
@@ -564,8 +794,7 @@ pub async fn crawl(
             CheckpointLoad::Incompatible => {
                 checkpoint_reset = true;
                 tracing::warn!(
-                    path = %path.display(),
-                    "crawl: checkpoint format incompatible — discarding for a fresh start"
+                    "crawl: restored checkpoint format incompatible — discarding for a fresh start"
                 );
             }
             CheckpointLoad::None => {}
@@ -579,16 +808,57 @@ pub async fn crawl(
         }
         frontier.push(canonicalize_str(seed), 0);
     }
-    // Revisit: seed the frontier from existing page records and remember each
-    // one's stored validators for the conditional GET.
+    // Revisit: seed the frontier from existing page records — but spend the
+    // budget where change is likely. Each seed's learned cadence yields a
+    // due_score(now) (cold-start URLs inherit their host's mean interval as the
+    // prior); seeds below `min_due_score` or ranked past `revisit_budget` are
+    // skipped this run and counted honestly in `skipped_not_due`.
+    let mut skipped_not_due = 0usize;
     if cfg.revisit {
         if let Some(source) = source {
-            for seed in source.seeds().await {
+            let seeds = source.seeds().await;
+            let priors = host_cadence_priors(&seeds);
+            let now = epoch_now();
+            let mut scored: Vec<(f64, RevisitSeed)> = Vec::with_capacity(seeds.len());
+            for seed in seeds {
+                let prior = seed
+                    .cadence
+                    .interval_secs
+                    .or_else(|| host_of(&seed.url).and_then(|h| priors.get(&h).copied()))
+                    .unwrap_or(DEFAULT_CADENCE_PRIOR_SECS);
+                let score = due_score(&seed.cadence, now, prior);
+                if score < cfg.min_due_score {
+                    skipped_not_due += 1;
+                    continue;
+                }
+                scored.push((score, seed));
+            }
+            // Most-due first; ties broken by URL for determinism.
+            scored.sort_by(|a, b| {
+                b.0.partial_cmp(&a.0)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+                    .then_with(|| a.1.url.cmp(&b.1.url))
+            });
+            if let Some(budget) = cfg.revisit_budget {
+                if scored.len() > budget {
+                    skipped_not_due += scored.len() - budget;
+                    scored.truncate(budget);
+                }
+            }
+            for (_, seed) in scored {
                 let url = canonicalize_str(&seed.url);
                 if let Some(host) = host_of(&url) {
                     seed_hosts.insert(host);
                 }
-                conditional.insert(url.clone(), (seed.etag, seed.last_modified));
+                conditional.insert(
+                    url.clone(),
+                    KnownPage {
+                        etag: seed.etag,
+                        last_modified: seed.last_modified,
+                        simhash: seed.simhash,
+                        cadence: seed.cadence,
+                    },
+                );
                 frontier.push(url, 0);
             }
         }
@@ -601,9 +871,12 @@ pub async fn crawl(
 
     let mut robots: HashMap<String, RobotRules> = HashMap::new();
     let mut hosts: HashSet<String> = HashSet::new();
-    let mut stats = CrawlStats::default();
-    stats.resumed = resumed;
-    stats.checkpoint_reset = checkpoint_reset;
+    let mut stats = CrawlStats {
+        resumed,
+        checkpoint_reset,
+        skipped_not_due,
+        ..Default::default()
+    };
     let mut in_flight = FuturesUnordered::new();
     // Per-host earliest-next-fetch, driven by robots.txt Crawl-delay.
     let mut next_allowed: HashMap<String, tokio::time::Instant> = HashMap::new();
@@ -663,7 +936,9 @@ pub async fn crawl(
             let same_domain = cfg.same_domain;
             // A known page (in `conditional`) gets a revalidating conditional GET.
             let cond = if cfg.revisit {
-                conditional.get(&url).cloned()
+                conditional
+                    .get(&url)
+                    .map(|k| (k.etag.clone(), k.last_modified.clone()))
             } else {
                 None
             };
@@ -701,6 +976,20 @@ pub async fn crawl(
                 stats.revisited += 1;
                 stats.unchanged_304 += 1;
                 tracing::debug!(url = %url, "crawl: 304 unchanged");
+                // The 304 is still a cadence observation: bump the check
+                // counters and stream a check-only marker so the estimator
+                // improves every run (the sink merges it into the record).
+                if sink.is_some() {
+                    if let Some(known) = conditional.get(&url) {
+                        let cadence = known.cadence.observe_unchanged(epoch_now());
+                        sink_buf.push(unchanged_record(url, cadence));
+                        if sink_buf.len() >= PAGE_SINK_STRIDE {
+                            if let Some(s) = sink.as_mut() {
+                                s.emit(std::mem::take(&mut sink_buf)).await;
+                            }
+                        }
+                    }
+                }
                 continue;
             }
             CrawlFetch::Gone(url, status) => {
@@ -752,6 +1041,18 @@ pub async fn crawl(
             }
             // Stream this kept page's compact fingerprint to the sink (batched).
             if sink.is_some() {
+                // Cadence bookkeeping: a KNOWN page's change is graded by SimHash
+                // distance from its stored fingerprint (boilerplate churn weighs
+                // ~0, a real edit ~1) and feeds the EWMA interval; an unknown URL
+                // starts a fresh baseline. Authoritative in revisit mode — a full
+                // fresh recrawl restarts baselines (it can't know prior state).
+                let now = epoch_now();
+                let cadence = match conditional.get(&fetched.url) {
+                    Some(known) => known
+                        .cadence
+                        .observe_changed(now, change_weight(known.simhash, hash)),
+                    None => RevisitCadence::first_seen(now),
+                };
                 sink_buf.push(CrawlPageRecord {
                     url: fetched.url.clone(),
                     title: fetched.title.clone(),
@@ -768,6 +1069,8 @@ pub async fn crawl(
                     etag: fetched.etag.clone(),
                     last_modified: fetched.last_modified.clone(),
                     gone: false,
+                    unchanged: false,
+                    cadence: Some(cadence),
                 });
                 if sink_buf.len() >= PAGE_SINK_STRIDE {
                     if let Some(s) = sink.as_mut() {
@@ -776,7 +1079,7 @@ pub async fn crawl(
                 }
             }
             // Periodic checkpoint, gated by wall-clock rather than page count.
-            // `Checkpoint::save` serializes the WHOLE frontier (up to MAX_FRONTIER
+            // `save_checkpoint` serializes the WHOLE frontier (up to MAX_FRONTIER
             // seen-strings + queue + kept hashes) — O(frontier), not O(delta) — so
             // firing it every N kept pages made total checkpoint work
             // O(pages/N × frontier): a 100k-page crawl did thousands of full ~10 MB
@@ -786,9 +1089,9 @@ pub async fn crawl(
             // save below still captures the true end state, and the frontier's own
             // seen-set makes a resume idempotent, so widening the worst-case resume
             // loss from N pages to a few seconds is safe.
-            if cfg.checkpoint.is_some() && last_checkpoint.elapsed() >= CHECKPOINT_MIN_INTERVAL {
-                if let Some(path) = &cfg.checkpoint {
-                    if !Checkpoint::save(path, &frontier, dedup_index.hashes()).await {
+            if checkpointer.is_some() && last_checkpoint.elapsed() >= CHECKPOINT_MIN_INTERVAL {
+                if let Some(sink) = &checkpointer {
+                    if !save_checkpoint(sink, &frontier, dedup_index.hashes(), false).await {
                         stats.checkpoint_errors += 1;
                     }
                 }
@@ -820,7 +1123,7 @@ pub async fn crawl(
 
         // Live progress: cheap seam call every stride; the runtime throttles the
         // actual persist/emit so a huge crawl stays observable without spamming.
-        if stats.crawled % PROGRESS_STRIDE == 0 {
+        if stats.crawled.is_multiple_of(PROGRESS_STRIDE) {
             emit_progress(&progress, &stats, frontier.len(), hosts.len());
         }
 
@@ -840,8 +1143,10 @@ pub async fn crawl(
     stats.frontier_remaining = frontier.len();
     stats.frontier_dropped = frontier.dropped();
     stats.skipped_host_budget = frontier.skipped_host_budget();
-    if let Some(path) = &cfg.checkpoint {
-        if !Checkpoint::save(path, &frontier, dedup_index.hashes()).await {
+    // Final, unthrottled save so the persisted state reflects the true end of
+    // the run (an incomplete crawl's remaining frontier is the resume point).
+    if let Some(sink) = &checkpointer {
+        if !save_checkpoint(sink, &frontier, dedup_index.hashes(), true).await {
             stats.checkpoint_errors += 1;
         }
     }
@@ -893,11 +1198,11 @@ const CHECKPOINT_VERSION: u32 = 1;
 
 /// Result of attempting to restore a checkpoint.
 enum CheckpointLoad {
-    /// No checkpoint file present (or unreadable) — start fresh, not an error.
+    /// No checkpoint state present — start fresh, not an error.
     None,
     /// A compatible checkpoint restored.
     Loaded(Checkpoint),
-    /// A file existed but was an incompatible version / unparseable format;
+    /// State existed but was an incompatible version / unparseable format;
     /// discarded for a fresh start (surfaced as `checkpoint_reset`).
     Incompatible,
 }
@@ -916,53 +1221,43 @@ struct Checkpoint {
 }
 
 impl Checkpoint {
-    async fn load(path: &PathBuf) -> CheckpointLoad {
-        // A missing/unreadable file is a fresh start, not a reset signal.
-        let Ok(bytes) = tokio::fs::read(path).await else {
+    /// Interprets restored state. `Null` is "nothing stored" (fresh start); a
+    /// present value that doesn't parse as the current version is an
+    /// incompatible/corrupt checkpoint — never resumed from silently.
+    fn from_value(state: &serde_json::Value) -> CheckpointLoad {
+        if state.is_null() {
             return CheckpointLoad::None;
-        };
-        // A file that IS present but doesn't parse as the current version is an
-        // incompatible/corrupt checkpoint — never resume from it silently.
-        match serde_json::from_slice::<Checkpoint>(&bytes) {
+        }
+        match serde_json::from_value::<Checkpoint>(state.clone()) {
             Ok(cp) if cp.version == CHECKPOINT_VERSION => CheckpointLoad::Loaded(cp),
             _ => CheckpointLoad::Incompatible,
         }
     }
+}
 
-    /// Best-effort save; checkpointing must never fail the crawl, but a failure
-    /// is no longer swallowed — returns `false` (and warn-logs) so the caller can
-    /// surface a `checkpoint_errors` count in the result.
-    async fn save(path: &PathBuf, frontier: &Frontier, kept_hashes: &[u64]) -> bool {
-        let cp = Checkpoint {
-            version: CHECKPOINT_VERSION,
-            queue: frontier.queued(),
-            seen: frontier.seen.iter().cloned().collect(),
-            kept_hashes: kept_hashes.to_vec(),
-        };
-        let bytes = match serde_json::to_vec(&cp) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), "crawl: checkpoint serialize failed: {e}");
-                return false;
-            }
-        };
-        if let Some(parent) = path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                tracing::warn!(path = %path.display(), "crawl: checkpoint dir create failed: {e}");
-                return false;
-            }
+/// Serializes the frontier state and hands it to the durable checkpoint sink.
+/// Best-effort: checkpointing must never fail the crawl, but a failure is not
+/// swallowed — returns `false` (warn-logged) so the caller can surface a
+/// `checkpoint_errors` count in the result. The sink throttles its own
+/// persistence; `force` bypasses that for the final end-of-run snapshot.
+async fn save_checkpoint(
+    sink: &Arc<dyn crate::app::CheckpointSink>,
+    frontier: &Frontier,
+    kept_hashes: &[u64],
+    force: bool,
+) -> bool {
+    let cp = Checkpoint {
+        version: CHECKPOINT_VERSION,
+        queue: frontier.queued(),
+        seen: frontier.seen.iter().cloned().collect(),
+        kept_hashes: kept_hashes.to_vec(),
+    };
+    match serde_json::to_value(&cp) {
+        Ok(state) => sink.save(state, force).await,
+        Err(e) => {
+            tracing::warn!("crawl: checkpoint serialize failed: {e}");
+            false
         }
-        // Write-then-rename so a crash mid-write can't corrupt the checkpoint.
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = tokio::fs::write(&tmp, bytes).await {
-            tracing::warn!(path = %tmp.display(), "crawl: checkpoint write failed: {e}");
-            return false;
-        }
-        if let Err(e) = tokio::fs::rename(&tmp, path).await {
-            tracing::warn!(path = %path.display(), "crawl: checkpoint rename failed: {e}");
-            return false;
-        }
-        true
     }
 }
 
@@ -1248,7 +1543,7 @@ impl RobotRules {
             let key = key.trim().to_ascii_lowercase();
             // `Sitemap:` values are absolute URLs — re-join the split colon.
             let value = if key == "sitemap" {
-                line.splitn(2, ':').nth(1).unwrap_or("").trim()
+                line.split_once(':').map(|x| x.1).unwrap_or("").trim()
             } else {
                 value.trim()
             };
@@ -1543,9 +1838,11 @@ mod tests {
             include_patterns: vec![],
             exclude_patterns: vec![],
             sitemap_seeds: false,
-            checkpoint: None,
+            resume_state: None,
             revisit: false,
             discover: false,
+            revisit_budget: None,
+            min_due_score: 0.0,
         }
     }
 
@@ -1584,6 +1881,7 @@ mod tests {
             test_cfg(&["https://ex.com/"]),
             None,
             Some(sink),
+            None,
             None,
             None,
         )
@@ -1640,6 +1938,7 @@ mod tests {
             None,
             None,
             Some(progress),
+            None,
         )
         .await
         .unwrap();
@@ -1693,21 +1992,9 @@ mod tests {
         });
 
         let source = Box::new(SeedSource(vec![
-            RevisitSeed {
-                url: "https://ex.com/stable".into(),
-                etag: Some("v1".into()),
-                last_modified: None,
-            },
-            RevisitSeed {
-                url: "https://ex.com/changed".into(),
-                etag: Some("stale".into()),
-                last_modified: None,
-            },
-            RevisitSeed {
-                url: "https://ex.com/gone".into(),
-                etag: None,
-                last_modified: None,
-            },
+            RevisitSeed::bare("https://ex.com/stable", Some("v1".into()), None),
+            RevisitSeed::bare("https://ex.com/changed", Some("stale".into()), None),
+            RevisitSeed::bare("https://ex.com/gone", None, None),
         ]));
 
         let records = Arc::new(SyncMutex::new(Vec::new()));
@@ -1718,7 +2005,7 @@ mod tests {
         let mut cfg = test_cfg(&[]);
         cfg.revisit = true;
 
-        let stats = crawl(http, cfg, None, Some(sink), Some(source), None)
+        let stats = crawl(http, cfg, None, Some(sink), Some(source), None, None)
             .await
             .unwrap();
 
@@ -1735,8 +2022,9 @@ mod tests {
         assert_eq!(stats.crawled, 1, "only the 200 counts as crawled");
 
         let recs = records.lock().unwrap();
-        let live: Vec<_> = recs.iter().filter(|r| !r.gone).collect();
+        let live: Vec<_> = recs.iter().filter(|r| !r.gone && !r.unchanged).collect();
         let gone: Vec<_> = recs.iter().filter(|r| r.gone).collect();
+        let checks: Vec<_> = recs.iter().filter(|r| r.unchanged).collect();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].url, "https://ex.com/changed");
         assert_eq!(
@@ -1744,9 +2032,20 @@ mod tests {
             Some("new-tag"),
             "response ETag stored"
         );
+        // The changed page carries updated cadence counters (weight 1.0: no
+        // stored fingerprint means the change can't be discounted).
+        let cad = live[0].cadence.as_ref().expect("cadence attached");
+        assert_eq!(cad.checks, 1);
+        assert!((cad.changes - 1.0).abs() < 1e-9);
         assert_eq!(gone.len(), 1);
         assert_eq!(gone[0].url, "https://ex.com/gone");
         assert_eq!(gone[0].status, 404);
+        // The 304 emitted a check-only marker with bumped counters.
+        assert_eq!(checks.len(), 1);
+        assert_eq!(checks[0].url, "https://ex.com/stable");
+        let cad = checks[0].cadence.as_ref().expect("cadence on marker");
+        assert_eq!(cad.checks, 1);
+        assert_eq!(cad.changes, 0.0, "a 304 is not a change");
     }
 
     #[tokio::test]
@@ -1772,15 +2071,15 @@ mod tests {
             pages,
             ..Default::default()
         });
-        let source = Box::new(SeedSource(vec![RevisitSeed {
-            url: "https://ex.com/hub".into(),
-            etag: None,
-            last_modified: None,
-        }]));
+        let source = Box::new(SeedSource(vec![RevisitSeed::bare(
+            "https://ex.com/hub",
+            None,
+            None,
+        )]));
         let mut cfg = test_cfg(&[]);
         cfg.revisit = true; // discover stays false
 
-        let stats = crawl(http, cfg, None, None, Some(source), None)
+        let stats = crawl(http, cfg, None, None, Some(source), None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1830,7 +2129,7 @@ mod tests {
             fail,
             ..Default::default()
         });
-        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, None, None)
+        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, None, None, None)
             .await
             .unwrap();
 
@@ -1904,43 +2203,104 @@ mod tests {
         assert!(!index.is_near_dup(!0u64));
     }
 
+    /// Collects every state blob handed to the checkpoint seam, so tests can
+    /// assert on what the crawl persists.
+    struct CollectCheckpoints(Arc<SyncMutex<Vec<serde_json::Value>>>);
+
+    #[async_trait]
+    impl crate::app::CheckpointSink for CollectCheckpoints {
+        async fn save(&self, state: serde_json::Value, _force: bool) -> bool {
+            self.0.lock().unwrap().push(state);
+            true
+        }
+    }
+
     #[tokio::test]
     async fn checkpoint_version_mismatch_forces_fresh_start() {
-        let dir = std::env::temp_dir().join(format!("pumper-crawl-cp-{}", std::process::id()));
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join("cp.json");
-
-        // A missing file is a fresh start, not a reset.
+        // Null restored state is a fresh start, not a reset.
         assert!(matches!(
-            Checkpoint::load(&path).await,
+            Checkpoint::from_value(&serde_json::Value::Null),
             CheckpointLoad::None
         ));
 
-        // A pre-versioning file (no `version` field) parses as version 0 and is
+        // Pre-versioning state (no `version` field) parses as version 0 and is
         // rejected as incompatible rather than resumed silently-wrong.
-        tokio::fs::write(
-            &path,
-            br#"{"queue":[["https://x.com/",0]],"seen":["https://x.com/"],"kept_hashes":[1,2]}"#,
+        let old: serde_json::Value = serde_json::from_str(
+            r#"{"queue":[["https://x.com/",0]],"seen":["https://x.com/"],"kept_hashes":[1,2]}"#,
         )
-        .await
         .unwrap();
         assert!(matches!(
-            Checkpoint::load(&path).await,
+            Checkpoint::from_value(&old),
             CheckpointLoad::Incompatible
         ));
 
-        // A current-version checkpoint round-trips.
+        // A current-version checkpoint round-trips through the sink seam.
         let mut frontier = Frontier::new(None);
         frontier.push("https://x.com/".into(), 0);
-        assert!(Checkpoint::save(&path, &frontier, &[7u64]).await);
-        match Checkpoint::load(&path).await {
+        let saved = Arc::new(SyncMutex::new(Vec::new()));
+        let sink: Arc<dyn crate::app::CheckpointSink> =
+            Arc::new(CollectCheckpoints(saved.clone()));
+        assert!(save_checkpoint(&sink, &frontier, &[7u64], true).await);
+        let state = saved.lock().unwrap().pop().expect("one checkpoint saved");
+        match Checkpoint::from_value(&state) {
             CheckpointLoad::Loaded(cp) => {
                 assert_eq!(cp.version, CHECKPOINT_VERSION);
                 assert_eq!(cp.kept_hashes, vec![7]);
+                assert_eq!(cp.queue, vec![("https://x.com/".to_string(), 0)]);
             }
             _ => panic!("expected a compatible checkpoint to load"),
         }
-        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn crawl_persists_and_resumes_frontier_state() {
+        // Run 1: a page-capped crawl leaves work in the frontier and hands its
+        // end state to the checkpoint sink.
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://ex.com/".to_string(),
+            (
+                200,
+                "<html><body><a href=\"/a\">a</a><a href=\"/b\">b</a></body></html>".to_string(),
+            ),
+        );
+        pages.insert(
+            "https://ex.com/a".to_string(),
+            (200, "<html><body><p>page a body</p></body></html>".to_string()),
+        );
+        pages.insert(
+            "https://ex.com/b".to_string(),
+            (200, "<html><body><p>page b body</p></body></html>".to_string()),
+        );
+        let http = Arc::new(MockHttp {
+            pages,
+            ..Default::default()
+        });
+        let mut cfg = test_cfg(&["https://ex.com/"]);
+        cfg.max_pages = 1;
+        cfg.concurrency = 1;
+        let saved = Arc::new(SyncMutex::new(Vec::new()));
+        let sink: Arc<dyn crate::app::CheckpointSink> =
+            Arc::new(CollectCheckpoints(saved.clone()));
+        let stats = crawl(http.clone(), cfg, None, None, None, None, Some(sink))
+            .await
+            .unwrap();
+        assert_eq!(stats.kept, 1);
+        assert!(!stats.resumed);
+        let state = saved.lock().unwrap().last().cloned().expect("final save");
+
+        // Run 2: restoring that state resumes (seen-set intact — the seed is not
+        // re-enqueued) and reports `resumed`.
+        let mut cfg = test_cfg(&["https://ex.com/"]);
+        cfg.concurrency = 1;
+        cfg.resume_state = Some(state);
+        let stats = crawl(http, cfg, None, None, None, None, None).await.unwrap();
+        assert!(stats.resumed, "restored state marks the run resumed");
+        assert!(!stats.checkpoint_reset);
+        assert_eq!(
+            stats.kept, 2,
+            "resume crawls only the remaining frontier, not the already-seen seed"
+        );
     }
 
     #[test]
@@ -2077,9 +2437,11 @@ mod tests {
             include_patterns: vec!["/blog/".into()],
             exclude_patterns: vec!["\\.pdf$".into()],
             sitemap_seeds: false,
-            checkpoint: None,
+            resume_state: None,
             revisit: false,
             discover: false,
+            revisit_budget: None,
+            min_due_score: 0.0,
         };
         let f = UrlFilter::compile(&cfg).unwrap();
         assert!(f.allows("https://x.com/blog/post"));
@@ -2116,6 +2478,151 @@ mod tests {
         assert_eq!(parsed.excerpt.chars().count(), EXCERPT_CHARS);
         assert!(parsed.content_chars > EXCERPT_CHARS);
         assert!(parsed.title.is_none());
+    }
+
+    #[test]
+    fn change_weight_grades_by_simhash_distance() {
+        // Unknown old fingerprint: can't discount, full weight.
+        assert_eq!(change_weight(0, 0xDEAD), 1.0);
+        // Identical and boilerplate-close: zero weight (churn isn't change).
+        assert_eq!(change_weight(0xFF, 0xFF), 0.0);
+        assert_eq!(change_weight(0b111, 0b000), 0.0, "distance 3 = boilerplate");
+        // Ramps between the boilerplate floor and the full-change ceiling.
+        let w4 = change_weight(0b1111, 0b0000); // distance 4
+        assert!(w4 > 0.0 && w4 < 0.5, "{w4}");
+        // Distance >= 16 is a full change.
+        assert_eq!(change_weight(u64::MAX, u64::MAX << 16), 1.0);
+    }
+
+    #[test]
+    fn due_score_never_checked_is_one_and_grows_with_elapsed() {
+        let never = RevisitCadence::default();
+        assert_eq!(due_score(&never, 1_000_000, 3600.0), 1.0);
+
+        // Learned hourly interval: after ~1 interval, P ≈ 1 - 1/e ≈ 0.63.
+        let cadence = RevisitCadence {
+            checks: 5,
+            changes: 4.0,
+            last_checked_at: Some(0),
+            last_change_at: Some(0),
+            interval_secs: Some(3600.0),
+        };
+        let p1 = due_score(&cadence, 3600, 999.0);
+        assert!((p1 - 0.632).abs() < 0.01, "{p1}");
+        // Monotonic: more elapsed, more due; freshly checked, barely due.
+        assert!(due_score(&cadence, 7200, 999.0) > p1);
+        assert!(due_score(&cadence, 60, 999.0) < 0.05);
+        // No learned interval: the (host) prior drives the clock.
+        let cold = RevisitCadence {
+            last_checked_at: Some(0),
+            ..RevisitCadence::default()
+        };
+        assert!(due_score(&cold, 3600, 3600.0) > due_score(&cold, 3600, 86_400.0));
+    }
+
+    #[test]
+    fn cadence_observations_update_counters_and_ewma() {
+        let first = RevisitCadence::first_seen(100);
+        assert_eq!(first.checks, 1);
+        assert_eq!(first.changes, 0.0);
+        assert_eq!(first.last_change_at, Some(100));
+
+        // A change 1000s later seeds the EWMA with the first gap.
+        let changed = first.observe_changed(1100, 1.0);
+        assert_eq!(changed.checks, 2);
+        assert_eq!(changed.interval_secs, Some(1000.0));
+        assert_eq!(changed.last_change_at, Some(1100));
+        // A second gap of 2000s smooths: 0.3*2000 + 0.7*1000 = 1300.
+        let again = changed.observe_changed(3100, 1.0);
+        assert_eq!(again.interval_secs, Some(1300.0));
+        // Unchanged moves only the due clock; zero weight degrades to a check.
+        let checked = again.observe_unchanged(4000);
+        assert_eq!(checked.last_checked_at, Some(4000));
+        assert_eq!(checked.last_change_at, Some(3100));
+        assert_eq!(checked.interval_secs, again.interval_secs);
+        let cosmetic = again.observe_changed(4000, 0.0);
+        assert_eq!(cosmetic.changes, again.changes, "weight 0 is not a change");
+    }
+
+    #[test]
+    fn host_priors_average_learned_intervals_per_host() {
+        let seed = |url: &str, interval: Option<f64>| RevisitSeed {
+            url: url.into(),
+            etag: None,
+            last_modified: None,
+            simhash: 0,
+            cadence: RevisitCadence {
+                interval_secs: interval,
+                ..RevisitCadence::default()
+            },
+        };
+        let seeds = vec![
+            seed("https://a.com/1", Some(100.0)),
+            seed("https://a.com/2", Some(300.0)),
+            seed("https://a.com/3", None), // cold — contributes nothing
+            seed("https://b.com/1", None), // host with no signal at all
+        ];
+        let priors = host_cadence_priors(&seeds);
+        assert_eq!(priors.get("a.com").copied(), Some(200.0));
+        assert!(!priors.contains_key("b.com"));
+    }
+
+    #[tokio::test]
+    async fn revisit_budget_and_min_due_score_skip_seeds_honestly() {
+        // Three known pages, all served 200. One is freshly-checked (cold, low
+        // due score) and must be filtered by min_due_score; of the two due
+        // ones, revisit_budget = 1 keeps only the MORE due (never-checked)
+        // seed. skipped_not_due reports both skips.
+        let now = epoch_now();
+        let mut pages = HashMap::new();
+        for path in ["hot", "warm", "cold"] {
+            pages.insert(
+                format!("https://ex.com/{path}"),
+                (
+                    200,
+                    format!("<html><body><p>content of {path} page</p></body></html>"),
+                ),
+            );
+        }
+        let http = Arc::new(MockHttp {
+            pages,
+            ..Default::default()
+        });
+        let cadence = |checked: i64, interval: f64| RevisitCadence {
+            checks: 3,
+            changes: 2.0,
+            last_checked_at: Some(checked),
+            last_change_at: Some(checked),
+            interval_secs: Some(interval),
+        };
+        let seed = |url: &str, cad: RevisitCadence| RevisitSeed {
+            url: url.into(),
+            etag: None,
+            last_modified: None,
+            simhash: 0,
+            cadence: cad,
+        };
+        let source = Box::new(SeedSource(vec![
+            // Never checked: score 1.0 — the most due.
+            RevisitSeed::bare("https://ex.com/hot", None, None),
+            // Checked 2 intervals ago: due (score ~0.86) but ranks second.
+            seed("https://ex.com/warm", cadence(now - 7200, 3600.0)),
+            // Checked seconds ago against a week-long interval: score ~0.
+            seed("https://ex.com/cold", cadence(now - 5, 604_800.0)),
+        ]));
+        let mut cfg = test_cfg(&[]);
+        cfg.revisit = true;
+        cfg.min_due_score = 0.5;
+        cfg.revisit_budget = Some(1);
+
+        let stats = crawl(http, cfg, None, None, Some(source), None, None)
+            .await
+            .unwrap();
+        assert_eq!(stats.revisited, 1, "only the budgeted most-due seed ran");
+        assert_eq!(
+            stats.skipped_not_due, 2,
+            "one below min_due_score + one past the budget"
+        );
     }
 
     #[test]

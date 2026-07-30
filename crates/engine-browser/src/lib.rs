@@ -47,10 +47,13 @@ use chromiumoxide::browser::{Browser as ChromeBrowser, BrowserConfig as ChromeCo
 use chromiumoxide::cdp::browser_protocol::fetch::{
     ContinueRequestParams, EventRequestPaused, FailRequestParams,
 };
-use chromiumoxide::cdp::browser_protocol::network::{ErrorReason, ResourceType};
+use chromiumoxide::cdp::browser_protocol::network::{
+    EnableParams, ErrorReason, EventRequestWillBeSent, EventResponseReceived,
+    GetResponseBodyParams, ResourceType,
+};
 use futures::StreamExt;
 use pumper_core::config::BrowserConfig;
-use pumper_core::engine::PageAction;
+use pumper_core::engine::{CapturedCall, PageAction};
 use pumper_core::{
     lru_touch_evict, profile_browser_dir, Browser, Error, RenderRequest, RenderedPage, Result,
 };
@@ -72,6 +75,62 @@ const DEFAULT_PROFILE_KEY: &str = "";
 /// `launch_timeout` so a wedged launch surfaces a typed error (and releases the
 /// per-key launch gate) rather than parking every waiter for the full 20s.
 const LAUNCH_TIMEOUT_SECS: u64 = 15;
+
+// ── network capture (API X-ray) caps ─────────────────────────────────────────
+// A `capture_network` render observes the page's own XHR/fetch traffic; every
+// cap below bounds what an arbitrary page can make us buffer.
+
+/// Max captured JSON responses returned per render.
+const CAPTURE_MAX_CALLS: usize = 30;
+/// Per-response body cap (bytes); over-cap bodies are dropped, never truncated
+/// (a truncated body is no longer valid JSON).
+const CAPTURE_MAX_BODY_BYTES: usize = 256 * 1024;
+/// Total budget across all captured bodies in one render (bytes).
+const CAPTURE_MAX_TOTAL_BYTES: usize = 2 * 1024 * 1024;
+/// Candidate events remembered before body fetch (some won't yield a body, so
+/// keep more candidates than final capture slots).
+const CAPTURE_MAX_CANDIDATES: usize = 4 * CAPTURE_MAX_CALLS;
+
+/// Whether a response MIME type is JSON (`application/json`,
+/// `application/vnd.foo+json`, `text/json`, with or without parameters).
+fn is_json_mime(mime: &str) -> bool {
+    let essence = mime.split(';').next().unwrap_or("").trim().to_lowercase();
+    essence.ends_with("/json") || essence.ends_with("+json")
+}
+
+/// Same-site check for captured calls: the API host must be the page's host or
+/// a sibling/subdomain of it (`www.example.com` page ↔ `api.example.com` API).
+/// Comparing after stripping a leading `www.` and accepting suffix containment
+/// keeps this dependency-free (no PSL); a cross-site CDN or tracker never
+/// shares the page's registrable tail this way.
+fn same_site(page_host: &str, call_host: &str) -> bool {
+    let a = page_host
+        .trim_start_matches("www.")
+        .to_lowercase();
+    let b = call_host.trim_start_matches("www.").to_lowercase();
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    a == b || b.ends_with(&format!(".{a}")) || a.ends_with(&format!(".{b}"))
+}
+
+/// Capture-budget decision: whether a body of `len` bytes may still be taken
+/// given the running `total` and call `count`. Pure for unit tests.
+fn capture_fits(len: usize, total: usize, count: usize) -> bool {
+    count < CAPTURE_MAX_CALLS
+        && len <= CAPTURE_MAX_BODY_BYTES
+        && total + len <= CAPTURE_MAX_TOTAL_BYTES
+}
+
+/// One network response observed during the render, pending body retrieval.
+#[derive(Debug, Clone)]
+struct PendingCapture {
+    request_id: chromiumoxide::cdp::browser_protocol::network::RequestId,
+    url: String,
+    method: String,
+    status: u16,
+    content_type: String,
+}
 
 /// Whether a held Chrome instance must be relaunched before the next render.
 /// Pure so it can be unit-tested without a real browser: an instance is stale
@@ -391,9 +450,82 @@ impl Browser for BrowserEngine {
             None
         };
 
+        // Network capture (API X-ray): when requested, remember same-site JSON
+        // responses as they arrive; bodies are pulled AFTER settle/actions (and
+        // before the tab closes), size-capped. Listeners attach before goto so
+        // the page's very first XHR is observed.
+        let candidates: Arc<std::sync::Mutex<Vec<PendingCapture>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let capture_task = if req.capture_network {
+            let page_host = url::Url::parse(&req.url)
+                .ok()
+                .and_then(|u| u.host_str().map(str::to_lowercase))
+                .unwrap_or_default();
+            // Explicitly enable the Network domain — harmless if already on.
+            if let Err(e) = page.execute(EnableParams::default()).await {
+                warn!("network capture: enable failed: {e}");
+            }
+            let mut sent = page
+                .event_listener::<EventRequestWillBeSent>()
+                .await
+                .map_err(|e| Error::Browser(format!("capture listener (request): {e}")))?;
+            let mut received = page
+                .event_listener::<EventResponseReceived>()
+                .await
+                .map_err(|e| Error::Browser(format!("capture listener (response): {e}")))?;
+            let sink = candidates.clone();
+            Some(tokio::spawn(async move {
+                // request-id → method, from the request side of the pair.
+                let mut methods: HashMap<String, String> = HashMap::new();
+                loop {
+                    tokio::select! {
+                        ev = sent.next() => {
+                            let Some(ev) = ev else { break };
+                            if methods.len() < 4 * CAPTURE_MAX_CANDIDATES {
+                                methods.insert(
+                                    ev.request_id.inner().clone(),
+                                    ev.request.method.clone(),
+                                );
+                            }
+                        }
+                        ev = received.next() => {
+                            let Some(ev) = ev else { break };
+                            let mime = ev.response.mime_type.clone();
+                            let call_host = url::Url::parse(&ev.response.url)
+                                .ok()
+                                .and_then(|u| u.host_str().map(str::to_lowercase))
+                                .unwrap_or_default();
+                            if !is_json_mime(&mime) || !same_site(&page_host, &call_host) {
+                                continue;
+                            }
+                            let mut sink = sink.lock().expect("capture sink poisoned");
+                            if sink.len() >= CAPTURE_MAX_CANDIDATES {
+                                continue;
+                            }
+                            sink.push(PendingCapture {
+                                request_id: ev.request_id.clone(),
+                                url: ev.response.url.clone(),
+                                method: methods
+                                    .get(ev.request_id.inner())
+                                    .cloned()
+                                    .unwrap_or_else(|| "GET".to_string()),
+                                status: ev.response.status as u16,
+                                content_type: mime,
+                            });
+                        }
+                    }
+                }
+            }))
+        } else {
+            None
+        };
+
         if let Err(e) = page.goto(req.url.as_str()).await {
             if let Some(d) = &drainer {
                 d.abort();
+            }
+            if let Some(c) = &capture_task {
+                c.abort();
             }
             let _ = page.close().await;
             return Err(Error::Browser(format!("goto {}: {e}", req.url)));
@@ -446,6 +578,52 @@ impl Browser for BrowserEngine {
             None => None,
         };
 
+        // Pull captured JSON bodies while the tab is still alive (CDP retains
+        // response bodies only for the page's lifetime). Size-capped per body
+        // and in total; non-parsing bodies are dropped.
+        let mut network: Vec<CapturedCall> = Vec::new();
+        if req.capture_network {
+            let pending: Vec<PendingCapture> = candidates
+                .lock()
+                .expect("capture sink poisoned")
+                .drain(..)
+                .collect();
+            let mut total = 0usize;
+            for p in pending {
+                if network.len() >= CAPTURE_MAX_CALLS {
+                    break;
+                }
+                let got = match page
+                    .execute(GetResponseBodyParams::new(p.request_id.clone()))
+                    .await
+                {
+                    Ok(res) => res.result,
+                    Err(_) => continue, // body evicted / no body (204, redirects)
+                };
+                if got.base64_encoded {
+                    // A JSON body is text; base64 here means binary — skip.
+                    continue;
+                }
+                if !capture_fits(got.body.len(), total, network.len()) {
+                    continue;
+                }
+                let Ok(body) = serde_json::from_str::<serde_json::Value>(&got.body) else {
+                    continue;
+                };
+                total += got.body.len();
+                network.push(CapturedCall {
+                    url: p.url,
+                    method: p.method,
+                    status: p.status,
+                    content_type: p.content_type,
+                    body,
+                });
+            }
+            if !network.is_empty() {
+                info!(url = %req.url, calls = network.len(), "captured network JSON responses");
+            }
+        }
+
         // Capture content + url, then ALWAYS release the tab and the interception
         // drainer — even if content() failed, so a failed render does not leak a
         // Chrome tab plus a background drainer task.
@@ -453,6 +631,9 @@ impl Browser for BrowserEngine {
         let final_url = page.url().await.ok().flatten();
         if let Some(d) = &drainer {
             d.abort();
+        }
+        if let Some(c) = &capture_task {
+            c.abort();
         }
         if let Err(e) = page.close().await {
             warn!("page close: {e}");
@@ -484,6 +665,7 @@ impl Browser for BrowserEngine {
             selector_found,
             blocked_resources,
             actions_completed,
+            network,
         })
     }
 }
@@ -736,6 +918,48 @@ mod tests {
         assert!(is_stale(true, 201, 200));
         // 0 disables recycling regardless of count.
         assert!(!is_stale(true, u64::MAX, 0));
+    }
+
+    #[test]
+    fn json_mime_detection_covers_the_real_shapes() {
+        for yes in [
+            "application/json",
+            "application/json; charset=utf-8",
+            "text/json",
+            "application/vnd.api+json",
+            "APPLICATION/JSON",
+        ] {
+            assert!(is_json_mime(yes), "{yes:?} is JSON");
+        }
+        for no in ["text/html", "application/javascript", "image/png", "", "json"] {
+            assert!(!is_json_mime(no), "{no:?} is not JSON");
+        }
+    }
+
+    #[test]
+    fn same_site_accepts_subdomains_and_rejects_cross_site() {
+        assert!(same_site("example.com", "example.com"));
+        assert!(same_site("www.example.com", "api.example.com"));
+        assert!(same_site("example.com", "api.v2.example.com"));
+        assert!(same_site("app.example.com", "example.com"), "page on subdomain, API on apex");
+        assert!(!same_site("example.com", "tracker.io"));
+        assert!(!same_site("example.com", "notexample.com"), "suffix needs a dot boundary");
+        assert!(!same_site("", "example.com"));
+        assert!(!same_site("example.com", ""));
+    }
+
+    #[test]
+    fn capture_budget_caps_per_body_total_and_count() {
+        // Under every cap => fits.
+        assert!(capture_fits(1024, 0, 0));
+        // Per-body cap is strict-over.
+        assert!(capture_fits(CAPTURE_MAX_BODY_BYTES, 0, 0));
+        assert!(!capture_fits(CAPTURE_MAX_BODY_BYTES + 1, 0, 0));
+        // Total budget counts the incoming body.
+        assert!(!capture_fits(1, CAPTURE_MAX_TOTAL_BYTES, 0));
+        assert!(capture_fits(1, CAPTURE_MAX_TOTAL_BYTES - 1, 0));
+        // Call-count ceiling.
+        assert!(!capture_fits(1, 0, CAPTURE_MAX_CALLS));
     }
 
     #[test]

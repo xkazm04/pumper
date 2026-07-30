@@ -24,7 +24,7 @@ Every **kept** page is upserted into the crawl app's `pages` dataset as it is cr
 
 `url, title` (extracted from `<title>`), `status, content_chars` (visible-text char count, script/style excluded), `simhash, excerpt` (first ~300 text chars), `artifact_path` (the `page-NNNN.html` basename under the job's artifacts dir), `depth, job_id`, and `etag` / `last_modified` (response validators captured from every fetch, so a later revisit can send conditional GETs). A revisit that finds a page gone rewrites its record to `{url, status, gone: true, job_id}` (see below).
 
-This makes crawled pages queryable/diffable and lets **dataset triggers + watches fire per-page** through the normal dataset-change path (`fire_dataset_triggers` / watch notifications run off the run's revisions). Note: the full-text **search indexer** is result-key based (`records`/`stories`/`items`), so dataset records are not auto-indexed into search — that path is unchanged here.
+This makes crawled pages queryable/diffable and lets **dataset triggers + watches fire per-page** through the normal dataset-change path (`fire_dataset_triggers` / watch notifications run off the run's revisions). Note: `pages` is **not** indexed into full-text search. The result-key indexer (`records`/`stories`/`items`) doesn't see dataset rows, and the per-record path is opt-in — an app has to name the dataset in its result's `index_datasets` (see [search.md](search.md)), which the crawl app does not. Making crawled pages searchable would mean emitting `index_datasets: [{app: "crawl", dataset: "pages"}]`, or a one-off `search-backfill --app crawl --dataset pages`.
 
 ## Incremental recrawl — site-change sentinel (`mode: "revisit"`)
 
@@ -63,4 +63,4 @@ Run it manually the same way — omit the trigger and pass `source.keys` (or not
 
 - Crawl-delay gates dispatch; same-host in-flight fetches dispatched earlier can still cluster (the engine-level governor softens this). Frontier capped at 100k seen URLs. No JS rendering in the crawl loop (http engine only).
 - Revisit seeds are capped at 10k live `pages` records per run and `max_pages` still caps re-fingerprinted (changed/new) pages, so a very large monitored set is swept across multiple runs, not all at once. Conditional-GET support depends on the origin sending `ETag`/`Last-Modified`; origins that send neither are always re-fetched in full (still diffed by simhash, just not cheaply).
-- Dataset records are not fed to the full-text search index (indexer explodes result keys, not dataset rows).
+- The `pages` dataset is not fed to the full-text search index: the crawl app doesn't emit `index_datasets`, and the result-key indexer explodes result arrays, not dataset rows.

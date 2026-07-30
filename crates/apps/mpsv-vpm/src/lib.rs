@@ -10,6 +10,16 @@
 //!     cell per (occupation × org type) carries the national roll-up.
 //!   * `vacancy_samples` — a bounded reservoir of representative postings per
 //!     CZ-ISCO unit group, for job-description references.
+//!   * vacancy survival ledger — a compact per-posting lifecycle ledger
+//!     (`vacancy-ledger.json` artifact + `vacancy_ledger` pointer record) diffed
+//!     against the prior run to derive `cz-labour/vacancy_lifecycle`: per
+//!     CZ-ISCO unit group × kraj, the distribution of days a posting stays
+//!     listed before it disappears. HONEST LABELING: disappearance conflates
+//!     filled / withdrawn / expired — the metric is **time-to-CLOSE**, NOT
+//!     time-to-fill. Repost detection (same IČO + occupation + kraj + salary
+//!     band reappearing within `repostWindowDays`) partially de-noises it. A
+//!     run gap larger than `maxGapDays` closes nothing (carry-forward), so one
+//!     outage can't mark ~300k postings closed.
 //!
 //! The raw 188 MB feed is parsed into a typed subset (bounded memory) and
 //! aggregated in-process; only the small aggregates are persisted. A full
@@ -67,6 +77,22 @@ const ARES_NACE_CAP: usize = 12;
 /// `|ALL|` revisions at default cardinality; a hit is logged, since a silent
 /// truncation would shorten some cells' trend windows.
 const TRENDS_REVISION_SCAN: i64 = 50_000;
+/// Vacancy survival ledger: one compact artifact per run + a pointer record so
+/// the next run can locate and diff it (`read_source_artifact` needs the
+/// writing job's id, which changes every run).
+const LEDGER_DATASET: &str = "vacancy_ledger";
+const LEDGER_ARTIFACT: &str = "vacancy-ledger.json";
+/// Lifecycle aggregate — lives in the shared `cz-labour` namespace (same
+/// pattern as `salary_gap`): a labour-market product, not app-internal state.
+const LIFECYCLE_DATASET: &str = "vacancy_lifecycle";
+/// If more days than this passed since the prior ledger run, close NOTHING —
+/// carry the ledger forward. A missed run must not mark ~300k postings closed.
+const MAX_GAP_DAYS_DEFAULT: i64 = 3;
+/// A closed posting whose (IČO, czIsco, kraj, salary band) reappears within
+/// this many days is a repost, not a fill — link it and de-noise the metric.
+const REPOST_WINDOW_DAYS_DEFAULT: i64 = 30;
+/// CZK width of the salary bands used for repost matching.
+const SALARY_BAND_CZK: f64 = 5_000.0;
 /// Bulk-read cap for the ARES skip-set — one `list()` replaces a per-IČO `get()`.
 /// Above the `employers` dataset's realistic size; a hit is logged, since a
 /// truncated set would re-fetch already-known IČOs.
@@ -89,12 +115,18 @@ impl ScrapeApp for MpsvVpm {
          statistics into `cz-labour/salary_gap` (per CZ-ISCO unit group × sphere), \
          and enriches sampled employers from the key-free ARES business register \
          into `employers` (keyed by IČO: name, legal form, founded, kraj, CZ-NACE). \
+         Keeps a per-posting survival ledger diffed daily into \
+         `cz-labour/vacancy_lifecycle` (unit group × kraj: median/p75 days to \
+         CLOSE — disappearance conflates filled/withdrawn/expired — plus repost \
+         share and churn). \
          Drops stale relics: postings first posted more than \
          `maxPostedAgeDays` before the feed date are excluded (0 = keep all). \
          Params: {\"url\": endpoint override, \"maxRecords\": 0=all, \
          \"minCount\": 3 (min postings per aggregate cell), \"samplesPerGroup\": 4, \
          \"maxPostedAgeDays\": 730 (0 = keep all ages), \
-         \"aresMaxLookups\": 50 (new ARES lookups per run, 0 = disable)}"
+         \"aresMaxLookups\": 50 (new ARES lookups per run, 0 = disable), \
+         \"maxGapDays\": 3 (run gap beyond which the ledger closes nothing), \
+         \"repostWindowDays\": 30 (repost matching window)}"
     }
 
     /// Daily full sync at 06:00 UTC. Change detection makes the output meaningful
@@ -110,6 +142,8 @@ impl ScrapeApp for MpsvVpm {
             "samplesPerGroup": 4,
             "maxPostedAgeDays": 730,
             "aresMaxLookups": ARES_MAX_LOOKUPS_DEFAULT,
+            "maxGapDays": MAX_GAP_DAYS_DEFAULT,
+            "repostWindowDays": REPOST_WINDOW_DAYS_DEFAULT,
         })
     }
 
@@ -205,10 +239,32 @@ impl ScrapeApp for MpsvVpm {
         let mut skill_demand: HashMap<(String, String), Cell> = HashMap::new();
         let mut education_agg: HashMap<(String, String), Cell> = HashMap::new();
         let mut group_all: HashMap<String, Cell> = HashMap::new();
+        // Survival-ledger view of TODAY's feed: portalId → the compact tuple the
+        // diff needs. Collected BEFORE the recency filter — a stale relic is
+        // still a live posting; dropping it here would falsely close it.
+        let mut ledger_today: HashMap<String, TodayPosting> = HashMap::new();
         // gather a few extra candidates per group, then keep only the richest N
         let gather_cap = samples_per_group.saturating_mul(6).max(samples_per_group);
 
         for p in feed.polozky.iter().take(considered) {
+            // Survival ledger: track every classifiable posting with a stable id.
+            if let (Some(pid), Some(cz)) = (p.portalId, p.czisco()) {
+                ledger_today.insert(
+                    pid.to_string(),
+                    TodayPosting {
+                        czisco: cz,
+                        kraj: p.kraj(),
+                        band: salary_band(p.monthly_salary_point()),
+                        ico: p
+                            .zamestnavatel
+                            .as_ref()
+                            .and_then(|z| z.ico.as_deref())
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string),
+                    },
+                );
+            }
             // Recency filter: drop ancient relics (posted before the cutoff). A
             // posting with no posting date can't be aged, so it is kept.
             let posted = p.posted_date();
@@ -636,6 +692,114 @@ impl ScrapeApp for MpsvVpm {
             "maxLookups": ares_max,
         });
 
+        // ── Vacancy survival ledger ─────────────────────────────────────────
+        // Diff today's per-posting view against the prior run's ledger artifact
+        // to learn which postings disappeared (time-to-CLOSE — filled, withdrawn
+        // or expired; the feed can't tell which), detect reposts, and aggregate
+        // the rolling closed window into `cz-labour/vacancy_lifecycle`. The
+        // ledger itself is ONE compact artifact per run; a `vacancy_ledger`
+        // pointer record (artifact_path + job_id) lets the next run find it via
+        // `read_source_artifact`. Every day not captured is lost forever, so a
+        // broken/missing prior ledger restarts the ledger with a warn — it must
+        // never fail the run.
+        let max_gap_days = ctx
+            .params
+            .get("maxGapDays")
+            .and_then(Value::as_i64)
+            .unwrap_or(MAX_GAP_DAYS_DEFAULT)
+            .max(1);
+        let repost_window_days = ctx
+            .params
+            .get("repostWindowDays")
+            .and_then(Value::as_i64)
+            .unwrap_or(REPOST_WINDOW_DAYS_DEFAULT)
+            .max(1);
+        let ledger_date = ref_date.unwrap_or_else(|| chrono::Utc::now().date_naive());
+        let prior_ledger: Option<Ledger> =
+            match ctx.datasets.get(&ctx.app, LEDGER_DATASET, "current").await? {
+                Some(rec) => match ctx.read_source_artifact(&ctx.app, &rec).await {
+                    Ok(body) => match serde_json::from_str::<Ledger>(&body) {
+                        Ok(l) => Some(l),
+                        Err(e) => {
+                            tracing::warn!(
+                                "mpsv-vpm: prior vacancy ledger unparseable ({e}) — restarting ledger"
+                            );
+                            None
+                        }
+                    },
+                    Err(e) => {
+                        tracing::warn!(
+                            "mpsv-vpm: prior vacancy ledger unreadable ({e}) — restarting ledger"
+                        );
+                        None
+                    }
+                },
+                None => None,
+            };
+        let had_prior = prior_ledger.is_some();
+        let diff = diff_ledger(
+            prior_ledger,
+            &ledger_today,
+            ledger_date,
+            max_gap_days,
+            repost_window_days,
+        );
+        if diff.carried && had_prior {
+            tracing::warn!(
+                gap_days = diff.gap_days,
+                max_gap_days,
+                "mpsv-vpm: ledger run gap outside tolerance — carried forward, no closures recorded"
+            );
+        }
+        // Live posting counts per (unit group × kraj) — the churn denominator.
+        let mut live_counts: HashMap<(String, String), usize> = HashMap::new();
+        for t in ledger_today.values() {
+            let ug = unit_group(&t.czisco);
+            if let Some(k) = &t.kraj {
+                *live_counts.entry((ug.clone(), k.clone())).or_default() += 1;
+            }
+            *live_counts.entry((ug, "ALL".to_string())).or_default() += 1;
+        }
+        let lifecycle_items =
+            aggregate_lifecycle(&diff.ledger.closed, &live_counts, min_count, repost_window_days);
+        let lifecycle = ctx
+            .datasets
+            .upsert_many(GAP_APP, LIFECYCLE_DATASET, &lifecycle_items)
+            .await?;
+        let ledger_bytes = serde_json::to_vec(&diff.ledger)?;
+        let ledger_len = ledger_bytes.len();
+        ctx.save_artifact(LEDGER_ARTIFACT, &ledger_bytes).await?;
+        // Pointer LAST — only after the artifact is durably written, so a crash
+        // between the two can't leave the pointer at a nonexistent file.
+        ctx.upsert(
+            LEDGER_DATASET,
+            "current",
+            &json!({
+                "artifact_path": LEDGER_ARTIFACT,
+                "job_id": ctx.job_id.to_string(),
+                "run_date": ledger_date.to_string(),
+                "open": diff.ledger.open.len(),
+                "closedInWindow": diff.ledger.closed.len(),
+                "bytes": ledger_len,
+            }),
+        )
+        .await?;
+        let vacancy_ledger = json!({
+            "runDate": ledger_date.to_string(),
+            "open": diff.ledger.open.len(),
+            "new": diff.new_now,
+            "ongoing": diff.ongoing,
+            "closed": diff.closed_now,
+            "reposts": diff.reposts_now,
+            "closedInWindow": diff.ledger.closed.len(),
+            "gapDays": diff.gap_days,
+            "carriedForward": diff.carried,
+            "lifecycleCells": lifecycle_items.len(),
+            "lifecycleNew": lifecycle.new.len(),
+            "lifecycleChanged": lifecycle.changed.len(),
+            "artifactBytes": ledger_len,
+        });
+
         let out = json!({
             "source": "data.mpsv.cz/volna-mista",
             "feedRecords": total,
@@ -664,6 +828,7 @@ impl ScrapeApp for MpsvVpm {
             "fadingTop": fading_top,
             "salaryGap": salary_gap,
             "employers": employer_summary,
+            "vacancyLedger": vacancy_ledger,
             "freshness": freshness,
         });
         ctx.save_artifact("summary.json", &serde_json::to_vec_pretty(&out)?)
@@ -872,6 +1037,335 @@ fn normalize_ares_employer(ico: &str, v: &Value) -> Option<Value> {
         "nace": nace,
         "naceCount": nace_total,
     }))
+}
+
+// ── vacancy survival ledger ─────────────────────────────────────────────────
+//
+// Compact per-posting lifecycle state carried run-to-run as ONE JSON artifact.
+// Rows serialize as tuples (arrays), not objects — at ~300k open postings the
+// field names would dominate the file; tuple form keeps a full national ledger
+// around ~25 MB open + a rolling closed window (bounded by `repostWindowDays`).
+//
+// METRIC HONESTY: a posting that stops appearing in the feed has CLOSED —
+// filled, withdrawn by the employer, or expired; the feed cannot distinguish.
+// Everything derived here is therefore time-to-CLOSE, never "time-to-fill".
+
+/// One open posting: `(id, czIsco, kraj, salaryBand, ico, firstSeen, lastSeen,
+/// seenCount)`; dates are `YYYY-MM-DD`.
+type OpenTuple = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    String,
+    u32,
+);
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, Deserialize)]
+#[serde(from = "OpenTuple", into = "OpenTuple")]
+struct OpenEntry {
+    id: String,
+    czisco: String,
+    kraj: Option<String>,
+    band: Option<String>,
+    ico: Option<String>,
+    first_seen: String,
+    last_seen: String,
+    seen_count: u32,
+}
+
+impl From<OpenTuple> for OpenEntry {
+    fn from((id, czisco, kraj, band, ico, first_seen, last_seen, seen_count): OpenTuple) -> Self {
+        Self { id, czisco, kraj, band, ico, first_seen, last_seen, seen_count }
+    }
+}
+impl From<OpenEntry> for OpenTuple {
+    fn from(e: OpenEntry) -> Self {
+        (e.id, e.czisco, e.kraj, e.band, e.ico, e.first_seen, e.last_seen, e.seen_count)
+    }
+}
+
+/// One closed posting kept for the repost window: `(id, czIsco, kraj,
+/// salaryBand, ico, closedAt, daysOpen, repostId)`. `days_open` = closedAt −
+/// firstSeen (days-to-CLOSE). `repost_id` links the posting that reappeared
+/// with the same (IČO, czIsco, kraj, band) within the window.
+type ClosedTuple = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    i64,
+    Option<String>,
+);
+
+#[derive(Clone, Debug, PartialEq, serde::Serialize, Deserialize)]
+#[serde(from = "ClosedTuple", into = "ClosedTuple")]
+struct ClosedEntry {
+    id: String,
+    czisco: String,
+    kraj: Option<String>,
+    band: Option<String>,
+    ico: Option<String>,
+    closed_at: String,
+    days_open: i64,
+    repost_id: Option<String>,
+}
+
+impl From<ClosedTuple> for ClosedEntry {
+    fn from((id, czisco, kraj, band, ico, closed_at, days_open, repost_id): ClosedTuple) -> Self {
+        Self { id, czisco, kraj, band, ico, closed_at, days_open, repost_id }
+    }
+}
+impl From<ClosedEntry> for ClosedTuple {
+    fn from(e: ClosedEntry) -> Self {
+        (e.id, e.czisco, e.kraj, e.band, e.ico, e.closed_at, e.days_open, e.repost_id)
+    }
+}
+
+/// The whole run-to-run ledger artifact: the run it describes, all open
+/// postings, and the closures still inside the repost window.
+#[derive(Default, serde::Serialize, Deserialize)]
+struct Ledger {
+    run_date: String,
+    #[serde(default)]
+    open: Vec<OpenEntry>,
+    #[serde(default)]
+    closed: Vec<ClosedEntry>,
+}
+
+/// Today's view of one posting — everything the diff and repost matcher need.
+struct TodayPosting {
+    czisco: String,
+    kraj: Option<String>,
+    band: Option<String>,
+    ico: Option<String>,
+}
+
+struct LedgerDiff {
+    ledger: Ledger,
+    new_now: usize,
+    ongoing: usize,
+    closed_now: usize,
+    reposts_now: usize,
+    /// True when nothing was closed because the run gap was outside tolerance
+    /// (or the prior run date didn't parse — never mass-close on bad data).
+    carried: bool,
+    gap_days: i64,
+}
+
+/// Salary band for repost matching: [`SALARY_BAND_CZK`]-wide buckets of the
+/// monthly midpoint, labeled by their lower bound ("40k" = 40 000–44 999 CZK).
+fn salary_band(salary: Option<f64>) -> Option<String> {
+    salary.map(|s| {
+        let lo = (s / SALARY_BAND_CZK).floor() as i64 * (SALARY_BAND_CZK as i64 / 1_000);
+        format!("{lo}k")
+    })
+}
+
+/// Diffs the prior ledger against today's feed view. Pure — all persistence
+/// happens in the caller.
+///
+/// * First run (`prior` None): everything is new; nothing can close.
+/// * Gap tolerance: if `today − prior.run_date` is outside `1..=max_gap_days`
+///   (missed runs, same-day re-run, or an unparseable prior date), NOTHING is
+///   closed — prior entries absent today are carried forward unchanged, since
+///   their absence spans an unobserved window.
+/// * Normal day: absent → closed (`days_open` = today − first_seen), present →
+///   `last_seen`/`seen_count` advance, unknown → new (first_seen = today).
+/// * Reposts: a new posting whose (IČO, czIsco, kraj, band) matches a
+///   still-unmatched closure inside `repost_window_days` links to it 1:1
+///   (newest closure first); postings without an IČO never match.
+fn diff_ledger(
+    prior: Option<Ledger>,
+    today_map: &HashMap<String, TodayPosting>,
+    today: NaiveDate,
+    max_gap_days: i64,
+    repost_window_days: i64,
+) -> LedgerDiff {
+    let today_s = today.to_string();
+    let (prior_open, prior_closed, gap_days) = match prior {
+        Some(l) => {
+            let gap = NaiveDate::parse_from_str(&l.run_date, "%Y-%m-%d")
+                .map(|d| (today - d).num_days())
+                .unwrap_or(i64::MAX);
+            (l.open, l.closed, gap)
+        }
+        None => (Vec::new(), Vec::new(), 0),
+    };
+    let carried = !prior_open.is_empty() && !(1..=max_gap_days).contains(&gap_days);
+
+    // Closures still inside the repost window survive; older ones age out.
+    let window_start = today - Duration::days(repost_window_days);
+    let mut closed: Vec<ClosedEntry> = prior_closed
+        .into_iter()
+        .filter(|c| {
+            NaiveDate::parse_from_str(&c.closed_at, "%Y-%m-%d")
+                .is_ok_and(|d| d >= window_start)
+        })
+        .collect();
+
+    let mut known: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut open: Vec<OpenEntry> = Vec::with_capacity(today_map.len());
+    let (mut ongoing, mut closed_now) = (0usize, 0usize);
+    for mut e in prior_open {
+        known.insert(e.id.clone());
+        if today_map.contains_key(&e.id) {
+            e.last_seen = today_s.clone();
+            e.seen_count += 1;
+            ongoing += 1;
+            open.push(e);
+        } else if carried {
+            open.push(e); // absence unobservable across the gap — keep it open
+        } else {
+            let days_open = NaiveDate::parse_from_str(&e.first_seen, "%Y-%m-%d")
+                .map(|f| (today - f).num_days().max(1))
+                .unwrap_or(1);
+            closed.push(ClosedEntry {
+                id: e.id,
+                czisco: e.czisco,
+                kraj: e.kraj,
+                band: e.band,
+                ico: e.ico,
+                closed_at: today_s.clone(),
+                days_open,
+                repost_id: None,
+            });
+            closed_now += 1;
+        }
+    }
+
+    // Unmatched closures indexed by the repost key; last index = newest closure.
+    let mut repost_index: HashMap<(String, String, String, String), Vec<usize>> = HashMap::new();
+    for (i, c) in closed.iter().enumerate() {
+        if c.repost_id.is_none() {
+            if let Some(ico) = &c.ico {
+                repost_index
+                    .entry((
+                        ico.clone(),
+                        c.czisco.clone(),
+                        c.kraj.clone().unwrap_or_default(),
+                        c.band.clone().unwrap_or_default(),
+                    ))
+                    .or_default()
+                    .push(i);
+            }
+        }
+    }
+    let mut new_ids: Vec<&String> = today_map.keys().filter(|id| !known.contains(*id)).collect();
+    new_ids.sort(); // deterministic 1:1 matching
+    let (mut new_now, mut reposts_now) = (0usize, 0usize);
+    for id in new_ids {
+        let t = &today_map[id];
+        if let Some(ico) = &t.ico {
+            let key = (
+                ico.clone(),
+                t.czisco.clone(),
+                t.kraj.clone().unwrap_or_default(),
+                t.band.clone().unwrap_or_default(),
+            );
+            if let Some(slot) = repost_index.get_mut(&key).and_then(Vec::pop) {
+                closed[slot].repost_id = Some(id.clone());
+                reposts_now += 1;
+            }
+        }
+        open.push(OpenEntry {
+            id: id.clone(),
+            czisco: t.czisco.clone(),
+            kraj: t.kraj.clone(),
+            band: t.band.clone(),
+            ico: t.ico.clone(),
+            first_seen: today_s.clone(),
+            last_seen: today_s.clone(),
+            seen_count: 1,
+        });
+        new_now += 1;
+    }
+
+    LedgerDiff {
+        ledger: Ledger { run_date: today_s, open, closed },
+        new_now,
+        ongoing,
+        closed_now,
+        reposts_now,
+        carried,
+        gap_days,
+    }
+}
+
+/// Aggregates the rolling closed window into `cz-labour/vacancy_lifecycle`
+/// rows: per (CZ-ISCO unit group × kraj, plus a kraj `ALL` roll-up), the
+/// days-to-CLOSE distribution (median/p75, nearest-rank), repost share, and
+/// churn (window closures vs currently-live postings in the cell). Cells below
+/// `min_count` closures are suppressed (the same privacy/statistical floor as
+/// the salary aggregates). Keys `{unitGroup}|{krajId}`, sorted for
+/// deterministic upserts.
+///
+/// The `metric` field says `time_to_close` on every record on purpose:
+/// disappearance conflates filled / withdrawn / expired, so this must never be
+/// presented as time-to-fill.
+fn aggregate_lifecycle(
+    closed: &[ClosedEntry],
+    live_counts: &HashMap<(String, String), usize>,
+    min_count: usize,
+    window_days: i64,
+) -> Vec<(String, Value)> {
+    #[derive(Default)]
+    struct LifeCell {
+        days: Vec<i64>,
+        reposts: usize,
+    }
+    let mut cells: HashMap<(String, String), LifeCell> = HashMap::new();
+    let mut add = |ug: String, kraj: String, c: &ClosedEntry| {
+        let cell = cells.entry((ug, kraj)).or_default();
+        cell.days.push(c.days_open);
+        cell.reposts += c.repost_id.is_some() as usize;
+    };
+    for c in closed {
+        let ug = unit_group(&c.czisco);
+        if let Some(k) = &c.kraj {
+            add(ug.clone(), k.clone(), c);
+        }
+        add(ug, "ALL".to_string(), c);
+    }
+    let mut items: Vec<(String, Value)> = Vec::new();
+    for ((ug, kraj), mut cell) in cells {
+        if cell.days.len() < min_count.max(1) {
+            continue;
+        }
+        cell.days.sort_unstable();
+        let pct = |p: f64| -> i64 {
+            let idx = (((cell.days.len() - 1) as f64) * p).round() as usize;
+            cell.days[idx.min(cell.days.len() - 1)]
+        };
+        let n = cell.days.len();
+        let live = live_counts.get(&(ug.clone(), kraj.clone())).copied();
+        items.push((
+            format!("{ug}|{kraj}"),
+            json!({
+                "czIscoGroup": ug,
+                "krajId": kraj,
+                // Time from first observation to disappearance from the feed.
+                // NOT time-to-fill: closure = filled OR withdrawn OR expired.
+                "metric": "time_to_close",
+                "windowDays": window_days,
+                "closedCount": n,
+                "medianDaysToClose": pct(0.5),
+                "p75DaysToClose": pct(0.75),
+                "repostCount": cell.reposts,
+                "repostSharePct": (cell.reposts as f64 / n as f64 * 100.0 * 10.0).round() / 10.0,
+                "liveCount": live,
+                "churnPct": live.filter(|&l| l > 0).map(|l| {
+                    (n as f64 / l as f64 * 100.0 * 10.0).round() / 10.0
+                }),
+            }),
+        ));
+    }
+    items.sort_by(|a, b| a.0.cmp(&b.0));
+    items
 }
 
 // ── typed subset of the feed (unknown fields are ignored, bounding memory) ──
@@ -1283,7 +1777,7 @@ mod tests {
     #[test]
     fn official_index_reads_string_encoded_stats() {
         // Regression: as_f64-only dropped rows whose stats arrived as strings.
-        let rows = vec![
+        let rows = [
             json!({"czIsco": "CzIsco/1120", "sfera": "MZDOVA", "medianMzda": "111959", "mzdaPrumer": "190185"}),
         ];
         let idx = official_wage_index(rows.iter());
@@ -1295,7 +1789,7 @@ mod tests {
 
     #[test]
     fn official_index_keys_by_unit_group_and_drops_medianless_rows() {
-        let rows = vec![
+        let rows = [
             json!({"czIsco": "CzIsco/1120", "sfera": "MZDOVA", "medianMzda": 111959.0, "mzdaPrumer": 190185.0}),
             json!({"czIsco": "CzIsco/2433", "sfera": "PLATOVA"}), // no median → dropped
             json!({"sfera": "MZDOVA", "medianMzda": 40000.0}),    // no code → dropped
@@ -1457,7 +1951,7 @@ mod tests {
 
     #[test]
     fn distinct_icos_dedupes_pads_and_drops_invalid() {
-        let samples = vec![
+        let samples = [
             json!({"employerIco": "27074358"}),
             json!({"employerIco": "27074358"}),  // duplicate
             json!({"employerIco": "45274649 "}), // trimmed
@@ -1471,5 +1965,306 @@ mod tests {
             distinct_icos(samples.iter()),
             vec!["27074358", "45274649", "01234567"]
         );
+    }
+
+    // ── vacancy survival ledger ─────────────────────────────────────────────
+
+    fn d(s: &str) -> NaiveDate {
+        NaiveDate::parse_from_str(s, "%Y-%m-%d").unwrap()
+    }
+
+    fn tp(isco: &str, kraj: Option<&str>, band: Option<&str>, ico: Option<&str>) -> TodayPosting {
+        TodayPosting {
+            czisco: isco.to_string(),
+            kraj: kraj.map(str::to_string),
+            band: band.map(str::to_string),
+            ico: ico.map(str::to_string),
+        }
+    }
+
+    fn today_map(entries: Vec<(&str, TodayPosting)>) -> HashMap<String, TodayPosting> {
+        entries
+            .into_iter()
+            .map(|(id, t)| (id.to_string(), t))
+            .collect()
+    }
+
+    fn open_e(id: &str, isco: &str, ico: Option<&str>, first_seen: &str, last_seen: &str) -> OpenEntry {
+        OpenEntry {
+            id: id.to_string(),
+            czisco: isco.to_string(),
+            kraj: Some("Kraj/108".to_string()),
+            band: Some("40k".to_string()),
+            ico: ico.map(str::to_string),
+            first_seen: first_seen.to_string(),
+            last_seen: last_seen.to_string(),
+            seen_count: 1,
+        }
+    }
+
+    fn ledger(run_date: &str, open: Vec<OpenEntry>, closed: Vec<ClosedEntry>) -> Ledger {
+        Ledger {
+            run_date: run_date.to_string(),
+            open,
+            closed,
+        }
+    }
+
+    #[test]
+    fn salary_band_buckets_by_5k_and_never_fabricates() {
+        assert_eq!(salary_band(Some(40_000.0)), Some("40k".to_string()));
+        assert_eq!(salary_band(Some(44_999.0)), Some("40k".to_string()));
+        assert_eq!(salary_band(Some(45_000.0)), Some("45k".to_string()));
+        assert_eq!(salary_band(None), None);
+    }
+
+    #[test]
+    fn diff_first_run_everything_new_nothing_closed() {
+        let today = today_map(vec![
+            ("1", tp("CzIsco/5223", Some("Kraj/108"), Some("40k"), Some("123"))),
+            ("2", tp("CzIsco/9329", None, None, None)),
+        ]);
+        let r = diff_ledger(None, &today, d("2026-07-30"), 3, 30);
+        assert_eq!(r.new_now, 2);
+        assert_eq!((r.ongoing, r.closed_now, r.reposts_now), (0, 0, 0));
+        assert!(!r.carried);
+        assert_eq!(r.ledger.open.len(), 2);
+        assert!(r.ledger.closed.is_empty());
+        assert!(r.ledger.open.iter().all(|e| e.first_seen == "2026-07-30" && e.seen_count == 1));
+    }
+
+    #[test]
+    fn diff_normal_day_ongoing_advances_and_missing_closes_with_days_open() {
+        let prior = ledger(
+            "2026-07-29",
+            vec![
+                open_e("1", "CzIsco/5223", None, "2026-07-20", "2026-07-29"),
+                open_e("2", "CzIsco/9329", None, "2026-07-25", "2026-07-29"),
+            ],
+            vec![],
+        );
+        let today = today_map(vec![(
+            "1",
+            tp("CzIsco/5223", Some("Kraj/108"), Some("40k"), None),
+        )]);
+        let r = diff_ledger(Some(prior), &today, d("2026-07-30"), 3, 30);
+        assert_eq!((r.new_now, r.ongoing, r.closed_now), (0, 1, 1));
+        let kept = &r.ledger.open[0];
+        assert_eq!(kept.id, "1");
+        assert_eq!(kept.last_seen, "2026-07-30");
+        assert_eq!(kept.seen_count, 2);
+        assert_eq!(kept.first_seen, "2026-07-20"); // never reset
+        let closed = &r.ledger.closed[0];
+        assert_eq!(closed.id, "2");
+        assert_eq!(closed.closed_at, "2026-07-30");
+        assert_eq!(closed.days_open, 5); // 07-25 → 07-30
+        assert!(closed.repost_id.is_none());
+    }
+
+    #[test]
+    fn diff_gap_beyond_tolerance_closes_nothing_and_carries_forward() {
+        let prior = ledger(
+            "2026-07-20", // 10-day outage > maxGapDays 3
+            vec![
+                open_e("1", "CzIsco/5223", None, "2026-07-10", "2026-07-20"),
+                open_e("2", "CzIsco/9329", None, "2026-07-15", "2026-07-20"),
+            ],
+            vec![],
+        );
+        let today = today_map(vec![
+            ("1", tp("CzIsco/5223", Some("Kraj/108"), Some("40k"), None)),
+            ("3", tp("CzIsco/7112", None, None, None)),
+        ]);
+        let r = diff_ledger(Some(prior), &today, d("2026-07-30"), 3, 30);
+        assert!(r.carried);
+        assert_eq!(r.gap_days, 10);
+        assert_eq!(r.closed_now, 0);
+        assert!(r.ledger.closed.is_empty());
+        // "2" was absent but survives untouched; "1" advances; "3" is new.
+        assert_eq!(r.ledger.open.len(), 3);
+        let e2 = r.ledger.open.iter().find(|e| e.id == "2").unwrap();
+        assert_eq!(e2.last_seen, "2026-07-20");
+        assert_eq!(r.new_now, 1);
+    }
+
+    #[test]
+    fn diff_same_day_rerun_and_bad_prior_date_never_close() {
+        let prior_open = vec![open_e("1", "CzIsco/5223", None, "2026-07-25", "2026-07-30")];
+        let today = today_map(vec![]);
+        // Same-day re-run: gap 0 is outside 1..=max, so the absent posting stays.
+        let r = diff_ledger(
+            Some(ledger("2026-07-30", prior_open.clone(), vec![])),
+            &today,
+            d("2026-07-30"),
+            3,
+            30,
+        );
+        assert!(r.carried && r.closed_now == 0 && r.ledger.open.len() == 1);
+        // Unparseable prior run_date: never mass-close on bad data.
+        let r = diff_ledger(
+            Some(ledger("garbage", prior_open, vec![])),
+            &today,
+            d("2026-07-30"),
+            3,
+            30,
+        );
+        assert!(r.carried && r.closed_now == 0 && r.ledger.open.len() == 1);
+    }
+
+    #[test]
+    fn repost_matches_on_ico_isco_kraj_band_within_window_and_links_ids() {
+        let prior = ledger(
+            "2026-07-29",
+            vec![open_e("old", "CzIsco/5223", Some("123"), "2026-07-01", "2026-07-29")],
+            vec![],
+        );
+        // Day 1: "old" disappears → closed.
+        let r1 = diff_ledger(Some(prior), &today_map(vec![]), d("2026-07-30"), 3, 30);
+        assert_eq!(r1.closed_now, 1);
+        // Day 2: same employer + occupation + kraj + band reappears under a new id.
+        let today = today_map(vec![(
+            "new",
+            tp("CzIsco/5223", Some("Kraj/108"), Some("40k"), Some("123")),
+        )]);
+        let r2 = diff_ledger(Some(r1.ledger), &today, d("2026-07-31"), 3, 30);
+        assert_eq!(r2.reposts_now, 1);
+        let c = &r2.ledger.closed[0];
+        assert_eq!(c.id, "old");
+        assert_eq!(c.repost_id.as_deref(), Some("new"));
+    }
+
+    #[test]
+    fn repost_requires_ico_and_exact_cell_match() {
+        let closed = ClosedEntry {
+            id: "old".to_string(),
+            czisco: "CzIsco/5223".to_string(),
+            kraj: Some("Kraj/108".to_string()),
+            band: Some("40k".to_string()),
+            ico: None, // no employer id → can never be repost-linked
+            closed_at: "2026-07-29".to_string(),
+            days_open: 4,
+            repost_id: None,
+        };
+        let today = today_map(vec![(
+            "new",
+            tp("CzIsco/5223", Some("Kraj/108"), Some("40k"), Some("123")),
+        )]);
+        let r = diff_ledger(
+            Some(ledger("2026-07-29", vec![], vec![closed.clone()])),
+            &today,
+            d("2026-07-30"),
+            3,
+            30,
+        );
+        assert_eq!(r.reposts_now, 0);
+        // With an IČO but a different salary band, still no match.
+        let mut with_ico = closed;
+        with_ico.ico = Some("123".to_string());
+        with_ico.band = Some("60k".to_string());
+        let r = diff_ledger(
+            Some(ledger("2026-07-29", vec![], vec![with_ico])),
+            &today,
+            d("2026-07-30"),
+            3,
+            30,
+        );
+        assert_eq!(r.reposts_now, 0);
+    }
+
+    #[test]
+    fn closed_entries_age_out_of_the_repost_window() {
+        let stale = ClosedEntry {
+            id: "old".to_string(),
+            czisco: "CzIsco/5223".to_string(),
+            kraj: Some("Kraj/108".to_string()),
+            band: Some("40k".to_string()),
+            ico: Some("123".to_string()),
+            closed_at: "2026-06-01".to_string(), // far outside a 30-day window
+            days_open: 10,
+            repost_id: None,
+        };
+        let today = today_map(vec![(
+            "new",
+            tp("CzIsco/5223", Some("Kraj/108"), Some("40k"), Some("123")),
+        )]);
+        let r = diff_ledger(
+            Some(ledger("2026-07-29", vec![], vec![stale])),
+            &today,
+            d("2026-07-30"),
+            3,
+            30,
+        );
+        // Pruned before matching: no repost link, and the window stays bounded.
+        assert_eq!(r.reposts_now, 0);
+        assert!(r.ledger.closed.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_aggregate_percentiles_repost_share_churn_and_min_count() {
+        let mk = |days: i64, kraj: Option<&str>, repost: bool| ClosedEntry {
+            id: format!("c{days}"),
+            czisco: "CzIsco/52230".to_string(), // unit group 5223
+            kraj: kraj.map(str::to_string),
+            band: None,
+            ico: None,
+            closed_at: "2026-07-30".to_string(),
+            days_open: days,
+            repost_id: repost.then(|| "r".to_string()),
+        };
+        let closed = vec![
+            mk(2, Some("Kraj/108"), false),
+            mk(4, Some("Kraj/108"), true),
+            mk(6, Some("Kraj/108"), false),
+            mk(30, Some("Kraj/116"), false), // below minCount as a regional cell
+        ];
+        let mut live = HashMap::new();
+        live.insert(("5223".to_string(), "Kraj/108".to_string()), 30usize);
+        live.insert(("5223".to_string(), "ALL".to_string()), 40usize);
+        let items = aggregate_lifecycle(&closed, &live, 3, 30);
+        // Kraj/116 (1 closure) suppressed; Kraj/108 + ALL survive, sorted.
+        let keys: Vec<&str> = items.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["5223|ALL", "5223|Kraj/108"]);
+        let regional = &items[1].1;
+        assert_eq!(regional["metric"], "time_to_close");
+        assert_eq!(regional["closedCount"], 3);
+        assert_eq!(regional["medianDaysToClose"], 4);
+        assert_eq!(regional["p75DaysToClose"], 6);
+        assert_eq!(regional["repostCount"], 1);
+        assert_eq!(regional["repostSharePct"], 33.3);
+        assert_eq!(regional["liveCount"], 30);
+        assert_eq!(regional["churnPct"], 10.0); // 3 closed vs 30 live
+        let all = &items[0].1;
+        assert_eq!(all["closedCount"], 4); // Kraj/116 closure still counts here
+        assert_eq!(all["churnPct"], 10.0); // 4 vs 40
+        // Unknown live cell → no fabricated churn.
+        let no_live = aggregate_lifecycle(&closed, &HashMap::new(), 3, 30);
+        assert!(no_live[0].1["churnPct"].is_null());
+        assert!(no_live[0].1["liveCount"].is_null());
+    }
+
+    #[test]
+    fn ledger_serializes_rows_as_compact_tuples_and_round_trips() {
+        let l = ledger(
+            "2026-07-30",
+            vec![open_e("1", "CzIsco/5223", Some("123"), "2026-07-20", "2026-07-30")],
+            vec![ClosedEntry {
+                id: "2".to_string(),
+                czisco: "CzIsco/9329".to_string(),
+                kraj: None,
+                band: None,
+                ico: None,
+                closed_at: "2026-07-30".to_string(),
+                days_open: 3,
+                repost_id: None,
+            }],
+        );
+        let s = serde_json::to_string(&l).unwrap();
+        // Rows are arrays, not objects — field names must not repeat 300k times.
+        assert!(s.contains(r#"["1","CzIsco/5223","Kraj/108","40k","123","2026-07-20","2026-07-30",1]"#));
+        assert!(s.contains(r#"["2","CzIsco/9329",null,null,null,"2026-07-30",3,null]"#));
+        let back: Ledger = serde_json::from_str(&s).unwrap();
+        assert_eq!(back.open, l.open);
+        assert_eq!(back.closed, l.closed);
+        assert_eq!(back.run_date, "2026-07-30");
     }
 }

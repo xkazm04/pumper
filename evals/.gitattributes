@@ -1,0 +1,4 @@
+# Frozen eval fixtures and recorded transcripts are byte-exact captures.
+# Line-ending normalization would silently rewrite the very artifacts the eval
+# freezes, so opt the whole tree out of it.
+* -text

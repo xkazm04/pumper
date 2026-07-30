@@ -3,9 +3,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use pumper_core::{
-    Config, CostLedger, Datasets, EngineSet, Fetcher, Governor, HttpCache, NoPlugins, NoSearch,
-    Plugins, ResearchCache, Resilience, ScrapeApp, Search, Storage, TierMemory,
+    Config, CostLedger, Datasets, EngineSet, Fetcher, Governor, HttpCache, HttpClient, NoPlugins,
+    NoSearch, Plugins, ResearchCache, Resilience, ScrapeApp, Search, Storage, TierMemory,
 };
+use pumper_engine_archive::ArchiveEngine;
 use pumper_engine_browser::BrowserEngine;
 use pumper_engine_claude::ClaudeEngine;
 use pumper_engine_http::HttpEngine;
@@ -102,7 +103,9 @@ impl AppState {
             search,
             registry,
         } = parts;
-        let datasets = Arc::new(Datasets::new(storage.pool()));
+        let datasets = Arc::new(
+            Datasets::new(storage.pool()).with_derived_max_depth(config.derived.max_depth),
+        );
         let costs = Arc::new(CostLedger::new(storage.pool()));
         let cache = Arc::new(HttpCache::new(storage.pool(), &config.cache));
         let research_cache = Arc::new(ResearchCache::new(
@@ -164,19 +167,22 @@ impl AppState {
         )?);
         let browser = Arc::new(BrowserEngine::new(&config.browser, profiles_dir));
         let claude = Arc::new(ClaudeEngine::new(&config.claude));
+        // Tier-zero archive engine (`[archive]`, default OFF). Its CDX and
+        // snapshot requests run through the SAME HttpEngine, so archive.org is
+        // governed/cached/capped exactly like any other host.
+        let archive: Option<Arc<dyn HttpClient>> = config
+            .archive
+            .enabled
+            .then(|| Arc::new(ArchiveEngine::new(&config.archive, http.clone())) as _);
         let fetch = Fetcher::new(
             http.clone(),
             browser.clone(),
             claude.clone(),
             governor.clone(),
             &config.fetcher,
-        );
-        let engines = Arc::new(EngineSet {
-            http,
-            browser,
-            claude,
-            fetch,
-        });
+        )
+        .with_archive(archive);
+        let engines = Arc::new(EngineSet::new(http, browser, claude, fetch));
 
         let plugins: Arc<dyn Plugins> = if config.plugins.enabled {
             Arc::new(WasmPluginHost::new(&config.plugins)?)

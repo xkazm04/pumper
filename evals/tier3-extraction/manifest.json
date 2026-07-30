@@ -1,0 +1,188 @@
+{
+  "eval": "tier3-extraction",
+  "what": "Golden-fixture eval over the Claude tier of the tiered fetcher (crates/core/src/fetcher.rs) — the path that turns a page the HTTP and browser tiers could not read into Markdown. Runner: crates/core/tests/eval_tier3_extraction.rs.",
+  "fixtures": {
+    "real": true,
+    "captured_at": "2026-07-26",
+    "how": "curl -sL with a desktop UA, whole response body, unmodified. Sources: the portal URLs in catalog/data-sources.toml and the connector docs pages in catalog/connector-docs.json — i.e. pages this repo actually targets.",
+    "note": "Selected by measured text density on the frozen body: a page whose HTML carries no server-rendered text is a real thing the fetcher meets, but it makes a useless *extraction* fixture."
+  },
+  "recorded": {
+    "real": true,
+    "recorded_at": "2026-07-26",
+    "cli_version": "claude 2.1.220 (Claude Code)",
+    "command": "claude -p --output-format json --model sonnet --max-turns 1",
+    "total_cost_usd": 2.62,
+    "prompt": "The production tier-3 prompt verbatim ('Fetch <url> and extract its main textual content as clean Markdown. Respond with only the content, no commentary.') followed by the frozen snapshot of the page, because the recorder must not depend on the live web. In production the model fetches the page itself, so its input is the page either way.",
+    "note": "Transcripts are the verbatim CLI envelopes. Nothing is hand-authored, and nothing was re-rolled for a better score — oh-grants-portal's commentary preamble is a real prompt-adherence miss, kept and scored as one."
+  },
+  "scoring": {
+    "weights": {
+      "term_coverage": 0.55,
+      "commentary_free": 0.2,
+      "chrome_free": 0.1,
+      "length_in_band": 0.15
+    },
+    "baseline_score": "the score measured at recording time, floored to 2dp. The eval fails when a case scores below it.",
+    "measured_mean_at_recording": 0.971
+  },
+  "cases": [
+    {
+      "id": "irs-eo-bulk",
+      "url": "https://www.irs.gov/charities-non-profits/tax-exempt-organization-search-bulk-data-downloads",
+      "source": "catalog/data-sources.toml (irs-bmf)",
+      "must_include": [
+        "Tax Exempt Organization Search bulk data downloads",
+        "Publication 78",
+        "Exempt Organizations Business Master File",
+        "Automatic revocation of exemption list",
+        "Form 990-N",
+        "auto-revocation",
+        "Downloading instructions",
+        "Form 990-series"
+      ],
+      "baseline_score": 1.0
+    },
+    {
+      "id": "oh-grants-portal",
+      "url": "https://grantsportal.ohio.gov/Public/FundingOpportunities",
+      "source": "catalog/data-sources.toml (oh-grants)",
+      "must_include": [
+        "Funding Opportunities",
+        "CARES Act Local Distribution Tracking",
+        "Agency Programs",
+        "Ohio Arts Council",
+        "Office of Criminal Justice Services",
+        "Department of Natural Resources",
+        "Mental Health and Addiction Services",
+        "no funding opportunities to display"
+      ],
+      "baseline_score": 0.8
+    },
+    {
+      "id": "arxiv",
+      "url": "https://info.arxiv.org/help/api/index.html",
+      "source": "catalog/connector-docs.json (arxiv)",
+      "must_include": [
+        "arXiv API",
+        "Terms of Use",
+        "arXivLabs",
+        "interoperability",
+        "brand use guidelines",
+        "bulk data pipelines",
+        "arXiv affiliate"
+      ],
+      "baseline_score": 1.0
+    },
+    {
+      "id": "gitlab",
+      "url": "https://docs.gitlab.com/ee/api/rest/",
+      "source": "catalog/connector-docs.json (gitlab)",
+      "must_include": [
+        "REST API",
+        "Rate limits",
+        "Response format",
+        "Path parameters",
+        "Namespaced paths",
+        "/api/v4",
+        "414 Request-URI Too Large",
+        "iid",
+        "Array and hash types",
+        "ISO 8601"
+      ],
+      "baseline_score": 1.0
+    },
+    {
+      "id": "azure_devops",
+      "url": "https://learn.microsoft.com/en-us/rest/api/azure/devops/",
+      "source": "catalog/connector-docs.json (azure_devops)",
+      "must_include": [
+        "Azure DevOps Services REST API",
+        "Create the request",
+        "Authenticate",
+        "Process the response",
+        "Client Libraries",
+        "dev.azure.com/{organization}",
+        "api-version",
+        "_apis/wit/workitems",
+        "application/json"
+      ],
+      "baseline_score": 1.0
+    },
+    {
+      "id": "azure_cloud",
+      "url": "https://learn.microsoft.com/en-us/azure/active-directory/develop/quickstart-register-app",
+      "source": "catalog/connector-docs.json (azure_cloud)",
+      "must_include": [
+        "Register an application",
+        "Microsoft Entra ID",
+        "Prerequisites",
+        "Grant admin consent",
+        "redirect URI",
+        "Application (client) ID",
+        "App registrations"
+      ],
+      "baseline_score": 1.0
+    },
+    {
+      "id": "convex",
+      "url": "https://docs.convex.dev/http-api/",
+      "source": "catalog/connector-docs.json (convex)",
+      "must_include": [
+        "Convex HTTP API",
+        "API authentication",
+        "Functions API",
+        "Convex value format",
+        "/api/query",
+        "/api/mutation",
+        "/api/action",
+        "Authorization",
+        "functionIdentifier"
+      ],
+      "baseline_score": 1.0
+    },
+    {
+      "id": "discord_webhook",
+      "url": "https://support.discord.com/hc/en-us/articles/228383668",
+      "source": "catalog/connector-docs.json (discord_webhook)",
+      "must_include": [
+        "Intro to Webhooks",
+        "Making a Webhook",
+        "GitHub Webhook Integration",
+        "text channel",
+        "Server Settings",
+        "Integrations"
+      ],
+      "baseline_score": 1.0
+    },
+    {
+      "id": "figma",
+      "url": "https://www.figma.com/developers/api",
+      "source": "catalog/connector-docs.json (figma)",
+      "must_include": [
+        "Figma API",
+        "Base URL",
+        "Getting started",
+        "OpenAPI specification",
+        "https://api.figma.com",
+        "personal access token"
+      ],
+      "baseline_score": 0.9
+    },
+    {
+      "id": "aws_s3",
+      "url": "https://docs.aws.amazon.com/AmazonS3/latest/API/Welcome.html",
+      "source": "catalog/connector-docs.json (aws_s3)",
+      "must_include": [
+        "Amazon S3",
+        "Amazon S3 Control",
+        "Amazon S3 on Outposts",
+        "Amazon S3 Tables",
+        "Amazon S3 Vectors",
+        "2006-03-01",
+        "Amazon S3 Developer Guide"
+      ],
+      "baseline_score": 1.0
+    }
+  ]
+}

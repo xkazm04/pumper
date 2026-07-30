@@ -8,6 +8,7 @@
 //! single source the axum routing table and the OpenAPI document are both
 //! generated from — and exposes [`router`] for `main.rs`.
 
+use axum::extract::DefaultBodyLimit;
 use axum::Router;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
@@ -15,13 +16,25 @@ use utoipa_axum::routes;
 
 use crate::state::AppState;
 
+// The `?filter=` spec parser, re-exported for the external-trigger fire path
+// (`crate::triggers` sits outside `routes` and cannot reach the private
+// `datasets` submodule directly). One parser, both surfaces — no drift.
+pub(crate) use datasets::parse_filters;
+// The defaults-merge, re-exported for the MCP enqueue tool (`crate::mcp`) so a
+// job enqueued by an agent gets byte-identical params to one POSTed over HTTP.
+pub(crate) use jobs::merge_params;
+
 mod datasets;
+mod derived;
 mod error;
 mod events;
 mod health;
+mod economics;
+mod ingress;
 mod jobs;
 mod meta;
 mod query;
+mod recipes;
 mod runtime;
 mod schedules;
 mod search;
@@ -32,11 +45,15 @@ mod watches;
 // module so the `routes!(...)` registrations below resolve. Each submodule
 // exposes only its handlers as `pub(crate)`; DTOs and helpers stay private.
 use datasets::*;
+use derived::*;
 use events::*;
 use health::*;
+use economics::*;
+use ingress::*;
 use jobs::*;
 use meta::*;
 use query::*;
+use recipes::*;
 use runtime::*;
 use schedules::*;
 use search::*;
@@ -62,20 +79,63 @@ use watches::*;
         (name = "schedules", description = "Cron schedules"),
         (name = "datasets", description = "Change-detected dataset records, export, history"),
         (name = "grants", description = "Filtered query surface over the cross-source grants corpus"),
+        (name = "derived", description = "Derived datasets: filter/project/lookup specs recomputed on upstream deltas"),
         (name = "watches", description = "Dataset change webhooks"),
         (name = "triggers", description = "Reactive pipelines"),
+        (name = "ingress", description = "Inbound event ingress: signed external webhooks as trigger inputs"),
         (name = "webhooks", description = "Outbound delivery log"),
         (name = "search", description = "Full-text search and saved searches"),
         (name = "extract", description = "Declarative RuleSet preview / dry-run"),
         (name = "plugins", description = "WASM plugin host"),
         (name = "events", description = "Server-sent event streams"),
         (name = "hosts", description = "Learned per-host tier memory and politeness"),
+        (name = "cache", description = "HTTP cache freshness model (learned change cadence)"),
         (name = "profiles", description = "Session vault: named login profiles"),
+        (name = "recipes", description = "API X-ray: discovered JSON-API endpoints behind rendered pages"),
         (name = "meta", description = "The OpenAPI document itself"),
         (name = "sources", description = "Extraction health: per-source degradation detection"),
     )
 )]
 struct ApiDoc;
+
+/// Ceiling on an inbound request body, applied to every route.
+///
+/// Sized from what the POST surface actually accepts, all of which is
+/// hand-authored JSON config: job `params`, a cron string, a webhook URL + HMAC
+/// secret, a trigger definition, a saved search, a source-state flip.
+/// `POST /jobs/retry` is the widest and it carries only `{app, status, limit}` —
+/// the id list is server-generated and capped at 500. The largest realistic body
+/// on this list is a trigger with an inline payload template, measured in
+/// kilobytes; 1 MiB is three orders of magnitude of headroom, so no legitimate
+/// request can hit it, while an unbounded body can no longer make the process
+/// buffer arbitrary memory before a handler ever runs.
+///
+/// The one endpoint that genuinely takes a *document* rather than config
+/// (`POST /extract/preview`) gets a scoped override — see
+/// [`PREVIEW_BODY_LIMIT_BYTES`] — instead of this number being raised for
+/// everyone.
+pub(crate) const BODY_LIMIT_BYTES: usize = 1024 * 1024;
+
+/// Ceiling for `POST /extract/preview`, whose `html` field is a whole web page.
+///
+/// Deliberately equal to `PREVIEW_MAX_BODY_BYTES` in `runtime.rs`, the budget the
+/// same endpoint already enforces on its `url`-fetch path: the two ways to hand
+/// a preview a document must accept the same document, or the same page would
+/// preview through `url` and 413 through `html`.
+pub(crate) const PREVIEW_BODY_LIMIT_BYTES: usize = 8 * 1024 * 1024;
+
+/// An "override" that is not larger than the thing it overrides is a
+/// footgun that reads as protection — reject it at compile time.
+const _: () = assert!(PREVIEW_BODY_LIMIT_BYTES > BODY_LIMIT_BYTES);
+
+/// The routes that take a document-sized body, carrying their own larger limit.
+/// Kept as a separate `OpenApiRouter` so the override is scoped by construction
+/// — a route only gets the bigger ceiling by being moved into this function.
+fn large_body_router() -> OpenApiRouter<AppState> {
+    OpenApiRouter::new()
+        .routes(routes!(extract_preview))
+        .layer(DefaultBodyLimit::max(PREVIEW_BODY_LIMIT_BYTES))
+}
 
 /// Builds the router with every route registered through its `#[utoipa::path]`
 /// annotation, so the axum routing table and the OpenAPI document are generated
@@ -97,6 +157,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(stream_job))
         .routes(routes!(job_costs))
         .routes(routes!(cost_summary))
+        .routes(routes!(economics_report))
         .routes(routes!(list_schedules, create_schedule))
         .routes(routes!(delete_schedule))
         .routes(routes!(set_schedule_enabled))
@@ -106,6 +167,10 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(dataset_duplicates))
         .routes(routes!(dataset_changes))
         .routes(routes!(record_history))
+        .routes(routes!(list_derived, create_derived))
+        .routes(routes!(get_derived, delete_derived))
+        .routes(routes!(set_derived_enabled))
+        .routes(routes!(backfill_derived))
         .routes(routes!(list_watches, create_watch))
         .routes(routes!(delete_watch))
         .routes(routes!(set_watch_enabled))
@@ -114,13 +179,19 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(set_trigger_enabled))
         .routes(routes!(test_trigger))
         .routes(routes!(trigger_runs))
+        .routes(routes!(list_ingress_sources, create_ingress_source))
+        .routes(routes!(delete_ingress_source))
+        .routes(routes!(set_ingress_source_enabled))
+        .routes(routes!(ingest))
         .routes(routes!(list_deliveries))
         .routes(routes!(get_delivery))
         .routes(routes!(replay_delivery))
+        .routes(routes!(cache_freshness))
         .routes(routes!(list_hosts))
         .routes(routes!(get_host))
         .routes(routes!(delete_host_memory))
         .routes(routes!(list_profiles))
+        .routes(routes!(list_recipes))
         .routes(routes!(list_plugins))
         .routes(routes!(reload_plugins))
         .routes(routes!(search))
@@ -130,11 +201,11 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(set_saved_search_enabled))
         .routes(routes!(delete_search_dataset))
         .routes(routes!(search_status))
-        .routes(routes!(extract_preview))
         .routes(routes!(list_grants))
         .routes(routes!(closing_soon))
         .routes(routes!(catalog_sources))
         .routes(routes!(catalog_health))
+        .routes(routes!(catalog_reconcile, catalog_reconcile_apply))
         .routes(routes!(list_sources))
         .routes(routes!(get_source))
         .routes(routes!(source_runs))
@@ -142,10 +213,21 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(datahub_status))
         .routes(routes!(datahub_sync))
         .routes(routes!(openapi_json))
+        // Document-bodied routes, with their own scoped body ceiling.
+        .merge(large_body_router())
 }
 
 pub fn router(state: AppState) -> Router {
     let (router, _api) = openapi_router().split_for_parts();
+    // MCP endpoint (`[mcp] enabled`, default OFF). Merged here — inside the
+    // layer stack below (body limit, compression, trace) but deliberately
+    // OUTSIDE the OpenAPI document: /mcp speaks JSON-RPC, not REST, and the
+    // spec-coverage test's EXPECTED inventory documents the REST surface only.
+    let router = if state.config.mcp.enabled {
+        router.merge(crate::mcp::router())
+    } else {
+        router
+    };
     // gzip/br responses when the client sends accept-encoding — record JSON is
     // highly repetitive (identical keys per row, ISO timestamps) so it compresses
     // ~5-10x, a real win for remote consumers and the streamed export path.
@@ -156,7 +238,13 @@ pub fn router(state: AppState) -> Router {
     // accept-encoding are unaffected.
     let router = router
         .layer(tower_http::compression::CompressionLayer::new())
-        .layer(tower_http::trace::TraceLayer::new_for_http());
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        // Outermost of the three, so it is the first thing an inbound request
+        // meets. `DefaultBodyLimit` works by putting the limit in the request
+        // extensions for `Json`/`Bytes` to read, and the *innermost* layer wins
+        // — which is precisely why `large_body_router`'s per-route override
+        // survives this global one instead of being clobbered by it.
+        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES));
     // CORS is OFF by default (same-origin only). A permissive allow-all on an
     // unauthenticated, mutating, data-bearing API lets any site the operator
     // visits drive it cross-origin (DNS-rebinding defeats the localhost
@@ -311,6 +399,7 @@ mod api_spec_tests {
         "GET /jobs/{id}/stream",
         "GET /jobs/{id}/costs",
         "GET /costs",
+        "GET /economics",
         "GET /schedules",
         "POST /schedules",
         "DELETE /schedules/{id}",
@@ -322,6 +411,12 @@ mod api_spec_tests {
         "DELETE /datasets/{app}/{dataset}/records/{key}",
         "GET /datasets/{app}/{dataset}/changes",
         "GET /datasets/{app}/{dataset}/history",
+        "GET /derived",
+        "POST /derived",
+        "GET /derived/{id}",
+        "DELETE /derived/{id}",
+        "POST /derived/{id}/enabled",
+        "POST /derived/{id}/backfill",
         "GET /watches",
         "POST /watches",
         "DELETE /watches/{id}",
@@ -332,13 +427,20 @@ mod api_spec_tests {
         "POST /triggers/{id}/enabled",
         "POST /triggers/{id}/test",
         "GET /triggers/{id}/runs",
+        "GET /ingress/sources",
+        "POST /ingress/sources",
+        "DELETE /ingress/sources/{id}",
+        "POST /ingress/sources/{id}/enabled",
+        "POST /ingest/{id}",
         "GET /webhooks/deliveries",
         "GET /webhooks/deliveries/{id}",
         "POST /webhooks/deliveries/{id}/replay",
+        "GET /cache/freshness",
         "GET /hosts",
         "GET /hosts/{host}",
         "DELETE /hosts/{host}/memory",
         "GET /profiles",
+        "GET /recipes",
         "GET /plugins",
         "POST /plugins/reload",
         "GET /search",
@@ -354,6 +456,8 @@ mod api_spec_tests {
         "GET /grants/closing-soon",
         "GET /catalog/sources",
         "GET /catalog/health",
+        "GET /catalog/reconcile",
+        "POST /catalog/reconcile",
         "GET /sources",
         "GET /sources/{id}",
         "GET /sources/{id}/runs",
@@ -394,6 +498,33 @@ mod api_spec_tests {
         assert!(
             undocumented.is_empty(),
             "spec has operations not in the expected inventory (update EXPECTED): {undocumented:?}"
+        );
+    }
+
+    /// Routes exempted from the global [`super::BODY_LIMIT_BYTES`] ceiling by
+    /// living in `large_body_router`. Every entry is a route that takes a
+    /// *document* rather than JSON config; the EXPECTED-diff makes moving a
+    /// route into the larger ceiling a visible, deliberate edit rather than a
+    /// one-line drive-by. Raising the global limit to accommodate a new document
+    /// route is the anti-pattern this list exists to prevent.
+    const EXPECTED_LARGE_BODY: &[&str] = &["POST /extract/preview"];
+
+    #[test]
+    fn only_document_routes_get_the_larger_body_ceiling() {
+        let api = super::large_body_router().split_for_parts().1;
+        let json = serde_json::to_value(&api).expect("spec serializes");
+        let mut ops = BTreeSet::new();
+        for (path, item) in json["paths"].as_object().expect("paths object") {
+            for method in item.as_object().expect("path item object").keys() {
+                ops.insert(format!("{} {}", method.to_uppercase(), path));
+            }
+        }
+        let expected: BTreeSet<String> =
+            EXPECTED_LARGE_BODY.iter().map(|s| s.to_string()).collect();
+        assert_eq!(
+            ops, expected,
+            "the body-limit override's scope changed — update EXPECTED_LARGE_BODY only if the \
+             new route genuinely accepts a document-sized body"
         );
     }
 

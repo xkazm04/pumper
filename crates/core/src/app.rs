@@ -33,6 +33,31 @@ impl ProgressReporter for NoProgress {
     fn report(&self, _snapshot: Value) {}
 }
 
+/// Durable-execution checkpoint seam. A long-running app hands
+/// [`CheckpointSink::save`] a compact JSON snapshot of its resumable state; the
+/// runtime persists it keyed by job id (attempts-lineage guarded, like
+/// `complete`) so a crash, reap, timeout, or graceful-shutdown suspend costs a
+/// *resume* instead of a restart. Implementations throttle their own writes
+/// (the server impl coalesces like the progress reporter); `force` bypasses the
+/// throttle for final/suspend snapshots. Returns `false` when the write did not
+/// land (stale lineage or a storage error) so apps can count it — persistence
+/// failures must never fail the job.
+#[async_trait]
+pub trait CheckpointSink: Send + Sync {
+    async fn save(&self, state: Value, force: bool) -> bool;
+}
+
+/// No-op sink — the default when a runtime wires no checkpoint seam (tests,
+/// embedders). Saves are silently dropped (reported as landed).
+pub struct NoCheckpoints;
+
+#[async_trait]
+impl CheckpointSink for NoCheckpoints {
+    async fn save(&self, _state: Value, _force: bool) -> bool {
+        true
+    }
+}
+
 /// Everything a job run gets from the runtime: its params, the engines, the
 /// dataset store (dedup + change detection), the sandboxed WASM plugin host,
 /// and a per-job artifacts directory for raw dumps (HTML, JSON, screenshots).
@@ -59,15 +84,46 @@ pub struct AppContext {
     /// the write paths below when enforcement is on. [`Resilience::disabled`]
     /// makes every consultation a no-op.
     pub health: Arc<crate::resilience::Resilience>,
+    /// API X-ray recipe store: discovered JSON-API endpoints behind rendered
+    /// pages (see [`AppContext::xray`] and [`crate::recipes`]).
+    pub recipes: Arc<crate::recipes::RecipeStore>,
     /// Sandboxed WASM plugin host (fuel + memory limited).
     pub plugins: Arc<dyn Plugins>,
     /// Throttled live-progress seam: long-running apps report compact snapshots
     /// that surface on `GET /jobs/{id}` and as `progress` SSE events.
     pub progress: Arc<dyn ProgressReporter>,
+    /// Durable-execution seam: `ctx.checkpoint(..)` persists resumable state
+    /// through this sink (throttled; lineage-guarded server-side).
+    pub checkpoints: Arc<dyn CheckpointSink>,
+    /// The last persisted checkpoint for this job, handed back on re-claim —
+    /// `None` on a fresh first attempt or after the poisoned-checkpoint escape.
+    /// Advisory: apps must tolerate any stored shape and start fresh on doubt.
+    pub restored: Option<Value>,
     pub artifacts_dir: PathBuf,
 }
 
 impl AppContext {
+    /// Persists a durable checkpoint of this job's resumable state (throttled —
+    /// safe to call in a tight loop). On a later attempt of the same job, the
+    /// last persisted snapshot comes back via [`restore`](Self::restore).
+    /// Returns whether the write landed (`false` = throttle-skipped is *not*
+    /// reported false; only stale-lineage/storage failures are).
+    pub async fn checkpoint(&self, state: Value) -> bool {
+        self.checkpoints.save(state, false).await
+    }
+
+    /// Unthrottled checkpoint — for final/suspend snapshots where losing the
+    /// write means re-doing real work on resume.
+    pub async fn checkpoint_now(&self, state: Value) -> bool {
+        self.checkpoints.save(state, true).await
+    }
+
+    /// The last checkpoint persisted by a prior attempt of this job, if any.
+    /// Advisory: treat unexpected shapes as "start fresh", never as an error.
+    pub fn restore(&self) -> Option<&Value> {
+        self.restored.as_ref()
+    }
+
     /// Writes a file under `data/artifacts/<app>/<job_id>/` and returns its path.
     pub async fn save_artifact(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         // `name` may be composed from job params (e.g. census `cbp-{naics}.json`),
@@ -310,8 +366,10 @@ impl AppContext {
         Ok(outcome)
     }
 
-    /// Metered Claude research: same as `engines.claude.research(...)` but
-    /// cache-aware and budget-governed. Identical requests within the cache
+    /// Metered Claude research — **the only way to reach the model.** The
+    /// researcher behind [`EngineSet`] is `pub(crate)` precisely so this is not
+    /// a convention an app can forget: it is cache-aware and budget-governed,
+    /// and a direct call loses all of it. Identical requests within the cache
     /// TTL are served from disk at zero cost (recorded as a `cache_hit`
     /// event); misses refuse to start once the job budget is exhausted, clamp
     /// the per-call ceiling to the remaining headroom, and store their output
@@ -334,7 +392,7 @@ impl AppContext {
         if let Some(remaining) = self.require_budget().await? {
             req.max_budget_usd = Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
         }
-        let out = self.engines.claude.research(req).await?;
+        let out = self.engines.researcher().research(req).await?;
         self.meter("claude", None, out.cost_usd.unwrap_or(0.0), None)
             .await;
         if let Some(key) = &key {
@@ -343,6 +401,41 @@ impl AppContext {
             }
         }
         Ok(out)
+    }
+
+    /// API X-ray post-render pass: persists a `capture_network` render's
+    /// observed JSON calls as a job artifact and runs the discovery heuristic
+    /// against the fields this job extracted from the same page, upserting
+    /// high-overlap candidates as unvalidated [`crate::recipes::ApiRecipe`]s.
+    ///
+    /// Call after a render that set `RenderRequest.capture_network` (per-request
+    /// opt-in), handing it the record values extracted from that page. Returns
+    /// `(captured_calls, recipes_discovered)`. Best-effort like the other
+    /// telemetry seams: a recipe write failure is warn-logged, never fails the
+    /// job; an empty capture is a cheap no-op.
+    pub async fn xray(
+        &self,
+        page: &crate::engine::RenderedPage,
+        extracted: &[Value],
+    ) -> Result<(usize, usize)> {
+        if page.network.is_empty() {
+            return Ok((0, 0));
+        }
+        // Raw captures land beside the job's other artifacts for inspection.
+        let bytes = serde_json::to_vec_pretty(&page.network)?;
+        self.save_artifact("network-capture.json", &bytes).await?;
+
+        let candidates = crate::recipes::discover_recipes(&page.network, extracted);
+        let mut stored = 0usize;
+        for recipe in &candidates {
+            match self.recipes.upsert(recipe).await {
+                Ok(_) => stored += 1,
+                Err(e) => {
+                    tracing::warn!(job = %self.job_id, host = %recipe.host, "api recipe write failed: {e}")
+                }
+            }
+        }
+        Ok((page.network.len(), stored))
     }
 
     pub fn require_str(&self, key: &str) -> Result<&str> {
@@ -508,6 +601,76 @@ impl Requirement {
     }
 }
 
+// ── App manifest (agent-ready registry) ─────────────────────────────────────
+
+/// How a run of this app spends money — coarse, static, and honest, so an
+/// agent (or a human) can tell a free API sync from a Claude-driven job
+/// before enqueueing anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CostClass {
+    /// Free engines only (HTTP/browser); a run never produces spend events.
+    Free,
+    /// May spend via metered escalation (e.g. a fetch strategy that can reach
+    /// the Claude tier), but doesn't drive the model by design.
+    Metered,
+    /// Drives Claude by design — every meaningful run costs real money and
+    /// should carry a `budget_usd`.
+    Claude,
+}
+
+impl CostClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CostClass::Free => "free",
+            CostClass::Metered => "metered",
+            CostClass::Claude => "claude",
+        }
+    }
+}
+
+/// One worked example invocation: params that are known-good against the
+/// app's `params_schema`. The server's manifest test validates every example
+/// against its own schema, so examples can't drift into lies.
+#[derive(Debug, Clone)]
+pub struct ManifestExample {
+    /// What this invocation does, phrased for an agent picking between examples.
+    pub description: &'static str,
+    /// The `params` object to POST.
+    pub params: Value,
+}
+
+/// Rich machine-operable self-description of a [`ScrapeApp`]: a JSON Schema
+/// for its params, worked examples, the shape of its result, and its cost
+/// class. Served by `GET /apps` (and as MCP tool definitions via
+/// `GET /apps?format=tools` and the `/mcp` endpoint); enqueue validates params
+/// against `params_schema` when one is declared.
+///
+/// The default ([`AppManifest::default`]) declares nothing: no schema (params
+/// accepted as before), no examples, `Free`. Every existing app therefore
+/// compiles and behaves untouched; apps opt into richer manifests by
+/// overriding [`ScrapeApp::manifest`].
+#[derive(Debug, Clone, Default)]
+pub struct AppManifest {
+    /// JSON Schema (draft 2020-12) for the job `params` object. When `Some`,
+    /// the server rejects an enqueue whose merged params fail it (422 with
+    /// JSON-pointer paths). Keep `additionalProperties` permissive unless a
+    /// stray key is genuinely an error — the schema is a contract for agents,
+    /// not a straitjacket for humans.
+    pub params_schema: Option<Value>,
+    /// Worked invocations, each guaranteed (by test) to pass `params_schema`.
+    pub examples: Vec<ManifestExample>,
+    /// Human/agent description of the job-result JSON shape. Advisory.
+    pub output_shape: Option<&'static str>,
+    /// How runs of this app spend money.
+    pub cost_class: CostClass,
+}
+
+impl Default for CostClass {
+    fn default() -> Self {
+        CostClass::Free
+    }
+}
+
 /// One scraping use case. Implement this in a crate under `crates/apps/` and
 /// register it in the server's `registry.rs` — that is the whole integration.
 #[async_trait]
@@ -536,6 +699,15 @@ pub trait ScrapeApp: Send + Sync {
     /// Params used for scheduled runs and for API calls without a body.
     fn default_params(&self) -> Value {
         Value::Object(Default::default())
+    }
+
+    /// The app's agent-ready manifest: params JSON Schema, worked examples,
+    /// output shape, cost class. The default declares nothing — `name()` +
+    /// `default_params()` already describe the app well enough to list it —
+    /// so every app compiles untouched; the most-used apps override this with
+    /// rich manifests. When a schema is declared, enqueue enforces it (422).
+    fn manifest(&self) -> AppManifest {
+        AppManifest::default()
     }
 
     /// Executes one job. The returned JSON is stored as the job result.

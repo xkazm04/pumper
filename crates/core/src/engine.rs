@@ -72,6 +72,14 @@ pub fn profile_browser_dir(profiles_dir: &Path, name: &str) -> Result<PathBuf> {
     Ok(profile_dir(profiles_dir, name)?.join(PROFILE_BROWSER_DIR))
 }
 
+/// Provenance response header set by the archive engine: `"archive"` when the
+/// body was served from a web archive snapshot rather than the live site.
+/// Stored with the response's header map, so provenance survives into records.
+pub const FETCHED_VIA_HEADER: &str = "x-pumper-fetched-via";
+/// Provenance response header set by the archive engine: the snapshot's capture
+/// timestamp (RFC 3339 UTC). Present only alongside [`FETCHED_VIA_HEADER`].
+pub const SNAPSHOT_TS_HEADER: &str = "x-pumper-snapshot-ts";
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum HttpMethod {
@@ -137,6 +145,14 @@ pub struct HttpRequest {
     /// yields a typed [`Error::Profile`].
     #[serde(default)]
     pub profile: Option<String>,
+    /// Archive freshness window (seconds). When set, an archive-capable client
+    /// (the tier-zero archive engine) may serve a stored web-archive snapshot of
+    /// this URL captured no longer than this many seconds ago; an older-only (or
+    /// absent) snapshot is a typed miss, and the tiered fetcher falls through to
+    /// the live ladder. Ignored by the plain HTTP engine. `None` = live-only,
+    /// exactly the previous behavior.
+    #[serde(default)]
+    pub archive_max_age: Option<u64>,
 }
 
 impl HttpRequest {
@@ -154,6 +170,7 @@ impl HttpRequest {
             timeout_secs: None,
             proxy: None,
             profile: None,
+            archive_max_age: None,
         }
     }
 }
@@ -212,6 +229,27 @@ pub enum PageAction {
     },
 }
 
+/// One same-origin JSON response observed by the browser tier while rendering a
+/// page with [`RenderRequest::capture_network`] set — the raw material of the
+/// API X-ray (discovering the data API behind a SPA). Bodies are size-capped by
+/// the engine (per response and in total), so a capture can never balloon a
+/// render's memory.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapturedCall {
+    /// Full request URL (with query string) as the page issued it.
+    pub url: String,
+    /// HTTP method (`GET`, `POST`, ...).
+    pub method: String,
+    /// Response status code.
+    pub status: u16,
+    /// Response `Content-Type` / MIME type as reported by CDP.
+    pub content_type: String,
+    /// Parsed JSON response body. Responses that fail to parse as JSON, exceed
+    /// the per-body cap, or arrive after the total budget is spent are dropped
+    /// (never truncated into invalid JSON).
+    pub body: Value,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RenderRequest {
     pub url: String,
@@ -245,6 +283,12 @@ pub struct RenderRequest {
     /// — the browser-tier mirror of `HttpRequest.max_body_bytes`.
     #[serde(default)]
     pub max_body_bytes: Option<u64>,
+    /// Capture same-origin JSON network responses observed during the render
+    /// into [`RenderedPage::network`] (per-request opt-in; the API X-ray seam).
+    /// `false` (default) = no CDP network capture — exactly the previous
+    /// behavior.
+    #[serde(default)]
+    pub capture_network: bool,
 }
 
 impl RenderRequest {
@@ -258,6 +302,7 @@ impl RenderRequest {
             load_all_resources: false,
             profile: None,
             max_body_bytes: None,
+            capture_network: false,
         }
     }
 }
@@ -282,6 +327,9 @@ pub struct RenderedPage {
     /// counts as one). `0` when none were requested — lets a caller see that an
     /// infinite-scroll script actually executed rather than silently no-op'd.
     pub actions_completed: usize,
+    /// Same-origin JSON responses captured during the render. Empty unless the
+    /// request set [`RenderRequest::capture_network`]; size-capped by the engine.
+    pub network: Vec<CapturedCall>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
@@ -359,12 +407,46 @@ pub trait Researcher: Send + Sync {
 }
 
 /// Everything an app can scrape with, handed over via [`crate::AppContext`].
+///
+/// **The `claude` engine is deliberately not public.** Every model call must go
+/// through [`crate::AppContext::research`], which adds the research cache, the
+/// per-job budget governor and cost metering; a direct
+/// `ctx.engines.claude.research(...)` silently loses all three (it happened —
+/// `connector-api-watch` summarized every doc diff off-ledger). Field privacy is
+/// what makes the chokepoint structural rather than conventional: an app crate
+/// cannot name the researcher, so it cannot bypass the wrapper. Construct with
+/// [`EngineSet::new`]; core-internal consumers use [`EngineSet::researcher`].
 pub struct EngineSet {
     pub http: Arc<dyn HttpClient>,
     pub browser: Arc<dyn Browser>,
-    pub claude: Arc<dyn Researcher>,
+    pub(crate) claude: Arc<dyn Researcher>,
     /// Tiered fetcher that picks/escalates engines automatically.
     pub fetch: crate::fetcher::Fetcher,
+}
+
+impl EngineSet {
+    /// Assembles the engine set. The researcher is moved in and thereafter
+    /// reachable only through the metered chokepoint.
+    pub fn new(
+        http: Arc<dyn HttpClient>,
+        browser: Arc<dyn Browser>,
+        claude: Arc<dyn Researcher>,
+        fetch: crate::fetcher::Fetcher,
+    ) -> Self {
+        Self {
+            http,
+            browser,
+            claude,
+            fetch,
+        }
+    }
+
+    /// The raw researcher — **core-internal**, for the one caller that is itself
+    /// the chokepoint ([`crate::AppContext::research`]). Named rather than
+    /// field-public so the bypass surface is a single greppable symbol.
+    pub(crate) fn researcher(&self) -> &Arc<dyn Researcher> {
+        &self.claude
+    }
 }
 
 #[cfg(test)]
@@ -405,6 +487,27 @@ mod tests {
     }
 
     #[test]
+    fn capture_network_is_serde_defaulted_and_round_trips() {
+        // Older payloads omit it => false => no capture (previous behavior).
+        let r: RenderRequest = serde_json::from_str(r#"{"url":"https://x/"}"#).unwrap();
+        assert!(!r.capture_network);
+        assert!(!RenderRequest::new("https://x/").capture_network);
+        // Present => round-trips; a captured call deserializes.
+        let r: RenderRequest =
+            serde_json::from_str(r#"{"url":"https://x/","capture_network":true}"#).unwrap();
+        assert!(r.capture_network);
+        let call: CapturedCall = serde_json::from_str(
+            r#"{"url":"https://x/api?q=1","method":"GET","status":200,
+                "content_type":"application/json","body":{"items":[1,2]}}"#,
+        )
+        .unwrap();
+        assert_eq!(call.status, 200);
+        assert_eq!(call.body["items"][0], 1);
+        // RenderedPage default carries no captures.
+        assert!(RenderedPage::default().network.is_empty());
+    }
+
+    #[test]
     fn http_request_conditional_validators_are_serde_defaulted() {
         // Older payloads (and the common case) omit the conditional fields.
         let req: HttpRequest = serde_json::from_str(r#"{"url":"https://x/"}"#).unwrap();
@@ -440,6 +543,18 @@ mod tests {
         assert_eq!(r2.profile.as_deref(), Some("acme_login"));
         assert!(HttpRequest::get("https://x/").profile.is_none());
         assert!(RenderRequest::new("https://x/").profile.is_none());
+    }
+
+    #[test]
+    fn archive_max_age_is_serde_defaulted_and_round_trips() {
+        // Older payloads omit it => None => live-only (previous behavior).
+        let req: HttpRequest = serde_json::from_str(r#"{"url":"https://x/"}"#).unwrap();
+        assert!(req.archive_max_age.is_none());
+        assert!(HttpRequest::get("https://x/").archive_max_age.is_none());
+        // Present => round-trips.
+        let req: HttpRequest =
+            serde_json::from_str(r#"{"url":"https://x/","archive_max_age":86400}"#).unwrap();
+        assert_eq!(req.archive_max_age, Some(86_400));
     }
 
     #[test]

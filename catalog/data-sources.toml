@@ -13,9 +13,12 @@
 #               gb, cz, ca (Canada), ...  NB: us-ca = California, ca = Canada
 #   name        human name of the source
 #   url         primary endpoint / portal
-#   category    open-calls | awarded-history | registry | labor-market
+#   category    open-calls | awarded-history | registry | labor-market | market-stats
 #               (labor-market = job postings + wage benchmarks; a separate domain
 #                from the grant/nonprofit categories above)
+#               (market-stats = US business demographics/formation statistics for
+#                the Ledgerline trades intelligence; scheduled Census apps live
+#                here so the server drift-gate can cross-check their crons)
 #   engine      http | browser | claude | bulk        (http/browser = web, claude = llm, bulk = file download)
 #   access      key-free | api-key | bulk | scrape
 #   cadence     one-time | on-demand | daily | weekly | monthly | quarterly | annual
@@ -404,6 +407,59 @@ status = "blocked"
 confidence = 2
 dataset = ""
 notes = "No public read API; JS SPA; LMC ToS is the binding constraint (robots allows /prace/ but the ToS does not). Indeed CZ's public job API is deprecated; volnamista.cz is ingest-only XML. High legal risk — deliberately NOT ingested in v1."
+# ── US business demographics & formation (Ledgerline trades intelligence) ────
+# The annual census-density/census-nonemp stock apps predate the catalog and are
+# CATALOG_EXEMPT in the server's coverage test; these two are ON the scheduler,
+# so they are cataloged here — the drift-gate cross-checks cron vs schedule().
+
+[[source]]
+id = "census-bfs"
+app = "census-bfs"
+market = "us"
+name = "Census Business Formation Statistics (EITS BFS timeseries)"
+url = "https://api.census.gov/data/timeseries/eits/bfs"
+category = "market-stats"
+engine = "http"
+access = "api-key"
+cadence = "weekly"
+cron = "0 0 11 * * FRI"
+status = "live"
+confidence = 4
+dataset = "formations"
+notes = "Monthly business applications (BA_BA) + high-propensity (BA_HBA) per NAICS sector x state, NSA, refreshed weekly by Census. Sector grain ONLY (grain=naics_sector on every record) — no trade-level inference. Also derives formation_velocity (T12M/YoY/acceleration) and refreshes census/market_blend's formation block. Free CENSUS_API_KEY (shared); keyless requests 302 to missing_key.html. Endpoint + variable dictionary verified 2026-07-30; row shape re-verified on first keyed run."
+
+[[source]]
+id = "census-nesd"
+app = "census-nesd"
+market = "us"
+name = "Census Nonemployer Statistics by Demographics (NES-D owner age)"
+url = "https://api.census.gov/data/2021/absnesdo"
+category = "market-stats"
+engine = "http"
+access = "api-key"
+cadence = "annual"
+cron = "0 0 6 20 6 *"
+status = "live"
+confidence = 4
+dataset = "owner_age"
+notes = "Owners of nonemployer firms per age band x 4-digit trade NAICS x state (absnesdo, OWNRAGE question, all-demographics slice only). Disclosure-suppressed cells dropped, never zeroed. Feeds pct_owners_55plus + succession_receipts on census/market_blend — a succession wave-size indicator, not a per-business prediction. Free CENSUS_API_KEY (shared); NES-D lags ~2y (params.year). Endpoint + variable dictionary verified 2026-07-30; row shape re-verified on first keyed run."
+
+[[source]]
+id = "cordis"
+app = "cordis"
+market = "eu"
+name = "CORDIS Search API (funded Horizon projects)"
+url = "https://cordis.europa.eu/api/search/results"
+category = "awarded-history"
+engine = "http"
+access = "key-free"
+cadence = "weekly"
+cron = "0 0 7 * * 1"
+status = "live"
+confidence = 3
+dataset = "projects"
+notes = "Funded Horizon project outcomes (RCN-keyed: topic, EU contribution, coordinator, participants). Aggregated per topic-lineage family into cordis/topic_stats; eu-sedia joins a history block onto open SEDIA topics pre-upsert. API envelope ASSUMED from public docs, pinned in crate doc-header — drift raises a loud error; verify on first live run. Resume cursor in cordis/state covers the corpus across runs (maxProjects 500/run default)."
+
 # ── Personas connector API-doc monitoring (feeds curated marketplace events) ──
 
 [[source]]

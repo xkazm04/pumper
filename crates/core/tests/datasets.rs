@@ -421,3 +421,298 @@ async fn prune_revisions_keeps_the_newest_n_and_respects_the_cutoff() {
     .unwrap();
     assert_eq!(kept_k2, 2);
 }
+
+// ── derived datasets (M11) ───────────────────────────────────────────────────
+
+use std::collections::BTreeMap;
+
+use pumper_core::{DerivedLookup, NewDerivedSpec, Storage};
+
+/// Creates a derived spec with the given shape (source app fixed to "app").
+async fn make_spec(
+    storage: &Storage,
+    source: &str,
+    target: &str,
+    filters: &[&str],
+    project: &[(&str, &str)],
+    lookup: Option<DerivedLookup>,
+) -> pumper_core::DerivedSpec {
+    let filters: Vec<String> = filters.iter().map(|s| s.to_string()).collect();
+    let project: BTreeMap<String, String> = project
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect();
+    storage
+        .create_derived_spec(&NewDerivedSpec {
+            source_app: "app",
+            source_dataset: source,
+            target_dataset: target,
+            filters: &filters,
+            project: &project,
+            lookup: lookup.as_ref(),
+        })
+        .await
+        .expect("create derived spec")
+}
+
+#[tokio::test]
+async fn derived_spec_filters_and_projects_fresh_keys_on_upsert() {
+    let store = fresh_db("derived-basic").await;
+    let ds = store.datasets();
+    make_spec(
+        &store.storage,
+        "grants",
+        "ca_grants",
+        &["$.state:eq:CA"],
+        &[("name", "$.title"), ("state", "$.state")],
+        None,
+    )
+    .await;
+
+    let items = vec![
+        (
+            "g1".to_string(),
+            json!({ "title": "Solar", "state": "CA", "noise": 1 }),
+        ),
+        ("g2".to_string(), json!({ "title": "Wind", "state": "NY" })),
+        ("g3".to_string(), json!({ "title": "Hydro", "state": "CA" })),
+    ];
+    ds.upsert_many("app", "grants", &items).await.unwrap();
+
+    // Matching rows land projected, keyed by the source key; NY is filtered out.
+    let g1 = ds
+        .get("app", "ca_grants", "g1")
+        .await
+        .unwrap()
+        .expect("g1 derived");
+    assert_eq!(g1.data, json!({ "name": "Solar", "state": "CA" }));
+    assert!(ds.get("app", "ca_grants", "g3").await.unwrap().is_some());
+    assert!(ds.get("app", "ca_grants", "g2").await.unwrap().is_none());
+
+    // Re-upserting unchanged source rows recomputes nothing: fresh-keys-only,
+    // and the target's change detection dedups no-ops.
+    ds.upsert_many("app", "grants", &items).await.unwrap();
+    let history = ds.history("app", "ca_grants", "g1", 10).await.unwrap();
+    assert_eq!(history.len(), 1, "no spurious derived revisions");
+
+    // A source CHANGE flows through as a derived change.
+    ds.upsert_many(
+        "app",
+        "grants",
+        &[(
+            "g1".to_string(),
+            json!({ "title": "Solar III", "state": "CA" }),
+        )],
+    )
+    .await
+    .unwrap();
+    let g1 = ds.get("app", "ca_grants", "g1").await.unwrap().unwrap();
+    assert_eq!(g1.data["name"], "Solar III");
+}
+
+#[tokio::test]
+async fn derived_lookup_merges_the_sibling_dataset_record() {
+    let store = fresh_db("derived-lookup").await;
+    let ds = store.datasets();
+    // Lookup side first (no spec on it, so no cascade).
+    ds.upsert_many(
+        "app",
+        "agencies",
+        &[(
+            "doe".to_string(),
+            json!({ "name": "Dept of Energy", "tier": 1 }),
+        )],
+    )
+    .await
+    .unwrap();
+    make_spec(
+        &store.storage,
+        "grants",
+        "grants_enriched",
+        &[],
+        &[("title", "$.title"), ("agency", "$.agency")],
+        Some(DerivedLookup {
+            dataset: "agencies".into(),
+            key_expr: "$.agency".into(),
+            merge_as: "agency_info".into(),
+        }),
+    )
+    .await;
+
+    ds.upsert_many(
+        "app",
+        "grants",
+        &[
+            ("g1".to_string(), json!({ "title": "Solar", "agency": "doe" })),
+            (
+                "g2".to_string(),
+                json!({ "title": "Wind", "agency": "unknown" }),
+            ),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let g1 = ds
+        .get("app", "grants_enriched", "g1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(g1.data["agency_info"]["name"], "Dept of Energy");
+    // A missing lookup record still lands the row — just unenriched.
+    let g2 = ds
+        .get("app", "grants_enriched", "g2")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(g2.data["title"], "Wind");
+    assert!(g2.data.get("agency_info").is_none());
+}
+
+#[tokio::test]
+async fn derived_chain_stops_at_the_depth_cap() {
+    let store = fresh_db("derived-depth").await;
+    let ds = store.datasets().with_derived_max_depth(2);
+    // a -> b -> c -> d (all passthrough). Cap 2 allows b (depth 1) and c
+    // (depth 2); d would be depth 3 and must be skipped.
+    make_spec(&store.storage, "a", "b", &[], &[], None).await;
+    make_spec(&store.storage, "b", "c", &[], &[], None).await;
+    make_spec(&store.storage, "c", "d", &[], &[], None).await;
+
+    ds.upsert_many("app", "a", &[("k".to_string(), json!({ "v": 1 }))])
+        .await
+        .unwrap();
+
+    assert!(
+        ds.get("app", "b", "k").await.unwrap().is_some(),
+        "depth 1 lands"
+    );
+    assert!(
+        ds.get("app", "c", "k").await.unwrap().is_some(),
+        "depth 2 lands"
+    );
+    assert!(
+        ds.get("app", "d", "k").await.unwrap().is_none(),
+        "depth 3 is past the cap and must be skipped"
+    );
+}
+
+#[tokio::test]
+async fn derived_kill_switch_makes_a_spec_fully_inert() {
+    let store = fresh_db("derived-kill").await;
+    let ds = store.datasets();
+    let spec = make_spec(&store.storage, "src", "dst", &[], &[], None).await;
+    store
+        .storage
+        .set_derived_enabled(&spec.id, false)
+        .await
+        .unwrap();
+
+    ds.upsert_many("app", "src", &[("k1".to_string(), json!({ "v": 1 }))])
+        .await
+        .unwrap();
+    assert!(
+        ds.get("app", "dst", "k1").await.unwrap().is_none(),
+        "disabled = inert"
+    );
+
+    store
+        .storage
+        .set_derived_enabled(&spec.id, true)
+        .await
+        .unwrap();
+    ds.upsert_many("app", "src", &[("k2".to_string(), json!({ "v": 2 }))])
+        .await
+        .unwrap();
+    assert!(
+        ds.get("app", "dst", "k2").await.unwrap().is_some(),
+        "re-enabled flows"
+    );
+}
+
+#[tokio::test]
+async fn derived_cycles_are_rejected_at_create_time() {
+    let store = fresh_db("derived-cycle").await;
+    make_spec(&store.storage, "a", "b", &[], &[], None).await;
+    make_spec(&store.storage, "b", "c", &[], &[], None).await;
+
+    async fn try_spec(
+        storage: &Storage,
+        source: &str,
+        target: &str,
+    ) -> pumper_core::Result<pumper_core::DerivedSpec> {
+        let filters: Vec<String> = Vec::new();
+        let project = BTreeMap::new();
+        storage
+            .create_derived_spec(&NewDerivedSpec {
+                source_app: "app",
+                source_dataset: source,
+                target_dataset: target,
+                filters: &filters,
+                project: &project,
+                lookup: None,
+            })
+            .await
+    }
+    // Self-loop, direct back-edge, transitive back-edge: all refused.
+    assert!(matches!(
+        try_spec(&store.storage, "x", "x").await,
+        Err(pumper_core::Error::BadRequest(_))
+    ));
+    assert!(matches!(
+        try_spec(&store.storage, "b", "a").await,
+        Err(pumper_core::Error::BadRequest(_))
+    ));
+    assert!(matches!(
+        try_spec(&store.storage, "c", "a").await,
+        Err(pumper_core::Error::BadRequest(_))
+    ));
+    // Acyclic fan-out is fine.
+    assert!(try_spec(&store.storage, "a", "d").await.is_ok());
+}
+
+#[tokio::test]
+async fn backfill_materializes_existing_source_rows_in_bounded_batches() {
+    let store = fresh_db("derived-backfill").await;
+    let ds = store.datasets();
+    // Rows exist BEFORE the spec: the live hook never saw them.
+    let items: Vec<(String, serde_json::Value)> = (0..5)
+        .map(|i| {
+            (
+                format!("k{i}"),
+                json!({ "n": i, "state": if i % 2 == 0 { "CA" } else { "NY" } }),
+            )
+        })
+        .collect();
+    ds.upsert_many("app", "grants", &items).await.unwrap();
+
+    let spec = make_spec(
+        &store.storage,
+        "grants",
+        "ca_grants",
+        &["$.state:eq:CA"],
+        &[("n", "$.n")],
+        None,
+    )
+    .await;
+
+    // batch=2 forces multiple keyset pages over the 5 rows.
+    let report = ds.backfill_derived(&spec, 2).await.unwrap();
+    assert_eq!(report.scanned, 5);
+    assert_eq!(report.matched, 3, "k0/k2/k4 pass the CA filter");
+    assert_eq!(report.new, 3);
+    for i in [0, 2, 4] {
+        let rec = ds
+            .get("app", "ca_grants", &format!("k{i}"))
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("k{i} backfilled"));
+        assert_eq!(rec.data, json!({ "n": i }));
+    }
+    assert!(ds.get("app", "ca_grants", "k1").await.unwrap().is_none());
+
+    // Idempotent: a second backfill recomputes to all-unchanged.
+    let again = ds.backfill_derived(&spec, 2).await.unwrap();
+    assert_eq!(again.new, 0);
+    assert_eq!(again.unchanged, 3);
+}

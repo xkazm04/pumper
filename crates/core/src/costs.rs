@@ -174,6 +174,97 @@ impl CostLedger {
     }
 }
 
+// ── job yield ───────────────────────────────────────────────────────────────
+
+/// One yield observation parsed out of a completed job's result JSON: the
+/// `UpsertSummary`-shaped counts apps already report (`"new"`, `"changed"`,
+/// `"unchanged"`, `"removed"`). Persisted to `job_yield` so the cost ledger can
+/// be joined against what the spend actually produced (`GET /economics`).
+///
+/// Every count is `Option`: a result that doesn't report a number stores NULL —
+/// never 0, which would be a claim ("this run produced nothing") the result
+/// didn't make.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct YieldEntry {
+    /// Where in the result the summary sat: `""` for the result root, else the
+    /// dot-joined key path (`"datasets.velocity"`, `"unified"`). Apps that write
+    /// several datasets nest one summary per dataset; the path is the closest
+    /// thing the result convention has to a dataset name.
+    pub dataset: String,
+    pub new: Option<i64>,
+    pub changed: Option<i64>,
+    pub unchanged: Option<i64>,
+    pub removed: Option<i64>,
+}
+
+/// Ceiling on entries parsed from one result — a pathological result (records
+/// that themselves carry `new` fields) must not turn into thousands of rows.
+const MAX_YIELD_ENTRIES: usize = 16;
+/// How deep the walk descends. Observed conventions sit at the root or one to
+/// two objects down (`datasets.formations`); anything deeper is record data.
+const MAX_YIELD_DEPTH: usize = 3;
+
+/// Extracts yield summaries from a job-result JSON, worker-side, no app changes.
+///
+/// Conventions found in the fleet (2026-07): most apps report
+/// `{"new": n, "changed": n, "unchanged": n}` numbers at the result root
+/// (hackernews, extractor, cordis, eu-sedia, plugin, …); multi-dataset apps nest
+/// the same shape under dataset-named keys (`census-bfs`'s
+/// `datasets.{formations,velocity}`, homewyse/valuation's `"unified"`,
+/// census-density's saturation block); crawl reports numeric `new`/`changed`
+/// page counts at the root. An object counts as a summary when it carries a
+/// numeric (or array-valued — the raw `UpsertSummary` shape, counted by length)
+/// `new` or `changed`; other counts are recorded when parseable and left `None`
+/// when not. Objects with no such field (e.g. cms-fee-schedule's
+/// `change_since_last_run: "new"` *string*) yield nothing.
+pub fn extract_yields(result: &serde_json::Value) -> Vec<YieldEntry> {
+    let mut out = Vec::new();
+    walk_yields(result, String::new(), 0, &mut out);
+    out
+}
+
+fn walk_yields(v: &serde_json::Value, path: String, depth: usize, out: &mut Vec<YieldEntry>) {
+    if out.len() >= MAX_YIELD_ENTRIES || depth > MAX_YIELD_DEPTH {
+        return;
+    }
+    let Some(obj) = v.as_object() else { return };
+    let new = yield_count(obj.get("new"));
+    let changed = yield_count(obj.get("changed"));
+    if new.is_some() || changed.is_some() {
+        out.push(YieldEntry {
+            dataset: path.clone(),
+            new,
+            changed,
+            unchanged: yield_count(obj.get("unchanged")),
+            removed: yield_count(obj.get("removed")),
+        });
+    }
+    // Keep walking below a match: a root summary and a nested `"unified"` block
+    // are different datasets, both real. Arrays (`records`, …) are never
+    // descended — their elements are data, not summaries.
+    for (key, child) in obj {
+        if child.is_object() {
+            let child_path = if path.is_empty() {
+                key.clone()
+            } else {
+                format!("{path}.{key}")
+            };
+            walk_yields(child, child_path, depth + 1, out);
+        }
+    }
+}
+
+/// A count field: a non-negative integer, or an array counted by length (the
+/// raw `UpsertSummary` serialization carries key *lists*). Anything else —
+/// strings, floats, negatives, absent — is "not reported" (`None`), never 0.
+fn yield_count(v: Option<&serde_json::Value>) -> Option<i64> {
+    match v? {
+        serde_json::Value::Number(n) => n.as_i64().filter(|&n| n >= 0),
+        serde_json::Value::Array(a) => i64::try_from(a.len()).ok(),
+        _ => None,
+    }
+}
+
 #[derive(sqlx::FromRow)]
 struct CostEventRow {
     job_id: String,
@@ -245,6 +336,100 @@ mod tests {
     #[test]
     fn a_negative_seed_floors_at_zero() {
         assert_eq!(SpentTotal::new(-3.0).get(), 0.0);
+    }
+
+    // ── job yield extraction ──
+
+    #[test]
+    fn extracts_root_summary_counts() {
+        // The dominant convention: numeric new/changed/unchanged at the root
+        // (hackernews, extractor, cordis, eu-sedia, plugin, …).
+        let result = serde_json::json!({
+            "count": 30, "new": 5, "changed": 2, "unchanged": 23, "records": [{"id": 1}]
+        });
+        let out = extract_yields(&result);
+        assert_eq!(
+            out,
+            vec![YieldEntry {
+                dataset: String::new(),
+                new: Some(5),
+                changed: Some(2),
+                unchanged: Some(23),
+                removed: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn extracts_nested_dataset_summaries() {
+        // census-bfs shape: per-dataset summaries under `datasets.*`, no root counts.
+        let result = serde_json::json!({
+            "rows": 120,
+            "datasets": {
+                "formations": { "new": 10, "changed": 0, "unchanged": 110 },
+                "velocity": { "new": 3, "changed": 1, "unchanged": 0 },
+            }
+        });
+        let mut out = extract_yields(&result);
+        out.sort_by(|a, b| a.dataset.cmp(&b.dataset));
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].dataset, "datasets.formations");
+        assert_eq!(out[0].new, Some(10));
+        assert_eq!(out[1].dataset, "datasets.velocity");
+        assert_eq!(out[1].changed, Some(1));
+    }
+
+    #[test]
+    fn root_and_nested_summaries_are_both_captured() {
+        // homewyse/valuation shape: own dataset at the root PLUS a nested
+        // `unified` cross-source summary — different datasets, both real.
+        let result = serde_json::json!({
+            "new": 4, "changed": 1, "unchanged": 40,
+            "unified": { "new": 4, "changed": 1 },
+        });
+        let out = extract_yields(&result);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].dataset, "");
+        assert_eq!(out[1].dataset, "unified");
+        assert_eq!(out[1].unchanged, None, "unified reports no unchanged — stays None");
+    }
+
+    #[test]
+    fn array_valued_counts_use_length_and_strings_yield_nothing() {
+        // Raw UpsertSummary serialization carries key LISTS; count by length.
+        let raw = serde_json::json!({ "new": ["a", "b"], "changed": [], "unchanged": 7 });
+        let out = extract_yields(&raw);
+        assert_eq!(out[0].new, Some(2));
+        assert_eq!(out[0].changed, Some(0));
+        // cms-fee-schedule reports `change_since_last_run: "new"` — a string
+        // VALUE under a different key. No numeric new/changed → no entry.
+        let strings = serde_json::json!({ "change_since_last_run": "new", "release": "26A" });
+        assert!(extract_yields(&strings).is_empty());
+        // A string under the `new` key itself is unparseable → not a summary.
+        assert!(extract_yields(&serde_json::json!({ "new": "yes" })).is_empty());
+    }
+
+    #[test]
+    fn negatives_floats_and_non_objects_are_not_counts() {
+        assert!(extract_yields(&serde_json::json!({ "new": -3 })).is_empty());
+        assert!(extract_yields(&serde_json::json!({ "new": 1.5 })).is_empty());
+        assert!(extract_yields(&serde_json::json!(null)).is_empty());
+        assert!(extract_yields(&serde_json::json!([{"new": 1}])).is_empty());
+        assert!(extract_yields(&serde_json::json!("new")).is_empty());
+    }
+
+    #[test]
+    fn entry_count_and_depth_are_bounded() {
+        // 100 summary-shaped children must not become 100 rows.
+        let mut children = serde_json::Map::new();
+        for i in 0..100 {
+            children.insert(format!("d{i:03}"), serde_json::json!({ "new": 1, "changed": 0 }));
+        }
+        let out = extract_yields(&serde_json::Value::Object(children));
+        assert_eq!(out.len(), 16);
+        // A summary buried past the depth cap is record data, not telemetry.
+        let deep = serde_json::json!({ "a": { "b": { "c": { "d": { "new": 1, "changed": 0 } } } } });
+        assert!(extract_yields(&deep).is_empty());
     }
 
     #[test]

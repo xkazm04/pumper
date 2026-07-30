@@ -302,7 +302,7 @@ impl ScrapeApp for CensusDensity {
                 ));
             }
 
-            ranked.sort_by(|a, b| b.1.cmp(&a.1));
+            ranked.sort_by_key(|(_, e)| std::cmp::Reverse(*e));
             let top: Vec<Value> = ranked
                 .iter()
                 .take(5)
@@ -338,7 +338,7 @@ impl ScrapeApp for CensusDensity {
 
         let mut overall_vec: Vec<(String, i64)> =
             overall.iter().map(|(k, v)| (k.clone(), *v)).collect();
-        overall_vec.sort_by(|a, b| b.1.cmp(&a.1));
+        overall_vec.sort_by_key(|(_, e)| std::cmp::Reverse(*e));
         let top_overall: Vec<Value> = overall_vec
             .iter()
             .take(10)
@@ -473,9 +473,20 @@ impl ScrapeApp for CensusDensity {
 // they match.
 //
 // The result lives under the virtual shared app namespace `census` (the
-// grants-common `grants/unified` pattern): both real apps re-derive it after
-// their own upserts, so the blend stays fresh regardless of which annual run
+// grants-common `grants/unified` pattern): all the Census apps re-derive it
+// after their own upserts, so the blend stays fresh regardless of which run
 // happens last.
+//
+// Two optional joins ride on the same cell grain, each Null (never a
+// fabricated zero) when its source app hasn't run:
+//  - SUCCESSION (census-nesd `owner_age`): `pct_owners_55plus` across the
+//    reported NES-D age bands, and `succession_receipts` = that share × the
+//    solo side's total receipts — a wave-size indicator in dollars, not a
+//    per-business prediction (bands are coarse, e.g. 55–64).
+//  - FORMATION (census-bfs `formation_velocity`): inbound-competition block
+//    joined by the naics4's 2-digit SECTOR (BFS's only grain) — carried under
+//    a `formation` object labeled `grain: "naics_sector"` so a sector-level
+//    signal can't silently read as trade-level.
 // ---------------------------------------------------------------------------
 
 /// Virtual app namespace holding the cross-app blended dataset.
@@ -561,10 +572,39 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
         })
         .collect();
 
-    let items = blend_market(&employers, &solos, &base_by_place);
+    // Optional succession + formation inputs, read by app/dataset NAME (no
+    // crate dependency — census-nesd/census-bfs depend on this crate for the
+    // re-blend hook, so a reverse edge would cycle). Empty when those apps
+    // haven't run → the blend emits Null fields (graceful).
+    let owner_age = live(
+        ctx.datasets
+            .list("census-nesd", "owner_age", BLEND_READ_LIMIT)
+            .await?,
+    );
+    let formation_velocity = live(
+        ctx.datasets
+            .list("census-bfs", "formation_velocity", BLEND_READ_LIMIT)
+            .await?,
+    );
+
+    let items = blend_market(
+        &employers,
+        &solos,
+        &base_by_place,
+        &owner_age,
+        &formation_velocity,
+    );
     let count = |cov: &str| items.iter().filter(|(_, v)| v["coverage"] == cov).count();
     let (both, employer_only, solo_only) =
         (count("both"), count("employer_only"), count("solo_only"));
+    let with_succession = items
+        .iter()
+        .filter(|(_, v)| !v["pct_owners_55plus"].is_null())
+        .count();
+    let with_formation = items
+        .iter()
+        .filter(|(_, v)| !v["formation"].is_null())
+        .count();
     let summary = ctx
         .datasets
         .upsert_many(MARKET_APP, MARKET_BLEND_DATASET, &items)
@@ -575,6 +615,8 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
         "matched_both": both,
         "employer_only": employer_only,
         "solo_only": solo_only,
+        "with_succession": with_succession,
+        "with_formation": with_formation,
         "new": summary.new.len(),
         "changed": summary.changed.len(),
         "unchanged": summary.unchanged,
@@ -589,10 +631,16 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
 /// on only one side is still emitted — with 0 on the missing side and a
 /// `coverage` marker — so the dataset shows WHERE the blend is partial rather
 /// than hiding it.
+///
+/// `owner_age` are census-nesd `owner_age` band records (may be empty) and
+/// `formation_velocity` census-bfs `formation_velocity` records (may be
+/// empty); each contributes Null fields, never zeros, when absent for a cell.
 pub fn blend_market(
     employers: &[Value],
     solos: &[Value],
     base_by_place: &BTreeMap<String, (i64, String)>,
+    owner_age: &[Value],
+    formation_velocity: &[Value],
 ) -> Vec<(String, Value)> {
     // (naics4, state_fips) → accumulating blend halves.
     #[derive(Default)]
@@ -603,10 +651,43 @@ pub fn blend_market(
         employer_naics: BTreeSet<String>,
         employer_year: Option<String>,
         solo_estab: Option<i64>,
+        /// Present only when the solo side reported receipts — the succession
+        /// dollar figure needs real receipts, not a defaulted 0.
+        solo_receipts_thousands: Option<i64>,
         solo_year: Option<String>,
     }
     let str_field = |v: &Value, f: &str| v.get(f).and_then(Value::as_str).map(str::to_string);
     let num_field = |v: &Value, f: &str| v.get(f).and_then(Value::as_i64).unwrap_or(0);
+
+    // SUCCESSION input: (naics, state_fips) → reported age bands + vintage.
+    let mut age_bands: BTreeMap<(String, String), Vec<(String, i64)>> = BTreeMap::new();
+    let mut age_year: BTreeMap<(String, String), String> = BTreeMap::new();
+    for r in owner_age {
+        let (Some(naics), Some(st)) = (str_field(r, "naics"), str_field(r, "state_fips")) else {
+            continue;
+        };
+        let (Some(band), Some(owners)) = (
+            str_field(r, "age_band"),
+            r.get("owners").and_then(Value::as_i64),
+        ) else {
+            continue;
+        };
+        let key = (naics, st);
+        if let Some(y) = str_field(r, "year") {
+            age_year.entry(key.clone()).or_insert(y);
+        }
+        age_bands.entry(key).or_default().push((band, owners));
+    }
+
+    // FORMATION input: (sector category, state_fips) → velocity record.
+    let velocity_by_key: BTreeMap<(String, String), &Value> = formation_velocity
+        .iter()
+        .filter_map(|r| {
+            let sector = r.get("sector").and_then(Value::as_str)?.to_string();
+            let st = r.get("state_fips").and_then(Value::as_str)?.to_string();
+            Some(((sector, st), r))
+        })
+        .collect();
 
     let mut cells: BTreeMap<(String, String), Cell> = BTreeMap::new();
 
@@ -634,6 +715,9 @@ pub fn blend_market(
         };
         let cell = cells.entry((naics4, st)).or_default();
         *cell.solo_estab.get_or_insert(0) += num_field(s, "nonemployers");
+        if let Some(rcpt) = s.get("receipts_thousands").and_then(Value::as_i64) {
+            *cell.solo_receipts_thousands.get_or_insert(0) += rcpt;
+        }
         cell.solo_year = cell.solo_year.take().or_else(|| str_field(s, "year"));
         if let Some(state) = str_field(s, "state") {
             cell.state.get_or_insert(state);
@@ -675,6 +759,48 @@ pub fn blend_market(
                     ),
                     _ => (Value::Null, Value::Null, Value::Null),
                 };
+            // SUCCESSION: 55+ owner share across reported NES-D bands, and the
+            // wave in dollars against the solo side's receipts. Nulls (never a
+            // fabricated 0%) when NES-D hasn't run / is suppressed for the cell,
+            // and no dollar figure without real receipts.
+            let cell_key = (naics4.clone(), st_fips.clone());
+            let pct_55 = age_bands
+                .get(&cell_key)
+                .and_then(|bands| census_common::owner_age_share_55plus(bands));
+            let pct_owners_55plus = pct_55
+                .map(|p| Value::from((p * 10_000.0).round() / 10_000.0))
+                .unwrap_or(Value::Null);
+            let owner_age_year = age_year
+                .get(&cell_key)
+                .map(|y| Value::from(y.clone()))
+                .unwrap_or(Value::Null);
+            let succession_receipts = match (pct_55, c.solo_receipts_thousands) {
+                (Some(p), Some(rcpt)) => {
+                    Value::from((p * rcpt as f64 * 1000.0).round() as i64)
+                }
+                _ => Value::Null,
+            };
+            // FORMATION: sector-grain velocity joined by the naics4's 2-digit
+            // sector — carried as a labeled block so it can't read as
+            // trade-level data.
+            let formation = census_common::bfs_sector_category(&naics4)
+                .and_then(|cat| velocity_by_key.get(&(cat, st_fips.clone())))
+                .map(|v| {
+                    json!({
+                        "sector": v.get("sector").cloned().unwrap_or(Value::Null),
+                        "t12m_applications":
+                            v.get("t12m_applications").cloned().unwrap_or(Value::Null),
+                        "yoy_delta_pct":
+                            v.get("yoy_delta_pct").cloned().unwrap_or(Value::Null),
+                        "accel_pct": v.get("accel_pct").cloned().unwrap_or(Value::Null),
+                        "t12m_high_propensity":
+                            v.get("t12m_high_propensity").cloned().unwrap_or(Value::Null),
+                        "as_of_period":
+                            v.get("as_of_period").cloned().unwrap_or(Value::Null),
+                        "grain": "naics_sector",
+                    })
+                })
+                .unwrap_or(Value::Null);
             let value = json!({
                 "naics4": naics4,
                 "trade": c.trade,
@@ -690,6 +816,10 @@ pub fn blend_market(
                 "base": base,
                 "denominator_kind": denom_kind,
                 "total_market_per_10k": total_market_per_10k,
+                "pct_owners_55plus": pct_owners_55plus,
+                "owner_age_year": owner_age_year,
+                "succession_receipts": succession_receipts,
+                "formation": formation,
                 "coverage": coverage,
             });
             (format!("{naics4}:{st_fips}"), value)
@@ -843,7 +973,7 @@ mod tests {
             emp("238210", "state", "CA", "06", 50),
         ];
         let solos = vec![solo("2382", "CA", "06", 300)];
-        let items = blend_market(&employers, &solos, &BTreeMap::new());
+        let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &[]);
         assert_eq!(items.len(), 1);
         let (key, v) = &items[0];
         assert_eq!(key, "2382:06");
@@ -866,7 +996,7 @@ mod tests {
             emp("238220", "state", "CA", "06", 100),
         ];
         let solos = vec![solo("2382", "CA", "06", 10)];
-        let items = blend_market(&employers, &solos, &BTreeMap::new());
+        let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &[]);
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].1["employer_establishments"], 100);
     }
@@ -875,7 +1005,7 @@ mod tests {
     fn one_sided_groups_are_emitted_with_coverage_markers() {
         let employers = vec![emp("561730", "state", "TX", "48", 80)];
         let solos = vec![solo("2382", "FL", "12", 25)];
-        let items = blend_market(&employers, &solos, &BTreeMap::new());
+        let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &[]);
         assert_eq!(items.len(), 2);
         let by_key: BTreeMap<_, _> = items.into_iter().collect();
         let e = &by_key["5617:48"];
@@ -894,7 +1024,7 @@ mod tests {
     fn zero_totals_yield_null_share_not_a_division_artifact() {
         let employers = vec![emp("238220", "state", "AK", "02", 0)];
         let solos = vec![solo("2382", "AK", "02", 0)];
-        let items = blend_market(&employers, &solos, &BTreeMap::new());
+        let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &[]);
         assert_eq!(items[0].1["solo_share"], Value::Null);
         assert_eq!(items[0].1["total_market"], 0);
     }
@@ -906,15 +1036,85 @@ mod tests {
         // Base known for CA (households = 10,000): 400 operators / 10k * 10k = 400.
         let mut bases = BTreeMap::new();
         bases.insert("CA".to_string(), (10_000i64, "households".to_string()));
-        let items = blend_market(&employers, &solos, &bases);
+        let items = blend_market(&employers, &solos, &bases, &[], &[]);
         let v = &items[0].1;
         assert_eq!(v["base"], 10_000);
         assert_eq!(v["denominator_kind"], "households");
         assert_eq!(v["total_market_per_10k"], json!(400.0));
 
         // No base for the place → nulls, never a fabricated number.
-        let none = blend_market(&employers, &solos, &BTreeMap::new());
+        let none = blend_market(&employers, &solos, &BTreeMap::new(), &[], &[]);
         assert!(none[0].1["base"].is_null());
         assert!(none[0].1["total_market_per_10k"].is_null());
+    }
+
+    fn band(naics: &str, st: &str, label: &str, owners: i64) -> Value {
+        json!({
+            "naics": naics, "state_fips": st, "age_band": label,
+            "owners": owners, "year": "2021",
+        })
+    }
+
+    #[test]
+    fn succession_fields_join_owner_age_onto_the_cell() {
+        let employers = vec![emp("238220", "state", "CA", "06", 100)];
+        // Solo side WITH receipts (NRCPTOT convention: $1,000s).
+        let solos = vec![json!({
+            "naics": "2382", "trade": "Building equipment contractors",
+            "state": "CA", "state_fips": "06", "nonemployers": 300,
+            "receipts_thousands": 500, "year": "2021",
+        })];
+        let ages = vec![
+            band("2382", "06", "25 to 54", 60),
+            band("2382", "06", "55 to 64", 30),
+            band("2382", "06", "65 or over", 10),
+        ];
+        let items = blend_market(&employers, &solos, &BTreeMap::new(), &ages, &[]);
+        let v = &items[0].1;
+        assert_eq!(v["pct_owners_55plus"], json!(0.4));
+        assert_eq!(v["owner_age_year"], "2021");
+        // 40% of $500k receipts = $200,000 succession wave.
+        assert_eq!(v["succession_receipts"], 200_000);
+    }
+
+    #[test]
+    fn no_owner_age_data_or_no_receipts_yields_nulls_not_zeros() {
+        let employers = vec![emp("238220", "state", "CA", "06", 100)];
+        // solo() helper has no receipts_thousands field.
+        let solos = vec![solo("2382", "CA", "06", 300)];
+        // No NES-D data at all → both succession fields Null.
+        let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &[]);
+        assert!(items[0].1["pct_owners_55plus"].is_null());
+        assert!(items[0].1["succession_receipts"].is_null());
+        // NES-D present but receipts unreported → share yes, dollars Null.
+        let ages = vec![band("2382", "06", "55 to 64", 1), band("2382", "06", "25 to 54", 1)];
+        let items = blend_market(&employers, &solos, &BTreeMap::new(), &ages, &[]);
+        assert_eq!(items[0].1["pct_owners_55plus"], json!(0.5));
+        assert!(items[0].1["succession_receipts"].is_null());
+    }
+
+    #[test]
+    fn formation_block_joins_by_sector_and_keeps_its_grain_label() {
+        let employers = vec![emp("238220", "state", "CA", "06", 100)];
+        let solos = vec![solo("2382", "CA", "06", 300)];
+        let velocity = vec![json!({
+            "sector": "NAICS23", "state_fips": "06",
+            "t12m_applications": 1320.0, "yoy_delta_pct": 10.0,
+            "accel_pct": 0.0, "t12m_high_propensity": 400.0,
+            "as_of_period": "2026-06",
+        })];
+        let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &velocity);
+        let f = &items[0].1["formation"];
+        assert_eq!(f["sector"], "NAICS23");
+        assert_eq!(f["t12m_applications"], json!(1320.0));
+        assert_eq!(f["yoy_delta_pct"], json!(10.0));
+        assert_eq!(f["as_of_period"], "2026-06");
+        // Sector-grain honesty travels with the block.
+        assert_eq!(f["grain"], "naics_sector");
+
+        // A different state's velocity must not leak in.
+        let velocity_tx = vec![json!({ "sector": "NAICS23", "state_fips": "48" })];
+        let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &velocity_tx);
+        assert!(items[0].1["formation"].is_null());
     }
 }

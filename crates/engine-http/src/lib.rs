@@ -529,7 +529,7 @@ fn charset_from_meta(head: &[u8]) -> Option<String> {
     // delimiter scan below stops at the CLOSING quote, not the opening one.
     let after = after.strip_prefix(['"', '\'']).unwrap_or(after);
     let end = after
-        .find(|c: char| c == '"' || c == '\'' || c == ' ' || c == ';' || c == '/' || c == '>')
+        .find(['"', '\'', ' ', ';', '/', '>'])
         .unwrap_or(after.len());
     let label = after[..end].trim();
     (!label.is_empty()).then(|| label.to_string())
@@ -668,7 +668,14 @@ impl HttpClient for HttpEngine {
                                 ..stale.response
                             });
                         }
-                        // Changed: store and return the fresh body.
+                        // Changed: log the labeled observation (feeds the
+                        // change-cadence estimator; the 304 counterpart is
+                        // recorded inside `refresh`), store, return fresh body.
+                        // Only a real 2xx body is a "changed" observation — an
+                        // origin error is evidence of neither outcome.
+                        if resp.is_success() {
+                            self.cache.record_revalidation(key, true).await;
+                        }
                         self.cache.put(key, &req.url, &resp, ttl).await?;
                         return Ok(resp);
                     }
@@ -864,8 +871,10 @@ mod tests {
         // A per-request proxy equal to the configured [http] proxy reuses the
         // base client rather than pooling a duplicate (no live network needed —
         // build_client just constructs a client).
-        let mut cfg = HttpConfig::default();
-        cfg.proxy = Some("http://gw:8080".into());
+        let cfg = HttpConfig {
+            proxy: Some("http://gw:8080".into()),
+            ..Default::default()
+        };
         // build_client must accept a valid proxy URL.
         assert!(build_client(&cfg, cfg.proxy.as_deref(), None).is_ok());
     }
@@ -892,7 +901,7 @@ mod tests {
         pool.insert("pN", reqwest::Client::new(), MAX_POOLED_CLIENTS);
         assert_eq!(pool.clients.len(), MAX_POOLED_CLIENTS);
         assert!(pool.get("p0").is_some(), "recently-touched entry retained");
-        assert!(pool.clients.get("p1").is_none(), "LRU entry evicted");
+        assert!(!pool.clients.contains_key("p1"), "LRU entry evicted");
         assert!(pool.get("pN").is_some(), "newest entry present");
     }
 
