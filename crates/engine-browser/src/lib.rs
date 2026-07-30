@@ -55,7 +55,8 @@ use futures::StreamExt;
 use pumper_core::config::BrowserConfig;
 use pumper_core::engine::{CapturedCall, PageAction};
 use pumper_core::{
-    lru_touch_evict, profile_browser_dir, Browser, Error, RenderRequest, RenderedPage, Result,
+    filled_fields_js, lru_touch_evict, parse_filled_fields, profile_browser_dir, Browser, Error,
+    RenderRequest, RenderedPage, Result, TransactEvidence, TransactRequest,
 };
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
@@ -668,6 +669,56 @@ impl Browser for BrowserEngine {
             network,
         })
     }
+
+    /// Executes a declarative transact flow **dry-run only** (M06 v1): the
+    /// reversible steps run through the existing render/action machinery
+    /// (profile-bound Chrome, tab cap, action deadline), the live DOM values of
+    /// every filled field are read via `evaluate`, and the flow STOPS at that
+    /// state — `req.submit_action` is never handed to the executor; there is no
+    /// code path here that could run it. The evidence bundle carries the DOM
+    /// snapshot, filled-field summary, and the exact would-be action.
+    async fn transact(&self, req: TransactRequest) -> Result<TransactEvidence> {
+        // Defense in depth: apps validate before dispatch, and the engine
+        // re-validates so a raw caller can't slip `submit: true` past the app
+        // layer. Typed Error::Transact, never a silent downgrade to dry-run.
+        req.validate()?;
+        let fill = req.fill_selectors();
+        let mut render = RenderRequest::new(&req.url);
+        render.profile = req.profile.clone();
+        render.wait_for_selector = req.wait_for_selector.clone();
+        render.extra_wait_ms = req.extra_wait_ms;
+        render.max_body_bytes = req.max_body_bytes;
+        // Only the reversible steps are executed. `submit_action` is
+        // deliberately NOT appended — stop-before-submit is structural.
+        render.actions = req.steps.clone();
+        render.evaluate = Some(filled_fields_js(&fill));
+        let page = self.render(render).await?;
+        Ok(evidence_from_render(req, &fill, page))
+    }
+}
+
+/// Assembles the dry-run evidence bundle from a completed render. Pure, so the
+/// stop-before-submit contract (`dry_run: true`, `would_submit` untouched, no
+/// screenshot claim the engine can't honor) is testable without Chrome.
+fn evidence_from_render(
+    req: TransactRequest,
+    fill_selectors: &[String],
+    page: RenderedPage,
+) -> TransactEvidence {
+    TransactEvidence {
+        dry_run: true,
+        idempotency_key: req.idempotency_key,
+        url: req.url,
+        final_url: page.final_url,
+        steps_completed: page.actions_completed,
+        filled_fields: parse_filled_fields(fill_selectors, page.evaluated.as_ref()),
+        would_submit: req.submit_action,
+        dom_html: page.html,
+        // Honest gap: the render path does not expose screenshot capture yet;
+        // claiming a path here would be a lie the reviewer acts on.
+        screenshot_path: None,
+        nav_timed_out: page.nav_timed_out,
+    }
 }
 
 /// Polls for `selector` until it appears or `deadline` passes. Shared by the
@@ -969,5 +1020,42 @@ mod tests {
         assert!(over_html_cap(101, 100), "strictly over fails");
         // 0 disables the cap regardless of size.
         assert!(!over_html_cap(u64::MAX, 0));
+    }
+
+    /// The dry-run evidence contract (M06 v1): `dry_run` is hard-coded true,
+    /// the would-be submit action travels verbatim and UNEXECUTED into the
+    /// bundle, filled fields decode from the evaluate result, and no screenshot
+    /// path is claimed (the render path can't produce one yet).
+    #[test]
+    fn transact_evidence_is_dry_run_with_the_would_be_action_verbatim() {
+        let req: TransactRequest = serde_json::from_str(
+            r##"{"url":"https://portal.example/signup",
+                 "idempotency_key":"signup-1",
+                 "steps":[{"action":"type","selector":"#email","text":"a@b.c"}],
+                 "submit_action":{"action":"click","selector":"#submit"}}"##,
+        )
+        .unwrap();
+        let fill = req.fill_selectors();
+        let page = RenderedPage {
+            html: "<form>...</form>".into(),
+            final_url: Some("https://portal.example/signup?step=confirm".into()),
+            evaluated: Some(serde_json::json!([
+                {"selector": "#email", "value": "a@b.c", "found": true}
+            ])),
+            actions_completed: 1,
+            ..Default::default()
+        };
+        let ev = evidence_from_render(req, &fill, page);
+        assert!(ev.dry_run);
+        assert_eq!(ev.idempotency_key, "signup-1");
+        assert_eq!(ev.steps_completed, 1);
+        assert_eq!(ev.filled_fields.len(), 1);
+        assert_eq!(ev.filled_fields[0].value.as_deref(), Some("a@b.c"));
+        assert!(
+            matches!(&ev.would_submit, PageAction::Click { selector } if selector == "#submit"),
+            "the irreversible action is reported, never executed"
+        );
+        assert!(ev.screenshot_path.is_none(), "no screenshot claim without capture support");
+        assert_eq!(ev.dom_html, "<form>...</form>");
     }
 }
