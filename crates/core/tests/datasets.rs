@@ -450,9 +450,42 @@ async fn make_spec(
             filters: &filters,
             project: &project,
             lookup: lookup.as_ref(),
+            group: None,
         })
         .await
         .expect("create derived spec")
+}
+
+/// Creates an aggregate (group_by) spec: source → target with the given group
+/// paths and `{out: expr}` aggregates (source app fixed to "app").
+async fn make_group_spec(
+    storage: &Storage,
+    source: &str,
+    target: &str,
+    filters: &[&str],
+    group_by: &[&str],
+    aggregates: &[(&str, &str)],
+) -> pumper_core::Result<pumper_core::DerivedSpec> {
+    let filters: Vec<String> = filters.iter().map(|s| s.to_string()).collect();
+    let project = BTreeMap::new();
+    let group = pumper_core::DerivedGroup {
+        group_by: group_by.iter().map(|s| s.to_string()).collect(),
+        aggregates: aggregates
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect(),
+    };
+    storage
+        .create_derived_spec(&NewDerivedSpec {
+            source_app: "app",
+            source_dataset: source,
+            target_dataset: target,
+            filters: &filters,
+            project: &project,
+            lookup: None,
+            group: Some(&group),
+        })
+        .await
 }
 
 #[tokio::test]
@@ -651,6 +684,7 @@ async fn derived_cycles_are_rejected_at_create_time() {
                 filters: &filters,
                 project: &project,
                 lookup: None,
+                group: None,
             })
             .await
     }
@@ -715,4 +749,293 @@ async fn backfill_materializes_existing_source_rows_in_bounded_batches() {
     let again = ds.backfill_derived(&spec, 2).await.unwrap();
     assert_eq!(again.new, 0);
     assert_eq!(again.unchanged, 3);
+}
+
+// ── derived group_by + aggregates (M11 v2) ───────────────────────────────────
+
+#[tokio::test]
+async fn derived_group_counts_and_sums_track_add_change_remove() {
+    let store = fresh_db("derived-group-basic").await;
+    let ds = store.datasets();
+    make_group_spec(
+        &store.storage,
+        "sales",
+        "sales_by_state",
+        &[],
+        &["$.state"],
+        &[("n", "count"), ("total", "sum($.amount)")],
+    )
+    .await
+    .expect("create group spec");
+
+    // Add: two CA rows, one NY row.
+    ds.upsert_many(
+        "app",
+        "sales",
+        &[
+            ("s1".to_string(), json!({ "state": "CA", "amount": 10 })),
+            ("s2".to_string(), json!({ "state": "CA", "amount": 5 })),
+            ("s3".to_string(), json!({ "state": "NY", "amount": 7 })),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let ca = ds.get("app", "sales_by_state", "CA").await.unwrap().unwrap();
+    assert_eq!(
+        ca.data,
+        json!({ "state": "CA", "stale": false, "n": 2, "total": 15 })
+    );
+    let ny = ds.get("app", "sales_by_state", "NY").await.unwrap().unwrap();
+    assert_eq!(ny.data["n"], json!(1));
+    assert_eq!(ny.data["total"], json!(7));
+
+    // Change: s2 MOVES CA -> NY. Both the old and the new group recompute.
+    ds.upsert_many(
+        "app",
+        "sales",
+        &[("s2".to_string(), json!({ "state": "NY", "amount": 5 }))],
+    )
+    .await
+    .unwrap();
+    let ca = ds.get("app", "sales_by_state", "CA").await.unwrap().unwrap();
+    assert_eq!(ca.data["n"], json!(1), "CA lost the moved row");
+    assert_eq!(ca.data["total"], json!(10));
+    let ny = ds.get("app", "sales_by_state", "NY").await.unwrap().unwrap();
+    assert_eq!(ny.data["n"], json!(2), "NY gained the moved row");
+    assert_eq!(ny.data["total"], json!(12));
+
+    // Remove: a full snapshot without s3 tombstones it; NY shrinks exactly.
+    let removed = ds
+        .detect_removed("app", "sales", &["s1".to_string(), "s2".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(removed, vec!["s3".to_string()]);
+    let ny = ds.get("app", "sales_by_state", "NY").await.unwrap().unwrap();
+    assert_eq!(ny.data["n"], json!(1));
+    assert_eq!(ny.data["total"], json!(5));
+}
+
+#[tokio::test]
+async fn derived_group_recompute_touches_only_affected_groups() {
+    let store = fresh_db("derived-group-affected").await;
+    let ds = store.datasets();
+    make_group_spec(
+        &store.storage,
+        "sales",
+        "by_state",
+        &[],
+        &["$.state"],
+        &[("n", "count")],
+    )
+    .await
+    .unwrap();
+
+    ds.upsert_many(
+        "app",
+        "sales",
+        &[
+            ("a".to_string(), json!({ "state": "CA" })),
+            ("b".to_string(), json!({ "state": "NY" })),
+        ],
+    )
+    .await
+    .unwrap();
+
+    // A new CA row must recompute CA only: NY's derived row gains no revision.
+    ds.upsert_many("app", "sales", &[("c".to_string(), json!({ "state": "CA" }))])
+        .await
+        .unwrap();
+    let ca = ds.get("app", "by_state", "CA").await.unwrap().unwrap();
+    assert_eq!(ca.data["n"], json!(2));
+    let ny_history = ds.history("app", "by_state", "NY", 10).await.unwrap();
+    assert_eq!(
+        ny_history.len(),
+        1,
+        "untouched group must not be recomputed (no spurious revisions)"
+    );
+    let ca_history = ds.history("app", "by_state", "CA", 10).await.unwrap();
+    assert_eq!(ca_history.len(), 2, "affected group recomputed once more");
+}
+
+#[tokio::test]
+async fn derived_group_oversized_group_goes_stale_never_wrong() {
+    let store = fresh_db("derived-group-stale").await;
+    // Any CA recompute may scan at most 2 rows; 3 CA rows exceed the bound.
+    let ds = store.datasets().with_max_group_scan(2);
+    let spec = make_group_spec(
+        &store.storage,
+        "sales",
+        "by_state",
+        &[],
+        &["$.state"],
+        &[("n", "count"), ("total", "sum($.amount)")],
+    )
+    .await
+    .unwrap();
+
+    ds.upsert_many(
+        "app",
+        "sales",
+        &[
+            ("a".to_string(), json!({ "state": "CA", "amount": 1 })),
+            ("b".to_string(), json!({ "state": "CA", "amount": 2 })),
+            ("c".to_string(), json!({ "state": "CA", "amount": 3 })),
+            ("d".to_string(), json!({ "state": "NY", "amount": 9 })),
+        ],
+    )
+    .await
+    .unwrap();
+
+    // Oversized group: stale marker, NO aggregate fields — absent, not wrong.
+    let ca = ds.get("app", "by_state", "CA").await.unwrap().unwrap();
+    assert_eq!(ca.data, json!({ "state": "CA", "stale": true }));
+    // The small group is exact.
+    let ny = ds.get("app", "by_state", "NY").await.unwrap().unwrap();
+    assert_eq!(
+        ny.data,
+        json!({ "state": "NY", "stale": false, "n": 1, "total": 9 })
+    );
+
+    // Backfill pages the whole source, so it computes the oversized group
+    // exactly and clears the flag.
+    let report = ds.backfill_derived(&spec, 2).await.unwrap();
+    assert_eq!(report.scanned, 4);
+    assert_eq!(report.matched, 2, "two groups materialized");
+    let ca = ds.get("app", "by_state", "CA").await.unwrap().unwrap();
+    assert_eq!(
+        ca.data,
+        json!({ "state": "CA", "stale": false, "n": 3, "total": 6 })
+    );
+}
+
+#[tokio::test]
+async fn derived_group_backfill_covers_pre_existing_rows() {
+    let store = fresh_db("derived-group-backfill").await;
+    let ds = store.datasets();
+    // Rows exist BEFORE the spec — the live hook never saw them — and the
+    // spec's filters apply pre-aggregation.
+    let items: Vec<(String, serde_json::Value)> = (0..5)
+        .map(|i| {
+            (
+                format!("k{i}"),
+                json!({ "amount": i, "kind": if i == 0 { "junk" } else { "sale" },
+                        "state": if i % 2 == 0 { "CA" } else { "NY" } }),
+            )
+        })
+        .collect();
+    ds.upsert_many("app", "sales", &items).await.unwrap();
+
+    let spec = make_group_spec(
+        &store.storage,
+        "sales",
+        "by_state",
+        &["$.kind:eq:sale"],
+        &["$.state"],
+        &[("n", "count"), ("total", "sum($.amount)")],
+    )
+    .await
+    .unwrap();
+
+    // batch=2 forces multiple keyset pages over the 5 rows.
+    let report = ds.backfill_derived(&spec, 2).await.unwrap();
+    assert_eq!(report.scanned, 5);
+    assert_eq!(report.matched, 2);
+    assert_eq!(report.new, 2);
+    // k0 (junk) is filtered out: CA = k2+k4, NY = k1+k3.
+    let ca = ds.get("app", "by_state", "CA").await.unwrap().unwrap();
+    assert_eq!(
+        ca.data,
+        json!({ "state": "CA", "stale": false, "n": 2, "total": 6 })
+    );
+    let ny = ds.get("app", "by_state", "NY").await.unwrap().unwrap();
+    assert_eq!(ny.data["n"], json!(2));
+    assert_eq!(ny.data["total"], json!(4));
+
+    // Idempotent: a second backfill recomputes to all-unchanged.
+    let again = ds.backfill_derived(&spec, 2).await.unwrap();
+    assert_eq!(again.new, 0);
+    assert_eq!(again.unchanged, 2);
+}
+
+#[tokio::test]
+async fn derived_group_validation_rejects_unsupported_shapes() {
+    let store = fresh_db("derived-group-validation").await;
+    let err = |r: pumper_core::Result<pumper_core::DerivedSpec>| {
+        assert!(
+            matches!(r, Err(pumper_core::Error::BadRequest(_))),
+            "expected BadRequest"
+        );
+    };
+
+    // Aggregates + lookup is not supported (a group row has no single source
+    // record to resolve a key_expr against).
+    let group = pumper_core::DerivedGroup {
+        group_by: vec!["$.state".into()],
+        aggregates: [("n".to_string(), "count".to_string())].into_iter().collect(),
+    };
+    let lookup = DerivedLookup {
+        dataset: "other".into(),
+        key_expr: "$.k".into(),
+        merge_as: "extra".into(),
+    };
+    let filters: Vec<String> = Vec::new();
+    let project = BTreeMap::new();
+    err(store
+        .storage
+        .create_derived_spec(&NewDerivedSpec {
+            source_app: "app",
+            source_dataset: "s",
+            target_dataset: "t",
+            filters: &filters,
+            project: &project,
+            lookup: Some(&lookup),
+            group: Some(&group),
+        })
+        .await);
+
+    // Aggregates + project is not supported (group rows are synthesized).
+    let projected: BTreeMap<String, String> =
+        [("x".to_string(), "$.x".to_string())].into_iter().collect();
+    err(store
+        .storage
+        .create_derived_spec(&NewDerivedSpec {
+            source_app: "app",
+            source_dataset: "s",
+            target_dataset: "t",
+            filters: &filters,
+            project: &projected,
+            lookup: None,
+            group: Some(&group),
+        })
+        .await);
+
+    // Malformed group content: bad aggregate expr, non-$. path, empty halves,
+    // and a collision with the reserved `stale` field.
+    err(make_group_spec(&store.storage, "s", "t", &[], &["$.state"], &[("n", "avg($.x)")]).await);
+    err(make_group_spec(&store.storage, "s", "t", &[], &["state"], &[("n", "count")]).await);
+    err(make_group_spec(&store.storage, "s", "t", &[], &[], &[("n", "count")]).await);
+    err(make_group_spec(&store.storage, "s", "t", &[], &["$.state"], &[]).await);
+    err(make_group_spec(&store.storage, "s", "t", &[], &["$.state"], &[("stale", "count")]).await);
+
+    // A well-formed aggregate spec is accepted and round-trips its group half.
+    let spec = make_group_spec(
+        &store.storage,
+        "s",
+        "t",
+        &[],
+        &["$.state"],
+        &[("n", "count")],
+    )
+    .await
+    .unwrap();
+    let loaded = store
+        .storage
+        .get_derived_spec(&spec.id)
+        .await
+        .unwrap()
+        .unwrap();
+    let g = loaded.group.expect("group half round-trips");
+    assert_eq!(g.group_by, vec!["$.state".to_string()]);
+    assert!(loaded.lookup.is_none());
 }
