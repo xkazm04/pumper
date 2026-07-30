@@ -1,6 +1,7 @@
 ---
 name: architect
 description: Heavy-hitter structural scan of the pumper codebase — parallel Explore agents sweep one theme or area for weak patterns to upgrade and strong patterns to codify, the user triages findings (execute now / queue / drop / rework), and a durable vault backlog of ADRs carries decisions across sessions. Invoke with `/architect [scan|area|resume]`. Pairs with /perfect (product directions); /architect handles structure, not features.
+argument-hint: "[decision or topic]"
 ---
 
 # Architect (pumper edition)

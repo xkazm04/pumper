@@ -3,6 +3,7 @@ name: passport-onboard
 memory: project
 category: Maintenance
 description: Guided, select-driven onboarding of a repository against the Personas App Readiness Passport — assess every dimension, offer batched skip/path-A/path-B choices in the terminal, then execute accepted work with parallel subagents. Works for brand-new projects and as a completion checklist for developed ones. Invoked standalone in a repo, or dispatched by the Personas passport wall via Fleet.
+argument-hint: "[project]"
 ---
 
 # Passport Onboard

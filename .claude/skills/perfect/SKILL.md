@@ -1,6 +1,7 @@
 ---
 name: perfect
 description: Session-after-session product perfection loop for pumper. The strongest available model (Fable) directs — it walks context-map.json context-by-context, proposes 5 challenged, high-value directions per context (features, API/data-product elevations, significant optimizations), gates them with the user until 10 are accepted, then orchestrates builder subagents (Sonnet for routine S/M work, Opus for large or risk-flagged briefs) per context in isolated worktrees while making every review/merge decision itself. All state lives in the repo's .perfect/ vault so any future session resumes the loop exactly where the last one stopped. Invoke with `/perfect [init|propose|build|status|reflect] [context-name]`.
+argument-hint: "[context]"
 ---
 
 # Perfect — the direction-and-delivery loop (pumper edition)

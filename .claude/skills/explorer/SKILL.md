@@ -1,6 +1,7 @@
 ---
 name: explorer
 description: Wander one logical area of the pumper codebase, surface 10 items worth fixing, triage with the user, then execute the accepted ones in-session. Daily low-friction quality sweeps with per-context coverage memory. Pairs with /research (external sources) and /architect (heavy structural change).
+argument-hint: "[area or path]"
 category: Maintenance
 memory: vault
 contexts: tracked

@@ -3,6 +3,7 @@ name: tiger
 memory: vault
 category: Testing
 description: Hunts the highest-value surface of pumper — the LLM call sites — and drives them to their potential across three lenses. (1) Code quality of the AI plumbing (chokepoint, telemetry, caching/dedupe, schema+validation+self-repair). (2) Business value, using the Character method (representative consumers with jobs-to-be-done + a senior-quality bar + time-saved) but TESTING ONLY THE LLM PIECES — does each prompt's grounding and output clear the bar. (3) Model optimization — benchmark the same character inputs across models × effort levels to find degradation/upgrade vs cost/latency. Everything is memorized in a linked Obsidian vault (one note per call site / character / model / session). Pumper's LLM surface is the `claude` engine (a CLI subprocess, not an HTTP SDK). Invoke with `/tiger init|scan|run|benchmark|recall|backlog [args]`.
+argument-hint: "[target]"
 ---
 
 # Tiger — hunt the LLM value (pumper edition)

@@ -1,6 +1,7 @@
 ---
 name: research
 description: Extract actionable improvements for pumper from external sources (video, blog, article, raw text). Scores ideas against the codebase, buckets into Code / New App / New Data Source, and persists findings to the repo memory vault.
+argument-hint: "[source or question]"
 category: Maintenance
 memory: vault
 ---
