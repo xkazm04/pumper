@@ -12,9 +12,84 @@ use pumper_core::{
     DocReport, Error, FetchHealth, FetchRequest, FetchStrategy, FieldStatus, ManifestExample,
     ObservedDoc, Record, Result, RuleSet, ScrapeApp, UpsertSummary,
 };
+use pumper_core::config::ArchiveConfig;
+use pumper_engine_archive::ArchiveEngine;
 use serde_json::{json, Value};
 
 pub struct Extractor;
+
+/// Default per-run snapshot cap for the Wayback backfill mode
+/// (`source.archive.max_snapshots`), and the hard ceiling it clamps to — one
+/// run never fans over more than [`ARCHIVE_SNAPSHOT_CEILING`] captures; wider
+/// ranges report `truncated: true` and are resumed with a narrower `from`/`to`.
+const DEFAULT_MAX_SNAPSHOTS: usize = 100;
+const ARCHIVE_SNAPSHOT_CEILING: usize = 1000;
+
+/// Parsed `source.archive` params (Wayback historical backfill).
+struct ArchiveParams {
+    /// The CDX target: an exact URL (`url`) or a Wayback wildcard/prefix
+    /// pattern (`url_pattern`, e.g. `example.com/products/*`).
+    target: String,
+    from: Option<String>,
+    to: Option<String>,
+    max_snapshots: usize,
+    base_url: String,
+}
+
+/// Pure parse/validation of the `source.archive` object: exactly one of
+/// `url`/`url_pattern`; `from`/`to` must be 4-14 digit CDX bounds when
+/// present; `max_snapshots` defaults to [`DEFAULT_MAX_SNAPSHOTS`] and clamps
+/// into `1..=`[`ARCHIVE_SNAPSHOT_CEILING`].
+fn parse_archive_params(
+    archive: &serde_json::Map<String, Value>,
+) -> std::result::Result<ArchiveParams, String> {
+    let url = archive.get("url").and_then(Value::as_str);
+    let pattern = archive.get("url_pattern").and_then(Value::as_str);
+    let target = match (url, pattern) {
+        (Some(u), None) => u.to_string(),
+        (None, Some(p)) => p.to_string(),
+        (Some(_), Some(_)) => {
+            return Err("source.archive: url and url_pattern are mutually exclusive".into())
+        }
+        (None, None) => {
+            return Err("source.archive requires url or url_pattern".into());
+        }
+    };
+    let bound = |k: &str| -> std::result::Result<Option<String>, String> {
+        match archive.get(k) {
+            None => Ok(None),
+            Some(v) => {
+                let s = v
+                    .as_str()
+                    .ok_or_else(|| format!("source.archive.{k} must be a string"))?;
+                if !pumper_engine_archive::valid_cdx_bound(s) {
+                    return Err(format!(
+                        "source.archive.{k} '{s}' is not a CDX time bound (4-14 digits, e.g. \
+                         \"2019\" or \"20190601123045\")"
+                    ));
+                }
+                Ok(Some(s.to_string()))
+            }
+        }
+    };
+    let max_snapshots = archive
+        .get("max_snapshots")
+        .and_then(Value::as_u64)
+        .map(|n| (n.max(1) as usize).min(ARCHIVE_SNAPSHOT_CEILING))
+        .unwrap_or(DEFAULT_MAX_SNAPSHOTS);
+    let base_url = archive
+        .get("base_url")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| ArchiveConfig::default().base_url);
+    Ok(ArchiveParams {
+        target,
+        from: bound("from")?,
+        to: bound("to")?,
+        max_snapshots,
+        base_url,
+    })
+}
 
 /// Max live records pulled from a source dataset when no explicit `keys` (and no
 /// `_trigger.keys`) narrow the set — bounds the dataset read and the fan-out.
@@ -39,6 +114,11 @@ struct SourceDoc {
     key: String,
     url: String,
     observed_at: Option<String>,
+    /// Provenance tag for records whose body came from an external archive
+    /// rather than this system's own fetch/crawl history (`"wayback"` for the
+    /// `source.archive` backfill mode); rendered as `_fetched_via` so the two
+    /// histories compose under one convention.
+    fetched_via: Option<&'static str>,
     body: String,
 }
 
@@ -49,6 +129,7 @@ impl SourceDoc {
             url: key.clone(),
             key,
             observed_at: None,
+            fetched_via: None,
             body,
         }
     }
@@ -179,11 +260,12 @@ async fn extract_and_upsert(
     // and dropped here anyway (was: `.iter().map(|(_,d)| d.clone())`, deep-cloning
     // every HTML body and roughly doubling peak RSS over the whole batch).
     let mut keys: Vec<String> = Vec::with_capacity(keyed.len());
-    let mut metas: Vec<(String, Option<String>)> = Vec::with_capacity(keyed.len());
+    let mut metas: Vec<(String, Option<String>, Option<&'static str>)> =
+        Vec::with_capacity(keyed.len());
     let mut docs: Vec<String> = Vec::with_capacity(keyed.len());
     for d in keyed {
         keys.push(d.key);
-        metas.push((d.url, d.observed_at));
+        metas.push((d.url, d.observed_at, d.fetched_via));
         docs.push(d.body);
     }
     let reported = run_extraction(compiled, docs.clone()).await?;
@@ -200,13 +282,8 @@ async fn extract_and_upsert(
         .into_iter()
         .zip(metas)
         .zip(reported)
-        .map(|((key, (url, observed_at)), (mut rec, _))| {
-            if let Value::Object(map) = &mut rec {
-                map.insert("_url".into(), Value::String(url));
-                if let Some(ts) = observed_at {
-                    map.insert("_observed_at".into(), Value::String(ts));
-                }
-            }
+        .map(|((key, (url, observed_at, fetched_via)), (mut rec, _))| {
+            tag_record(&mut rec, url, observed_at, fetched_via);
             records.push(rec.clone());
             (key, rec)
         })
@@ -220,6 +297,27 @@ async fn extract_and_upsert(
         summary,
         health: verdict,
     })
+}
+
+/// Stamps the shared provenance convention onto an extracted record: `_url`
+/// (natural source URL), `_observed_at` (when the body was observed; absent for
+/// present-day bodies), and `_fetched_via` (external-archive provenance, e.g.
+/// `"wayback"`; absent for this system's own fetches).
+fn tag_record(
+    rec: &mut Value,
+    url: String,
+    observed_at: Option<String>,
+    fetched_via: Option<&'static str>,
+) {
+    if let Value::Object(map) = rec {
+        map.insert("_url".into(), Value::String(url));
+        if let Some(ts) = observed_at {
+            map.insert("_observed_at".into(), Value::String(ts));
+        }
+        if let Some(via) = fetched_via {
+            map.insert("_fetched_via".into(), Value::String(via.into()));
+        }
+    }
 }
 
 /// What one extraction pass produced: the records, the aggregate quality signal,
@@ -304,7 +402,10 @@ impl ScrapeApp for Extractor {
          archive is reachable via source.as_of (RFC3339 snapshot), source.versions: \"all\" \
          (every archived revision + current), or source.backfill: true + url_pattern \
          (batched fan over the whole page_versions archive); historical records are keyed \
-         {url}@{date} and tagged _url + _observed_at."
+         {url}@{date} and tagged _url + _observed_at. source.archive: {url|url_pattern, \
+         from, to, max_snapshots} backfills from the Wayback Machine instead — snapshots \
+         are digest-deduped, fetched via the governed engine, and upserted with the same \
+         {url}@{date} keys plus _fetched_via: \"wayback\"."
     }
 
     fn manifest(&self) -> AppManifest {
@@ -327,8 +428,45 @@ impl ScrapeApp for Extractor {
                     },
                     "source": {
                         "type": "object",
-                        "required": ["app", "dataset"],
+                        "anyOf": [
+                            { "required": ["app", "dataset"] },
+                            { "required": ["archive"] }
+                        ],
                         "properties": {
+                            "archive": {
+                                "type": "object",
+                                "properties": {
+                                    "url": {
+                                        "type": "string",
+                                        "description": "Exact URL to backfill from the Wayback Machine. Mutually exclusive with url_pattern."
+                                    },
+                                    "url_pattern": {
+                                        "type": "string",
+                                        "description": "Wayback CDX wildcard/prefix target (e.g. \"example.com/products/*\"). Mutually exclusive with url."
+                                    },
+                                    "from": {
+                                        "type": "string",
+                                        "pattern": "^[0-9]{4,14}$",
+                                        "description": "Lower capture-time bound: YYYYMMDDhhmmss or any digit prefix (e.g. \"2019\")."
+                                    },
+                                    "to": {
+                                        "type": "string",
+                                        "pattern": "^[0-9]{4,14}$",
+                                        "description": "Upper capture-time bound, same format as `from`."
+                                    },
+                                    "max_snapshots": {
+                                        "type": "integer",
+                                        "minimum": 1,
+                                        "maximum": 1000,
+                                        "description": "Per-run snapshot cap (default 100, ceiling 1000); the result reports truncated: true when the range held more."
+                                    },
+                                    "base_url": {
+                                        "type": "string",
+                                        "description": "Wayback deployment base URL (default https://web.archive.org)."
+                                    }
+                                },
+                                "description": "Wayback historical backfill: enumerate archived captures (digest-deduped, oldest first), extract each, and upsert time-series records keyed {url}@{date} tagged _fetched_via: \"wayback\". No app/dataset needed."
+                            },
                             "app": { "type": "string" },
                             "dataset": { "type": "string" },
                             "keys": { "type": "array", "items": { "type": "string" } },
@@ -376,6 +514,23 @@ impl ScrapeApp for Extractor {
                         "source": { "app": "crawl", "dataset": "pages" },
                         "rules": { "title": { "type": "css", "selector": "title" } },
                         "concurrency": 8
+                    }),
+                },
+                ManifestExample {
+                    description: "Wayback historical backfill: extract a price time series \
+                                  from the web archive's captures of a page, before this \
+                                  system ever crawled it",
+                    params: json!({
+                        "source": {
+                            "archive": {
+                                "url": "https://example.com/products/widget",
+                                "from": "2019",
+                                "to": "20211231",
+                                "max_snapshots": 200
+                            }
+                        },
+                        "rules": { "price": { "type": "css", "selector": ".price" } },
+                        "dataset": "price_history"
                     }),
                 },
                 ManifestExample {
@@ -548,6 +703,14 @@ impl Extractor {
             .ok_or_else(|| {
                 Error::App("param 'source' must be an object {app, dataset, keys?}".into())
             })?;
+        // Wayback historical backfill: `source.archive` reads bodies from the
+        // web archive's CDX index instead of a local app dataset — no
+        // app/dataset needed.
+        if let Some(archive) = source.get("archive").and_then(Value::as_object) {
+            return self
+                .run_archive_backfill(ctx, compiled, dataset, archive)
+                .await;
+        }
         let src_app = source
             .get("app")
             .and_then(Value::as_str)
@@ -684,6 +847,7 @@ impl Extractor {
                         key: versioned_key(&key, ts),
                         url: key.clone(),
                         observed_at: Some(ts.clone()),
+                        fetched_via: None,
                         body,
                     }),
                     Err(reason) => {
@@ -787,6 +951,7 @@ impl Extractor {
                         key: versioned_key(url, ts),
                         url: url.to_string(),
                         observed_at: Some(ts.to_string()),
+                        fetched_via: None,
                         body,
                     }),
                     Err(reason) => missing.push(json!({"key": v.key, "reason": reason})),
@@ -830,6 +995,122 @@ impl Extractor {
             "unchanged": unchanged,
             "fields_matched": fields_matched,
             "fields_total": fields_total,
+        }))
+    }
+
+    /// Wayback historical backfill (`source.archive`): enumerate the web
+    /// archive's CDX captures of a URL (or Wayback wildcard pattern) across a
+    /// date range, fetch each snapshot's raw body through the governed HTTP
+    /// engine, run the ruleset, and upsert records keyed
+    /// `{natural_key}@{snapshot_date}` tagged `_url` + `_observed_at` +
+    /// `_fetched_via: "wayback"` — the same convention as the crawl-archive
+    /// backfill, so a Wayback pre-history and this system's own crawl history
+    /// compose into one time series. Bounded by `max_snapshots` per run, with
+    /// the enumeration's honest `truncated` flag echoed in the result.
+    async fn run_archive_backfill(
+        &self,
+        ctx: &AppContext,
+        compiled: Arc<CompiledRuleSet>,
+        dataset: &str,
+        archive: &serde_json::Map<String, Value>,
+    ) -> Result<Value> {
+        let p = parse_archive_params(archive).map_err(Error::App)?;
+        let engine = ArchiveEngine::new(
+            &ArchiveConfig {
+                enabled: true,
+                base_url: p.base_url.clone(),
+            },
+            ctx.engines.http.clone(),
+        );
+        let list = engine
+            .list_snapshots(&p.target, p.from.as_deref(), p.to.as_deref(), p.max_snapshots)
+            .await?;
+        let found = list.snapshots.len();
+        let truncated = list.truncated;
+
+        // Fetch each snapshot's raw body through the governed HTTP engine —
+        // archive.org keeps the same per-host politeness as any other host —
+        // with the same bounded fan-out as the urls mode.
+        let concurrency = fetch_concurrency(ctx);
+        let http = ctx.engines.http.clone();
+        let base = engine.base_url().to_string();
+        let fetches = list.snapshots.into_iter().map(|snap| {
+            let http = http.clone();
+            let base = base.clone();
+            async move {
+                let Some(dt) = pumper_engine_archive::snapshot_datetime(&snap.timestamp) else {
+                    return (snap, Err("unparseable capture timestamp".to_string()));
+                };
+                let observed = dt.to_rfc3339();
+                let url = pumper_engine_archive::snapshot_url(&base, &snap.timestamp, &snap.original);
+                match http.fetch(pumper_core::HttpRequest::get(url)).await {
+                    Ok(resp) if resp.is_success() && !resp.body.is_empty() => {
+                        (snap, Ok((observed, resp.body)))
+                    }
+                    Ok(resp) => (snap, Err(format!("snapshot fetch: status {}", resp.status))),
+                    Err(e) => (snap, Err(format!("snapshot fetch failed: {e}"))),
+                }
+            }
+        });
+        let fetched_pairs: Vec<_> = futures::stream::iter(fetches)
+            .buffer_unordered(concurrency)
+            .collect()
+            .await;
+
+        let mut keyed: Vec<SourceDoc> = Vec::new();
+        let mut failed: Vec<Value> = Vec::new();
+        let mut fetch = FetchHealth {
+            attempted: found as u32,
+            ok: 0,
+        };
+        for (snap, outcome) in fetched_pairs {
+            match outcome {
+                Ok((observed, body)) => {
+                    fetch.ok += 1;
+                    keyed.push(SourceDoc {
+                        key: versioned_key(&snap.original, &observed),
+                        url: snap.original,
+                        observed_at: Some(observed),
+                        fetched_via: Some("wayback"),
+                        body,
+                    });
+                }
+                Err(reason) => failed.push(json!({
+                    "timestamp": snap.timestamp,
+                    "url": snap.original,
+                    "reason": reason,
+                })),
+            }
+        }
+        // Snapshots enumerate oldest-first but the fan-out completes out of
+        // order; restore chronology so same-day re-captures upsert newest-last.
+        keyed.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.observed_at.cmp(&b.observed_at)));
+
+        let fetched = keyed.len();
+        let out = extract_and_upsert(ctx, compiled, dataset, keyed, fetch).await?;
+
+        let failed_count = failed.len();
+        failed.truncate(MISSING_ECHO_LIMIT);
+        Ok(json!({
+            "mode": "archive",
+            "target": p.target,
+            "from": p.from,
+            "to": p.to,
+            "max_snapshots": p.max_snapshots,
+            "snapshots_found": found,
+            "truncated": truncated,
+            "fetched": fetched,
+            "failed": failed_count,
+            "failed_snapshots": failed,
+            "fetch_ok_rate": fetch.rate(),
+            "new": out.summary.new.len(),
+            "changed": out.summary.changed.len(),
+            "unchanged": out.summary.unchanged,
+            "fields_matched": out.matched,
+            "fields_total": out.total,
+            "worst_fields": out.worst,
+            "health": out.health,
+            "records": out.records,
         }))
     }
 }
@@ -959,6 +1240,77 @@ mod tests {
         assert_eq!(pick_as_of(&observed, "2025-12-31T23:59:59Z").unwrap(), None);
         // Bad as_of is an error, not a silent empty pick.
         assert!(pick_as_of(&observed, "yesterday").is_err());
+    }
+
+    #[test]
+    fn archive_params_require_exactly_one_target() {
+        use super::parse_archive_params;
+        use serde_json::json;
+        let obj = |v: serde_json::Value| v.as_object().unwrap().clone();
+        // url alone and url_pattern alone both work.
+        let p = parse_archive_params(&obj(json!({"url": "https://a/x"}))).unwrap();
+        assert_eq!(p.target, "https://a/x");
+        let p = parse_archive_params(&obj(json!({"url_pattern": "a.com/products/*"}))).unwrap();
+        assert_eq!(p.target, "a.com/products/*");
+        // Neither or both are errors, not guesses.
+        assert!(parse_archive_params(&obj(json!({}))).is_err());
+        assert!(
+            parse_archive_params(&obj(json!({"url": "https://a/", "url_pattern": "a/*"}))).is_err()
+        );
+    }
+
+    #[test]
+    fn archive_params_validate_bounds_and_clamp_the_cap() {
+        use super::{parse_archive_params, ARCHIVE_SNAPSHOT_CEILING, DEFAULT_MAX_SNAPSHOTS};
+        use serde_json::json;
+        let obj = |v: serde_json::Value| v.as_object().unwrap().clone();
+        let p = parse_archive_params(&obj(
+            json!({"url": "https://a/x", "from": "2019", "to": "20211231"}),
+        ))
+        .unwrap();
+        assert_eq!(p.from.as_deref(), Some("2019"));
+        assert_eq!(p.to.as_deref(), Some("20211231"));
+        assert_eq!(p.max_snapshots, DEFAULT_MAX_SNAPSHOTS);
+        assert_eq!(p.base_url, "https://web.archive.org");
+        // Non-digit bounds are rejected before any network call.
+        assert!(parse_archive_params(&obj(json!({"url": "https://a/x", "from": "2019-06"}))).is_err());
+        assert!(parse_archive_params(&obj(json!({"url": "https://a/x", "to": "yesterday"}))).is_err());
+        // The per-run cap clamps into 1..=ceiling — never unbounded.
+        let p = parse_archive_params(&obj(json!({"url": "https://a/x", "max_snapshots": 0}))).unwrap();
+        assert_eq!(p.max_snapshots, 1);
+        let p = parse_archive_params(&obj(json!({"url": "https://a/x", "max_snapshots": 999999})))
+            .unwrap();
+        assert_eq!(p.max_snapshots, ARCHIVE_SNAPSHOT_CEILING);
+    }
+
+    #[test]
+    fn wayback_records_carry_the_m42_key_and_tag_convention() {
+        use super::{tag_record, versioned_key};
+        use serde_json::json;
+        // Key: {natural_key}@{snapshot_date} — the crawl-archive convention.
+        let observed = "2020-05-01T12:30:00+00:00";
+        assert_eq!(
+            versioned_key("https://a/x", observed),
+            "https://a/x@2020-05-01"
+        );
+        // Tags: _url + _observed_at + _fetched_via: "wayback".
+        let mut rec = json!({"price": "9.99"});
+        tag_record(
+            &mut rec,
+            "https://a/x".into(),
+            Some(observed.into()),
+            Some("wayback"),
+        );
+        assert_eq!(rec["_url"], "https://a/x");
+        assert_eq!(rec["_observed_at"], observed);
+        assert_eq!(rec["_fetched_via"], "wayback");
+        // A present-day record gets neither historical tag — the convention
+        // stays composable with the crawl history (which sets no _fetched_via).
+        let mut rec = json!({"price": "9.99"});
+        tag_record(&mut rec, "https://a/x".into(), None, None);
+        assert_eq!(rec["_url"], "https://a/x");
+        assert!(rec.get("_observed_at").is_none());
+        assert!(rec.get("_fetched_via").is_none());
     }
 
     #[test]

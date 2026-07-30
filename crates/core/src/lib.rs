@@ -49,8 +49,9 @@ pub use cache::{HttpCache, KeyFreshness, ResearchCache, StaleEntry};
 pub use costs::{extract_yields, CostEvent, CostLedger, CostSummary, SpentTotal, YieldEntry};
 #[cfg(feature = "storage")]
 pub use datasets::{
-    derived_would_cycle, diff_values, filters_match, parse_filter_spec, parse_filter_specs,
-    project_value, trust_label, ChangeKind, Datasets, DerivedBackfill, DerivedLookup, DerivedSpec,
+    derived_would_cycle, diff_values, filters_match, parse_aggregate, parse_aggregates,
+    parse_filter_spec, parse_filter_specs, project_value, trust_label, validate_group, Aggregate,
+    ChangeKind, Datasets, DerivedBackfill, DerivedGroup, DerivedLookup, DerivedSpec,
     DupPair, Record, Revision, RevisionPage, UpsertSummary, TRUST_STABLE,
 };
 pub use resilience::{
@@ -98,7 +99,7 @@ pub use json_salvage::salvage_json;
 pub use lru::{lru_touch, lru_touch_evict};
 pub use markdown::html_to_markdown;
 pub use plugin::{NoPlugins, Plugins};
-pub use recipes::{discover_recipes, ApiRecipe};
+pub use recipes::{discover_recipes, payload_overlaps, ApiRecipe, RecipeSource};
 #[cfg(feature = "storage")]
 pub use recipes::RecipeStore;
 pub use search::{

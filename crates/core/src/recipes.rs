@@ -14,15 +14,21 @@
 //! without a browser. [`RecipeStore`] (feature `storage`) persists recipes into
 //! the `api_recipes` table (migration 0025) and backs `GET /recipes`.
 //!
-//! ## The fetcher seam (step 4, deliberately not taken here)
+//! ## The fetcher branch (step 4, now taken)
 //!
-//! A *validated* recipe is the raw material for a pre-HTTP "api" tier in
-//! `fetcher.rs`, ordered api-recipe → archive → live HTTP: when a recipe exists
-//! for the host/path pattern, fetch the API URL (threading the same `profile`
-//! cookies) instead of rendering the page. That branch composes with the
-//! archive tier's `skip_http`-style routing and is left as this documented
-//! seam: recipes ship as data + the `/recipes` route; nothing consumes them at
-//! fetch time yet, and `validated` stays `false` until a replay path exists.
+//! A *validated* recipe backs the pre-archive `api_recipe` tier in
+//! `fetcher.rs`, ordered api-recipe → archive → live HTTP: when a recipe
+//! matches the request's host, the fetcher replays the recipe's API URL
+//! ([`ApiRecipe::replay_url`], threading the same `profile` cookies) via the
+//! HTTP engine and returns the structured JSON body with a `TierTrace` entry
+//! of tier `api_recipe`. The branch is double-opt-in (`FetchRequest.use_recipes`
+//! or `[recipes] enabled`, both default-OFF) and never terminal on failure: a
+//! non-JSON / non-overlapping / errored replay records a strike
+//! ([`RecipeSource::record_failure`]) and falls through to archive/live, and
+//! `[recipes] max_failures` consecutive strikes un-validate the recipe. With
+//! `[recipes] auto_validate` ON, an unvalidated recipe is tried
+//! opportunistically and a successful replay whose payload still overlaps its
+//! [`ApiRecipe::json_paths`] ([`payload_overlaps`]) marks it validated.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -65,6 +71,71 @@ pub struct ApiRecipe {
     pub score: f64,
     /// Proven by a successful replay. Discovery always writes `false`.
     pub validated: bool,
+}
+
+impl ApiRecipe {
+    /// Fills the observed `params` back into `url_template`, yielding the
+    /// concrete API URL a replay fetches. Values are form-encoded. Returns
+    /// `None` when a placeholder has no observed value (a template that can't
+    /// be replayed blind) — the fetcher then skips the recipe branch.
+    pub fn replay_url(&self) -> Option<String> {
+        let mut url = self.url_template.clone();
+        if let Value::Object(map) = &self.params {
+            for (k, v) in map {
+                let raw = match v {
+                    Value::String(s) => s.clone(),
+                    other => other.to_string(),
+                };
+                let encoded: String = url::form_urlencoded::byte_serialize(raw.as_bytes()).collect();
+                url = url.replace(&format!("{{{k}}}"), &encoded);
+            }
+        }
+        // Any placeholder left unfilled means the template needs a value we
+        // never observed — refuse rather than fire a literal `{page}` upstream.
+        (!url.contains('{')).then_some(url)
+    }
+}
+
+/// Whether a replayed payload still carries at least one of the recipe's
+/// expected field paths — the "same shape" half of validating a replay. Paths
+/// are the generalized (`[*]`) forms discovery produced, so any row count
+/// matches; an API that renamed or restructured its fields stops overlapping
+/// and the replay counts as thin.
+pub fn payload_overlaps(json_paths: &[String], payload: &Value) -> bool {
+    if json_paths.is_empty() {
+        return false;
+    }
+    let mut leaves = Vec::new();
+    collect_payload_leaves(payload, "$", &mut leaves);
+    let present: BTreeSet<&str> = leaves.iter().map(|(p, _)| p.as_str()).collect();
+    json_paths.iter().any(|p| present.contains(p.as_str()))
+}
+
+/// Read side of the fetcher's `api_recipe` tier plus its strike/validation
+/// state machine. Object-safe so the `Fetcher` (which compiles without the
+/// `storage` feature) can hold `Option<Arc<dyn RecipeSource>>`; [`RecipeStore`]
+/// is the real implementation.
+#[async_trait::async_trait]
+pub trait RecipeSource: Send + Sync {
+    /// Best recipe for `host`: validated recipes first, then best score. With
+    /// `include_unvalidated = false` (the `auto_validate`-OFF fetcher default)
+    /// only validated recipes are returned.
+    async fn best_for_host(
+        &self,
+        host: &str,
+        include_unvalidated: bool,
+    ) -> crate::Result<Option<ApiRecipe>>;
+
+    /// A successful overlapping replay: resets the consecutive-failure counter,
+    /// and with `validate = true` (the `auto_validate` path) also marks the
+    /// recipe validated.
+    async fn record_success(&self, id: &str, validate: bool) -> crate::Result<()>;
+
+    /// A failed/thin replay: increments the consecutive-failure counter.
+    /// Returns `true` when this strike crossed `unvalidate_after` and a
+    /// validated recipe was demoted back to unvalidated (counter reset so the
+    /// next validation attempt starts clean).
+    async fn record_failure(&self, id: &str, unvalidate_after: u32) -> crate::Result<bool>;
 }
 
 /// Normalizes a leaf value for overlap comparison: strings are trimmed +
@@ -323,6 +394,79 @@ impl RecipeStore {
     }
 }
 
+/// The real [`RecipeSource`]: rows from `api_recipes`, strikes in its
+/// `consecutive_failures` column (migration 0028).
+#[cfg(feature = "storage")]
+#[async_trait::async_trait]
+impl RecipeSource for RecipeStore {
+    async fn best_for_host(
+        &self,
+        host: &str,
+        include_unvalidated: bool,
+    ) -> crate::Result<Option<ApiRecipe>> {
+        let row: Option<(String, String, String, String, String, f64, i64)> = sqlx::query_as(
+            "SELECT id, host, url_template, params, json_paths, score, validated \
+             FROM api_recipes \
+             WHERE host = ?1 AND (validated = 1 OR ?2) \
+             ORDER BY validated DESC, score DESC, url_template \
+             LIMIT 1",
+        )
+        .bind(host)
+        .bind(include_unvalidated)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(id, host, url_template, params, json_paths, score, validated)| ApiRecipe {
+                id,
+                host,
+                url_template,
+                params: serde_json::from_str(&params).unwrap_or(Value::Null),
+                json_paths: serde_json::from_str(&json_paths).unwrap_or_default(),
+                score,
+                validated: validated != 0,
+            },
+        ))
+    }
+
+    async fn record_success(&self, id: &str, validate: bool) -> crate::Result<()> {
+        sqlx::query(
+            "UPDATE api_recipes \
+             SET consecutive_failures = 0, \
+                 validated = CASE WHEN ?2 THEN 1 ELSE validated END \
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(validate)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn record_failure(&self, id: &str, unvalidate_after: u32) -> crate::Result<bool> {
+        let row: Option<(i64, i64)> = sqlx::query_as(
+            "UPDATE api_recipes SET consecutive_failures = consecutive_failures + 1 \
+             WHERE id = ?1 \
+             RETURNING consecutive_failures, validated",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let Some((failures, validated)) = row else {
+            return Ok(false); // recipe deleted since the fetch looked it up
+        };
+        if validated != 0 && failures >= i64::from(unvalidate_after) {
+            sqlx::query(
+                "UPDATE api_recipes SET validated = 0, consecutive_failures = 0 WHERE id = ?1",
+            )
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+            return Ok(true);
+        }
+        Ok(false)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -439,5 +583,145 @@ mod tests {
         let recipes = discover_recipes(&network, &extracted);
         assert_eq!(recipes.len(), 1, "same (host, template) folds to one recipe");
         assert_eq!(recipes[0].url_template, "https://example.com/api/list?page={page}");
+    }
+
+    fn recipe_fixture() -> ApiRecipe {
+        ApiRecipe {
+            id: String::new(),
+            host: "example.com".into(),
+            url_template: "https://example.com/api/search?q={q}&page={page}".into(),
+            params: json!({"q": "grant writing", "page": "2"}),
+            json_paths: vec!["$.results[*].title".into()],
+            score: 0.9,
+            validated: false,
+        }
+    }
+
+    #[test]
+    fn replay_url_fills_and_encodes_observed_params() {
+        let r = recipe_fixture();
+        assert_eq!(
+            r.replay_url().unwrap(),
+            "https://example.com/api/search?q=grant+writing&page=2"
+        );
+        // A template with no query replays as itself.
+        let mut bare = recipe_fixture();
+        bare.url_template = "https://example.com/api/feed".into();
+        bare.params = json!({});
+        assert_eq!(bare.replay_url().unwrap(), "https://example.com/api/feed");
+    }
+
+    #[test]
+    fn replay_url_refuses_unfilled_placeholders() {
+        // A placeholder with no observed value must not fire literally.
+        let mut r = recipe_fixture();
+        r.params = json!({"q": "grants"}); // {page} has no value
+        assert!(r.replay_url().is_none());
+    }
+
+    #[test]
+    fn payload_overlap_checks_the_generalized_paths() {
+        let paths = vec!["$.results[*].title".to_string()];
+        // Same shape, different rows → overlaps (paths generalize row indices).
+        let good = json!({"results": [{"title": "Newly Posted Grant"}]});
+        assert!(payload_overlaps(&paths, &good));
+        // Restructured API → no overlap → the replay counts as thin.
+        let renamed = json!({"items": [{"name": "Newly Posted Grant"}]});
+        assert!(!payload_overlaps(&paths, &renamed));
+        // No expected paths at all can never validate anything.
+        assert!(!payload_overlaps(&[], &good));
+    }
+
+    // ── strike / validation state machine (storage-backed) ──────────────────
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn strike_machine_unvalidates_after_n_consecutive_failures() {
+        let store = crate::testing::TempStore::new("recipe-strikes").await;
+        let recipes = store.storage.recipes();
+        let id = recipes.upsert(&recipe_fixture()).await.unwrap();
+        recipes.set_validated(&id, true).await.unwrap();
+
+        // Two strikes under a threshold of 3: still validated.
+        assert!(!recipes.record_failure(&id, 3).await.unwrap());
+        assert!(!recipes.record_failure(&id, 3).await.unwrap());
+        let r = recipes.best_for_host("example.com", false).await.unwrap();
+        assert!(r.is_some_and(|r| r.validated), "2 strikes must not demote");
+
+        // A success in between resets the counter...
+        recipes.record_success(&id, false).await.unwrap();
+        assert!(!recipes.record_failure(&id, 3).await.unwrap());
+        assert!(!recipes.record_failure(&id, 3).await.unwrap());
+        // ...so it takes 3 fresh consecutive failures to demote.
+        assert!(
+            recipes.record_failure(&id, 3).await.unwrap(),
+            "third consecutive strike must un-validate"
+        );
+        assert!(
+            recipes
+                .best_for_host("example.com", false)
+                .await
+                .unwrap()
+                .is_none(),
+            "a demoted recipe is invisible to validated-only lookups"
+        );
+        // Unknown id: no panic, no demotion signal.
+        assert!(!recipes.record_failure("nope", 3).await.unwrap());
+    }
+
+    #[cfg(feature = "test-support")]
+    #[tokio::test]
+    async fn best_for_host_prefers_validated_and_gates_unvalidated() {
+        let store = crate::testing::TempStore::new("recipe-lookup").await;
+        let recipes = store.storage.recipes();
+
+        let mut low = recipe_fixture();
+        low.url_template = "https://example.com/api/old?page={page}".into();
+        low.params = json!({"page": "1"});
+        low.score = 0.5;
+        let low_id = recipes.upsert(&low).await.unwrap();
+        recipes.set_validated(&low_id, true).await.unwrap();
+        let high_unvalidated = recipe_fixture(); // score 0.9, validated: false
+        recipes.upsert(&high_unvalidated).await.unwrap();
+
+        // Validated-only lookup: the lower-scoring validated recipe wins.
+        let r = recipes
+            .best_for_host("example.com", false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.id, low_id);
+        assert!(r.validated);
+        // Opportunistic lookup still prefers validated over raw score.
+        let r = recipes
+            .best_for_host("example.com", true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.id, low_id, "validated outranks score even opportunistically");
+        // Host filter must hold.
+        assert!(recipes
+            .best_for_host("other.example", true)
+            .await
+            .unwrap()
+            .is_none());
+
+        // record_success(validate: true) promotes — the auto_validate path:
+        // demote the validated one, promote the high-scorer, and the
+        // validated-only lookup flips to it.
+        recipes.set_validated(&low_id, false).await.unwrap();
+        let hi = recipes
+            .best_for_host("example.com", true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(!hi.validated);
+        recipes.record_success(&hi.id, true).await.unwrap();
+        let r = recipes
+            .best_for_host("example.com", false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(r.id, hi.id, "a validating success must promote the recipe");
     }
 }

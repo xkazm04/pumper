@@ -11,26 +11,27 @@
 //! protocol lives in this module; swapping in a crate later is a local change.
 //!
 //! Mounted only when `[mcp] enabled = true` (default OFF), and read-mostly by
-//! default: the one actuating tool, `enqueue_job`, sits behind its own
-//! `[mcp] allow_enqueue` switch and clamps every job budget to
-//! `[mcp] max_job_budget_usd`.
+//! default: the actuating tools — `enqueue_job` and its research sugar
+//! `fetch_readable` / `deep_research` — sit behind the `[mcp] allow_enqueue`
+//! switch and clamp every job budget to `[mcp] max_job_budget_usd`.
 //!
-//! **Notifications seam (deliberate)**: the EventBus replay ring could feed
-//! MCP `notifications/*` to subscribed clients, but server-initiated messages
-//! require the transport's SSE half (a `GET /mcp` stream + session ids).
-//! Stateless POST keeps the surface trivially correct, so `GET /mcp` returns
-//! 405 and agents poll `tools/call query_dataset` / `GET /events` (SSE)
-//! instead. If subscriptions earn their keep, implement the GET stream here —
-//! `EventBus::subscribe_with_replay` already provides resume semantics.
+//! **Notifications** (the transport's SSE half) live in [`live`]: `GET /mcp`
+//! opens an SSE stream of JSON-RPC `notifications/pumper/*` messages bridged
+//! read-only from the EventBus (subscribe + replay ring, `Last-Event-ID`
+//! resume, per-connection `?app=`/`?kind=` filters, lag-tolerant bounded
+//! buffering). POST stays stateless — the stream is a one-way event feed, not
+//! a session.
+
+mod live;
 
 use axum::extract::State;
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
 use crate::state::AppState;
+use axum::http::StatusCode;
 
 /// Protocol revisions this server speaks. The client's requested version is
 /// echoed when supported; otherwise the newest supported one is offered.
@@ -43,19 +44,9 @@ const QUERY_LIMIT_CAP: i64 = 1000;
 const SEARCH_LIMIT_CAP: usize = 100;
 
 /// The `/mcp` routes. Only merged into the main router when `[mcp] enabled`.
+/// POST = stateless JSON-RPC exchanges; GET = the SSE notification stream.
 pub(crate) fn router() -> Router<AppState> {
-    Router::new().route("/mcp", post(handle_post).get(handle_get))
-}
-
-/// The transport's server→client stream half is deliberately not implemented
-/// (see the module doc's notifications seam).
-async fn handle_get() -> Response {
-    (
-        StatusCode::METHOD_NOT_ALLOWED,
-        [("allow", "POST")],
-        "this MCP server is stateless: POST JSON-RPC messages to /mcp",
-    )
-        .into_response()
+    Router::new().route("/mcp", post(handle_post).get(live::handle_get))
 }
 
 /// One streamable-HTTP exchange: a JSON-RPC request, notification, or batch in;
@@ -133,9 +124,12 @@ fn initialize_result(params: &Value) -> Value {
         "serverInfo": { "name": "pumper", "version": env!("CARGO_PKG_VERSION") },
         "instructions": "Local scraping / data-product service. Start with the list_apps tool \
             (every app's params schema, examples, and cost class), query stored data with \
-            query_dataset (`$.path:op:value` filters) and search (full text). enqueue_job is \
-            only offered when the operator has enabled [mcp] allow_enqueue; its budget_usd is \
-            clamped to [mcp] max_job_budget_usd. Catalog + app manifests are resources.",
+            query_dataset (`$.path:op:value` filters) and search (full text). enqueue_job, \
+            fetch_readable, and deep_research are only offered when the operator has enabled \
+            [mcp] allow_enqueue; every budget_usd is clamped to [mcp] max_job_budget_usd. Await \
+            a job with wait_job (timeout capped by [mcp] wait_job_max_secs), or open GET /mcp \
+            (SSE, optional ?app=/?kind= filters, Last-Event-ID resume) for live \
+            notifications/pumper/* events. Catalog + app manifests are resources.",
     })
 }
 
@@ -190,8 +184,62 @@ fn server_tools(state: &AppState) -> Vec<Value> {
                 "additionalProperties": false
             }
         }),
+        json!({
+            "name": "wait_job",
+            "description": format!(
+                "Wait for a job to reach a terminal status (succeeded | failed | cancelled), \
+                 watching the live event stream. timeout_secs is clamped to the operator's \
+                 [mcp] wait_job_max_secs cap ({}s; omitted = that cap). Hitting the deadline \
+                 returns timed_out: true with the job's current snapshot — call again to keep \
+                 waiting.",
+                state.config.mcp.wait_job_max_secs
+            ),
+            "inputSchema": {
+                "type": "object",
+                "required": ["job_id"],
+                "properties": {
+                    "job_id": { "type": "string", "format": "uuid" },
+                    "timeout_secs": { "type": "integer", "minimum": 1 }
+                },
+                "additionalProperties": false
+            }
+        }),
     ];
     if state.config.mcp.allow_enqueue {
+        tools.push(json!({
+            "name": "fetch_readable",
+            "description": "Fetch one URL as clean Markdown via the tiered fetcher: enqueues \
+                a 'readable' job and returns its job id (then wait_job for the result; the \
+                document lands in the job's page.md artifact). Same operator gates as \
+                enqueue_job.",
+            "inputSchema": {
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                    "url": { "type": "string", "minLength": 1 }
+                },
+                "additionalProperties": false
+            }
+        }));
+        tools.push(json!({
+            "name": "deep_research",
+            "description": format!(
+                "Agentic web research (search, read, synthesize) via the Claude engine: \
+                 enqueues a 'research' job and returns its job id (then wait_job for the \
+                 result). budget_usd is the run's spend ceiling, clamped to the operator's \
+                 [mcp] max_job_budget_usd rail (${:.2}); omitted = that rail.",
+                state.config.mcp.max_job_budget_usd
+            ),
+            "inputSchema": {
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string", "minLength": 1 },
+                    "budget_usd": { "type": "number", "minimum": 0 }
+                },
+                "additionalProperties": false
+            }
+        }));
         tools.push(json!({
             "name": "enqueue_job",
             "description": format!(
@@ -229,8 +277,13 @@ async fn tools_call(state: &AppState, id: Value, params: &Value) -> Value {
         "list_apps" => Ok(tool_list_apps(state)),
         "query_dataset" => tool_query_dataset(state, &args).await,
         "search" => tool_search(state, &args).await,
+        "wait_job" => live::wait_job(state, &args).await,
         "enqueue_job" if state.config.mcp.allow_enqueue => tool_enqueue(state, &args).await,
-        "enqueue_job" => Err(
+        "fetch_readable" if state.config.mcp.allow_enqueue => {
+            tool_fetch_readable(state, &args).await
+        }
+        "deep_research" if state.config.mcp.allow_enqueue => tool_deep_research(state, &args).await,
+        "enqueue_job" | "fetch_readable" | "deep_research" => Err(
             "enqueue is disabled on this MCP surface — the operator must set \
              [mcp] allow_enqueue = true"
                 .to_string(),
@@ -344,23 +397,69 @@ fn clamp_budget(requested: Option<f64>, ceiling: f64) -> f64 {
 
 async fn tool_enqueue(state: &AppState, args: &Value) -> Result<Value, String> {
     let name = require_str(args, "app")?;
-    let Some(app) = state.registry.get(name) else {
-        return Err(format!("unknown app '{name}' — call list_apps first"));
-    };
     let over = args.get("params").cloned();
     if let Some(over) = &over {
         if !over.is_object() {
             return Err("'params' must be an object".into());
         }
     }
-    let params = crate::routes::merge_params(app.default_params(), over);
-    if let Some(schema) = &app.manifest().params_schema {
-        validate_params(schema, &params)?;
+    let budget = clamp_budget(
+        args.get("budget_usd").and_then(Value::as_f64),
+        state.config.mcp.max_job_budget_usd,
+    );
+    let idempotency_key = args
+        .get("idempotency_key")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .filter(|k| !k.trim().is_empty());
+    enqueue_app(state, name, over, budget, idempotency_key).await
+}
+
+/// `fetch_readable`: sugar over enqueueing the `readable` app — one URL in,
+/// clean Markdown out (as the job's `page.md` artifact). Rides the exact gated
+/// enqueue path: allow_enqueue is checked by the dispatcher, budget clamped.
+async fn tool_fetch_readable(state: &AppState, args: &Value) -> Result<Value, String> {
+    let url = require_str(args, "url")?;
+    if url.trim().is_empty() {
+        return Err("'url' must be non-empty".into());
+    }
+    let budget = clamp_budget(None, state.config.mcp.max_job_budget_usd);
+    enqueue_app(state, "readable", Some(json!({ "url": url })), budget, None).await
+}
+
+/// `deep_research`: sugar over enqueueing the `research` app. The clamped
+/// budget is BOTH the job's spend ceiling and the app's own `max_budget_usd`
+/// param, so the Claude engine enforces the same rail mid-run.
+async fn tool_deep_research(state: &AppState, args: &Value) -> Result<Value, String> {
+    let query = require_str(args, "query")?;
+    if query.trim().is_empty() {
+        return Err("'query' must be non-empty".into());
     }
     let budget = clamp_budget(
         args.get("budget_usd").and_then(Value::as_f64),
         state.config.mcp.max_job_budget_usd,
     );
+    let params = json!({ "query": query, "max_budget_usd": budget });
+    enqueue_app(state, "research", Some(params), budget, None).await
+}
+
+/// The one gated enqueue path every actuating tool funnels through: params
+/// shallow-merge over the app's defaults, schema-validate, budget already
+/// clamped by the caller, dedup + worker wake exactly like the HTTP surface.
+async fn enqueue_app(
+    state: &AppState,
+    name: &str,
+    over: Option<Value>,
+    budget: f64,
+    idempotency_key: Option<String>,
+) -> Result<Value, String> {
+    let Some(app) = state.registry.get(name) else {
+        return Err(format!("unknown app '{name}' — call list_apps first"));
+    };
+    let params = crate::routes::merge_params(app.default_params(), over);
+    if let Some(schema) = &app.manifest().params_schema {
+        validate_params(schema, &params)?;
+    }
     let opts = pumper_core::EnqueueOptions {
         params,
         max_attempts: 1,
@@ -370,11 +469,7 @@ async fn tool_enqueue(state: &AppState, args: &Value) -> Result<Value, String> {
         callback_secret: None,
         // 0 is a real ceiling here (free tiers only), not "unlimited".
         budget_usd: Some(budget),
-        idempotency_key: args
-            .get("idempotency_key")
-            .and_then(Value::as_str)
-            .map(String::from)
-            .filter(|k| !k.trim().is_empty()),
+        idempotency_key,
         schedule_id: None,
         trigger_id: None,
     };
@@ -386,7 +481,10 @@ async fn tool_enqueue(state: &AppState, args: &Value) -> Result<Value, String> {
     if created {
         state.notify.notify_one();
     }
-    let note = format!("poll GET /jobs/{} (or query_dataset) for the result", job.id);
+    let note = format!(
+        "wait_job {{\"job_id\": \"{0}\"}} for the terminal status, or poll GET /jobs/{0}",
+        job.id
+    );
     Ok(json!({
         "job": job,
         "created": created,

@@ -119,7 +119,9 @@ async fn tools_list_is_read_only_until_enqueue_is_opted_in() {
         .iter()
         .filter_map(|t| t["name"].as_str())
         .collect();
-    assert_eq!(names, vec!["list_apps", "query_dataset", "search"]);
+    // wait_job is read-only (awaits status, spends nothing) so it is always
+    // offered; the actuating tools are not.
+    assert_eq!(names, vec!["list_apps", "query_dataset", "search", "wait_job"]);
 
     // Calling the withheld tool is a readable tool error naming the switch.
     let resp = handle_rpc(&state, &call("enqueue_job", json!({ "app": "fake" })))

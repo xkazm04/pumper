@@ -19,10 +19,11 @@ use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 
-use crate::config::FetcherConfig;
+use crate::config::{FetcherConfig, RecipesConfig};
 use crate::engine::{Browser, HttpClient, HttpRequest, RenderRequest, Researcher};
 use crate::governor::Governor;
 use crate::markdown::{html_to_markdown, text_len_capped};
+use crate::recipes::{payload_overlaps, RecipeSource};
 use crate::{Error, ResearchRequest, Result};
 
 /// Case-insensitive marker phrases that identify a bot-wall / interstitial
@@ -110,6 +111,12 @@ pub struct FetchRequest {
     /// `None` = live-only, exactly the previous behavior.
     #[serde(default)]
     pub archive_max_age: Option<u64>,
+    /// Try a learned API recipe (M05, see [`crate::recipes`]) ahead of every
+    /// other tier for this fetch, even when the global `[recipes] enabled`
+    /// switch is off. Default-OFF; with neither this nor the config switch set,
+    /// recipes are never consulted.
+    #[serde(default)]
+    pub use_recipes: bool,
 }
 
 impl FetchRequest {
@@ -128,6 +135,7 @@ impl FetchRequest {
             ttl_override: None,
             profile: None,
             archive_max_age: None,
+            use_recipes: false,
         }
     }
 }
@@ -140,6 +148,10 @@ impl FetchRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FetchTier {
+    /// Learned API-recipe replay (M05) — tried even before the archive tier,
+    /// double-opt-in (`FetchRequest.use_recipes` / `[recipes] enabled`) and,
+    /// like the archive tier, never terminal on failure.
+    ApiRecipe,
     Archive,
     Http,
     Browser,
@@ -150,6 +162,7 @@ impl FetchTier {
     /// The `&'static str` tier name (matches `FetchOutcome.engine`).
     pub fn as_str(self) -> &'static str {
         match self {
+            FetchTier::ApiRecipe => "api_recipe",
             FetchTier::Archive => "archive",
             FetchTier::Http => "http",
             FetchTier::Browser => "browser",
@@ -245,6 +258,18 @@ pub struct Fetcher {
     /// snapshots; its own outbound requests (CDX + snapshot body) run through
     /// the real HTTP engine, so archive.org is governed like any host.
     archive: Option<Arc<dyn HttpClient>>,
+    /// Learned API-recipe source (`[recipes]`, M05). `None` (the default) or a
+    /// fetch with neither opt-in flag leaves the ladder untouched. Replays run
+    /// through the real HTTP engine, so recipe hosts stay governed/cached.
+    recipes: Option<Arc<dyn RecipeSource>>,
+    /// `[recipes] enabled`: consult recipes on every fetch (per-request
+    /// `use_recipes` opts a single fetch in regardless).
+    recipes_enabled: bool,
+    /// `[recipes] auto_validate`: also try unvalidated recipes, and let a
+    /// successful overlapping replay promote them via `record_success`.
+    recipes_auto_validate: bool,
+    /// `[recipes] max_failures`: consecutive strikes that un-validate.
+    recipes_max_failures: u32,
     /// The same per-host politeness governor the HTTP engine uses. The HTTP tier
     /// is governed inside `HttpEngine::send` (so raw-HTTP callers like the crawler
     /// are still spaced); the browser tier has no such internal seam, so the
@@ -269,9 +294,29 @@ impl Fetcher {
             browser,
             claude,
             archive: None,
+            recipes: None,
+            recipes_enabled: false,
+            recipes_auto_validate: false,
+            recipes_max_failures: RecipesConfig::default().max_failures,
             governor,
             min_content_chars: cfg.min_content_chars,
         }
+    }
+
+    /// Wires the (optional) learned API-recipe source and its `[recipes]`
+    /// tuning. `None` — the default — leaves the ladder exactly as it was;
+    /// even when wired, a fetch consults recipes only when it sets
+    /// `use_recipes` or `[recipes] enabled` is on.
+    pub fn with_recipes(
+        mut self,
+        recipes: Option<Arc<dyn RecipeSource>>,
+        cfg: &RecipesConfig,
+    ) -> Self {
+        self.recipes = recipes;
+        self.recipes_enabled = cfg.enabled;
+        self.recipes_auto_validate = cfg.auto_validate;
+        self.recipes_max_failures = cfg.max_failures;
+        self
     }
 
     /// Wires the (optional) tier-zero archive engine. `None` — the default —
@@ -286,6 +331,22 @@ impl Fetcher {
         let min_chars = req.min_content_chars.unwrap_or(self.min_content_chars);
         let mut escalations: Vec<String> = Vec::new();
         let mut trace: Vec<TierTrace> = Vec::new();
+
+        // --- API-recipe tier (pre-archive, double-opt-in) --- a validated
+        // recipe for the request's host replays the page's discovered JSON API
+        // instead of touching the page at all: one governed HTTP call, a
+        // structured body, no render. Strictly opportunistic like the archive
+        // tier: any miss/thin/error records a strike and falls through. The
+        // browser-only strategy is excluded — the caller explicitly wants a JS
+        // render, which an API payload cannot be.
+        if (req.use_recipes || self.recipes_enabled) && req.strategy != FetchStrategy::Browser {
+            if let Some(out) = self
+                .try_recipe(&req, &mut escalations, &mut trace)
+                .await
+            {
+                return Ok(out);
+            }
+        }
 
         // --- Archive tier (tier zero, opt-in) --- tried BEFORE any live tier,
         // but only when the caller declared a freshness window and an archive
@@ -637,6 +698,121 @@ impl Fetcher {
             escalations.join("; ")
         )))
     }
+
+    /// One attempt at the API-recipe tier. `Some(outcome)` means the recipe
+    /// replay won (structured JSON in `text`, engine `api_recipe`); `None`
+    /// means no usable recipe or a failed/thin replay — the strike is recorded
+    /// and the caller falls through to the archive/live ladder.
+    async fn try_recipe(
+        &self,
+        req: &FetchRequest,
+        escalations: &mut Vec<String>,
+        trace: &mut Vec<TierTrace>,
+    ) -> Option<FetchOutcome> {
+        let source = self.recipes.as_ref()?;
+        let host = url::Url::parse(&req.url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_lowercase))?;
+        // Unvalidated recipes are only tried opportunistically when
+        // auto-validation is on; otherwise validated-only.
+        let recipe = match source
+            .best_for_host(&host, self.recipes_auto_validate)
+            .await
+        {
+            Ok(Some(r)) => r,
+            Ok(None) => return None,
+            Err(e) => {
+                escalations.push(format!("api_recipe tier failed: recipe lookup: {e}"));
+                return None;
+            }
+        };
+        let Some(api_url) = recipe.replay_url() else {
+            return None; // un-replayable template (unfilled placeholder)
+        };
+        let mut api_req = HttpRequest::get(&api_url);
+        api_req.no_cache = req.no_cache;
+        api_req.ttl_override = req.ttl_override;
+        api_req.profile = req.profile.clone();
+        let started = Instant::now();
+        match self.http.fetch(api_req).await {
+            Ok(resp) => {
+                let latency_ms = elapsed_ms(started);
+                let parsed = serde_json::from_str::<serde_json::Value>(&resp.body).ok();
+                let overlaps = parsed
+                    .as_ref()
+                    .is_some_and(|v| payload_overlaps(&recipe.json_paths, v));
+                if resp.is_success() && overlaps {
+                    // A successful overlapping replay resets the strike counter
+                    // and — under auto_validate — proves an unvalidated recipe.
+                    let validate = self.recipes_auto_validate && !recipe.validated;
+                    if let Err(e) = source.record_success(&recipe.id, validate).await {
+                        escalations
+                            .push(format!("api_recipe tier: recording success failed: {e}"));
+                    }
+                    trace.push(TierTrace {
+                        tier: FetchTier::ApiRecipe,
+                        verdict: TierVerdict::Ok,
+                        http_status: Some(resp.status),
+                        content_chars: Some(resp.body.chars().count()),
+                        cache_hit: Some(resp.cache_hit),
+                        latency_ms,
+                        cost_usd: None,
+                        detail: Some(format!("recipe {}", recipe.id)),
+                    });
+                    return Some(FetchOutcome {
+                        url: req.url.clone(),
+                        engine: "api_recipe",
+                        status: Some(resp.status),
+                        html: None,
+                        markdown: None,
+                        // Structured JSON body — deliberately `text`, not
+                        // `html`: this is API data, not a document.
+                        text: Some(resp.body),
+                        escalations: std::mem::take(escalations),
+                        trace: std::mem::take(trace),
+                        cost_usd: None,
+                    });
+                }
+                // Thin/failed replay → strike (may un-validate) → fall through.
+                let demoted = source
+                    .record_failure(&recipe.id, self.recipes_max_failures)
+                    .await
+                    .unwrap_or(false);
+                let why = if !resp.is_success() {
+                    "non-success status"
+                } else if parsed.is_none() {
+                    "non-JSON payload"
+                } else {
+                    "payload lost the expected field paths"
+                };
+                escalations.push(format!(
+                    "api_recipe tier thin: status {}, {why}{}",
+                    resp.status,
+                    if demoted { " (recipe un-validated)" } else { "" }
+                ));
+                trace.push(TierTrace {
+                    tier: FetchTier::ApiRecipe,
+                    verdict: TierVerdict::Thin,
+                    http_status: Some(resp.status),
+                    content_chars: Some(resp.body.chars().count()),
+                    cache_hit: Some(resp.cache_hit),
+                    latency_ms,
+                    cost_usd: None,
+                    detail: Some(why.into()),
+                });
+                None
+            }
+            Err(e) => {
+                // Engine error is a strike too — a recipe pointing at a dead
+                // endpoint must eventually un-validate itself.
+                let _ = source
+                    .record_failure(&recipe.id, self.recipes_max_failures)
+                    .await;
+                trace_tier_error(escalations, trace, FetchTier::ApiRecipe, "api_recipe", &e, started);
+                None
+            }
+        }
+    }
 }
 
 /// Milliseconds since `started`, saturating into a `u64` for the trace.
@@ -796,6 +972,11 @@ mod tests {
             serde_json::to_string(&FetchTier::Archive).unwrap(),
             "\"archive\""
         );
+        assert_eq!(
+            serde_json::to_string(&FetchTier::ApiRecipe).unwrap(),
+            "\"api_recipe\""
+        );
+        assert_eq!(FetchTier::ApiRecipe.as_str(), "api_recipe");
         assert_eq!(FetchTier::Archive.as_str(), "archive");
         assert_eq!(FetchTier::Http.as_str(), "http");
         assert_eq!(FetchTier::Browser.as_str(), "browser");
@@ -1172,5 +1353,336 @@ mod tests {
             Duration::from_secs(2),
             "healthy browser render must decay the penalty"
         );
+    }
+
+    // --- API-recipe tier (pre-archive, double-opt-in) ---
+
+    use std::sync::Mutex;
+
+    use crate::recipes::ApiRecipe;
+    use serde_json::json;
+
+    const API_URL: &str = "https://example.test/api/search?q=grants&page=1";
+    const PAGE_URL: &str = "https://example.test/page";
+
+    fn test_recipe(validated: bool) -> ApiRecipe {
+        ApiRecipe {
+            id: "r1".into(),
+            host: "example.test".into(),
+            url_template: "https://example.test/api/search?q={q}&page={page}".into(),
+            params: json!({"q": "grants", "page": "1"}),
+            json_paths: vec!["$.results[*].title".into()],
+            score: 0.9,
+            validated,
+        }
+    }
+
+    /// Scripted [`RecipeSource`]: one recipe, call recording, no storage.
+    #[derive(Default)]
+    struct ScriptedRecipes {
+        recipe: Option<ApiRecipe>,
+        lookups: Mutex<Vec<(String, bool)>>,
+        successes: Mutex<Vec<(String, bool)>>,
+        failures: Mutex<Vec<(String, u32)>>,
+    }
+    #[async_trait]
+    impl RecipeSource for ScriptedRecipes {
+        async fn best_for_host(
+            &self,
+            host: &str,
+            include_unvalidated: bool,
+        ) -> Result<Option<ApiRecipe>> {
+            self.lookups
+                .lock()
+                .unwrap()
+                .push((host.to_string(), include_unvalidated));
+            Ok(self
+                .recipe
+                .clone()
+                .filter(|r| r.host == host && (r.validated || include_unvalidated)))
+        }
+        async fn record_success(&self, id: &str, validate: bool) -> Result<()> {
+            self.successes.lock().unwrap().push((id.to_string(), validate));
+            Ok(())
+        }
+        async fn record_failure(&self, id: &str, unvalidate_after: u32) -> Result<bool> {
+            self.failures
+                .lock()
+                .unwrap()
+                .push((id.to_string(), unvalidate_after));
+            Ok(false)
+        }
+    }
+
+    /// Never-called guards for gating tests.
+    struct PanicRecipes;
+    #[async_trait]
+    impl RecipeSource for PanicRecipes {
+        async fn best_for_host(&self, _: &str, _: bool) -> Result<Option<ApiRecipe>> {
+            panic!("recipes must not be consulted without an opt-in");
+        }
+        async fn record_success(&self, _: &str, _: bool) -> Result<()> {
+            unreachable!()
+        }
+        async fn record_failure(&self, _: &str, _: u32) -> Result<bool> {
+            unreachable!()
+        }
+    }
+
+    struct PanicArchive;
+    #[async_trait]
+    impl HttpClient for PanicArchive {
+        async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
+            panic!("archive tier must not run when the recipe tier wins");
+        }
+    }
+
+    /// HTTP stub that routes by URL: JSON for the recipe's API URL, a healthy
+    /// page for everything else (the live-HTTP fallback).
+    struct RouteHttp {
+        api_body: String,
+        api_status: u16,
+    }
+    #[async_trait]
+    impl HttpClient for RouteHttp {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            let (status, body) = if req.url == API_URL {
+                (self.api_status, self.api_body.clone())
+            } else {
+                (200, GOOD_PAGE.to_string())
+            };
+            Ok(HttpResponse {
+                status,
+                headers: std::collections::HashMap::new(),
+                body,
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    fn recipe_fetcher(
+        http: Arc<dyn HttpClient>,
+        source: Arc<dyn RecipeSource>,
+        cfg: &RecipesConfig,
+    ) -> Fetcher {
+        Fetcher::new(
+            http,
+            Arc::new(DeadBrowser),
+            Arc::new(StubResearcher),
+            enabled_governor(),
+            &FetcherConfig {
+                min_content_chars: 100,
+                ..FetcherConfig::default()
+            },
+        )
+        .with_recipes(Some(source), cfg)
+    }
+
+    const OVERLAPPING_JSON: &str =
+        r#"{"results": [{"title": "Alpha Grant"}, {"title": "Beta Grant"}]}"#;
+
+    #[tokio::test]
+    async fn recipe_tier_wins_before_archive_and_live() {
+        // Validated recipe + overlapping JSON replay: the fetch never touches
+        // the archive (PanicArchive) even though a window is set, and the trace
+        // carries a single winning `api_recipe` entry.
+        let source = Arc::new(ScriptedRecipes {
+            recipe: Some(test_recipe(true)),
+            ..Default::default()
+        });
+        let fetcher = recipe_fetcher(
+            Arc::new(RouteHttp {
+                api_body: OVERLAPPING_JSON.into(),
+                api_status: 200,
+            }),
+            source.clone(),
+            &RecipesConfig::default(),
+        )
+        .with_archive(Some(Arc::new(PanicArchive)));
+
+        let mut req = FetchRequest::new(PAGE_URL);
+        req.use_recipes = true;
+        req.archive_max_age = Some(3600);
+        let out = fetcher.fetch(req).await.unwrap();
+
+        assert_eq!(out.engine, "api_recipe");
+        assert_eq!(out.status, Some(200));
+        let body: serde_json::Value = serde_json::from_str(out.text.as_deref().unwrap()).unwrap();
+        assert_eq!(body["results"][0]["title"], "Alpha Grant");
+        assert_eq!(out.trace.len(), 1);
+        assert_eq!(out.trace[0].tier, FetchTier::ApiRecipe);
+        assert_eq!(out.trace[0].verdict, TierVerdict::Ok);
+        // Validated-only lookup (auto_validate off), success without promotion.
+        assert_eq!(
+            source.lookups.lock().unwrap().as_slice(),
+            &[("example.test".to_string(), false)]
+        );
+        assert_eq!(
+            source.successes.lock().unwrap().as_slice(),
+            &[("r1".to_string(), false)]
+        );
+        assert!(source.failures.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recipe_mismatch_strikes_and_falls_through_to_live() {
+        // The API answered but lost the expected field paths: strike recorded
+        // (with the configured threshold), fall through to the live HTTP tier.
+        let source = Arc::new(ScriptedRecipes {
+            recipe: Some(test_recipe(true)),
+            ..Default::default()
+        });
+        let cfg = RecipesConfig {
+            enabled: true, // config switch (no per-request flag) also gates in
+            max_failures: 5,
+            ..RecipesConfig::default()
+        };
+        let fetcher = recipe_fetcher(
+            Arc::new(RouteHttp {
+                api_body: r#"{"items": [{"name": "renamed shape"}]}"#.into(),
+                api_status: 200,
+            }),
+            source.clone(),
+            &cfg,
+        );
+
+        let out = fetcher.fetch(FetchRequest::new(PAGE_URL)).await.unwrap();
+        assert_eq!(out.engine, "http", "a thin replay must fall through");
+        assert!(out
+            .trace
+            .iter()
+            .any(|t| t.tier == FetchTier::ApiRecipe && t.verdict == TierVerdict::Thin));
+        assert!(out
+            .escalations
+            .iter()
+            .any(|e| e.contains("api_recipe tier thin")));
+        assert_eq!(
+            source.failures.lock().unwrap().as_slice(),
+            &[("r1".to_string(), 5)],
+            "strike must carry the configured un-validate threshold"
+        );
+        assert!(source.successes.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn recipe_engine_error_strikes_and_falls_through() {
+        // The API endpoint errors outright: strike + Error trace entry, then
+        // the live ladder serves as usual.
+        struct ApiFailsHttp;
+        #[async_trait]
+        impl HttpClient for ApiFailsHttp {
+            async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+                if req.url == API_URL {
+                    return Err(Error::Http("connection refused".into()));
+                }
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: std::collections::HashMap::new(),
+                    body: GOOD_PAGE.into(),
+                    final_url: req.url,
+                    cache_hit: false,
+                })
+            }
+        }
+        let source = Arc::new(ScriptedRecipes {
+            recipe: Some(test_recipe(true)),
+            ..Default::default()
+        });
+        let mut req = FetchRequest::new(PAGE_URL);
+        req.use_recipes = true;
+        let out = recipe_fetcher(
+            Arc::new(ApiFailsHttp),
+            source.clone(),
+            &RecipesConfig::default(),
+        )
+        .fetch(req)
+        .await
+        .unwrap();
+        assert_eq!(out.engine, "http");
+        assert!(out
+            .trace
+            .iter()
+            .any(|t| t.tier == FetchTier::ApiRecipe && t.verdict == TierVerdict::Error));
+        assert_eq!(source.failures.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn unvalidated_recipe_needs_auto_validate_and_then_promotes() {
+        // auto_validate OFF: the unvalidated recipe is invisible (validated-only
+        // lookup) — the live tier serves and no recipe call is recorded.
+        let source = Arc::new(ScriptedRecipes {
+            recipe: Some(test_recipe(false)),
+            ..Default::default()
+        });
+        let http = Arc::new(RouteHttp {
+            api_body: OVERLAPPING_JSON.into(),
+            api_status: 200,
+        });
+        let mut req = FetchRequest::new(PAGE_URL);
+        req.use_recipes = true;
+        let out = recipe_fetcher(http.clone(), source.clone(), &RecipesConfig::default())
+            .fetch(req.clone())
+            .await
+            .unwrap();
+        assert_eq!(out.engine, "http");
+        assert!(out.trace.iter().all(|t| t.tier != FetchTier::ApiRecipe));
+        assert!(source.successes.lock().unwrap().is_empty());
+
+        // auto_validate ON: tried opportunistically, and the successful
+        // overlapping replay promotes it (record_success validate: true).
+        let cfg = RecipesConfig {
+            auto_validate: true,
+            ..RecipesConfig::default()
+        };
+        let out = recipe_fetcher(http, source.clone(), &cfg)
+            .fetch(req)
+            .await
+            .unwrap();
+        assert_eq!(out.engine, "api_recipe");
+        assert_eq!(
+            source.successes.lock().unwrap().as_slice(),
+            &[("r1".to_string(), true)],
+            "a successful overlapping replay must validate the recipe"
+        );
+    }
+
+    #[tokio::test]
+    async fn recipes_are_never_consulted_without_an_opt_in() {
+        // Neither `use_recipes` nor `[recipes] enabled`: the wired source is
+        // never even looked up (PanicRecipes) — default behavior is untouched.
+        let fetcher = recipe_fetcher(
+            Arc::new(StubHttp),
+            Arc::new(PanicRecipes),
+            &RecipesConfig::default(),
+        );
+        let out = fetcher.fetch(FetchRequest::new(PAGE_URL)).await.unwrap();
+        assert_eq!(out.engine, "http");
+
+        // The browser-only strategy also skips the recipe tier even opted in.
+        let governor = enabled_governor();
+        let fetcher = Fetcher::new(
+            Arc::new(DeadHttp),
+            Arc::new(StubBrowser {
+                html: GOOD_PAGE.into(),
+            }),
+            Arc::new(StubResearcher),
+            governor,
+            &FetcherConfig {
+                min_content_chars: 100,
+                ..FetcherConfig::default()
+            },
+        )
+        .with_recipes(
+            Some(Arc::new(PanicRecipes)),
+            &RecipesConfig {
+                enabled: true,
+                ..RecipesConfig::default()
+            },
+        );
+        let mut req = FetchRequest::new(PAGE_URL);
+        req.strategy = FetchStrategy::Browser;
+        let out = fetcher.fetch(req).await.unwrap();
+        assert_eq!(out.engine, "browser");
     }
 }

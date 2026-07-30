@@ -1,8 +1,9 @@
-//! Derived datasets (M11): CRUD for filter/project(/lookup) specs that
-//! recompute incrementally on each upstream upsert, plus the bounded backfill
-//! that materializes a new spec over the existing source rows. The recompute
-//! itself rides `Datasets::upsert_many` in core — these routes only manage the
-//! specs and trigger backfills.
+//! Derived datasets (M11): CRUD for filter/project(/lookup) specs and v2
+//! group_by/aggregate specs that recompute incrementally on each upstream
+//! upsert, plus the bounded backfill that materializes a new spec over the
+//! existing source rows. The recompute itself rides `Datasets::upsert_many`
+//! (and `detect_removed` for aggregate groups) in core — these routes only
+//! manage the specs and trigger backfills.
 
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
@@ -52,6 +53,12 @@ pub(crate) struct CreateDerivedBody {
     project: Option<std::collections::BTreeMap<String, String>>,
     /// Optional single-key join: `{dataset, key_expr, merge_as}`.
     lookup: Option<LookupBody>,
+    /// Aggregate spec (v2): `$.path` group keys. Requires `aggregates`;
+    /// mutually exclusive with `lookup` and `project`.
+    group_by: Option<Vec<String>>,
+    /// Aggregate outputs: `{out_field: "count" | "sum($.path)"}`. Requires
+    /// `group_by`.
+    aggregates: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Body twin of core's [`DerivedLookup`] (which doesn't carry a utoipa schema).
@@ -121,6 +128,21 @@ pub(crate) async fn create_derived(
             )));
         }
     }
+    // Aggregate half (v2): `group_by` and `aggregates` come together or not at
+    // all. Content validation (paths, expressions, name collisions) and the
+    // lookup/project exclusivity live in core's create path.
+    let group: Option<pumper_core::DerivedGroup> = match (&body.group_by, &body.aggregates) {
+        (Some(group_by), Some(aggregates)) => Some(pumper_core::DerivedGroup {
+            group_by: group_by.clone(),
+            aggregates: aggregates.clone(),
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(bad(
+                "group_by and aggregates must be provided together".into(),
+            ))
+        }
+    };
     // Cycle rejection happens inside create_derived_spec (the one write path a
     // spec can enter through); a rejected spec surfaces as 400 via BadRequest.
     let lookup: Option<DerivedLookup> = body.lookup.as_ref().map(DerivedLookup::from);
@@ -133,6 +155,7 @@ pub(crate) async fn create_derived(
             filters: &filters,
             project: &project,
             lookup: lookup.as_ref(),
+            group: group.as_ref(),
         })
         .await?;
     Ok((StatusCode::CREATED, Json(spec)))

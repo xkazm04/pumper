@@ -169,11 +169,21 @@ pub struct Datasets {
     /// the cap are skipped with a warning, never an error — the source ingest
     /// must not fail because a spec chain is too deep. See `[derived] max_depth`.
     derived_max_depth: u32,
+    /// Max source rows one aggregate group may re-scan during incremental
+    /// maintenance. A group past this bound gets a `stale: true` derived row
+    /// instead of a partially-computed (wrong) number; backfill — which pages
+    /// the whole source anyway — computes it exactly and clears the flag.
+    /// See `[derived] max_group_scan`.
+    max_group_scan: i64,
 }
 
 /// Default for [`Datasets::derived_max_depth`] — mirrors
 /// `config::DerivedConfig::default()`.
 const DERIVED_MAX_DEPTH_DEFAULT: u32 = 3;
+
+/// Default for [`Datasets::max_group_scan`] — mirrors
+/// `config::DerivedConfig::default()`.
+const DERIVED_MAX_GROUP_SCAN_DEFAULT: i64 = 10_000;
 
 /// Records committed per write transaction in the batch write paths
 /// (`upsert_many`, `detect_removed`). Trades throughput (fewer commits/fsyncs and
@@ -187,12 +197,20 @@ impl Datasets {
         Self {
             pool,
             derived_max_depth: DERIVED_MAX_DEPTH_DEFAULT,
+            max_group_scan: DERIVED_MAX_GROUP_SCAN_DEFAULT,
         }
     }
 
     /// Overrides the derived-chain depth cap (from `[derived] max_depth`).
     pub fn with_derived_max_depth(mut self, max_depth: u32) -> Self {
         self.derived_max_depth = max_depth;
+        self
+    }
+
+    /// Overrides the per-group recompute scan bound (from
+    /// `[derived] max_group_scan`). Clamped to at least 1.
+    pub fn with_max_group_scan(mut self, max_group_scan: i64) -> Self {
+        self.max_group_scan = max_group_scan.max(1);
         self
     }
 
@@ -611,6 +629,11 @@ impl Datasets {
                 }
             }
         }
+        drop(conn);
+        // Aggregate derived specs (M11 v2) count only live rows, so removals
+        // shrink groups: recompute the affected groups. Fail-open like the
+        // upsert-side hook — a broken spec must never fail the sync.
+        self.apply_derived_removed(app, dataset, &to_remove).await;
         Ok(to_remove)
     }
 
@@ -1241,6 +1264,17 @@ impl Datasets {
         let by_key: std::collections::HashMap<&str, &Value> =
             items.iter().map(|(k, v)| (k.as_str(), v)).collect();
         for spec in &specs {
+            if let Some(group) = &spec.group {
+                // Aggregate spec (v2): recompute only the groups this batch
+                // touched, from source truth. Same fail-open stance.
+                if let Err(e) = self
+                    .apply_derived_group(spec, group, &by_key, summary, depth)
+                    .await
+                {
+                    tracing::warn!(spec = %spec.id, "derived: group recompute failed: {e}");
+                }
+                continue;
+            }
             let mut out: Vec<(String, Value)> = Vec::new();
             for key in summary.fresh_keys() {
                 let Some(data) = by_key.get(key.as_str()) else {
@@ -1307,6 +1341,9 @@ impl Datasets {
         batch: i64,
     ) -> Result<DerivedBackfill> {
         let batch = batch.clamp(1, MAX_BACKFILL_BATCH);
+        if let Some(group) = &spec.group {
+            return self.backfill_derived_group(spec, group, batch).await;
+        }
         let mut report = DerivedBackfill::default();
         let mut after: Option<(String, String)> = None;
         loop {
@@ -1337,6 +1374,349 @@ impl Datasets {
                 break;
             }
             after = page.last().map(|r| (ts(r.updated_at), r.key.clone()));
+        }
+        Ok(report)
+    }
+
+    // ── derived: group_by + aggregates (M11 v2) ──────────────────────────────
+
+    /// Incremental maintenance for one aggregate spec: derive the set of group
+    /// tuples this batch touched (new tuple for every fresh key, plus the OLD
+    /// tuple of changed keys — a record that moved groups dirties both sides),
+    /// then recompute each affected group from source truth. Recompute is exact
+    /// because it re-reads the source rows of the group, never applies deltas;
+    /// the `max_group_scan` bound is what keeps it honest — an oversized group
+    /// gets a `stale: true` row instead of a number we didn't fully compute.
+    async fn apply_derived_group(
+        &self,
+        spec: &DerivedSpec,
+        group: &DerivedGroup,
+        by_key: &std::collections::HashMap<&str, &Value>,
+        summary: &UpsertSummary,
+        depth: u32,
+    ) -> Result<()> {
+        let filters = parse_filter_specs(&spec.filters)?;
+        let aggs = parse_aggregates(&group.aggregates)?;
+        let mut tuples: std::collections::HashSet<Vec<String>> = Default::default();
+        for key in summary.fresh_keys() {
+            let Some(data) = by_key.get(key.as_str()) else {
+                continue;
+            };
+            let new_tuple = group_tuple(&group.group_by, data);
+            if let Some(t) = &new_tuple {
+                tuples.insert(t.clone());
+            }
+            // Changed keys may have LEFT a group: reconstruct the old tuple
+            // from the latest revision's field diff (`from` values overlay the
+            // new record). A key missing from the diff didn't move.
+            if summary.changed.iter().any(|k| k == key) {
+                if let Some(old) = self
+                    .old_group_tuple(spec, group, key, data, new_tuple.as_deref())
+                    .await?
+                {
+                    tuples.insert(old);
+                }
+            }
+        }
+        self.recompute_groups(spec, group, &filters, &aggs, tuples, depth)
+            .await
+    }
+
+    /// The group tuple a changed record belonged to BEFORE this write, read
+    /// from the diff stored on its newest revision. `None` when the old row
+    /// had no complete tuple (or didn't change group fields).
+    async fn old_group_tuple(
+        &self,
+        spec: &DerivedSpec,
+        group: &DerivedGroup,
+        key: &str,
+        new_data: &Value,
+        new_tuple: Option<&[String]>,
+    ) -> Result<Option<Vec<String>>> {
+        let revs = self
+            .history(&spec.source_app, &spec.source_dataset, key, 1)
+            .await?;
+        let Some(diff) = revs.first().and_then(|r| r.diff.as_ref()) else {
+            return Ok(None);
+        };
+        let mut old: Vec<String> = Vec::with_capacity(group.group_by.len());
+        let mut moved = false;
+        for path in &group.group_by {
+            let rel = path.trim_start_matches("$.");
+            let v = match diff.get(rel) {
+                Some(entry) => {
+                    moved = true;
+                    entry.get("from").and_then(group_value_text)
+                }
+                None => lookup_json_path(new_data, path).and_then(|v| group_value_text(v)),
+            };
+            match v {
+                Some(v) => old.push(v),
+                None => return Ok(None),
+            }
+        }
+        if !moved || Some(old.as_slice()) == new_tuple {
+            return Ok(None);
+        }
+        Ok(Some(old))
+    }
+
+    /// Recomputes each tuple's group row from the live source rows and upserts
+    /// the batch into the target at `depth + 1`.
+    async fn recompute_groups(
+        &self,
+        spec: &DerivedSpec,
+        group: &DerivedGroup,
+        filters: &[JsonFilter],
+        aggs: &std::collections::BTreeMap<String, Aggregate>,
+        tuples: std::collections::HashSet<Vec<String>>,
+        depth: u32,
+    ) -> Result<()> {
+        if tuples.is_empty() {
+            return Ok(());
+        }
+        let mut out: Vec<(String, Value)> = Vec::new();
+        for tuple in tuples {
+            match self.recompute_group_row(spec, group, filters, aggs, &tuple).await {
+                Ok(row) => out.push(row),
+                Err(e) => {
+                    tracing::warn!(spec = %spec.id, "derived: group row skipped: {e}");
+                }
+            }
+        }
+        if out.is_empty() {
+            return Ok(());
+        }
+        self.upsert_many_at_depth(&spec.source_app, &spec.target_dataset, &out, None, depth + 1)
+            .await?;
+        Ok(())
+    }
+
+    /// Builds one group's derived row from source truth: scan the group's live
+    /// source rows (bounded at `max_group_scan + 1`) and evaluate every
+    /// aggregate. Over the bound, the row is `{group fields, stale: true}` with
+    /// NO aggregate fields — absent, not wrong. The derived key is the group
+    /// values joined with `|` (escaped, see [`group_row_key`]).
+    async fn recompute_group_row(
+        &self,
+        spec: &DerivedSpec,
+        group: &DerivedGroup,
+        filters: &[JsonFilter],
+        aggs: &std::collections::BTreeMap<String, Aggregate>,
+        tuple: &[String],
+    ) -> Result<(String, Value)> {
+        let rows = self
+            .group_source_rows(
+                &spec.source_app,
+                &spec.source_dataset,
+                filters,
+                &group.group_by,
+                tuple,
+                self.max_group_scan + 1,
+            )
+            .await?;
+        let mut data = serde_json::Map::new();
+        for (path, value) in group.group_by.iter().zip(tuple) {
+            data.insert(group_field_name(path).to_string(), Value::String(value.clone()));
+        }
+        if rows.len() as i64 > self.max_group_scan {
+            data.insert("stale".into(), Value::Bool(true));
+            return Ok((group_row_key(tuple), Value::Object(data)));
+        }
+        data.insert("stale".into(), Value::Bool(false));
+        for (out, agg) in aggs {
+            let v = match agg {
+                Aggregate::Count => Value::from(rows.len() as u64),
+                Aggregate::Sum(path) => {
+                    let sum: f64 = rows
+                        .iter()
+                        .filter_map(|r| lookup_json_path(r, path).and_then(Value::as_f64))
+                        .sum();
+                    // Whole sums render as integers so counts-of-cents style
+                    // data doesn't grow a spurious `.0`.
+                    if sum.fract() == 0.0 && sum.abs() < (i64::MAX as f64) {
+                        Value::from(sum as i64)
+                    } else {
+                        Value::from(sum)
+                    }
+                }
+            };
+            data.insert(out.clone(), v);
+        }
+        Ok((group_row_key(tuple), Value::Object(data)))
+    }
+
+    /// Live source rows of ONE group (spec filters ANDed with the group-value
+    /// predicates), capped at `limit`. Group matching compares
+    /// `CAST(json_extract(...) AS TEXT)` against the tuple's canonical text —
+    /// the SQL twin of [`group_value_text`] — and the `json_type` guard keeps
+    /// bool/object/array fields out on both sides.
+    async fn group_source_rows(
+        &self,
+        app: &str,
+        dataset: &str,
+        filters: &[JsonFilter],
+        group_by: &[String],
+        tuple: &[String],
+        limit: i64,
+    ) -> Result<Vec<Value>> {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT data FROM records WHERE removed_at IS NULL AND app = ",
+        );
+        qb.push_bind(app);
+        qb.push(" AND dataset = ");
+        qb.push_bind(dataset);
+        push_json_filters(&mut qb, filters);
+        for (path, value) in group_by.iter().zip(tuple) {
+            qb.push(" AND json_type(data, ");
+            qb.push_bind(path.as_str());
+            qb.push(") IN ('text','integer','real') AND CAST(json_extract(data, ");
+            qb.push_bind(path.as_str());
+            qb.push(") AS TEXT) = ");
+            qb.push_bind(value.as_str());
+        }
+        qb.push(" LIMIT ");
+        qb.push_bind(limit);
+        let raw: Vec<(String,)> = qb.build_query_as().fetch_all(&self.pool).await?;
+        Ok(raw
+            .into_iter()
+            .map(|(d,)| serde_json::from_str(&d).unwrap_or(Value::Null))
+            .collect())
+    }
+
+    /// Removal-side maintenance: recompute the groups the removed records
+    /// belonged to. Called by [`detect_removed`](Self::detect_removed) after
+    /// tombstoning (fail-open — a broken spec never fails the sync); the
+    /// tombstoned rows still carry their data, and the recompute scan excludes
+    /// them via `removed_at IS NULL`, so the groups shrink exactly.
+    async fn apply_derived_removed(&self, app: &str, dataset: &str, removed: &[String]) {
+        let specs = match self.enabled_derived(app, dataset).await {
+            Ok(s) if s.iter().any(|s| s.group.is_some()) => s,
+            Ok(_) => return,
+            Err(e) => {
+                tracing::warn!(app, dataset, "derived: failed to load specs: {e}");
+                return;
+            }
+        };
+        if self.derived_max_depth < 1 {
+            return;
+        }
+        for spec in specs.iter().filter(|s| s.group.is_some()) {
+            let group = spec.group.as_ref().expect("filtered on group");
+            let (filters, aggs) = match (
+                parse_filter_specs(&spec.filters),
+                parse_aggregates(&group.aggregates),
+            ) {
+                (Ok(f), Ok(a)) => (f, a),
+                (Err(e), _) | (_, Err(e)) => {
+                    tracing::warn!(spec = %spec.id, "derived: bad spec skipped: {e}");
+                    continue;
+                }
+            };
+            let mut tuples: std::collections::HashSet<Vec<String>> = Default::default();
+            for key in removed {
+                match self.get(app, dataset, key).await {
+                    Ok(Some(rec)) => {
+                        if filters_match(&filters, &rec.data) {
+                            if let Some(t) = group_tuple(&group.group_by, &rec.data) {
+                                tuples.insert(t);
+                            }
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::warn!(spec = %spec.id, key = %key, "derived: removed-key read failed: {e}");
+                    }
+                }
+            }
+            if let Err(e) = self.recompute_groups(spec, group, &filters, &aggs, tuples, 0).await {
+                tracing::warn!(spec = %spec.id, "derived: removal recompute failed: {e}");
+            }
+        }
+    }
+
+    /// Backfill for an aggregate spec: one full pass over the live source rows
+    /// (keyset pages of `batch`) accumulating every group in memory, then one
+    /// exact upsert per group — always fresh (`stale: false`), so a backfill is
+    /// also the repair path for groups the live bound marked stale. Groups
+    /// whose last source row disappeared before the backfill keep their old
+    /// derived row (backfill only sees groups that still have rows); the live
+    /// removal hook is what zeroes a group as it empties.
+    async fn backfill_derived_group(
+        &self,
+        spec: &DerivedSpec,
+        group: &DerivedGroup,
+        batch: i64,
+    ) -> Result<DerivedBackfill> {
+        let filters = parse_filter_specs(&spec.filters)?;
+        let aggs = parse_aggregates(&group.aggregates)?;
+        let mut report = DerivedBackfill::default();
+        // tuple -> (count, per-aggregate sums keyed like `aggs`)
+        let mut groups: std::collections::HashMap<Vec<String>, (u64, std::collections::BTreeMap<String, f64>)> =
+            Default::default();
+        let mut after: Option<(String, String)> = None;
+        loop {
+            let page = self
+                .list_page(&spec.source_app, &spec.source_dataset, after, batch, None)
+                .await?;
+            let n = page.len() as i64;
+            for rec in &page {
+                if rec.removed_at.is_some() {
+                    continue;
+                }
+                report.scanned += 1;
+                if !filters_match(&filters, &rec.data) {
+                    continue;
+                }
+                let Some(tuple) = group_tuple(&group.group_by, &rec.data) else {
+                    continue;
+                };
+                let entry = groups.entry(tuple).or_default();
+                entry.0 += 1;
+                for (out, agg) in &aggs {
+                    if let Aggregate::Sum(path) = agg {
+                        if let Some(v) = lookup_json_path(&rec.data, path).and_then(Value::as_f64) {
+                            *entry.1.entry(out.clone()).or_default() += v;
+                        }
+                    }
+                }
+            }
+            if n < batch {
+                break;
+            }
+            after = page.last().map(|r| (ts(r.updated_at), r.key.clone()));
+        }
+        let mut out: Vec<(String, Value)> = Vec::new();
+        for (tuple, (count, sums)) in &groups {
+            let mut data = serde_json::Map::new();
+            for (path, value) in group.group_by.iter().zip(tuple) {
+                data.insert(group_field_name(path).to_string(), Value::String(value.clone()));
+            }
+            data.insert("stale".into(), Value::Bool(false));
+            for (name, agg) in &aggs {
+                let v = match agg {
+                    Aggregate::Count => Value::from(*count),
+                    Aggregate::Sum(_) => {
+                        let sum = sums.get(name).copied().unwrap_or(0.0);
+                        if sum.fract() == 0.0 && sum.abs() < (i64::MAX as f64) {
+                            Value::from(sum as i64)
+                        } else {
+                            Value::from(sum)
+                        }
+                    }
+                };
+                data.insert(name.clone(), v);
+            }
+            out.push((group_row_key(tuple), Value::Object(data)));
+        }
+        report.matched = out.len() as u64;
+        if !out.is_empty() {
+            let s = self
+                .upsert_many_at_depth(&spec.source_app, &spec.target_dataset, &out, None, 1)
+                .await?;
+            report.new += s.new.len() as u64;
+            report.changed += s.changed.len() as u64;
+            report.unchanged += s.unchanged as u64;
         }
         Ok(report)
     }
@@ -1426,6 +1806,142 @@ pub struct DerivedLookup {
     pub merge_as: String,
 }
 
+/// Aggregate half of a derived spec (M11 v2): bucket the source rows by the
+/// text value of each `group_by` path and evaluate `aggregates`
+/// (`{out_field: "count" | "sum($.path)"}`) per bucket. One derived row per
+/// group, keyed by the joined group values; rows whose group fields are
+/// missing or non-scalar (bool/object/array/null) belong to no group.
+/// Mutually exclusive with `lookup` and `project` — enforced at create time
+/// and structurally by sharing the stored `lookup` column.
+#[derive(Debug, Clone, Serialize, serde::Deserialize)]
+pub struct DerivedGroup {
+    /// `$.path` group keys, in order. Values group by their canonical text
+    /// (strings bare, numbers rendered) — the string "42" and the number 42
+    /// share a group, and float keys are discouraged.
+    pub group_by: Vec<String>,
+    /// `{out_field: "count" | "sum($.path)"}` — order-stable via BTreeMap so
+    /// the derived row (and its change detection) is deterministic.
+    pub aggregates: std::collections::BTreeMap<String, String>,
+}
+
+/// One parsed aggregate expression. v2 scope is count + sum.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Aggregate {
+    Count,
+    /// Numeric sum over a `$.path`; rows where the path is missing or
+    /// non-numeric contribute nothing (0), mirroring SQL `SUM` over NULLs.
+    Sum(String),
+}
+
+/// Parses one aggregate expression: `count` or `sum($.path)`.
+pub fn parse_aggregate(expr: &str) -> Result<Aggregate> {
+    let expr = expr.trim();
+    if expr == "count" {
+        return Ok(Aggregate::Count);
+    }
+    if let Some(inner) = expr
+        .strip_prefix("sum(")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        let path = inner.trim();
+        if path.starts_with("$.") {
+            return Ok(Aggregate::Sum(path.to_string()));
+        }
+        return Err(Error::BadRequest(format!(
+            "sum path '{path}' must be a JSON path starting with '$.' (in '{expr}')"
+        )));
+    }
+    Err(Error::BadRequest(format!(
+        "unknown aggregate '{expr}' (expected 'count' or 'sum($.path)')"
+    )))
+}
+
+/// Parses a whole aggregate map, preserving output-field order.
+pub fn parse_aggregates(
+    aggregates: &std::collections::BTreeMap<String, String>,
+) -> Result<std::collections::BTreeMap<String, Aggregate>> {
+    aggregates
+        .iter()
+        .map(|(out, expr)| Ok((out.clone(), parse_aggregate(expr)?)))
+        .collect()
+}
+
+/// Validates an aggregate spec at create time so a stored spec can always be
+/// evaluated: paths well-formed, expressions parseable, and the derived row's
+/// field names (group segments + aggregate outs + the reserved `stale`) free
+/// of collisions.
+pub fn validate_group(group: &DerivedGroup) -> Result<()> {
+    let bad = |msg: String| Error::BadRequest(msg);
+    if group.group_by.is_empty() {
+        return Err(bad("group_by must name at least one JSON path".into()));
+    }
+    if group.aggregates.is_empty() {
+        return Err(bad("aggregates must define at least one output".into()));
+    }
+    let mut names: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    names.insert("stale");
+    for path in &group.group_by {
+        if !path.starts_with("$.") {
+            return Err(bad(format!(
+                "group_by path '{path}' must be a JSON path starting with '$.'"
+            )));
+        }
+        if !names.insert(group_field_name(path)) {
+            return Err(bad(format!(
+                "group_by path '{path}' collides with another derived-row field \
+                 ('stale' is reserved)"
+            )));
+        }
+    }
+    for (out, expr) in &group.aggregates {
+        parse_aggregate(expr)?;
+        if !names.insert(out.as_str()) {
+            return Err(bad(format!(
+                "aggregate output '{out}' collides with another derived-row field \
+                 ('stale' is reserved)"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// The derived-row field a group path lands under: its last segment
+/// (`$.meta.state` → `state`).
+pub(crate) fn group_field_name(path: &str) -> &str {
+    path.trim_start_matches("$.").rsplit('.').next().unwrap_or(path)
+}
+
+/// A group value's canonical text: strings bare, numbers rendered — the
+/// in-memory twin of the SQL `CAST(json_extract(...) AS TEXT)` predicate.
+/// Bool/null/object/array yield `None`: such rows belong to no group (the SQL
+/// side excludes them via `json_type`).
+fn group_value_text(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        _ => None,
+    }
+}
+
+/// A record's group tuple: the canonical text of every `group_by` path, or
+/// `None` when any is missing/non-scalar (the row belongs to no group).
+pub(crate) fn group_tuple(group_by: &[String], data: &Value) -> Option<Vec<String>> {
+    group_by
+        .iter()
+        .map(|p| lookup_json_path(data, p).and_then(group_value_text))
+        .collect()
+}
+
+/// Derived key for a group row: the group values joined with `|`, with `\` and
+/// `|` escaped so distinct tuples can never collide on one key.
+pub(crate) fn group_row_key(tuple: &[String]) -> String {
+    tuple
+        .iter()
+        .map(|v| v.replace('\\', "\\\\").replace('|', "\\|"))
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// A dataset declared as a transformation of another dataset in the same app:
 /// filter (ANDed `$.path:op:value` specs, the `?filter=` grammar) → project
 /// (`{out_field: "$.path"}`; empty = passthrough) → optional single-key lookup.
@@ -1442,6 +1958,10 @@ pub struct DerivedSpec {
     /// deterministic (and hashing/change detection with it).
     pub project: std::collections::BTreeMap<String, String>,
     pub lookup: Option<DerivedLookup>,
+    /// Aggregate half (M11 v2). Stored in the same column as `lookup` (a spec
+    /// is either row-shaped or group-shaped, never both), so v2 needed no
+    /// migration; at most one of `lookup`/`group` is `Some`.
+    pub group: Option<DerivedGroup>,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
 }
@@ -1478,6 +1998,23 @@ impl TryFrom<DerivedRow> for DerivedSpec {
     type Error = Error;
 
     fn try_from(r: DerivedRow) -> Result<DerivedSpec> {
+        // The `lookup` column holds either shape; their required fields are
+        // disjoint, so the untagged parse is unambiguous.
+        #[derive(serde::Deserialize)]
+        #[serde(untagged)]
+        enum StoredJoin {
+            Lookup(DerivedLookup),
+            Group(DerivedGroup),
+        }
+        let (lookup, group) = match r
+            .lookup
+            .as_deref()
+            .and_then(|s| serde_json::from_str::<StoredJoin>(s).ok())
+        {
+            Some(StoredJoin::Lookup(l)) => (Some(l), None),
+            Some(StoredJoin::Group(g)) => (None, Some(g)),
+            None => (None, None),
+        };
         Ok(DerivedSpec {
             id: r.id,
             source_app: r.source_app,
@@ -1485,10 +2022,8 @@ impl TryFrom<DerivedRow> for DerivedSpec {
             target_dataset: r.target_dataset,
             filters: serde_json::from_str(&r.filters).unwrap_or_default(),
             project: serde_json::from_str(&r.project).unwrap_or_default(),
-            lookup: r
-                .lookup
-                .as_deref()
-                .and_then(|s| serde_json::from_str(s).ok()),
+            lookup,
+            group,
             enabled: r.enabled != 0,
             created_at: parse_ts(&r.created_at)?,
         })
@@ -1857,6 +2392,7 @@ mod tests {
             filters: Vec::new(),
             project: Default::default(),
             lookup: None,
+            group: None,
             enabled: true,
             created_at: Utc::now(),
         }
@@ -1932,6 +2468,65 @@ mod tests {
             "resolved paths land; missing paths are omitted, not null"
         );
         assert_eq!(project_value(&Default::default(), &data), data);
+    }
+
+    #[test]
+    fn aggregate_parser_accepts_count_and_sum_only() {
+        assert_eq!(parse_aggregate("count").unwrap(), Aggregate::Count);
+        assert_eq!(
+            parse_aggregate("sum($.amount)").unwrap(),
+            Aggregate::Sum("$.amount".into())
+        );
+        assert_eq!(
+            parse_aggregate(" sum( $.a.b ) ").unwrap(),
+            Aggregate::Sum("$.a.b".into())
+        );
+        // v2 scope is count + sum; everything else is refused loudly.
+        assert!(parse_aggregate("avg($.x)").is_err());
+        assert!(parse_aggregate("sum(amount)").is_err(), "path must be $.-rooted");
+        assert!(parse_aggregate("sum($.x").is_err(), "unbalanced parens");
+        assert!(parse_aggregate("").is_err());
+    }
+
+    #[test]
+    fn group_validation_guards_paths_names_and_reserved_stale() {
+        let mk = |group_by: &[&str], aggs: &[(&str, &str)]| DerivedGroup {
+            group_by: group_by.iter().map(|s| s.to_string()).collect(),
+            aggregates: aggs
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect(),
+        };
+        assert!(validate_group(&mk(&["$.state"], &[("n", "count")])).is_ok());
+        assert!(validate_group(&mk(&[], &[("n", "count")])).is_err());
+        assert!(validate_group(&mk(&["$.state"], &[])).is_err());
+        assert!(validate_group(&mk(&["state"], &[("n", "count")])).is_err());
+        // `stale` is reserved, and outs can't shadow group fields.
+        assert!(validate_group(&mk(&["$.state"], &[("stale", "count")])).is_err());
+        assert!(validate_group(&mk(&["$.stale"], &[("n", "count")])).is_err());
+        assert!(validate_group(&mk(&["$.state"], &[("state", "count")])).is_err());
+        // Two paths ending in the same segment collide on the derived row.
+        assert!(validate_group(&mk(&["$.a.id", "$.b.id"], &[("n", "count")])).is_err());
+    }
+
+    #[test]
+    fn group_tuples_and_keys_are_canonical_and_collision_free() {
+        let data = json!({ "state": "CA", "meta": { "n": 42 }, "flag": true });
+        assert_eq!(
+            group_tuple(&["$.state".into(), "$.meta.n".into()], &data),
+            Some(vec!["CA".to_string(), "42".to_string()]),
+            "strings bare, numbers rendered"
+        );
+        // Missing or non-scalar (bool) group fields exclude the row entirely.
+        assert_eq!(group_tuple(&["$.nope".into()], &data), None);
+        assert_eq!(group_tuple(&["$.flag".into()], &data), None);
+        // Joined keys escape the separator so tuples can't collide.
+        assert_eq!(group_row_key(&["CA".into(), "42".into()]), "CA|42");
+        assert_ne!(
+            group_row_key(&["a|b".into(), "c".into()]),
+            group_row_key(&["a".into(), "b|c".into()])
+        );
+        assert_eq!(group_field_name("$.meta.state"), "state");
     }
 
     #[test]
