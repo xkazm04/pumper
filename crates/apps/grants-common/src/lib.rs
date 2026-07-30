@@ -16,6 +16,20 @@ pub const UNIFIED_APP: &str = "grants";
 pub const UNIFIED_DATASET: &str = "unified";
 pub const DUP_DATASET: &str = "duplicate_links";
 
+/// Append-only lifecycle-event timeline (`grants/events`), keyed
+/// `{opportunity_key}:{observed_at_date}:{kind}` — one event per opportunity ×
+/// day × kind, so an intra-day re-observation refines the same row instead of
+/// duplicating it. Queryable via the generic `?filter=` surface
+/// (e.g. `$.kind:eq:deadline_extended`).
+///
+/// Retention: events are meant to accumulate for years (they ARE the product —
+/// per-agency extension-rate history), so no sweep deletes them. The unified
+/// dataset's *revisions* that feed classification are subject to the normal
+/// retention janitor (`[retention]`, OFF by default); classification only ever
+/// needs the latest two revisions per key, so any revision-prune window ≥ 1
+/// prior revision is safe for this feature.
+pub const EVENTS_DATASET: &str = "events";
+
 /// SimHash Hamming distance for cross-source near-duplicate linking. One
 /// constant so every source links identically — a per-app literal drifts.
 pub const DUP_DISTANCE: u32 = 3;
@@ -26,6 +40,8 @@ pub struct UnifiedOutcome {
     pub swept: usize,
     pub cross_source_dups: usize,
     pub warnings: Vec<String>,
+    /// Lifecycle events written to `grants/events` this run.
+    pub events: usize,
 }
 
 impl UnifiedOutcome {
@@ -35,7 +51,11 @@ impl UnifiedOutcome {
         let Value::Object(map) = out else { return };
         map.insert(
             "unified".into(),
-            json!({ "new": self.unified.new.len(), "changed": self.unified.changed.len() }),
+            json!({
+                "new": self.unified.new.len(),
+                "changed": self.unified.changed.len(),
+                "events": self.events,
+            }),
         );
         map.insert("swept".into(), json!(self.swept));
         map.insert("warnings".into(), json!(self.warnings));
@@ -61,6 +81,12 @@ pub async fn finalize_unified(
     unified_items: &[(String, Value)],
 ) -> Result<UnifiedOutcome> {
     let unified = sync_unified(ctx, unified_items).await?;
+    // Amendment radar: classify source-observed changes into typed lifecycle
+    // events. Runs BEFORE the sweep so the two newest revisions per changed key
+    // are guaranteed to be (prior source snapshot, new source snapshot) — a
+    // sweep write in between would make "old" our own inferred closure instead
+    // of what the source last published.
+    let events = record_events(ctx, &unified).await?;
     // Lifecycle: flip past-due open/forecasted unified rows to closed — these
     // upsert-only sources never see a delisting otherwise.
     let swept = sweep_closed(ctx).await?;
@@ -71,6 +97,7 @@ pub async fn finalize_unified(
         swept,
         cross_source_dups,
         warnings,
+        events,
     })
 }
 
@@ -254,6 +281,191 @@ pub async fn sync_unified(ctx: &AppContext, items: &[(String, Value)]) -> Result
     ctx.datasets
         .upsert_many(UNIFIED_APP, UNIFIED_DATASET, items)
         .await
+}
+
+/// The v1 amendment-radar taxonomy: semantic lifecycle transitions on fields
+/// every source normalizes (close_date, status, award amounts). Each variant is
+/// something a subscriber would act on — not a raw field diff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventKind {
+    /// `close_date` moved later.
+    DeadlineExtended,
+    /// `close_date` moved earlier (while the grant is not being closed early —
+    /// that transition is `ClosedEarly`).
+    DeadlineAccelerated,
+    /// `status` forecasted → open: a forecast became a real, applicable posting.
+    ForecastPosted,
+    /// `award_ceiling` (or, failing that, `total_funding`) increased.
+    AwardRaised,
+    /// `status` closed → open with a deadline that is not already past.
+    Reopened,
+    /// `status` open → closed while the published deadline is still in the
+    /// future — the source retired it before its own close date.
+    ClosedEarly,
+}
+
+impl EventKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EventKind::DeadlineExtended => "deadline_extended",
+            EventKind::DeadlineAccelerated => "deadline_accelerated",
+            EventKind::ForecastPosted => "forecast_posted",
+            EventKind::AwardRaised => "award_raised",
+            EventKind::Reopened => "reopened",
+            EventKind::ClosedEarly => "closed_early",
+        }
+    }
+}
+
+/// One classified lifecycle event: which transition fired, on which unified
+/// field, with the before/after values (canonical forms — dates as
+/// `YYYY-MM-DD`, money as numbers).
+#[derive(Debug, Clone)]
+pub struct GrantEvent {
+    pub kind: EventKind,
+    pub field: &'static str,
+    pub before: Value,
+    pub after: Value,
+}
+
+/// Classifies the transition from one unified snapshot (`old`) to the next
+/// (`new`) into zero or more typed lifecycle events. PURE — all I/O stays in
+/// [`record_events`], so the taxonomy is unit-testable like the closing-soon
+/// digest.
+///
+/// Honesty rules (all deliberate, all tested):
+/// - **Both values must parse** for any comparison — an unparseable or missing
+///   date/number on either side yields no event, never a guess. A source
+///   temporarily blanking a field must not fire the radar.
+/// - **Equal values yield nothing**, so a field that flip-flops A→B→A within a
+///   run (the stored snapshot ends where it started) emits no event.
+/// - **Sweep flip-flop guard**: `Reopened` requires the new record's deadline
+///   to not already be past. Our own `sweep_closed` flips past-due rows to
+///   closed; when the source still lists the row as open with the same stale
+///   deadline, the next sync writes closed→open — a real transition in the
+///   revision chain but not a real reopening, and without this guard it would
+///   fire daily.
+/// - `ClosedEarly` requires a still-future deadline for the same reason in
+///   mirror image: closing at/after the deadline is normal expiry, not news.
+pub fn classify_events(old: &Value, new: &Value, observed_on: chrono::NaiveDate) -> Vec<GrantEvent> {
+    let mut events = Vec::new();
+    let str_field = |v: &Value, f: &str| -> Option<String> {
+        v.get(f).and_then(Value::as_str).map(String::from)
+    };
+    let date_field =
+        |v: &Value, f: &str| v.get(f).and_then(Value::as_str).and_then(parse_date);
+
+    // Deadline movement — both sides must parse.
+    let old_close = date_field(old, "close_date");
+    let new_close = date_field(new, "close_date");
+    if let (Some(o), Some(n)) = (old_close, new_close) {
+        if n != o {
+            events.push(GrantEvent {
+                kind: if n > o {
+                    EventKind::DeadlineExtended
+                } else {
+                    EventKind::DeadlineAccelerated
+                },
+                field: "close_date",
+                before: Value::String(o.to_string()),
+                after: Value::String(n.to_string()),
+            });
+        }
+    }
+
+    // Status transitions — at most one per change.
+    let old_status = str_field(old, "status");
+    let new_status = str_field(new, "status");
+    let status_event = match (old_status.as_deref(), new_status.as_deref()) {
+        (Some("forecasted"), Some("open")) => Some(EventKind::ForecastPosted),
+        // Guard: only a reopening whose deadline is not already past (or has no
+        // deadline yet) is real — see the sweep flip-flop note above.
+        (Some("closed"), Some("open")) if !new_close.is_some_and(|d| d < observed_on) => {
+            Some(EventKind::Reopened)
+        }
+        // Closed while the published deadline is still ahead of us.
+        (Some("open"), Some("closed"))
+            if new_close.or(old_close).is_some_and(|d| d > observed_on) =>
+        {
+            Some(EventKind::ClosedEarly)
+        }
+        _ => None,
+    };
+    if let Some(kind) = status_event {
+        events.push(GrantEvent {
+            kind,
+            field: "status",
+            before: old_status.map(Value::String).unwrap_or(Value::Null),
+            after: new_status.map(Value::String).unwrap_or(Value::Null),
+        });
+    }
+
+    // Award raised — award_ceiling preferred, total_funding as fallback; both
+    // sides must be numbers (Null→number is "posted", not "raised").
+    let num_field = |v: &Value, f: &str| v.get(f).and_then(Value::as_f64);
+    for field in ["award_ceiling", "total_funding"] {
+        if let (Some(o), Some(n)) = (num_field(old, field), num_field(new, field)) {
+            if n > o {
+                events.push(GrantEvent {
+                    kind: EventKind::AwardRaised,
+                    field,
+                    before: Value::from(o),
+                    after: Value::from(n),
+                });
+                break;
+            }
+        }
+    }
+
+    events
+}
+
+/// The I/O half of the amendment radar: for every key the sync reported as
+/// changed, load its two newest unified revisions (new snapshot + the prior
+/// one the upsert diffed against), classify, and append the typed events into
+/// `grants/events`. Brand-new keys have no prior snapshot and are skipped —
+/// first sight is not an amendment. Returns the number of events written.
+async fn record_events(ctx: &AppContext, summary: &UpsertSummary) -> Result<usize> {
+    let now = chrono::Utc::now();
+    let today = now.date_naive();
+    let mut items: Vec<(String, Value)> = Vec::new();
+    for key in &summary.changed {
+        let revs = ctx
+            .datasets
+            .history(UNIFIED_APP, UNIFIED_DATASET, key, 2)
+            .await?;
+        let (Some(newest), Some(prior)) = (revs.first(), revs.get(1)) else {
+            continue;
+        };
+        let (Some(new), Some(old)) = (newest.data.as_ref(), prior.data.as_ref()) else {
+            continue; // a 'removed' prior revision has no snapshot to diff against
+        };
+        let source = new
+            .get("source")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| source_of(key))
+            .to_string();
+        for ev in classify_events(old, new, today) {
+            items.push((
+                format!("{key}:{today}:{}", ev.kind.as_str()),
+                json!({
+                    "opportunity_key": key,
+                    "source": source,
+                    "kind": ev.kind.as_str(),
+                    "field": ev.field,
+                    "before": ev.before,
+                    "after": ev.after,
+                    "observed_at": pumper_core::datasets::ts(now),
+                }),
+            ));
+        }
+    }
+    if !items.is_empty() {
+        ctx.datasets
+            .upsert_many(UNIFIED_APP, EVENTS_DATASET, &items)
+            .await?;
+    }
+    Ok(items.len())
 }
 
 /// Lifecycle sweep for the upsert-only unified dataset: these sources only
@@ -784,6 +996,152 @@ mod tests {
     #[test]
     fn eu_sedia_row_without_identifier_is_skipped() {
         assert!(normalize_eu_sedia(&json!({ "title": "no id" })).is_none());
+    }
+
+    // ---- amendment radar (classify_events) ----
+
+    fn on(y: i32, m: u32, d: u32) -> chrono::NaiveDate {
+        chrono::NaiveDate::from_ymd_opt(y, m, d).unwrap()
+    }
+
+    #[test]
+    fn deadline_extended_fires_when_close_date_moves_later() {
+        let old = json!({ "status": "open", "close_date": "2026-08-15" });
+        let new = json!({ "status": "open", "close_date": "2026-09-30" });
+        let evs = classify_events(&old, &new, on(2026, 7, 30));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].kind, EventKind::DeadlineExtended);
+        assert_eq!(evs[0].field, "close_date");
+        assert_eq!(evs[0].before, json!("2026-08-15"));
+        assert_eq!(evs[0].after, json!("2026-09-30"));
+    }
+
+    #[test]
+    fn deadline_accelerated_fires_when_close_date_moves_earlier() {
+        // Mixed formats parse to the same canonical dates.
+        let old = json!({ "status": "open", "close_date": "09/30/2026" });
+        let new = json!({ "status": "open", "close_date": "2026-08-15" });
+        let evs = classify_events(&old, &new, on(2026, 7, 30));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].kind, EventKind::DeadlineAccelerated);
+        assert_eq!(evs[0].before, json!("2026-09-30"));
+        assert_eq!(evs[0].after, json!("2026-08-15"));
+    }
+
+    #[test]
+    fn forecast_posted_fires_on_forecasted_to_open() {
+        let old = json!({ "status": "forecasted", "close_date": Value::Null });
+        let new = json!({ "status": "open", "close_date": "2026-12-01" });
+        let evs = classify_events(&old, &new, on(2026, 7, 30));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].kind, EventKind::ForecastPosted);
+        assert_eq!(evs[0].before, json!("forecasted"));
+        assert_eq!(evs[0].after, json!("open"));
+    }
+
+    #[test]
+    fn award_raised_prefers_ceiling_and_requires_both_numbers() {
+        // Ceiling raised → one event on award_ceiling (total_funding also rose,
+        // but only the preferred field reports — one raise, one event).
+        let old = json!({ "award_ceiling": 500_000.0, "total_funding": 1_000_000.0 });
+        let new = json!({ "award_ceiling": 750_000.0, "total_funding": 2_000_000.0 });
+        let evs = classify_events(&old, &new, on(2026, 7, 30));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].kind, EventKind::AwardRaised);
+        assert_eq!(evs[0].field, "award_ceiling");
+        assert_eq!(evs[0].before, json!(500_000.0));
+        assert_eq!(evs[0].after, json!(750_000.0));
+
+        // Fallback: no ceiling on either side, total_funding raised.
+        let old = json!({ "award_ceiling": Value::Null, "total_funding": 1_000_000.0 });
+        let new = json!({ "award_ceiling": Value::Null, "total_funding": 1_500_000.0 });
+        let evs = classify_events(&old, &new, on(2026, 7, 30));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].field, "total_funding");
+
+        // Null → number is "posted", not "raised" — both sides must parse.
+        let old = json!({ "award_ceiling": Value::Null });
+        let new = json!({ "award_ceiling": 750_000.0 });
+        assert!(classify_events(&old, &new, on(2026, 7, 30)).is_empty());
+
+        // A decrease is not in the v1 taxonomy.
+        let old = json!({ "award_ceiling": 750_000.0 });
+        let new = json!({ "award_ceiling": 500_000.0 });
+        assert!(classify_events(&old, &new, on(2026, 7, 30)).is_empty());
+    }
+
+    #[test]
+    fn reopened_fires_only_with_a_not_yet_past_deadline() {
+        // Genuine reopen: closed → open with a future deadline.
+        let old = json!({ "status": "closed", "close_date": "2026-06-01" });
+        let new = json!({ "status": "open", "close_date": "2026-10-01" });
+        let evs = classify_events(&old, &new, on(2026, 7, 30));
+        assert_eq!(evs.len(), 2); // deadline_extended + reopened
+        assert!(evs.iter().any(|e| e.kind == EventKind::Reopened));
+        assert!(evs.iter().any(|e| e.kind == EventKind::DeadlineExtended));
+
+        // No deadline at all is still a reopen (rolling window).
+        let old = json!({ "status": "closed", "close_date": Value::Null });
+        let new = json!({ "status": "open", "close_date": Value::Null });
+        let evs = classify_events(&old, &new, on(2026, 7, 30));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].kind, EventKind::Reopened);
+
+        // Sweep flip-flop guard: our sweep closed a past-due row, the source
+        // re-lists it open with the SAME stale deadline — not a reopening.
+        let old = json!({ "status": "closed", "close_date": "2026-06-01" });
+        let new = json!({ "status": "open", "close_date": "2026-06-01" });
+        assert!(classify_events(&old, &new, on(2026, 7, 30)).is_empty());
+    }
+
+    #[test]
+    fn closed_early_requires_a_still_future_deadline() {
+        // Closed 2 months before its own deadline → closed_early.
+        let old = json!({ "status": "open", "close_date": "2026-10-01" });
+        let new = json!({ "status": "closed", "close_date": "2026-10-01" });
+        let evs = classify_events(&old, &new, on(2026, 7, 30));
+        assert_eq!(evs.len(), 1);
+        assert_eq!(evs[0].kind, EventKind::ClosedEarly);
+        assert_eq!(evs[0].field, "status");
+
+        // Closed at/after the deadline is normal expiry, not news.
+        let old = json!({ "status": "open", "close_date": "2026-07-30" });
+        let new = json!({ "status": "closed", "close_date": "2026-07-30" });
+        assert!(classify_events(&old, &new, on(2026, 7, 30)).is_empty());
+        let old = json!({ "status": "open", "close_date": "2026-06-01" });
+        let new = json!({ "status": "closed", "close_date": "2026-06-01" });
+        assert!(classify_events(&old, &new, on(2026, 7, 30)).is_empty());
+
+        // No parseable deadline on either side → cannot claim "early".
+        let old = json!({ "status": "open", "close_date": Value::Null });
+        let new = json!({ "status": "closed", "close_date": Value::Null });
+        assert!(classify_events(&old, &new, on(2026, 7, 30)).is_empty());
+    }
+
+    #[test]
+    fn unparseable_dates_never_fire_deadline_events() {
+        // Source glitch blanks/garbles the date — no event, never a guess.
+        let old = json!({ "status": "open", "close_date": "2026-08-15" });
+        let new = json!({ "status": "open", "close_date": "Deadline—see website" });
+        assert!(classify_events(&old, &new, on(2026, 7, 30)).is_empty());
+        let old = json!({ "status": "open", "close_date": Value::Null });
+        let new = json!({ "status": "open", "close_date": "2026-08-15" });
+        assert!(classify_events(&old, &new, on(2026, 7, 30)).is_empty());
+    }
+
+    #[test]
+    fn flip_flop_within_a_run_emits_nothing() {
+        // A→B→A: the stored snapshot ends where the prior revision started, so
+        // the classifier sees equal values on every axis — no events.
+        let old = json!({
+            "status": "open", "close_date": "2026-08-15", "award_ceiling": 500_000.0
+        });
+        let new = old.clone();
+        assert!(classify_events(&old, &new, on(2026, 7, 30)).is_empty());
+        // An unrelated field changing (title) still emits no lifecycle event.
+        let mut retitled = old.clone();
+        retitled["title"] = json!("Renamed");
+        assert!(classify_events(&old, &retitled, on(2026, 7, 30)).is_empty());
     }
 
     #[test]
