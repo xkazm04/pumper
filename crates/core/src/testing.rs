@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::app::{AppContext, NoProgress};
+use crate::app::{AppContext, NoCheckpoints, NoProgress};
 use crate::cache::ResearchCache;
 use crate::config::{FetcherConfig, GovernorConfig, ResilienceConfig, StorageConfig};
 use crate::costs::{CostLedger, SpentTotal};
@@ -212,6 +212,7 @@ pub struct TestContext<'a> {
     budget_usd: Option<f64>,
     artifacts_dir: Option<std::path::PathBuf>,
     research_cache_ttl_secs: u64,
+    restored: Option<Value>,
 }
 
 impl<'a> TestContext<'a> {
@@ -225,7 +226,14 @@ impl<'a> TestContext<'a> {
             budget_usd: None,
             artifacts_dir: None,
             research_cache_ttl_secs: 0,
+            restored: None,
         }
+    }
+
+    /// Hands the context a restored checkpoint, as the worker does on re-claim.
+    pub fn restored(mut self, state: Value) -> Self {
+        self.restored = Some(state);
+        self
     }
 
     /// Enables the research cache behind [`AppContext::research`] (default: off,
@@ -283,6 +291,8 @@ impl<'a> TestContext<'a> {
             }),
             plugins: Arc::new(NoPlugins),
             progress: Arc::new(NoProgress),
+            checkpoints: Arc::new(NoCheckpoints),
+            restored: self.restored,
             artifacts_dir: self
                 .artifacts_dir
                 .unwrap_or_else(|| self.storage.artifacts_dir.join(&self.app).join("job")),

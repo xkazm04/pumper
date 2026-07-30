@@ -75,6 +75,10 @@ pub struct Schedule {
     pub misfire_policy: String,
     /// Attempt budget for jobs this schedule enqueues; `None` = server default.
     pub max_attempts: Option<i64>,
+    /// Which controller owns this row: `None` = hand-made / code-seeded (sacred —
+    /// the catalog reconciler never touches these); `Some("catalog")` = driven by
+    /// `catalog/data-sources.toml` via the reconciler.
+    pub managed_by: Option<String>,
     pub last_run: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
@@ -82,7 +86,7 @@ pub struct Schedule {
 /// Column list shared by every `schedules` SELECT (kept in sync with `ScheduleRow`).
 const SCHEDULE_COLUMNS: &str =
     "id, app, cron, params, enabled, priority, timezone, misfire_policy, max_attempts, \
-     last_run, created_at";
+     managed_by, last_run, created_at";
 
 /// Create-time fields for a schedule (borrowed; storage assigns id/enabled/time).
 #[derive(Debug, Clone)]
@@ -833,10 +837,15 @@ impl Storage {
     #[allow(clippy::too_many_arguments)]
     pub async fn create_trigger(&self, t: &NewTrigger<'_>) -> Result<Trigger> {
         let id = Uuid::new_v4().to_string();
+        let filters_json = t
+            .filters
+            .filter(|f| !f.is_empty())
+            .map(|f| serde_json::to_string(f).unwrap_or_else(|_| "[]".into()));
         sqlx::query(
             "INSERT INTO triggers (id, name, source_kind, source_app, source_dataset, on_change, \
-             on_status, target_app, params, budget_usd, priority, max_attempts, enabled, created_at) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13)",
+             on_status, target_app, params, budget_usd, priority, max_attempts, enabled, created_at, \
+             filters) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, 1, ?13, ?14)",
         )
         .bind(&id)
         .bind(t.name)
@@ -851,6 +860,7 @@ impl Storage {
         .bind(t.priority)
         .bind(t.max_attempts.max(1))
         .bind(now())
+        .bind(filters_json)
         .execute(&self.pool)
         .await?;
         self.get_trigger(&id)
@@ -1263,7 +1273,233 @@ impl Storage {
         .await?;
         row.map(Delivery::try_from).transpose()
     }
+
+    // ── ingress ──────────────────────────────────────────────────────────────
+    // Inbound event ingress sources: per-caller credentials for POST /ingest/{id}.
+
+    pub async fn create_ingress_source(&self, name: &str, secret: &str) -> Result<IngressSource> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO ingress_sources (id, name, secret, enabled, created_at) \
+             VALUES (?1, ?2, ?3, 1, ?4)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(secret)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_ingress_source(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn get_ingress_source(&self, id: &str) -> Result<Option<IngressSource>> {
+        let row: Option<IngressSourceRow> = sqlx::query_as(
+            "SELECT id, name, secret, enabled, created_at FROM ingress_sources WHERE id = ?1",
+        )
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(IngressSource::try_from).transpose()
+    }
+
+    pub async fn list_ingress_sources(&self) -> Result<Vec<IngressSource>> {
+        let rows: Vec<IngressSourceRow> = sqlx::query_as(
+            "SELECT id, name, secret, enabled, created_at FROM ingress_sources ORDER BY created_at",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(IngressSource::try_from).collect()
+    }
+
+    pub async fn set_ingress_source_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
+        let result = sqlx::query("UPDATE ingress_sources SET enabled = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    pub async fn delete_ingress_source(&self, id: &str) -> Result<bool> {
+        let result = sqlx::query("DELETE FROM ingress_sources WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Enabled external-kind triggers for one ingress source — the evaluation
+    /// set for an inbound event. `source_app = '*'` triggers match every source.
+    pub async fn enabled_external_triggers(&self, source_id: &str) -> Result<Vec<Trigger>> {
+        let rows: Vec<TriggerRow> = sqlx::query_as(&format!(
+            "SELECT {TRIGGER_COLUMNS} FROM triggers \
+             WHERE source_kind = 'external' AND (source_app = ?1 OR source_app = '*') \
+             AND enabled = 1"
+        ))
+        .bind(source_id)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Trigger::try_from).collect()
+    }
+
+    // ── reconcile ───────────────────────────────────────────────────────────
+    // Catalog GitOps reconciler (M19). Every mutating method here is fenced
+    // with `AND managed_by = ?tag` in SQL so an untagged (hand-made or
+    // code-seeded) schedule can never be touched, even by a buggy plan.
+
+    /// Creates (or re-syncs) the catalog-managed schedule for `app`, tagged
+    /// `managed_by = tag`. Id is the stable `catalog-<app>` so re-applying a plan
+    /// is idempotent; a conflicting re-apply updates cron and re-enables rather
+    /// than duplicating. Params stay `{}` — the scheduler falls back to the
+    /// app's `default_params()` at fire time.
+    pub async fn create_managed_schedule(
+        &self,
+        app: &str,
+        cron: &str,
+        tag: &str,
+    ) -> Result<Schedule> {
+        let id = format!("catalog-{app}");
+        sqlx::query(
+            "INSERT INTO schedules (id, app, cron, params, enabled, priority, managed_by, created_at) \
+             VALUES (?1, ?2, ?3, '{}', 1, 0, ?4, ?5) \
+             ON CONFLICT(id) DO UPDATE SET cron = excluded.cron, enabled = 1 \
+             WHERE schedules.managed_by = excluded.managed_by",
+        )
+        .bind(&id)
+        .bind(app)
+        .bind(cron)
+        .bind(tag)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_schedule(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    /// Updates the cron of a schedule owned by `tag` (and re-enables it, since
+    /// the desired state of a cron-bearing catalog row is "running"). Returns
+    /// `false` when the row doesn't exist *or isn't owned by `tag`* — the fence.
+    pub async fn set_managed_schedule_cron(
+        &self,
+        id: &str,
+        cron: &str,
+        tag: &str,
+    ) -> Result<bool> {
+        let result =
+            sqlx::query("UPDATE schedules SET cron = ?2, enabled = 1 WHERE id = ?1 AND managed_by = ?3")
+                .bind(id)
+                .bind(cron)
+                .bind(tag)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Enables/disables a schedule owned by `tag`. Returns `false` when the row
+    /// doesn't exist *or isn't owned by `tag`* — the fence.
+    pub async fn set_managed_schedule_enabled(
+        &self,
+        id: &str,
+        enabled: bool,
+        tag: &str,
+    ) -> Result<bool> {
+        let result =
+            sqlx::query("UPDATE schedules SET enabled = ?2 WHERE id = ?1 AND managed_by = ?3")
+                .bind(id)
+                .bind(enabled as i64)
+                .bind(tag)
+                .execute(&self.pool)
+                .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    // ── checkpoints ──────────────────────────────────────────────────────────
+
+    /// Persists a job's durable-execution checkpoint, guarded by the same
+    /// attempts-lineage rule as [`complete`](Self::complete): the write only
+    /// lands while `(id, attempt)` still owns the `running` row, so a stale task
+    /// whose job was reset/reaped and re-claimed can never overwrite the live
+    /// attempt's checkpoint. Returns whether the write landed (`false` = stale,
+    /// discarded). Oversized blobs (> [`MAX_CHECKPOINT_BYTES`]) are rejected
+    /// with an error — a checkpoint that big is a bug, not state.
+    pub async fn save_checkpoint(&self, id: Uuid, attempt: i64, state: &Value) -> Result<bool> {
+        let blob = state.to_string();
+        if blob.len() > MAX_CHECKPOINT_BYTES {
+            return Err(Error::App(format!(
+                "checkpoint too large: {} bytes (cap {MAX_CHECKPOINT_BYTES})",
+                blob.len()
+            )));
+        }
+        // INSERT..SELECT so the lineage guard and the upsert are one atomic
+        // statement; `resume_failures` is preserved across overwrites (it counts
+        // restores handed out, not writes). The SELECT's WHERE clause also
+        // disambiguates the UPSERT grammar for SQLite's parser.
+        let r = sqlx::query(
+            "INSERT INTO checkpoints (job_id, state, attempt, resume_failures, updated_at) \
+             SELECT ?1, ?2, ?3, 0, ?4 FROM jobs \
+             WHERE id = ?1 AND status = 'running' AND attempts = ?3 \
+             ON CONFLICT(job_id) DO UPDATE SET \
+               state = excluded.state, attempt = excluded.attempt, \
+               updated_at = excluded.updated_at",
+        )
+        .bind(id.to_string())
+        .bind(blob)
+        .bind(attempt)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// A job's stored checkpoint as `(state, resume_failures)`, or `None`. A
+    /// blob that no longer parses is treated as absent (never resumed from
+    /// silently) — the caller decides whether to clear it.
+    pub async fn load_checkpoint(&self, id: Uuid) -> Result<Option<(Value, i64)>> {
+        let row: Option<(String, i64)> =
+            sqlx::query_as("SELECT state, resume_failures FROM checkpoints WHERE job_id = ?1")
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.and_then(|(state, failures)| {
+            serde_json::from_str(&state)
+                .ok()
+                .map(|v: Value| (v, failures))
+        }))
+    }
+
+    /// Counts one restore handed out from a job's checkpoint (called at claim
+    /// time, before the attempt runs) and returns the new count. The counter is
+    /// the poisoned-checkpoint escape: attempts that *complete* clear the row,
+    /// so a count that keeps growing means every restored attempt has failed.
+    pub async fn bump_checkpoint_resumes(&self, id: Uuid) -> Result<i64> {
+        let n: Option<i64> = sqlx::query_scalar(
+            "UPDATE checkpoints SET resume_failures = resume_failures + 1 \
+             WHERE job_id = ?1 RETURNING resume_failures",
+        )
+        .bind(id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(n.unwrap_or(0))
+    }
+
+    /// Drops a job's checkpoint (on terminal completion, or when the blob is
+    /// judged poisoned). Idempotent.
+    pub async fn clear_checkpoint(&self, id: Uuid) -> Result<()> {
+        sqlx::query("DELETE FROM checkpoints WHERE job_id = ?1")
+            .bind(id.to_string())
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
 }
+
+/// Hard cap on one checkpoint blob (bytes). Generous enough for a 100k-URL
+/// crawl frontier (~a few MB) while keeping a runaway app from turning the jobs
+/// database into a blob store.
+pub const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
 
 /// Job timing aggregates (seconds) for the metrics endpoint: execution duration
 /// (started→finished) and queue wait (created→started), each as sum/count/max so
@@ -1333,7 +1569,7 @@ impl TryFrom<JobRow> for Job {
 
 const TRIGGER_COLUMNS: &str = "id, name, source_kind, source_app, source_dataset, on_change, \
                                on_status, target_app, params, budget_usd, priority, \
-                               max_attempts, enabled, created_at";
+                               max_attempts, enabled, created_at, filters";
 
 /// A reactive-pipeline edge: (source event) → (enqueue target app). The set of
 /// triggers is the pipeline DAG.
@@ -1358,6 +1594,10 @@ pub struct Trigger {
     pub max_attempts: i64,
     pub enabled: bool,
     pub created_at: DateTime<Utc>,
+    /// JSON-path predicate specs (`$.path:op:value`, the `?filter=` grammar)
+    /// ANDed against the inbound payload. External kind only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub filters: Option<Vec<String>>,
 }
 
 impl Trigger {
@@ -1381,6 +1621,8 @@ pub struct NewTrigger<'a> {
     pub budget_usd: Option<f64>,
     pub priority: i64,
     pub max_attempts: i64,
+    /// External kind only: `$.path:op:value` predicate specs (ANDed).
+    pub filters: Option<&'a [String]>,
 }
 
 #[derive(sqlx::FromRow)]
@@ -1399,6 +1641,7 @@ struct TriggerRow {
     max_attempts: i64,
     enabled: i64,
     created_at: String,
+    filters: Option<String>,
 }
 
 impl TryFrom<TriggerRow> for Trigger {
@@ -1420,6 +1663,10 @@ impl TryFrom<TriggerRow> for Trigger {
             max_attempts: r.max_attempts,
             enabled: r.enabled != 0,
             created_at: parse_ts(&r.created_at)?,
+            filters: r
+                .filters
+                .as_deref()
+                .and_then(|s| serde_json::from_str(s).ok()),
         })
     }
 }
@@ -1557,6 +1804,7 @@ struct ScheduleRow {
     timezone: Option<String>,
     misfire_policy: String,
     max_attempts: Option<i64>,
+    managed_by: Option<String>,
     last_run: Option<String>,
     created_at: String,
 }
@@ -1575,7 +1823,44 @@ impl TryFrom<ScheduleRow> for Schedule {
             timezone: r.timezone,
             misfire_policy: r.misfire_policy,
             max_attempts: r.max_attempts,
+            managed_by: r.managed_by,
             last_run: r.last_run.as_deref().map(parse_ts).transpose()?,
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+/// An inbound-event ingress source: the per-caller credential for
+/// `POST /ingest/{id}`. The secret signs every inbound body (HMAC-SHA256) and
+/// is never serialized into list/read responses.
+#[derive(Debug, Clone, Serialize)]
+pub struct IngressSource {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing)]
+    pub secret: String,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+#[derive(sqlx::FromRow)]
+struct IngressSourceRow {
+    id: String,
+    name: String,
+    secret: String,
+    enabled: i64,
+    created_at: String,
+}
+
+impl TryFrom<IngressSourceRow> for IngressSource {
+    type Error = Error;
+
+    fn try_from(r: IngressSourceRow) -> Result<IngressSource> {
+        Ok(IngressSource {
+            id: r.id,
+            name: r.name,
+            secret: r.secret,
+            enabled: r.enabled != 0,
             created_at: parse_ts(&r.created_at)?,
         })
     }

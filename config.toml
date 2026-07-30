@@ -121,6 +121,17 @@ dir = "data/search-index"
 # failure_secret = "..."                                    # HMAC-SHA256 secret for failure_url
 auto_retry = true   # auto-drain the dead-letter queue: re-send failed deliveries with backoff (30s→1m→5m→30m→2h, then 'dead')
 
+# Inbound event ingress (POST /ingest/{id}) — HMAC-verified external webhooks
+# become `external` events on the bus that triggers can match (on 'external' +
+# source filter + $.path predicates). This is the FIRST write surface designed
+# for non-localhost callers, so it ships OFF; every source carries its own
+# signing secret. See docs/features/ingress.md for the GitHub worked example.
+[ingress]
+enabled = false
+# max_body_bytes = 262144    # hard cap per inbound event body (256 KiB)
+# rate_limit_per_min = 60    # per-source token bucket (also the burst size)
+# max_skew_secs = 300        # accepted clock skew for timestamped signatures
+
 # Extraction health — per-source degradation detection (see
 # docs/features/resilient-extraction.md). Detection is arithmetic over data the
 # extraction pass already produced, so it is effectively free; the only thing
@@ -146,6 +157,14 @@ invariant_min_support = 500      # records an invariant must hold over before it
 invariant_min_confidence = 0.99
 invariant_violation_ratio = 0.2  # fraction of a cohort that must break one to count
 sketch_retention_runs = 60       # runs of per-field sketches kept (>= window_runs)
+
+# Catalog GitOps reconciler — treats catalog/data-sources.toml as desired state
+# for the schedules table. Boot always runs a DRY-RUN and logs drift loudly;
+# review with GET /catalog/reconcile, apply with POST /catalog/reconcile.
+# Only schedules tagged managed_by = "catalog" are ever written; hand-made and
+# code-seeded rows are sacred.
+[catalog]
+auto_reconcile = false   # true = apply the boot plan automatically (orphans are still never touched)
 
 # DataHub metadata shadow — pushes dataset entities, inferred schema, lineage,
 # and per-run freshness (operation) events to a DataHub GMS. Metadata only;

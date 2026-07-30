@@ -24,6 +24,55 @@ pub struct Config {
     pub resilience: ResilienceConfig,
     pub datahub: DatahubConfig,
     pub archive: ArchiveConfig,
+    pub catalog: CatalogConfig,
+    pub ingress: IngressConfig,
+}
+
+/// Inbound event ingress (`POST /ingest/{id}`): HMAC-verified external webhooks
+/// stamped onto the event bus as `external` events that triggers can match.
+///
+/// This is the FIRST write surface designed for non-localhost callers, so it is
+/// disabled by default and every source carries its own signing secret. When
+/// disabled the routes still mount but every ingest returns 409; the CRUD
+/// surface still works, so sources can be staged before the flip.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct IngressConfig {
+    /// Master switch. `false` = every `POST /ingest/{id}` is refused (409).
+    pub enabled: bool,
+    /// Hard cap on an inbound event body (bytes). Inbound payloads are event
+    /// notifications, not documents; anything bigger should arrive as a fetch
+    /// by the triggered job, not as the trigger itself.
+    pub max_body_bytes: usize,
+    /// Per-source token-bucket rate limit (events/minute; also the burst size).
+    pub rate_limit_per_min: u32,
+    /// Max accepted clock skew (seconds) for timestamped signatures
+    /// (`x-pumper-timestamp` present). Bounds replay of a captured request.
+    pub max_skew_secs: i64,
+}
+
+impl Default for IngressConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_body_bytes: 256 * 1024,
+            rate_limit_per_min: 60,
+            max_skew_secs: 300,
+        }
+    }
+}
+
+/// Catalog GitOps reconciler (`catalog/data-sources.toml` as desired state for
+/// the schedules table). The reconciler always *plans* at boot and logs drift
+/// loudly; this only controls whether it is allowed to APPLY that plan on its
+/// own. Manual applies go through `POST /catalog/reconcile` either way.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct CatalogConfig {
+    /// Apply the boot-time reconcile plan automatically (create/update/disable
+    /// catalog-managed schedules; orphans are never auto-touched). Default OFF:
+    /// a bad TOML edit should be a loud log, not a silent mass-disable.
+    pub auto_reconcile: bool,
 }
 
 /// Tier-zero archive engine (Wayback Machine CDX, v1). When enabled, the server
@@ -375,6 +424,28 @@ impl Config {
             )));
         }
 
+        // Ingress guards only bind when the surface is actually reachable. A
+        // zero body cap or zero rate limit parses fine and then rejects every
+        // single inbound event — an enabled surface that silently drops 100% of
+        // traffic is a misconfiguration, not a policy.
+        let i = &self.ingress;
+        if i.enabled {
+            if i.max_body_bytes == 0 {
+                return Err(Error::Config(
+                    "[ingress] max_body_bytes must be > 0 when ingress is enabled — \
+                     a zero cap rejects every inbound event"
+                        .into(),
+                ));
+            }
+            if i.rate_limit_per_min == 0 {
+                return Err(Error::Config(
+                    "[ingress] rate_limit_per_min must be > 0 when ingress is enabled — \
+                     a zero bucket admits no events"
+                        .into(),
+                ));
+            }
+        }
+
         // A cap below the base means the very first penalty already exceeds it, so
         // the cap silently stops being a cap.
         let g = &self.governor;
@@ -450,6 +521,12 @@ pub struct WorkerConfig {
     /// starving forever. `0` disables aging — claim order is then exactly
     /// `priority DESC, created_at` (the historical behaviour).
     pub priority_aging_coefficient_secs: f64,
+    /// Poisoned-checkpoint escape: after this many attempts have started from a
+    /// job's durable checkpoint without any of them completing, the checkpoint
+    /// is discarded and the next attempt starts fresh — restored state is
+    /// advisory, and a blob that reliably kills its consumer must not retry
+    /// forever. `0` disables restores entirely (checkpoints still persist).
+    pub max_resume_failures: i64,
 }
 
 impl Default for WorkerConfig {
@@ -472,6 +549,9 @@ impl Default for WorkerConfig {
             // higher-priority stream escalates past it within the hour rather
             // than never. Matches the job-timeout / schedule scale.
             priority_aging_coefficient_secs: 900.0,
+            // Three strikes: enough to ride out an unlucky crash/reap streak,
+            // few enough that a genuinely poisoned blob stops burning attempts.
+            max_resume_failures: 3,
         }
     }
 }
@@ -943,6 +1023,36 @@ mod tests {
         // Enabled with a sane base passes.
         cfg.archive.enabled = true;
         cfg.archive.base_url = "http://localhost:8090".into();
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn ingress_ships_disabled_with_sane_limits() {
+        // The first non-localhost write surface MUST be opt-in.
+        let i = IngressConfig::default();
+        assert!(!i.enabled, "ingress must be opt-in");
+        assert!(i.max_body_bytes > 0);
+        assert!(i.rate_limit_per_min > 0);
+        assert!(i.max_skew_secs > 0);
+    }
+
+    #[test]
+    fn enabled_ingress_rejects_zero_caps() {
+        let mut cfg = Config::default();
+        cfg.ingress.enabled = true;
+        cfg.ingress.max_body_bytes = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("[ingress] max_body_bytes"), "{err}");
+
+        let mut cfg = Config::default();
+        cfg.ingress.enabled = true;
+        cfg.ingress.rate_limit_per_min = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("[ingress] rate_limit_per_min"), "{err}");
+
+        // Disabled => the rules don't bind (nothing reaches the surface).
+        let mut cfg = Config::default();
+        cfg.ingress.max_body_bytes = 0;
         assert!(cfg.validate().is_ok());
     }
 

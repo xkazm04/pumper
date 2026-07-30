@@ -19,11 +19,13 @@ use sqlx::SqlitePool;
 /// here in the same change that adds the migration that creates it.
 const EXPECTED_TABLES: &[&str] = &[
     "_sqlx_migrations",
+    "checkpoints",
     "cost_events",
     "doc_fingerprints",
     "field_invariants",
     "field_sketches",
     "http_cache",
+    "ingress_sources",
     "jobs",
     "record_revisions",
     "records",

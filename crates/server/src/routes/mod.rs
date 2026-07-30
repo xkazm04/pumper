@@ -16,10 +16,16 @@ use utoipa_axum::routes;
 
 use crate::state::AppState;
 
+// The `?filter=` spec parser, re-exported for the external-trigger fire path
+// (`crate::triggers` sits outside `routes` and cannot reach the private
+// `datasets` submodule directly). One parser, both surfaces — no drift.
+pub(crate) use datasets::parse_filters;
+
 mod datasets;
 mod error;
 mod events;
 mod health;
+mod ingress;
 mod jobs;
 mod meta;
 mod query;
@@ -35,6 +41,7 @@ mod watches;
 use datasets::*;
 use events::*;
 use health::*;
+use ingress::*;
 use jobs::*;
 use meta::*;
 use query::*;
@@ -65,6 +72,7 @@ use watches::*;
         (name = "grants", description = "Filtered query surface over the cross-source grants corpus"),
         (name = "watches", description = "Dataset change webhooks"),
         (name = "triggers", description = "Reactive pipelines"),
+        (name = "ingress", description = "Inbound event ingress: signed external webhooks as trigger inputs"),
         (name = "webhooks", description = "Outbound delivery log"),
         (name = "search", description = "Full-text search and saved searches"),
         (name = "extract", description = "Declarative RuleSet preview / dry-run"),
@@ -154,6 +162,10 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(set_trigger_enabled))
         .routes(routes!(test_trigger))
         .routes(routes!(trigger_runs))
+        .routes(routes!(list_ingress_sources, create_ingress_source))
+        .routes(routes!(delete_ingress_source))
+        .routes(routes!(set_ingress_source_enabled))
+        .routes(routes!(ingest))
         .routes(routes!(list_deliveries))
         .routes(routes!(get_delivery))
         .routes(routes!(replay_delivery))
@@ -174,6 +186,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(closing_soon))
         .routes(routes!(catalog_sources))
         .routes(routes!(catalog_health))
+        .routes(routes!(catalog_reconcile, catalog_reconcile_apply))
         .routes(routes!(list_sources))
         .routes(routes!(get_source))
         .routes(routes!(source_runs))
@@ -379,6 +392,11 @@ mod api_spec_tests {
         "POST /triggers/{id}/enabled",
         "POST /triggers/{id}/test",
         "GET /triggers/{id}/runs",
+        "GET /ingress/sources",
+        "POST /ingress/sources",
+        "DELETE /ingress/sources/{id}",
+        "POST /ingress/sources/{id}/enabled",
+        "POST /ingest/{id}",
         "GET /webhooks/deliveries",
         "GET /webhooks/deliveries/{id}",
         "POST /webhooks/deliveries/{id}/replay",
@@ -401,6 +419,8 @@ mod api_spec_tests {
         "GET /grants/closing-soon",
         "GET /catalog/sources",
         "GET /catalog/health",
+        "GET /catalog/reconcile",
+        "POST /catalog/reconcile",
         "GET /sources",
         "GET /sources/{id}",
         "GET /sources/{id}/runs",

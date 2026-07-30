@@ -38,7 +38,9 @@ pub mod search;
 pub mod simhash;
 
 #[cfg(feature = "storage")]
-pub use app::{AppContext, NoProgress, ProgressReporter, Requirement, ScrapeApp};
+pub use app::{
+    AppContext, CheckpointSink, NoCheckpoints, NoProgress, ProgressReporter, Requirement, ScrapeApp,
+};
 #[cfg(feature = "storage")]
 pub use cache::{HttpCache, ResearchCache, StaleEntry};
 #[cfg(feature = "storage")]
@@ -56,13 +58,16 @@ pub use resilience::{
 pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
 #[cfg(feature = "storage")]
 pub use storage::{
-    Delivery, EnqueueOptions, JobTimingStats, NewSchedule, NewTrigger, SavedSearch, Schedule,
-    Storage, Trigger, Watch,
+    Delivery, EnqueueOptions, IngressSource, JobTimingStats, NewSchedule, NewTrigger, SavedSearch,
+    Schedule, Storage, Trigger, Watch, MAX_CHECKPOINT_BYTES,
 };
 #[cfg(feature = "storage")]
 pub use tiers::{HostProfile, TierMemory};
 
-pub use catalog::{Catalog, Source};
+pub use catalog::{
+    Catalog, PlanCreate, PlanDisable, PlanOrphan, PlanUpdate, ReconcilePlan, Source,
+    CATALOG_MANAGED_BY,
+};
 pub use config::Config;
 pub use crawl::{
     crawl, CrawlConfig, CrawlPageRecord, CrawlProgressSnapshot, CrawlStats, PageSink, PageSource,
