@@ -78,7 +78,7 @@ scraper = "0.23"
 # streamed-body path, which bypasses reqwest's `.text()` charset handling.
 encoding_rs = "0.8"
 ego-tree = "0.10"
-chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
+chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
 futures = "0.3"
 
 # high-throughput extraction (no-GIL parallelism + SIMD)
