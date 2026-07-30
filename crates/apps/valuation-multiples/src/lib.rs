@@ -86,7 +86,11 @@ impl ScrapeApp for ValuationMultiples {
             }));
         }
 
-        let trades = taxonomy::prompt_list();
+        // Trade universe = governed registry, enum fallback (identical list —
+        // and prompt — while the registry dataset is absent).
+        let entries = taxonomy::taxonomy(&ctx).await?;
+        let trades = taxonomy::prompt_list_of(&entries);
+        let n_trades = entries.len();
         let prompt = format!(
             "You are a business-valuation analyst for small US home-services companies. \
              For {year}, compile the typical SMALL-BUSINESS valuation multiples for each of \
@@ -99,7 +103,7 @@ impl ScrapeApp for ValuationMultiples {
              \"sde_multiple_median\": number, \"sde_multiple_low\": number, \
              \"sde_multiple_high\": number, \"revenue_multiple\": number, \
              \"notes\": string}}]}}\n\
-             Multiples are ratios (e.g. 2.5 means 2.5x SDE). Include all 5 trades."
+             Multiples are ratios (e.g. 2.5 means 2.5x SDE). Include all {n_trades} trades."
         );
 
         let mut request = ResearchRequest::new(prompt).with_role(role);
@@ -120,7 +124,8 @@ impl ScrapeApp for ValuationMultiples {
         let (data, output) =
             trades_common::research_json(&ctx, "valuation-multiples", request).await?;
 
-        let (all_records, rejected, unknown_trades) = collect_valuation_records(&data, &year);
+        let (all_records, rejected, unknown_trades) =
+            collect_valuation_records(&entries, &data, &year);
 
         if all_records.is_empty() {
             return Err(Error::App(
@@ -158,6 +163,7 @@ impl ScrapeApp for ValuationMultiples {
 ///   and all multiples positive. Violators rejected with reasons.
 /// - Unknown trade labels keep the raw string and are flagged, not dropped.
 fn collect_valuation_records(
+    entries: &[taxonomy::TradeEntry],
     data: &Value,
     year: &str,
 ) -> (Vec<(String, Value)>, Vec<Rejection>, Vec<String>) {
@@ -176,7 +182,7 @@ fn collect_valuation_records(
                 continue;
             }
             // Normalize to a canonical label; unknown labels keep raw + flag.
-            let (trade, known) = taxonomy::canonicalize(&raw);
+            let (trade, known) = taxonomy::canonicalize_in(entries, &raw);
             if !known {
                 unknown_trades.push(raw.clone());
             }
@@ -262,7 +268,7 @@ mod tests {
         // Median above the high end of the band: implausible, must not upsert.
         bad["sde_multiple_median"] = json!(4.0);
         let data = json!({ "trades": [bad, multiples_entry("Plumbing")] });
-        let (records, rejected, _) = collect_valuation_records(&data, "2025");
+        let (records, rejected, _) = collect_valuation_records(&taxonomy::seed_entries(), &data, "2025");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].0, "US:Plumbing");
         assert_eq!(rejected.len(), 1);
@@ -278,7 +284,7 @@ mod tests {
         // "HVAC/R" must key as US:HVAC with the stored `trade` field agreeing,
         // stamped state=US + year so the ingest lifts market = "US".
         let data = json!({ "trades": [multiples_entry("HVAC/R")] });
-        let (records, rejected, unknown) = collect_valuation_records(&data, "2025");
+        let (records, rejected, unknown) = collect_valuation_records(&taxonomy::seed_entries(), &data, "2025");
         assert!(rejected.is_empty());
         assert!(unknown.is_empty());
         let (key, rec) = &records[0];
@@ -293,7 +299,7 @@ mod tests {
         let mut bad = multiples_entry("Roofing");
         bad["revenue_multiple"] = json!(-0.5);
         let data = json!({ "trades": [bad] });
-        let (records, rejected, unknown) = collect_valuation_records(&data, "2025");
+        let (records, rejected, unknown) = collect_valuation_records(&taxonomy::seed_entries(), &data, "2025");
         // Unknown label is flagged even when the record is rejected on values.
         assert!(records.is_empty());
         assert_eq!(rejected[0].key, "US:Roofing");

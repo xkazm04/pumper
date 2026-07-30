@@ -26,7 +26,7 @@ use pumper_core::{
     AppContext, AppManifest, CostClass, Error, ManifestExample, ResearchRequest, Result, ScrapeApp,
 };
 use serde_json::{json, Value};
-use trades_common::taxonomy::Trade;
+use trades_common::taxonomy;
 use trades_common::unified::{self, COMPLIANCE, UNIFIED_APP};
 use trades_common::validate::{self, Rejection};
 
@@ -153,37 +153,46 @@ impl ScrapeApp for StateLicensing {
             .map(|t| t as u32)
             .or(Some(30));
 
-        // Requested trades (default: all five canonical). Unknown labels are an
-        // error up front — a typo must not silently research nothing.
-        let trades: Vec<Trade> = match ctx.params.get("trades").and_then(Value::as_array) {
-            Some(arr) => {
-                let mut out = Vec::new();
-                for v in arr {
-                    let raw = v.as_str().unwrap_or("");
-                    let t = Trade::from_label(raw).ok_or_else(|| {
-                        Error::App(format!(
-                            "state-licensing: unknown trade label {raw:?} (canonical: {})",
-                            trades_common::taxonomy::prompt_list()
-                        ))
-                    })?;
-                    if !out.contains(&t) {
-                        out.push(t);
+        // Trade universe = governed `trades/taxonomy` registry, compile-time
+        // enum as fallback (identical five while the registry is absent).
+        let taxonomy_entries = taxonomy::taxonomy(&ctx).await?;
+
+        // Requested trades (default: the whole live taxonomy). Unknown labels
+        // are an error up front — a typo must not silently research nothing.
+        let trades: Vec<taxonomy::TradeEntry> =
+            match ctx.params.get("trades").and_then(Value::as_array) {
+                Some(arr) => {
+                    let mut out: Vec<taxonomy::TradeEntry> = Vec::new();
+                    for v in arr {
+                        let raw = v.as_str().unwrap_or("");
+                        let (canonical, known) = taxonomy::canonicalize_in(&taxonomy_entries, raw);
+                        let entry = taxonomy_entries
+                            .iter()
+                            .find(|e| known && e.label == canonical)
+                            .ok_or_else(|| {
+                                Error::App(format!(
+                                    "state-licensing: unknown trade label {raw:?} (canonical: {})",
+                                    taxonomy::prompt_list_of(&taxonomy_entries)
+                                ))
+                            })?;
+                        if !out.iter().any(|e| e.label == entry.label) {
+                            out.push(entry.clone());
+                        }
                     }
+                    out
                 }
-                out
-            }
-            None => Trade::ALL.to_vec(),
-        };
+                None => taxonomy_entries.clone(),
+            };
 
         let mut all_records: Vec<(String, Value)> = Vec::new();
         let mut rejected: Vec<Rejection> = Vec::new();
-        let mut trades_run: Vec<&'static str> = Vec::new();
-        let mut trades_skipped: Vec<&'static str> = Vec::new();
+        let mut trades_run: Vec<String> = Vec::new();
+        let mut trades_skipped: Vec<String> = Vec::new();
         let mut coverage = serde_json::Map::new();
         let (mut cost_usd, mut duration_ms, mut num_turns) = (0.0_f64, 0_u64, 0_u64);
 
         for trade in trades {
-            let label = trade.label();
+            let label = trade.label.as_str();
 
             // Vintage freshness gate BEFORE the metered call: licensing rules
             // change rarely, so a trade whose sentinel record already carries
@@ -191,7 +200,7 @@ impl ScrapeApp for StateLicensing {
             // same facts. `force: true` bypasses (handled inside vintage_held).
             let sentinel = format!("{SENTINEL_STATE}:{label}");
             if trades_common::vintage_held(&ctx, UNIFIED_APP, COMPLIANCE, &sentinel, &year).await? {
-                trades_skipped.push(label);
+                trades_skipped.push(label.to_string());
                 continue;
             }
 
@@ -220,10 +229,10 @@ impl ScrapeApp for StateLicensing {
             cost_usd += output.cost_usd.unwrap_or(0.0);
             duration_ms += output.duration_ms.unwrap_or(0);
             num_turns += output.num_turns.unwrap_or(0);
-            trades_run.push(label);
+            trades_run.push(label.to_string());
 
             let (records, mut trade_rejected, present) =
-                parse_trade_records(&data, label, trade.soc_code(), &year);
+                parse_trade_records(&data, label, &trade.soc_code, &year);
             let missing: Vec<&str> = US_JURISDICTIONS
                 .iter()
                 .copied()
