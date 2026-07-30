@@ -1,0 +1,16 @@
+-- Host weather (M01 v1): federated host-intelligence exchange.
+--
+-- Adds a per-host `observations` counter to `tier_memory` — the number of
+-- tiered-fetch outcomes recorded locally for the host. It is the evidence
+-- weight behind the host-weather bundle (`GET /host-weather/export`):
+--   * export applies a `?min_observations=` floor so thin/noisy hosts don't
+--     travel between deployments, and
+--   * import merges count-weighted — a remote browser pin is only adopted when
+--     the remote deployment has strictly more observations than we do, so a
+--     better-observed local pin is never downgraded by imported intel.
+--
+-- Existing rows start at 0: their history predates the counter, so they read
+-- as "thin" and stay home until they earn fresh local observations. Penalty-only
+-- rows (write-behind snapshots) never increment it — penalties are politeness
+-- state, not tier evidence.
+ALTER TABLE tier_memory ADD COLUMN observations INTEGER NOT NULL DEFAULT 0;

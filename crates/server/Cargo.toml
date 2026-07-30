@@ -14,6 +14,7 @@ async-trait.workspace = true
 pumper-core.workspace = true
 pumper-engine-http.workspace = true
 pumper-engine-archive.workspace = true
+pumper-engine-remote.workspace = true
 pumper-engine-browser.workspace = true
 pumper-engine-claude.workspace = true
 pumper-engine-wasm.workspace = true
@@ -44,6 +45,8 @@ app-plugin.workspace = true
 app-crawl.workspace = true
 app-smlouvy-dump-watch.workspace = true
 app-provisioner.workspace = true
+app-transact.workspace = true
+app-peer.workspace = true
 
 axum.workspace = true
 tower-http.workspace = true

@@ -7,6 +7,7 @@ use pumper_core::{
     NoSearch, Plugins, ResearchCache, Resilience, ScrapeApp, Search, Storage, TierMemory,
 };
 use pumper_engine_archive::ArchiveEngine;
+use pumper_engine_remote::RemoteEngine;
 use pumper_engine_browser::BrowserEngine;
 use pumper_engine_claude::ClaudeEngine;
 use pumper_engine_http::HttpEngine;
@@ -46,6 +47,12 @@ pub struct AppState {
     /// Embedded full-text search index.
     pub search: Arc<dyn Search>,
     pub registry: Arc<HashMap<String, Arc<dyn ScrapeApp>>>,
+    /// Read-only listing entries for dynamic WASM apps discovered in
+    /// `[plugins] app_dir` at boot (M28 v1 slice): surfaced on `GET /apps` with
+    /// `dynamic: true, runnable: false`, and matched by the enqueue handler to
+    /// reject them with a typed error instead of a blank 404. Never runnable —
+    /// there is no execution path until the component-model host lands.
+    pub dynamic_apps: Arc<Vec<serde_json::Value>>,
     /// Pinged on enqueue so the worker picks up work without waiting a poll tick.
     pub notify: Arc<Notify>,
     /// Dedicated client for firing result webhooks.
@@ -131,6 +138,14 @@ impl AppState {
             .timeout(Duration::from_secs(15))
             .build()?;
         let events = Arc::new(EventBus::new(EVENT_BROADCAST_CAPACITY, EVENT_RING_CAPACITY));
+        // Dynamic-app discovery (M28 v1). The one exception to "no IO" here,
+        // and only when `[plugins] app_dir` is explicitly set (default: unset →
+        // zero IO, so test states stay pure): scans the dir once and freezes the
+        // read-only listing for the process lifetime.
+        let dynamic_apps = Arc::new(crate::registry::dynamic_app_entries(
+            &config.plugins,
+            &registry,
+        ));
 
         Ok(Self {
             config: Arc::new(config),
@@ -146,6 +161,7 @@ impl AppState {
             plugins,
             search,
             registry: Arc::new(registry),
+            dynamic_apps,
             notify: Arc::new(Notify::new()),
             webhook_client,
             events,
@@ -190,6 +206,16 @@ impl AppState {
         // per-request `use_recipes` opt-in works even with the global switch
         // off; with neither opt-in the fetcher never consults it.
         let recipes: Arc<dyn pumper_core::RecipeSource> = Arc::new(storage.recipes());
+        // Remote fetch fabric (M17, `[remote]`, default OFF). Wired at the
+        // live-HTTP tier position only when enabled AND nodes are configured
+        // (enabled + no nodes = a serve-only node: /fetch-proxy answers peers,
+        // nothing is dispatched). The engine round-robins peer /fetch-proxy
+        // endpoints and falls back to the local HttpEngine on any node error;
+        // its proxy POSTs also run through the local engine, so peers are
+        // governed like any host.
+        let remote: Option<Arc<dyn HttpClient>> = (config.remote.enabled
+            && !config.remote.nodes.is_empty())
+        .then(|| Arc::new(RemoteEngine::new(&config.remote, http.clone())) as _);
         let fetch = Fetcher::new(
             http.clone(),
             browser.clone(),
@@ -198,6 +224,7 @@ impl AppState {
             &config.fetcher,
         )
         .with_archive(archive)
+        .with_remote(remote)
         .with_recipes(Some(recipes), &config.recipes);
         let engines = Arc::new(EngineSet::new(http, browser, claude, fetch));
 

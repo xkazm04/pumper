@@ -25,6 +25,8 @@ pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 pub(crate) fn error_code(status: StatusCode) -> &'static str {
     match status {
         StatusCode::BAD_REQUEST => "bad_request",
+        StatusCode::UNAUTHORIZED => "unauthorized",
+        StatusCode::BAD_GATEWAY => "bad_gateway",
         StatusCode::NOT_FOUND => "not_found",
         StatusCode::CONFLICT => "conflict",
         StatusCode::PAYLOAD_TOO_LARGE => "too_large",

@@ -35,6 +35,8 @@ pub fn apps() -> Vec<Arc<dyn ScrapeApp>> {
         Arc::new(app_crawl::Crawl),
         Arc::new(app_smlouvy_dump_watch::SmlouvyDumpWatch),
         Arc::new(app_provisioner::Provisioner),
+        Arc::new(app_transact::Transact),
+        Arc::new(app_peer::Peer),
     ]
 }
 
@@ -71,6 +73,117 @@ pub(crate) fn tool_definition(app: &dyn ScrapeApp) -> Value {
         "requires": requires,
         "ready": ready,
     })
+}
+
+// ---- Dynamic apps (M28 v1 slice: discovery + listing ONLY) ------------------
+//
+// Kept deliberately separate from the static `apps()` list above: static
+// entries are compiled-in `ScrapeApp` impls added one line at a time; dynamic
+// entries are `.wasm` modules discovered at boot from `[plugins] app_dir` and
+// surfaced READ-ONLY. Nothing below ever produces something the worker can run.
+
+/// Why every dynamic app is `runnable: false` in this build. Returned verbatim
+/// in listings and in the enqueue rejection so the two surfaces cannot drift.
+pub(crate) const DYNAMIC_NOT_RUNNABLE_REASON: &str =
+    "dynamic WASM apps are discovery-only in this build: running one requires the \
+     component-model host (typed WIT world, async host imports for fetch/storage, \
+     fuel + wall-clock + spend budgets across the boundary) — the next slice. \
+     Enqueue is rejected outright; no partial execution path exists.";
+
+/// Discovers dynamic apps in `[plugins] app_dir` (feature OFF when unset) and
+/// renders each as a read-only `GET /apps` listing entry. A dynamic app whose
+/// name collides with a compiled-in app is skipped with a warning — static
+/// registration always wins, and a file in a data dir must never shadow it.
+pub(crate) fn dynamic_app_entries(
+    cfg: &pumper_core::config::PluginConfig,
+    static_apps: &std::collections::HashMap<String, Arc<dyn ScrapeApp>>,
+) -> Vec<Value> {
+    let Some(dir) = &cfg.app_dir else {
+        return Vec::new();
+    };
+    pumper_engine_wasm::discover_dynamic_apps(dir)
+        .into_iter()
+        .filter(|d| {
+            let clash = static_apps.contains_key(&d.name);
+            if clash {
+                tracing::warn!(
+                    name = %d.name,
+                    "dynamic app shadows a compiled-in app — skipped (static wins)"
+                );
+            }
+            !clash
+        })
+        .map(|d| dynamic_entry(&d.name, &d.manifest))
+        .collect()
+}
+
+/// Maps one discovered manifest to its listing entry. Mirrors the static-app
+/// listing keys where they make sense (`name`, `description`, `schedule`,
+/// `requires`, `ready`, `has_params_schema`) and adds the dynamic contract:
+/// `dynamic: true`, `runnable: false`, and the reason string. The module's
+/// filename is the authoritative name; a `name` key inside the manifest is
+/// ignored, matching the plugin-manifest convention.
+fn dynamic_entry(name: &str, manifest: &Value) -> Value {
+    let description = manifest
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("(dynamic app: describe() provided no description)");
+    let params_schema = manifest.get("params_schema").cloned();
+    json!({
+        "name": name,
+        "description": description,
+        "schedule": Value::Null,
+        "requires": ["host:component-model"],
+        "ready": false,
+        "dynamic": true,
+        "runnable": false,
+        "reason": DYNAMIC_NOT_RUNNABLE_REASON,
+        "has_params_schema": params_schema.is_some(),
+        "params_schema": params_schema.unwrap_or(Value::Null),
+    })
+}
+
+#[cfg(test)]
+mod dynamic_tests {
+    use super::{dynamic_entry, DYNAMIC_NOT_RUNNABLE_REASON};
+    use serde_json::json;
+
+    /// The invariant this slice exists to hold: whatever a module's describe()
+    /// claims — including lying about being runnable or smuggling a name — the
+    /// listing entry is read-only: `dynamic: true`, `runnable: false`, reason
+    /// attached, filename-authoritative name.
+    #[test]
+    fn dynamic_entries_are_never_runnable_and_filename_named() {
+        let manifests = [
+            json!({ "description": "well-behaved", "params_schema": { "type": "object" } }),
+            json!({ "name": "impostor", "runnable": true, "dynamic": false }),
+            json!({}),
+        ];
+        for manifest in &manifests {
+            let entry = dynamic_entry("disk_name", manifest);
+            assert_eq!(entry["name"], "disk_name");
+            assert_eq!(entry["dynamic"], true);
+            assert_eq!(entry["runnable"], false);
+            assert_eq!(entry["ready"], false);
+            assert_eq!(entry["reason"], DYNAMIC_NOT_RUNNABLE_REASON);
+        }
+    }
+
+    #[test]
+    fn dynamic_entry_maps_manifest_description_and_schema() {
+        let entry = dynamic_entry(
+            "quotes",
+            &json!({ "description": "scrapes quotes", "params_schema": { "type": "object" } }),
+        );
+        assert_eq!(entry["description"], "scrapes quotes");
+        assert_eq!(entry["has_params_schema"], true);
+        assert_eq!(entry["params_schema"]["type"], "object");
+        // And the degraded shape: no description, no schema.
+        let bare = dynamic_entry("bare", &json!({}));
+        assert!(bare["description"].as_str().unwrap().contains("no description"));
+        assert_eq!(bare["has_params_schema"], false);
+        assert!(bare["params_schema"].is_null());
+    }
 }
 
 #[cfg(test)]

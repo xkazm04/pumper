@@ -88,6 +88,42 @@ async fn aged_out_pin_lapses_and_earns_a_fresh_strike_count() {
 }
 
 #[tokio::test]
+async fn observations_count_outcomes_and_gate_the_weather_export() {
+    let store = fresh_db("tier-weather").await;
+    let tiers = TierMemory::new(store.storage.pool(), 0);
+
+    // 3 outcomes (2 losses + 1 win) — every recorded outcome counts, and a
+    // win resets strikes without resetting the evidence counter.
+    tiers.record("deep.example", "browser", true).await.unwrap();
+    tiers.record("deep.example", "browser", true).await.unwrap();
+    tiers.record("deep.example", "http", false).await.unwrap();
+    // 1 outcome; and a skip-path record (browser win, no http attempt) that
+    // must not count because it teaches nothing.
+    tiers.record("thin.example", "claude", true).await.unwrap();
+    tiers.record("thin.example", "browser", false).await.unwrap();
+    // Penalty-only snapshot rows never accrue observations.
+    tiers
+        .save_penalties(&[("penalty.example".into(), 1000)])
+        .await
+        .unwrap();
+
+    let deep = tiers.get("deep.example").await.unwrap().unwrap();
+    assert_eq!(deep.observations, 3);
+    assert_eq!(deep.http_strikes, 0, "win reset strikes, kept observations");
+    assert_eq!(
+        tiers.get("thin.example").await.unwrap().unwrap().observations,
+        1
+    );
+
+    // The export floor keeps thin and penalty-only hosts home.
+    let exported = tiers.export_weather(2).await.unwrap();
+    assert_eq!(exported.len(), 1, "only the well-observed host travels");
+    assert_eq!(exported[0].host, "deep.example");
+    // Floor 0 exports everything, including the penalty-only row.
+    assert_eq!(tiers.export_weather(0).await.unwrap().len(), 3);
+}
+
+#[tokio::test]
 async fn penalties_persist_and_reload_and_forget_resets() {
     let store = fresh_db("tier-penalty").await;
     let storage = &store.storage;

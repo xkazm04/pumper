@@ -4,6 +4,7 @@ members = [
     "crates/core",
     "crates/engine-http",
     "crates/engine-archive",
+    "crates/engine-remote",
     "crates/engine-browser",
     "crates/engine-claude",
     "crates/engine-wasm",
@@ -21,6 +22,7 @@ edition = "2021"
 pumper-core = { path = "crates/core" }
 pumper-engine-http = { path = "crates/engine-http" }
 pumper-engine-archive = { path = "crates/engine-archive" }
+pumper-engine-remote = { path = "crates/engine-remote" }
 pumper-engine-browser = { path = "crates/engine-browser" }
 pumper-engine-claude = { path = "crates/engine-claude" }
 pumper-engine-wasm = { path = "crates/engine-wasm" }
@@ -54,6 +56,8 @@ app-plugin = { path = "crates/apps/plugin" }
 app-smlouvy-dump-watch = { path = "crates/apps/smlouvy-dump-watch" }
 app-crawl = { path = "crates/apps/crawl" }
 app-provisioner = { path = "crates/apps/provisioner" }
+app-transact = { path = "crates/apps/transact" }
+app-peer = { path = "crates/apps/peer" }
 
 # async runtime + web
 tokio = { version = "1", features = ["full"] }

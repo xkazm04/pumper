@@ -10,7 +10,10 @@
 
 mod body_limit;
 mod durable;
+mod fetch_proxy;
+mod dynamic_apps;
 mod harness;
+mod host_weather;
 mod mcp;
 mod mcp_live;
 mod router;

@@ -418,6 +418,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "app-peer"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pumper-core",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "app-plugin"
 version = "0.1.0"
 dependencies = [
@@ -497,6 +507,17 @@ dependencies = [
  "pumper-core",
  "serde_json",
  "trades-common",
+]
+
+[[package]]
+name = "app-transact"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "pumper-core",
+ "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -3705,6 +3726,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "pumper-engine-remote"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "pumper-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "pumper-engine-search"
 version = "0.1.0"
 dependencies = [
@@ -3751,6 +3784,7 @@ dependencies = [
  "app-homewyse-pricing",
  "app-mpsv-ispv",
  "app-mpsv-vpm",
+ "app-peer",
  "app-plugin",
  "app-provisioner",
  "app-readable",
@@ -3759,6 +3793,7 @@ dependencies = [
  "app-state-licensing",
  "app-state-tax",
  "app-trade-wages",
+ "app-transact",
  "app-valuation-multiples",
  "app-watch",
  "async-stream",
@@ -3777,6 +3812,7 @@ dependencies = [
  "pumper-engine-browser",
  "pumper-engine-claude",
  "pumper-engine-http",
+ "pumper-engine-remote",
  "pumper-engine-search",
  "pumper-engine-wasm",
  "reqwest 0.12.28",

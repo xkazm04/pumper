@@ -25,6 +25,7 @@ pub struct Config {
     pub resilience: ResilienceConfig,
     pub datahub: DatahubConfig,
     pub archive: ArchiveConfig,
+    pub remote: RemoteConfig,
     pub recipes: RecipesConfig,
     pub catalog: CatalogConfig,
     pub contracts: ContractsConfig,
@@ -228,6 +229,54 @@ impl Default for ArchiveConfig {
         Self {
             enabled: false,
             base_url: "https://web.archive.org".into(),
+        }
+    }
+}
+
+/// Distributed fetch fabric (M17 v1). One config drives both sides of the seam:
+///
+/// - **serving**: when `enabled` and `secret` is set, this node's
+///   `POST /fetch-proxy` route accepts a serialized `HttpRequest` from a peer
+///   (authenticated by the shared secret) and runs it through the LOCAL fetch
+///   stack — HTTP engine, politeness governor, cache, body caps — returning the
+///   response as JSON.
+/// - **dispatching**: when `enabled` and `nodes` is non-empty, the tiered
+///   fetcher's live-HTTP tier routes through the remote engine: round-robin
+///   over `nodes`, falling back to the local engine on any node error.
+///
+/// Default OFF with no nodes: nothing is served, nothing is dispatched, and the
+/// fetcher behaves exactly as before. Cluster-wide governor state is a later
+/// slice (M01's host-weather bundle) — each node governs targets independently.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RemoteConfig {
+    /// Master switch for BOTH sides. `false` = `/fetch-proxy` rejects every
+    /// call and the remote engine is never built.
+    pub enabled: bool,
+    /// Peer base URLs to dispatch fetches to (e.g. `"http://10.0.0.2:8088"`).
+    /// Empty = serve-only: this node accepts proxied fetches but never sends any.
+    pub nodes: Vec<String>,
+    /// Shared secret, sent/required in the `x-pumper-remote-secret` header.
+    /// MUST be non-empty when `enabled` — an unauthenticated `/fetch-proxy`
+    /// would be an open proxy.
+    pub secret: String,
+    /// Per proxy call timeout (seconds), end to end, on the dispatching side.
+    pub timeout_secs: u64,
+    /// Cap (bytes) on a proxied response body: the serving side clamps the
+    /// inner request's `max_body_bytes` to this, and the dispatching side sizes
+    /// its transport cap from it.
+    pub max_body_bytes: u64,
+}
+
+impl Default for RemoteConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            nodes: Vec::new(),
+            secret: String::new(),
+            timeout_secs: 60,
+            // Matches `[http] max_body_bytes`' 16 MiB default.
+            max_body_bytes: DEFAULT_MAX_BODY_BYTES,
         }
     }
 }
@@ -626,6 +675,38 @@ impl Config {
                 "[archive] base_url ('{}') must be an absolute http(s) URL",
                 a.base_url
             )));
+        }
+
+        // Remote fetch fabric. An enabled fabric without a secret is an OPEN
+        // PROXY (any caller could fetch arbitrary URLs from this node's IP);
+        // a node URL that isn't absolute http(s) fails far away on every
+        // dispatch; zero caps parse fine and then reject/starve every call.
+        let rm = &self.remote;
+        if rm.enabled {
+            if rm.secret.trim().is_empty() {
+                return Err(Error::Config(
+                    "[remote] secret must be set when the fetch fabric is enabled — \
+                     an unauthenticated /fetch-proxy is an open proxy"
+                        .into(),
+                ));
+            }
+            for node in &rm.nodes {
+                if !matches!(
+                    url::Url::parse(node).as_ref().map(|u| u.scheme()),
+                    Ok("http") | Ok("https")
+                ) {
+                    return Err(Error::Config(format!(
+                        "[remote] node ('{node}') must be an absolute http(s) URL"
+                    )));
+                }
+            }
+            if rm.timeout_secs == 0 || rm.max_body_bytes == 0 {
+                return Err(Error::Config(format!(
+                    "[remote] timeout_secs ({}) and max_body_bytes ({}) must be > 0 \
+                     when the fetch fabric is enabled",
+                    rm.timeout_secs, rm.max_body_bytes
+                )));
+            }
         }
 
         // A zero strike threshold would un-validate a recipe on its first
@@ -1108,6 +1189,12 @@ pub struct PluginConfig {
     /// `max_memory_mb × concurrent_calls` of wasm memory and can saturate tokio's
     /// blocking pool. `0` → `available_parallelism()` (fallback 4). Default: 0.
     pub max_concurrent: usize,
+    /// Optional directory scanned for **dynamic app** `.wasm` modules (M28 v1
+    /// slice). A module here that exports `describe()` is listed READ-ONLY in
+    /// `GET /apps` (`dynamic: true, runnable: false`) — discovery + manifest
+    /// only; executing dynamic apps needs the component-model host (next
+    /// slice). `None` (the default) disables discovery entirely.
+    pub app_dir: Option<PathBuf>,
 }
 
 impl Default for PluginConfig {
@@ -1118,6 +1205,7 @@ impl Default for PluginConfig {
             fuel: 200_000_000,
             max_memory_mb: 64,
             max_concurrent: 0,
+            app_dir: None,
         }
     }
 }
@@ -1154,6 +1242,49 @@ mod tests {
         Config::default()
             .validate()
             .expect("shipped defaults must satisfy their own invariants");
+    }
+
+    #[test]
+    fn remote_defaults_are_off_and_empty() {
+        let r = RemoteConfig::default();
+        assert!(!r.enabled);
+        assert!(r.nodes.is_empty());
+        assert!(r.secret.is_empty());
+        assert_eq!(r.timeout_secs, 60);
+        assert_eq!(r.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
+        // Disabled: the empty secret is inert.
+        Config::default().validate().expect("default [remote] is valid");
+    }
+
+    #[test]
+    fn enabled_remote_without_a_secret_or_with_bad_nodes_is_rejected() {
+        // No secret => open proxy => rejected at boot.
+        let mut cfg = Config::default();
+        cfg.remote.enabled = true;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("[remote] secret"), "{err}");
+
+        // A relative / schemeless node URL fails every dispatch far from here.
+        let mut cfg = Config::default();
+        cfg.remote.enabled = true;
+        cfg.remote.secret = "s3cret".into();
+        cfg.remote.nodes = vec!["node-a:8088".into()];
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("[remote] node"), "{err}");
+
+        // Zero caps starve/reject every call.
+        let mut cfg = Config::default();
+        cfg.remote.enabled = true;
+        cfg.remote.secret = "s3cret".into();
+        cfg.remote.max_body_bytes = 0;
+        assert!(cfg.validate().is_err());
+
+        // Enabled + secret + absolute nodes (or none: serve-only) is valid.
+        let mut cfg = Config::default();
+        cfg.remote.enabled = true;
+        cfg.remote.secret = "s3cret".into();
+        cfg.remote.nodes = vec!["http://10.0.0.2:8088".into()];
+        cfg.validate().expect("a well-formed [remote] validates");
     }
 
     #[test]

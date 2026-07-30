@@ -18,6 +18,15 @@ use crate::state::{AppState, AppStateParts};
 /// the supplied apps registered, and worker knobs tuned for fast tests. The
 /// returned `TempStore` must be kept alive for the state's lifetime.
 pub async fn test_state(apps: Vec<Arc<dyn ScrapeApp>>) -> (AppState, TempStore) {
+    test_state_with(apps, |_| {}).await
+}
+
+/// [`test_state`] with a config hook applied after the standard test tuning —
+/// for tests exercising config-gated surfaces (e.g. `[plugins] app_dir`).
+pub async fn test_state_with(
+    apps: Vec<Arc<dyn ScrapeApp>>,
+    tweak: impl FnOnce(&mut Config),
+) -> (AppState, TempStore) {
     let store = TempStore::new("server-e2e").await;
     let mut config = Config::default();
     config.storage.database_path = store.path().join("pumper.db");
@@ -26,6 +35,7 @@ pub async fn test_state(apps: Vec<Arc<dyn ScrapeApp>>) -> (AppState, TempStore) 
     config.worker.shutdown_drain_secs = 1;
     config.worker.job_timeout_secs = 30;
     config.worker.heartbeat_secs = 0;
+    tweak(&mut config);
 
     let mut registry: HashMap<String, Arc<dyn ScrapeApp>> = HashMap::new();
     for app in apps {

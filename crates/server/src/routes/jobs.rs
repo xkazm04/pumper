@@ -64,6 +64,7 @@ pub(crate) struct EnqueueBody {
         (status = 202, description = "Job enqueued", body = Object),
         (status = 200, description = "Idempotency-Key replay: the original job", body = Object),
         (status = 404, description = "Unknown app", body = Object),
+        (status = 409, description = "The name is a discovered dynamic WASM app (`GET /apps` lists it with `dynamic: true, runnable: false`) — listed but not runnable in this build; the message carries the reason", body = Object),
         (status = 422, description = "Merged params fail the app's declared JSON Schema (message carries JSON-pointer paths)", body = Object),
     )
 )]
@@ -74,6 +75,24 @@ pub(crate) async fn enqueue_job(
     body: Option<Json<EnqueueBody>>,
 ) -> Result<(StatusCode, Json<Job>), ApiError> {
     let Some(app) = state.registry.get(&name) else {
+        // Not compiled in — but if discovery listed it as a dynamic app, say so
+        // precisely (409 + the listing's own reason) instead of a blank 404:
+        // dynamic apps are read-only manifests until the component-model host
+        // lands, and nothing here may pretend otherwise.
+        if let Some(entry) = state
+            .dynamic_apps
+            .iter()
+            .find(|e| e.get("name").and_then(serde_json::Value::as_str) == Some(name.as_str()))
+        {
+            let reason = entry
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or(crate::registry::DYNAMIC_NOT_RUNNABLE_REASON);
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!("dynamic app '{name}' is not runnable: {reason}"),
+            ));
+        }
         return Err(ApiError(
             StatusCode::NOT_FOUND,
             format!("unknown app '{name}'"),
