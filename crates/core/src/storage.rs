@@ -1577,10 +1577,31 @@ impl Storage {
                 n.source_dataset, n.target_dataset
             )));
         }
+        // Aggregate specs (v2) are group-shaped, not row-shaped: they cannot
+        // carry a per-row lookup or projection, and they share the stored
+        // `lookup` column — validated here, the one write path a spec enters
+        // through, so every stored spec is evaluable.
+        if let Some(group) = n.group {
+            if n.lookup.is_some() {
+                return Err(Error::BadRequest(
+                    "a derived spec cannot combine aggregates with lookup".into(),
+                ));
+            }
+            if !n.project.is_empty() {
+                return Err(Error::BadRequest(
+                    "a derived spec cannot combine aggregates with project \
+                     (group rows are synthesized, not projected per record)"
+                        .into(),
+                ));
+            }
+            crate::datasets::validate_group(group)?;
+        }
         let id = Uuid::new_v4().to_string();
-        let lookup_json = n
-            .lookup
-            .map(|l| serde_json::to_string(l).unwrap_or_else(|_| "null".into()));
+        let lookup_json = match (n.lookup, n.group) {
+            (Some(l), _) => Some(serde_json::to_string(l).unwrap_or_else(|_| "null".into())),
+            (None, Some(g)) => Some(serde_json::to_string(g).unwrap_or_else(|_| "null".into())),
+            (None, None) => None,
+        };
         sqlx::query(
             "INSERT INTO derived (id, source_app, source_dataset, target_dataset, filters, \
              project, lookup, enabled, created_at) \
@@ -1655,6 +1676,8 @@ pub struct NewDerivedSpec<'a> {
     pub filters: &'a [String],
     pub project: &'a std::collections::BTreeMap<String, String>,
     pub lookup: Option<&'a crate::datasets::DerivedLookup>,
+    /// Aggregate half (M11 v2); mutually exclusive with `lookup`/`project`.
+    pub group: Option<&'a crate::datasets::DerivedGroup>,
 }
 
 /// Hard cap on one checkpoint blob (bytes). Generous enough for a 100k-URL

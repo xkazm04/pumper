@@ -104,7 +104,9 @@ impl AppState {
             registry,
         } = parts;
         let datasets = Arc::new(
-            Datasets::new(storage.pool()).with_derived_max_depth(config.derived.max_depth),
+            Datasets::new(storage.pool())
+                .with_derived_max_depth(config.derived.max_depth)
+                .with_max_group_scan(config.derived.max_group_scan),
         );
         let costs = Arc::new(CostLedger::new(storage.pool()));
         let cache = Arc::new(HttpCache::new(storage.pool(), &config.cache));
@@ -174,6 +176,10 @@ impl AppState {
             .archive
             .enabled
             .then(|| Arc::new(ArchiveEngine::new(&config.archive, http.clone())) as _);
+        // Learned API-recipe source (`[recipes]`, M05): always wired so a
+        // per-request `use_recipes` opt-in works even with the global switch
+        // off; with neither opt-in the fetcher never consults it.
+        let recipes: Arc<dyn pumper_core::RecipeSource> = Arc::new(storage.recipes());
         let fetch = Fetcher::new(
             http.clone(),
             browser.clone(),
@@ -181,7 +187,8 @@ impl AppState {
             governor.clone(),
             &config.fetcher,
         )
-        .with_archive(archive);
+        .with_archive(archive)
+        .with_recipes(Some(recipes), &config.recipes);
         let engines = Arc::new(EngineSet::new(http, browser, claude, fetch));
 
         let plugins: Arc<dyn Plugins> = if config.plugins.enabled {

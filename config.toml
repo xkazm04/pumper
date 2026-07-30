@@ -85,6 +85,18 @@ enabled = false
 enabled = false
 # base_url = "https://web.archive.org"   # override for a self-hosted pywb
 
+# Learned API-recipe replay (M05, see GET /recipes). When enabled (or a fetch
+# sets `use_recipes`), a VALIDATED recipe for the request's host replays the
+# page's discovered JSON API ahead of the archive and live tiers — one governed
+# HTTP call, structured JSON back (TierTrace tier `api_recipe`). A failed/thin
+# replay records a strike and always falls through to archive/live;
+# `max_failures` consecutive strikes un-validate the recipe.
+[recipes]
+enabled = false
+# auto_validate = false   # ON: also try unvalidated recipes; a successful
+#                         # overlapping replay marks them validated
+# max_failures = 3        # consecutive failed replays that un-validate
+
 [browser]
 chrome_executable = 'C:\Program Files\Google\Chrome\Application\chrome.exe'
 headless = true
@@ -179,15 +191,18 @@ sketch_retention_runs = 60       # runs of per-field sketches kept (>= window_ru
 [catalog]
 auto_reconcile = false   # true = apply the boot plan automatically (orphans are still never touched)
 
-# MCP server — mounts POST /mcp (streamable-HTTP JSON-RPC) exposing the app
+# MCP server — mounts /mcp: POST (streamable-HTTP JSON-RPC) exposing the app
 # registry, datasets, and search as native agent tools, plus catalog + app
-# manifests as resources. Read-mostly by design: the enqueue tool (the one that
-# spends money and loads targets) has its own switch AND a hard budget ceiling.
+# manifests as resources; GET (SSE) streaming live JSON-RPC notifications
+# bridged from the event bus (?app=/?kind= filters, Last-Event-ID resume).
+# Read-mostly by design: the actuating tools (enqueue_job, fetch_readable,
+# deep_research) share one opt-in switch AND a hard budget ceiling.
 # See docs/features/mcp.md for the .mcp.json client snippet.
 [mcp]
 enabled = false
-# allow_enqueue = false      # second opt-in: offer the enqueue_job tool at all
+# allow_enqueue = false      # second opt-in: offer enqueue_job/fetch_readable/deep_research at all
 # max_job_budget_usd = 1.0   # hard clamp on any MCP-enqueued job's budget_usd (0 = free tiers only)
+# wait_job_max_secs = 60     # cap on the wait_job tool's timeout_secs (bounds one held tool call)
 
 # DataHub metadata shadow — pushes dataset entities, inferred schema, lineage,
 # and per-run freshness (operation) events to a DataHub GMS. Metadata only;

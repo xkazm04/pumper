@@ -25,6 +25,7 @@ pub struct Config {
     pub resilience: ResilienceConfig,
     pub datahub: DatahubConfig,
     pub archive: ArchiveConfig,
+    pub recipes: RecipesConfig,
     pub catalog: CatalogConfig,
     pub ingress: IngressConfig,
     pub mcp: McpConfig,
@@ -125,6 +126,10 @@ pub struct McpConfig {
     /// larger requested budget is clamped, an absent one defaults to this.
     /// `0` = MCP-enqueued jobs run with a zero budget (free tiers only).
     pub max_job_budget_usd: f64,
+    /// Cap (seconds) on the `wait_job` tool's `timeout_secs`: a larger request
+    /// is clamped, an absent one defaults to this. Bounds how long one MCP
+    /// tool call may hold its HTTP response open awaiting a terminal status.
+    pub wait_job_max_secs: u64,
 }
 
 impl Default for McpConfig {
@@ -133,6 +138,7 @@ impl Default for McpConfig {
             enabled: false,
             allow_enqueue: false,
             max_job_budget_usd: 1.0,
+            wait_job_max_secs: 60,
         }
     }
 }
@@ -206,6 +212,38 @@ impl Default for ArchiveConfig {
         Self {
             enabled: false,
             base_url: "https://web.archive.org".into(),
+        }
+    }
+}
+
+/// Learned API-recipe replay (M05 step 4): when a *validated* recipe (see
+/// `GET /recipes` and [`crate::recipes`]) exists for a fetch's host, the tiered
+/// fetcher replays the discovered JSON API ahead of the archive and live tiers,
+/// returning structured JSON with a `TierTrace` entry of tier `api_recipe`.
+/// Default OFF: recipes stay pure discovery data unless a fetch opts in
+/// (`FetchRequest.use_recipes`) or this section flips `enabled = true`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RecipesConfig {
+    /// Master switch: consider recipes on every fetch. A single fetch can opt
+    /// in without it via `FetchRequest.use_recipes = true`.
+    pub enabled: bool,
+    /// When ON, an *unvalidated* recipe is also tried opportunistically, and a
+    /// successful replay whose payload still overlaps the recipe's expected
+    /// field paths marks it validated. OFF (default) = only validated recipes
+    /// are ever replayed; validation stays a manual/operator decision.
+    pub auto_validate: bool,
+    /// Consecutive failed/thin replays after which a validated recipe is
+    /// un-validated (back to opportunistic-only). Must be >= 1.
+    pub max_failures: u32,
+}
+
+impl Default for RecipesConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            auto_validate: false,
+            max_failures: 3,
         }
     }
 }
@@ -370,11 +408,19 @@ pub struct DerivedConfig {
     /// hops past this are skipped (warn-logged). Cycles are rejected at
     /// spec-create time; this cap bounds the acyclic chains.
     pub max_depth: u32,
+    /// Max source rows one aggregate group re-scans during incremental
+    /// maintenance (M11 v2). A group past the bound gets a `stale: true`
+    /// derived row instead of a wrong number; `POST /derived/{id}/backfill`
+    /// computes it exactly and clears the flag.
+    pub max_group_scan: i64,
 }
 
 impl Default for DerivedConfig {
     fn default() -> Self {
-        Self { max_depth: 3 }
+        Self {
+            max_depth: 3,
+            max_group_scan: 10_000,
+        }
     }
 }
 
@@ -547,6 +593,17 @@ impl Config {
                 "[archive] base_url ('{}') must be an absolute http(s) URL",
                 a.base_url
             )));
+        }
+
+        // A zero strike threshold would un-validate a recipe on its first
+        // failure ever recorded — before any success could reset the counter —
+        // making auto-validation a one-shot coin flip. Catch it at boot.
+        if self.recipes.max_failures == 0 {
+            return Err(Error::Config(
+                "[recipes] max_failures must be >= 1 — a validated recipe needs at \
+                 least one consecutive failure before it is un-validated"
+                    .into(),
+            ));
         }
 
         // Ingress guards only bind when the surface is actually reachable. A
@@ -1186,6 +1243,19 @@ mod tests {
         assert!(!a.enabled, "the archive tier must be opt-in");
         assert_eq!(a.base_url, "https://web.archive.org");
         Config::default().validate().unwrap();
+    }
+
+    #[test]
+    fn recipes_ship_fully_off_and_reject_a_zero_strike_threshold() {
+        let r = RecipesConfig::default();
+        assert!(!r.enabled, "recipe replay must be opt-in");
+        assert!(!r.auto_validate, "auto-validation must be opt-in");
+        assert_eq!(r.max_failures, 3);
+
+        let mut cfg = Config::default();
+        cfg.recipes.max_failures = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("[recipes] max_failures"), "{err}");
     }
 
     #[test]
