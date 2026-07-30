@@ -262,6 +262,7 @@ dependencies = [
  "census-common",
  "pumper-core",
  "serde_json",
+ "trades-common",
 ]
 
 [[package]]
@@ -273,6 +274,7 @@ dependencies = [
  "census-common",
  "pumper-core",
  "serde_json",
+ "trades-common",
 ]
 
 [[package]]
@@ -284,6 +286,7 @@ dependencies = [
  "census-common",
  "pumper-core",
  "serde_json",
+ "trades-common",
 ]
 
 [[package]]

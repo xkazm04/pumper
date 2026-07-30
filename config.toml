@@ -223,6 +223,9 @@ gms_url = "http://localhost:8080"             # local docker quickstart (Cloud: 
 # env = "PROD"                                # URN fabric segment
 # emit_schema = true                          # infer schemaMetadata from each dataset's newest record
 # emit_profile = true                         # emit row-count datasetProfile
+# emit_flows = true                           # M25: schedules as dataFlow, runs as dataJob (in/out edges), trigger DAG + RuleSet column lineage
+# govern = false                              # M26: OPT-IN pull loop — DataHub deprecation / cost:pause tags / failing assertions act on the fleet
+# govern_interval_secs = 300                  # governance poll cadence (min 30)
 
 # Information economics (M04) — GET /economics joins the cost ledger with
 # per-job yield (job_yield) into $/new-record and $/changed-record per app over
