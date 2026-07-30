@@ -12,6 +12,7 @@ use pumper_core::{
     DocReport, Error, FetchHealth, FetchRequest, FetchStrategy, FieldStatus, ManifestExample,
     ObservedDoc, Record, Result, RuleSet, ScrapeApp, UpsertSummary,
 };
+use app_crawl::reliability;
 use pumper_core::config::ArchiveConfig;
 use pumper_engine_archive::ArchiveEngine;
 use serde_json::{json, Value};
@@ -277,7 +278,7 @@ async fn extract_and_upsert(
     // Health verdict FIRST, then the write: the state settled here is what the
     // upsert below gates on (trust stamp, quarantine dataset, removal
     // suppression). Judging afterwards would stamp a verdict that did not exist.
-    let verdict = observe(ctx, dataset, &keys, docs, &reported, fetch).await;
+    let verdict = observe(ctx, dataset, &keys, docs, &reported, fetch, &worst).await;
 
     let mut records: Vec<Value> = Vec::with_capacity(reported.len());
     let items: Vec<(String, Value)> = keys
@@ -343,10 +344,14 @@ async fn observe(
     docs: Vec<String>,
     reported: &[(Value, DocReport)],
     fetch: FetchHealth,
+    worst: &[Value],
 ) -> Option<Value> {
     if !ctx.health.enabled() {
         return None;
     }
+    // Captured before `fetch` moves into the detector. Honest-Null when nothing
+    // was fetched (source mode over stored bodies) — never a fabricated 1.0.
+    let fetch_ok_rate = (fetch.attempted > 0).then(|| fetch.rate());
     let values: Vec<Value> = reported.iter().map(|(v, _)| v.clone()).collect();
     // Fingerprinting parses each body once more, on the same rayon path the
     // extraction ran on — off the async runtime so it can't stall the reactor.
@@ -366,7 +371,7 @@ async fn observe(
         })
         .collect();
     match ctx.observe_extraction(dataset, &observed, fetch).await {
-        Ok(verdict) => verdict.map(|v| {
+        Ok(Some(v)) => {
             if v.state != v.previous_state {
                 tracing::warn!(
                     source = %v.source_id,
@@ -377,13 +382,71 @@ async fn observe(
                     "extraction health state changed"
                 );
             }
-            json!(v)
-        }),
+            // Web Reliability Index (M41): persist the verdict the detector just
+            // rendered — previously consumed once (the log line above + one job
+            // result) and discarded. Attributed to each host the run's keys
+            // resolve to; the verdict itself is per source (`{app}/{dataset}`),
+            // which the stored record flags via `verdict_scope: "source"`.
+            // Best-effort inside `record_observations`, never fails the run.
+            let mut hosts: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
+            for key in keys {
+                if let Some(host) = observation_host(key) {
+                    *hosts.entry(host).or_default() += 1;
+                }
+            }
+            let worst_kept: Vec<Value> = worst.iter().take(5).cloned().collect();
+            let deltas: Vec<(String, reliability::HostDelta)> = hosts
+                .into_iter()
+                .map(|(host, host_docs)| {
+                    (
+                        host,
+                        reliability::HostDelta::Extraction(reliability::ExtractionObs {
+                            source_id: v.source_id.clone(),
+                            state: v.state.as_str().to_string(),
+                            previous_state: v.previous_state.as_str().to_string(),
+                            score: v.score,
+                            diagnosis: v.diagnosis.map(|d| d.as_str().to_string()),
+                            docs: host_docs,
+                            fetch_ok_rate,
+                            worst_fields: worst_kept.clone(),
+                        }),
+                    )
+                })
+                .collect();
+            reliability::record_observations(&ctx.datasets, &ctx.job_id.to_string(), deltas)
+                .await;
+            Some(json!(v))
+        }
+        Ok(None) => None,
         Err(e) => {
             tracing::warn!("extraction health evaluation failed: {e}");
             None
         }
     }
+}
+
+/// Host a document key attributes its reliability observation to. Keys are
+/// source URLs (urls mode) or dataset keys (source mode — the crawl `pages`
+/// key IS the canonical URL; historical archive keys are `{url}@{date}`).
+/// Non-URL keys yield `None` — an observation is only recorded when the host
+/// is actually known, never guessed from an opaque key.
+fn observation_host(key: &str) -> Option<String> {
+    if !(key.starts_with("http://") || key.starts_with("https://")) {
+        return None;
+    }
+    // Strip a historical `@YYYY-MM-DD` suffix so a bare-domain archive key
+    // (`https://x.com@2026-01-01`) can't misparse the date as the host.
+    let key = match key.rsplit_once('@') {
+        Some((prefix, suffix))
+            if suffix.len() == 10
+                && suffix.chars().all(|c| c.is_ascii_digit() || c == '-') =>
+        {
+            prefix
+        }
+        _ => key,
+    };
+    app_crawl::host_of(key)
 }
 
 #[async_trait]
@@ -1222,6 +1285,43 @@ fn tier_won(out: &pumper_core::FetchOutcome) -> bool {
         t.verdict == pumper_core::TierVerdict::Ok
             && t.http_status.is_none_or(|s| (200..300).contains(&s))
     })
+}
+
+#[cfg(test)]
+mod observation_host_tests {
+    use super::observation_host;
+
+    #[test]
+    fn resolves_url_keys_to_hosts() {
+        assert_eq!(
+            observation_host("https://Example.COM/jobs?page=2"),
+            Some("example.com".into())
+        );
+        assert_eq!(
+            observation_host("http://example.com"),
+            Some("example.com".into())
+        );
+    }
+
+    #[test]
+    fn strips_historical_archive_date_suffix() {
+        assert_eq!(
+            observation_host("https://example.com/page@2026-01-01"),
+            Some("example.com".into())
+        );
+        // Bare-domain archive key: without the strip, `@` would misparse the
+        // date as the host (userinfo rule).
+        assert_eq!(
+            observation_host("https://example.com@2026-01-01"),
+            Some("example.com".into())
+        );
+    }
+
+    #[test]
+    fn non_url_keys_yield_no_host() {
+        assert_eq!(observation_host("CA:electrician"), None);
+        assert_eq!(observation_host("opportunity-12345"), None);
+    }
 }
 
 #[cfg(test)]
