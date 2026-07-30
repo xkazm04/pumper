@@ -8,6 +8,9 @@ name = "pumper"
 path = "src/main.rs"
 
 [dependencies]
+# Needed at build time (not just dev): the worker's JobCheckpointer implements
+# pumper-core's async CheckpointSink trait.
+async-trait.workspace = true
 pumper-core.workspace = true
 pumper-engine-http.workspace = true
 pumper-engine-archive.workspace = true

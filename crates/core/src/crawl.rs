@@ -124,10 +124,12 @@ pub struct CrawlConfig {
     /// Expand seeds from each seed host's sitemaps (robots.txt `Sitemap:`
     /// directives, falling back to /sitemap.xml).
     pub sitemap_seeds: bool,
-    /// Persist frontier state here (JSON): loaded at start when present, saved
-    /// periodically and at the end — so an interrupted or page-capped crawl
-    /// resumes where it left off instead of refetching everything.
-    pub checkpoint: Option<PathBuf>,
+    /// Frontier state persisted by a prior run (the JSON a checkpoint sink was
+    /// handed), restored at start — so an interrupted or page-capped crawl
+    /// resumes where it left off instead of refetching everything. Advisory: an
+    /// incompatible/unparseable value is discarded for a clean fresh start
+    /// (surfaced as `checkpoint_reset`), never resumed silently-wrong.
+    pub resume_state: Option<serde_json::Value>,
     /// Incremental recrawl / site-change sentinel mode. When true the frontier is
     /// seeded from existing `pages` records (via the [`PageSource`] seam) and each
     /// known page is fetched with a conditional GET using its stored
@@ -529,6 +531,11 @@ struct Fetched {
 /// `sink`, when provided, receives batches of [`CrawlPageRecord`] for KEPT pages
 /// during the crawl — the seam the app layer uses to upsert per-page
 /// fingerprints into the `pages` dataset without core knowing about storage.
+///
+/// `checkpointer`, when provided, receives the serialized frontier state
+/// (queue + seen-set + kept hashes) periodically and at the end — the durable
+/// -execution seam (`AppContext::checkpoints`). The same JSON comes back as
+/// `cfg.resume_state` on a resumed attempt.
 pub async fn crawl(
     http: Arc<dyn HttpClient>,
     cfg: CrawlConfig,
@@ -536,6 +543,7 @@ pub async fn crawl(
     mut sink: Option<Box<dyn PageSink>>,
     source: Option<Box<dyn PageSource>>,
     progress: Option<ProgressFn>,
+    checkpointer: Option<Arc<dyn crate::app::CheckpointSink>>,
 ) -> Result<CrawlStats> {
     let concurrency = cfg.concurrency.clamp(1, 256);
     // Buffer of kept-page fingerprints awaiting the next batched sink flush.
@@ -554,8 +562,8 @@ pub async fn crawl(
     // -seen URLs (including the seeds) aren't re-enqueued. An incompatible
     // (older-format) checkpoint is discarded for a clean fresh start — never a
     // silently-wrong partial resume.
-    if let Some(path) = &cfg.checkpoint {
-        match Checkpoint::load(path).await {
+    if let Some(state) = &cfg.resume_state {
+        match Checkpoint::from_value(state) {
             CheckpointLoad::Loaded(cp) => {
                 frontier.restore(cp.queue, cp.seen);
                 dedup_index = SimHashIndex::from_hashes(cfg.dedup_distance, cp.kept_hashes);
@@ -564,8 +572,7 @@ pub async fn crawl(
             CheckpointLoad::Incompatible => {
                 checkpoint_reset = true;
                 tracing::warn!(
-                    path = %path.display(),
-                    "crawl: checkpoint format incompatible — discarding for a fresh start"
+                    "crawl: restored checkpoint format incompatible — discarding for a fresh start"
                 );
             }
             CheckpointLoad::None => {}
@@ -778,7 +785,7 @@ pub async fn crawl(
                 }
             }
             // Periodic checkpoint, gated by wall-clock rather than page count.
-            // `Checkpoint::save` serializes the WHOLE frontier (up to MAX_FRONTIER
+            // `save_checkpoint` serializes the WHOLE frontier (up to MAX_FRONTIER
             // seen-strings + queue + kept hashes) — O(frontier), not O(delta) — so
             // firing it every N kept pages made total checkpoint work
             // O(pages/N × frontier): a 100k-page crawl did thousands of full ~10 MB
@@ -788,9 +795,9 @@ pub async fn crawl(
             // save below still captures the true end state, and the frontier's own
             // seen-set makes a resume idempotent, so widening the worst-case resume
             // loss from N pages to a few seconds is safe.
-            if cfg.checkpoint.is_some() && last_checkpoint.elapsed() >= CHECKPOINT_MIN_INTERVAL {
-                if let Some(path) = &cfg.checkpoint {
-                    if !Checkpoint::save(path, &frontier, dedup_index.hashes()).await {
+            if checkpointer.is_some() && last_checkpoint.elapsed() >= CHECKPOINT_MIN_INTERVAL {
+                if let Some(sink) = &checkpointer {
+                    if !save_checkpoint(sink, &frontier, dedup_index.hashes(), false).await {
                         stats.checkpoint_errors += 1;
                     }
                 }
@@ -842,8 +849,10 @@ pub async fn crawl(
     stats.frontier_remaining = frontier.len();
     stats.frontier_dropped = frontier.dropped();
     stats.skipped_host_budget = frontier.skipped_host_budget();
-    if let Some(path) = &cfg.checkpoint {
-        if !Checkpoint::save(path, &frontier, dedup_index.hashes()).await {
+    // Final, unthrottled save so the persisted state reflects the true end of
+    // the run (an incomplete crawl's remaining frontier is the resume point).
+    if let Some(sink) = &checkpointer {
+        if !save_checkpoint(sink, &frontier, dedup_index.hashes(), true).await {
             stats.checkpoint_errors += 1;
         }
     }
@@ -895,11 +904,11 @@ const CHECKPOINT_VERSION: u32 = 1;
 
 /// Result of attempting to restore a checkpoint.
 enum CheckpointLoad {
-    /// No checkpoint file present (or unreadable) — start fresh, not an error.
+    /// No checkpoint state present — start fresh, not an error.
     None,
     /// A compatible checkpoint restored.
     Loaded(Checkpoint),
-    /// A file existed but was an incompatible version / unparseable format;
+    /// State existed but was an incompatible version / unparseable format;
     /// discarded for a fresh start (surfaced as `checkpoint_reset`).
     Incompatible,
 }
@@ -918,53 +927,43 @@ struct Checkpoint {
 }
 
 impl Checkpoint {
-    async fn load(path: &PathBuf) -> CheckpointLoad {
-        // A missing/unreadable file is a fresh start, not a reset signal.
-        let Ok(bytes) = tokio::fs::read(path).await else {
+    /// Interprets restored state. `Null` is "nothing stored" (fresh start); a
+    /// present value that doesn't parse as the current version is an
+    /// incompatible/corrupt checkpoint — never resumed from silently.
+    fn from_value(state: &serde_json::Value) -> CheckpointLoad {
+        if state.is_null() {
             return CheckpointLoad::None;
-        };
-        // A file that IS present but doesn't parse as the current version is an
-        // incompatible/corrupt checkpoint — never resume from it silently.
-        match serde_json::from_slice::<Checkpoint>(&bytes) {
+        }
+        match serde_json::from_value::<Checkpoint>(state.clone()) {
             Ok(cp) if cp.version == CHECKPOINT_VERSION => CheckpointLoad::Loaded(cp),
             _ => CheckpointLoad::Incompatible,
         }
     }
+}
 
-    /// Best-effort save; checkpointing must never fail the crawl, but a failure
-    /// is no longer swallowed — returns `false` (and warn-logs) so the caller can
-    /// surface a `checkpoint_errors` count in the result.
-    async fn save(path: &PathBuf, frontier: &Frontier, kept_hashes: &[u64]) -> bool {
-        let cp = Checkpoint {
-            version: CHECKPOINT_VERSION,
-            queue: frontier.queued(),
-            seen: frontier.seen.iter().cloned().collect(),
-            kept_hashes: kept_hashes.to_vec(),
-        };
-        let bytes = match serde_json::to_vec(&cp) {
-            Ok(b) => b,
-            Err(e) => {
-                tracing::warn!(path = %path.display(), "crawl: checkpoint serialize failed: {e}");
-                return false;
-            }
-        };
-        if let Some(parent) = path.parent() {
-            if let Err(e) = tokio::fs::create_dir_all(parent).await {
-                tracing::warn!(path = %path.display(), "crawl: checkpoint dir create failed: {e}");
-                return false;
-            }
+/// Serializes the frontier state and hands it to the durable checkpoint sink.
+/// Best-effort: checkpointing must never fail the crawl, but a failure is not
+/// swallowed — returns `false` (warn-logged) so the caller can surface a
+/// `checkpoint_errors` count in the result. The sink throttles its own
+/// persistence; `force` bypasses that for the final end-of-run snapshot.
+async fn save_checkpoint(
+    sink: &Arc<dyn crate::app::CheckpointSink>,
+    frontier: &Frontier,
+    kept_hashes: &[u64],
+    force: bool,
+) -> bool {
+    let cp = Checkpoint {
+        version: CHECKPOINT_VERSION,
+        queue: frontier.queued(),
+        seen: frontier.seen.iter().cloned().collect(),
+        kept_hashes: kept_hashes.to_vec(),
+    };
+    match serde_json::to_value(&cp) {
+        Ok(state) => sink.save(state, force).await,
+        Err(e) => {
+            tracing::warn!("crawl: checkpoint serialize failed: {e}");
+            false
         }
-        // Write-then-rename so a crash mid-write can't corrupt the checkpoint.
-        let tmp = path.with_extension("json.tmp");
-        if let Err(e) = tokio::fs::write(&tmp, bytes).await {
-            tracing::warn!(path = %tmp.display(), "crawl: checkpoint write failed: {e}");
-            return false;
-        }
-        if let Err(e) = tokio::fs::rename(&tmp, path).await {
-            tracing::warn!(path = %path.display(), "crawl: checkpoint rename failed: {e}");
-            return false;
-        }
-        true
     }
 }
 
@@ -1545,7 +1544,7 @@ mod tests {
             include_patterns: vec![],
             exclude_patterns: vec![],
             sitemap_seeds: false,
-            checkpoint: None,
+            resume_state: None,
             revisit: false,
             discover: false,
         }
@@ -1586,6 +1585,7 @@ mod tests {
             test_cfg(&["https://ex.com/"]),
             None,
             Some(sink),
+            None,
             None,
             None,
         )
@@ -1642,6 +1642,7 @@ mod tests {
             None,
             None,
             Some(progress),
+            None,
         )
         .await
         .unwrap();
@@ -1720,7 +1721,7 @@ mod tests {
         let mut cfg = test_cfg(&[]);
         cfg.revisit = true;
 
-        let stats = crawl(http, cfg, None, Some(sink), Some(source), None)
+        let stats = crawl(http, cfg, None, Some(sink), Some(source), None, None)
             .await
             .unwrap();
 
@@ -1782,7 +1783,7 @@ mod tests {
         let mut cfg = test_cfg(&[]);
         cfg.revisit = true; // discover stays false
 
-        let stats = crawl(http, cfg, None, None, Some(source), None)
+        let stats = crawl(http, cfg, None, None, Some(source), None, None)
             .await
             .unwrap();
         assert_eq!(
@@ -1832,7 +1833,7 @@ mod tests {
             fail,
             ..Default::default()
         });
-        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, None, None)
+        let stats = crawl(http, test_cfg(&["https://ex.com/"]), None, None, None, None, None)
             .await
             .unwrap();
 
@@ -1906,43 +1907,104 @@ mod tests {
         assert!(!index.is_near_dup(!0u64));
     }
 
+    /// Collects every state blob handed to the checkpoint seam, so tests can
+    /// assert on what the crawl persists.
+    struct CollectCheckpoints(Arc<SyncMutex<Vec<serde_json::Value>>>);
+
+    #[async_trait]
+    impl crate::app::CheckpointSink for CollectCheckpoints {
+        async fn save(&self, state: serde_json::Value, _force: bool) -> bool {
+            self.0.lock().unwrap().push(state);
+            true
+        }
+    }
+
     #[tokio::test]
     async fn checkpoint_version_mismatch_forces_fresh_start() {
-        let dir = std::env::temp_dir().join(format!("pumper-crawl-cp-{}", std::process::id()));
-        tokio::fs::create_dir_all(&dir).await.unwrap();
-        let path = dir.join("cp.json");
-
-        // A missing file is a fresh start, not a reset.
+        // Null restored state is a fresh start, not a reset.
         assert!(matches!(
-            Checkpoint::load(&path).await,
+            Checkpoint::from_value(&serde_json::Value::Null),
             CheckpointLoad::None
         ));
 
-        // A pre-versioning file (no `version` field) parses as version 0 and is
+        // Pre-versioning state (no `version` field) parses as version 0 and is
         // rejected as incompatible rather than resumed silently-wrong.
-        tokio::fs::write(
-            &path,
-            br#"{"queue":[["https://x.com/",0]],"seen":["https://x.com/"],"kept_hashes":[1,2]}"#,
+        let old: serde_json::Value = serde_json::from_str(
+            r#"{"queue":[["https://x.com/",0]],"seen":["https://x.com/"],"kept_hashes":[1,2]}"#,
         )
-        .await
         .unwrap();
         assert!(matches!(
-            Checkpoint::load(&path).await,
+            Checkpoint::from_value(&old),
             CheckpointLoad::Incompatible
         ));
 
-        // A current-version checkpoint round-trips.
+        // A current-version checkpoint round-trips through the sink seam.
         let mut frontier = Frontier::new(None);
         frontier.push("https://x.com/".into(), 0);
-        assert!(Checkpoint::save(&path, &frontier, &[7u64]).await);
-        match Checkpoint::load(&path).await {
+        let saved = Arc::new(SyncMutex::new(Vec::new()));
+        let sink: Arc<dyn crate::app::CheckpointSink> =
+            Arc::new(CollectCheckpoints(saved.clone()));
+        assert!(save_checkpoint(&sink, &frontier, &[7u64], true).await);
+        let state = saved.lock().unwrap().pop().expect("one checkpoint saved");
+        match Checkpoint::from_value(&state) {
             CheckpointLoad::Loaded(cp) => {
                 assert_eq!(cp.version, CHECKPOINT_VERSION);
                 assert_eq!(cp.kept_hashes, vec![7]);
+                assert_eq!(cp.queue, vec![("https://x.com/".to_string(), 0)]);
             }
             _ => panic!("expected a compatible checkpoint to load"),
         }
-        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test]
+    async fn crawl_persists_and_resumes_frontier_state() {
+        // Run 1: a page-capped crawl leaves work in the frontier and hands its
+        // end state to the checkpoint sink.
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://ex.com/".to_string(),
+            (
+                200,
+                "<html><body><a href=\"/a\">a</a><a href=\"/b\">b</a></body></html>".to_string(),
+            ),
+        );
+        pages.insert(
+            "https://ex.com/a".to_string(),
+            (200, "<html><body><p>page a body</p></body></html>".to_string()),
+        );
+        pages.insert(
+            "https://ex.com/b".to_string(),
+            (200, "<html><body><p>page b body</p></body></html>".to_string()),
+        );
+        let http = Arc::new(MockHttp {
+            pages,
+            ..Default::default()
+        });
+        let mut cfg = test_cfg(&["https://ex.com/"]);
+        cfg.max_pages = 1;
+        cfg.concurrency = 1;
+        let saved = Arc::new(SyncMutex::new(Vec::new()));
+        let sink: Arc<dyn crate::app::CheckpointSink> =
+            Arc::new(CollectCheckpoints(saved.clone()));
+        let stats = crawl(http.clone(), cfg, None, None, None, None, Some(sink))
+            .await
+            .unwrap();
+        assert_eq!(stats.kept, 1);
+        assert!(!stats.resumed);
+        let state = saved.lock().unwrap().last().cloned().expect("final save");
+
+        // Run 2: restoring that state resumes (seen-set intact — the seed is not
+        // re-enqueued) and reports `resumed`.
+        let mut cfg = test_cfg(&["https://ex.com/"]);
+        cfg.concurrency = 1;
+        cfg.resume_state = Some(state);
+        let stats = crawl(http, cfg, None, None, None, None, None).await.unwrap();
+        assert!(stats.resumed, "restored state marks the run resumed");
+        assert!(!stats.checkpoint_reset);
+        assert_eq!(
+            stats.kept, 2,
+            "resume crawls only the remaining frontier, not the already-seen seed"
+        );
     }
 
     #[test]
@@ -2079,7 +2141,7 @@ mod tests {
             include_patterns: vec!["/blog/".into()],
             exclude_patterns: vec!["\\.pdf$".into()],
             sitemap_seeds: false,
-            checkpoint: None,
+            resume_state: None,
             revisit: false,
             discover: false,
         };

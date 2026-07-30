@@ -125,20 +125,59 @@ pub(crate) async fn run_one(state: &AppState) -> bool {
     }
 }
 
-/// Graceful-shutdown drain: waits up to `shutdown_drain_secs` for in-flight jobs
-/// to finish (each holds a semaphore permit, so reacquiring all of them means the
-/// queue is idle). Jobs still running when the deadline passes are re-queued —
-/// mirroring `recover_stuck` — so a slow job resumes cleanly on the next boot
-/// instead of being stranded in `running`.
+/// Graceful-shutdown drain: waits for in-flight jobs to finish (each holds a
+/// semaphore permit, so reacquiring all of them means the queue is idle) — but
+/// splits `shutdown_drain_secs` into two phases instead of waiting the whole
+/// window and abandoning whatever is left:
+///
+/// 1. **Clean finish** (deadline minus a suspend-grace slice): jobs that can
+///    complete, do.
+/// 2. **Cooperative suspend**: every still-running job's cancel token is fired.
+///    Under an active shutdown, `execute` treats that cancellation as *suspend*
+///    — the job is re-queued (`reset` semantics, attempts headroom granted) and
+///    its latest durable checkpoint resumes it on the next boot. This is the
+///    "checkpoint instead of abandon" half of durable execution.
+///
+/// Anything still running at the true deadline is re-queued via
+/// `recover_stuck`, exactly as before — its checkpoint also survives, since
+/// checkpoints are only cleared on completion.
 async fn drain(state: &AppState, semaphore: &Arc<Semaphore>, concurrency: usize) {
-    let deadline = Duration::from_secs(state.config.worker.shutdown_drain_secs);
+    let total_secs = state.config.worker.shutdown_drain_secs;
+    let deadline = Duration::from_secs(total_secs);
+    // Reserve the tail of the window for the suspend round-trip (token fire →
+    // requeue → permit release); 1–10s scaled to the configured window.
+    let grace = Duration::from_secs((total_secs / 5).clamp(1, 10).min(total_secs.max(1)));
+    let clean_window = deadline.saturating_sub(grace);
     info!(
         deadline_secs = deadline.as_secs(),
+        suspend_grace_secs = grace.as_secs(),
         "worker draining in-flight jobs"
     );
     let acquire = semaphore.clone().acquire_many_owned(concurrency as u32);
-    match tokio::time::timeout(deadline, acquire).await {
-        Ok(_) => info!("worker drained cleanly; no jobs left running"),
+    tokio::pin!(acquire);
+    if tokio::time::timeout(clean_window, &mut acquire).await.is_ok() {
+        info!("worker drained cleanly; no jobs left running");
+        return;
+    }
+    // Phase 2: signal cooperative suspend through the existing per-job cancel
+    // tokens. `execute` sees shutdown + cancellation and re-queues with the
+    // checkpoint intact rather than marking the job cancelled.
+    let tokens: Vec<_> = state
+        .job_cancels
+        .lock()
+        .unwrap()
+        .values()
+        .map(|(_, token)| token.clone())
+        .collect();
+    warn!(
+        jobs = tokens.len(),
+        "drain window closing; suspending in-flight jobs to their checkpoints"
+    );
+    for token in tokens {
+        token.cancel();
+    }
+    match tokio::time::timeout(grace, &mut acquire).await {
+        Ok(_) => info!("in-flight jobs suspended; checkpoints will resume them on next boot"),
         Err(_) => match state.storage.recover_stuck().await {
             Ok(n) => warn!(
                 requeued = n,
@@ -146,6 +185,46 @@ async fn drain(state: &AppState, semaphore: &Arc<Semaphore>, concurrency: usize)
             ),
             Err(e) => error!("drain re-queue failed: {e}"),
         },
+    }
+}
+
+/// The checkpoint state to hand a freshly-claimed attempt, applying the
+/// poisoned-blob escape: once `max_resume_failures` restored attempts have all
+/// failed to complete, the checkpoint is discarded (fresh start) instead of
+/// being retried forever. Fail-open — an unreadable checkpoint store never
+/// blocks the run, it just means no restore.
+async fn load_restore(state: &AppState, job: &Job) -> Option<Value> {
+    let max = state.config.worker.max_resume_failures;
+    if max <= 0 {
+        return None;
+    }
+    match state.storage.load_checkpoint(job.id).await {
+        Ok(Some((checkpoint, failures))) => {
+            if failures >= max {
+                warn!(
+                    job = %job.id,
+                    failures,
+                    "checkpoint looks poisoned ({failures} restored attempts failed); \
+                     discarding for a fresh start"
+                );
+                if let Err(e) = state.storage.clear_checkpoint(job.id).await {
+                    warn!(job = %job.id, "poisoned-checkpoint clear failed: {e}");
+                }
+                return None;
+            }
+            // Count this hand-out; a completing attempt clears the row, so the
+            // counter only ever reaches `max` through repeated failures.
+            if let Err(e) = state.storage.bump_checkpoint_resumes(job.id).await {
+                warn!(job = %job.id, "checkpoint resume-count bump failed: {e}");
+            }
+            info!(job = %job.id, attempt = job.attempts, "resuming from durable checkpoint");
+            Some(checkpoint)
+        }
+        Ok(None) => None,
+        Err(e) => {
+            warn!(job = %job.id, "checkpoint load failed, starting fresh: {e}");
+            None
+        }
     }
 }
 
@@ -206,6 +285,11 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             0.0
         }
     };
+    // Durable execution: hand this attempt the last persisted checkpoint (if
+    // any), with the poisoned-blob escape — a checkpoint whose every restored
+    // attempt has failed is discarded so the job can start fresh instead of
+    // dying to the same state `max_resume_failures` more times.
+    let restored = load_restore(&state, &job).await;
     let ctx = AppContext {
         job_id: job.id,
         app: job.app.clone(),
@@ -222,6 +306,12 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         progress: state
             .progress
             .reporter(job.id, job.app.clone(), state.events.clone()),
+        checkpoints: Arc::new(crate::progress::JobCheckpointer::new(
+            job.id,
+            job.attempts,
+            state.storage.clone(),
+        )),
+        restored,
         artifacts_dir: state
             .storage
             .artifacts_dir
@@ -259,6 +349,23 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     };
 
     match outcome {
+        Outcome::Cancelled if state.shutdown.is_cancelled() => {
+            // Shutdown suspend, not a user cancel: `drain` fired the per-job
+            // cancel tokens ahead of its deadline so in-flight jobs stop *now*,
+            // while their latest durable checkpoint (written throttled during
+            // the run) survives. Re-queue with attempts headroom — mirroring
+            // `reset`, not `cancel` — so the job resumes from its checkpoint on
+            // the next boot instead of being abandoned mid-work.
+            match state.storage.reset(job.id).await {
+                Ok(Some(_)) => {
+                    warn!(job = %job.id, "job suspended for shutdown; re-queued to resume from checkpoint");
+                    publish(&state, JobEvent::new(job.id, job.app.clone(), "queued"));
+                }
+                Ok(None) => {}
+                Err(e) => error!(job = %job.id, "failed to persist shutdown suspend: {e}"),
+            }
+            return;
+        }
         Outcome::Cancelled => {
             // Cooperative cancel of a running job: mark it cancelled (not failed)
             // and emit the terminal event, mirroring the queued-cancel path
@@ -267,6 +374,9 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             match state.storage.cancel_running(job.id, job.attempts).await {
                 Ok(true) => {
                     warn!(job = %job.id, "running job cancelled");
+                    if let Err(e) = state.storage.clear_checkpoint(job.id).await {
+                        warn!(job = %job.id, "cancelled-job checkpoint clear failed: {e}");
+                    }
                     publish(&state, JobEvent::new(job.id, job.app.clone(), "cancelled"));
                 }
                 Ok(false) => {}
@@ -294,7 +404,14 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                 }
             }
             match state.storage.complete(job.id, job.attempts, result).await {
-                Ok(true) => info!(job = %job.id, "job succeeded"),
+                Ok(true) => {
+                    info!(job = %job.id, "job succeeded");
+                    // A completed job's checkpoint is spent state; drop it so
+                    // the table only holds resumable (in-progress) work.
+                    if let Err(e) = state.storage.clear_checkpoint(job.id).await {
+                        warn!(job = %job.id, "checkpoint clear failed: {e}");
+                    }
+                }
                 Ok(false) => {
                     // The job was reset/reaped mid-run and re-claimed elsewhere;
                     // this run's result is stale. Drop it (no side effects, no
@@ -587,6 +704,14 @@ async fn finalize(state: &AppState, id: uuid::Uuid) {
     let Ok(Some(job)) = state.storage.get(id).await else {
         return;
     };
+    // A terminal job's checkpoint can never be resumed from again (retry grants
+    // a fresh attempt lineage and complete/fail paths land here) — drop it so
+    // the checkpoints table only holds live, resumable work.
+    if matches!(job.status, JobStatus::Failed | JobStatus::Cancelled) {
+        if let Err(e) = state.storage.clear_checkpoint(job.id).await {
+            warn!(job = %job.id, "terminal checkpoint clear failed: {e}");
+        }
+    }
     let mut event = JobEvent::new(job.id, job.app.clone(), job.status.as_str());
     event.result = job.result.clone();
     event.error = job.error.clone();

@@ -210,9 +210,11 @@ impl ScrapeApp for Crawl {
          crawls; 0/absent = unlimited), \"same_domain\": true, \
          \"dedup_distance\": 3, \"respect_robots\": true, \
          \"include_patterns\": [\"regex\", ..], \"exclude_patterns\": [\"regex\", ..], \
-         \"sitemap_seeds\": false, \"checkpoint\": \"name\" (resumable frontier), \
+         \"sitemap_seeds\": false, \
          \"mode\": \"revisit\" (incremental recrawl of the `pages` dataset via \
-         conditional GETs; \"discover\": true opts into link-following)}"
+         conditional GETs; \"discover\": true opts into link-following)}. \
+         Frontier state is checkpointed durably per job: an interrupted, reaped, \
+         or shutdown-suspended crawl resumes where it left off on its next attempt."
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -277,29 +279,13 @@ impl ScrapeApp for Crawl {
             include_patterns: str_array("include_patterns"),
             exclude_patterns: str_array("exclude_patterns"),
             sitemap_seeds: bool_param("sitemap_seeds", false),
-            // Named checkpoints live beside (not inside) the per-job artifacts
-            // dir, so a later job with the same name resumes the crawl.
-            checkpoint: ctx
-                .params
-                .get("checkpoint")
-                .and_then(Value::as_str)
-                .map(|name| {
-                    let safe: String = name
-                        .chars()
-                        .map(|c| {
-                            if c.is_alphanumeric() || c == '-' || c == '_' {
-                                c
-                            } else {
-                                '-'
-                            }
-                        })
-                        .collect();
-                    ctx.artifacts_dir
-                        .parent()
-                        .unwrap_or(&ctx.artifacts_dir)
-                        .join("checkpoints")
-                        .join(format!("{safe}.json"))
-                }),
+            // Durable execution: a prior attempt's frontier checkpoint (persisted
+            // through `ctx.checkpoint` below) comes back here on re-claim, so a
+            // crashed/reaped/suspended crawl resumes instead of restarting. The
+            // old app-private named-file checkpoint path is gone — the platform
+            // seam owns persistence, lineage-guarding, and the poisoned-blob
+            // escape now.
+            resume_state: ctx.restore().cloned(),
             revisit,
             discover: bool_param("discover", false),
         };
@@ -348,6 +334,10 @@ impl ScrapeApp for Crawl {
             Some(sink),
             source,
             Some(progress),
+            // Durable-execution seam: the crawler streams its frontier state
+            // through the job's checkpoint sink (runtime-throttled, lineage-
+            // guarded), which is what `resume_state` restores on re-claim.
+            Some(ctx.checkpoints.clone()),
         )
         .await?;
 

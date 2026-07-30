@@ -33,6 +33,31 @@ impl ProgressReporter for NoProgress {
     fn report(&self, _snapshot: Value) {}
 }
 
+/// Durable-execution checkpoint seam. A long-running app hands
+/// [`CheckpointSink::save`] a compact JSON snapshot of its resumable state; the
+/// runtime persists it keyed by job id (attempts-lineage guarded, like
+/// `complete`) so a crash, reap, timeout, or graceful-shutdown suspend costs a
+/// *resume* instead of a restart. Implementations throttle their own writes
+/// (the server impl coalesces like the progress reporter); `force` bypasses the
+/// throttle for final/suspend snapshots. Returns `false` when the write did not
+/// land (stale lineage or a storage error) so apps can count it — persistence
+/// failures must never fail the job.
+#[async_trait]
+pub trait CheckpointSink: Send + Sync {
+    async fn save(&self, state: Value, force: bool) -> bool;
+}
+
+/// No-op sink — the default when a runtime wires no checkpoint seam (tests,
+/// embedders). Saves are silently dropped (reported as landed).
+pub struct NoCheckpoints;
+
+#[async_trait]
+impl CheckpointSink for NoCheckpoints {
+    async fn save(&self, _state: Value, _force: bool) -> bool {
+        true
+    }
+}
+
 /// Everything a job run gets from the runtime: its params, the engines, the
 /// dataset store (dedup + change detection), the sandboxed WASM plugin host,
 /// and a per-job artifacts directory for raw dumps (HTML, JSON, screenshots).
@@ -64,10 +89,38 @@ pub struct AppContext {
     /// Throttled live-progress seam: long-running apps report compact snapshots
     /// that surface on `GET /jobs/{id}` and as `progress` SSE events.
     pub progress: Arc<dyn ProgressReporter>,
+    /// Durable-execution seam: `ctx.checkpoint(..)` persists resumable state
+    /// through this sink (throttled; lineage-guarded server-side).
+    pub checkpoints: Arc<dyn CheckpointSink>,
+    /// The last persisted checkpoint for this job, handed back on re-claim —
+    /// `None` on a fresh first attempt or after the poisoned-checkpoint escape.
+    /// Advisory: apps must tolerate any stored shape and start fresh on doubt.
+    pub restored: Option<Value>,
     pub artifacts_dir: PathBuf,
 }
 
 impl AppContext {
+    /// Persists a durable checkpoint of this job's resumable state (throttled —
+    /// safe to call in a tight loop). On a later attempt of the same job, the
+    /// last persisted snapshot comes back via [`restore`](Self::restore).
+    /// Returns whether the write landed (`false` = throttle-skipped is *not*
+    /// reported false; only stale-lineage/storage failures are).
+    pub async fn checkpoint(&self, state: Value) -> bool {
+        self.checkpoints.save(state, false).await
+    }
+
+    /// Unthrottled checkpoint — for final/suspend snapshots where losing the
+    /// write means re-doing real work on resume.
+    pub async fn checkpoint_now(&self, state: Value) -> bool {
+        self.checkpoints.save(state, true).await
+    }
+
+    /// The last checkpoint persisted by a prior attempt of this job, if any.
+    /// Advisory: treat unexpected shapes as "start fresh", never as an error.
+    pub fn restore(&self) -> Option<&Value> {
+        self.restored.as_ref()
+    }
+
     /// Writes a file under `data/artifacts/<app>/<job_id>/` and returns its path.
     pub async fn save_artifact(&self, name: &str, bytes: &[u8]) -> Result<PathBuf> {
         // `name` may be composed from job params (e.g. census `cbp-{naics}.json`),

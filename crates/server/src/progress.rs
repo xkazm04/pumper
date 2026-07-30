@@ -86,6 +86,73 @@ pub struct JobProgressReporter {
     since: AtomicU32,
 }
 
+/// Minimum wall-clock spacing between a job's durable checkpoint writes. Wider
+/// than the progress interval — each save is a real SQLite write of the whole
+/// state blob, and losing a few seconds of progress on resume is the documented
+/// contract (the frontier/seen-set style state apps checkpoint is idempotent to
+/// replay).
+const CHECKPOINT_MIN_INTERVAL: Duration = Duration::from_secs(5);
+
+/// The server's [`pumper_core::CheckpointSink`]: persists a job's checkpoint
+/// blob through [`Storage::save_checkpoint`], throttled like
+/// [`JobProgressReporter`] (first call writes, then ≥ every
+/// [`CHECKPOINT_MIN_INTERVAL`]; `force` bypasses the throttle for final/suspend
+/// snapshots). Writes carry the attempt number so the storage layer's
+/// attempts-lineage fence discards saves from a task whose job was reset or
+/// reaped mid-run — mirroring `complete(job.id, job.attempts, ..)`.
+pub struct JobCheckpointer {
+    job_id: Uuid,
+    attempt: i64,
+    storage: std::sync::Arc<pumper_core::Storage>,
+    last: Mutex<Option<Instant>>,
+}
+
+impl JobCheckpointer {
+    pub fn new(job_id: Uuid, attempt: i64, storage: std::sync::Arc<pumper_core::Storage>) -> Self {
+        Self {
+            job_id,
+            attempt,
+            storage,
+            last: Mutex::new(None),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl pumper_core::CheckpointSink for JobCheckpointer {
+    async fn save(&self, state: Value, force: bool) -> bool {
+        if !force {
+            let now = Instant::now();
+            let mut last = self.last.lock().unwrap();
+            let due = last.is_none_or(|prev| now.duration_since(prev) >= CHECKPOINT_MIN_INTERVAL);
+            if !due {
+                // Throttle-skipped, not failed: the caller keeps its loop cheap.
+                return true;
+            }
+            *last = Some(now);
+        } else {
+            *self.last.lock().unwrap() = Some(Instant::now());
+        }
+        match self
+            .storage
+            .save_checkpoint(self.job_id, self.attempt, &state)
+            .await
+        {
+            Ok(true) => true,
+            Ok(false) => {
+                // The job was reset/reaped and re-claimed; this task's state is
+                // stale and must not overwrite the live attempt's checkpoint.
+                tracing::warn!(job = %self.job_id, "checkpoint discarded: stale attempt lineage");
+                false
+            }
+            Err(e) => {
+                tracing::warn!(job = %self.job_id, "checkpoint write failed: {e}");
+                false
+            }
+        }
+    }
+}
+
 impl ProgressReporter for JobProgressReporter {
     fn report(&self, snapshot: Value) {
         // Throttle: emit on the first call, then only once the interval elapses
@@ -147,6 +214,36 @@ mod tests {
         // Clearing drops the buffered snapshot (finalize path).
         store.clear(&id);
         assert_eq!(store.snapshot(&id), None);
+    }
+
+    #[tokio::test]
+    async fn checkpointer_throttles_persists_and_respects_lineage() {
+        use pumper_core::CheckpointSink;
+        let store = pumper_core::testing::TempStore::new("cp-reporter").await;
+        let storage = std::sync::Arc::new(store.storage.clone());
+        let job = storage
+            .enqueue("crawl", pumper_core::EnqueueOptions::default())
+            .await
+            .unwrap();
+        let claimed = storage.claim_next(&[], 0.0).await.unwrap().unwrap();
+
+        let cp = JobCheckpointer::new(job.id, claimed.attempts, storage.clone());
+        // First save writes; an immediate second is throttle-skipped (reported
+        // ok, blob unchanged); force bypasses the throttle.
+        assert!(cp.save(json!({"n": 1}), false).await);
+        assert!(cp.save(json!({"n": 2}), false).await);
+        let (state, _) = storage.load_checkpoint(job.id).await.unwrap().unwrap();
+        assert_eq!(state, json!({"n": 1}), "second save coalesced");
+        assert!(cp.save(json!({"n": 3}), true).await);
+        let (state, _) = storage.load_checkpoint(job.id).await.unwrap().unwrap();
+        assert_eq!(state, json!({"n": 3}), "forced save bypasses the throttle");
+
+        // A checkpointer holding a stale attempt lineage reports failure and
+        // leaves the live blob alone.
+        let stale = JobCheckpointer::new(job.id, claimed.attempts - 1, storage.clone());
+        assert!(!stale.save(json!({"n": 99}), true).await);
+        let (state, _) = storage.load_checkpoint(job.id).await.unwrap().unwrap();
+        assert_eq!(state, json!({"n": 3}), "stale lineage never overwrites");
     }
 
     #[test]
