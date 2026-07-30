@@ -269,6 +269,70 @@ fn describe_manifest(engine: &Engine, module: &Module) -> Option<Value> {
     serde_json::from_slice(&bytes).ok()
 }
 
+// ---- Dynamic-app discovery (M28 v1 slice: discovery + manifest ONLY) --------
+
+/// A dynamic-app candidate found in `[plugins] app_dir`: a `.wasm` module that
+/// exports a working `describe()` returning a JSON **object** manifest. This is
+/// the whole v1 contract — the module is *listed*, never *run*. Actually
+/// executing a dynamic app requires the component-model host (typed WIT world,
+/// async host imports for fetch/storage, budget + politeness enforcement across
+/// the boundary), which is the documented next slice, deliberately not faked
+/// here: there is NO execution path for these modules.
+pub struct DynamicAppManifest {
+    /// File stem of the module — the app's listing name (authoritative; a
+    /// `name` key inside the manifest is ignored, matching plugin manifests).
+    pub name: String,
+    /// The parsed `describe()` output (always a JSON object).
+    pub manifest: Value,
+}
+
+/// Scans `dir` for `.wasm` modules exporting `describe()` and returns their
+/// manifests, sorted by name. Modules that fail to compile, lack `describe`,
+/// trap, or return non-object JSON are skipped with a warning — a dynamic APP
+/// (unlike an extraction plugin) must self-describe to be listable at all. A
+/// missing/unreadable dir is simply empty. Each probe runs in a fresh
+/// fuel-and-memory-limited store, so a hostile module can't spin discovery.
+pub fn discover_dynamic_apps(dir: &Path) -> Vec<DynamicAppManifest> {
+    let mut config = Config::new();
+    config.consume_fuel(true);
+    let engine = match Engine::new(&config) {
+        Ok(engine) => engine,
+        Err(err) => {
+            tracing::warn!("dynamic-app discovery: wasm engine failed: {err}");
+            return Vec::new();
+        }
+    };
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut apps = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+            continue;
+        };
+        let module = match Module::from_file(&engine, &path) {
+            Ok(module) => module,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), "dynamic app failed to compile: {err}");
+                continue;
+            }
+        };
+        match describe_manifest(&engine, &module) {
+            Some(manifest @ Value::Object(_)) => apps.push(DynamicAppManifest { name, manifest }),
+            _ => tracing::warn!(
+                path = %path.display(),
+                "skipping dynamic app: no working describe() returning a JSON object manifest"
+            ),
+        }
+    }
+    apps.sort_by(|a, b| a.name.cmp(&b.name));
+    apps
+}
+
 fn execute(
     engine: Engine,
     module: Module,
@@ -319,6 +383,74 @@ fn execute(
     let out = read_packed(&mut store, &memory, packed)?;
     serde_json::from_slice(&out)
         .map_err(|e| Error::App(format!("plugin returned invalid JSON: {e}")))
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::discover_dynamic_apps;
+    use std::path::PathBuf;
+
+    const MANIFEST_JSON: &str =
+        r#"{"description":"demo dynamic app","params_schema":{"type":"object"}}"#;
+
+    /// A module whose `describe()` returns `data` (placed at offset 16) packed
+    /// as `(ptr << 32) | len`. wasmtime's default `wat` feature compiles the
+    /// text form transparently, so writing it to a `.wasm` file is enough.
+    fn describing_wat(data: &str) -> String {
+        let escaped = data.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            "(module (memory (export \"memory\") 1) (data (i32.const 16) \"{escaped}\") \
+             (func (export \"describe\") (result i64) \
+               (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const {len}))))",
+            len = data.len()
+        )
+    }
+
+    fn fresh_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "pumper-dynamic-apps-{tag}-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn discovery_lists_only_object_describing_modules_sorted() {
+        let dir = fresh_dir("mixed");
+        // Two well-formed dynamic apps, written out of order to prove sorting.
+        std::fs::write(dir.join("beta.wasm"), describing_wat(MANIFEST_JSON)).unwrap();
+        std::fs::write(dir.join("alpha.wasm"), describing_wat(MANIFEST_JSON)).unwrap();
+        // Legacy extraction-plugin shape: compiles, but no describe() → skipped.
+        std::fs::write(
+            dir.join("extract_only.wasm"),
+            "(module (memory (export \"memory\") 1))",
+        )
+        .unwrap();
+        // describe() returning valid JSON that is NOT an object → skipped.
+        std::fs::write(dir.join("scalar.wasm"), describing_wat("42")).unwrap();
+        // Non-wasm noise → ignored.
+        std::fs::write(dir.join("notes.txt"), "not a module").unwrap();
+
+        let apps = discover_dynamic_apps(&dir);
+        let names: Vec<&str> = apps.iter().map(|a| a.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+        for app in &apps {
+            assert_eq!(
+                app.manifest["description"].as_str(),
+                Some("demo dynamic app")
+            );
+            assert!(app.manifest["params_schema"].is_object());
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn discovery_of_missing_dir_is_empty() {
+        let dir = std::env::temp_dir().join("pumper-dynamic-apps-definitely-missing");
+        assert!(discover_dynamic_apps(&dir).is_empty());
+    }
 }
 
 #[cfg(test)]
