@@ -13,6 +13,8 @@ tracing.workspace = true
 # Versioned-archive source mode: `as_of` timestamp comparison + backfill URL patterns.
 chrono.workspace = true
 regex.workspace = true
+# Wayback historical backfill (`source.archive`): CDX range enumeration + raw snapshot URLs.
+pumper-engine-archive.workspace = true
 
 [dev-dependencies]
 uuid.workspace = true

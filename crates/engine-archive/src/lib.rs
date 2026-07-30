@@ -21,15 +21,14 @@
 //! retries, body caps, charset-aware capped body reader, and TTL cache as any
 //! other host — nothing here talks to the network directly.
 //!
-//! ## Backfill seam (deliberately out of scope for this batch)
+//! ## Backfill (historical range enumeration)
 //!
-//! A `backfill` job type — enumerate CDX captures of a URL across a date range
-//! and run each through an app's normal extraction into timestamped records —
-//! needs worker/job-type changes and is Batch-3 territory. The seam is
-//! [`cdx_query_url`]: it already accepts an optional `to` (as-of upper bound);
-//! a backfill worker would drop `limit=1`, page the CDX index with
-//! `from`/`to`, and feed each `(timestamp, original)` pair to
-//! [`snapshot_url`].
+//! [`ArchiveEngine::list_snapshots`] enumerates CDX captures of a URL across a
+//! date range — digest-deduped, oldest first, capped with an honest
+//! `truncated` flag. The extractor app's `source.archive` mode builds on it:
+//! each `(timestamp, original)` pair feeds [`snapshot_url`] for the raw body,
+//! runs the ruleset, and lands as a `{natural_key}@{snapshot_date}` record
+//! tagged `_fetched_via: "wayback"` (the M42 backfill key convention).
 
 use std::sync::Arc;
 
@@ -53,6 +52,20 @@ pub struct CdxSnapshot {
     /// The captured URL as archived (may differ from the request URL in
     /// scheme/canonicalization — snapshot fetches must use this one).
     pub original: String,
+    /// Content digest from the CDX row (field 6 of the default order), used to
+    /// skip byte-identical re-captures during range enumeration. `None` when
+    /// the row carried too few fields to include one.
+    pub digest: Option<String>,
+}
+
+/// Result of a CDX **range enumeration** ([`ArchiveEngine::list_snapshots`]):
+/// digest-deduped captures, oldest first, plus an honest truncation flag —
+/// `truncated: true` means the index held more captures than `max` and the
+/// list is an incomplete prefix of the range, never a silent cap.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotList {
+    pub snapshots: Vec<CdxSnapshot>,
+    pub truncated: bool,
 }
 
 /// Tier-zero archive engine: an [`HttpClient`] over the Wayback Machine.
@@ -71,6 +84,62 @@ impl ArchiveEngine {
             base_url: cfg.base_url.trim_end_matches('/').to_string(),
             inner,
         }
+    }
+
+    /// This deployment's Wayback base URL (trailing-slash-trimmed) — the base
+    /// callers feed to [`snapshot_url`] for captures returned by
+    /// [`list_snapshots`](Self::list_snapshots).
+    pub fn base_url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// CDX **range enumeration** (the backfill seam): every 200-status capture
+    /// of `url` between `from` and `to` (14-digit timestamps or any digit
+    /// prefix; `None` = unbounded), oldest first, deduped by content digest,
+    /// capped at `max` with an honest `truncated` flag (`limit = max + 1` is
+    /// requested so a full window is distinguishable from an overfull one).
+    /// The CDX request runs through the **inner** governed transport, so
+    /// archive.org keeps its politeness guarantees. `url` may use Wayback
+    /// wildcard/prefix syntax (e.g. `example.com/products/*`).
+    pub async fn list_snapshots(
+        &self,
+        url: &str,
+        from: Option<&str>,
+        to: Option<&str>,
+        max: usize,
+    ) -> Result<SnapshotList> {
+        for (name, bound) in [("from", from), ("to", to)] {
+            if let Some(b) = bound {
+                if !valid_cdx_bound(b) {
+                    return Err(Error::Http(format!(
+                        "bad archive '{name}' bound '{b}': want 4-14 digits (YYYY[MMDDhhmmss])"
+                    )));
+                }
+            }
+        }
+        let max = max.max(1);
+        let req = HttpRequest::get(cdx_range_query_url(
+            &self.base_url,
+            url,
+            from,
+            to,
+            max + 1,
+        ));
+        let resp = self.inner.fetch(req).await?;
+        if !resp.is_success() {
+            return Err(Error::Http(format!(
+                "archive CDX range query for {url} failed: status {}",
+                resp.status
+            )));
+        }
+        let list = select_snapshots(parse_cdx_lines(&resp.body), max);
+        debug!(
+            url,
+            snapshots = list.snapshots.len(),
+            truncated = list.truncated,
+            "enumerated archive captures"
+        );
+        Ok(list)
     }
 }
 
@@ -91,6 +160,41 @@ pub fn cdx_query_url(base_url: &str, target: &str, to: Option<&str>) -> String {
     url
 }
 
+/// The CDX query for a **range enumeration** of `target`'s captures: ascending
+/// (oldest first), 200-status only, server-side `collapse=digest` to thin
+/// adjacent identical re-captures (client-side dedup still runs — collapse is
+/// adjacency-only). `from`/`to` are 14-digit timestamps or any prefix
+/// (e.g. `2019`); `limit` bounds the row count.
+pub fn cdx_range_query_url(
+    base_url: &str,
+    target: &str,
+    from: Option<&str>,
+    to: Option<&str>,
+    limit: usize,
+) -> String {
+    let mut url = format!(
+        "{}/cdx/search/cdx?url={}&filter=statuscode:200&collapse=digest&limit={}",
+        base_url,
+        urlencode(target),
+        limit
+    );
+    if let Some(from) = from {
+        url.push_str("&from=");
+        url.push_str(&urlencode(from));
+    }
+    if let Some(to) = to {
+        url.push_str("&to=");
+        url.push_str(&urlencode(to));
+    }
+    url
+}
+
+/// Whether `s` is a valid CDX time bound: 4–14 ASCII digits (a full
+/// `YYYYMMDDhhmmss` timestamp or any prefix, e.g. `2019` or `201906`).
+pub fn valid_cdx_bound(s: &str) -> bool {
+    (4..=CDX_TS_LEN).contains(&s.len()) && s.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Raw snapshot-body URL: the `id_` flag asks Wayback for the archived bytes
 /// with no toolbar injection or link rewriting.
 pub fn snapshot_url(base_url: &str, timestamp: &str, original: &str) -> String {
@@ -102,22 +206,67 @@ fn urlencode(value: &str) -> String {
     url::form_urlencoded::byte_serialize(value.as_bytes()).collect()
 }
 
-/// Parses the first data line of a plaintext CDX response. The default CDX
-/// field order is `urlkey timestamp original mimetype statuscode digest
-/// length`; an empty body (no captures) or a malformed line yields `None`.
-pub fn parse_cdx_first_line(body: &str) -> Option<CdxSnapshot> {
-    let line = body.lines().find(|l| !l.trim().is_empty())?;
+/// Parses one plaintext CDX data line. The default CDX field order is
+/// `urlkey timestamp original mimetype statuscode digest length`; a malformed
+/// line (too few fields, bad timestamp) yields `None`.
+pub fn parse_cdx_line(line: &str) -> Option<CdxSnapshot> {
     let mut fields = line.split_whitespace();
     let _urlkey = fields.next()?;
     let timestamp = fields.next()?;
     let original = fields.next()?;
+    let _mimetype = fields.next();
+    let _statuscode = fields.next();
+    let digest = fields.next().map(str::to_string);
     if timestamp.len() != CDX_TS_LEN || !timestamp.bytes().all(|b| b.is_ascii_digit()) {
         return None;
     }
     Some(CdxSnapshot {
         timestamp: timestamp.to_string(),
         original: original.to_string(),
+        digest,
     })
+}
+
+/// Parses the first data line of a plaintext CDX response; an empty body (no
+/// captures) or a malformed first line yields `None`.
+pub fn parse_cdx_first_line(body: &str) -> Option<CdxSnapshot> {
+    parse_cdx_line(body.lines().find(|l| !l.trim().is_empty())?)
+}
+
+/// Parses every well-formed data line of a plaintext CDX response, in order.
+/// Malformed lines are skipped, matching [`parse_cdx_first_line`]'s tolerance.
+pub fn parse_cdx_lines(body: &str) -> Vec<CdxSnapshot> {
+    body.lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(parse_cdx_line)
+        .collect()
+}
+
+/// Range-enumeration post-processing over rows fetched with `limit = max + 1`:
+/// dedup by content digest (first — i.e. oldest — capture of each digest wins;
+/// digest-less rows are kept as unique), cap the result at `max`, and flag
+/// truncation honestly: `truncated` is true whenever the raw row count exceeded
+/// `max` — the index held more captures than the caller allowed, even if
+/// dedup shrank the returned list below the cap.
+pub fn select_snapshots(rows: Vec<CdxSnapshot>, max: usize) -> SnapshotList {
+    let truncated = rows.len() > max;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut snapshots: Vec<CdxSnapshot> = Vec::new();
+    for row in rows {
+        if let Some(d) = &row.digest {
+            if !seen.insert(d.clone()) {
+                continue;
+            }
+        }
+        snapshots.push(row);
+        if snapshots.len() == max {
+            break;
+        }
+    }
+    SnapshotList {
+        snapshots,
+        truncated,
+    }
 }
 
 /// A 14-digit CDX capture timestamp as a UTC datetime.
@@ -290,6 +439,140 @@ mod tests {
             parse_cdx_first_line("com,example)/ 2024010203040X https://example.com/"),
             None
         );
+    }
+
+    #[test]
+    fn cdx_range_query_url_pins_the_range_contract() {
+        let u = cdx_range_query_url(
+            "https://web.archive.org",
+            "https://example.com/",
+            Some("2019"),
+            Some("20200630"),
+            11,
+        );
+        assert!(u.starts_with("https://web.archive.org/cdx/search/cdx?url="));
+        // Ascending enumeration: no limit=1, no sort=reverse.
+        assert!(!u.contains("limit=1&"));
+        assert!(!u.contains("sort=reverse"));
+        assert!(u.contains("limit=11"));
+        assert!(u.contains("collapse=digest"));
+        assert!(u.contains("filter=statuscode%3A200") || u.contains("filter=statuscode:200"));
+        assert!(u.contains("&from=2019"));
+        assert!(u.contains("&to=20200630"));
+        // Bounds are optional independently.
+        let u = cdx_range_query_url("https://web.archive.org", "https://example.com/", None, None, 5);
+        assert!(!u.contains("&from=") && !u.contains("&to="));
+    }
+
+    #[test]
+    fn cdx_bounds_validate_digit_prefixes() {
+        assert!(valid_cdx_bound("2019"));
+        assert!(valid_cdx_bound("201906"));
+        assert!(valid_cdx_bound("20190601123045"));
+        assert!(!valid_cdx_bound("201")); // too short
+        assert!(!valid_cdx_bound("201906011230456")); // too long
+        assert!(!valid_cdx_bound("2019-06")); // non-digit
+        assert!(!valid_cdx_bound(""));
+    }
+
+    #[test]
+    fn cdx_lines_parse_in_order_and_skip_malformed() {
+        let body = "com,example)/ 20190101000000 https://example.com/ text/html 200 AAA 10\n\
+                    garbage-line\n\
+                    com,example)/ 20200101000000 https://example.com/ text/html 200 BBB 11\n";
+        let rows = parse_cdx_lines(body);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].timestamp, "20190101000000");
+        assert_eq!(rows[0].digest.as_deref(), Some("AAA"));
+        assert_eq!(rows[1].digest.as_deref(), Some("BBB"));
+        // A digest-less (short but valid) row parses with digest: None.
+        let rows = parse_cdx_lines("com,example)/ 20190101000000 https://example.com/\n");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].digest, None);
+    }
+
+    fn snap(ts: &str, digest: Option<&str>) -> CdxSnapshot {
+        CdxSnapshot {
+            timestamp: ts.into(),
+            original: "https://example.com/".into(),
+            digest: digest.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn select_snapshots_dedups_by_digest_keeping_oldest() {
+        let rows = vec![
+            snap("20190101000000", Some("AAA")),
+            snap("20190201000000", Some("AAA")), // re-capture, dropped
+            snap("20190301000000", Some("BBB")),
+            snap("20190401000000", None), // digest-less rows are unique
+            snap("20190501000000", None),
+        ];
+        let list = select_snapshots(rows, 10);
+        assert!(!list.truncated);
+        let ts: Vec<&str> = list.snapshots.iter().map(|s| s.timestamp.as_str()).collect();
+        assert_eq!(
+            ts,
+            ["20190101000000", "20190301000000", "20190401000000", "20190501000000"]
+        );
+    }
+
+    #[test]
+    fn select_snapshots_truncation_is_honest() {
+        // Fetched with limit = max + 1: an overfull window flags truncation…
+        let rows: Vec<CdxSnapshot> = (0..4)
+            .map(|i| snap(&format!("2019010100000{i}"), Some(&format!("D{i}"))))
+            .collect();
+        let list = select_snapshots(rows.clone(), 3);
+        assert!(list.truncated);
+        assert_eq!(list.snapshots.len(), 3);
+        // …even when dedup shrinks the result below the cap — the index still
+        // held more rows than the caller allowed to be fetched.
+        let dup: Vec<CdxSnapshot> = (0..4).map(|i| snap(&format!("2019010100000{i}"), Some("SAME"))).collect();
+        let list = select_snapshots(dup, 3);
+        assert!(list.truncated);
+        assert_eq!(list.snapshots.len(), 1);
+        // An exactly-full window is complete, not truncated.
+        let list = select_snapshots(rows[..3].to_vec(), 3);
+        assert!(!list.truncated);
+        assert_eq!(list.snapshots.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn list_snapshots_enumerates_through_the_governed_inner() {
+        let (engine, inner) = engine_over(ScriptedInner {
+            cdx_body: "com,example)/ 20190101000000 https://example.com/ text/html 200 AAA 1\n\
+                       com,example)/ 20190201000000 https://example.com/ text/html 200 AAA 2\n\
+                       com,example)/ 20200101000000 https://example.com/ text/html 200 BBB 3\n"
+                .into(),
+            page_body: "unused".into(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let list = engine
+            .list_snapshots("https://example.com/", Some("2019"), Some("2020"), 10)
+            .await
+            .unwrap();
+        assert_eq!(list.snapshots.len(), 2, "digest-deduped");
+        assert!(!list.truncated);
+        let seen = inner.seen.lock().unwrap();
+        assert_eq!(seen.len(), 1, "exactly one CDX request, via the inner transport");
+        assert!(seen[0].contains("&from=2019") && seen[0].contains("&to=2020"));
+        assert!(seen[0].contains("limit=11"), "requests max + 1 rows");
+    }
+
+    #[tokio::test]
+    async fn list_snapshots_rejects_bad_bounds_without_fetching() {
+        let (engine, inner) = engine_over(ScriptedInner {
+            cdx_body: String::new(),
+            page_body: String::new(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let err = engine
+            .list_snapshots("https://example.com/", Some("last-year"), None, 10)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("bad archive 'from' bound"), "{err}");
+        assert!(inner.seen.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -493,5 +776,28 @@ mod tests {
             Some("archive")
         );
         assert!(resp.headers.contains_key(SNAPSHOT_TS_HEADER));
+    }
+
+    /// Hits the real Wayback CDX range endpoint. Run explicitly with:
+    /// `cargo test -p pumper-engine-archive -- --ignored live_wayback`
+    #[tokio::test]
+    #[ignore = "network: hits web.archive.org"]
+    async fn live_wayback_list_snapshots_range() {
+        let cfg = ArchiveConfig {
+            enabled: true,
+            base_url: "https://web.archive.org".into(),
+        };
+        let engine = ArchiveEngine::new(&cfg, Arc::new(PlainClient(reqwest::Client::new())));
+        let list = engine
+            .list_snapshots("https://example.com/", Some("2020"), Some("2021"), 5)
+            .await
+            .expect("live CDX range enumeration");
+        assert!(!list.snapshots.is_empty());
+        assert!(list.snapshots.len() <= 5);
+        // example.com is captured near-daily; a 2-year window overflows max=5.
+        assert!(list.truncated);
+        for s in &list.snapshots {
+            assert!(s.timestamp.starts_with("2020") || s.timestamp.starts_with("2021"));
+        }
     }
 }
