@@ -1,0 +1,14 @@
+[package]
+name = "app-cordis"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+pumper-core.workspace = true
+# `topic_lineage` (the Horizon identifier grammar) lives in eu-sedia so the
+# join side and the aggregation side share one implementation without a new
+# workspace-dependency entry (app-eu-sedia is already registered there).
+app-eu-sedia.workspace = true
+async-trait.workspace = true
+serde_json.workspace = true
+url.workspace = true

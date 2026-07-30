@@ -14,6 +14,12 @@
 //! capped at 100. Filter `type` in {1=grant topics, 2=PROSPECT} and
 //! `status`=31094502 (open). Results are volatile (weight/checksum/highlights),
 //! so we normalize each hit to a stable grant record before upserting.
+//!
+//! Win-intelligence (M31): Horizon topics additionally carry a `history` block
+//! joined from the `cordis` app's `topic_stats` dataset — funded-outcome priors
+//! (project count, EU contribution, top participant orgs) for the topic's
+//! predecessor family, keyed by [`topic_lineage`]. Topics whose family has no
+//! stats get no block. Queryable via `?filter=history.stats.project_count:gte:1`.
 
 use std::collections::HashMap;
 
@@ -155,6 +161,39 @@ impl ScrapeApp for EuSedia {
         // sort), so a truncated run must not read as a clean sweep.
         let truncated = pages_fetched >= max_pages && (pages_fetched * page_size) < total;
 
+        // Win-intelligence join (moonshot M31): annotate each open Horizon topic
+        // with its predecessor-family funded-outcomes stats from the `cordis`
+        // app's `topic_stats` dataset (read via the dataset store — no cross-app
+        // fetch). One read per distinct family, not per record. A family with no
+        // stats record gets NO `history` block — absence of evidence is never
+        // rendered as a zero-project history.
+        let mut family_stats: HashMap<String, Option<Value>> = HashMap::new();
+        let mut history_joined: u64 = 0;
+        for (key, record) in &mut records {
+            let Some(family) = topic_lineage(key) else {
+                continue;
+            };
+            let stats = match family_stats.get(&family) {
+                Some(cached) => cached.clone(),
+                None => {
+                    let fetched = ctx
+                        .datasets
+                        .get("cordis", "topic_stats", &family)
+                        .await?
+                        .map(|r| r.data);
+                    family_stats.insert(family.clone(), fetched.clone());
+                    fetched
+                }
+            };
+            if let (Some(stats), Value::Object(map)) = (stats, &mut *record) {
+                map.insert(
+                    "history".into(),
+                    json!({ "family": family, "source": "cordis", "stats": stats }),
+                );
+                history_joined += 1;
+            }
+        }
+
         let summary = ctx.upsert_many("opportunities", &records).await?;
 
         // Cross-source layer: publish the pan-EU corpus into grants/unified so it
@@ -178,6 +217,7 @@ impl ScrapeApp for EuSedia {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            "historyJoined": history_joined,
             "truncated": truncated,
         });
         cross.merge_into(&mut out);
@@ -200,6 +240,44 @@ impl ScrapeApp for EuSedia {
         }
         Ok(out)
     }
+}
+
+/// Horizon topic-family key: the identifier with its call-year segment removed,
+/// so successor topics across work programmes collapse onto one lineage key
+/// (`HORIZON-CL4-2026-DATA-01` and `HORIZON-CL4-2024-DATA-01` →
+/// `HORIZON-CL4-DATA-01`). This is the join key between open SEDIA topics and
+/// funded CORDIS outcomes (the `cordis` app aggregates `topic_stats` per family).
+///
+/// **Horizon-only by design**: identifiers must start with `HORIZON-` and carry
+/// exactly one plausible call-year segment (2020–2039). Other programmes
+/// (Erasmus+, LIFE, CERV, …) use different, less regular grammars — returning
+/// `None` there is honest; guessing a family would fabricate lineage. Counter
+/// segments (`-01`, `-01-05`) are kept: they distinguish topics within a
+/// destination, which is exactly the granularity predecessor matching needs.
+/// If a second year-like segment appears, only the first is removed.
+pub fn topic_lineage(identifier: &str) -> Option<String> {
+    let id = identifier.trim();
+    let segments: Vec<&str> = id.split('-').collect();
+    if segments.first() != Some(&"HORIZON") || segments.len() < 3 {
+        return None;
+    }
+    let is_year = |s: &str| {
+        s.len() == 4
+            && s.chars().all(|c| c.is_ascii_digit())
+            && (2020..=2039).contains(&s.parse::<u32>().unwrap_or(0))
+    };
+    let year_pos = segments.iter().position(|s| is_year(s))?;
+    let family: Vec<&str> = segments
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != year_pos)
+        .map(|(_, s)| *s)
+        .collect();
+    // A family must still name something beyond the programme prefix.
+    if family.len() < 2 {
+        return None;
+    }
+    Some(family.join("-"))
 }
 
 /// Reads a params array of strings, or a fallback. Accepts `["1","2"]`.
@@ -341,13 +419,59 @@ fn sedia_request(url: String, body: String) -> HttpRequest {
         timeout_secs: None,
         proxy: None,
         profile: None,
+        archive_max_age: None,
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{clean_inline, clean_text, normalize, DESCRIPTION_TEXT_CAP};
+    use super::{clean_inline, clean_text, normalize, topic_lineage, DESCRIPTION_TEXT_CAP};
     use serde_json::json;
+
+    #[test]
+    fn lineage_strips_year_and_keeps_counters() {
+        assert_eq!(
+            topic_lineage("HORIZON-CL4-2026-DATA-01").as_deref(),
+            Some("HORIZON-CL4-DATA-01")
+        );
+        // Successor topics across programme years share one family.
+        assert_eq!(
+            topic_lineage("HORIZON-CL4-2024-DATA-01"),
+            topic_lineage("HORIZON-CL4-2026-DATA-01")
+        );
+        // Double counters (destination + topic) are kept whole.
+        assert_eq!(
+            topic_lineage("HORIZON-MSCA-2024-PF-01-01").as_deref(),
+            Some("HORIZON-MSCA-PF-01-01")
+        );
+        assert_eq!(
+            topic_lineage("HORIZON-EIC-2025-PATHFINDEROPEN-01").as_deref(),
+            Some("HORIZON-EIC-PATHFINDEROPEN-01")
+        );
+    }
+
+    #[test]
+    fn lineage_is_horizon_only_and_never_guesses() {
+        // Other programmes have different grammars — no family, not a wrong one.
+        assert_eq!(topic_lineage("ERASMUS-EDU-2026-PEX-TEACH-ACA"), None);
+        assert_eq!(topic_lineage("LIFE-2026-SAP-NAT"), None);
+        assert_eq!(topic_lineage("CERV-2025-CHILD"), None);
+        // Horizon identifiers without a plausible call-year segment.
+        assert_eq!(topic_lineage("HORIZON-JU-CLEANH2"), None);
+        // 4-digit segment outside the 2020-2039 window is not a year.
+        assert_eq!(topic_lineage("HORIZON-CL3-0142-X-01"), None);
+        // Nothing left beyond the prefix once the year goes.
+        assert_eq!(topic_lineage("HORIZON-2026"), None);
+        assert_eq!(topic_lineage(""), None);
+    }
+
+    #[test]
+    fn lineage_removes_only_the_first_year_like_segment() {
+        assert_eq!(
+            topic_lineage("HORIZON-CL5-2024-2030-VISION-01").as_deref(),
+            Some("HORIZON-CL5-2030-VISION-01")
+        );
+    }
 
     /// Realistic SEDIA descriptionByte shape: entities, nested tags, boilerplate
     /// whitespace, list markup.
