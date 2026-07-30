@@ -194,6 +194,12 @@ sketch_retention_runs = 60       # runs of per-field sketches kept (>= window_ru
 [catalog]
 auto_reconcile = false   # true = apply the boot plan automatically (orphans are still never touched)
 
+# Declared data contracts ([source.contract] blocks in catalog/data-sources.toml).
+# Always evaluated at publish time and surfaced on /catalog/health + /sources;
+# this only decides whether a violation also gates (verdict block vs warn).
+[contracts]
+enforce = false   # soak mode first, exactly like [resilience] enforce
+
 # MCP server — mounts /mcp: POST (streamable-HTTP JSON-RPC) exposing the app
 # registry, datasets, and search as native agent tools, plus catalog + app
 # manifests as resources; GET (SSE) streaming live JSON-RPC notifications

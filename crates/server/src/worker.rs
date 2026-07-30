@@ -445,6 +445,11 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                 // before the hooks — this ordering IS the enforcement, and if it
                 // moves below them the guarantee is gone.
                 suppress_unhealthy(&state, &job.app, &mut by_dataset).await;
+                // Declared data contracts (M20): the same choke point, the
+                // declared complement to the inferred gate above. Verdicts are
+                // always recorded; datasets are dropped only under
+                // `[contracts] enforce = true`.
+                enforce_contracts(&state, &job, &mut by_dataset);
                 notify_watches(&state, &job, &by_dataset).await;
                 crate::triggers::fire_dataset_triggers(&state, &job, &by_dataset).await;
             }
@@ -595,6 +600,80 @@ async fn suppress_unhealthy(
                  cannot be recalled"
             );
             by_dataset.remove(dataset);
+        }
+    }
+}
+
+/// Evaluates declared data contracts (`[source.contract]` in the catalog) over
+/// this run's revisions, at the same choke point where `suppress_unhealthy`
+/// gates pushes — before any webhook or trigger fires.
+///
+/// Semantics: datasets without a declared contract are untouched. For each
+/// contracted dataset the verdict is `pass` (no violations), `warn`
+/// (violations, `[contracts] enforce = false` — recorded and surfaced, nothing
+/// gated) or `block` (violations with enforcement on — the dataset is removed
+/// from the batch so watches/triggers never see it; the data itself is already
+/// stored and stays queryable). The latest verdict per `<app>/<dataset>` is
+/// kept in memory and surfaced on `/catalog/health` and `/sources`. Fail-open:
+/// an unreadable catalog skips evaluation, it never blocks delivery.
+fn enforce_contracts(
+    state: &AppState,
+    job: &Job,
+    by_dataset: &mut HashMap<&str, Vec<&pumper_core::Revision>>,
+) {
+    let catalog = match pumper_core::Catalog::load() {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(job = %job.id, "contract check skipped (catalog unreadable): {e}");
+            return;
+        }
+    };
+    let enforce = state.config.contracts.enforce;
+    let datasets: Vec<&str> = by_dataset.keys().copied().collect();
+    for dataset in datasets {
+        let Some((_, contract)) = catalog.contract_for(&job.app, dataset) else {
+            continue;
+        };
+        let revs = &by_dataset[dataset];
+        let records: Vec<&serde_json::Value> = revs
+            .iter()
+            .filter(|r| r.change != "removed")
+            .filter_map(|r| r.data.as_ref())
+            .collect();
+        let removed = revs.iter().filter(|r| r.change == "removed").count();
+        let violations = contract.evaluate(&records, removed);
+        let verdict = pumper_core::ContractVerdict::from_violations(&violations, enforce);
+        let outcome = serde_json::json!({
+            "verdict": verdict.as_str(),
+            "violations": violations,
+            "records": records.len(),
+            "removed": removed,
+            "enforced": enforce,
+            "job_id": job.id,
+            "checked_at": pumper_core::datasets::ts(chrono::Utc::now()),
+        });
+        state
+            .contract_verdicts
+            .lock()
+            .expect("contract verdict lock")
+            .insert(format!("{}/{}", job.app, dataset), outcome);
+        match verdict {
+            pumper_core::ContractVerdict::Pass => {}
+            pumper_core::ContractVerdict::Warn => warn!(
+                app = %job.app,
+                dataset,
+                ?violations,
+                "data contract violated (warn-only: [contracts] enforce = false)"
+            ),
+            pumper_core::ContractVerdict::Block => {
+                warn!(
+                    app = %job.app,
+                    dataset,
+                    ?violations,
+                    "pushes suppressed: declared data contract violated"
+                );
+                by_dataset.remove(dataset);
+            }
         }
     }
 }

@@ -33,6 +33,7 @@ mod economics;
 mod ingress;
 mod jobs;
 mod meta;
+mod provenance;
 mod query;
 mod recipes;
 mod runtime;
@@ -52,6 +53,7 @@ use economics::*;
 use ingress::*;
 use jobs::*;
 use meta::*;
+use provenance::*;
 use query::*;
 use recipes::*;
 use runtime::*;
@@ -92,6 +94,7 @@ use watches::*;
         (name = "cache", description = "HTTP cache freshness model (learned change cadence)"),
         (name = "profiles", description = "Session vault: named login profiles"),
         (name = "recipes", description = "API X-ray: discovered JSON-API endpoints behind rendered pages"),
+        (name = "provenance", description = "Record-level derivation chains (M12): who wrote each revision from what, plus read-only re-derivation"),
         (name = "meta", description = "The OpenAPI document itself"),
         (name = "sources", description = "Extraction health: per-source degradation detection"),
     )
@@ -167,6 +170,8 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(dataset_duplicates))
         .routes(routes!(dataset_changes))
         .routes(routes!(record_history))
+        .routes(routes!(get_provenance))
+        .routes(routes!(rederive_provenance))
         .routes(routes!(list_derived, create_derived))
         .routes(routes!(get_derived, delete_derived))
         .routes(routes!(set_derived_enabled))
@@ -415,6 +420,8 @@ mod api_spec_tests {
         "DELETE /datasets/{app}/{dataset}/records/{key}",
         "GET /datasets/{app}/{dataset}/changes",
         "GET /datasets/{app}/{dataset}/history",
+        "GET /provenance/{app}/{dataset}/{key}",
+        "POST /provenance/{app}/{dataset}/{key}/rederive",
         "GET /derived",
         "POST /derived",
         "GET /derived/{id}",

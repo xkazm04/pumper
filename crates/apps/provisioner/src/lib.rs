@@ -266,6 +266,7 @@ pub fn build_catalog_row(prompt: &str, primary: &Candidate, conf: u8) -> Source 
         confidence: conf,
         dataset: proposal_key(prompt),
         notes: format!("compiled by provisioner from prompt: {prompt}"),
+        contract: None, // contracts are human-declared, never machine-proposed
     }
 }
 

@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::cache::ResearchCache;
 use crate::costs::{CostLedger, SpentTotal};
-use crate::datasets::{ChangeKind, Datasets, Record, UpsertSummary};
+use crate::datasets::{ChangeKind, Datasets, Provenance, Record, UpsertSummary};
 use crate::engine::{EngineSet, ResearchOutput, ResearchRequest};
 use crate::fetcher::{FetchOutcome, FetchRequest};
 use crate::plugin::Plugins;
@@ -446,24 +446,75 @@ impl AppContext {
     }
 
     /// Upserts one record into `<this app>/<dataset>`, reporting new/changed/unchanged.
+    /// Every write through the context stamps the revision with this job's id
+    /// (M12 provenance) — the one derivation fact the runtime always knows.
     pub async fn upsert(&self, dataset: &str, key: &str, value: &Value) -> Result<ChangeKind> {
+        self.upsert_with_provenance(dataset, key, value, Provenance::default())
+            .await
+    }
+
+    /// [`upsert`](Self::upsert) with the derivation facts the app knows for
+    /// THIS record — `source_url`, `artifact_sha`, `rules_hash` — stamped onto
+    /// the revision. `job_id` is always overwritten with this job's own id
+    /// (the context is the producing job; a caller-supplied value would be a
+    /// fabrication). Leave what you don't know `None` — never guess.
+    pub async fn upsert_with_provenance(
+        &self,
+        dataset: &str,
+        key: &str,
+        value: &Value,
+        prov: Provenance,
+    ) -> Result<ChangeKind> {
         let (dataset, trust) = self.write_target(dataset).await;
+        let prov = self.stamp(prov);
         self.datasets
-            .upsert_trusted(&self.app, &dataset, key, value, trust)
+            .upsert_stamped(&self.app, &dataset, key, value, trust, Some(&prov))
             .await
     }
 
     /// Upserts a batch and returns a new/changed/unchanged summary — the primary
-    /// dedup + change-detection entry point for periodic scrapes.
+    /// dedup + change-detection entry point for periodic scrapes. Revisions are
+    /// stamped with this job's id; per-record facts stay unknown here (see
+    /// [`upsert_many_with_provenance`](Self::upsert_many_with_provenance)).
     pub async fn upsert_many(
         &self,
         dataset: &str,
         items: &[(String, Value)],
     ) -> Result<UpsertSummary> {
-        let (dataset, trust) = self.write_target(dataset).await;
-        self.datasets
-            .upsert_many_trusted(&self.app, &dataset, items, trust)
+        self.upsert_many_with_provenance(dataset, items, Provenance::default())
             .await
+    }
+
+    /// [`upsert_many`](Self::upsert_many) with ONE batch-level provenance stamp
+    /// (e.g. a shared `rules_hash`, or the one listing URL a whole batch came
+    /// from). `job_id` is always this job's own id. Facts that differ per
+    /// record must NOT be stamped batch-wide — write those rows through
+    /// [`upsert_with_provenance`](Self::upsert_with_provenance) instead.
+    pub async fn upsert_many_with_provenance(
+        &self,
+        dataset: &str,
+        items: &[(String, Value)],
+        prov: Provenance,
+    ) -> Result<UpsertSummary> {
+        let (dataset, trust) = self.write_target(dataset).await;
+        let prov = self.stamp(prov);
+        self.datasets
+            .upsert_many_stamped(&self.app, &dataset, items, trust, Some(&prov))
+            .await
+    }
+
+    /// Forces the stamp's `job_id` to this job — the context IS the producing
+    /// job, so this field is never caller-controlled.
+    fn stamp(&self, mut prov: Provenance) -> Provenance {
+        prov.job_id = Some(self.job_id.to_string());
+        prov
+    }
+
+    /// Registers a RuleSet in the content-addressed registry and returns the
+    /// hash to stamp as [`Provenance::rules_hash`] — the pin that makes a
+    /// revision re-derivable after the app's live rules move on.
+    pub async fn register_rules(&self, rules: &Value) -> Result<String> {
+        self.datasets.register_rules(rules).await
     }
 
     /// Full-snapshot sync: upserts the batch, then marks previously-seen keys

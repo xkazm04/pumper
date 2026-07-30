@@ -16,15 +16,61 @@ use pumper_core::{
 };
 use serde_json::{json, Value};
 
+pub mod reliability;
+
 pub struct Crawl;
 
 /// Per-host fetch tally accumulated by [`MeteringHttpClient`] over a crawl.
+/// The same observation point that always fed `learn_tier`, kept as counters
+/// instead of a single boolean so the run's fetch-layer telemetry can also be
+/// persisted into the Web Reliability Index (see [`reliability`]) — richer
+/// tallying of responses the crawl made anyway, never extra fetches.
 #[derive(Default)]
 struct HostTally {
     fetches: usize,
-    /// True if any fetch to this host hit a bot-wall status or failed at the
-    /// transport layer — the signal the tier router learns from.
-    http_lost: bool,
+    /// 2xx responses.
+    ok: usize,
+    /// Bot-wall statuses (403/429/503) — same set as `fetcher::http_bot_wall`
+    /// (which is crate-private).
+    botwall: usize,
+    /// Transport-layer failures (DNS/TLS/connection/timeout).
+    transport_errors: usize,
+    /// `304 Not Modified` answers — evidence the host honors conditional GETs.
+    not_modified: usize,
+    /// `404`/`410` answers — the gone lifecycle.
+    gone: usize,
+    /// Responses carrying an `ETag` or `Last-Modified` validator header.
+    validators_seen: usize,
+}
+
+impl HostTally {
+    /// The signal the tier router learns from: any bot-wall or transport loss.
+    fn http_lost(&self) -> bool {
+        self.botwall > 0 || self.transport_errors > 0
+    }
+
+    /// Folds one fetch outcome into the tally (pure classification, kept out of
+    /// the client so it is unit-testable).
+    fn record(&mut self, result: &Result<HttpResponse>) {
+        self.fetches += 1;
+        match result {
+            Ok(resp) => {
+                match resp.status {
+                    403 | 429 | 503 => self.botwall += 1,
+                    304 => self.not_modified += 1,
+                    404 | 410 => self.gone += 1,
+                    s if (200..300).contains(&s) => self.ok += 1,
+                    _ => {}
+                }
+                if resp.headers.keys().any(|k| {
+                    k.eq_ignore_ascii_case("etag") || k.eq_ignore_ascii_case("last-modified")
+                }) {
+                    self.validators_seen += 1;
+                }
+            }
+            Err(_) => self.transport_errors += 1,
+        }
+    }
 }
 
 /// Wraps the raw HTTP client the crawler drives so the crawl — the platform's
@@ -46,17 +92,9 @@ impl HttpClient for MeteringHttpClient {
         let host = host_of(&req.url);
         let result = self.inner.fetch(req).await;
         if let Some(host) = host {
-            // Same bot-wall status set as `fetcher::http_bot_wall` (which is
-            // crate-private); a transport error is also an HTTP-tier loss.
-            let lost = match &result {
-                Ok(resp) => matches!(resp.status, 403 | 429 | 503),
-                Err(_) => true,
-            };
             // std Mutex, no `.await` held across the guard.
             let mut tallies = self.tallies.lock().unwrap_or_else(|e| e.into_inner());
-            let tally = tallies.entry(host).or_default();
-            tally.fetches += 1;
-            tally.http_lost |= lost;
+            tallies.entry(host).or_default().record(&result);
         }
         result
     }
@@ -64,8 +102,9 @@ impl HttpClient for MeteringHttpClient {
 
 /// Lowercased host of an http(s) URL — enough for crawl targets, without pulling
 /// in the `url` crate. Strips scheme, any `userinfo@`, the path/query/fragment,
-/// and the port.
-fn host_of(url: &str) -> Option<String> {
+/// and the port. Public so the sibling extractor app can attribute its
+/// reliability observations to the same host notion.
+pub fn host_of(url: &str) -> Option<String> {
     let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
     let authority = after_scheme.split(['/', '?', '#']).next()?;
     let authority = authority
@@ -623,12 +662,34 @@ impl ScrapeApp for Crawl {
         // ROI accounting and, crucially, teaches the router which hosts bot-wall
         // the HTTP tier — the crawl's richest signal, previously discarded.
         let tallies = std::mem::take(&mut *tallies.lock().unwrap_or_else(|e| e.into_inner()));
+        let mut reliability_deltas: Vec<(String, reliability::HostDelta)> =
+            Vec::with_capacity(tallies.len());
         for (host, tally) in tallies {
             let url = format!("https://{host}/");
             let detail = format!("crawl: {} http fetches", tally.fetches);
             ctx.meter("http", Some(&url), 0.0, Some(&detail)).await;
-            ctx.learn_tier(&host, "http", tally.http_lost).await;
+            ctx.learn_tier(&host, "http", tally.http_lost()).await;
+            // Web Reliability Index (M41): the same per-host outcomes, persisted
+            // instead of discarded after the router learns from them.
+            reliability_deltas.push((
+                host,
+                reliability::HostDelta::Crawl(reliability::CrawlHostObs {
+                    fetches: tally.fetches as u64,
+                    ok: tally.ok as u64,
+                    botwall: tally.botwall as u64,
+                    transport_errors: tally.transport_errors as u64,
+                    not_modified: tally.not_modified as u64,
+                    gone: tally.gone as u64,
+                    validators_seen: tally.validators_seen as u64,
+                }),
+            ));
         }
+        let reliability_hosts = reliability::record_observations(
+            &ctx.datasets,
+            &ctx.job_id.to_string(),
+            reliability_deltas,
+        )
+        .await;
 
         let pages_new = counts.new.load(Ordering::Relaxed);
         let pages_changed = counts.changed.load(Ordering::Relaxed);
@@ -671,13 +732,58 @@ impl ScrapeApp for Crawl {
             // Versioned crawl archive: changed revisions copied to
             // revision-suffixed artifacts + `page_versions` records.
             "versions_archived": counts.versions_archived.load(Ordering::Relaxed),
+            // Web Reliability Index: hosts whose fetch telemetry was folded into
+            // `web-reliability/host_observations` + `host_index` this run.
+            "reliability_hosts": reliability_hosts,
         }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{host_of, versioned_artifact_name};
+    use super::{host_of, versioned_artifact_name, HostTally};
+    use pumper_core::{Error, HttpResponse, Result};
+    use std::collections::HashMap;
+
+    fn resp(status: u16, headers: &[(&str, &str)]) -> Result<HttpResponse> {
+        Ok(HttpResponse {
+            status,
+            headers: headers
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<HashMap<_, _>>(),
+            body: String::new(),
+            final_url: "https://example.com/".into(),
+            cache_hit: false,
+        })
+    }
+
+    #[test]
+    fn tally_classifies_outcomes_and_validators() {
+        let mut t = HostTally::default();
+        t.record(&resp(200, &[("ETag", "\"abc\"")]));
+        t.record(&resp(304, &[]));
+        t.record(&resp(404, &[]));
+        t.record(&resp(429, &[]));
+        t.record(&resp(200, &[("last-modified", "yesterday")]));
+        t.record(&Err(Error::App("dns".into())));
+        assert_eq!(t.fetches, 6);
+        assert_eq!(t.ok, 2);
+        assert_eq!(t.not_modified, 1);
+        assert_eq!(t.gone, 1);
+        assert_eq!(t.botwall, 1);
+        assert_eq!(t.transport_errors, 1);
+        assert_eq!(t.validators_seen, 2);
+        assert!(t.http_lost());
+    }
+
+    #[test]
+    fn tally_clean_host_is_not_lost() {
+        let mut t = HostTally::default();
+        t.record(&resp(200, &[]));
+        t.record(&resp(304, &[]));
+        assert!(!t.http_lost());
+    }
 
     #[test]
     fn versioned_name_inserts_revision_before_html_suffix() {

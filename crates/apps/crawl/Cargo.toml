@@ -8,5 +8,7 @@ pumper-core.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+# Web Reliability Index: `{host}@{date}` observation keys.
+chrono.workspace = true
 # Version-archive artifact copies (async fs, no new runtime feature surface).
 tokio = { workspace = true, features = ["fs"] }

@@ -37,9 +37,12 @@ pub(crate) struct SourcesQuery {
     tag = "sources",
     params(SourcesQuery),
     responses(
-        (status = 200, description = "`{enabled, enforcing, count, sources: [{id, app, dataset, \
-            state, degradation_score, state_since, last_verdict, tripped_of_last3, ...}]}`. \
-            `enforcing: false` means verdicts are recorded but nothing is gated."),
+        (status = 200, description = "`{enabled, enforcing, contracts_enforce, count, sources: \
+            [{id, app, dataset, state, degradation_score, state_since, last_verdict, \
+            tripped_of_last3, ..., contract?}]}`. \
+            `enforcing: false` means verdicts are recorded but nothing is gated. `contract` is \
+            the latest declared-contract verdict (`{verdict: pass|warn|block, violations, ...}`) \
+            for sources with a `[source.contract]` catalog block that have run since boot."),
         (status = 503, description = "Detection is disabled ([resilience] enabled = false)", body = Object),
     )
 )]
@@ -55,9 +58,25 @@ pub(crate) async fn list_sources(
             query.limit.clamp(1, 500),
         )
         .await?;
+    // Declared-contract verdicts (M20) ride along per row: the inferred health
+    // in this table and the declared floor are the two halves of "was the
+    // output right", so they read together.
+    let sources: Vec<Value> = sources
+        .iter()
+        .map(|s| {
+            let mut row = serde_json::to_value(s).unwrap_or(Value::Null);
+            if let Value::Object(map) = &mut row {
+                if let Some(v) = contract_verdict(&state, &s.id) {
+                    map.insert("contract".into(), v);
+                }
+            }
+            row
+        })
+        .collect();
     Ok(Json(json!({
         "enabled": true,
         "enforcing": state.health.enforcing(),
+        "contracts_enforce": state.config.contracts.enforce,
         "count": sources.len(),
         "sources": sources,
     })))
@@ -123,6 +142,7 @@ pub(crate) async fn get_source(
         .unwrap_or(false);
     Ok(Json(json!({
         "source": source,
+        "contract": contract_verdict(&state, &id).unwrap_or(Value::Null),
         "enforcing": state.health.enforcing(),
         "statistical_coverage": coverage,
         "runs": runs,
@@ -219,6 +239,19 @@ pub(crate) async fn set_source_state(
     Ok(Json(
         json!({ "id": id, "state": parsed.as_str(), "reason": reason }),
     ))
+}
+
+/// The latest publish-time data-contract verdict for a `<app>/<dataset>`
+/// source id (M20), recorded by the worker seam. In-memory: null-absent before
+/// the first contracted run since boot. None when no verdict exists — sources
+/// without a declared contract simply carry no `contract` key.
+fn contract_verdict(state: &AppState, id: &str) -> Option<Value> {
+    state
+        .contract_verdicts
+        .lock()
+        .expect("contract verdict lock")
+        .get(id)
+        .cloned()
 }
 
 /// The health store, or 503 when detection is switched off — a health question

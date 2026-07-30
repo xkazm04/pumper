@@ -41,6 +41,7 @@ app-census-bfs = { path = "crates/apps/census-bfs" }
 app-cordis = { path = "crates/apps/cordis" }
 app-homewyse-pricing = { path = "crates/apps/homewyse-pricing" }
 app-state-tax = { path = "crates/apps/state-tax" }
+app-state-licensing = { path = "crates/apps/state-licensing" }
 app-valuation-multiples = { path = "crates/apps/valuation-multiples" }
 app-trade-wages = { path = "crates/apps/trade-wages" }
 trades-common = { path = "crates/apps/trades-common" }

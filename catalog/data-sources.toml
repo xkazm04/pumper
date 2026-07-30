@@ -47,6 +47,18 @@ confidence = 5
 dataset = "opportunities"
 notes = "POST-only (bare GET = 403). Verified live: 1366 posted opps, dedup confirmed."
 
+# Declared data contract (M20): the floor every publish must clear. Fields are
+# the raw Search2 hit shape live-verified 2026-07-30 (`id` arrives as string OR
+# number, so only `title`/`number` are type-pinned).
+[source.contract]
+required_fields = ["id", "title"]
+max_row_delta_pct = 50.0
+max_staleness_hours = 48
+
+[source.contract.types]
+title = "string"
+number = "string"
+
 [[source]]
 id = "grants-gov-xml"
 app = ""
@@ -428,6 +440,23 @@ confidence = 4
 dataset = "formations"
 notes = "Monthly business applications (BA_BA) + high-propensity (BA_HBA) per NAICS sector, US-NATIONAL ONLY — the BFS geography is us (geography.json fips=[us]; for=state:XX and for=state:* both HTTP 400), NSA, refreshed weekly by Census. A working request REQUIRES for=us:* AND time_slot_id=0. QUIRK: predicate columns are DUPLICATED in the header row — resolve columns by first occurrence. National sector grain ONLY (grain=naics_sector_national on every record) — no state or trade-level inference. Also derives formation_velocity (T12M/YoY/acceleration, one national record per sector) and refreshes census/market_blend's formation block (labeled national). Free CENSUS_API_KEY (shared); keyless requests 302 to missing_key.html. LIVE-verified with a real key 2026-07-30."
 
+# Declared data contract (M20) for the `formations` records (live-verified
+# shape 2026-07-30). `applications` is honest-Null when suppressed upstream, so
+# it is range-bounded (>= 0 when present) but NOT required.
+[source.contract]
+required_fields = ["sector", "geo", "period", "grain"]
+max_row_delta_pct = 50.0
+max_staleness_hours = 336
+
+[source.contract.types]
+sector = "string"
+period = "string"
+grain = "string"
+
+[source.contract.ranges]
+applications = { min = 0.0 }
+high_propensity_applications = { min = 0.0 }
+
 [[source]]
 id = "census-nesd"
 app = "census-nesd"
@@ -443,6 +472,22 @@ status = "live"
 confidence = 4
 dataset = "owner_age"
 notes = "Owners of nonemployer firms per age band x 2-digit SECTOR NAICS x state (absnesdo, OWNRAGE question, all-demographics slice only). Per-state data exists at sector grain ONLY: NAICS2017=23 returns real rows; =238 / =2381 return HTTP 204 No Content — a contract-VALID empty meaning 'not published at this grain', not drift. Disclosure-suppressed cells dropped, never zeroed. Feeds pct_owners_55plus + succession_receipts on census/market_blend at sector grain (labeled succession_grain=naics_sector) — a succession wave-size indicator, not a per-business or per-trade prediction. Free CENSUS_API_KEY (shared); NES-D lags ~2y (params.year). LIVE-verified with a real key 2026-07-30."
+
+[[source]]
+id = "state-licensing"
+app = "state-licensing"
+market = "us"
+name = "US contractor licensing / bonding / insurance compliance (Claude research)"
+url = "local Claude CLI (web-verified agentic research; no upstream endpoint)"
+category = "market-stats"
+engine = "claude"
+access = "key-free"
+cadence = "annual"
+cron = "0 0 8 15 1 *"
+status = "live"
+confidence = 3
+dataset = "compliance"
+notes = "Per state x trade (51 jurisdictions x 5 canonical trades) state-level license requirement (none/registration/exam_license), typical license cost, surety bond, liability-insurance minimum, and solo-operator workers'-comp signal. Chunked ONE metered call per trade (state-tax's one-call/51-jurisdiction pattern); each trade vintage-gated on CA:<trade> year BEFORE research, so the annual scheduled run only pays for trades not yet held (force:true bypasses). Writes cross-source trades/compliance (keys <ST>:<trade>) and joins a compliance block onto the per-state trades/operator_economics rows. STATE grain only — county/city variation flagged via local_variation+notes, never invented figures. Costs real money per run (cost_class=claude)."
 
 [[source]]
 id = "cordis"

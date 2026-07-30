@@ -142,6 +142,17 @@ pub struct SearchRequest {
     pub since: Option<i64>,
     /// Skip this many ranked hits before `limit` — page 2 = `offset: limit`.
     pub offset: usize,
+    /// Only hits whose extracted money amount (whole US dollars, index-time
+    /// conservative extraction) is >= this. Docs with NO extracted amount never
+    /// match an amount filter — the field is absent, not zero.
+    pub amount_gte: Option<u64>,
+    /// Only hits whose extracted amount is <= this (whole US dollars).
+    pub amount_lte: Option<u64>,
+    /// Only hits whose extracted deadline-like date (`event_date`, unix seconds
+    /// UTC midnight) is at/after this. Absent field never matches.
+    pub date_after: Option<i64>,
+    /// Only hits whose extracted deadline-like date is at/before this.
+    pub date_before: Option<i64>,
     /// Compute the app/dataset facet breakdowns. **Off by default** — facets
     /// require sampling far more docs than `limit` (decoding each), which is pure
     /// waste for a caller that reads only hit ids (the saved-search runner) or

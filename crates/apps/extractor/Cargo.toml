@@ -15,6 +15,9 @@ chrono.workspace = true
 regex.workspace = true
 # Wayback historical backfill (`source.archive`): CDX range enumeration + raw snapshot URLs.
 pumper-engine-archive.workspace = true
+# Web Reliability Index: shared host-observation persistence + `host_of` live
+# in the sibling crawl app crate (path dep — both crates are workspace members).
+app-crawl = { path = "../crawl" }
 
 [dev-dependencies]
 uuid.workspace = true

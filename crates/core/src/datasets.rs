@@ -99,6 +99,54 @@ pub struct Revision {
     /// Trust of the write that produced this revision — so the era a degrading
     /// source wrote stays exactly identifiable after the fact.
     pub trust: String,
+    /// Derivation stamp of the write that produced this revision. Every field
+    /// is honest-Null: absent means "unknown", never a fabricated value (M12).
+    #[serde(flatten)]
+    pub provenance: Provenance,
+}
+
+/// Derivation stamp on a revision: where the value came from, mechanically.
+/// Every field is optional and `None` means UNKNOWN — a write path stamps only
+/// what it truly knows (the migration-0030 twin of the `trust` NULL-means-
+/// stable choice, so pre-existing revisions need no backfill and no field is
+/// ever invented).
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct Provenance {
+    /// Producing job (uuid as text) — carries schedule/trigger lineage via the
+    /// jobs table.
+    pub job_id: Option<String>,
+    /// URL the record's content was fetched from.
+    pub source_url: Option<String>,
+    /// sha256 (hex) of the archived source body on disk.
+    pub artifact_sha: Option<String>,
+    /// sha256 (hex) of the canonical RuleSet JSON that extracted the value —
+    /// see [`rules_hash`]; replayable via the `rules_versions` registry.
+    pub rules_hash: Option<String>,
+}
+
+impl Provenance {
+    /// True when nothing is known — the stamp of a legacy or anonymous write.
+    pub fn is_empty(&self) -> bool {
+        self.job_id.is_none()
+            && self.source_url.is_none()
+            && self.artifact_sha.is_none()
+            && self.rules_hash.is_none()
+    }
+
+    /// True when the revision can be re-derived: the archived body AND the
+    /// exact ruleset are both pinned. Anything less is not reproducible and
+    /// must be refused, not approximated.
+    pub fn replayable(&self) -> bool {
+        self.artifact_sha.is_some() && self.rules_hash.is_some()
+    }
+}
+
+/// Canonical content hash of a RuleSet (or any JSON value): sha256 over the
+/// serde_json string form, whose object keys are BTreeMap-sorted — the same
+/// canonicalization [`hash_value`] uses for record change detection, so two
+/// semantically identical rulesets can never hash apart on key order.
+pub fn rules_hash(rules: &Value) -> String {
+    hash_value(rules)
 }
 
 /// A keyset page of revisions plus the cursor to fetch the next page (None at
@@ -239,6 +287,22 @@ impl Datasets {
         value: &Value,
         trust: Option<&str>,
     ) -> Result<ChangeKind> {
+        self.upsert_stamped(app, dataset, key, value, trust, None)
+            .await
+    }
+
+    /// [`upsert_trusted`](Self::upsert_trusted) additionally stamping the
+    /// revision with a [`Provenance`] (M12). `None` (and every `None` field)
+    /// writes `NULL` = unknown — never fabricate a stamp.
+    pub async fn upsert_stamped(
+        &self,
+        app: &str,
+        dataset: &str,
+        key: &str,
+        value: &Value,
+        trust: Option<&str>,
+        prov: Option<&Provenance>,
+    ) -> Result<ChangeKind> {
         let hash = hash_value(value);
         let sim = crate::simhash::simhash_value(value) as i64;
         let now = Utc::now();
@@ -263,6 +327,7 @@ impl Datasets {
             sim,
             now,
             trust,
+            prov,
         )
         .await;
         match result {
@@ -291,6 +356,7 @@ impl Datasets {
         sim: i64,
         now: DateTime<Utc>,
         trust: Option<&str>,
+        prov: Option<&Provenance>,
     ) -> Result<ChangeKind> {
         let existing: Option<(String, String, Option<String>)> = sqlx::query_as(
             "SELECT hash, data, removed_at FROM records WHERE app = ?1 AND dataset = ?2 AND key = ?3",
@@ -348,6 +414,7 @@ impl Datasets {
                     Some(&diff),
                     now,
                     trust,
+                    prov,
                 )
                 .await?;
                 Ok(ChangeKind::Changed)
@@ -377,6 +444,7 @@ impl Datasets {
                     None,
                     now,
                     trust,
+                    prov,
                 )
                 .await?;
                 Ok(ChangeKind::New)
@@ -399,16 +467,21 @@ impl Datasets {
         diff: Option<&Value>,
         when: DateTime<Utc>,
         trust: Option<&str>,
+        prov: Option<&Provenance>,
     ) -> Result<()>
     where
         E: sqlx::SqliteExecutor<'e>,
     {
+        // A `None` stamp binds four NULLs — identical to a `Provenance` whose
+        // fields are all `None`, so "no stamp" and "unknown stamp" cannot drift.
+        let p = prov.cloned().unwrap_or_default();
         sqlx::query(
-            "INSERT INTO record_revisions (app, dataset, key, revision, change, data, diff, created_at, trust) \
+            "INSERT INTO record_revisions (app, dataset, key, revision, change, data, diff, created_at, trust, \
+                                           job_id, source_url, artifact_sha, rules_hash) \
              VALUES (?1, ?2, ?3, \
                      (SELECT COALESCE(MAX(revision), 0) + 1 FROM record_revisions \
                       WHERE app = ?1 AND dataset = ?2 AND key = ?3), \
-                     ?4, ?5, ?6, ?7, ?8)",
+                     ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         )
         .bind(app)
         .bind(dataset)
@@ -418,6 +491,10 @@ impl Datasets {
         .bind(diff.map(Value::to_string))
         .bind(ts(when))
         .bind(trust)
+        .bind(p.job_id)
+        .bind(p.source_url)
+        .bind(p.artifact_sha)
+        .bind(p.rules_hash)
         .execute(executor)
         .await?;
         Ok(())
@@ -432,7 +509,8 @@ impl Datasets {
         limit: i64,
     ) -> Result<Vec<Revision>> {
         let rows: Vec<RevisionRow> = sqlx::query_as(
-            "SELECT app, dataset, key, revision, change, data, diff, created_at, trust \
+            "SELECT app, dataset, key, revision, change, data, diff, created_at, trust, \
+                    job_id, source_url, artifact_sha, rules_hash \
              FROM record_revisions WHERE app = ?1 AND dataset = ?2 AND key = ?3 \
              ORDER BY revision DESC LIMIT ?4",
         )
@@ -459,7 +537,8 @@ impl Datasets {
         trust: Option<&str>,
     ) -> Result<Vec<Revision>> {
         let rows: Vec<RevisionRow> = sqlx::query_as(&format!(
-            "SELECT app, dataset, key, revision, change, data, diff, created_at, trust \
+            "SELECT app, dataset, key, revision, change, data, diff, created_at, trust, \
+                    job_id, source_url, artifact_sha, rules_hash \
              FROM record_revisions \
              WHERE app = ?1 AND (?2 IS NULL OR dataset = ?2) AND (?3 IS NULL OR created_at > ?3) \
              AND {} \
@@ -492,7 +571,8 @@ impl Datasets {
             .map(|(t, r)| (Some(t), Some(r)))
             .unwrap_or((None, None));
         let rows: Vec<RevisionRow> = sqlx::query_as(
-            "SELECT app, dataset, key, revision, change, data, diff, created_at, trust \
+            "SELECT app, dataset, key, revision, change, data, diff, created_at, trust, \
+                    job_id, source_url, artifact_sha, rules_hash \
              FROM record_revisions WHERE app = ?1 AND dataset = ?2 AND key = ?3 \
              AND (?4 IS NULL OR created_at < ?4 OR (created_at = ?4 AND revision < ?5)) \
              ORDER BY revision DESC LIMIT ?6",
@@ -537,7 +617,8 @@ impl Datasets {
             .map(|(t, r)| (Some(t), Some(r)))
             .unwrap_or((None, None));
         let rows: Vec<RevisionFeedRow> = sqlx::query_as(&format!(
-            "SELECT rowid AS rowid, app, dataset, key, revision, change, data, diff, created_at, trust \
+            "SELECT rowid AS rowid, app, dataset, key, revision, change, data, diff, created_at, trust, \
+                    job_id, source_url, artifact_sha, rules_hash \
              FROM record_revisions \
              WHERE app = ?1 AND (?2 IS NULL OR dataset = ?2) AND (?3 IS NULL OR created_at > ?3) \
              AND (?4 IS NULL OR created_at < ?4 OR (created_at = ?4 AND rowid < ?5)) \
@@ -692,7 +773,7 @@ impl Datasets {
         // entirely while a source is degrading, so every `removed` revision that
         // reaches here was written by a source we stand behind.
         Self::add_revision(
-            &mut *conn, app, dataset, key, "removed", None, None, now, None,
+            &mut *conn, app, dataset, key, "removed", None, None, now, None, None,
         )
         .await?;
         Ok(())
@@ -732,7 +813,26 @@ impl Datasets {
         items: &[(String, Value)],
         trust: Option<&str>,
     ) -> Result<UpsertSummary> {
-        self.upsert_many_at_depth(app, dataset, items, trust, 0)
+        self.upsert_many_at_depth(app, dataset, items, trust, None, 0)
+            .await
+    }
+
+    /// [`upsert_many_trusted`](Self::upsert_many_trusted) stamping every
+    /// revision this batch appends with ONE shared [`Provenance`] (M12). The
+    /// stamp is batch-level by design: a listing sync knows its producing
+    /// job (and possibly the ruleset), but not a distinct source URL per
+    /// record — per-record facts a batch writer doesn't know stay `None`
+    /// (honest-Null), and a writer that does know them per record uses
+    /// [`upsert_stamped`](Self::upsert_stamped) row by row.
+    pub async fn upsert_many_stamped(
+        &self,
+        app: &str,
+        dataset: &str,
+        items: &[(String, Value)],
+        trust: Option<&str>,
+        prov: Option<&Provenance>,
+    ) -> Result<UpsertSummary> {
+        self.upsert_many_at_depth(app, dataset, items, trust, prov, 0)
             .await
     }
 
@@ -746,10 +846,13 @@ impl Datasets {
         dataset: &'a str,
         items: &'a [(String, Value)],
         trust: Option<&'a str>,
+        prov: Option<&'a Provenance>,
         depth: u32,
     ) -> futures::future::BoxFuture<'a, Result<UpsertSummary>> {
         Box::pin(async move {
-            let summary = self.upsert_many_inner(app, dataset, items, trust).await?;
+            let summary = self
+                .upsert_many_inner(app, dataset, items, trust, prov)
+                .await?;
             // Fresh keys flow through matching enabled derived specs in the
             // same flow. Fail-open: a broken spec must never fail the source
             // ingest, so derived errors are logged, not propagated.
@@ -768,6 +871,7 @@ impl Datasets {
         dataset: &str,
         items: &[(String, Value)],
         trust: Option<&str>,
+        prov: Option<&Provenance>,
     ) -> Result<UpsertSummary> {
         let mut summary = UpsertSummary::default();
         if items.is_empty() {
@@ -794,6 +898,7 @@ impl Datasets {
                     sim,
                     now,
                     trust,
+                    prov,
                 )
                 .await
                 {
@@ -1237,6 +1342,69 @@ impl Datasets {
         Ok(names)
     }
 
+    // ── provenance ───────────────────────────────────────────────────────────
+    // M12 reproducible records: content-addressed RuleSet registry + the
+    // per-key provenance summary behind `GET /provenance/{app}/{dataset}/{key}`.
+    // The stamps themselves ride the upsert flow (`upsert_stamped` /
+    // `upsert_many_stamped`) and come back on every `Revision`.
+
+    /// Registers a RuleSet (any JSON value) in the content-addressed
+    /// `rules_versions` registry and returns its canonical hash — the value to
+    /// stamp as [`Provenance::rules_hash`]. Idempotent: the hash IS the
+    /// identity, so re-registering the same rules is a no-op. Re-derivation
+    /// replays the *registered* rules for a revision's hash, never the app's
+    /// current config — rules evolve; the registry is what pins history.
+    pub async fn register_rules(&self, rules: &Value) -> Result<String> {
+        let hash = rules_hash(rules);
+        sqlx::query(
+            "INSERT OR IGNORE INTO rules_versions (hash, rules, created_at) VALUES (?1, ?2, ?3)",
+        )
+        .bind(&hash)
+        .bind(rules.to_string())
+        .bind(ts(Utc::now()))
+        .execute(&self.pool)
+        .await?;
+        Ok(hash)
+    }
+
+    /// The registered RuleSet JSON for a hash, or `None` when that ruleset was
+    /// never registered (its revisions are stamped but not replayable).
+    pub async fn rules_by_hash(&self, hash: &str) -> Result<Option<Value>> {
+        let raw: Option<String> =
+            sqlx::query_scalar("SELECT rules FROM rules_versions WHERE hash = ?1")
+                .bind(hash)
+                .fetch_optional(&self.pool)
+                .await?;
+        raw.map(|s| {
+            serde_json::from_str(&s)
+                .map_err(|e| Error::Parse(format!("stored rules for '{hash}' unparseable: {e}")))
+        })
+        .transpose()
+    }
+
+    /// Stamp coverage of one record's revision chain, computed in SQL so the
+    /// numbers cover the WHOLE chain even when the caller pages it:
+    /// `(total, with job_id, replayable = artifact_sha AND rules_hash)`.
+    pub async fn provenance_coverage(
+        &self,
+        app: &str,
+        dataset: &str,
+        key: &str,
+    ) -> Result<(i64, i64, i64)> {
+        let row: (i64, i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), \
+                    COALESCE(SUM(job_id IS NOT NULL), 0), \
+                    COALESCE(SUM(artifact_sha IS NOT NULL AND rules_hash IS NOT NULL), 0) \
+             FROM record_revisions WHERE app = ?1 AND dataset = ?2 AND key = ?3",
+        )
+        .bind(app)
+        .bind(dataset)
+        .bind(key)
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     // ── derived ──────────────────────────────────────────────────────────────
     // Derived datasets (M11 v1): filter/project(/single-key lookup) specs that
     // recompute incrementally on each upstream delta, riding the upsert flow
@@ -1324,7 +1492,7 @@ impl Datasets {
                 continue;
             }
             if let Err(e) = self
-                .upsert_many_at_depth(app, &spec.target_dataset, &out, None, depth + 1)
+                .upsert_many_at_depth(app, &spec.target_dataset, &out, None, None, depth + 1)
                 .await
             {
                 tracing::warn!(spec = %spec.id, target = %spec.target_dataset,
@@ -1396,7 +1564,7 @@ impl Datasets {
             report.matched += items.len() as u64;
             if !items.is_empty() {
                 let s = self
-                    .upsert_many_at_depth(&spec.source_app, &spec.target_dataset, &items, None, 1)
+                    .upsert_many_at_depth(&spec.source_app, &spec.target_dataset, &items, None, None, 1)
                     .await?;
                 report.new += s.new.len() as u64;
                 report.changed += s.changed.len() as u64;
@@ -1519,7 +1687,7 @@ impl Datasets {
         if out.is_empty() {
             return Ok(());
         }
-        self.upsert_many_at_depth(&spec.source_app, &spec.target_dataset, &out, None, depth + 1)
+        self.upsert_many_at_depth(&spec.source_app, &spec.target_dataset, &out, None, None, depth + 1)
             .await?;
         Ok(())
     }
@@ -1744,7 +1912,7 @@ impl Datasets {
         report.matched = out.len() as u64;
         if !out.is_empty() {
             let s = self
-                .upsert_many_at_depth(&spec.source_app, &spec.target_dataset, &out, None, 1)
+                .upsert_many_at_depth(&spec.source_app, &spec.target_dataset, &out, None, None, 1)
                 .await?;
             report.new += s.new.len() as u64;
             report.changed += s.changed.len() as u64;
@@ -2267,6 +2435,11 @@ struct RevisionRow {
     diff: Option<String>,
     created_at: String,
     trust: Option<String>,
+    // 0030 provenance stamp — every column NULL-means-unknown.
+    job_id: Option<String>,
+    source_url: Option<String>,
+    artifact_sha: Option<String>,
+    rules_hash: Option<String>,
 }
 
 /// The change feed needs a stable per-row tiebreak; `record_revisions` has no
@@ -2293,6 +2466,12 @@ impl TryFrom<RevisionRow> for Revision {
             diff: r.diff.as_deref().and_then(|s| serde_json::from_str(s).ok()),
             created_at: parse_ts(&r.created_at)?,
             trust: trust_label(r.trust.as_deref()),
+            provenance: Provenance {
+                job_id: r.job_id,
+                source_url: r.source_url,
+                artifact_sha: r.artifact_sha,
+                rules_hash: r.rules_hash,
+            },
         })
     }
 }

@@ -72,6 +72,11 @@ pub struct AppState {
     /// Outcome of the most recent DataHub emission (job or sync), surfaced on
     /// `GET /datahub/status`. In-memory only — emission is best-effort telemetry.
     pub datahub_last: crate::datahub::StatusCell,
+    /// Latest data-contract verdict per `<app>/<dataset>` (M20), recorded at the
+    /// worker's publish seam and surfaced on `/catalog/health` + `/sources`.
+    /// In-memory only — a verdict is per-run telemetry, re-established by the
+    /// next run; std Mutex, only quick insert/clone, no await held.
+    pub contract_verdicts: Arc<std::sync::Mutex<HashMap<String, serde_json::Value>>>,
 }
 
 /// The externally-supplied inputs of an [`AppState`]: the pieces `init` builds
@@ -146,6 +151,7 @@ impl AppState {
             job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
             datahub_last: Arc::new(std::sync::Mutex::new(None)),
+            contract_verdicts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }
 

@@ -30,6 +30,19 @@ pub async fn research_json(
     app: &str,
     request: ResearchRequest,
 ) -> Result<(Value, ResearchOutput)> {
+    research_json_named(ctx, app, request, "research.json").await
+}
+
+/// [`research_json`] with an explicit artifact name — for apps that make more
+/// than one metered call per job (e.g. state-licensing's per-trade chunking):
+/// each call's raw answer lands in its own artifact instead of the calls
+/// silently overwriting one shared `research.json`.
+pub async fn research_json_named(
+    ctx: &AppContext,
+    app: &str,
+    request: ResearchRequest,
+    artifact_name: &str,
+) -> Result<(Value, ResearchOutput)> {
     // Metered seam: records a cost event against the job, honors budget_usd, and
     // serves identical re-runs from the research cache (see core/app.rs).
     let output = ctx.research(request).await?;
@@ -38,7 +51,7 @@ pub async fn research_json(
         Some(j) => serde_json::to_vec_pretty(j)?,
         None => output.text.clone().into_bytes(),
     };
-    ctx.save_artifact("research.json", &artifact).await?;
+    ctx.save_artifact(artifact_name, &artifact).await?;
 
     let data = match output.json.clone() {
         Some(j) => j,
@@ -224,6 +237,29 @@ pub mod validate {
         }
     }
 
+    /// Push a violation if the value is present and negative. For magnitudes
+    /// where zero is a legitimate answer (a $0 license fee in a no-license
+    /// state, a $0 bond where none is required) — unlike [`require_positive`],
+    /// which treats 0 as implausible.
+    pub fn require_nonnegative(reasons: &mut Vec<String>, label: &str, v: Option<f64>) {
+        if let Some(v) = v {
+            if v < 0.0 {
+                reasons.push(format!("{label}: {v} < 0"));
+            }
+        }
+    }
+
+    /// Push a violation if the value is present and above `max` — a coarse
+    /// sanity ceiling for agent-returned dollar magnitudes (a $80M "license
+    /// fee" is a parse or hallucination, not a fact).
+    pub fn require_at_most(reasons: &mut Vec<String>, label: &str, v: Option<f64>, max: f64) {
+        if let Some(v) = v {
+            if v > max {
+                reasons.push(format!("{label}: {v} > plausibility cap {max}"));
+            }
+        }
+    }
+
     /// Push a violation if the value is present and outside the percentage
     /// range [0, 100].
     pub fn require_rate(reasons: &mut Vec<String>, label: &str, v: Option<f64>) {
@@ -273,6 +309,27 @@ pub mod validate {
             require_positive(&mut r, "wage", Some(0.0));
             require_positive(&mut r, "wage", Some(-1.0));
             assert_eq!(r.len(), 2);
+        }
+
+        #[test]
+        fn nonnegative_allows_zero_flags_negative() {
+            let mut r = Vec::new();
+            require_nonnegative(&mut r, "fee", Some(0.0));
+            require_nonnegative(&mut r, "fee", Some(250.0));
+            require_nonnegative(&mut r, "fee", None);
+            assert!(r.is_empty());
+            require_nonnegative(&mut r, "fee", Some(-5.0));
+            assert_eq!(r.len(), 1);
+        }
+
+        #[test]
+        fn at_most_flags_values_over_the_cap() {
+            let mut r = Vec::new();
+            require_at_most(&mut r, "bond", Some(15_000.0), 5_000_000.0);
+            require_at_most(&mut r, "bond", None, 5_000_000.0);
+            assert!(r.is_empty());
+            require_at_most(&mut r, "bond", Some(80_000_000.0), 5_000_000.0);
+            assert_eq!(r.len(), 1);
         }
 
         #[test]
@@ -453,6 +510,13 @@ pub mod unified {
     /// Virtual app namespace holding the cross-source trades dataset.
     pub const UNIFIED_APP: &str = "trades";
     pub const OPERATOR_ECONOMICS: &str = "operator_economics";
+    /// Per state × trade licensing / bonding / insurance reference written by
+    /// the `state-licensing` app (keys `<ST>:<trade>`), joined here as a
+    /// `compliance` block on the matching per-state rows.
+    pub const COMPLIANCE: &str = "compliance";
+    /// Read cap for the compliance dataset: well past 51 jurisdictions × 5
+    /// trades (= 255) so the join can't silently truncate.
+    const COMPLIANCE_READ_LIMIT: i64 = 5_000;
     /// The national-roll-up locality (matches homewyse-pricing's default).
     const NATIONAL_LOCALITY: &str = "United States";
     /// Read cap for the pricing dataset: well past 51 localities × 5 trades × 4
@@ -503,6 +567,18 @@ pub mod unified {
             .await?;
         let pricing: Vec<&Value> = pricing_recs.iter().map(|r| &r.data).collect();
 
+        // Per state × trade compliance (state-licensing app): keyed `<ST>:<trade>`,
+        // looked up per-row below. State-grain data, so the national `US:{trade}`
+        // roll-up carries no compliance block (Null, never a fabricated average).
+        let compliance_recs = ctx
+            .datasets
+            .list(UNIFIED_APP, COMPLIANCE, COMPLIANCE_READ_LIMIT)
+            .await?;
+        let compliance: std::collections::HashMap<String, Value> = compliance_recs
+            .into_iter()
+            .map(|r| (r.key, r.data))
+            .collect();
+
         let mut items: Vec<(String, Value)> = Vec::new();
         for trade in Trade::ALL {
             let label = trade.label();
@@ -539,6 +615,9 @@ pub mod unified {
                         "pricing": national_pricing,
                         "pricing_locality": NATIONAL_LOCALITY,
                         "tax": tax_context(federal.as_ref(), median_state_rate),
+                        // Compliance is state-grain (licensing is a state power);
+                        // a national roll-up would be a fabricated average.
+                        "compliance": Value::Null,
                         "valuation": valuation.as_ref().map(valuation_summary),
                     }),
                 ));
@@ -561,6 +640,10 @@ pub mod unified {
                         "pricing": state_pricing,
                         "pricing_locality": code,
                         "tax": state_tax_context(federal.as_ref(), trec),
+                        "compliance": compliance
+                            .get(&format!("{code}:{label}"))
+                            .map(compliance_summary)
+                            .unwrap_or(Value::Null),
                         "valuation": valuation.as_ref().map(valuation_summary),
                     }),
                 ));
@@ -621,6 +704,24 @@ pub mod unified {
                 "income_tax_type": state.get("income_tax_type"),
                 "top_marginal_rate": state.get("top_marginal_rate"),
             },
+        })
+    }
+
+    /// Compact compliance subset lifted from a state-licensing record: what it
+    /// costs to legally exist in the state — requirement level, license/bond
+    /// dollars, insurance minimum, workers-comp signal, plus the honesty
+    /// fields (`grain`, `local_variation`, `year`) so a consumer knows the
+    /// figure is state-grain and whether counties/cities complicate it.
+    fn compliance_summary(rec: &Value) -> Value {
+        json!({
+            "requirement_level": rec.get("requirement_level"),
+            "license_cost_usd": rec.get("license_cost_usd"),
+            "bond_amount_usd": rec.get("bond_amount_usd"),
+            "insurance_min_liability_usd": rec.get("insurance_min_liability_usd"),
+            "workers_comp_required": rec.get("workers_comp_required"),
+            "grain": rec.get("grain"),
+            "local_variation": rec.get("local_variation"),
+            "year": rec.get("year"),
         })
     }
 
@@ -719,6 +820,29 @@ pub mod unified {
             assert_eq!(tx["median"], 250.0);
             // A locality with no priced jobs → None, never a fabricated average.
             assert!(summarize_pricing(&refs, "Plumbing", "Ohio").is_none());
+        }
+
+        #[test]
+        fn compliance_summary_carries_costs_and_honesty_fields() {
+            let rec = json!({
+                "state": "CA", "trade": "Plumbing",
+                "requirement_level": "exam_license",
+                "license_cost_usd": 600.0,
+                "bond_amount_usd": 25000.0,
+                "insurance_min_liability_usd": 1000000.0,
+                "workers_comp_required": false,
+                "grain": "state", "local_variation": false, "year": "2026",
+                "notes": "CSLB C-36",
+            });
+            let c = compliance_summary(&rec);
+            assert_eq!(c["requirement_level"], "exam_license");
+            assert_eq!(c["bond_amount_usd"], 25000.0);
+            assert_eq!(c["grain"], "state");
+            assert_eq!(c["local_variation"], false);
+            // Absent fields stay Null — never fabricated.
+            let sparse = compliance_summary(&json!({ "requirement_level": "none" }));
+            assert_eq!(sparse["requirement_level"], "none");
+            assert!(sparse["bond_amount_usd"].is_null());
         }
 
         #[test]

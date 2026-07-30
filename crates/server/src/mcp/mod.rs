@@ -378,6 +378,7 @@ async fn tool_search(state: &AppState, args: &Value) -> Result<Value, String> {
         since: None,
         offset: 0,
         facets: false,
+        ..Default::default()
     };
     let results = state.search.query(req).await.map_err(|e| e.to_string())?;
     Ok(json!({

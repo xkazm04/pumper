@@ -27,6 +27,7 @@ pub struct Config {
     pub archive: ArchiveConfig,
     pub recipes: RecipesConfig,
     pub catalog: CatalogConfig,
+    pub contracts: ContractsConfig,
     pub ingress: IngressConfig,
     pub mcp: McpConfig,
     pub economics: EconomicsConfig,
@@ -188,6 +189,21 @@ pub struct CatalogConfig {
     /// catalog-managed schedules; orphans are never auto-touched). Default OFF:
     /// a bad TOML edit should be a loud log, not a silent mass-disable.
     pub auto_reconcile: bool,
+}
+
+/// Declared data contracts (`[source.contract]` blocks in the catalog).
+/// Contracts are always *evaluated* at publish time for sources that declare
+/// one — verdicts are recorded and surfaced on `/catalog/health` and
+/// `/sources` either way; this only controls whether a violated contract also
+/// *gates* (suppresses the dataset's pushes/triggers, like
+/// `[resilience] enforce` does for inferred health).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(default)]
+pub struct ContractsConfig {
+    /// Gate pushes on contract violations (verdict `block` instead of `warn`).
+    /// Default OFF — soak mode, exactly how resilience started: watch the
+    /// verdicts on `/catalog/health` until the contracts prove non-flaky.
+    pub enforce: bool,
 }
 
 /// Tier-zero archive engine (Wayback Machine CDX, v1). When enabled, the server

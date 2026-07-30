@@ -10,3 +10,7 @@ async-trait.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+# M14 entity enrichment: conservative index-time extraction (both already
+# workspace deps — regex for money/date patterns, chrono for calendar validity).
+regex.workspace = true
+chrono.workspace = true

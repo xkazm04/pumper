@@ -1039,3 +1039,113 @@ async fn derived_group_validation_rejects_unsupported_shapes() {
     assert_eq!(g.group_by, vec!["$.state".to_string()]);
     assert!(loaded.lookup.is_none());
 }
+
+// ── provenance (M12) ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn provenance_stamps_round_trip_and_unstamped_writes_stay_honest_null() {
+    use pumper_core::Provenance;
+    let store = fresh_db("datasets-provenance").await;
+    let ds = Datasets::new(store.storage.pool());
+
+    // Fully stamped write.
+    let prov = Provenance {
+        job_id: Some("11111111-2222-3333-4444-555555555555".into()),
+        source_url: Some("https://example.com/listing".into()),
+        artifact_sha: Some("ab".repeat(32)),
+        rules_hash: Some("cd".repeat(32)),
+    };
+    ds.upsert_stamped("app", "d", "k1", &json!({ "v": 1 }), None, Some(&prov))
+        .await
+        .unwrap();
+    let rev = &ds.history("app", "d", "k1", 10).await.unwrap()[0];
+    assert_eq!(rev.provenance.job_id, prov.job_id);
+    assert_eq!(rev.provenance.source_url, prov.source_url);
+    assert_eq!(rev.provenance.artifact_sha, prov.artifact_sha);
+    assert_eq!(rev.provenance.rules_hash, prov.rules_hash);
+    assert!(rev.provenance.replayable());
+
+    // Legacy/unstamped write: every field NULL = unknown, nothing invented.
+    ds.upsert("app", "d", "k2", &json!({ "v": 2 })).await.unwrap();
+    let rev = &ds.history("app", "d", "k2", 10).await.unwrap()[0];
+    assert!(rev.provenance.is_empty(), "unstamped write must stamp nothing");
+    assert!(!rev.provenance.replayable());
+
+    // Batch-level stamp lands on every revision of the batch.
+    let batch_prov = Provenance {
+        job_id: Some("job-batch".into()),
+        rules_hash: Some("ef".repeat(32)),
+        ..Default::default()
+    };
+    let items = vec![
+        ("b1".to_string(), json!({ "v": 3 })),
+        ("b2".to_string(), json!({ "v": 4 })),
+    ];
+    ds.upsert_many_stamped("app", "d", &items, None, Some(&batch_prov))
+        .await
+        .unwrap();
+    for key in ["b1", "b2"] {
+        let rev = &ds.history("app", "d", key, 10).await.unwrap()[0];
+        assert_eq!(rev.provenance.job_id.as_deref(), Some("job-batch"));
+        assert_eq!(rev.provenance.rules_hash, batch_prov.rules_hash);
+        assert!(rev.provenance.source_url.is_none(), "unknown stays unknown");
+        assert!(
+            !rev.provenance.replayable(),
+            "rules without a pinned artifact must not claim replayability"
+        );
+    }
+
+    // Removal revisions carry no stamp (mirrors the no-trust-on-tombstone rule).
+    ds.detect_removed("app", "d", &["k1".into(), "k2".into(), "b1".into()])
+        .await
+        .unwrap();
+    let rev = &ds.history("app", "d", "b2", 10).await.unwrap()[0];
+    assert_eq!(rev.change, "removed");
+    assert!(rev.provenance.is_empty());
+}
+
+#[tokio::test]
+async fn rules_registry_is_content_addressed_and_idempotent() {
+    let store = fresh_db("datasets-rules-registry").await;
+    let ds = Datasets::new(store.storage.pool());
+
+    let rules = json!({ "title": { "type": "css", "selector": "h1" } });
+    let h1 = ds.register_rules(&rules).await.unwrap();
+    assert_eq!(h1, pumper_core::datasets::rules_hash(&rules));
+    // Idempotent: same rules, same hash, no error.
+    assert_eq!(ds.register_rules(&rules).await.unwrap(), h1);
+    // Round-trips byte-canonically.
+    assert_eq!(ds.rules_by_hash(&h1).await.unwrap(), Some(rules.clone()));
+    // Unknown hashes are None, not an error — stamped-but-unregistered is a
+    // legitimate (refusable) state.
+    assert_eq!(ds.rules_by_hash("nope").await.unwrap(), None);
+    // Different rules hash apart.
+    let other = json!({ "title": { "type": "css", "selector": "h2" } });
+    assert_ne!(ds.register_rules(&other).await.unwrap(), h1);
+}
+
+#[tokio::test]
+async fn provenance_coverage_counts_whole_chain() {
+    use pumper_core::Provenance;
+    let store = fresh_db("datasets-prov-coverage").await;
+    let ds = Datasets::new(store.storage.pool());
+
+    // rev 1: unstamped; rev 2: job only; rev 3: fully replayable.
+    ds.upsert("app", "d", "k", &json!({ "v": 1 })).await.unwrap();
+    let job_only = Provenance { job_id: Some("j".into()), ..Default::default() };
+    ds.upsert_stamped("app", "d", "k", &json!({ "v": 2 }), None, Some(&job_only))
+        .await
+        .unwrap();
+    let full = Provenance {
+        job_id: Some("j".into()),
+        source_url: Some("https://x".into()),
+        artifact_sha: Some("aa".into()),
+        rules_hash: Some("bb".into()),
+    };
+    ds.upsert_stamped("app", "d", "k", &json!({ "v": 3 }), None, Some(&full))
+        .await
+        .unwrap();
+
+    let (total, with_job, replayable) = ds.provenance_coverage("app", "d", "k").await.unwrap();
+    assert_eq!((total, with_job, replayable), (3, 2, 1));
+}
