@@ -6,7 +6,10 @@
 //!
 //! For a GET, the engine:
 //! 1. queries the CDX index for the *newest* capture of the URL
-//!    (`<base>/cdx/search/cdx?url=<u>&limit=1&sort=reverse&filter=statuscode:200`),
+//!    (`<base>/cdx/search/cdx?url=<u>&limit=1&sort=reverse&filter=statuscode:200`).
+//!    LIVE-VERIFIED 2026-07-30: the CDX API returns **400 for requests without a
+//!    User-Agent header** — any client fronting this engine must set one (the
+//!    production HttpEngine always does via `[http] user_agent`),
 //! 2. checks that capture against the caller's freshness window
 //!    (`HttpRequest.archive_max_age`, seconds) — an older-only capture is a
 //!    typed miss so the tiered fetcher falls through to the live ladder,
@@ -764,7 +767,12 @@ mod tests {
             enabled: true,
             base_url: "https://web.archive.org".into(),
         };
-        let engine = ArchiveEngine::new(&cfg, Arc::new(PlainClient(reqwest::Client::new())));
+        let engine = ArchiveEngine::new(&cfg, Arc::new(PlainClient(
+            reqwest::Client::builder()
+                .user_agent("pumper-live-test")
+                .build()
+                .unwrap(),
+        )));
         // example.com is captured constantly; a 10-year window can't flake.
         let mut req = HttpRequest::get("https://example.com/");
         req.archive_max_age = Some(10 * 365 * 24 * 3600);
@@ -787,7 +795,12 @@ mod tests {
             enabled: true,
             base_url: "https://web.archive.org".into(),
         };
-        let engine = ArchiveEngine::new(&cfg, Arc::new(PlainClient(reqwest::Client::new())));
+        let engine = ArchiveEngine::new(&cfg, Arc::new(PlainClient(
+            reqwest::Client::builder()
+                .user_agent("pumper-live-test")
+                .build()
+                .unwrap(),
+        )));
         let list = engine
             .list_snapshots("https://example.com/", Some("2020"), Some("2021"), 5)
             .await
