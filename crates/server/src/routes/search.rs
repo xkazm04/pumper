@@ -30,6 +30,16 @@ pub(crate) struct SearchQuery {
     since: Option<i64>,
     /// Skip this many ranked hits before `limit` (page 2 = `offset=limit`). Capped.
     offset: Option<usize>,
+    /// Only hits whose index-time-extracted money amount (whole US dollars) is
+    /// >= this. Docs where no amount was extracted never match.
+    amount_gte: Option<u64>,
+    /// Only hits whose extracted amount is <= this (whole US dollars).
+    amount_lte: Option<u64>,
+    /// Only hits whose extracted deadline (`event_date`, unix seconds) is
+    /// at/after this. Docs with no extracted deadline never match.
+    date_after: Option<i64>,
+    /// Only hits whose extracted deadline is at/before this (unix seconds).
+    date_before: Option<i64>,
 }
 
 fn default_search_limit() -> usize {
@@ -44,7 +54,7 @@ fn default_search_limit() -> usize {
     tag = "search",
     params(SearchQuery),
     responses(
-        (status = 200, description = "`{query, total, count, hits, facets}` — BM25 ranked (or `sort=newest`), highlighted snippets. `total` is the full match count; `count` is the returned page size. `offset` pages (offset=limit → page 2); `sort=newest` orders by index time; `since=<unix-secs>` filters to recent docs."),
+        (status = 200, description = "`{query, total, count, hits, facets}` — BM25 ranked (or `sort=newest`), highlighted snippets. `total` is the full match count; `count` is the returned page size. `offset` pages (offset=limit → page 2); `sort=newest` orders by index time; `since=<unix-secs>` filters to recent docs. Entity filters (index-time regex extraction; docs without an extracted value never match): `amount_gte`/`amount_lte` in whole US dollars, `date_before`/`date_after` on the extracted deadline (unix seconds)."),
         (status = 400, description = "Empty query", body = Object),
     )
 )]
@@ -78,6 +88,10 @@ pub(crate) async fn search(
         since: query.since,
         // Clamp like `limit`: deep Tantivy offsets get progressively costlier.
         offset: query.offset.unwrap_or(0).min(SEARCH_MAX_OFFSET),
+        amount_gte: query.amount_gte,
+        amount_lte: query.amount_lte,
+        date_after: query.date_after,
+        date_before: query.date_before,
         // The HTTP surface is the one facet consumer — the response exposes them.
         facets: true,
     };

@@ -3,6 +3,8 @@
 //! ranking over the title + body fields; re-indexing an id replaces the prior
 //! document.
 
+pub mod enrich;
+
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -39,11 +41,26 @@ struct Fields {
     title: Field,
     body: Field,
     indexed_at: Field,
+    amount: Field,
+    event_date: Field,
 }
 
 /// Field names the current build's schema expects. An opened index missing any of
 /// these (or with body not stored) is an older schema and is rebuilt.
-const SCHEMA_FIELDS: &[&str] = &["id", "app", "dataset", "url", "title", "body", "indexed_at"];
+/// `amount`/`event_date` are the entity-typed enrichment fields (M14) — adding
+/// them here IS the schema version bump: an index built before them is wiped
+/// empty on open and must be rebuilt via the `search-backfill` bin.
+const SCHEMA_FIELDS: &[&str] = &[
+    "id",
+    "app",
+    "dataset",
+    "url",
+    "title",
+    "body",
+    "indexed_at",
+    "amount",
+    "event_date",
+];
 
 /// Background-commit cadence: the committer flushes at most this often, so a
 /// burst of jobs amortizes into a handful of commits instead of one fsync each.
@@ -168,6 +185,13 @@ impl TantivyIndex {
         // Recency dimension: FAST for order-by + range, INDEXED for the range
         // query, STORED so it can be returned. Unix seconds.
         builder.add_i64_field("indexed_at", INDEXED | STORED | FAST);
+        // Entity-typed enrichment (M14): both OPTIONAL per doc — absent when
+        // extraction found nothing (never guessed). `amount` = largest currency
+        // amount in the doc, whole US dollars. `event_date` = earliest upcoming
+        // deadline-like date, unix seconds (UTC midnight). FAST + INDEXED for
+        // range predicates; STORED so hits could surface them later.
+        builder.add_u64_field("amount", INDEXED | STORED | FAST);
+        builder.add_i64_field("event_date", INDEXED | STORED | FAST);
         let schema = builder.build();
 
         std::fs::create_dir_all(&cfg.dir)?;
@@ -206,6 +230,8 @@ impl TantivyIndex {
             title: field("title")?,
             body: field("body")?,
             indexed_at: field("indexed_at")?,
+            amount: field("amount")?,
+            event_date: field("event_date")?,
         };
 
         let writer: IndexWriter = index
@@ -313,7 +339,13 @@ impl Search for TantivyIndex {
             for d in docs {
                 // Upsert: drop any prior document with this id, then add.
                 w.delete_term(Term::from_field_text(f.id, &d.id));
-                w.add_document(doc!(
+                // Index-time entity enrichment (M14): conservative regex-only
+                // extraction over title+body. No match = field ABSENT on the
+                // doc (a range filter then simply never matches it).
+                let text = format!("{}\n{}", d.title, d.body);
+                let amount = enrich::max_amount_dollars(&text);
+                let event_date = enrich::earliest_upcoming_deadline(&text, d.indexed_at);
+                let mut tdoc = doc!(
                     f.id => d.id,
                     f.app => d.app,
                     f.dataset => d.dataset,
@@ -321,8 +353,15 @@ impl Search for TantivyIndex {
                     f.title => d.title,
                     f.body => d.body,
                     f.indexed_at => d.indexed_at,
-                ))
-                .map_err(|e| Error::App(format!("add_document: {e}")))?;
+                );
+                if let Some(a) = amount {
+                    tdoc.add_u64(f.amount, a);
+                }
+                if let Some(ts) = event_date {
+                    tdoc.add_i64(f.event_date, ts);
+                }
+                w.add_document(tdoc)
+                    .map_err(|e| Error::App(format!("add_document: {e}")))?;
             }
             Ok(())
         })
@@ -432,6 +471,31 @@ impl Search for TantivyIndex {
                         Bound::Unbounded,
                     )),
                 ));
+            }
+            // Entity-typed range predicates (M14). Docs where extraction found
+            // no amount / no deadline have the field ABSENT and never match a
+            // range clause — filtering by amount implies "has an amount".
+            if req.amount_gte.is_some() || req.amount_lte.is_some() {
+                let lower = req
+                    .amount_gte
+                    .map(|v| Bound::Included(Term::from_field_u64(f.amount, v)))
+                    .unwrap_or(Bound::Unbounded);
+                let upper = req
+                    .amount_lte
+                    .map(|v| Bound::Included(Term::from_field_u64(f.amount, v)))
+                    .unwrap_or(Bound::Unbounded);
+                clauses.push((Occur::Must, Box::new(RangeQuery::new(lower, upper))));
+            }
+            if req.date_after.is_some() || req.date_before.is_some() {
+                let lower = req
+                    .date_after
+                    .map(|v| Bound::Included(Term::from_field_i64(f.event_date, v)))
+                    .unwrap_or(Bound::Unbounded);
+                let upper = req
+                    .date_before
+                    .map(|v| Bound::Included(Term::from_field_i64(f.event_date, v)))
+                    .unwrap_or(Bound::Unbounded);
+                clauses.push((Occur::Must, Box::new(RangeQuery::new(lower, upper))));
             }
             let query: Box<dyn Query> = if clauses.len() == 1 {
                 clauses.pop().unwrap().1
