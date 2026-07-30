@@ -282,7 +282,10 @@ mod catalog_tests {
     /// reason. Kept explicit so a NEW in-scope source app can't be silently omitted
     /// — adding one that isn't listed here fails the coverage check below. Reasons:
     ///  - generic tooling / engines, not a data *source*: `crawl`, `extractor`,
-    ///    `plugin`, `readable`, `research`, `watch`.
+    ///    `plugin`, `readable`, `research`, `watch`, and `provisioner` (an
+    ///    on-demand compiler that *proposes* catalog rows for human review —
+    ///    it deliberately never appears in the catalog it writes proposals for,
+    ///    has no schedule, and its output is always `status = "planned"`).
     ///  - `hackernews`: an example/template app, not a production pipeline.
     ///  - sibling-product consumers outside this catalog's grant/labor scope, same
     ///    rationale the `census-*` docs already state ("a separate Ledgerline
@@ -300,6 +303,7 @@ mod catalog_tests {
         "hackernews",
         "homewyse-pricing",
         "plugin",
+        "provisioner",
         "readable",
         "research",
         "smlouvy-dump-watch",

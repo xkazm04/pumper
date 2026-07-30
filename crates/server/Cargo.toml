@@ -42,6 +42,7 @@ app-extractor.workspace = true
 app-plugin.workspace = true
 app-crawl.workspace = true
 app-smlouvy-dump-watch.workspace = true
+app-provisioner.workspace = true
 
 axum.workspace = true
 tower-http.workspace = true
