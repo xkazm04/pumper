@@ -72,6 +72,9 @@ pub struct AppState {
     /// Outcome of the most recent DataHub emission (job or sync), surfaced on
     /// `GET /datahub/status`. In-memory only — emission is best-effort telemetry.
     pub datahub_last: crate::datahub::StatusCell,
+    /// M26 governance state: `cost:pause`d apps + last poll summary, surfaced on
+    /// `GET /datahub/status`. In-memory only — re-derived from DataHub each poll.
+    pub datahub_govern: crate::datahub::GovernCell,
     /// Latest data-contract verdict per `<app>/<dataset>` (M20), recorded at the
     /// worker's publish seam and surfaced on `/catalog/health` + `/sources`.
     /// In-memory only — a verdict is per-run telemetry, re-established by the
@@ -151,6 +154,7 @@ impl AppState {
             job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
             datahub_last: Arc::new(std::sync::Mutex::new(None)),
+            datahub_govern: Default::default(),
             contract_verdicts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })
     }

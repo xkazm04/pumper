@@ -357,7 +357,9 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         engines: state.engines.clone(),
         datasets: state.datasets.clone(),
         costs: state.costs.clone(),
-        budget_usd: job.budget_usd,
+        // M26: a `cost:pause` DataHub tag on the app's datasets forces $0 —
+        // the budget governor then serves free tiers only (reversible pause).
+        budget_usd: crate::datahub::effective_budget(&state, &job.app, job.budget_usd),
         spent_usd: std::sync::Arc::new(pumper_core::SpentTotal::new(spent_seed)),
         research_cache: state.research_cache.clone(),
         tiers: state.tiers.clone(),

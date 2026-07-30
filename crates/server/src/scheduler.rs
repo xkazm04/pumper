@@ -74,6 +74,10 @@ pub async fn run(state: AppState) {
         // (non-blocking) and strictly idle-slot via Governor::try_acquire, so
         // it can neither delay this loop nor crowd out live traffic.
         crate::refresher::tick(&state);
+        // And the DataHub governance pull ([datahub] govern, default OFF):
+        // interval-gated and spawned — deprecations/tags/assertions in DataHub
+        // become schedule disables, Claude-tier pauses, and immediate syncs.
+        crate::datahub::govern_tick(&state);
         // Stop enqueuing new scheduled work as soon as shutdown is signalled.
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
