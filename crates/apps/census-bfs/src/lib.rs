@@ -2,34 +2,39 @@
 //! Statistics (BFS)** — the leading edge of competition.
 //!
 //! CBP/NES describe the trades market as it was ~2 years ago; BFS publishes
-//! *current* new business applications per NAICS sector × state. This app
-//! ingests application counts (and the high-propensity subset) for the
-//! construction/services sectors, upserts the raw series into `formations`,
-//! derives trailing-12-month velocity/acceleration per state × sector into
-//! `formation_velocity`, and refreshes the density blend's formation block —
-//! "how fast is new competition entering this market right now", on a weekly
-//! scheduler. Fast path — GET JSON API, no HTML, no browser.
+//! *current* new business applications per NAICS sector, **US-national only**.
+//! This app ingests application counts (and the high-propensity subset) for
+//! the construction/services sectors, upserts the raw national series into
+//! `formations`, derives trailing-12-month velocity/acceleration per sector
+//! into `formation_velocity`, and refreshes the density blend's formation
+//! block — "how fast is new competition entering the market right now", on a
+//! weekly scheduler. Fast path — GET JSON API, no HTML, no browser.
 //!
 //! Data type: LEADING INDICATOR (business applications). Access: FREE Census
 //! key (`params.api_key` or env `CENSUS_API_KEY`, shared with the other Census
 //! apps). Cataloged in `catalog/data-sources.toml` (scheduled → drift-gated).
 //!
-//! Contract notes (verified 2026-07-30 against api.census.gov/data.json and the
-//! key-free variable dictionary; data rows are key-gated — a keyless request
-//! 302s to missing_key.html like CBP/NES, so the row shape is re-verified on
-//! the first keyed run): BFS is an EITS timeseries at
-//! `https://api.census.gov/data/timeseries/eits/bfs` (NOT `…/timeseries/bfs`,
-//! which 404s). EITS conventions differ from the year-vintage apps:
-//! `get=cell_value,data_type_code,category_code,seasonally_adj`, predicates
-//! `time=from+{year}` (monthly periods `YYYY-MM` in the echoed `time` column),
-//! `category_code={NAICS sector, e.g. NAICS23}`, `data_type_code=BA_BA`
-//! (all business applications) / `BA_HBA` (high-propensity),
-//! `seasonally_adj=no`, `for=state:*`. `cell_value` arrives as a string.
+//! Contract notes (LIVE-verified 2026-07-30 with a real key): BFS is an EITS
+//! timeseries at `https://api.census.gov/data/timeseries/eits/bfs` (NOT
+//! `…/timeseries/bfs`, which 404s). Geography is **US-ONLY** — the dataset's
+//! geography.json exposes fips = [us]; `for=state:XX` and `for=state:*` both
+//! return HTTP 400 "unknown/unsupported geography hierarchy". A working
+//! request REQUIRES `for=us:*` AND `time_slot_id=0`:
+//! `get=cell_value,data_type_code,category_code,seasonally_adj&for=us:*`
+//! `&time=from+{year}` (or `time=YYYY-MM`), `category_code={NAICS23|NAICS56}`,
+//! `data_type_code=BA_BA` (all applications) / `BA_HBA` (high-propensity),
+//! `seasonally_adj=no`, `time_slot_id=0`. `cell_value` arrives as a string.
+//! QUIRK: predicate columns are DUPLICATED in the header row (e.g.
+//! `["cell_value","data_type_code","category_code","seasonally_adj","time",
+//! "category_code","data_type_code","seasonally_adj","time_slot_id","us"]`) —
+//! columns must be resolved by FIRST occurrence of the name (or by position of
+//! `cell_value`), never by unique-name assumptions.
 //!
 //! HONEST GRAIN: BFS is NAICS *sector* level (23 Construction, 56 Admin &
-//! support/waste). Every record carries `grain: "naics_sector"` — trade-level
-//! (4/6-digit) inference is deliberately impossible to read out of this
-//! dataset, and consumers must keep it that way.
+//! support/waste) at NATIONAL geography only. Every record carries
+//! `grain: "naics_sector_national"` — state-level or trade-level (4/6-digit)
+//! inference is deliberately impossible to read out of this dataset, and
+//! consumers must keep it that way.
 
 use async_trait::async_trait;
 use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
@@ -59,13 +64,14 @@ impl ScrapeApp for CensusBfs {
     fn description(&self) -> &'static str {
         "US business-formation velocity from Census Business Formation Statistics \
          (EITS BFS timeseries JSON API). Monthly business applications + \
-         high-propensity applications per NAICS sector × state (`formations`), with \
-         derived trailing-12-month velocity/YoY/acceleration (`formation_velocity`) \
-         feeding the census/market_blend formation block. Sector grain — records are \
-         labeled grain=naics_sector, no trade-level inference. Requires a FREE Census \
-         API key (params.api_key or env CENSUS_API_KEY). Params: {\"from_year\": \
-         \"2022\", \"states\": \"06,12,48\" (FIPS list; default all), \"sectors\": \
-         [\"NAICS23\",\"NAICS56\"], \"api_key\": \"...\"}"
+         high-propensity applications per NAICS sector, US-NATIONAL only — the BFS \
+         API serves no state geography (`formations`), with derived trailing-12-month \
+         velocity/YoY/acceleration (`formation_velocity`) feeding the \
+         census/market_blend formation block. National sector grain — records are \
+         labeled grain=naics_sector_national, no state or trade-level inference. \
+         Requires a FREE Census API key (params.api_key or env CENSUS_API_KEY). \
+         Params: {\"from_year\": \"2022\", \"sectors\": [\"NAICS23\",\"NAICS56\"], \
+         \"api_key\": \"...\"}"
     }
 
     fn requires(&self) -> &'static [pumper_core::Requirement] {
@@ -89,13 +95,6 @@ impl ScrapeApp for CensusBfs {
             .and_then(Value::as_str)
             .unwrap_or(DEFAULT_FROM_YEAR)
             .to_string();
-        let states = ctx
-            .params
-            .get("states")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .trim()
-            .to_string();
         let sectors: Vec<(String, String)> =
             match ctx.params.get("sectors").and_then(Value::as_array) {
                 Some(arr) => arr
@@ -118,24 +117,20 @@ impl ScrapeApp for CensusBfs {
 
         let api_key = census_common::api_key(&ctx, "census-bfs")?;
 
-        let for_clause = if states.is_empty() || states == "*" {
-            "for=state:*".to_string()
-        } else {
-            format!("for=state:{states}")
-        };
-
         let mut formation_records: Vec<(String, Value)> = Vec::new();
         let mut velocity_records: Vec<(String, Value)> = Vec::new();
         let mut sector_summaries: Vec<Value> = Vec::new();
 
         for (sector, label) in &sectors {
-            // (state_fips, period) → (applications, high-propensity).
-            let mut cells: BTreeMap<(String, String), (Option<f64>, Option<f64>)> =
-                BTreeMap::new();
+            // period → (applications, high-propensity). National series — the
+            // BFS API serves no state geography (for=us:* is the only grain).
+            let mut cells: BTreeMap<String, (Option<f64>, Option<f64>)> = BTreeMap::new();
 
             for (dt_code, slot) in [("BA_BA", 0usize), ("BA_HBA", 1usize)] {
+                // `for=us:*` and `time_slot_id=0` are both REQUIRED — without
+                // them the API 400s (state geographies) or returns nothing.
                 let url = format!(
-                    "https://api.census.gov/data/timeseries/eits/bfs?get=cell_value,data_type_code,category_code,seasonally_adj&{for_clause}&time=from+{from_year}&category_code={sector}&data_type_code={dt_code}&seasonally_adj=no&key={api_key}"
+                    "https://api.census.gov/data/timeseries/eits/bfs?get=cell_value,data_type_code,category_code,seasonally_adj&for=us:*&time=from+{from_year}&category_code={sector}&data_type_code={dt_code}&seasonally_adj=no&time_slot_id=0&key={api_key}"
                 );
                 let resp = ctx.engines.http.fetch(HttpRequest::get(url)).await?;
                 // An empty series for one sector/measure is a note, not a failure.
@@ -170,6 +165,10 @@ impl ScrapeApp for CensusBfs {
                 )
                 .await?;
 
+                // QUIRK: EITS duplicates the predicate columns in the header
+                // row (each requested get= var appears again as an echoed
+                // predicate) — `position` resolves the FIRST occurrence, which
+                // is the contract here; never assume unique column names.
                 let header = rows.first().cloned().unwrap_or_default();
                 let idx = |name: &str| header.iter().position(|h| h.as_str() == name);
                 let i_val = idx("cell_value").ok_or_else(|| {
@@ -180,13 +179,10 @@ impl ScrapeApp for CensusBfs {
                 let i_time = idx("time").ok_or_else(|| {
                     Error::App(format!("Census BFS {sector}: no time column in {header:?}"))
                 })?;
-                let i_state = idx("state").ok_or_else(|| {
-                    Error::App(format!("Census BFS {sector}: no state column in {header:?}"))
-                })?;
                 let i_sa = idx("seasonally_adj");
 
-                for (st, period, v) in parse_series_rows(&rows, i_val, i_time, i_state, i_sa) {
-                    let cell = cells.entry((st, period)).or_default();
+                for (period, v) in parse_series_rows(&rows, i_val, i_time, i_sa) {
+                    let cell = cells.entry(period).or_default();
                     if slot == 0 {
                         cell.0 = Some(v);
                     } else {
@@ -195,60 +191,45 @@ impl ScrapeApp for CensusBfs {
                 }
             }
 
-            // Raw monthly records.
-            let mut months_by_state: BTreeMap<String, Vec<(String, f64)>> = BTreeMap::new();
-            let mut hp_by_state: BTreeMap<String, Vec<(String, f64)>> = BTreeMap::new();
-            for ((st_fips, period), (ba, hba)) in &cells {
-                let state = census_common::state_abbr(st_fips).to_string();
+            // Raw monthly records — one national series per sector.
+            let mut months: Vec<(String, f64)> = Vec::new();
+            let mut hp_months: Vec<(String, f64)> = Vec::new();
+            for (period, (ba, hba)) in &cells {
                 if let Some(v) = ba {
-                    months_by_state
-                        .entry(st_fips.clone())
-                        .or_default()
-                        .push((period.clone(), *v));
+                    months.push((period.clone(), *v));
                 }
                 if let Some(v) = hba {
-                    hp_by_state
-                        .entry(st_fips.clone())
-                        .or_default()
-                        .push((period.clone(), *v));
+                    hp_months.push((period.clone(), *v));
                 }
                 formation_records.push((
-                    format!("{sector}:{st_fips}:{period}"),
+                    format!("US|{sector}|{period}"),
                     json!({
                         "sector": sector,
                         "sector_label": label,
-                        "state": state,
-                        "state_fips": st_fips,
+                        "geo": "US",
                         "period": period,
                         "applications": ba.map(Value::from).unwrap_or(Value::Null),
                         "high_propensity_applications":
                             hba.map(Value::from).unwrap_or(Value::Null),
                         "seasonally_adj": "no",
-                        "grain": "naics_sector",
+                        "grain": "naics_sector_national",
                         "source": "eits/bfs",
                     }),
                 ));
             }
 
-            // Derived velocity per state.
+            // Derived velocity — national, per sector.
             let mut sector_velocity = 0usize;
-            for (st_fips, months) in &months_by_state {
-                let v = compute_velocity(months);
-                if v.months_available == 0 {
-                    continue;
-                }
-                let hp_t12m = hp_by_state
-                    .get(st_fips)
-                    .map(|m| compute_velocity(m))
-                    .and_then(|hv| hv.t12m);
-                sector_velocity += 1;
+            let v = compute_velocity(&months);
+            if v.months_available > 0 {
+                let hp_t12m = compute_velocity(&hp_months).t12m;
+                sector_velocity = 1;
                 velocity_records.push((
-                    format!("{sector}:{st_fips}"),
+                    format!("US|{sector}"),
                     json!({
                         "sector": sector,
                         "sector_label": label,
-                        "state": census_common::state_abbr(st_fips),
-                        "state_fips": st_fips,
+                        "geo": "US",
                         "months_available": v.months_available,
                         "as_of_period": v.as_of,
                         "t12m_applications": v.t12m.map(Value::from).unwrap_or(Value::Null),
@@ -260,7 +241,7 @@ impl ScrapeApp for CensusBfs {
                         "t12m_high_propensity":
                             hp_t12m.map(Value::from).unwrap_or(Value::Null),
                         "seasonally_adj": "no",
-                        "grain": "naics_sector",
+                        "grain": "naics_sector_national",
                     }),
                 ));
             }
@@ -268,7 +249,6 @@ impl ScrapeApp for CensusBfs {
             sector_summaries.push(json!({
                 "sector": sector,
                 "label": label,
-                "states_reported": months_by_state.len(),
                 "monthly_cells": cells.len(),
                 "velocity_records": sector_velocity,
             }));
@@ -306,17 +286,19 @@ impl ScrapeApp for CensusBfs {
     }
 }
 
-/// Parse EITS series rows into `(state_fips, period, value)` tuples. Rows with
-/// a non-numeric or negative cell (EITS suppression/jam conventions) are
+/// Parse EITS series rows into `(period, value)` tuples (national series —
+/// there is no state column; BFS geography is `us` only). Rows with a
+/// non-numeric or negative cell (EITS suppression/jam conventions) are
 /// dropped, never recorded as zero applications; a seasonally-adjusted row
-/// that leaks past the `seasonally_adj=no` predicate is dropped too.
+/// that leaks past the `seasonally_adj=no` predicate is dropped too. Column
+/// indices must be resolved by FIRST occurrence of the header name — EITS
+/// duplicates the predicate columns in the header row.
 fn parse_series_rows(
     rows: &[Vec<String>],
     i_val: usize,
     i_time: usize,
-    i_state: usize,
     i_sa: Option<usize>,
-) -> Vec<(String, String, f64)> {
+) -> Vec<(String, f64)> {
     rows.iter()
         .skip(1)
         .filter_map(|row| {
@@ -332,13 +314,12 @@ fn parse_series_rows(
                 .ok()
                 .filter(|v| *v >= 0.0)?;
             let period = row.get(i_time)?.trim().to_string();
-            let st = row.get(i_state)?.trim().to_string();
-            (!period.is_empty() && !st.is_empty()).then_some((st, period, v))
+            (!period.is_empty()).then_some((period, v))
         })
         .collect()
 }
 
-/// Trailing-window formation velocity for one state × sector series.
+/// Trailing-window formation velocity for one national sector series.
 #[derive(Debug, Default, PartialEq)]
 pub struct Velocity {
     pub months_available: usize,
@@ -472,16 +453,52 @@ mod tests {
     #[test]
     fn suppressed_and_adjusted_series_rows_are_dropped() {
         let rows: Vec<Vec<String>> = vec![
-            vec!["cell_value", "seasonally_adj", "time", "state"],
-            vec!["120", "no", "2024-01", "06"],
-            vec!["-999", "no", "2024-02", "06"], // jam sentinel
-            vec!["abc", "no", "2024-03", "06"],  // non-numeric
-            vec!["130", "yes", "2024-04", "06"], // adjusted leak
+            vec!["cell_value", "seasonally_adj", "time", "us"],
+            vec!["120", "no", "2024-01", "1"],
+            vec!["-999", "no", "2024-02", "1"], // jam sentinel
+            vec!["abc", "no", "2024-03", "1"],  // non-numeric
+            vec!["130", "yes", "2024-04", "1"], // adjusted leak
         ]
         .into_iter()
         .map(|r| r.into_iter().map(String::from).collect())
         .collect();
-        let out = parse_series_rows(&rows, 0, 2, 3, Some(1));
-        assert_eq!(out, vec![("06".to_string(), "2024-01".to_string(), 120.0)]);
+        let out = parse_series_rows(&rows, 0, 2, Some(1));
+        assert_eq!(out, vec![("2024-01".to_string(), 120.0)]);
+    }
+
+    /// The LIVE header shape: predicate columns duplicated after the get= vars
+    /// (`…,"time","category_code","data_type_code","seasonally_adj",
+    /// "time_slot_id","us"]`). First-occurrence resolution must pick the real
+    /// value columns and still parse the row.
+    #[test]
+    fn duplicated_predicate_header_columns_resolve_by_first_occurrence() {
+        let rows: Vec<Vec<String>> = vec![
+            vec![
+                "cell_value",
+                "data_type_code",
+                "category_code",
+                "seasonally_adj",
+                "time",
+                "category_code",
+                "data_type_code",
+                "seasonally_adj",
+                "time_slot_id",
+                "us",
+            ],
+            vec![
+                "50183", "BA_BA", "NAICS23", "no", "2025-01", "NAICS23", "BA_BA", "no",
+                "0", "1",
+            ],
+        ]
+        .into_iter()
+        .map(|r| r.into_iter().map(String::from).collect())
+        .collect();
+        let header = rows.first().cloned().unwrap();
+        let idx = |name: &str| header.iter().position(|h| h.as_str() == name);
+        let (i_val, i_time, i_sa) =
+            (idx("cell_value").unwrap(), idx("time").unwrap(), idx("seasonally_adj"));
+        assert_eq!((i_val, i_time, i_sa), (0, 4, Some(3)));
+        let out = parse_series_rows(&rows, i_val, i_time, i_sa);
+        assert_eq!(out, vec![("2025-01".to_string(), 50183.0)]);
     }
 }
