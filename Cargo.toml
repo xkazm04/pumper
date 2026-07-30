@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/core",
     "crates/engine-http",
+    "crates/engine-archive",
     "crates/engine-browser",
     "crates/engine-claude",
     "crates/engine-wasm",
@@ -19,6 +20,7 @@ edition = "2021"
 # internal
 pumper-core = { path = "crates/core" }
 pumper-engine-http = { path = "crates/engine-http" }
+pumper-engine-archive = { path = "crates/engine-archive" }
 pumper-engine-browser = { path = "crates/engine-browser" }
 pumper-engine-claude = { path = "crates/engine-claude" }
 pumper-engine-wasm = { path = "crates/engine-wasm" }
@@ -34,6 +36,9 @@ app-cms-fee-schedule = { path = "crates/apps/cms-fee-schedule" }
 census-common = { path = "crates/apps/census-common" }
 app-census-density = { path = "crates/apps/census-density" }
 app-census-nonemp = { path = "crates/apps/census-nonemp" }
+app-census-nesd = { path = "crates/apps/census-nesd" }
+app-census-bfs = { path = "crates/apps/census-bfs" }
+app-cordis = { path = "crates/apps/cordis" }
 app-homewyse-pricing = { path = "crates/apps/homewyse-pricing" }
 app-state-tax = { path = "crates/apps/state-tax" }
 app-valuation-multiples = { path = "crates/apps/valuation-multiples" }
