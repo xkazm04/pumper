@@ -99,6 +99,11 @@ pub struct AppContext {
     /// `None` on a fresh first attempt or after the poisoned-checkpoint escape.
     /// Advisory: apps must tolerate any stored shape and start fresh on doubt.
     pub restored: Option<Value>,
+    /// VCR mode (M24): `Off` (default), `Record` (persist every fetch/research
+    /// through this context into the job's cassette artifact), or `Replay`
+    /// (serve every fetch/research from a prior job's cassette — a MISS is a
+    /// typed error, never a silent live fetch; replay spends $0).
+    pub vcr: crate::vcr::Vcr,
     pub artifacts_dir: PathBuf,
 }
 
@@ -258,6 +263,18 @@ impl AppContext {
     /// cost event (tier used, escalation trail, Claude spend) against this job.
     /// Prefer this over calling the fetcher directly.
     pub async fn fetch(&self, mut req: FetchRequest) -> Result<FetchOutcome> {
+        // VCR replay: resolve from the recorded cassette and touch nothing
+        // live — no engine, no governor delay, no tier learning (a replayed
+        // outcome must not train the router), no spend. A MISS is a typed
+        // error; falling through to a live fetch would silently defeat the
+        // determinism that is the entire point of replay.
+        if let crate::vcr::Vcr::Replay(cassette) = &self.vcr {
+            let entry = cassette.resolve(crate::vcr::METHOD_GET, &req.url, &req.url)?;
+            let outcome = crate::vcr::to_fetch_outcome(entry, cassette.replay_of())?;
+            self.meter(outcome.engine, Some(&req.url), 0.0, Some("vcr_replay"))
+                .await;
+            return Ok(outcome);
+        }
         let host = url::Url::parse(&req.url)
             .ok()
             .and_then(|u| u.host_str().map(str::to_lowercase));
@@ -363,6 +380,12 @@ impl AppContext {
             detail.as_deref(),
         )
         .await;
+        // VCR record: persist this fetch's final outcome (whatever tier won —
+        // a browser render is recorded as its final response equivalent) into
+        // the job's cassette. Best-effort; a write failure never fails the job.
+        if let crate::vcr::Vcr::Record(recorder) = &self.vcr {
+            recorder.record(crate::vcr::fetch_entry(&outcome)).await;
+        }
         Ok(outcome)
     }
 
@@ -375,6 +398,18 @@ impl AppContext {
     /// the per-call ceiling to the remaining headroom, and store their output
     /// for the next caller. `resume_session` requests bypass the cache.
     pub async fn research(&self, mut req: ResearchRequest) -> Result<ResearchOutput> {
+        // VCR replay: the cassette is the only source. Keyed by the canonical
+        // request key (prompt/system/role/model/effort/turns/schema — budget
+        // clamps excluded), so a replay under a different budget still
+        // resolves. A MISS is a typed error — replay never drives the model.
+        if let crate::vcr::Vcr::Replay(cassette) = &self.vcr {
+            let key = ResearchCache::key(&req);
+            let head: String = req.prompt.chars().take(120).collect();
+            let entry = cassette.resolve(crate::vcr::METHOD_RESEARCH, &key, &head)?;
+            let out = crate::vcr::to_research_output(entry, cassette.replay_of())?;
+            self.meter("claude", None, 0.0, Some("vcr_replay")).await;
+            return Ok(out);
+        }
         let cacheable = req.resume_session.is_none() && self.research_cache.enabled();
         let key = cacheable.then(|| ResearchCache::key(&req));
         if let Some(key) = &key {
@@ -385,6 +420,9 @@ impl AppContext {
                 });
                 self.meter("claude", None, 0.0, Some(&detail)).await;
                 hit.cost_usd = Some(0.0);
+                // A cache-served answer still belongs in the cassette — the
+                // replay job must not depend on the cache's TTL surviving.
+                self.record_research(&req, &hit).await;
                 return Ok(hit);
             }
         }
@@ -392,7 +430,7 @@ impl AppContext {
         if let Some(remaining) = self.require_budget().await? {
             req.max_budget_usd = Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
         }
-        let out = self.engines.researcher().research(req).await?;
+        let out = self.engines.researcher().research(req.clone()).await?;
         self.meter("claude", None, out.cost_usd.unwrap_or(0.0), None)
             .await;
         if let Some(key) = &key {
@@ -400,7 +438,18 @@ impl AppContext {
                 tracing::warn!(job = %self.job_id, "research cache write failed: {e}");
             }
         }
+        self.record_research(&req, &out).await;
         Ok(out)
+    }
+
+    /// VCR record of one research answer (no-op unless in `Record` mode).
+    async fn record_research(&self, req: &ResearchRequest, out: &ResearchOutput) {
+        if let crate::vcr::Vcr::Record(recorder) = &self.vcr {
+            let key = ResearchCache::key(req);
+            recorder
+                .record(crate::vcr::research_entry(&key, req, out))
+                .await;
+        }
     }
 
     /// API X-ray post-render pass: persists a `capture_network` render's
