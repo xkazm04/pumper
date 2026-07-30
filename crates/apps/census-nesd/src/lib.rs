@@ -2,11 +2,13 @@
 //! Demographics (NES-D)** — the succession-wave input.
 //!
 //! NES-D publishes owner characteristics (age, sex, ethnicity, race, veteran
-//! status) of nonemployer firms per NAICS × state. We pull the **owner age
-//! band** composition for the same 4-digit trade codes census-nonemp tracks, so
-//! the density blend can compute where a retirement wave of solo trades
-//! operators will hit (`pct_owners_55plus`, `succession_receipts`). Upserted
-//! into the `owner_age` dataset. Fast path — GET JSON API, no HTML, no browser.
+//! status) of nonemployer firms per NAICS × state — **2-digit sector NAICS
+//! only**. We pull the **owner age band** composition for the sectors covering
+//! the trades census-nonemp tracks (23 Construction, 56 Admin & support/waste),
+//! so the density blend can compute where a retirement wave of solo trades
+//! operators will hit (`pct_owners_55plus`, `succession_receipts` — sector
+//! grain, labeled so). Upserted into the `owner_age` dataset. Fast path — GET
+//! JSON API, no HTML, no browser.
 //!
 //! Data type: OWNER DEMOGRAPHICS (owners of nonemployer firms, by age band).
 //! Access: FREE Census key (shared with census-density/census-nonemp;
@@ -14,25 +16,27 @@
 //! consumer; cataloged in `catalog/data-sources.toml` because it is on the
 //! scheduler (the drift gate cross-checks the cron).
 //!
-//! Contract notes (verified 2026-07-30 against api.census.gov/data.json and the
-//! key-free variable dictionary; data rows are key-gated — a keyless request
-//! 302s to missing_key.html exactly like CBP/NES, so the row shape is
-//! re-verified on the first keyed run): the NES-D *owner characteristics* table
-//! lives at `https://api.census.gov/data/{year}/absnesdo` (NOT `…/nesd` — that
-//! path does not exist in the discovery doc). Success is a JSON
-//! array-of-arrays, row 0 the header, columns matched by NAME. Variables:
-//! `OWNNOPD` (number of owners of nonemployer firms), `OWNNOPD_PCT`, question
-//! code `QDESC`/`QDESC_LABEL` (age rows carry the OWNRAGE question), band code
-//! `OWNCHAR`/`OWNCHAR_LABEL` ("Under 25" … "65 or over" plus structural
-//! "Total reporting"/"Item not reported" rows), and per-demographic
-//! `OWNER_SEX/ETH/RACE/VET` (+`_LABEL`). We keep only the all-demographics
-//! rows (each `OWNER_*_LABEL` = "Total…") of the age question, and only
-//! *reported* age bands. The 2021 vintage exposes `NAICS2017`; later vintages
-//! are expected to switch classification (mirroring census-nonemp's year gate)
-//! — override with `params.naics_var` if a release deviates. Suppressed cells
-//! are negative sentinels / blanks → dropped, never counted as zero owners.
-//! Age bands are coarse — the derived index is a *wave-size indicator*, not a
-//! per-business prediction, and the dataset says so.
+//! Contract notes (LIVE-verified 2026-07-30 with a real key): the NES-D *owner
+//! characteristics* table lives at
+//! `https://api.census.gov/data/{year}/absnesdo` (NOT `…/nesd` — that path
+//! does not exist in the discovery doc). GRAIN: per-state data exists ONLY at
+//! 2-digit sector NAICS — `NAICS2017=23&for=state:XX` returns real OWNRAGE
+//! rows, while `NAICS2017=238` and `=2381` return HTTP 204 No Content (a
+//! contract-VALID empty response meaning "not published at this grain", not
+//! drift and not an error). Success is a JSON array-of-arrays, row 0 the
+//! header, columns matched by NAME. Variables: `OWNNOPD` (number of owners of
+//! nonemployer firms), `OWNNOPD_PCT`, question code `QDESC`/`QDESC_LABEL` (age
+//! rows carry the OWNRAGE question), band code `OWNCHAR`/`OWNCHAR_LABEL`
+//! ("Under 25" … "65 or over" plus structural "Total reporting"/"Item not
+//! reported" rows), and per-demographic `OWNER_SEX/ETH/RACE/VET` (+`_LABEL`).
+//! We keep only the all-demographics rows (each `OWNER_*_LABEL` = "Total…") of
+//! the age question, and only *reported* age bands. The 2021 vintage exposes
+//! `NAICS2017`; later vintages are expected to switch classification
+//! (mirroring census-nonemp's year gate) — override with `params.naics_var` if
+//! a release deviates. Suppressed cells are negative sentinels / blanks →
+//! dropped, never counted as zero owners. Age bands are coarse and the grain
+//! is a whole SECTOR — the derived index is a *wave-size indicator*, not a
+//! per-business or per-trade prediction, and the dataset says so.
 
 use async_trait::async_trait;
 use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
@@ -46,15 +50,15 @@ const DEFAULT_YEAR: &str = "2021";
 /// NES-D `QDESC_LABEL` values. Overridable via `params.age_question`.
 const DEFAULT_AGE_QUESTION: &str = "OWNRAGE";
 
-/// Same 4-digit trade codes as census-nonemp — the blend joins on them.
-const DEFAULT_TRADES: &[(&str, &str)] = &[
+/// 2-digit NAICS sectors covering the trades census-nonemp tracks (2382 → 23,
+/// 5617 → 56). NES-D publishes per-state owner demographics at sector grain
+/// ONLY — 3/4-digit requests return HTTP 204 (not published at that grain).
+/// The blend joins by the trade group's 2-digit sector prefix.
+const DEFAULT_SECTORS: &[(&str, &str)] = &[
+    ("23", "Construction (incl. plumbing, HVAC, electrical trades)"),
     (
-        "2382",
-        "Building equipment contractors (plumbing, HVAC, electrical)",
-    ),
-    (
-        "5617",
-        "Services to buildings & dwellings (landscaping, pool)",
+        "56",
+        "Administrative & support and waste management services (incl. landscaping, pool)",
     ),
 ];
 
@@ -67,11 +71,13 @@ impl ScrapeApp for CensusNesd {
     fn description(&self) -> &'static str {
         "US solo-trades owner-age demographics from Census Nonemployer Statistics by \
          Demographics (NES-D, absnesdo JSON API). Owners of nonemployer firms per age \
-         band × trade NAICS × state, upserted into the `owner_age` dataset — the input \
-         for the succession-wave fields on `census/market_blend`. Requires a FREE \
-         Census API key (params.api_key or env CENSUS_API_KEY). Params: {\"year\": \
-         \"2021\", \"states\": \"06,12,48\" (FIPS list; default all), \"naics\": \
-         [\"2382\",\"5617\"] (4-digit), \"naics_var\": \"NAICS2017\", \
+         band × 2-digit NAICS SECTOR × state (NES-D publishes per-state data at \
+         sector grain only; finer NAICS → HTTP 204 = not published), upserted into \
+         the `owner_age` dataset — the sector-grain input for the succession-wave \
+         fields on `census/market_blend`. Requires a FREE Census API key \
+         (params.api_key or env CENSUS_API_KEY). Params: {\"year\": \"2021\", \
+         \"states\": \"06,12,48\" (FIPS list; default all), \"naics\": \
+         [\"23\",\"56\"] (2-digit sectors), \"naics_var\": \"NAICS2017\", \
          \"age_question\": \"OWNRAGE\", \"api_key\": \"...\"}"
     }
 
@@ -111,25 +117,25 @@ impl ScrapeApp for CensusNesd {
             .unwrap_or(DEFAULT_AGE_QUESTION)
             .to_string();
 
-        let trades: Vec<(String, String)> = match ctx.params.get("naics").and_then(Value::as_array)
-        {
-            Some(arr) => arr
-                .iter()
-                .filter_map(Value::as_str)
-                .map(|c| {
-                    let label = DEFAULT_TRADES
-                        .iter()
-                        .find(|(k, _)| *k == c)
-                        .map(|(_, l)| l.to_string())
-                        .unwrap_or_else(|| c.to_string());
-                    (c.to_string(), label)
-                })
-                .collect(),
-            None => DEFAULT_TRADES
-                .iter()
-                .map(|(c, l)| (c.to_string(), l.to_string()))
-                .collect(),
-        };
+        let sectors: Vec<(String, String)> =
+            match ctx.params.get("naics").and_then(Value::as_array) {
+                Some(arr) => arr
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(|c| {
+                        let label = DEFAULT_SECTORS
+                            .iter()
+                            .find(|(k, _)| *k == c)
+                            .map(|(_, l)| l.to_string())
+                            .unwrap_or_else(|| c.to_string());
+                        (c.to_string(), label)
+                    })
+                    .collect(),
+                None => DEFAULT_SECTORS
+                    .iter()
+                    .map(|(c, l)| (c.to_string(), l.to_string()))
+                    .collect(),
+            };
 
         let api_key = census_common::api_key(&ctx, "census-nesd")?;
 
@@ -151,19 +157,29 @@ impl ScrapeApp for CensusNesd {
         };
 
         let mut all_records: Vec<(String, Value)> = Vec::new();
-        let mut trade_summaries: Vec<Value> = Vec::new();
+        let mut sector_summaries: Vec<Value> = Vec::new();
+        let mut not_published: usize = 0;
 
-        for (naics, label) in &trades {
+        for (naics, label) in &sectors {
             let url = format!(
-                "https://api.census.gov/data/{year}/absnesdo?get=OWNNOPD,OWNNOPD_PCT,QDESC_LABEL,OWNCHAR,OWNCHAR_LABEL,OWNER_SEX_LABEL,OWNER_ETH_LABEL,OWNER_RACE_LABEL,OWNER_VET_LABEL&{for_clause}&{naics_var}={naics}&key={api_key}"
+                // LIVE-VERIFIED 2026-07-30: without an explicit QDESC_LABEL
+                // predicate the API returns an unstable subset of questions
+                // (a live run saw only USBORN/USCITIZEN rows for a query that
+                // moments earlier included OWNRAGE). Pinning the question as a
+                // predicate is deterministic and shrinks the payload; the
+                // echoed QDESC_LABEL column keeps the parse unchanged.
+                "https://api.census.gov/data/{year}/absnesdo?get=OWNNOPD,OWNNOPD_PCT,OWNCHAR,OWNCHAR_LABEL,OWNER_SEX_LABEL,OWNER_ETH_LABEL,OWNER_RACE_LABEL,OWNER_VET_LABEL&{for_clause}&{naics_var}={naics}&QDESC_LABEL={age_question}&key={api_key}"
             );
             let resp = ctx.engines.http.fetch(HttpRequest::get(url)).await?;
-            // 204 No Content (fully suppressed at this level) → a note, not a
-            // failed run.
+            // HTTP 204 No Content is contract-VALID: NES-D per-state data only
+            // exists at 2-digit sector grain, so a finer (or unpublished) code
+            // is simply "not published at this grain" — a stat, never an error.
             if resp.status == 204 || resp.body.trim().is_empty() {
-                trade_summaries.push(json!({
-                    "naics": naics, "label": label,
-                    "note": "no data — NES-D owner-age figures suppressed at this level",
+                not_published += 1;
+                sector_summaries.push(json!({
+                    "sector": naics, "label": label,
+                    "note": "not published at this grain (HTTP 204 — NES-D serves \
+                             2-digit sector NAICS per state only)",
                 }));
                 continue;
             }
@@ -258,8 +274,8 @@ impl ScrapeApp for CensusNesd {
                 .collect();
             by_share.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-            trade_summaries.push(json!({
-                "naics": naics,
+            sector_summaries.push(json!({
+                "sector": naics,
                 "label": label,
                 "states_reported": rollup.bands_by_state.len(),
                 "age_band_records": rollup.records.len(),
@@ -283,7 +299,9 @@ impl ScrapeApp for CensusNesd {
         Ok(json!({
             "source": format!("census/absnesdo/{year}"),
             "year": year,
-            "trades": trade_summaries,
+            "grain": "naics_sector",
+            "sectors": sector_summaries,
+            "sectors_not_published": not_published,
             "market_blend": market_blend,
             "records": all_records.len(),
             "new": summary.new.len(),
@@ -306,8 +324,8 @@ struct AgeCols {
     state: usize,
 }
 
-/// Per-trade rollup of the age rows: dataset records keyed
-/// `{naics}:{state_fips}:{band_code}`, the per-state band lists the summary
+/// Per-sector rollup of the age rows: dataset records keyed
+/// `{state_fips}|{sector}|{band_code}`, the per-state band lists the summary
 /// share math runs on, and the distinct question labels seen (diagnostics).
 struct AgeRollup {
     records: Vec<(String, Value)>,
@@ -317,8 +335,9 @@ struct AgeRollup {
 }
 
 /// Map the NES-D array-of-arrays payload into per-state × age-band records for
-/// one trade NAICS. Keeps only: the owner-age question, the all-demographics
-/// ("Total") slice, *reported* age bands, and unsuppressed owner counts.
+/// one 2-digit NAICS sector. Keeps only: the owner-age question, the
+/// all-demographics ("Total") slice, *reported* age bands, and unsuppressed
+/// owner counts.
 fn map_age_rows(
     rows: &[Vec<String>],
     cols: &AgeCols,
@@ -339,11 +358,16 @@ fn map_age_rows(
             continue;
         }
         // Only the all-demographics slice: every present OWNER_*_LABEL must be
-        // its "Total…" roll-up, otherwise the same owners are counted once per
-        // sex/ethnicity/race/veteran cross-tab.
+        // its roll-up value, otherwise the same owners are counted once per
+        // sex/ethnicity/race/veteran cross-tab. LIVE-VERIFIED 2026-07-30: the
+        // real roll-up label is "All owners of nonemployer firms" (not
+        // "Total…" — that guess silently dropped every OWNRAGE row).
         let all_total = cols.demo_labels.iter().all(|&i| {
             row.get(i)
-                .map(|v| v.trim().to_lowercase().starts_with("total"))
+                .map(|v| {
+                    let v = v.trim().to_lowercase();
+                    v.starts_with("all") || v.starts_with("total")
+                })
                 .unwrap_or(true)
         });
         if !all_total {
@@ -375,10 +399,10 @@ fn map_age_rows(
             .push((band.clone(), owners));
 
         records.push((
-            format!("{naics}:{st_fips}:{band_code}"),
+            format!("{st_fips}|{naics}|{band_code}"),
             json!({
-                "naics": naics,
-                "trade": label,
+                "sector": naics,
+                "sector_label": label,
                 "state": state,
                 "state_fips": st_fips,
                 "age_band_code": band_code,
@@ -386,9 +410,10 @@ fn map_age_rows(
                 "owners": owners,
                 "owners_pct": owners_pct,
                 "basis": "owners_of_nonemployer_firms",
-                // Coarse bands: a wave-size indicator, not a per-business
-                // prediction — consumers must not present it as one.
-                "grain": "owner_age_band",
+                // Coarse bands at whole-sector grain: a wave-size indicator,
+                // not a per-business or per-trade prediction — consumers must
+                // not present it as one.
+                "grain": "naics_sector_owner_age_band",
                 "year": year,
             }),
         ));
@@ -459,7 +484,7 @@ mod tests {
     }
 
     fn rollup(data: &[[&str; 10]]) -> AgeRollup {
-        map_age_rows(&rows(data), &cols(), "2382", "Building equipment", "2021", "OWNRAGE")
+        map_age_rows(&rows(data), &cols(), "23", "Construction", "2021", "OWNRAGE")
     }
 
     #[test]
@@ -482,11 +507,12 @@ mod tests {
         ]);
         assert_eq!(r.records.len(), 1);
         let (key, v) = &r.records[0];
-        assert_eq!(key, "2382:06:AG04");
+        assert_eq!(key, "06|23|AG04");
+        assert_eq!(v["sector"], "23");
         assert_eq!(v["owners"], 100);
         assert_eq!(v["age_band"], "55 to 64");
         assert_eq!(v["state"], "CA");
-        assert_eq!(v["grain"], "owner_age_band");
+        assert_eq!(v["grain"], "naics_sector_owner_age_band");
         assert!(r.questions_seen.contains("OWNRVET"));
     }
 

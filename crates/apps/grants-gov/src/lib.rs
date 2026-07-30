@@ -32,7 +32,10 @@
 //!   (forecasted) with applicantTypes[] (objects with `description` or bare
 //!   strings), applicantEligibilityDesc, costSharing (bool or "Yes"/"No"),
 //!   awardFloor / awardCeiling / estimatedFunding (numbers or "$"-strings),
-//!   expectedNumberOfAwards, responseDate — and attachment folders under
+//!   numberOfAwards (LIVE-VERIFIED 2026-07-30; `expectedNumberOfAwards` does not
+//!   appear in real payloads — read as fallback only), responseDate (may be null
+//!   on already-awarded listings whose prose lives in responseDateDesc) — and
+//!   attachment folders under
 //!   `synopsisAttachmentFolders[]` (each with `synopsisAttachments[]` carrying
 //!   id / fileName / fileDescription / mimeType / fileLobSize), with a flat
 //!   `attachments[]` tolerated as fallback. The attachment download-URL
@@ -591,7 +594,9 @@ fn requirements_block(detail: &Value) -> Value {
         "award_floor": grants_common::money_scalar(syn, &["awardFloor"]),
         "award_ceiling": grants_common::money_scalar(syn, &["awardCeiling"]),
         "estimated_total_funding": grants_common::money_scalar(syn, &["estimatedFunding"]),
-        "expected_awards": count_value(syn.get("expectedNumberOfAwards")),
+        // Live-verified 2026-07-30: the real synopsis key is `numberOfAwards`;
+        // `expectedNumberOfAwards` never appears (kept as fallback for drift).
+        "expected_awards": count_value(syn.get("numberOfAwards").or_else(|| syn.get("expectedNumberOfAwards"))),
         "eligibility_text": syn
             .get("applicantEligibilityDesc")
             .and_then(Value::as_str)

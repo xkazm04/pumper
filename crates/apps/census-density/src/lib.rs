@@ -477,16 +477,21 @@ impl ScrapeApp for CensusDensity {
 // after their own upserts, so the blend stays fresh regardless of which run
 // happens last.
 //
-// Two optional joins ride on the same cell grain, each Null (never a
-// fabricated zero) when its source app hasn't run:
-//  - SUCCESSION (census-nesd `owner_age`): `pct_owners_55plus` across the
-//    reported NES-D age bands, and `succession_receipts` = that share × the
-//    solo side's total receipts — a wave-size indicator in dollars, not a
-//    per-business prediction (bands are coarse, e.g. 55–64).
-//  - FORMATION (census-bfs `formation_velocity`): inbound-competition block
-//    joined by the naics4's 2-digit SECTOR (BFS's only grain) — carried under
-//    a `formation` object labeled `grain: "naics_sector"` so a sector-level
-//    signal can't silently read as trade-level.
+// Two optional joins ride on the cell grain, each Null (never a fabricated
+// zero) when its source app hasn't run — and each COARSER than the cell, which
+// the labels say out loud:
+//  - SUCCESSION (census-nesd `owner_age`): NES-D publishes per-state owner
+//    demographics at 2-digit SECTOR grain only, so `pct_owners_55plus` is the
+//    share across the reported age bands of the naics4's SECTOR (2382 → 23),
+//    and `succession_receipts` = that sector share × the solo side's trade
+//    receipts — a wave-size indicator in dollars, not a per-business or
+//    per-trade prediction. Labeled `succession_grain: "naics_sector"`.
+//  - FORMATION (census-bfs `formation_velocity`): the BFS API is US-NATIONAL
+//    only (no state geography), so the inbound-competition block joined by the
+//    naics4's 2-digit sector is the same NATIONAL signal on every state row —
+//    carried under a `formation` object labeled
+//    `grain: "naics_sector_national"` + `scope: "national"` so a national
+//    sector-level signal can't silently read as state- or trade-level.
 // ---------------------------------------------------------------------------
 
 /// Virtual app namespace holding the cross-app blended dataset.
@@ -632,9 +637,11 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
 /// `coverage` marker — so the dataset shows WHERE the blend is partial rather
 /// than hiding it.
 ///
-/// `owner_age` are census-nesd `owner_age` band records (may be empty) and
-/// `formation_velocity` census-bfs `formation_velocity` records (may be
-/// empty); each contributes Null fields, never zeros, when absent for a cell.
+/// `owner_age` are census-nesd `owner_age` band records (2-digit SECTOR grain,
+/// joined via the naics4's sector prefix; may be empty) and
+/// `formation_velocity` census-bfs `formation_velocity` records (NATIONAL
+/// sector grain — one per sector, no state; may be empty); each contributes
+/// Null fields, never zeros, when absent for a cell.
 pub fn blend_market(
     employers: &[Value],
     solos: &[Value],
@@ -659,11 +666,13 @@ pub fn blend_market(
     let str_field = |v: &Value, f: &str| v.get(f).and_then(Value::as_str).map(str::to_string);
     let num_field = |v: &Value, f: &str| v.get(f).and_then(Value::as_i64).unwrap_or(0);
 
-    // SUCCESSION input: (naics, state_fips) → reported age bands + vintage.
+    // SUCCESSION input: (2-digit sector, state_fips) → reported age bands +
+    // vintage. NES-D is sector grain — records carry `sector` (e.g. "23").
     let mut age_bands: BTreeMap<(String, String), Vec<(String, i64)>> = BTreeMap::new();
     let mut age_year: BTreeMap<(String, String), String> = BTreeMap::new();
     for r in owner_age {
-        let (Some(naics), Some(st)) = (str_field(r, "naics"), str_field(r, "state_fips")) else {
+        let (Some(sector), Some(st)) = (str_field(r, "sector"), str_field(r, "state_fips"))
+        else {
             continue;
         };
         let (Some(band), Some(owners)) = (
@@ -672,20 +681,20 @@ pub fn blend_market(
         ) else {
             continue;
         };
-        let key = (naics, st);
+        let key = (sector, st);
         if let Some(y) = str_field(r, "year") {
             age_year.entry(key.clone()).or_insert(y);
         }
         age_bands.entry(key).or_default().push((band, owners));
     }
 
-    // FORMATION input: (sector category, state_fips) → velocity record.
-    let velocity_by_key: BTreeMap<(String, String), &Value> = formation_velocity
+    // FORMATION input: sector category → NATIONAL velocity record (the BFS API
+    // has no state geography — one record per sector, keyed `US|{sector}`).
+    let velocity_by_sector: BTreeMap<String, &Value> = formation_velocity
         .iter()
         .filter_map(|r| {
             let sector = r.get("sector").and_then(Value::as_str)?.to_string();
-            let st = r.get("state_fips").and_then(Value::as_str)?.to_string();
-            Some(((sector, st), r))
+            Some((sector, r))
         })
         .collect();
 
@@ -759,19 +768,25 @@ pub fn blend_market(
                     ),
                     _ => (Value::Null, Value::Null, Value::Null),
                 };
-            // SUCCESSION: 55+ owner share across reported NES-D bands, and the
-            // wave in dollars against the solo side's receipts. Nulls (never a
-            // fabricated 0%) when NES-D hasn't run / is suppressed for the cell,
-            // and no dollar figure without real receipts.
-            let cell_key = (naics4.clone(), st_fips.clone());
+            // SUCCESSION: 55+ owner share across reported NES-D bands of the
+            // naics4's 2-digit SECTOR (NES-D's per-state grain — 2382 joins
+            // through 23), and the wave in dollars against the solo side's
+            // receipts. Nulls (never a fabricated 0%) when NES-D hasn't run /
+            // is suppressed for the cell, and no dollar figure without real
+            // receipts. Sector grain is coarser than the trade cell — labeled.
+            let sector2: String = naics4.chars().take(2).collect();
+            let sector_key = (sector2, st_fips.clone());
             let pct_55 = age_bands
-                .get(&cell_key)
+                .get(&sector_key)
                 .and_then(|bands| census_common::owner_age_share_55plus(bands));
             let pct_owners_55plus = pct_55
                 .map(|p| Value::from((p * 10_000.0).round() / 10_000.0))
                 .unwrap_or(Value::Null);
+            let succession_grain = pct_55
+                .map(|_| Value::from("naics_sector"))
+                .unwrap_or(Value::Null);
             let owner_age_year = age_year
-                .get(&cell_key)
+                .get(&sector_key)
                 .map(|y| Value::from(y.clone()))
                 .unwrap_or(Value::Null);
             let succession_receipts = match (pct_55, c.solo_receipts_thousands) {
@@ -780,11 +795,13 @@ pub fn blend_market(
                 }
                 _ => Value::Null,
             };
-            // FORMATION: sector-grain velocity joined by the naics4's 2-digit
-            // sector — carried as a labeled block so it can't read as
-            // trade-level data.
+            // FORMATION: NATIONAL sector-grain velocity joined by the naics4's
+            // 2-digit sector — the BFS API serves no state geography, so a
+            // state row's formation context is the national sector signal, and
+            // the block's labels say so (grain + scope) so it can't read as
+            // state- or trade-level data.
             let formation = census_common::bfs_sector_category(&naics4)
-                .and_then(|cat| velocity_by_key.get(&(cat, st_fips.clone())))
+                .and_then(|cat| velocity_by_sector.get(&cat))
                 .map(|v| {
                     json!({
                         "sector": v.get("sector").cloned().unwrap_or(Value::Null),
@@ -797,7 +814,8 @@ pub fn blend_market(
                             v.get("t12m_high_propensity").cloned().unwrap_or(Value::Null),
                         "as_of_period":
                             v.get("as_of_period").cloned().unwrap_or(Value::Null),
-                        "grain": "naics_sector",
+                        "grain": "naics_sector_national",
+                        "scope": "national",
                     })
                 })
                 .unwrap_or(Value::Null);
@@ -817,6 +835,7 @@ pub fn blend_market(
                 "denominator_kind": denom_kind,
                 "total_market_per_10k": total_market_per_10k,
                 "pct_owners_55plus": pct_owners_55plus,
+                "succession_grain": succession_grain,
                 "owner_age_year": owner_age_year,
                 "succession_receipts": succession_receipts,
                 "formation": formation,
@@ -1048,9 +1067,10 @@ mod tests {
         assert!(none[0].1["total_market_per_10k"].is_null());
     }
 
-    fn band(naics: &str, st: &str, label: &str, owners: i64) -> Value {
+    // NES-D owner-age records are 2-digit SECTOR grain (e.g. "23"), never 4-digit.
+    fn band(sector: &str, st: &str, label: &str, owners: i64) -> Value {
         json!({
-            "naics": naics, "state_fips": st, "age_band": label,
+            "sector": sector, "state_fips": st, "age_band": label,
             "owners": owners, "year": "2021",
         })
     }
@@ -1065,13 +1085,15 @@ mod tests {
             "receipts_thousands": 500, "year": "2021",
         })];
         let ages = vec![
-            band("2382", "06", "25 to 54", 60),
-            band("2382", "06", "55 to 64", 30),
-            band("2382", "06", "65 or over", 10),
+            band("23", "06", "25 to 54", 60),
+            band("23", "06", "55 to 64", 30),
+            band("23", "06", "65 or over", 10),
         ];
         let items = blend_market(&employers, &solos, &BTreeMap::new(), &ages, &[]);
         let v = &items[0].1;
+        // The 2382 cell joins its SECTOR's (23) bands — sector grain, labeled.
         assert_eq!(v["pct_owners_55plus"], json!(0.4));
+        assert_eq!(v["succession_grain"], "naics_sector");
         assert_eq!(v["owner_age_year"], "2021");
         // 40% of $500k receipts = $200,000 succession wave.
         assert_eq!(v["succession_receipts"], 200_000);
@@ -1082,26 +1104,28 @@ mod tests {
         let employers = vec![emp("238220", "state", "CA", "06", 100)];
         // solo() helper has no receipts_thousands field.
         let solos = vec![solo("2382", "CA", "06", 300)];
-        // No NES-D data at all → both succession fields Null.
+        // No NES-D data at all → both succession fields Null (and no grain label).
         let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &[]);
         assert!(items[0].1["pct_owners_55plus"].is_null());
+        assert!(items[0].1["succession_grain"].is_null());
         assert!(items[0].1["succession_receipts"].is_null());
         // NES-D present but receipts unreported → share yes, dollars Null.
-        let ages = vec![band("2382", "06", "55 to 64", 1), band("2382", "06", "25 to 54", 1)];
+        let ages = vec![band("23", "06", "55 to 64", 1), band("23", "06", "25 to 54", 1)];
         let items = blend_market(&employers, &solos, &BTreeMap::new(), &ages, &[]);
         assert_eq!(items[0].1["pct_owners_55plus"], json!(0.5));
         assert!(items[0].1["succession_receipts"].is_null());
     }
 
     #[test]
-    fn formation_block_joins_by_sector_and_keeps_its_grain_label() {
+    fn formation_block_joins_by_sector_and_keeps_its_national_grain_label() {
         let employers = vec![emp("238220", "state", "CA", "06", 100)];
         let solos = vec![solo("2382", "CA", "06", 300)];
+        // BFS velocity is NATIONAL — one record per sector, no state fields.
         let velocity = vec![json!({
-            "sector": "NAICS23", "state_fips": "06",
+            "sector": "NAICS23", "geo": "US",
             "t12m_applications": 1320.0, "yoy_delta_pct": 10.0,
             "accel_pct": 0.0, "t12m_high_propensity": 400.0,
-            "as_of_period": "2026-06",
+            "as_of_period": "2026-06", "grain": "naics_sector_national",
         })];
         let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &velocity);
         let f = &items[0].1["formation"];
@@ -1109,12 +1133,14 @@ mod tests {
         assert_eq!(f["t12m_applications"], json!(1320.0));
         assert_eq!(f["yoy_delta_pct"], json!(10.0));
         assert_eq!(f["as_of_period"], "2026-06");
-        // Sector-grain honesty travels with the block.
-        assert_eq!(f["grain"], "naics_sector");
+        // National sector-grain honesty travels with the block: a state row's
+        // formation context is a NATIONAL signal and must say so.
+        assert_eq!(f["grain"], "naics_sector_national");
+        assert_eq!(f["scope"], "national");
 
-        // A different state's velocity must not leak in.
-        let velocity_tx = vec![json!({ "sector": "NAICS23", "state_fips": "48" })];
-        let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &velocity_tx);
+        // A different sector's national velocity must not leak in.
+        let velocity_other = vec![json!({ "sector": "NAICS72", "geo": "US" })];
+        let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &velocity_other);
         assert!(items[0].1["formation"].is_null());
     }
 }
