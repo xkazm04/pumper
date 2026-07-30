@@ -162,7 +162,13 @@ impl ScrapeApp for CensusNesd {
 
         for (naics, label) in &sectors {
             let url = format!(
-                "https://api.census.gov/data/{year}/absnesdo?get=OWNNOPD,OWNNOPD_PCT,QDESC_LABEL,OWNCHAR,OWNCHAR_LABEL,OWNER_SEX_LABEL,OWNER_ETH_LABEL,OWNER_RACE_LABEL,OWNER_VET_LABEL&{for_clause}&{naics_var}={naics}&key={api_key}"
+                // LIVE-VERIFIED 2026-07-30: without an explicit QDESC_LABEL
+                // predicate the API returns an unstable subset of questions
+                // (a live run saw only USBORN/USCITIZEN rows for a query that
+                // moments earlier included OWNRAGE). Pinning the question as a
+                // predicate is deterministic and shrinks the payload; the
+                // echoed QDESC_LABEL column keeps the parse unchanged.
+                "https://api.census.gov/data/{year}/absnesdo?get=OWNNOPD,OWNNOPD_PCT,OWNCHAR,OWNCHAR_LABEL,OWNER_SEX_LABEL,OWNER_ETH_LABEL,OWNER_RACE_LABEL,OWNER_VET_LABEL&{for_clause}&{naics_var}={naics}&QDESC_LABEL={age_question}&key={api_key}"
             );
             let resp = ctx.engines.http.fetch(HttpRequest::get(url)).await?;
             // HTTP 204 No Content is contract-VALID: NES-D per-state data only
@@ -352,11 +358,16 @@ fn map_age_rows(
             continue;
         }
         // Only the all-demographics slice: every present OWNER_*_LABEL must be
-        // its "Total…" roll-up, otherwise the same owners are counted once per
-        // sex/ethnicity/race/veteran cross-tab.
+        // its roll-up value, otherwise the same owners are counted once per
+        // sex/ethnicity/race/veteran cross-tab. LIVE-VERIFIED 2026-07-30: the
+        // real roll-up label is "All owners of nonemployer firms" (not
+        // "Total…" — that guess silently dropped every OWNRAGE row).
         let all_total = cols.demo_labels.iter().all(|&i| {
             row.get(i)
-                .map(|v| v.trim().to_lowercase().starts_with("total"))
+                .map(|v| {
+                    let v = v.trim().to_lowercase();
+                    v.starts_with("all") || v.starts_with("total")
+                })
                 .unwrap_or(true)
         });
         if !all_total {
