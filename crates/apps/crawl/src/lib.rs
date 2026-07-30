@@ -4,6 +4,7 @@
 //! job's artifact directory.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -87,6 +88,32 @@ struct PageCounts {
     new: AtomicUsize,
     changed: AtomicUsize,
     unchanged: AtomicUsize,
+    /// Page revisions archived into `page_versions` (with a revision-suffixed
+    /// artifact copy) because a revisit found the body CHANGED.
+    versions_archived: AtomicUsize,
+}
+
+/// Dataset holding the versioned crawl archive: one record per CHANGED revision
+/// of a page, keyed `{url}#{revision}`. Each record carries `artifact_path` +
+/// `job_id` in the exact shape `AppContext::read_source_artifact` expects, so
+/// extractor/plugin `source` mode can read historical bodies unchanged.
+///
+/// Retention: the archive is capped by the EXISTING dataset retention seams, no
+/// new janitor — `Datasets::prune_revisions` / the dataset prune API bounds the
+/// `page_versions` revision history like any other dataset, and the janitor
+/// (OFF by default) plus per-job artifact cleanup bound the on-disk copies.
+/// Storage grows only with real change (unchanged revisits archive nothing).
+const VERSIONS_DATASET: &str = "page_versions";
+
+/// Inserts a `.r{revision}` suffix before the artifact's `.html` extension
+/// (`page-<hex>.html` → `page-<hex>.r3.html`), so each archived revision owns a
+/// distinct file while the un-suffixed name keeps meaning "latest". Falls back
+/// to appending for non-`.html` names. Stays a single safe path segment.
+fn versioned_artifact_name(artifact_path: &str, revision: i64) -> String {
+    match artifact_path.strip_suffix(".html") {
+        Some(stem) => format!("{stem}.r{revision}.html"),
+        None => format!("{artifact_path}.r{revision}"),
+    }
 }
 
 /// [`PageSink`] that upserts each batch of kept-page fingerprints into the
@@ -98,7 +125,80 @@ struct DatasetPageSink {
     datasets: Arc<Datasets>,
     app: String,
     job_id: String,
+    /// This job's artifact dir — where core wrote each kept page's latest body
+    /// (URL-hash name). On `changed` the sink copies that body to a
+    /// revision-suffixed file and records it in [`VERSIONS_DATASET`].
+    artifacts_dir: PathBuf,
     counts: Arc<PageCounts>,
+}
+
+impl DatasetPageSink {
+    /// Archives the CHANGED keys of one upsert batch into the versioned crawl
+    /// archive: copy `page-<hex>.html` → `page-<hex>.r{revision}.html` and upsert
+    /// a `page_versions` record keyed `{url}#{revision}` (artifact path, simhash,
+    /// fetched_at). New first-sightings and unchanged revisits archive nothing —
+    /// the un-suffixed artifact already IS the latest body, so the archive grows
+    /// only when a page actually changes. Best-effort like the rest of the sink:
+    /// an archive failure warns and skips, never fails the crawl.
+    async fn archive_changed(&self, changed: &[String], meta: &HashMap<String, (String, u64)>) {
+        let mut versions: Vec<(String, Value)> = Vec::new();
+        for url in changed {
+            let Some((artifact_path, simhash)) = meta.get(url) else {
+                continue; // not in this batch (shouldn't happen) — nothing to copy
+            };
+            if artifact_path.is_empty() {
+                continue; // crawl ran without an output dir — no body to archive
+            }
+            // The revision number (and its authoritative timestamp) of the write
+            // that just happened comes from the record's revision history.
+            let rev = match self.datasets.history(&self.app, "pages", url, 1).await {
+                Ok(revs) => match revs.into_iter().next() {
+                    Some(r) => r,
+                    None => continue, // changed key with no revision row — skip
+                },
+                Err(e) => {
+                    tracing::warn!(url = %url, "crawl version archive: history read failed: {e}");
+                    continue;
+                }
+            };
+            let versioned = versioned_artifact_name(artifact_path, rev.revision);
+            let src = self.artifacts_dir.join(artifact_path);
+            let dst = self.artifacts_dir.join(&versioned);
+            if let Err(e) = tokio::fs::copy(&src, &dst).await {
+                tracing::warn!(url = %url, path = %src.display(),
+                    "crawl version archive: artifact copy failed: {e}");
+                continue;
+            }
+            versions.push((
+                format!("{url}#{}", rev.revision),
+                json!({
+                    "url": url,
+                    "revision": rev.revision,
+                    // Same {artifact_path, job_id} contract as `pages` records, so
+                    // read_source_artifact resolves historical bodies unchanged.
+                    "artifact_path": versioned,
+                    "job_id": self.job_id,
+                    "simhash": simhash,
+                    "fetched_at": rev.created_at.to_rfc3339(),
+                }),
+            ));
+        }
+        if versions.is_empty() {
+            return;
+        }
+        match self
+            .datasets
+            .upsert_many(&self.app, VERSIONS_DATASET, &versions)
+            .await
+        {
+            Ok(_) => {
+                self.counts
+                    .versions_archived
+                    .fetch_add(versions.len(), Ordering::Relaxed);
+            }
+            Err(e) => tracing::warn!(job = %self.job_id, "crawl page_versions upsert failed: {e}"),
+        }
+    }
 }
 
 #[async_trait]
@@ -109,6 +209,9 @@ impl PageSink for DatasetPageSink {
         // revision that triggers/watches fire on) and are NOT counted as changed.
         let mut live: Vec<(String, Value)> = Vec::new();
         let mut gone: Vec<(String, Value)> = Vec::new();
+        // url → (artifact_path, simhash) for this batch's live pages, kept so the
+        // version archive can copy the just-written body of any CHANGED key.
+        let mut live_meta: HashMap<String, (String, u64)> = HashMap::new();
         for p in batch {
             if p.gone {
                 gone.push((
@@ -116,6 +219,7 @@ impl PageSink for DatasetPageSink {
                     json!({ "url": p.url, "status": p.status, "gone": true, "job_id": self.job_id }),
                 ));
             } else {
+                live_meta.insert(p.url.clone(), (p.artifact_path.clone(), p.simhash));
                 live.push((
                     p.url.clone(),
                     json!({
@@ -148,6 +252,11 @@ impl PageSink for DatasetPageSink {
                     self.counts
                         .unchanged
                         .fetch_add(summary.unchanged, Ordering::Relaxed);
+                    // Versioned crawl archive: every CHANGED key gets its new body
+                    // copied to a revision-suffixed artifact + a page_versions row.
+                    if !summary.changed.is_empty() {
+                        self.archive_changed(&summary.changed, &live_meta).await;
+                    }
                 }
                 Err(e) => tracing::warn!(job = %self.job_id, "crawl pages upsert failed: {e}"),
             }
@@ -215,7 +324,10 @@ impl ScrapeApp for Crawl {
          \"mode\": \"revisit\" (incremental recrawl of the `pages` dataset via \
          conditional GETs; \"discover\": true opts into link-following)}. \
          Frontier state is checkpointed durably per job: an interrupted, reaped, \
-         or shutdown-suspended crawl resumes where it left off on its next attempt."
+         or shutdown-suspended crawl resumes where it left off on its next attempt. \
+         Changed pages are archived into the `page_versions` dataset (key \
+         `{url}#{revision}`, revision-suffixed artifact copy) — retention is the \
+         existing dataset prune API / janitor, no separate knob."
     }
 
     fn manifest(&self) -> AppManifest {
@@ -268,8 +380,10 @@ impl ScrapeApp for Crawl {
                 },
             ],
             output_shape: Some(
-                "{pages, new, changed, unchanged, skipped, hosts} — crawl tallies plus the \
-                 `pages` dataset upsert summary; bodies land in the job's artifact dir",
+                "{pages, new, changed, unchanged, skipped, hosts, versions_archived} — crawl \
+                 tallies plus the `pages` dataset upsert summary; bodies land in the job's \
+                 artifact dir, changed revisions also as revision-suffixed copies recorded in \
+                 `page_versions`",
             ),
             cost_class: CostClass::Free,
         }
@@ -356,6 +470,7 @@ impl ScrapeApp for Crawl {
             datasets: ctx.datasets.clone(),
             app: ctx.app.clone(),
             job_id: ctx.job_id.to_string(),
+            artifacts_dir: ctx.artifacts_dir.clone(),
             counts: counts.clone(),
         });
 
@@ -445,13 +560,33 @@ impl ScrapeApp for Crawl {
             "changed": pages_changed,
             "new": pages_new,
             "gone": stats.gone,
+            // Versioned crawl archive: changed revisions copied to
+            // revision-suffixed artifacts + `page_versions` records.
+            "versions_archived": counts.versions_archived.load(Ordering::Relaxed),
         }))
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::host_of;
+    use super::{host_of, versioned_artifact_name};
+
+    #[test]
+    fn versioned_name_inserts_revision_before_html_suffix() {
+        assert_eq!(
+            versioned_artifact_name("page-ab12.html", 3),
+            "page-ab12.r3.html"
+        );
+        assert_eq!(
+            versioned_artifact_name("page-ab12.html", 1),
+            "page-ab12.r1.html"
+        );
+    }
+
+    #[test]
+    fn versioned_name_appends_for_non_html_names() {
+        assert_eq!(versioned_artifact_name("body.bin", 2), "body.bin.r2");
+    }
 
     #[test]
     fn extracts_lowercased_host() {

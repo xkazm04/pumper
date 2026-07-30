@@ -18,7 +18,65 @@ pub struct Extractor;
 
 /// Max live records pulled from a source dataset when no explicit `keys` (and no
 /// `_trigger.keys`) narrow the set — bounds the dataset read and the fan-out.
+/// Backfill mode also pages through `page_versions` in batches of this size.
 const SOURCE_LIST_LIMIT: i64 = 10_000;
+
+/// The crawl app's versioned archive dataset: one record per CHANGED revision of
+/// a page, keyed `{url}#{revision}`, carrying `{url, revision, artifact_path,
+/// job_id, simhash, fetched_at}` — the same artifact contract as `pages`, so
+/// [`AppContext::read_source_artifact`] resolves historical bodies unchanged.
+const VERSIONS_DATASET: &str = "page_versions";
+
+/// One resolved input document: the output-record key, the natural source URL,
+/// an optional observation timestamp (set only for archived versions / the
+/// version-resolved live body), and the body itself.
+///
+/// Records extracted from a historical version are keyed
+/// `{natural_key}@{observed_at_date}` — a DISTINCT key per observation — so
+/// change detection treats backfill rows as separate time-series points, not as
+/// churn on the present-day record.
+struct SourceDoc {
+    key: String,
+    url: String,
+    observed_at: Option<String>,
+    body: String,
+}
+
+impl SourceDoc {
+    /// A present-day document: key IS the natural key, no observation tag.
+    fn live(key: String, body: String) -> Self {
+        Self {
+            url: key.clone(),
+            key,
+            observed_at: None,
+            body,
+        }
+    }
+}
+
+/// Key for a record derived from an archived observation:
+/// `{natural_key}@{YYYY-MM-DD}` (date part of the version's `fetched_at`).
+fn versioned_key(url: &str, observed_at: &str) -> String {
+    let date = observed_at.get(..10).unwrap_or(observed_at);
+    format!("{url}@{date}")
+}
+
+/// Index of the newest `observed` timestamp at or before `as_of` (both RFC3339).
+/// Unparseable candidate timestamps are skipped; a bad `as_of` is an error.
+fn pick_as_of(observed: &[String], as_of: &str) -> std::result::Result<Option<usize>, String> {
+    let cutoff = chrono::DateTime::parse_from_rfc3339(as_of)
+        .map_err(|e| format!("bad as_of '{as_of}' (want RFC3339): {e}"))?;
+    let mut best: Option<(usize, chrono::DateTime<chrono::FixedOffset>)> = None;
+    for (i, ts) in observed.iter().enumerate() {
+        let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts) else {
+            continue;
+        };
+        if t <= cutoff && best.map_or(true, |(_, b)| t > b) {
+            best = Some((i, t));
+        }
+    }
+    Ok(best.map(|(i, _)| i))
+}
 
 /// Default in-flight fetch cap, matching `CrawlConfig.concurrency`.
 const DEFAULT_FETCH_CONCURRENCY: usize = 16;
@@ -114,13 +172,20 @@ async fn extract_and_upsert(
     ctx: &AppContext,
     compiled: Arc<CompiledRuleSet>,
     dataset: &str,
-    keyed: Vec<(String, String)>,
+    keyed: Vec<SourceDoc>,
     fetch: FetchHealth,
 ) -> Result<ExtractOutcome> {
-    // Split keys from bodies without copying either — `keyed` is owned and dropped
-    // here anyway (was: `.iter().map(|(_,d)| d.clone())`, deep-cloning every HTML
-    // body and roughly doubling peak RSS over the whole batch).
-    let (keys, docs): (Vec<String>, Vec<String>) = keyed.into_iter().unzip();
+    // Split keys/meta from bodies without copying the bodies — `keyed` is owned
+    // and dropped here anyway (was: `.iter().map(|(_,d)| d.clone())`, deep-cloning
+    // every HTML body and roughly doubling peak RSS over the whole batch).
+    let mut keys: Vec<String> = Vec::with_capacity(keyed.len());
+    let mut metas: Vec<(String, Option<String>)> = Vec::with_capacity(keyed.len());
+    let mut docs: Vec<String> = Vec::with_capacity(keyed.len());
+    for d in keyed {
+        keys.push(d.key);
+        metas.push((d.url, d.observed_at));
+        docs.push(d.body);
+    }
     let reported = run_extraction(compiled, docs.clone()).await?;
     // Borrow the reports rather than deep-cloning each into a throwaway Vec.
     let (matched, total, worst) = summarize_reports(reported.iter().map(|(_, r)| r));
@@ -133,10 +198,14 @@ async fn extract_and_upsert(
     let mut records: Vec<Value> = Vec::with_capacity(reported.len());
     let items: Vec<(String, Value)> = keys
         .into_iter()
+        .zip(metas)
         .zip(reported)
-        .map(|(key, (mut rec, _))| {
+        .map(|((key, (url, observed_at)), (mut rec, _))| {
             if let Value::Object(map) = &mut rec {
-                map.insert("_url".into(), Value::String(key.clone()));
+                map.insert("_url".into(), Value::String(url));
+                if let Some(ts) = observed_at {
+                    map.insert("_observed_at".into(), Value::String(ts));
+                }
             }
             records.push(rec.clone());
             (key, rec)
@@ -231,7 +300,11 @@ impl ScrapeApp for Extractor {
          \"concurrency\": 16 (max in-flight fetches), \"dataset\": \"extracted\"}. \
          Source mode reads each record's stored body \
          (artifact_path under the origin job's dir) instead of re-fetching; keys default to \
-         the firing trigger's _trigger.keys, else all live records."
+         the firing trigger's _trigger.keys, else all live records. The crawl's versioned \
+         archive is reachable via source.as_of (RFC3339 snapshot), source.versions: \"all\" \
+         (every archived revision + current), or source.backfill: true + url_pattern \
+         (batched fan over the whole page_versions archive); historical records are keyed \
+         {url}@{date} and tagged _url + _observed_at."
     }
 
     fn manifest(&self) -> AppManifest {
@@ -258,7 +331,24 @@ impl ScrapeApp for Extractor {
                         "properties": {
                             "app": { "type": "string" },
                             "dataset": { "type": "string" },
-                            "keys": { "type": "array", "items": { "type": "string" } }
+                            "keys": { "type": "array", "items": { "type": "string" } },
+                            "as_of": {
+                                "type": "string",
+                                "description": "RFC3339 timestamp: resolve each key to the newest archived version (crawl page_versions) observed at or before this instant. Mutually exclusive with `versions`."
+                            },
+                            "versions": {
+                                "type": "string",
+                                "enum": ["all"],
+                                "description": "Fan over every archived version of each key plus the current body; output keyed {url}@{date}."
+                            },
+                            "backfill": {
+                                "type": "boolean",
+                                "description": "Fan over the source app's whole page_versions archive in batches (ignores keys); combine with url_pattern."
+                            },
+                            "url_pattern": {
+                                "type": "string",
+                                "description": "Backfill only: regex a version's URL must match to be extracted."
+                            }
                         },
                         "description": "Source mode: read stored bodies of these records (no re-fetch)."
                     },
@@ -286,6 +376,20 @@ impl ScrapeApp for Extractor {
                         "source": { "app": "crawl", "dataset": "pages" },
                         "rules": { "title": { "type": "css", "selector": "title" } },
                         "concurrency": 8
+                    }),
+                },
+                ManifestExample {
+                    description: "Retroactive backfill: run new rules over every archived \
+                                  version of matching pages, producing a time-series dataset",
+                    params: json!({
+                        "source": {
+                            "app": "crawl",
+                            "dataset": "pages",
+                            "backfill": true,
+                            "url_pattern": "^https://example\\.com/products/"
+                        },
+                        "rules": { "price": { "type": "css", "selector": ".price" } },
+                        "dataset": "price_history"
                     }),
                 },
             ],
@@ -389,7 +493,7 @@ impl Extractor {
             .collect()
             .await;
 
-        let mut keyed: Vec<(String, String)> = Vec::new();
+        let mut keyed: Vec<SourceDoc> = Vec::new();
         let mut failed: Vec<String> = Vec::new();
         let mut fetch = FetchHealth {
             attempted: urls.len() as u32,
@@ -400,7 +504,7 @@ impl Extractor {
                 fetch.ok += 1;
             }
             match doc {
-                Some(d) => keyed.push((url, d)),
+                Some(d) => keyed.push(SourceDoc::live(url, d)),
                 None => failed.push(url),
             }
         }
@@ -467,27 +571,43 @@ impl Extractor {
         let explicit_keys = str_array(source.get("keys"))
             .or_else(|| str_array(ctx.params.pointer("/_trigger/keys")));
 
-        let mut keyed: Vec<(String, String)> = Vec::new();
+        // Versioned-archive resolution (crawl `page_versions`): `backfill` fans a
+        // rule set over ALL archived versions matching a URL pattern (its own
+        // batched runner); `as_of` / `versions:"all"` resolve the chosen keys
+        // through the archive instead of the live record.
+        if source
+            .get("backfill")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            return self
+                .run_backfill(ctx, compiled, dataset, &src_app, source)
+                .await;
+        }
+        let as_of = source
+            .get("as_of")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        let versions_all = source.get("versions").and_then(Value::as_str) == Some("all");
+        if as_of.is_some() && versions_all {
+            return Err(Error::App(
+                "source.as_of and source.versions are mutually exclusive".into(),
+            ));
+        }
+
+        let mut keyed: Vec<SourceDoc> = Vec::new();
         let mut missing: Vec<Value> = Vec::new();
         let requested: usize;
 
-        if let Some(keys) = explicit_keys {
-            // Named keys: fetch each record, then read its stored body. Both a
-            // missing record and an unreadable artifact are reported per key.
+        // Resolve the natural keys first (explicit / trigger keys, else the live
+        // sweep) — every mode selects the same key set; the modes differ only in
+        // WHICH stored body each key resolves to. The sweep already holds the
+        // records, so it carries them along instead of re-fetching per key.
+        let selected: Vec<(String, Option<Record>)> = if let Some(keys) = explicit_keys {
             requested = keys.len();
-            for key in keys {
-                match ctx.datasets.get(&src_app, &src_dataset, &key).await? {
-                    Some(r) => match ctx.read_source_artifact(&src_app, &r).await {
-                        Ok(body) => keyed.push((key, body)),
-                        Err(reason) => missing.push(json!({"key": key, "reason": reason})),
-                    },
-                    None => {
-                        missing.push(json!({"key": key, "reason": "no record in source dataset"}))
-                    }
-                }
-            }
+            keys.into_iter().map(|k| (k, None)).collect()
         } else {
-            // No keys: process every live (not removed, not gone) record.
+            // No keys: every live (not removed, not gone) record.
             let records: Vec<Record> = ctx
                 .datasets
                 .list(&src_app, &src_dataset, SOURCE_LIST_LIMIT)
@@ -499,10 +619,76 @@ impl Extractor {
                 })
                 .collect();
             requested = records.len();
-            for r in &records {
-                match ctx.read_source_artifact(&src_app, r).await {
-                    Ok(body) => keyed.push((r.key.clone(), body)),
-                    Err(reason) => missing.push(json!({"key": r.key, "reason": reason})),
+            records
+                .into_iter()
+                .map(|r| (r.key.clone(), Some(r)))
+                .collect()
+        };
+
+        for (key, pre_fetched) in selected {
+            let live = match pre_fetched {
+                Some(r) => Some(r),
+                None => ctx.datasets.get(&src_app, &src_dataset, &key).await?,
+            };
+            if as_of.is_none() && !versions_all {
+                // Present-day mode (unchanged behavior): the live record's body.
+                match live {
+                    Some(r) => match ctx.read_source_artifact(&src_app, &r).await {
+                        Ok(body) => keyed.push(SourceDoc::live(key, body)),
+                        Err(reason) => missing.push(json!({"key": key, "reason": reason})),
+                    },
+                    None => {
+                        missing.push(json!({"key": key, "reason": "no record in source dataset"}))
+                    }
+                }
+                continue;
+            }
+            // Historical modes: candidates = archived versions + the live body
+            // (observed at the live record's updated_at) — the archive holds only
+            // CHANGED revisions, so a never-changed page still resolves.
+            let mut candidates: Vec<(String, Record)> = Vec::new();
+            for v in versions_for(ctx, &src_app, &key).await? {
+                if let Some(ts) = v.data.get("fetched_at").and_then(Value::as_str) {
+                    candidates.push((ts.to_string(), v));
+                }
+            }
+            if let Some(r) = live {
+                if r.removed_at.is_none()
+                    && !r.data.get("gone").and_then(Value::as_bool).unwrap_or(false)
+                {
+                    candidates.push((r.updated_at.to_rfc3339(), r));
+                }
+            }
+            if candidates.is_empty() {
+                missing.push(json!({"key": key, "reason": "no record or archived version"}));
+                continue;
+            }
+            let chosen: Vec<&(String, Record)> = if let Some(as_of) = &as_of {
+                let observed: Vec<String> = candidates.iter().map(|(ts, _)| ts.clone()).collect();
+                match pick_as_of(&observed, as_of).map_err(Error::App)? {
+                    Some(i) => vec![&candidates[i]],
+                    None => {
+                        missing.push(json!({
+                            "key": key,
+                            "reason": format!("no version observed at or before {as_of}"),
+                        }));
+                        continue;
+                    }
+                }
+            } else {
+                candidates.iter().collect()
+            };
+            for (ts, record) in chosen {
+                match ctx.read_source_artifact(&src_app, record).await {
+                    Ok(body) => keyed.push(SourceDoc {
+                        key: versioned_key(&key, ts),
+                        url: key.clone(),
+                        observed_at: Some(ts.clone()),
+                        body,
+                    }),
+                    Err(reason) => {
+                        missing.push(json!({"key": record.key, "reason": reason}));
+                    }
                 }
             }
         }
@@ -530,6 +716,143 @@ impl Extractor {
             "records": out.records,
         }))
     }
+
+    /// Backfill mode: fan the compiled rule set over ALL archived versions in the
+    /// source app's `page_versions` dataset (optionally narrowed by a
+    /// `url_pattern` regex), paging in [`SOURCE_LIST_LIMIT`] batches and
+    /// extracting+upserting per batch so a large archive never accumulates in
+    /// memory. Records are keyed `{url}@{observed_at_date}` and tagged
+    /// `_url`/`_observed_at`, producing naturally time-series datasets. Only the
+    /// archive is fanned — a plain `source` run covers the present-day bodies.
+    async fn run_backfill(
+        &self,
+        ctx: &AppContext,
+        compiled: Arc<CompiledRuleSet>,
+        dataset: &str,
+        src_app: &str,
+        source: &serde_json::Map<String, Value>,
+    ) -> Result<Value> {
+        let pattern = source
+            .get("url_pattern")
+            .and_then(Value::as_str)
+            .map(|p| {
+                regex::Regex::new(p).map_err(|e| Error::App(format!("bad url_pattern '{p}': {e}")))
+            })
+            .transpose()?;
+
+        let mut after: Option<(String, String)> = None;
+        let mut scanned = 0usize;
+        let mut skipped_pattern = 0usize;
+        let mut loaded = 0usize;
+        let mut batches = 0usize;
+        let mut missing: Vec<Value> = Vec::new();
+        let (mut new, mut changed, mut unchanged) = (0usize, 0usize, 0usize);
+        let (mut fields_matched, mut fields_total) = (0u64, 0u64);
+        loop {
+            let batch = ctx
+                .datasets
+                .list_page(
+                    src_app,
+                    VERSIONS_DATASET,
+                    after.clone(),
+                    SOURCE_LIST_LIMIT,
+                    None,
+                )
+                .await?;
+            let Some(last) = batch.last() else { break };
+            after = Some((pumper_core::datasets::ts(last.updated_at), last.key.clone()));
+            let short = (batch.len() as i64) < SOURCE_LIST_LIMIT;
+
+            let mut keyed: Vec<SourceDoc> = Vec::new();
+            for v in &batch {
+                if v.removed_at.is_some() {
+                    continue;
+                }
+                scanned += 1;
+                let Some(url) = v.data.get("url").and_then(Value::as_str) else {
+                    missing.push(json!({"key": v.key, "reason": "version record has no url"}));
+                    continue;
+                };
+                if pattern.as_ref().is_some_and(|re| !re.is_match(url)) {
+                    skipped_pattern += 1;
+                    continue;
+                }
+                let Some(ts) = v.data.get("fetched_at").and_then(Value::as_str) else {
+                    missing
+                        .push(json!({"key": v.key, "reason": "version record has no fetched_at"}));
+                    continue;
+                };
+                match ctx.read_source_artifact(src_app, v).await {
+                    Ok(body) => keyed.push(SourceDoc {
+                        key: versioned_key(url, ts),
+                        url: url.to_string(),
+                        observed_at: Some(ts.to_string()),
+                        body,
+                    }),
+                    Err(reason) => missing.push(json!({"key": v.key, "reason": reason})),
+                }
+            }
+            if !keyed.is_empty() {
+                loaded += keyed.len();
+                batches += 1;
+                let out = extract_and_upsert(
+                    ctx,
+                    compiled.clone(),
+                    dataset,
+                    keyed,
+                    FetchHealth::default(),
+                )
+                .await?;
+                new += out.summary.new.len();
+                changed += out.summary.changed.len();
+                unchanged += out.summary.unchanged;
+                fields_matched += out.matched;
+                fields_total += out.total;
+            }
+            if short {
+                break;
+            }
+        }
+        // Bound the per-key echo; the full count is still reported.
+        let missing_count = missing.len();
+        missing.truncate(MISSING_ECHO_LIMIT);
+        Ok(json!({
+            "mode": "backfill",
+            "source": {"app": src_app, "dataset": VERSIONS_DATASET},
+            "scanned": scanned,
+            "skipped_pattern": skipped_pattern,
+            "loaded": loaded,
+            "batches": batches,
+            "missing": missing_count,
+            "missing_keys": missing,
+            "new": new,
+            "changed": changed,
+            "unchanged": unchanged,
+            "fields_matched": fields_matched,
+            "fields_total": fields_total,
+        }))
+    }
+}
+
+/// Cap on the per-key `missing_keys` echo in a backfill result — a large archive
+/// could otherwise blow up the stored job result; `missing` keeps the full count.
+const MISSING_ECHO_LIMIT: usize = 100;
+
+/// All archived versions of one URL from the source app's [`VERSIONS_DATASET`],
+/// via a bound (never interpolated) JSON filter on `$.url`.
+async fn versions_for(ctx: &AppContext, src_app: &str, url: &str) -> Result<Vec<Record>> {
+    ctx.datasets
+        .list_filtered(
+            src_app,
+            VERSIONS_DATASET,
+            &[pumper_core::datasets::JsonFilter::Eq {
+                path: "$.url".into(),
+                value: url.into(),
+            }],
+            None,
+            SOURCE_LIST_LIMIT,
+        )
+        .await
 }
 
 /// Whether the fetch layer actually delivered: some tier won with a verdict of
@@ -600,6 +923,42 @@ mod tests {
         let (matched, total, worst) = summarize_reports(reports.iter());
         assert_eq!((matched, total), (2, 2));
         assert!(worst.is_empty());
+    }
+
+    #[test]
+    fn versioned_key_uses_date_part() {
+        use super::versioned_key;
+        assert_eq!(
+            versioned_key("https://a/x", "2026-07-30T10:11:12+00:00"),
+            "https://a/x@2026-07-30"
+        );
+        // Degenerate timestamp shorter than a date: used as-is, never panics.
+        assert_eq!(versioned_key("https://a/x", "2026"), "https://a/x@2026");
+    }
+
+    #[test]
+    fn pick_as_of_selects_newest_at_or_before_cutoff() {
+        use super::pick_as_of;
+        let observed = vec![
+            "2026-01-01T00:00:00+00:00".to_string(),
+            "2026-03-01T00:00:00+00:00".to_string(),
+            "2026-06-01T00:00:00+00:00".to_string(),
+            "not-a-timestamp".to_string(), // skipped, never picked
+        ];
+        // Between the 2nd and 3rd observations → the 2nd wins.
+        assert_eq!(
+            pick_as_of(&observed, "2026-04-15T00:00:00Z").unwrap(),
+            Some(1)
+        );
+        // Exactly at an observation → inclusive.
+        assert_eq!(
+            pick_as_of(&observed, "2026-06-01T00:00:00Z").unwrap(),
+            Some(2)
+        );
+        // Before everything → None (honest miss, not a fallback to the present).
+        assert_eq!(pick_as_of(&observed, "2025-12-31T23:59:59Z").unwrap(), None);
+        // Bad as_of is an error, not a silent empty pick.
+        assert!(pick_as_of(&observed, "yesterday").is_err());
     }
 
     #[test]

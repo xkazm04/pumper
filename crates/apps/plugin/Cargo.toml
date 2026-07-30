@@ -8,3 +8,6 @@ pumper-core.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 futures.workspace = true
+# Versioned-archive source mode: `as_of` timestamp comparison + backfill URL patterns.
+chrono.workspace = true
+regex.workspace = true
