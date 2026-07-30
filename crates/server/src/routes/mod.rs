@@ -89,6 +89,7 @@ use watches::*;
         (name = "plugins", description = "WASM plugin host"),
         (name = "events", description = "Server-sent event streams"),
         (name = "hosts", description = "Learned per-host tier memory and politeness"),
+        (name = "cache", description = "HTTP cache freshness model (learned change cadence)"),
         (name = "profiles", description = "Session vault: named login profiles"),
         (name = "recipes", description = "API X-ray: discovered JSON-API endpoints behind rendered pages"),
         (name = "meta", description = "The OpenAPI document itself"),
@@ -185,6 +186,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_deliveries))
         .routes(routes!(get_delivery))
         .routes(routes!(replay_delivery))
+        .routes(routes!(cache_freshness))
         .routes(routes!(list_hosts))
         .routes(routes!(get_host))
         .routes(routes!(delete_host_memory))
@@ -433,6 +435,7 @@ mod api_spec_tests {
         "GET /webhooks/deliveries",
         "GET /webhooks/deliveries/{id}",
         "POST /webhooks/deliveries/{id}/replay",
+        "GET /cache/freshness",
         "GET /hosts",
         "GET /hosts/{host}",
         "DELETE /hosts/{host}/memory",

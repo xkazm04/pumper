@@ -668,7 +668,14 @@ impl HttpClient for HttpEngine {
                                 ..stale.response
                             });
                         }
-                        // Changed: store and return the fresh body.
+                        // Changed: log the labeled observation (feeds the
+                        // change-cadence estimator; the 304 counterpart is
+                        // recorded inside `refresh`), store, return fresh body.
+                        // Only a real 2xx body is a "changed" observation — an
+                        // origin error is evidence of neither outcome.
+                        if resp.is_success() {
+                            self.cache.record_revalidation(key, true).await;
+                        }
                         self.cache.put(key, &req.url, &resp, ttl).await?;
                         return Ok(resp);
                     }

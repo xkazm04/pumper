@@ -139,6 +139,39 @@ impl Governor {
         }
     }
 
+    /// Non-blocking acquire: claims the host's slot ONLY if it is free right
+    /// now, returning whether it was claimed. Never sleeps. Built for strictly
+    /// idle-slot background work (the cache refresher): a busy or penalized
+    /// host answers `false` and the background caller simply skips it, so
+    /// opportunistic traffic can never queue behind — or delay — live jobs.
+    ///
+    /// Claiming advances `next_slot` exactly like [`acquire`], so a live
+    /// request that arrives just after still gets normally-spaced (the engine's
+    /// own `acquire` will wait out the claimed interval).
+    pub fn try_acquire(&self, host: &str) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let host = host.to_lowercase();
+        let base = self
+            .per_domain
+            .get(&host)
+            .copied()
+            .unwrap_or(self.default_interval);
+        let now = Instant::now();
+        let mut entry = self.hosts.entry(host).or_insert_with(|| HostState {
+            next_slot: now,
+            penalty: Duration::ZERO,
+            last_seen: now,
+        });
+        if entry.next_slot > now {
+            return false; // slot busy — idle-slot callers back off
+        }
+        entry.last_seen = now;
+        entry.next_slot = now + base + entry.penalty;
+        true
+    }
+
     /// Records a rate-limit response (429/503) for `host`: the learned extra
     /// spacing doubles (starting at 1s), honors a larger server `Retry-After`,
     /// caps at 5 minutes — and the host's next slot is pushed out so already
@@ -354,6 +387,37 @@ mod tests {
         // Reward on an unpenalized host is a no-op.
         g.reward("y.com").await;
         assert_eq!(g.penalty("y.com").await, Duration::ZERO);
+    }
+
+    #[tokio::test]
+    async fn try_acquire_claims_free_slot_and_refuses_busy_one() {
+        // 200ms spacing so a claimed slot stays busy for a measurable window.
+        let cfg = GovernorConfig {
+            enabled: true,
+            default_rps: 5.0,
+            jitter_ms: 0,
+            ..GovernorConfig::default()
+        };
+        let g = Governor::new(&cfg);
+        // First claim wins; an immediate second is refused (slot busy).
+        assert!(g.try_acquire("x.com"));
+        assert!(!g.try_acquire("x.com"), "slot just claimed must be busy");
+        // Distinct hosts are independent.
+        assert!(g.try_acquire("y.com"));
+        // A penalized host with a pushed-out slot refuses too.
+        g.penalize("z.com", Some(Duration::from_secs(60))).await;
+        assert!(!g.try_acquire("z.com"), "penalized slot must refuse");
+    }
+
+    #[tokio::test]
+    async fn try_acquire_is_always_true_when_disabled() {
+        let cfg = GovernorConfig {
+            enabled: false,
+            ..GovernorConfig::default()
+        };
+        let g = Governor::new(&cfg);
+        assert!(g.try_acquire("x.com"));
+        assert!(g.try_acquire("x.com"));
     }
 
     #[tokio::test]

@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use pumper_core::{
     crawl, AppContext, AppManifest, CostClass, CrawlConfig, CrawlPageRecord, Datasets, Error,
     HttpClient, HttpRequest, HttpResponse, ManifestExample, PageSink, PageSource, Result,
-    RevisitSeed, ScrapeApp,
+    RevisitCadence, RevisitSeed, ScrapeApp,
 };
 use serde_json::{json, Value};
 
@@ -91,7 +91,16 @@ struct PageCounts {
     /// Page revisions archived into `page_versions` (with a revision-suffixed
     /// artifact copy) because a revisit found the body CHANGED.
     versions_archived: AtomicUsize,
+    /// Cadence-only counter merges written for `304` check markers (M07). Kept
+    /// separate from `changed` — a cadence bump is bookkeeping, not content.
+    cadence_updates: AtomicUsize,
 }
+
+/// Full stored `pages` record per URL, captured at revisit-seed load so the
+/// sink can merge a 304's cadence bump into the record WITHOUT re-reading the
+/// dataset (the read already happened to build the seeds). std Mutex — quick
+/// map ops only, never held across an `.await`.
+type SeedData = Arc<Mutex<HashMap<String, Value>>>;
 
 /// Dataset holding the versioned crawl archive: one record per CHANGED revision
 /// of a page, keyed `{url}#{revision}`. Each record carries `artifact_path` +
@@ -130,6 +139,9 @@ struct DatasetPageSink {
     /// revision-suffixed file and records it in [`VERSIONS_DATASET`].
     artifacts_dir: PathBuf,
     counts: Arc<PageCounts>,
+    /// Stored record data per seeded URL (revisit runs; empty otherwise) — the
+    /// merge base for 304 cadence markers.
+    seed_data: SeedData,
 }
 
 impl DatasetPageSink {
@@ -209,11 +221,33 @@ impl PageSink for DatasetPageSink {
         // revision that triggers/watches fire on) and are NOT counted as changed.
         let mut live: Vec<(String, Value)> = Vec::new();
         let mut gone: Vec<(String, Value)> = Vec::new();
+        // 304 check markers: cadence counters merged onto the stored record.
+        let mut checks: Vec<(String, Value)> = Vec::new();
         // url → (artifact_path, simhash) for this batch's live pages, kept so the
         // version archive can copy the just-written body of any CHANGED key.
         let mut live_meta: HashMap<String, (String, u64)> = HashMap::new();
         for p in batch {
-            if p.gone {
+            if p.unchanged {
+                // Merge the bumped cadence into the record as loaded at seed
+                // time — everything else about the page is by definition
+                // unchanged (the origin said 304). NOTE: this UPSERT is a
+                // changed revision (the cadence moved), so watches/triggers on
+                // `pages` see check bookkeeping; bounded per URL per run.
+                let mut base = self
+                    .seed_data
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&p.url)
+                    .cloned()
+                    .unwrap_or_else(|| json!({ "url": p.url }));
+                if let Value::Object(map) = &mut base {
+                    map.insert(
+                        "cadence".into(),
+                        serde_json::to_value(&p.cadence).unwrap_or(Value::Null),
+                    );
+                }
+                checks.push((p.url.clone(), base));
+            } else if p.gone {
                 gone.push((
                     p.url.clone(),
                     json!({ "url": p.url, "status": p.status, "gone": true, "job_id": self.job_id }),
@@ -235,6 +269,10 @@ impl PageSink for DatasetPageSink {
                         // can send If-None-Match / If-Modified-Since.
                         "etag": p.etag,
                         "last_modified": p.last_modified,
+                        // Learned change-cadence counters (M07): checks/changes/
+                        // last_change_at + EWMA interval, read back as revisit
+                        // seeds to drive the due-score frontier.
+                        "cadence": p.cadence,
                         "job_id": self.job_id,
                     }),
                 ));
@@ -266,6 +304,20 @@ impl PageSink for DatasetPageSink {
                 tracing::warn!(job = %self.job_id, "crawl gone-marker upsert failed: {e}");
             }
         }
+        if !checks.is_empty() {
+            // Deliberately NOT folded into new/changed counts: a cadence bump is
+            // estimator bookkeeping, not observed content change.
+            match self.datasets.upsert_many(&self.app, "pages", &checks).await {
+                Ok(_) => {
+                    self.counts
+                        .cadence_updates
+                        .fetch_add(checks.len(), Ordering::Relaxed);
+                }
+                Err(e) => {
+                    tracing::warn!(job = %self.job_id, "crawl cadence-marker upsert failed: {e}")
+                }
+            }
+        }
     }
 }
 
@@ -276,29 +328,49 @@ struct DatasetPageSource {
     datasets: Arc<Datasets>,
     app: String,
     limit: i64,
+    /// Populated during `seeds()` with each seeded URL's full record data — the
+    /// sink's merge base for 304 cadence markers (no second dataset read).
+    seed_data: SeedData,
 }
 
 #[async_trait]
 impl PageSource for DatasetPageSource {
     async fn seeds(&self) -> Vec<RevisitSeed> {
         match self.datasets.list(&self.app, "pages", self.limit).await {
-            Ok(records) => records
-                .into_iter()
-                .filter(|r| {
-                    r.removed_at.is_none()
-                        && !r.data.get("gone").and_then(Value::as_bool).unwrap_or(false)
-                })
-                .map(|r| RevisitSeed {
-                    etag: r.data.get("etag").and_then(Value::as_str).map(String::from),
-                    last_modified: r
+            Ok(records) => {
+                let mut seeds = Vec::new();
+                let mut data_map = HashMap::new();
+                for r in records {
+                    if r.removed_at.is_some()
+                        || r.data.get("gone").and_then(Value::as_bool).unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    // Learned cadence counters written by DatasetPageSink;
+                    // records that predate them default to a cold-start seed.
+                    let cadence = r
                         .data
-                        .get("last_modified")
-                        .and_then(Value::as_str)
-                        .map(String::from),
-                    // The record key is the canonical URL (see DatasetPageSink).
-                    url: r.key,
-                })
-                .collect(),
+                        .get("cadence")
+                        .cloned()
+                        .and_then(|v| serde_json::from_value::<RevisitCadence>(v).ok())
+                        .unwrap_or_default();
+                    data_map.insert(r.key.clone(), r.data.clone());
+                    seeds.push(RevisitSeed {
+                        etag: r.data.get("etag").and_then(Value::as_str).map(String::from),
+                        last_modified: r
+                            .data
+                            .get("last_modified")
+                            .and_then(Value::as_str)
+                            .map(String::from),
+                        simhash: r.data.get("simhash").and_then(Value::as_u64).unwrap_or(0),
+                        cadence,
+                        // The record key is the canonical URL (see DatasetPageSink).
+                        url: r.key,
+                    });
+                }
+                *self.seed_data.lock().unwrap_or_else(|e| e.into_inner()) = data_map;
+                seeds
+            }
             Err(e) => {
                 tracing::warn!(app = %self.app, "crawl revisit seed load failed: {e}");
                 Vec::new()
@@ -322,7 +394,9 @@ impl ScrapeApp for Crawl {
          \"include_patterns\": [\"regex\", ..], \"exclude_patterns\": [\"regex\", ..], \
          \"sitemap_seeds\": false, \
          \"mode\": \"revisit\" (incremental recrawl of the `pages` dataset via \
-         conditional GETs; \"discover\": true opts into link-following)}. \
+         conditional GETs; \"discover\": true opts into link-following; \
+         \"revisit_budget\" + \"min_due_score\" spend the budget on the URLs \
+         most likely changed, per learned per-URL change cadence)}. \
          Frontier state is checkpointed durably per job: an interrupted, reaped, \
          or shutdown-suspended crawl resumes where it left off on its next attempt. \
          Changed pages are archived into the `page_versions` dataset (key \
@@ -360,7 +434,18 @@ impl ScrapeApp for Crawl {
                         "enum": ["revisit"],
                         "description": "Incremental recrawl of the existing `pages` dataset via conditional GETs."
                     },
-                    "discover": { "type": "boolean" }
+                    "discover": { "type": "boolean" },
+                    "revisit_budget": {
+                        "type": ["integer", "null"],
+                        "minimum": 1,
+                        "description": "Revisit mode: max known pages fetched this run, spent on the highest due-score URLs (learned change cadence). Absent/0 = all seeds."
+                    },
+                    "min_due_score": {
+                        "type": "number",
+                        "minimum": 0,
+                        "maximum": 1,
+                        "description": "Revisit mode: skip seeds whose probability-changed-since-last-check falls below this (0 = fetch all; skipped seeds are counted in skipped_not_due)."
+                    }
                 },
                 "additionalProperties": true
             })),
@@ -460,18 +545,36 @@ impl ScrapeApp for Crawl {
             resume_state: ctx.restore().cloned(),
             revisit,
             discover: bool_param("discover", false),
+            // Learned change-cadence frontier (M07): spend the revisit budget on
+            // the URLs most likely to have changed since last check.
+            revisit_budget: ctx
+                .params
+                .get("revisit_budget")
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .filter(|&n| n > 0),
+            min_due_score: ctx
+                .params
+                .get("min_due_score")
+                .and_then(Value::as_f64)
+                .map(|s| s.clamp(0.0, 1.0))
+                .unwrap_or(0.0),
         };
 
         // Per-page fingerprints stream into the `pages` dataset as the crawl
         // runs (key = canonical URL), so crawled pages become queryable/diffable
         // and dataset triggers + watches fire per-page.
         let counts = Arc::new(PageCounts::default());
+        // Shared between source (writer, at seed load) and sink (reader, on 304
+        // markers): the stored record data per seeded URL.
+        let seed_data: SeedData = Arc::new(Mutex::new(HashMap::new()));
         let sink: Box<dyn PageSink> = Box::new(DatasetPageSink {
             datasets: ctx.datasets.clone(),
             app: ctx.app.clone(),
             job_id: ctx.job_id.to_string(),
             artifacts_dir: ctx.artifacts_dir.clone(),
             counts: counts.clone(),
+            seed_data: seed_data.clone(),
         });
 
         // Revisit mode reads existing page records to seed the frontier.
@@ -480,6 +583,7 @@ impl ScrapeApp for Crawl {
                 datasets: ctx.datasets.clone(),
                 app: ctx.app.clone(),
                 limit: REVISIT_SEED_LIMIT,
+                seed_data: seed_data.clone(),
             }) as Box<dyn PageSource>
         });
 
@@ -556,6 +660,10 @@ impl ScrapeApp for Crawl {
             "revisit": revisit,
             "revisited": stats.revisited,
             "unchanged_304": stats.unchanged_304,
+            // Learned-cadence frontier accounting (M07): seeds skipped as
+            // not-due / over-budget, and 304 cadence-counter merges written.
+            "skipped_not_due": stats.skipped_not_due,
+            "cadence_updates": counts.cadence_updates.load(Ordering::Relaxed),
             // `changed`/`new` = live pages re-fingerprinted / first-seen this run.
             "changed": pages_changed,
             "new": pages_new,

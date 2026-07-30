@@ -62,6 +62,19 @@ profiles_dir = "data/profiles"
 enabled = true
 ttl_secs = 3600
 
+# Background cache refresher (M02 self-refreshing mirror) — piggybacks on the
+# scheduler tick to conditionally revalidate cached entries just before their
+# PREDICTED next change (an EWMA over the observed change gaps in the
+# `revalidations` log; GET /cache/freshness shows the model). Strictly polite:
+# each request is admitted only through the governor's non-blocking idle-slot
+# try_acquire, and hard per-tick budgets bound total background traffic.
+[refresher]
+enabled = false
+# horizon_secs = 300        # revalidate keys whose predicted change is within this window
+# global_per_tick = 10      # max background revalidations per scheduler tick
+# per_host_per_tick = 2     # max per host per tick
+# retention_days = 30       # revalidation-log retention
+
 # Tier-zero archive engine (Wayback Machine CDX, v1). When enabled AND a fetch
 # sets `archive_max_age` (seconds), the tiered fetcher tries a stored
 # web.archive.org snapshot BEFORE touching the live site — zero load on the

@@ -29,6 +29,47 @@ pub struct Config {
     pub ingress: IngressConfig,
     pub mcp: McpConfig,
     pub economics: EconomicsConfig,
+    pub refresher: RefresherConfig,
+}
+
+/// Background cache refresher (M02 self-refreshing mirror): a scheduler-tick
+/// piggyback that conditionally revalidates `http_cache` entries just before
+/// their predicted next change (learned from the revalidation log's EWMA
+/// inter-change intervals), so app-facing fetches find warm, provably-fresh
+/// entries instead of paying live-network latency.
+///
+/// Strictly opportunistic and strictly polite: every request first takes
+/// `Governor::try_acquire` — an idle-slot-only, non-blocking claim — so
+/// background refreshes can never queue behind or delay live jobs, and per-tick
+/// budgets bound total background traffic. Default OFF.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct RefresherConfig {
+    /// Master switch. `false` = no background revalidation at all (the
+    /// revalidation log still accrues from demand-path revalidations).
+    pub enabled: bool,
+    /// How close (seconds) a key's predicted next change must be before the
+    /// refresher considers it near-due.
+    pub horizon_secs: u64,
+    /// Max background revalidations per scheduler tick across all hosts.
+    pub global_per_tick: usize,
+    /// Max background revalidations per host per tick.
+    pub per_host_per_tick: usize,
+    /// Revalidation-log retention (days); older observations are pruned by the
+    /// tick so the append-only log stays bounded.
+    pub retention_days: u32,
+}
+
+impl Default for RefresherConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            horizon_secs: 300,
+            global_per_tick: 10,
+            per_host_per_tick: 2,
+            retention_days: 30,
+        }
+    }
 }
 
 /// Information economics (M04): joining the cost ledger with per-job yield
@@ -540,6 +581,28 @@ impl Config {
             )));
         }
 
+        // Refresher guards only bind when the loop actually runs. Zero budgets
+        // or a zero horizon parse fine and then produce a tick that scans the
+        // freshness model every interval while refreshing nothing — an enabled
+        // feature that silently does no work.
+        let rf = &self.refresher;
+        if rf.enabled {
+            if rf.global_per_tick == 0 || rf.per_host_per_tick == 0 {
+                return Err(Error::Config(format!(
+                    "[refresher] global_per_tick ({}) and per_host_per_tick ({}) must be > 0 \
+                     when the refresher is enabled — zero budgets refresh nothing",
+                    rf.global_per_tick, rf.per_host_per_tick
+                )));
+            }
+            if rf.horizon_secs == 0 {
+                return Err(Error::Config(
+                    "[refresher] horizon_secs must be > 0 when the refresher is enabled — \
+                     a zero window never finds a near-due key"
+                        .into(),
+                ));
+            }
+        }
+
         // A cap below the base means the very first penalty already exceeds it, so
         // the cap silently stops being a cap.
         let g = &self.governor;
@@ -995,6 +1058,27 @@ mod tests {
         Config::default()
             .validate()
             .expect("shipped defaults must satisfy their own invariants");
+    }
+
+    #[test]
+    fn enabled_refresher_with_zero_budget_or_horizon_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.refresher.enabled = true;
+        cfg.refresher.global_per_tick = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("global_per_tick"), "{err}");
+
+        let mut cfg = Config::default();
+        cfg.refresher.enabled = true;
+        cfg.refresher.horizon_secs = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("horizon_secs"), "{err}");
+
+        // Disabled: the same zeros are inert (the feature is off).
+        let mut cfg = Config::default();
+        cfg.refresher.global_per_tick = 0;
+        cfg.refresher.horizon_secs = 0;
+        cfg.validate().expect("disabled refresher never binds");
     }
 
     #[test]

@@ -126,6 +126,56 @@ pub(crate) async fn delete_host_memory(
     }
 }
 
+// ---- Cache freshness (M02 self-refreshing mirror) ---------------------------
+
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct FreshnessQuery {
+    /// Max keys returned (most-urgent first).
+    #[serde(default = "default_limit")]
+    limit: i64,
+}
+
+/// Predicted staleness of the HTTP cache, per key and per host, from the
+/// learned change-cadence model (EWMA of observed inter-change gaps in the
+/// revalidation log). `due_in_secs <= 0` means the model predicts the origin
+/// has already changed since the entry was last confirmed.
+#[utoipa::path(
+    get,
+    path = "/cache/freshness",
+    tag = "cache",
+    params(FreshnessQuery),
+    responses((status = 200, description = "`{refresher_enabled, keys: [{key, url, checks, \
+        changes, last_checked_at, last_change_at, interval_secs, predicted_next_change, \
+        due_in_secs}], hosts: [{host, keys, due_now}]}` — keys sorted most-urgent first"))
+)]
+pub(crate) async fn cache_freshness(
+    State(state): State<AppState>,
+    Query(query): Query<FreshnessQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let limit = query.limit.clamp(1, 1000) as usize;
+    let keys = state.cache.freshness(chrono::Utc::now(), limit).await?;
+    // Per-host rollup: how many modelled keys, how many already predicted-stale.
+    let mut hosts: std::collections::BTreeMap<String, (usize, usize)> =
+        std::collections::BTreeMap::new();
+    for k in &keys {
+        let host = crate::refresher::host_of(&k.url).unwrap_or_default();
+        let entry = hosts.entry(host).or_insert((0, 0));
+        entry.0 += 1;
+        if k.due_in_secs <= 0.0 {
+            entry.1 += 1;
+        }
+    }
+    let hosts: Vec<Value> = hosts
+        .into_iter()
+        .map(|(host, (n, due))| json!({ "host": host, "keys": n, "due_now": due }))
+        .collect();
+    Ok(Json(json!({
+        "refresher_enabled": state.config.refresher.enabled,
+        "keys": keys,
+        "hosts": hosts,
+    })))
+}
+
 // ---- Session profiles -----------------------------------------------------
 
 /// One profile of the session vault (`[fetcher] profiles_dir`), as it exists on

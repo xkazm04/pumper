@@ -69,6 +69,11 @@ pub async fn run(state: AppState) {
         if state.config.webhooks.auto_retry {
             crate::webhook::drain_due(&state).await;
         }
+        // And the cache refresher ([refresher], default OFF): revalidate cached
+        // entries whose learned change cadence says a change is near — spawned
+        // (non-blocking) and strictly idle-slot via Governor::try_acquire, so
+        // it can neither delay this loop nor crowd out live traffic.
+        crate::refresher::tick(&state);
         // Stop enqueuing new scheduled work as soon as shutdown is signalled.
         tokio::select! {
             _ = state.shutdown.cancelled() => break,

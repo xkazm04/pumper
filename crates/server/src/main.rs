@@ -4,6 +4,7 @@ mod e2e;
 mod events;
 mod mcp;
 mod progress;
+mod refresher;
 mod registry;
 mod routes;
 mod scheduler;

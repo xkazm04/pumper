@@ -33,6 +33,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "record_revisions",
     "records",
     "research_cache",
+    "revalidations",
     "saved_search_seen",
     "saved_searches",
     "schedules",

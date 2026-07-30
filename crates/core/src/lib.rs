@@ -44,7 +44,7 @@ pub use app::{
     ProgressReporter, Requirement, ScrapeApp,
 };
 #[cfg(feature = "storage")]
-pub use cache::{HttpCache, ResearchCache, StaleEntry};
+pub use cache::{HttpCache, KeyFreshness, ResearchCache, StaleEntry};
 #[cfg(feature = "storage")]
 pub use costs::{extract_yields, CostEvent, CostLedger, CostSummary, SpentTotal, YieldEntry};
 #[cfg(feature = "storage")]
@@ -73,8 +73,8 @@ pub use catalog::{
 };
 pub use config::Config;
 pub use crawl::{
-    crawl, CrawlConfig, CrawlPageRecord, CrawlProgressSnapshot, CrawlStats, PageSink, PageSource,
-    ProgressFn, RevisitSeed,
+    change_weight, crawl, due_score, CrawlConfig, CrawlPageRecord, CrawlProgressSnapshot,
+    CrawlStats, PageSink, PageSource, ProgressFn, RevisitCadence, RevisitSeed,
 };
 pub use engine::{
     profile_browser_dir, profile_cookies_path, profile_dir, validate_profile_name, Browser,
