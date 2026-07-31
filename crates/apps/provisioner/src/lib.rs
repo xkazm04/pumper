@@ -27,7 +27,8 @@ use pumper_core::{
     FetchRequest, FetchStrategy, ManifestExample, ResearchRequest, Result, RuleSet, ScrapeApp,
     Source,
 };
-use serde::Serialize;
+use pumper_core::datasets::Provenance;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
 pub struct Provisioner;
@@ -47,10 +48,21 @@ const SAMPLE_PROMPT_CAP_CHARS: usize = 12_000;
 /// Max chars of the proposal-record key derived from the prompt.
 const KEY_CAP_CHARS: usize = 64;
 
+/// Default archive-tier freshness window for candidate SAMPLING (seconds, 24h).
+///
+/// Sampling exists to learn a page's SHAPE well enough to draft selectors, not
+/// to capture its current values — and layouts move on the scale of months. So
+/// a day-old web-archive snapshot is a fully adequate sample, and taking it
+/// spares an unknown third-party host the first-contact hit from a compile that
+/// may be re-run several times over one prompt. The archive tier is
+/// opportunistic, never terminal: an absent, older, or thin snapshot falls
+/// straight through to the live ladder. `0` opts out (live-only).
+const DEFAULT_SAMPLE_ARCHIVE_MAX_AGE_SECS: u64 = 86_400;
+
 // ── discovery ───────────────────────────────────────────────────────────────
 
 /// One candidate source URL the research stage proposed.
-#[derive(Debug, Clone, PartialEq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Candidate {
     pub url: String,
     pub name: String,
@@ -317,6 +329,52 @@ fn excerpt(body: &str, max: usize) -> String {
 
 // ── the app ─────────────────────────────────────────────────────────────────
 
+// ── durable execution ───────────────────────────────────────────────────────
+
+/// The resumable unit of a compile (M23): everything the METERED discovery
+/// stage produced. Stages after it (sampling, drafting) are free-tier or
+/// re-derivable, and their inputs (page bodies) are far larger than the state
+/// they would save — so the checkpoint stops here deliberately.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DiscoveryCheckpoint {
+    /// The prompt's proposal key. A checkpoint is only honored for a run
+    /// compiling the SAME prompt — restoring another prompt's candidates would
+    /// silently compile the wrong source.
+    proposal_key: String,
+    candidates: Vec<Candidate>,
+    /// Research session to resume, so the drafting calls keep the discovery
+    /// context instead of paying to rebuild it.
+    #[serde(default)]
+    session_id: Option<String>,
+}
+
+impl DiscoveryCheckpoint {
+    /// Best-effort persist — a checkpoint that fails to write costs a repeated
+    /// research call on re-claim, never the run.
+    async fn save(&self, ctx: &AppContext) {
+        match serde_json::to_value(self) {
+            Ok(v) => {
+                ctx.checkpoint_now(v).await;
+            }
+            Err(e) => tracing::warn!("provisioner checkpoint serialize failed: {e}"),
+        }
+    }
+
+    /// Restores a checkpoint for THIS prompt, or `None` (fresh run, foreign
+    /// prompt, or an unreadable blob — all of which simply re-run discovery).
+    fn restore(ctx: &AppContext, proposal_key: &str) -> Option<Self> {
+        Self::from_blob(ctx.restore(), proposal_key)
+    }
+
+    /// The restore decision, pure so it is testable without a runtime: a blob
+    /// is honored only when it parses AND belongs to this prompt AND actually
+    /// carries candidates.
+    fn from_blob(blob: Option<&Value>, proposal_key: &str) -> Option<Self> {
+        let cp: Self = serde_json::from_value(blob?.clone()).ok()?;
+        (cp.proposal_key == proposal_key && !cp.candidates.is_empty()).then_some(cp)
+    }
+}
+
 #[async_trait]
 impl ScrapeApp for Provisioner {
     fn name(&self) -> &'static str {
@@ -331,8 +389,10 @@ impl ScrapeApp for Provisioner {
          {catalog_row, rule_set, seeds, cadence, budget, sample_stats, confidence} \
          record into provisioner/proposals. NEVER writes data-sources.toml or \
          creates schedules — the emitted row is always status=planned with no cron; \
-         a human applies it via the catalog reconciler. Params: {\"prompt\": \"...\", \
-         \"budget_usd\": 1.0, \"max_iterations\": 2}"
+         a human applies it via the catalog reconciler. The metered discovery \
+         stage is checkpointed, so a reaped/suspended compile resumes without \
+         re-spending it. Params: {\"prompt\": \"...\", \"budget_usd\": 1.0, \
+         \"max_iterations\": 2, \"sample_archive_max_age\": 86400}"
     }
 
     fn manifest(&self) -> AppManifest {
@@ -344,7 +404,15 @@ impl ScrapeApp for Provisioner {
                 "properties": {
                     "prompt": { "type": "string", "minLength": 1 },
                     "budget_usd": { "type": "number", "minimum": 0 },
-                    "max_iterations": { "type": "integer", "minimum": 1, "maximum": 5 }
+                    "max_iterations": { "type": "integer", "minimum": 1, "maximum": 5 },
+                    "sample_archive_max_age": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Archive-tier freshness window (seconds) for candidate \
+                                        SAMPLING only; a snapshot no older than this may serve \
+                                        the shape-learning fetch instead of hitting the origin. \
+                                        Default 86400, 0 = live-only."
+                    }
                 },
                 "additionalProperties": true
             })),
@@ -367,8 +435,9 @@ impl ScrapeApp for Provisioner {
             ],
             output_shape: Some(
                 "{proposal_key, candidates, seeds, iterations, accepted, confidence, \
-                 sample_stats, cost_usd} — the full proposal record is upserted into \
-                 provisioner/proposals and saved as the proposal.json artifact; \
+                 sample_stats, cost_usd, resumed_discovery} — the full proposal record is \
+                 upserted into provisioner/proposals (stamped with the primary sampled URL \
+                 as its source) and saved as the proposal.json artifact; \
                  nothing is written to the catalog and no schedule is created",
             ),
             cost_class: CostClass::Claude,
@@ -384,10 +453,33 @@ impl ScrapeApp for Provisioner {
             .and_then(Value::as_u64)
             .map(|n| (n as u32).clamp(1, ITERATIONS_CAP))
             .unwrap_or(DEFAULT_MAX_ITERATIONS);
+        let sample_archive_max_age = ctx
+            .params
+            .get("sample_archive_max_age")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_SAMPLE_ARCHIVE_MAX_AGE_SECS);
         let mut cost_usd = 0.0f64;
 
+        // Durable execution (M23): discovery is the one irreversibly METERED
+        // stage of a compile — a reap or shutdown between it and the drafting
+        // loop used to re-spend that research call from scratch. Its outcome
+        // (the candidate list + the resumable research session) is checkpointed
+        // and restored on re-claim; everything after it is free-tier work that
+        // is cheaper to redo than to persist.
+        let key = proposal_key(&prompt);
+        let resumed = DiscoveryCheckpoint::restore(&ctx, &key);
+        let resumed_discovery = resumed.is_some();
+
         // ── stage 1: discover candidate sources ─────────────────────────────
-        let discovery_schema = json!({
+        let (mut session_id, candidates) = if let Some(cp) = resumed {
+            tracing::info!(
+                job = %ctx.job_id,
+                candidates = cp.candidates.len(),
+                "provisioner resumed from checkpoint: discovery research not re-spent"
+            );
+            (cp.session_id, cp.candidates)
+        } else {
+            let discovery_schema = json!({
             "type": "object",
             "required": ["candidates"],
             "properties": {
@@ -420,20 +512,30 @@ impl ScrapeApp for Provisioner {
         .with_role("research");
         discover.max_budget_usd = budget_usd;
         discover.json_schema = Some(discovery_schema);
-        let out = ctx.research(discover).await?;
-        cost_usd += out.cost_usd.unwrap_or(0.0);
-        let mut session_id = out.session_id.clone();
-        let report = out
-            .json
-            .clone()
-            .or_else(|| salvage_json(&out.text))
-            .unwrap_or(Value::Null);
-        let candidates = parse_candidates(&report);
-        if candidates.is_empty() {
-            return Err(Error::App(format!(
-                "provisioner: research produced no usable candidate URLs for prompt {prompt:?}"
-            )));
-        }
+            let out = ctx.research(discover).await?;
+            cost_usd += out.cost_usd.unwrap_or(0.0);
+            let session_id = out.session_id.clone();
+            let report = out
+                .json
+                .clone()
+                .or_else(|| salvage_json(&out.text))
+                .unwrap_or(Value::Null);
+            let candidates = parse_candidates(&report);
+            if candidates.is_empty() {
+                return Err(Error::App(format!(
+                    "provisioner: research produced no usable candidate URLs for prompt {prompt:?}"
+                )));
+            }
+            // Checkpoint the metered stage's outcome BEFORE any further work.
+            DiscoveryCheckpoint {
+                proposal_key: key.clone(),
+                candidates: candidates.clone(),
+                session_id: session_id.clone(),
+            }
+            .save(&ctx)
+            .await;
+            (session_id, candidates)
+        };
 
         // ── stage 2: sample candidates via the tiered fetcher ───────────────
         let mut seeds: Vec<String> = Vec::new();
@@ -441,6 +543,14 @@ impl ScrapeApp for Provisioner {
         for (i, cand) in candidates.iter().enumerate() {
             let mut req = FetchRequest::new(&cand.url);
             req.strategy = FetchStrategy::Auto;
+            // Sampling is shape-learning against an UNKNOWN third-party host —
+            // exactly the case both cheap seams were built for: a learned API
+            // recipe (M05) can replace a heavy render outright, and a recent
+            // archive snapshot (M18) is an adequate shape sample. Both are
+            // opportunistic: neither can terminate the ladder, so a miss simply
+            // fetches live as before.
+            req.use_recipes = true;
+            req.archive_max_age = (sample_archive_max_age > 0).then_some(sample_archive_max_age);
             match ctx.fetch(req).await {
                 Ok(mut outcome) => {
                     let body = outcome
@@ -573,8 +683,23 @@ impl ScrapeApp for Provisioner {
         let proposal = build_proposal(
             &prompt, &row, &rules_value, &seeds, budget_usd, &dry, iterations, cost_usd,
         );
-        let key = proposal_key(&prompt);
-        let change = ctx.upsert("proposals", &key, &proposal).await?;
+        // Provenance (M12): a proposal is derived from ONE page — the primary
+        // candidate whose sampled body the rules were drafted and dry-run
+        // against — so that URL is a real per-record fact, not a guess. The
+        // other sampled seeds are listed inside the record itself.
+        //
+        // `rules_hash` stays None on purpose: the drafted RuleSet is this
+        // record's PAYLOAD, not the thing that extracted it. Stamping it would
+        // claim a derivation that never happened (and the field is what the
+        // replay path resolves against). `artifact_sha` likewise — the sample
+        // artifacts are the inputs, not an archived copy of this record.
+        let prov = Provenance {
+            source_url: Some(primary.url.clone()),
+            ..Provenance::default()
+        };
+        let change = ctx
+            .upsert_with_provenance("proposals", &key, &proposal, prov)
+            .await?;
         ctx.save_artifact("proposal.json", &serde_json::to_vec_pretty(&proposal)?)
             .await?;
 
@@ -589,6 +714,9 @@ impl ScrapeApp for Provisioner {
             "sample_stats": serde_json::to_value(&dry)?,
             "cost_usd": cost_usd,
             "session_id": session_id,
+            // Durable execution: true when this attempt reused a prior
+            // attempt's discovery instead of re-spending the research call.
+            "resumed_discovery": resumed_discovery,
         }))
     }
 }
@@ -597,6 +725,39 @@ impl ScrapeApp for Provisioner {
 mod tests {
     use super::*;
     use pumper_core::Catalog;
+
+    #[test]
+    fn discovery_checkpoint_round_trips_and_is_bound_to_its_prompt() {
+        let key = proposal_key("track czech rust salaries");
+        let cp = DiscoveryCheckpoint {
+            proposal_key: key.clone(),
+            candidates: vec![cand("https://a.example/list")],
+            session_id: Some("sess-1".into()),
+        };
+        let blob = serde_json::to_value(&cp).unwrap();
+
+        let back = DiscoveryCheckpoint::from_blob(Some(&blob), &key).expect("same prompt resumes");
+        assert_eq!(back.candidates, cp.candidates);
+        assert_eq!(back.session_id.as_deref(), Some("sess-1"));
+
+        // A checkpoint from a DIFFERENT prompt must never be adopted — it would
+        // silently compile the wrong source.
+        assert!(DiscoveryCheckpoint::from_blob(Some(&blob), &proposal_key("something else")).is_none());
+    }
+
+    #[test]
+    fn unusable_checkpoints_fall_back_to_a_fresh_discovery() {
+        let key = proposal_key("p");
+        // Fresh run, corrupt blob, and an empty-candidate blob all mean "run
+        // discovery" — a checkpoint must never be able to fail the job.
+        assert!(DiscoveryCheckpoint::from_blob(None, &key).is_none());
+        assert!(DiscoveryCheckpoint::from_blob(Some(&json!("garbage")), &key).is_none());
+        assert!(DiscoveryCheckpoint::from_blob(
+            Some(&json!({ "proposal_key": key, "candidates": [] })),
+            &key
+        )
+        .is_none());
+    }
 
     fn cand(url: &str) -> Candidate {
         Candidate {

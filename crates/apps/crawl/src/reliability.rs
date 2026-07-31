@@ -37,6 +37,7 @@
 //! tallies, extraction health verdicts). **No new fetches, no probing.**
 //! Persistence is best-effort: failures warn and never fail the job.
 
+use pumper_core::datasets::Provenance;
 use pumper_core::Datasets;
 use serde_json::{json, Map, Value};
 
@@ -324,12 +325,25 @@ pub async fn record_observations(
         ));
     }
     let recorded = obs_items.len();
-    if let Err(e) = datasets.upsert_many(APP, OBS_DATASET, &obs_items).await {
+    // Derivation stamp (M12): these records are folds over EVERY fetch a run
+    // made against a host, so the producing job is the only honest fact — there
+    // is no single source URL and no RuleSet behind an aggregate counter.
+    let prov = Provenance {
+        job_id: Some(job_id.to_string()),
+        ..Provenance::default()
+    };
+    if let Err(e) = datasets
+        .upsert_many_stamped(APP, OBS_DATASET, &obs_items, None, Some(&prov))
+        .await
+    {
         tracing::warn!(job = %job_id, "web-reliability observations upsert failed: {e}");
         return 0;
     }
     if !idx_items.is_empty() {
-        if let Err(e) = datasets.upsert_many(APP, INDEX_DATASET, &idx_items).await {
+        if let Err(e) = datasets
+            .upsert_many_stamped(APP, INDEX_DATASET, &idx_items, None, Some(&prov))
+            .await
+        {
             tracing::warn!(job = %job_id, "web-reliability index upsert failed: {e}");
         }
     }
