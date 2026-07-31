@@ -7,7 +7,10 @@
 //! (`POST /watches`) for a Visualping-style monitor with webhook alerts.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, FetchRequest, FetchStrategy, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, FetchRequest, FetchStrategy, ManifestExample, Provenance,
+    Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -33,6 +36,59 @@ impl ScrapeApp for Watch {
          \"cache_ttl_secs\": 60}. Bypasses the HTTP cache by default so it sees \
          live bodies; set `cache_ttl_secs` to cap staleness instead. \
          Schedule it via POST /schedules and subscribe via POST /watches."
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "pattern": "^https?://",
+                        "description": "Page to monitor; it is also the record key in the `pages` dataset."
+                    },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["http", "browser", "auto", "auto_with_research"],
+                        "description": "Fetch ladder entry point (default \"auto\")."
+                    },
+                    "wait_for_selector": {
+                        "type": "string",
+                        "description": "Browser tier only: CSS selector to await before capturing — use it to fingerprint the content region rather than a spinner."
+                    },
+                    "min_content_chars": { "type": "integer", "minimum": 1 },
+                    "cache_ttl_secs": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Cap cache staleness at N seconds instead of bypassing the HTTP cache entirely (the default). Useful when several watches share one hot endpoint."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Watch a release-notes page for changes (schedule this + a dataset watch for webhook alerts)",
+                    params: json!({ "url": "https://example.com/releases" }),
+                },
+                ManifestExample {
+                    description: "JS-rendered status page: render in the browser, fingerprint only the content region, and share one cached body across sibling watches",
+                    params: json!({
+                        "url": "https://status.example.com/",
+                        "strategy": "browser",
+                        "wait_for_selector": "main .incidents",
+                        "cache_ttl_secs": 60
+                    }),
+                },
+            ],
+            output_shape: Some(
+                "{url, engine, status, change: new|changed|unchanged, chars, diff} — the \
+                 field-level diff of this run's `pages` record versus the previous revision",
+            ),
+            cost_class: CostClass::Metered,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -75,14 +131,31 @@ impl ScrapeApp for Watch {
 
         // Compact fingerprint: change detection runs on this record, so keep it
         // small but informative — the excerpt makes diffs human-readable.
+        let body_sha = hex_sha256(markdown.as_bytes());
         let record = json!({
             "url": outcome.url,
             "title": first_heading(&markdown),
             "chars": markdown.chars().count(),
-            "content_sha256": hex_sha256(markdown.as_bytes()),
+            "content_sha256": body_sha.clone(),
             "excerpt": markdown.chars().take(EXCERPT_CHARS).collect::<String>(),
         });
-        let change = ctx.upsert("pages", &url, &record).await?;
+        // Provenance (M12): this app knows both derivation facts for the record
+        // it is about to write — the exact URL the body came from (the post-
+        // redirect `outcome.url`, not the requested one) and the sha256 of the
+        // body it saved as `page.md`. No RuleSet is involved (the fingerprint is
+        // computed in code), so `rules_hash` stays Null rather than invented.
+        let change = ctx
+            .upsert_with_provenance(
+                "pages",
+                &url,
+                &record,
+                Provenance {
+                    source_url: Some(outcome.url.clone()),
+                    artifact_sha: Some(body_sha),
+                    ..Provenance::default()
+                },
+            )
+            .await?;
 
         // Surface what actually changed straight in the job result.
         let diff = ctx

@@ -10,7 +10,7 @@ use futures::StreamExt;
 use pumper_core::{
     extract_batch_with_report, signals_batch, AppContext, AppManifest, CompiledRuleSet, CostClass,
     DocReport, Error, FetchHealth, FetchRequest, FetchStrategy, FieldStatus, ManifestExample,
-    ObservedDoc, Record, Result, RuleSet, ScrapeApp, UpsertSummary,
+    ObservedDoc, Provenance, Record, Result, RuleSet, ScrapeApp, UpsertSummary,
 };
 use app_crawl::reliability;
 use pumper_core::config::ArchiveConfig;
@@ -259,6 +259,7 @@ async fn extract_and_upsert(
     dataset: &str,
     keyed: Vec<SourceDoc>,
     fetch: FetchHealth,
+    rules_hash: Option<&str>,
 ) -> Result<ExtractOutcome> {
     // Split keys/meta from bodies without copying the bodies — `keyed` is owned
     // and dropped here anyway (was: `.iter().map(|(_,d)| d.clone())`, deep-cloning
@@ -281,6 +282,19 @@ async fn extract_and_upsert(
     // suppression). Judging afterwards would stamp a verdict that did not exist.
     let verdict = observe(ctx, dataset, &keys, docs, &reported, fetch, &worst).await;
 
+    // Provenance (M12). `rules_hash` is the batch's honest shared fact: ONE
+    // registered RuleSet produced every record here, so stamping it batch-wide
+    // is exact — and it is the pin that makes these revisions re-derivable after
+    // the caller's rules move on. `source_url` is per-record and the batch write
+    // path carries only one stamp, so it is claimed ONLY when every document in
+    // the batch came from the same URL (a single-URL run, or a Wayback backfill
+    // of one page); a mixed batch leaves it Null rather than naming one of many.
+    let prov = Provenance {
+        rules_hash: rules_hash.map(str::to_string),
+        source_url: single_source_url(&metas),
+        ..Provenance::default()
+    };
+
     let mut records: Vec<Value> = Vec::with_capacity(reported.len());
     let items: Vec<(String, Value)> = keys
         .into_iter()
@@ -292,7 +306,9 @@ async fn extract_and_upsert(
             (key, rec)
         })
         .collect();
-    let summary = ctx.upsert_many(dataset, &items).await?;
+    let summary = ctx
+        .upsert_many_with_provenance(dataset, &items, prov)
+        .await?;
     Ok(ExtractOutcome {
         records,
         matched,
@@ -301,6 +317,19 @@ async fn extract_and_upsert(
         summary,
         health: verdict,
     })
+}
+
+/// The one source URL every document in this batch came from, or `None` when
+/// the batch spans several (or none). Honest-Null by construction: a batch-level
+/// `source_url` may only be claimed when it is true of every record in it.
+fn single_source_url(
+    metas: &[(String, Option<String>, Option<&'static str>)],
+) -> Option<String> {
+    let first = metas.first()?.0.as_str();
+    metas
+        .iter()
+        .all(|(url, _, _)| url == first)
+        .then(|| first.to_string())
 }
 
 /// Stamps the shared provenance convention onto an extracted record: `_url`
@@ -758,16 +787,28 @@ impl ScrapeApp for Extractor {
             let induce = induce.clone();
             return induce::run_induce(&ctx, &induce).await;
         }
-        let rules: RuleSet = ctx
+        let rules_json = ctx
             .params
             .get("rules")
             .cloned()
-            .ok_or_else(|| Error::App("param 'rules' is required".into()))
-            .and_then(|v| {
-                serde_json::from_value(v).map_err(|e| Error::App(format!("bad rules: {e}")))
-            })?;
+            .ok_or_else(|| Error::App("param 'rules' is required".into()))?;
+        let rules: RuleSet = serde_json::from_value(rules_json.clone())
+            .map_err(|e| Error::App(format!("bad rules: {e}")))?;
         // Compile (and validate selectors/regex) once, before the fan-out.
         let compiled = Arc::new(rules.compile()?);
+        // M12: register THIS run's rule set in the content-addressed registry and
+        // carry its hash onto every revision the run writes — extractor is the
+        // one place in the fleet where a real `rules_hash` exists, and it is what
+        // makes a record re-derivable once the caller's live rules have moved on.
+        // Best-effort: provenance is additive metadata and a registry write
+        // failure must never fail a working extraction.
+        let rules_hash = match ctx.register_rules(&rules_json).await {
+            Ok(hash) => Some(hash),
+            Err(e) => {
+                tracing::warn!("ruleset registration failed, revisions unstamped: {e}");
+                None
+            }
+        };
         let dataset = ctx
             .params
             .get("dataset")
@@ -778,9 +819,11 @@ impl ScrapeApp for Extractor {
         // Two input modes: fetch live `urls`, or read stored bodies from a
         // crawl→dataset `source`. Exactly one is required.
         if ctx.params.get("source").is_some() {
-            self.run_source_mode(&ctx, compiled, &dataset).await
+            self.run_source_mode(&ctx, compiled, &dataset, rules_hash.as_deref())
+                .await
         } else {
-            self.run_urls_mode(&ctx, compiled, &dataset).await
+            self.run_urls_mode(&ctx, compiled, &dataset, rules_hash.as_deref())
+                .await
         }
     }
 }
@@ -793,6 +836,7 @@ impl Extractor {
         ctx: &AppContext,
         compiled: Arc<CompiledRuleSet>,
         dataset: &str,
+        rules_hash: Option<&str>,
     ) -> Result<Value> {
         let urls: Vec<String> = ctx
             .params
@@ -867,7 +911,7 @@ impl Extractor {
 
         let requested = urls.len();
         let fetched = keyed.len();
-        let out = extract_and_upsert(ctx, compiled, dataset, keyed, fetch).await?;
+        let out = extract_and_upsert(ctx, compiled, dataset, keyed, fetch, rules_hash).await?;
 
         Ok(json!({
             "mode": "urls",
@@ -896,6 +940,7 @@ impl Extractor {
         ctx: &AppContext,
         compiled: Arc<CompiledRuleSet>,
         dataset: &str,
+        rules_hash: Option<&str>,
     ) -> Result<Value> {
         let source = ctx
             .params
@@ -909,7 +954,7 @@ impl Extractor {
         // app/dataset needed.
         if let Some(archive) = source.get("archive").and_then(Value::as_object) {
             return self
-                .run_archive_backfill(ctx, compiled, dataset, archive)
+                .run_archive_backfill(ctx, compiled, dataset, archive, rules_hash)
                 .await;
         }
         let src_app = source
@@ -945,7 +990,7 @@ impl Extractor {
             .unwrap_or(false)
         {
             return self
-                .run_backfill(ctx, compiled, dataset, &src_app, source)
+                .run_backfill(ctx, compiled, dataset, &src_app, source, rules_hash)
                 .await;
         }
         let as_of = source
@@ -1062,7 +1107,15 @@ impl Extractor {
         // Nothing was fetched, so the fetch layer cannot explain a bad extraction
         // and must not gate the verdict. An unreadable stored body is a corpus
         // problem, not a fetch problem, and is reported in `missing` instead.
-        let out = extract_and_upsert(ctx, compiled, dataset, keyed, FetchHealth::default()).await?;
+        let out = extract_and_upsert(
+            ctx,
+            compiled,
+            dataset,
+            keyed,
+            FetchHealth::default(),
+            rules_hash,
+        )
+        .await?;
 
         Ok(json!({
             "mode": "source",
@@ -1096,6 +1149,7 @@ impl Extractor {
         dataset: &str,
         src_app: &str,
         source: &serde_json::Map<String, Value>,
+        rules_hash: Option<&str>,
     ) -> Result<Value> {
         let pattern = source
             .get("url_pattern")
@@ -1105,14 +1159,21 @@ impl Extractor {
             })
             .transpose()?;
 
-        let mut after: Option<(String, String)> = None;
-        let mut scanned = 0usize;
-        let mut skipped_pattern = 0usize;
-        let mut loaded = 0usize;
-        let mut batches = 0usize;
+        // Durable execution (M23): backfill is the one genuinely long extractor
+        // mode — it pages the WHOLE `page_versions` archive, extracting and
+        // upserting per batch. The resumable unit is the keyset cursor plus the
+        // running tallies, so a reap resumes at the next page instead of
+        // re-reading and re-extracting every archived revision from the start.
+        let mut st = BackfillState::restore(ctx.restore());
+        let resumed = st.after.is_some();
+        let mut after: Option<(String, String)> = st.after.clone();
+        let mut scanned = st.scanned;
+        let mut skipped_pattern = st.skipped_pattern;
+        let mut loaded = st.loaded;
+        let mut batches = st.batches;
         let mut missing: Vec<Value> = Vec::new();
-        let (mut new, mut changed, mut unchanged) = (0usize, 0usize, 0usize);
-        let (mut fields_matched, mut fields_total) = (0u64, 0u64);
+        let (mut new, mut changed, mut unchanged) = (st.new, st.changed, st.unchanged);
+        let (mut fields_matched, mut fields_total) = (st.fields_matched, st.fields_total);
         loop {
             let batch = ctx
                 .datasets
@@ -1167,6 +1228,7 @@ impl Extractor {
                     dataset,
                     keyed,
                     FetchHealth::default(),
+                    rules_hash,
                 )
                 .await?;
                 new += out.summary.new.len();
@@ -1175,6 +1237,22 @@ impl Extractor {
                 fields_matched += out.matched;
                 fields_total += out.total;
             }
+            // Cursor + tallies AFTER the batch's writes committed, so a resume
+            // never re-does a page and never double-counts one.
+            st = BackfillState {
+                v: BACKFILL_STATE_VERSION,
+                after: after.clone(),
+                scanned,
+                skipped_pattern,
+                loaded,
+                batches,
+                new,
+                changed,
+                unchanged,
+                fields_matched,
+                fields_total,
+            };
+            ctx.checkpoint(st.to_value()).await;
             if short {
                 break;
             }
@@ -1184,6 +1262,7 @@ impl Extractor {
         missing.truncate(MISSING_ECHO_LIMIT);
         Ok(json!({
             "mode": "backfill",
+            "resumed_from_checkpoint": resumed,
             "source": {"app": src_app, "dataset": VERSIONS_DATASET},
             "scanned": scanned,
             "skipped_pattern": skipped_pattern,
@@ -1214,6 +1293,7 @@ impl Extractor {
         compiled: Arc<CompiledRuleSet>,
         dataset: &str,
         archive: &serde_json::Map<String, Value>,
+        rules_hash: Option<&str>,
     ) -> Result<Value> {
         let p = parse_archive_params(archive).map_err(Error::App)?;
         let engine = ArchiveEngine::new(
@@ -1288,7 +1368,7 @@ impl Extractor {
         keyed.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.observed_at.cmp(&b.observed_at)));
 
         let fetched = keyed.len();
-        let out = extract_and_upsert(ctx, compiled, dataset, keyed, fetch).await?;
+        let out = extract_and_upsert(ctx, compiled, dataset, keyed, fetch, rules_hash).await?;
 
         let failed_count = failed.len();
         failed.truncate(MISSING_ECHO_LIMIT);
@@ -1319,6 +1399,58 @@ impl Extractor {
 /// Cap on the per-key `missing_keys` echo in a backfill result — a large archive
 /// could otherwise blow up the stored job result; `missing` keeps the full count.
 const MISSING_ECHO_LIMIT: usize = 100;
+
+/// Backfill checkpoint blob version — bump on shape change; a mismatch restores
+/// fresh (a full re-scan is correct; a mis-resumed cursor silently skips rows).
+const BACKFILL_STATE_VERSION: u32 = 1;
+
+/// The resumable state of a backfill run: the `page_versions` keyset cursor plus
+/// the running tallies. `missing_keys` is deliberately NOT carried — it is a
+/// per-attempt diagnostic, and a resumed run reporting a prior attempt's
+/// unreadable artifacts as its own would be a fabricated observation.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+struct BackfillState {
+    v: u32,
+    /// Keyset cursor `(updated_at-as-stored, key)` of the last committed page.
+    #[serde(default)]
+    after: Option<(String, String)>,
+    #[serde(default)]
+    scanned: usize,
+    #[serde(default)]
+    skipped_pattern: usize,
+    #[serde(default)]
+    loaded: usize,
+    #[serde(default)]
+    batches: usize,
+    #[serde(default)]
+    new: usize,
+    #[serde(default)]
+    changed: usize,
+    #[serde(default)]
+    unchanged: usize,
+    #[serde(default)]
+    fields_matched: u64,
+    #[serde(default)]
+    fields_total: u64,
+}
+
+impl BackfillState {
+    /// Advisory restore: anything that isn't a current-version state restarts
+    /// the scan from the top rather than erroring.
+    fn restore(restored: Option<&Value>) -> Self {
+        restored
+            .and_then(|v| serde_json::from_value::<BackfillState>(v.clone()).ok())
+            .filter(|s| s.v == BACKFILL_STATE_VERSION)
+            .unwrap_or(BackfillState {
+                v: BACKFILL_STATE_VERSION,
+                ..BackfillState::default()
+            })
+    }
+
+    fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
 
 /// All archived versions of one URL from the source app's [`VERSIONS_DATASET`],
 /// via a bound (never interpolated) JSON filter on `$.url`.

@@ -2,7 +2,9 @@
 //! Serves as the template for classic fetch-and-parse use cases.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Result, ScrapeApp,
+};
 use scraper::{Html, Selector};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -32,6 +34,40 @@ impl ScrapeApp for HackerNews {
 
     // Uncomment for a recurring scrape every 6 hours:
     // fn schedule(&self) -> Option<&'static str> { Some("0 0 */6 * * *") }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "pages": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 5,
+                        "description": "Front-page listing pages to fetch (30 stories each); clamped to 1..=5."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Front page only (30 stories) — the default run",
+                    params: json!({}),
+                },
+                ManifestExample {
+                    description: "Top 90 stories: walk three listing pages in one snapshot",
+                    params: json!({ "pages": 3 }),
+                },
+            ],
+            output_shape: Some(
+                "{count, new, changed, unchanged, stories: [{rank, id, title, url, points, \
+                 author, comments}]} — a full-snapshot sync of the `stories` dataset (keyed by \
+                 HN item id), so stories that fell off the listing are tombstoned",
+            ),
+            cost_class: CostClass::Free,
+        }
+    }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
         let pages = ctx

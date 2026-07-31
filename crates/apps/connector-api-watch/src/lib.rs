@@ -25,8 +25,11 @@ use std::collections::BTreeSet;
 use async_trait::async_trait;
 use pumper_core::datasets::ChangeKind;
 use pumper_core::fetcher::FetchRequest;
-use pumper_core::{AppContext, Error, ResearchOutput, ResearchRequest, Result, ScrapeApp};
-use serde::Deserialize;
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, ManifestExample, Provenance, ResearchOutput,
+    ResearchRequest, Result, ScrapeApp,
+};
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -35,6 +38,51 @@ const DEFAULT_MANIFEST: &str = "catalog/connector-docs.json";
 /// Cap the diff fed to Claude so a large doc rewrite can't blow up the prompt.
 const MAX_DIFF_LINES: usize = 200;
 const MAX_DIFF_CHARS: usize = 6000;
+
+/// Checkpoint blob version — bump on shape change; a mismatch restores fresh.
+const STATE_VERSION: u32 = 1;
+
+/// Resumable state (M23) for the per-connector sweep. Each connector costs a
+/// fetch plus (by default) a metered Claude summary, and the whole run is a
+/// serial walk over the watch list, so a reap/timeout partway through would
+/// otherwise re-pay every connector already summarized.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+struct RunState {
+    v: u32,
+    /// Connector slugs already fully processed this job — never re-fetched or
+    /// re-summarized on a resumed attempt.
+    #[serde(default)]
+    done: Vec<String>,
+    /// Change events accumulated so far (the changes.json hand-off payload).
+    #[serde(default)]
+    changes: Vec<Value>,
+    /// Per-connector failures accumulated so far.
+    #[serde(default)]
+    errors: Vec<Value>,
+}
+
+impl RunState {
+    fn fresh() -> Self {
+        RunState {
+            v: STATE_VERSION,
+            ..RunState::default()
+        }
+    }
+
+    fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
+
+/// Restores the sweep's progress from the advisory checkpoint blob. Anything
+/// that isn't a current-version [`RunState`] restarts the sweep from zero —
+/// never an error (re-fetching is correct; mis-resuming is not).
+fn restore_state(restored: Option<&Value>) -> RunState {
+    restored
+        .and_then(|v| serde_json::from_value::<RunState>(v.clone()).ok())
+        .filter(|s| s.v == STATE_VERSION)
+        .unwrap_or_else(RunState::fresh)
+}
 
 #[derive(Debug, Deserialize)]
 struct Manifest {
@@ -75,6 +123,54 @@ impl ScrapeApp for ConnectorApiWatch {
         json!({ "manifest": DEFAULT_MANIFEST, "summarize": true, "limit": 0 })
     }
 
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "manifest": {
+                        "type": "string",
+                        "description": "Path to the watch list JSON ({connectors: [{slug, label, docs_url}]}); default catalog/connector-docs.json."
+                    },
+                    "summarize": {
+                        "type": "boolean",
+                        "description": "Run the metered Claude diff-summary pass on changed docs (default true). false = deterministic line-count summaries only, and the run costs nothing."
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Cap connectors scanned this run (0 = all)."
+                    },
+                    "only": {
+                        "type": "array",
+                        "items": { "type": "string", "minLength": 1 },
+                        "minItems": 1,
+                        "description": "Restrict the sweep to these connector slugs."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Full monthly sweep of every connector in the watch list (the scheduled default)",
+                    params: json!({ "manifest": DEFAULT_MANIFEST, "summarize": true, "limit": 0 }),
+                },
+                ManifestExample {
+                    description: "Re-check two connectors without spending on Claude summaries",
+                    params: json!({ "only": ["stripe", "elevenlabs"], "summarize": false }),
+                },
+            ],
+            output_shape: Some(
+                "{scanned, changed, changes: [{connector, label, docs_url, detected_at, summary, \
+                 tags, severity, lines_added, lines_removed}], errors} — also written verbatim to \
+                 the changes.json artifact, which is the hand-off to the personas event-seed \
+                 bridge. Docs bodies land in the `connector_docs` dataset (keyed by slug).",
+            ),
+            cost_class: CostClass::Claude,
+        }
+    }
+
     async fn run(&self, ctx: AppContext) -> Result<Value> {
         let manifest_path = ctx
             .params
@@ -101,10 +197,13 @@ impl ScrapeApp for ConnectorApiWatch {
         let manifest: Manifest = serde_json::from_str(&raw)
             .map_err(|e| Error::App(format!("parse manifest {manifest_path}: {e}")))?;
 
-        let mut scanned = 0usize;
-        let mut changed = 0usize;
-        let mut errors: Vec<Value> = Vec::new();
-        let mut changes: Vec<Value> = Vec::new();
+        // Durable execution (M23): a resumed attempt skips the connectors the
+        // prior attempt already fetched + summarized, and carries their events
+        // forward. An unusable blob restarts the sweep — re-fetching is safe.
+        let mut state = restore_state(ctx.restore());
+        let resumed = !state.done.is_empty();
+        let done: BTreeSet<String> = state.done.iter().cloned().collect();
+        let mut scanned = state.done.len();
 
         for entry in &manifest.connectors {
             if let Some(ref set) = only {
@@ -112,11 +211,18 @@ impl ScrapeApp for ConnectorApiWatch {
                     continue;
                 }
             }
+            if done.contains(&entry.slug) {
+                continue;
+            }
             if limit > 0 && scanned >= limit {
                 break;
             }
             scanned += 1;
 
+            // One connector = one resumable unit. Every early exit below leaves
+            // the block, so the connector is marked done + checkpointed exactly
+            // once, whatever path it took.
+            'connector: {
             // Prior content (for diffing) BEFORE we upsert the new content.
             let prior_markdown = match ctx.datasets.get(&ctx.app, DATASET, &entry.slug).await {
                 Ok(Some(rec)) => rec
@@ -127,9 +233,13 @@ impl ScrapeApp for ConnectorApiWatch {
                 _ => None,
             };
 
+            // Through the metered chokepoint, not `engines.fetch` raw: this call
+            // site was invisible to the cost ledger, taught the tier router
+            // nothing, and could not be recorded/replayed by VCR. A change
+            // detector must NEVER set `archive_max_age` — a stale archived body
+            // would manufacture a "no change" verdict — so the archive tier stays
+            // off here by construction.
             let outcome = match ctx
-                .engines
-                .fetch
                 .fetch(FetchRequest {
                     url: entry.docs_url.clone(),
                     to_markdown: true,
@@ -140,39 +250,57 @@ impl ScrapeApp for ConnectorApiWatch {
                 Ok(o) => o,
                 Err(e) => {
                     tracing::warn!(slug = %entry.slug, "fetch failed: {e}");
-                    errors.push(json!({ "connector": entry.slug, "error": e.to_string() }));
-                    continue;
+                    state
+                        .errors
+                        .push(json!({ "connector": entry.slug, "error": e.to_string() }));
+                    break 'connector;
                 }
             };
             let markdown = outcome.markdown.clone().unwrap_or_default();
             if markdown.trim().is_empty() {
-                errors.push(json!({ "connector": entry.slug, "error": "empty document" }));
-                continue;
+                state
+                    .errors
+                    .push(json!({ "connector": entry.slug, "error": "empty document" }));
+                break 'connector;
             }
             let hash = sha256(&markdown);
 
             let record = json!({
                 "docs_url": entry.docs_url,
                 "label": entry.label,
-                "hash": hash,
+                "hash": hash.clone(),
                 "markdown": markdown,
                 "engine": outcome.engine,
             });
+            // Provenance (M12): one record, one known source URL (post-redirect)
+            // and the sha256 of the exact body stored in it. No RuleSet produced
+            // this record (it is the whole document), so `rules_hash` stays Null.
             let kind = ctx
-                .upsert(DATASET, &entry.slug, &record)
+                .upsert_with_provenance(
+                    DATASET,
+                    &entry.slug,
+                    &record,
+                    Provenance {
+                        source_url: Some(outcome.url.clone()),
+                        artifact_sha: Some(hash),
+                        ..Provenance::default()
+                    },
+                )
                 .await
                 .unwrap_or(ChangeKind::Unchanged);
 
             // Only a CHANGED record (not a first-seen baseline) is a real event.
             if kind != ChangeKind::Changed {
-                continue;
+                break 'connector;
             }
-            let Some(prev) = prior_markdown else { continue };
+            let Some(prev) = prior_markdown else {
+                break 'connector;
+            };
             let (added, removed) = line_diff(&prev, &markdown);
             if added.is_empty() && removed.is_empty() {
-                continue; // hash flipped on noise (whitespace/reorder) — not substantive
+                // hash flipped on noise (whitespace/reorder) — not substantive
+                break 'connector;
             }
-            changed += 1;
 
             let detected_at = chrono::Utc::now().to_rfc3339();
             let (summary, tags, severity) = if summarize {
@@ -194,7 +322,7 @@ impl ScrapeApp for ConnectorApiWatch {
                 )
             };
 
-            changes.push(json!({
+            state.changes.push(json!({
                 "connector": entry.slug,
                 "label": entry.label,
                 "docs_url": entry.docs_url,
@@ -205,13 +333,21 @@ impl ScrapeApp for ConnectorApiWatch {
                 "lines_added": added.len(),
                 "lines_removed": removed.len(),
             }));
+            }
+
+            // Connector finished (changed, unchanged, or failed) — persist the
+            // cursor so a re-claimed attempt never re-fetches or re-summarizes
+            // it. Throttled; a failed write only costs a redone connector.
+            state.done.push(entry.slug.clone());
+            ctx.checkpoint(state.to_value()).await;
         }
 
         let result = json!({
             "scanned": scanned,
-            "changed": changed,
-            "changes": changes,
-            "errors": errors,
+            "changed": state.changes.len(),
+            "changes": state.changes,
+            "errors": state.errors,
+            "resumed_from_checkpoint": resumed,
         });
         ctx.save_artifact("changes.json", &serde_json::to_vec_pretty(&result)?)
             .await?;
