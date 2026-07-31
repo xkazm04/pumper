@@ -25,7 +25,8 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use pumper_core::{
-    html_to_markdown, AppContext, Error, HttpMethod, HttpRequest, Result, ScrapeApp,
+    html_to_markdown, AppContext, AppManifest, CostClass, Error, HttpMethod, HttpRequest,
+    ManifestExample, Provenance, Result, ScrapeApp,
 };
 use serde_json::{json, Value};
 
@@ -62,6 +63,62 @@ impl ScrapeApp for EuSedia {
         // topics from drifting in and out of it. `truncated` is the tripwire if
         // even 5000 isn't enough.
         json!({ "types": ["1", "2"], "statuses": ["31094502"], "pageSize": 100, "maxPages": 50 })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "types": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "SEDIA `type` facet codes as STRINGS: \"1\" = grant topics, \"2\" = PROSPECT."
+                    },
+                    "statuses": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "SEDIA `status` facet codes as STRINGS: \"31094502\" = open, \"31094501\" = forthcoming, \"31094503\" = closed."
+                    },
+                    "pageSize": {
+                        "type": "integer", "minimum": 1, "maximum": 100,
+                        "description": "Hard-capped at 100 by the SEDIA API."
+                    },
+                    "maxPages": {
+                        "type": "integer", "minimum": 1, "maximum": 50,
+                        "description": "Page cap. SEDIA's match-all window has no stable sort, so a truncated run's uncovered topics drift between runs — reported as `truncated` plus a warning."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Daily sweep of every open pan-EU topic (the scheduled default)",
+                    params: json!({
+                        "types": ["1", "2"], "statuses": ["31094502"],
+                        "pageSize": 100, "maxPages": 50
+                    }),
+                },
+                ManifestExample {
+                    description: "Forward look: forthcoming grant topics only, first few pages",
+                    params: json!({
+                        "types": ["1"], "statuses": ["31094501"],
+                        "pageSize": 100, "maxPages": 5
+                    }),
+                },
+            ],
+            output_shape: Some(
+                "{source, types[], statuses[], totalResults, fetched, enriched, pages, new, \
+                 changed, unchanged, historyJoined, truncated, unified: {new, changed, events}, \
+                 swept, crossSourceDups, warnings[], index_datasets[]} — normalized topics in \
+                 the `opportunities` dataset (keyed by topic identifier), Horizon topics \
+                 carrying a `history` block joined from cordis/topic_stats",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -194,7 +251,20 @@ impl ScrapeApp for EuSedia {
             }
         }
 
-        let summary = ctx.upsert_many("opportunities", &records).await?;
+        // Provenance (M12): every page hits the one SEDIA search endpoint (only
+        // the paging query-string differs), so the batch-level `source_url` is
+        // honest. `rules_hash` stays Null deliberately — `normalize` is Rust
+        // code, not a registered RuleSet, so there is nothing replayable to pin.
+        let summary = ctx
+            .upsert_many_with_provenance(
+                "opportunities",
+                &records,
+                Provenance {
+                    source_url: Some(SEDIA_URL.to_string()),
+                    ..Provenance::default()
+                },
+            )
+            .await?;
 
         // Cross-source layer: publish the pan-EU corpus into grants/unified so it
         // joins GET /grants filtering, closing-soon, sweep_closed, cross-source
@@ -204,7 +274,7 @@ impl ScrapeApp for EuSedia {
             .iter()
             .filter_map(|(_, rec)| grants_common::normalize_eu_sedia(rec))
             .collect();
-        let cross = grants_common::finalize_unified(&ctx, &unified_items).await?;
+        let cross = grants_common::finalize_unified(&ctx, &unified_items, Some(SEDIA_URL)).await?;
 
         let mut out = json!({
             "source": "ec.europa.eu/funding-tenders/sedia",

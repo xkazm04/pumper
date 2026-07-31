@@ -8,6 +8,9 @@ pumper-core.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+# Content hash of the archived PPRRVU CSV, stamped as `Provenance.artifact_sha`
+# (M12) so a stored fee-schedule row names the exact body it was parsed from.
+sha2.workspace = true
 # CMS ships the RVU release as a ZIP; deflate is the only method those archives
 # use. Not hoisted to [workspace.dependencies] — this is currently the only
 # consumer (hoist when a second binary-archive app lands).

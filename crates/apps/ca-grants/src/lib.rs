@@ -13,7 +13,10 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, HttpMethod, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, HttpMethod, HttpRequest, ManifestExample,
+    Provenance, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 
 pub struct CaGrants;
@@ -42,6 +45,47 @@ impl ScrapeApp for CaGrants {
 
     fn default_params(&self) -> Value {
         json!({ "status": "active", "limit": 1000, "maxPages": 25 })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": "Portal `Status` value to filter on server-side (\"active\" = currently open). An EMPTY string means no filter — every status."
+                    },
+                    "limit": {
+                        "type": "integer", "minimum": 1, "maximum": 1000,
+                        "description": "CKAN page size (rows per datastore_search call)."
+                    },
+                    "maxPages": {
+                        "type": "integer", "minimum": 1, "maximum": 100,
+                        "description": "Page cap. Stopping on the cap with records left is reported as `truncated` plus a warning, never a silent partial sweep."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Daily sync of currently-open California grants (the scheduled default)",
+                    params: json!({ "status": "active", "limit": 1000, "maxPages": 25 }),
+                },
+                ManifestExample {
+                    description: "Full backfill: every grant in the portal regardless of status",
+                    params: json!({ "status": "", "limit": 1000, "maxPages": 100 }),
+                },
+            ],
+            output_shape: Some(
+                "{source, status, total, fetched, pages, new, changed, unchanged, truncated, \
+                 unified: {new, changed, events}, swept, crossSourceDups, warnings[], \
+                 index_datasets[]} — CKAN sync tallies over the `opportunities` dataset \
+                 (keyed by PortalID) plus the shared grants/unified cross-source layer",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -154,7 +198,20 @@ impl ScrapeApp for CaGrants {
             .map(|(i, r)| (record_key(r, i), r.clone()))
             .collect();
 
-        let summary = ctx.upsert_many("opportunities", &items).await?;
+        // Provenance (M12): every page came from the one CKAN datastore_search
+        // endpoint, so the batch-level `source_url` is a fact. Records are stored
+        // as CKAN returned them — no RuleSet, no per-record archived body — so
+        // `rules_hash`/`artifact_sha` stay honestly Null.
+        let summary = ctx
+            .upsert_many_with_provenance(
+                "opportunities",
+                &items,
+                Provenance {
+                    source_url: Some(CKAN_URL.to_string()),
+                    ..Provenance::default()
+                },
+            )
+            .await?;
 
         // Cross-source layer: normalize into grants/unified, sweep past-due rows
         // closed, and link SimHash near-duplicates syndicated across portals.
@@ -162,7 +219,7 @@ impl ScrapeApp for CaGrants {
             .iter()
             .filter_map(grants_common::normalize_ca_grants)
             .collect();
-        let cross = grants_common::finalize_unified(&ctx, &unified_items).await?;
+        let cross = grants_common::finalize_unified(&ctx, &unified_items, Some(CKAN_URL)).await?;
 
         let mut out = json!({
             "source": "data.ca.gov/california-grants-portal",
