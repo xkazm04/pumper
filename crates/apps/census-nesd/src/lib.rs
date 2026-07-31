@@ -39,7 +39,10 @@
 //! per-business or per-trade prediction, and the dataset says so.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Result, ScrapeApp,
+    UpsertSummary,
+};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -94,6 +97,66 @@ impl ScrapeApp for CensusNesd {
 
     fn default_params(&self) -> Value {
         json!({ "year": DEFAULT_YEAR })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "year": {
+                        "type": "string",
+                        "description": "NES-D vintage (lags ~2 years; 2021 is the live one). Also picks the classification predicate: >= 2022 → NAICS2022, else NAICS2017."
+                    },
+                    "states": {
+                        "type": "string",
+                        "description": "Comma-separated state FIPS list (e.g. \"06,12,48\"). Empty or \"*\" = all states."
+                    },
+                    "naics": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "2-DIGIT NAICS sectors. NES-D publishes per-state owner demographics at sector grain only — 3/4-digit codes return HTTP 204 (not published), which is counted, not an error."
+                    },
+                    "naics_var": {
+                        "type": "string",
+                        "description": "Override the classification predicate (NAICS2017 / NAICS2022) when a release deviates from the year rule."
+                    },
+                    "age_question": {
+                        "type": "string",
+                        "description": "QDESC_LABEL predicate selecting the owner-age question (default OWNRAGE). Pinning it is required — without it the API returns an unstable question subset."
+                    },
+                    "api_key": {
+                        "type": "string",
+                        "description": "Free Census API key; falls back to env CENSUS_API_KEY."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Annual refresh: owner-age bands for both trade sectors, all states",
+                    params: json!({ "year": DEFAULT_YEAR }),
+                },
+                ManifestExample {
+                    description: "Construction sector only, three states",
+                    params: json!({
+                        "year": DEFAULT_YEAR,
+                        "states": "06,48,12",
+                        "naics": ["23"]
+                    }),
+                },
+            ],
+            output_shape: Some(
+                "{source, year, grain: \"naics_sector\", sectors: [{sector, label, \
+                 states_reported, age_band_records, top_states_by_pct_owners_55plus} | \
+                 {sector, label, note}], sectors_not_published, market_blend, records, new, \
+                 changed, unchanged} — a sector with no published per-state data (HTTP 204) \
+                 is counted in sectors_not_published, never an error",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -169,7 +232,11 @@ impl ScrapeApp for CensusNesd {
             },
         };
 
-        let mut all_records: Vec<(String, Value)> = Vec::new();
+        // Provenance (M12) is per-request — one URL and one archived artifact
+        // per sector — so each sector's rows carry their own stamp and the run
+        // reports one merged rollup instead of one anonymous batch.
+        let mut summary = UpsertSummary::default();
+        let mut record_count = 0usize;
         let mut sector_summaries: Vec<Value> = Vec::new();
         let mut not_published: usize = 0;
 
@@ -183,7 +250,7 @@ impl ScrapeApp for CensusNesd {
                 // echoed QDESC_LABEL column keeps the parse unchanged.
                 "https://api.census.gov/data/{year}/absnesdo?get=OWNNOPD,OWNNOPD_PCT,OWNCHAR,OWNCHAR_LABEL,OWNER_SEX_LABEL,OWNER_ETH_LABEL,OWNER_RACE_LABEL,OWNER_VET_LABEL&{for_clause}&{naics_var}={naics}&QDESC_LABEL={age_question}&key={api_key}"
             );
-            let resp = ctx.engines.http.fetch(HttpRequest::get(url)).await?;
+            let resp = ctx.engines.http.fetch(HttpRequest::get(url.clone())).await?;
             // HTTP 204 No Content is contract-VALID: NES-D per-state data only
             // exists at 2-digit sector grain, so a finer (or unpublished) code
             // is simply "not published at this grain" — a stat, never an error.
@@ -220,11 +287,11 @@ impl ScrapeApp for CensusNesd {
                     "Census NES-D {year} NAICS {naics}: bad JSON rows: {e}"
                 ))
             })?;
-            ctx.save_artifact(
-                &format!("nesd-{naics}.json"),
-                &serde_json::to_vec_pretty(&rows)?,
-            )
-            .await?;
+            // Bind the archived bytes once: `artifact_sha` must hash exactly what
+            // was stored, never a re-serialization of it.
+            let artifact = serde_json::to_vec_pretty(&rows)?;
+            ctx.save_artifact(&format!("nesd-{naics}.json"), &artifact)
+                .await?;
 
             let header = rows.first().cloned().unwrap_or_default();
             let idx = |name: &str| header.iter().position(|h| h.as_str() == name);
@@ -296,10 +363,17 @@ impl ScrapeApp for CensusNesd {
                     .map(|(s, share)| json!({ "state": s, "pct_owners_55plus": share }))
                     .collect::<Vec<_>>(),
             }));
-            all_records.extend(rollup.records);
+            record_count += rollup.records.len();
+            census_common::merge_summary(
+                &mut summary,
+                ctx.upsert_many_with_provenance(
+                    "owner_age",
+                    &rollup.records,
+                    census_common::http_provenance(&url, &artifact),
+                )
+                .await?,
+            );
         }
-
-        let summary = ctx.upsert_many("owner_age", &all_records).await?;
 
         // Re-derive the blended `census/market_blend` (adds/refreshes the
         // succession fields). Degrades gracefully when the other Census apps
@@ -316,7 +390,7 @@ impl ScrapeApp for CensusNesd {
             "sectors": sector_summaries,
             "sectors_not_published": not_published,
             "market_blend": market_blend,
-            "records": all_records.len(),
+            "records": record_count,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
@@ -442,6 +516,30 @@ fn map_age_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manifest must describe the params the app actually ships: every key
+    /// in `default_params` and in every worked example has to be a declared
+    /// property. A schema that drifts from its own canonical invocations is
+    /// worse than no schema — enqueue enforces it, so the drift shows up as a
+    /// 422 on the app's own documented call.
+    #[test]
+    fn manifest_declares_every_param_it_ships() {
+        let app = CensusNesd;
+        let m = app.manifest();
+        let schema = m.params_schema.expect("rich manifest declares a schema");
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema declares properties");
+        assert!(!m.examples.is_empty(), "a schema needs worked examples");
+        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let mut shipped = vec![app.default_params()];
+        shipped.extend(m.examples.iter().map(|e| e.params.clone()));
+        for params in shipped {
+            for key in params.as_object().expect("params are an object").keys() {
+                assert!(props.contains_key(key), "undeclared param '{key}'");
+            }
+        }
+    }
 
     // Header shaped like the real absnesdo payload (columns addressed by name
     // in run(); the tests pre-resolve the same indices).

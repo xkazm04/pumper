@@ -15,7 +15,9 @@
 //! "role": "research|compose", "model": "...", "effort": "...", "max_turns": 20}.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, ManifestExample, ResearchRequest, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 use trades_common::taxonomy;
 use trades_common::unified;
@@ -44,6 +46,57 @@ impl ScrapeApp for HomewysePricing {
 
     fn default_params(&self) -> Value {
         json!({ "locality": DEFAULT_LOCALITY, "year": DEFAULT_YEAR })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "locality": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Market the prices are researched for (a country, state or metro). Scopes both the record keys and the freshness gate — a Texas refresh never satisfies a national one."
+                    },
+                    "year": { "type": "string", "description": "Pricing year stamped on every record." },
+                    "role": { "type": "string", "enum": ["research", "compose"] },
+                    "model": { "type": "string" },
+                    "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
+                    "max_turns": { "type": "integer", "minimum": 1 },
+                    "max_age_days": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Age freshness gate for THIS locality (default 90). A newer record skips the metered run."
+                    },
+                    "force": { "type": "boolean", "description": "Bypass the age gate and re-pay the ~20-turn research run." }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "National refresh (free no-op if priced within 90 days)",
+                    params: json!({ "locality": DEFAULT_LOCALITY, "year": DEFAULT_YEAR }),
+                },
+                ManifestExample {
+                    description: "Force fresh metro pricing regardless of how recently it was priced",
+                    params: json!({
+                        "locality": "Phoenix, AZ",
+                        "year": DEFAULT_YEAR,
+                        "force": true,
+                        "max_turns": 25
+                    }),
+                },
+            ],
+            output_shape: Some(
+                "{source, locality, year, trades: [{trade, jobs_priced}], records, new, \
+                 changed, unchanged, rejected: [{key, reasons}], rejected_count, \
+                 unknown_trades, unified: {new, changed}, cost_usd, duration_ms, \
+                 num_turns} — or {source, locality, year, skipped, cost_usd: 0.0} when \
+                 the age gate holds",
+            ),
+            cost_class: CostClass::Claude,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -131,6 +184,11 @@ impl ScrapeApp for HomewysePricing {
         // that failed ~1/3 of runs (e.g. a dropped key, `"low":150,"300,"high":500`). The
         // salvage_json fallback below still catches anything the schema path misses.
         request.json_schema = Some(pricing_schema());
+        // Provenance (M12): pin the derivation spec (prompt + structured-output
+        // schema + model/effort) behind this answer. Pricing is the weakest-
+        // sourced domain here, so knowing exactly which prompt produced a stored
+        // band is the difference between an explainable figure and a rumor.
+        let prov = trades_common::research_provenance(&ctx, "homewyse-pricing", &request).await;
         let (data, output) =
             trades_common::research_json(&ctx, "homewyse-pricing", request).await?;
 
@@ -214,7 +272,11 @@ impl ScrapeApp for HomewysePricing {
             ));
         }
 
-        let summary = ctx.upsert_many("pricing", &all_records).await?;
+        // One research call produced every row, so a batch-level stamp is the
+        // honest grain.
+        let summary = ctx
+            .upsert_many_with_provenance("pricing", &all_records, prov)
+            .await?;
 
         // Cross-source layer: rebuild trades/operator_economics from all four
         // source datasets (mirrors grants-common's sync_unified).
@@ -301,7 +363,32 @@ fn slugify(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::slugify;
+    use super::{slugify, HomewysePricing};
+    use pumper_core::ScrapeApp;
+
+    /// The manifest must describe the params the app actually ships: every key
+    /// in `default_params` and in every worked example has to be a declared
+    /// property. A schema that drifts from its own canonical invocations is
+    /// worse than no schema — enqueue enforces it, so the drift shows up as a
+    /// 422 on the app's own documented call.
+    #[test]
+    fn manifest_declares_every_param_it_ships() {
+        let app = HomewysePricing;
+        let m = app.manifest();
+        let schema = m.params_schema.expect("rich manifest declares a schema");
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema declares properties");
+        assert!(!m.examples.is_empty(), "a schema needs worked examples");
+        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let mut shipped = vec![app.default_params()];
+        shipped.extend(m.examples.iter().map(|e| e.params.clone()));
+        for params in shipped {
+            for key in params.as_object().expect("params are an object").keys() {
+                assert!(props.contains_key(key), "undeclared param '{key}'");
+            }
+        }
+    }
 
     #[test]
     fn slugify_stabilizes_phrasing_drift() {

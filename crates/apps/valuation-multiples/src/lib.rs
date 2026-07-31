@@ -15,7 +15,9 @@
 //! "role": "research|compose", "max_turns": 25}.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, ManifestExample, ResearchRequest, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 use trades_common::taxonomy;
 use trades_common::unified;
@@ -42,6 +44,46 @@ impl ScrapeApp for ValuationMultiples {
 
     fn default_params(&self) -> Value {
         json!({ "year": DEFAULT_YEAR })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "year": { "type": "string", "description": "Year the multiples are compiled for." },
+                    "role": { "type": "string", "enum": ["research", "compose"] },
+                    "model": { "type": "string" },
+                    "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
+                    "max_turns": { "type": "integer", "minimum": 1 },
+                    "max_age_days": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Age freshness gate (default 90). Broker multiples drift slowly, so a recent refresh skips the metered run."
+                    },
+                    "force": { "type": "boolean", "description": "Bypass the age gate and re-pay the ~25-turn research run." }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Refresh SDE + revenue multiples (free no-op if valued within 90 days)",
+                    params: json!({ "year": DEFAULT_YEAR }),
+                },
+                ManifestExample {
+                    description: "Force a re-valuation with a tighter freshness window",
+                    params: json!({ "year": DEFAULT_YEAR, "max_age_days": 30, "force": true }),
+                },
+            ],
+            output_shape: Some(
+                "{source, year, records, new, changed, unchanged, rejected: [{key, \
+                 reasons}], rejected_count, unknown_trades, unified: {new, changed}, \
+                 cost_usd, duration_ms, num_turns} — or {source, year, skipped, records, \
+                 cost_usd: 0.0} when the age gate holds",
+            ),
+            cost_class: CostClass::Claude,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -121,6 +163,9 @@ impl ScrapeApp for ValuationMultiples {
         // Constrain the final answer to the multiples schema (`claude --json-schema`);
         // salvage_json below still catches anything the schema path misses.
         request.json_schema = Some(multiples_schema());
+        // Provenance (M12): pin the derivation spec (prompt + structured-output
+        // schema + model/effort) that produced these multiples.
+        let prov = trades_common::research_provenance(&ctx, "valuation-multiples", &request).await;
         let (data, output) =
             trades_common::research_json(&ctx, "valuation-multiples", request).await?;
 
@@ -133,7 +178,11 @@ impl ScrapeApp for ValuationMultiples {
             ));
         }
 
-        let summary = ctx.upsert_many("valuation", &all_records).await?;
+        // One research call produced every row, so a batch-level stamp is the
+        // honest grain.
+        let summary = ctx
+            .upsert_many_with_provenance("valuation", &all_records, prov)
+            .await?;
 
         // Cross-source layer: rebuild trades/operator_economics from all four
         // source datasets (mirrors grants-common's sync_unified).
@@ -251,6 +300,30 @@ fn multiples_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manifest must describe the params the app actually ships: every key
+    /// in `default_params` and in every worked example has to be a declared
+    /// property. A schema that drifts from its own canonical invocations is
+    /// worse than no schema — enqueue enforces it, so the drift shows up as a
+    /// 422 on the app's own documented call.
+    #[test]
+    fn manifest_declares_every_param_it_ships() {
+        let app = ValuationMultiples;
+        let m = app.manifest();
+        let schema = m.params_schema.expect("rich manifest declares a schema");
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema declares properties");
+        assert!(!m.examples.is_empty(), "a schema needs worked examples");
+        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let mut shipped = vec![app.default_params()];
+        shipped.extend(m.examples.iter().map(|e| e.params.clone()));
+        for params in shipped {
+            for key in params.as_object().expect("params are an object").keys() {
+                assert!(props.contains_key(key), "undeclared param '{key}'");
+            }
+        }
+    }
 
     // A multiples entry shaped like the agent's structured answer for one trade.
     fn multiples_entry(trade: &str) -> Value {

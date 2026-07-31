@@ -25,7 +25,10 @@
 //! `params.year`; default 2021).
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Result, ScrapeApp,
+    UpsertSummary,
+};
 use serde_json::{json, Value};
 
 pub struct CensusNonemp;
@@ -70,6 +73,58 @@ impl ScrapeApp for CensusNonemp {
 
     fn default_params(&self) -> Value {
         json!({ "year": DEFAULT_YEAR })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "year": {
+                        "type": "string",
+                        "description": "NES vintage (NES lags ~2 years). Also selects the NAICS classification predicate: >= 2022 → NAICS2022, else NAICS2017."
+                    },
+                    "states": {
+                        "type": "string",
+                        "description": "Comma-separated state FIPS list (e.g. \"06,12,48\"). Empty or \"*\" = all states."
+                    },
+                    "naics": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "4-digit NAICS trade codes. 6-digit × state is disclosure-suppressed for nonemployers (HTTP 204). Default: the enabled trades/taxonomy registry codes, else 2382 + 5617."
+                    },
+                    "api_key": {
+                        "type": "string",
+                        "description": "Free Census API key; falls back to env CENSUS_API_KEY."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Annual refresh of the default trade codes across all states",
+                    params: json!({ "year": DEFAULT_YEAR }),
+                },
+                ManifestExample {
+                    description: "Building-equipment contractors in CA/TX/FL only",
+                    params: json!({
+                        "year": DEFAULT_YEAR,
+                        "states": "06,48,12",
+                        "naics": ["2382"]
+                    }),
+                },
+            ],
+            output_shape: Some(
+                "{source, year, trades: [{naics, label, states_reported, total_nonemployers, \
+                 total_receipts_thousands, national_avg_receipts_per_operator, \
+                 top_states_by_density, top_states_by_avg_receipts} | {naics, label, note}], \
+                 market_blend, records, new, changed, unchanged} — a fully suppressed NAICS \
+                 yields a `note` entry, not a failure",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -137,14 +192,18 @@ impl ScrapeApp for CensusNonemp {
             _ => "NAICS2017",
         };
 
-        let mut all_records: Vec<(String, Value)> = Vec::new();
+        // Provenance (M12) is per-request — one URL, one archived artifact per
+        // NAICS — so each trade's rows are upserted with their own stamp and the
+        // run reports one merged rollup, rather than one anonymous batch.
+        let mut summary = UpsertSummary::default();
+        let mut record_count = 0usize;
         let mut trade_summaries: Vec<Value> = Vec::new();
 
         for (naics, label) in &trades {
             let url = format!(
                 "https://api.census.gov/data/{year}/nonemp?get=NAME,NESTAB,NRCPTOT&{for_clause}&{naics_var}={naics}&key={api_key}"
             );
-            let resp = ctx.engines.http.fetch(HttpRequest::get(url)).await?;
+            let resp = ctx.engines.http.fetch(HttpRequest::get(url.clone())).await?;
             // 204 No Content (fully suppressed) or a non-JSON body → record a note,
             // don't fail the whole run.
             if resp.status == 204 || resp.body.trim().is_empty() {
@@ -178,11 +237,11 @@ impl ScrapeApp for CensusNonemp {
                     "Census NES {year} NAICS {naics}: bad JSON rows: {e}"
                 ))
             })?;
-            ctx.save_artifact(
-                &format!("nonemp-{naics}.json"),
-                &serde_json::to_vec_pretty(&rows)?,
-            )
-            .await?;
+            // The archived bytes ARE what `artifact_sha` hashes — bind them once
+            // so the stamp can never describe a body other than the stored one.
+            let artifact = serde_json::to_vec_pretty(&rows)?;
+            ctx.save_artifact(&format!("nonemp-{naics}.json"), &artifact)
+                .await?;
 
             let header = rows.first().cloned().unwrap_or_default();
             let idx = |name: &str| header.iter().position(|h| h.as_str() == name);
@@ -208,7 +267,18 @@ impl ScrapeApp for CensusNonemp {
                 total_estab,
                 total_rcpt,
             } = map_trade_rows(&rows, i_estab, i_rcpt, i_state, naics, label, &year);
-            all_records.extend(records);
+            record_count += records.len();
+            // Stamp THIS request's key-redacted URL + the sha of the artifact it
+            // was archived as onto every row it produced.
+            census_common::merge_summary(
+                &mut summary,
+                ctx.upsert_many_with_provenance(
+                    "nonemployers",
+                    &records,
+                    census_common::http_provenance(&url, &artifact),
+                )
+                .await?,
+            );
 
             let mut by_density = ranked.clone();
             by_density.sort_by_key(|(_, estab, _)| std::cmp::Reverse(*estab));
@@ -234,8 +304,6 @@ impl ScrapeApp for CensusNonemp {
             }));
         }
 
-        let summary = ctx.upsert_many("nonemployers", &all_records).await?;
-
         // Re-derive the blended employer+solo `census/market_blend` dataset
         // (shared logic lives in app-census-density). BOTH Census apps trigger
         // the blend after their own upserts because they run annually and
@@ -252,7 +320,7 @@ impl ScrapeApp for CensusNonemp {
             "year": year,
             "trades": trade_summaries,
             "market_blend": market_blend,
-            "records": all_records.len(),
+            "records": record_count,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
@@ -328,6 +396,30 @@ fn map_trade_rows(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manifest must describe the params the app actually ships: every key
+    /// in `default_params` and in every worked example has to be a declared
+    /// property. A schema that drifts from its own canonical invocations is
+    /// worse than no schema — enqueue enforces it, so the drift shows up as a
+    /// 422 on the app's own documented call.
+    #[test]
+    fn manifest_declares_every_param_it_ships() {
+        let app = CensusNonemp;
+        let m = app.manifest();
+        let schema = m.params_schema.expect("rich manifest declares a schema");
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema declares properties");
+        assert!(!m.examples.is_empty(), "a schema needs worked examples");
+        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let mut shipped = vec![app.default_params()];
+        shipped.extend(m.examples.iter().map(|e| e.params.clone()));
+        for params in shipped {
+            for key in params.as_object().expect("params are an object").keys() {
+                assert!(props.contains_key(key), "undeclared param '{key}'");
+            }
+        }
+    }
 
     // Rows shaped like the real NES array-of-arrays payload: row 0 is the
     // header ["NAME","NESTAB","NRCPTOT","state"], data rows follow.

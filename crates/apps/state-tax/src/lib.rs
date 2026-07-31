@@ -16,7 +16,9 @@
 //! "role": "research|compose", "max_turns": 30}.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, ManifestExample, ResearchRequest, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 use trades_common::unified;
 use trades_common::validate::{self, Rejection};
@@ -52,6 +54,47 @@ impl ScrapeApp for StateTax {
 
     fn default_params(&self) -> Value {
         json!({ "year": DEFAULT_YEAR })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "year": {
+                        "type": "string",
+                        "description": "Tax year the rates are compiled for. Doubles as the vintage freshness key — a year already held costs nothing."
+                    },
+                    "role": { "type": "string", "enum": ["research", "compose"] },
+                    "model": { "type": "string" },
+                    "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
+                    "max_turns": { "type": "integer", "minimum": 1 },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Bypass the vintage freshness gate and re-pay the ~30-turn research run."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Compile a tax year (free no-op when that vintage is already held)",
+                    params: json!({ "year": DEFAULT_YEAR }),
+                },
+                ManifestExample {
+                    description: "Force a re-research of a held vintage at high effort",
+                    params: json!({ "year": DEFAULT_YEAR, "force": true, "effort": "high", "max_turns": 40 }),
+                },
+            ],
+            output_shape: Some(
+                "{source, year, records, states_covered, states_expected, missing_states, \
+                 new, changed, unchanged, rejected: [{key, reasons}], rejected_count, \
+                 unified: {new, changed}, cost_usd, duration_ms, num_turns} — or \
+                 {source, year, skipped, records, cost_usd: 0.0} when the vintage gate holds",
+            ),
+            cost_class: CostClass::Claude,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -268,6 +311,30 @@ fn tax_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manifest must describe the params the app actually ships: every key
+    /// in `default_params` and in every worked example has to be a declared
+    /// property. A schema that drifts from its own canonical invocations is
+    /// worse than no schema — enqueue enforces it, so the drift shows up as a
+    /// 422 on the app's own documented call.
+    #[test]
+    fn manifest_declares_every_param_it_ships() {
+        let app = StateTax;
+        let m = app.manifest();
+        let schema = m.params_schema.expect("rich manifest declares a schema");
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema declares properties");
+        assert!(!m.examples.is_empty(), "a schema needs worked examples");
+        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let mut shipped = vec![app.default_params()];
+        shipped.extend(m.examples.iter().map(|e| e.params.clone()));
+        for params in shipped {
+            for key in params.as_object().expect("params are an object").keys() {
+                assert!(props.contains_key(key), "undeclared param '{key}'");
+            }
+        }
+    }
 
     #[test]
     fn roster_is_51_unique_uppercase_jurisdictions_including_dc() {

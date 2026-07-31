@@ -5,8 +5,9 @@
 //! forgotten in another, silently summing `-666666666` into national totals.
 //! One definition each, used by both, so a fix can't land in only half the fleet.
 
-use pumper_core::{AppContext, Error, Result};
+use pumper_core::{AppContext, Error, Provenance, Result, UpsertSummary};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 /// Parses a Census numeric cell.
 ///
@@ -36,6 +37,68 @@ pub fn api_key(ctx: &AppContext, app: &str) -> Result<String> {
                  https://api.census.gov/data/key_signup.html"
             ))
         })
+}
+
+// ---------------------------------------------------------------------------
+// Provenance (M12) for the keyed Census JSON APIs.
+// ---------------------------------------------------------------------------
+
+/// The Census request URL with the API key removed — what a provenance stamp is
+/// allowed to record. The live URL carries `key=<secret>`, and `source_url` is
+/// read back by anyone with dataset access (`GET /datasets/.../revisions`), so
+/// stamping it verbatim would publish the shared credential into the ledger.
+/// Everything else about the request (dataset, vintage, predicates) is kept —
+/// that is precisely the part that makes the stamp useful.
+pub fn redact_key(url: &str) -> String {
+    let mut out = String::with_capacity(url.len());
+    for (i, part) in url.split('&').enumerate() {
+        if i > 0 {
+            out.push('&');
+        }
+        match part.split_once("key=") {
+            // Only a whole `key=` parameter (start of the query or of this
+            // `&`-segment) — never a substring like `api_key=`/`&mykey=`.
+            Some((head, _)) if head.is_empty() || head.ends_with('?') => {
+                out.push_str(head);
+                out.push_str("key=REDACTED");
+            }
+            _ => out.push_str(part),
+        }
+    }
+    out
+}
+
+/// sha256 (hex) of the bytes actually written as the job artifact — the
+/// `artifact_sha` half of a provenance stamp. Hash the exact bytes handed to
+/// `ctx.save_artifact`, never a re-serialization, or the stamp points at a body
+/// that was never stored.
+pub fn artifact_sha(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
+/// Provenance for one Census API response: the key-redacted request URL plus
+/// the sha of the artifact that response was archived as. `rules_hash` stays
+/// `None` — these records are parsed by compiled code, not by a registered
+/// RuleSet, and inventing a hash for one would be a lie.
+pub fn http_provenance(url: &str, artifact_bytes: &[u8]) -> Provenance {
+    Provenance {
+        source_url: Some(redact_key(url)),
+        artifact_sha: Some(artifact_sha(artifact_bytes)),
+        ..Provenance::default()
+    }
+}
+
+/// Folds one per-request upsert summary into a run-level total. Provenance is
+/// per-request (one URL, one artifact), so these apps upsert per request rather
+/// than once per run — the job result still reports a single new/changed/
+/// unchanged rollup.
+pub fn merge_summary(acc: &mut UpsertSummary, mut next: UpsertSummary) {
+    acc.new.append(&mut next.new);
+    acc.changed.append(&mut next.changed);
+    acc.unchanged += next.unchanged;
+    acc.removed.append(&mut next.removed);
 }
 
 /// USPS abbreviation for a state FIPS code; an unknown code passes through
@@ -165,9 +228,76 @@ pub fn bfs_sector_category(naics: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bfs_sector_category, census_num, is_55_plus_age_band, is_reported_age_band,
-        owner_age_share_55plus, state_abbr,
+        artifact_sha, bfs_sector_category, census_num, http_provenance, is_55_plus_age_band,
+        is_reported_age_band, merge_summary, owner_age_share_55plus, redact_key, state_abbr,
     };
+    use pumper_core::UpsertSummary;
+
+    /// The credential must never reach a provenance stamp — `source_url` is
+    /// readable by every dataset consumer. Gutting `redact_key` to identity
+    /// turns this red.
+    #[test]
+    fn redact_key_strips_the_census_credential_and_keeps_the_query() {
+        let url = "https://api.census.gov/data/2021/nonemp?get=NESTAB&for=state:*&NAICS2017=2382&key=abc123secret";
+        let red = redact_key(url);
+        assert!(!red.contains("abc123secret"), "{red}");
+        assert!(red.ends_with("key=REDACTED"));
+        assert!(red.contains("NAICS2017=2382") && red.contains("for=state:*"));
+        // Key first in the query string is redacted too.
+        assert_eq!(
+            redact_key("https://x/data?key=s3cret&get=A"),
+            "https://x/data?key=REDACTED&get=A"
+        );
+        // A URL with no key is untouched.
+        assert_eq!(redact_key("https://x/data?get=A"), "https://x/data?get=A");
+    }
+
+    #[test]
+    fn artifact_sha_hashes_the_stored_bytes() {
+        // sha256("") — pins that we hash the bytes, not a serde form of them.
+        assert_eq!(
+            artifact_sha(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        assert_ne!(artifact_sha(b"a"), artifact_sha(b"b"));
+    }
+
+    #[test]
+    fn http_provenance_stamps_url_and_sha_but_never_invents_a_rules_hash() {
+        let p = http_provenance("https://x/data?get=A&key=s3cret", b"[[\"a\"]]");
+        assert_eq!(
+            p.source_url.as_deref(),
+            Some("https://x/data?get=A&key=REDACTED")
+        );
+        assert_eq!(p.artifact_sha.as_deref(), Some(&*artifact_sha(b"[[\"a\"]]")));
+        // No RuleSet produced these records — a fabricated hash would claim
+        // replayability the app cannot deliver.
+        assert!(p.rules_hash.is_none());
+        assert!(!p.replayable());
+    }
+
+    #[test]
+    fn merge_summary_accumulates_every_bucket() {
+        let mut acc = UpsertSummary {
+            new: vec!["a".into()],
+            changed: vec![],
+            unchanged: 2,
+            removed: vec![],
+        };
+        merge_summary(
+            &mut acc,
+            UpsertSummary {
+                new: vec!["b".into()],
+                changed: vec!["c".into()],
+                unchanged: 3,
+                removed: vec!["d".into()],
+            },
+        );
+        assert_eq!(acc.new, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(acc.changed, vec!["c".to_string()]);
+        assert_eq!(acc.unchanged, 5);
+        assert_eq!(acc.removed, vec!["d".to_string()]);
+    }
 
     #[test]
     fn census_num_rejects_suppression_sentinels() {
