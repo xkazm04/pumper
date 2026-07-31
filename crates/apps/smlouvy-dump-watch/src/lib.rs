@@ -24,7 +24,9 @@
 //!                   2016→now history (~100+ dumps). Omitted → all dumps.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 
 pub struct SmlouvyDumpWatch;
@@ -142,6 +144,50 @@ impl ScrapeApp for SmlouvyDumpWatch {
         json!({ "index_url": DEFAULT_INDEX_URL })
     }
 
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "index_url": {
+                        "type": "string",
+                        "description": "Dump-index location. Defaults to the production \
+                                        https://data.smlouvy.gov.cz/index.xml."
+                    },
+                    "year_from": {
+                        "type": "integer",
+                        "minimum": 2016,
+                        "description": "Keep only dumps whose `rok` >= this year, so a consumer \
+                                        that only cares about recent months doesn't track the \
+                                        full 2016→now history. Omitted = all dumps. NOTE: \
+                                        raising it tombstones the now-excluded dumps (the sync \
+                                        is a full snapshot)."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Watch the whole published history (the scheduled daily run)",
+                    params: json!({ "index_url": DEFAULT_INDEX_URL }),
+                },
+                ManifestExample {
+                    description: "Track only dumps from 2024 onward — a consumer that re-ingests \
+                                  recent months and doesn't want the 2016→2023 backlog",
+                    params: json!({ "year_from": 2024 }),
+                },
+            ],
+            output_shape: Some(
+                "{index_url, dumps_in_index, dumps_tracked, year_from, new, changed, unchanged, \
+                 removed, fresh_dumps[], newest_period, newest_url} — full-snapshot sync of the \
+                 `dumps` dataset keyed by dump URL; `fresh_dumps` are the new/re-generated dump \
+                 URLs a dataset trigger should re-download",
+            ),
+            cost_class: CostClass::Free,
+        }
+    }
+
     async fn run(&self, ctx: AppContext) -> Result<Value> {
         let index_url = ctx
             .params
@@ -183,6 +229,14 @@ impl ScrapeApp for SmlouvyDumpWatch {
         // because its hash/size differ.
         let items: Vec<(String, Value)> =
             dumps.iter().map(|d| (d.url.clone(), d.record())).collect();
+        // Provenance (M12): every record is parsed out of THIS index document, so
+        // `source_url = index_url` would be exactly right — but `sync_many` has no
+        // provenance-carrying variant, and hand-rolling
+        // `upsert_many_with_provenance` + `datasets.detect_removed` here would
+        // bypass the degrading-source removal suppression that lives inside
+        // `sync_many`. A stamped `source_url` is not worth risking a mass
+        // tombstone of the dump index, so this run stamps only the `job_id` the
+        // context always sets. Core gap reported: `sync_many_with_provenance`.
         let summary = ctx.sync_many("dumps", &items).await?;
 
         // The freshly-changed dumps are the actionable ingest targets — a dataset
@@ -231,6 +285,31 @@ mod tests {
     <odkaz>https://data.smlouvy.gov.cz/dump_2017_01.xml</odkaz>
   </dump>
 </index>"#;
+
+    /// Both params in the schema are ones `run` actually reads, and the
+    /// scheduled default is a valid instance of it.
+    #[test]
+    fn manifest_declares_the_params_run_reads_and_defaults_fit_it() {
+        let m = SmlouvyDumpWatch.manifest();
+        let schema = m.params_schema.expect("schema declared");
+        let props = schema["properties"].as_object().expect("properties");
+        assert!(props.contains_key("index_url") && props.contains_key("year_from"));
+        assert_eq!(props.len(), 2, "no param the code never reads");
+        assert_eq!(m.examples.len(), 2);
+        for ex in &m.examples {
+            for k in ex.params.as_object().expect("object").keys() {
+                assert!(props.contains_key(k), "example uses undeclared param '{k}'");
+            }
+        }
+        for k in SmlouvyDumpWatch
+            .default_params()
+            .as_object()
+            .expect("object")
+            .keys()
+        {
+            assert!(props.contains_key(k), "default_params param '{k}' undeclared");
+        }
+    }
 
     #[test]
     fn parses_every_dump_with_fields() {
