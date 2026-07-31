@@ -141,6 +141,20 @@ confidence = 5
 dataset = "opportunities"
 notes = "The only US state with a true open-call API (CKAN, 37 fields, refreshed daily 8:45pm). Verified live end-to-end: 164 active grants, keyed by PortalID, dedup confirmed."
 
+# Declared data contract (M20) — raw CKAN row shape (data.ca.gov). PortalID is
+# the live-verified key; Title/Status are types-only because the normalizer keeps
+# legacy-name fallbacks. Upsert-only (no sync_many), so removals never legitimately
+# occur and any delta is worth a warn.
+[source.contract]
+required_fields = ["PortalID"]
+max_row_delta_pct = 40.0
+max_staleness_hours = 48
+
+[source.contract.types]
+Title = "string"
+Status = "string"
+PortalID = "string"
+
 [[source]]
 id = "ny-grants"
 app = ""
@@ -255,6 +269,20 @@ confidence = 5
 dataset = "opportunities"
 notes = "POST multipart (query+languages). apiKey=SEDIA static. Filter type in {1,2}, status=31094502. Shared source attached to every EU member-state profile. Verified live end-to-end: 601 open topics, keyed by identifier, dedup confirmed. See grant-writing app docs/eu-market-deep-dive."
 
+# Declared data contract (M20) for the app's OWN normalized topic record (not the
+# raw SEDIA hit). `identifier` is the record key and always written; title/url
+# legitimately null on sparse topics. `status` is the numeric facet code AS A
+# STRING (the numeric-status mapping is deliberate — see normalize_eu_sedia).
+[source.contract]
+required_fields = ["identifier"]
+max_row_delta_pct = 50.0
+max_staleness_hours = 48
+
+[source.contract.types]
+identifier = "string"
+title = "string"
+status = "string"
+
 [[source]]
 id = "uk-360giving"
 app = ""
@@ -340,6 +368,30 @@ confidence = 5
 dataset = "role_region_agg"
 notes = "~188 MB single JSON {polozky:[]}, replaced daily, CC BY 4.0. Per posting: monthly salary min/max CZK, profeseCzIsco, employer IČO, kraj/okres/obec, public/agency flags. Parsed to a typed subset and aggregated in-memory (CZ-ISCO×kraj×orgType) → role_region_agg (+ national kraj=ALL cell) and vacancy_samples; a full per-posting upsert is avoided (upsert_many is per-row). Needs the raised [http] timeout_secs. Verified live 2026-07-05."
 
+# Declared data contract (M20) for `role_region_agg`. The salary bounds ARE the
+# app's own SALARY_MIN/SALARY_MAX admission band — a value outside it means the
+# parser broke, not that the market moved. count={min=1} deliberately, not 3: the
+# privacy floor is the `minCount` param and a legitimate minCount=1 run must not
+# warn. No max_staleness_hours: the daily cadence already derives the window and
+# a tighter number fires on one skipped run.
+[source.contract]
+required_fields = ["czIsco", "krajId", "orgType", "count", "salaryCount"]
+max_row_delta_pct = 20.0
+
+[source.contract.types]
+czIsco = "string"
+krajId = "string"
+orgType = "string"
+count = "number"
+salaryCount = "number"
+salaryMedian = "number"
+
+[source.contract.ranges]
+count = { min = 1.0 }
+salaryMin = { min = 5000.0, max = 2000000.0 }
+salaryMedian = { min = 5000.0, max = 2000000.0 }
+salaryMax = { min = 5000.0, max = 2000000.0 }
+
 [[source]]
 id = "mpsv-ispv"
 app = "mpsv-ispv"
@@ -355,6 +407,23 @@ status = "live"
 confidence = 5
 dataset = "wages"
 notes = "~320 KB {polozky:[]}, CC BY 4.0. Median/mean + monthly deciles D1/Q1/Q3/D9 per czIsco|sfera (MZDOVA wage vs PLATOVA salary sphere). The salary-calibration anchor joined to mpsv-vpm on czIsco. Verified live 2026-07-05."
+
+# Declared data contract (M20) for `wages`. `medianMzda` is deliberately NOT
+# type-pinned: the feed delivers it as a number OR a quoted Czech-formatted
+# string (wage_num handles both), so typing it would flag good data. Ranges only
+# evaluate numeric values, so they are safe alongside that. `sfera` is typed but
+# not required — rows legitimately omit it.
+[source.contract]
+required_fields = ["czIsco"]
+max_row_delta_pct = 10.0
+
+[source.contract.types]
+czIsco = "string"
+sfera = "string"
+
+[source.contract.ranges]
+medianMzda = { min = 1000.0, max = 5000000.0 }
+mzdaPrumer = { min = 1000.0, max = 5000000.0 }
 
 [[source]]
 id = "mpsv-vpm-prirustky"
@@ -473,6 +542,30 @@ confidence = 4
 dataset = "owner_age"
 notes = "Owners of nonemployer firms per age band x 2-digit SECTOR NAICS x state (absnesdo, OWNRAGE question, all-demographics slice only). Per-state data exists at sector grain ONLY: NAICS2017=23 returns real rows; =238 / =2381 return HTTP 204 No Content — a contract-VALID empty meaning 'not published at this grain', not drift. Disclosure-suppressed cells dropped, never zeroed. Feeds pct_owners_55plus + succession_receipts on census/market_blend at sector grain (labeled succession_grain=naics_sector) — a succession wave-size indicator, not a per-business or per-trade prediction. Free CENSUS_API_KEY (shared); NES-D lags ~2y (params.year). LIVE-verified with a real key 2026-07-30."
 
+# Declared data contract (M20) for `owner_age` (live-verified shape 2026-07-30).
+# Suppressed cells are DROPPED, so every stored row is a reported one and the
+# required set is exactly what map_age_rows always writes. owners_pct is
+# honest-Null when the percentage cell is suppressed — bounded, not required.
+[source.contract]
+required_fields = ["sector", "state", "state_fips", "age_band", "age_band_code", "owners", "basis", "grain", "year"]
+max_row_delta_pct = 10.0
+max_staleness_hours = 9000
+
+[source.contract.types]
+sector = "string"
+state = "string"
+state_fips = "string"
+age_band = "string"
+age_band_code = "string"
+basis = "string"
+grain = "string"
+year = "string"
+owners = "number"
+
+[source.contract.ranges]
+owners = { min = 0.0 }
+owners_pct = { min = 0.0, max = 100.0 }
+
 [[source]]
 id = "state-licensing"
 app = "state-licensing"
@@ -489,6 +582,30 @@ confidence = 3
 dataset = "compliance"
 notes = "Per state x trade (51 jurisdictions x 5 canonical trades) state-level license requirement (none/registration/exam_license), typical license cost, surety bond, liability-insurance minimum, and solo-operator workers'-comp signal. Chunked ONE metered call per trade (state-tax's one-call/51-jurisdiction pattern); each trade vintage-gated on CA:<trade> year BEFORE research, so the annual scheduled run only pays for trades not yet held (force:true bypasses). Writes cross-source trades/compliance (keys <ST>:<trade>) and joins a compliance block onto the per-state trades/operator_economics rows. STATE grain only — county/city variation flagged via local_variation+notes, never invented figures. Costs real money per run (cost_class=claude)."
 
+# Declared data contract (M20) for `compliance`. The dollar ranges mirror the
+# app's own plausibility caps exactly, so a violation means a row reached the
+# store without passing validation. Booleans stay Null when the agent did not
+# report them (never fabricated), so they are typed but not required.
+[source.contract]
+required_fields = ["state", "trade", "soc_code", "requirement_level", "grain", "year"]
+max_row_delta_pct = 5.0
+max_staleness_hours = 9000
+
+[source.contract.types]
+state = "string"
+trade = "string"
+soc_code = "string"
+requirement_level = "string"
+grain = "string"
+year = "string"
+workers_comp_required = "bool"
+local_variation = "bool"
+
+[source.contract.ranges]
+license_cost_usd = { min = 0.0, max = 50000.0 }
+bond_amount_usd = { min = 0.0, max = 5000000.0 }
+insurance_min_liability_usd = { min = 0.0, max = 100000000.0 }
+
 [[source]]
 id = "cordis"
 app = "cordis"
@@ -504,6 +621,26 @@ status = "live"
 confidence = 3
 dataset = "projects"
 notes = "Funded Horizon project outcomes, two-stage (VERIFIED live 2026-07-30): search listing (q=contenttype='project' AND programme/code='HORIZON') enumerates project ids only; per-project detail fetch supplies money (ecMaxContribution/totalCost), clean ISO dates, topic identifiers (relations.associations relatedMasterCall/SubCall) and orgs (legalName + per-org ecContribution + role). RCN-keyed into cordis/projects; aggregated per topic-lineage family into cordis/topic_stats; eu-sedia joins a history block onto open SEDIA topics pre-upsert. Drift raises a loud error. Resume page cursor in cordis/state covers the ~23k corpus across runs (maxProjects = detail fetches/run, default 500); searchAfter cursor noted for future deep paging."
+
+# Declared data contract (M20) for the normalized project detail (live-verified
+# 2026-07-30), which always carries `rcn`; the id-only fallback exists solely for
+# drift, so requiring `rcn` is exactly the signal wanted. Money is honest-Null,
+# so the ranges only trip on genuinely corrupt numbers. Upsert-only: removals are
+# never legitimate for a funded-project archive.
+[source.contract]
+required_fields = ["rcn"]
+max_row_delta_pct = 10.0
+max_staleness_hours = 192
+
+[source.contract.types]
+rcn = "string"
+title = "string"
+ec_contribution = "number"
+participants = "array"
+
+[source.contract.ranges]
+ec_contribution = { min = 0.0, max = 2000000000.0 }
+total_cost = { min = 0.0, max = 2000000000.0 }
 
 # ── Personas connector API-doc monitoring (feeds curated marketplace events) ──
 
@@ -522,3 +659,18 @@ status = "live"
 confidence = 4
 dataset = "connector_docs"
 notes = "Monthly diff of each Personas connector's public docs_url (watch list in catalog/connector-docs.json, generated by personas/scripts/events/generate-connector-events.mjs). Claude-summarizes changes into artifacts/connector-api-watch/<job>/changes.json → bridged into personas builtin_shared_events.rs. See personas/docs/plans/curated-connector-events.md."
+
+# Declared data contract (M20). Deliberately NO max_staleness_hours: unchanged
+# docs produce no revision, so a quiet month is normal and a staleness floor
+# would fire false alarms. `label` is typed but not required (the watch list
+# allows it empty).
+[source.contract]
+required_fields = ["docs_url", "hash", "markdown", "engine"]
+max_row_delta_pct = 20.0
+
+[source.contract.types]
+docs_url = "string"
+hash = "string"
+markdown = "string"
+label = "string"
+engine = "string"
