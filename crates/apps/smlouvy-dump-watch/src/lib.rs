@@ -25,7 +25,8 @@
 
 use async_trait::async_trait;
 use pumper_core::{
-    AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Result, ScrapeApp,
+    AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Provenance, Result,
+    ScrapeApp,
 };
 use serde_json::{json, Value};
 
@@ -229,15 +230,18 @@ impl ScrapeApp for SmlouvyDumpWatch {
         // because its hash/size differ.
         let items: Vec<(String, Value)> =
             dumps.iter().map(|d| (d.url.clone(), d.record())).collect();
-        // Provenance (M12): every record is parsed out of THIS index document, so
-        // `source_url = index_url` would be exactly right — but `sync_many` has no
-        // provenance-carrying variant, and hand-rolling
-        // `upsert_many_with_provenance` + `datasets.detect_removed` here would
-        // bypass the degrading-source removal suppression that lives inside
-        // `sync_many`. A stamped `source_url` is not worth risking a mass
-        // tombstone of the dump index, so this run stamps only the `job_id` the
-        // context always sets. Core gap reported: `sync_many_with_provenance`.
-        let summary = ctx.sync_many("dumps", &items).await?;
+        // Provenance (M12): every record is parsed out of THIS index document,
+        // so a batch-level `source_url` is a fact here, not an approximation.
+        let summary = ctx
+            .sync_many_with_provenance(
+                "dumps",
+                &items,
+                Provenance {
+                    source_url: Some(index_url.clone()),
+                    ..Provenance::default()
+                },
+            )
+            .await?;
 
         // The freshly-changed dumps are the actionable ingest targets — a dataset
         // trigger reads these keys from `_trigger` and re-downloads exactly them.

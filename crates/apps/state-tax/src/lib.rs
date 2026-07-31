@@ -164,6 +164,8 @@ impl ScrapeApp for StateTax {
         // Constrain the final answer to the tax schema (`claude --json-schema`);
         // salvage_json below still catches anything the schema path misses.
         request.json_schema = Some(tax_schema());
+        // Pin the derivation spec before `request` is consumed by the call.
+        let prov = trades_common::research_provenance(&ctx, "state-tax", &request).await;
         let (data, output) = trades_common::research_json(&ctx, "state-tax", request).await?;
 
         let mut all_records: Vec<(String, Value)> = Vec::new();
@@ -245,7 +247,14 @@ impl ScrapeApp for StateTax {
 
         // Full 50-state + DC snapshot, so sync_many: a state that drops out of a
         // later run is marked removed instead of lingering as stale data.
-        let summary = ctx.sync_many("tax", &all_records).await?;
+        // Provenance (M12): the same derivation-spec pin its sibling research
+        // apps use — an agentic answer has no single source URL, so rules_hash
+        // is the only honest stamp. Carried through the sync path (rather than
+        // a hand-rolled upsert) so the degrading-source removal guard still
+        // applies.
+        let summary = ctx
+            .sync_many_with_provenance("tax", &all_records, prov)
+            .await?;
 
         // Cross-source layer: state-tax contributes the federal + illustrative-state
         // tax context to trades/operator_economics (mirrors grants-common's sync).
