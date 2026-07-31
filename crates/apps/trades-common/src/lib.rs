@@ -11,8 +11,10 @@
 //!     magnitudes) so a nonsensical record is rejected with per-record detail
 //!     instead of silently upserted.
 
-use pumper_core::{salvage_json, AppContext, Error, ResearchOutput, ResearchRequest, Result};
-use serde_json::Value;
+use pumper_core::{
+    salvage_json, AppContext, Error, Provenance, ResearchOutput, ResearchRequest, Result,
+};
+use serde_json::{json, Value};
 
 /// Runs a metered research request, archives the raw answer as `research.json`,
 /// and returns its JSON alongside the raw output (which the caller still needs
@@ -63,6 +65,48 @@ pub async fn research_json_named(
         })?,
     };
     Ok((data, output))
+}
+
+/// **Provenance (M12) for an agentic record**: registers the *derivation spec*
+/// that produced this run's answer — the exact prompt, the structured-output
+/// schema, and the model/effort the operator pinned — in the content-addressed
+/// rules registry, and returns its hash as [`Provenance::rules_hash`].
+///
+/// For a scraper the RuleSet is a set of selectors; for these apps it is the
+/// prompt + `--json-schema` contract, which is precisely the thing that has to
+/// be recovered to explain (or re-derive) a stored figure after the live prompt
+/// moves on — and precisely the thing that silently changes between vintages.
+/// The hash is a content hash of registered JSON, not an assertion about the
+/// sources the agent visited.
+///
+/// `source_url` is deliberately left `None`: an agentic answer is synthesized
+/// from many pages the app never sees, so any single URL here would be a
+/// fabrication. A registry write failure is warn-logged and degrades to an
+/// unstamped write — provenance is metadata and must never fail a paid run.
+pub async fn research_provenance(
+    ctx: &AppContext,
+    app: &str,
+    request: &ResearchRequest,
+) -> Provenance {
+    let spec = json!({
+        "kind": "agentic_research",
+        "app": app,
+        "prompt": request.prompt,
+        "role": request.role,
+        "json_schema": request.json_schema,
+        "model": request.model,
+        "effort": request.effort,
+    });
+    match ctx.register_rules(&spec).await {
+        Ok(hash) => Provenance {
+            rules_hash: Some(hash),
+            ..Provenance::default()
+        },
+        Err(e) => {
+            tracing::warn!(app, "research derivation-spec registration failed: {e}");
+            Provenance::default()
+        }
+    }
 }
 
 /// The `year` param an agentic trades app was refreshed for. Central so the four

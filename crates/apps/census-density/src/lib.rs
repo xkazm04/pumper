@@ -28,7 +28,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 
 pub struct CensusDensity;
@@ -78,6 +80,73 @@ impl ScrapeApp for CensusDensity {
 
     fn default_params(&self) -> Value {
         json!({ "year": DEFAULT_YEAR, "geo": "state" })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "year": { "type": "string", "description": "CBP vintage (CBP lags ~2 years)." },
+                    "geo": {
+                        "type": "string",
+                        "enum": ["state", "county"],
+                        "description": "Geographic grain. `county` REQUIRES a `states` FIPS filter — CBP does not serve county:* nationwide."
+                    },
+                    "states": {
+                        "type": "string",
+                        "description": "Comma-separated state FIPS list (e.g. \"06,12,48\"). Empty or \"*\" = all states; required when geo=county."
+                    },
+                    "naics": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "6-digit NAICS trade codes. Default: the enabled trades/taxonomy registry codes, else the four built-in trade codes."
+                    },
+                    "naics_var": {
+                        "type": "string",
+                        "description": "Classification predicate (NAICS2017 / NAICS2022) — must match the vintage the requested year publishes."
+                    },
+                    "normalize": {
+                        "type": "boolean",
+                        "description": "Join an ACS base and rank by establishments per 10k (saturation). Default true; a denominator failure degrades to the absolute ranking."
+                    },
+                    "denominator": {
+                        "type": "string",
+                        "enum": ["households", "population", "owner_occupied"],
+                        "description": "Which ACS base normalization divides by."
+                    },
+                    "acs_dataset": { "type": "string", "description": "ACS dataset path for the denominator (default acs/acs5)." },
+                    "acs_year": { "type": "string", "description": "ACS vintage for the denominator (defaults to `year`)." },
+                    "api_key": { "type": "string", "description": "Free Census API key; falls back to env CENSUS_API_KEY." }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "All states, default trade codes, saturation normalized per household",
+                    params: json!({ "year": DEFAULT_YEAR, "geo": "state" }),
+                },
+                ManifestExample {
+                    description: "County grain inside three states (a states filter is mandatory for county)",
+                    params: json!({
+                        "year": DEFAULT_YEAR,
+                        "geo": "county",
+                        "states": "06,48,12",
+                        "denominator": "owner_occupied"
+                    }),
+                },
+            ],
+            output_shape: Some(
+                "{source, geo, year, trades: [{naics, label, places_reported, \
+                 total_establishments, total_employees, national_avg_wage, \
+                 national_avg_establishment_size, top}], top_places_overall, \
+                 top_places_by_saturation, normalization, market_blend, records, new, \
+                 changed, unchanged} — suppressed cells are absent (Null), never zeroed",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -178,14 +247,18 @@ impl ScrapeApp for CensusDensity {
             ));
         }
 
-        let mut all_records: Vec<(String, Value)> = Vec::new();
+        // Provenance (M12) is per-request — one CBP URL and one archived
+        // artifact per NAICS — so each trade's rows are upserted with their own
+        // stamp and the run reports one merged rollup.
+        let mut summary = pumper_core::UpsertSummary::default();
+        let mut record_count = 0usize;
         let mut trade_summaries: Vec<Value> = Vec::new();
         // place label -> combined establishments across all trades (overall ranking).
         let mut overall: BTreeMap<String, i64> = BTreeMap::new();
 
         for (naics, label) in &trades {
             let url = build_url(&year, &geo, &states, naics, &naics_var, &api_key);
-            let resp = ctx.engines.http.fetch(HttpRequest::get(url)).await?;
+            let resp = ctx.engines.http.fetch(HttpRequest::get(url.clone())).await?;
             if !resp.is_success() {
                 return Err(Error::App(format!(
                     "Census CBP {year} NAICS {naics}: HTTP {} (body starts: {})",
@@ -212,11 +285,11 @@ impl ScrapeApp for CensusDensity {
                     "Census CBP {year} NAICS {naics}: bad JSON rows: {e}"
                 ))
             })?;
-            ctx.save_artifact(
-                &format!("cbp-{naics}.json"),
-                &serde_json::to_vec_pretty(&rows)?,
-            )
-            .await?;
+            // Bind the archived bytes once: `artifact_sha` must hash exactly what
+            // was stored, never a re-serialization of it.
+            let artifact = serde_json::to_vec_pretty(&rows)?;
+            ctx.save_artifact(&format!("cbp-{naics}.json"), &artifact)
+                .await?;
 
             let header = rows.first().cloned().unwrap_or_default();
             let idx = |name: &str| header.iter().position(|h| h.as_str() == name);
@@ -240,6 +313,7 @@ impl ScrapeApp for CensusDensity {
             let i_emp = idx("EMP");
             let i_pay = idx("PAYANN");
 
+            let mut trade_records: Vec<(String, Value)> = Vec::new();
             let mut places_reported: u32 = 0;
             let mut total_estab: i64 = 0;
             let mut total_emp: i64 = 0;
@@ -295,7 +369,7 @@ impl ScrapeApp for CensusDensity {
                 ranked.push((place.clone(), estab));
                 *overall.entry(place.clone()).or_insert(0) += estab;
 
-                all_records.push((
+                trade_records.push((
                     key,
                     json!({
                         "naics": naics,
@@ -344,9 +418,18 @@ impl ScrapeApp for CensusDensity {
                 "national_avg_establishment_size": national_avg_establishment_size,
                 "top": top,
             }));
-        }
 
-        let summary = ctx.upsert_many("establishments", &all_records).await?;
+            record_count += trade_records.len();
+            census_common::merge_summary(
+                &mut summary,
+                ctx.upsert_many_with_provenance(
+                    "establishments",
+                    &trade_records,
+                    census_common::http_provenance(&url, &artifact),
+                )
+                .await?,
+            );
+        }
 
         let mut overall_vec: Vec<(String, i64)> =
             overall.iter().map(|(k, v)| (k.clone(), *v)).collect();
@@ -460,7 +543,7 @@ impl ScrapeApp for CensusDensity {
             "top_places_by_saturation": saturation,
             "normalization": normalization,
             "market_blend": market_blend,
-            "records": all_records.len(),
+            "records": record_count,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
@@ -981,6 +1064,30 @@ async fn fetch_denominator(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manifest must describe the params the app actually ships: every key
+    /// in `default_params` and in every worked example has to be a declared
+    /// property. A schema that drifts from its own canonical invocations is
+    /// worse than no schema — enqueue enforces it, so the drift shows up as a
+    /// 422 on the app's own documented call.
+    #[test]
+    fn manifest_declares_every_param_it_ships() {
+        let app = CensusDensity;
+        let m = app.manifest();
+        let schema = m.params_schema.expect("rich manifest declares a schema");
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema declares properties");
+        assert!(!m.examples.is_empty(), "a schema needs worked examples");
+        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let mut shipped = vec![app.default_params()];
+        shipped.extend(m.examples.iter().map(|e| e.params.clone()));
+        for params in shipped {
+            for key in params.as_object().expect("params are an object").keys() {
+                assert!(props.contains_key(key), "undeclared param '{key}'");
+            }
+        }
+    }
 
     fn emp(naics: &str, geo: &str, place: &str, st: &str, estab: i64) -> Value {
         json!({

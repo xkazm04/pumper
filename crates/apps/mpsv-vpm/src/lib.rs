@@ -53,7 +53,10 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use chrono::{Duration, NaiveDate, Utc};
-use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Provenance, Result,
+    ScrapeApp,
+};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -183,6 +186,95 @@ impl ScrapeApp for MpsvVpm {
             "repostWindowDays": REPOST_WINDOW_DAYS_DEFAULT,
             "nowcastWindow": NOWCAST_WINDOW_DEFAULT,
         })
+    }
+
+    /// Every property below is a param the `run` body actually reads, with the
+    /// bounds the code actually enforces (`clamp`/`max`/`min`), so an agent that
+    /// respects the schema never has a value silently rewritten under it.
+    /// `default_params` above is a valid instance of this schema — the registry
+    /// test enforces that for scheduled apps.
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "Feed override (default: the ~188 MB national volna-mista.json). Point at a trimmed mirror for a cheap smoke run."
+                    },
+                    "maxRecords": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Cap on postings considered; 0 = the whole feed. A cap makes the run cheap but the aggregates unrepresentative."
+                    },
+                    "minCount": {
+                        "type": "integer", "minimum": 1,
+                        "description": "Minimum postings (or closures) per cell before it is published — the statistical/privacy floor on every aggregate. Default 3; lowering it publishes thin cells."
+                    },
+                    "samplesPerGroup": {
+                        "type": "integer", "minimum": 1, "maximum": 50,
+                        "description": "Vacancy samples kept per CZ-ISCO unit group."
+                    },
+                    "maxPostedAgeDays": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Drop postings first posted more than this many days before the feed date; 0 = keep every age. Does NOT affect the survival ledger, which sees every live posting."
+                    },
+                    "aresMaxLookups": {
+                        "type": "integer", "minimum": 0, "maximum": 500,
+                        "description": "New ARES employer lookups this run (0 disables enrichment). The backlog drains across daily runs."
+                    },
+                    "maxGapDays": {
+                        "type": "integer", "minimum": 1,
+                        "description": "Run gap beyond which the vacancy ledger closes NOTHING and carries forward — the guard against one outage marking ~300k postings closed."
+                    },
+                    "repostWindowDays": {
+                        "type": "integer", "minimum": 1,
+                        "description": "Window in which a reappearing (IČO, occupation, kraj, salary band) counts as a repost rather than a fill, and how long closures stay in the lifecycle aggregate."
+                    },
+                    "nowcastWindow": {
+                        "type": "integer", "minimum": 1, "maximum": 24,
+                        "description": "Newest stored salary_gap observations per cell used for the ratio-carry nowcast."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Full daily national sync — every aggregate, the ledger diff, \
+                                  the nowcast and 50 ARES lookups (the scheduled default)",
+                    params: json!({
+                        "maxRecords": 0,
+                        "minCount": 3,
+                        "samplesPerGroup": 4,
+                        "maxPostedAgeDays": 730,
+                        "aresMaxLookups": ARES_MAX_LOOKUPS_DEFAULT,
+                        "maxGapDays": MAX_GAP_DAYS_DEFAULT,
+                        "repostWindowDays": REPOST_WINDOW_DAYS_DEFAULT,
+                        "nowcastWindow": NOWCAST_WINDOW_DEFAULT,
+                    }),
+                },
+                ManifestExample {
+                    description: "Cheap smoke run: first 20k postings, no ARES enrichment — \
+                                  exercises the whole pipeline in seconds. Aggregates from a \
+                                  truncated feed are NOT representative; don't publish them.",
+                    params: json!({ "maxRecords": 20_000, "aresMaxLookups": 0 }),
+                },
+                ManifestExample {
+                    description: "Current-market view: only postings from the last 180 days, \
+                                  strict cell floor of 10 for tighter statistics",
+                    params: json!({ "maxPostedAgeDays": 180, "minCount": 10 }),
+                },
+            ],
+            output_shape: Some(
+                "{feedRecords, considered, kept, filteredOld, agg*/region*/samples*/skill*/\
+                 education*/trend* tallies, trendingTop[], fadingTop[], salaryGap{…}, \
+                 salaryNowcast{…}, employers{…}, vacancyLedger{…}, freshness{…}} — writes \
+                 mpsv-vpm/{role_region_agg, region_agg, vacancy_samples, skill_demand, \
+                 education_agg, role_trends, employers, freshness, vacancy_ledger} and the \
+                 shared cz-labour/{salary_gap, salary_nowcast, vacancy_lifecycle}",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -455,10 +547,41 @@ impl ScrapeApp for MpsvVpm {
             "maxPostedAgeDays": max_posted_age_days,
         });
 
-        let agg = ctx.upsert_many("role_region_agg", &agg_items).await?;
-        let region = ctx.upsert_many("region_agg", &region_items).await?;
-        let samples = ctx.upsert_many("vacancy_samples", &sample_items).await?;
-        ctx.upsert("freshness", "current", &freshness).await?;
+        // Provenance (M12). Honest-Null discipline for a feed-aggregating app:
+        //   * `feed_prov` — every posting behind these rows was read out of THIS
+        //     one document, so its URL IS the source URL of each record. That the
+        //     row is an aggregate of many postings does not make the URL a guess:
+        //     there is exactly one URL, and it is this one.
+        //   * `source_url` is left Null wherever a record is a JOIN or a
+        //     time-series over the store (role_trends, salary_gap, salary_nowcast,
+        //     vacancy_lifecycle) or an aggregate of many fetched URLs (employers) —
+        //     naming one of them would be a fabrication.
+        //   * `rules_hash`/`artifact_sha` stay Null everywhere: extraction is Rust
+        //     code, not a registered RuleSet, and the ~188 MB body is never
+        //     archived (it is dropped as soon as it is parsed).
+        let feed_prov = || Provenance {
+            source_url: Some(url.clone()),
+            ..Default::default()
+        };
+        // The `cz-labour` products are written straight through `ctx.datasets`
+        // (they belong to a shared namespace no app owns), which bypasses the
+        // context's automatic stamping — so today they carry NO provenance at
+        // all. The producing job is a fact we do know; stamp it explicitly.
+        let job_prov = Provenance {
+            job_id: Some(ctx.job_id.to_string()),
+            ..Default::default()
+        };
+        let agg = ctx
+            .upsert_many_with_provenance("role_region_agg", &agg_items, feed_prov())
+            .await?;
+        let region = ctx
+            .upsert_many_with_provenance("region_agg", &region_items, feed_prov())
+            .await?;
+        let samples = ctx
+            .upsert_many_with_provenance("vacancy_samples", &sample_items, feed_prov())
+            .await?;
+        ctx.upsert_with_provenance("freshness", "current", &freshness, feed_prov())
+            .await?;
 
         // Skills demand + education aggregates (same min-count gate as the salary
         // cells). Persisting them turns the salary table into labour-market
@@ -486,8 +609,12 @@ impl ScrapeApp for MpsvVpm {
                 cell.to_education_value(ug, edu_id, group_median),
             ));
         }
-        let skill = ctx.upsert_many("skill_demand", &skill_items).await?;
-        let education = ctx.upsert_many("education_agg", &education_items).await?;
+        let skill = ctx
+            .upsert_many_with_provenance("skill_demand", &skill_items, feed_prov())
+            .await?;
+        let education = ctx
+            .upsert_many_with_provenance("education_agg", &education_items, feed_prov())
+            .await?;
 
         // Trending vs fading roles: national posting-count trajectories from
         // role_region_agg's revision history (the change-intelligence
@@ -602,7 +729,7 @@ impl ScrapeApp for MpsvVpm {
                 .count();
             let gap_sum = ctx
                 .datasets
-                .upsert_many(GAP_APP, GAP_DATASET, &gap_items)
+                .upsert_many_stamped(GAP_APP, GAP_DATASET, &gap_items, None, Some(&job_prov))
                 .await?;
             let top_gaps = |dir: f64| -> Vec<Value> {
                 let mut v: Vec<&(String, Value)> = gap_items
@@ -691,7 +818,13 @@ impl ScrapeApp for MpsvVpm {
             );
             let nc_sum = ctx
                 .datasets
-                .upsert_many(GAP_APP, NOWCAST_DATASET, &nowcast_items)
+                .upsert_many_stamped(
+                    GAP_APP,
+                    NOWCAST_DATASET,
+                    &nowcast_items,
+                    None,
+                    Some(&job_prov),
+                )
                 .await?;
             let confidence_count = |level: &str| {
                 nowcast_items
@@ -742,12 +875,39 @@ impl ScrapeApp for MpsvVpm {
                 "mpsv-vpm: employers skip-set hit the cap — some known IČOs may be re-fetched"
             );
         }
-        let mut employer_items: Vec<(String, Value)> = Vec::new();
+        // Durable execution (M23). This loop is the one genuinely resumable unit
+        // of work in the job: up to `aresMaxLookups` SEQUENTIAL, politeness-
+        // governed HTTP lookups against a third party (minutes of wall clock),
+        // whose results were persisted only after the last one — so a reap,
+        // timeout or shutdown mid-phase discarded every lookup already paid for,
+        // and the retry re-fetched them all. Checkpointing the per-item progress
+        // makes a re-claim resume where it stopped.
+        //
+        // Everything BEFORE this phase is deliberately not checkpointed: the
+        // ~188 MB feed arrives as one document (no page cursor to save), and the
+        // in-memory aggregation over ~300k postings has no intermediate state
+        // worth persisting — a snapshot of it would be larger than the work it
+        // saves, and it is re-derived in seconds once the body is in hand. The
+        // ledger diff is likewise a pure function of the feed plus the PRIOR
+        // run's artifact, so a retry recomputes it identically.
+        let resumed = ctx
+            .restore()
+            .and_then(AresCheckpoint::from_value)
+            .unwrap_or_default();
+        let mut employer_items: Vec<(String, Value)> = resumed.records;
+        let resumed_count = employer_items.len();
+        let already_fetched: std::collections::HashSet<String> =
+            employer_items.iter().map(|(k, _)| k.clone()).collect();
         let mut ares_skipped = 0usize; // already enriched in a prior run
-        let mut ares_failed = 0usize; // transport / 404 / malformed
+        let mut ares_failed = resumed.failed; // transport / 404 / malformed
         let mut ares_capped = 0usize; // left for a later run (per-run cap)
-        let mut ares_looked_up = 0usize;
+        let mut ares_looked_up = resumed.looked_up;
+        let lookups_before = ares_looked_up;
         for ico in &icos {
+            // a prior attempt of THIS job already fetched it → don't pay twice
+            if already_fetched.contains(ico) {
+                continue;
+            }
             // already in the employers dataset → nothing to fetch
             if known_employers.contains(ico) {
                 ares_skipped += 1;
@@ -758,43 +918,38 @@ impl ScrapeApp for MpsvVpm {
                 continue;
             }
             ares_looked_up += 1;
-            let ares_url = format!("{ARES_URL}/{ico}");
-            let resp = match ctx.engines.http.fetch(HttpRequest::get(&ares_url)).await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("mpsv-vpm: ARES fetch failed for IČO {ico}: {e}");
-                    ares_failed += 1;
-                    continue;
-                }
-            };
-            if !resp.is_success() {
-                tracing::warn!(
-                    "mpsv-vpm: ARES returned status {} for IČO {ico} — skipping",
-                    resp.status
-                );
-                ares_failed += 1;
-                continue;
-            }
-            let subject: Value = match serde_json::from_str(&resp.body) {
-                Ok(v) => v,
-                Err(e) => {
-                    tracing::warn!("mpsv-vpm: ARES body for IČO {ico} was not JSON: {e}");
-                    ares_failed += 1;
-                    continue;
-                }
-            };
-            match normalize_ares_employer(ico, &subject) {
+            match fetch_ares_employer(&ctx, ico).await {
                 Some(rec) => employer_items.push((ico.clone(), rec)),
-                None => {
-                    tracing::warn!("mpsv-vpm: ARES subject for IČO {ico} had no usable name");
-                    ares_failed += 1;
-                }
+                None => ares_failed += 1,
             }
+            // Runtime-throttled, so calling it every lookup is cheap; the state
+            // is at most `aresMaxLookups` compact employer records.
+            ctx.checkpoint(AresCheckpoint::to_value(
+                &employer_items,
+                ares_looked_up,
+                ares_failed,
+            ))
+            .await;
         }
+        if ares_looked_up > lookups_before {
+            // Unthrottled final snapshot: losing the tail of the phase to the
+            // throttle would re-spend real lookups on the next attempt.
+            ctx.checkpoint_now(AresCheckpoint::to_value(
+                &employer_items,
+                ares_looked_up,
+                ares_failed,
+            ))
+            .await;
+        }
+        // No `source_url`: this batch is an aggregate of one ARES URL PER RECORD,
+        // and stamping any single one of them batch-wide would be a fabrication.
+        // (Per-record stamping would mean leaving `upsert_many`, which is also
+        // the derived-spec seam — not worth losing for one field.)
         let employers = ctx.upsert_many("employers", &employer_items).await?;
         let employer_summary = json!({
             "distinctIcos": icos.len(),
             "enriched": employer_items.len(),
+            "resumedFromCheckpoint": resumed_count,
             "new": employers.new.len(),
             "changed": employers.changed.len(),
             "unchanged": employers.unchanged,
@@ -876,7 +1031,13 @@ impl ScrapeApp for MpsvVpm {
             aggregate_lifecycle(&diff.ledger.closed, &live_counts, min_count, repost_window_days);
         let lifecycle = ctx
             .datasets
-            .upsert_many(GAP_APP, LIFECYCLE_DATASET, &lifecycle_items)
+            .upsert_many_stamped(
+                GAP_APP,
+                LIFECYCLE_DATASET,
+                &lifecycle_items,
+                None,
+                Some(&job_prov),
+            )
             .await?;
         let ledger_bytes = serde_json::to_vec(&diff.ledger)?;
         let ledger_len = ledger_bytes.len();
@@ -1260,6 +1421,89 @@ fn ares_nace_codes(v: &Value) -> (Vec<String>, usize) {
         .take(ARES_NACE_CAP)
         .collect();
     (codes, arr.len())
+}
+
+/// Resumable state of the ARES enrichment phase (M23 checkpoint): the employer
+/// records this job has already fetched, and how much of the per-run lookup
+/// budget it has already spent. Lookups are the expensive, externally-paced part;
+/// everything else in the phase is recomputed for free.
+#[derive(Default)]
+struct AresCheckpoint {
+    /// IČO → normalized employer record, already fetched by a prior attempt.
+    records: Vec<(String, Value)>,
+    /// Lookups charged against `aresMaxLookups` so far (successes AND failures —
+    /// a retry must not get a fresh budget by failing).
+    looked_up: usize,
+    /// Failures already counted, so the summary stays truthful across a resume.
+    failed: usize,
+}
+
+impl AresCheckpoint {
+    /// Advisory decode: ANY unexpected shape means "start this phase fresh",
+    /// never an error. A stored snapshot from a different app version, a
+    /// truncated write, or a future phase tag all fall back to `None`.
+    fn from_value(v: &Value) -> Option<Self> {
+        if v.get("phase").and_then(Value::as_str) != Some("ares") {
+            return None;
+        }
+        let records: Vec<(String, Value)> = v
+            .get("records")
+            .and_then(Value::as_object)?
+            .iter()
+            .map(|(k, r)| (k.clone(), r.clone()))
+            .collect();
+        Some(Self {
+            looked_up: v
+                .get("looked_up")
+                .and_then(Value::as_u64)
+                .unwrap_or(records.len() as u64) as usize,
+            failed: v.get("failed").and_then(Value::as_u64).unwrap_or(0) as usize,
+            records,
+        })
+    }
+
+    /// The snapshot handed to the checkpoint sink.
+    fn to_value(records: &[(String, Value)], looked_up: usize, failed: usize) -> Value {
+        json!({
+            "phase": "ares",
+            "records": records.iter().cloned().collect::<serde_json::Map<String, Value>>(),
+            "looked_up": looked_up,
+            "failed": failed,
+        })
+    }
+}
+
+/// One ARES lookup: fetch → parse → normalize. EVERY failure mode (transport,
+/// non-2xx, non-JSON, no usable business name) warns and yields `None` —
+/// enrichment is a side quest and must never fail the run.
+async fn fetch_ares_employer(ctx: &AppContext, ico: &str) -> Option<Value> {
+    let ares_url = format!("{ARES_URL}/{ico}");
+    let resp = match ctx.engines.http.fetch(HttpRequest::get(&ares_url)).await {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!("mpsv-vpm: ARES fetch failed for IČO {ico}: {e}");
+            return None;
+        }
+    };
+    if !resp.is_success() {
+        tracing::warn!(
+            "mpsv-vpm: ARES returned status {} for IČO {ico} — skipping",
+            resp.status
+        );
+        return None;
+    }
+    let subject: Value = match serde_json::from_str(&resp.body) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("mpsv-vpm: ARES body for IČO {ico} was not JSON: {e}");
+            return None;
+        }
+    };
+    let rec = normalize_ares_employer(ico, &subject);
+    if rec.is_none() {
+        tracing::warn!("mpsv-vpm: ARES subject for IČO {ico} had no usable name");
+    }
+    rec
 }
 
 /// Compact normalized employer record from one ARES economic-subject response.
@@ -1940,6 +2184,67 @@ struct Sample {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manifest must describe the params the code actually reads. The server
+    /// registry test validates examples against the schema; this one catches the
+    /// drift that a validator cannot see — an example or a scheduled default
+    /// naming a key the schema never declares.
+    #[test]
+    fn manifest_examples_and_defaults_only_use_declared_params() {
+        let m = MpsvVpm.manifest();
+        let schema = m.params_schema.expect("schema declared");
+        let props = schema["properties"].as_object().expect("properties");
+        for key in ["url", "maxRecords", "minCount", "aresMaxLookups", "nowcastWindow"] {
+            assert!(props.contains_key(key), "schema must declare '{key}'");
+        }
+        let declared = |params: &Value, what: &str| {
+            for k in params.as_object().expect("object params").keys() {
+                assert!(props.contains_key(k), "{what} uses undeclared param '{k}'");
+            }
+        };
+        declared(&MpsvVpm.default_params(), "default_params");
+        assert!(!m.examples.is_empty(), "agents need at least one example");
+        for ex in &m.examples {
+            declared(&ex.params, ex.description);
+        }
+    }
+
+    #[test]
+    fn ares_checkpoint_round_trips_records_and_budget() {
+        let records = vec![
+            ("00000001".to_string(), json!({ "ico": "00000001", "name": "A" })),
+            ("00000002".to_string(), json!({ "ico": "00000002", "name": "B" })),
+        ];
+        let snapshot = AresCheckpoint::to_value(&records, 5, 3);
+        let restored = AresCheckpoint::from_value(&snapshot).expect("decodes");
+        let mut got = restored.records.clone();
+        got.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(got, records);
+        // Failures count against the budget too — a retry must not win a fresh
+        // lookup allowance by having failed.
+        assert_eq!((restored.looked_up, restored.failed), (5, 3));
+    }
+
+    #[test]
+    fn ares_checkpoint_treats_any_foreign_or_broken_shape_as_start_fresh() {
+        for bad in [
+            json!({}),
+            json!({ "phase": "crawl", "records": {} }),
+            json!({ "phase": "ares" }),                 // no records object
+            json!({ "phase": "ares", "records": [] }),  // wrong records type
+            json!("nonsense"),
+        ] {
+            assert!(
+                AresCheckpoint::from_value(&bad).is_none(),
+                "must start fresh on {bad}"
+            );
+        }
+        // A snapshot from an older writer without the counters still resumes:
+        // the records themselves are the lookups already paid for.
+        let partial = json!({ "phase": "ares", "records": { "00000001": { "name": "A" } } });
+        let c = AresCheckpoint::from_value(&partial).expect("decodes");
+        assert_eq!((c.records.len(), c.looked_up, c.failed), (1, 1, 0));
+    }
 
     fn cell(salaries: &[f64]) -> Cell {
         let mut c = Cell::default();

@@ -47,12 +47,12 @@
 //! detail corpus. Money fields follow the shared honest-Null rule ($0, prose,
 //! absent → Null, never a fabricated zero).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use pumper_core::{
-    AppContext, AppManifest, CostClass, Error, HttpMethod, HttpRequest, ManifestExample, Result,
-    ScrapeApp,
+    AppContext, AppManifest, CostClass, Error, HttpMethod, HttpRequest, ManifestExample,
+    Provenance, Result, ScrapeApp,
 };
 use serde_json::{json, Value};
 
@@ -283,7 +283,21 @@ impl ScrapeApp for GrantsGov {
             })
             .collect();
 
-        let summary = ctx.upsert_many("opportunities", &items).await?;
+        // Provenance (M12): every page of this batch was fetched from the one
+        // Search2 endpoint, so the batch-level `source_url` is a fact, not a
+        // guess. `artifact_sha`/`rules_hash` stay Null — the hits are stored
+        // verbatim, no RuleSet extracted them, and the saved artifact is only
+        // page 1, not the body behind each record.
+        let summary = ctx
+            .upsert_many_with_provenance(
+                "opportunities",
+                &items,
+                Provenance {
+                    source_url: Some(SEARCH2_URL.to_string()),
+                    ..Provenance::default()
+                },
+            )
+            .await?;
 
         // NOFO detail harvest (default OFF): only the delta this sync surfaced —
         // new + changed keys — ever triggers a fetchOpportunity call, capped per
@@ -302,39 +316,67 @@ impl ScrapeApp for GrantsGov {
         let mut details_out: Option<Value> = None;
         let mut details_warning: Option<String> = None;
         if harvest_details {
-            let (delta, capped) = capped_delta(&summary.new, &summary.changed, max_details);
-            let delta_total = summary.new.len() + summary.changed.len();
+            // Durable execution (M23). The harvest is the only genuinely long,
+            // resumable unit here: one governor-paced fetchOpportunity call per
+            // delta key, up to `maxDetailsPerRun`. It is also the stage a
+            // restart would silently ZERO — on a re-claim the listing re-syncs,
+            // every opportunity reads back `unchanged`, and the delta collapses
+            // to empty. So the checkpoint carries the delta itself, not just a
+            // cursor, and progress is flushed to the dataset before it is
+            // recorded as done.
+            let resumed = restored_harvest(ctx.restore());
+            let (delta, capped, delta_total) = match &resumed {
+                Some(state) => (state.delta.clone(), state.capped, state.delta_total),
+                None => {
+                    let (delta, capped) =
+                        capped_delta(&summary.new, &summary.changed, max_details);
+                    (delta, capped, summary.new.len() + summary.changed.len())
+                }
+            };
+            let mut done: HashSet<String> =
+                resumed.map(|s| s.done).unwrap_or_default().into_iter().collect();
+            let resumed_count = done.len();
+
             let by_key: HashMap<&str, &Value> =
                 items.iter().map(|(k, v)| (k.as_str(), v)).collect();
-            let mut detail_items: Vec<(String, Value)> = Vec::new();
-            for (i, key) in delta.iter().enumerate() {
-                let detail = fetch_detail(&ctx, key, i == 0).await?;
-                detail_items.push((
+            let mut buffer: Vec<(String, Value)> = Vec::new();
+            let mut first_fetch = resumed_count == 0;
+            let pending: Vec<String> = delta
+                .iter()
+                .filter(|k| !done.contains(k.as_str()))
+                .cloned()
+                .collect();
+            for key in &pending {
+                let detail = fetch_detail(&ctx, key, first_fetch).await?;
+                first_fetch = false;
+                buffer.push((
                     key.clone(),
                     detail_record(key, by_key.get(key.as_str()).copied(), &detail),
                 ));
+                if buffer.len() >= DETAIL_FLUSH {
+                    flush_details(&ctx, &mut buffer, &mut done).await?;
+                    ctx.checkpoint(harvest_state(&delta, &done, capped, delta_total))
+                        .await;
+                }
             }
-            if !detail_items.is_empty() {
-                ctx.datasets
-                    .upsert_many(
-                        grants_common::UNIFIED_APP,
-                        grants_common::DETAILS_DATASET,
-                        &detail_items,
-                    )
-                    .await?;
-            }
+            flush_details(&ctx, &mut buffer, &mut done).await?;
+            // Final snapshot is unthrottled: losing it costs a whole re-harvest.
+            ctx.checkpoint_now(harvest_state(&delta, &done, capped, delta_total))
+                .await;
+
             if capped {
                 details_warning = Some(format!(
                     "detail harvest capped: fetched {} of {delta_total} new/changed \
                      opportunities (maxDetailsPerRun={max_details}) — the rest will be \
                      picked up as they change, or raise the cap",
-                    detail_items.len()
+                    done.len()
                 ));
             }
             details_out = Some(json!({
-                "harvested": detail_items.len(),
+                "harvested": done.len(),
                 "deltaTotal": delta_total,
                 "capped": capped,
+                "resumedFrom": resumed_count,
             }));
         }
 
@@ -344,7 +386,8 @@ impl ScrapeApp for GrantsGov {
             .iter()
             .filter_map(grants_common::normalize_grants_gov)
             .collect();
-        let cross = grants_common::finalize_unified(&ctx, &unified_items).await?;
+        let cross =
+            grants_common::finalize_unified(&ctx, &unified_items, Some(SEARCH2_URL)).await?;
 
         // Closing-soon digest: posted opportunities whose closeDate falls within
         // the next `digestDays` days, soonest first — the deadline-alert surface
@@ -459,6 +502,112 @@ const FETCH_OPPORTUNITY_URL: &str = "https://api.grants.gov/v1/api/fetchOpportun
 /// metadata for a later fetch pass, never fetched in v1.
 const ATTACHMENT_DOWNLOAD_BASE: &str =
     "https://apply07.grants.gov/grantsws/rest/opportunity/att/download";
+
+/// Detail records buffered before a dataset flush. The flush is what makes a
+/// key durable, so this also bounds how much work a crash can cost (one
+/// governor-paced fetch each).
+const DETAIL_FLUSH: usize = 25;
+
+/// Checkpoint schema version — a stored snapshot from a different shape is
+/// treated as "start fresh", never as an error (the sink is advisory).
+const HARVEST_STATE_VERSION: u64 = 1;
+
+/// A prior attempt's detail-harvest progress, as restored from the checkpoint.
+struct HarvestState {
+    delta: Vec<String>,
+    done: Vec<String>,
+    capped: bool,
+    delta_total: usize,
+}
+
+/// The checkpoint payload: the delta this run committed to harvesting, and how
+/// far it got. Small by construction — ids only, never record bodies.
+fn harvest_state(
+    delta: &[String],
+    done: &HashSet<String>,
+    capped: bool,
+    delta_total: usize,
+) -> Value {
+    // Sorted so the snapshot is stable across flushes (a HashSet is not).
+    let mut done: Vec<&String> = done.iter().collect();
+    done.sort();
+    json!({
+        "v": HARVEST_STATE_VERSION,
+        "stage": "details",
+        "delta": delta,
+        "done": done,
+        "capped": capped,
+        "deltaTotal": delta_total,
+    })
+}
+
+/// Reads a restored checkpoint back, tolerating ANY stored shape: a version
+/// bump, a missing field, or a snapshot with no remaining delta all mean
+/// "start fresh" rather than a failed run.
+fn restored_harvest(state: Option<&Value>) -> Option<HarvestState> {
+    let state = state?;
+    if state.get("v").and_then(Value::as_u64) != Some(HARVEST_STATE_VERSION)
+        || state.get("stage").and_then(Value::as_str) != Some("details")
+    {
+        return None;
+    }
+    let strings = |key: &str| -> Vec<String> {
+        state
+            .get(key)
+            .and_then(Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(Value::as_str)
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let delta = strings("delta");
+    if delta.is_empty() {
+        return None;
+    }
+    Some(HarvestState {
+        done: strings("done"),
+        capped: state.get("capped").and_then(Value::as_bool).unwrap_or(false),
+        delta_total: state
+            .get("deltaTotal")
+            .and_then(Value::as_u64)
+            .unwrap_or(delta.len() as u64) as usize,
+        delta,
+    })
+}
+
+/// Writes the buffered detail records and marks their keys done. Stamped with
+/// the fetchOpportunity endpoint the whole buffer was fetched from (M12) —
+/// per-record bodies differ only by the POSTed id, so the URL is shared and
+/// honest.
+async fn flush_details(
+    ctx: &AppContext,
+    buffer: &mut Vec<(String, Value)>,
+    done: &mut HashSet<String>,
+) -> Result<()> {
+    if buffer.is_empty() {
+        return Ok(());
+    }
+    ctx.datasets
+        .upsert_many_stamped(
+            grants_common::UNIFIED_APP,
+            grants_common::DETAILS_DATASET,
+            buffer,
+            None,
+            Some(&Provenance {
+                job_id: Some(ctx.job_id.to_string()),
+                source_url: Some(FETCH_OPPORTUNITY_URL.to_string()),
+                ..Provenance::default()
+            }),
+        )
+        .await?;
+    for (key, _) in buffer.drain(..) {
+        done.insert(key);
+    }
+    Ok(())
+}
 
 /// The new-then-changed delta keys the detail harvest will fetch, honestly
 /// capped: returns (keys to fetch, whether the cap truncated the delta).
@@ -925,6 +1074,48 @@ mod tests {
         // Exactly at the cap is not a truncation.
         let (_, capped) = capped_delta(&new, &changed, 4);
         assert!(!capped);
+    }
+
+    // ---- durable detail harvest (M23) ----
+
+    #[test]
+    fn harvest_state_round_trips_and_resumes_where_it_stopped() {
+        let delta = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        let done: HashSet<String> = ["b".to_string()].into_iter().collect();
+        let snap = harvest_state(&delta, &done, true, 9);
+        let restored = restored_harvest(Some(&snap)).expect("round-trips");
+        assert_eq!(restored.delta, delta);
+        assert_eq!(restored.done, vec!["b".to_string()]);
+        assert!(restored.capped);
+        assert_eq!(restored.delta_total, 9);
+        // The remaining work is the delta minus what already landed — the whole
+        // point: a re-claimed run must not re-fetch `b`.
+        let remaining: Vec<&String> = restored
+            .delta
+            .iter()
+            .filter(|k| !restored.done.contains(k))
+            .collect();
+        assert_eq!(remaining, vec!["a", "c"]);
+    }
+
+    #[test]
+    fn restored_harvest_treats_any_foreign_shape_as_start_fresh() {
+        assert!(restored_harvest(None).is_none());
+        // Another app's / another version's snapshot.
+        assert!(restored_harvest(Some(&json!({ "frontier": [] }))).is_none());
+        assert!(restored_harvest(Some(&json!({ "v": 99, "stage": "details", "delta": ["a"] })))
+            .is_none());
+        assert!(restored_harvest(Some(&json!({ "v": 1, "stage": "listing", "delta": ["a"] })))
+            .is_none());
+        // A snapshot with nothing left to do is not a resume.
+        assert!(restored_harvest(Some(&json!({ "v": 1, "stage": "details", "delta": [] })))
+            .is_none());
+        // Missing optional fields default rather than failing.
+        let partial = json!({ "v": 1, "stage": "details", "delta": ["a", "b"] });
+        let restored = restored_harvest(Some(&partial)).expect("tolerated");
+        assert!(restored.done.is_empty());
+        assert!(!restored.capped);
+        assert_eq!(restored.delta_total, 2);
     }
 
     #[test]

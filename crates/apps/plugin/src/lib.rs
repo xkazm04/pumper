@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use futures::StreamExt;
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, FetchRequest, FetchStrategy, ManifestExample,
-    Record, Result, ScrapeApp,
+    Provenance, Record, Result, ScrapeApp,
 };
 use serde_json::{json, Value};
 
@@ -32,6 +32,55 @@ fn plugin_params(ctx: &AppContext) -> Value {
         .get("plugin_params")
         .cloned()
         .unwrap_or(Value::Null)
+}
+
+/// The `rules_hash` pin (M12) for a plugin run, or `None` when this deployment
+/// cannot state one honestly.
+///
+/// The "rules" that produced a plugin record are the WASM module plus the
+/// per-job `plugin_params` envelope, so the registered pin is
+/// `{plugin, version, params}` — and it is registered ONLY when the module
+/// self-describes a `version` (`describe` export). Without a version, a pin
+/// keyed on the plugin *name* would claim re-derivability across silently
+/// swapped .wasm builds — exactly the fabrication `Provenance`'s honest-Null
+/// contract forbids — so an undescribed plugin leaves `rules_hash` Null.
+async fn plugin_rules_hash(ctx: &AppContext, plugin: &str) -> Option<String> {
+    let version = ctx
+        .plugins
+        .manifests()
+        .into_iter()
+        .find(|m| m.get("name").and_then(Value::as_str) == Some(plugin))
+        .and_then(|m| m.get("version").cloned())
+        .filter(|v| !v.is_null())?;
+    let pin = json!({
+        "plugin": plugin,
+        "version": version,
+        "params": plugin_params(ctx),
+    });
+    // Best-effort: provenance is additive, and a registry write failure must
+    // never fail a working plugin run.
+    ctx.register_rules(&pin).await.ok()
+}
+
+/// The one source URL every document in this batch came from, or `None` when the
+/// batch spans several. A batch-level `source_url` may only be claimed when it
+/// is true of every record in it.
+fn single_source_url(metas: &[DocMeta]) -> Option<String> {
+    let first = metas.first()?.url.as_str();
+    metas
+        .iter()
+        .all(|m| m.url == first)
+        .then(|| first.to_string())
+}
+
+/// The batch stamp for a plugin upsert: the run's rules pin plus a source URL
+/// only when the whole batch shares one.
+fn batch_provenance(metas: &[DocMeta], rules_hash: Option<&str>) -> Provenance {
+    Provenance {
+        rules_hash: rules_hash.map(str::to_string),
+        source_url: single_source_url(metas),
+        ..Provenance::default()
+    }
 }
 
 /// Pure param parse for [`concurrency`] — clamps `concurrency` to `>= 1`,
@@ -61,6 +110,56 @@ pub(crate) const VERSIONS_DATASET: &str = "page_versions";
 /// Cap on the per-key `missing_keys` echo in a backfill result — a large archive
 /// could otherwise blow up the stored job result; `missing` keeps the full count.
 const MISSING_ECHO_LIMIT: usize = 100;
+
+/// Backfill checkpoint blob version — bump on shape change; a mismatch restores
+/// fresh (a full re-scan is correct; a mis-resumed cursor silently skips rows).
+const BACKFILL_STATE_VERSION: u32 = 1;
+
+/// The resumable state of a backfill run (M23): the `page_versions` keyset
+/// cursor plus the running tallies. `missing_keys` is deliberately NOT carried —
+/// it is a per-attempt diagnostic, and reporting a prior attempt's unreadable
+/// artifacts as this one's observations would be a fabrication.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize, PartialEq)]
+struct BackfillState {
+    v: u32,
+    /// Keyset cursor `(updated_at-as-stored, key)` of the last committed page.
+    #[serde(default)]
+    after: Option<(String, String)>,
+    #[serde(default)]
+    scanned: usize,
+    #[serde(default)]
+    skipped_pattern: usize,
+    #[serde(default)]
+    loaded: usize,
+    #[serde(default)]
+    ran: usize,
+    #[serde(default)]
+    batches: usize,
+    #[serde(default)]
+    new: usize,
+    #[serde(default)]
+    changed: usize,
+    #[serde(default)]
+    unchanged: usize,
+}
+
+impl BackfillState {
+    /// Advisory restore: anything that isn't a current-version state restarts
+    /// the scan from the top rather than erroring.
+    fn restore(restored: Option<&Value>) -> Self {
+        restored
+            .and_then(|v| serde_json::from_value::<BackfillState>(v.clone()).ok())
+            .filter(|s| s.v == BACKFILL_STATE_VERSION)
+            .unwrap_or(BackfillState {
+                v: BACKFILL_STATE_VERSION,
+                ..BackfillState::default()
+            })
+    }
+
+    fn to_value(&self) -> Value {
+        serde_json::to_value(self).unwrap_or(Value::Null)
+    }
+}
 
 /// Output-record identity for one input document: the record key, the natural
 /// source URL, and (for archived versions) the observation timestamp. Historical
@@ -299,10 +398,13 @@ impl ScrapeApp for Plugin {
 
         // Two input modes: fetch live `urls`, or read stored bodies from a
         // crawl→dataset `source`. Exactly one is required.
+        let rules_hash = plugin_rules_hash(&ctx, &plugin).await;
         if ctx.params.get("source").is_some() {
-            self.run_source_mode(&ctx, &plugin, &dataset).await
+            self.run_source_mode(&ctx, &plugin, &dataset, rules_hash.as_deref())
+                .await
         } else {
-            self.run_urls_mode(&ctx, &plugin, &dataset).await
+            self.run_urls_mode(&ctx, &plugin, &dataset, rules_hash.as_deref())
+                .await
         }
     }
 }
@@ -310,7 +412,13 @@ impl ScrapeApp for Plugin {
 impl Plugin {
     /// URLs mode: fetch each URL (tiered) and run the plugin over it — fetch and
     /// plugin execution pipelined per URL.
-    async fn run_urls_mode(&self, ctx: &AppContext, plugin: &str, dataset: &str) -> Result<Value> {
+    async fn run_urls_mode(
+        &self,
+        ctx: &AppContext,
+        plugin: &str,
+        dataset: &str,
+        rules_hash: Option<&str>,
+    ) -> Result<Value> {
         let urls: Vec<String> = ctx
             .params
             .get("urls")
@@ -376,7 +484,9 @@ impl Plugin {
         let ran = results.iter().filter(|r| r.get("error").is_none()).count();
         let metas: Vec<DocMeta> = urls.iter().map(|u| DocMeta::live(u.clone())).collect();
         let items = upsert_items(&metas, &mut results);
-        let summary = ctx.upsert_many(dataset, &items).await?;
+        let summary = ctx
+            .upsert_many_with_provenance(dataset, &items, batch_provenance(&metas, rules_hash))
+            .await?;
 
         Ok(json!({
             "mode": "urls",
@@ -398,6 +508,7 @@ impl Plugin {
         ctx: &AppContext,
         plugin: &str,
         dataset: &str,
+        rules_hash: Option<&str>,
     ) -> Result<Value> {
         let source = ctx
             .params
@@ -436,7 +547,9 @@ impl Plugin {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            return self.run_backfill(ctx, plugin, dataset, &src_app).await;
+            return self
+                .run_backfill(ctx, plugin, dataset, &src_app, rules_hash)
+                .await;
         }
         let as_of = source
             .get("as_of")
@@ -551,7 +664,9 @@ impl Plugin {
         let loaded = metas.len();
         let ran = results.iter().filter(|r| r.get("error").is_none()).count();
         let items = upsert_items(&metas, &mut results);
-        let summary = ctx.upsert_many(dataset, &items).await?;
+        let summary = ctx
+            .upsert_many_with_provenance(dataset, &items, batch_provenance(&metas, rules_hash))
+            .await?;
 
         Ok(json!({
             "mode": "source",
@@ -615,6 +730,7 @@ impl Plugin {
         plugin: &str,
         dataset: &str,
         src_app: &str,
+        rules_hash: Option<&str>,
     ) -> Result<Value> {
         let pattern = ctx
             .params
@@ -625,14 +741,21 @@ impl Plugin {
             })
             .transpose()?;
 
-        let mut after: Option<(String, String)> = None;
-        let mut scanned = 0usize;
-        let mut skipped_pattern = 0usize;
-        let mut loaded = 0usize;
-        let mut ran = 0usize;
-        let mut batches = 0usize;
+        // Durable execution (M23): backfill is the one genuinely long plugin
+        // mode — it pages the WHOLE `page_versions` archive, running the module
+        // and upserting per batch. The resumable unit is the keyset cursor plus
+        // the running tallies, so a reap resumes at the next page instead of
+        // re-running the plugin over every archived revision from the start.
+        let mut st = BackfillState::restore(ctx.restore());
+        let resumed = st.after.is_some();
+        let mut after: Option<(String, String)> = st.after.clone();
+        let mut scanned = st.scanned;
+        let mut skipped_pattern = st.skipped_pattern;
+        let mut loaded = st.loaded;
+        let mut ran = st.ran;
+        let mut batches = st.batches;
         let mut missing: Vec<Value> = Vec::new();
-        let (mut new, mut changed, mut unchanged) = (0usize, 0usize, 0usize);
+        let (mut new, mut changed, mut unchanged) = (st.new, st.changed, st.unchanged);
         loop {
             let batch = ctx
                 .datasets
@@ -686,11 +809,32 @@ impl Plugin {
                 let (metas, mut results) = self.run_plugin_batch(ctx, plugin, keyed).await;
                 ran += results.iter().filter(|r| r.get("error").is_none()).count();
                 let items = upsert_items(&metas, &mut results);
-                let summary = ctx.upsert_many(dataset, &items).await?;
+                let summary = ctx
+                    .upsert_many_with_provenance(
+                        dataset,
+                        &items,
+                        batch_provenance(&metas, rules_hash),
+                    )
+                    .await?;
                 new += summary.new.len();
                 changed += summary.changed.len();
                 unchanged += summary.unchanged;
             }
+            // Cursor + tallies AFTER the batch's writes committed, so a resume
+            // never re-runs a page and never double-counts one.
+            st = BackfillState {
+                v: BACKFILL_STATE_VERSION,
+                after: after.clone(),
+                scanned,
+                skipped_pattern,
+                loaded,
+                ran,
+                batches,
+                new,
+                changed,
+                unchanged,
+            };
+            ctx.checkpoint(st.to_value()).await;
             if short {
                 break;
             }
@@ -700,6 +844,7 @@ impl Plugin {
         missing.truncate(MISSING_ECHO_LIMIT);
         Ok(json!({
             "mode": "backfill",
+            "resumed_from_checkpoint": resumed,
             "plugin": plugin,
             "source": { "app": src_app, "dataset": VERSIONS_DATASET },
             "scanned": scanned,
@@ -740,8 +885,41 @@ fn upsert_items(metas: &[DocMeta], results: &mut [Value]) -> Vec<(String, Value)
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_concurrency, pick_as_of, versioned_key, DEFAULT_CONCURRENCY};
+    use super::{
+        batch_provenance, parse_concurrency, pick_as_of, versioned_key, DocMeta,
+        DEFAULT_CONCURRENCY,
+    };
     use serde_json::json;
+
+    #[test]
+    fn batch_source_url_is_claimed_only_when_every_doc_shares_one() {
+        let one = [DocMeta::live("https://a/x".into())];
+        let mixed = [
+            DocMeta::live("https://a/x".into()),
+            DocMeta::live("https://a/y".into()),
+        ];
+        assert_eq!(
+            batch_provenance(&one, Some("deadbeef")).source_url.as_deref(),
+            Some("https://a/x")
+        );
+        // Naming one URL of many would be a fabrication on the other records.
+        assert_eq!(batch_provenance(&mixed, Some("deadbeef")).source_url, None);
+        // An empty batch knows nothing.
+        assert_eq!(batch_provenance(&[], Some("deadbeef")).source_url, None);
+    }
+
+    #[test]
+    fn an_undescribed_plugin_leaves_the_rules_pin_null() {
+        // `plugin_rules_hash` returns None when the module doesn't self-describe
+        // a version; the stamp must then carry no pin rather than one keyed on a
+        // plugin NAME, which would claim re-derivability across swapped builds.
+        let metas = [DocMeta::live("https://a/x".into())];
+        let prov = batch_provenance(&metas, None);
+        assert!(prov.rules_hash.is_none());
+        assert!(!prov.replayable());
+        // …but the URL it does know is still stated.
+        assert_eq!(prov.source_url.as_deref(), Some("https://a/x"));
+    }
 
     #[test]
     fn versioned_key_uses_date_part() {

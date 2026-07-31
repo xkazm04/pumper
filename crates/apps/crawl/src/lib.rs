@@ -9,12 +9,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
+use pumper_core::datasets::Provenance;
 use pumper_core::{
     crawl, AppContext, AppManifest, CostClass, CrawlConfig, CrawlPageRecord, Datasets, Error,
     HttpClient, HttpRequest, HttpResponse, ManifestExample, PageSink, PageSource, Result,
     RevisitCadence, RevisitSeed, ScrapeApp,
 };
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 pub mod link_graph;
 pub mod reliability;
@@ -168,6 +170,13 @@ fn versioned_artifact_name(artifact_path: &str, revision: i64) -> String {
     }
 }
 
+/// sha256 (hex) of an archived page body — the value stamped as
+/// [`Provenance::artifact_sha`], and the same digest form the rest of the
+/// platform uses for content addressing.
+fn body_sha(bytes: &[u8]) -> String {
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 /// [`PageSink`] that upserts each batch of kept-page fingerprints into the
 /// `pages` dataset (key = canonical URL). Uses `upsert_many` — partial-batch
 /// semantics, never `sync_many` (a crawl is a partial view, not a full snapshot,
@@ -192,6 +201,24 @@ struct DatasetPageSink {
 }
 
 impl DatasetPageSink {
+    /// The batch-level derivation stamp (M12) for this sink's writes: the
+    /// producing job, and nothing else.
+    ///
+    /// A batch spans many pages, so a batch-level `source_url` would be a
+    /// fabrication — and it would also be redundant: a `pages`/`edges` record's
+    /// key IS its URL (`{url}` / `{from}|{to}`), so the per-record source is
+    /// already recoverable without inventing one. Per-record stamping here
+    /// would mean one write transaction per crawled page on the platform's
+    /// highest-volume write path — the exact amplification `upsert_many`'s
+    /// chunked commits exist to avoid. `rules_hash` stays `None`: a crawl runs
+    /// no RuleSet, it fingerprints whole bodies.
+    fn job_prov(&self) -> Provenance {
+        Provenance {
+            job_id: Some(self.job_id.clone()),
+            ..Provenance::default()
+        }
+    }
+
     /// Archives the CHANGED keys of one upsert batch into the versioned crawl
     /// archive: copy `page-<hex>.html` → `page-<hex>.r{revision}.html` and upsert
     /// a `page_versions` record keyed `{url}#{revision}` (artifact path, simhash,
@@ -200,7 +227,13 @@ impl DatasetPageSink {
     /// only when a page actually changes. Best-effort like the rest of the sink:
     /// an archive failure warns and skips, never fails the crawl.
     async fn archive_changed(&self, changed: &[String], meta: &HashMap<String, (String, u64)>) {
-        let mut versions: Vec<(String, Value)> = Vec::new();
+        // (key, value, artifact sha) — the archive is the ONE crawl write path
+        // whose per-record derivation facts are genuinely known and not already
+        // in the key: the page URL behind `{url}#{revision}`, and the sha256 of
+        // the exact body copy this record points at. Volume is changed pages
+        // only, and this path already does a per-record history read + file
+        // write, so per-record stamping adds no new write pattern.
+        let mut versions: Vec<(String, Value, String)> = Vec::new();
         for url in changed {
             let Some((artifact_path, simhash)) = meta.get(url) else {
                 continue; // not in this batch (shouldn't happen) — nothing to copy
@@ -223,8 +256,20 @@ impl DatasetPageSink {
             let versioned = versioned_artifact_name(artifact_path, rev.revision);
             let src = self.artifacts_dir.join(artifact_path);
             let dst = self.artifacts_dir.join(&versioned);
-            if let Err(e) = tokio::fs::copy(&src, &dst).await {
-                tracing::warn!(url = %url, path = %src.display(),
+            // Read → hash → write rather than `fs::copy`: the copy has to touch
+            // every byte anyway, so the sha256 of the archived body is free here
+            // and turns the revision into a content-addressed one (M12).
+            let body = match tokio::fs::read(&src).await {
+                Ok(b) => b,
+                Err(e) => {
+                    tracing::warn!(url = %url, path = %src.display(),
+                        "crawl version archive: artifact read failed: {e}");
+                    continue;
+                }
+            };
+            let sha = body_sha(&body);
+            if let Err(e) = tokio::fs::write(&dst, &body).await {
+                tracing::warn!(url = %url, path = %dst.display(),
                     "crawl version archive: artifact copy failed: {e}");
                 continue;
             }
@@ -239,24 +284,45 @@ impl DatasetPageSink {
                     "job_id": self.job_id,
                     "simhash": simhash,
                     "fetched_at": rev.created_at.to_rfc3339(),
+                    // Content address of the archived body this record points
+                    // at — the same value stamped as the revision's
+                    // `artifact_sha`, kept in the record too so a reader that
+                    // has the row can verify the file without the ledger.
+                    "artifact_sha": sha,
                 }),
+                sha,
             ));
         }
         if versions.is_empty() {
             return;
         }
-        match self
-            .datasets
-            .upsert_many(&self.app, VERSIONS_DATASET, &versions)
-            .await
-        {
-            Ok(_) => {
-                self.counts
-                    .versions_archived
-                    .fetch_add(versions.len(), Ordering::Relaxed);
+        let mut archived = 0usize;
+        for (key, value, sha) in &versions {
+            let prov = Provenance {
+                job_id: Some(self.job_id.clone()),
+                // The page URL itself — a real per-record fact, and NOT the
+                // record key here (the key carries the `#revision` suffix).
+                source_url: value.get("url").and_then(Value::as_str).map(String::from),
+                artifact_sha: Some(sha.clone()),
+                // No RuleSet extracted this record: the crawl archives whole
+                // bodies. `None` = unknown, never a fabricated pin.
+                rules_hash: None,
+            };
+            match self
+                .datasets
+                .upsert_stamped(&self.app, VERSIONS_DATASET, key, value, None, Some(&prov))
+                .await
+            {
+                Ok(_) => archived += 1,
+                Err(e) => {
+                    tracing::warn!(job = %self.job_id, key = %key,
+                        "crawl page_versions upsert failed: {e}")
+                }
             }
-            Err(e) => tracing::warn!(job = %self.job_id, "crawl page_versions upsert failed: {e}"),
         }
+        self.counts
+            .versions_archived
+            .fetch_add(archived, Ordering::Relaxed);
     }
 }
 
@@ -338,8 +404,16 @@ impl PageSink for DatasetPageSink {
                 ));
             }
         }
+        // One derivation stamp per batch write (M12): the producing job. See
+        // `job_prov` for why per-record source URLs are deliberately not
+        // stamped on these paths.
+        let prov = self.job_prov();
         if !live.is_empty() {
-            match self.datasets.upsert_many(&self.app, "pages", &live).await {
+            match self
+                .datasets
+                .upsert_many_stamped(&self.app, "pages", &live, None, Some(&prov))
+                .await
+            {
                 Ok(summary) => {
                     self.counts
                         .new
@@ -360,14 +434,22 @@ impl PageSink for DatasetPageSink {
             }
         }
         if !gone.is_empty() {
-            if let Err(e) = self.datasets.upsert_many(&self.app, "pages", &gone).await {
+            if let Err(e) = self
+                .datasets
+                .upsert_many_stamped(&self.app, "pages", &gone, None, Some(&prov))
+                .await
+            {
                 tracing::warn!(job = %self.job_id, "crawl gone-marker upsert failed: {e}");
             }
         }
         if !checks.is_empty() {
             // Deliberately NOT folded into new/changed counts: a cadence bump is
             // estimator bookkeeping, not observed content change.
-            match self.datasets.upsert_many(&self.app, "pages", &checks).await {
+            match self
+                .datasets
+                .upsert_many_stamped(&self.app, "pages", &checks, None, Some(&prov))
+                .await
+            {
                 Ok(_) => {
                     self.counts
                         .cadence_updates
@@ -384,7 +466,13 @@ impl PageSink for DatasetPageSink {
             // like the rest of the sink — a failure warns, never fails the crawl.
             match self
                 .datasets
-                .upsert_many(&self.app, link_graph::EDGES_DATASET, &edge_rows)
+                .upsert_many_stamped(
+                    &self.app,
+                    link_graph::EDGES_DATASET,
+                    &edge_rows,
+                    None,
+                    Some(&prov),
+                )
                 .await
             {
                 Ok(_) => {
@@ -481,7 +569,10 @@ impl ScrapeApp for Crawl {
          existing dataset prune API / janitor, no separate knob. Each kept \
          page's outbound links are persisted into the `edges` dataset (key \
          `{from_url}|{to_url}`; per-page out-degree cap 200, dropped counted) — \
-         the run's most-linked-to pages are echoed as `top_linked`."
+         the run's most-linked-to pages are echoed as `top_linked`. Every write \
+         is provenance-stamped with the producing job; archived `page_versions` \
+         revisions additionally carry the page URL and the sha256 of the exact \
+         archived body."
     }
 
     fn manifest(&self) -> AppManifest {
@@ -802,8 +893,10 @@ impl ScrapeApp for Crawl {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use super::{host_of, versioned_artifact_name, HostTally};
-    use pumper_core::{Error, HttpResponse, Result};
+    use pumper_core::testing::TempStore;
+    use pumper_core::{CrawlPageRecord, Error, HttpResponse, Result};
     use std::collections::HashMap;
 
     fn resp(status: u16, headers: &[(&str, &str)]) -> Result<HttpResponse> {
@@ -892,5 +985,130 @@ mod tests {
     fn rejects_empty_or_hostless() {
         assert_eq!(host_of("https:///just-a-path"), None);
         assert_eq!(host_of(""), None);
+    }
+
+    // ── provenance (M12) ────────────────────────────────────────────────────
+
+    const JOB: &str = "11111111-2222-3333-4444-555555555555";
+
+    fn page(url: &str, simhash: u64, artifact: &str) -> CrawlPageRecord {
+        CrawlPageRecord {
+            url: url.into(),
+            title: Some("t".into()),
+            status: 200,
+            content_chars: 10,
+            simhash,
+            excerpt: "x".into(),
+            artifact_path: artifact.into(),
+            depth: 0,
+            etag: None,
+            last_modified: None,
+            gone: false,
+            unchanged: false,
+            cadence: None,
+            links: vec!["https://example.com/b".into()],
+        }
+    }
+
+    /// Builds a sink over a temp store, with the page body already on disk
+    /// exactly as core's crawl would have written it.
+    async fn sink_over(store: &TempStore, body: &[u8], artifact: &str) -> DatasetPageSink {
+        let artifacts_dir = store.path().join("job-artifacts");
+        tokio::fs::create_dir_all(&artifacts_dir).await.unwrap();
+        tokio::fs::write(artifacts_dir.join(artifact), body)
+            .await
+            .unwrap();
+        DatasetPageSink {
+            datasets: Arc::new(store.datasets()),
+            app: "crawl".into(),
+            job_id: JOB.into(),
+            artifacts_dir,
+            counts: Arc::new(PageCounts::default()),
+            seed_data: Arc::new(Mutex::new(HashMap::new())),
+            edges: Arc::new(Mutex::new(link_graph::EdgeGraph::default())),
+        }
+    }
+
+    #[tokio::test]
+    async fn page_and_edge_writes_are_stamped_with_the_producing_job_only() {
+        let store = TempStore::new("crawl-prov-pages").await;
+        let datasets = store.datasets();
+        let mut sink = sink_over(&store, b"<html>one</html>", "page-a.html").await;
+        sink.emit(vec![page("https://example.com/a", 7, "page-a.html")])
+            .await;
+
+        let rev = datasets
+            .history("crawl", "pages", "https://example.com/a", 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(rev.provenance.job_id.as_deref(), Some(JOB));
+        // Honest-Null on a batch path: a batch spans many pages, and the key
+        // already IS the URL — a batch-level source_url would be invented.
+        assert!(rev.provenance.source_url.is_none());
+        assert!(rev.provenance.rules_hash.is_none());
+        assert!(rev.provenance.artifact_sha.is_none());
+
+        let edge = datasets
+            .history(
+                "crawl",
+                link_graph::EDGES_DATASET,
+                "https://example.com/a|https://example.com/b",
+                1,
+            )
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(edge.provenance.job_id.as_deref(), Some(JOB));
+        assert!(edge.provenance.source_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn archived_version_carries_source_url_and_the_body_sha() {
+        let store = TempStore::new("crawl-prov-versions").await;
+        let datasets = store.datasets();
+        let mut sink = sink_over(&store, b"<html>one</html>", "page-a.html").await;
+        sink.emit(vec![page("https://example.com/a", 7, "page-a.html")])
+            .await;
+
+        // Second sighting with a different fingerprint = a CHANGED page, which
+        // is what the version archive records.
+        let changed_body = b"<html>two</html>";
+        tokio::fs::write(sink.artifacts_dir.join("page-a.html"), changed_body)
+            .await
+            .unwrap();
+        sink.emit(vec![page("https://example.com/a", 9, "page-a.html")])
+            .await;
+
+        let versions = datasets.list("crawl", VERSIONS_DATASET, 10).await.unwrap();
+        assert_eq!(versions.len(), 1, "one archived revision");
+        let key = versions[0].key.clone();
+        assert!(key.starts_with("https://example.com/a#"));
+        let expected_sha = body_sha(changed_body);
+        assert_eq!(versions[0].data["artifact_sha"], json!(expected_sha));
+
+        let rev = datasets
+            .history("crawl", VERSIONS_DATASET, &key, 1)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(rev.provenance.job_id.as_deref(), Some(JOB));
+        // Per-record facts the archive genuinely knows: the page URL (NOT the
+        // `#revision`-suffixed key) and the sha of the body on disk.
+        assert_eq!(
+            rev.provenance.source_url.as_deref(),
+            Some("https://example.com/a")
+        );
+        assert_eq!(rev.provenance.artifact_sha.as_deref(), Some(&*expected_sha));
+        // No RuleSet extracted it, so the stamp must NOT claim replayability.
+        assert!(rev.provenance.rules_hash.is_none());
+        assert!(!rev.provenance.replayable());
+
+        // The archived copy is byte-identical to what was hashed.
+        let archived = versions[0].data["artifact_path"].as_str().unwrap();
+        let bytes = tokio::fs::read(sink.artifacts_dir.join(archived))
+            .await
+            .unwrap();
+        assert_eq!(body_sha(&bytes), expected_sha);
     }
 }

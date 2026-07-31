@@ -37,7 +37,9 @@
 //! consumers must keep it that way.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 
@@ -86,6 +88,50 @@ impl ScrapeApp for CensusBfs {
 
     fn default_params(&self) -> Value {
         json!({ "from_year": DEFAULT_FROM_YEAR })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "from_year": {
+                        "type": "string",
+                        "description": "First year of the requested series (`time=from+YYYY`). Needs >= 24 months of history for a T12M window plus its prior-year comparison."
+                    },
+                    "sectors": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "minItems": 1,
+                        "description": "BFS `category_code` values — NAICS SECTOR grain only (e.g. NAICS23, NAICS56). BFS publishes no state geography and no finer NAICS."
+                    },
+                    "api_key": {
+                        "type": "string",
+                        "description": "Free Census API key; falls back to env CENSUS_API_KEY."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Weekly refresh of both trade sectors from the default start year",
+                    params: json!({ "from_year": DEFAULT_FROM_YEAR }),
+                },
+                ManifestExample {
+                    description: "Construction sector only, deeper history",
+                    params: json!({ "from_year": "2018", "sectors": ["NAICS23"] }),
+                },
+            ],
+            output_shape: Some(
+                "{source, from_year, sectors: [{sector, label, monthly_cells, \
+                 velocity_records}], market_blend, formations: {records, new, changed, \
+                 unchanged}, formation_velocity: {records, new, changed, unchanged}} — \
+                 every record is US-national NAICS-sector grain \
+                 (grain=naics_sector_national); t12m fields stay Null until 12 months exist",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -372,6 +418,30 @@ pub fn compute_velocity(months: &[(String, f64)]) -> Velocity {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manifest must describe the params the app actually ships: every key
+    /// in `default_params` and in every worked example has to be a declared
+    /// property. A schema that drifts from its own canonical invocations is
+    /// worse than no schema — enqueue enforces it, so the drift shows up as a
+    /// 422 on the app's own documented call.
+    #[test]
+    fn manifest_declares_every_param_it_ships() {
+        let app = CensusBfs;
+        let m = app.manifest();
+        let schema = m.params_schema.expect("rich manifest declares a schema");
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema declares properties");
+        assert!(!m.examples.is_empty(), "a schema needs worked examples");
+        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let mut shipped = vec![app.default_params()];
+        shipped.extend(m.examples.iter().map(|e| e.params.clone()));
+        for params in shipped {
+            for key in params.as_object().expect("params are an object").keys() {
+                assert!(props.contains_key(key), "undeclared param '{key}'");
+            }
+        }
+    }
 
     fn series(spec: &[(&str, f64)]) -> Vec<(String, f64)> {
         spec.iter().map(|(p, v)| (p.to_string(), *v)).collect()

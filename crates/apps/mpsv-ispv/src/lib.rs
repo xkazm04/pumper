@@ -22,7 +22,10 @@
 //! `diferenciaceD1M`/`Q1M`/`Q3M`/`D9M` (monthly) and the hourly analogues.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Provenance, Result,
+    ScrapeApp,
+};
 use serde_json::{json, Value};
 
 pub struct MpsvIspv;
@@ -44,6 +47,34 @@ impl ScrapeApp for MpsvIspv {
     /// Quarterly (the source refreshes on annual/quarterly cycles).
     fn schedule(&self) -> Option<&'static str> {
         Some("0 0 7 1 */3 *")
+    }
+
+    /// The app reads NO params — the source is one fixed key-free document. The
+    /// schema says exactly that (empty `properties`, permissive
+    /// `additionalProperties` so a human can still pass a note), and the single
+    /// worked example is the scheduled invocation. Inventing knobs the code
+    /// never reads would be a lie an agent would act on.
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "description": "No parameters: the ISPV endpoint, keying and dataset are fixed.",
+                "properties": {},
+                "additionalProperties": true
+            })),
+            examples: vec![ManifestExample {
+                description: "Refresh the official ISPV wage anchor (the scheduled quarterly run; \
+                              also the way to pull a just-published vintage on demand)",
+                params: json!({}),
+            }],
+            output_shape: Some(
+                "{source, rows, stored, new, changed, unchanged} — `rows` is the raw `polozky` \
+                 count, `stored` the rows that carried a `czIsco` and were upserted into the \
+                 `wages` dataset (key `<czIsco>|<sfera>`, value = the whole source row)",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -68,7 +99,23 @@ impl ScrapeApp for MpsvIspv {
 
         let items = keyed_rows(&rows);
 
-        let summary = ctx.upsert_many("wages", &items).await?;
+        // Provenance (M12): every `wages` row is one object read out of THIS one
+        // document, so the batch-level `source_url` is literally the URL each
+        // record's content was fetched from — not an approximation. `rules_hash`
+        // stays Null: the extraction is Rust code (`keyed_rows`), not a
+        // registered RuleSet, so there is nothing replayable to pin.
+        // `artifact_sha` stays Null too: the saved artifact is a re-serialized
+        // pretty-print, not the byte-exact source body.
+        let summary = ctx
+            .upsert_many_with_provenance(
+                "wages",
+                &items,
+                Provenance {
+                    source_url: Some(URL.to_string()),
+                    ..Default::default()
+                },
+            )
+            .await?;
 
         Ok(json!({
             "source": "data.mpsv.cz/ispv-zamestnani",
@@ -113,6 +160,25 @@ mod tests {
 
     fn sample_rows() -> Vec<Value> {
         serde_json::from_str(SAMPLE).expect("sample parses")
+    }
+
+    /// The manifest claims this app takes no params. That claim must stay true:
+    /// if a param is ever read from `ctx.params`, the schema has to grow with it.
+    #[test]
+    fn manifest_declares_a_paramless_schema_with_a_worked_example() {
+        let m = MpsvIspv.manifest();
+        let schema = m.params_schema.expect("schema declared");
+        assert!(
+            schema["properties"]
+                .as_object()
+                .expect("properties object")
+                .is_empty(),
+            "app reads no params — declaring one would mislead an agent"
+        );
+        assert_eq!(m.examples.len(), 1);
+        assert_eq!(m.examples[0].params, json!({}));
+        // Scheduled runs enqueue default_params, which must satisfy the schema.
+        assert_eq!(MpsvIspv.default_params(), json!({}));
     }
 
     #[test]

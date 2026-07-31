@@ -55,8 +55,12 @@ use std::collections::BTreeMap;
 use std::io::Read as _;
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, ChangeKind, Error, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, ChangeKind, CostClass, Error, HttpRequest, ManifestExample,
+    Provenance, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 pub struct CmsFeeSchedule;
 
@@ -494,6 +498,13 @@ fn diff_schedules(
     })
 }
 
+/// sha256 (hex) of a byte body — the `Provenance.artifact_sha` convention.
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    format!("{:x}", hasher.finalize())
+}
+
 /// Downloads, extracts, parses and stores one release's PPRRVU corpus, returning
 /// the run-output `parse` block. Any error here is reported by the caller
 /// WITHOUT failing the watcher run.
@@ -509,6 +520,16 @@ async fn ingest_release(ctx: &AppContext, release: Release) -> Result<Value> {
     let release_id = release.id();
     ctx.save_artifact(&format!("pprrvu-{release_id}.csv"), csv.as_bytes())
         .await?;
+    // Provenance (M12): every row below is parsed from THIS CSV, archived beside
+    // the job — so both the URL it came from and the content hash of the stored
+    // body are known facts, not guesses. `rules_hash` stays Null: the column
+    // mapping is pinned Rust code, not a registered RuleSet.
+    let artifact_sha = sha256_hex(csv.as_bytes());
+    let prov = Provenance {
+        source_url: Some(release.zip_url()),
+        artifact_sha: Some(artifact_sha.clone()),
+        ..Provenance::default()
+    };
     let parsed = parse_pprrvu(&csv, &release_id)?;
 
     // Prior corpus BEFORE the upsert overwrites it — the diff's "before" side.
@@ -533,7 +554,9 @@ async fn ingest_release(ctx: &AppContext, release: Release) -> Result<Value> {
         .map(|(k, v)| (k.clone(), RvuRow::of(v)))
         .collect();
 
-    let summary = ctx.upsert_many("fee_schedule", &parsed.rows).await?;
+    let summary = ctx
+        .upsert_many_with_provenance("fee_schedule", &parsed.rows, prov.clone())
+        .await?;
     let diff = diff_schedules(
         &prev_map,
         &next_map,
@@ -542,13 +565,16 @@ async fn ingest_release(ctx: &AppContext, release: Release) -> Result<Value> {
         cf_before,
         parsed.conversion_factor,
     );
-    ctx.upsert("fee_schedule_changes", &release_id, &diff)
+    // The diff is computed from the new parse AND the previously stored corpus,
+    // so it carries the same artifact stamp as the rows it summarizes.
+    ctx.upsert_with_provenance("fee_schedule_changes", &release_id, &diff, prov)
         .await?;
 
     Ok(json!({
         "status": "ok",
         "release": release_id,
         "csv_entry": entry,
+        "artifact_sha": artifact_sha,
         "rows": parsed.rows.len(),
         "conversion_factor": parsed.conversion_factor,
         "upsert": { "new": summary.new.len(), "changed": summary.changed.len(),
@@ -587,6 +613,51 @@ impl ScrapeApp for CmsFeeSchedule {
         // permanently lit). A caller who knows what Counterbill has baked can still
         // pass `known_release` as an explicit override.
         json!({ "schedule": "pfs", "force": false })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "schedule": {
+                        "type": "string",
+                        "enum": ["pfs"],
+                        "description": "Fee schedule to watch. Only \"pfs\" (Physician Fee Schedule RVU files) is supported today; anything else is a run error, so the enum is the real contract."
+                    },
+                    "known_release": {
+                        "type": ["string", "null"],
+                        "description": "OPTIONAL baseline release id (e.g. \"RVU26A\") — what the consumer currently has baked. Omit to self-baseline off the release stored last run."
+                    },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Re-download and re-parse the latest release even when it is unchanged since last run (backfill / re-parse). Default false."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Monthly freshness check: detect the latest RVU release, self-baselining off the last one stored (the scheduled default)",
+                    params: json!({ "schedule": "pfs", "force": false }),
+                },
+                ManifestExample {
+                    description: "Re-parse the current release against an explicit baked baseline (backfill the fee_schedule corpus)",
+                    params: json!({ "schedule": "pfs", "known_release": "RVU26A", "force": true }),
+                },
+            ],
+            output_shape: Some(
+                "{schedule, latest_release, year, quarter, quarter_num, zip_url, source_url, \
+                 index_url, known_release, baseline, baseline_source, is_newer_than_known, \
+                 change_since_last_run, is_fresh, releases_found[], ingest: {release, zip_url, \
+                 source_url}, parse: {status: ok|skipped|error, rows?, conversion_factor?, \
+                 artifact_sha?, changes?, error?}, ingest_hint} — release watch in `releases`, \
+                 per-HCPCS RVUs in `fee_schedule`, release diffs in `fee_schedule_changes`",
+            ),
+            // Only the free http engine: an index page and a direct ZIP download.
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -660,7 +731,20 @@ impl ScrapeApp for CmsFeeSchedule {
             "zip_url": latest.zip_url(),
             "source_url": latest.source_url(),
         });
-        let change: ChangeKind = ctx.upsert("releases", schedule, &record).await?;
+        // The release record is derived from exactly one fetched page — the PFS
+        // index — so that URL is the honest stamp (the ZIP it points at has not
+        // been fetched at this point).
+        let change: ChangeKind = ctx
+            .upsert_with_provenance(
+                "releases",
+                schedule,
+                &record,
+                Provenance {
+                    source_url: Some(PFS_INDEX_URL.to_string()),
+                    ..Provenance::default()
+                },
+            )
+            .await?;
 
         // Is the detected latest newer than the effective baseline? A cold start
         // (no baseline) treats any detected release as actionable.
@@ -939,6 +1023,20 @@ G0008,,\"Admin influenza virus vac\",X,,0.00,0.61,,NA,,0.01,0.62,0.62,32.3465\n\
         // Garbage bytes are a loud typed error, not a panic.
         let err = extract_pprrvu_csv(b"not a zip").unwrap_err();
         assert!(err.to_string().contains("ZIP"), "{err}");
+    }
+
+    #[test]
+    fn artifact_sha_is_a_stable_sha256_of_the_archived_csv() {
+        // The stamp must be the plain sha256 hex of the exact bytes written as
+        // the artifact — a replay tool has to be able to re-derive it.
+        assert_eq!(
+            sha256_hex(b""),
+            "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        );
+        let a = sha256_hex(PPRRVU_SAMPLE.as_bytes());
+        assert_eq!(a.len(), 64);
+        assert_eq!(a, sha256_hex(PPRRVU_SAMPLE.as_bytes()), "deterministic");
+        assert_ne!(a, sha256_hex(format!("{PPRRVU_SAMPLE} ").as_bytes()));
     }
 
     // ── M32: release diff ───────────────────────────────────────────────────

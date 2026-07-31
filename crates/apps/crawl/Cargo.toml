@@ -12,3 +12,10 @@ tracing.workspace = true
 chrono.workspace = true
 # Version-archive artifact copies (async fs, no new runtime feature surface).
 tokio = { workspace = true, features = ["fs"] }
+# Provenance (M12): sha256 of the archived page body stamped on each
+# `page_versions` revision.
+sha2.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+pumper-core = { workspace = true, features = ["test-support"] }

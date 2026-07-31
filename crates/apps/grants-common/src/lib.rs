@@ -8,8 +8,22 @@
 //! near-duplicates (the same grant syndicated on two portals) are linked via
 //! SimHash into `grants/duplicate_links`.
 
-use pumper_core::{AppContext, Result, UpsertSummary};
+use pumper_core::{AppContext, Provenance, Result, UpsertSummary};
 use serde_json::{json, Value};
+
+/// Derivation stamp (M12) for a cross-source write. `job_id` is the one fact
+/// the runtime always knows; `source_url` is passed ONLY where the whole batch
+/// genuinely came from that one endpoint (a source app's listing URL). Derived
+/// writes — lifecycle events, the past-due sweep, duplicate links — are
+/// computed from many records, so they stamp job lineage and nothing else:
+/// naming one URL there would be a fabrication.
+fn stamp(ctx: &AppContext, source_url: Option<&str>) -> Provenance {
+    Provenance {
+        job_id: Some(ctx.job_id.to_string()),
+        source_url: source_url.map(str::to_string),
+        ..Provenance::default()
+    }
+}
 
 /// Virtual app namespace holding the cross-source datasets.
 pub const UNIFIED_APP: &str = "grants";
@@ -84,11 +98,16 @@ impl UnifiedOutcome {
 /// Shared so the sources cannot drift apart — before this, each app hand-rolled
 /// the same four calls, and one silently skipping the sweep (or linking at a
 /// different distance) would be invisible.
+///
+/// `source_url` is the source app's listing endpoint — the one URL this whole
+/// normalized batch was fetched from — stamped as provenance on the unified
+/// rows. Pass `None` when a caller cannot name a single honest URL.
 pub async fn finalize_unified(
     ctx: &AppContext,
     unified_items: &[(String, Value)],
+    source_url: Option<&str>,
 ) -> Result<UnifiedOutcome> {
-    let unified = sync_unified(ctx, unified_items).await?;
+    let unified = sync_unified(ctx, unified_items, source_url).await?;
     // Amendment radar: classify source-observed changes into typed lifecycle
     // events. Runs BEFORE the sweep so the two newest revisions per changed key
     // are guaranteed to be (prior source snapshot, new source snapshot) — a
@@ -284,10 +303,22 @@ fn sedia_close_date(deadline: &Value, today: chrono::NaiveDate) -> Option<String
     Some(chosen.to_string())
 }
 
-/// Upserts normalized grants into the cross-source unified dataset.
-pub async fn sync_unified(ctx: &AppContext, items: &[(String, Value)]) -> Result<UpsertSummary> {
+/// Upserts normalized grants into the cross-source unified dataset, stamping
+/// each revision with this job's id and (when the caller can name one honestly)
+/// the source listing URL the batch was fetched from.
+pub async fn sync_unified(
+    ctx: &AppContext,
+    items: &[(String, Value)],
+    source_url: Option<&str>,
+) -> Result<UpsertSummary> {
     ctx.datasets
-        .upsert_many(UNIFIED_APP, UNIFIED_DATASET, items)
+        .upsert_many_stamped(
+            UNIFIED_APP,
+            UNIFIED_DATASET,
+            items,
+            None,
+            Some(&stamp(ctx, source_url)),
+        )
         .await
 }
 
@@ -469,8 +500,15 @@ async fn record_events(ctx: &AppContext, summary: &UpsertSummary) -> Result<usiz
         }
     }
     if !items.is_empty() {
+        // Derived from revision history, not one fetched URL — job lineage only.
         ctx.datasets
-            .upsert_many(UNIFIED_APP, EVENTS_DATASET, &items)
+            .upsert_many_stamped(
+                UNIFIED_APP,
+                EVENTS_DATASET,
+                &items,
+                None,
+                Some(&stamp(ctx, None)),
+            )
             .await?;
     }
     Ok(items.len())
@@ -519,8 +557,15 @@ pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
         updates.push((rec.key, updated));
     }
     if !updates.is_empty() {
+        // An inferred closure, not a source publish: no source_url is honest here.
         ctx.datasets
-            .upsert_many(UNIFIED_APP, UNIFIED_DATASET, &updates)
+            .upsert_many_stamped(
+                UNIFIED_APP,
+                UNIFIED_DATASET,
+                &updates,
+                None,
+                Some(&stamp(ctx, None)),
+            )
             .await?;
     }
     Ok(updates.len())
@@ -591,8 +636,9 @@ pub async fn link_duplicates(ctx: &AppContext, max_distance: u32) -> Result<usiz
         })
         .collect();
     if !items.is_empty() {
+        // A SimHash pairing over the stored corpus — job lineage only.
         ctx.datasets
-            .upsert_many(UNIFIED_APP, DUP_DATASET, &items)
+            .upsert_many_stamped(UNIFIED_APP, DUP_DATASET, &items, None, Some(&stamp(ctx, None)))
             .await?;
     }
     Ok(items.len())

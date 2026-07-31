@@ -6,6 +6,8 @@ edition.workspace = true
 [dependencies]
 pumper-core.workspace = true
 async-trait.workspace = true
+# Checkpoint state blobs (M23) are derived Serialize/Deserialize structs.
+serde.workspace = true
 serde_json.workspace = true
 futures.workspace = true
 # Versioned-archive source mode: `as_of` timestamp comparison + backfill URL patterns.

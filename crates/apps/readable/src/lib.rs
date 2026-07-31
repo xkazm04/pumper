@@ -3,7 +3,10 @@
 //! HTML-to-Markdown preprocessing pipeline in one call.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, FetchRequest, FetchStrategy, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, FetchRequest, FetchStrategy, ManifestExample, Result,
+    ScrapeApp,
+};
 use serde_json::{json, Value};
 
 pub struct Readable;
@@ -19,7 +22,72 @@ impl ScrapeApp for Readable {
          to the `page.md` artifact; the result JSON is compact (set \"inline\": true \
          to also return the Markdown in the result). Params: \
          {\"url\": \"...\", \"strategy\": \"http|browser|auto|auto_with_research\", \
-         \"wait_for_selector\": \".article\", \"min_content_chars\": 250, \"inline\": false}"
+         \"wait_for_selector\": \".article\", \"min_content_chars\": 250, \"inline\": false, \
+         \"archive_max_age\": 604800 (accept a web-archive snapshot no older than N \
+         seconds instead of touching the live site), \"use_recipes\": false (try a \
+         learned JSON-API recipe for this host first)}"
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "required": ["url"],
+                "properties": {
+                    "url": { "type": "string", "pattern": "^https?://" },
+                    "strategy": {
+                        "type": "string",
+                        "enum": ["http", "browser", "auto", "auto_with_research"],
+                        "description": "Fetch ladder entry point (default \"auto\": http → browser)."
+                    },
+                    "wait_for_selector": {
+                        "type": "string",
+                        "description": "Browser tier only: CSS selector to await before capturing."
+                    },
+                    "min_content_chars": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Below this many extracted chars the tier is judged thin and the ladder escalates."
+                    },
+                    "inline": {
+                        "type": "boolean",
+                        "description": "Also return the Markdown in the job result (default false — it always lands in the page.md artifact)."
+                    },
+                    "archive_max_age": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Archive tier (default off): accept a web-archive snapshot captured within this many seconds INSTEAD of fetching the live page. Only for reads where a slightly stale body is fine (research/backfill); never for change detection."
+                    },
+                    "use_recipes": {
+                        "type": "boolean",
+                        "description": "Try a learned JSON-API recipe for this host ahead of the live tiers (default false). Useful on JS-heavy hosts the x-ray has already profiled."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Read one page as Markdown, escalating http → browser as needed",
+                    params: json!({ "url": "https://example.com/post", "strategy": "auto" }),
+                },
+                ManifestExample {
+                    description: "Cheap/polite historical read: accept a web-archive snapshot up \
+                                  to a week old rather than hitting the live site",
+                    params: json!({
+                        "url": "https://example.com/docs/pricing",
+                        "archive_max_age": 604800,
+                        "inline": true
+                    }),
+                },
+            ],
+            output_shape: Some(
+                "{url, engine (archive|http|browser|claude|api_recipe), status, escalations, \
+                 markdown_chars, artifact: \"page.md\", markdown?} — the document lives in the \
+                 page.md artifact unless `inline` was set",
+            ),
+            cost_class: CostClass::Metered,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -44,6 +112,17 @@ impl ScrapeApp for Readable {
             .get("min_content_chars")
             .and_then(Value::as_u64)
             .map(|n| n as usize);
+        // Archive tier (M18) + API recipes (M05), both per-request opt-in and
+        // absent by default — an unset param leaves the live ladder exactly as
+        // it was. `readable` is the one app in this group where a stale-but-cheap
+        // body is legitimately acceptable: it is a one-shot reader, not a monitor,
+        // so the caller decides how old a body they will take.
+        req.archive_max_age = ctx.params.get("archive_max_age").and_then(Value::as_u64);
+        req.use_recipes = ctx
+            .params
+            .get("use_recipes")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
 
         let mut outcome = ctx.fetch(req).await?;
 

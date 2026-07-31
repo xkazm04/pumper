@@ -588,7 +588,28 @@ impl AppContext {
         dataset: &str,
         items: &[(String, Value)],
     ) -> Result<UpsertSummary> {
-        let mut summary = self.upsert_many(dataset, items).await?;
+        self.sync_many_with_provenance(dataset, items, Provenance::default())
+            .await
+    }
+
+    /// [`sync_many`](Self::sync_many) carrying ONE batch-level provenance stamp.
+    ///
+    /// Full-snapshot syncers are exactly the apps whose whole batch *does* come
+    /// from one document, so a batch-level `source_url` is a fact for them
+    /// rather than an approximation. Without this variant they had to choose
+    /// between stamping nothing and hand-rolling the upsert — which would
+    /// bypass the degrading-source removal guard above. The same per-record
+    /// caveat applies: facts that differ per row belong in
+    /// [`upsert_with_provenance`](Self::upsert_with_provenance).
+    pub async fn sync_many_with_provenance(
+        &self,
+        dataset: &str,
+        items: &[(String, Value)],
+        prov: Provenance,
+    ) -> Result<UpsertSummary> {
+        let mut summary = self
+            .upsert_many_with_provenance(dataset, items, prov)
+            .await?;
         let state = self.health.enforced_state(&self.app, dataset).await;
         if state.suppresses_removals() {
             tracing::warn!(

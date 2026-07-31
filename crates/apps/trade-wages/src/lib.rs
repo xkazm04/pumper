@@ -26,7 +26,9 @@
 //! human flips `enabled` — there is NO auto-enable.
 
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, ResearchRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, CostClass, Error, ManifestExample, ResearchRequest, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 use trades_common::taxonomy;
 use trades_common::unified;
@@ -57,6 +59,53 @@ impl ScrapeApp for TradeWages {
 
     fn default_params(&self) -> Value {
         json!({ "year": DEFAULT_YEAR })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "year": {
+                        "type": "string",
+                        "description": "BLS OEWS vintage. Doubles as the freshness key — a vintage already held costs nothing."
+                    },
+                    "role": { "type": "string", "enum": ["research", "compose"] },
+                    "model": { "type": "string" },
+                    "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
+                    "max_turns": { "type": "integer", "minimum": 1 },
+                    "force": {
+                        "type": "boolean",
+                        "description": "Bypass the vintage freshness gate and re-pay the ~25-turn research run."
+                    },
+                    "propose_trade": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "TAXONOMY-PROPOSER mode: one metered call drafts a trades/taxonomy record for this candidate trade with enabled=false. No wages are researched, and nothing consumes the draft until a human flips `enabled`."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Refresh the wage bands for an OEWS vintage (free no-op when already held)",
+                    params: json!({ "year": DEFAULT_YEAR }),
+                },
+                ManifestExample {
+                    description: "Taxonomy-proposer mode: draft a registry entry for a new trade (enabled=false)",
+                    params: json!({ "propose_trade": "roofing" }),
+                },
+            ],
+            output_shape: Some(
+                "{source, year, records, new, changed, unchanged, rejected: [{key, \
+                 reasons}], rejected_count, unknown_trades, unified: {new, changed}, \
+                 cost_usd, duration_ms, num_turns}; the vintage gate returns {source, \
+                 year, skipped, records, cost_usd: 0.0}; propose_trade mode returns the \
+                 drafted taxonomy record instead of wages",
+            ),
+            cost_class: CostClass::Claude,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -138,6 +187,11 @@ impl ScrapeApp for TradeWages {
         // Constrain the final answer to the wage schema (`claude --json-schema`) so the
         // CLI validates structure; salvage_json below still catches anything it misses.
         request.json_schema = Some(wages_schema());
+        // Provenance (M12): pin the derivation spec (prompt + structured-output
+        // schema + model/effort) that produced this answer, so a stored wage band
+        // stays explainable after the live prompt moves on. Registered BEFORE the
+        // metered call so the pinned spec is the one actually sent.
+        let prov = trades_common::research_provenance(&ctx, "trade-wages", &request).await;
         let (data, output) = trades_common::research_json(&ctx, "trade-wages", request).await?;
 
         let (all_records, rejected, unknown_trades) = collect_wage_records(&entries, &data, &year);
@@ -147,7 +201,11 @@ impl ScrapeApp for TradeWages {
                 "trade-wages: agent JSON contained no plausible trades".into(),
             ));
         }
-        let summary = ctx.upsert_many("wages", &all_records).await?;
+        // One batch, one derivation — a batch-level stamp is the honest grain
+        // here (every row came out of the same single research call).
+        let summary = ctx
+            .upsert_many_with_provenance("wages", &all_records, prov)
+            .await?;
 
         // Cross-source layer: rebuild trades/operator_economics from the current
         // state of all four source datasets (mirrors grants-common's sync_unified).
@@ -566,6 +624,30 @@ fn propose_schema() -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The manifest must describe the params the app actually ships: every key
+    /// in `default_params` and in every worked example has to be a declared
+    /// property. A schema that drifts from its own canonical invocations is
+    /// worse than no schema — enqueue enforces it, so the drift shows up as a
+    /// 422 on the app's own documented call.
+    #[test]
+    fn manifest_declares_every_param_it_ships() {
+        let app = TradeWages;
+        let m = app.manifest();
+        let schema = m.params_schema.expect("rich manifest declares a schema");
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema declares properties");
+        assert!(!m.examples.is_empty(), "a schema needs worked examples");
+        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let mut shipped = vec![app.default_params()];
+        shipped.extend(m.examples.iter().map(|e| e.params.clone()));
+        for params in shipped {
+            for key in params.as_object().expect("params are an object").keys() {
+                assert!(props.contains_key(key), "undeclared param '{key}'");
+            }
+        }
+    }
 
     // A wage entry shaped like the agent's structured answer (BLS OEWS national
     // figures for one trade).

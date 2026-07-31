@@ -49,11 +49,14 @@
 //! ~23k-project Horizon corpus is covered over successive weekly runs without
 //! hammering the API in one go.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use app_eu_sedia::topic_lineage;
 use async_trait::async_trait;
-use pumper_core::{AppContext, Error, HttpRequest, Result, ScrapeApp};
+use pumper_core::{
+    AppContext, AppManifest, ChangeKind, CostClass, Error, HttpRequest, ManifestExample,
+    Provenance, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 
 pub struct Cordis;
@@ -99,6 +102,52 @@ impl ScrapeApp for Cordis {
         // Full-corpus coverage comes from the resume cursor across scheduled
         // runs, not one big sweep.
         json!({ "pageSize": 100, "maxProjects": 500 })
+    }
+
+    fn manifest(&self) -> AppManifest {
+        AppManifest {
+            params_schema: Some(json!({
+                "$schema": "https://json-schema.org/draft/2020-12/schema",
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "CORDIS query override. The VERIFIED working grammar is `contenttype='project' AND programme/code='HORIZON'`; the older `/project/frameworkProgramme=` grammar silently returns total:0."
+                    },
+                    "pageSize": {
+                        "type": "integer", "minimum": 1, "maximum": 100,
+                        "description": "Listing page size (`num`) for the id-enumeration stage."
+                    },
+                    "maxProjects": {
+                        "type": "integer", "minimum": 1, "maximum": 5000,
+                        "description": "Cap on per-project DETAIL fetches this run — the expensive, governor-paced stage. Full-corpus coverage comes from the resume cursor across scheduled runs, not one big sweep."
+                    },
+                    "startPage": {
+                        "type": "integer", "minimum": 1,
+                        "description": "Overrides the persisted resume cursor in cordis/state (1-based listing page)."
+                    }
+                },
+                "additionalProperties": true
+            })),
+            examples: vec![
+                ManifestExample {
+                    description: "Weekly cursor advance: next 500 Horizon projects from where the last run stopped (the scheduled default)",
+                    params: json!({ "pageSize": 100, "maxProjects": 500 }),
+                },
+                ManifestExample {
+                    description: "Re-sweep from the top of the corpus, ignoring the persisted cursor",
+                    params: json!({ "pageSize": 100, "maxProjects": 1000, "startPage": 1 }),
+                },
+            ],
+            output_shape: Some(
+                "{source, query, totalResults, startPage, pages, ids_enumerated, \
+                 skipped_unlisted, detail_failed, skipped_unkeyed, fetched, resumed_from, new, \
+                 changed, unchanged, corpus, families, stats_new, stats_changed, \
+                 cursor_next_page, corpus_swept} — RCN-keyed projects in `projects`, \
+                 per-topic-family rollups in `topic_stats` (read by eu-sedia)",
+            ),
+            cost_class: CostClass::Free,
+        }
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
@@ -203,13 +252,36 @@ impl ScrapeApp for Cordis {
         ids.truncate(max_projects as usize);
 
         // ── Stage 2: per-project detail fetch (the real data). ──
-        let mut records: Vec<(String, Value)> = Vec::new();
+        //
+        // Durable execution (M23): this stage is up to `maxProjects` separate
+        // governor-paced requests — by far the longest thing this app does, and
+        // the reason a reap used to cost the whole run. Each project is written
+        // the moment it normalizes, and the ids written so far are checkpointed,
+        // so a re-claim skips them instead of re-fetching. The listing stage is
+        // deliberately NOT checkpointed: it is ~5 cheap calls and re-running it
+        // is what regenerates `ids` for the resume to filter.
+        let mut done: HashSet<String> = restored_done(ctx.restore(), start_page);
+        let resumed_from = ids.iter().filter(|id| done.contains(*id)).count() as u64;
+        let mut new_keys: u64 = 0;
+        let mut changed_keys: u64 = 0;
+        let mut unchanged_keys: u64 = 0;
+        let mut normalized: u64 = 0;
+        let mut attempted: u64 = 0;
         let mut detail_failed: u64 = 0;
         let mut skipped: u64 = 0; // detail parsed but unkeyable
-        for (i, id) in ids.iter().enumerate() {
+        let mut first_detail = resumed_from == 0;
+        let pending: Vec<String> = ids
+            .iter()
+            .filter(|id| !done.contains(*id))
+            .cloned()
+            .collect();
+        for id in &pending {
+            attempted += 1;
             let url = format!("{DETAIL_URL}/{id}?format=json");
             let resp = ctx.engines.http.fetch(HttpRequest::get(&url)).await?;
             if !resp.is_success() {
+                // NOT marked done — a transient failure must be retried on the
+                // next attempt, not silently skipped forever.
                 detail_failed += 1;
                 continue;
             }
@@ -217,27 +289,53 @@ impl ScrapeApp for Cordis {
                 detail_failed += 1;
                 continue;
             };
-            if i == 0 {
+            if first_detail {
+                first_detail = false;
                 ctx.save_artifact("detail1.json", &serde_json::to_vec_pretty(&detail)?)
                     .await?;
             }
             match normalize_detail(&detail) {
-                Some((key, record)) => records.push((key, record)),
+                Some((key, record)) => {
+                    // Provenance (M12): this record came from exactly one URL and
+                    // we know it — the per-record case the batch path cannot
+                    // express. `rules_hash`/`artifact_sha` stay Null: extraction
+                    // is Rust code, not a registered RuleSet, and only the first
+                    // detail body is archived.
+                    let kind = ctx
+                        .upsert_with_provenance(
+                            "projects",
+                            &key,
+                            &record,
+                            Provenance {
+                                source_url: Some(url.clone()),
+                                ..Provenance::default()
+                            },
+                        )
+                        .await?;
+                    match kind {
+                        ChangeKind::New => new_keys += 1,
+                        ChangeKind::Changed => changed_keys += 1,
+                        ChangeKind::Unchanged => unchanged_keys += 1,
+                    }
+                    normalized += 1;
+                }
                 None => skipped += 1,
             }
+            done.insert(id.clone());
+            ctx.checkpoint(stage2_state(start_page, &done)).await;
         }
-        // Drift stays loud: enumerating ids and normalizing NONE of them is a
-        // contract break, never a clean empty sweep.
-        if !ids.is_empty() && records.is_empty() {
+        // Drift stays loud: attempting detail fetches and normalizing NONE of
+        // them is a contract break, never a clean empty sweep. Gated on what
+        // this attempt actually tried — a fully-resumed run legitimately
+        // normalizes nothing new.
+        if attempted > 0 && normalized == 0 {
             return Err(Error::App(format!(
-                "cordis: {} project ids enumerated but 0 detail records normalized \
-                 ({detail_failed} fetch/parse failures, {skipped} unkeyable) — the \
-                 detail contract drifted (detail1.json artifact holds a raw body)",
-                ids.len()
+                "cordis: {attempted} project detail fetches attempted but 0 records \
+                 normalized ({detail_failed} fetch/parse failures, {skipped} unkeyable) \
+                 — the detail contract drifted (detail1.json artifact holds a raw body)"
             )));
         }
-
-        let summary = ctx.upsert_many("projects", &records).await?;
+        ctx.checkpoint_now(stage2_state(start_page, &done)).await;
 
         // Re-aggregate topic families over the WHOLE stored corpus (not just
         // this run's window) so stats stay consistent while the cursor sweeps.
@@ -246,6 +344,9 @@ impl ScrapeApp for Cordis {
         let corpus_values: Vec<&Value> = corpus.iter().map(|r| &r.data).collect();
         let stats = aggregate_topic_stats(&corpus_values);
         let families = stats.len();
+        // A rollup over thousands of stored projects from as many URLs: only job
+        // lineage is knowable, so `upsert_many`'s automatic job_id stamp is the
+        // whole honest provenance here. Naming one source_url would be a lie.
         let stats_summary = ctx.upsert_many("topic_stats", &stats).await?;
 
         // Persist the resume cursor: wrap to page 1 once the corpus is covered.
@@ -263,10 +364,11 @@ impl ScrapeApp for Cordis {
             "skipped_unlisted": unlisted,
             "detail_failed": detail_failed,
             "skipped_unkeyed": skipped,
-            "fetched": records.len(),
-            "new": summary.new.len(),
-            "changed": summary.changed.len(),
-            "unchanged": summary.unchanged,
+            "fetched": normalized,
+            "resumed_from": resumed_from,
+            "new": new_keys,
+            "changed": changed_keys,
+            "unchanged": unchanged_keys,
             "corpus": corpus.len(),
             "families": families,
             "stats_new": stats_summary.new.len(),
@@ -275,6 +377,49 @@ impl ScrapeApp for Cordis {
             "corpus_swept": exhausted,
         }))
     }
+}
+
+/// Checkpoint schema version — a snapshot in any other shape means "start
+/// fresh", never a failed run (the sink is advisory by contract).
+const STAGE2_STATE_VERSION: u64 = 1;
+
+/// The stage-2 checkpoint payload: which listing window this attempt is working
+/// (so a run that resumes under a *different* `startPage` cannot inherit a
+/// stale done-set) and the project ids already written to `projects`. Ids only —
+/// never record bodies, so the snapshot stays small at 5000 projects.
+fn stage2_state(start_page: u64, done: &HashSet<String>) -> Value {
+    let mut ids: Vec<&String> = done.iter().collect();
+    ids.sort(); // a HashSet has no order; a stable snapshot diffs cleanly
+    json!({
+        "v": STAGE2_STATE_VERSION,
+        "stage": "details",
+        "start_page": start_page,
+        "done": ids,
+    })
+}
+
+/// The already-written project ids from a prior attempt of this job, or an
+/// empty set. Tolerates any stored shape; a snapshot taken against a different
+/// `start_page` is discarded rather than misapplied to a different window.
+fn restored_done(state: Option<&Value>, start_page: u64) -> HashSet<String> {
+    let empty = HashSet::new();
+    let Some(state) = state else { return empty };
+    if state.get("v").and_then(Value::as_u64) != Some(STAGE2_STATE_VERSION)
+        || state.get("stage").and_then(Value::as_str) != Some("details")
+        || state.get("start_page").and_then(Value::as_u64) != Some(start_page)
+    {
+        return empty;
+    }
+    state
+        .get("done")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
+        .unwrap_or(empty)
 }
 
 /// Locates `(total, results)` in the verified search envelope:
@@ -602,6 +747,49 @@ mod tests {
         assert!(extract_hits(&json!({ "payload": { "results": [] } })).is_none());
         // The old assumed `hits` key is drift now, not an accepted alias.
         assert!(extract_hits(&json!({ "payload": { "total": 5, "hits": [] } })).is_none());
+    }
+
+    // ── Durable execution: stage-2 resume state ──
+
+    #[test]
+    fn stage2_state_round_trips_and_skips_written_projects() {
+        let done: HashSet<String> = ["101070522".to_string(), "101059379".to_string()]
+            .into_iter()
+            .collect();
+        let snap = stage2_state(7, &done);
+        assert_eq!(restored_done(Some(&snap), 7), done);
+        // The remaining work is the enumerated ids minus what already landed.
+        let ids = vec![
+            "101070522".to_string(),
+            "101059379".to_string(),
+            "101099999".to_string(),
+        ];
+        let restored = restored_done(Some(&snap), 7);
+        let pending: Vec<&String> = ids.iter().filter(|i| !restored.contains(*i)).collect();
+        assert_eq!(pending, vec!["101099999"]);
+    }
+
+    #[test]
+    fn restored_done_discards_snapshots_it_cannot_trust() {
+        let done: HashSet<String> = ["a".to_string()].into_iter().collect();
+        let snap = stage2_state(7, &done);
+        // A different listing window enumerates different ids — the done-set
+        // from another window must NOT suppress fetches in this one.
+        assert!(restored_done(Some(&snap), 8).is_empty());
+        assert!(restored_done(None, 7).is_empty());
+        // Foreign / versioned-out shapes start fresh instead of erroring.
+        assert!(restored_done(Some(&json!({ "frontier": ["x"] })), 7).is_empty());
+        assert!(restored_done(
+            Some(&json!({ "v": 99, "stage": "details", "start_page": 7, "done": ["a"] })),
+            7
+        )
+        .is_empty());
+        // A well-formed snapshot with no done ids is simply an empty resume.
+        assert!(restored_done(
+            Some(&json!({ "v": 1, "stage": "details", "start_page": 7 })),
+            7
+        )
+        .is_empty());
     }
 
     // ── Stage 2: verified detail shape ──

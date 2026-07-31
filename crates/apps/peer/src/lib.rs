@@ -35,6 +35,14 @@
 //! `Datasets::detect_removed`, which writes `removed_at` + a `removed`
 //! revision) — so downstream triggers on the mirror see removals too.
 //!
+//! ## Provenance of a mirrored record (M12)
+//!
+//! A mirror must not claim it scraped the origin. Each applied revision is
+//! stamped with the LOCAL pulling job, the ORIGIN's own `source_url` and
+//! `rules_hash` carried through verbatim (unknown stays unknown), and NO
+//! `artifact_sha` — this node holds no archived body, so mirroring that field
+//! would falsely mark the record replayable. See [`mirror_provenance`].
+//!
 //! ## Cursor state (`peer/state` dataset)
 //!
 //! One record per (peer URL, remote dataset, namespace), key
@@ -155,7 +163,8 @@ impl ScrapeApp for Peer {
             ],
             output_shape: Some(
                 "{ peer, datasets: [{dataset, namespace, status: ok|not_modified|error, pulled, \
-                 new, changed, unchanged, tombstones_applied, capped, walk_resumed, \
+                 new, changed, unchanged, origin_provenance_kept, \
+                 origin_artifact_sha_dropped, tombstones_applied, capped, walk_resumed, \
                  walk_completed, since, note?, error?}], tombstones: string }",
             ),
             cost_class: CostClass::Free,
@@ -247,11 +256,6 @@ async fn pull_one(
     let mut st = PeerState::load(stored.as_ref());
 
     let feed_url = format!("{base}/datasets/{remote_app}/{dataset}/changes");
-    let prov = Provenance {
-        job_id: Some(ctx.job_id.to_string()),
-        source_url: Some(feed_url.clone()),
-        ..Provenance::default()
-    };
 
     let resumed = st.walk.is_some();
     let mut walk = st.walk.take().unwrap_or_default();
@@ -265,6 +269,8 @@ async fn pull_one(
     let mut applied_unchanged = 0usize;
     let mut skipped_dupe = 0usize;
     let mut skipped_malformed = 0usize;
+    let mut origin_provenance_kept = 0usize;
+    let mut origin_artifact_sha_dropped = 0usize;
     let mut tombstone_keys: Vec<String> = Vec::new();
     let mut completed = false;
     let mut not_modified = false;
@@ -330,6 +336,13 @@ async fn pull_one(
         skipped_dupe += plan.skipped_dupe;
         skipped_malformed += plan.skipped_malformed;
         for up in &plan.upserts {
+            let prov = mirror_provenance(up, &ctx.job_id.to_string());
+            if up.source_url.is_some() {
+                origin_provenance_kept += 1;
+            }
+            if up.origin_artifact_sha {
+                origin_artifact_sha_dropped += 1;
+            }
             let kind = ctx
                 .datasets
                 .upsert_stamped(
@@ -428,6 +441,12 @@ async fn pull_one(
         "unchanged": applied_unchanged,
         "skipped_older_revisions": skipped_dupe,
         "skipped_malformed": skipped_malformed,
+        // Provenance honesty (M12), visible per run rather than implied: how
+        // many mirrored records preserved the ORIGIN's source_url, and how many
+        // carried an origin `artifact_sha` this node deliberately did not
+        // mirror (it holds no such artifact — see `mirror_provenance`).
+        "origin_provenance_kept": origin_provenance_kept,
+        "origin_artifact_sha_dropped": origin_artifact_sha_dropped,
         "tombstones_applied": tombstones_applied,
         "capped": !completed,
         "walk_resumed": resumed,
@@ -503,6 +522,17 @@ struct PlannedUpsert {
     key: String,
     data: Value,
     trust: String,
+    /// The ORIGIN's `source_url` as carried by the feed revision — where the
+    /// content actually came from, which is not this peer's feed URL. Carried
+    /// through so the mirror preserves the origin's derivation rather than
+    /// overwriting it (see [`mirror_provenance`]).
+    source_url: Option<String>,
+    /// The origin's `rules_hash`, carried through for the same reason.
+    rules_hash: Option<String>,
+    /// Whether the origin revision carried an `artifact_sha`. The sha is
+    /// deliberately NOT mirrored (see [`mirror_provenance`]); this only feeds
+    /// the run report so the drop is visible rather than silent.
+    origin_artifact_sha: bool,
 }
 
 #[derive(Debug, Default)]
@@ -543,6 +573,12 @@ fn plan_actions(items: &[Value], seen: &mut HashSet<String>) -> PullPlan {
                     continue;
                 };
                 seen.insert(key.to_string());
+                let str_field = |name: &str| {
+                    item.get(name)
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.trim().is_empty())
+                        .map(str::to_string)
+                };
                 plan.upserts.push(PlannedUpsert {
                     key: key.to_string(),
                     data: data.clone(),
@@ -551,12 +587,46 @@ fn plan_actions(items: &[Value], seen: &mut HashSet<String>) -> PullPlan {
                         .and_then(Value::as_str)
                         .unwrap_or("stable")
                         .to_string(),
+                    source_url: str_field("source_url"),
+                    rules_hash: str_field("rules_hash"),
+                    origin_artifact_sha: str_field("artifact_sha").is_some(),
                 });
             }
             _ => plan.skipped_malformed += 1,
         }
     }
     plan
+}
+
+/// The derivation stamp a MIRRORED record gets (M12).
+///
+/// The honesty problem peering creates: this node did not fetch the origin
+/// page, it copied someone else's record. Three deliberate choices:
+///
+/// - `job_id` — always the LOCAL pulling job. `AppContext` enforces this for
+///   its own writes for the same reason: the producing job here is this pull,
+///   and the remote's job id is meaningless against this node's `jobs` table.
+/// - `source_url` — the ORIGIN's own `source_url`, carried through verbatim
+///   when the feed supplied one. That is where the content genuinely came
+///   from. Stamping the peer's *feed* URL instead (what v1 did) overwrote the
+///   real provenance with a transport detail and made every mirrored record
+///   look like it was scraped from the peer node. When the origin knew no
+///   source URL, the mirror stays `None` = unknown rather than inventing the
+///   feed URL; the pull job's params + the `peer/state` record are where the
+///   transport path is recorded.
+/// - `artifact_sha` — deliberately DROPPED. It means "sha256 of the archived
+///   body **on disk**", and this node holds no such artifact. Mirroring it
+///   would make [`Provenance::replayable`] answer true for a record this node
+///   provably cannot re-derive. `rules_hash` is kept (a content-addressed
+///   ruleset identity is still true off-node, and alone it cannot claim
+///   replayability).
+fn mirror_provenance(up: &PlannedUpsert, local_job_id: &str) -> Provenance {
+    Provenance {
+        job_id: Some(local_job_id.to_string()),
+        source_url: up.source_url.clone(),
+        artifact_sha: None,
+        rules_hash: up.rules_hash.clone(),
+    }
 }
 
 /// One page of the cursor-mode feed: `{items, next_cursor}`.
@@ -683,6 +753,53 @@ mod tests {
             "diff": null, "created_at": created_at, "trust": "stable",
             "job_id": "j", "source_url": null, "artifact_sha": null, "rules_hash": null,
         })
+    }
+
+    /// A feed revision carrying the origin's full derivation stamp.
+    fn rev_with_provenance(key: &str) -> Value {
+        json!({
+            "app": "hackernews", "dataset": "stories", "key": key,
+            "revision": 2, "change": "changed", "data": {"v": 1}, "diff": null,
+            "created_at": "t2", "trust": "stable",
+            "job_id": "remote-job-uuid",
+            "source_url": "https://origin.example/item?id=1",
+            "artifact_sha": "deadbeef",
+            "rules_hash": "cafebabe",
+        })
+    }
+
+    #[test]
+    fn mirror_keeps_the_origin_source_url_and_never_the_peer_feed_url() {
+        let mut seen = HashSet::new();
+        let plan = plan_actions(&[rev_with_provenance("k1")], &mut seen);
+        let prov = mirror_provenance(&plan.upserts[0], "local-job");
+        // The producing job is THIS pull; the remote's job id is meaningless here.
+        assert_eq!(prov.job_id.as_deref(), Some("local-job"));
+        // The content came from the origin page — not from the peer's feed.
+        assert_eq!(
+            prov.source_url.as_deref(),
+            Some("https://origin.example/item?id=1")
+        );
+        assert_eq!(prov.rules_hash.as_deref(), Some("cafebabe"));
+        // This node holds no archived body: mirroring the sha would falsely
+        // mark a record replayable that cannot be re-derived here.
+        assert!(prov.artifact_sha.is_none());
+        assert!(!prov.replayable());
+        assert!(plan.upserts[0].origin_artifact_sha, "the drop is reported");
+    }
+
+    #[test]
+    fn unknown_origin_provenance_stays_unknown() {
+        // The origin knew no source URL. Substituting the feed URL would be a
+        // fabrication — honest-Null instead.
+        let mut seen = HashSet::new();
+        let plan = plan_actions(&[rev("k1", "new", json!({"v": 1}), "t1")], &mut seen);
+        let prov = mirror_provenance(&plan.upserts[0], "local-job");
+        assert_eq!(prov.job_id.as_deref(), Some("local-job"));
+        assert!(prov.source_url.is_none());
+        assert!(prov.rules_hash.is_none());
+        assert!(prov.artifact_sha.is_none());
+        assert!(!plan.upserts[0].origin_artifact_sha);
     }
 
     #[test]

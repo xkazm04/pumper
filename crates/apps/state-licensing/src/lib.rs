@@ -128,11 +128,12 @@ impl ScrapeApp for StateLicensing {
                 },
             ],
             output_shape: Some(
-                "{source, year, trades_run: [..], trades_skipped: [..], records, \
-                 coverage: {<trade>: {states_covered, missing_states}}, new, changed, \
-                 unchanged, rejected: [..], rejected_count, unified: {new, changed}, \
-                 cost_usd, duration_ms, num_turns} — per-trade vintage skips are free; \
-                 cost fields are summed across the per-trade metered calls",
+                "{source, year, trades_run: [..], trades_skipped: [..], \
+                 trades_resumed: [..], records, coverage: {<trade>: {states_covered, \
+                 missing_states}}, new, changed, unchanged, rejected: [..], \
+                 rejected_count, unified: {new, changed}, cost_usd, duration_ms, \
+                 num_turns} — per-trade vintage skips and checkpoint resumes are free; \
+                 cost fields cover only the metered calls THIS attempt made",
             ),
             cost_class: CostClass::Claude,
         }
@@ -184,15 +185,43 @@ impl ScrapeApp for StateLicensing {
                 None => taxonomy_entries.clone(),
             };
 
-        let mut all_records: Vec<(String, Value)> = Vec::new();
-        let mut rejected: Vec<Rejection> = Vec::new();
+        // Durable execution (M23). A full-roster run makes up to FIVE ~30-turn
+        // metered Claude calls, so a reap / timeout / restart part-way through
+        // the roster currently discards every dollar already spent. Each trade's
+        // rows are now upserted as soon as they validate, and the completed set
+        // is checkpointed — a re-claim resumes at the first unfinished trade.
+        //
+        // This is checked BEFORE the vintage gate on purpose: the vintage gate
+        // would cover the ordinary case (the completed trade's own rows now
+        // carry this year), but `force: true` disables it, and a forced run is
+        // exactly the expensive one whose partial progress must not be re-paid.
+        let mut completed = restore_completed(ctx.restore(), &year);
+
+        let mut rejected: Vec<Value> = Vec::new();
         let mut trades_run: Vec<String> = Vec::new();
+        let mut trades_resumed: Vec<String> = Vec::new();
         let mut trades_skipped: Vec<String> = Vec::new();
         let mut coverage = serde_json::Map::new();
+        let mut records_total: usize = 0;
         let (mut cost_usd, mut duration_ms, mut num_turns) = (0.0_f64, 0_u64, 0_u64);
+        let mut summary = pumper_core::UpsertSummary::default();
 
         for trade in trades {
             let label = trade.label.as_str();
+
+            // Already finished (and already upserted) in an earlier attempt of
+            // THIS job — replay its reporting, pay nothing.
+            if let Some(done) = completed.get(label).cloned() {
+                trades_resumed.push(label.to_string());
+                if let Some(cov) = done.get("coverage") {
+                    coverage.insert(label.to_string(), cov.clone());
+                }
+                records_total += done.get("records").and_then(Value::as_u64).unwrap_or(0) as usize;
+                if let Some(rej) = done.get("rejected").and_then(Value::as_array) {
+                    rejected.extend(rej.iter().cloned());
+                }
+                continue;
+            }
 
             // Vintage freshness gate BEFORE the metered call: licensing rules
             // change rarely, so a trade whose sentinel record already carries
@@ -221,6 +250,13 @@ impl ScrapeApp for StateLicensing {
             // (`claude --json-schema`); salvage_json still backstops it.
             request.json_schema = Some(licensing_schema());
 
+            // Provenance (M12): pin THIS trade's derivation spec (its own prompt
+            // + structured-output schema + model/effort) before the metered call,
+            // so a stored bond/fee figure stays explainable once the live prompt
+            // moves on. Per trade, because the prompt is per trade.
+            let prov =
+                trades_common::research_provenance(&ctx, "state-licensing", &request).await;
+
             // Per-trade artifact name so five calls don't overwrite one file.
             let artifact = format!("research-{}.json", artifact_slug(label));
             let (data, output) =
@@ -231,46 +267,73 @@ impl ScrapeApp for StateLicensing {
             num_turns += output.num_turns.unwrap_or(0);
             trades_run.push(label.to_string());
 
-            let (records, mut trade_rejected, present) =
+            let (records, trade_rejected, present) =
                 parse_trade_records(&data, label, &trade.soc_code, &year);
             let missing: Vec<&str> = US_JURISDICTIONS
                 .iter()
                 .copied()
                 .filter(|j| !present.contains(*j))
                 .collect();
-            coverage.insert(
-                label.to_string(),
-                json!({
-                    "states_covered": present.len(),
-                    "states_expected": US_JURISDICTIONS.len(),
-                    "missing_states": missing,
-                }),
-            );
+            let trade_coverage = json!({
+                "states_covered": present.len(),
+                "states_expected": US_JURISDICTIONS.len(),
+                "missing_states": missing,
+            });
+            coverage.insert(label.to_string(), trade_coverage.clone());
             if present.is_empty() {
                 return Err(Error::App(format!(
                     "state-licensing: agent JSON for trade {label} contained no plausible \
                      state records"
                 )));
             }
-            all_records.extend(records);
-            rejected.append(&mut trade_rejected);
-        }
 
-        // Partial-scope runs are the norm (per-trade chunking + vintage skips),
-        // so this is an idempotent JOIN-style upsert — never a full-snapshot
-        // sync, which would mark every other trade's rows removed. Written
-        // twice on purpose: the app's OWN namespace (`state-licensing/
-        // compliance`) is what the catalog freshness monitor watches
-        // (`/catalog/health` lists `source.app/source.dataset`), and the
-        // cross-source copy (`trades/compliance`) sits beside
-        // operator_economics for trades-namespace consumers and the join.
-        ctx.datasets
-            .upsert_many(self.name(), COMPLIANCE, &all_records)
-            .await?;
-        let summary = ctx
-            .datasets
-            .upsert_many(UNIFIED_APP, COMPLIANCE, &all_records)
-            .await?;
+            // Partial-scope runs are the norm (per-trade chunking + vintage
+            // skips), so this is an idempotent JOIN-style upsert — never a
+            // full-snapshot sync, which would mark every other trade's rows
+            // removed. Written twice on purpose: the app's OWN namespace
+            // (`state-licensing/compliance`) is what the catalog freshness
+            // monitor watches (`/catalog/health` lists
+            // `source.app/source.dataset`), and the cross-source copy
+            // (`trades/compliance`) sits beside operator_economics for
+            // trades-namespace consumers and the join. Per trade rather than
+            // once at the end so a reap can't discard a call already paid for.
+            ctx.upsert_many_with_provenance(COMPLIANCE, &records, prov.clone())
+                .await?;
+            let unified_prov = pumper_core::Provenance {
+                job_id: Some(ctx.job_id.to_string()),
+                ..prov
+            };
+            let mut trade_summary = ctx
+                .datasets
+                .upsert_many_stamped(UNIFIED_APP, COMPLIANCE, &records, None, Some(&unified_prov))
+                .await?;
+            summary.new.append(&mut trade_summary.new);
+            summary.changed.append(&mut trade_summary.changed);
+            summary.unchanged += trade_summary.unchanged;
+
+            records_total += records.len();
+            let trade_rejected_json: Vec<Value> =
+                trade_rejected.iter().map(Rejection::to_json).collect();
+            rejected.extend(trade_rejected_json.iter().cloned());
+
+            // Checkpoint AFTER the rows are durable, unthrottled: the write we
+            // are protecting cost a ~30-turn metered call, so losing it to a
+            // throttle window would defeat the point.
+            completed.insert(
+                label.to_string(),
+                json!({
+                    "coverage": trade_coverage,
+                    "records": records.len(),
+                    "rejected": trade_rejected_json,
+                }),
+            );
+            ctx.checkpoint_now(json!({
+                "v": CHECKPOINT_VERSION,
+                "year": year,
+                "trades": completed,
+            }))
+            .await;
+        }
 
         // Land the `compliance` block on the per-state operator_economics rows
         // (mirrors state-tax's end-of-run unified sync).
@@ -281,12 +344,15 @@ impl ScrapeApp for StateLicensing {
             "year": year,
             "trades_run": trades_run,
             "trades_skipped": trades_skipped,
-            "records": all_records.len(),
+            // Trades whose metered call was already paid for and persisted by an
+            // earlier attempt of this job — resumed, not re-run.
+            "trades_resumed": trades_resumed,
+            "records": records_total,
             "coverage": coverage,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
-            "rejected": rejected.iter().map(Rejection::to_json).collect::<Vec<_>>(),
+            "rejected": rejected,
             "rejected_count": rejected.len(),
             "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
             "cost_usd": cost_usd,
@@ -294,6 +360,34 @@ impl ScrapeApp for StateLicensing {
             "num_turns": num_turns,
         }))
     }
+}
+
+/// Schema version of the checkpoint payload. Bump on any incompatible change —
+/// an old snapshot is then ignored and the job simply starts fresh (a resume is
+/// an optimization; it must never be a correctness dependency).
+const CHECKPOINT_VERSION: u64 = 1;
+
+/// Per-trade completion map from a prior attempt of THIS job, or empty.
+///
+/// Advisory by contract: any unexpected shape, a version bump, or a snapshot for
+/// a different `year` (a different vintage is a different derivation, and its
+/// rows must not be reported as this run's) yields "start fresh" rather than an
+/// error.
+fn restore_completed(state: Option<&Value>, year: &str) -> serde_json::Map<String, Value> {
+    let empty = serde_json::Map::new();
+    let Some(state) = state else {
+        return empty;
+    };
+    if state.get("v").and_then(Value::as_u64) != Some(CHECKPOINT_VERSION)
+        || state.get("year").and_then(Value::as_str) != Some(year)
+    {
+        return empty;
+    }
+    state
+        .get("trades")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or(empty)
 }
 
 /// The one-call/51-jurisdiction research prompt for a single trade.
@@ -477,6 +571,30 @@ fn licensing_schema() -> Value {
 mod tests {
     use super::*;
 
+    /// The manifest must describe the params the app actually ships: every key
+    /// in `default_params` and in every worked example has to be a declared
+    /// property. A schema that drifts from its own canonical invocations is
+    /// worse than no schema — enqueue enforces it, so the drift shows up as a
+    /// 422 on the app's own documented call.
+    #[test]
+    fn manifest_declares_every_param_it_ships() {
+        let app = StateLicensing;
+        let m = app.manifest();
+        let schema = m.params_schema.expect("rich manifest declares a schema");
+        let props = schema["properties"]
+            .as_object()
+            .expect("schema declares properties");
+        assert!(!m.examples.is_empty(), "a schema needs worked examples");
+        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let mut shipped = vec![app.default_params()];
+        shipped.extend(m.examples.iter().map(|e| e.params.clone()));
+        for params in shipped {
+            for key in params.as_object().expect("params are an object").keys() {
+                assert!(props.contains_key(key), "undeclared param '{key}'");
+            }
+        }
+    }
+
     #[test]
     fn roster_is_51_unique_uppercase_jurisdictions_including_dc_and_sentinel() {
         let set: std::collections::HashSet<&str> = US_JURISDICTIONS.iter().copied().collect();
@@ -600,6 +718,34 @@ mod tests {
         let (_, rec) = &records[0];
         assert!(rec["workers_comp_required"].is_null());
         assert!(rec["local_variation"].is_null());
+    }
+
+    /// A resume must replay only a snapshot that is unambiguously THIS run's
+    /// work. Anything else — no snapshot, a bumped version, a different vintage,
+    /// or junk — starts fresh, because wrongly replaying would report another
+    /// vintage's coverage as this run's and skip a trade that was never paid for.
+    #[test]
+    fn restore_only_accepts_this_versions_snapshot_for_this_year() {
+        let good = json!({
+            "v": CHECKPOINT_VERSION,
+            "year": "2026",
+            "trades": { "Plumbing": { "coverage": { "states_covered": 51 }, "records": 51, "rejected": [] } },
+        });
+        let restored = restore_completed(Some(&good), "2026");
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored["Plumbing"]["records"], 51);
+
+        assert!(restore_completed(None, "2026").is_empty());
+        assert!(
+            restore_completed(Some(&good), "2027").is_empty(),
+            "a snapshot for another vintage is not this run's work"
+        );
+        let old = json!({ "v": CHECKPOINT_VERSION + 1, "year": "2026", "trades": { "HVAC": {} } });
+        assert!(restore_completed(Some(&old), "2026").is_empty());
+        assert!(restore_completed(Some(&json!("garbage")), "2026").is_empty());
+        // Right envelope, missing body: still fresh, never an error.
+        let headless = json!({ "v": CHECKPOINT_VERSION, "year": "2026" });
+        assert!(restore_completed(Some(&headless), "2026").is_empty());
     }
 
     #[test]
