@@ -55,6 +55,76 @@ pub async fn test_state_with(
     (state, store)
 }
 
+/// The **real** worker loop (`worker::run`) running in the background, with a
+/// deterministic shutdown. Used by the lifecycle tests, which must exercise the
+/// loop itself — claim/permit handling, per-app caps, the two-phase drain — not
+/// just the `run_one` seam.
+pub struct WorkerLoop {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl WorkerLoop {
+    /// Spawns `worker::run` against this state. Nothing test-only is injected:
+    /// this is the same entry point `main` uses.
+    pub fn start(state: &AppState) -> Self {
+        Self {
+            handle: tokio::spawn(crate::worker::run(state.clone())),
+        }
+    }
+
+    /// Fires the shutdown token and waits for the loop (including its drain) to
+    /// exit. Panics if it doesn't, because a loop that won't stop is a bug.
+    pub async fn shutdown(self, state: &AppState, timeout: Duration) {
+        state.shutdown.cancel();
+        tokio::time::timeout(timeout, self.handle)
+            .await
+            .expect("worker loop must exit within the drain deadline")
+            .expect("worker loop task must not panic");
+    }
+}
+
+/// Polls `check` every 10ms until it returns true, then returns. Panics with
+/// `what` on timeout. Condition-driven rather than a fixed sleep, so the tests
+/// are neither flaky nor slower than the thing they wait for.
+pub async fn wait_for<F, Fut>(what: &str, timeout: Duration, mut check: F)
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = bool>,
+{
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if check().await {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for: {what}"
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// Waits until a job reaches `want` and returns the row.
+pub async fn wait_status(
+    state: &AppState,
+    id: uuid::Uuid,
+    want: pumper_core::JobStatus,
+    timeout: Duration,
+) -> pumper_core::Job {
+    wait_for(
+        &format!("job {id} to reach {}", want.as_str()),
+        timeout,
+        || async { matches!(state.storage.get(id).await, Ok(Some(j)) if j.status == want) },
+    )
+    .await;
+    state
+        .storage
+        .get(id)
+        .await
+        .expect("read job")
+        .expect("job row")
+}
+
 /// A scriptable `ScrapeApp`, driven entirely by job params:
 /// - `{"sleep_ms": N}` — hold the job open (drain/cancel tests)
 /// - `{"fail": "msg"}` — return an app error
@@ -156,6 +226,12 @@ impl TestReceiver {
 
     pub fn url(&self) -> String {
         format!("http://{}/hook", self.addr)
+    }
+
+    /// Everything received so far, without waiting — for asserting that a
+    /// delivery did NOT happen.
+    pub fn hits_so_far(&self) -> Vec<Hit> {
+        self.hits.lock().unwrap().clone()
     }
 
     /// Polls until at least `n` requests arrived (webhook dispatch is

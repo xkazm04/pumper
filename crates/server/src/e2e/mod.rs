@@ -23,3 +23,4 @@ mod shutdown_drain;
 mod sink_delivery;
 mod webhook_contract;
 mod worker_fanout;
+mod worker_lifecycle;
