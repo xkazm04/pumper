@@ -30,6 +30,7 @@ pub(crate) use retention::artifact_retention_plan;
 
 mod datasets;
 mod derived;
+mod doctor;
 mod economics;
 mod error;
 mod events;
@@ -55,6 +56,7 @@ mod watches;
 // exposes only its handlers as `pub(crate)`; DTOs and helpers stay private.
 use datasets::*;
 use derived::*;
+use doctor::*;
 use economics::*;
 use events::*;
 use health::*;
@@ -185,6 +187,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(dataset_duplicates))
         .routes(routes!(dataset_changes))
         .routes(routes!(record_history))
+        .routes(routes!(datasets_doctor))
         .routes(routes!(get_provenance))
         .routes(routes!(rederive_provenance))
         .routes(routes!(retention_preview))
@@ -443,6 +446,7 @@ mod api_spec_tests {
         "DELETE /datasets/{app}/{dataset}/records/{key}",
         "GET /datasets/{app}/{dataset}/changes",
         "GET /datasets/{app}/{dataset}/history",
+        "GET /datasets/doctor",
         "GET /provenance/{app}/{dataset}/{key}",
         "POST /provenance/{app}/{dataset}/{key}/rederive",
         "GET /retention/preview",

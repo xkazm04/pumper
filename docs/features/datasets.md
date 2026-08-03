@@ -78,6 +78,43 @@ append-only ledgers, and the configured windows. `days` defaults to the configur
 enabled. The preview and the janitor call the **same** plan builder, so they cannot
 disagree. Both walk the whole artifact tree — on-demand only, never a hot path.
 
+## `datasets doctor` — store integrity report
+
+`GET /datasets/doctor?skip_artifacts=` (`just doctor`) — **read-only**. Every query
+is a `SELECT`, every filesystem touch is a `stat`; it reports and never repairs,
+so you can always tell whether the store was healthy or merely healed. It performs
+**full scans** (`record_revisions`, `records`, the whole artifact tree), so it is
+an on-demand operator tool — never on a hot path, never on a timer.
+`skip_artifacts=true` drops the tree walk and the per-body checks.
+
+**A healthy store returns `findings: []` and `healthy: true`.** Descriptive
+numbers that are not problems live outside `findings` (`coverage`, `tables`,
+`artifacts`), because a report that always says something gets ignored.
+
+Each finding carries a concrete remediation — the binary to run, the config key
+to set, the route to call — never a bare count, plus up to 10 examples.
+
+| Check | Fires when | Remediation |
+| --- | --- | --- |
+| `missing_artifact_bodies` | a replayable revision's stamped body is not on disk — `rederive` will answer 409 for that key | re-run the producing job; check for manual deletion (retention pins replayable bodies, so it was not retention) |
+| `half_stamped_provenance` | a revision stamps exactly one of `artifact_sha` / `rules_hash` | fix the app's write path to stamp both or neither; stamps are never rewritten retroactively |
+| `unregistered_rulesets` | a stamped `rules_hash` is absent from `rules_versions` | register at write time (`INSERT OR IGNORE`); unrecoverable rulesets stay non-replayable rather than replayed against today's rules |
+| `records_without_simhash` | live records with `simhash = 0`, silently skipped by `/duplicates` | `just reindex` with the server stopped |
+| `unbounded_table_growth` | an append-only table has retention off **and** rows older than 180 days | set the named `[storage]` key, confirm with `GET /retention/preview` |
+| `orphan_derived_specs` | a derived spec's source dataset holds no records | `POST /derived/{id}/backfill` once it has records, or `DELETE /derived/{id}` |
+| `stale_rebuild_tables` | a `*_new` table-rebuild scaffold survived in `sqlite_master` | restore from backup and re-run migrations; do not drop it by hand |
+
+`artifacts.per_app` reports files and bytes on disk per app — the numbers that
+make the retention decisions above inspectable.
+
+> **On `triggers_new`:** it is **not** a stale table. Migration 0021 rebuilds
+> `triggers` through a `triggers_new` scaffold (SQLite cannot `ALTER` a `CHECK`
+> constraint) and `RENAME`s it into place; migrations run in a transaction, so the
+> scaffold is never observable afterwards. CRUD correctly targets `triggers`.
+> `stale_rebuild_tables` exists to catch a rebuild that genuinely did not land —
+> it is empty on every correctly-migrated database, which
+> `the_triggers_rebuild_scaffold_does_not_survive_migration` pins.
+
 ## Known gaps
 
 - **Duplicate scan** uses banded SimHash bucketing (`simhash::BandedIndex`, shared with the crawler's near-dup gate): candidates come from `distance + 1` contiguous bit-bands and are then verified by exact Hamming, so the pair set, the `MAX_DUP_PAIRS`=10,000 cap and the result ordering are identical to the all-pairs scan it replaced. Bands are `64 / (distance + 1)` bits wide, so **the index turns banding off above distance 5** and verifies against a plain walk — same answers, linear candidate generation. At the distance every real caller uses (3: the `/duplicates` default and grants `link_duplicates`) a 50k-record scan measured **~0.8s vs ~23s** for the all-pairs sweep.

@@ -144,6 +144,20 @@ impl Provenance {
     }
 }
 
+/// A revision that claims to be reproducible, and where it says its archived
+/// body lives. Produced by [`Datasets::replayable_revisions`] for the store
+/// integrity report; pairing it with the filesystem is what turns a claim into
+/// a verified one (or a named finding).
+#[derive(Debug, Clone, Serialize)]
+pub struct ReplayableRevision {
+    pub app: String,
+    pub dataset: String,
+    pub key: String,
+    pub revision: i64,
+    #[serde(flatten)]
+    pub reference: ArtifactRef,
+}
+
 /// Canonical content hash of a RuleSet (or any JSON value): sha256 over the
 /// serde_json string form, whose object keys are BTreeMap-sorted — the same
 /// canonicalization [`hash_value`] uses for record change detection, so two
@@ -1768,6 +1782,124 @@ impl Datasets {
             .into_iter()
             .map(|(app, job_id, name)| ArtifactRef { app, job_id, name })
             .collect())
+    }
+
+    // ── store integrity (read-only; `datasets doctor`) ───────────────────────
+    // Every query below is a SELECT. Several are FULL SCANS of `record_revisions`
+    // or `records` — the audit is an on-demand operator tool, never on a hot path
+    // and never on the worker loop.
+
+    /// Every replayable revision with the body location it claims, newest first.
+    /// The doctor pairs this with the filesystem to find revisions whose stamped
+    /// body is gone — a provenance claim the store can no longer honour.
+    pub async fn replayable_revisions(&self, limit: i64) -> Result<Vec<ReplayableRevision>> {
+        let rows: Vec<(String, String, String, i64, String, String)> = sqlx::query_as(
+            "SELECT app, dataset, key, revision, \
+                    json_extract(data, '$.job_id'), \
+                    json_extract(data, '$.artifact_path') \
+             FROM record_revisions \
+             WHERE artifact_sha IS NOT NULL AND rules_hash IS NOT NULL \
+               AND json_extract(data, '$.job_id') IS NOT NULL \
+               AND json_extract(data, '$.artifact_path') IS NOT NULL \
+             ORDER BY created_at DESC LIMIT ?1",
+        )
+        .bind(limit.max(0))
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(app, dataset, key, revision, job_id, name)| ReplayableRevision {
+                    reference: ArtifactRef {
+                        app: app.clone(),
+                        job_id,
+                        name,
+                    },
+                    app,
+                    dataset,
+                    key,
+                    revision,
+                },
+            )
+            .collect())
+    }
+
+    /// Revisions stamped with exactly ONE of `artifact_sha` / `rules_hash`.
+    ///
+    /// Neither half alone is reproducible, so `rederive` refuses them — the write
+    /// path recorded work it cannot cash in. Not the same thing as an unstamped
+    /// legacy revision, which is honestly Null and claims nothing. Returns
+    /// `(app, dataset, count)`.
+    pub async fn half_stamped_revisions(&self) -> Result<Vec<(String, String, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT app, dataset, COUNT(*) FROM record_revisions \
+             WHERE (artifact_sha IS NULL) <> (rules_hash IS NULL) \
+             GROUP BY app, dataset ORDER BY COUNT(*) DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// `rules_hash` values stamped on revisions but absent from the
+    /// content-addressed `rules_versions` registry. Re-derivation refuses these
+    /// with "stamped but never registered": the historical ruleset is gone, so
+    /// replaying would mean using today's rules and calling it reproduction.
+    /// Returns `(rules_hash, revisions affected)`.
+    pub async fn unregistered_rules_hashes(&self) -> Result<Vec<(String, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT r.rules_hash, COUNT(*) FROM record_revisions r \
+             WHERE r.rules_hash IS NOT NULL \
+               AND NOT EXISTS (SELECT 1 FROM rules_versions v WHERE v.hash = r.rules_hash) \
+             GROUP BY r.rules_hash ORDER BY COUNT(*) DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Per-dataset stamp coverage over the WHOLE store:
+    /// `(app, dataset, revisions, with_job_id, replayable)`. The dataset-wide
+    /// twin of [`provenance_coverage`](Self::provenance_coverage), which answers
+    /// the same question for one record.
+    pub async fn provenance_coverage_by_dataset(
+        &self,
+    ) -> Result<Vec<(String, String, i64, i64, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT app, dataset, COUNT(*), \
+                    COALESCE(SUM(job_id IS NOT NULL), 0), \
+                    COALESCE(SUM(artifact_sha IS NOT NULL AND rules_hash IS NOT NULL), 0) \
+             FROM record_revisions GROUP BY app, dataset ORDER BY app, dataset",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Live records carrying no SimHash fingerprint, per dataset. `duplicate_pairs`
+    /// skips `simhash = 0` rows as "no textual content", so a dataset full of them
+    /// has a near-duplicate report that is quietly incomplete rather than empty.
+    /// Remediation is the `reindex` binary.
+    pub async fn null_simhash_counts(&self) -> Result<Vec<(String, String, i64)>> {
+        Ok(sqlx::query_as(
+            "SELECT app, dataset, COUNT(*) FROM records \
+             WHERE removed_at IS NULL AND (simhash IS NULL OR simhash = 0) \
+             GROUP BY app, dataset ORDER BY COUNT(*) DESC",
+        )
+        .fetch_all(&self.pool)
+        .await?)
+    }
+
+    /// Derived specs whose source `(app, dataset)` holds no records at all — they
+    /// recompute forever over nothing, and the target dataset they advertise will
+    /// never fill. Returns `(id, source, target)`.
+    pub async fn orphan_derived_specs(&self) -> Result<Vec<(String, String, String)>> {
+        Ok(sqlx::query_as(
+            "SELECT d.id, d.source_app || '/' || d.source_dataset, d.target_dataset \
+             FROM derived d \
+             WHERE NOT EXISTS (SELECT 1 FROM records r \
+                               WHERE r.app = d.source_app AND r.dataset = d.source_dataset) \
+             ORDER BY d.created_at, d.id",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     // ── derived ──────────────────────────────────────────────────────────────

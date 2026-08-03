@@ -13,6 +13,8 @@ pub mod costs;
 #[cfg(feature = "storage")]
 pub mod datasets;
 #[cfg(feature = "storage")]
+pub mod doctor;
+#[cfg(feature = "storage")]
 pub mod storage;
 #[cfg(feature = "test-support")]
 pub mod testing;
@@ -57,7 +59,11 @@ pub use datasets::{
     derived_would_cycle, diff_values, filters_match, parse_aggregate, parse_aggregates,
     parse_filter_spec, parse_filter_specs, project_value, trust_label, validate_group, Aggregate,
     ChangeKind, Datasets, DerivedBackfill, DerivedGroup, DerivedLookup, DerivedSpec, DupPair,
-    Provenance, Record, Revision, RevisionPage, UpsertSummary, TRUST_STABLE,
+    Provenance, Record, ReplayableRevision, Revision, RevisionPage, UpsertSummary, TRUST_STABLE,
+};
+#[cfg(feature = "storage")]
+pub use doctor::{
+    diagnose, DatasetCoverage, Finding, MissingBody, Severity, StoreFacts, TableGrowth,
 };
 pub use resilience::{
     doc_signals, signals_batch, CohortDrift, Diagnosis, DocSignals, FetchHealth, ObservedDoc,
@@ -74,7 +80,7 @@ pub use retention::{
 #[cfg(feature = "storage")]
 pub use storage::{
     Delivery, EnqueueOptions, IngressSource, JobStages, JobTimingStats, LedgerPruned,
-    LedgerRetention, NewDerivedSpec, NewSchedule, NewTrigger, PluginHook, RevisionCount,
+    LedgerRetention, LedgerStat, NewDerivedSpec, NewSchedule, NewTrigger, PluginHook, RevisionCount,
     SavedSearch, Schedule, SearchMaterialize, Storage, Trigger, TriggerPluginHooks, Watch,
     YieldSummary, LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
 };

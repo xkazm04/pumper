@@ -26,8 +26,10 @@
       "doc": "docs/features/datasets.md",
       "sourceGlobs": [
         "crates/core/src/datasets.rs",
+        "crates/core/src/doctor.rs",
         "crates/core/src/retention.rs",
         "crates/core/src/simhash.rs",
+        "crates/server/src/routes/doctor.rs",
         "crates/server/src/routes/retention.rs",
         "crates/core/migrations/**"
       ]

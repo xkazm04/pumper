@@ -40,6 +40,7 @@ The global 1 MiB is sized from what the POST surface actually accepts — all ha
 | Grants | `GET /grants?status=&agency=&source=&closing_before=&closing_after=&min_award=&limit=&cursor=` · `GET /grants/closing-soon?days=` (see below) |
 | Catalog | `GET /catalog/sources?market=&status=&category=` (the machine-readable data-source catalog) · `GET /catalog/health` (per-source freshness monitor; see below) |
 | Source health | `GET /sources?state=&app=&limit=` · `GET /sources/{id}` (`id` = `<app>/<dataset>`) · `GET /sources/{id}/runs?limit=` · `POST /sources/{id}/state` (`{state, reason?}` — manual override; the only way out of quarantine). All `503` when `[resilience] enabled = false`. See below. |
+| Store integrity | `GET /datasets/doctor?skip_artifacts=` (**read-only** audit; `findings` empty on a healthy store, each with its remediation — see [datasets.md § `datasets doctor`](datasets.md). Full scans; on-demand only) |
 | Retention | `GET /retention/preview?days=` (**read-only dry run**: reclaimable artifact bytes per app, split reclaimable/pinned/cassette, plus ledger row counts and the configured windows — deletes nothing. See [datasets.md § Retention](datasets.md)) |
 | Meta | `GET /openapi.json` (OpenAPI 3.1 spec for all routes) |
 

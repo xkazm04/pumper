@@ -67,6 +67,26 @@ ci: fmt-check lint test
 reindex:
     cargo run -p pumper-server --bin reindex
 
+# Repairs NOTHING, and needs the server RUNNING (`just run`) — unlike reindex and
+# search-backfill, which need it stopped. Performs full scans, so run it on demand
+# rather than on a timer. `just doctor 8088` for a non-default port.
+#
+# Read-only store integrity report; empty `findings` means the store is healthy.
+doctor port='8088':
+    curl -s "http://127.0.0.1:{{port}}/datasets/doctor"
+
+# Deletes nothing, and needs the server RUNNING. `just retention-preview 90`
+# models a 90-day window the config has not enabled.
+#
+# Retention dry run: reclaimable artifact bytes per app (pinned bytes broken out).
+retention-preview days='':
+    #!/usr/bin/env sh
+    # Omit `?days=` entirely when no argument is given, so the server applies the
+    # configured [storage] artifact_retention_days rather than parsing an empty
+    # value.
+    if [ -n "{{days}}" ]; then q="?days={{days}}"; else q=""; fi
+    curl -s "http://127.0.0.1:8088/retention/preview$q"
+
 # A scope is required, e.g.
 #   just search-backfill "--app grants --dataset unified"
 #   just search-backfill --all

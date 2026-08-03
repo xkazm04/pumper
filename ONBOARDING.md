@@ -424,7 +424,12 @@ run"*. The two maintenance binaries must be run with the **server stopped**.
 The repo-root `justfile` is the canonical task runner and wraps every command
 above — `just check`, `just test`, `just test-ignored`, `just lint`, `just fmt`,
 `just fmt-check`, `just build`, `just run`, `just dev`, plus `just ci` (the whole
-CI job), `just reindex`, `just search-backfill <scope>` and `just plugin <crate>`.
+CI job), `just reindex`, `just search-backfill <scope>` and `just plugin <crate>`,
+plus two **read-only** operator recipes that need the server *running* rather than
+stopped: `just doctor` (store integrity report — findings each carry their
+remediation, empty means healthy) and `just retention-preview [days]` (reclaimable
+artifact bytes per app; deletes nothing). Both perform full scans, so run them on
+demand. See [docs/features/datasets.md](docs/features/datasets.md).
 Install once with `cargo install just`; `just --list` shows them all. Keep the
 recipes and this section in sync.
 

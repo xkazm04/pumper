@@ -1384,14 +1384,53 @@ impl Storage {
     /// Row counts of the tables that have no natural bound, for the read-only
     /// store report. Cheap `COUNT(*)`s, but still a table scan each — on-demand.
     pub async fn ledger_row_counts(&self) -> Result<Vec<(String, i64)>> {
+        Ok(self
+            .ledger_stats()
+            .await?
+            .into_iter()
+            .map(|s| (s.table, s.rows))
+            .collect())
+    }
+
+    /// Per-table growth of the append-only stores: rows plus the age of the
+    /// oldest row. The age is what separates "big because it is busy" from "big
+    /// because nothing ever bounded it" — a table with rows going back a year and
+    /// retention off is accruing, not merely large.
+    ///
+    /// Read-only, one `COUNT(*)` + one `MIN(created_at)` per table. On-demand.
+    pub async fn ledger_stats(&self) -> Result<Vec<LedgerStat>> {
         let mut out = Vec::new();
         for table in LEDGER_TABLES {
-            let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-                .fetch_one(&self.pool)
-                .await?;
-            out.push((table.to_string(), n));
+            // `table` comes from a crate constant, never from a caller.
+            let row: (i64, Option<String>) =
+                sqlx::query_as(&format!("SELECT COUNT(*), MIN(created_at) FROM {table}"))
+                    .fetch_one(&self.pool)
+                    .await?;
+            out.push(LedgerStat {
+                table: table.to_string(),
+                rows: row.0,
+                oldest: row.1.as_deref().and_then(|s| parse_ts(s).ok()),
+            });
         }
         Ok(out)
+    }
+
+    /// Tables named `*_new` still present in `sqlite_master`.
+    ///
+    /// SQLite cannot `ALTER` a `CHECK` constraint, so a migration that needs one
+    /// rebuilds the table: `CREATE TABLE x_new` → copy → `DROP TABLE x` →
+    /// `ALTER TABLE x_new RENAME TO x` (migration 0021 does exactly this to
+    /// `triggers`). The scaffold is transient and each migration runs in a
+    /// transaction, so on any correctly-migrated database this returns EMPTY —
+    /// which is the point of checking. A leftover means a rebuild did not
+    /// complete, and the live table may be the pre-rebuild one.
+    pub async fn stale_rebuild_tables(&self) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar(
+            "SELECT name FROM sqlite_master \
+             WHERE type = 'table' AND name LIKE '%\\_new' ESCAPE '\\' ORDER BY name",
+        )
+        .fetch_all(&self.pool)
+        .await?)
     }
 
     // ── ingress ──────────────────────────────────────────────────────────────
@@ -2486,6 +2525,15 @@ impl LedgerRetention {
     pub fn any_enabled(&self) -> bool {
         *self != Self::default()
     }
+}
+
+/// Growth of one append-only table: how many rows, and how far back they go.
+#[derive(Debug, Clone, Serialize)]
+pub struct LedgerStat {
+    pub table: String,
+    pub rows: i64,
+    /// `created_at` of the oldest row, or `None` when the table is empty.
+    pub oldest: Option<DateTime<Utc>>,
 }
 
 /// Rows removed by one [`Storage::prune_ledgers`] pass.
