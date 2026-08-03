@@ -15,6 +15,15 @@ async fn fresh_db(tag: &str) -> TempStore {
     TempStore::new(tag).await
 }
 
+/// A healthy source's removal guard. Removal detection is only reachable with
+/// one, and only a non-degrading `SourceState` yields one.
+fn ok_guard() -> pumper_core::datasets::RemovalGuard {
+    pumper_core::datasets::RemovalGuard::for_source_state(
+        pumper_core::resilience::SourceState::Healthy,
+    )
+    .expect("a healthy source permits removals")
+}
+
 #[tokio::test]
 async fn reindex_rewrites_stale_simhashes_without_touching_content() {
     let store = fresh_db("datasets-reindex").await;
@@ -249,7 +258,10 @@ async fn detect_removed_tombstones_with_matching_removed_revisions() {
 
     // Next full snapshot drops k1 and k3.
     let present: Vec<String> = vec!["k0".into(), "k2".into(), "k4".into()];
-    let mut removed = ds.detect_removed("app", "d", &present).await.unwrap();
+    let mut removed = ds
+        .detect_removed("app", "d", &present, ok_guard())
+        .await
+        .unwrap();
     removed.sort();
     assert_eq!(removed, vec!["k1".to_string(), "k3".to_string()]);
 
@@ -278,7 +290,10 @@ async fn detect_removed_tombstones_with_matching_removed_revisions() {
     }
 
     // Idempotent: a second identical snapshot re-removes nothing (already tombstoned).
-    let removed2 = ds.detect_removed("app", "d", &present).await.unwrap();
+    let removed2 = ds
+        .detect_removed("app", "d", &present, ok_guard())
+        .await
+        .unwrap();
     assert!(
         removed2.is_empty(),
         "already-removed keys are not re-removed"
@@ -300,7 +315,10 @@ async fn detect_removed_noops_on_an_empty_snapshot() {
         .collect();
     ds.upsert_many("app", "d", &items).await.unwrap();
 
-    let removed = ds.detect_removed("app", "d", &[]).await.unwrap();
+    let removed = ds
+        .detect_removed("app", "d", &[], ok_guard())
+        .await
+        .unwrap();
     assert!(removed.is_empty(), "empty snapshot must remove nothing");
 
     let live: i64 = sqlx::query_scalar(
@@ -826,7 +844,12 @@ async fn derived_group_counts_and_sums_track_add_change_remove() {
 
     // Remove: a full snapshot without s3 tombstones it; NY shrinks exactly.
     let removed = ds
-        .detect_removed("app", "sales", &["s1".to_string(), "s2".to_string()])
+        .detect_removed(
+            "app",
+            "sales",
+            &["s1".to_string(), "s2".to_string()],
+            ok_guard(),
+        )
         .await
         .unwrap();
     assert_eq!(removed, vec!["s3".to_string()]);
@@ -1146,9 +1169,14 @@ async fn provenance_stamps_round_trip_and_unstamped_writes_stay_honest_null() {
     }
 
     // Removal revisions carry no stamp (mirrors the no-trust-on-tombstone rule).
-    ds.detect_removed("app", "d", &["k1".into(), "k2".into(), "b1".into()])
-        .await
-        .unwrap();
+    ds.detect_removed(
+        "app",
+        "d",
+        &["k1".into(), "k2".into(), "b1".into()],
+        ok_guard(),
+    )
+    .await
+    .unwrap();
     let rev = &ds.history("app", "d", "b2", 10).await.unwrap()[0];
     assert_eq!(rev.change, "removed");
     assert!(rev.provenance.is_empty());

@@ -184,6 +184,50 @@ pub enum JsonFilter {
     NumGteAny { paths: Vec<String>, value: f64 },
 }
 
+/// Authorization to run full-snapshot removal detection
+/// ([`Datasets::detect_removed`]).
+///
+/// Removal detection tombstones every live key absent from a snapshot, which is
+/// the single most destructive thing an ingest can do: a half-broken run
+/// produces a short-but-nonempty batch and the whole tail of the dataset
+/// disappears. The store's own `present.is_empty()` guard only covers a *fully*
+/// empty snapshot — a partial batch is precisely the case it misses — so the
+/// real protection is the source's health state.
+///
+/// That protection used to live one layer **above** the store, in
+/// `AppContext::sync_many_with_provenance`. Any caller that hand-rolled
+/// `upsert_many` + `detect_removed` bypassed it silently, and one did (the peer
+/// app, reconstructing a fake "present" set from the live keys). Requiring this
+/// token turns the check from a convention into a precondition: there is no way
+/// to reach removal detection without having asked the health state, because
+/// there is no other way to obtain the token.
+///
+/// It carries no data — its whole value is that it cannot be forged.
+#[derive(Debug, Clone, Copy)]
+pub struct RemovalGuard {
+    _sealed: (),
+}
+
+impl RemovalGuard {
+    /// The guarded seam. `Some` only when the source's health state permits
+    /// removals; `None` means this run must be downgraded to a plain upsert and
+    /// leave every existing record — live or tombstoned — exactly as it is.
+    ///
+    /// What "degrading" means is [`SourceState::suppresses_removals`] and is
+    /// unchanged; this only moves *where* the answer is enforced.
+    pub fn for_source_state(state: crate::resilience::SourceState) -> Option<Self> {
+        (!state.suppresses_removals()).then_some(Self { _sealed: () })
+    }
+
+    /// The store's own materialized-view path: the capped search result set IS
+    /// the complete snapshot of the view, and there is no external source whose
+    /// health could be degrading. Crate-private on purpose — nothing outside
+    /// the store may mint a guard without asking a health state.
+    pub(crate) fn for_self_derived_snapshot() -> Self {
+        Self { _sealed: () }
+    }
+}
+
 /// A near-duplicate record pair and their SimHash Hamming distance.
 #[derive(Debug, Clone, Serialize)]
 pub struct DupPair {
@@ -667,15 +711,24 @@ impl Datasets {
     /// from `present` as removed (sets `removed_at` and appends a 'removed'
     /// revision). Returns the removed keys. Call after upserting a batch that
     /// represents the complete current state of the dataset.
+    ///
+    /// Requires a [`RemovalGuard`], which can only be obtained by asking the
+    /// source's health state — see that type for why the check is a parameter
+    /// rather than a convention one layer up. A caller that already knows
+    /// exactly which records disappeared wants
+    /// [`tombstone_keys`](Self::tombstone_keys) instead: that is removal by
+    /// name, not inference from a snapshot, and needs no guard.
     pub async fn detect_removed(
         &self,
         app: &str,
         dataset: &str,
         present: &[String],
+        _guard: RemovalGuard,
     ) -> Result<Vec<String>> {
-        // An empty snapshot almost always means the scrape failed, not that the
-        // entire dataset genuinely disappeared. Refuse to tombstone everything —
-        // callers that legitimately empty a dataset should delete explicitly.
+        // Defence in depth behind the health guard: an empty snapshot almost
+        // always means the scrape failed, not that the entire dataset genuinely
+        // disappeared. Refuse to tombstone everything — callers that legitimately
+        // empty a dataset should delete explicitly.
         if present.is_empty() {
             return Ok(Vec::new());
         }
@@ -691,22 +744,84 @@ impl Datasets {
             .into_iter()
             .filter(|k| !present.contains(k.as_str()))
             .collect();
+        self.apply_tombstones(app, dataset, to_remove).await
+    }
+
+    /// Tombstones exactly the named keys that are currently live — the same two
+    /// writes `detect_removed` makes (`removed_at` + a `removed` revision), and
+    /// therefore the same change-feed / watch / trigger signal. Returns the keys
+    /// actually tombstoned, in the order given; unknown and already-tombstoned
+    /// keys are skipped.
+    ///
+    /// Removal by **name**, not by inference. A caller here already holds the
+    /// per-record removal fact (a peer feed's `removed` revisions), so there is
+    /// no short snapshot to misread and nothing for a [`RemovalGuard`] to
+    /// protect against — which is exactly why this exists: without it, such a
+    /// caller reconstructs a fake "present" set out of the live keys and drives
+    /// `detect_removed` with it, re-entering the inference path it never needed
+    /// and bypassing the health check on the way.
+    pub async fn tombstone_keys(
+        &self,
+        app: &str,
+        dataset: &str,
+        keys: &[String],
+    ) -> Result<Vec<String>> {
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut live: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let unique: Vec<&str> = {
+            let mut seen = std::collections::HashSet::new();
+            keys.iter()
+                .map(String::as_str)
+                .filter(|k| seen.insert(*k))
+                .collect()
+        };
+        for slice in unique.chunks(rows_per_statement(1, 2)) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT key FROM records WHERE removed_at IS NULL AND app = ",
+            );
+            qb.push_bind(app);
+            qb.push(" AND dataset = ");
+            qb.push_bind(dataset);
+            qb.push(" AND key IN (");
+            push_key_list(&mut qb, slice);
+            qb.push(")");
+            let found: Vec<(String,)> = qb.build_query_as().fetch_all(&self.pool).await?;
+            live.extend(found.into_iter().map(|(k,)| k));
+        }
+        let to_remove: Vec<String> = unique
+            .into_iter()
+            .filter(|k| live.contains(*k))
+            .map(str::to_string)
+            .collect();
+        self.apply_tombstones(app, dataset, to_remove).await
+    }
+
+    /// The shared write half of both removal paths: tombstone every key in
+    /// `to_remove` and append its `removed` revision.
+    ///
+    /// Two properties, both learned the hard way:
+    ///   (1) Atomicity — the `UPDATE removed_at` and its `removed` revision run
+    ///       in ONE transaction, so a crash between them can't tombstone a
+    ///       record with no revision. That was a permanent signal loss: the next
+    ///       sync sees `removed_at` already set and the key still absent, so it
+    ///       never revisits the key and the change feed / watches / dataset
+    ///       triggers never fire for that removal. `upsert` was hardened for
+    ///       exactly this reason; the removal path writes the same two rows and
+    ///       had been missed.
+    ///   (2) Cost — chunked commits instead of 2 write transactions per key
+    ///       (a 2k-key removal was 4k commits).
+    async fn apply_tombstones(
+        &self,
+        app: &str,
+        dataset: &str,
+        to_remove: Vec<String>,
+    ) -> Result<Vec<String>> {
         if to_remove.is_empty() {
             return Ok(Vec::new());
         }
         let now = Utc::now();
-
-        // Two fixes over the old per-key pair of autocommit writes:
-        //   (1) Atomicity — the `UPDATE removed_at` and its `removed` revision now
-        //       run in ONE transaction, so a crash between them can't tombstone a
-        //       record with no revision. That was a permanent signal loss: the
-        //       next sync sees `removed_at` already set and the key still absent,
-        //       so it never revisits the key and the change feed / watches / dataset
-        //       triggers never fire for that removal. `upsert` was hardened for
-        //       exactly this reason; `detect_removed` writes the same two rows and
-        //       had been missed.
-        //   (2) Cost — chunked commits instead of 2 write transactions per key
-        //       (a 2k-key removal was 4k commits).
         let mut conn = self.pool.acquire().await?;
         for chunk in to_remove.chunks(UPSERT_CHUNK) {
             sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
@@ -763,7 +878,14 @@ impl Datasets {
             .collect();
         let summary = self.upsert_many(app, dataset, &items).await?;
         let present: Vec<String> = items.into_iter().map(|(k, _)| k).collect();
-        let removed = self.detect_removed(app, dataset, &present).await?;
+        let removed = self
+            .detect_removed(
+                app,
+                dataset,
+                &present,
+                RemovalGuard::for_self_derived_snapshot(),
+            )
+            .await?;
         Ok((summary, removed))
     }
 

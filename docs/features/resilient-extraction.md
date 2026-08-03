@@ -143,7 +143,9 @@ half-broken run produces a short-but-nonempty batch, and `detect_removed`
 tombstones every key missing from it. `detect_removed` already no-ops on an
 *empty* `present` list (fixed 2026-07-14); a partially-broken run is the case
 that guard does not cover, and it is the single most destructive thing a
-degrading source can do.
+degrading source can do. `detect_removed` now *requires* a `RemovalGuard`, which
+only a non-degrading `SourceState` yields, so the downgrade cannot be bypassed by
+a caller that reaches past `sync_many` (§7.2).
 
 ### 2.3 The input–output divergence test (the core idea)
 
@@ -813,9 +815,19 @@ into the live dataset, which is the same code path and produces proper revisions
 1. **A degrading source must never tombstone its own dataset.** `sync_many` is
    downgraded to `upsert_many` in `degraded`/`quarantined`. `detect_removed`
    already no-ops on an empty batch; a *partial* batch is the dangerous case and
-   this is the guard for it. Concretely, this is a check inside
-   `AppContext::sync_many`, not in each app — per the "guard-at-the-wrong-seam"
-   anti-pattern, a control wired into one caller silently exempts the others.
+   this is the guard for it.
+
+   The check lives **in the store**, as a precondition of removal detection:
+   `Datasets::detect_removed` takes a `RemovalGuard`, and the only public way to
+   mint one is `RemovalGuard::for_source_state(state)`, which returns `None` for
+   a degrading source. It used to be a check inside `AppContext::sync_many` —
+   one layer above — which is the "guard-at-the-wrong-seam" anti-pattern one step
+   removed: it covered every caller that *went through* `sync_many`, and the
+   `peer` app (hand-rolling upsert + `detect_removed`) simply did not. A token
+   the store demands cannot be walked around, and
+   `crates/core/tests/removal_guard.rs` holds the EXPECTED inventory of call
+   sites. A caller that already knows which records disappeared uses
+   `Datasets::tombstone_keys` — removal by name, no inference, no guard needed.
 2. **A degrading source must never push.** Watches (`dataset.changed`), triggers
    (`fresh`/`changed`/`removed`), and saved-search alerts all fire from the
    worker's post-run hooks. Health evaluation runs **before** those hooks and they

@@ -32,8 +32,11 @@
 //! revision seen per key within one walk is applied (it is the latest state);
 //! older revisions of the same key are skipped. `removed` revisions ARE
 //! carried by the feed and are applied as real local tombstones (via
-//! `Datasets::detect_removed`, which writes `removed_at` + a `removed`
-//! revision) — so downstream triggers on the mirror see removals too.
+//! `Datasets::tombstone_keys` — removal by NAME, which writes `removed_at` + a
+//! `removed` revision) — so downstream triggers on the mirror see removals too.
+//! It is deliberately NOT `detect_removed`: this app knows exactly which keys
+//! died, so inferring them from a synthetic full snapshot (what v1 did) only
+//! bought a way around the degrading-source removal guard.
 //!
 //! ## Provenance of a mirrored record (M12)
 //!
@@ -209,8 +212,14 @@ impl ScrapeApp for Peer {
 
         let mut reports: Vec<Value> = Vec::new();
         for spec in &specs {
-            let report = match pull_one(&ctx, &base, spec, namespace_override.as_deref(), max_records)
-                .await
+            let report = match pull_one(
+                &ctx,
+                &base,
+                spec,
+                namespace_override.as_deref(),
+                max_records,
+            )
+            .await
             {
                 Ok(r) => r,
                 Err(e) => json!({
@@ -374,9 +383,14 @@ async fn pull_one(
         }
     }
 
-    // Tombstones: `detect_removed` is the one public seam that writes a real
-    // tombstone (removed_at + 'removed' revision), driven by a full present
-    // set — so hand it "every live key except the tombstoned ones".
+    // Tombstones: the feed NAMED these keys as removed, so `tombstone_keys`
+    // writes the same two rows (`removed_at` + a `removed` revision) directly.
+    //
+    // v1 drove `Datasets::detect_removed` instead, by listing every live record
+    // and handing back "all of them except the dead ones" as a synthetic full
+    // snapshot. It produced the right rows, but it re-entered full-snapshot
+    // *inference* — which this app never needed — and in doing so reached past
+    // the degrading-source removal guard that every `sync_many` caller gets.
     let mut tombstones_applied = 0usize;
     if !tombstone_keys.is_empty() {
         let count = ctx.datasets.record_count(&namespace, &dataset).await?;
@@ -388,19 +402,16 @@ async fn pull_one(
             .filter(|r| r.removed_at.is_none())
             .map(|r| r.key)
             .collect();
-        let dead: HashSet<&str> = tombstone_keys.iter().map(String::as_str).collect();
-        let present: Vec<String> = live.into_iter().filter(|k| !dead.contains(k.as_str())).collect();
-        if present.is_empty() {
-            // detect_removed refuses an empty present set by design; honor it.
+        if tombstones_would_empty_the_mirror(&live, &tombstone_keys) {
             notes.push(format!(
                 "{} tombstone(s) NOT applied: they would empty the entire local \
-                 mirror, which the store refuses (delete explicitly if intended)",
+                 mirror, which this app refuses (delete explicitly if intended)",
                 tombstone_keys.len()
             ));
         } else {
             tombstones_applied = ctx
                 .datasets
-                .detect_removed(&namespace, &dataset, &present)
+                .tombstone_keys(&namespace, &dataset, &tombstone_keys)
                 .await?
                 .len();
         }
@@ -429,7 +440,8 @@ async fn pull_one(
     st.dataset = dataset.clone();
     st.namespace = namespace.clone();
     st.last_job_id = Some(ctx.job_id.to_string());
-    ctx.upsert(STATE_DATASET, &state_key, &st.to_value()?).await?;
+    ctx.upsert(STATE_DATASET, &state_key, &st.to_value()?)
+        .await?;
 
     Ok(json!({
         "dataset": spec,
@@ -598,6 +610,22 @@ fn plan_actions(items: &[Value], seen: &mut HashSet<String>) -> PullPlan {
     plan
 }
 
+/// Whether applying `dead` would leave the local mirror with no live record.
+///
+/// A mirror that empties itself is almost always an origin problem (a feed that
+/// replayed every removal, a wiped upstream index) rather than a genuine "this
+/// dataset no longer exists", and a mirror is not the place to make that call.
+/// The store used to refuse this for us as a side effect of the empty-`present`
+/// guard on `detect_removed`; naming it here keeps the behavior after the switch
+/// to `tombstone_keys`, which — being removal by name — has no such guard.
+fn tombstones_would_empty_the_mirror(live: &[String], dead: &[String]) -> bool {
+    if live.is_empty() {
+        return false; // nothing live to lose
+    }
+    let dead: HashSet<&str> = dead.iter().map(String::as_str).collect();
+    live.iter().all(|k| dead.contains(k.as_str()))
+}
+
 /// The derivation stamp a MIRRORED record gets (M12).
 ///
 /// The honesty problem peering creates: this node did not fetch the origin
@@ -664,9 +692,7 @@ fn parse_feed_page(body: &Value) -> Result<FeedPage> {
 /// `"app/dataset"` → (app, dataset). Exactly one slash, both halves non-empty.
 fn parse_dataset_spec(spec: &str) -> Result<(String, String)> {
     match spec.split_once('/') {
-        Some((app, ds))
-            if !app.trim().is_empty() && !ds.trim().is_empty() && !ds.contains('/') =>
-        {
+        Some((app, ds)) if !app.trim().is_empty() && !ds.trim().is_empty() && !ds.contains('/') => {
             Ok((app.trim().to_string(), ds.trim().to_string()))
         }
         _ => Err(Error::App(format!(
@@ -815,8 +841,14 @@ mod tests {
 
     #[test]
     fn namespace_defaults_to_peer_prefixed_remote_app() {
-        assert_eq!(resolve_namespace(None, "hackernews").unwrap(), "peer_hackernews");
-        assert_eq!(resolve_namespace(Some("mirror-a"), "x").unwrap(), "mirror-a");
+        assert_eq!(
+            resolve_namespace(None, "hackernews").unwrap(),
+            "peer_hackernews"
+        );
+        assert_eq!(
+            resolve_namespace(Some("mirror-a"), "x").unwrap(),
+            "mirror-a"
+        );
     }
 
     #[test]
@@ -825,7 +857,10 @@ mod tests {
         // write-origin corruption the design forbids.
         assert!(resolve_namespace(Some("hackernews"), "hackernews").is_err());
         for bad in ["", "a/b", "a b", "a\\b", "peer|x", &"x".repeat(65)] {
-            assert!(resolve_namespace(Some(bad), "app").is_err(), "must reject {bad:?}");
+            assert!(
+                resolve_namespace(Some(bad), "app").is_err(),
+                "must reject {bad:?}"
+            );
         }
     }
 
@@ -918,10 +953,10 @@ mod tests {
     #[test]
     fn malformed_items_are_counted_never_applied_or_fatal() {
         let items = vec![
-            json!({"change": "new"}),                       // no key
-            json!({"key": "k", "change": "mystery"}),       // unknown change kind
-            rev("k2", "new", Value::Null, "t1"),            // new without data
-            json!({"key": "k3"}),                           // no change
+            json!({"change": "new"}),                 // no key
+            json!({"key": "k", "change": "mystery"}), // unknown change kind
+            rev("k2", "new", Value::Null, "t1"),      // new without data
+            json!({"key": "k3"}),                     // no change
         ];
         let mut seen = HashSet::new();
         let plan = plan_actions(&items, &mut seen);
@@ -961,6 +996,32 @@ mod tests {
         );
         assert!(normalize_base_url("peer:8877").is_err());
         assert!(normalize_base_url("ftp://x").is_err());
+    }
+
+    #[test]
+    fn a_mirror_refuses_to_tombstone_itself_empty_but_not_a_partial_sweep() {
+        // v1 got this for free: it drove `detect_removed` with a synthetic
+        // "present" set, and the store refuses an EMPTY present set. Removal by
+        // name has no such guard — it does exactly what it is told — so the
+        // refusal has to be stated here or a feed replaying every removal wipes
+        // the mirror silently.
+        let live = |ks: &[&str]| ks.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(tombstones_would_empty_the_mirror(
+            &live(&["a", "b"]),
+            &live(&["b", "a"])
+        ));
+        // Extra dead keys we do not hold locally still count as "empties it".
+        assert!(tombstones_would_empty_the_mirror(
+            &live(&["a"]),
+            &live(&["a", "ghost"])
+        ));
+        // A partial sweep is the normal case and must go through.
+        assert!(!tombstones_would_empty_the_mirror(
+            &live(&["a", "b", "c"]),
+            &live(&["b"])
+        ));
+        // Nothing live: no data to lose, so nothing to refuse.
+        assert!(!tombstones_would_empty_the_mirror(&[], &live(&["a"])));
     }
 
     #[test]

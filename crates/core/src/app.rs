@@ -611,7 +611,10 @@ impl AppContext {
             .upsert_many_with_provenance(dataset, items, prov)
             .await?;
         let state = self.health.enforced_state(&self.app, dataset).await;
-        if state.suppresses_removals() {
+        // The store will not run removal detection without this token, so the
+        // check cannot be skipped by a caller that reaches past this method —
+        // there is no other way to obtain one.
+        let Some(guard) = crate::datasets::RemovalGuard::for_source_state(state) else {
             tracing::warn!(
                 job = %self.job_id,
                 dataset,
@@ -620,11 +623,11 @@ impl AppContext {
                  must not tombstone the keys missing from it"
             );
             return Ok(summary);
-        }
+        };
         let present: Vec<String> = items.iter().map(|(k, _)| k.clone()).collect();
         summary.removed = self
             .datasets
-            .detect_removed(&self.app, dataset, &present)
+            .detect_removed(&self.app, dataset, &present, guard)
             .await?;
         Ok(summary)
     }

@@ -15,7 +15,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use pumper_core::datasets::ChangeKind;
+use pumper_core::datasets::{ChangeKind, RemovalGuard};
+use pumper_core::resilience::SourceState;
 use pumper_core::testing::TempStore;
 use pumper_core::Datasets;
 use serde_json::{json, Value};
@@ -122,9 +123,12 @@ async fn batched_upsert_many_matches_per_record_upserts_not_a_batched_approximat
                 .filter(|_| rng.below(4) != 0)
                 .collect();
             if !present.is_empty() {
-                b.removed = batched.detect_removed("app", "d", &present).await.unwrap();
+                b.removed = batched
+                    .detect_removed("app", "d", &present, ok_guard())
+                    .await
+                    .unwrap();
                 r.removed = reference
-                    .detect_removed("app", "d", &present)
+                    .detect_removed("app", "d", &present, ok_guard())
                     .await
                     .unwrap();
                 b.removed.sort();
@@ -157,6 +161,11 @@ async fn batched_upsert_many_matches_per_record_upserts_not_a_batched_approximat
             "round {round}: revision chains diverged (number/kind/snapshot/diff)"
         );
     }
+}
+
+/// A healthy source's removal guard — the only way to reach removal detection.
+fn ok_guard() -> RemovalGuard {
+    RemovalGuard::for_source_state(SourceState::Healthy).expect("a healthy source permits removals")
 }
 
 /// The reference implementation: the per-record loop the batch path replaced.
