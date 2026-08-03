@@ -5,7 +5,7 @@ use std::time::Duration;
 use pumper_core::{AppContext, Job, JobStatus, SearchDoc};
 use serde_json::Value;
 use tokio::sync::{Mutex, Semaphore};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::events::JobEvent;
@@ -520,7 +520,12 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                 notify_watches(&state, &job, &by_dataset).await;
                 crate::triggers::fire_dataset_triggers(&state, &job, &by_dataset).await;
             }
-            notify_saved_searches(&state, &job).await;
+            // Saved searches are scoped against every app this run put documents
+            // under — the job's own app AND the virtual apps named by
+            // `index_datasets` (e.g. `grants`), which is the app those docs
+            // actually carry. See `run_indexed_apps`.
+            let indexed_apps = run_indexed_apps(&job.app, &index_specs);
+            notify_saved_searches(&state, &job, &indexed_apps).await;
             // Metadata shadow: push this run's dataset entities/lineage/freshness
             // to DataHub. Detached and fail-open — a down GMS never touches jobs.
             crate::datahub::on_job_success(state.clone(), job.clone(), index_specs);
@@ -813,10 +818,50 @@ async fn notify_watches(
     }
 }
 
+/// Every app namespace this run's documents landed under: the job's own app,
+/// plus each **virtual** app named by the result's `index_datasets` specs.
+///
+/// The two are genuinely different namespaces. `dataset_search_docs` indexes the
+/// named datasets under the spec's `app` verbatim, so a `ca-grants` run publishes
+/// its per-opportunity docs as app `grants` (`grants_common::UNIFIED_APP`). A
+/// saved search scoped to `grants` — the only scope that matches how those docs
+/// were indexed — must therefore be considered in scope for that run.
+///
+/// Order-preserving and de-duplicated (job app first); empty app names are
+/// dropped, since an empty namespace matches nothing.
+fn run_indexed_apps(job_app: &str, index_specs: &[(String, String)]) -> Vec<String> {
+    let mut apps: Vec<String> = Vec::with_capacity(1 + index_specs.len());
+    for app in std::iter::once(job_app).chain(index_specs.iter().map(|(a, _)| a.as_str())) {
+        if !app.is_empty() && !apps.iter().any(|seen| seen == app) {
+            apps.push(app.to_string());
+        }
+    }
+    apps
+}
+
+/// Whether a saved search's `app` filter covers a run that indexed under
+/// `indexed_apps` (see [`run_indexed_apps`]).
+///
+/// Unscoped (`None`) searches always run. A scoped search runs only when this
+/// run actually wrote documents under that exact app — deliberately NOT widened
+/// to "any app", so a search pinned to one namespace still ignores unrelated
+/// runs.
+fn search_covers_run(search_app: Option<&str>, indexed_apps: &[String]) -> bool {
+    match search_app {
+        None => true,
+        Some(app) => indexed_apps.iter().any(|indexed| indexed == app),
+    }
+}
+
 /// Runs enabled saved searches after a job's results were indexed, alerting
-/// each NEW match exactly once (`saved_search_seen` dedup). Scoped to searches
-/// whose app filter is empty or matches the finished job's app.
-async fn notify_saved_searches(state: &AppState, job: &Job) {
+/// each NEW match exactly once (`saved_search_seen` dedup). Scoped by
+/// [`search_covers_run`] over [`run_indexed_apps`] — the job's app plus the
+/// virtual apps it indexed datasets under.
+///
+/// When several source apps feed one virtual app (`grants-gov` and `ca-grants`
+/// both publishing into `grants`), each run re-evaluates the same search; the
+/// `claim_unseen` dedupe is what keeps that from alerting twice on one document.
+async fn notify_saved_searches(state: &AppState, job: &Job, indexed_apps: &[String]) {
     let searches = match state.storage.list_saved_searches(true).await {
         Ok(list) if !list.is_empty() => list,
         Ok(_) => return,
@@ -833,7 +878,15 @@ async fn notify_saved_searches(state: &AppState, job: &Job) {
         warn!(job = %job.id, "search flush before saved-search scan failed: {e}");
     }
     for search in searches {
-        if search.app.as_deref().is_some_and(|app| app != job.app) {
+        if !search_covers_run(search.app.as_deref(), indexed_apps) {
+            // Silence is this bug's signature: a mis-scoped standing alert used
+            // to skip every run without a word. Say which filter missed what.
+            debug!(
+                search = %search.id, job = %job.id,
+                filter_app = search.app.as_deref().unwrap_or(""),
+                indexed_apps = ?indexed_apps,
+                "saved search skipped: its app filter is not among the apps this run indexed under"
+            );
             continue;
         }
         // Materialization (M13 "queries as datasets") runs regardless of whether
@@ -858,9 +911,24 @@ async fn notify_saved_searches(state: &AppState, job: &Job) {
             }
         };
         let ids: Vec<String> = results.hits.iter().map(|h| h.id.clone()).collect();
+        if ids.is_empty() {
+            debug!(
+                search = %search.id, job = %job.id, query = %search.query,
+                filter_app = search.app.as_deref().unwrap_or(""),
+                filter_dataset = search.dataset.as_deref().unwrap_or(""),
+                "saved search ran but matched no documents"
+            );
+            continue;
+        }
         let unseen = match state.storage.claim_unseen(&search.id, &ids).await {
             Ok(unseen) if !unseen.is_empty() => unseen,
-            Ok(_) => continue,
+            Ok(_) => {
+                debug!(
+                    search = %search.id, job = %job.id, hits = ids.len(),
+                    "saved search matched only already-alerted documents; no webhook"
+                );
+                continue;
+            }
             Err(e) => {
                 warn!(search = %search.id, "saved search dedup failed: {e}");
                 continue;
@@ -1155,6 +1223,71 @@ fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
         body: rec.to_string(),
         // Job-result docs carry no record timestamp — index at completion time.
         indexed_at: chrono::Utc::now().timestamp(),
+    }
+}
+
+#[cfg(test)]
+mod saved_search_scope_tests {
+    use super::{run_indexed_apps, search_covers_run};
+    use serde_json::json;
+
+    /// The regression: `grants-gov`/`ca-grants` index their per-opportunity docs
+    /// under the VIRTUAL app `grants` (`grants_common::UNIFIED_APP`), so a saved
+    /// search scoped to `grants` — the only scope matching how those docs were
+    /// indexed — must not be skipped just because `job.app` is the source app.
+    #[test]
+    fn alert_scoped_to_virtual_app_is_not_skipped() {
+        // The result shape `UnifiedOutcome::merge_into` writes, read back through
+        // the same parser the worker uses.
+        let result = json!({
+            "unified": { "new": 2, "changed": 0 },
+            "index_datasets": [{ "app": "grants", "dataset": "unified" }],
+        });
+        let specs = crate::datahub::index_dataset_specs(&result);
+        let indexed = run_indexed_apps("ca-grants", &specs);
+        assert_eq!(indexed, vec!["ca-grants".to_string(), "grants".to_string()]);
+        assert!(
+            search_covers_run(Some("grants"), &indexed),
+            "a search scoped to the virtual app must run on the source app's job"
+        );
+        assert!(search_covers_run(Some("ca-grants"), &indexed));
+        assert!(search_covers_run(None, &indexed), "unscoped always runs");
+    }
+
+    /// Scoping is widened to the run's real namespaces — never to "all apps".
+    #[test]
+    fn unrelated_app_scope_is_still_excluded() {
+        let indexed = run_indexed_apps("ca-grants", &[("grants".into(), "unified".into())]);
+        assert!(!search_covers_run(Some("hackernews"), &indexed));
+        assert!(!search_covers_run(Some("eu-sedia"), &indexed));
+        assert!(
+            !search_covers_run(Some(""), &indexed),
+            "an empty app filter names no namespace and matches nothing"
+        );
+    }
+
+    /// A plain run with no `index_datasets` keeps exactly the old semantics.
+    #[test]
+    fn job_without_index_datasets_scopes_to_its_own_app_only() {
+        let indexed = run_indexed_apps("hackernews", &[]);
+        assert_eq!(indexed, vec!["hackernews".to_string()]);
+        assert!(search_covers_run(Some("hackernews"), &indexed));
+        assert!(!search_covers_run(Some("grants"), &indexed));
+    }
+
+    /// Several source apps feed one virtual app; the app list stays a set, so a
+    /// search is evaluated once per run (dedupe across runs is `claim_unseen`).
+    #[test]
+    fn repeated_virtual_app_is_listed_once() {
+        let specs = vec![
+            ("grants".to_string(), "unified".to_string()),
+            ("grants".to_string(), "events".to_string()),
+        ];
+        assert_eq!(
+            run_indexed_apps("grants", &specs),
+            vec!["grants".to_string()],
+            "job app equal to the virtual app collapses to one entry"
+        );
     }
 }
 
