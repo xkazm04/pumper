@@ -38,6 +38,8 @@ pub mod markdown;
 pub mod plugin;
 pub mod recipes;
 pub mod resilience;
+#[cfg(feature = "storage")]
+pub mod retention;
 pub mod search;
 pub mod simhash;
 
@@ -64,10 +66,17 @@ pub use resilience::{
 #[cfg(feature = "storage")]
 pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
 #[cfg(feature = "storage")]
+pub use retention::{
+    artifact_is_reclaimable, artifact_usage, delete_artifacts, keep_reason,
+    plan_artifact_retention, scan_artifact_tree, AppReclaim, ArtifactFile, ArtifactRef, KeepReason,
+    RetentionPlan,
+};
+#[cfg(feature = "storage")]
 pub use storage::{
-    Delivery, EnqueueOptions, IngressSource, JobStages, JobTimingStats, NewDerivedSpec,
-    NewSchedule, NewTrigger, PluginHook, RevisionCount, SavedSearch, Schedule, SearchMaterialize,
-    Storage, Trigger, TriggerPluginHooks, Watch, YieldSummary, MAX_CHECKPOINT_BYTES,
+    Delivery, EnqueueOptions, IngressSource, JobStages, JobTimingStats, LedgerPruned,
+    LedgerRetention, NewDerivedSpec, NewSchedule, NewTrigger, PluginHook, RevisionCount,
+    SavedSearch, Schedule, SearchMaterialize, Storage, Trigger, TriggerPluginHooks, Watch,
+    YieldSummary, LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
 };
 #[cfg(feature = "storage")]
 pub use tiers::{

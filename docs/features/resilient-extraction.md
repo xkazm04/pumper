@@ -86,11 +86,12 @@ an accept path, and no human reviews anything.
    precise and would force every consumer to understand it. Records carry one
    `trust` value. The per-field detail lives in `source_runs`/`field_sketches` for
    anyone who wants it.
-5. **Repair depends on retained page bodies.** `extraction.md` records that
-   artifact bodies have no retention or GC policy — they persist until manually
-   removed. This design *creates* a hard dependency on some bodies surviving, so
-   it ships its own small, explicit retention store (`data/golden/`, §6.3) rather
-   than relying on that accident.
+5. **Repair depends on retained page bodies.** Artifact retention exists now
+   (`[storage] artifact_retention_days`, off by default, provenance-pinned — see
+   `datasets.md`), but it is an *operator* policy over per-job dirs and nothing
+   in it knows what repair needs. This design therefore keeps its own small,
+   explicit retention store (`data/golden/`, §6.3) rather than depending on
+   whatever window the deployment happens to configure.
 6. **`/changes` defaults to trusted-only; push surfaces suppress.** Pull APIs are
    re-readable and therefore recoverable, so they filter but stay inspectable.
    Pushes (webhooks, triggers) are irreversible once sent, so they suppress. §7.3.
@@ -1059,7 +1060,8 @@ on a handful of rows. They get golden-doc detection only and are marked
 hidden.
 
 **10.6 Artifact retention.** Golden bodies live in `data/golden/`, outside the
-per-job artifact dirs, precisely so that the (still absent) artifact GC cannot
+per-job artifact dirs, precisely so that artifact retention
+(`[storage] artifact_retention_days`, which walks only `data/artifacts/`) cannot
 take them. Recent bodies for the holdout corpus are best-effort: if fewer than
 `holdout_min_docs` survive, repair declines with outcome `no_corpus` rather than
 validating against three pages.

@@ -53,7 +53,7 @@ The crawl writes every kept page's body to disk and records `artifact_path` + `j
 
 Run it manually the same way — omit the trigger and pass `source.keys` (or nothing, to sweep all live `pages`).
 
-**Artifact-retention caveat**: source mode reads bodies from the **origin crawl job's** per-job artifacts dir. There is **no retention/GC policy** — bodies persist until manually deleted; once a body is gone, its key surfaces in the extractor's `missing_keys` rather than as a silent null. A revisit crawl writes fresh bodies under a **new** `job_id` and updates the record's `job_id`, so extraction always follows the latest stored body.
+**Artifact retention**: source mode reads bodies from the **origin crawl job's** per-job artifacts dir. Retention is **off by default** (`[storage] artifact_retention_days = 0`); when enabled, bodies past the window are reclaimed *unless a replayable revision pins them* (see [datasets.md § Retention](datasets.md)). Once a body is gone — reclaimed or manually deleted — its key surfaces in the extractor's `missing_keys` rather than as a silent null. A revisit crawl writes fresh bodies under a **new** `job_id` and updates the record's `job_id`, so extraction always follows the latest stored body; the abandoned older copy is exactly what retention reclaims, and it stays pinned for as long as a replayable revision still claims to reproduce from it. `GET /retention/preview` shows what would be reclaimed, per app, without deleting.
 
 ## Result stats
 

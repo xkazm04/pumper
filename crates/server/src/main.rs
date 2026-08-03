@@ -287,11 +287,22 @@ async fn cache_janitor(state: AppState) {
     }
 }
 
-/// Bounds the two append-only stores.
+/// Bounds every store that would otherwise grow without end.
 ///
 /// **Revision history** older than the configured retention window (keeping the
 /// newest N per record) — off unless `[storage] revision_retention_days > 0`,
 /// because deleting a dataset's accrued history is data loss and must be opt-in.
+///
+/// **Archived bodies** under `artifacts_dir` older than
+/// `[storage] artifact_retention_days` — same opt-in posture, and additionally
+/// *pinned*: a body a replayable revision still points at is never reclaimed,
+/// however old (`pumper_core::retention`). This is the one loop that touches the
+/// artifact tree, and it runs the identical plan `GET /retention/preview` shows.
+///
+/// **The four unbounded ledgers** (`cost_events`, `webhook_deliveries`,
+/// `job_yield`, `saved_search_seen`) — each with its own day knob, all off by
+/// default, each scoped so an in-flight row survives (see
+/// `Storage::prune_ledgers`).
 ///
 /// **Extraction-health sketches and run rows** beyond
 /// `[resilience] sketch_retention_runs` — on whenever detection is, because these
@@ -302,15 +313,28 @@ async fn cache_janitor(state: AppState) {
 async fn retention_janitor(state: AppState) {
     let days = state.config.storage.revision_retention_days;
     let keep_min = state.config.storage.revision_retention_keep_min;
+    let artifact_days = state.config.storage.artifact_retention_days;
+    let ledgers = state.config.storage.ledger_retention();
     let sketch_runs = state
         .health
         .enabled()
         .then(|| state.config.resilience.sketch_retention_runs);
-    if days == 0 && sketch_runs.is_none() {
+    if !state
+        .config
+        .storage
+        .any_retention_enabled(sketch_runs.is_some())
+    {
         return; // nothing to bound
     }
     let interval = std::time::Duration::from_secs(6 * 3600);
-    tracing::info!(days, keep_min, ?sketch_runs, "retention janitor enabled");
+    tracing::info!(
+        days,
+        keep_min,
+        artifact_days,
+        ?ledgers,
+        ?sketch_runs,
+        "retention janitor enabled"
+    );
     loop {
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
@@ -324,6 +348,38 @@ async fn retention_janitor(state: AppState) {
                 }
                 Ok(_) => {}
                 Err(e) => tracing::warn!("revision prune failed: {e}"),
+            }
+        }
+        if ledgers.any_enabled() {
+            match state.storage.prune_ledgers(&ledgers).await {
+                Ok(p) if p.total() > 0 => {
+                    tracing::info!(?p, "retention janitor pruned ledgers")
+                }
+                Ok(_) => {}
+                Err(e) => tracing::warn!("ledger prune failed: {e}"),
+            }
+        }
+        if artifact_days > 0 {
+            // Pins are read BEFORE the plan is built, from the same snapshot the
+            // preview endpoint reads — a body that gained a replayable revision
+            // since the last tick is protected on this one.
+            match crate::routes::artifact_retention_plan(&state, artifact_days).await {
+                Ok((files, plan)) => {
+                    let (n, bytes) = pumper_core::retention::delete_artifacts(
+                        &state.storage.artifacts_dir,
+                        &files,
+                        &plan,
+                    );
+                    if n > 0 {
+                        tracing::info!(
+                            files = n,
+                            bytes,
+                            pinned = plan.pinned_files,
+                            "retention janitor reclaimed archived bodies"
+                        );
+                    }
+                }
+                Err(e) => tracing::warn!("artifact retention plan failed: {e}"),
             }
         }
         if let (Some(keep), Some(store)) = (sketch_runs, state.health.store()) {

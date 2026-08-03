@@ -1301,6 +1301,99 @@ impl Storage {
         row.map(Delivery::try_from).transpose()
     }
 
+    // ── ledger retention ─────────────────────────────────────────────────────
+    // Four append-only tables had no prune path at all: `cost_events` (one row
+    // per metered engine call), `webhook_deliveries` (one row per outbound POST,
+    // body included), `job_yield` (one row per dataset per job) and
+    // `saved_search_seen` (one row per alerted doc, forever). On a machine with
+    // cron schedules they are the tables that grow while nobody is looking.
+    //
+    // Every knob is OFF by default and every prune is scoped by a predicate that
+    // protects something still in use — deleting a ledger is data loss, so the
+    // precedent set by `revision_retention_days` (opt-in, with the reason stated)
+    // is followed exactly rather than softened.
+
+    /// Prunes the four unbounded ledgers according to `retention`. Each `0` day
+    /// count skips its table entirely, so an unconfigured deployment does nothing.
+    ///
+    /// The scoping predicates, and why each exists:
+    ///
+    /// - **cost_events** — only events of jobs that have already reached a
+    ///   terminal state. A running job's budget ceiling is enforced against the
+    ///   SUM of its own events; pruning under it would silently hand it more
+    ///   money than the operator granted. Guarded by
+    ///   `prune_cost_events_spares_a_running_jobs_events`.
+    /// - **webhook_deliveries** — only `delivered` (and, under a separate knob,
+    ///   `dead`) rows. `pending` and `failed` are the live retry queue and the
+    ///   replayable dead-letter queue; pruning either would drop an undelivered
+    ///   payload on the floor.
+    /// - **job_yield** — plain age. It is derived from job results, which remain.
+    /// - **saved_search_seen** — plain age, and the sharpest edge in this list:
+    ///   a pruned `seen` row makes an already-alerted document look new again, so
+    ///   a still-matching doc re-fires its webhook. Off unless the operator
+    ///   deliberately accepts that.
+    pub async fn prune_ledgers(&self, retention: &LedgerRetention) -> Result<LedgerPruned> {
+        let mut out = LedgerPruned::default();
+        if retention.cost_event_days > 0 {
+            out.cost_events = sqlx::query(
+                "DELETE FROM cost_events WHERE created_at < ?1 \
+                 AND NOT EXISTS (SELECT 1 FROM jobs j WHERE j.id = cost_events.job_id \
+                                 AND j.status IN ('queued', 'running'))",
+            )
+            .bind(ts(cutoff(retention.cost_event_days)))
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        }
+        if retention.delivered_webhook_days > 0 {
+            out.webhook_deliveries += sqlx::query(
+                "DELETE FROM webhook_deliveries WHERE status = 'delivered' AND created_at < ?1",
+            )
+            .bind(ts(cutoff(retention.delivered_webhook_days)))
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        }
+        if retention.dead_webhook_days > 0 {
+            out.webhook_deliveries += sqlx::query(
+                "DELETE FROM webhook_deliveries WHERE status = 'dead' AND created_at < ?1",
+            )
+            .bind(ts(cutoff(retention.dead_webhook_days)))
+            .execute(&self.pool)
+            .await?
+            .rows_affected();
+        }
+        if retention.job_yield_days > 0 {
+            out.job_yield = sqlx::query("DELETE FROM job_yield WHERE created_at < ?1")
+                .bind(ts(cutoff(retention.job_yield_days)))
+                .execute(&self.pool)
+                .await?
+                .rows_affected();
+        }
+        if retention.saved_search_seen_days > 0 {
+            out.saved_search_seen =
+                sqlx::query("DELETE FROM saved_search_seen WHERE created_at < ?1")
+                    .bind(ts(cutoff(retention.saved_search_seen_days)))
+                    .execute(&self.pool)
+                    .await?
+                    .rows_affected();
+        }
+        Ok(out)
+    }
+
+    /// Row counts of the tables that have no natural bound, for the read-only
+    /// store report. Cheap `COUNT(*)`s, but still a table scan each — on-demand.
+    pub async fn ledger_row_counts(&self) -> Result<Vec<(String, i64)>> {
+        let mut out = Vec::new();
+        for table in LEDGER_TABLES {
+            let n: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+                .fetch_one(&self.pool)
+                .await?;
+            out.push((table.to_string(), n));
+        }
+        Ok(out)
+    }
+
     // ── ingress ──────────────────────────────────────────────────────────────
     // Inbound event ingress sources: per-caller credentials for POST /ingest/{id}.
 
@@ -2358,6 +2451,58 @@ impl TryFrom<IngressSourceRow> for IngressSource {
 
 /// Splits an optional keyset cursor pair into two bind-ready Options, so a
 /// single SQL `WHERE (?1 IS NULL OR ...)` clause covers the first-page case.
+/// The append-only tables with no natural bound, in report order. Kept as one
+/// list so `ledger_row_counts` and the store report cannot drift from what
+/// [`Storage::prune_ledgers`] actually knows how to bound.
+pub const LEDGER_TABLES: &[&str] = &[
+    "cost_events",
+    "webhook_deliveries",
+    "job_yield",
+    "saved_search_seen",
+    "record_revisions",
+];
+
+/// Day-count retention for the four unbounded ledgers. `0` means OFF, which is
+/// the default for every field: each of these deletions is data loss of a
+/// different kind (spend history, delivery evidence, yield telemetry, alert
+/// suppression), so retention is something an operator turns on, never something
+/// that happens to them. See [`Storage::prune_ledgers`] for the per-table
+/// scoping predicates.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LedgerRetention {
+    pub cost_event_days: u64,
+    /// `delivered` rows — the successful-delivery log.
+    pub delivered_webhook_days: u64,
+    /// `dead` rows — the exhausted dead-letter tail. Separate knob because a DLQ
+    /// entry is evidence of a failure someone may still want to see.
+    pub dead_webhook_days: u64,
+    pub job_yield_days: u64,
+    pub saved_search_seen_days: u64,
+}
+
+impl LedgerRetention {
+    /// True when at least one table is bounded — the janitor's "is there work"
+    /// check, so a fully unconfigured deployment never even opens a transaction.
+    pub fn any_enabled(&self) -> bool {
+        *self != Self::default()
+    }
+}
+
+/// Rows removed by one [`Storage::prune_ledgers`] pass.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub struct LedgerPruned {
+    pub cost_events: u64,
+    pub webhook_deliveries: u64,
+    pub job_yield: u64,
+    pub saved_search_seen: u64,
+}
+
+impl LedgerPruned {
+    pub fn total(&self) -> u64 {
+        self.cost_events + self.webhook_deliveries + self.job_yield + self.saved_search_seen
+    }
+}
+
 fn split_after(after: Option<(String, String)>) -> (Option<String>, Option<String>) {
     after
         .map(|(t, i)| (Some(t), Some(i)))
@@ -2372,6 +2517,12 @@ fn ts(dt: DateTime<Utc>) -> String {
 
 fn now() -> String {
     ts(Utc::now())
+}
+
+/// Retention cutoff `days` before now. Named so every ledger prune derives its
+/// boundary the same way (and so the janitor's log and the SQL can never drift).
+fn cutoff(days: u64) -> DateTime<Utc> {
+    Utc::now() - chrono::Duration::days(days as i64)
 }
 
 fn parse_ts(s: &str) -> Result<DateTime<Utc>> {

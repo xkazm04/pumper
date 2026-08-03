@@ -37,6 +37,47 @@ A quarantined source writes to the shadow dataset `<ds>@q`, which is an ordinary
 - **Virtual namespaces**: several apps may feed one cross-source dataset by passing an explicit app name to `ctx.datasets` (e.g. `grants/unified`, `census/market_blend`, `cz-labour/salary_gap`) with source-prefixed keys.
 - Big payloads go to `ctx.save_artifact` (files under `data/artifacts/<app>/<job>/`); records and results stay compact.
 
+## Retention
+
+Everything here is **off by default** and enabled per key under `[storage]`. Each
+deletion is data loss of a different kind, and this service runs local-first with
+no second operator to ask, so retention is something you turn on — never something
+that happens to you. The single `retention_janitor` in `main.rs` (one loop, every
+6h) runs all of it.
+
+| Key | Bounds | Scoped so this survives |
+| --- | --- | --- |
+| `revision_retention_days` | `record_revisions` past the window | the newest `revision_retention_keep_min` revisions of every record |
+| `artifact_retention_days` | bodies under `artifacts_dir` past the window | **any body a replayable revision points at**, plus VCR cassettes |
+| `artifact_retention_include_cassettes` | (flag) lets retention reclaim `cassette.ndjson` too | — |
+| `cost_event_retention_days` | `cost_events` | events of jobs still `queued`/`running` (they back the budget ceiling) |
+| `webhook_delivery_retention_days` | `delivered` rows in `webhook_deliveries` | `pending`/`failed` — the live retry queue and the replayable DLQ |
+| `webhook_dead_letter_retention_days` | `dead` rows (the exhausted DLQ tail) | as above |
+| `job_yield_retention_days` | `job_yield` (backs `GET /economics`) | — |
+| `saved_search_seen_retention_days` | `saved_search_seen` | — ⚠ pruning a `seen` row makes an already-alerted doc look new, so a still-matching doc **re-fires its webhook** |
+
+**The pinning rule.** An archived body is reclaimable only when *no replayable
+revision points at it* — replayable meaning `artifact_sha` **and** `rules_hash` are
+both stamped, i.e. exactly what `POST /provenance/{app}/{ds}/{key}/rederive`
+requires. Age proposes; the provenance graph vetoes. Both halves are pinned: the
+snapshot a replayable revision carries (where the body was when it was written)
+and the record's current `job_id`/`artifact_path` (where re-derivation looks
+today, after a crawl revisit moved the body to a new job dir). Without the pin,
+retention would quietly turn reproducible records into permanent
+`archived body unavailable` answers.
+
+Because pins are held by revisions, config validation rejects
+`revision_retention_days < artifact_retention_days` — history pruned first would
+un-pin bodies before their own window was up.
+
+**Dry run.** `GET /retention/preview?days=` reports, without deleting anything:
+per-app `files`/`bytes` for the artifact tree split into
+`reclaimable` / `pinned` / `cassette`, the totals, current row counts of the
+append-only ledgers, and the configured windows. `days` defaults to the configured
+`artifact_retention_days`, so you can model a window the deployment has not
+enabled. The preview and the janitor call the **same** plan builder, so they cannot
+disagree. Both walk the whole artifact tree — on-demand only, never a hot path.
+
 ## Known gaps
 
 - **Duplicate scan** uses banded SimHash bucketing (`simhash::BandedIndex`, shared with the crawler's near-dup gate): candidates come from `distance + 1` contiguous bit-bands and are then verified by exact Hamming, so the pair set, the `MAX_DUP_PAIRS`=10,000 cap and the result ordering are identical to the all-pairs scan it replaced. Bands are `64 / (distance + 1)` bits wide, so **the index turns banding off above distance 5** and verifies against a plain walk — same answers, linear candidate generation. At the distance every real caller uses (3: the `/duplicates` default and grants `link_duplicates`) a 50k-record scan measured **~0.8s vs ~23s** for the all-pairs sweep.

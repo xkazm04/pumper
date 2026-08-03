@@ -4,12 +4,15 @@
 //! for both dedup (skip records already seen) and monitoring (act only on
 //! diffs), turning one-off scrapes into datasets that accrue over time.
 
+use std::collections::HashSet;
+
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
+use crate::retention::ArtifactRef;
 use crate::{Error, Result};
 
 /// Upper bound on the pairs returned by `duplicate_pairs`, so a pathological
@@ -1722,6 +1725,49 @@ impl Datasets {
         .fetch_one(&self.pool)
         .await?;
         Ok(row)
+    }
+
+    /// Every archived body a **replayable** revision still points at — the veto
+    /// list artifact retention must respect (see [`crate::retention`]).
+    ///
+    /// A revision is replayable when `artifact_sha` AND `rules_hash` are both
+    /// stamped; `POST /provenance/.../rederive` then locates the body by the
+    /// record's `job_id` + `artifact_path` convention and verifies it against the
+    /// stamped hash. So the pin needs both halves: the *snapshot* a replayable
+    /// revision carries (where the body was when that revision was written) and
+    /// the *current* record of any key that has a replayable revision (where
+    /// rederive will actually look today, after a crawl revisit moved the body
+    /// to a new `job_id`). Missing either half would let retention delete a body
+    /// the API still promises to replay.
+    ///
+    /// **Full scan of `record_revisions` + `records`.** On-demand only — the
+    /// retention janitor and the read-only reports, never a request hot path.
+    pub async fn pinned_artifact_refs(&self) -> Result<HashSet<ArtifactRef>> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT DISTINCT app, \
+                    json_extract(data, '$.job_id'), \
+                    json_extract(data, '$.artifact_path') \
+             FROM record_revisions \
+             WHERE artifact_sha IS NOT NULL AND rules_hash IS NOT NULL \
+               AND json_extract(data, '$.job_id') IS NOT NULL \
+               AND json_extract(data, '$.artifact_path') IS NOT NULL \
+             UNION \
+             SELECT DISTINCT r.app, \
+                    json_extract(r.data, '$.job_id'), \
+                    json_extract(r.data, '$.artifact_path') \
+             FROM records r \
+             WHERE json_extract(r.data, '$.job_id') IS NOT NULL \
+               AND json_extract(r.data, '$.artifact_path') IS NOT NULL \
+               AND EXISTS (SELECT 1 FROM record_revisions v \
+                           WHERE v.app = r.app AND v.dataset = r.dataset AND v.key = r.key \
+                             AND v.artifact_sha IS NOT NULL AND v.rules_hash IS NOT NULL)",
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|(app, job_id, name)| ArtifactRef { app, job_id, name })
+            .collect())
     }
 
     // ── derived ──────────────────────────────────────────────────────────────

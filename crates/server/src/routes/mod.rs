@@ -23,6 +23,10 @@ pub(crate) use datasets::parse_filters;
 // The defaults-merge, re-exported for the MCP enqueue tool (`crate::mcp`) so a
 // job enqueued by an agent gets byte-identical params to one POSTed over HTTP.
 pub(crate) use jobs::merge_params;
+// The retention plan builder, re-exported for `main.rs`'s janitor: the dry-run
+// endpoint and the loop that actually deletes MUST compute the same plan, so
+// there is exactly one implementation and both call it.
+pub(crate) use retention::artifact_retention_plan;
 
 mod datasets;
 mod derived;
@@ -39,6 +43,7 @@ mod query;
 mod receipt;
 mod recipes;
 mod remote;
+mod retention;
 mod runtime;
 mod schedules;
 mod search;
@@ -62,6 +67,7 @@ use query::*;
 use receipt::*;
 use recipes::*;
 use remote::*;
+use retention::*;
 use runtime::*;
 use schedules::*;
 use search::*;
@@ -101,6 +107,7 @@ use watches::*;
         (name = "profiles", description = "Session vault: named login profiles"),
         (name = "recipes", description = "API X-ray: discovered JSON-API endpoints behind rendered pages"),
         (name = "remote", description = "Distributed fetch fabric: peer nodes proxy fetches through this node's local stack"),
+        (name = "retention", description = "Read-only retention dry run: reclaimable artifact bytes per app and ledger sizes"),
         (name = "provenance", description = "Record-level derivation chains (M12): who wrote each revision from what, plus read-only re-derivation"),
         (name = "meta", description = "The OpenAPI document itself"),
         (name = "sources", description = "Extraction health: per-source degradation detection"),
@@ -180,6 +187,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(record_history))
         .routes(routes!(get_provenance))
         .routes(routes!(rederive_provenance))
+        .routes(routes!(retention_preview))
         .routes(routes!(list_derived, create_derived))
         .routes(routes!(get_derived, delete_derived))
         .routes(routes!(set_derived_enabled))
@@ -437,6 +445,7 @@ mod api_spec_tests {
         "GET /datasets/{app}/{dataset}/history",
         "GET /provenance/{app}/{dataset}/{key}",
         "POST /provenance/{app}/{dataset}/{key}/rederive",
+        "GET /retention/preview",
         "GET /derived",
         "POST /derived",
         "GET /derived/{id}",

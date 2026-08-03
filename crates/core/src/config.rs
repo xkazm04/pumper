@@ -709,6 +709,44 @@ impl Config {
             }
         }
 
+        // Retention. Every knob is off by default, so these rules only bind on a
+        // deployment that deliberately turned deletion on — and each one catches
+        // a value that parses fine and then deletes more, or less, than the
+        // operator can see from the file.
+        let st = &self.storage;
+        if st.revision_retention_days > 0 && st.revision_retention_keep_min < 1 {
+            return Err(Error::Config(format!(
+                "[storage] revision_retention_keep_min ({}) must be >= 1 when \
+                 revision_retention_days is set — keeping zero revisions per record deletes the \
+                 whole history of every record past the cutoff, not just its tail",
+                st.revision_retention_keep_min
+            )));
+        }
+        if st.artifact_retention_include_cassettes && st.artifact_retention_days == 0 {
+            return Err(Error::Config(
+                "[storage] artifact_retention_include_cassettes is set while \
+                 artifact_retention_days is 0 — the flag reads as 'cassettes are unprotected' \
+                 but nothing reclaims artifacts at all, so it does nothing"
+                    .into(),
+            ));
+        }
+        // Artifact retention keeps a body alive while a REPLAYABLE revision points
+        // at it, so the pin only lasts as long as that revision does. A revision
+        // window shorter than the artifact window means history is pruned first
+        // and the body loses its pin early — the shorter of the two silently
+        // becomes the real artifact window, which is not what the file says.
+        if st.artifact_retention_days > 0
+            && st.revision_retention_days > 0
+            && st.revision_retention_days < st.artifact_retention_days
+        {
+            return Err(Error::Config(format!(
+                "[storage] revision_retention_days ({}) must be >= artifact_retention_days ({}) \
+                 — artifact pins are held by replayable revisions, so pruning history first \
+                 un-pins bodies before their own window is up",
+                st.revision_retention_days, st.artifact_retention_days
+            )));
+        }
+
         // A zero strike threshold would un-validate a recipe on its first
         // failure ever recorded — before any success could reset the counter —
         // making auto-validation a one-shot coin flip. Catch it at boot.
@@ -918,6 +956,35 @@ pub struct StorageConfig {
     pub revision_retention_days: u64,
     /// Newest revisions always kept per record when pruning is enabled.
     pub revision_retention_keep_min: i64,
+    /// Artifact-tree retention (days). When `> 0`, the janitor reclaims archived
+    /// bodies under `artifacts_dir` older than this — **except** any body a
+    /// *replayable* revision still points at, which is pinned regardless of age
+    /// (`crate::retention`). `0` (the default) disables it: a body is the
+    /// evidence behind a record, and `POST /provenance/.../rederive`, the
+    /// crawl→extract seam and VCR replay all read the tree, so reclaiming it is
+    /// an explicit opt-in exactly like revision history.
+    pub artifact_retention_days: u64,
+    /// Let artifact retention reclaim VCR cassettes too. Off by default:
+    /// `cassette.ndjson` is the entire substrate of `Vcr::Replay`, nothing
+    /// records which job will be replayed next, and a missing cassette is a hard
+    /// `ReplayMiss` rather than a degraded result.
+    pub artifact_retention_include_cassettes: bool,
+    /// Days of `cost_events` kept. Events of jobs that are still queued/running
+    /// are never pruned (they back the budget ceiling). `0` = off.
+    pub cost_event_retention_days: u64,
+    /// Days of `delivered` webhook deliveries kept. `pending`/`failed` rows are
+    /// the live retry queue and are never pruned. `0` = off.
+    pub webhook_delivery_retention_days: u64,
+    /// Days of `dead` (retry-exhausted) webhook deliveries kept — the DLQ tail.
+    /// Separate from the delivered knob because a dead letter is failure
+    /// evidence. `0` = off.
+    pub webhook_dead_letter_retention_days: u64,
+    /// Days of per-job yield telemetry kept (backs `GET /economics`). `0` = off.
+    pub job_yield_retention_days: u64,
+    /// Days of saved-search `seen` doc-ids kept. **Turning this on can re-alert:**
+    /// a pruned row makes an already-notified document look new again, so a
+    /// still-matching doc fires its webhook a second time. `0` = off.
+    pub saved_search_seen_retention_days: u64,
 }
 
 impl Default for StorageConfig {
@@ -927,7 +994,42 @@ impl Default for StorageConfig {
             artifacts_dir: "data/artifacts".into(),
             revision_retention_days: 0, // off by default
             revision_retention_keep_min: 5,
+            // Every retention knob below is off by default for the same reason:
+            // each one deletes something a reader still might want, and this
+            // service is local-first with no second operator to ask.
+            artifact_retention_days: 0,
+            artifact_retention_include_cassettes: false,
+            cost_event_retention_days: 0,
+            webhook_delivery_retention_days: 0,
+            webhook_dead_letter_retention_days: 0,
+            job_yield_retention_days: 0,
+            saved_search_seen_retention_days: 0,
         }
+    }
+}
+
+// Retention plumbing needs the SQLite-backed `Storage` types, so it rides the
+// same feature gate they do.
+#[cfg(feature = "storage")]
+impl StorageConfig {
+    /// The ledger knobs in the shape [`crate::storage::Storage::prune_ledgers`]
+    /// takes. One conversion, so the janitor cannot wire a key to the wrong table.
+    pub fn ledger_retention(&self) -> crate::storage::LedgerRetention {
+        crate::storage::LedgerRetention {
+            cost_event_days: self.cost_event_retention_days,
+            delivered_webhook_days: self.webhook_delivery_retention_days,
+            dead_webhook_days: self.webhook_dead_letter_retention_days,
+            job_yield_days: self.job_yield_retention_days,
+            saved_search_seen_days: self.saved_search_seen_retention_days,
+        }
+    }
+
+    /// True when anything at all is bounded — the janitor's enable check.
+    pub fn any_retention_enabled(&self, sketches: bool) -> bool {
+        self.revision_retention_days > 0
+            || self.artifact_retention_days > 0
+            || self.ledger_retention().any_enabled()
+            || sketches
     }
 }
 
@@ -1327,6 +1429,96 @@ mod tests {
         cfg.refresher.global_per_tick = 0;
         cfg.refresher.horizon_secs = 0;
         cfg.validate().expect("disabled refresher never binds");
+    }
+
+    /// The defaults must be a completely inert retention posture: a deployment
+    /// that never mentions `[storage]` deletes nothing at all.
+    #[test]
+    fn retention_is_entirely_off_by_default() {
+        let cfg = Config::default();
+        let s = &cfg.storage;
+        assert_eq!(s.revision_retention_days, 0);
+        assert_eq!(s.artifact_retention_days, 0);
+        assert!(!s.artifact_retention_include_cassettes);
+        assert_eq!(s.cost_event_retention_days, 0);
+        assert_eq!(s.webhook_delivery_retention_days, 0);
+        assert_eq!(s.webhook_dead_letter_retention_days, 0);
+        assert_eq!(s.job_yield_retention_days, 0);
+        assert_eq!(s.saved_search_seen_retention_days, 0);
+        cfg.validate().expect("the inert default validates");
+    }
+
+    /// `keep_min = 0` with pruning on deletes a record's ENTIRE history past the
+    /// cutoff rather than trimming its tail — the config reads like a trim and
+    /// behaves like an erase.
+    #[test]
+    fn zero_keep_min_with_revision_pruning_on_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.storage.revision_retention_days = 30;
+        cfg.storage.revision_retention_keep_min = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("revision_retention_keep_min"), "{err}");
+        // Inert while pruning is off.
+        cfg.storage.revision_retention_days = 0;
+        cfg.validate()
+            .expect("keep_min is meaningless with pruning off");
+    }
+
+    /// The cassette opt-in with no artifact retention parses fine and does
+    /// nothing, while reading as "cassettes are unprotected".
+    #[test]
+    fn cassette_opt_in_without_artifact_retention_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.storage.artifact_retention_include_cassettes = true;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(
+            err.contains("artifact_retention_include_cassettes"),
+            "{err}"
+        );
+    }
+
+    /// Artifact pins are held by replayable revisions, so a shorter revision
+    /// window silently becomes the real artifact window.
+    #[test]
+    fn a_revision_window_shorter_than_the_artifact_window_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.storage.artifact_retention_days = 90;
+        cfg.storage.revision_retention_days = 30;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("revision_retention_days"), "{err}");
+        cfg.storage.revision_retention_days = 90;
+        cfg.validate().expect("equal windows are fine");
+        // Revision retention off means history is kept forever — pins never
+        // expire early, so there is nothing to reject.
+        cfg.storage.revision_retention_days = 0;
+        cfg.validate()
+            .expect("unbounded history cannot un-pin anything");
+    }
+
+    /// The ledger knobs must map to the tables they name, and `any_enabled` must
+    /// be false for a default config or the janitor spins on nothing.
+    #[test]
+    fn ledger_retention_maps_each_key_to_its_own_table() {
+        let mut cfg = Config::default();
+        assert!(!cfg.storage.ledger_retention().any_enabled());
+        cfg.storage.cost_event_retention_days = 1;
+        cfg.storage.webhook_delivery_retention_days = 2;
+        cfg.storage.webhook_dead_letter_retention_days = 3;
+        cfg.storage.job_yield_retention_days = 4;
+        cfg.storage.saved_search_seen_retention_days = 5;
+        let l = cfg.storage.ledger_retention();
+        assert_eq!(
+            (
+                l.cost_event_days,
+                l.delivered_webhook_days,
+                l.dead_webhook_days,
+                l.job_yield_days,
+                l.saved_search_seen_days
+            ),
+            (1, 2, 3, 4, 5)
+        );
+        assert!(l.any_enabled());
+        assert!(cfg.storage.any_retention_enabled(false));
     }
 
     #[test]
