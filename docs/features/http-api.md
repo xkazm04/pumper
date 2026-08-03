@@ -58,7 +58,7 @@ All three send `content-disposition: attachment; filename="{ds}.{ext}"`.
 
 The value keeps any `:` after the op (so timestamps/URLs pass through). Example: `?filter=$.state:eq:CA&filter=$.employees:numgte:50`. A malformed spec (missing op/value, non-`$.` path, unknown op, non-numeric `numgte`) returns `400 bad_request`. This is the same `JsonFilter` engine the `/grants` route exposes with typed params — the `filter` grammar generalizes it to every app's datasets. When a filter is present on `GET /datasets/{app}/{ds}`, only **live** records match (a tombstoned row never appears); the unfiltered first page keeps the legacy behaviour (all records).
 
-`GET /datasets/{app}/{ds}/duplicates` runs an in-memory O(n²) pairwise SimHash sweep, so it is bounded: datasets over **10,000 records** return `413 too_large` (the message carries the actual count and the cap) rather than pinning a core. Narrow the dataset or run the scan offline.
+`GET /datasets/{app}/{ds}/duplicates` runs an in-memory SimHash sweep (banded candidate lookup, exact-Hamming verified), so it is bounded: datasets over **10,000 records** return `413 too_large` (the message carries the actual count and the cap) rather than pinning a core. Narrow the dataset or run the scan offline. Banding only filters at small distances — above `distance=5` the scan degrades to the pairwise walk, which the 10k cap keeps bounded.
 
 ## RuleSet preview (`POST /extract/preview`)
 

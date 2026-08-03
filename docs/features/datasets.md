@@ -26,7 +26,7 @@ A quarantined source writes to the shadow dataset `<ds>@q`, which is an ordinary
 
 - `GET /datasets/{app}/{ds}?limit=&cursor=&trust=` — records newest-updated first; `cursor=` (even empty) switches to `{items, next_cursor}` keyset pagination (`updated_at|key`); absent = legacy bare array. Removed records included with `removed_at` set.
 - `GET /datasets/{app}/{ds}/export?format=json|ndjson|csv` — `json` buffered (100k cap); `ndjson`/`csv` **stream** in keyset-paged 1000-row batches with content-disposition (CSV: fixed columns key/timestamps/data-as-JSON, RFC-4180 quoted).
-- `GET /apps/{name}/datasets` — dataset names per app. `GET /datasets/{app}/{ds}/duplicates?distance=` — SimHash near-duplicate pairs (O(n²), local scale).
+- `GET /apps/{name}/datasets` — dataset names per app. `GET /datasets/{app}/{ds}/duplicates?distance=` — SimHash near-duplicate pairs.
 
 ## Conventions
 
@@ -37,4 +37,5 @@ A quarantined source writes to the shadow dataset `<ds>@q`, which is an ordinary
 
 ## Known gaps
 
-- SimHash duplicate scan is O(n²) (LSH banding is a backlog idea). No Parquet export. `changes_since` scans per app — fine for SQLite scale.
+- **Duplicate scan** uses banded SimHash bucketing (`simhash::BandedIndex`, shared with the crawler's near-dup gate): candidates come from `distance + 1` contiguous bit-bands and are then verified by exact Hamming, so the pair set, the `MAX_DUP_PAIRS`=10,000 cap and the result ordering are identical to the all-pairs scan it replaced. Bands are `64 / (distance + 1)` bits wide, so **the index turns banding off above distance 5** and verifies against a plain walk — same answers, linear candidate generation. At the distance every real caller uses (3: the `/duplicates` default and grants `link_duplicates`) a 50k-record scan measured **~0.8s vs ~23s** for the all-pairs sweep.
+- No Parquet export. `changes_since` scans per app — fine for SQLite scale.

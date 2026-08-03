@@ -1262,8 +1262,14 @@ impl Datasets {
 
     /// Finds near-duplicate record pairs within a dataset using SimHash Hamming
     /// distance (semantic dedup — catches near-identical content, not just exact
-    /// matches). O(n²) scan, fine for local datasets. Records with no textual
-    /// content (simhash 0) are skipped.
+    /// matches). Records with no textual content (simhash 0) are skipped.
+    ///
+    /// Candidates come from the shared banded index
+    /// ([`BandedIndex`](crate::simhash::BandedIndex), the crawler's near-dup
+    /// bucketing) and are then verified by exact Hamming, so the pair set is
+    /// identical to the all-pairs scan this replaces — `MAX_DUP_PAIRS` capped
+    /// input, not just output. The grants unified layer runs `link_duplicates`
+    /// over the whole corpus every run, where the pairwise scan was quadratic.
     pub async fn duplicate_pairs(
         &self,
         app: &str,
@@ -1280,32 +1286,7 @@ impl Datasets {
         .bind(dataset)
         .fetch_all(&self.pool)
         .await?;
-        let mut pairs = Vec::new();
-        'scan: for i in 0..rows.len() {
-            if rows[i].1 == 0 {
-                continue;
-            }
-            for j in (i + 1)..rows.len() {
-                if rows[j].1 == 0 {
-                    continue;
-                }
-                let distance = crate::simhash::hamming(rows[i].1 as u64, rows[j].1 as u64);
-                if distance <= max_distance {
-                    pairs.push(DupPair {
-                        a: rows[i].0.clone(),
-                        b: rows[j].0.clone(),
-                        distance,
-                    });
-                    // Bound the result: a pathological dataset must not return an
-                    // unbounded pair list.
-                    if pairs.len() >= MAX_DUP_PAIRS {
-                        break 'scan;
-                    }
-                }
-            }
-        }
-        pairs.sort_by_key(|p| p.distance);
-        Ok(pairs)
+        Ok(banded_duplicate_pairs(&rows, max_distance))
     }
 
     /// Recomputes every record's SimHash from its stored JSON, rewriting only the
@@ -2723,6 +2704,66 @@ impl TryFrom<RevisionRow> for Revision {
     }
 }
 
+/// Near-duplicate pairs among `(key, simhash)` rows, via band-bucketed
+/// candidate generation plus exact Hamming verification.
+///
+/// **Output contract, preserved exactly from the all-pairs scan** (consumers
+/// index into this list and the grants link layer stores the first pairs it
+/// sees, so a reordering is a data change):
+///
+/// - a pair is `(a, b)` with `a` the earlier row, `b` the later one;
+/// - pairs are enumerated in `(a-index, b-index)` ascending order, and the
+///   `MAX_DUP_PAIRS` cap truncates *that* order — the cap is on the walk, not on
+///   the sorted result;
+/// - the final `sort_by_key(distance)` is stable, so equal-distance pairs keep
+///   enumeration order.
+///
+/// The index is built over ALL rows first and then queried per row, rather than
+/// built incrementally, precisely to keep that a-major walk order: an
+/// incremental build would enumerate b-major and cap a different subset.
+/// Rows with simhash 0 (no textual content) never enter the index and are never
+/// queried.
+fn banded_duplicate_pairs(rows: &[(String, i64)], max_distance: u32) -> Vec<DupPair> {
+    // Rows with simhash 0 carry no textual content — "empty", not "identical" —
+    // so they never enter the index and are never queried. That makes the index
+    // slot a COMPACTION of the row index, not the row index: `slot_of_row` is
+    // what keeps the `j > i` skip honest. Conflating the two silently compares a
+    // row against itself and against rows it already covered.
+    let mut index = crate::simhash::BandedIndex::new(max_distance);
+    let mut slot_of_row: Vec<Option<usize>> = Vec::with_capacity(rows.len());
+    for (i, (_, sim)) in rows.iter().enumerate() {
+        if *sim == 0 {
+            slot_of_row.push(None);
+        } else {
+            slot_of_row.push(Some(index.len()));
+            index.insert(*sim as u64, i);
+        }
+    }
+    let mut pairs = Vec::new();
+    for (i, (key, sim)) in rows.iter().enumerate() {
+        let Some(slot) = slot_of_row[i] else {
+            continue;
+        };
+        // Slots ascend and start past this row's own slot, so this visits
+        // exactly the `j > i` the inner loop did, in the same order.
+        index.for_each_neighbor_after(*sim as u64, slot, |_, &j| {
+            pairs.push(DupPair {
+                a: key.clone(),
+                b: rows[j].0.clone(),
+                distance: crate::simhash::hamming(*sim as u64, rows[j].1 as u64),
+            });
+            // Bound the result: a pathological dataset must not return an
+            // unbounded pair list.
+            pairs.len() < MAX_DUP_PAIRS
+        });
+        if pairs.len() >= MAX_DUP_PAIRS {
+            break;
+        }
+    }
+    pairs.sort_by_key(|p| p.distance);
+    pairs
+}
+
 // ── batch upsert planning ───────────────────────────────────────────────────
 // The pure half of `upsert_many`: what the store currently holds for a chunk's
 // keys, what each item resolves to, and which record writes that collapses into.
@@ -3188,5 +3229,145 @@ mod tests {
         assert_eq!(diff["$"], json!({ "from": [1, 2], "to": [1, 3] }));
         let same = diff_values(&json!("x"), &json!("x"));
         assert_eq!(same, json!({}));
+    }
+
+    // ── banded duplicate detection ──────────────────────────────────────────
+
+    /// The all-pairs scan the banded index replaced, kept as the reference
+    /// implementation. Same walk order, same cap, same stable final sort.
+    fn all_pairs_scan(rows: &[(String, i64)], max_distance: u32) -> Vec<DupPair> {
+        let mut pairs = Vec::new();
+        'scan: for i in 0..rows.len() {
+            if rows[i].1 == 0 {
+                continue;
+            }
+            for j in (i + 1)..rows.len() {
+                if rows[j].1 == 0 {
+                    continue;
+                }
+                let distance = crate::simhash::hamming(rows[i].1 as u64, rows[j].1 as u64);
+                if distance <= max_distance {
+                    pairs.push(DupPair {
+                        a: rows[i].0.clone(),
+                        b: rows[j].0.clone(),
+                        distance,
+                    });
+                    if pairs.len() >= MAX_DUP_PAIRS {
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        pairs.sort_by_key(|p| p.distance);
+        pairs
+    }
+
+    fn as_triples(pairs: &[DupPair]) -> Vec<(&str, &str, u32)> {
+        pairs
+            .iter()
+            .map(|p| (p.a.as_str(), p.b.as_str(), p.distance))
+            .collect()
+    }
+
+    /// A fixture with *known* near-duplicates: a base hash, exact copies, and
+    /// neighbours at controlled Hamming distances (including one at exactly the
+    /// threshold and one just past it), interleaved with unrelated hashes and
+    /// content-free rows (simhash 0, which must never be compared).
+    fn dup_fixture() -> Vec<(String, i64)> {
+        let base: u64 = 0x0f1e_2d3c_4b5a_6978;
+        let flip = |bits: &[u32]| -> i64 {
+            let mut h = base;
+            for b in bits {
+                h ^= 1u64 << b;
+            }
+            h as i64
+        };
+        vec![
+            ("exact-a".to_string(), base as i64),
+            ("far".to_string(), 0x1234_5678_9abc_def0u64 as i64),
+            ("d1".to_string(), flip(&[0])),
+            ("empty-1".to_string(), 0),
+            ("d3".to_string(), flip(&[5, 33, 61])),
+            ("exact-b".to_string(), base as i64),
+            ("d7".to_string(), flip(&[1, 2, 3, 40, 41, 42, 63])),
+            ("empty-2".to_string(), 0),
+            ("d2".to_string(), flip(&[17, 18])),
+            ("far2".to_string(), !base as i64),
+            ("d4".to_string(), flip(&[7, 23, 39, 55])),
+            (
+                "d12".to_string(),
+                flip(&[0, 4, 8, 12, 16, 20, 24, 28, 32, 36, 40, 44]),
+            ),
+        ]
+    }
+
+    #[test]
+    fn banded_duplicate_pairs_match_the_all_pairs_scan_not_a_bucketed_approximation() {
+        // Band bucketing is only a speedup if it decides identically. Sweeping
+        // the whole distance range the API allows (the route clamps at 20) plus
+        // 0 (exact match) catches an off-by-one in the band widths, which would
+        // show up as a MISSING pair — a silent false negative, the failure mode
+        // a "did it find some duplicates?" test never notices.
+        let rows = dup_fixture();
+        for distance in 0..=20u32 {
+            let banded = banded_duplicate_pairs(&rows, distance);
+            let reference = all_pairs_scan(&rows, distance);
+            assert_eq!(
+                as_triples(&banded),
+                as_triples(&reference),
+                "distance {distance}: banded pair set differs from the all-pairs scan"
+            );
+        }
+    }
+
+    #[test]
+    fn banded_duplicate_pairs_keep_the_cap_and_the_walk_order() {
+        // 150 identical records make 11,175 pairs — past MAX_DUP_PAIRS. The cap
+        // truncates the (a-index, b-index) WALK, not the distance-sorted result,
+        // and the banded walk must truncate at exactly the same place: consumers
+        // (grants `link_duplicates`) persist the pairs they are handed.
+        let rows: Vec<(String, i64)> = (0..150)
+            .map(|i| (format!("k{i:03}"), 0x0f1e_2d3c_4b5a_6978u64 as i64))
+            .collect();
+        let banded = banded_duplicate_pairs(&rows, 3);
+        let reference = all_pairs_scan(&rows, 3);
+        assert_eq!(banded.len(), MAX_DUP_PAIRS, "cap must still bind");
+        assert_eq!(as_triples(&banded), as_triples(&reference));
+    }
+
+    #[test]
+    fn content_free_records_are_never_reported_as_duplicates_of_each_other() {
+        // simhash 0 means "no textual content", not "identical content". Two
+        // empty records are not duplicates, and the banded index must not bucket
+        // them together — the regression a naive "index everything" port makes.
+        let rows = vec![
+            ("empty-1".to_string(), 0),
+            ("empty-2".to_string(), 0),
+            ("real".to_string(), 0x00ff_00ff_00ff_00ffu64 as i64),
+        ];
+        assert!(banded_duplicate_pairs(&rows, 20).is_empty());
+    }
+
+    #[test]
+    fn content_free_rows_shift_index_slots_without_shifting_the_pair_walk() {
+        // simhash-0 rows are not indexed, so an index slot is a COMPACTION of
+        // the row index. Using the row index as the "already covered" threshold
+        // then skips real neighbours (here: the three leading empties would hide
+        // every pair among the first rows after them). The fixture front-loads
+        // the empties so the two indexes are maximally out of step.
+        let h: u64 = 0x0f1e_2d3c_4b5a_6978;
+        let rows = vec![
+            ("empty-1".to_string(), 0),
+            ("empty-2".to_string(), 0),
+            ("empty-3".to_string(), 0),
+            ("a".to_string(), h as i64),
+            ("b".to_string(), (h ^ 1) as i64),
+            ("c".to_string(), (h ^ 0b11) as i64),
+        ];
+        assert_eq!(
+            as_triples(&banded_duplicate_pairs(&rows, 3)),
+            as_triples(&all_pairs_scan(&rows, 3))
+        );
+        assert_eq!(banded_duplicate_pairs(&rows, 3).len(), 3, "a-b, a-c, b-c");
     }
 }

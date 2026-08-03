@@ -659,22 +659,15 @@ impl Frontier {
     }
 }
 
-/// Banded SimHash index for near-duplicate detection — SAME Hamming-distance
-/// semantics as a linear scan (`any kept within distance d`), but candidate
-/// lookup instead of an O(n) scan per page.
+/// The crawler's near-duplicate gate: a thin wrapper over the shared
+/// [`BandedIndex`](crate::simhash::BandedIndex) that keeps the crawler's own
+/// vocabulary (`is_near_dup` + a checkpointable list of kept hashes).
 ///
-/// Pigeonhole: two 64-bit hashes within Hamming distance `d` differ in at most
-/// `d` bits, so across `b = d + 1` contiguous bit-bands at least one band is
-/// bit-identical. Each kept hash is bucketed by every band value; a query
-/// gathers candidates from its own band buckets and verifies the true Hamming
-/// distance. That guarantees no false negatives (a true near-dup always shares
-/// a band) — the exact same decision the linear scan would make, only faster.
+/// The banding itself deliberately does NOT live here: the dataset store's
+/// `duplicate_pairs` needs the same buckets, and two copies of the band
+/// arithmetic is exactly where an off-by-one becomes a silent false negative.
 struct SimHashIndex {
-    distance: u32,
-    /// Per-band `(shift, mask)` to extract that band's value from a hash.
-    segs: Vec<(u32, u64)>,
-    /// Per-band bucket: band value -> hashes carrying it.
-    buckets: Vec<HashMap<u64, Vec<u64>>>,
+    inner: crate::simhash::BandedIndex<()>,
     /// Every kept hash, in insert order — persisted to the checkpoint so dedup
     /// survives a resume (8 bytes each: bounded by kept count, not bodies).
     all: Vec<u64>,
@@ -682,26 +675,8 @@ struct SimHashIndex {
 
 impl SimHashIndex {
     fn new(distance: u32) -> Self {
-        // b = d + 1 bands guarantee a shared band for any pair within distance d.
-        let bands = (distance + 1).clamp(1, 64) as usize;
-        let base = 64 / bands;
-        let rem = 64 % bands;
-        let mut segs = Vec::with_capacity(bands);
-        let mut shift = 0u32;
-        for i in 0..bands {
-            let width = base + if i < rem { 1 } else { 0 };
-            let mask = if width == 64 {
-                u64::MAX
-            } else {
-                (1u64 << width) - 1
-            };
-            segs.push((shift, mask));
-            shift += width as u32;
-        }
         Self {
-            distance,
-            segs,
-            buckets: vec![HashMap::new(); bands],
+            inner: crate::simhash::BandedIndex::new(distance),
             all: Vec::new(),
         }
     }
@@ -718,22 +693,11 @@ impl SimHashIndex {
     /// True when some already-kept hash is within `distance` Hamming bits of
     /// `hash`. Identical decision to `all.iter().any(|h| hamming(*h, hash) <= d)`.
     fn is_near_dup(&self, hash: u64) -> bool {
-        for (i, (shift, mask)) in self.segs.iter().enumerate() {
-            let band = (hash >> shift) & mask;
-            if let Some(cands) = self.buckets[i].get(&band) {
-                if cands.iter().any(|&h| hamming(h, hash) <= self.distance) {
-                    return true;
-                }
-            }
-        }
-        false
+        self.inner.is_near_dup(hash)
     }
 
     fn insert(&mut self, hash: u64) {
-        for (i, (shift, mask)) in self.segs.iter().enumerate() {
-            let band = (hash >> shift) & mask;
-            self.buckets[i].entry(band).or_default().push(hash);
-        }
+        self.inner.insert(hash, ());
         self.all.push(hash);
     }
 

@@ -171,3 +171,106 @@ async fn bulk_upsert_50k_cost_report() {
     println!("unchanged {:>7.1}ms", hold_unchanged.as_secs_f64() * 1000.0);
     println!("changed   {:>7.1}ms", hold_changed.as_secs_f64() * 1000.0);
 }
+
+#[tokio::test]
+#[ignore = "perf harness: ~50k records, timing-dependent"]
+async fn duplicate_scan_50k_cost_report() {
+    // Banded candidate lookup vs the all-pairs scan it replaced, on the same
+    // 50k rows. The all-pairs reference runs here (not in the store) so the
+    // comparison is like-for-like on the same fingerprints.
+    let store = TempStore::new("datasets-dup-perf").await;
+    let ds = Datasets::new(store.storage.pool());
+    ds.upsert_many("bench", "postings", &distinct_corpus(N))
+        .await
+        .unwrap();
+
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT key, simhash FROM records \
+         WHERE app = 'bench' AND dataset = 'postings' AND removed_at IS NULL",
+    )
+    .fetch_all(&store.storage.pool())
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), N);
+
+    println!("\n=== duplicate scan, N={N} ===");
+    for distance in [3u32, 8, 20] {
+        let t = Instant::now();
+        let banded = ds
+            .duplicate_pairs("bench", "postings", distance)
+            .await
+            .unwrap();
+        let banded_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        let t = Instant::now();
+        let brute = all_pairs_scan(&rows, distance);
+        let brute_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        assert_eq!(banded.len(), brute.len(), "pair counts must agree");
+        println!(
+            "distance {distance:>2}: banded {banded_ms:>9.1}ms   all-pairs {brute_ms:>9.1}ms   \
+             ({} pairs)",
+            banded.len()
+        );
+    }
+}
+
+/// A corpus of genuinely DISTINCT records — the shape a duplicate scan is
+/// actually run over (a grants/postings corpus where near-dups are the rare
+/// finding, not the norm), plus a small planted set of true near-duplicates so
+/// the scan has something to find. `corpus()` above is the opposite extreme:
+/// every record differs only in a number, so nearly all 1.25e9 pairs are
+/// near-dups and the MAX_DUP_PAIRS cap binds on the very first row.
+fn distinct_corpus(n: usize) -> Vec<(String, serde_json::Value)> {
+    // A wide vocabulary: 24 tokens drawn from 200k make each record's token set
+    // essentially unique, which is what makes the fingerprints spread across the
+    // band buckets the way a real corpus of distinct documents does.
+    let mut seed = 0x243f_6a88_85a3_08d3u64;
+    let mut next = move || {
+        seed ^= seed >> 12;
+        seed ^= seed << 25;
+        seed ^= seed >> 27;
+        seed.wrapping_mul(0x2545_f491_4f6c_dd1d)
+    };
+    let mut out: Vec<(String, serde_json::Value)> = Vec::with_capacity(n);
+    for i in 0..n {
+        // Every 500th record is a near-copy of its predecessor: a real
+        // duplicate the scan must still find.
+        if i % 500 == 499 && !out.is_empty() {
+            let mut near = out[i - 1].1.clone();
+            near["id"] = json!(i);
+            out.push((format!("doc-{i:06}"), near));
+            continue;
+        }
+        let body: String = (0..24)
+            .map(|_| format!("tok{}", next() % 200_000))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push((format!("doc-{i:06}"), json!({ "id": i, "body": body })));
+    }
+    out
+}
+
+/// The O(n²) scan `duplicate_pairs` used to do, kept here as the perf reference.
+fn all_pairs_scan(rows: &[(String, i64)], max_distance: u32) -> Vec<(usize, usize, u32)> {
+    const MAX_DUP_PAIRS: usize = 10_000;
+    let mut pairs = Vec::new();
+    'scan: for i in 0..rows.len() {
+        if rows[i].1 == 0 {
+            continue;
+        }
+        for j in (i + 1)..rows.len() {
+            if rows[j].1 == 0 {
+                continue;
+            }
+            let distance = pumper_core::simhash::hamming(rows[i].1 as u64, rows[j].1 as u64);
+            if distance <= max_distance {
+                pairs.push((i, j, distance));
+                if pairs.len() >= MAX_DUP_PAIRS {
+                    break 'scan;
+                }
+            }
+        }
+    }
+    pairs
+}
