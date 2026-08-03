@@ -1,417 +1,2058 @@
 {
-  "$schema": "https://vibeman.dev/schemas/context-map.json",
-  "projectId": "51ed5294-46d2-4a0e-9d7e-502b5e9b8be1",
-  "projectName": "pumper",
-  "projectPath": "C:\\Users\\mkdol\\dolla\\pumper",
-  "version": "2.0.0",
+  "contexts": [
+    {
+      "api_surface": null,
+      "business_feature": "Agentic Research",
+      "category": "lib",
+      "cross_refs": [
+        "claude-engine",
+        "app-runtime"
+      ],
+      "db_tables": [],
+      "description": "Durable agentic research via the Claude Code CLI engine: execution is chunked into bounded steps and checkpointed after each budget-consuming step (session id, spend, step/turn cursor, partial findings) so a crash or timeout resumes from the last checkpoint rather than re-paying the whole session.",
+      "entry_points": [
+        "crates/apps/research/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/research/src/lib.rs"
+      ],
+      "group": "Content & Research Apps",
+      "group_id": "68ff006b-69ec-40f0-a794-3185301aa6bb",
+      "id": "86170021-1e6d-44b3-ab87-f570cd95fb11",
+      "keywords": [
+        "Claude CLI",
+        "agentic",
+        "durable execution",
+        "checkpoint",
+        "session resume",
+        "turns_per_step",
+        "ResearchRequest",
+        "budget",
+        "cost metering"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.264363700+00:00",
+      "name": "agentic-research",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": "GET /health, GET /metrics, GET /openapi.json, GET /economics, GET /costs, POST /extract/preview",
+      "business_feature": "HTTP API Gateway",
+      "category": "api",
+      "cross_refs": [
+        "dataset-api",
+        "job-search-api",
+        "automation-api"
+      ],
+      "db_tables": [],
+      "description": "The axum HTTP router that registers every REST endpoint from per-domain submodules and generates a matching OpenAPI 3.x document from the same source. Owns the global body-limit policy, CORS, compression, and tracing middleware. The EXPECTED route inventory in routes/mod.rs is enforced by a test so routes cannot be added or removed silently.",
+      "entry_points": [
+        "crates/server/src/main.rs",
+        "crates/server/src/routes/mod.rs"
+      ],
+      "file_paths": [
+        "crates/server/src/routes/mod.rs",
+        "crates/server/src/routes/error.rs",
+        "crates/server/src/routes/health.rs",
+        "crates/server/src/routes/meta.rs",
+        "crates/server/src/routes/economics.rs",
+        "crates/server/src/routes/runtime.rs",
+        "crates/server/src/state.rs",
+        "crates/server/src/main.rs"
+      ],
+      "group": "HTTP API",
+      "group_id": "40699915-7a69-40dd-8320-969b42fdaf17",
+      "id": "768d6d69-8a39-4894-bd0e-06c2c3ba7cb7",
+      "keywords": [
+        "axum",
+        "OpenAPI",
+        "utoipa",
+        "CORS",
+        "compression",
+        "body-limit",
+        "EXPECTED inventory",
+        "AppState",
+        "router"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.262078800+00:00",
+      "name": "api-surface",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "axum",
+        "utoipa",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Job App Runtime",
+      "category": "lib",
+      "cross_refs": [
+        "job-worker",
+        "dataset-store",
+        "tiered-fetcher"
+      ],
+      "db_tables": [],
+      "description": "The per-job AppContext handed to every ScrapeApp::run call — wires metered fetch/research, budget enforcement, checkpoint persistence, live progress reporting, VCR record/replay, dataset upsert, artifact I/O, and source-health gating into one coherent facade. Also defines the ScrapeApp trait, AppManifest, and the CostClass taxonomy.",
+      "entry_points": [
+        "crates/core/src/app.rs"
+      ],
+      "file_paths": [
+        "crates/core/src/app.rs"
+      ],
+      "group": "Core Platform",
+      "group_id": "853ae333-2736-45c3-be60-5283c8e79c50",
+      "id": "774946dd-98ca-41bd-961e-a554f6af5585",
+      "keywords": [
+        "AppContext",
+        "ScrapeApp",
+        "ProgressReporter",
+        "CheckpointSink",
+        "AppManifest",
+        "CostClass",
+        "budget_usd",
+        "vcr",
+        "artifacts_dir",
+        "observe_extraction"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.260991600+00:00",
+      "name": "app-runtime",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Web Archive Engine",
+      "category": "lib",
+      "cross_refs": [],
+      "db_tables": [],
+      "description": "Tier-zero opportunistic HttpClient over the Wayback Machine CDX API — serves stored snapshots before hitting the live site, subject to a caller-supplied freshness window. Also provides list_snapshots for historical range enumeration (digest-deduped, oldest-first) used by the extractor backfill mode.",
+      "entry_points": [
+        "crates/engine-archive/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/engine-archive/src/lib.rs"
+      ],
+      "group": "Scraping Engines",
+      "group_id": "fe6d46c0-881b-4933-91de-de89ecf8a2dd",
+      "id": "71758603-1902-4cf9-85c1-bd326b841b34",
+      "keywords": [
+        "wayback",
+        "CDX",
+        "archive_max_age",
+        "FETCHED_VIA_HEADER",
+        "SNAPSHOT_TS_HEADER",
+        "CdxSnapshot",
+        "backfill",
+        "list_snapshots"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.260139400+00:00",
+      "name": "archive-engine",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "reqwest",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": "GET/POST /schedules, DELETE /schedules/{id}, POST /schedules/{id}/enabled, GET/POST /triggers, DELETE /triggers/{id}, POST /triggers/{id}/enabled, POST /triggers/{id}/test, GET /triggers/{id}/runs, GET/POST /watches, DELETE /watches/{id}, GET /webhooks/deliveries, POST /webhooks/deliveries/{id}/replay, GET/POST /ingress/sources, POST /ingest/{id}",
+      "business_feature": "Automation & Webhook API",
+      "category": "api",
+      "cross_refs": [
+        "trigger-pipeline",
+        "webhook-delivery",
+        "cron-scheduler"
+      ],
+      "db_tables": [
+        "schedules",
+        "triggers",
+        "trigger_runs",
+        "watches",
+        "webhook_deliveries",
+        "ingress_sources"
+      ],
+      "description": "REST routes for all pipeline automation surfaces: cron schedules CRUD and enable/disable, trigger CRUD with test-fire and run-history, dataset-watch CRUD, delivery log inspection and replay, and external ingress source management for signed inbound webhooks.",
+      "entry_points": [
+        "crates/server/src/routes/schedules.rs",
+        "crates/server/src/routes/triggers.rs"
+      ],
+      "file_paths": [
+        "crates/server/src/routes/schedules.rs",
+        "crates/server/src/routes/triggers.rs",
+        "crates/server/src/routes/watches.rs",
+        "crates/server/src/routes/events.rs",
+        "crates/server/src/routes/ingress.rs"
+      ],
+      "group": "HTTP API",
+      "group_id": "40699915-7a69-40dd-8320-969b42fdaf17",
+      "id": "48712746-fb94-4b5a-8c9f-541633b2695d",
+      "keywords": [
+        "schedule",
+        "cron",
+        "trigger",
+        "watch",
+        "ingress",
+        "delivery",
+        "replay",
+        "enable/disable",
+        "HMAC",
+        "idempotency"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.262540300+00:00",
+      "name": "automation-api",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "axum"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Headless Browser Engine",
+      "category": "lib",
+      "cross_refs": [],
+      "db_tables": [],
+      "description": "Concrete Browser implementation over Chrome via chromiumoxide CDP — lazy-launches Chrome with a persistent user-data directory, executes PageAction scripts (scroll/click/type/wait) for JS-heavy pages, and captures same-origin JSON network traffic for API X-ray discovery. Handles crash recovery, per-profile LRU holder pool, and render concurrency limits.",
+      "entry_points": [
+        "crates/engine-browser/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/engine-browser/src/lib.rs"
+      ],
+      "group": "Scraping Engines",
+      "group_id": "fe6d46c0-881b-4933-91de-de89ecf8a2dd",
+      "id": "3ec0394d-b58e-44f6-81f4-c64f072f8e1f",
+      "keywords": [
+        "chromiumoxide",
+        "CDP",
+        "chrome",
+        "headless",
+        "user-data-dir",
+        "PageAction",
+        "capture_network",
+        "render",
+        "transact",
+        "Browser"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.259749700+00:00",
+      "name": "browser-engine",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "chromiumoxide",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Browser Transaction Executor",
+      "category": "lib",
+      "cross_refs": [
+        "browser-engine",
+        "app-runtime"
+      ],
+      "db_tables": [],
+      "description": "Executes a declarative browser flow in dry-run mode: navigates, fills, clicks, and waits up to the confirmation state, then stops before the irreversible submit action and emits an evidence bundle (DOM snapshot plus filled-field summary) for human review. Live submission is structurally impossible in v1.",
+      "entry_points": [
+        "crates/apps/transact/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/transact/src/lib.rs"
+      ],
+      "group": "Content & Research Apps",
+      "group_id": "68ff006b-69ec-40f0-a794-3185301aa6bb",
+      "id": "c5fad075-db04-4229-a31e-f90e843b03e3",
+      "keywords": [
+        "browser flow",
+        "dry-run",
+        "PageAction",
+        "evidence bundle",
+        "dom.html",
+        "idempotency key",
+        "session profile",
+        "transact"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.264789+00:00",
+      "name": "browser-transact",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Claude Research Engine",
+      "category": "lib",
+      "cross_refs": [],
+      "db_tables": [],
+      "description": "Concrete Researcher implementation that spawns the Claude Code CLI as a subprocess (claude -p --output-format json), piping the prompt via stdin. Resolves model, effort, and budget from named role presets in config or per-request fields. The single entry point for agentic web research.",
+      "entry_points": [
+        "crates/engine-claude/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/engine-claude/src/lib.rs"
+      ],
+      "group": "Scraping Engines",
+      "group_id": "fe6d46c0-881b-4933-91de-de89ecf8a2dd",
+      "id": "af956273-47a2-410f-a313-7c901b749a22",
+      "keywords": [
+        "claude",
+        "subprocess",
+        "stdin",
+        "Researcher",
+        "role",
+        "effort",
+        "max_budget_usd",
+        "json-schema",
+        "allowed_tools",
+        "agentic"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.259943300+00:00",
+      "name": "claude-engine",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Connector API Watcher",
+      "category": "lib",
+      "cross_refs": [
+        "data-pipeline-catalog",
+        "claude-engine"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Monthly fetcher of every Personas connector's public API-docs page; detects line-level changes against the stored Markdown record and uses Claude to summarize what changed for developers. Output is a changes.json artifact fed to the Personas distribution pipeline. The watched connector list comes from catalog/connector-docs.json.",
+      "entry_points": [
+        "crates/apps/connector-api-watch/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/connector-api-watch/src/lib.rs"
+      ],
+      "group": "Content & Research Apps",
+      "group_id": "68ff006b-69ec-40f0-a794-3185301aa6bb",
+      "id": "37366c48-ba29-43e5-a89c-cd159626f01d",
+      "keywords": [
+        "connector docs",
+        "API change detection",
+        "Markdown diff",
+        "Claude summary",
+        "durable checkpoint",
+        "connector-docs.json",
+        "Personas"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.264986200+00:00",
+      "name": "connector-api-watch",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Web Crawl Core",
+      "category": "lib",
+      "cross_refs": [
+        "web-crawler",
+        "tiered-fetcher"
+      ],
+      "db_tables": [],
+      "description": "High-concurrency breadth-first URL crawler with a bounded deduplicating frontier (capped at 100k URLs) that drops near-duplicate pages via SimHash banded indexing before bodies are written to artifact files. Respects robots.txt, uses the shared governor for politeness, and streams CrawlPageRecord fingerprints to a PageSink dataset writer without accumulating bodies in memory.",
+      "entry_points": [
+        "crates/core/src/crawl.rs"
+      ],
+      "file_paths": [
+        "crates/core/src/crawl.rs",
+        "crates/core/src/simhash.rs"
+      ],
+      "group": "Core Platform",
+      "group_id": "853ae333-2736-45c3-be60-5283c8e79c50",
+      "id": "7f7fa847-22c8-4cfd-8268-6d6a176185c1",
+      "keywords": [
+        "CrawlConfig",
+        "PageSink",
+        "PageSource",
+        "SimHash",
+        "banded",
+        "robots.txt",
+        "frontier",
+        "MAX_FRONTIER",
+        "CrawlStats",
+        "RevisitCadence"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.261260500+00:00",
+      "name": "crawler-core",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Cron Scheduler",
+      "category": "lib",
+      "cross_refs": [
+        "data-pipeline-catalog",
+        "job-worker",
+        "automation-api"
+      ],
+      "db_tables": [
+        "schedules"
+      ],
+      "description": "DB-backed cron scheduler that fires enabled schedules, collapses misfires from downtime into single runs or skips them honoring per-schedule timezone and misfire policy. Also reconciles the catalog TOML desired state against the live schedules table, and piggybacks stale-job reaping, webhook DLQ draining, and DataHub governance polling on each tick.",
+      "entry_points": [
+        "crates/server/src/scheduler.rs"
+      ],
+      "file_paths": [
+        "crates/server/src/scheduler.rs",
+        "crates/server/src/refresher.rs"
+      ],
+      "group": "Job Orchestration",
+      "group_id": "6ffc1acf-5098-4a90-96de-1e9cd8a1aa8c",
+      "id": "21a8ac52-1ba1-4d8c-b821-5b43184bfdc2",
+      "keywords": [
+        "cron",
+        "scheduler",
+        "misfire",
+        "fire_once",
+        "DST",
+        "timezone",
+        "catalog reconcile",
+        "managed_by",
+        "overlap guard",
+        "boot_reconcile",
+        "cache refresher"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.262938700+00:00",
+      "name": "cron-scheduler",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio",
+        "cron"
+      ]
+    },
+    {
+      "api_surface": "MPSV open data endpoints",
+      "business_feature": "Czech Labor Market Data",
+      "category": "lib",
+      "cross_refs": [
+        "http-engine",
+        "dataset-storage"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Two MPSV open-data apps: mpsv-ispv ingests the Czech ISPV average-earnings dataset (CZ-ISCO occupation × wage/salary sphere, median/mean/decile spread) quarterly; mpsv-vpm ingests the national vacancy register (~300k live postings) daily and aggregates it into per-role/region salary distributions, vacancy lifecycle metrics, and a salary nowcast projecting current medians from the ISPV anchor.",
+      "entry_points": [
+        "crates/apps/mpsv-ispv/src/lib.rs",
+        "crates/apps/mpsv-vpm/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/mpsv-ispv/src/lib.rs",
+        "crates/apps/mpsv-vpm/src/lib.rs"
+      ],
+      "group": "Market Data",
+      "group_id": "0a7a8d2e-c3b5-45df-ba3e-1c17de130d9a",
+      "id": "e7c270e5-f8bc-4270-9785-7bd065cd9290",
+      "keywords": [
+        "ISPV",
+        "VPM",
+        "CZ-ISCO",
+        "wages",
+        "decile",
+        "median",
+        "Czech labor market",
+        "vacancy feed",
+        "krajregion",
+        "nowcast",
+        "time-to-close",
+        "repost detection",
+        "CC BY 4.0"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.266116100+00:00",
+      "name": "czech-labor-market",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": "data.smlouvy.gov.cz dump index XML",
+      "business_feature": "Czech Procurement Monitor",
+      "category": "lib",
+      "cross_refs": [
+        "http-engine",
+        "dataset-storage"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Parses the Registr smluv (Czech public contract register) monthly dump index XML from data.smlouvy.gov.cz, detects which dump files are new or re-generated by hash/size change, and upserts them keyed by dump URL — giving downstream consumers precise change signals without downloading the large (~100 MB) dump files themselves.",
+      "entry_points": [
+        "crates/apps/smlouvy-dump-watch/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/smlouvy-dump-watch/src/lib.rs"
+      ],
+      "group": "Grants Intelligence",
+      "group_id": "aad42d5e-d36b-40ea-b57b-baecd51142a5",
+      "id": "ace86816-2407-49bf-8532-a33d66bfd9aa",
+      "keywords": [
+        "Registr smluv",
+        "Czech contracts",
+        "dump index",
+        "sha1 hash",
+        "year/month key",
+        "XML parse",
+        "tender-radar",
+        "smlouvy.gov.cz"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.265791200+00:00",
+      "name": "czech-procurement",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": "GET /catalog/sources, GET /catalog/health, GET /catalog/reconcile, POST /catalog/reconcile",
+      "business_feature": "Data Pipeline Catalog",
+      "category": "config",
+      "cross_refs": [
+        "cron-scheduler",
+        "automation-api"
+      ],
+      "db_tables": [],
+      "description": "GitOps-style registry of all data pipelines as [[source]] declarations in data-sources.toml, cross-validated against the live app registry. The catalog reconciler syncs schedule rows tagged managed_by:catalog against the desired cron state in the TOML without touching hand-made rows. connector-docs.json lists 100+ third-party API docs monitored for drift.",
+      "entry_points": [
+        "catalog/data-sources.toml",
+        "crates/core/src/catalog.rs"
+      ],
+      "file_paths": [
+        "crates/core/src/catalog.rs"
+      ],
+      "group": "Core Platform",
+      "group_id": "853ae333-2736-45c3-be60-5283c8e79c50",
+      "id": "cc7f0c9f-afb1-4c5a-8c76-2842f98f1075",
+      "keywords": [
+        "Source",
+        "Catalog",
+        "reconcile",
+        "CATALOG_MANAGED_BY",
+        "ContractVerdict",
+        "PlanCreate",
+        "PlanUpdate",
+        "managed_by",
+        "cron",
+        "market",
+        "status: live/planned/blocked"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.261852600+00:00",
+      "name": "data-pipeline-catalog",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "TOML"
+      ]
+    },
+    {
+      "api_surface": "GET /datahub/status, POST /datahub/sync",
+      "business_feature": "DataHub Metadata Bridge",
+      "category": "lib",
+      "cross_refs": [
+        "job-worker",
+        "dataset-storage",
+        "data-pipeline-catalog"
+      ],
+      "db_tables": [],
+      "description": "Pushes dataset entity metadata (properties, inferred schema, freshness operations, row-count profiles, column and table lineage) to a DataHub GMS instance after each successful job. Also polls DataHub governance signals back: deprecation disables catalog-managed schedules, cost:pause tags force budget to $0, and failing assertions enqueue immediate syncs.",
+      "entry_points": [
+        "crates/server/src/datahub.rs"
+      ],
+      "file_paths": [
+        "crates/server/src/datahub.rs"
+      ],
+      "group": "Event Pipeline",
+      "group_id": "9075d6e0-c51c-41b2-a80d-0a94babdb835",
+      "id": "1145fbbb-7d68-4b96-8c19-d2cd3b1f041d",
+      "keywords": [
+        "DataHub",
+        "GMS",
+        "lineage",
+        "schema inference",
+        "dataset entity",
+        "operation timeseries",
+        "profile",
+        "dataFlow",
+        "dataJob",
+        "governance",
+        "cost:pause",
+        "deprecation",
+        "assertions"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.263644900+00:00",
+      "name": "datahub-bridge",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio",
+        "reqwest"
+      ]
+    },
+    {
+      "api_surface": "GET /datasets/{app}/{dataset}, GET .../export, GET .../duplicates, GET .../changes, GET .../history, DELETE /datasets/{app}/{dataset}, POST /derived, GET/DELETE /derived/{id}, POST /derived/{id}/backfill, GET /provenance/{app}/{dataset}/{key}",
+      "business_feature": "Dataset Query API",
+      "category": "api",
+      "cross_refs": [
+        "dataset-storage",
+        "api-surface"
+      ],
+      "db_tables": [
+        "records",
+        "revisions",
+        "derived_specs"
+      ],
+      "description": "REST surface for querying, exporting, and managing datasets: change history, duplicate detection, derived-dataset CRUD, provenance/lineage trails, and rederive triggers. Exposes the full record-store surface to external consumers including the TypeScript SDK.",
+      "entry_points": [
+        "crates/server/src/routes/datasets.rs"
+      ],
+      "file_paths": [
+        "crates/server/src/routes/datasets.rs",
+        "crates/server/src/routes/derived.rs",
+        "crates/server/src/routes/provenance.rs",
+        "crates/server/src/routes/query.rs"
+      ],
+      "group": "HTTP API",
+      "group_id": "40699915-7a69-40dd-8320-969b42fdaf17",
+      "id": "b7d4eb4e-4cee-4394-b08f-bf53e585b5fa",
+      "keywords": [
+        "export",
+        "changes",
+        "history",
+        "duplicates",
+        "derived",
+        "provenance",
+        "lineage",
+        "filter",
+        "cursor",
+        "tombstone"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.262195100+00:00",
+      "name": "dataset-api",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "axum"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Dataset Replication",
+      "category": "lib",
+      "cross_refs": [
+        "dataset-storage",
+        "dataset-api"
+      ],
+      "db_tables": [
+        "records",
+        "revisions"
+      ],
+      "description": "Pull-only dataset mirror: walks another Pumper node's revision-feed API with cursor-based pagination, applies revisions locally under a namespace prefix with origin provenance, and handles ETag conditional-GET to avoid re-fetching unchanged feeds. A max_records budget suspends mid-walk with a resumable cursor.",
+      "entry_points": [
+        "crates/apps/peer/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/peer/src/lib.rs"
+      ],
+      "group": "Content & Research Apps",
+      "group_id": "68ff006b-69ec-40f0-a794-3185301aa6bb",
+      "id": "1a039179-56bf-4403-b4de-eff46622b273",
+      "keywords": [
+        "peering",
+        "mirror",
+        "replication",
+        "cursor",
+        "revision feed",
+        "ETag",
+        "conditional GET",
+        "namespace",
+        "tombstone",
+        "provenance"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.264454600+00:00",
+      "name": "dataset-peering",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Dataset & Job Persistence",
+      "category": "data",
+      "cross_refs": [
+        "app-runtime",
+        "job-worker",
+        "dataset-api"
+      ],
+      "db_tables": [
+        "records",
+        "revisions",
+        "derived_specs",
+        "jobs",
+        "schedules",
+        "triggers",
+        "watches",
+        "cost_events"
+      ],
+      "description": "SQLite-backed persistent record store with content-addressed change detection — apps upsert typed JSON records and the store hashes values to report New/Changed/Unchanged/Removed. Supports full-snapshot sync with removal detection, derived dataset specs, trust labeling, revision history, duplicate detection, and filter/aggregation queries. Also owns the durable job queue, cost ledger, and pre-migration backup.",
+      "entry_points": [
+        "crates/core/src/datasets.rs",
+        "crates/core/src/storage.rs"
+      ],
+      "file_paths": [
+        "crates/core/src/datasets.rs",
+        "crates/core/src/storage.rs",
+        "crates/core/src/job.rs",
+        "crates/core/src/costs.rs",
+        "crates/core/src/backup.rs"
+      ],
+      "group": "Core Platform",
+      "group_id": "853ae333-2736-45c3-be60-5283c8e79c50",
+      "id": "e3ca4414-1cee-4159-91f2-afe2be05dc2f",
+      "keywords": [
+        "ChangeKind",
+        "Record",
+        "Revision",
+        "UpsertSummary",
+        "sync_many",
+        "trust",
+        "Provenance",
+        "DerivedSpec",
+        "CostLedger",
+        "SpentTotal",
+        "backup",
+        "WAL"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.261506600+00:00",
+      "name": "dataset-storage",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "sqlx",
+        "SQLite"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Declarative URL Extractor",
+      "category": "lib",
+      "cross_refs": [
+        "extraction-core",
+        "archive-engine",
+        "tiered-fetcher"
+      ],
+      "db_tables": [],
+      "description": "Generic extraction app that fetches a list of URLs through the tiered fetcher and runs a declarative RuleSet (CSS/XPath/Regex/JSON) over all of them concurrently using the SIMD extraction engine. Also handles Wayback Machine archive backfill via CDX enumeration and historical snapshot extraction, and induction of draft RuleSets from sample pages.",
+      "entry_points": [
+        "crates/apps/extractor/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/extractor/src/lib.rs",
+        "crates/apps/extractor/src/induce.rs",
+        "crates/apps/extractor/src/replay.rs"
+      ],
+      "group": "Content & Research Apps",
+      "group_id": "68ff006b-69ec-40f0-a794-3185301aa6bb",
+      "id": "f20b44f3-ddda-44a2-bbed-bbc93392b729",
+      "keywords": [
+        "RuleSet",
+        "CSS",
+        "XPath",
+        "regex",
+        "extraction",
+        "SIMD",
+        "Wayback CDX",
+        "archive backfill",
+        "CompiledRuleSet",
+        "reliability",
+        "FetchHealth"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.264546200+00:00",
+      "name": "declarative-extractor",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio",
+        "rayon"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Engine Capability Contracts",
+      "category": "lib",
+      "cross_refs": [
+        "http-engine",
+        "browser-engine",
+        "claude-engine",
+        "wasm-plugin-host"
+      ],
+      "db_tables": [],
+      "description": "Defines the three pluggable capability traits (HttpClient, Browser, Researcher), the Search trait, the plugin host interface, the EngineSet container that wires them together, and all shared request/response models. Also owns core primitives: configuration schema, error types, LRU cache, and jitter timing — the foundation everything else depends on.",
+      "entry_points": [
+        "crates/core/src/engine.rs",
+        "crates/core/src/config.rs"
+      ],
+      "file_paths": [
+        "crates/core/src/engine.rs",
+        "crates/core/src/plugin.rs",
+        "crates/core/src/search.rs",
+        "crates/core/src/config.rs",
+        "crates/core/src/error.rs",
+        "crates/core/src/lru.rs",
+        "crates/core/src/jitter.rs",
+        "crates/core/src/lib.rs"
+      ],
+      "group": "Core Platform",
+      "group_id": "853ae333-2736-45c3-be60-5283c8e79c50",
+      "id": "be559f0a-578f-4092-9f87-7169535f8fcc",
+      "keywords": [
+        "HttpClient",
+        "Browser",
+        "Researcher",
+        "EngineSet",
+        "RenderRequest",
+        "TransactRequest",
+        "ResearchRequest",
+        "PluginHost",
+        "Search",
+        "config"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.260883600+00:00",
+      "name": "engine-contracts",
+      "pinned": false,
+      "tech_stack": [
+        "Rust"
+      ]
+    },
+    {
+      "api_surface": "SEDIA Search API, CORDIS search/detail API",
+      "business_feature": "EU Grants Ingestion",
+      "category": "lib",
+      "cross_refs": [
+        "grants-unified-layer",
+        "http-engine"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Two complementary apps: eu-sedia ingests EU Funding and Tenders Portal open-call topics from the SEDIA Search API for all EU programmes (Horizon Europe, Erasmus+, CERV, LIFE) and joins CORDIS win-intelligence history onto Horizon topics. cordis runs two-stage ingestion of CORDIS Horizon-funded projects and rolls up per-topic funded outcome stats used by eu-sedia.",
+      "entry_points": [
+        "crates/apps/eu-sedia/src/lib.rs",
+        "crates/apps/cordis/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/eu-sedia/src/lib.rs",
+        "crates/apps/cordis/src/lib.rs"
+      ],
+      "group": "Grants Intelligence",
+      "group_id": "aad42d5e-d36b-40ea-b57b-baecd51142a5",
+      "id": "f85cc5c8-d4d2-41ae-8ea4-47c0ec324b1b",
+      "keywords": [
+        "SEDIA",
+        "EU grants",
+        "Horizon Europe",
+        "open calls",
+        "CORDIS",
+        "funded projects",
+        "topic_stats",
+        "win-intelligence",
+        "history block",
+        "RCN"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.265523400+00:00",
+      "name": "eu-grants",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Declarative Extraction Engine",
+      "category": "lib",
+      "cross_refs": [
+        "app-runtime",
+        "declarative-extractor"
+      ],
+      "db_tables": [],
+      "description": "Declarative multi-rule extraction over fetched documents — CSS, Regex, JSON Pointer, XPath, constant, and repeating-container (Each) rules compiled once and executed via rayon across all CPU cores, with SIMD JSON parsing. Also includes zero-shot heuristic induction of RuleSets from same-template pages, Markdown conversion, and JSON salvage for malformed LLM output.",
+      "entry_points": [
+        "crates/core/src/extract.rs"
+      ],
+      "file_paths": [
+        "crates/core/src/extract.rs",
+        "crates/core/src/induce.rs",
+        "crates/core/src/markdown.rs",
+        "crates/core/src/json_salvage.rs"
+      ],
+      "group": "Core Platform",
+      "group_id": "853ae333-2736-45c3-be60-5283c8e79c50",
+      "id": "4900edcb-aa2c-4b1b-9d49-1a9551437609",
+      "keywords": [
+        "RuleSet",
+        "CompiledRuleSet",
+        "Rule::Each",
+        "FieldStatus",
+        "DocReport",
+        "rayon",
+        "simd-json",
+        "css",
+        "xpath",
+        "json-pointer",
+        "regex",
+        "induce",
+        "Markdown"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.261146300+00:00",
+      "name": "extraction-core",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "rayon",
+        "simd-json",
+        "scraper"
+      ]
+    },
+    {
+      "api_surface": "GET /grants, GET /grants/closing-soon",
+      "business_feature": "Unified Grants Intelligence",
+      "category": "lib",
+      "cross_refs": [
+        "us-federal-grants",
+        "us-state-grants",
+        "eu-grants",
+        "dataset-storage"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Shared library that normalizes every source app's raw opportunities into one canonical schema in grants/unified (keyed source:source_id), detects lifecycle events (deadline extensions, closures) into grants/events, links near-duplicate opportunities across sources via SimHash into grants/duplicate_links, and exposes a unified grants query surface.",
+      "entry_points": [
+        "crates/apps/grants-common/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/grants-common/src/lib.rs"
+      ],
+      "group": "Grants Intelligence",
+      "group_id": "aad42d5e-d36b-40ea-b57b-baecd51142a5",
+      "id": "32a8d2ae-8df1-418e-b1a0-37e54e02ecbf",
+      "keywords": [
+        "unified grants",
+        "canonical schema",
+        "cross-source normalization",
+        "lifecycle events",
+        "deadline extension",
+        "SimHash",
+        "duplicate links",
+        "UNIFIED_APP",
+        "UNIFIED_DATASET"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.265686900+00:00",
+      "name": "grants-unified-layer",
+      "pinned": false,
+      "tech_stack": [
+        "Rust"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "HackerNews Example App",
+      "category": "lib",
+      "cross_refs": [
+        "app-runtime",
+        "http-engine"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Template/example app that fetches up to 5 pages of the HackerNews front page listing via plain HTTP, parses stories into typed records (rank, id, title, url, points, author, comments), and upserts them into the stories dataset keyed by HN item id. Serves as the canonical reference implementation for classic fetch-and-parse scraping apps.",
+      "entry_points": [
+        "crates/apps/hackernews/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/hackernews/src/lib.rs"
+      ],
+      "group": "Content & Research Apps",
+      "group_id": "68ff006b-69ec-40f0-a794-3185301aa6bb",
+      "id": "73bdd704-055a-4511-9657-f8c73837064c",
+      "keywords": [
+        "example",
+        "template",
+        "HackerNews",
+        "fetch",
+        "parse",
+        "scraper",
+        "stories",
+        "reference"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.265071900+00:00",
+      "name": "hackernews-example",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio",
+        "scraper"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "HTTP Fetch Engine",
+      "category": "lib",
+      "cross_refs": [],
+      "db_tables": [],
+      "description": "Concrete HttpClient over reqwest with per-(proxy, profile) LRU client pooling, persistent cookie jars for named login profiles, exponential-backoff retry, and a browser-like User-Agent. Serves as the default fast-path fetch tier for all scraping apps. Depends only on core engine traits.",
+      "entry_points": [
+        "crates/engine-http/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/engine-http/src/lib.rs"
+      ],
+      "group": "Scraping Engines",
+      "group_id": "fe6d46c0-881b-4933-91de-de89ecf8a2dd",
+      "id": "7fcc181e-567d-4bfb-9265-6c7f3f3bd4b3",
+      "keywords": [
+        "reqwest",
+        "ProfileJar",
+        "cookie_store",
+        "retry",
+        "exponential backoff",
+        "proxy",
+        "client pool",
+        "HttpClient"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.258525200+00:00",
+      "name": "http-engine",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "reqwest",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": "GET /jobs, POST /apps/{name}/jobs, GET /jobs/{id}/stream, DELETE /jobs/{id}, POST /jobs/{id}/retry, GET /search, GET /searches, POST /searches, GET /hosts, DELETE /hosts/{host}/memory, GET /host-weather/export, POST /host-weather/import, GET /recipes, POST /fetch-proxy",
+      "business_feature": "Job & Search API",
+      "category": "api",
+      "cross_refs": [
+        "job-worker",
+        "search-engine",
+        "tiered-fetcher"
+      ],
+      "db_tables": [
+        "jobs",
+        "saved_searches",
+        "host_profiles",
+        "api_recipes"
+      ],
+      "description": "REST routes for job lifecycle management (enqueue, stream, retry, cancel), full-text search (queries, saved searches, status, backfill), host-intelligence management (tier memory, weather import/export), API recipe inspection, and the distributed fetch-proxy endpoint for peer nodes.",
+      "entry_points": [
+        "crates/server/src/routes/jobs.rs",
+        "crates/server/src/routes/search.rs"
+      ],
+      "file_paths": [
+        "crates/server/src/routes/jobs.rs",
+        "crates/server/src/routes/search.rs",
+        "crates/server/src/routes/host_weather.rs",
+        "crates/server/src/routes/recipes.rs",
+        "crates/server/src/routes/remote.rs"
+      ],
+      "group": "HTTP API",
+      "group_id": "40699915-7a69-40dd-8320-969b42fdaf17",
+      "id": "d96241c9-a10f-4871-8a2d-5ae0b24cb57c",
+      "keywords": [
+        "enqueue",
+        "job stream",
+        "SSE",
+        "search",
+        "saved search",
+        "host tier",
+        "weather",
+        "recipes",
+        "fetch-proxy",
+        "peer"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.262374900+00:00",
+      "name": "job-search-api",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "axum"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Job Worker",
+      "category": "lib",
+      "cross_refs": [
+        "dataset-storage",
+        "app-runtime",
+        "trigger-pipeline",
+        "webhook-delivery"
+      ],
+      "db_tables": [
+        "jobs",
+        "job_checkpoints",
+        "job_yields"
+      ],
+      "description": "Async job worker that claims due jobs from the queue, runs them under a global concurrency semaphore with per-app caps, enforces wall-clock timeouts and heartbeating, and drives graceful shutdown with checkpoint-based suspend-and-resume. Post-run side effects include search indexing, dataset-change pushes, webhook delivery, DataHub sync, and trigger firing.",
+      "entry_points": [
+        "crates/server/src/worker.rs"
+      ],
+      "file_paths": [
+        "crates/server/src/worker.rs",
+        "crates/server/src/progress.rs",
+        "crates/server/src/registry.rs"
+      ],
+      "group": "Job Orchestration",
+      "group_id": "6ffc1acf-5098-4a90-96de-1e9cd8a1aa8c",
+      "id": "f5e841e6-df86-4ce0-8270-e3610d5581d1",
+      "keywords": [
+        "semaphore",
+        "heartbeat",
+        "VCR",
+        "checkpoint",
+        "durable execution",
+        "cancel token",
+        "stale reap",
+        "contract enforcement",
+        "search indexing",
+        "JobCheckpointer",
+        "registry"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.262794200+00:00",
+      "name": "job-worker",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Maintenance & Dev Tooling",
+      "category": "config",
+      "cross_refs": [
+        "search-engine",
+        "api-surface"
+      ],
+      "db_tables": [],
+      "description": "Standalone maintenance binaries and developer tooling: reindex rewrites Tantivy-derived columns (must run with server stopped due to exclusive writer lock); search-backfill indexes historical records scoped by app/dataset; the justfile is the canonical task runner; CI/CD runs fmt-check + clippy + tests on every push.",
+      "entry_points": [
+        "justfile",
+        "crates/server/src/bin/reindex.rs"
+      ],
+      "file_paths": [
+        "crates/server/src/bin/reindex.rs",
+        "crates/server/src/bin/search-backfill.rs",
+        "scripts/docs/check-doc-sync.mjs"
+      ],
+      "group": "Job Orchestration",
+      "group_id": "6ffc1acf-5098-4a90-96de-1e9cd8a1aa8c",
+      "id": "014cd3d4-c6ec-4a6e-a47c-7d1b4da6aa9e",
+      "keywords": [
+        "reindex",
+        "search-backfill",
+        "just",
+        "clippy",
+        "cargo-deny",
+        "RUSTSEC",
+        "doc-sync",
+        "Stop hook",
+        "feature-doc-map",
+        "maintenance",
+        "CI"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.263068200+00:00",
+      "name": "maintenance-tooling",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "cargo",
+        "GitHub Actions",
+        "Node.js"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Page Change Monitor",
+      "category": "lib",
+      "cross_refs": [
+        "tiered-fetcher",
+        "dataset-storage"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Lightweight scheduled page monitor: fetches any URL via the tiered fetcher, reduces it to a fingerprint record (title, char count, content hash, excerpt), and upserts it keyed by URL — the dataset store's change detection then acts as Visualping-style alerting when paired with a dataset watch and cron schedule. Readable fetches a single URL as clean Markdown artifact.",
+      "entry_points": [
+        "crates/apps/watch/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/watch/src/lib.rs",
+        "crates/apps/readable/src/lib.rs"
+      ],
+      "group": "Content & Research Apps",
+      "group_id": "68ff006b-69ec-40f0-a794-3185301aa6bb",
+      "id": "d1bd21ae-05b8-4333-8039-a3a1895f6916",
+      "keywords": [
+        "change monitor",
+        "fingerprint",
+        "hash",
+        "Markdown",
+        "excerpt",
+        "tiered fetcher",
+        "archive tier",
+        "inline",
+        "FetchStrategy"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.264202900+00:00",
+      "name": "page-monitor",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "WASM Plugin Runner",
+      "category": "lib",
+      "cross_refs": [
+        "wasm-plugin-host",
+        "declarative-extractor"
+      ],
+      "db_tables": [],
+      "description": "Runs a named WASM plugin over a list of URLs (fetching live) or stored crawl records (no re-fetch), deduping JSON results into a dataset. Supports plugin_params forwarding so one module serves multiple configurations per job. The observatory module provides additional quality monitoring.",
+      "entry_points": [
+        "crates/apps/plugin/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/plugin/src/lib.rs",
+        "crates/apps/plugin/src/observatory.rs"
+      ],
+      "group": "Content & Research Apps",
+      "group_id": "68ff006b-69ec-40f0-a794-3185301aa6bb",
+      "id": "35a30975-5b43-4001-b8e9-ec52796dcc5a",
+      "keywords": [
+        "WASM plugin",
+        "sandbox",
+        "plugin_params",
+        "rules_hash",
+        "provenance",
+        "dedup",
+        "concurrency",
+        "observatory"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.264633800+00:00",
+      "name": "plugin-runner",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Distributed Fetch Proxy",
+      "category": "lib",
+      "cross_refs": [],
+      "db_tables": [],
+      "description": "Coordinator-side distributed fetch proxy that ships serialized HttpRequest objects to peer Pumper nodes' POST /fetch-proxy endpoints and deserializes the response. Round-robin node selection with automatic local-engine fallback on any peer failure; enables geographic egress distribution without changing per-request app code.",
+      "entry_points": [
+        "crates/engine-remote/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/engine-remote/src/lib.rs"
+      ],
+      "group": "Scraping Engines",
+      "group_id": "fe6d46c0-881b-4933-91de-de89ecf8a2dd",
+      "id": "40bc16af-0f30-442a-9101-45f01c3efbf6",
+      "keywords": [
+        "fetch-proxy",
+        "REMOTE_SECRET_HEADER",
+        "round-robin",
+        "ProxyResponse",
+        "local fallback",
+        "distributed",
+        "peer nodes"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.260347700+00:00",
+      "name": "remote-engine",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "reqwest",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Full-Text Search Engine",
+      "category": "lib",
+      "cross_refs": [],
+      "db_tables": [],
+      "description": "Embedded BM25 full-text search over datasets using Tantivy with no external service dependency. Indexes (id, app, dataset, url, title, body) plus entity-typed fast fields (amount, event_date) extracted by conservative regex rules at index time. Handles schema version detection and in-place index rebuild on schema upgrade.",
+      "entry_points": [
+        "crates/engine-search/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/engine-search/src/lib.rs",
+        "crates/engine-search/src/enrich.rs"
+      ],
+      "group": "Scraping Engines",
+      "group_id": "fe6d46c0-881b-4933-91de-de89ecf8a2dd",
+      "id": "dc51a7e6-82ec-481a-9e07-9161ecd45989",
+      "keywords": [
+        "tantivy",
+        "BM25",
+        "full-text search",
+        "amount",
+        "event_date",
+        "MONEY_RE",
+        "DATE_ISO_RE",
+        "facets",
+        "IndexWriter",
+        "reindex"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.260443500+00:00",
+      "name": "search-engine",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tantivy",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Source Provisioner",
+      "category": "lib",
+      "cross_refs": [
+        "claude-engine",
+        "extraction-core",
+        "data-pipeline-catalog"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Speaks a data source into existence from a natural-language prompt: researches candidate URLs, samples them, iteratively drafts and dry-runs a declarative RuleSet until a majority of fields match, then emits a complete provision proposal (status=planned) into the provisioner/proposals dataset. Never writes the catalog or creates schedules.",
+      "entry_points": [
+        "crates/apps/provisioner/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/provisioner/src/lib.rs"
+      ],
+      "group": "Content & Research Apps",
+      "group_id": "68ff006b-69ec-40f0-a794-3185301aa6bb",
+      "id": "726b0eac-19e0-4f6d-b022-453e2d73317d",
+      "keywords": [
+        "provisioner",
+        "proposal",
+        "RuleSet draft",
+        "dry-run",
+        "extract_one_with_report",
+        "status=planned",
+        "archive sampling",
+        "agentic"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.264875500+00:00",
+      "name": "source-provisioner",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Source Health Monitor",
+      "category": "lib",
+      "cross_refs": [
+        "app-runtime",
+        "dataset-storage"
+      ],
+      "db_tables": [
+        "source_health",
+        "source_runs",
+        "source_sketches"
+      ],
+      "description": "Self-supervised extraction health monitor that detects selector rebinding (distinctness collapse), value-domain drift, and violated data invariants by comparing each run's ObservedDoc signals against the source's own rolling history — no external ground truth required. Produces a SourceVerdict (healthy/degrading/broken) that gates writes and suppresses removal detection for degrading sources.",
+      "entry_points": [
+        "crates/core/src/resilience/mod.rs"
+      ],
+      "file_paths": [
+        "crates/core/src/resilience/mod.rs",
+        "crates/core/src/resilience/detect.rs",
+        "crates/core/src/resilience/sketch.rs",
+        "crates/core/src/resilience/store.rs",
+        "crates/core/src/resilience/invariants.rs"
+      ],
+      "group": "Core Platform",
+      "group_id": "853ae333-2736-45c3-be60-5283c8e79c50",
+      "id": "f93738c9-8715-4def-a6a4-6462fb10e08d",
+      "keywords": [
+        "SourceVerdict",
+        "SourceState",
+        "ObservedDoc",
+        "DocSignals",
+        "HealthStore",
+        "CohortDrift",
+        "Invariant",
+        "degrading",
+        "quarantine",
+        "suppresses_removals"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.261605400+00:00",
+      "name": "source-resilience",
+      "pinned": false,
+      "tech_stack": [
+        "Rust"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Tiered Fetch Policy",
+      "category": "lib",
+      "cross_refs": [],
+      "db_tables": [
+        "http_cache",
+        "research_cache",
+        "host_profiles",
+        "api_recipes"
+      ],
+      "description": "Policy layer that auto-escalates fetch attempts across tiers (archive → http → browser → Claude) based on content quality signals such as thin body, bot-wall markers, and challenge pages. Also manages per-domain politeness via a token-bucket governor, an HTTP/research response cache, learned tier preferences (tier memory), and API recipe replay.",
+      "entry_points": [
+        "crates/core/src/fetcher.rs"
+      ],
+      "file_paths": [
+        "crates/core/src/fetcher.rs",
+        "crates/core/src/governor.rs",
+        "crates/core/src/tiers.rs",
+        "crates/core/src/cache.rs",
+        "crates/core/src/recipes.rs"
+      ],
+      "group": "Scraping Engines",
+      "group_id": "fe6d46c0-881b-4933-91de-de89ecf8a2dd",
+      "id": "786eb264-8b2b-4a68-b57a-57718843047c",
+      "keywords": [
+        "FetchStrategy",
+        "TierTrace",
+        "CHALLENGE_MARKERS",
+        "token-bucket",
+        "Governor",
+        "TierMemory",
+        "HttpCache",
+        "ResearchCache",
+        "ApiRecipe",
+        "escalation"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.260589600+00:00",
+      "name": "tiered-fetcher",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio",
+        "DashMap"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Trades Operator Economics",
+      "category": "lib",
+      "cross_refs": [
+        "claude-engine",
+        "trades-pricing"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Three agentic apps that research regulatory and tax context for US sole-proprietor trades operators (state-tax: all 50-state income-tax structure; state-licensing: contractor licensing/bonding/insurance requirements per state × trade; trade-wages: BLS OEWS wage bands + SOC codes), all sharing the trades-common library for metered research calls, plausibility validation, taxonomy registry, and the cross-source trades/ dataset namespace.",
+      "entry_points": [
+        "crates/apps/trades-common/src/lib.rs",
+        "crates/apps/state-tax/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/state-tax/src/lib.rs",
+        "crates/apps/state-licensing/src/lib.rs",
+        "crates/apps/trade-wages/src/lib.rs",
+        "crates/apps/trades-common/src/lib.rs"
+      ],
+      "group": "Market Data",
+      "group_id": "0a7a8d2e-c3b5-45df-ba3e-1c17de130d9a",
+      "id": "c54cf00c-ba30-4306-84e7-45f9fe0c6157",
+      "keywords": [
+        "state income tax",
+        "contractor licensing",
+        "bonding",
+        "BLS OEWS",
+        "SOC code",
+        "wage bands",
+        "taxonomy",
+        "plausibility validation",
+        "research_json",
+        "salvage_json",
+        "sole proprietor",
+        "trades",
+        "Ledgerline"
+      ],
+      "last_written_at": "2026-08-03T19:10:18.908134400+00:00",
+      "name": "trades-operator-economics",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Trades Pricing & Valuation",
+      "category": "lib",
+      "cross_refs": [
+        "claude-engine",
+        "trades-operator-economics"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Three apps that research pricing and valuation benchmarks for US home-services trades via the Claude research engine: homewyse-pricing synthesizes low/median/high service prices from cost guides (Homewyse, Angi, Thumbtack); valuation-multiples synthesizes SDE/revenue multiples from BizBuySell broker data; cms-fee-schedule detects new CMS Physician Fee Schedule releases, downloads the PPRRVU CSV, and diffs release-over-release for Counterbill's Medicare reference-price database.",
+      "entry_points": [
+        "crates/apps/homewyse-pricing/src/lib.rs",
+        "crates/apps/cms-fee-schedule/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/homewyse-pricing/src/lib.rs",
+        "crates/apps/valuation-multiples/src/lib.rs",
+        "crates/apps/cms-fee-schedule/src/lib.rs"
+      ],
+      "group": "Market Data",
+      "group_id": "0a7a8d2e-c3b5-45df-ba3e-1c17de130d9a",
+      "id": "17e7c4d2-8d60-487d-84f3-d864ebf791d0",
+      "keywords": [
+        "Homewyse",
+        "service pricing",
+        "valuation multiples",
+        "SDE",
+        "BizBuySell",
+        "CMS",
+        "Medicare",
+        "fee schedule",
+        "PPRRVU",
+        "HCPCS",
+        "RVU",
+        "Counterbill",
+        "Ledgerline",
+        "Claude CLI"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.266255400+00:00",
+      "name": "trades-pricing",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Reactive Trigger Pipeline",
+      "category": "lib",
+      "cross_refs": [
+        "job-worker",
+        "wasm-plugin-host",
+        "automation-api"
+      ],
+      "db_tables": [
+        "triggers",
+        "trigger_runs",
+        "ingress_sources"
+      ],
+      "description": "Reactive edge system wiring source events (dataset change or terminal job status) to target-app job enqueues, with cycle-detection and max-depth guards on the provenance chain. Also handles external ingress — signed inbound webhooks that fire triggers — and WASM predicate/transform plugin hooks. Idempotency-keyed dedup ensures a trigger fires at most once per source run.",
+      "entry_points": [
+        "crates/server/src/triggers.rs"
+      ],
+      "file_paths": [
+        "crates/server/src/triggers.rs"
+      ],
+      "group": "Event Pipeline",
+      "group_id": "9075d6e0-c51c-41b2-a80d-0a94babdb835",
+      "id": "9a917ca2-5805-4c8f-abcb-a41adc66799f",
+      "keywords": [
+        "trigger",
+        "reactive",
+        "dataset.changed",
+        "job terminal",
+        "cycle detection",
+        "depth guard",
+        "provenance chain",
+        "predicate plugin",
+        "transform plugin",
+        "ingress",
+        "idempotency key"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.263329400+00:00",
+      "name": "trigger-pipeline",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": "Census Bureau EITS, CBP, NES, NES-D APIs",
+      "business_feature": "US Business Census",
+      "category": "lib",
+      "cross_refs": [
+        "http-engine",
+        "dataset-storage"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Four Census Bureau apps that feed the Ledgerline geographic launch-ranking model: census-bfs ingests BFS timeseries for trailing-12-month business formation velocity; census-density ingests County Business Patterns CBP saturation per NAICS code; census-nonemp ingests Nonemployer Statistics solo-operator revenue benchmarks; census-nesd ingests owner-age demographics for succession-wave signals. Shared census-common library provides API-key resolution and suppression-safe numeric parsing.",
+      "entry_points": [
+        "crates/apps/census-bfs/src/lib.rs",
+        "crates/apps/census-density/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/census-bfs/src/lib.rs",
+        "crates/apps/census-density/src/lib.rs",
+        "crates/apps/census-nonemp/src/lib.rs",
+        "crates/apps/census-nesd/src/lib.rs",
+        "crates/apps/census-common/src/lib.rs"
+      ],
+      "group": "Market Data",
+      "group_id": "0a7a8d2e-c3b5-45df-ba3e-1c17de130d9a",
+      "id": "b2e1ff1c-3167-4792-a24e-f52f68b2e6f3",
+      "keywords": [
+        "BFS",
+        "CBP",
+        "NES",
+        "NES-D",
+        "NAICS",
+        "Census API",
+        "saturation",
+        "formation velocity",
+        "owner age",
+        "succession wave",
+        "nonemployer",
+        "suppression sentinel",
+        "Ledgerline"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.266000500+00:00",
+      "name": "us-business-census",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": "Grants.gov Search2 API (POST /v2/api/search2)",
+      "business_feature": "US Federal Grants Ingestion",
+      "category": "lib",
+      "cross_refs": [
+        "grants-unified-layer",
+        "http-engine"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Ingests every US federal grant opportunity from the Grants.gov Search2 POST-only JSON API (key-free), paginating up to configurable limits and upserting opportunities keyed by opportunity id. Optionally harvests full announcement records for new/changed opportunities into a detail corpus dataset. Runs daily at 09:00 UTC.",
+      "entry_points": [
+        "crates/apps/grants-gov/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/grants-gov/src/lib.rs"
+      ],
+      "group": "Grants Intelligence",
+      "group_id": "aad42d5e-d36b-40ea-b57b-baecd51142a5",
+      "id": "02a4fba4-0e72-4f77-a03b-73d989a345b7",
+      "keywords": [
+        "Grants.gov",
+        "Search2",
+        "federal grants",
+        "posted",
+        "forecasted",
+        "harvestDetails",
+        "fetchOpportunity",
+        "pagination",
+        "opportunities"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.265334100+00:00",
+      "name": "us-federal-grants",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": "data.ca.gov CKAN datastore_search API",
+      "business_feature": "US State Grants Ingestion",
+      "category": "lib",
+      "cross_refs": [
+        "grants-unified-layer",
+        "http-engine"
+      ],
+      "db_tables": [
+        "records"
+      ],
+      "description": "Ingests open California state grant opportunities from the California Grants Portal (data.ca.gov CKAN datastore_search API), filtering by status and paginating. Feeds the cross-source unified grants layer. Planned expansion to NY, TX, IL, OH portals noted in the catalog.",
+      "entry_points": [
+        "crates/apps/ca-grants/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/ca-grants/src/lib.rs"
+      ],
+      "group": "Grants Intelligence",
+      "group_id": "aad42d5e-d36b-40ea-b57b-baecd51142a5",
+      "id": "461c82c4-0a61-4db8-b79c-2a1ed340114c",
+      "keywords": [
+        "California",
+        "CKAN",
+        "data.ca.gov",
+        "PortalID",
+        "open calls",
+        "pagination",
+        "ca-grants"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.265416700+00:00",
+      "name": "us-state-grants",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "VCR Record/Replay",
+      "category": "lib",
+      "cross_refs": [
+        "app-runtime"
+      ],
+      "db_tables": [],
+      "description": "Deterministic job re-execution support — in Record mode every fetch and research call through AppContext is appended as a CassetteEntry to cassette.ndjson; in Replay mode every call resolves from a prior job's cassette with a typed error on miss. Also provides VCR-aware testing helpers for unit tests that need reproducible network I/O.",
+      "entry_points": [
+        "crates/core/src/vcr.rs"
+      ],
+      "file_paths": [
+        "crates/core/src/vcr.rs",
+        "crates/core/src/testing.rs"
+      ],
+      "group": "Core Platform",
+      "group_id": "853ae333-2736-45c3-be60-5283c8e79c50",
+      "id": "d87b97ee-8069-4147-99cb-3a1a7fc8e2a9",
+      "keywords": [
+        "Cassette",
+        "CassetteEntry",
+        "Recorder",
+        "cassette.ndjson",
+        "req_hash",
+        "ReplayMiss",
+        "vcr_replay",
+        "record",
+        "deterministic"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.261407100+00:00",
+      "name": "vcr-testing",
+      "pinned": false,
+      "tech_stack": [
+        "Rust"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "WASM Plugin Examples",
+      "category": "lib",
+      "cross_refs": [
+        "wasm-plugin-host",
+        "trigger-pipeline"
+      ],
+      "db_tables": [],
+      "description": "Four reference WASM plugin crates demonstrating the host ABI: title-extractor (reference extraction plugin), delta-slim (trigger transform that shapes delta payloads), trigger-gate (trigger predicate that filters by count/dataset), and busyloop (hostile fuel-exhaustion test verifying the wasmtime cap traps runaway plugins). Compiled separately to wasm32-unknown-unknown.",
+      "entry_points": [
+        "plugins-src/title-extractor/src/lib.rs"
+      ],
+      "file_paths": [
+        "plugins-src/title-extractor/src/lib.rs",
+        "plugins-src/delta-slim/src/lib.rs",
+        "plugins-src/trigger-gate/src/lib.rs",
+        "plugins-src/busyloop/src/lib.rs"
+      ],
+      "group": "Event Pipeline",
+      "group_id": "9075d6e0-c51c-41b2-a80d-0a94babdb835",
+      "id": "1e3e680e-980a-42c8-80e9-b04bf7da43de",
+      "keywords": [
+        "WASM",
+        "alloc",
+        "extract_v2",
+        "describe",
+        "params_schema",
+        "fuel cap",
+        "predicate",
+        "transform",
+        "delta-slim",
+        "trigger-gate",
+        "busyloop",
+        "ABI"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.263801400+00:00",
+      "name": "wasm-plugin-examples",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "wasm32-unknown-unknown"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "WASM Plugin Runtime",
+      "category": "lib",
+      "cross_refs": [],
+      "db_tables": [],
+      "description": "Sandboxed in-process UDF runtime using wasmtime — executes named .wasm modules with a deterministic CPU-fuel cap and hard linear-memory ceiling with zero ambient authority. Serves extraction, trigger-predicate, and trigger-transform plugins through a uniform {doc, params} ABI; compiled modules are cached.",
+      "entry_points": [
+        "crates/engine-wasm/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/engine-wasm/src/lib.rs"
+      ],
+      "group": "Scraping Engines",
+      "group_id": "fe6d46c0-881b-4933-91de-de89ecf8a2dd",
+      "id": "95c4adc5-9e15-4326-8a9e-d2d490ed0faa",
+      "keywords": [
+        "wasmtime",
+        "fuel",
+        "LinearMemory",
+        "sandbox",
+        "extractor",
+        "predicate",
+        "transform",
+        "hot-swap",
+        "alloc",
+        "describe"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.260040600+00:00",
+      "name": "wasm-plugin-host",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "wasmtime",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Web Crawler",
+      "category": "lib",
+      "cross_refs": [
+        "crawler-core",
+        "tiered-fetcher"
+      ],
+      "db_tables": [],
+      "description": "High-volume broad-depth web crawler seeding from URL lists, streaming page bodies to artifact files while deduplicating near-duplicates by SHA-256. Contributes fetch telemetry to a Web Reliability Index and maintains a link graph. The platform's highest-volume fetch path, using the shared crawler-core and governor.",
+      "entry_points": [
+        "crates/apps/crawl/src/lib.rs"
+      ],
+      "file_paths": [
+        "crates/apps/crawl/src/lib.rs",
+        "crates/apps/crawl/src/link_graph.rs",
+        "crates/apps/crawl/src/reliability.rs"
+      ],
+      "group": "Content & Research Apps",
+      "group_id": "68ff006b-69ec-40f0-a794-3185301aa6bb",
+      "id": "ae04a5a2-9b47-44b2-b4d9-31cd412f294d",
+      "keywords": [
+        "crawl",
+        "robots.txt",
+        "SHA-256 dedup",
+        "artifact streaming",
+        "bot-wall",
+        "link graph",
+        "Web Reliability Index",
+        "CrawlConfig",
+        "RevisitSeed"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.264064100+00:00",
+      "name": "web-crawler",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio"
+      ]
+    },
+    {
+      "api_surface": null,
+      "business_feature": "Webhook & SSE Delivery",
+      "category": "lib",
+      "cross_refs": [
+        "trigger-pipeline",
+        "automation-api",
+        "job-worker"
+      ],
+      "db_tables": [
+        "webhook_deliveries",
+        "watches"
+      ],
+      "description": "Outbound webhook subsystem for dataset-change notifications: three sinks (HTTP webhook, Slack incoming-webhook, file-NDJSON), HMAC-SHA256 request signing, an in-process retry loop, a dead-letter queue with configurable backoff schedule, and manual replay. Also fans out job lifecycle transitions and dataset changes to SSE subscribers via a bounded replay ring.",
+      "entry_points": [
+        "crates/server/src/webhook.rs"
+      ],
+      "file_paths": [
+        "crates/server/src/webhook.rs",
+        "crates/server/src/events.rs"
+      ],
+      "group": "Event Pipeline",
+      "group_id": "9075d6e0-c51c-41b2-a80d-0a94babdb835",
+      "id": "213c386f-a917-47d3-b567-2df2001b116c",
+      "keywords": [
+        "webhook",
+        "dataset.changed",
+        "HMAC",
+        "signing",
+        "Slack sink",
+        "file sink",
+        "DLQ",
+        "backoff",
+        "replay",
+        "SSE",
+        "EventBus",
+        "ring buffer",
+        "Last-Event-ID"
+      ],
+      "last_written_at": "2026-08-03T19:10:14.263488200+00:00",
+      "name": "webhook-delivery",
+      "pinned": false,
+      "tech_stack": [
+        "Rust",
+        "tokio",
+        "reqwest"
+      ]
+    }
+  ],
+  "generated_at": "2026-08-03T19:10:19.171109300+00:00",
+  "generator": "personas-context-scan",
   "groups": [
     {
-      "name": "Scraping Runtime Core",
+      "color": "indigo",
+      "context_count": 8,
       "domain": "shared",
-      "type": null,
-      "color": "#3B82F6",
-      "icon": null,
-      "contexts": [
-        {
-          "name": "Tiered Fetcher & Politeness",
-          "description": "Fetches a URL on the cheapest engine that works and escalates (http -> browser -> claude) when content looks thin, fronted by a per-domain politeness governor and a content-addressed TTL cache.",
-          "businessFeature": "Tiered Fetcher & Politeness",
-          "category": "lib",
-          "filePaths": [
-            "crates/core/src/fetcher.rs",
-            "crates/core/src/governor.rs",
-            "crates/core/src/cache.rs",
-            "crates/core/src/tiers.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "App & Job Model",
-          "description": "The contract a scraping app implements and the job lifecycle it runs in � job params, status, per-run context (engines, dataset store, artifacts dir), plus global config and error types.",
-          "businessFeature": "App & Job Model",
-          "category": "lib",
-          "filePaths": [
-            "crates/core/src/app.rs",
-            "crates/core/src/job.rs",
-            "crates/core/src/lib.rs",
-            "crates/core/src/config.rs",
-            "crates/core/src/error.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "Engine Capability Traits",
-          "description": "Defines the capability interfaces every scraping app programs against � fetch, plugin execution, and search � so apps stay decoupled from concrete engine implementations.",
-          "businessFeature": "Engine Capability Traits",
-          "category": "lib",
-          "filePaths": [
-            "crates/core/src/engine.rs",
-            "crates/core/src/plugin.rs",
-            "crates/core/src/search.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        }
-      ]
+      "id": "fe6d46c0-881b-4933-91de-de89ecf8a2dd",
+      "name": "Scraping Engines"
     },
     {
-      "name": "Data Extraction & Storage",
-      "domain": "data",
-      "type": null,
-      "color": "#F97316",
-      "icon": null,
-      "contexts": [
-        {
-          "name": "Broad Crawler",
-          "description": "Seed a set of URLs and crawl outward with a bounded, deduplicated frontier and thousands of concurrent fetch tasks, streaming page bodies to disk with robots.txt politeness and SimHash near-duplicate dropping.",
-          "businessFeature": "Broad Crawler",
-          "category": "lib",
-          "filePaths": [
-            "crates/core/src/crawl.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "Declarative Extraction Engine",
-          "description": "Turn raw HTML/JSON documents into structured fields with a compiled rule set (CSS / regex / JSON pointer / constant) run in parallel across CPU cores, plus HTML-to-clean-Markdown preprocessing.",
-          "businessFeature": "Declarative Extraction Engine",
-          "category": "lib",
-          "filePaths": [
-            "crates/core/src/extract.rs",
-            "crates/core/src/markdown.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "Dataset Store & Change Detection",
-          "description": "Upsert typed records keyed by a stable id and learn whether each is new, changed, or unchanged since last run � the substrate for dedup and diff-based monitoring, with SimHash near-duplicate detection.",
-          "businessFeature": "Dataset Store & Change Detection",
-          "category": "data",
-          "filePaths": [
-            "crates/core/src/datasets.rs",
-            "crates/core/src/storage.rs",
-            "crates/core/src/simhash.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        }
-      ]
+      "color": "amber",
+      "context_count": 8,
+      "domain": "shared",
+      "id": "853ae333-2736-45c3-be60-5283c8e79c50",
+      "name": "Core Platform"
     },
     {
-      "name": "Scraping Engines",
-      "domain": "integration",
-      "type": null,
-      "color": "#8B5CF6",
-      "icon": null,
-      "contexts": [
-        {
-          "name": "Full-Text Search Index",
-          "description": "Embedded BM25 full-text search over scraped records using a memory-mapped Tantivy index � no external service; re-indexing an id replaces the prior document.",
-          "businessFeature": "Full-Text Search Index",
-          "category": "lib",
-          "filePaths": [
-            "crates/engine-search/src/lib.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "WASM Plugin Sandbox",
-          "description": "Run untrusted, hot-swappable WebAssembly extraction/transform modules over documents with a CPU-fuel budget and hard memory cap (wasmtime), plus the bundled sample plugins.",
-          "businessFeature": "WASM Plugin Sandbox",
-          "category": "lib",
-          "filePaths": [
-            "crates/engine-wasm/src/lib.rs",
-            "plugins-src/busyloop/src/lib.rs",
-            "plugins-src/title-extractor/src/lib.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "Fetch Engines (HTTP / Browser / Claude)",
-          "description": "The three fetch tiers: fast reqwest HTTP with cookie jar and backoff, a headless Chrome (chromiumoxide) engine with a persistent session for JS-heavy or gated pages, and the Claude Code CLI as an agentic research engine.",
-          "businessFeature": "Fetch Engines",
-          "category": "lib",
-          "filePaths": [
-            "crates/engine-http/src/lib.rs",
-            "crates/engine-browser/src/lib.rs",
-            "crates/engine-browser/tests/render.rs",
-            "crates/engine-claude/src/lib.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        }
-      ]
-    },
-    {
-      "name": "Job Server & API",
+      "color": "blue",
+      "context_count": 4,
       "domain": "infrastructure",
-      "type": null,
-      "color": "#EF4444",
-      "icon": null,
-      "contexts": [
-        {
-          "name": "Configuration & Data Source Catalog",
-          "description": "Service configuration and the curated catalog of data sources and connector API docs the apps and watchers operate against.",
-          "businessFeature": "Configuration & Data Source Catalog",
-          "category": "config",
-          "filePaths": [
-            "config.toml",
-            "catalog/data-sources.toml",
-            "catalog/connector-docs.json"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "Live Events & Webhooks",
-          "description": "Streams live job events to SSE subscribers and delivers finished job results to a caller-supplied callback URL with optional HMAC signing, so consumers never have to poll.",
-          "businessFeature": "Live Events & Webhooks",
-          "category": "api",
-          "filePaths": [
-            "crates/server/src/events.rs",
-            "crates/server/src/webhook.rs"
-          ],
-          "target": null,
-          "apiRoutes": [
-            "/events",
-            "/jobs/{id}/stream"
-          ]
-        },
-        {
-          "name": "Job Worker & Cron Scheduler",
-          "description": "Executes queued jobs against the right app and reconciles a DB-backed cron table each tick, enqueuing scheduled runs whose next firing is due.",
-          "businessFeature": "Job Worker & Cron Scheduler",
-          "category": "lib",
-          "filePaths": [
-            "crates/server/src/worker.rs",
-            "crates/server/src/scheduler.rs",
-            "crates/server/src/progress.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "DataHub Metadata Emitter",
-          "description": "Pushes a metadata-only shadow of the dataset store (entities, inferred schema, run-derived lineage, freshness operations) to a DataHub GMS over its OpenAPI ingestion surface; fail-open on job success plus a one-shot backfill endpoint.",
-          "businessFeature": "DataHub Metadata Emitter",
-          "category": "api",
-          "filePaths": [
-            "crates/server/src/datahub.rs"
-          ],
-          "target": null,
-          "apiRoutes": [
-            "/datahub/status",
-            "/datahub/sync"
-          ]
-        },
-        {
-          "name": "App Registry",
-          "description": "The catalog of every scraping app the service can run, mapping app names to their implementations so new use cases become available by registering a crate.",
-          "businessFeature": "App Registry",
-          "category": "lib",
-          "filePaths": [
-            "crates/server/src/registry.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "HTTP API & Routes",
-          "description": "The axum HTTP surface for the service � enqueue jobs, list apps/jobs/datasets, export records, search, and manage plugins � wired together with shared application state at startup.",
-          "businessFeature": "HTTP API & Routes",
-          "category": "api",
-          "filePaths": [
-            "crates/server/src/routes.rs",
-            "crates/server/src/main.rs",
-            "crates/server/src/state.rs"
-          ],
-          "target": null,
-          "apiRoutes": [
-            "/apps",
-            "/jobs",
-            "/datasets",
-            "/search",
-            "/plugins",
-            "/metrics",
-            "/health"
-          ]
-        }
-      ]
+      "id": "40699915-7a69-40dd-8320-969b42fdaf17",
+      "name": "HTTP API"
     },
     {
-      "name": "Public Funding & Grants Apps",
-      "domain": "feature",
-      "type": null,
-      "color": "#F59E0B",
-      "icon": null,
-      "contexts": [
-        {
-          "name": "EU & Regulatory Funding Watchers",
-          "description": "Watches pan-EU open calls on the SEDIA Funding & Tenders Portal and CMS fee-schedule releases, capturing new/changed items over time for monitoring.",
-          "businessFeature": "EU & Regulatory Funding Watchers",
-          "category": "lib",
-          "filePaths": [
-            "crates/apps/eu-sedia/src/lib.rs",
-            "crates/apps/cms-fee-schedule/src/lib.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "US Grant Opportunities",
-          "description": "Pulls open grant opportunities from Grants.gov (federal Search2 API) and the California Grants Portal into queryable, deduplicated datasets.",
-          "businessFeature": "US Grant Opportunities",
-          "category": "lib",
-          "filePaths": [
-            "crates/apps/grants-gov/src/lib.rs",
-            "crates/apps/ca-grants/src/lib.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        }
-      ]
+      "color": "violet",
+      "context_count": 3,
+      "domain": "infrastructure",
+      "id": "6ffc1acf-5098-4a90-96de-1e9cd8a1aa8c",
+      "name": "Job Orchestration"
     },
     {
-      "name": "Economic & Labor Market Data Apps",
-      "domain": "feature",
-      "type": null,
-      "color": "#10B981",
-      "icon": null,
-      "contexts": [
-        {
-          "name": "US Trades Wages, Tax & Valuation",
-          "description": "Claude-research-driven reference datasets for US home-services trades: wage bands, service pricing, state/federal income tax, and small-business valuation multiples.",
-          "businessFeature": "US Trades Wages, Tax & Valuation",
-          "category": "lib",
-          "filePaths": [
-            "crates/apps/trade-wages/src/lib.rs",
-            "crates/apps/homewyse-pricing/src/lib.rs",
-            "crates/apps/state-tax/src/lib.rs",
-            "crates/apps/valuation-multiples/src/lib.rs",
-            "crates/apps/trades-common/src/lib.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "Czech Labour Market (MPSV)",
-          "description": "Builds Czech labour-market datasets: open vacancy aggregates from MPSV / �rad pr�ce CR and average-earnings benchmarks by CZ-ISCO from ISPV.",
-          "businessFeature": "Czech Labour Market",
-          "category": "lib",
-          "filePaths": [
-            "crates/apps/mpsv-vpm/src/lib.rs",
-            "crates/apps/mpsv-ispv/src/lib.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "US Trades Business Density (Census)",
-          "description": "Measures US trades-business density and self-employed receipts from the Census County Business Patterns and Nonemployer Statistics APIs.",
-          "businessFeature": "US Trades Business Density",
-          "category": "lib",
-          "filePaths": [
-            "crates/apps/census-density/src/lib.rs",
-            "crates/apps/census-nonemp/src/lib.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        }
-      ]
+      "color": "orange",
+      "context_count": 4,
+      "domain": "integration",
+      "id": "9075d6e0-c51c-41b2-a80d-0a94babdb835",
+      "name": "Event Pipeline"
     },
     {
-      "name": "Content & Research Apps",
+      "color": "emerald",
+      "context_count": 10,
       "domain": "feature",
-      "type": null,
-      "color": "#EC4899",
-      "icon": null,
-      "contexts": [
-        {
-          "name": "Extraction, Crawl & API Watch",
-          "description": "General-purpose tooling apps: declarative extraction over a URL list, broad outward crawling, running WASM plugins over pages, and monitoring connector API docs for changes.",
-          "businessFeature": "Extraction, Crawl & API Watch",
-          "category": "lib",
-          "filePaths": [
-            "crates/apps/extractor/src/lib.rs",
-            "crates/apps/crawl/src/lib.rs",
-            "crates/apps/plugin/src/lib.rs",
-            "crates/apps/connector-api-watch/src/lib.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        },
-        {
-          "name": "Web Research & Readable Content",
-          "description": "Example content apps: agentic web research via the Claude engine, fetching any URL as clean Markdown, and scraping the Hacker News front page.",
-          "businessFeature": "Web Research & Readable Content",
-          "category": "lib",
-          "filePaths": [
-            "crates/apps/research/src/lib.rs",
-            "crates/apps/readable/src/lib.rs",
-            "crates/apps/hackernews/src/lib.rs"
-          ],
-          "target": null,
-          "apiRoutes": []
-        }
-      ]
+      "id": "68ff006b-69ec-40f0-a794-3185301aa6bb",
+      "name": "Content & Research Apps"
+    },
+    {
+      "color": "red",
+      "context_count": 5,
+      "domain": "feature",
+      "id": "aad42d5e-d36b-40ea-b57b-baecd51142a5",
+      "name": "Grants Intelligence"
+    },
+    {
+      "color": "pink",
+      "context_count": 4,
+      "domain": "feature",
+      "id": "0a7a8d2e-c3b5-45df-ba3e-1c17de130d9a",
+      "name": "Market Data"
     }
   ],
-  "ungrouped": [],
-  "relationships": [],
-  "index": [
-    "Scraping Runtime Core › Tiered Fetcher & Politeness [lib] — 3 files",
-    "Scraping Runtime Core › App & Job Model [lib] — 5 files",
-    "Scraping Runtime Core › Engine Capability Traits [lib] — 3 files",
-    "Data Extraction & Storage › Broad Crawler [lib] — 1 files",
-    "Data Extraction & Storage › Declarative Extraction Engine [lib] — 2 files",
-    "Data Extraction & Storage › Dataset Store & Change Detection [data] — 3 files",
-    "Scraping Engines › Full-Text Search Index [lib] — 1 files",
-    "Scraping Engines › WASM Plugin Sandbox [lib] — 3 files",
-    "Scraping Engines › Fetch Engines (HTTP / Browser / Claude) [lib] — 4 files",
-    "Job Server & API › Configuration & Data Source Catalog [config] — 3 files",
-    "Job Server & API › Live Events & Webhooks [api] — 2 files",
-    "Job Server & API › Job Worker & Cron Scheduler [lib] — 2 files",
-    "Job Server & API › DataHub Metadata Emitter [api] — 1 files",
-    "Job Server & API › App Registry [lib] — 1 files",
-    "Job Server & API › HTTP API & Routes [api] — 3 files",
-    "Public Funding & Grants Apps › EU & Regulatory Funding Watchers [lib] — 2 files",
-    "Public Funding & Grants Apps › US Grant Opportunities [lib] — 2 files",
-    "Economic & Labor Market Data Apps › US Trades Wages, Tax & Valuation [lib] — 4 files",
-    "Economic & Labor Market Data Apps › Czech Labour Market (MPSV) [lib] — 2 files",
-    "Economic & Labor Market Data Apps › US Trades Business Density (Census) [lib] — 2 files",
-    "Content & Research Apps › Extraction, Crawl & API Watch [lib] — 4 files",
-    "Content & Research Apps › Web Research & Readable Content [lib] — 3 files"
-  ],
-  "summary": {
-    "totalGroups": 7,
-    "totalContexts": 22,
-    "totalFiles": 56,
-    "categories": {
-      "lib": 17,
-      "data": 1,
-      "config": 1,
-      "api": 3
-    },
-    "domains": {
-      "shared": 1,
-      "data": 1,
-      "integration": 1,
-      "infrastructure": 1,
-      "feature": 3
-    }
+  "project": {
+    "id": "512809db-ba9b-4a0e-80b6-5bfb7e3051e9",
+    "name": "Pumper",
+    "root": "C:\\Users\\mkdol\\dolla\\pumper"
   },
-  "audit": {
-    "ok": true,
-    "tier": "medium",
-    "warnings": 0
+  "provenance": {
+    "git_commit": "611360f087bde15c7a28f24b023d98d0582c56cb",
+    "git_commit_count": 385
   },
-  "instructions": "Context map for pumper. Each group is a business domain (domain field); each context is a feature with its files (filePaths) + a technical category. Read this to learn which files belong to which feature BEFORE editing. When you change a context's files, update them here (or run Vibeman's refresh) to keep this fresh.",
-  "generatedAt": "2026-07-10T06:19:16.246Z",
-  "revision": "4a136526d6d3"
+  "stats": {
+    "contexts": 46,
+    "files": 115,
+    "groups": 8,
+    "use_cases": 0
+  },
+  "taxonomy": {
+    "context_categories": [
+      "ui",
+      "api",
+      "lib",
+      "data",
+      "test",
+      "config"
+    ],
+    "group_domains": [
+      "feature",
+      "infrastructure",
+      "shared",
+      "integration",
+      "data"
+    ]
+  },
+  "use_cases": [],
+  "version": 2
 }

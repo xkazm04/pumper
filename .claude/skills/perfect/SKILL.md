@@ -238,7 +238,20 @@ This skill declares `contexts: tracked` — the Personas app measures per-contex
 | `"version": 2` (integer), **no** `$schema` key, flat top-level `contexts` array | The Personas app's own export, rewritten after every context scan | **Yes** — these are exactly the names the app knows |
 | `"$schema": "https://vibeman.dev/…"`, `"version": "2.0.0"` (string), `groups[].contexts[]` | A stale foreign Vibeman auto-map | **No** — the app has never scanned this repo; its names anchor to nothing |
 
-**Today this repo still carries the Vibeman map**, so the app knows zero contexts here. Until a context scan runs (Personas → the project's Dev Tools → context scan; it overwrites `context-map.json` with the app export), emit outbox nodes **without** the `context` field — they still carry `"skill":"perfect"` and count as skill evidence, they just cannot count toward per-context coverage. Do not invent or guess a name to fill the field; a wrong name is indistinguishable from no name in the ledger, and hides the fact that the scan is missing. Say so once in the session summary so the operator knows a scan is the unblock. The loop's own queue in `Perfect.md` may keep using the Vibeman names — that is a separate, purely local concern.
+**As of 2026-08-03 the app has scanned this repo**, so `context-map.json` is now the app export — 46 contexts across 8 groups, kebab-case (`api-surface`, `browser-engine`, `claude-engine`, `archive-engine`, …). Those names are authoritative; use them for both the outbox `context` field and this loop's own queue in `Perfect.md` (the queue predates the scan and still carries the old Vibeman names — remap it on the next Phase 0 pass, per step 2's diff rule).
+
+The table stays as the guard for the day the file changes shape again. **If you ever find the Vibeman markers back at that path**, the app's map and the file have diverged: emit outbox nodes **without** the `context` field until a re-scan, rather than guessing. A wrong name is indistinguishable from no name in the ledger (both land as `unanchored` and are excluded from the coverage math), so guessing hides the divergence instead of surfacing it. Say so once in the session summary.
+
+A re-scan does not need the UI — the running app exposes a loopback bridge:
+
+```bash
+curl -s http://127.0.0.1:17400/dev-tools/projects                       # find the project_id
+curl -s -X POST http://127.0.0.1:17400/dev-tools/scan-codebase \
+  -H 'content-type: application/json' --data-binary @body.json          # {"project_id":"…","delta_mode":true}
+curl -s http://127.0.0.1:17400/dev-tools/scan-status/<scan_id>          # running | completed | failed
+```
+
+Port is 17400 unless taken (the server scans upward from there). Send bodies as `--data-binary @file`, not inline `-d` — a Windows path in a shell-quoted `-d` loses a backslash and the JSON parser rejects it.
 
 Always set `"skill":"perfect"`, and `"context":"<name>"` too once the scan has run — together they drive the per-skill context-coverage % (last 30 days). Skip silently when not Personas-managed.
 
