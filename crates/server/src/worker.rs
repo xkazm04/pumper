@@ -256,12 +256,71 @@ fn app_limit(state: &AppState, app: &str) -> usize {
         .unwrap_or(state.config.worker.default_app_concurrency)
 }
 
-/// How a run left the queue: the app finished (Ok/Err), the wall-clock timeout
-/// tripped, or a cancellation token fired mid-run.
+/// How a run left the queue: the app finished (Ok/Err), it panicked, the
+/// wall-clock timeout tripped, or a cancellation token fired mid-run.
 enum Outcome {
     Finished(pumper_core::Result<Value>),
+    /// The app's future unwound. Carries the rendered `panicked: …` error.
+    Panicked(String),
     TimedOut,
     Cancelled,
+}
+
+/// Prefix on a panic-derived `job.error`, so a caller reading the row can tell
+/// a panic apart from an app-returned error, a `timed out after Ns` timeout,
+/// and a reaper's `lease expired (heartbeat stale)`.
+const PANIC_ERROR_PREFIX: &str = "panicked: ";
+
+/// Renders a caught panic payload as a job error string.
+///
+/// `std`'s payload is `&str` for a literal `panic!("…")` and `String` for a
+/// formatted one; anything else (a `panic_any`) has no printable form, so we
+/// say so rather than inventing a message. `location` is the `file:line:col`
+/// captured by [`install_panic_location_hook`] when available.
+fn panic_error(payload: &(dyn std::any::Any + Send), location: Option<&str>) -> String {
+    let msg = payload
+        .downcast_ref::<&'static str>()
+        .map(|s| (*s).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "<non-string panic payload>".to_string());
+    match location {
+        Some(loc) => format!("{PANIC_ERROR_PREFIX}{msg} (at {loc})"),
+        None => format!("{PANIC_ERROR_PREFIX}{msg}"),
+    }
+}
+
+thread_local! {
+    /// Set by the panic hook on the panicking thread; read back by the
+    /// `catch_unwind` handler, which resumes on that same thread.
+    static LAST_PANIC_LOCATION: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Installs, once per process, a panic hook that stashes each panic's source
+/// location before delegating to whatever hook was already installed.
+///
+/// `catch_unwind` hands back only the payload — the `file:line:col` lives in
+/// `PanicHookInfo` and is otherwise lost. Chaining (rather than replacing) the
+/// previous hook keeps the default backtrace logging and anything a host binary
+/// installed (e.g. Sentry) intact.
+fn install_panic_location_hook() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let location = info
+                .location()
+                .map(|l| format!("{}:{}:{}", l.file(), l.line(), l.column()));
+            LAST_PANIC_LOCATION.with(|slot| *slot.borrow_mut() = location);
+            previous(info);
+        }));
+    });
+}
+
+/// Takes (and clears) the location recorded by the most recent panic on this
+/// thread.
+fn take_panic_location() -> Option<String> {
+    LAST_PANIC_LOCATION.with(|slot| slot.borrow_mut().take())
 }
 
 async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::CancellationToken) {
@@ -380,7 +439,24 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     };
 
     let timeout = Duration::from_secs(state.config.worker.job_timeout_secs);
-    let run = app.run(ctx);
+    // Panic containment: an app that unwinds must fail its job on THIS tick,
+    // through the normal attempt-fenced `fail()` path, carrying the panic
+    // payload as the error. Without this the spawned task just dies, the row
+    // stays `running`, and `stale_after_secs` later the reaper mislabels it
+    // "lease expired (heartbeat stale)".
+    //
+    // AssertUnwindSafe: the state a panicking app could leave torn is its own
+    // (`ctx` is moved in and dropped with the future); everything the worker
+    // touches afterwards — the storage handle, the job row, the event bus — is
+    // read fresh from `state`, never from the app's half-finished values.
+    //
+    // This CANNOT catch a non-yielding wedge: an app spinning without an
+    // `.await` never returns from `poll`, so neither this branch nor the
+    // heartbeat branch above is ever reached and no unwind happens at all. The
+    // heartbeat goes stale and the reaper (`reap_once`) remains the backstop for
+    // that class — as it does for a hard abort (`process::exit`, OOM, SIGKILL).
+    let run = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(app.run(ctx)));
+    install_panic_location_hook();
     tokio::pin!(run);
     let sleep = tokio::time::sleep(timeout);
     tokio::pin!(sleep);
@@ -401,7 +477,12 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             biased;
             _ = cancel.cancelled() => break Outcome::Cancelled,
             _ = &mut sleep => break Outcome::TimedOut,
-            res = &mut run => break Outcome::Finished(res),
+            res = &mut run => break match res {
+                Ok(res) => Outcome::Finished(res),
+                Err(payload) => {
+                    Outcome::Panicked(panic_error(&*payload, take_panic_location().as_deref()))
+                }
+            },
             _ = maybe_tick(&mut heartbeat) => {
                 let _ = state.storage.heartbeat(job.id, job.attempts).await;
             }
@@ -546,6 +627,22 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                 Ok(None) => return,
                 Ok(Some(_)) => {}
                 Err(pe) => error!(job = %job.id, "failed to persist failure: {pe}"),
+            }
+        }
+        Outcome::Panicked(error) => {
+            // Same attempt-fenced path as an app-returned error — fencing,
+            // backoff and retry semantics are identical; only the error text
+            // (and its `panicked: ` marker) differs.
+            error!(job = %job.id, %error, "job panicked");
+            match state.storage.fail(job.id, job.attempts, &error).await {
+                Ok(Some(JobStatus::Queued)) => {
+                    state.notify.notify_one();
+                    return;
+                }
+                // Stale (job reset/reaped mid-run): the live attempt owns it.
+                Ok(None) => return,
+                Ok(Some(_)) => {}
+                Err(pe) => error!(job = %job.id, "failed to persist panic: {pe}"),
             }
         }
         Outcome::TimedOut => {
@@ -1223,6 +1320,44 @@ fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
         body: rec.to_string(),
         // Job-result docs carry no record timestamp — index at completion time.
         indexed_at: chrono::Utc::now().timestamp(),
+    }
+}
+
+#[cfg(test)]
+mod panic_error_tests {
+    use super::{panic_error, PANIC_ERROR_PREFIX};
+
+    /// The anti-pattern: a panic reported as an indistinguishable failure (or,
+    /// worse, as the reaper's "lease expired" message two minutes later).
+    #[test]
+    fn panic_error_is_distinguishable_from_app_error_and_reaped_lease() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new("boom".to_string());
+        let rendered = panic_error(&*payload, Some("crates/apps/x/src/lib.rs:12:5"));
+        assert!(rendered.starts_with(PANIC_ERROR_PREFIX));
+        assert!(rendered.contains("boom"));
+        assert!(rendered.contains("crates/apps/x/src/lib.rs:12:5"));
+        // The three error strings a caller must be able to tell apart.
+        assert!(!rendered.starts_with("timed out after"));
+        assert_ne!(rendered, "lease expired (heartbeat stale)");
+    }
+
+    #[test]
+    fn str_and_string_payloads_both_render_their_message() {
+        let literal: Box<dyn std::any::Any + Send> = Box::new("unwrap on None");
+        let owned: Box<dyn std::any::Any + Send> = Box::new("unwrap on None".to_string());
+        assert_eq!(panic_error(&*literal, None), "panicked: unwrap on None");
+        assert_eq!(panic_error(&*owned, None), "panicked: unwrap on None");
+    }
+
+    /// A `panic_any(non_string)` has no printable message — say so rather than
+    /// producing an empty, meaningless error.
+    #[test]
+    fn opaque_payload_says_so_instead_of_rendering_empty() {
+        let payload: Box<dyn std::any::Any + Send> = Box::new(42u32);
+        assert_eq!(
+            panic_error(&*payload, None),
+            "panicked: <non-string panic payload>"
+        );
     }
 }
 

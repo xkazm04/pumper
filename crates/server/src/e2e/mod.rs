@@ -10,12 +10,13 @@
 
 mod body_limit;
 mod durable;
-mod fetch_proxy;
 mod dynamic_apps;
+mod fetch_proxy;
 mod harness;
 mod host_weather;
 mod mcp;
 mod mcp_live;
+mod panic_containment;
 mod router;
 mod scheduler_overlap;
 mod shutdown_drain;
