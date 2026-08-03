@@ -240,6 +240,23 @@ const DERIVED_MAX_GROUP_SCAN_DEFAULT: i64 = 10_000;
 /// ms — well inside the 5s `busy_timeout`.
 const UPSERT_CHUNK: usize = 500;
 
+/// Bound parameters one generated statement may carry.
+///
+/// SQLite's `SQLITE_MAX_VARIABLE_NUMBER` is 32766 since 3.32 but **999** on
+/// anything older, and the limit is a compile-time property of whatever libsqlite
+/// this binary links against — not something the query builder can discover.
+/// 900 is under the conservative bound on every build, so a batched statement
+/// can never fail with `too many SQL variables` on someone else's SQLite.
+const MAX_BIND_PARAMS: usize = 900;
+
+/// How many rows a multi-row statement with `cols` bound columns may carry
+/// without crossing [`MAX_BIND_PARAMS`]. `fixed` reserves the parameters bound
+/// outside the row list (e.g. the `app`/`dataset`/`last_seen` of an IN-list
+/// UPDATE). Always at least 1, so a wide row still makes progress.
+fn rows_per_statement(cols: usize, fixed: usize) -> usize {
+    (MAX_BIND_PARAMS.saturating_sub(fixed) / cols.max(1)).max(1)
+}
+
 impl Datasets {
     pub fn new(pool: SqlitePool) -> Self {
         Self {
@@ -782,19 +799,27 @@ impl Datasets {
     /// Upserts many records, returning a summary of new/changed/unchanged.
     ///
     /// This is the most-executed write path in the product (every ingest run
-    /// upserts its whole listing). Rather than one `BEGIN IMMEDIATE` transaction
-    /// per record — a WAL commit/fsync and a database-wide write-lock acquisition
-    /// each, so a 5k-record batch was 5k commits — records are committed in chunks
-    /// of `UPSERT_CHUNK` on a single held connection: ~10 commits for that batch,
-    /// and the write lock is taken ~10 times instead of 5k (the mechanism behind
-    /// cross-app write stalls during a large sync). Each record keeps its exact
-    /// per-record read→write→revision semantics via `upsert_in_tx`.
+    /// upserts its whole listing), and it is **set-shaped**, not row-shaped:
+    ///
+    /// - Records are committed in chunks of `UPSERT_CHUNK` on a single held
+    ///   connection, so a 5k-record batch is ~10 commits and ~10 write-lock
+    ///   acquisitions rather than 5k of each.
+    /// - Within a chunk the statement count is bounded by the *bind-parameter
+    ///   limit*, not by the record count: two batched reads (current hashes,
+    ///   next revision numbers), one multi-row upsert for the records whose
+    ///   content moved, one IN-list `UPDATE` for the re-confirmed ones, and one
+    ///   multi-row insert for the revisions. That is ~20 statements per 500-row
+    ///   chunk instead of ~1,500 — and since the whole chunk runs under
+    ///   `BEGIN IMMEDIATE`, statements-per-chunk *is* write-lock hold time, the
+    ///   mechanism behind cross-app write stalls during a large sync.
+    ///
+    /// Verdicts are decided in memory by [`plan_chunk`], which reproduces the
+    /// per-record read→write→revision sequence exactly — including a key that
+    /// appears twice inside one batch.
     ///
     /// A failure rolls back its own chunk and propagates; chunks committed before
-    /// it stay committed (the same partial-progress-then-error shape the old
-    /// per-record loop had). The chunk size bounds how long the write lock is held
-    /// against other apps' workers — 500 records of non-commit work stays well
-    /// inside the 5s `busy_timeout`.
+    /// it stay committed (the same partial-progress-then-error shape the
+    /// per-record loop had).
     pub async fn upsert_many(
         &self,
         app: &str,
@@ -877,42 +902,20 @@ impl Datasets {
         if items.is_empty() {
             return Ok(summary);
         }
+        // Fingerprint the whole batch BEFORE taking any write lock. Hashing and
+        // SimHashing are pure CPU; doing them inside `BEGIN IMMEDIATE` — as the
+        // per-record loop did — billed every other app's writer for this batch's
+        // CPU, and on a large sync that dominates the lock hold time.
+        let prints = fingerprint_batch(items);
         let mut conn = self.pool.acquire().await?;
-        for chunk in items.chunks(UPSERT_CHUNK) {
+        for (chunk, prints) in items.chunks(UPSERT_CHUNK).zip(prints.chunks(UPSERT_CHUNK)) {
             sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
             // Accumulate this chunk separately so a mid-chunk failure that rolls
             // back doesn't leave the returned summary claiming uncommitted rows.
-            let mut chunk_summary = UpsertSummary::default();
-            let mut chunk_result: Result<()> = Ok(());
-            for (key, value) in chunk {
-                let hash = hash_value(value);
-                let sim = crate::simhash::simhash_value(value) as i64;
-                let now = Utc::now();
-                match Self::upsert_in_tx(
-                    &mut conn,
-                    app,
-                    dataset,
-                    key,
-                    value,
-                    hash.as_str(),
-                    sim,
-                    now,
-                    trust,
-                    prov,
-                )
-                .await
-                {
-                    Ok(ChangeKind::New) => chunk_summary.new.push(key.clone()),
-                    Ok(ChangeKind::Changed) => chunk_summary.changed.push(key.clone()),
-                    Ok(ChangeKind::Unchanged) => chunk_summary.unchanged += 1,
-                    Err(e) => {
-                        chunk_result = Err(e);
-                        break;
-                    }
-                }
-            }
+            let chunk_result =
+                Self::upsert_chunk_in_tx(&mut conn, app, dataset, chunk, prints, trust, prov).await;
             match chunk_result {
-                Ok(()) => {
+                Ok(chunk_summary) => {
                     sqlx::query("COMMIT").execute(&mut *conn).await?;
                     summary.new.extend(chunk_summary.new);
                     summary.changed.extend(chunk_summary.changed);
@@ -925,6 +928,219 @@ impl Datasets {
             }
         }
         Ok(summary)
+    }
+
+    /// One chunk of a batch upsert, inside the caller's write transaction:
+    /// **two** batched reads, then **set-shaped** writes — instead of the
+    /// SELECT + INSERT/UPDATE + revision-INSERT triple this used to issue per
+    /// record (~1,500 statements per 500-row chunk, each one holding the
+    /// DB-wide write lock for the whole chunk).
+    ///
+    /// Read the whole chunk's current state once, decide every verdict in
+    /// memory ([`plan_chunk`]), then emit the writes as multi-row statements.
+    /// The reads happen inside the same `BEGIN IMMEDIATE` as the writes, so the
+    /// read→write→revision sequence is exactly as atomic as it was per record:
+    /// a concurrent same-key writer still waits for the COMMIT.
+    #[allow(clippy::too_many_arguments)]
+    async fn upsert_chunk_in_tx(
+        conn: &mut sqlx::SqliteConnection,
+        app: &str,
+        dataset: &str,
+        chunk: &[(String, Value)],
+        prints: &[Fingerprint],
+        trust: Option<&str>,
+        prov: Option<&Provenance>,
+    ) -> Result<UpsertSummary> {
+        // One timestamp for the chunk. Per-record `Utc::now()` bought nothing —
+        // the stored format is microsecond RFC 3339 and a chunk lands inside one
+        // transaction anyway — and every ordered read already tiebreaks a shared
+        // stamp (`list_page` by key, `changes_page` by rowid).
+        let now = Utc::now();
+        let keys: Vec<&str> = {
+            let mut seen = std::collections::HashSet::new();
+            chunk
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .filter(|k| seen.insert(*k))
+                .collect()
+        };
+        let mut state = Self::read_key_states(conn, app, dataset, &keys).await?;
+        let mut next_revision = Self::read_next_revisions(conn, app, dataset, &keys).await?;
+        let plans = plan_chunk(chunk, prints, &mut state, &mut next_revision);
+        Self::write_chunk(conn, app, dataset, chunk, prints, &plans, now, trust, prov).await?;
+        Ok(summarize_chunk(chunk, &plans))
+    }
+
+    /// Current store state of every key in the chunk, read in one statement per
+    /// [`MAX_BIND_PARAMS`]-sized slice of the IN-list. Replaces the per-record
+    /// `SELECT hash, data, removed_at`.
+    async fn read_key_states(
+        conn: &mut sqlx::SqliteConnection,
+        app: &str,
+        dataset: &str,
+        keys: &[&str],
+    ) -> Result<std::collections::HashMap<String, KeyState>> {
+        let mut out = std::collections::HashMap::with_capacity(keys.len());
+        for slice in keys.chunks(rows_per_statement(1, 2)) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT key, hash, data, removed_at FROM records WHERE app = ",
+            );
+            qb.push_bind(app);
+            qb.push(" AND dataset = ");
+            qb.push_bind(dataset);
+            qb.push(" AND key IN (");
+            push_key_list(&mut qb, slice);
+            qb.push(")");
+            let rows: Vec<(String, String, String, Option<String>)> =
+                qb.build_query_as().fetch_all(&mut *conn).await?;
+            for (key, hash, data, removed_at) in rows {
+                out.insert(
+                    key,
+                    KeyState {
+                        hash,
+                        data,
+                        removed: removed_at.is_some(),
+                    },
+                );
+            }
+        }
+        Ok(out)
+    }
+
+    /// The revision number each key's next revision must take, read in one
+    /// statement per IN-list slice. Replaces the per-row
+    /// `(SELECT COALESCE(MAX(revision), 0) + 1 …)` subquery — same value, same
+    /// transaction, so the same serialization guarantee holds. Keys with no
+    /// history are absent and start at 1.
+    async fn read_next_revisions(
+        conn: &mut sqlx::SqliteConnection,
+        app: &str,
+        dataset: &str,
+        keys: &[&str],
+    ) -> Result<std::collections::HashMap<String, i64>> {
+        let mut out = std::collections::HashMap::new();
+        for slice in keys.chunks(rows_per_statement(1, 2)) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT key, MAX(revision) FROM record_revisions WHERE app = ",
+            );
+            qb.push_bind(app);
+            qb.push(" AND dataset = ");
+            qb.push_bind(dataset);
+            qb.push(" AND key IN (");
+            push_key_list(&mut qb, slice);
+            qb.push(") GROUP BY key");
+            let rows: Vec<(String, i64)> = qb.build_query_as().fetch_all(&mut *conn).await?;
+            for (key, max_revision) in rows {
+                out.insert(key, max_revision + 1);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Emits a planned chunk as multi-row statements: one upsert covering every
+    /// key whose content moved, one IN-list `UPDATE` for the keys that only need
+    /// their `last_seen`/`trust` refreshed, and one multi-row insert for the
+    /// revisions.
+    #[allow(clippy::too_many_arguments)]
+    async fn write_chunk(
+        conn: &mut sqlx::SqliteConnection,
+        app: &str,
+        dataset: &str,
+        chunk: &[(String, Value)],
+        prints: &[Fingerprint],
+        plans: &[PlannedWrite],
+        now: DateTime<Utc>,
+        trust: Option<&str>,
+        prov: Option<&Provenance>,
+    ) -> Result<()> {
+        let now_s = ts(now);
+        let (content, touched_only) = collapse_record_writes(chunk, plans);
+
+        // Content writes. `ON CONFLICT DO UPDATE` covers New and Changed in one
+        // statement shape: a new key inserts (first_seen = now), an existing one
+        // updates and is revived (`removed_at = NULL`) — exactly what the two
+        // per-record statements did, and `first_seen` is left alone by the update
+        // branch so a revived record keeps its original first sighting.
+        for slice in content.chunks(rows_per_statement(10, 0)) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT INTO records (app, dataset, key, hash, data, simhash, \
+                 first_seen, last_seen, updated_at, trust) ",
+            );
+            qb.push_values(slice.iter(), |mut b, (idx, _plan)| {
+                let print = &prints[*idx];
+                b.push_bind(app)
+                    .push_bind(dataset)
+                    .push_bind(chunk[*idx].0.as_str())
+                    .push_bind(print.hash.as_str())
+                    .push_bind(print.json.as_str())
+                    .push_bind(print.sim)
+                    .push_bind(now_s.as_str())
+                    .push_bind(now_s.as_str())
+                    .push_bind(now_s.as_str())
+                    .push_bind(trust);
+            });
+            qb.push(
+                " ON CONFLICT(app, dataset, key) DO UPDATE SET \
+                 hash = excluded.hash, data = excluded.data, simhash = excluded.simhash, \
+                 last_seen = excluded.last_seen, updated_at = excluded.updated_at, \
+                 removed_at = NULL, trust = excluded.trust",
+            );
+            qb.build().execute(&mut *conn).await?;
+        }
+
+        // Unchanged content, but trust still moves: a source that entered
+        // `degraded` since the last run is no longer stood behind, even for the
+        // records it re-confirmed. Leaving a stale `stable` stamp here would let
+        // a filtered read serve them as trusted.
+        for slice in touched_only.chunks(rows_per_statement(1, 4)) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("UPDATE records SET last_seen = ");
+            qb.push_bind(now_s.as_str());
+            qb.push(", trust = ");
+            qb.push_bind(trust);
+            qb.push(" WHERE app = ");
+            qb.push_bind(app);
+            qb.push(" AND dataset = ");
+            qb.push_bind(dataset);
+            qb.push(" AND key IN (");
+            push_key_list(&mut qb, slice);
+            qb.push(")");
+            qb.build().execute(&mut *conn).await?;
+        }
+
+        // Revisions, in item order — one per New/Changed *occurrence*, so a key
+        // written twice in one batch keeps both links of its chain.
+        let p = prov.cloned().unwrap_or_default();
+        let revisions: Vec<&PlannedWrite> = plans
+            .iter()
+            .filter(|p| p.kind != ChangeKind::Unchanged)
+            .collect();
+        for slice in revisions.chunks(rows_per_statement(13, 0)) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "INSERT INTO record_revisions (app, dataset, key, revision, change, data, diff, \
+                 created_at, trust, job_id, source_url, artifact_sha, rules_hash) ",
+            );
+            qb.push_values(slice.iter(), |mut b, plan| {
+                b.push_bind(app)
+                    .push_bind(dataset)
+                    .push_bind(chunk[plan.idx].0.as_str())
+                    .push_bind(plan.revision)
+                    .push_bind(if plan.kind == ChangeKind::New {
+                        "new"
+                    } else {
+                        "changed"
+                    })
+                    .push_bind(prints[plan.idx].json.as_str())
+                    .push_bind(plan.diff.as_ref().map(Value::to_string))
+                    .push_bind(now_s.as_str())
+                    .push_bind(trust)
+                    .push_bind(p.job_id.clone())
+                    .push_bind(p.source_url.clone())
+                    .push_bind(p.artifact_sha.clone())
+                    .push_bind(p.rules_hash.clone());
+            });
+            qb.build().execute(&mut *conn).await?;
+        }
+        Ok(())
     }
 
     /// Permanently deletes one record and its entire revision history in one
@@ -2504,6 +2720,198 @@ impl TryFrom<RevisionRow> for Revision {
                 rules_hash: r.rules_hash,
             },
         })
+    }
+}
+
+// ── batch upsert planning ───────────────────────────────────────────────────
+// The pure half of `upsert_many`: what the store currently holds for a chunk's
+// keys, what each item resolves to, and which record writes that collapses into.
+// Kept out of the async write path so the verdict logic is unit-testable against
+// the per-record semantics it replaces.
+
+/// The store's state for one key while a chunk is planned: content hash, stored
+/// JSON (needed only to diff a change), and whether it is tombstoned.
+#[derive(Debug, Clone)]
+struct KeyState {
+    hash: String,
+    data: String,
+    removed: bool,
+}
+
+/// One item's resolved verdict plus everything the batched statements need.
+#[derive(Debug, Clone)]
+struct PlannedWrite {
+    /// Position of the item within the chunk (indexes both `chunk` and its
+    /// parallel [`Fingerprint`] slice).
+    idx: usize,
+    kind: ChangeKind,
+    /// Field-level diff — `Some` only for [`ChangeKind::Changed`].
+    diff: Option<Value>,
+    /// Revision number this write appends (0 and unused for Unchanged).
+    revision: i64,
+}
+
+/// Everything about a record that can be derived from its value alone: the
+/// content hash change detection compares, the SimHash near-dup fingerprint, and
+/// the canonical JSON text stored in `data`.
+///
+/// Computed once per item, **before** the write transaction opens and once
+/// rather than once per use. Both hashes are pure CPU over the record's JSON;
+/// computing them under `BEGIN IMMEDIATE` made every other app's writer wait
+/// through this batch's hashing, which on a large sync is most of the lock hold.
+#[derive(Debug, Clone)]
+struct Fingerprint {
+    hash: String,
+    sim: i64,
+    json: String,
+}
+
+/// Fingerprints a whole batch. Hash canonicalization is untouched — the same
+/// [`hash_value`] / [`crate::simhash::simhash_value`] over the same value — so
+/// stored hashes and fingerprints stay comparable with everything written before.
+fn fingerprint_batch(items: &[(String, Value)]) -> Vec<Fingerprint> {
+    items
+        .iter()
+        .map(|(_, value)| Fingerprint {
+            hash: hash_value(value),
+            sim: crate::simhash::simhash_value(value) as i64,
+            json: value.to_string(),
+        })
+        .collect()
+}
+
+/// Resolves a chunk into per-item verdicts against the store state read in one
+/// batch, walking items **in order** and threading each verdict back into
+/// `state` — so the sequence is identical to the per-record
+/// read→write→revision loop this replaces.
+///
+/// Order is the whole point. Batching the read without feeding the writes back
+/// into it breaks the case a per-record loop got right for free: a key that
+/// appears TWICE in one batch. The second occurrence must be judged against what
+/// the first one just wrote (New then Changed, with a diff v1→v2), not against
+/// the pre-batch snapshot — which would report it New a second time and collide
+/// on the revision number.
+fn plan_chunk(
+    items: &[(String, Value)],
+    prints: &[Fingerprint],
+    state: &mut std::collections::HashMap<String, KeyState>,
+    next_revision: &mut std::collections::HashMap<String, i64>,
+) -> Vec<PlannedWrite> {
+    let mut plans = Vec::with_capacity(items.len());
+    for (idx, (key, value)) in items.iter().enumerate() {
+        let print = &prints[idx];
+        let previous = state.get(key);
+        let kind = match previous {
+            // Unchanged content AND live: nothing to write but the sighting.
+            Some(p) if p.hash == print.hash && !p.removed => ChangeKind::Unchanged,
+            // Different content, or a tombstone reappearing — a revived record
+            // is Changed even when its content matches the old snapshot.
+            Some(_) => ChangeKind::Changed,
+            None => ChangeKind::New,
+        };
+        let diff = match (kind, previous) {
+            (ChangeKind::Changed, Some(p)) => {
+                let old: Value = serde_json::from_str(&p.data).unwrap_or(Value::Null);
+                Some(diff_values(&old, value))
+            }
+            _ => None,
+        };
+        let revision = if kind == ChangeKind::Unchanged {
+            0
+        } else {
+            next_revision_for(next_revision, key)
+        };
+        if kind != ChangeKind::Unchanged {
+            state.insert(
+                key.clone(),
+                KeyState {
+                    hash: print.hash.clone(),
+                    data: print.json.clone(),
+                    removed: false,
+                },
+            );
+        }
+        plans.push(PlannedWrite {
+            idx,
+            kind,
+            diff,
+            revision,
+        });
+    }
+    plans
+}
+
+/// The revision number `key`'s next revision takes, advancing the counter. A key
+/// with no history starts at 1 — the same value the `COALESCE(MAX(revision), 0)
+/// + 1` subquery produced.
+fn next_revision_for(next: &mut std::collections::HashMap<String, i64>, key: &str) -> i64 {
+    let slot = next.entry(key.to_string()).or_insert(1);
+    let revision = *slot;
+    *slot += 1;
+    revision
+}
+
+/// Splits a planned chunk into the record writes it needs: `(content, touched)`.
+///
+/// `content` is one entry per key whose content moved, carrying that key's
+/// **last** New/Changed plan — the row the sequential loop would leave behind —
+/// in first-appearance order. `touched` is the keys that were only ever
+/// Unchanged, which need `last_seen`/`trust` refreshed and nothing else.
+///
+/// Collapsing by *last write* rather than *last occurrence* is the correctness
+/// point: a key that goes Changed then Unchanged inside one batch must still
+/// have its new content written. Taking the last occurrence would keep the stale
+/// row and silently drop the change the revision chain already recorded.
+fn collapse_record_writes<'p>(
+    chunk: &'p [(String, Value)],
+    plans: &'p [PlannedWrite],
+) -> (Vec<(usize, &'p PlannedWrite)>, Vec<&'p str>) {
+    let mut content: Vec<(usize, &PlannedWrite)> = Vec::new();
+    let mut at: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    let mut unchanged_only: Vec<&str> = Vec::new();
+    let mut seen_unchanged: std::collections::HashSet<&str> = std::collections::HashSet::new();
+    for plan in plans {
+        let key = chunk[plan.idx].0.as_str();
+        if plan.kind == ChangeKind::Unchanged {
+            if !at.contains_key(key) && seen_unchanged.insert(key) {
+                unchanged_only.push(key);
+            }
+            continue;
+        }
+        match at.get(key) {
+            Some(&pos) => content[pos] = (plan.idx, plan),
+            None => {
+                at.insert(key, content.len());
+                content.push((plan.idx, plan));
+            }
+        }
+    }
+    // A key that ended up with a content write also gets its last_seen from it.
+    unchanged_only.retain(|k| !at.contains_key(k));
+    (content, unchanged_only)
+}
+
+/// The per-item summary of a planned chunk, in item order — one entry per
+/// *occurrence*, matching what the per-record loop pushed.
+fn summarize_chunk(chunk: &[(String, Value)], plans: &[PlannedWrite]) -> UpsertSummary {
+    let mut summary = UpsertSummary::default();
+    for plan in plans {
+        let key = &chunk[plan.idx].0;
+        match plan.kind {
+            ChangeKind::New => summary.new.push(key.clone()),
+            ChangeKind::Changed => summary.changed.push(key.clone()),
+            ChangeKind::Unchanged => summary.unchanged += 1,
+        }
+    }
+    summary
+}
+
+/// Pushes a comma-separated list of bound key parameters (the body of an
+/// `IN (…)`). Bound, never interpolated — a record key is caller data.
+fn push_key_list<'a>(qb: &mut sqlx::QueryBuilder<'a, sqlx::Sqlite>, keys: &[&'a str]) {
+    let mut sep = qb.separated(", ");
+    for key in keys {
+        sep.push_bind(*key);
     }
 }
 

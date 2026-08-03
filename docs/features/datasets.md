@@ -31,6 +31,7 @@ A quarantined source writes to the shadow dataset `<ds>@q`, which is an ordinary
 ## Conventions
 
 - Keys are stable external ids (opportunity id, URL, `czisco|kraj|org`). Timestamps are fixed-width RFC 3339 UTC micros (`ts()` helpers) so lexicographic SQL comparison = chronological.
+- **Batch writes are set-shaped.** `upsert_many` commits in chunks of 500 on one held connection, and within a chunk issues a bounded number of statements (two batched reads + multi-row writes) rather than one triple per record — the statement count per chunk *is* the write-lock hold time other apps wait on. Consequence for consumers: **every record in one chunk shares one `last_seen`/`updated_at`/revision `created_at` stamp**. Ordered reads already tiebreak that — `/datasets/{app}/{ds}` by `key`, `/changes` by rowid — so paging stays stable; do not rely on records within a batch having distinct timestamps.
 - **Virtual namespaces**: several apps may feed one cross-source dataset by passing an explicit app name to `ctx.datasets` (e.g. `grants/unified`, `census/market_blend`, `cz-labour/salary_gap`) with source-prefixed keys.
 - Big payloads go to `ctx.save_artifact` (files under `data/artifacts/<app>/<job>/`); records and results stay compact.
 
