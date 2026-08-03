@@ -30,6 +30,12 @@ pub struct JobEvent {
     pub result: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    /// Where this run's wall-clock went (run / index / hooks / alerts / total),
+    /// stamped on the terminal event of a succeeded job. Absent on every other
+    /// transition and on jobs that failed before their fan-out — an unmeasured
+    /// stage is omitted, never reported as zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stages: Option<pumper_core::JobStages>,
 }
 
 impl JobEvent {
@@ -40,6 +46,7 @@ impl JobEvent {
             status: status.into(),
             result: None,
             error: None,
+            stages: None,
         }
     }
 
@@ -55,6 +62,7 @@ impl JobEvent {
             status: "external".into(),
             result: Some(payload),
             error: None,
+            stages: None,
         }
     }
 }

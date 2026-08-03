@@ -11,6 +11,7 @@
 mod body_limit;
 mod durable;
 mod dynamic_apps;
+mod fanout_offslot;
 mod fetch_proxy;
 mod harness;
 mod host_weather;

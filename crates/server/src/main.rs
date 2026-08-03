@@ -2,6 +2,7 @@ mod datahub;
 #[cfg(test)]
 mod e2e;
 mod events;
+mod fanout;
 mod mcp;
 mod progress;
 mod refresher;

@@ -1576,6 +1576,47 @@ impl Storage {
         Ok(rows)
     }
 
+    // ── job stages ───────────────────────────────────────────────────────────
+
+    /// Stamps where one run's wall-clock went (`job_stages`, migration 0034).
+    /// One row per job — a retried job's row is replaced by the attempt that
+    /// produced its current outcome. Best-effort telemetry, exactly like
+    /// [`Self::record_job_yield`]: the caller logs and continues on error.
+    pub async fn record_job_stages(&self, job_id: Uuid, app: &str, s: &JobStages) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO job_stages (job_id, app, attempt, run_ms, index_ms, hooks_ms, \
+             alerts_ms, total_ms, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
+             ON CONFLICT(job_id) DO UPDATE SET app = ?2, attempt = ?3, run_ms = ?4, \
+             index_ms = ?5, hooks_ms = ?6, alerts_ms = ?7, total_ms = ?8, created_at = ?9",
+        )
+        .bind(job_id.to_string())
+        .bind(app)
+        .bind(s.attempt)
+        .bind(s.run_ms)
+        .bind(s.index_ms)
+        .bind(s.hooks_ms)
+        .bind(s.alerts_ms)
+        .bind(s.total_ms)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    /// One job's stage timings, or `None` when the job has none — a job that
+    /// ran before this table existed, or one that never reached its fan-out.
+    /// `None` is an honest "unknown", never a zeroed row.
+    pub async fn job_stages(&self, job_id: Uuid) -> Result<Option<JobStages>> {
+        let row = sqlx::query_as::<_, JobStages>(
+            "SELECT attempt, run_ms, index_ms, hooks_ms, alerts_ms, total_ms \
+             FROM job_stages WHERE job_id = ?1",
+        )
+        .bind(job_id.to_string())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
     // ── derived ──────────────────────────────────────────────────────────────
     // CRUD for derived-dataset specs (M11). The hot-path read (enabled specs
     // for one source) and the recompute/backfill mechanics live on `Datasets`;
@@ -1701,6 +1742,34 @@ pub struct NewDerivedSpec<'a> {
 /// crawl frontier (~a few MB) while keeping a runaway app from turning the jobs
 /// database into a blob store.
 pub const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Where one job run's wall-clock went (`job_stages`, migration 0034).
+///
+/// Every duration is `Option`: `None` means the run never reached that stage
+/// (it failed first, or the stage was skipped), which is deliberately distinct
+/// from `Some(0)` ("the stage ran and took under a millisecond"). Readers must
+/// render `None` as unknown — an invented zero would claim the stage was free.
+///
+/// `total_ms` spans claim → end of fan-out and is **not** the sum of the named
+/// stages: the queue's own bookkeeping (completion write, checkpoint clear,
+/// yield record) sits between them.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, sqlx::FromRow)]
+pub struct JobStages {
+    /// The attempt these numbers describe.
+    pub attempt: i64,
+    /// The app's own `run()`, i.e. the scraping itself.
+    pub run_ms: Option<i64>,
+    /// Building and committing this run's search documents (+ deletions).
+    pub index_ms: Option<i64>,
+    /// Loading the run's revisions, the health/contract gates, watch webhooks
+    /// and dataset triggers.
+    pub hooks_ms: Option<i64>,
+    /// Saved-search evaluation: the forced index flush, materialization, and
+    /// standing-alert dispatch.
+    pub alerts_ms: Option<i64>,
+    /// Claim → end of fan-out.
+    pub total_ms: Option<i64>,
+}
 
 /// One (app, dataset) group of the trailing-window yield rollup
 /// ([`Storage::yield_summary`]). Counts are `Option`: `None` means no result in

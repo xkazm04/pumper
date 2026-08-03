@@ -509,17 +509,25 @@ async fn the_health_gate_runs_before_the_watch_and_trigger_hooks() {
 }
 
 /// Structural companion to the behavioural test above: the two gates must
-/// appear BEFORE the two hooks in `execute`. `suppress_unhealthy`'s own comment
-/// says "this ordering IS the enforcement, and if it moves below them the
-/// guarantee is gone" — this fails if anyone moves it.
+/// appear BEFORE the two hooks. `suppress_unhealthy`'s own comment says "this
+/// ordering IS the enforcement, and if it moves below them the guarantee is
+/// gone" — this fails if anyone moves it.
+///
+/// The four call sites moved out of `execute` and into `finalize_fanout` when
+/// the fan-out came off the worker's concurrency permit. That is a change of
+/// *task*, not of order — so this test keeps the identical order assertion and
+/// adds the property the move made necessary: all four must live in ONE
+/// function body. Splitting them across the permit boundary (some inline, some
+/// on the pool) would let a webhook fire concurrently with the gate that is
+/// supposed to have already vetoed it, which the order check alone cannot see.
 #[tokio::test]
-async fn gate_calls_precede_hook_calls_in_execute() {
+async fn gate_calls_precede_hook_calls_in_the_success_fanout() {
     let src = include_str!("../worker.rs");
     let at = |needle: &str| {
         src.find(needle)
             .unwrap_or_else(|| panic!("call site not found in worker.rs: {needle}"))
     };
-    // EXPECTED order — the pipeline `execute` runs after a successful job.
+    // EXPECTED order — the pipeline run after a successful job.
     let expected = [
         "suppress_unhealthy(&state, &job.app, &mut by_dataset)",
         "enforce_contracts(&state, &job, &mut by_dataset)",
@@ -531,6 +539,27 @@ async fn gate_calls_precede_hook_calls_in_execute() {
         positions.windows(2).all(|w| w[0] < w[1]),
         "gates must precede hooks; found order {:?} for {expected:?}",
         positions
+    );
+    // Each call site appears exactly once, so a second (ungated) copy of a hook
+    // can't be added elsewhere without failing here.
+    for needle in expected {
+        assert_eq!(
+            src.matches(needle).count(),
+            1,
+            "the gate/hook pipeline must have exactly one call site each: {needle}"
+        );
+    }
+    // …and all four sit inside `finalize_fanout`, the single unit the pool runs.
+    let fanout_start = at("async fn finalize_fanout(");
+    let next_fn = src[fanout_start..]
+        .find("\nfn ")
+        .map(|i| fanout_start + i)
+        .expect("finalize_fanout is followed by another item");
+    assert!(
+        positions
+            .iter()
+            .all(|p| (fanout_start..next_fn).contains(p)),
+        "every gate and hook must run inside finalize_fanout — one task, one order"
     );
 }
 

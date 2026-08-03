@@ -55,6 +55,11 @@ pub struct AppState {
     pub dynamic_apps: Arc<Vec<serde_json::Value>>,
     /// Pinged on enqueue so the worker picks up work without waiting a poll tick.
     pub notify: Arc<Notify>,
+    /// Bounded pool a finished job's derived/outbound fan-out (search indexing,
+    /// watch webhooks, dataset triggers, saved-search alerts, the terminal
+    /// event) runs on, so that work no longer holds one of the worker's scrape
+    /// permits. Drained on shutdown — see `crate::fanout`.
+    pub fanout: Arc<crate::fanout::FanoutPool>,
     /// Dedicated client for firing result webhooks.
     pub webhook_client: reqwest::Client,
     /// Fan-out of job status transitions to SSE subscribers, with a bounded
@@ -146,6 +151,8 @@ impl AppState {
             &config.plugins,
             &registry,
         ));
+        let fanout_concurrency = config.worker.fanout_concurrency;
+        let fanout_max_queued = config.worker.fanout_max_queued;
 
         Ok(Self {
             config: Arc::new(config),
@@ -163,6 +170,10 @@ impl AppState {
             registry: Arc::new(registry),
             dynamic_apps,
             notify: Arc::new(Notify::new()),
+            fanout: Arc::new(crate::fanout::FanoutPool::new(
+                fanout_concurrency,
+                fanout_max_queued,
+            )),
             webhook_client,
             events,
             progress: Arc::new(ProgressStore::new()),

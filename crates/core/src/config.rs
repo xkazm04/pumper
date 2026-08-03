@@ -855,6 +855,18 @@ pub struct WorkerConfig {
     /// advisory, and a blob that reliably kills its consumer must not retry
     /// forever. `0` disables restores entirely (checkpoints still persist).
     pub max_resume_failures: i64,
+    /// How many finished jobs may run their post-completion fan-out (search
+    /// indexing, watch webhooks, dataset triggers, saved-search alerts +
+    /// materialization, the terminal event and result webhook) concurrently,
+    /// **off** the worker's scrape permits. That work is derived and outbound;
+    /// running it inline meant a slow index or a large materialization burned
+    /// one of the `concurrency` slots for its whole duration. `0` runs it
+    /// inline on the job's own permit (the historical behaviour).
+    pub fanout_concurrency: usize,
+    /// Backlog ceiling for the fan-out pool. At the ceiling a job's fan-out
+    /// runs inline on its worker permit instead — slower, but never dropped: a
+    /// dropped fan-out is a webhook that silently never arrives.
+    pub fanout_max_queued: usize,
 }
 
 impl Default for WorkerConfig {
@@ -880,6 +892,15 @@ impl Default for WorkerConfig {
             // Three strikes: enough to ride out an unlucky crash/reap streak,
             // few enough that a genuinely poisoned blob stops burning attempts.
             max_resume_failures: 3,
+            // Matches the default scrape concurrency: fan-out is roughly one
+            // unit per finished job, so a pool the size of the queue keeps up
+            // without becoming a second unbounded execution surface.
+            fanout_concurrency: 4,
+            // ~64 jobs of backlog before a job pays for its own fan-out inline.
+            // Deep enough that a burst of quick jobs never blocks on a slow
+            // index; shallow enough that the backlog can't grow into memory
+            // pressure unnoticed.
+            fanout_max_queued: 64,
         }
     }
 }

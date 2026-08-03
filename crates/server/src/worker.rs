@@ -115,10 +115,17 @@ pub(crate) async fn run_one(state: &AppState) -> bool {
                 .insert(job.id, (job.attempts, cancel.clone()));
             publish(state, JobEvent::new(job.id, job.app.clone(), "running"));
             execute(state.clone(), job.clone(), cancel).await;
-            let mut m = state.job_cancels.lock().unwrap();
-            if m.get(&job.id).map(|(a, _)| *a) == Some(job.attempts) {
-                m.remove(&job.id);
+            {
+                let mut m = state.job_cancels.lock().unwrap();
+                if m.get(&job.id).map(|(a, _)| *a) == Some(job.attempts) {
+                    m.remove(&job.id);
+                }
             }
+            // The fan-out is deliberately off this task now, so this seam waits
+            // for it: `run_one` promises "one job, fully processed", and every
+            // test that asserts on a webhook, a trigger hop or an index write
+            // depends on that promise.
+            state.fanout.drain(Duration::from_secs(60)).await;
             true
         }
         _ => false,
@@ -160,6 +167,7 @@ async fn drain(state: &AppState, semaphore: &Arc<Semaphore>, concurrency: usize)
         .is_ok()
     {
         info!("worker drained cleanly; no jobs left running");
+        drain_fanout(state, grace).await;
         return;
     }
     // Phase 2: signal cooperative suspend through the existing per-job cancel
@@ -188,6 +196,29 @@ async fn drain(state: &AppState, semaphore: &Arc<Semaphore>, concurrency: usize)
             ),
             Err(e) => error!("drain re-queue failed: {e}"),
         },
+    }
+    drain_fanout(state, grace).await;
+}
+
+/// Second half of the drain: a job's fan-out no longer holds a worker permit,
+/// so re-acquiring every permit above no longer proves the queue is idle. Wait
+/// for the pool too, and — this is the point — **say so** when it doesn't
+/// finish, instead of letting the process exit over silently-unsent webhooks.
+async fn drain_fanout(state: &AppState, grace: Duration) {
+    let inflight = state.fanout.inflight();
+    if inflight == 0 {
+        return;
+    }
+    info!(inflight, "draining in-flight job fan-out");
+    let left = state.fanout.drain(grace).await;
+    if left > 0 {
+        warn!(
+            abandoned = left,
+            "shutdown reached its deadline with job fan-out still running; those jobs' \
+             index/hook/alert work did not finish (their results are persisted)"
+        );
+    } else {
+        info!("job fan-out drained cleanly");
     }
 }
 
@@ -324,6 +355,9 @@ fn take_panic_location() -> Option<String> {
 }
 
 async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::CancellationToken) {
+    // Stage accounting starts at the claim, so `total_ms` covers the whole
+    // slot+fan-out span a caller sees as "this job took N seconds".
+    let started = std::time::Instant::now();
     let Some(app) = state.registry.get(&job.app).cloned() else {
         warn!(app = %job.app, job = %job.id, "job references unregistered app");
         let _ = state
@@ -472,6 +506,7 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     });
     // Race the app future against the wall-clock timeout, the cancel token, and
     // the heartbeat tick.
+    let run_started = std::time::Instant::now();
     let outcome = loop {
         tokio::select! {
             biased;
@@ -488,6 +523,7 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             }
         }
     };
+    let run_ms = elapsed_ms(run_started);
 
     match outcome {
         Outcome::Cancelled if state.shutdown.is_cancelled() => {
@@ -532,24 +568,6 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             if let (Some(replay_id), Value::Object(map)) = (replay_of, &mut result) {
                 map.insert("vcr_replay_of".into(), Value::String(replay_id.to_string()));
             }
-            // Index the result into full-text search before persisting it. Apps
-            // whose result stays compact (counts, not arrays) can additionally
-            // name datasets to index per-record via `index_datasets` — see
-            // `dataset_search_docs`.
-            let mut docs = search_docs(&job.app, job.id, &result);
-            let index_specs = crate::datahub::index_dataset_specs(&result);
-            let (dataset_docs, dataset_deletes) = dataset_search_docs(&state, &job, &result).await;
-            docs.extend(dataset_docs);
-            if let Err(e) = state.search.index(docs).await {
-                warn!(job = %job.id, "search index failed: {e}");
-            }
-            // Removed records (this run's `removed` revisions) are dropped from the
-            // index rather than left as stale hits.
-            if !dataset_deletes.is_empty() {
-                if let Err(e) = state.search.delete_ids(&dataset_deletes).await {
-                    warn!(job = %job.id, "search delete failed: {e}");
-                }
-            }
             // Information economics (M04): parse the result's UpsertSummary-shaped
             // counts BEFORE `complete` consumes it. Recorded only if the
             // completion lands (below) — a stale attempt's numbers are not yield.
@@ -582,34 +600,29 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                     warn!(job = %job.id, "completion discarded: job was reset or reaped mid-run");
                     return;
                 }
-                Err(e) => error!(job = %job.id, "failed to persist result: {e}"),
+                Err(e) => {
+                    // The row is still `running`: this task never took ownership
+                    // of an outcome, so it must not announce one. The reaper is
+                    // the recovery path (as it is for a hard abort).
+                    error!(job = %job.id, "failed to persist result: {e}; skipping fan-out");
+                    return;
+                }
             }
-            // One revision batch for this run, shared by watches + triggers.
-            let changes = load_run_changes(&state, &job).await;
-            if !changes.is_empty() {
-                let mut by_dataset = group_by_dataset(&changes);
-                // A degrading source never pushes. A webhook is irreversible once
-                // sent, so a source we no longer stand behind is dropped here,
-                // before the hooks — this ordering IS the enforcement, and if it
-                // moves below them the guarantee is gone.
-                suppress_unhealthy(&state, &job.app, &mut by_dataset).await;
-                // Declared data contracts (M20): the same choke point, the
-                // declared complement to the inferred gate above. Verdicts are
-                // always recorded; datasets are dropped only under
-                // `[contracts] enforce = true`.
-                enforce_contracts(&state, &job, &mut by_dataset);
-                notify_watches(&state, &job, &by_dataset).await;
-                crate::triggers::fire_dataset_triggers(&state, &job, &by_dataset).await;
-            }
-            // Saved searches are scoped against every app this run put documents
-            // under — the job's own app AND the virtual apps named by
-            // `index_datasets` (e.g. `grants`), which is the app those docs
-            // actually carry. See `run_indexed_apps`.
-            let indexed_apps = run_indexed_apps(&job.app, &index_specs);
-            notify_saved_searches(&state, &job, &indexed_apps).await;
-            // Metadata shadow: push this run's dataset entities/lineage/freshness
-            // to DataHub. Detached and fail-open — a down GMS never touches jobs.
-            crate::datahub::on_job_success(state.clone(), job.clone(), index_specs);
+            // Everything past this point is DERIVED and OUTBOUND work — search
+            // indexing, hooks, alerts, the terminal event. It used to run right
+            // here, still holding this job's worker permit, so a slow index or a
+            // large materialization burned a scrape slot. It now runs on the
+            // bounded fan-out pool instead (inline when the pool is full or
+            // disabled — never dropped). See `crate::fanout`.
+            let stages = StageWatch::new(job.attempts, run_ms, started);
+            let (st, jb) = (state.clone(), job.clone());
+            state
+                .fanout
+                .run("finalize", job.id, async move {
+                    finalize_fanout(st, jb, stages).await;
+                })
+                .await;
+            return;
         }
         Outcome::Finished(Err(e)) => {
             warn!(job = %job.id, error = %e, "job failed");
@@ -666,6 +679,181 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         }
     }
     finalize(&state, job.id).await;
+}
+
+/// Milliseconds since `t`, saturating — a duration can't be negative and an
+/// `i64` of milliseconds covers ~292 million years, so this never wraps.
+fn elapsed_ms(t: std::time::Instant) -> i64 {
+    t.elapsed().as_millis().min(i64::MAX as u128) as i64
+}
+
+/// The stages a completed run's wall-clock is attributed to.
+#[derive(Debug, Clone, Copy)]
+enum Stage {
+    Index,
+    Hooks,
+    Alerts,
+}
+
+/// Accumulates one run's per-stage wall clock into a [`pumper_core::JobStages`].
+///
+/// A stage that never runs stays `None` — "this run didn't get there" — and is
+/// never filled in with a 0 that would read as "it was free". Only stages that
+/// actually executed report a number.
+struct StageWatch {
+    started: std::time::Instant,
+    stages: pumper_core::JobStages,
+}
+
+impl StageWatch {
+    fn new(attempt: i64, run_ms: i64, started: std::time::Instant) -> Self {
+        Self {
+            started,
+            stages: pumper_core::JobStages {
+                attempt,
+                run_ms: Some(run_ms),
+                ..Default::default()
+            },
+        }
+    }
+
+    /// Runs `fut`, recording how long it took against `which`.
+    async fn time<F: std::future::Future>(&mut self, which: Stage, fut: F) -> F::Output {
+        let at = std::time::Instant::now();
+        let out = fut.await;
+        let ms = elapsed_ms(at);
+        match which {
+            Stage::Index => self.stages.index_ms = Some(ms),
+            Stage::Hooks => self.stages.hooks_ms = Some(ms),
+            Stage::Alerts => self.stages.alerts_ms = Some(ms),
+        }
+        out
+    }
+
+    /// Closes the total span and hands back the record to persist.
+    fn finish(mut self) -> pumper_core::JobStages {
+        self.stages.total_ms = Some(elapsed_ms(self.started));
+        self.stages
+    }
+}
+
+/// Whether the outcome this task wrote is still the job's outcome — the fence
+/// that keeps a stale run's fan-out from firing.
+///
+/// The anti-pattern: a job reset or reaped mid-run is re-claimed elsewhere, and
+/// the abandoned task then indexes, webhooks and triggers on behalf of a run
+/// that no longer owns the job. `complete()` already fences the *write* on
+/// `(status, attempts)`; because the fan-out now runs on its own task, the same
+/// fence has to be re-checked when that task starts.
+///
+/// `None` (the row is gone) and any attempt/status mismatch both mean "not
+/// ours" — fail closed, since a delivered webhook cannot be recalled.
+fn fanout_owns_outcome(row: Option<&Job>, attempt: i64) -> bool {
+    matches!(row, Some(j) if j.attempts == attempt && j.status == JobStatus::Succeeded)
+}
+
+/// Everything a succeeded job does after its result is persisted, run as ONE
+/// unit off the worker's concurrency permit (see [`crate::fanout`]).
+///
+/// The ordering inside this function is load-bearing and guarded twice (a
+/// behavioural e2e and a structural inventory test over these call sites):
+/// `suppress_unhealthy` → `enforce_contracts` → `notify_watches` →
+/// `fire_dataset_triggers`. The gates sit above the hooks because a delivered
+/// webhook cannot be recalled. Moving this block onto another task does not
+/// weaken that: it is the same sequential block, executed in the same order, on
+/// one task — and it now begins with an explicit staleness fence
+/// ([`fanout_owns_outcome`]) that the inline version got for free from having
+/// just written the completion itself.
+async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
+    let row = match state.storage.get(job.id).await {
+        Ok(row) => row,
+        Err(e) => {
+            // Fail closed: unable to prove this run still owns the job.
+            warn!(job = %job.id, "fan-out skipped: job re-read failed: {e}");
+            return;
+        }
+    };
+    if !fanout_owns_outcome(row.as_ref(), job.attempts) {
+        warn!(
+            job = %job.id, attempt = job.attempts,
+            "fan-out discarded: the job was reset or reaped and no longer carries this run's \
+             outcome"
+        );
+        return;
+    }
+    let result = row.and_then(|j| j.result).unwrap_or(Value::Null);
+
+    // Index the result into full-text search. Apps whose result stays compact
+    // (counts, not arrays) can additionally name datasets to index per-record
+    // via `index_datasets` — see `dataset_search_docs`.
+    let index_specs = crate::datahub::index_dataset_specs(&result);
+    stages
+        .time(Stage::Index, async {
+            let mut docs = search_docs(&job.app, job.id, &result);
+            let (dataset_docs, dataset_deletes) = dataset_search_docs(&state, &job, &result).await;
+            docs.extend(dataset_docs);
+            if let Err(e) = state.search.index(docs).await {
+                warn!(job = %job.id, "search index failed: {e}");
+            }
+            // Removed records (this run's `removed` revisions) are dropped from
+            // the index rather than left as stale hits.
+            if !dataset_deletes.is_empty() {
+                if let Err(e) = state.search.delete_ids(&dataset_deletes).await {
+                    warn!(job = %job.id, "search delete failed: {e}");
+                }
+            }
+        })
+        .await;
+
+    stages
+        .time(Stage::Hooks, async {
+            // One revision batch for this run, shared by watches + triggers.
+            let changes = load_run_changes(&state, &job).await;
+            if changes.is_empty() {
+                return;
+            }
+            let mut by_dataset = group_by_dataset(&changes);
+            // A degrading source never pushes. A webhook is irreversible once
+            // sent, so a source we no longer stand behind is dropped here,
+            // before the hooks — this ordering IS the enforcement, and if it
+            // moves below them the guarantee is gone.
+            suppress_unhealthy(&state, &job.app, &mut by_dataset).await;
+            // Declared data contracts (M20): the same choke point, the
+            // declared complement to the inferred gate above. Verdicts are
+            // always recorded; datasets are dropped only under
+            // `[contracts] enforce = true`.
+            enforce_contracts(&state, &job, &mut by_dataset);
+            notify_watches(&state, &job, &by_dataset).await;
+            crate::triggers::fire_dataset_triggers(&state, &job, &by_dataset).await;
+        })
+        .await;
+
+    // Saved searches are scoped against every app this run put documents
+    // under — the job's own app AND the virtual apps named by
+    // `index_datasets` (e.g. `grants`), which is the app those docs
+    // actually carry. See `run_indexed_apps`.
+    let indexed_apps = run_indexed_apps(&job.app, &index_specs);
+    stages
+        .time(
+            Stage::Alerts,
+            notify_saved_searches(&state, &job, &indexed_apps),
+        )
+        .await;
+    // Metadata shadow: push this run's dataset entities/lineage/freshness
+    // to DataHub. Detached and fail-open — a down GMS never touches jobs.
+    crate::datahub::on_job_success(state.clone(), job.clone(), index_specs);
+
+    // Stamp where the wall-clock went before the terminal event, so the event
+    // (and `GET /jobs/{id}/receipt`) can carry it. Best-effort telemetry.
+    let stages = stages.finish();
+    if let Err(e) = state
+        .storage
+        .record_job_stages(job.id, &job.app, &stages)
+        .await
+    {
+        warn!(job = %job.id, "stage-timing record failed: {e}");
+    }
+    finalize_with_stages(&state, job.id, Some(stages)).await;
 }
 
 /// Parses the VCR enqueue params out of a job's params object:
@@ -1138,6 +1326,18 @@ async fn materialize_saved_search(
 
 /// Emits the terminal event and fires the result webhook, if configured.
 async fn finalize(state: &AppState, id: uuid::Uuid) {
+    finalize_with_stages(state, id, None).await;
+}
+
+/// [`finalize`] plus this run's stage timings, when the caller measured them.
+/// Only the success path (the fan-out) does — a job that failed before its
+/// fan-out has no index/hooks/alerts numbers, and `None` says so rather than
+/// stamping zeros.
+async fn finalize_with_stages(
+    state: &AppState,
+    id: uuid::Uuid,
+    stages: Option<pumper_core::JobStages>,
+) {
     // In-flight progress is done being useful once the job is terminal; drop the
     // buffered snapshot so the map doesn't grow with completed jobs.
     state.progress.clear(&id);
@@ -1155,6 +1355,7 @@ async fn finalize(state: &AppState, id: uuid::Uuid) {
     let mut event = JobEvent::new(job.id, job.app.clone(), job.status.as_str());
     event.result = job.result.clone();
     event.error = job.error.clone();
+    event.stages = stages;
     publish(state, event);
     webhook::dispatch(
         state.webhook_client.clone(),
@@ -1320,6 +1521,59 @@ fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
         body: rec.to_string(),
         // Job-result docs carry no record timestamp — index at completion time.
         indexed_at: chrono::Utc::now().timestamp(),
+    }
+}
+
+#[cfg(test)]
+mod fanout_fence_tests {
+    use super::fanout_owns_outcome;
+    use pumper_core::{Job, JobStatus};
+
+    fn job(status: JobStatus, attempts: i64) -> Job {
+        Job {
+            id: uuid::Uuid::new_v4(),
+            app: "fake".into(),
+            params: serde_json::json!({}),
+            status,
+            attempts,
+            max_attempts: 3,
+            priority: 0,
+            callback_url: None,
+            callback_secret: None,
+            budget_usd: None,
+            schedule_id: None,
+            trigger_id: None,
+            result: None,
+            error: None,
+            created_at: chrono::Utc::now(),
+            available_at: chrono::Utc::now(),
+            started_at: None,
+            finished_at: None,
+        }
+    }
+
+    /// The anti-pattern the fence exists for: a job reset or reaped mid-run is
+    /// re-claimed elsewhere (its attempt advances), and the abandoned task's
+    /// fan-out then indexes and webhooks on behalf of a run that no longer owns
+    /// the job. A delivered webhook cannot be recalled, so this fails closed.
+    #[test]
+    fn a_reclaimed_attempt_does_not_fan_out() {
+        assert!(fanout_owns_outcome(Some(&job(JobStatus::Succeeded, 1)), 1));
+        // Reset + re-claimed: attempts advanced past what this task holds.
+        assert!(!fanout_owns_outcome(Some(&job(JobStatus::Succeeded, 2)), 1));
+        // Re-queued and not yet re-claimed, or retried into a new lineage.
+        assert!(!fanout_owns_outcome(Some(&job(JobStatus::Queued, 1)), 1));
+        assert!(!fanout_owns_outcome(Some(&job(JobStatus::Running, 1)), 1));
+        // Someone else's terminal state is not this run's outcome either.
+        assert!(!fanout_owns_outcome(Some(&job(JobStatus::Failed, 1)), 1));
+        assert!(!fanout_owns_outcome(Some(&job(JobStatus::Cancelled, 1)), 1));
+    }
+
+    /// A row that vanished (pruned, or another install's id) proves nothing —
+    /// and "cannot prove it" must not mean "push anyway".
+    #[test]
+    fn a_missing_row_fails_closed() {
+        assert!(!fanout_owns_outcome(None, 1));
     }
 }
 

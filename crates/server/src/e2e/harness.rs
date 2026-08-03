@@ -27,6 +27,17 @@ pub async fn test_state_with(
     apps: Vec<Arc<dyn ScrapeApp>>,
     tweak: impl FnOnce(&mut Config),
 ) -> (AppState, TempStore) {
+    test_state_indexed(apps, Arc::new(NoSearch), tweak).await
+}
+
+/// [`test_state_with`] with the search index supplied by the caller — the seam
+/// for a *slow* index fixture, which is the only way to measure what the
+/// post-completion fan-out costs a worker slot.
+pub async fn test_state_indexed(
+    apps: Vec<Arc<dyn ScrapeApp>>,
+    search: Arc<dyn pumper_core::Search>,
+    tweak: impl FnOnce(&mut Config),
+) -> (AppState, TempStore) {
     let store = TempStore::new("server-e2e").await;
     let mut config = Config::default();
     config.storage.database_path = store.path().join("pumper.db");
@@ -48,7 +59,7 @@ pub async fn test_state_with(
         governor: Arc::new(Governor::new(&GovernorConfig::default())),
         engines: dead_engines(),
         plugins: Arc::new(NoPlugins),
-        search: Arc::new(NoSearch),
+        search,
         registry,
     })
     .expect("assemble test AppState");
