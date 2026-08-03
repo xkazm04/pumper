@@ -1,7 +1,10 @@
 ---
 name: perfect
+contexts: tracked
+memory: vault
+category: Development
 description: Session-after-session product perfection loop for pumper. The strongest available model (Fable) directs — it walks context-map.json context-by-context, proposes 5 challenged, high-value directions per context (features, API/data-product elevations, significant optimizations), gates them with the user until 10 are accepted, then orchestrates builder subagents (Sonnet for routine S/M work, Opus for large or risk-flagged briefs) per context in isolated worktrees while making every review/merge decision itself. All state lives in the repo's .perfect/ vault so any future session resumes the loop exactly where the last one stopped. Invoke with `/perfect [init|propose|build|status|reflect] [context-name]`.
-argument-hint: "[context]"
+argument-hint: "[init|propose|build|status|reflect] [context]"
 ---
 
 # Perfect — the direction-and-delivery loop (pumper edition)
@@ -103,6 +106,12 @@ Loop while `pool < 10` and the user hasn't said stop:
    - Does it conflict with an active arc or a "removed / explicit non-goal" record (e.g. trigger fan-in barriers are a documented non-goal)?
    - Is the value claim concrete — can I name the consumer moment it improves?
    - Can ONE builder session genuinely ship it behind the acceptance criteria? (Size it S/M/L honestly here — the size + the nature of the criteria are what pick the builder's model at build time, so a sloppy size is a real cost mistake, not just bookkeeping.)
+
+   **Director self-check before the gate** — a proposal that fails any of these never reaches the user:
+   - Names the concrete files it will touch (from scout evidence, not guessed).
+   - Names the consumer-visible outcome in one sentence a non-developer would care about.
+   - States why it beats the next-best alternative direction for this context.
+   - Survives the taste filter above (outcome-value, not cosmetic churn).
 5. **Present** the 5 in chat — numbered, each: title · lens · size · one-paragraph why · evidence · acceptance criteria. Then gate with **AskUserQuestion (multiSelect)** — the tool caps options at 4 per question, so use TWO questions in one call: Q1 = directions 1–3, Q2 = directions 4–5 (labels = `N · short title`, description = one-line value claim + size). The user can annotate via "Other" (e.g. `edit 2: …`, `stop`); selecting nothing in both = none accepted.
 6. Record outcomes in the vault (rejected ones too, with the user's implied reason — rejections steer future proposals). Accepted → `directions/<slug>.md` with `status: accepted`, pool counter++, context gets `cooldown_until`. Update `Perfect.md` after every context, not at session end — a killed session must lose nothing.
 7. **A `none` gate that carries a steer** (the user says what they wanted instead) is a re-scout order, not a rejection of the context: promote the steer to `config.md → ## User taste` if it generalizes, re-scout at the steered depth/angle, and re-propose the SAME context once before advancing the cursor. Never re-present any rejected direction.
@@ -213,3 +222,26 @@ per direction → status (done|blocked|decision-needed), commits, files, verific
 - **Honest ledger**: a direction only reaches `shipped` with gates green AND the Director having read the diff; anything else is `failed` with a reason. No silent drops — every accepted direction's fate is recorded.
 - **Interruptibility is a feature**: write the vault incrementally (after every context in P, after every merge in B) so a killed session resumes losslessly.
 - **The user is the product owner**: the gate is theirs; the Director challenges but never overrides a rejection, and repeated rejections of a lens/context recalibrate the queue scores.
+
+## App context coverage (Personas-managed repos)
+
+This skill declares `contexts: tracked` — the Personas app measures per-context memory coverage for it. When run inside a Personas-managed repo (a `.personas/` dir exists, or the app dispatched this run), append JSON lines to `.personas/memory-outbox.jsonl` at the repo root (append, never rewrite) — one node per context you meaningfully worked on:
+
+```json
+{"type":"node","kind":"progress","title":"<=200 chars: what you did in this context","body":"optional detail","context":"<exact context name the app knows>","skill":"perfect"}
+```
+
+**Which name — this is the part that silently fails.** The ingest anchors a node by matching `context` against the names the app actually knows, case-insensitively. A name it does not recognize is NOT an error: the node is stored with a null context and simply never counts toward coverage. So **check the map before you emit anything** — repo-root `context-map.json` can be either of two unrelated artifacts:
+
+| Marker | What it is | Use its names? |
+|---|---|---|
+| `"version": 2` (integer), **no** `$schema` key, flat top-level `contexts` array | The Personas app's own export, rewritten after every context scan | **Yes** — these are exactly the names the app knows |
+| `"$schema": "https://vibeman.dev/…"`, `"version": "2.0.0"` (string), `groups[].contexts[]` | A stale foreign Vibeman auto-map | **No** — the app has never scanned this repo; its names anchor to nothing |
+
+**Today this repo still carries the Vibeman map**, so the app knows zero contexts here. Until a context scan runs (Personas → the project's Dev Tools → context scan; it overwrites `context-map.json` with the app export), emit outbox nodes **without** the `context` field — they still carry `"skill":"perfect"` and count as skill evidence, they just cannot count toward per-context coverage. Do not invent or guess a name to fill the field; a wrong name is indistinguishable from no name in the ledger, and hides the fact that the scan is missing. Say so once in the session summary so the operator knows a scan is the unblock. The loop's own queue in `Perfect.md` may keep using the Vibeman names — that is a separate, purely local concern.
+
+Always set `"skill":"perfect"`, and `"context":"<name>"` too once the scan has run — together they drive the per-skill context-coverage % (last 30 days). Skip silently when not Personas-managed.
+
+**Append incrementally, not at the end** — same rule as the vault: one line the moment a context's proposal pass closes, one more when a direction from it ships. "Before finishing" loses everything when a session is killed, and this loop's sessions get killed.
+
+**Who ingests it:** the app sweeps the outbox into the Memory Ledger and deletes the file when a *Fleet-spawned* session exits, and whenever the Skills Manager panel (Dev Tools → Skills) is opened for the project. A `/perfect` run in a plain terminal is neither, so its lines sit on disk until the user next opens that panel — that is expected, not a failure. Never hand-write into the ledger DB; the outbox is the only door.
