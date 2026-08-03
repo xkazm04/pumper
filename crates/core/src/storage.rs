@@ -35,6 +35,10 @@ pub struct EnqueueOptions {
     pub schedule_id: Option<String>,
     /// Set by trigger evaluation: which trigger fired this job (lineage).
     pub trigger_id: Option<String>,
+    /// Set by trigger evaluation: which job's OUTCOME fired this one. The
+    /// complement of `trigger_id` (which trigger) and what makes "the hops this
+    /// run caused" an index seek rather than a scan of the jobs table.
+    pub source_job_id: Option<String>,
 }
 
 /// A standing subscription: deliver a `dataset.changed` event whenever a job
@@ -180,8 +184,8 @@ impl Storage {
         let insert = sqlx::query(
             "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
              callback_url, callback_secret, budget_usd, idempotency_key, schedule_id, \
-             trigger_id, created_at, available_at) \
-             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+             trigger_id, source_job_id, created_at, available_at) \
+             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         )
         .bind(id.to_string())
         .bind(app)
@@ -194,6 +198,7 @@ impl Storage {
         .bind(&opts.idempotency_key)
         .bind(&opts.schedule_id)
         .bind(&opts.trigger_id)
+        .bind(&opts.source_job_id)
         .bind(ts(created))
         .bind(ts(available))
         .execute(&self.pool)
@@ -1617,6 +1622,102 @@ impl Storage {
         Ok(row)
     }
 
+    // ── job receipt joins ────────────────────────────────────────────────────
+    // Job-scoped reads behind `GET /jobs/{id}/receipt`. Each is an index seek on
+    // one job id (migration 0035), never a corpus scan — a receipt is a
+    // per-job audit view, not a metrics query.
+
+    /// This job's persisted yield rows (`job_yield`), one per dataset summary
+    /// its result reported. Counts stay `Option`: NULL means the result did not
+    /// report that number, which is not the same as zero.
+    pub async fn job_yield_entries(&self, job_id: Uuid) -> Result<Vec<crate::costs::YieldEntry>> {
+        let rows: Vec<YieldRow> = sqlx::query_as(
+            "SELECT dataset, new_count, changed_count, unchanged_count, removed_count \
+             FROM job_yield WHERE job_id = ?1 ORDER BY id",
+        )
+        .bind(job_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| crate::costs::YieldEntry {
+                dataset: r.dataset,
+                new: r.new_count,
+                changed: r.changed_count,
+                unchanged: r.unchanged_count,
+                removed: r.removed_count,
+            })
+            .collect())
+    }
+
+    /// Revisions this job actually wrote, grouped by `(app, dataset, change)`.
+    ///
+    /// Counted from `record_revisions.job_id` — the provenance stamp (0030), so
+    /// this is attribution by *identity*, not the time-window approximation the
+    /// worker's own push path uses. Revisions written by a path that doesn't
+    /// stamp a job (or before 0030) carry NULL and are therefore invisible here;
+    /// the receipt says so rather than folding them in.
+    ///
+    /// Lives here rather than on `Datasets` because it is a job-scoped read for
+    /// the job receipt; `Datasets` owns the revision write path and the
+    /// record-scoped chain reads.
+    pub async fn job_revision_counts(&self, job_id: Uuid) -> Result<Vec<RevisionCount>> {
+        let rows = sqlx::query_as::<_, RevisionCount>(
+            "SELECT app, dataset, change, COUNT(*) AS count FROM record_revisions \
+             WHERE job_id = ?1 GROUP BY app, dataset, change ORDER BY app, dataset, change",
+        )
+        .bind(job_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Outbound deliveries logged against this job id — its own result callback
+    /// (`kind = 'job'`) and the global failure firehose (`kind = 'failure'`).
+    ///
+    /// Watch and saved-search deliveries are deliberately NOT here: they are
+    /// logged against the watch / search id, so the log cannot attribute them to
+    /// a job. The receipt names that gap instead of guessing.
+    pub async fn job_deliveries(&self, job_id: Uuid) -> Result<Vec<Delivery>> {
+        let rows: Vec<DeliveryRow> = sqlx::query_as(
+            "SELECT id, kind, ref_id, url, event, '' AS body, status, attempts, last_error, \
+             created_at, updated_at FROM webhook_deliveries \
+             WHERE ref_id = ?1 AND kind IN ('job', 'failure') ORDER BY created_at DESC",
+        )
+        .bind(job_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Delivery::try_from).collect()
+    }
+
+    /// The extraction-health verdicts THIS run produced (`source_runs`, keyed
+    /// `(source_id, job_id)`) — the honest at-run-time answer, as opposed to
+    /// the source's state right now, which a later run may have changed.
+    /// Empty when health detection was off for the run.
+    pub async fn job_health_verdicts(&self, job_id: Uuid) -> Result<Vec<JobHealthVerdict>> {
+        let rows = sqlx::query_as::<_, JobHealthVerdict>(
+            "SELECT source_id, verdict, diagnosis, score, state_after \
+             FROM source_runs WHERE job_id = ?1 ORDER BY source_id",
+        )
+        .bind(job_id.to_string())
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Jobs this job's outcome caused a trigger to enqueue (`source_job_id`,
+    /// migration 0035). Empty for a run that fired nothing — and also for a run
+    /// that predates the column, which the receipt reports as unknown.
+    pub async fn triggered_hops(&self, job_id: Uuid) -> Result<Vec<Job>> {
+        let sql =
+            format!("SELECT {JOB_COLUMNS} FROM jobs WHERE source_job_id = ?1 ORDER BY created_at");
+        let rows: Vec<JobRow> = sqlx::query_as(&sql)
+            .bind(job_id.to_string())
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(Job::try_from).collect()
+    }
+
     // ── derived ──────────────────────────────────────────────────────────────
     // CRUD for derived-dataset specs (M11). The hot-path read (enabled specs
     // for one source) and the recompute/backfill mechanics live on `Datasets`;
@@ -1742,6 +1843,40 @@ pub struct NewDerivedSpec<'a> {
 /// crawl frontier (~a few MB) while keeping a runaway app from turning the jobs
 /// database into a blob store.
 pub const MAX_CHECKPOINT_BYTES: usize = 8 * 1024 * 1024;
+
+/// A `job_yield` row as stored (the `*_count` column names), mapped to the
+/// public [`crate::costs::YieldEntry`] on read.
+#[derive(sqlx::FromRow)]
+struct YieldRow {
+    dataset: String,
+    new_count: Option<i64>,
+    changed_count: Option<i64>,
+    unchanged_count: Option<i64>,
+    removed_count: Option<i64>,
+}
+
+/// One source's extraction-health verdict from a single run
+/// ([`Storage::job_health_verdicts`]). `diagnosis` is `None` when the detector
+/// had nothing to say — unknown, not "healthy".
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct JobHealthVerdict {
+    pub source_id: String,
+    pub verdict: String,
+    pub diagnosis: Option<String>,
+    pub score: f64,
+    pub state_after: String,
+}
+
+/// One `(app, dataset, change)` group of the revisions a single job wrote
+/// ([`Storage::job_revision_counts`]). `change` is the revision kind — `new`,
+/// `changed` or `removed`.
+#[derive(Debug, Clone, Serialize, sqlx::FromRow)]
+pub struct RevisionCount {
+    pub app: String,
+    pub dataset: String,
+    pub change: String,
+    pub count: i64,
+}
 
 /// Where one job run's wall-clock went (`job_stages`, migration 0034).
 ///

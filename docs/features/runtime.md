@@ -54,6 +54,19 @@ Each schedule carries three cron-maturity fields (`schedules` table cols `timezo
 - APIs: `GET /jobs/{id}/costs` (events, total, cost-per-fresh-record), `GET /costs?app=&since=` (app×engine rollup), `pumper_cost_usd{app,engine}` gauges on `/metrics`.
 - Research cache: identical `ResearchRequest`s within `claude.research_cache_ttl_secs` (default 24h, 0 disables) are served from disk at zero cost, logged as `cache_hit (saved ~$X)` events. `resume_session` requests bypass.
 
+## Job receipt
+
+`GET /jobs/{id}/receipt` — one read-only document answering "what did this job cost me and what did it actually change?", joining the surfaces that previously had to be joined by hand. Blocks: `job` (status, attempts, lineage, `wall_ms`), `stages` (the per-stage timings above), `cost` (total, calls, per-engine, the job's `budget_usd`), `yield` (what the result reported, per dataset), `changes` (what the revision log records, per app/dataset/change kind), `verdicts` (extraction-health verdicts *this run* produced, plus its in-memory contract verdicts), `artifacts` (file names + byte sizes read from `data/artifacts/<app>/<job_id>/`), `deliveries` (webhook deliveries keyed to this job) and `trigger_hops` (the jobs this run's outcome enqueued).
+
+**Honest nulls, and an `unknown[]` list that names every gap in the caller's words** — nothing is inferred, averaged or back-filled. The structural gaps it reports:
+- `stages: null` for a job that predates migration 0034, failed before its fan-out, or hasn't finished — and the message says which.
+- `wall_ms: null` while a job is unfinished (never "now − started_at", which would grow on every refresh).
+- `changes` counts revisions by the `job_id` provenance stamp (migration 0030), so a write path that doesn't stamp one is invisible rather than approximated from a time window.
+- Watch (`dataset.changed`) and saved-search (`search.matched`) deliveries are logged against the watch/search id, so **no** delivery can be attributed to the run that caused it; the receipt says so instead of listing a plausible subset.
+- `trigger_hops` reads `jobs.source_job_id` (migration 0035); hops enqueued before it are not recoverable.
+
+Every join is an index seek on the job id — a receipt is a per-job audit view, not a metrics query, and it must not slow down as the corpus grows.
+
 ## AppContext (what a running app gets)
 
 `job_id`, `app`, `params`, `engines`, `datasets`, `costs`, `budget_usd`, `research_cache`, `tiers`, `plugins`, `progress` (throttled live-progress seam — see [Live progress](#live-progress)), `health` (extraction-health judge — see below), `artifacts_dir` + helpers: `fetch` (metered, budget-governed, tier-routed), `research` (metered, cached), `upsert`/`upsert_many`/`sync_many`, `observe_extraction`, `save_artifact`, `require_str`, `remaining_budget_usd`.

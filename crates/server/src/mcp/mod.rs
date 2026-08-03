@@ -476,6 +476,7 @@ async fn enqueue_app(
         idempotency_key,
         schedule_id: None,
         trigger_id: None,
+        source_job_id: None,
     };
     let (job, created) = state
         .storage

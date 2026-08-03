@@ -36,6 +36,7 @@ mod jobs;
 mod meta;
 mod provenance;
 mod query;
+mod receipt;
 mod recipes;
 mod remote;
 mod runtime;
@@ -58,6 +59,7 @@ use jobs::*;
 use meta::*;
 use provenance::*;
 use query::*;
+use receipt::*;
 use recipes::*;
 use remote::*;
 use runtime::*;
@@ -164,6 +166,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(reset_job))
         .routes(routes!(stream_job))
         .routes(routes!(job_costs))
+        .routes(routes!(job_receipt))
         .routes(routes!(cost_summary))
         .routes(routes!(economics_report))
         .routes(routes!(list_schedules, create_schedule))
@@ -418,6 +421,7 @@ mod api_spec_tests {
         "POST /jobs/{id}/reset",
         "GET /jobs/{id}/stream",
         "GET /jobs/{id}/costs",
+        "GET /jobs/{id}/receipt",
         "GET /costs",
         "GET /economics",
         "GET /schedules",

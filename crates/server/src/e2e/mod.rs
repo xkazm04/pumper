@@ -15,6 +15,7 @@ mod fanout_offslot;
 mod fetch_proxy;
 mod harness;
 mod host_weather;
+mod job_receipt;
 mod mcp;
 mod mcp_live;
 mod panic_containment;

@@ -126,6 +126,7 @@ pub(crate) async fn enqueue_job(
         idempotency_key,
         schedule_id: None,
         trigger_id: None,
+        source_job_id: None,
     };
     let (job, created) = state.storage.enqueue_dedup(&name, opts).await?;
     if created {

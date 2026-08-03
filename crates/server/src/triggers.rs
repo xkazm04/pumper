@@ -572,6 +572,10 @@ async fn enqueue_hop(state: &AppState, trigger: &Trigger, source: &Job, obj: Val
         budget_usd: trigger.budget_usd,
         idempotency_key: Some(idempotency_key(&trigger.id, &source.id.to_string())),
         trigger_id: Some(trigger.id.clone()),
+        // Reverse lineage: `trigger_id` says which trigger fired the hop, this
+        // says which run's outcome did. `GET /jobs/{id}/receipt` reads it to
+        // list the hops one job caused without scanning the jobs table.
+        source_job_id: Some(source.id.to_string()),
         ..Default::default()
     };
     match state.storage.enqueue_dedup(&trigger.target_app, opts).await {
