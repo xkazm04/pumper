@@ -73,6 +73,8 @@ pub use resilience::{
 #[cfg(feature = "storage")]
 pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
 #[cfg(feature = "storage")]
+pub use resilience::preview::{preview_fleet, FleetPreview, SourcePreview};
+#[cfg(feature = "storage")]
 pub use retention::{
     artifact_is_reclaimable, artifact_usage, delete_artifacts, keep_reason,
     plan_artifact_retention, scan_artifact_tree, AppReclaim, ArtifactFile, ArtifactRef, KeepReason,

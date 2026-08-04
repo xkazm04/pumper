@@ -29,6 +29,7 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just plugin <crate>` | builds `plugins-src/<crate>` for `wasm32-unknown-unknown` |
 | `just doctor [port]` | `GET /datasets/doctor` — read-only store integrity report (server RUNNING) |
 | `just retention-preview [days]` | `GET /retention/preview` — reclaimable bytes, deletes nothing (server RUNNING) |
+| `just enforcement-preview [app]` | `GET /enforcement/preview` — what `[resilience] enforce = true` would have done, gates nothing (server RUNNING) |
 
 `--bin pumper` is **required**: the `pumper-server` package ships three binaries
 (`pumper`, `reindex`, `search-backfill`) and has no `default-run`, so a bare

@@ -193,6 +193,71 @@ pub(crate) async fn source_runs(
     Ok(Json(json!({ "id": id, "count": runs.len(), "runs": runs })))
 }
 
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct EnforcementPreviewQuery {
+    /// Only sources served by this app.
+    app: Option<String>,
+    /// Stored runs replayed per source, newest-backwards (default 60, max 1000).
+    runs: Option<i64>,
+    /// Sources to replay (default 500).
+    limit: Option<i64>,
+}
+
+/// **What `[resilience] enforce = true` would have done.** Read-only replay of
+/// the stored verdicts — it changes nothing, gates nothing, and re-judges
+/// nothing.
+///
+/// `enforce` ships `false`, and this is the answer to the only question that
+/// gates turning it on. Soak mode is a no-op strictly *downstream*: every run is
+/// judged, the ladder moves, and the verdict/score/`reasons` are written whether
+/// or not enforcement is on — the single thing `enforce` changes is that the
+/// four gated consumers read `Healthy` instead of the real state. So this replays
+/// the recorded `state_after` of each run, in order, and reports what each state
+/// would have gated.
+///
+/// **Fidelity, not re-simulation.** Every verdict here is the one recorded at the
+/// time by the rules in force at the time. Runs the detector could not judge
+/// (`inconclusive`, `content_empty`, `below_cohort`) moved nothing, and are never
+/// credited with a transition; a state change across such a run is reported with
+/// `cause: "outside"` (an operator override, or a pruned run), not attributed to
+/// it.
+#[utoipa::path(
+    get,
+    path = "/enforcement/preview",
+    tag = "sources",
+    params(EnforcementPreviewQuery),
+    responses(
+        (status = 200, description = "`{enforcing, ready, not_ready: [{id, state, gates, since}], \
+            unmonitored, totals, sources: [{id, state, gates, live_state, monitored, \
+            window_opens_at, window_opens_in, runs_replayed, unjudged_runs, \
+            transitions: [{at, from, to, cause, verdict, score, diagnosis, reasons, gates}], \
+            consequences}]}`. \
+            `ready: true` means no source's current state gates anything, so flipping \
+            `[resilience] enforce` would change nothing about the next run; `not_ready` names \
+            the sources that make it false. Counts are **runs and the documents in them**, \
+            never deliveries — how many webhooks a suppressed run would have sent is not \
+            stored. Deletes and writes nothing."),
+        (status = 503, description = "Detection is disabled ([resilience] enabled = false)", body = Object),
+    )
+)]
+pub(crate) async fn enforcement_preview(
+    State(state): State<AppState>,
+    Query(query): Query<EnforcementPreviewQuery>,
+) -> Result<Json<Value>, ApiError> {
+    let store = health_store(&state)?;
+    let preview = pumper_core::preview_fleet(
+        store,
+        state.health.enforcing(),
+        query.app.as_deref(),
+        query
+            .runs
+            .unwrap_or(pumper_core::resilience::preview::DEFAULT_REPLAY_RUNS),
+        query.limit.unwrap_or(500).clamp(1, 500),
+    )
+    .await?;
+    Ok(Json(serde_json::to_value(preview).unwrap_or(Value::Null)))
+}
+
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct SourceStateBody {
     /// `healthy|suspect|degraded|quarantined|probation|retired`.

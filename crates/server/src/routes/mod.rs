@@ -237,6 +237,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(get_source))
         .routes(routes!(source_runs))
         .routes(routes!(set_source_state))
+        .routes(routes!(enforcement_preview))
         .routes(routes!(datahub_status))
         .routes(routes!(datahub_sync))
         .routes(routes!(openapi_json))
@@ -504,6 +505,7 @@ mod api_spec_tests {
         "GET /sources/{id}",
         "GET /sources/{id}/runs",
         "POST /sources/{id}/state",
+        "GET /enforcement/preview",
         "GET /datahub/status",
         "POST /datahub/sync",
         "GET /openapi.json",

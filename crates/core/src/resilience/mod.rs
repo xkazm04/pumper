@@ -40,12 +40,16 @@
 //! - [`sketch`] — the fixed-size per-field summaries and the statistics on them.
 //! - [`detect`] — the pure verdict: score, diagnosis, state transition.
 //! - [`store`] — persistence, the rolling baseline, and invariant mining.
+//! - [`preview`] — replay of the stored verdicts: what `enforce = true` would
+//!   have done, without doing any of it.
 //!
 //! Detection is free: arithmetic over data the extraction pass already produced,
 //! plus one row per field per run.
 
 pub mod detect;
 pub mod invariants;
+#[cfg(feature = "storage")]
+pub mod preview;
 pub mod sketch;
 #[cfg(feature = "storage")]
 pub mod store;

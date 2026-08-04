@@ -87,6 +87,19 @@ retention-preview days='':
     if [ -n "{{days}}" ]; then q="?days={{days}}"; else q=""; fi
     curl -s "http://127.0.0.1:8088/retention/preview$q"
 
+# Gates nothing and writes nothing, and needs the server RUNNING. Replays the
+# STORED verdicts — it does not re-judge history against today's rules.
+# `just enforcement-preview extractor` scopes it to one app.
+#
+# What `[resilience] enforce = true` would have done: per-source would-be state
+# timeline, the counts it would have gated, and `ready` + `not_ready`.
+enforcement-preview app='':
+    #!/usr/bin/env sh
+    # Omit `?app=` entirely when no argument is given, so the server replays the
+    # whole fleet rather than filtering on an empty app name.
+    if [ -n "{{app}}" ]; then q="?app={{app}}"; else q=""; fi
+    curl -s "http://127.0.0.1:8088/enforcement/preview$q"
+
 # A scope is required, e.g.
 #   just search-backfill "--app grants --dataset unified"
 #   just search-backfill --all

@@ -26,6 +26,7 @@
 | Schema + persistence (§5) | **shipped** for the tables detection needs | migration `0020` |
 | Trust stamping, `sync_many` downgrade, push suppression, index skip, quarantine dataset (§7) | **shipped**, gated on `enforce` | `core::app`, `server::worker` |
 | `GET /sources`, `/sources/{id}`, `/sources/{id}/runs`, `POST /sources/{id}/state` (§8.4) | **shipped** | `server::routes` |
+| Enforcement preview (§8.5) | **shipped** — `GET /enforcement/preview`, read-only replay of the STORED verdicts | `core::resilience::preview` |
 | Config surface + validation (§9) | **shipped** | `[resilience]` |
 | Golden documents (§3.2, §6.3 retention store) | **not built** |  |
 | Profile registry (§4) | **not built** |  |
@@ -35,7 +36,9 @@
 
 `[resilience] enforce = false` ships as the default: every verdict is computed and
 stored, nothing is gated. That is §12.6's soak mode, and it is the state the
-system is in until an operator reads `GET /sources` and decides otherwise.
+system is in until an operator reads `GET /sources` and decides otherwise —
+or, before deciding, asks `GET /enforcement/preview` (§8.5) what turning it on
+*would* have done.
 
 ---
 
@@ -1051,6 +1054,80 @@ POST   /profiles/extraction/{name}/rollback        # {to}
 GET    /repairs?source=&outcome=&cursor=           # attempt log incl. cost
 GET    /repairs/{id}                               # candidates, scores, reject reasons
 ```
+
+### 8.5 Enforcement preview — what would have happened
+
+`GET /enforcement/preview` (`just enforcement-preview [app]`) answers the only
+question that gates flipping `enforce`: *what would this have done to my fleet?*
+
+It works because soak mode is a no-op strictly **downstream**. `observe` judges
+every run, moves the source's state and writes the verdict, the score and the
+self-explaining `reasons` to `source_runs` **regardless** of `enforce`; the one
+thing `enforce` changes is that `Resilience::enforced_state` answers `Healthy` to
+the four consumers that gate on it. So the ladder in the database is already the
+ladder enforcement would have walked, and a preview is a *replay of stored rows*:
+
+- **It re-judges nothing.** Every verdict, score and state reported is the one
+  recorded at the time, under the rules in force at the time. Re-running today's
+  detector over old runs would answer a different question and be worthless as a
+  rollout gate.
+- **`state_after` IS the would-be state.** Gating is applied to the write of the
+  run that settled the state (`observe_extraction` runs *before* the upsert), so
+  each run's consequences are the ones its own `state_after` implies.
+- **An unjudged run moved nothing.** `inconclusive`, `content_empty` and
+  `below_cohort` runs neither move the state nor enter the baseline, and are never
+  credited with a transition. A state change across such a run is reported with
+  `cause: "outside"` — an operator `POST /sources/{id}/state`, or the deciding run
+  having been pruned — rather than blamed on the run that happens to sit next to it.
+- **The window opens mid-history.** Retention prunes old runs, so the oldest
+  retained run is usually not the one that caused the current state;
+  `window_opens_at` / `window_opens_in` say where the replay starts instead of
+  inventing a transition at the edge.
+
+**Zero side effects, asserted.** Every statement in `core::resilience::preview` is
+a `SELECT`, and `crates/core/tests/enforcement_preview.rs` snapshots every health
+table plus the database file bytes around a preview and requires them identical.
+
+The four consequences, each traced to the live call site that applies it — the
+list is an inventory test (`every_enforcement_consequence_is_previewed`), so a
+fifth consumer of `enforced_state` cannot be added without the preview learning
+about it:
+
+| Count | What it would have done | Call site |
+|---|---|---|
+| `diverted_writes` | batch lands in `<dataset>@q`, not the live dataset | `core::app::AppContext::write_target` |
+| `withheld_removals` | full-snapshot sync downgraded to upsert; nothing tombstoned | `core::app::AppContext::sync_many_with_provenance` |
+| `suppressed_pushes` | revisions never reach watches or triggers | `server::worker::suppress_unhealthy` |
+| `skipped_index_writes` | revisions not indexed | `server::worker::dataset_search_docs` |
+| `trust_stamped` | records carry `provisional` / `quarantined` (a label, not a suppression) | `write_target` |
+
+Counts are **runs and the documents in them, never deliveries**: how many webhooks
+a suppressed run would have sent depends on the watches registered at that moment
+and is not stored, and inventing the number would be a fabrication.
+
+Response shape:
+
+```
+GET /enforcement/preview?app=&runs=&limit=
+{
+  "enforcing": false,          # true => this describes what DID happen
+  "ready": false,              # no source's current state gates anything
+  "not_ready": [ { "id", "state", "gates": [...], "since": <transition> } ],
+  "unmonitored": ["app/dataset"],   # never cleared the cohort floor: weak evidence,
+                                    #   but gates nothing, so it does not block readiness
+  "totals": { "diverted_writes": {"runs","docs"}, ... },
+  "sources": [ {
+    "id", "state", "gates", "live_state", "monitored",
+    "runs_replayed", "unjudged_runs", "window_opens_at", "window_opens_in",
+    "transitions": [ { "at","from","to","cause","verdict","score","diagnosis","reasons","gates" } ],
+    "consequences": { ... }
+  } ]
+}
+```
+
+`live_state` is the `sources` row as `GET /sources` serves it. It differs from
+the replayed `state` only when something outside the run history moved it, and is
+surfaced so the preview can never quietly disagree with the health table.
 
 Metrics (cardinality-capped — per-field series limited to the worst 10 fields per
 source, because `/metrics` is scraped and label explosion is a real cost):
