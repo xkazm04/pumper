@@ -5,10 +5,13 @@
 //!      uses — schema-guarded, budget-clamped, cached) to identify 1–3
 //!      candidate source URLs;
 //!   2. samples each candidate through the tiered fetcher (the readable path);
-//!   3. drafts a declarative [`RuleSet`] against the sampled bodies and
+//!   3. drafts a declarative [`RuleSet`] against the PRIMARY sampled body and
 //!      DRY-RUNS it through the real extraction engine
-//!      ([`pumper_core::extract_one_with_report`]), iterating up to
-//!      `max_iterations` until a strict majority of fields match;
+//!      ([`pumper_core::extract_one_with_report`]) **against that same
+//!      document**, iterating up to `max_iterations` until a strict majority of
+//!      its fields hold and no degenerate-draft rejection fires. The other
+//!      candidates are held-out generalization evidence, reported per candidate
+//!      and never pooled into the accept bar;
 //!   4. emits a complete **provision proposal** record into
 //!      `provisioner/proposals`: `{catalog_row (TOML-shaped Source), rule_set,
 //!      seeds, samples, cadence, budget, sample_stats, confidence, verdict}`.
@@ -32,9 +35,9 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use pumper_core::{
-    extract_one_with_report, salvage_json, AppContext, AppManifest, CostClass, Error, FetchOutcome,
-    FetchRequest, FetchStrategy, ManifestExample, ResearchRequest, Result, RuleSet, ScrapeApp,
-    Source,
+    extract_one_with_report, salvage_json, AppContext, AppManifest, CoercionStatus, CostClass,
+    DocReport, Error, FetchOutcome, FetchRequest, FetchStrategy, ManifestExample, ResearchRequest,
+    Result, Rule, RuleSet, ScrapeApp, Source,
 };
 use pumper_core::datasets::Provenance;
 use serde::{Deserialize, Serialize};
@@ -236,95 +239,276 @@ fn sample_artifact_name(i: usize, body_field: &str) -> String {
     }
 }
 
+// ── degenerate-draft rejection ──────────────────────────────────────────────
+//
+// Three ways a draft can pass a match-rate bar while extracting nothing of
+// value. All three are decidable from the extraction the dry run already ran,
+// so they cost nothing and are known BEFORE any metered repair iteration is
+// spent — and before an acceptance can stop the loop on a worthless draft.
+
+/// True when EVERY top-level rule is a `const`.
+///
+/// `Rule::Const` always binds — it is a literal, not a selector — so a rule set
+/// of nothing but constants scores a perfect 100 against any document,
+/// including an empty one. It is the shortest path to passing this app's dry
+/// run while extracting zero facts from the page.
+pub fn const_only_rule_set(rules: &RuleSet) -> bool {
+    !rules.fields.is_empty()
+        && rules
+            .fields
+            .values()
+            .all(|f| matches!(f.rule, Rule::Const { .. }))
+}
+
+/// `each` fields that yielded ZERO items on **every** document examined.
+///
+/// `FieldStatus::ContainerEmpty` deliberately does not count as a miss — a job
+/// board with no postings this week is a working selector over a quiet listing,
+/// and the health detector must not cry wolf over it. But that reasoning needs
+/// a selector with a track record, and a draft has none: a listing rule that is
+/// empty on every sample we have is precisely the selector never shown to work.
+///
+/// `items_per_doc` holds one map per document, `each`-field name → item count.
+pub fn always_empty_each_fields(items_per_doc: &[BTreeMap<String, usize>]) -> Vec<String> {
+    let mut names: Vec<String> = Vec::new();
+    let Some(first) = items_per_doc.first() else {
+        return names;
+    };
+    for name in first.keys() {
+        if items_per_doc
+            .iter()
+            .all(|doc| doc.get(name).copied().unwrap_or(0) == 0)
+        {
+            names.push(name.clone());
+        }
+    }
+    names
+}
+
+/// Fields whose selector matched but whose transform chain then reduced the
+/// value to nothing — [`CoercionStatus::CoercionFailed`], the wrong-element
+/// signature (`to_number` over `"Add to cart"`).
+///
+/// The extraction engine has always computed this alongside the match status,
+/// and the dry run never read it: such a field reported `Matched` and counted
+/// as a working selector.
+pub fn coercion_failed_fields(report: &DocReport) -> Vec<String> {
+    report
+        .coercion
+        .iter()
+        .filter(|(_, s)| **s == CoercionStatus::CoercionFailed)
+        .map(|(name, _)| name.clone())
+        .collect()
+}
+
 // ── dry-run harness ─────────────────────────────────────────────────────────
 
-/// Per-field outcome across the sampled bodies.
-#[derive(Debug, Clone, Serialize)]
+/// One field's outcome on the PRIMARY document.
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct FieldStat {
-    /// Docs where the field's rule bound (Matched, or ContainerEmpty — a
-    /// present-but-quiet listing is not a broken selector).
-    pub matched_docs: usize,
-    pub total_docs: usize,
+    /// The rule bound: `Matched`, or `ContainerEmpty` — a present-but-quiet
+    /// listing is not a broken selector.
+    pub bound: bool,
+    /// Post-transform outcome (`coerced` · `coercion_failed` · `no_transforms`).
+    pub coercion: String,
+    /// `each` rules only: items yielded on this document.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub items: Option<usize>,
 }
 
 impl FieldStat {
-    /// A field "holds" when it bound on at least half the sampled docs.
+    /// A field "holds" when it bound AND its transforms did not reduce it to
+    /// nothing. A matched selector over the wrong element is not a hold.
     fn holds(&self) -> bool {
-        self.total_docs > 0 && self.matched_docs * 2 >= self.total_docs
+        self.bound && self.coercion != "coercion_failed"
     }
 }
 
-/// The dry-run verdict for one drafted rule set over the sampled bodies.
-#[derive(Debug, Clone, Serialize)]
-pub struct DryRun {
-    pub stats: BTreeMap<String, FieldStat>,
-    pub docs: usize,
-    pub fields_total: usize,
-    pub fields_matched: usize,
-    /// The STOP RULE: a strict majority of fields hold across the samples.
-    pub accepted: bool,
-    /// Fields that failed to hold, worst first — the repair-prompt feedback.
-    pub worst_fields: Vec<String>,
+/// A candidate document the draft was NOT written against.
+pub struct HeldOutDoc<'a> {
+    pub url: &'a str,
+    pub body: &'a str,
 }
 
-/// Runs a drafted rule set through the REAL extraction engine over the sampled
-/// bodies and scores it. A rule set that doesn't compile is an `Err` — the
-/// loop feeds the compile error back to the model as repair feedback rather
-/// than treating it as a scored-zero draft.
-pub fn dry_run(rules: &RuleSet, bodies: &[String]) -> Result<DryRun> {
+/// What one held-out candidate says about the drafted rules.
+///
+/// Reported per candidate and never pooled into the accept bar: these are
+/// DIFFERENT SITES with different markup, so a field missing here is evidence
+/// about generalization, not evidence that the draft is wrong for the page it
+/// was written against.
+#[derive(Debug, Clone, Serialize)]
+pub struct HeldOutStat {
+    pub url: String,
+    pub fields_held: usize,
+    pub fields_total: usize,
+    /// Fields that did not hold on this document, alphabetically.
+    pub fields_missing: Vec<String>,
+}
+
+/// The dry-run verdict for one drafted rule set.
+#[derive(Debug, Clone, Serialize)]
+pub struct DryRun {
+    /// Per-field outcome on the PRIMARY document — the one the draft was
+    /// written against, and the only one the accept bar reads.
+    pub stats: BTreeMap<String, FieldStat>,
+    /// Total documents examined (primary + held out).
+    pub docs: usize,
+    pub fields_total: usize,
+    pub fields_held: usize,
+    /// The STOP RULE: a strict majority of fields hold **on the primary
+    /// document**, and the draft is not degenerate.
+    pub accepted: bool,
+    /// Fields that failed to hold on the primary, alphabetically — the
+    /// repair-prompt feedback.
+    pub worst_fields: Vec<String>,
+    /// Per-candidate generalization evidence. Never part of `accepted`.
+    pub held_out: Vec<HeldOutStat>,
+    /// Deterministic reasons the draft is unusable whatever it scored. Any
+    /// entry here forces `accepted = false`.
+    pub rejections: Vec<String>,
+}
+
+/// Runs a drafted rule set through the REAL extraction engine and scores it
+/// **against its own document**.
+///
+/// The draft is written against `primary` and nothing else (see the drafting
+/// prompt), so `primary` is what the accept bar reads. Scoring it as a pooled
+/// majority over up to three candidates from DIFFERENT SITES made the bar move
+/// with how many candidates happened to fetch: with 1 sample a primary-only
+/// field passed, with 3 it needed `1*2 >= 3` and failed, so repair iterations
+/// burned on a cross-site mismatch no selector can fix. The other candidates are
+/// now held-out evidence, reported per candidate.
+///
+/// A rule set that doesn't compile is an `Err` — the loop feeds the compile
+/// error back to the model as repair feedback rather than scoring it a zero.
+pub fn dry_run(rules: &RuleSet, primary: &str, held_out: &[HeldOutDoc<'_>]) -> Result<DryRun> {
     if rules.fields.is_empty() {
         return Err(Error::App("drafted rule set has no fields".into()));
     }
     let compiled = rules.compile()?;
-    let mut stats: BTreeMap<String, FieldStat> = rules
-        .fields
-        .keys()
-        .map(|name| {
-            (
-                name.clone(),
-                FieldStat {
-                    matched_docs: 0,
-                    total_docs: bodies.len(),
-                },
-            )
-        })
-        .collect();
-    for body in bodies {
-        let (_, report) = extract_one_with_report(&compiled, body);
-        for (name, status) in &report.fields {
-            if !status.is_miss() {
-                if let Some(stat) = stats.get_mut(name) {
-                    stat.matched_docs += 1;
-                }
-            }
-        }
+
+    let (primary_values, primary_report) = extract_one_with_report(&compiled, primary);
+    let stats = field_stats(rules, &primary_values, &primary_report);
+
+    // Item counts across EVERY document, so an `each` rule is only condemned
+    // when it is empty on all the evidence we have.
+    let mut items_per_doc = vec![each_item_counts(rules, &primary_values)];
+    let mut held: Vec<HeldOutStat> = Vec::new();
+    for doc in held_out {
+        let (values, report) = extract_one_with_report(&compiled, doc.body);
+        items_per_doc.push(each_item_counts(rules, &values));
+        let s = field_stats(rules, &values, &report);
+        let missing: Vec<String> = s
+            .iter()
+            .filter(|(_, st)| !st.holds())
+            .map(|(name, _)| name.clone())
+            .collect();
+        held.push(HeldOutStat {
+            url: doc.url.to_string(),
+            fields_held: s.len() - missing.len(),
+            fields_total: s.len(),
+            fields_missing: missing,
+        });
     }
+
+    let mut rejections: Vec<String> = Vec::new();
+    if const_only_rule_set(rules) {
+        rejections.push(
+            "every rule is a `const`: constants always bind, so this draft would score \
+             perfectly while extracting nothing from the page"
+                .into(),
+        );
+    }
+    let empty_each = always_empty_each_fields(&items_per_doc);
+    if !empty_each.is_empty() {
+        rejections.push(format!(
+            "`each` field(s) yielded 0 items on every sampled document: {}",
+            empty_each.join(", ")
+        ));
+    }
+    let miscoerced = coercion_failed_fields(&primary_report);
+    if !miscoerced.is_empty() {
+        rejections.push(format!(
+            "field(s) matched an element whose value the transforms could not coerce \
+             (wrong element): {}",
+            miscoerced.join(", ")
+        ));
+    }
+
     let fields_total = stats.len();
-    let fields_matched = stats.values().filter(|s| s.holds()).count();
-    // Strict majority: more than half the fields must hold.
-    let accepted = fields_matched * 2 > fields_total;
-    let mut worst: Vec<(&String, &FieldStat)> =
-        stats.iter().filter(|(_, s)| !s.holds()).collect();
-    worst.sort_by_key(|(name, s)| (s.matched_docs, name.as_str().to_string()));
-    let worst_fields = worst.into_iter().map(|(name, _)| name.clone()).collect();
+    let fields_held = stats.values().filter(|s| s.holds()).count();
+    // Strict majority of the PRIMARY document's fields, and nothing degenerate.
+    let accepted = fields_held * 2 > fields_total && rejections.is_empty();
+    let worst_fields: Vec<String> = stats
+        .iter()
+        .filter(|(_, s)| !s.holds())
+        .map(|(name, _)| name.clone())
+        .collect();
     Ok(DryRun {
         stats,
-        docs: bodies.len(),
+        docs: 1 + held_out.len(),
         fields_total,
-        fields_matched,
+        fields_held,
         accepted,
         worst_fields,
+        held_out: held,
+        rejections,
     })
 }
 
-/// Overall confidence 0–100: the fraction of (field × doc) cells that bound.
+/// Per-field outcome on one document, from the extraction the caller already ran.
+fn field_stats(rules: &RuleSet, values: &Value, report: &DocReport) -> BTreeMap<String, FieldStat> {
+    rules
+        .fields
+        .iter()
+        .map(|(name, field)| {
+            let stat = FieldStat {
+                bound: report.fields.get(name).is_some_and(|s| !s.is_miss()),
+                coercion: report
+                    .coercion
+                    .get(name)
+                    .map(wire_str)
+                    .unwrap_or_else(|| "no_transforms".into()),
+                items: matches!(field.rule, Rule::Each { .. }).then(|| {
+                    values
+                        .get(name)
+                        .and_then(Value::as_array)
+                        .map_or(0, Vec::len)
+                }),
+            };
+            (name.clone(), stat)
+        })
+        .collect()
+}
+
+/// Item counts for the rule set's `each` fields on one extracted document.
+fn each_item_counts(rules: &RuleSet, values: &Value) -> BTreeMap<String, usize> {
+    rules
+        .fields
+        .iter()
+        .filter(|(_, f)| matches!(f.rule, Rule::Each { .. }))
+        .map(|(name, _)| {
+            (
+                name.clone(),
+                values.get(name).and_then(Value::as_array).map_or(0, Vec::len),
+            )
+        })
+        .collect()
+}
+
+/// Overall confidence 0–100: the share of the **primary document's** fields
+/// that hold — bound, and survived their own transforms.
+///
+/// The old definition averaged (field × doc) cells across up to three different
+/// SITES, so the number moved with how many candidates happened to fetch rather
+/// than with how good the draft was for the page it was written against. A
+/// degenerate draft scores 0 whatever its match rate: the rejection is the
+/// finding, and a number beside it would only argue with it.
 pub fn confidence(dry: &DryRun) -> u8 {
-    let cells = dry.fields_total * dry.docs;
-    if cells == 0 {
+    if !dry.rejections.is_empty() || dry.fields_total == 0 {
         return 0;
     }
-    let bound: usize = dry.stats.values().map(|s| s.matched_docs).sum();
-    ((bound as f64 / cells as f64) * 100.0).round().min(100.0) as u8
+    ((dry.fields_held as f64 / dry.fields_total as f64) * 100.0).round() as u8
 }
 
 // ── proposal record ─────────────────────────────────────────────────────────
@@ -382,13 +566,19 @@ pub fn proposed_dataset(key: &str) -> String {
 /// everything from one that bound nothing.
 pub fn row_notes(prompt: &str, dry: &DryRun, score_0_100: u8) -> String {
     let verdict = if dry.accepted { "ACCEPTED" } else { "REJECTED" };
+    let why = if dry.rejections.is_empty() {
+        String::new()
+    } else {
+        format!(" DEGENERATE DRAFT: {}.", dry.rejections.join("; "))
+    };
     format!(
-        "provisioner proposal — dry run {verdict} ({}/{} fields bound over {} sampled doc(s); \
-         score {score_0_100}/100 = confidence {}/5). UNPROVISIONED: no app crate, no dataset, \
-         nothing scheduled. Prompt: {prompt}",
-        dry.fields_matched,
+        "provisioner proposal — dry run {verdict} ({}/{} fields held on the primary sampled \
+         document, {} held-out candidate(s) examined; score {score_0_100}/100 = confidence \
+         {}/5).{why} UNPROVISIONED: no app crate, no dataset, nothing scheduled. \
+         Prompt: {prompt}",
+        dry.fields_held,
         dry.fields_total,
-        dry.docs,
+        dry.held_out.len(),
         confidence_1_to_5(score_0_100),
     )
 }
@@ -585,8 +775,12 @@ impl ScrapeApp for Provisioner {
         "Compile a natural-language prompt into a reviewed provisioning PROPOSAL: \
          research 1-3 candidate source URLs, sample them via the tiered fetcher, \
          draft a declarative rule set and dry-run it through the real extraction \
-         engine (iterating until a majority of fields match), then emit a \
-         {catalog_row, rule_set, seeds, cadence, budget, sample_stats, confidence} \
+         engine against the page it was written for (iterating until a majority of \
+         that page's fields hold; the other candidates are held-out evidence, and \
+         const-only / always-empty-`each` / coercion-failed drafts are rejected \
+         outright), then emit a \
+         {catalog_row, rule_set, seeds, samples, cadence, budget, sample_stats, \
+         confidence, verdict} \
          record into provisioner/proposals. NEVER writes data-sources.toml or \
          creates schedules — the emitted row is always status=planned with no cron; \
          a human applies it via the catalog reconciler. The metered discovery \
@@ -635,7 +829,12 @@ impl ScrapeApp for Provisioner {
             ],
             output_shape: Some(
                 "{proposal_key, candidates, seeds, samples, iterations, accepted, verdict, \
-                 confidence, catalog_confidence, sample_stats, cost_usd, resumed_discovery} — \
+                 rejections, confidence, catalog_confidence, sample_stats, cost_usd, \
+                 resumed_discovery} — `sample_stats` scores the draft against the PRIMARY \
+                 sampled document and reports the other candidates under `held_out`, per \
+                 candidate, never pooled; `rejections` names any degenerate-draft finding \
+                 (const-only rule set, `each` field empty on every document, coercion-failed \
+                 field) that vetoes acceptance whatever the match rate; \
                  `samples` records, per seed, the fetch tier that actually served it, which \
                  body field carried it, its byte count and the per-tier trace; `confidence` \
                  is 0-100 and `catalog_confidence` its 1-5 catalog-scale projection; \
@@ -860,18 +1059,36 @@ impl ScrapeApp for Provisioner {
                     continue;
                 }
             };
-            match dry_run(&rules, &bodies) {
+            // The draft is written against `bodies[0]`, so that is what it is
+            // scored against; the other candidates are held-out evidence.
+            let held: Vec<HeldOutDoc<'_>> = bodies
+                .iter()
+                .zip(seeds.iter())
+                .skip(1)
+                .map(|(body, url)| HeldOutDoc { url, body })
+                .collect();
+            match dry_run(&rules, &bodies[0], &held) {
                 Ok(dry) => {
                     let accepted = dry.accepted;
                     feedback = (!accepted).then(|| {
-                        format!(
-                            "{}/{} fields matched a majority of {} sampled docs; \
-                             failing fields (worst first): {}",
-                            dry.fields_matched,
-                            dry.fields_total,
-                            dry.docs,
-                            dry.worst_fields.join(", ")
-                        )
+                        // A degenerate draft gets its own reason, not a score:
+                        // "3/4 fields matched" would be actively misleading
+                        // feedback for a rule set of nothing but constants.
+                        if !dry.rejections.is_empty() {
+                            format!(
+                                "the draft is unusable regardless of its match rate: {}",
+                                dry.rejections.join("; ")
+                            )
+                        } else {
+                            format!(
+                                "{}/{} fields held on the page the draft was written against \
+                                 ({}); failing fields: {}",
+                                dry.fields_held,
+                                dry.fields_total,
+                                primary.url,
+                                dry.worst_fields.join(", ")
+                            )
+                        }
                     });
                     last_rules_value = Some(draft);
                     last_dry = Some(dry);
@@ -947,6 +1164,7 @@ impl ScrapeApp for Provisioner {
             "iterations": iterations,
             "accepted": dry.accepted,
             "verdict": if dry.accepted { "accepted" } else { "rejected" },
+            "rejections": dry.rejections,
             "confidence": conf,
             "catalog_confidence": row.confidence,
             "sample_stats": serde_json::to_value(&dry)?,
@@ -1144,6 +1362,19 @@ mod tests {
 
     // ── dry-run harness (the LLM boundary stubbed: drafts are fixtures) ─────
 
+    /// A DIFFERENT site's listing page — same data, entirely different markup.
+    /// This is what a second or third candidate actually looks like, and why
+    /// pooling it into the accept bar was incoherent.
+    const OTHER_SITE: &str = r#"
+        <html><body><header><span class="page-title">Prices</span></header>
+        <ul class="results">
+            <li class="row"><b>Delta</b><em>40 USD</em></li>
+        </ul></body></html>"#;
+
+    fn held<'a>(url: &'a str, body: &'a str) -> HeldOutDoc<'a> {
+        HeldOutDoc { url, body }
+    }
+
     #[test]
     fn good_draft_is_accepted_by_the_dry_run() {
         let rules = ruleset(json!({
@@ -1153,24 +1384,26 @@ mod tests {
                                  "price": {"type": "css", "selector": ".price",
                                            "transforms": [{"op": "to_number"}]}}}
         }));
-        let dry = dry_run(&rules, &[FIXTURE.to_string()]).unwrap();
+        let dry = dry_run(&rules, FIXTURE, &[]).unwrap();
         assert!(dry.accepted);
-        assert_eq!(dry.fields_matched, 2);
+        assert_eq!(dry.fields_held, 2);
         assert!(dry.worst_fields.is_empty());
+        assert!(dry.rejections.is_empty());
+        assert_eq!(dry.stats["items"].items, Some(2));
         assert_eq!(confidence(&dry), 100);
     }
 
     #[test]
     fn majority_miss_is_rejected_and_names_the_worst_fields() {
-        // 1 of 3 fields binds — no majority.
+        // 1 of 3 fields holds — no majority on the primary document.
         let rules = ruleset(json!({
             "heading": {"type": "css", "selector": "h1"},
             "author": {"type": "css", "selector": ".author"},
             "date": {"type": "css", "selector": "time"}
         }));
-        let dry = dry_run(&rules, &[FIXTURE.to_string()]).unwrap();
+        let dry = dry_run(&rules, FIXTURE, &[]).unwrap();
         assert!(!dry.accepted);
-        assert_eq!(dry.fields_matched, 1);
+        assert_eq!(dry.fields_held, 1);
         assert_eq!(dry.worst_fields, vec!["author".to_string(), "date".into()]);
     }
 
@@ -1180,16 +1413,16 @@ mod tests {
             "heading": {"type": "css", "selector": "h1"},
             "missing": {"type": "css", "selector": ".nope"}
         }));
-        let dry = dry_run(&rules, &[FIXTURE.to_string()]).unwrap();
+        let dry = dry_run(&rules, FIXTURE, &[]).unwrap();
         assert!(!dry.accepted, "strict majority: 1/2 must not pass");
     }
 
     #[test]
     fn uncompilable_draft_is_feedback_not_a_scored_zero() {
         let rules = ruleset(json!({"x": {"type": "css", "selector": ":::"}}));
-        assert!(dry_run(&rules, &[FIXTURE.to_string()]).is_err());
+        assert!(dry_run(&rules, FIXTURE, &[]).is_err());
         // And an empty rule object is equally a loud error.
-        assert!(dry_run(&ruleset(json!({})), &[FIXTURE.to_string()]).is_err());
+        assert!(dry_run(&ruleset(json!({})), FIXTURE, &[]).is_err());
     }
 
     #[test]
@@ -1198,13 +1431,12 @@ mod tests {
         // research's tests stub its engine boundary: draft 1 fails (feedback
         // names the broken field), draft 2 — "repaired" — is accepted. Two
         // iterations, matching max_iterations' default.
-        let bodies = vec![FIXTURE.to_string()];
         let draft1 = ruleset(json!({
             "heading": {"type": "css", "selector": "h1"},
             "name": {"type": "css", "selector": ".product-name"}, // wrong
             "price": {"type": "css", "selector": ".cost"}         // wrong
         }));
-        let first = dry_run(&draft1, &bodies).unwrap();
+        let first = dry_run(&draft1, FIXTURE, &[]).unwrap();
         assert!(!first.accepted);
         assert_eq!(first.worst_fields, vec!["name".to_string(), "price".into()]);
 
@@ -1213,19 +1445,178 @@ mod tests {
             "name": {"type": "css", "selector": ".card h3", "all": true},
             "price": {"type": "css", "selector": ".card .price", "all": true}
         }));
-        let second = dry_run(&draft2, &bodies).unwrap();
+        let second = dry_run(&draft2, FIXTURE, &[]).unwrap();
         assert!(second.accepted, "repaired draft must stop the loop");
-        assert_eq!(second.fields_matched, 3);
+        assert_eq!(second.fields_held, 3);
+    }
+
+    // ── scoring is per-document, not pooled across sites ────────────────────
+
+    /// The incoherence this replaces: the draft was written against `bodies[0]`
+    /// alone but scored as a pooled two-level majority over up to three bodies
+    /// from DIFFERENT SITES. A field that binds only on its own page needed
+    /// `1*2 >= 3` with three samples and failed — so the number of candidates
+    /// that happened to fetch silently moved the pass bar, and repair
+    /// iterations burned on a cross-site mismatch no selector can fix.
+    #[test]
+    fn the_accept_bar_reads_the_primary_document_not_a_pool_of_other_sites() {
+        let rules = ruleset(json!({
+            "heading": {"type": "css", "selector": "h1"},
+            "items": {"type": "each", "selector": ".card", "container": "#list",
+                      "fields": {"name": {"type": "css", "selector": "h3"}}}
+        }));
+        // Alone: a clean pass.
+        let alone = dry_run(&rules, FIXTURE, &[]).unwrap();
+        assert!(alone.accepted);
+        assert_eq!(confidence(&alone), 100);
+
+        // With two unrelated sites added — the SAME draft against the SAME page
+        // it was written for. Under the old pooled bar these selectors bound on
+        // 1 of 3 docs and the draft was rejected.
+        let with_others = dry_run(
+            &rules,
+            FIXTURE,
+            &[
+                held("https://b.example", OTHER_SITE),
+                held("https://c.example", OTHER_SITE),
+            ],
+        )
+        .unwrap();
+        assert!(
+            with_others.accepted,
+            "adding candidates must not move the pass bar"
+        );
+        assert_eq!(
+            confidence(&with_others),
+            confidence(&alone),
+            "confidence must not move with the sample count either"
+        );
+
+        // The held-out evidence is REPORTED, per candidate, never pooled.
+        assert_eq!(with_others.docs, 3);
+        assert_eq!(with_others.held_out.len(), 2);
+        assert_eq!(with_others.held_out[0].url, "https://b.example");
+        assert_eq!(with_others.held_out[0].fields_held, 0);
+        assert_eq!(with_others.held_out[0].fields_total, 2);
+        assert_eq!(
+            with_others.held_out[0].fields_missing,
+            vec!["heading".to_string(), "items".into()]
+        );
+        // …and it did not contaminate the primary's own stats.
+        assert!(with_others.worst_fields.is_empty());
+    }
+
+    // ── degenerate drafts ───────────────────────────────────────────────────
+
+    /// `Rule::Const` always binds, so a rule set of nothing but constants
+    /// scored a perfect 100 against any document — including an empty one —
+    /// and stopped the loop having extracted zero facts from the page.
+    #[test]
+    fn a_const_only_draft_is_rejected_not_scored_a_perfect_hundred() {
+        let rules = ruleset(json!({
+            "source": {"type": "const", "value": "widgets"},
+            "currency": {"type": "const", "value": "USD"}
+        }));
+        assert!(const_only_rule_set(&rules));
+        let dry = dry_run(&rules, FIXTURE, &[]).unwrap();
+        assert_eq!(dry.fields_held, 2, "constants do bind — that is the trap");
+        assert!(!dry.accepted, "…but a draft that reads nothing is unusable");
+        assert!(dry.rejections[0].contains("every rule is a `const`"));
+        assert_eq!(confidence(&dry), 0, "a rejected draft has no confidence");
+        // One const among real selectors is fine — that is a legitimate
+        // provenance/constant field, not a degenerate draft.
+        let mixed = ruleset(json!({
+            "currency": {"type": "const", "value": "USD"},
+            "heading": {"type": "css", "selector": "h1"}
+        }));
+        assert!(!const_only_rule_set(&mixed));
+        assert!(dry_run(&mixed, FIXTURE, &[]).unwrap().accepted);
+    }
+
+    /// `ContainerEmpty` is deliberately not a miss (a quiet job board is not a
+    /// broken selector) — but that reasoning needs a selector with a track
+    /// record, and a draft has none. An `each` rule empty on EVERY sample is
+    /// exactly the listing selector never shown to work, and it used to pass.
+    #[test]
+    fn an_each_field_empty_on_every_doc_is_rejected_not_counted_as_bound() {
+        let rules = ruleset(json!({
+            "heading": {"type": "css", "selector": "h1"},
+            "items": {"type": "each", "selector": ".no-such-item", "container": "#list",
+                      "fields": {"name": {"type": "css", "selector": "h3"}}}
+        }));
+        let dry = dry_run(&rules, FIXTURE, &[]).unwrap();
+        // The container matched, so the engine reports it bound, not missed.
+        assert!(dry.stats["items"].bound);
+        assert_eq!(dry.stats["items"].items, Some(0));
+        assert!(!dry.accepted);
+        assert!(dry.rejections[0].contains("0 items on every sampled document"));
+
+        // The pure predicate: empty everywhere is a rejection, empty somewhere
+        // is not — a genuinely quiet listing on one page must stay usable.
+        let m = |n: usize| BTreeMap::from([("items".to_string(), n)]);
+        assert_eq!(always_empty_each_fields(&[m(0), m(0)]), vec!["items"]);
+        assert!(always_empty_each_fields(&[m(0), m(3)]).is_empty());
+        assert!(always_empty_each_fields(&[]).is_empty());
+    }
+
+    /// `to_number` over `"Add to cart"` yields null while the field still
+    /// reports `Matched`. The engine has always computed this
+    /// (`CoercionStatus::CoercionFailed`) and the dry run never read it, so a
+    /// selector pointing at the wrong element counted as a working one.
+    #[test]
+    fn a_coercion_failed_field_is_rejected_not_counted_as_matched() {
+        let rules = ruleset(json!({
+            "heading": {"type": "css", "selector": "h1"},
+            // Matches the <h3>, which is a product name, not a number.
+            "price": {"type": "css", "selector": ".card h3",
+                      "transforms": [{"op": "to_number"}]}
+        }));
+        let dry = dry_run(&rules, FIXTURE, &[]).unwrap();
+        assert!(
+            dry.stats["price"].bound,
+            "the selector did match — the trap"
+        );
+        assert_eq!(dry.stats["price"].coercion, "coercion_failed");
+        assert!(!dry.stats["price"].holds(), "a wrong element is not a hold");
+        assert!(!dry.accepted);
+        assert!(dry.rejections[0].contains("price"));
+        assert_eq!(confidence(&dry), 0);
+    }
+
+    /// Every rejection is decided from the extraction the dry run ALREADY ran,
+    /// so it is known before the loop can spend a repair call — and a
+    /// degenerate draft can never be the thing that stops the loop.
+    #[test]
+    fn degenerate_rejections_are_deterministic_and_need_no_metered_call() {
+        for rules in [
+            json!({"a": {"type": "const", "value": 1}}),
+            json!({"a": {"type": "each", "selector": ".none", "container": "#list",
+                         "fields": {"x": {"type": "css", "selector": "h3"}}}}),
+            json!({"a": {"type": "css", "selector": ".card h3",
+                         "transforms": [{"op": "to_number"}]}}),
+        ] {
+            let rs = ruleset(rules);
+            let a = dry_run(&rs, FIXTURE, &[]).unwrap();
+            let b = dry_run(&rs, FIXTURE, &[]).unwrap();
+            assert!(!a.rejections.is_empty());
+            assert_eq!(a.rejections, b.rejections, "must be deterministic");
+            assert!(!a.accepted);
+        }
     }
 
     #[test]
-    fn confidence_reflects_partial_binding() {
+    fn confidence_reflects_partial_binding_of_the_primary_document() {
         let rules = ruleset(json!({
             "heading": {"type": "css", "selector": "h1"},
             "missing": {"type": "css", "selector": ".nope"}
         }));
-        let dry = dry_run(&rules, &[FIXTURE.to_string()]).unwrap();
+        let dry = dry_run(&rules, FIXTURE, &[]).unwrap();
         assert_eq!(confidence(&dry), 50);
+        // Held-out candidates are evidence, not score: adding a site where
+        // nothing binds must not change the number.
+        let with_other =
+            dry_run(&rules, FIXTURE, &[held("https://b.example", OTHER_SITE)]).unwrap();
+        assert_eq!(confidence(&with_other), 50);
     }
 
     // ── proposal record honesty ─────────────────────────────────────────────
@@ -1233,7 +1624,7 @@ mod tests {
     /// An accepted dry run over [`FIXTURE`], for row-shaping tests.
     fn fixture_dry() -> DryRun {
         let rules = ruleset(json!({"heading": {"type": "css", "selector": "h1"}}));
-        dry_run(&rules, &[FIXTURE.to_string()]).unwrap()
+        dry_run(&rules, FIXTURE, &[]).unwrap()
     }
 
     /// A rejected dry run over [`FIXTURE`] — nothing binds.
@@ -1242,7 +1633,7 @@ mod tests {
             "author": {"type": "css", "selector": ".author"},
             "date": {"type": "css", "selector": "time"}
         }));
-        dry_run(&rules, &[FIXTURE.to_string()]).unwrap()
+        dry_run(&rules, FIXTURE, &[]).unwrap()
     }
 
     /// The row wrote this app's 0–100 score straight into a catalog column
@@ -1341,7 +1732,7 @@ mod tests {
     #[test]
     fn proposal_carries_the_full_promised_shape() {
         let rules = ruleset(json!({"heading": {"type": "css", "selector": "h1"}}));
-        let dry = dry_run(&rules, &[FIXTURE.to_string()]).unwrap();
+        let dry = dry_run(&rules, FIXTURE, &[]).unwrap();
         let c = cand("https://a.example/widgets");
         let row = build_catalog_row(
             "track widget prices weekly",
