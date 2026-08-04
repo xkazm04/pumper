@@ -56,11 +56,12 @@ pub use cache::{HttpCache, KeyFreshness, ResearchCache, StaleEntry};
 pub use costs::{extract_yields, CostEvent, CostLedger, CostSummary, SpentTotal, YieldEntry};
 #[cfg(feature = "storage")]
 pub use datasets::{
-    derived_spec_fingerprint, derived_would_cycle, diff_values, filters_match, parse_aggregate,
-    parse_aggregates, parse_filter_spec, parse_filter_specs, parse_stored_join, project_value,
-    trust_label, validate_group, weakest_trust, Aggregate, ChangeKind, Datasets, DerivedBackfill,
-    DerivedGroup, DerivedLookup, DerivedSpec, DupPair, Provenance, Record, ReplayableRevision,
-    Revision, RevisionPage, UpsertSummary, TRUST_STABLE,
+    backfill_cursor, derived_spec_fingerprint, derived_would_cycle, diff_values, filters_match,
+    parse_aggregate, parse_aggregates, parse_backfill_cursor, parse_filter_spec,
+    parse_filter_specs, parse_stored_join, project_value, trust_label, validate_group,
+    weakest_trust, Aggregate, BackfillOpts, ChangeKind, Datasets, DerivedBackfill, DerivedGroup,
+    DerivedLookup, DerivedSpec, DupPair, Provenance, Record, ReplayableRevision, Revision,
+    RevisionPage, UpsertSummary, DEFAULT_BACKFILL_MAX_ROWS, TRUST_STABLE,
 };
 #[cfg(feature = "storage")]
 pub use doctor::{

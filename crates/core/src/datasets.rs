@@ -2223,19 +2223,21 @@ impl Datasets {
                     continue;
                 }
             };
-            let mut out: Vec<DerivedRowOut> = Vec::new();
-            for key in summary.fresh_keys() {
-                let Some(data) = by_key.get(key.as_str()) else {
+            let fresh: Vec<(&str, &Value, Option<&str>)> = summary
+                .fresh_keys()
+                .filter_map(|key| {
+                    by_key
+                        .get(key.as_str())
+                        .map(|data| (key.as_str(), *data, trust))
+                })
+                .collect();
+            let out = match self.derive_rows(spec, &filters, &fresh).await {
+                Ok(rows) => rows,
+                Err(e) => {
+                    tracing::warn!(spec = %spec.id, "derived: batch skipped: {e}");
                     continue;
-                };
-                match self.derive_row(spec, &filters, key, data, trust).await {
-                    Ok(Some(row)) => out.push(row),
-                    Ok(None) => {}
-                    Err(e) => {
-                        tracing::warn!(spec = %spec.id, key = %key, "derived: row skipped: {e}");
-                    }
                 }
-            }
+            };
             if out.is_empty() {
                 continue;
             }
@@ -2247,57 +2249,157 @@ impl Datasets {
         }
     }
 
-    /// Applies one spec to one source record: filter → project → lookup-merge.
-    /// `Ok(None)` = filtered out; the derived key is the source key (1:1).
+    /// Applies one spec to a WHOLE batch of source records: filter → project →
+    /// lookup-merge, keyed 1:1 by the source key. Filtered-out records simply
+    /// do not appear in the output.
     ///
-    /// `filters` is passed in already parsed (once per batch, not once per
-    /// record), and `source_trust` is the trust of the record being derived
-    /// from; the returned row carries [`weakest_trust`] of that and of any
-    /// record it joined to.
-    async fn derive_row(
+    /// Batch-shaped on purpose. The join used to be one `SELECT … WHERE key = ?`
+    /// **per source record**, so a 50k-row backfill with a lookup issued 50k
+    /// point queries; the keys are now collected across the batch, deduped, and
+    /// read in `IN (…)` chunks bounded by [`MAX_BIND_PARAMS`] — the same idiom
+    /// the batch upsert's `read_key_states` uses. `filters` arrives already
+    /// parsed, so the spec's grammar is parsed once per batch, never per row.
+    ///
+    /// A missing lookup key/record merges nothing — the row still lands, so a
+    /// late-arriving lookup side fills in on the next source delta.
+    async fn derive_rows(
         &self,
         spec: &DerivedSpec,
         filters: &[JsonFilter],
-        key: &str,
-        data: &Value,
-        source_trust: Option<&str>,
-    ) -> Result<Option<DerivedRowOut>> {
-        if !filters_match(filters, data) {
-            return Ok(None);
+        rows: &[(&str, &Value, Option<&str>)],
+    ) -> Result<Vec<DerivedRowOut>> {
+        // Pass 1 (pure): filter + project, remembering each survivor's join key.
+        let mut shaped: Vec<(String, Value, Option<&str>, Option<String>)> = Vec::new();
+        for (key, data, trust) in rows {
+            if !filters_match(filters, data) {
+                continue;
+            }
+            let value = project_value(&spec.project, data);
+            let join_key = spec
+                .lookup
+                .as_ref()
+                .and_then(|l| lookup_json_path(data, &l.key_expr))
+                .and_then(value_text);
+            shaped.push((key.to_string(), value, *trust, join_key));
         }
-        let mut value = project_value(&spec.project, data);
-        let mut joined_trust: Option<String> = None;
-        if let Some(lookup) = &spec.lookup {
-            // Single-key join: resolve the key expression against the SOURCE
-            // record, fetch from the sibling dataset, merge under `merge_as`.
-            // A missing key/record merges nothing — the row still lands, so a
-            // late-arriving lookup side fills in on the next source delta.
-            if let Some(lk) = lookup_json_path(data, &lookup.key_expr).and_then(value_text) {
-                if let Some(rec) = self.get(&spec.source_app, &lookup.dataset, &lk).await? {
-                    if rec.removed_at.is_none() {
-                        joined_trust = Some(rec.trust.clone());
+        // Pass 2 (one query per bind-limited chunk, not per row): resolve the
+        // join side for every distinct key this batch asked for.
+        let joined = match &spec.lookup {
+            Some(lookup) if !shaped.is_empty() => {
+                let mut keys: Vec<&str> = shaped
+                    .iter()
+                    .filter_map(|(_, _, _, k)| k.as_deref())
+                    .collect();
+                keys.sort_unstable();
+                keys.dedup();
+                self.live_records_by_key(&spec.source_app, &lookup.dataset, &keys)
+                    .await?
+            }
+            _ => Default::default(),
+        };
+        // Pass 3 (pure): merge + settle the inherited trust.
+        Ok(shaped
+            .into_iter()
+            .map(|(key, mut value, source_trust, join_key)| {
+                let mut joined_trust: Option<String> = None;
+                if let (Some(lookup), Some(jk)) = (&spec.lookup, join_key) {
+                    if let Some((data, trust)) = joined.get(&jk) {
+                        joined_trust = Some(trust.clone());
                         if let Value::Object(map) = &mut value {
-                            map.insert(lookup.merge_as.clone(), rec.data);
+                            map.insert(lookup.merge_as.clone(), data.clone());
                         }
                     }
                 }
+                let trust = weakest_trust([source_trust, joined_trust.as_deref()]);
+                (key, value, trust)
+            })
+            .collect())
+    }
+
+    /// `(data, trust)` of every LIVE record among `keys`, read in one statement
+    /// per bind-limited chunk. Tombstoned rows are excluded in SQL — the
+    /// per-record join checked `removed_at.is_none()` in Rust, same semantics.
+    async fn live_records_by_key(
+        &self,
+        app: &str,
+        dataset: &str,
+        keys: &[&str],
+    ) -> Result<std::collections::HashMap<String, (Value, String)>> {
+        let mut out = std::collections::HashMap::with_capacity(keys.len());
+        for slice in keys.chunks(rows_per_statement(1, 2)) {
+            let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+                "SELECT key, data, trust FROM records WHERE removed_at IS NULL AND app = ",
+            );
+            qb.push_bind(app);
+            qb.push(" AND dataset = ");
+            qb.push_bind(dataset);
+            qb.push(" AND key IN (");
+            push_key_list(&mut qb, slice);
+            qb.push(")");
+            let rows: Vec<(String, String, Option<String>)> =
+                qb.build_query_as().fetch_all(&self.pool).await?;
+            for (key, data, trust) in rows {
+                out.insert(
+                    key,
+                    (
+                        serde_json::from_str(&data).unwrap_or(Value::Null),
+                        trust_label(trust.as_deref()),
+                    ),
+                );
             }
         }
-        let trust = weakest_trust([source_trust, joined_trust.as_deref()]);
-        Ok(Some((key.to_string(), value, trust)))
+        Ok(out)
     }
 
     /// Materializes one spec over the existing live source rows in bounded
-    /// keyset batches (`POST /derived/{id}/backfill`). Runs at depth 1, so a
-    /// backfill's downstream cascade obeys the same cap as the live path.
+    /// keyset batches, with the default row budget
+    /// ([`BackfillOpts::default`]). See
+    /// [`backfill_derived_budgeted`](Self::backfill_derived_budgeted).
     pub async fn backfill_derived(
         &self,
         spec: &DerivedSpec,
         batch: i64,
     ) -> Result<DerivedBackfill> {
-        let batch = batch.clamp(1, MAX_BACKFILL_BATCH);
+        self.backfill_derived_budgeted(
+            spec,
+            &BackfillOpts {
+                batch,
+                ..Default::default()
+            },
+        )
+        .await
+    }
+
+    /// Materializes one spec over the existing live source rows in keyset pages
+    /// of `opts.batch` (`POST /derived/{id}/backfill`). Runs at depth 1, so a
+    /// backfill's downstream cascade obeys the same cap as the live path.
+    ///
+    /// **Budgeted and resumable.** The whole loop runs inside one HTTP request,
+    /// so an unbounded pass over a large source is a request that never returns
+    /// and, if the client gives up, restarts from zero. It now stops after
+    /// `opts.max_rows` scanned rows and hands back `done: false` plus the
+    /// keyset `cursor` to pass to the next call. Resuming is safe because the
+    /// work is idempotent per row: every page recomputes its rows from source
+    /// truth and the target's own change detection turns a repeat into
+    /// `unchanged`, so a resumed run, a re-run from scratch and an overlapping
+    /// retry all converge on the same rows.
+    ///
+    /// **Aggregate specs cannot resume mid-corpus** — a group's members are
+    /// spread across the whole scan order, so a partial pass would write
+    /// partial totals. They therefore treat the budget as a *ceiling*: over it,
+    /// the backfill fails with a `BadRequest` naming the limit and writes
+    /// NOTHING, rather than publishing a number it did not finish computing.
+    pub async fn backfill_derived_budgeted(
+        &self,
+        spec: &DerivedSpec,
+        opts: &BackfillOpts,
+    ) -> Result<DerivedBackfill> {
+        let batch = opts.batch.clamp(1, MAX_BACKFILL_BATCH);
+        let max_rows = opts.max_rows.max(1);
         if let Some(group) = &spec.group {
-            return self.backfill_derived_group(spec, group, batch).await;
+            return self
+                .backfill_derived_group(spec, group, batch, max_rows)
+                .await;
         }
         // Parsed ONCE for the whole backfill — the live path hoists it per
         // batch and the group path always did; only this loop re-parsed the
@@ -2305,25 +2407,21 @@ impl Datasets {
         let filters = parse_filter_specs(&spec.filters)?;
         let stamp = self.derived_provenance(spec, None).await;
         let mut report = DerivedBackfill::default();
-        let mut after: Option<(String, String)> = None;
+        let mut after = opts.cursor.as_deref().and_then(parse_backfill_cursor);
+        let mut examined: i64 = 0;
         loop {
             let page = self
                 .list_page(&spec.source_app, &spec.source_dataset, after, batch, None)
                 .await?;
             let n = page.len() as i64;
-            let mut items: Vec<DerivedRowOut> = Vec::new();
-            for rec in &page {
-                if rec.removed_at.is_some() {
-                    continue;
-                }
-                report.scanned += 1;
-                if let Some(row) = self
-                    .derive_row(spec, &filters, &rec.key, &rec.data, Some(&rec.trust))
-                    .await?
-                {
-                    items.push(row);
-                }
-            }
+            examined += n;
+            let live: Vec<(&str, &Value, Option<&str>)> = page
+                .iter()
+                .filter(|r| r.removed_at.is_none())
+                .map(|r| (r.key.as_str(), &r.data, Some(r.trust.as_str())))
+                .collect();
+            report.scanned += live.len() as u64;
+            let items = self.derive_rows(spec, &filters, &live).await?;
             report.matched += items.len() as u64;
             if !items.is_empty() {
                 let s = self.upsert_derived_rows(spec, items, &stamp, 1).await?;
@@ -2331,10 +2429,17 @@ impl Datasets {
                 report.changed += s.changed.len() as u64;
                 report.unchanged += s.unchanged as u64;
             }
+            // A short page means the source is exhausted, whatever the budget.
             if n < batch {
+                report.done = true;
                 break;
             }
-            after = page.last().map(|r| (ts(r.updated_at), r.key.clone()));
+            let next = page.last().map(backfill_cursor);
+            if examined >= max_rows {
+                report.cursor = next;
+                break;
+            }
+            after = next.as_deref().and_then(parse_backfill_cursor);
         }
         Ok(report)
     }
@@ -2629,11 +2734,16 @@ impl Datasets {
     /// whose last source row disappeared before the backfill keep their old
     /// derived row (backfill only sees groups that still have rows); the live
     /// removal hook is what zeroes a group as it empties.
+    ///
+    /// `max_rows` is a ceiling, not a budget: an aggregate needs the whole
+    /// corpus in one pass, so exceeding it is an error that writes nothing —
+    /// never a partial total published as if it were final.
     async fn backfill_derived_group(
         &self,
         spec: &DerivedSpec,
         group: &DerivedGroup,
         batch: i64,
+        max_rows: i64,
     ) -> Result<DerivedBackfill> {
         let filters = parse_filter_specs(&spec.filters)?;
         let aggs = parse_aggregates(&group.aggregates)?;
@@ -2644,11 +2754,22 @@ impl Datasets {
         let mut groups: std::collections::HashMap<Vec<String>, GroupAccumulator> =
             Default::default();
         let mut after: Option<(String, String)> = None;
+        let mut examined: i64 = 0;
         loop {
             let page = self
                 .list_page(&spec.source_app, &spec.source_dataset, after, batch, None)
                 .await?;
             let n = page.len() as i64;
+            examined += n;
+            if examined > max_rows {
+                return Err(Error::BadRequest(format!(
+                    "derived spec '{}' aggregates, and an aggregate backfill must scan the whole \
+                     source in ONE pass (a group's members are spread across the scan order, so a \
+                     partial pass would publish partial totals). The source exceeds max_rows={}; \
+                     nothing was written — re-run with a larger max_rows.",
+                    spec.id, max_rows
+                )));
+            }
             for rec in &page {
                 if rec.removed_at.is_some() {
                     continue;
@@ -2710,6 +2831,9 @@ impl Datasets {
             report.changed += s.changed.len() as u64;
             report.unchanged += s.unchanged as u64;
         }
+        // A group backfill either completes its single pass or errors out
+        // above — it never hands back a cursor.
+        report.done = true;
         Ok(report)
     }
 }
@@ -2961,16 +3085,75 @@ pub struct DerivedSpec {
     pub created_at: DateTime<Utc>,
 }
 
-/// Outcome of a backfill run over the existing source rows.
+/// Outcome of ONE backfill request over the existing source rows.
 #[derive(Debug, Default, Serialize)]
 pub struct DerivedBackfill {
-    /// Live source rows examined.
+    /// Live source rows examined **by this request**.
     pub scanned: u64,
     /// Rows that passed the spec's filters and were upserted.
     pub matched: u64,
     pub new: u64,
     pub changed: u64,
     pub unchanged: u64,
+    /// True when the source was scanned to its end. `false` means the row
+    /// budget stopped this request early — the counters describe this slice,
+    /// not the whole spec.
+    pub done: bool,
+    /// Keyset cursor to resume from, present exactly when `done` is false.
+    /// Feed it back as `cursor` on the next request.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+/// Rows one backfill request scans before it stops and hands back a cursor.
+///
+/// The backfill runs synchronously inside an HTTP request, so the ceiling is
+/// what keeps that request bounded. 50k pages a large corpus in a handful of
+/// calls while staying well inside any sane proxy timeout.
+pub const DEFAULT_BACKFILL_MAX_ROWS: i64 = 50_000;
+
+/// One backfill request's bounds and resume point.
+#[derive(Debug, Clone)]
+pub struct BackfillOpts {
+    /// Rows per keyset page (clamped to `1..=`[`MAX_BACKFILL_BATCH`]).
+    pub batch: i64,
+    /// Rows this request may scan before returning a cursor (aggregate specs
+    /// treat it as a hard ceiling — see
+    /// [`Datasets::backfill_derived_budgeted`]).
+    pub max_rows: i64,
+    /// Resume point from a previous response's `cursor`; `None` starts over.
+    pub cursor: Option<String>,
+}
+
+impl Default for BackfillOpts {
+    fn default() -> Self {
+        Self {
+            batch: 500,
+            max_rows: DEFAULT_BACKFILL_MAX_ROWS,
+            cursor: None,
+        }
+    }
+}
+
+/// The resume cursor for a page's last record: `<updated_at>|<key>`, the same
+/// `updated_at|key` keyset encoding the record and job list endpoints use. The
+/// timestamp is fixed-width and holds no `|`, so splitting on the FIRST one is
+/// unambiguous even for a key that contains a pipe.
+pub fn backfill_cursor(rec: &Record) -> String {
+    format!("{}|{}", ts(rec.updated_at), rec.key)
+}
+
+/// Parses a [`backfill_cursor`]. A blank or separator-less value starts from
+/// the top rather than failing the request — the same forgiving contract the
+/// HTTP cursor parsers have.
+pub fn parse_backfill_cursor(cursor: &str) -> Option<(String, String)> {
+    let trimmed = cursor.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    trimmed
+        .split_once('|')
+        .map(|(t, k)| (t.to_string(), k.to_string()))
 }
 
 pub(crate) const DERIVED_COLUMNS: &str =

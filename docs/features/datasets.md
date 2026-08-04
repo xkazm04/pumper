@@ -101,6 +101,16 @@ Before this, derived rows were written with `trust = NULL`, and NULL **means** `
 
 **Provenance.** Every derived revision stamps `rules_hash` = the hash of the spec's canonical fingerprint (id + source/target + filters/project/lookup/group), registered in `rules_versions` exactly like an extractor's RuleSet (migration 0030), so the derivation that produced a row is inspectable and an edited spec hashes apart from rows written under its old shape. It also inherits the source write's `job_id`. `source_url`/`artifact_sha` stay **Null**: a derived row was not fetched and has no archived body, so it never claims to be replayable. **Existing derived rows are not restamped retroactively** — stamps are never rewritten in place; re-running `POST /derived/{id}/backfill` rewrites them through the normal write path.
 
+**Backfill is budgeted and resumable.** `POST /derived/{id}/backfill` takes `{batch, max_rows, cursor}` and answers `{scanned, matched, new, changed, unchanged, done, cursor?}`:
+
+- `batch` — rows per keyset page (1..=1000, default 500).
+- `max_rows` — rows **this request** may scan (default 50,000). Hitting it returns `done: false` and a `cursor`; call again with that `cursor` to continue. `done: true` means the source was scanned to its end and no `cursor` comes back.
+- The counters describe the slice this request did, not the whole spec.
+- Resuming — or restarting from scratch, or retrying an overlapping range — is always safe: every page recomputes its rows from source truth and the target's change detection turns a repeat into `unchanged`.
+- **Aggregate specs treat `max_rows` as a hard ceiling instead of a budget.** A group's members are spread across the whole scan order, so a partial pass would publish partial totals; over the ceiling the request fails with **400** and writes nothing, naming the limit to raise.
+
+Before this the backfill looped the entire source inside the HTTP request with no bound, no progress and no cancellation — a large corpus meant a request that never returned, and a client that gave up restarted from zero. Two per-record costs went with it: the spec's filter grammar was re-parsed for **every source row** scanned (the aggregate path always hoisted it), and the `lookup` join issued one point query per row. Filters are now parsed once per request and join keys are deduped and read in `IN (…)` chunks bounded by the same bind-parameter limit the batch upsert uses. Measured on a 50k-row source with a 500-key lookup (16,667 matching rows, `crates/core/tests/derived_backfill_perf.rs`, `just test-ignored`): **1.77s vs 2.75s (−36%)**, with the join reduced from 16,667 point queries to ~100 chunked reads.
+
 **An unreadable spec is skipped, loudly.** The stored `lookup` column holds either the lookup or the group shape; a value that is present and unparseable used to parse as "neither", silently demoting a lookup/aggregate spec to a whole-record **passthrough** that kept writing wrong-shaped rows. It is now an error: the spec is logged at `error` and skipped (it writes nothing), `GET /derived` omits it rather than failing the whole listing, and `GET /derived/{id}` returns an error for that id.
 
 ## `datasets doctor` — store integrity report

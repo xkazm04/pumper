@@ -240,16 +240,24 @@ pub(crate) async fn set_derived_enabled(
 pub(crate) struct BackfillBody {
     /// Rows per keyset batch (clamped to 1..=1000; default 500).
     batch: Option<i64>,
+    /// Rows this request may scan before it stops and returns a `cursor`
+    /// (default 50000). Aggregate specs treat it as a hard ceiling instead:
+    /// they need one full pass, so exceeding it is a 400 that writes nothing.
+    max_rows: Option<i64>,
+    /// Resume point from a previous response's `cursor`. Absent starts over —
+    /// which is always safe, the work is idempotent per row.
+    cursor: Option<String>,
 }
 
 #[utoipa::path(
     post,
     path = "/derived/{id}/backfill",
     tag = "derived",
-    request_body(content = BackfillBody, description = "Optional `{batch}`"),
+    request_body(content = BackfillBody, description = "Optional `{batch, max_rows, cursor}`"),
     params(("id" = String, Path, description = "Spec id")),
     responses(
-        (status = 200, description = "Backfill summary: `{scanned, matched, new, changed, unchanged}`"),
+        (status = 200, description = "Backfill slice: `{scanned, matched, new, changed, unchanged, done, cursor?}`. `done: false` means the row budget stopped this request — call again with `cursor` to continue."),
+        (status = 400, description = "An aggregate spec's source exceeds `max_rows` (a partial aggregate pass is refused, not written)", body = Object),
         (status = 404, description = "Unknown spec", body = Object),
         (status = 409, description = "Spec is disabled", body = Object),
     )
@@ -273,7 +281,17 @@ pub(crate) async fn backfill_derived(
             format!("derived spec '{id}' is disabled"),
         ));
     }
-    let batch = body.and_then(|Json(b)| b.batch).unwrap_or(500);
-    let report = state.datasets.backfill_derived(&spec, batch).await?;
+    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let opts = pumper_core::BackfillOpts {
+        batch: body.batch.unwrap_or(500),
+        max_rows: body
+            .max_rows
+            .unwrap_or(pumper_core::DEFAULT_BACKFILL_MAX_ROWS),
+        cursor: body.cursor,
+    };
+    let report = state
+        .datasets
+        .backfill_derived_budgeted(&spec, &opts)
+        .await?;
     Ok(Json(report))
 }

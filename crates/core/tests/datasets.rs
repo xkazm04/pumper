@@ -1679,3 +1679,242 @@ async fn corrupt_lookup_column_skips_the_spec_not_writes_a_passthrough() {
         .is_empty());
     assert!(store.storage.get_derived_spec(&spec.id).await.is_err());
 }
+
+// ── derived: backfill budget + resume ────────────────────────────────────────
+
+/// The backfill loops the ENTIRE source synchronously inside one HTTP request.
+/// On a large corpus that is a request that never returns — and a client that
+/// gives up restarts from zero. It must stop at the budget and hand back a
+/// cursor instead of running to completion.
+#[tokio::test]
+async fn oversized_backfill_returns_a_cursor_not_a_full_pass() {
+    let store = fresh_db("derived-backfill-budget").await;
+    let ds = store.datasets();
+    let items: Vec<(String, serde_json::Value)> = (0..25)
+        .map(|i| (format!("k{i:02}"), json!({ "n": i })))
+        .collect();
+    ds.upsert_many("app", "src", &items).await.unwrap();
+    let spec = make_spec(&store.storage, "src", "tgt", &[], &[("n", "$.n")], None).await;
+
+    let first = ds
+        .backfill_derived_budgeted(
+            &spec,
+            &pumper_core::BackfillOpts {
+                batch: 5,
+                max_rows: 10,
+                cursor: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.scanned, 10, "the budget is respected, not exceeded");
+    assert!(!first.done, "25 rows do not fit in a 10-row budget");
+    let cursor = first
+        .cursor
+        .clone()
+        .expect("an unfinished pass hands back a cursor");
+    assert_eq!(
+        ds.list("app", "tgt", 100).await.unwrap().len(),
+        10,
+        "the slice it did scan is fully materialized"
+    );
+
+    // Resume: each call continues where the last stopped, no gap and no repeat.
+    let mut scanned = first.scanned;
+    let mut cursor = Some(cursor);
+    let mut guard = 0;
+    loop {
+        let next = ds
+            .backfill_derived_budgeted(
+                &spec,
+                &pumper_core::BackfillOpts {
+                    batch: 5,
+                    max_rows: 10,
+                    cursor: cursor.clone(),
+                },
+            )
+            .await
+            .unwrap();
+        scanned += next.scanned;
+        cursor = next.cursor.clone();
+        guard += 1;
+        assert!(guard < 10, "resume must terminate");
+        if next.done {
+            assert!(next.cursor.is_none(), "a finished pass has no cursor");
+            break;
+        }
+    }
+    assert_eq!(scanned, 25, "every source row was scanned exactly once");
+    assert_eq!(ds.list("app", "tgt", 100).await.unwrap().len(), 25);
+
+    // Idempotent: a re-run from scratch recomputes to all-unchanged.
+    let again = ds.backfill_derived(&spec, 5).await.unwrap();
+    assert!(again.done);
+    assert_eq!(again.new, 0);
+    assert_eq!(again.unchanged, 25);
+}
+
+/// A group's members are spread across the whole scan order, so a partial pass
+/// would publish partial totals. The budget is therefore a ceiling for
+/// aggregate specs: refuse loudly, write nothing.
+#[tokio::test]
+async fn group_backfill_refuses_a_partial_pass_instead_of_writing_partial_totals() {
+    let store = fresh_db("derived-backfill-group-budget").await;
+    let ds = store.datasets();
+    let items: Vec<(String, serde_json::Value)> = (0..20)
+        .map(|i| {
+            (
+                format!("k{i:02}"),
+                json!({ "state": if i % 2 == 0 { "CA" } else { "NY" }, "amount": 1 }),
+            )
+        })
+        .collect();
+    ds.upsert_many("app", "sales", &items).await.unwrap();
+    let spec = make_group_spec(
+        &store.storage,
+        "sales",
+        "by_state",
+        &[],
+        &["$.state"],
+        &[("n", "count")],
+    )
+    .await
+    .unwrap();
+    // Wipe what the live hook wrote, so anything present afterwards came from
+    // the refused backfill.
+    ds.delete_dataset("app", "by_state").await.unwrap();
+
+    let err = ds
+        .backfill_derived_budgeted(
+            &spec,
+            &pumper_core::BackfillOpts {
+                batch: 5,
+                max_rows: 10,
+                cursor: None,
+            },
+        )
+        .await;
+    assert!(
+        matches!(err, Err(pumper_core::Error::BadRequest(_))),
+        "an aggregate backfill over the ceiling must fail, not truncate"
+    );
+    assert!(
+        ds.list("app", "by_state", 10).await.unwrap().is_empty(),
+        "a refused aggregate pass writes NOTHING — never a partial total"
+    );
+
+    // With room for the whole corpus it completes exactly.
+    let ok = ds
+        .backfill_derived_budgeted(
+            &spec,
+            &pumper_core::BackfillOpts {
+                batch: 5,
+                max_rows: 1000,
+                cursor: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert!(ok.done);
+    assert_eq!(
+        ds.get("app", "by_state", "CA").await.unwrap().unwrap().data["n"],
+        json!(10)
+    );
+}
+
+/// A cursor is `updated_at|key`, and a key may itself contain a `|` — splitting
+/// on the LAST separator (or on every one) would corrupt the resume point.
+#[tokio::test]
+async fn backfill_cursor_round_trips_a_key_containing_a_pipe() {
+    let store = fresh_db("derived-backfill-cursor").await;
+    let ds = store.datasets();
+    ds.upsert_many(
+        "app",
+        "src",
+        &[("czisco|kraj|org".to_string(), json!({ "n": 1 }))],
+    )
+    .await
+    .unwrap();
+    let rec = ds
+        .get("app", "src", "czisco|kraj|org")
+        .await
+        .unwrap()
+        .unwrap();
+    let cursor = pumper_core::backfill_cursor(&rec);
+    let (ts, key) = pumper_core::parse_backfill_cursor(&cursor).unwrap();
+    assert_eq!(key, "czisco|kraj|org");
+    assert_eq!(ts, pumper_core::datasets::ts(rec.updated_at));
+    // Blank / separator-less cursors page from the top rather than failing.
+    assert_eq!(pumper_core::parse_backfill_cursor("  "), None);
+    assert_eq!(pumper_core::parse_backfill_cursor("garbage"), None);
+}
+
+/// The lookup join used to be one point query PER SOURCE RECORD. Batching it
+/// must not change a single derived row — same merges, same misses, same
+/// treatment of a tombstoned lookup row.
+#[tokio::test]
+async fn batched_lookup_join_matches_the_per_record_join() {
+    let store = fresh_db("derived-lookup-batched").await;
+    let ds = store.datasets();
+    ds.upsert_many(
+        "app",
+        "meta",
+        &[
+            ("m1".to_string(), json!({ "label": "one" })),
+            ("m2".to_string(), json!({ "label": "two" })),
+            ("gone".to_string(), json!({ "label": "removed" })),
+        ],
+    )
+    .await
+    .unwrap();
+    // `gone` is tombstoned: a removed lookup row merges nothing.
+    ds.tombstone_keys("app", "meta", &["gone".to_string()])
+        .await
+        .unwrap();
+
+    make_spec(
+        &store.storage,
+        "src",
+        "tgt",
+        &[],
+        &[("n", "$.n")],
+        Some(DerivedLookup {
+            dataset: "meta".into(),
+            key_expr: "$.meta".into(),
+            merge_as: "meta".into(),
+        }),
+    )
+    .await;
+
+    ds.upsert_many(
+        "app",
+        "src",
+        &[
+            // Two rows sharing one lookup key (deduped into one join read),
+            ("a".to_string(), json!({ "n": 1, "meta": "m1" })),
+            ("b".to_string(), json!({ "n": 2, "meta": "m1" })),
+            ("c".to_string(), json!({ "n": 3, "meta": "m2" })),
+            // a key with no lookup row, a tombstoned one, and no key at all.
+            ("d".to_string(), json!({ "n": 4, "meta": "missing" })),
+            ("e".to_string(), json!({ "n": 5, "meta": "gone" })),
+            ("f".to_string(), json!({ "n": 6 })),
+        ],
+    )
+    .await
+    .unwrap();
+
+    let got = |k: &str| {
+        let ds = &ds;
+        let k = k.to_string();
+        async move { ds.get("app", "tgt", &k).await.unwrap().unwrap().data }
+    };
+    assert_eq!(got("a").await["meta"], json!({ "label": "one" }));
+    assert_eq!(got("b").await["meta"], json!({ "label": "one" }));
+    assert_eq!(got("c").await["meta"], json!({ "label": "two" }));
+    for k in ["d", "e", "f"] {
+        assert!(
+            got(k).await.get("meta").is_none(),
+            "{k}: a missing/tombstoned lookup row merges nothing"
+        );
+    }
+}
