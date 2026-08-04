@@ -1603,24 +1603,44 @@ async fn dataset_search_docs(
                 continue;
             }
         };
-        // changes_since is newest-first; keep only the latest revision per key so
-        // a key changed twice in one run is indexed/deleted once, from its final state.
-        let mut seen = std::collections::HashSet::new();
-        for rev in revs {
-            if !seen.insert(rev.key.clone()) {
-                continue;
-            }
-            if rev.change == "removed" {
-                deletes.push(SearchDoc::dataset_id(app, dataset, &rev.key));
-            } else if let Some(data) = &rev.data {
-                docs.push(SearchDoc::from_dataset_record(
-                    app,
-                    dataset,
-                    &rev.key,
-                    data,
-                    rev.created_at.timestamp(),
-                ));
-            }
+        let (spec_docs, spec_deletes) = dataset_docs_from_revisions(app, dataset, &revs);
+        docs.extend(spec_docs);
+        deletes.extend(spec_deletes);
+    }
+    (docs, deletes)
+}
+
+/// The pure core of [`dataset_search_docs`]: one dataset's revision window →
+/// `(docs to index, doc ids to delete)`.
+///
+/// `changes_since` returns revisions **newest-first**, so the first revision seen
+/// for a key is its final state in this window; later ones are superseded and
+/// skipped. Without that dedupe a key written twice in one run would be indexed
+/// twice (harmless — same id, upsert) *or*, far worse, resurrected: a key that
+/// was changed and then removed would emit both a delete and an add, and the add
+/// would win.
+fn dataset_docs_from_revisions(
+    app: &str,
+    dataset: &str,
+    revs: &[pumper_core::Revision],
+) -> (Vec<SearchDoc>, Vec<String>) {
+    let mut docs = Vec::new();
+    let mut deletes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for rev in revs {
+        if !seen.insert(rev.key.as_str()) {
+            continue;
+        }
+        if rev.change == "removed" {
+            deletes.push(SearchDoc::dataset_id(app, dataset, &rev.key));
+        } else if let Some(data) = &rev.data {
+            docs.push(SearchDoc::from_dataset_record(
+                app,
+                dataset,
+                &rev.key,
+                data,
+                rev.created_at.timestamp(),
+            ));
         }
     }
     (docs, deletes)
@@ -1728,6 +1748,105 @@ mod job_result_doc_tests {
         assert!(
             sweeps_prior_job_snapshot(&mixed),
             "one identity-less doc in the batch is enough to have left ghosts"
+        );
+    }
+}
+
+#[cfg(test)]
+mod dataset_search_doc_tests {
+    use super::dataset_docs_from_revisions;
+    use chrono::{TimeZone, Utc};
+    use pumper_core::{Provenance, Revision};
+    use serde_json::json;
+
+    /// A revision as `changes_since` returns it (newest-first ordering is the
+    /// caller's; `secs` only stamps `created_at`).
+    fn rev(key: &str, change: &str, data: Option<serde_json::Value>, secs: i64) -> Revision {
+        Revision {
+            app: "grants".into(),
+            dataset: "unified".into(),
+            key: key.into(),
+            revision: 1,
+            change: change.into(),
+            data,
+            diff: None,
+            created_at: Utc.timestamp_opt(secs, 0).unwrap(),
+            trust: "stable".into(),
+            provenance: Provenance::default(),
+        }
+    }
+
+    #[test]
+    fn new_and_changed_keys_are_indexed_from_their_revision_snapshot() {
+        let revs = vec![
+            rev(
+                "a",
+                "new",
+                Some(json!({"title": "Alpha", "url": "https://x/a"})),
+                100,
+            ),
+            rev("b", "changed", Some(json!({"name": "Beta"})), 200),
+        ];
+        let (docs, deletes) = dataset_docs_from_revisions("grants", "unified", &revs);
+        assert!(deletes.is_empty());
+        assert_eq!(docs.len(), 2);
+        assert_eq!(docs[0].id, "grants:unified:a");
+        assert_eq!(docs[0].app, "grants");
+        assert_eq!(docs[0].dataset, "unified");
+        assert_eq!(docs[0].title, "Alpha");
+        assert_eq!(docs[0].url, "https://x/a");
+        assert_eq!(
+            docs[0].indexed_at, 100,
+            "recency comes from the revision, not wall clock"
+        );
+        assert_eq!(docs[1].title, "Beta", "title falls back through name");
+    }
+
+    /// The anti-pattern: a removed key left in the index as a stale hit forever.
+    #[test]
+    fn removed_keys_are_deleted_not_left_as_stale_hits() {
+        let revs = vec![rev("gone", "removed", None, 300)];
+        let (docs, deletes) = dataset_docs_from_revisions("grants", "unified", &revs);
+        assert!(docs.is_empty(), "a removed key has no snapshot to index");
+        assert_eq!(deletes, vec!["grants:unified:gone".to_string()]);
+    }
+
+    /// The anti-pattern: taking every revision in the window, so a key written
+    /// twice in one run is processed from a superseded state — and a
+    /// changed-then-removed key gets RESURRECTED by the older add.
+    #[test]
+    fn latest_revision_per_key_wins_not_every_revision() {
+        // changes_since is newest-first.
+        let revs = vec![
+            rev("a", "changed", Some(json!({"title": "final"})), 300),
+            rev("a", "new", Some(json!({"title": "first"})), 100),
+        ];
+        let (docs, deletes) = dataset_docs_from_revisions("grants", "unified", &revs);
+        assert_eq!(docs.len(), 1, "one doc per key, not one per revision");
+        assert_eq!(docs[0].title, "final");
+        assert!(deletes.is_empty());
+
+        let removed_last = vec![
+            rev("a", "removed", None, 300),
+            rev("a", "changed", Some(json!({"title": "first"})), 100),
+        ];
+        let (docs, deletes) = dataset_docs_from_revisions("grants", "unified", &removed_last);
+        assert!(
+            docs.is_empty(),
+            "a key removed at the end of the run must not be re-added by its earlier revision"
+        );
+        assert_eq!(deletes, vec!["grants:unified:a".to_string()]);
+    }
+
+    /// Ids must match `SearchDoc::dataset_id` exactly — the live path, the delete
+    /// path and the offline backfill all key off it.
+    #[test]
+    fn delete_ids_match_the_shared_doc_id_builder() {
+        let revs = vec![rev("k/1", "removed", None, 1)];
+        let (_, deletes) = dataset_docs_from_revisions("a", "d", &revs);
+        assert_eq!(
+            deletes,
+            vec![pumper_core::SearchDoc::dataset_id("a", "d", "k/1")]
         );
     }
 }

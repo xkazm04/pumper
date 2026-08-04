@@ -53,7 +53,7 @@ cargo run -p pumper-server --bin search-backfill -- --app grants   # all of an a
 cargo run -p pumper-server --bin search-backfill -- --all          # every dataset
 ```
 
-A scope is required so a broad rebuild is always deliberate. The backfill uses the same `SearchDoc::from_dataset_record` builder as the live path, so ids are stable and it upserts rather than duplicates — safe against a partially-populated index. Note that backfilling a dataset no app names in `index_datasets` makes it searchable but nothing keeps it current.
+A scope is required so a broad rebuild is always deliberate. The backfill uses the same `SearchDoc::from_dataset_record` builder as the live path, so ids are stable and it upserts rather than duplicates — safe against a partially-populated index. **Tombstoned rows are purged, not skipped**: each removed record's doc id is deleted from the index, because it may already be indexed (indexed while live, then removed during a window the live delete path missed) — the stale-hit state a rebuild exists to repair. The completion line reports both counts: `N record(s) indexed, M tombstoned record(s) purged`. Note that backfilling a dataset no app names in `index_datasets` makes it searchable but nothing keeps it current.
 
 ## Saved searches (standing alerts)
 
