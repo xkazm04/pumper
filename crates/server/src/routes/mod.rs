@@ -40,6 +40,7 @@ mod ingress;
 mod jobs;
 mod meta;
 mod provenance;
+mod provisioner;
 mod query;
 mod receipt;
 mod recipes;
@@ -65,6 +66,7 @@ use ingress::*;
 use jobs::*;
 use meta::*;
 use provenance::*;
+use provisioner::*;
 use query::*;
 use receipt::*;
 use recipes::*;
@@ -113,6 +115,7 @@ use watches::*;
         (name = "provenance", description = "Record-level derivation chains (M12): who wrote each revision from what, plus read-only re-derivation"),
         (name = "meta", description = "The OpenAPI document itself"),
         (name = "sources", description = "Extraction health: per-source degradation detection"),
+        (name = "provisioner", description = "Proposal lifecycle: list/validate/promote what the provisioner app compiled — never writes the catalog itself"),
     )
 )]
 struct ApiDoc;
@@ -238,6 +241,9 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(source_runs))
         .routes(routes!(set_source_state))
         .routes(routes!(enforcement_preview))
+        .routes(routes!(list_proposals))
+        .routes(routes!(validate_proposal))
+        .routes(routes!(promote_proposal))
         .routes(routes!(datahub_status))
         .routes(routes!(datahub_sync))
         .routes(routes!(openapi_json))
@@ -506,6 +512,9 @@ mod api_spec_tests {
         "GET /sources/{id}/runs",
         "POST /sources/{id}/state",
         "GET /enforcement/preview",
+        "GET /provisioner/proposals",
+        "POST /provisioner/proposals/{key}/validate",
+        "POST /provisioner/proposals/{key}/promote",
         "GET /datahub/status",
         "POST /datahub/sync",
         "GET /openapi.json",

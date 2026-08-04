@@ -658,12 +658,109 @@ pub fn build_catalog_row(
 }
 
 /// Renders the catalog row as a paste-ready `[[source]]` TOML fragment.
-fn catalog_toml(row: &Source) -> String {
+///
+/// `pub` (not just crate-internal) because the promotion route
+/// (`POST /provisioner/proposals/{key}/promote`) re-renders this same fragment
+/// server-side from the stored `catalog_row` rather than trusting the
+/// `catalog_toml` string a proposal happened to carry at compile time — one
+/// renderer, so the two can never drift.
+pub fn catalog_toml(row: &Source) -> String {
     #[derive(Serialize)]
     struct Frag<'a> {
         source: [&'a Source; 1],
     }
     toml::to_string(&Frag { source: [row] }).unwrap_or_default()
+}
+
+// ── proposal lifecycle ──────────────────────────────────────────────────────
+//
+// A proposal record's `status` is the LIFECYCLE state a human (or the
+// validate/promote routes) drives it through — distinct from `accepted` /
+// `verdict`, which are the frozen compile-time dry-run verdict and never
+// change after `run()` writes the record.
+//
+//   planned -> validated | failed -> promoted
+//
+// `planned` is every proposal's starting state, whatever its compile-time
+// verdict: a REJECTED proposal is still emitted (the misses are the useful
+// part) and still starts `planned`, so [`may_promote`] is what actually stops
+// a proposal that never demonstrated it binds anything from being promoted —
+// not the status value alone.
+
+/// The record's status immediately after `run()` writes it — nothing has
+/// validated or promoted it yet, whatever its compile-time verdict.
+pub const STATUS_PLANNED: &str = "planned";
+/// `POST .../validate` re-ran the dry run against a fresh sample and it held.
+pub const STATUS_VALIDATED: &str = "validated";
+/// `POST .../validate` re-ran the dry run against a fresh sample and it did not.
+pub const STATUS_FAILED: &str = "failed";
+/// `POST .../promote` emitted the catalog-row TOML fragment for this proposal.
+pub const STATUS_PROMOTED: &str = "promoted";
+
+/// Whether a proposal in `status`, with the ORIGINAL compile-time verdict
+/// `accepted`, may be promoted.
+///
+/// The catalog row is a claim ("this rule set binds this page"), so promoting
+/// one whose best available evidence says it does NOT bind would hand a
+/// reviewer a paste-ready fragment for a draft already known not to work:
+///   - `failed`: the LATEST evidence (a fresh re-validation) says no — never
+///     promotable until it validates clean.
+///   - `planned` (never validated): the only evidence is the original
+///     compile-time verdict, so it gates directly on `accepted`.
+///   - `validated` / `promoted`: the latest evidence says yes; `promoted` stays
+///     promotable so re-promoting (e.g. to re-render the fragment) is not an
+///     error, just a repeat of an already-cleared gate.
+pub fn may_promote(status: &str, accepted: bool) -> bool {
+    match status {
+        STATUS_FAILED => false,
+        STATUS_PLANNED => accepted,
+        STATUS_VALIDATED | STATUS_PROMOTED => true,
+        _ => false,
+    }
+}
+
+/// Whether a `planned` proposal aged `age_secs` past `max_age_secs` counts as
+/// expired.
+///
+/// Gated to `planned` on purpose: expiry names proposals ROTTING while waiting
+/// for a human to look at them. A `validated` or `promoted` proposal already
+/// had that attention (and a `failed` one has its own loud signal); re-flagging
+/// it as "expired" merely because it sat in the store past the window would
+/// bury the actually-neglected proposals in noise. `max_age_secs == 0` opts
+/// out (nothing ever expires).
+pub fn proposal_is_expired(status: &str, age_secs: i64, max_age_secs: i64) -> bool {
+    status == STATUS_PLANNED && max_age_secs > 0 && age_secs > max_age_secs
+}
+
+/// Re-runs a compiled proposal's `RuleSet` against a FRESHLY fetched sample —
+/// the validate route's core: catch drift the original compile could not have
+/// seen. Takes an already-fetched [`FetchOutcome`] rather than fetching itself
+/// so this crate keeps depending only on `core` (the dependency rule in
+/// README.md §Architecture) — the caller (the server route) owns the actual
+/// network call, exactly as `run()`'s own sampling stage does the fetch and
+/// hands this crate's pure helpers the outcome.
+///
+/// Scored with NO held-out documents: validation re-checks the one proposal it
+/// was asked to validate, not generalization across candidates — that
+/// evidence was already captured (and is not re-fetched) at compile time.
+pub fn validate_sample(mut outcome: FetchOutcome, rules: &RuleSet) -> Result<(SampleStat, DryRun)> {
+    let url = outcome.url.clone();
+    let engine = outcome.engine.to_string();
+    let tiers = tier_summary(&outcome);
+    let Some((body_field, body)) = select_sample_body(&mut outcome) else {
+        return Err(Error::App(format!(
+            "validate: fresh sample of {url} yielded no body on any field"
+        )));
+    };
+    let sample = SampleStat {
+        url,
+        engine,
+        body_field,
+        bytes: body.len(),
+        tiers,
+    };
+    let dry = dry_run(rules, &body, &[])?;
+    Ok((sample, dry))
 }
 
 /// Assembles the full proposal record written to `provisioner/proposals`.
@@ -703,6 +800,11 @@ pub fn build_proposal(
         // useful part), but it must never be mistakable for an accepted one.
         "verdict": if dry.accepted { "accepted" } else { "rejected" },
         "provisioned": false,
+        // Lifecycle state (planned -> validated|failed -> promoted), driven by
+        // the provisioner routes — see the "proposal lifecycle" section above.
+        // Every proposal starts here regardless of `verdict`: `may_promote`,
+        // not `status` alone, is what keeps a rejected draft from promoting.
+        "status": STATUS_PLANNED,
         "intended_dataset": row.dataset,
         "iterations": iterations,
         "cost_usd": cost_usd,
@@ -1761,13 +1863,19 @@ mod tests {
         for key in [
             "prompt", "catalog_row", "catalog_toml", "rule_set", "seeds", "samples", "cadence",
             "budget", "sample_stats", "confidence", "confidence_scale", "catalog_confidence",
-            "accepted", "verdict", "provisioned", "intended_dataset", "iterations", "cost_usd",
+            "accepted", "verdict", "provisioned", "status", "intended_dataset", "iterations",
+            "cost_usd",
         ] {
             assert!(p.get(key).is_some(), "proposal missing key {key}");
         }
         assert_eq!(p["cadence"], json!("weekly"));
         assert_eq!(p["confidence"], json!(100));
         assert_eq!(p["seeds"], json!(["https://a.example/widgets"]));
+        assert_eq!(
+            p["status"],
+            json!("planned"),
+            "every freshly compiled proposal starts planned, whatever its verdict"
+        );
         // The catalog row is TOML-shaped: it round-trips through the real
         // catalog parser.
         let parsed = Catalog::parse(p["catalog_toml"].as_str().unwrap()).unwrap();
@@ -1918,5 +2026,78 @@ mod tests {
         // Deterministic: same prompt, same key (upsert = revision, not dupe).
         assert_eq!(proposal_key("x y"), proposal_key("x y"));
         assert!(proposal_key(&"long ".repeat(50)).len() <= KEY_CAP_CHARS);
+    }
+
+    // ── proposal lifecycle ──────────────────────────────────────────────────
+
+    /// A `failed` proposal — the LATEST evidence says the rule set does not
+    /// bind — must never be promotable regardless of what it scored at compile
+    /// time; that is exactly the case a stale `accepted` flag would otherwise
+    /// let through.
+    #[test]
+    fn a_failed_revalidation_blocks_promotion_whatever_the_original_verdict() {
+        assert!(!may_promote(STATUS_FAILED, true));
+        assert!(!may_promote(STATUS_FAILED, false));
+    }
+
+    /// A never-validated (`planned`) proposal has only its compile-time verdict
+    /// as evidence, so promotion gates directly on it — a REJECTED proposal
+    /// (still emitted, per the record-honesty contract) must not be promotable
+    /// just because nothing has touched its status yet.
+    #[test]
+    fn a_never_validated_proposal_gates_on_its_compile_time_verdict() {
+        assert!(may_promote(STATUS_PLANNED, true));
+        assert!(!may_promote(STATUS_PLANNED, false));
+    }
+
+    /// Once the latest evidence (a fresh re-validation) says the rule set
+    /// binds, promotion no longer depends on the stale compile-time verdict —
+    /// and re-promoting an already-promoted proposal (re-rendering the
+    /// fragment) is not an error.
+    #[test]
+    fn validated_and_promoted_proposals_promote_regardless_of_the_stale_verdict() {
+        assert!(may_promote(STATUS_VALIDATED, false));
+        assert!(may_promote(STATUS_PROMOTED, false));
+    }
+
+    /// Only a `planned` proposal can rot — one already `validated` or
+    /// `promoted` had its attention, and `failed` has its own loud signal. A
+    /// non-planned proposal sitting past the window must not be relabeled
+    /// "expired" on top of its real status.
+    #[test]
+    fn only_a_planned_proposal_can_be_flagged_expired() {
+        assert!(proposal_is_expired(STATUS_PLANNED, 1_000_000, 100));
+        assert!(!proposal_is_expired(STATUS_VALIDATED, 1_000_000, 100));
+        assert!(!proposal_is_expired(STATUS_FAILED, 1_000_000, 100));
+        assert!(!proposal_is_expired(STATUS_PROMOTED, 1_000_000, 100));
+        // Within the window: not expired.
+        assert!(!proposal_is_expired(STATUS_PLANNED, 50, 100));
+        // `max_age_secs == 0` opts out entirely.
+        assert!(!proposal_is_expired(STATUS_PLANNED, 1_000_000, 0));
+    }
+
+    /// `validate_sample` is `dry_run` fed a FRESH fetch's body (not the stored
+    /// sample) with no held-out documents — the same sample->dry-run seam
+    /// `run()` uses for its primary candidate, factored out so the validate
+    /// route can drive it from a fetch it performed itself.
+    #[test]
+    fn validate_sample_scores_a_freshly_fetched_body_not_the_stored_one() {
+        let rules = ruleset(json!({
+            "heading": {"type": "css", "selector": "h1"},
+            "items": {"type": "each", "selector": ".card", "container": "#list",
+                      "fields": {"name": {"type": "css", "selector": "h3"}}}
+        }));
+        let fresh = outcome_with("http", Some(FIXTURE), None, None);
+        let (sample, dry) = validate_sample(fresh, &rules).expect("html body scores");
+        assert_eq!(sample.body_field, "html");
+        assert_eq!(sample.engine, "http");
+        assert!(dry.accepted);
+        assert_eq!(dry.docs, 1, "validation never carries held-out documents");
+        assert!(dry.held_out.is_empty());
+
+        // An empty fresh fetch (the source went dark since the compile) is a
+        // loud error, not a silently-scored zero.
+        let dead = outcome_with("http", Some("   "), None, None);
+        assert!(validate_sample(dead, &rules).is_err());
     }
 }

@@ -41,6 +41,7 @@ The global 1 MiB is sized from what the POST surface actually accepts — all ha
 | Grants | `GET /grants?status=&agency=&source=&closing_before=&closing_after=&min_award=&trust=&limit=&cursor=` · `GET /grants/closing-soon?days=` (see below) |
 | Catalog | `GET /catalog/sources?market=&status=&category=` (the machine-readable data-source catalog) · `GET /catalog/health` (per-source freshness monitor; see below) |
 | Source health | `GET /sources?state=&app=&limit=` · `GET /sources/{id}` (`id` = `<app>/<dataset>`) · `GET /sources/{id}/runs?limit=` · `POST /sources/{id}/state` (`{state, reason?}` — manual override; the only way out of quarantine). All `503` when `[resilience] enabled = false`. See below. |
+| Provisioner proposals | `GET /provisioner/proposals?limit=&cursor=` (backlog of what `provisioner` compiled; see below) · `POST /provisioner/proposals/{key}/validate` (re-checks against a FRESH fetch) · `POST /provisioner/proposals/{key}/promote` (renders the paste-ready TOML fragment; writes nothing to the catalog file) |
 | Store integrity | `GET /datasets/doctor?skip_artifacts=` (**read-only** audit; `findings` empty on a healthy store, each with its remediation — see [datasets.md § `datasets doctor`](datasets.md). Full scans; on-demand only) |
 | Retention | `GET /retention/preview?days=` (**read-only dry run**: reclaimable artifact bytes per app, split reclaimable/pinned/cassette, plus ledger row counts and the configured windows — deletes nothing. See [datasets.md § Retention](datasets.md)) |
 | Meta | `GET /openapi.json` (OpenAPI 3.1 spec for all routes) |
@@ -122,6 +123,24 @@ The other half of source liveness. `/catalog/health` answers *did this source ru
 - `POST /sources/{id}/state` `{state, reason?}` — manual override, and the **only** way out of `quarantined`. Quarantine is deliberately terminal without an operator: a stuck source is an acceptable outcome, a source that silently un-quarantines itself and resumes pushing garbage downstream is not. An unrecognized state is `400`.
 
 All four return `503` when `[resilience] enabled = false` — a health question asked of a disabled detector has no honest answer, and an empty list would read as "everything is fine".
+
+## Provisioner proposal lifecycle (`/provisioner/proposals`)
+
+The `provisioner` app (see [apps.md](apps.md)) compiles a prompt into a proposal record in `provisioner/proposals` and stops — it never writes `catalog/data-sources.toml` and never creates a schedule. This surface is the human-facing lifecycle **over** those records; it does not relax that invariant. `POST .../promote` still only ever *returns* a TOML fragment — the human still completes [ONBOARDING.md](../../ONBOARDING.md) Path B (write the app crate, register it, hand-paste the `[[source]]` entry).
+
+Every proposal record carries a lifecycle `status`, distinct from its frozen compile-time `verdict`/`accepted`:
+
+```
+planned -> validated | failed -> promoted
+```
+
+`planned` is where every proposal starts, whatever its compile-time verdict — a rejected draft is still emitted (the misses are the useful part) and still starts `planned`; `may_promote` is what actually blocks promoting one that never demonstrated it binds anything, not the status value alone.
+
+- **`GET /provisioner/proposals?limit=&cursor=`** — dual-mode list (bare array, or `{items, next_cursor}` with `cursor=`), most-recently-touched first. Each summary: `key, prompt, status, expired, verdict, accepted, catalog_confidence, engine, url, intended_dataset, age_secs`. `expired` is computed **at read time** (never stamped onto the record) against `[provisioner] proposal_max_age_secs` (default 30 days, `0` disables) — and only ever `true` for a still-`planned` proposal; one already `validated`/`promoted` had its review, and a `failed` one has its own loud signal.
+- **`POST /provisioner/proposals/{key}/validate`** — re-runs the proposal's drafted `RuleSet` against a **freshly fetched** sample of its primary URL (same `Auto`/`to_markdown`/`use_recipes` shape as the original compile's sampling stage, but deliberately never satisfied by an archive snapshot — validation exists to catch drift the compile could not have seen). Sets `status` to `validated` or `failed` and stores a `validation: {checked_at, sample, dry_run, accepted}` block (same shapes as the compile-time `samples[]`/`sample_stats`). `404` unknown key; `400` when the stored `rule_set` no longer parses, the `catalog_row` has no `url`, the fetch fails, or it yields no sampleable body.
+- **`POST /provisioner/proposals/{key}/promote`** — server-renders the paste-ready `[[source]]` TOML fragment from the stored `catalog_row` (the same renderer the compile itself used, so the two can never drift) and marks `status: "promoted"`. `404` unknown key; `409` when the proposal's best available evidence says its rule set does not bind (a `failed` re-validation, or a never-validated `planned` proposal whose compile-time `accepted` was `false`) — promoting it would hand a reviewer a fragment for a draft already known not to work; `400` when the stored `catalog_row` no longer parses.
+
+Every status transition is an ordinary dataset upsert, so it lands as a new revision — `GET /datasets/provisioner/proposals/history?key=<key>` shows the full planned → validated → promoted (or → failed) trail, and the generic dataset surface (`GET /datasets/provisioner/proposals`) still reaches the full record (compiled `rule_set`, `samples`, `sample_stats`) this list intentionally leaves out.
 
 ## Host profiles (`/hosts`)
 

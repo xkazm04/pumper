@@ -28,6 +28,7 @@ pub struct Config {
     pub remote: RemoteConfig,
     pub recipes: RecipesConfig,
     pub catalog: CatalogConfig,
+    pub provisioner: ProvisionerConfig,
     pub contracts: ContractsConfig,
     pub ingress: IngressConfig,
     pub mcp: McpConfig,
@@ -190,6 +191,32 @@ pub struct CatalogConfig {
     /// catalog-managed schedules; orphans are never auto-touched). Default OFF:
     /// a bad TOML edit should be a loud log, not a silent mass-disable.
     pub auto_reconcile: bool,
+}
+
+/// The `provisioner` app's proposal lifecycle (`provisioner/proposals`):
+/// `GET /provisioner/proposals` marks a still-`planned` proposal `expired`
+/// once it has sat unreviewed past this window.
+///
+/// A lazily-computed field on the LIST read path, not a maintenance tick that
+/// mutates the record: expiry is a judgement about staleness at read time, and
+/// nothing downstream needs it to be an eagerly stamped fact — the same reason
+/// `[retention] preview` and `[resilience] enforcement_preview` are read-only
+/// dry runs rather than background sweeps. See `docs/features/apps.md`
+/// "provisioner: proposal lifecycle".
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct ProvisionerConfig {
+    /// Age (seconds) past which a `planned` proposal is reported `expired`.
+    /// `0` opts out (nothing ever expires). Default 30 days.
+    pub proposal_max_age_secs: u64,
+}
+
+impl Default for ProvisionerConfig {
+    fn default() -> Self {
+        Self {
+            proposal_max_age_secs: 30 * 24 * 3600,
+        }
+    }
 }
 
 /// Declared data contracts (`[source.contract]` blocks in the catalog).
