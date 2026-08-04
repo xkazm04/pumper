@@ -543,8 +543,8 @@ pub(crate) async fn datahub_status(State(state): State<AppState>) -> Json<Value>
     path = "/datahub/sync",
     tag = "datahub",
     responses(
-        (status = 200, description = "`{kind: \"sync\", at, ok, datasets, entities?|error?}` — the emission summary (also on /datahub/status)"),
-        (status = 409, description = "[datahub] is disabled in config"),
+        (status = 200, description = "`{kind: \"sync\", at, ok, datasets, flows, trigger_edges, entities?|error?}` — the emission summary (also on /datahub/status)"),
+        (status = 409, description = "[datahub] is disabled in config, or a full sync is already running (one at a time — retry when it finishes)"),
     )
 )]
 pub(crate) async fn datahub_sync(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -554,5 +554,13 @@ pub(crate) async fn datahub_sync(State(state): State<AppState>) -> Result<Json<V
             "[datahub] is disabled — set enabled = true and gms_url in config".into(),
         ));
     }
-    Ok(Json(crate::datahub::full_sync(&state).await))
+    match crate::datahub::full_sync(&state).await {
+        crate::datahub::SyncOutcome::Ran(summary) => Ok(Json(summary)),
+        crate::datahub::SyncOutcome::Busy => Err(ApiError(
+            StatusCode::CONFLICT,
+            "a DataHub full sync is already running — one at a time; retry when it finishes \
+             (progress: GET /datahub/status → emissions.sync_running)"
+                .into(),
+        )),
+    }
 }

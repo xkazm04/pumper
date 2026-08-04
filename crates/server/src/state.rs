@@ -89,7 +89,9 @@ pub struct AppState {
     /// Short-TTL cache of the fully-rendered `/metrics` body, so a burst of
     /// Prometheus scrapes doesn't re-run the aggregate queries every time.
     pub metrics_cache: Arc<tokio::sync::Mutex<Option<(std::time::Instant, String)>>>,
-    /// Outcome of the most recent DataHub emission (job or sync), surfaced on
+    /// DataHub emission history: monotonic ok/failed counters plus the last
+    /// success and the last failure kept SEPARATELY (a success must not erase a
+    /// failure — that hid flapping), and the full-sync overlap flag. Surfaced on
     /// `GET /datahub/status`. In-memory only — emission is best-effort telemetry.
     pub datahub_last: crate::datahub::StatusCell,
     /// M26 governance state: `cost:pause`d apps + last poll summary, surfaced on
@@ -189,7 +191,7 @@ impl AppState {
             shutdown: CancellationToken::new(),
             job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
-            datahub_last: Arc::new(std::sync::Mutex::new(None)),
+            datahub_last: Arc::new(std::sync::Mutex::new(Default::default())),
             datahub_govern: Default::default(),
             contract_verdicts: Arc::new(std::sync::Mutex::new(HashMap::new())),
         })

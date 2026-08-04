@@ -846,8 +846,10 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
         )
         .await;
     // Metadata shadow: push this run's dataset entities/lineage/freshness
-    // to DataHub. Detached and fail-open — a down GMS never touches jobs.
-    crate::datahub::on_job_success(state.clone(), job.clone(), index_specs);
+    // to DataHub. Off-slot (on this pool) and fail-open — a down GMS never
+    // touches jobs, and a shutdown drains or loudly counts the emission
+    // rather than dropping it.
+    crate::datahub::on_job_success(&state, &job, index_specs).await;
 
     // Stamp where the wall-clock went before the terminal event, so the event
     // (and `GET /jobs/{id}/receipt`) can carry it. Best-effort telemetry.

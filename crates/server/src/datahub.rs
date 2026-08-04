@@ -4,9 +4,21 @@
 //! surface (`POST /openapi/entities/v1/`). No Python SDK, no Kafka: just JSON
 //! over the shared reqwest client. Record data never leaves the local store.
 //!
-//! Fail-open like webhooks/triggers: emission runs in a detached task after
-//! the job outcome is persisted, and any failure is a warn log plus a status
-//! entry on `GET /datahub/status` — never a job failure.
+//! Fail-open like webhooks/triggers: emission runs off the worker's scrape
+//! permit after the job outcome is persisted, and any failure is a warn log
+//! plus a status entry on `GET /datahub/status` — never a job failure.
+//!
+//! "Off the permit" is NOT "detached": job emission runs on the worker's
+//! [`crate::fanout::FanoutPool`], the same tracked pool the rest of the
+//! post-success fan-out uses, so a shutdown either drains it or *counts and
+//! logs* what it abandoned. A bare `tokio::spawn` here would make a shutdown
+//! during emission a silent metadata gap.
+//!
+//! There is deliberately **no retry**: a failed emission is recorded (see
+//! [`EmissionStatus`], which keeps the last failure separately from the last
+//! success so a flapping bridge is visible) and healed by the next run or a
+//! manual `POST /datahub/sync`. Metadata is idempotent and re-derived every
+//! run, so a queue/DLQ would buy staleness insurance nobody asked for.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -305,12 +317,26 @@ fn client() -> &'static reqwest::Client {
     })
 }
 
+/// Prefix naming what a mid-batch abort already pushed. Batching means a
+/// failure is never all-or-nothing: the batches before the failing one are
+/// already ingested at GMS, and an error that says only "500" hides that.
+/// There is no rollback and no retry — the next emission re-derives the whole
+/// set — but the status entry must not pretend nothing landed.
+pub(crate) fn partial_abort_note(sent: usize, total: usize) -> String {
+    if sent == 0 {
+        format!("(0 of {total} entities ingested) ")
+    } else {
+        format!("(partial: {sent} of {total} entities already ingested) ")
+    }
+}
+
 async fn post_entities(state: &AppState, entities: Vec<Value>) -> Result<usize, String> {
     let client = client();
     let cfg = &state.config.datahub;
     let url = format!("{}/openapi/entities/v1/", cfg.gms_url.trim_end_matches('/'));
     let token = cfg.resolve_token();
     let total = entities.len();
+    let mut sent = 0usize;
     for chunk in entities.chunks(BATCH) {
         let mut req = client.post(&url).json(&chunk);
         if let Some(t) = &token {
@@ -320,16 +346,86 @@ async fn post_entities(state: &AppState, entities: Vec<Value>) -> Result<usize, 
             let cause = std::error::Error::source(&e)
                 .map(|s| format!(" ({s})"))
                 .unwrap_or_default();
-            format!("POST {url}: {e}{cause}")
+            format!("{}POST {url}: {e}{cause}", partial_abort_note(sent, total))
         })?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             let body = body.chars().take(500).collect::<String>();
-            return Err(format!("POST {url}: {status}: {body}"));
+            return Err(format!(
+                "{}POST {url}: {status}: {body}",
+                partial_abort_note(sent, total)
+            ));
         }
+        sent += chunk.len();
     }
     Ok(total)
+}
+
+/// Emission history for `GET /datahub/status`.
+///
+/// The anti-pattern this replaces: ONE `last_emission` slot, where a success
+/// seconds after a failure erased the failure. A bridge that fails half its
+/// emissions then looked perfectly healthy on every poll. Successes and
+/// failures are kept apart and both are counted, so flapping is visible
+/// without a log dive.
+#[derive(Debug, Default)]
+pub struct EmissionStatus {
+    /// Most recent entry of either kind (back-compat `last_emission`).
+    pub last: Option<Value>,
+    pub last_success: Option<Value>,
+    pub last_error: Option<Value>,
+    /// Monotonic since boot (in-memory, like the entries themselves).
+    pub emissions_ok: u64,
+    pub emissions_failed: u64,
+    /// True while a `POST /datahub/sync` backfill is running — see
+    /// [`try_begin_sync`].
+    sync_running: bool,
+}
+
+impl EmissionStatus {
+    /// Files one outcome into the right slot and bumps its counter. Pure
+    /// (no state, no clock beyond the caller-supplied entry) so the
+    /// "a success must not erase the last error" rule is directly testable.
+    pub(crate) fn record(&mut self, entry: Value) {
+        if entry["ok"] == Value::Bool(true) {
+            self.emissions_ok += 1;
+            self.last_success = Some(entry.clone());
+        } else {
+            self.emissions_failed += 1;
+            self.last_error = Some(entry.clone());
+        }
+        self.last = Some(entry);
+    }
+}
+
+/// Held for the duration of one `full_sync`; releases the flag on drop, so a
+/// panic or an early return can't wedge the bridge into permanent 409.
+pub struct SyncGuard(StatusCell);
+
+impl Drop for SyncGuard {
+    fn drop(&mut self) {
+        self.0.lock().unwrap().sync_running = false;
+    }
+}
+
+/// Claims the single full-sync slot, or `None` when one is already running.
+/// A backfill walks every dataset and read-merges lineage; two in parallel
+/// double the GMS load and can interleave their read-merges into lost edges.
+pub(crate) fn try_begin_sync(cell: &StatusCell) -> Option<SyncGuard> {
+    let mut s = cell.lock().unwrap();
+    if s.sync_running {
+        return None;
+    }
+    s.sync_running = true;
+    Some(SyncGuard(cell.clone()))
+}
+
+/// What one `POST /datahub/sync` did.
+pub enum SyncOutcome {
+    Ran(Value),
+    /// Another backfill is already in flight; this call did nothing (409).
+    Busy,
 }
 
 /// Records the outcome of the most recent emission for `GET /datahub/status`.
@@ -342,7 +438,7 @@ fn record_status(state: &AppState, kind: &str, outcome: Result<usize, String>) -
             json!({ "kind": kind, "at": pumper_core::datasets::ts(chrono::Utc::now()), "ok": false, "error": e })
         }
     };
-    *state.datahub_last.lock().unwrap() = Some(entry.clone());
+    state.datahub_last.lock().unwrap().record(entry.clone());
     entry
 }
 
@@ -501,7 +597,8 @@ async fn flow_entities(state: &AppState, job: &Job, output_urns: &[String]) -> V
         job.trigger_id.as_deref(),
     );
     let flow_urn = dataflow_urn(env, &flow_id);
-    let mut custom: Vec<(&str, String)> = vec![("pumper_app", job.app.clone()), ("kind", kind.into())];
+    let mut custom: Vec<(&str, String)> =
+        vec![("pumper_app", job.app.clone()), ("kind", kind.into())];
     if let Some(s) = &job.schedule_id {
         custom.push(("schedule_id", s.clone()));
     }
@@ -549,17 +646,26 @@ async fn flow_entities(state: &AppState, job: &Job, output_urns: &[String]) -> V
     ]
 }
 
-/// Fire-and-forget emission for a succeeded job: every dataset in the job's
-/// namespace (a successful run refreshes them whether or not rows changed — the
-/// freshness signal must not go stale on quiet runs), plus the cross-namespace
+/// Emission for a succeeded job: every dataset in the job's namespace (a
+/// successful run refreshes them whether or not rows changed — the freshness
+/// signal must not go stale on quiet runs), plus the cross-namespace
 /// `index_datasets` outputs with lineage edges (own datasets → derived dataset)
 /// merged into the edges other writers already registered. One-line hook in the
 /// worker; everything (including the revision reads) happens off the hot path.
-pub fn on_job_success(state: AppState, job: Job, index_specs: Vec<(String, String)>) {
+///
+/// Runs on the worker's fan-out pool rather than a bare `tokio::spawn`: off the
+/// scrape permit, but **tracked** — the shutdown drain waits for it, and says
+/// out loud how many emissions it abandoned instead of dropping them silently.
+/// Panics are contained by the pool for the same reason.
+pub async fn on_job_success(state: &AppState, job: &Job, index_specs: Vec<(String, String)>) {
     if !state.config.datahub.enabled {
         return;
     }
-    tokio::spawn(async move {
+    let job_id = job.id;
+    let pool = state.fanout.clone();
+    let state = state.clone();
+    let job = job.clone();
+    pool.run("datahub", job_id, async move {
         let env = state.config.datahub.env.clone();
         let mut entities = Vec::new();
 
@@ -654,13 +760,28 @@ pub fn on_job_success(state: AppState, job: Job, index_specs: Vec<(String, Strin
                 record_status(&state, "job", Err(format!("({count} entities) {e}")));
             }
         }
-    });
+    })
+    .await;
 }
 
 /// One-shot backfill: walk every stored dataset and push entity + properties
 /// (+ profile/schema per config). The button to press right after connecting a
 /// fresh DataHub instance. Returns a summary; also recorded on `/datahub/status`.
-pub async fn full_sync(state: &AppState) -> Value {
+///
+/// Non-re-entrant by construction: a second concurrent call gets
+/// [`SyncOutcome::Busy`] (HTTP 409) rather than queueing or racing the first
+/// one's lineage read-merge. Rejecting beats queueing here — the backfill is
+/// idempotent, so "come back when it's done" loses nothing.
+pub async fn full_sync(state: &AppState) -> SyncOutcome {
+    let Some(_guard) = try_begin_sync(&state.datahub_last) else {
+        warn!("datahub: /datahub/sync rejected — a full sync is already running");
+        return SyncOutcome::Busy;
+    };
+    SyncOutcome::Ran(full_sync_inner(state).await)
+}
+
+/// The backfill body, always under the [`SyncGuard`].
+async fn full_sync_inner(state: &AppState) -> Value {
     let all = match state.datasets.list_all_datasets().await {
         Ok(all) => all,
         Err(e) => return record_status(state, "sync", Err(format!("list datasets: {e}"))),
@@ -797,7 +918,13 @@ pub type GovernCell = Arc<std::sync::Mutex<GovernState>>;
 /// poll) forces `$0`, which [`pumper_core::AppContext`]'s budget governor turns
 /// into free-tiers-only. One-line hook in the worker's `AppContext` build.
 pub fn effective_budget(state: &AppState, app: &str, requested: Option<f64>) -> Option<f64> {
-    if state.datahub_govern.lock().unwrap().paused_apps.contains(app) {
+    if state
+        .datahub_govern
+        .lock()
+        .unwrap()
+        .paused_apps
+        .contains(app)
+    {
         warn!(
             app,
             "datahub govern: cost:pause tag active — Claude-tier budget forced to $0 for this job"
@@ -929,7 +1056,11 @@ async fn fetch_govern_meta(state: &AppState, urn: &str) -> Result<Value, String>
         .json()
         .await
         .map_err(|e| format!("POST {url}: bad json: {e}"))?;
-    if body.get("errors").and_then(Value::as_array).is_some_and(|e| !e.is_empty()) {
+    if body
+        .get("errors")
+        .and_then(Value::as_array)
+        .is_some_and(|e| !e.is_empty())
+    {
         return Err(format!("graphql errors for {urn}"));
     }
     Ok(body)
@@ -1008,7 +1139,9 @@ async fn govern_poll(state: AppState) {
                 // M19 fence: only rows tagged managed_by = "catalog" — the SQL
                 // itself refuses anything else, hand-made schedules are sacred.
                 for s in schedules.iter().filter(|s| {
-                    s.app == *app && s.enabled && s.managed_by.as_deref() == Some(CATALOG_MANAGED_BY)
+                    s.app == *app
+                        && s.enabled
+                        && s.managed_by.as_deref() == Some(CATALOG_MANAGED_BY)
                 }) {
                     match state
                         .storage
@@ -1024,7 +1157,9 @@ async fn govern_poll(state: AppState) {
                             ));
                             disabled += 1;
                         }
-                        Ok(false) => warn!(id = %s.id, "datahub govern: disable fenced off (not catalog-managed)"),
+                        Ok(false) => {
+                            warn!(id = %s.id, "datahub govern: disable fenced off (not catalog-managed)")
+                        }
                         Err(e) => warn!(id = %s.id, "datahub govern: disable failed: {e}"),
                     }
                 }
@@ -1083,9 +1218,11 @@ async fn govern_poll(state: AppState) {
     record_govern(&state, summary);
 }
 
-/// Config + last-emission view for `GET /datahub/status`.
+/// Config + emission/governance view for `GET /datahub/status`.
 pub fn status(state: &AppState) -> Value {
     let cfg = &state.config.datahub;
+    let emissions = emission_status(state);
+    let last = emissions["last"].clone();
     let govern = {
         let g = state.datahub_govern.lock().unwrap();
         json!({
@@ -1103,12 +1240,27 @@ pub fn status(state: &AppState) -> Value {
         "emit_schema": cfg.emit_schema,
         "emit_profile": cfg.emit_profile,
         "emit_flows": cfg.emit_flows,
-        "last_emission": *state.datahub_last.lock().unwrap(),
+        "last_emission": last,
+        "emissions": emissions,
         "govern": govern,
     })
 }
 
-pub type StatusCell = Arc<std::sync::Mutex<Option<Value>>>;
+/// The emission half of [`status`]: counters plus the two independent slots.
+/// `last_error` is NOT cleared by a later success — that is the point.
+fn emission_status(state: &AppState) -> Value {
+    let s = state.datahub_last.lock().unwrap();
+    json!({
+        "ok": s.emissions_ok,
+        "failed": s.emissions_failed,
+        "last": s.last,
+        "last_success": s.last_success,
+        "last_error": s.last_error,
+        "sync_running": s.sync_running,
+    })
+}
+
+pub type StatusCell = Arc<std::sync::Mutex<EmissionStatus>>;
 
 #[cfg(test)]
 mod tests {
@@ -1234,7 +1386,9 @@ mod tests {
 
     #[test]
     fn job_rule_set_only_parses_declarative_rules() {
-        assert!(job_rule_set(&json!({"rules": {"t": {"type": "css", "selector": "h1"}}})).is_some());
+        assert!(
+            job_rule_set(&json!({"rules": {"t": {"type": "css", "selector": "h1"}}})).is_some()
+        );
         assert!(job_rule_set(&json!({})).is_none());
         assert!(job_rule_set(&json!({"rules": "not rules"})).is_none());
     }
@@ -1249,7 +1403,10 @@ mod tests {
         let fg = &aspect["fineGrainedLineages"][0];
         assert_eq!(fg["upstreamType"], "NONE");
         assert_eq!(fg["transformOperation"], "css:.price");
-        assert_eq!(fg["downstreams"][0], format!("urn:li:schemaField:({urn},price)"));
+        assert_eq!(
+            fg["downstreams"][0],
+            format!("urn:li:schemaField:({urn},price)")
+        );
     }
 
     #[test]
@@ -1296,7 +1453,9 @@ mod tests {
         // One disable for app `a` (deduped), one sync for a/d2.
         assert_eq!(actions.len(), 2);
         assert!(matches!(&actions[0], GovernAction::DisableSchedules { app, .. } if app == "a"));
-        assert!(matches!(&actions[1], GovernAction::EnqueueSync { app, dataset } if app == "a" && dataset == "d2"));
+        assert!(
+            matches!(&actions[1], GovernAction::EnqueueSync { app, dataset } if app == "a" && dataset == "d2")
+        );
         assert_eq!(paused, HashSet::from(["b".to_string()]));
     }
 
@@ -1305,6 +1464,50 @@ mod tests {
         let metas = vec![meta("a", "d1", false, false, false)];
         let (actions, paused) = plan_govern_actions(&metas);
         assert!(actions.is_empty() && paused.is_empty());
+    }
+
+    /// The anti-pattern: one `last_emission` slot, where the success that
+    /// followed a failure erased it and the bridge looked healthy while
+    /// dropping half its emissions.
+    #[test]
+    fn a_success_does_not_erase_the_last_error() {
+        let mut s = EmissionStatus::default();
+        s.record(json!({"kind": "job", "ok": false, "error": "boom"}));
+        s.record(json!({"kind": "job", "ok": true, "entities": 4}));
+        assert_eq!(s.last_error.as_ref().unwrap()["error"], "boom");
+        assert_eq!(s.last_success.as_ref().unwrap()["entities"], 4);
+        assert_eq!((s.emissions_ok, s.emissions_failed), (1, 1));
+        // `last` still tracks the newest of the two for the back-compat field.
+        assert_eq!(s.last.as_ref().unwrap()["ok"], true);
+    }
+
+    /// A mid-batch abort must not read as "nothing was ingested": earlier
+    /// batches are already at GMS and there is no rollback.
+    #[test]
+    fn partial_abort_note_names_what_already_landed_not_just_the_error() {
+        assert_eq!(partial_abort_note(0, 60), "(0 of 60 entities ingested) ");
+        assert_eq!(
+            partial_abort_note(25, 60),
+            "(partial: 25 of 60 entities already ingested) "
+        );
+    }
+
+    /// Two backfills at once double GMS load and can interleave the lineage
+    /// read-merge into lost edges. The slot is claimed, and released on drop
+    /// so a panic can't wedge the bridge into permanent 409.
+    #[test]
+    fn concurrent_sync_is_rejected_and_the_slot_is_released_on_drop() {
+        let cell: StatusCell = Arc::new(std::sync::Mutex::new(EmissionStatus::default()));
+        let first = try_begin_sync(&cell).expect("first sync claims the slot");
+        assert!(
+            try_begin_sync(&cell).is_none(),
+            "a second concurrent sync must be rejected, not run"
+        );
+        drop(first);
+        assert!(
+            try_begin_sync(&cell).is_some(),
+            "the slot must be free again once the first sync finishes"
+        );
     }
 
     #[test]
