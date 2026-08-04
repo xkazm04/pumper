@@ -33,25 +33,45 @@ use crate::state::AppState;
 struct MockGms {
     addr: SocketAddr,
     batches: Arc<Mutex<Vec<Vec<Value>>>>,
+    graphql: Arc<Mutex<usize>>,
 }
 
 impl MockGms {
     async fn spawn(statuses: Vec<u16>, delay: Duration) -> Self {
+        Self::spawn_with(statuses, delay, Duration::ZERO).await
+    }
+
+    /// `delay` slows the ingestion path; `graphql_delay` slows the governance
+    /// read path (`/api/graphql`) independently, so a *hanging poll* can be
+    /// staged without also stalling emissions.
+    async fn spawn_with(statuses: Vec<u16>, delay: Duration, graphql_delay: Duration) -> Self {
         let batches: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
+        let graphql: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
         let script = Arc::new(Mutex::new(VecDeque::from(statuses)));
 
         let batches_h = batches.clone();
+        let graphql_h = graphql.clone();
         let handler = move |req: axum::extract::Request| {
             let batches = batches_h.clone();
+            let graphql = graphql_h.clone();
             let script = script.clone();
             async move {
-                let is_ingest = req.method() == axum::http::Method::POST;
+                let is_graphql = req.uri().path().contains("/api/graphql");
+                let is_ingest = req.method() == axum::http::Method::POST && !is_graphql;
                 let body = axum::body::to_bytes(req.into_body(), 1 << 22)
                     .await
                     .unwrap_or_default();
                 if is_ingest {
                     let parsed: Vec<Value> = serde_json::from_slice(&body).unwrap_or_default();
                     batches.lock().unwrap().push(parsed);
+                }
+                if is_graphql {
+                    *graphql.lock().unwrap() += 1;
+                    tokio::time::sleep(graphql_delay).await;
+                    return (
+                        axum::http::StatusCode::OK,
+                        json!({"data": {"dataset": null}}).to_string(),
+                    );
                 }
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
@@ -71,7 +91,16 @@ impl MockGms {
         tokio::spawn(async move {
             let _ = axum::serve(listener, app).await;
         });
-        Self { addr, batches }
+        Self {
+            addr,
+            batches,
+            graphql,
+        }
+    }
+
+    /// Governance GraphQL reads received so far.
+    fn graphql_reads(&self) -> usize {
+        *self.graphql.lock().unwrap()
     }
 
     fn url(&self) -> String {
@@ -242,4 +271,57 @@ async fn a_second_sync_during_one_in_flight_is_rejected_not_run() {
         crate::datahub::full_sync(&state).await,
         SyncOutcome::Ran(_)
     ));
+}
+
+/// The anti-pattern: `govern_tick` stamping `last_poll` when the poll STARTED,
+/// so a poll slower than the interval overlapped the next one and two tasks
+/// raced to write `paused_apps`. Completion now gates the next poll, and an
+/// in-flight poll blocks a tick outright — proven here with a GMS that hangs
+/// its GraphQL reads while the interval is artificially aged past due.
+#[tokio::test]
+async fn a_tick_during_a_hanging_poll_does_not_start_a_second_poll() {
+    let gms = MockGms::spawn_with(vec![], Duration::ZERO, Duration::from_secs(3)).await;
+    let url = gms.url();
+    let (state, _store) = test_state_with(vec![Arc::new(FakeApp)], move |c| {
+        c.datahub.enabled = true;
+        c.datahub.gms_url = url;
+        c.datahub.govern = true;
+    })
+    .await;
+    seed_datasets(&state, 1).await;
+
+    crate::datahub::govern_tick(&state);
+    wait_for("the poll to reach GMS", Duration::from_secs(5), || {
+        let reads = gms.graphql_reads();
+        async move { reads > 0 }
+    })
+    .await;
+
+    // Age the completion stamp well past the interval, so the ONLY thing that
+    // can hold this tick back is the in-flight guard.
+    {
+        let mut g = state.datahub_govern.lock().unwrap();
+        assert!(g.in_flight, "the first poll must be marked in flight");
+        g.last_poll = std::time::Instant::now().checked_sub(Duration::from_secs(3600));
+    }
+    crate::datahub::govern_tick(&state);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        gms.graphql_reads(),
+        1,
+        "a tick during an in-flight poll must not start a second poll"
+    );
+
+    // And the guard is not a wedge: completion clears it and re-stamps.
+    wait_for("the poll to finish", Duration::from_secs(15), || {
+        let done = !state.datahub_govern.lock().unwrap().in_flight;
+        async move { done }
+    })
+    .await;
+    let g = state.datahub_govern.lock().unwrap();
+    assert!(
+        g.last_poll
+            .is_some_and(|t| t.elapsed() < Duration::from_secs(60)),
+        "completion must re-stamp last_poll, so the interval restarts from the END"
+    );
 }

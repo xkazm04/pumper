@@ -23,6 +23,7 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
+use futures::StreamExt;
 use pumper_core::extract::{Rule, RuleSet};
 use pumper_core::{EnqueueOptions, Job, CATALOG_MANAGED_BY};
 use serde_json::{json, Map, Value};
@@ -901,18 +902,81 @@ async fn full_sync_inner(state: &AppState) -> Value {
 //
 // Unreachable/absent DataHub = clean no-op: the FIRST read error aborts the
 // whole poll before any action is planned, matching the emitter's posture.
+//
+// The reads are bounded on BOTH axes, because a governance poll is the one path
+// where a slow GMS turns into Pumper acting on stale state:
+//
+//   * `POLL_CONCURRENCY` reads in flight at once, each with the SHORT
+//     `POLL_TIMEOUT` — not the emitter's 60s write timeout, which made 20
+//     datasets a ~20-minute worst case.
+//   * the next poll is gated on the previous one's COMPLETION (not on when it
+//     started), so two polls can never race on `paused_apps`.
+
+/// Governance reads in flight at once. Small on purpose: these are GraphQL
+/// reads against someone's GMS, and the poll is background work.
+const POLL_CONCURRENCY: usize = 4;
+/// Per-request timeout for the governance READ path. Deliberately far shorter
+/// than the emitter's 60s write client: a stalled read must not hold the poll,
+/// and a missed poll self-heals on the next tick.
+const POLL_TIMEOUT_SECS: u64 = 10;
+
+/// Worst case for one poll: `datasets / POLL_CONCURRENCY` batches, each bounded
+/// by [`POLL_TIMEOUT_SECS`]. Serial reads on the 60s client made this
+/// `datasets × 60` — 20 minutes for 20 datasets, i.e. unbounded in practice.
+pub(crate) fn worst_case_poll_secs(datasets: usize) -> u64 {
+    datasets.div_ceil(POLL_CONCURRENCY) as u64 * POLL_TIMEOUT_SECS
+}
+
+/// Whether this tick should start a poll.
+///
+/// The anti-pattern: stamping `last_poll` when a poll *starts*, so a poll
+/// slower than the interval overlapped the next one and two tasks raced to
+/// write `paused_apps`. Completion gates the next poll instead — `in_flight`
+/// makes overlap impossible by construction, and `since_last` is measured from
+/// the previous poll's END.
+pub(crate) fn poll_due(
+    in_flight: bool,
+    since_last: Option<std::time::Duration>,
+    interval: std::time::Duration,
+) -> bool {
+    if in_flight {
+        return false;
+    }
+    match since_last {
+        Some(elapsed) => elapsed >= interval,
+        None => true,
+    }
+}
 
 /// Governance state shared with the worker (pause enforcement) and the status
 /// route. In-memory only: a restart re-derives everything from DataHub on the
 /// next poll, so a dead DataHub after a restart means "no pauses" — fail-open.
 #[derive(Debug, Default)]
 pub struct GovernState {
-    last_poll: Option<std::time::Instant>,
+    /// When the last poll **finished** (see [`poll_due`]). `pub(crate)` so a
+    /// test can age it and exercise the in-flight guard on its own, without
+    /// waiting out the 30s minimum interval.
+    pub(crate) last_poll: Option<std::time::Instant>,
+    /// A poll is running right now; no other tick may start one.
+    pub(crate) in_flight: bool,
     paused_apps: HashSet<String>,
     last: Option<Value>,
 }
 
 pub type GovernCell = Arc<std::sync::Mutex<GovernState>>;
+
+/// Held for one poll. Releasing the in-flight flag and stamping the completion
+/// time both happen on **drop**, so a panicking or early-returning poll can
+/// neither wedge governance off forever nor re-fire on the very next tick.
+struct PollGuard(GovernCell);
+
+impl Drop for PollGuard {
+    fn drop(&mut self) {
+        let mut g = self.0.lock().unwrap();
+        g.in_flight = false;
+        g.last_poll = Some(std::time::Instant::now());
+    }
+}
 
 /// The budget a job actually runs with: `cost:pause` (from the last governance
 /// poll) forces `$0`, which [`pumper_core::AppContext`]'s budget governor turns
@@ -935,23 +999,30 @@ pub fn effective_budget(state: &AppState, app: &str, requested: Option<f64>) -> 
     }
 }
 
-/// Scheduler-tick entry point: interval-gated, spawned (non-blocking), gated on
-/// both `enabled` and `govern`.
+/// Scheduler-tick entry point: gated on `enabled` + `govern`, on the interval
+/// **since the last poll finished**, and on nothing else being in flight.
+/// Spawned, so a slow GMS never delays the scheduler loop.
 pub fn govern_tick(state: &AppState) {
     let cfg = &state.config.datahub;
     if !cfg.enabled || !cfg.govern {
         return;
     }
     let interval = std::time::Duration::from_secs(cfg.govern_interval_secs.max(30));
-    {
+    let guard = {
         let mut g = state.datahub_govern.lock().unwrap();
-        if matches!(g.last_poll, Some(t) if t.elapsed() < interval) {
+        if !poll_due(g.in_flight, g.last_poll.map(|t| t.elapsed()), interval) {
             return;
         }
-        g.last_poll = Some(std::time::Instant::now());
-    }
+        g.in_flight = true;
+        PollGuard(state.datahub_govern.clone())
+    };
     let state = state.clone();
-    tokio::spawn(async move { govern_poll(state).await });
+    tokio::spawn(async move {
+        // Moved in, so the flag clears (and completion is stamped) whenever the
+        // poll ends — including on panic.
+        let _guard = guard;
+        govern_poll(state).await
+    });
 }
 
 /// What one poll observed for one dataset.
@@ -1032,6 +1103,19 @@ pub(crate) fn plan_govern_actions(metas: &[DatasetMeta]) -> (Vec<GovernAction>, 
     (actions, paused)
 }
 
+/// Read-path client: same shape as [`client`], but with the short
+/// [`POLL_TIMEOUT_SECS`] instead of the 60s write timeout. Separate instance so
+/// tuning the governance path can never lengthen an ingestion POST.
+fn poll_client() -> &'static reqwest::Client {
+    static CLIENT: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    CLIENT.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(POLL_TIMEOUT_SECS))
+            .build()
+            .expect("datahub poll client")
+    })
+}
+
 /// One GraphQL read per dataset URN. Any transport / HTTP / GraphQL error is a
 /// hard `Err` — the caller aborts the poll (no partial governance).
 async fn fetch_govern_meta(state: &AppState, urn: &str) -> Result<Value, String> {
@@ -1041,7 +1125,7 @@ async fn fetch_govern_meta(state: &AppState, urn: &str) -> Result<Value, String>
                  deprecation { deprecated } \
                  tags { tags { tag { urn } } } \
                  health { type status } } }";
-    let mut req = client()
+    let mut req = poll_client()
         .post(&url)
         .json(&json!({ "query": query, "variables": { "urn": urn } }));
     if let Some(t) = cfg.resolve_token() {
@@ -1081,11 +1165,30 @@ async fn govern_poll(state: AppState) {
         }
     };
     let env = state.config.datahub.env.clone();
+    let started = std::time::Instant::now();
+    // Bounded-concurrency reads on the short-timeout client. Serial reads on
+    // the 60s write client made a slow GMS a ~20-minute poll for 20 datasets;
+    // the ceiling is now `worst_case_poll_secs(datasets)`.
+    let targets: Vec<(String, String, String)> = all
+        .iter()
+        .map(|(app, ds)| (app.clone(), ds.clone(), dataset_urn(&env, app, ds)))
+        .collect();
+    let reads = futures::stream::iter(targets.into_iter().map(|(app, ds, urn)| {
+        let state = &state;
+        async move {
+            fetch_govern_meta(state, &urn)
+                .await
+                .map(|body| govern_meta(&app, &ds, &body))
+        }
+    }))
+    .buffer_unordered(POLL_CONCURRENCY)
+    .collect::<Vec<_>>()
+    .await;
+
     let mut metas = Vec::with_capacity(all.len());
-    for (app, ds) in &all {
-        let urn = dataset_urn(&env, app, ds);
-        match fetch_govern_meta(&state, &urn).await {
-            Ok(body) => metas.push(govern_meta(app, ds, &body)),
+    for read in reads {
+        match read {
+            Ok(meta) => metas.push(meta),
             Err(e) => {
                 // Unreachable DataHub = clean no-op: abort before ANY action.
                 warn!("datahub govern: poll aborted, no actions taken: {e}");
@@ -1100,6 +1203,18 @@ async fn govern_poll(state: AppState) {
                 return;
             }
         }
+    }
+    // The bound is structural, not aspirational — say so when reality misses it
+    // (a GMS answering just under the per-request timeout for every batch).
+    let elapsed = started.elapsed();
+    let budget = worst_case_poll_secs(all.len());
+    if elapsed.as_secs() > budget {
+        warn!(
+            datasets = all.len(),
+            elapsed_secs = elapsed.as_secs(),
+            budget_secs = budget,
+            "datahub govern: poll exceeded its worst-case read budget"
+        );
     }
 
     let (actions, paused) = plan_govern_actions(&metas);
@@ -1207,6 +1322,8 @@ async fn govern_poll(state: AppState) {
         "at": pumper_core::datasets::ts(chrono::Utc::now()),
         "ok": true,
         "datasets_polled": all.len(),
+        "poll_ms": elapsed.as_millis() as u64,
+        "budget_secs": budget,
         "schedules_disabled": disabled,
         "syncs_enqueued": syncs,
         "paused_apps": paused.iter().collect::<Vec<_>>(),
@@ -1508,6 +1625,46 @@ mod tests {
             try_begin_sync(&cell).is_some(),
             "the slot must be free again once the first sync finishes"
         );
+    }
+
+    /// The anti-pattern: `last_poll` stamped when a poll STARTS, so a poll
+    /// slower than the interval overlapped the next one and two tasks raced to
+    /// write `paused_apps`.
+    #[test]
+    fn a_hanging_poll_gates_the_next_tick_not_just_the_interval() {
+        let interval = std::time::Duration::from_secs(300);
+        // Never polled → due.
+        assert!(poll_due(false, None, interval));
+        // In flight → NOT due, no matter how long ago the last one finished.
+        assert!(!poll_due(true, None, interval));
+        assert!(!poll_due(
+            true,
+            Some(std::time::Duration::from_secs(9_999)),
+            interval
+        ));
+        // Idle: the interval since COMPLETION decides.
+        assert!(!poll_due(
+            false,
+            Some(std::time::Duration::from_secs(299)),
+            interval
+        ));
+        assert!(poll_due(
+            false,
+            Some(std::time::Duration::from_secs(300)),
+            interval
+        ));
+    }
+
+    /// The anti-pattern: one serial read per dataset on the 60s write client,
+    /// making the poll's worst case grow linearly at a minute a dataset.
+    #[test]
+    fn worst_case_poll_is_bounded_by_batches_not_dataset_count() {
+        assert_eq!(worst_case_poll_secs(0), 0);
+        assert_eq!(worst_case_poll_secs(1), POLL_TIMEOUT_SECS);
+        assert_eq!(worst_case_poll_secs(4), POLL_TIMEOUT_SECS);
+        // 20 datasets: 5 batches × 10s = 50s, against 20 × 60s = 20 minutes.
+        assert_eq!(worst_case_poll_secs(20), 50);
+        assert!(worst_case_poll_secs(20) < 20 * 60);
     }
 
     #[test]
