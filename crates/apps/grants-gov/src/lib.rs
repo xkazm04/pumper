@@ -192,9 +192,11 @@ impl ScrapeApp for GrantsGov {
                  amounts joined in from that detail corpus (Search2 itself publishes none); \
                  `detailsFailed` counts detail-stage failures, which degrade the enrichment \
                  without failing the listing sync. The cross-source tail also reports \
-                 `corpusPass: {ran, cycle, batchSwept, corpusSwept}`: the corpus-wide sweep + \
-                 duplicate link runs once per UTC-day cycle on whichever grant source gets \
-                 there first, so a run that did not own it reports `crossSourceDups: null`",
+                 `crossSourceDups`, `recurrenceLinks` and \
+                 `corpusPass: {ran, cycle, batchSwept, corpusSwept}`: the corpus-wide relation \
+                 pass (sweep + duplicate/recurrence links) runs once per UTC-day cycle on \
+                 whichever grant source gets there first, so a run that did not own it reports \
+                 both link counts as null",
             ),
             cost_class: CostClass::Free,
         }

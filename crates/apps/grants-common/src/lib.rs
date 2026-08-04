@@ -4,9 +4,14 @@
 //! this crate additionally normalizes every opportunity into ONE canonical
 //! schema and upserts it into the cross-source `grants/unified` dataset
 //! (keyed `<source>:<source_id>`), so downstream consumers — search, exports,
-//! deadline digests, dedup — see one shape regardless of origin. Cross-source
-//! near-duplicates (the same grant syndicated on two portals) are linked via
-//! SimHash into `grants/duplicate_links`.
+//! deadline digests, dedup — see one shape regardless of origin.
+//!
+//! SimHash near-duplicates are then split into TWO typed relations, because
+//! "these two rows are the same program" means two entirely different things:
+//! `grants/duplicate_links` (one grant syndicated on two portals — apply to
+//! either) and `grants/recurrence_links` (the same program's next annual cycle
+//! — the earlier one is over, and the program reopens). See
+//! [`classify_relation`] and [`project_recurrence`].
 
 use pumper_core::resilience::{write_dataset, SourceState};
 use pumper_core::{AppContext, Provenance, Result, UpsertSummary};
@@ -30,6 +35,12 @@ fn stamp(ctx: &AppContext, source_url: Option<&str>) -> Provenance {
 pub const UNIFIED_APP: &str = "grants";
 pub const UNIFIED_DATASET: &str = "unified";
 pub const DUP_DATASET: &str = "duplicate_links";
+
+/// Annual-cycle links (`grants/recurrence_links`), keyed `a|b` like
+/// [`DUP_DATASET`]. A DISTINCT relation, not a tighter duplicate: these two rows
+/// are the same program in two different years, so the earlier one is over and
+/// the later one is the live opportunity. See [`classify_relation`].
+pub const RECURRENCE_DATASET: &str = "recurrence_links";
 
 /// Append-only lifecycle-event timeline (`grants/events`), keyed
 /// `{opportunity_key}:{observed_at_date}:{kind}` — one event per opportunity ×
@@ -128,6 +139,9 @@ pub struct UnifiedOutcome {
     /// not own the corpus pass. `None`, not `0` — "we did not look" is not the
     /// same claim as "there were none".
     pub cross_source_dups: Option<usize>,
+    /// Annual-cycle links written to `grants/recurrence_links`, or `None` when
+    /// this run did not own the corpus pass.
+    pub recurrences: Option<usize>,
     /// Whether this run owned (and therefore ran) this cycle's corpus-wide pass.
     pub corpus_pass: bool,
     /// The sync cycle this run belongs to (see [`corpus_cycle`]).
@@ -167,6 +181,10 @@ impl UnifiedOutcome {
         map.insert("warnings".into(), json!(self.warnings));
         // Null when this run did not own the corpus pass — see the field docs.
         map.insert("crossSourceDups".into(), json!(self.cross_source_dups));
+        // The sibling relation: same program, next annual cycle. Reported
+        // separately because it is NOT a duplicate — conflating the two counts
+        // would hide exactly the distinction this dataset exists to draw.
+        map.insert("recurrenceLinks".into(), json!(self.recurrences));
         // Which producer did the corpus-wide work this cycle, and what it cost.
         // Without this block a `swept: 0, crossSourceDups: null` run would be
         // indistinguishable from a broken one.
@@ -248,13 +266,12 @@ pub async fn finalize_unified(
     // corrections into a shadow dataset it did not read from.
     let cycle = corpus_cycle(now);
     let corpus_pass = claim_corpus_pass(ctx, &cycle).await?;
-    let (corpus_swept, cross_source_dups) = if corpus_pass {
-        (
-            Some(sweep_closed(ctx).await?),
-            Some(link_duplicates(ctx, DUP_DISTANCE).await?),
-        )
+    let (corpus_swept, cross_source_dups, recurrences) = if corpus_pass {
+        let swept = sweep_closed(ctx).await?;
+        let (dups, recurrences) = link_relations(ctx, DUP_DISTANCE).await?;
+        (Some(swept), Some(dups), Some(recurrences))
     } else {
-        (None, None)
+        (None, None, None)
     };
     let warnings = drift_warnings(unified_items);
     Ok(UnifiedOutcome {
@@ -263,6 +280,7 @@ pub async fn finalize_unified(
         batch_swept,
         corpus_swept,
         cross_source_dups,
+        recurrences,
         corpus_pass,
         cycle,
         warnings,
@@ -1030,37 +1048,460 @@ pub fn drift_warnings(items: &[(String, Value)]) -> Vec<String> {
     warnings
 }
 
-/// Links cross-source near-duplicates (SimHash Hamming ≤ `max_distance`) into
-/// `grants/duplicate_links`, keyed `a|b`. Same-source pairs are skipped — the
-/// interesting signal is one grant syndicated on two portals.
-pub async fn link_duplicates(ctx: &AppContext, max_distance: u32) -> Result<usize> {
+/// How far an observed gap between two cycles may sit from a whole number of
+/// years and still be called annual. Agencies slip a posting by weeks (a
+/// continuing resolution, a holiday, an amended NOFO), so a hard 365 would
+/// reject most real cycles; 45 days keeps 320–410 (and the 2- and 3-year
+/// multiples) apart from anything else, and is well outside the ±3 days a
+/// leap year moves.
+pub const RECURRENCE_TOLERANCE_DAYS: i64 = 45;
+
+/// The longest gap still read as one program's cycle. Beyond three years the
+/// claim "this reopens" is not supported by two postings.
+const MAX_RECURRENCE_YEARS: i64 = 3;
+
+/// Mean days in a calendar year, so a k-year gap is `k * 365.25` rather than an
+/// accumulating 365.
+const DAYS_PER_YEAR: f64 = 365.25;
+
+/// Cycles of one program needed before a NEXT window may be predicted. Two
+/// postings give one interval — an observation of a period, not evidence that
+/// it repeats. Three give two intervals, which can agree (or disagree, in which
+/// case nothing is predicted).
+const CYCLES_TO_PREDICT: usize = 3;
+
+/// What a near-duplicate pair actually is.
+///
+/// Two rows that SimHash puts next to each other are the SAME PROGRAM twice —
+/// but "twice" has two entirely different meanings, and one fixed Hamming
+/// distance cannot tell them apart:
+/// - [`Duplicate`](PairRelation::Duplicate) — one grant syndicated on two
+///   portals. Apply to either; they are one opportunity.
+/// - [`Recurrence`](PairRelation::Recurrence) — the SAME program's next annual
+///   cycle. Not a duplicate at all: the earlier one is gone and the later one
+///   is the live opportunity. For a grant-seeker this is the more useful fact —
+///   it says this program reopens, and roughly when.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PairRelation {
+    Duplicate,
+    /// Observed gap between the two cycles' deadlines, in days.
+    Recurrence {
+        period_days: i64,
+    },
+}
+
+impl PairRelation {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PairRelation::Duplicate => "duplicate",
+            PairRelation::Recurrence { .. } => "recurrence",
+        }
+    }
+}
+
+/// Classifies one near-duplicate pair, DETERMINISTICALLY — no model, no
+/// scoring, only fields the canonical schema already carries.
+///
+/// Precision over recall is the governing rule: a pair only becomes a
+/// recurrence when EVERY signal below agrees. Anything short of that falls back
+/// to today's behavior — an ordinary duplicate link for a cross-source pair,
+/// nothing at all for a same-source pair — because a confident-sounding "this
+/// reopens next August" that is wrong is worse than no link.
+///
+/// The signals, and why each one is here:
+/// - **`aln`** (Assistance Listing Number, the federal program's own permanent
+///   id): the single strongest identity signal in the schema, and the one field
+///   explicitly designed to stay constant across a program's annual cycles. If
+///   both rows publish one and they share no listing, they are different
+///   programs whatever their titles look like — no link at all.
+/// - **`agency`**: an annual cycle is re-posted by the same agency. Different
+///   agencies publishing similar titles is the cross-portal/syndication case,
+///   not a cycle.
+/// - **`title`**: SimHash already made these near-identical; the extra work
+///   here is stripping the year tokens (`FY2026`, `2026`, `2026-2027`) that are
+///   the *only* thing that usually differs between consecutive cycles. After
+///   that the titles must match exactly — which rejects "same agency, similar
+///   but materially different program".
+/// - **`close_date`**: the observed period. The gap must sit within
+///   [`RECURRENCE_TOLERANCE_DAYS`] of a whole number of years (up to
+///   [`MAX_RECURRENCE_YEARS`]). Two rows closing three weeks apart are two
+///   postings of one call, not two cycles.
+/// - **`open_date`**: the windows must be DISJOINT — the earlier cycle must
+///   close before the later one opens. A program cannot be in its next cycle
+///   while the previous one is still accepting applications; overlapping
+///   windows mean two concurrent variants, i.e. a duplicate.
+pub fn classify_relation(a: &Value, b: &Value, same_source: bool) -> Option<PairRelation> {
+    let fallback = if same_source {
+        // Today's behavior for same-source pairs: no link. Two rows on ONE
+        // portal that are not a cycle are a portal-internal artifact, and
+        // publishing them as "duplicates" was never the signal this exists for.
+        None
+    } else {
+        Some(PairRelation::Duplicate)
+    };
+
+    // `aln`: a hard veto, applied before anything else. Different listings =
+    // different programs, and no title/date coincidence overrides that.
+    if aln_conflict(a, b) {
+        return None;
+    }
+    // `agency`: a cycle is the same agency re-posting.
+    let (Some(agency_a), Some(agency_b)) = (
+        a.get("agency").and_then(Value::as_str),
+        b.get("agency").and_then(Value::as_str),
+    ) else {
+        return fallback;
+    };
+    if norm_text(agency_a) != norm_text(agency_b) {
+        return fallback;
+    }
+    // `title`: identical once the cycle's year tokens are removed.
+    let (Some(title_a), Some(title_b)) = (
+        a.get("title").and_then(Value::as_str),
+        b.get("title").and_then(Value::as_str),
+    ) else {
+        return fallback;
+    };
+    if program_title(title_a) != program_title(title_b) || program_title(title_a).is_empty() {
+        return fallback;
+    }
+    // `close_date` / `open_date`: two disjoint windows a whole number of years
+    // apart. Both deadlines must parse — an unknown date can never be evidence.
+    let (Some(close_a), Some(close_b)) = (
+        a.get("close_date")
+            .and_then(Value::as_str)
+            .and_then(parse_date),
+        b.get("close_date")
+            .and_then(Value::as_str)
+            .and_then(parse_date),
+    ) else {
+        return fallback;
+    };
+    let (earlier, later) = if close_a <= close_b { (a, b) } else { (b, a) };
+    if !windows_are_disjoint(earlier, later) {
+        return fallback;
+    }
+    match annual_period_days(close_a, close_b) {
+        Some(period_days) => Some(PairRelation::Recurrence { period_days }),
+        None => fallback,
+    }
+}
+
+/// True when both rows publish an ALN and they share no listing number. A row
+/// without an ALN (every non-federal source) vetoes nothing — absence is not
+/// disagreement.
+fn aln_conflict(a: &Value, b: &Value) -> bool {
+    let listings = |v: &Value| -> Vec<String> {
+        v.get("aln")
+            .and_then(Value::as_str)
+            .map(|s| {
+                s.split(',')
+                    .map(str::trim)
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let (la, lb) = (listings(a), listings(b));
+    !la.is_empty() && !lb.is_empty() && !la.iter().any(|x| lb.contains(x))
+}
+
+/// The earlier cycle must be closed before the later one opens. Unknown opens
+/// cannot prove an overlap, and the ≥ 320-day deadline gap already separates
+/// them, so a missing `open_date` is not treated as a conflict.
+fn windows_are_disjoint(earlier: &Value, later: &Value) -> bool {
+    let earlier_close = earlier
+        .get("close_date")
+        .and_then(Value::as_str)
+        .and_then(parse_date);
+    let later_open = later
+        .get("open_date")
+        .and_then(Value::as_str)
+        .and_then(parse_date);
+    match (earlier_close, later_open) {
+        (Some(close), Some(open)) => close < open,
+        _ => true,
+    }
+}
+
+/// The observed gap in days when two deadlines sit a whole number of years
+/// apart (within [`RECURRENCE_TOLERANCE_DAYS`]), else `None`.
+fn annual_period_days(a: chrono::NaiveDate, b: chrono::NaiveDate) -> Option<i64> {
+    let gap = (b - a).num_days().abs();
+    (1..=MAX_RECURRENCE_YEARS)
+        .any(|k| {
+            (gap - (k as f64 * DAYS_PER_YEAR).round() as i64).abs() <= RECURRENCE_TOLERANCE_DAYS
+        })
+        .then_some(gap)
+}
+
+/// A title reduced to the program it names: lowercased, punctuation collapsed,
+/// and the cycle's own year tokens removed (`FY2026`, `FY 26`, `2026`,
+/// `2026-2027`). Those tokens are usually the ONLY difference between two
+/// consecutive cycles, so stripping them is what lets an exact match be the
+/// (deliberately strict) title test.
+fn program_title(title: &str) -> String {
+    let normalized = norm_text(title);
+    let tokens: Vec<&str> = normalized.split(' ').filter(|t| !t.is_empty()).collect();
+    let mut kept: Vec<&str> = Vec::with_capacity(tokens.len());
+    let mut i = 0;
+    while i < tokens.len() {
+        if tokens[i] == "fy" {
+            // A bare `fy` marker: the digits it introduces ("FY 26", "FY 2026")
+            // are part of the same year token even though the space split them.
+            i += 1;
+            if i < tokens.len() && is_year_digits(tokens[i]) {
+                i += 1;
+            }
+            continue;
+        }
+        if !is_year_token(tokens[i]) {
+            kept.push(tokens[i]);
+        }
+        i += 1;
+    }
+    kept.join(" ")
+}
+
+/// A 2- or 4-digit run that can only be a year after an `fy` marker.
+fn is_year_digits(t: &str) -> bool {
+    (t.len() == 2 || t.len() == 4) && t.chars().all(|c| c.is_ascii_digit())
+}
+
+/// Lowercase, non-alphanumerics to single spaces, trimmed — so "CAL FIRE" and
+/// "Cal-Fire" compare equal without a fuzzy match.
+fn norm_text(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for ch in s.chars() {
+        if ch.is_alphanumeric() {
+            out.extend(ch.to_lowercase());
+        } else if !out.ends_with(' ') {
+            out.push(' ');
+        }
+    }
+    out.trim().to_string()
+}
+
+/// A token that names a fiscal/calendar year rather than the program: a bare
+/// four-digit year in a plausible range, or an `fy` prefix with digits.
+fn is_year_token(t: &str) -> bool {
+    if let Some(rest) = t.strip_prefix("fy") {
+        return rest.is_empty() || rest.chars().all(|c| c.is_ascii_digit());
+    }
+    t.len() == 4
+        && t.chars().all(|c| c.is_ascii_digit())
+        && t.parse::<i32>().is_ok_and(|y| (1900..=2199).contains(&y))
+}
+
+/// One observed cycle of a program, as the projection sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProgramCycle {
+    pub key: String,
+    pub open: Option<chrono::NaiveDate>,
+    pub close: chrono::NaiveDate,
+}
+
+/// What a program's observed cycles support claiming about its next one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecurrenceProjection {
+    /// Median observed gap between consecutive cycles, in days.
+    pub period_days: i64,
+    pub cycles: usize,
+    /// The next window, `None` unless the evidence supports predicting one.
+    pub next_open: Option<chrono::NaiveDate>,
+    pub next_close: Option<chrono::NaiveDate>,
+    /// Why a next window is (or is not) named — carried into the record so the
+    /// null is explained rather than merely empty.
+    pub basis: String,
+}
+
+/// Projects a program's next cycle from its observed ones. PURE.
+///
+/// **A period needs evidence.** Two postings give ONE interval: that is an
+/// observation of a gap, not proof of a rhythm, so the projection reports the
+/// period and leaves the next window `None`. Only at [`CYCLES_TO_PREDICT`]
+/// cycles — two intervals — can they corroborate each other, and even then they
+/// must agree within [`RECURRENCE_TOLERANCE_DAYS`] or nothing is predicted.
+/// This is the precision-over-recall rule applied to the most tempting output
+/// in the feature.
+pub fn project_recurrence(cycles: &[ProgramCycle]) -> Option<RecurrenceProjection> {
+    if cycles.len() < 2 {
+        return None;
+    }
+    let mut sorted: Vec<&ProgramCycle> = cycles.iter().collect();
+    sorted.sort_by_key(|c| (c.close, c.key.clone()));
+    let intervals: Vec<i64> = sorted
+        .windows(2)
+        .map(|w| (w[1].close - w[0].close).num_days())
+        .collect();
+    let mut ordered = intervals.clone();
+    ordered.sort_unstable();
+    let period_days = ordered[ordered.len() / 2];
+
+    let agree = intervals
+        .iter()
+        .all(|d| (d - period_days).abs() <= RECURRENCE_TOLERANCE_DAYS);
+    let last = sorted.last().expect("non-empty");
+    let (next_open, next_close, basis) = if cycles.len() < CYCLES_TO_PREDICT {
+        (
+            None,
+            None,
+            format!(
+                "{} observed interval(s); a next cycle is predicted only from {} cycles \
+                 ({} intervals that corroborate each other)",
+                intervals.len(),
+                CYCLES_TO_PREDICT,
+                CYCLES_TO_PREDICT - 1
+            ),
+        )
+    } else if !agree {
+        (
+            None,
+            None,
+            format!(
+                "{} observed intervals disagree by more than {RECURRENCE_TOLERANCE_DAYS} days \
+                 — the program reopens, but not on a period we can name",
+                intervals.len()
+            ),
+        )
+    } else {
+        (
+            last.open.map(|o| o + chrono::Duration::days(period_days)),
+            Some(last.close + chrono::Duration::days(period_days)),
+            format!(
+                "{} corroborating intervals, median {period_days} days",
+                intervals.len()
+            ),
+        )
+    };
+    Some(RecurrenceProjection {
+        period_days,
+        cycles: cycles.len(),
+        next_open,
+        next_close,
+        basis,
+    })
+}
+
+/// Links near-duplicate pairs (SimHash Hamming ≤ `max_distance`) into their two
+/// TYPED relations: cross-portal duplicates into `grants/duplicate_links` and
+/// annual cycles of one program into `grants/recurrence_links`. Returns
+/// `(duplicates, recurrences)`.
+///
+/// Same-source pairs are no longer discarded up front — that filter is exactly
+/// what hid the annual-cycle case, which is usually ONE portal re-posting a
+/// program under a new opportunity id. They are now examined and kept only when
+/// they classify as a recurrence.
+pub async fn link_relations(ctx: &AppContext, max_distance: u32) -> Result<(usize, usize)> {
     let pairs = ctx
         .datasets
         .duplicate_pairs(UNIFIED_APP, UNIFIED_DATASET, max_distance)
         .await?;
-    let items: Vec<(String, Value)> = pairs
-        .into_iter()
-        .filter(|p| source_of(&p.a) != source_of(&p.b))
-        .map(|p| {
-            (
-                format!("{}|{}", p.a, p.b),
-                json!({ "a": p.a, "b": p.b, "distance": p.distance }),
-            )
-        })
-        .collect();
-    if !items.is_empty() {
-        // A SimHash pairing over the stored corpus — job lineage only.
-        ctx.datasets
-            .upsert_many_stamped(
-                UNIFIED_APP,
-                DUP_DATASET,
-                &items,
-                None,
-                Some(&stamp(ctx, None)),
-            )
-            .await?;
+    if pairs.is_empty() {
+        return Ok((0, 0));
     }
-    Ok(items.len())
+    // Load only the rows the pairs actually reference. A full-corpus read would
+    // undo the coalescing win this feature is built on top of.
+    let mut rows: std::collections::HashMap<String, Value> = std::collections::HashMap::new();
+    for key in pairs.iter().flat_map(|p| [p.a.clone(), p.b.clone()]) {
+        if let std::collections::hash_map::Entry::Vacant(slot) = rows.entry(key.clone()) {
+            if let Some(rec) = ctx.datasets.get(UNIFIED_APP, UNIFIED_DATASET, &key).await? {
+                slot.insert(rec.data);
+            }
+        }
+    }
+
+    let mut dups: Vec<(String, Value)> = Vec::new();
+    // Recurrence pairs, grouped by the program they belong to, so a third cycle
+    // can corroborate the period the first two only observed.
+    let mut chains: std::collections::BTreeMap<String, Vec<(String, String, u32, i64)>> =
+        std::collections::BTreeMap::new();
+    for p in &pairs {
+        let (Some(a), Some(b)) = (rows.get(&p.a), rows.get(&p.b)) else {
+            continue;
+        };
+        let same_source = source_of(&p.a) == source_of(&p.b);
+        match classify_relation(a, b, same_source) {
+            Some(PairRelation::Duplicate) => dups.push((
+                format!("{}|{}", p.a, p.b),
+                json!({ "a": p.a, "b": p.b, "distance": p.distance, "relation": "duplicate" }),
+            )),
+            Some(PairRelation::Recurrence { period_days }) => {
+                let program = program_title(a.get("title").and_then(Value::as_str).unwrap_or(""));
+                chains.entry(program).or_default().push((
+                    p.a.clone(),
+                    p.b.clone(),
+                    p.distance,
+                    period_days,
+                ));
+            }
+            None => {}
+        }
+    }
+
+    let mut recurrences: Vec<(String, Value)> = Vec::new();
+    for (program, pairs) in &chains {
+        // Every distinct opportunity this program's pairs touch is one cycle.
+        let mut cycles: Vec<ProgramCycle> = Vec::new();
+        for key in pairs.iter().flat_map(|(a, b, _, _)| [a, b]) {
+            if cycles.iter().any(|c| &c.key == key) {
+                continue;
+            }
+            let Some(row) = rows.get(key) else { continue };
+            let Some(close) = row
+                .get("close_date")
+                .and_then(Value::as_str)
+                .and_then(parse_date)
+            else {
+                continue;
+            };
+            cycles.push(ProgramCycle {
+                key: key.clone(),
+                open: row
+                    .get("open_date")
+                    .and_then(Value::as_str)
+                    .and_then(parse_date),
+                close,
+            });
+        }
+        let Some(projection) = project_recurrence(&cycles) else {
+            continue;
+        };
+        let sample = rows.get(&pairs[0].0);
+        for (a, b, distance, period_days) in pairs {
+            recurrences.push((
+                format!("{a}|{b}"),
+                json!({
+                    "a": a,
+                    "b": b,
+                    "distance": distance,
+                    "relation": "recurrence",
+                    "program": program,
+                    "agency": sample.and_then(|r| r.get("agency")).cloned().unwrap_or(Value::Null),
+                    "aln": sample.and_then(|r| r.get("aln")).cloned().unwrap_or(Value::Null),
+                    // This pair's own observed gap, and the program-level median
+                    // the projection is built on.
+                    "observed_period_days": period_days,
+                    "period_days": projection.period_days,
+                    "cycles_observed": projection.cycles,
+                    "next_expected_open": projection.next_open.map(|d| d.to_string()),
+                    "next_expected_close": projection.next_close.map(|d| d.to_string()),
+                    "prediction_basis": projection.basis,
+                }),
+            ));
+        }
+    }
+
+    for (dataset, items) in [(DUP_DATASET, &dups), (RECURRENCE_DATASET, &recurrences)] {
+        if !items.is_empty() {
+            // A SimHash pairing over the stored corpus — job lineage only.
+            ctx.datasets
+                .upsert_many_stamped(UNIFIED_APP, dataset, items, None, Some(&stamp(ctx, None)))
+                .await?;
+        }
+    }
+    Ok((dups.len(), recurrences.len()))
 }
 
 fn source_of(key: &str) -> &str {
@@ -1902,6 +2343,7 @@ mod tests {
                 batch_swept: 0,
                 corpus_swept: Some(0),
                 cross_source_dups: Some(0),
+                recurrences: Some(0),
                 corpus_pass: true,
                 cycle: "2026-08-04".to_string(),
                 warnings: vec![],
@@ -2185,6 +2627,287 @@ mod tests {
         assert_eq!(out["corpusPass"]["ran"], json!(false));
         assert_eq!(out["corpusPass"]["corpusSwept"], Value::Null);
         assert_eq!(out["corpusPass"]["batchSwept"], json!(0));
+    }
+
+    // ---- recurrence is its own relation, not a tighter duplicate (G-E) ----
+
+    /// The SAME California wildfire program syndicated on grants.gov and on the
+    /// CA portal: same agency, same title, same application window. A genuine
+    /// cross-portal duplicate.
+    fn syndicated_pair() -> (Value, Value) {
+        let federal = json!({
+            "source": "grants-gov", "source_id": "100",
+            "title": "Wildfire Prevention Grant Program", "agency": "CAL FIRE",
+            "open_date": "2026-03-01", "close_date": "2026-06-30", "aln": Value::Null,
+        });
+        let state = json!({
+            "source": "ca-grants", "source_id": "CA-7",
+            "title": "Wildfire Prevention Grant Program", "agency": "Cal-Fire",
+            "open_date": "2026-03-01", "close_date": "2026-06-30", "aln": Value::Null,
+        });
+        (federal, state)
+    }
+
+    /// ONE federal program, two consecutive fiscal years — same ALN, same
+    /// agency, titles differing only by the year token, disjoint windows a year
+    /// apart. A genuine annual cycle, and the case the same-source filter used
+    /// to drop entirely.
+    fn annual_cycle_pair() -> (Value, Value) {
+        let fy26 = json!({
+            "source": "grants-gov", "source_id": "200",
+            "title": "Rural Health Network Development FY2026", "agency": "HHS",
+            "open_date": "2025-11-01", "close_date": "2026-02-15", "aln": "93.912",
+        });
+        let fy27 = json!({
+            "source": "grants-gov", "source_id": "201",
+            "title": "Rural Health Network Development FY2027", "agency": "HHS",
+            "open_date": "2026-11-01", "close_date": "2027-02-15", "aln": "93.912",
+        });
+        (fy26, fy27)
+    }
+
+    #[test]
+    fn a_cross_portal_duplicate_and_an_annual_cycle_are_typed_differently() {
+        // Both pairs are near-identical to SimHash. One fixed Hamming distance
+        // cannot tell them apart — the schema's own fields can.
+        let (federal, state) = syndicated_pair();
+        assert_eq!(
+            classify_relation(&federal, &state, false),
+            Some(PairRelation::Duplicate),
+            "same program, same window, two portals = one opportunity"
+        );
+
+        let (fy26, fy27) = annual_cycle_pair();
+        assert_eq!(
+            classify_relation(&fy26, &fy27, true),
+            Some(PairRelation::Recurrence { period_days: 365 }),
+            "same program, next fiscal year = not a duplicate at all"
+        );
+        // Order-independent: whichever way the pair arrives, the period is the
+        // same observation.
+        assert_eq!(
+            classify_relation(&fy27, &fy26, true),
+            Some(PairRelation::Recurrence { period_days: 365 })
+        );
+        assert_eq!(PairRelation::Duplicate.as_str(), "duplicate");
+        assert_eq!(
+            PairRelation::Recurrence { period_days: 365 }.as_str(),
+            "recurrence"
+        );
+    }
+
+    #[test]
+    fn an_uncertain_pair_stays_a_duplicate_it_is_never_promoted_to_a_prediction() {
+        // The anti-pattern: a confident-sounding "this reopens next August" that
+        // is wrong. Every signal short of unanimous falls back.
+        let (fy26, fy27) = annual_cycle_pair();
+
+        // `aln` veto: different federal listings are different programs, however
+        // identical the titles, agency and dates look.
+        let mut other_program = fy27.clone();
+        other_program["aln"] = json!("93.999");
+        assert_eq!(classify_relation(&fy26, &other_program, true), None);
+        // …and cross-source, the ALN veto still refuses to invent a link.
+        let mut other_source = other_program.clone();
+        other_source["source"] = json!("ca-grants");
+        assert_eq!(classify_relation(&fy26, &other_source, false), None);
+
+        // `agency` differs → not a cycle. Cross-source it stays an ordinary
+        // duplicate link; same-source it stays unlinked, as before.
+        let mut other_agency = fy27.clone();
+        other_agency["agency"] = json!("Department of Education");
+        assert_eq!(
+            classify_relation(&fy26, &other_agency, false),
+            Some(PairRelation::Duplicate)
+        );
+        assert_eq!(classify_relation(&fy26, &other_agency, true), None);
+
+        // `title` differs by more than the year token → not a cycle.
+        let mut other_title = fy27.clone();
+        other_title["title"] = json!("Urban Health Network Development FY2027");
+        assert_eq!(
+            classify_relation(&fy26, &other_title, false),
+            Some(PairRelation::Duplicate)
+        );
+
+        // `close_date` gap is not a whole number of years → two postings of one
+        // call, not two cycles.
+        let mut six_weeks_later = fy26.clone();
+        six_weeks_later["close_date"] = json!("2026-04-01");
+        six_weeks_later["open_date"] = json!("2026-03-01");
+        assert_eq!(classify_relation(&fy26, &six_weeks_later, true), None);
+
+        // Overlapping windows: the later "cycle" opened before the earlier one
+        // closed, so the program was never between cycles.
+        let mut overlapping = fy27.clone();
+        overlapping["open_date"] = json!("2026-01-01");
+        assert_eq!(classify_relation(&fy26, &overlapping, true), None);
+
+        // An unknown deadline can never be evidence.
+        let mut undated = fy27.clone();
+        undated["close_date"] = Value::Null;
+        assert_eq!(classify_relation(&fy26, &undated, true), None);
+        assert_eq!(
+            classify_relation(&fy26, &undated, false),
+            Some(PairRelation::Duplicate)
+        );
+    }
+
+    #[test]
+    fn a_next_cycle_is_never_predicted_from_a_single_observation() {
+        let cycle = |key: &str, open: &str, close: &str| ProgramCycle {
+            key: key.to_string(),
+            open: parse_date(open),
+            close: parse_date(close).unwrap(),
+        };
+
+        // ONE interval: the period is observed and reported, the next window is
+        // NOT — one gap is not a rhythm.
+        let two = vec![
+            cycle("grants-gov:200", "2025-11-01", "2026-02-15"),
+            cycle("grants-gov:201", "2026-11-01", "2027-02-15"),
+        ];
+        let p = project_recurrence(&two).expect("two cycles are a recurrence");
+        assert_eq!(p.period_days, 365);
+        assert_eq!(p.cycles, 2);
+        assert_eq!(p.next_open, None);
+        assert_eq!(p.next_close, None);
+        assert!(p.basis.contains("1 observed interval"), "{}", p.basis);
+
+        // TWO corroborating intervals: now the next window is earned.
+        let mut three = two.clone();
+        three.insert(0, cycle("grants-gov:199", "2024-11-01", "2025-02-15"));
+        let p = project_recurrence(&three).expect("three cycles");
+        assert_eq!(p.period_days, 365);
+        assert_eq!(p.cycles, 3);
+        assert_eq!(p.next_close, parse_date("2028-02-15"));
+        assert_eq!(p.next_open, parse_date("2027-11-01"));
+        assert!(p.basis.contains("2 corroborating intervals"), "{}", p.basis);
+
+        // Three cycles whose intervals DISAGREE: the program reopens, but on no
+        // period we can name — so no window, and the null says why.
+        let irregular = vec![
+            cycle("x:1", "2023-01-01", "2023-06-01"),
+            cycle("x:2", "2024-01-01", "2024-06-01"), // +366
+            cycle("x:3", "2026-01-01", "2026-11-01"), // +883
+        ];
+        let p = project_recurrence(&irregular).expect("still a recurrence");
+        assert_eq!(p.next_close, None);
+        assert!(p.basis.contains("disagree"), "{}", p.basis);
+
+        // A lone cycle is not a recurrence at all.
+        assert_eq!(project_recurrence(&two[..1]), None);
+        assert_eq!(project_recurrence(&[]), None);
+
+        // An unknown open_date costs the predicted open, not the whole
+        // projection — honest null, not a fabricated window.
+        let mut no_opens = three.clone();
+        for c in &mut no_opens {
+            c.open = None;
+        }
+        let p = project_recurrence(&no_opens).expect("three cycles");
+        assert_eq!(p.next_open, None);
+        assert_eq!(p.next_close, parse_date("2028-02-15"));
+    }
+
+    #[test]
+    fn a_program_title_is_its_year_tokens_removed_not_a_fuzzy_match() {
+        // The year token is usually the ONLY difference between two cycles.
+        assert_eq!(
+            program_title("Rural Health Network Development FY2026"),
+            "rural health network development"
+        );
+        assert_eq!(
+            program_title("Rural Health Network Development 2026-2027"),
+            "rural health network development"
+        );
+        assert_eq!(
+            program_title("Wildfire Prevention (FY 26)"),
+            "wildfire prevention"
+        );
+        // Punctuation and case are normalized, so CAL FIRE == Cal-Fire.
+        assert_eq!(norm_text("CAL FIRE"), norm_text("Cal-Fire"));
+        // Numbers that are NOT years survive — stripping them would collapse
+        // genuinely different programs onto one title.
+        assert_eq!(program_title("Section 8 Housing"), "section 8 housing");
+        assert_eq!(program_title("Title 42 Research"), "title 42 research");
+        // A title that is nothing but a year has no program identity, and an
+        // empty program title must never match another empty one.
+        assert!(program_title("FY2026").is_empty());
+        assert_eq!(
+            classify_relation(
+                &json!({ "title": "2026", "agency": "A", "close_date": "2026-02-15" }),
+                &json!({ "title": "2027", "agency": "A", "close_date": "2027-02-15" }),
+                true
+            ),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn the_two_relations_land_in_two_datasets() {
+        let store = pumper_core::testing::TempStore::new("grants-relations").await;
+        let ctx = pumper_core::testing::TestContext::new(&store.storage, "grants-gov").build();
+        let (federal, state) = syndicated_pair();
+        let (fy26, fy27) = annual_cycle_pair();
+        let corpus = vec![
+            ("grants-gov:100".to_string(), federal),
+            ("ca-grants:CA-7".to_string(), state),
+            ("grants-gov:200".to_string(), fy26),
+            ("grants-gov:201".to_string(), fy27),
+        ];
+        ctx.datasets
+            .upsert_many(UNIFIED_APP, UNIFIED_DATASET, &corpus)
+            .await
+            .unwrap();
+
+        // Max distance is widened so every pair is offered to the classifier:
+        // the WIRING is under test, not SimHash's sensitivity. The cost is that
+        // the two unrelated cross-source pairs are also offered, and they land
+        // (correctly, given they were declared near-duplicates) as duplicates —
+        // so this asserts on WHICH pair got WHICH relation, not on totals.
+        let (dups, recurrences) = link_relations(&ctx, 64).await.unwrap();
+        assert!(dups >= 1);
+        assert_eq!(recurrences, 1, "the annual cycle");
+
+        let dup_rows = ctx
+            .datasets
+            .list(UNIFIED_APP, DUP_DATASET, 100)
+            .await
+            .unwrap();
+        assert!(dup_rows
+            .iter()
+            .any(|r| r.key == "grants-gov:100|ca-grants:CA-7"));
+        assert!(dup_rows.iter().all(|r| r.data["relation"] == "duplicate"));
+        // The annual cycle is NOT also filed as a duplicate — that conflation is
+        // the whole thing this direction removes.
+        assert!(
+            !dup_rows
+                .iter()
+                .any(|r| r.key == "grants-gov:200|grants-gov:201"),
+            "the annual cycle must not appear in duplicate_links"
+        );
+
+        let rec_rows = ctx
+            .datasets
+            .list(UNIFIED_APP, RECURRENCE_DATASET, 100)
+            .await
+            .unwrap();
+        assert_eq!(rec_rows.len(), 1);
+        assert_eq!(rec_rows[0].key, "grants-gov:200|grants-gov:201");
+        let r = &rec_rows[0].data;
+        assert_eq!(r["relation"], "recurrence");
+        assert_eq!(r["program"], "rural health network development");
+        assert_eq!(r["aln"], "93.912");
+        assert_eq!(r["observed_period_days"], json!(365));
+        assert_eq!(r["cycles_observed"], json!(2));
+        // Two cycles = one interval, so the next window is honestly null and
+        // says why — never a prediction from a single observation.
+        assert_eq!(r["next_expected_close"], Value::Null);
+        assert!(r["prediction_basis"]
+            .as_str()
+            .unwrap()
+            .contains("1 observed interval"));
     }
 
     #[test]
