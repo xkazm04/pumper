@@ -52,7 +52,11 @@ async fn file_sink_appends_ndjson_and_logs_the_delivery() {
         .path()
         .join("sinks")
         .join(format!("{}.ndjson", watch.id));
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // Generous on purpose: this budget bounds a HANG, it does not measure
+    // latency. At 5s it flaked under full-suite parallel load while passing in
+    // isolation every time — a blown deadline here must mean the sink never
+    // wrote, never that the box was busy.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let content = loop {
         if let Ok(content) = tokio::fs::read_to_string(&path).await {
             break content;
@@ -76,7 +80,11 @@ async fn file_sink_appends_ndjson_and_logs_the_delivery() {
     // Same machinery as webhooks: the envelope's delivery id resolves to a
     // `delivered` row whose url is the file:// pseudo-URL (DLQ-replayable).
     let delivery_id = envelope["delivery_id"].as_str().expect("delivery id");
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    // Generous on purpose: this budget bounds a HANG, it does not measure
+    // latency. At 5s it flaked under full-suite parallel load while passing in
+    // isolation every time — a blown deadline here must mean the sink never
+    // wrote, never that the box was busy.
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     loop {
         if let Some(d) = state.storage.get_delivery(delivery_id).await.unwrap() {
             if d.status == "delivered" {
