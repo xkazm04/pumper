@@ -7,10 +7,10 @@ use pumper_core::{
     NoSearch, Plugins, ResearchCache, Resilience, ScrapeApp, Search, Storage, TierMemory,
 };
 use pumper_engine_archive::ArchiveEngine;
-use pumper_engine_remote::RemoteEngine;
 use pumper_engine_browser::BrowserEngine;
 use pumper_engine_claude::ClaudeEngine;
 use pumper_engine_http::HttpEngine;
+use pumper_engine_remote::RemoteEngine;
 use pumper_engine_search::TantivyIndex;
 use pumper_engine_wasm::WasmPluginHost;
 use tokio::sync::Notify;
@@ -53,6 +53,14 @@ pub struct AppState {
     /// reject them with a typed error instead of a blank 404. Never runnable —
     /// there is no execution path until the component-model host lands.
     pub dynamic_apps: Arc<Vec<serde_json::Value>>,
+    /// Prepared trigger evaluation sets, keyed by (source kind, app/source) and
+    /// stamped with `Storage::trigger_generation`. Every job completion asks it
+    /// twice (dataset + terminal) and every inbound ingress event once, so the
+    /// common "no triggers configured for this app" answer must not be a
+    /// database round trip. Invalidated implicitly by the generation counter
+    /// the storage layer bumps on create/enable-toggle/delete — see
+    /// `crate::triggers::TriggerEvalCache`.
+    pub trigger_cache: Arc<crate::triggers::TriggerEvalCache>,
     /// Pinged on enqueue so the worker picks up work without waiting a poll tick.
     pub notify: Arc<Notify>,
     /// Bounded pool a finished job's derived/outbound fan-out (search indexing,
@@ -169,6 +177,7 @@ impl AppState {
             search,
             registry: Arc::new(registry),
             dynamic_apps,
+            trigger_cache: Arc::new(crate::triggers::TriggerEvalCache::new()),
             notify: Arc::new(Notify::new()),
             fanout: Arc::new(crate::fanout::FanoutPool::new(
                 fanout_concurrency,

@@ -36,8 +36,8 @@ use pumper_core::{Error, Plugins, Result};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 use wasmtime::{
-    Config, Engine, Instance, Linker, Memory, Module, ResourceLimiter, Store, StoreLimits,
-    StoreLimitsBuilder, TypedFunc,
+    Config, Engine, Instance, InstancePre, Linker, Memory, Module, ResourceLimiter, Store,
+    StoreLimits, StoreLimitsBuilder, TypedFunc,
 };
 
 pub struct WasmPluginHost {
@@ -52,11 +52,19 @@ pub struct WasmPluginHost {
     modules: RwLock<HashMap<String, LoadedPlugin>>,
 }
 
-/// A compiled plugin plus its self-describing manifest (from the optional
-/// `describe` export), read once at load and cached for `GET /plugins`.
+/// A compiled, **pre-instantiated** plugin plus its self-describing manifest
+/// (from the optional `describe` export), read once at load and cached for
+/// `GET /plugins`.
+///
+/// The `InstancePre` is the load-time half of instantiation — import
+/// resolution and the type-checking a `Linker` would otherwise redo on every
+/// call — done once per plugin lifetime. What it deliberately does NOT share
+/// is the `Store`: every call still gets its own, so fuel budgets, linear
+/// memory and any state a plugin leaves behind stay per-invocation. Sharing a
+/// Store would trade the sandbox's isolation for the speedup.
 #[derive(Clone)]
 struct LoadedPlugin {
-    module: Module,
+    pre: InstancePre<StoreLimits>,
     manifest: Option<Value>,
 }
 
@@ -99,12 +107,12 @@ impl WasmPluginHost {
 #[async_trait]
 impl Plugins for WasmPluginHost {
     async fn run(&self, name: &str, input: &str, params: &Value) -> Result<Value> {
-        let module = self
+        let pre = self
             .modules
             .read()
             .unwrap()
             .get(name)
-            .map(|p| p.module.clone())
+            .map(|p| p.pre.clone())
             .ok_or_else(|| Error::App(format!("unknown plugin '{name}'")))?;
         let engine = self.engine.clone();
         let input = input.to_string();
@@ -123,11 +131,9 @@ impl Plugins for WasmPluginHost {
             .map_err(|e| Error::App(format!("plugin semaphore closed: {e}")))?;
         // Wasm execution is synchronous and CPU-bound — run it off the async
         // runtime so a busy plugin never stalls a tokio worker.
-        tokio::task::spawn_blocking(move || {
-            execute(engine, module, input, params, fuel, max_memory)
-        })
-        .await
-        .map_err(|e| Error::App(format!("plugin task panicked: {e}")))?
+        tokio::task::spawn_blocking(move || execute(engine, pre, input, params, fuel, max_memory))
+            .await
+            .map_err(|e| Error::App(format!("plugin task panicked: {e}")))?
     }
 
     fn list(&self) -> Vec<String> {
@@ -189,23 +195,49 @@ fn load_dir(engine: &Engine, dir: &Path) -> HashMap<String, LoadedPlugin> {
             Some(name) => name.to_string(),
             None => continue,
         };
-        match Module::from_file(engine, &path) {
-            Ok(module) => {
+        let module = match Module::from_file(engine, &path) {
+            Ok(module) => module,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), "failed to compile plugin: {err}");
+                continue;
+            }
+        };
+        match pre_instantiate(engine, &module) {
+            Ok(pre) => {
                 // Read the optional self-describing manifest once, best-effort —
                 // a missing/failed `describe` degrades to name-only metadata.
-                let manifest = describe_manifest(engine, &module);
-                map.insert(name, LoadedPlugin { module, manifest });
+                let manifest = describe_manifest(engine, &pre);
+                map.insert(name, LoadedPlugin { pre, manifest });
             }
-            Err(err) => tracing::warn!(path = %path.display(), "failed to compile plugin: {err}"),
+            Err(err) => {
+                tracing::warn!(path = %path.display(), "failed to link plugin: {err}")
+            }
         }
     }
     map
 }
 
-/// Builds a fuel-and-memory-limited store and instantiates `module` in it.
+/// Resolves a module's imports and type-checks it against the (empty) linker
+/// ONCE, yielding a reusable [`InstancePre`].
+///
+/// Plugins declare no imports, so this cannot fail for a well-formed module —
+/// but a module that *does* import something now fails at LOAD time with a
+/// clear message instead of failing identically on every call forever.
+fn pre_instantiate(engine: &Engine, module: &Module) -> Result<InstancePre<StoreLimits>> {
+    let linker: Linker<StoreLimits> = Linker::new(engine);
+    linker
+        .instantiate_pre(module)
+        .map_err(|e| Error::App(format!("pre-instantiate: {e}")))
+}
+
+/// Builds a fuel-and-memory-limited store and instantiates `pre` in it.
+///
+/// The store is per-call by design: fuel budget, linear memory and any residue
+/// a previous invocation left behind must not be visible to the next one. Only
+/// the *linking* work is shared, via the caller's [`InstancePre`].
 fn instantiate(
     engine: &Engine,
-    module: &Module,
+    pre: &InstancePre<StoreLimits>,
     fuel: u64,
     max_memory: usize,
 ) -> Result<(Store<StoreLimits>, Instance)> {
@@ -225,9 +257,8 @@ fn instantiate(
     store
         .set_fuel(fuel)
         .map_err(|e| Error::App(format!("set fuel: {e}")))?;
-    let linker: Linker<StoreLimits> = Linker::new(engine);
-    let instance = linker
-        .instantiate(&mut store, module)
+    let instance = pre
+        .instantiate(&mut store)
         .map_err(|e| Error::App(format!("instantiate: {e}")))?;
     Ok((store, instance))
 }
@@ -257,9 +288,8 @@ fn read_packed(store: &mut Store<StoreLimits>, memory: &Memory, packed: u64) -> 
 
 /// Best-effort read of a plugin's `describe() -> u64` manifest at load time.
 /// Any miss (no export, trap, non-JSON) → `None`, degrading to name-only.
-fn describe_manifest(engine: &Engine, module: &Module) -> Option<Value> {
-    let (mut store, instance) =
-        instantiate(engine, module, DESCRIBE_FUEL, 16 * 1024 * 1024).ok()?;
+fn describe_manifest(engine: &Engine, pre: &InstancePre<StoreLimits>) -> Option<Value> {
+    let (mut store, instance) = instantiate(engine, pre, DESCRIBE_FUEL, 16 * 1024 * 1024).ok()?;
     let memory = instance.get_memory(&mut store, "memory")?;
     let describe = instance
         .get_typed_func::<(), u64>(&mut store, "describe")
@@ -321,7 +351,14 @@ pub fn discover_dynamic_apps(dir: &Path) -> Vec<DynamicAppManifest> {
                 continue;
             }
         };
-        match describe_manifest(&engine, &module) {
+        let pre = match pre_instantiate(&engine, &module) {
+            Ok(pre) => pre,
+            Err(err) => {
+                tracing::warn!(path = %path.display(), "dynamic app failed to link: {err}");
+                continue;
+            }
+        };
+        match describe_manifest(&engine, &pre) {
             Some(manifest @ Value::Object(_)) => apps.push(DynamicAppManifest { name, manifest }),
             _ => tracing::warn!(
                 path = %path.display(),
@@ -335,13 +372,13 @@ pub fn discover_dynamic_apps(dir: &Path) -> Vec<DynamicAppManifest> {
 
 fn execute(
     engine: Engine,
-    module: Module,
+    pre: InstancePre<StoreLimits>,
     input: String,
     params: Value,
     fuel: u64,
     max_memory: usize,
 ) -> Result<Value> {
-    let (mut store, instance) = instantiate(&engine, &module, fuel, max_memory)?;
+    let (mut store, instance) = instantiate(&engine, &pre, fuel, max_memory)?;
     let memory = instance
         .get_memory(&mut store, "memory")
         .ok_or_else(|| Error::App("plugin exports no 'memory'".into()))?;
@@ -407,10 +444,8 @@ mod discovery_tests {
     }
 
     fn fresh_dir(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "pumper-dynamic-apps-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("pumper-dynamic-apps-{tag}-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -455,7 +490,88 @@ mod discovery_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_max_concurrent;
+    use super::*;
+
+    /// A minimal module in the plugin shape: a memory, an `alloc` and an
+    /// `extract_v2` that returns a fixed byte range. Enough to instantiate.
+    const FIXTURE_WAT: &str = r#"(module
+        (memory (export "memory") 1)
+        (data (i32.const 16) "{\"pass\":true}")
+        (func (export "alloc") (param i32) (result i32) (i32.const 1024))
+        (func (export "extract_v2") (param i32 i32) (result i64)
+          (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 13))))"#;
+
+    fn fixture_engine_and_module() -> (Engine, Module) {
+        let mut config = Config::new();
+        config.consume_fuel(true);
+        let engine = Engine::new(&config).expect("engine");
+        let module = Module::new(&engine, FIXTURE_WAT).expect("module");
+        (engine, module)
+    }
+
+    /// Measures the two instantiation paths against each other, and both
+    /// against the bare `Store::new` they share, so the report says which part
+    /// of a plugin call the per-invocation cost actually sits in.
+    ///
+    /// The gate is deliberately one-sided — pre-instantiation must not be a
+    /// REGRESSION — rather than "must be faster". Plugins declare no imports,
+    /// so the linking this hoists out of the call path is genuinely small for
+    /// them; the win is bounded, and asserting a speedup would be asserting
+    /// scheduler noise. `#[ignore]`d with the other timing-dependent tests
+    /// (`just test-ignored`).
+    #[test]
+    #[ignore = "timing-dependent microbenchmark; run with `cargo test -- --ignored`"]
+    fn instance_pre_instantiation_is_never_slower_than_relinking_per_call() {
+        const N: u32 = 2_000;
+        let (engine, module) = fixture_engine_and_module();
+        let limits = || StoreLimitsBuilder::new().memory_size(16 << 20).build();
+        let per_call = |d: std::time::Duration| d.as_secs_f64() * 1e6 / N as f64;
+
+        // The floor both paths pay: a fresh, limited, fuelled Store per call.
+        // Per-call isolation is non-negotiable, so this is not reclaimable.
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let mut store = Store::new(&engine, limits());
+            store.set_fuel(1_000_000).unwrap();
+            std::hint::black_box(&mut store);
+        }
+        let store_only = started.elapsed();
+
+        // BEFORE: a fresh Linker + full instantiate per call.
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let mut store = Store::new(&engine, limits());
+            store.set_fuel(1_000_000).unwrap();
+            let linker: Linker<StoreLimits> = Linker::new(&engine);
+            let _ = linker
+                .instantiate(&mut store, &module)
+                .expect("instantiate");
+        }
+        let relink = started.elapsed();
+
+        // AFTER: link once at load, then a fresh Store + InstancePre::instantiate.
+        let pre = pre_instantiate(&engine, &module).expect("pre");
+        let started = std::time::Instant::now();
+        for _ in 0..N {
+            let mut store = Store::new(&engine, limits());
+            store.set_fuel(1_000_000).unwrap();
+            let _ = pre.instantiate(&mut store).expect("instantiate");
+        }
+        let prelinked = started.elapsed();
+
+        eprintln!(
+            "instantiate x{N}: store-only {:.2}us/call | relink-per-call {:.2}us/call | \
+             InstancePre {:.2}us/call",
+            per_call(store_only),
+            per_call(relink),
+            per_call(prelinked),
+        );
+        assert!(
+            prelinked.as_secs_f64() < relink.as_secs_f64() * 1.5,
+            "pre-instantiation must never be a regression on relinking every call \
+             (relink {relink:?} vs pre {prelinked:?})"
+        );
+    }
 
     #[test]
     fn max_concurrent_honors_explicit_and_derives_default() {

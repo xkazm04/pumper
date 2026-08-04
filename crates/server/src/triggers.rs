@@ -401,15 +401,170 @@ pub fn external_trigger_obj(
     })
 }
 
-// ── worker hooks (IO around the pure helpers) ────────────────────────────────
+// ── the evaluation-set cache ─────────────────────────────────────────────────
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
+use pumper_core::datasets::JsonFilter;
 use pumper_core::storage::{NewTriggerRun, TRIGGER_SET_ID};
-use pumper_core::EnqueueOptions;
+use pumper_core::{EnqueueOptions, Storage};
 use tracing::{debug, info, warn};
 
 use crate::state::AppState;
+
+/// Which evaluation set a source event needs. `Dataset`/`Job` are keyed by the
+/// source app; `External` by the ingress source id (its set also folds in the
+/// `'*'` wildcard triggers, exactly as the SQL does).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvalScope<'a> {
+    Dataset(&'a str),
+    Job(&'a str),
+    External(&'a str),
+}
+
+impl EvalScope<'_> {
+    /// Cache key. The kind is part of it — a dataset trigger and a job trigger
+    /// on the same app are different sets, and collapsing them would fire both
+    /// kinds on either event.
+    fn key(&self) -> (&'static str, String) {
+        match self {
+            EvalScope::Dataset(app) => ("dataset", (*app).to_string()),
+            EvalScope::Job(app) => ("job", (*app).to_string()),
+            EvalScope::External(src) => ("external", (*src).to_string()),
+        }
+    }
+
+    async fn load(&self, storage: &Storage) -> pumper_core::Result<Vec<Trigger>> {
+        match self {
+            EvalScope::Dataset(app) => storage.enabled_triggers("dataset", app).await,
+            EvalScope::Job(app) => storage.enabled_triggers("job", app).await,
+            EvalScope::External(src) => storage.enabled_external_triggers(src).await,
+        }
+    }
+}
+
+/// One trigger with everything derivable from it that is FIXED for its
+/// lifetime, so the per-event path never re-derives it. Today that is the
+/// parsed filter specs: they are validated at create time, immutable
+/// afterwards (there is no update endpoint — a change is a delete + create),
+/// and re-parsing them per inbound event is pure waste.
+pub struct EvalTrigger {
+    pub trigger: Trigger,
+    /// `Ok` = the parsed predicate set (empty when the trigger has none).
+    /// `Err` = the stored specs no longer parse; the fire path skips loudly
+    /// rather than firing wide, exactly as the per-event parse used to.
+    pub filters: std::result::Result<Vec<JsonFilter>, ()>,
+}
+
+impl EvalTrigger {
+    fn new(trigger: Trigger) -> Self {
+        let filters = match trigger.filters.as_deref() {
+            None => Ok(Vec::new()),
+            Some(specs) => crate::routes::parse_filters(specs).map_err(|_| ()),
+        };
+        Self { trigger, filters }
+    }
+}
+
+/// An evaluation set: the triggers of one scope, prepared once.
+pub type EvalSet = Arc<Vec<Arc<EvalTrigger>>>;
+
+struct CacheEntry {
+    generation: u64,
+    set: EvalSet,
+}
+
+/// Generation-stamped cache of prepared evaluation sets.
+///
+/// The point is the ZERO-trigger case: a fleet with no triggers configured for
+/// an app used to pay a `SELECT … FROM triggers` on every single job
+/// completion, twice (dataset + terminal), to learn "still nothing". A cached
+/// EMPTY set answers that without touching SQLite.
+///
+/// Coherence rests on [`Storage::trigger_generation`]: a reader samples the
+/// generation BEFORE its SELECT and stamps the loaded set with that sample, so
+/// a set can never be stamped newer than the data it actually contains. A
+/// mutation bumps the generation after committing, so the very next lookup
+/// (which samples the bumped value) misses and reloads. A slow loader that
+/// finishes after a mutation stamps its result with the OLD generation, so it
+/// is never served either — the worst case is a redundant reload, never a
+/// stale decision.
+#[derive(Default)]
+pub struct TriggerEvalCache {
+    entries: Mutex<HashMap<(&'static str, String), CacheEntry>>,
+    /// How many times the cache actually went to the database. The observable
+    /// the "no queries when nothing is configured" guarantee is tested against.
+    db_loads: AtomicU64,
+}
+
+impl TriggerEvalCache {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Cached set for `generation`, or `None` when the entry is absent or was
+    /// stamped by an older generation.
+    fn get(&self, key: &(&'static str, String), generation: u64) -> Option<EvalSet> {
+        let entries = self.entries.lock().unwrap();
+        let entry = entries.get(key)?;
+        (entry.generation == generation).then(|| entry.set.clone())
+    }
+
+    /// Stores a freshly loaded set. Never lets an older generation overwrite a
+    /// newer one (two concurrent loaders straddling a mutation), which would
+    /// throw away the good entry without ever serving a stale one.
+    fn put(&self, key: (&'static str, String), generation: u64, set: &EvalSet) {
+        let mut entries = self.entries.lock().unwrap();
+        match entries.get(&key) {
+            Some(existing) if existing.generation > generation => {}
+            _ => {
+                entries.insert(
+                    key,
+                    CacheEntry {
+                        generation,
+                        set: set.clone(),
+                    },
+                );
+            }
+        }
+    }
+
+    /// Number of database loads performed so far — the observable the
+    /// "a completion with nothing configured queries nothing" guarantee is
+    /// asserted against. Read only by tests today, hence the allow.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn db_loads(&self) -> u64 {
+        self.db_loads.load(Ordering::Relaxed)
+    }
+}
+
+/// The prepared evaluation set for `scope`, from cache when the `triggers`
+/// table has not changed since it was cached.
+///
+/// Sampling the generation before the load — and only before — is the whole
+/// correctness argument; see [`TriggerEvalCache`].
+pub async fn eval_set(state: &AppState, scope: EvalScope<'_>) -> pumper_core::Result<EvalSet> {
+    let generation = state.storage.trigger_generation();
+    let key = scope.key();
+    if let Some(hit) = state.trigger_cache.get(&key, generation) {
+        return Ok(hit);
+    }
+    state.trigger_cache.db_loads.fetch_add(1, Ordering::Relaxed);
+    let set: EvalSet = Arc::new(
+        scope
+            .load(&state.storage)
+            .await?
+            .into_iter()
+            .map(|t| Arc::new(EvalTrigger::new(t)))
+            .collect(),
+    );
+    state.trigger_cache.put(key, generation, &set);
+    Ok(set)
+}
+
+// ── worker hooks (IO around the pure helpers) ────────────────────────────────
 
 /// Records ONE decision in the ledger (`trigger_runs`, migration 0036).
 ///
@@ -462,7 +617,7 @@ pub async fn fire_dataset_triggers(
     by_dataset: &HashMap<&str, Vec<&Revision>>,
 ) {
     let source_job_id = job.id.to_string();
-    let trigs = match state.storage.enabled_triggers("dataset", &job.app).await {
+    let trigs = match eval_set(state, EvalScope::Dataset(&job.app)).await {
         Ok(t) if !t.is_empty() => t,
         Ok(_) => return,
         Err(e) => {
@@ -497,7 +652,11 @@ pub async fn fire_dataset_triggers(
             dataset: Some(dataset),
             event_id: None,
         };
-        for trigger in trigs.iter().filter(|t| t.covers_dataset(dataset)) {
+        for trigger in trigs
+            .iter()
+            .map(|t| &t.trigger)
+            .filter(|t| t.covers_dataset(dataset))
+        {
             let matching: Vec<&Revision> = revs
                 .iter()
                 .copied()
@@ -544,7 +703,7 @@ pub async fn fire_dataset_triggers(
 /// Fires enabled terminal-job triggers matching this job's final status.
 pub async fn fire_terminal_triggers(state: &AppState, job: &Job) {
     let source_job_id = job.id.to_string();
-    let trigs = match state.storage.enabled_triggers("job", &job.app).await {
+    let trigs = match eval_set(state, EvalScope::Job(&job.app)).await {
         Ok(t) if !t.is_empty() => t,
         Ok(_) => return,
         Err(e) => {
@@ -572,7 +731,7 @@ pub async fn fire_terminal_triggers(state: &AppState, job: &Job) {
         event_id: None,
     };
     let mut fired = 0;
-    for trigger in &trigs {
+    for trigger in trigs.iter().map(|t| &t.trigger) {
         if !status_matches(trigger.on_status.as_deref(), job.status.as_str()) {
             record(state, ctx.row(&trigger.id, "status_mismatch")).await;
             continue;
@@ -615,7 +774,7 @@ pub async fn fire_external_triggers(
     event_id: &str,
     payload: &Value,
 ) -> usize {
-    let trigs = match state.storage.enabled_external_triggers(source_id).await {
+    let trigs = match eval_set(state, EvalScope::External(source_id)).await {
         Ok(t) if !t.is_empty() => t,
         Ok(_) => return 0,
         Err(e) => {
@@ -643,21 +802,17 @@ pub async fn fire_external_triggers(
         event_id: Some(event_id),
     };
     let mut fired = 0;
-    for trigger in &trigs {
-        // Predicates were validated at create time; a spec that no longer
-        // parses (defensive) skips the trigger loudly rather than firing wide.
-        let filters = match trigger.filters.as_deref() {
-            Some(specs) => match crate::routes::parse_filters(specs) {
-                Ok(f) => f,
-                Err(_) => {
-                    warn!(trigger = %trigger.id, "external trigger has unparseable filters; skipped");
-                    record(state, ctx.row(&trigger.id, "bad_filters")).await;
-                    continue;
-                }
-            },
-            None => Vec::new(),
+    for entry in trigs.iter() {
+        let trigger = &entry.trigger;
+        // Predicates were validated at create time and parsed ONCE when this
+        // evaluation set was prepared; a spec that no longer parses
+        // (defensive) skips the trigger loudly rather than firing wide.
+        let Ok(filters) = &entry.filters else {
+            warn!(trigger = %trigger.id, "external trigger has unparseable filters; skipped");
+            record(state, ctx.row(&trigger.id, "bad_filters")).await;
+            continue;
         };
-        if !payload_matches(&filters, payload) {
+        if !payload_matches(filters, payload) {
             record(state, ctx.row(&trigger.id, "filter_miss")).await;
             continue;
         }
@@ -959,6 +1114,88 @@ mod tests {
         // same run (they belong to different trigger kinds, but the keyspace
         // must not depend on that).
         assert_ne!(run, idempotency_key("T1", "J1"));
+    }
+
+    // ── the evaluation-set cache ─────────────────────────────────────────────
+
+    fn eval_trigger(id: &str, filters: Option<Vec<String>>) -> Arc<EvalTrigger> {
+        let mut t = trigger_with_hooks(TriggerPluginHooks {
+            predicate: None,
+            transform: None,
+        });
+        t.id = id.into();
+        t.plugin_hooks = None;
+        t.filters = filters;
+        Arc::new(EvalTrigger::new(t))
+    }
+
+    fn ids(set: &EvalSet) -> Vec<String> {
+        set.iter().map(|t| t.trigger.id.clone()).collect()
+    }
+
+    #[test]
+    fn cache_serves_within_a_generation_not_across_one() {
+        // The anti-pattern: a cache keyed only by scope, so a trigger created
+        // after the first lookup never reaches the next firing decision.
+        let cache = TriggerEvalCache::new();
+        let key = EvalScope::Dataset("grants").key();
+        let empty: EvalSet = Arc::new(Vec::new());
+        cache.put(key.clone(), 0, &empty);
+        assert!(cache.get(&key, 0).is_some(), "same generation hits");
+        assert!(
+            cache.get(&key, 1).is_none(),
+            "a mutation's generation must miss, not serve the pre-mutation set"
+        );
+        // …and the reload under the new generation is what gets served next.
+        let one: EvalSet = Arc::new(vec![eval_trigger("T1", None)]);
+        cache.put(key.clone(), 1, &one);
+        assert_eq!(ids(&cache.get(&key, 1).expect("hit")), vec!["T1"]);
+        assert!(cache.get(&key, 0).is_none(), "the old stamp is gone too");
+    }
+
+    #[test]
+    fn cache_keys_do_not_collide_across_kinds_or_apps() {
+        // A dataset trigger on `grants` and a job trigger on `grants` are
+        // different sets; one key for both would fire either kind on either
+        // event.
+        let cache = TriggerEvalCache::new();
+        let ds = EvalScope::Dataset("grants").key();
+        let job = EvalScope::Job("grants").key();
+        let ext = EvalScope::External("grants").key();
+        let other = EvalScope::Dataset("other").key();
+        cache.put(ds.clone(), 0, &Arc::new(vec![eval_trigger("DS", None)]));
+        assert!(cache.get(&job, 0).is_none());
+        assert!(cache.get(&ext, 0).is_none());
+        assert!(cache.get(&other, 0).is_none());
+        assert_eq!(ids(&cache.get(&ds, 0).expect("hit")), vec!["DS"]);
+    }
+
+    #[test]
+    fn a_slow_loader_never_overwrites_a_newer_entry() {
+        // Loader A samples generation 0, a mutation bumps to 1, loader B stores
+        // the fresh set, and only THEN does A finish. A's set is pre-mutation:
+        // it must neither be served nor replace B's.
+        let cache = TriggerEvalCache::new();
+        let key = EvalScope::External("src").key();
+        cache.put(key.clone(), 1, &Arc::new(vec![eval_trigger("FRESH", None)]));
+        cache.put(key.clone(), 0, &Arc::new(vec![eval_trigger("STALE", None)]));
+        assert_eq!(ids(&cache.get(&key, 1).expect("hit")), vec!["FRESH"]);
+    }
+
+    #[test]
+    fn filters_are_parsed_once_into_the_eval_set_not_per_event() {
+        // Parsed at prepare time, so the per-event path only matches.
+        let ok = eval_trigger("T1", Some(vec!["$.ref:eq:refs/heads/main".into()]));
+        let parsed = ok.filters.as_ref().expect("specs parse");
+        assert_eq!(parsed.len(), 1);
+        assert!(payload_matches(parsed, &payload()));
+        // No specs is an empty predicate set (matches everything), NOT an error.
+        let none = eval_trigger("T2", None);
+        assert!(none.filters.as_ref().expect("no specs is Ok").is_empty());
+        // A spec that no longer parses is remembered as the error it is, so the
+        // fire path can skip loudly instead of firing wide.
+        let bad = eval_trigger("T3", Some(vec!["not-a-filter-spec".into()]));
+        assert!(bad.filters.is_err());
     }
 
     // ── external (ingress) matching ──────────────────────────────────────────

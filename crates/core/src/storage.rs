@@ -1,4 +1,6 @@
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, SecondsFormat, Utc};
@@ -125,6 +127,16 @@ pub fn migrator() -> sqlx::migrate::Migrator {
 pub struct Storage {
     pool: SqlitePool,
     pub artifacts_dir: PathBuf,
+    /// Monotonic version of the `triggers` table, bumped by every mutation
+    /// (create / enable-toggle / delete) **after** the write commits. Callers
+    /// that cache an evaluation set stamp it with the value they read *before*
+    /// their SELECT and re-read on any change — see
+    /// [`Storage::trigger_generation`].
+    ///
+    /// `Arc` because `Storage` is `Clone` and clones (the test harness makes
+    /// one) must share one counter — a per-clone counter would be a silent
+    /// lost-invalidation hole.
+    trigger_generation: Arc<AtomicU64>,
 }
 
 impl Storage {
@@ -157,6 +169,7 @@ impl Storage {
         Ok(Self {
             pool,
             artifacts_dir: cfg.artifacts_dir.clone(),
+            trigger_generation: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -848,6 +861,30 @@ impl Storage {
 
     // ---- Reactive triggers ---------------------------------------------------
 
+    /// Current version of the `triggers` table. Any change to the table (a
+    /// create, an enable-toggle, a delete) makes this differ from every value
+    /// read before it, which is the whole contract: a cached evaluation set
+    /// stamped with an older value is stale by definition.
+    ///
+    /// The **read-before-query** discipline is what closes the invalidation
+    /// window. A reader samples the generation, THEN runs its SELECT, THEN
+    /// stamps the result with the sampled value. Writers bump only after their
+    /// statement has committed. So a reader that observes generation `g` is
+    /// guaranteed to see every write that produced `g`, and a reader racing a
+    /// write either observes the old `g` (and its entry is invalidated the
+    /// moment anybody re-reads) or the new one (and its SELECT saw the write).
+    /// There is no interleaving that lets a post-mutation reader be served a
+    /// pre-mutation set.
+    pub fn trigger_generation(&self) -> u64 {
+        self.trigger_generation.load(Ordering::Acquire)
+    }
+
+    /// Invalidates every cached trigger evaluation set. Called by (and only by)
+    /// the mutating trigger methods, always after the write commits.
+    fn bump_trigger_generation(&self) {
+        self.trigger_generation.fetch_add(1, Ordering::Release);
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub async fn create_trigger(&self, t: &NewTrigger<'_>) -> Result<Trigger> {
         let id = Uuid::new_v4().to_string();
@@ -883,6 +920,7 @@ impl Storage {
         .bind(hooks_json)
         .execute(&self.pool)
         .await?;
+        self.bump_trigger_generation();
         self.get_trigger(&id)
             .await?
             .ok_or(Error::Storage(sqlx::Error::RowNotFound))
@@ -957,6 +995,7 @@ impl Storage {
             .bind(enabled as i64)
             .execute(&self.pool)
             .await?;
+        self.bump_trigger_generation();
         Ok(result.rows_affected() > 0)
     }
 
@@ -965,6 +1004,7 @@ impl Storage {
             .bind(id)
             .execute(&self.pool)
             .await?;
+        self.bump_trigger_generation();
         Ok(result.rows_affected() > 0)
     }
 

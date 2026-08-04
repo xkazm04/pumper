@@ -25,6 +25,7 @@ mod router;
 mod scheduler_overlap;
 mod shutdown_drain;
 mod sink_delivery;
+mod trigger_cache;
 mod trigger_hops;
 mod trigger_ledger;
 mod webhook_contract;
