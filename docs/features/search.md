@@ -30,6 +30,15 @@ An app whose result stays compact (counts, not arrays — the fleet convention) 
 - **Facets**: `apps` + `datasets` counts over the top-1000 matches (honest sample), sorted by count. `app=`/`dataset=` params filter by exact term. **Computed only when requested** (`SearchRequest.facets`, which `GET /search` sets): facets sample ≥1000 docs and decode each, so a facet-less query (the saved-search runner, and any caller that reads only hit ids) ranks and decodes just the `offset+limit` page window — no facet-sampling overread.
 - **Fuzzy** (`fuzzy=true`): edit-distance-1 on title+body (transposition = one edit). Quoted `"exact phrases"` parse as phrase queries in either mode.
 
+### Entity-typed filters (`amount`, `event_date`)
+
+At index time, `crates/engine-search/src/enrich.rs` extracts two optional fields from each doc's title+body with conservative regex rules, and `GET /search` filters on them: `amount_gte`/`amount_lte` (whole US dollars) and `date_after`/`date_before` (unix seconds). **No match = no field**: a doc with nothing extracted is *absent* from the field, so it never matches any range filter — filtering by amount implies "has an amount", never "amount is 0".
+
+- **`amount`** — the largest amount carrying an explicit `$`/`usd` marker, whole dollars, scale suffixes (`k`/`m`/`mm`/`b`/`million`/`billion`) applied. Bare numbers are not money. Over $1T is treated as extraction noise and dropped. **Ambiguously formatted amounts are dropped, not guessed**: `$1.234,56` / `$1.234.567,89` / `$5.000.000` (European decimal or grouping) would be read as `$1` or `$5` by US-centric parsing, so the candidate is skipped entirely — other, unambiguous amounts in the same document still count.
+- **`event_date`** — the earliest *upcoming* deadline-like date (UTC midnight), where "deadline-like" requires a keyword (`deadline`, `due`, `clos…`, `expir…`, `apply`, `submit`, `respond`, `end_date`) within the preceding 120 bytes. A bare publication date is not a deadline. Accepted shapes: `YYYY-MM-DD` **including RFC3339 timestamps** (`2026-09-01T00:00:00Z`, offsets and fractional seconds), `M/D/YYYY`, and `Month D, YYYY`. Upcoming means within `[now − 1 day, now + 10 years]`; invalid calendar dates are dropped.
+
+Enrichment is computed **before** the index writer lock is taken (its own blocking task), so the locked section does index operations only, and both fields come from a single lowercased copy of the text rather than one per field.
+
 `GET /search/status` → `{enabled, doc_count, disk_bytes, segment_count}`. `doc_count` is the logical document count; `disk_bytes` is the index directory's on-disk size (sum of its files, best-effort — an unreadable entry counts 0) and `segment_count` the searchable segments the reader currently sees. The physical pair exists because `doc_count` hides growth on an upserting corpus: flat `doc_count` with climbing bytes/segments means ghosts or merges falling behind. Both are `0` when `[search] enabled = false` (`NoSearch` measures nothing rather than guessing).
 
 ## Maintenance

@@ -174,6 +174,31 @@ fn schema_is_current(index: &Index) -> bool {
     all_present && body_stored
 }
 
+/// A document with its index-time entity enrichment already computed (M14):
+/// conservative regex-only extraction over title+body. No match = field ABSENT on
+/// the doc (a range filter then simply never matches it).
+struct EnrichedDoc {
+    doc: SearchDoc,
+    amount: Option<u64>,
+    event_date: Option<i64>,
+}
+
+/// Enriches a batch. Pure and lock-free by construction — this is the work that
+/// used to run inside the writer-lock closure.
+fn enrich_docs(docs: Vec<SearchDoc>) -> Vec<EnrichedDoc> {
+    docs.into_iter()
+        .map(|doc| {
+            let text = format!("{}\n{}", doc.title, doc.body);
+            let (amount, event_date) = enrich::enrich_fields(&text, doc.indexed_at);
+            EnrichedDoc {
+                doc,
+                amount,
+                event_date,
+            }
+        })
+        .collect()
+}
+
 /// Total bytes of every regular file under `dir` (recursively). Best-effort: an
 /// unreadable entry contributes 0 rather than failing the whole measurement —
 /// telemetry must never take down `/search/status`.
@@ -356,18 +381,23 @@ impl Search for TantivyIndex {
         }
         let f = self.fields;
         let added = docs.len();
+        // Enrichment runs BEFORE the writer lock is taken, on its own blocking
+        // thread. It is pure CPU work (regex scans over every body) that needs
+        // nothing from the writer, and running it inside the lock both serialized
+        // it against every other indexing path and — until the char-boundary fix —
+        // put a panic site inside the lock, where it poisoned the mutex and took
+        // the whole batch with it.
+        let prepared = tokio::task::spawn_blocking(move || enrich_docs(docs))
+            .await
+            .map_err(|e| Error::App(format!("enrich task panicked: {e}")))?;
         // Deferred: the background committer flushes this, so hundreds of small
-        // jobs no longer pay a full commit/fsync each.
+        // jobs no longer pay a full commit/fsync each. The lock section below is
+        // index operations only.
         self.write_deferred("index", added, move |w| {
-            for d in docs {
+            for p in prepared {
+                let d = p.doc;
                 // Upsert: drop any prior document with this id, then add.
                 w.delete_term(Term::from_field_text(f.id, &d.id));
-                // Index-time entity enrichment (M14): conservative regex-only
-                // extraction over title+body. No match = field ABSENT on the
-                // doc (a range filter then simply never matches it).
-                let text = format!("{}\n{}", d.title, d.body);
-                let amount = enrich::max_amount_dollars(&text);
-                let event_date = enrich::earliest_upcoming_deadline(&text, d.indexed_at);
                 let mut tdoc = doc!(
                     f.id => d.id,
                     f.app => d.app,
@@ -377,10 +407,10 @@ impl Search for TantivyIndex {
                     f.body => d.body,
                     f.indexed_at => d.indexed_at,
                 );
-                if let Some(a) = amount {
+                if let Some(a) = p.amount {
                     tdoc.add_u64(f.amount, a);
                 }
-                if let Some(ts) = event_date {
+                if let Some(ts) = p.event_date {
                     tdoc.add_i64(f.event_date, ts);
                 }
                 w.add_document(tdoc)
