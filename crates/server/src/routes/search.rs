@@ -113,13 +113,19 @@ const SEARCH_MAX_OFFSET: usize = 10_000;
     get,
     path = "/search/status",
     tag = "search",
-    responses((status = 200, description = "`{enabled, doc_count}` — number of documents in the index. `doc_count: 0` on an enabled index means it was wiped (schema drift) or never populated; rebuild with the `search-backfill` bin."))
+    responses((status = 200, description = "`{enabled, doc_count, disk_bytes, segment_count}` — index telemetry. `doc_count: 0` on an enabled index means it was wiped (schema drift) or never populated; rebuild with the `search-backfill` bin. `disk_bytes` is the index directory's on-disk size and `segment_count` the searchable segments the reader sees — `doc_count` flat while those climb is the growth signal upserts hide. Both are 0 when search is disabled (`NoSearch` measures nothing rather than guessing)."))
 )]
 pub(crate) async fn search_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let doc_count = state.search.doc_count().await?;
+    // Physical footprint alongside the logical count: an index that upserts keeps
+    // doc_count flat while bytes/segments grow, so doc_count alone cannot show
+    // unbounded growth.
+    let stats = state.search.index_stats().await?;
     Ok(Json(json!({
         "enabled": state.config.search.enabled,
         "doc_count": doc_count,
+        "disk_bytes": stats.disk_bytes,
+        "segment_count": stats.segment_count,
     })))
 }
 

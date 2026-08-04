@@ -10,8 +10,8 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use pumper_core::config::SearchConfig;
 use pumper_core::{
-    Error, FacetCount, Result, Search, SearchDoc, SearchFacets, SearchHit, SearchRequest,
-    SearchResponse,
+    Error, FacetCount, Result, Search, SearchDoc, SearchFacets, SearchHit, SearchIndexStats,
+    SearchRequest, SearchResponse,
 };
 use std::ops::Bound;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -74,6 +74,9 @@ const COMMIT_PENDING_THRESHOLD: usize = 512;
 
 pub struct TantivyIndex {
     index: Index,
+    /// The index directory, kept so `index_stats` can measure the on-disk
+    /// footprint (Tantivy's `Index` does not expose its path portably).
+    dir: std::path::PathBuf,
     fields: Fields,
     writer: Arc<Mutex<IndexWriter>>,
     reader: IndexReader,
@@ -171,6 +174,25 @@ fn schema_is_current(index: &Index) -> bool {
     all_present && body_stored
 }
 
+/// Total bytes of every regular file under `dir` (recursively). Best-effort: an
+/// unreadable entry contributes 0 rather than failing the whole measurement —
+/// telemetry must never take down `/search/status`.
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut total = 0u64;
+    for entry in entries.flatten() {
+        let Ok(meta) = entry.metadata() else { continue };
+        if meta.is_dir() {
+            total = total.saturating_add(dir_size_bytes(&entry.path()));
+        } else {
+            total = total.saturating_add(meta.len());
+        }
+    }
+    total
+}
+
 impl TantivyIndex {
     pub fn new(cfg: &SearchConfig) -> Result<Self> {
         let mut builder = Schema::builder();
@@ -255,6 +277,7 @@ impl TantivyIndex {
         );
         Ok(Self {
             index,
+            dir: cfg.dir.clone(),
             fields,
             writer,
             reader,
@@ -421,6 +444,20 @@ impl Search for TantivyIndex {
     async fn doc_count(&self) -> Result<u64> {
         // num_docs reflects the last committed segment set the reader has loaded.
         Ok(self.reader.searcher().num_docs())
+    }
+
+    async fn index_stats(&self) -> Result<SearchIndexStats> {
+        // Segments as the reader currently sees them (committed set) — the same
+        // vantage point `doc_count` reports from.
+        let segment_count = self.reader.searcher().segment_readers().len() as u64;
+        let dir = self.dir.clone();
+        let disk_bytes = tokio::task::spawn_blocking(move || dir_size_bytes(&dir))
+            .await
+            .map_err(|e| Error::App(format!("index stats task panicked: {e}")))?;
+        Ok(SearchIndexStats {
+            disk_bytes,
+            segment_count,
+        })
     }
 
     async fn query(&self, req: SearchRequest) -> Result<SearchResponse> {

@@ -790,6 +790,19 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
     stages
         .time(Stage::Index, async {
             let mut docs = search_docs(&job.app, job.id, &result);
+            // Ghost-doc GC: identity-less job-result docs embed the job id, so
+            // every run used to mint a permanent new set. Sweep the app's prior
+            // snapshot BEFORE adding this run's (delete-then-add in opstamp
+            // order, so the new docs survive their own sweep).
+            if sweeps_prior_job_snapshot(&docs) {
+                if let Err(e) = state
+                    .search
+                    .delete_dataset(&job.app, JOB_RESULT_DATASET)
+                    .await
+                {
+                    warn!(job = %job.id, "search job-snapshot sweep failed: {e}");
+                }
+            }
             let (dataset_docs, dataset_deletes) = dataset_search_docs(&state, &job, &result).await;
             docs.extend(dataset_docs);
             if let Err(e) = state.search.index(docs).await {
@@ -1468,6 +1481,23 @@ fn publish(state: &AppState, event: JobEvent) {
     state.events.emit(event);
 }
 
+/// Reserved dataset name stamped on job-result docs that have **no stable
+/// identity** — the whole-result document and array elements with no url. Their
+/// ids embed the job id, so every run mints fresh ones; they are therefore the
+/// app's *latest run snapshot* and the previous run's set is swept before this
+/// run's lands (see [`sweeps_prior_job_snapshot`]).
+///
+/// It is a reserved name, not a real dataset: nothing in `Datasets` stores under
+/// it. Previously these docs stamped `dataset = app`, which put a dataset that
+/// does not exist into `/search` facets and made `?dataset=<app>` a filter over
+/// phantom rows.
+pub(crate) const JOB_RESULT_DATASET: &str = "_job";
+
+/// Reserved dataset name for job-result array elements that DO carry a url. Their
+/// id is `<app>:<url>`, so re-runs upsert in place; they accumulate across runs as
+/// a legitimate corpus and are never swept.
+pub(crate) const JOB_RECORD_DATASET: &str = "_records";
+
 /// Builds full-text search documents from a job's result: each element of a
 /// `records`/`stories`/`items` array, or the whole result as one document.
 fn search_docs(app: &str, job_id: Uuid, result: &Value) -> Vec<SearchDoc> {
@@ -1483,7 +1513,7 @@ fn search_docs(app: &str, job_id: Uuid, result: &Value) -> Vec<SearchDoc> {
         docs.push(SearchDoc {
             id: format!("{app}:{job_id}"),
             app: app.to_string(),
-            dataset: app.to_string(),
+            dataset: JOB_RESULT_DATASET.to_string(),
             url: String::new(),
             title: app.to_string(),
             body: result.to_string(),
@@ -1492,6 +1522,19 @@ fn search_docs(app: &str, job_id: Uuid, result: &Value) -> Vec<SearchDoc> {
         });
     }
     docs
+}
+
+/// True when this run mints at least one identity-less job-result doc — the only
+/// case where the app's previous run left documents that nothing will ever
+/// upsert or delete. The sweep is `delete_dataset(app, "_job")` issued *before*
+/// this run's docs are indexed, so the index holds one run's snapshot per app
+/// instead of one per run forever.
+///
+/// Deliberately NOT unconditional: `delete_dataset` commits, and a run whose
+/// records are all url-keyed (they upsert, nothing accumulates) would pay that
+/// fsync for nothing — undoing the deferred-commit amortization.
+fn sweeps_prior_job_snapshot(docs: &[SearchDoc]) -> bool {
+    docs.iter().any(|d| d.dataset == JOB_RESULT_DATASET)
 }
 
 /// Search docs + delete-ids for datasets the result names in `index_datasets`
@@ -1596,20 +1639,96 @@ fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
         .find_map(|k| rec.get(*k).and_then(Value::as_str))
         .unwrap_or("")
         .to_string();
-    let id = if url.is_empty() {
-        format!("{app}:{job_id}:{i}")
+    // A record with a url has a stable identity (upserts on re-run) and lives in
+    // the durable `_records` namespace; one without is tied to this job id and
+    // belongs to the sweepable latest-run snapshot.
+    let (id, dataset) = if url.is_empty() {
+        (format!("{app}:{job_id}:{i}"), JOB_RESULT_DATASET)
     } else {
-        format!("{app}:{url}")
+        (format!("{app}:{url}"), JOB_RECORD_DATASET)
     };
     SearchDoc {
         id,
         app: app.to_string(),
-        dataset: app.to_string(),
+        dataset: dataset.to_string(),
         url,
         title,
         body: rec.to_string(),
         // Job-result docs carry no record timestamp — index at completion time.
         indexed_at: chrono::Utc::now().timestamp(),
+    }
+}
+
+#[cfg(test)]
+mod job_result_doc_tests {
+    use super::{
+        record_doc, search_docs, sweeps_prior_job_snapshot, JOB_RECORD_DATASET, JOB_RESULT_DATASET,
+    };
+    use serde_json::json;
+    use uuid::Uuid;
+
+    /// The anti-pattern: stamping `dataset = <app>` on documents that came from a
+    /// job result, which put a dataset that does not exist into `/search` facets
+    /// and made `?dataset=<app>` a filter over phantom rows.
+    #[test]
+    fn job_docs_stamp_reserved_dataset_not_the_app_name() {
+        let job = Uuid::new_v4();
+        let whole = search_docs("hackernews", job, &json!({"count": 3}));
+        assert_eq!(whole.len(), 1);
+        assert_eq!(whole[0].app, "hackernews");
+        assert_eq!(whole[0].dataset, JOB_RESULT_DATASET);
+        assert_ne!(whole[0].dataset, "hackernews");
+
+        let urlless = record_doc("hackernews", job, 0, &json!({"title": "no url"}));
+        assert_eq!(urlless.dataset, JOB_RESULT_DATASET);
+        let urlful = record_doc("hackernews", job, 0, &json!({"url": "https://x/1"}));
+        assert_eq!(urlful.dataset, JOB_RECORD_DATASET);
+        assert_ne!(urlful.dataset, "hackernews");
+    }
+
+    /// Identity: url-keyed docs upsert (stable id), identity-less docs carry the
+    /// job id and are therefore per-run — which is exactly why they need sweeping.
+    #[test]
+    fn urlless_docs_are_per_run_not_upserting() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let rec = json!({"title": "no url"});
+        assert_ne!(
+            record_doc("app", a, 0, &rec).id,
+            record_doc("app", b, 0, &rec).id,
+            "identity-less docs differ per run — the ghost source"
+        );
+        let with_url = json!({"url": "https://x/1"});
+        assert_eq!(
+            record_doc("app", a, 0, &with_url).id,
+            record_doc("app", b, 0, &with_url).id,
+            "url-keyed docs upsert across runs"
+        );
+    }
+
+    /// The anti-pattern: sweeping (and thus committing) on every run, including
+    /// runs whose docs all upsert and leave nothing behind.
+    #[test]
+    fn sweeps_only_runs_that_mint_identityless_docs_not_url_keyed_ones() {
+        let job = Uuid::new_v4();
+        let url_keyed = search_docs(
+            "hackernews",
+            job,
+            &json!({"stories": [{"url": "https://x/1"}, {"url": "https://x/2"}]}),
+        );
+        assert!(!sweeps_prior_job_snapshot(&url_keyed));
+
+        let whole = search_docs("hackernews", job, &json!({"count": 3}));
+        assert!(sweeps_prior_job_snapshot(&whole));
+
+        let mixed = search_docs(
+            "hackernews",
+            job,
+            &json!({"items": [{"url": "https://x/1"}, {"title": "no url"}]}),
+        );
+        assert!(
+            sweeps_prior_job_snapshot(&mixed),
+            "one identity-less doc in the batch is enough to have left ghosts"
+        );
     }
 }
 

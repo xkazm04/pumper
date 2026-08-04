@@ -193,6 +193,20 @@ pub struct SearchResponse {
     pub total: u64,
 }
 
+/// Physical footprint of the index, for operator telemetry. `doc_count` alone
+/// cannot answer "is this thing growing without bound?" — a corpus that upserts
+/// keeps a flat doc count while ghost documents and unmerged segments pile up on
+/// disk. Both fields are best-effort observations, never estimates: an
+/// implementation that cannot measure them reports zero.
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct SearchIndexStats {
+    /// Bytes the index occupies on disk (sum of the index directory's files).
+    pub disk_bytes: u64,
+    /// Searchable segments the reader currently sees. A steadily climbing count
+    /// means merges are not keeping up with writes.
+    pub segment_count: u64,
+}
+
 #[async_trait]
 pub trait Search: Send + Sync {
     /// Indexes a batch of documents (re-indexing an existing `id` replaces it)
@@ -214,6 +228,13 @@ pub trait Search: Send + Sync {
     /// disabled index — the signal that a backfill is needed (an emptied index
     /// otherwise looks healthy: queries return 200 with fewer hits).
     async fn doc_count(&self) -> Result<u64>;
+
+    /// Physical index telemetry (bytes on disk, segment count). Default: zeros —
+    /// an implementation with no on-disk index reports nothing rather than a
+    /// made-up number.
+    async fn index_stats(&self) -> Result<SearchIndexStats> {
+        Ok(SearchIndexStats::default())
+    }
 
     /// Forces any deferred writes to commit and become queryable. `index()` may
     /// defer its commit for throughput, so a caller that must see its own writes

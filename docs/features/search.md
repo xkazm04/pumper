@@ -2,6 +2,20 @@
 
 Embedded Tantivy index (no external service), BM25-ranked over `title` + `body`. The worker indexes every successful job's result (elements of `records`/`stories`/`items` arrays, else the whole result) — id-keyed upserts.
 
+### Job-result documents: reserved namespaces and their lifecycle
+
+Documents minted from a job *result* are not stored dataset records, and they say so: they carry a **reserved dataset name**, never the app name (which previously advertised a dataset that does not exist in the store through `/search` facets and `?dataset=`).
+
+| doc | id | `dataset` | lifecycle |
+| --- | --- | --- | --- |
+| array element with a url | `<app>:<url>` | `_records` | upserts on the url; accumulates across runs as a durable corpus |
+| array element with no url | `<app>:<job_id>:<i>` | `_job` | **latest run per app** — swept |
+| whole result (no arrays) | `<app>:<job_id>` | `_job` | **latest run per app** — swept |
+
+`_job` ids embed the job id, so every run mints a fresh set that no upsert or delete would ever reclaim — the index grew with the number of runs forever. Before indexing a run that mints any `_job` doc, the worker sweeps the app's previous snapshot (`delete_dataset(app, "_job")`, issued *before* the adds so the new docs survive it). A run whose records are all url-keyed skips the sweep — nothing accumulated, and the sweep commits. Saved-search alerting is unaffected: `_job` ids are still unique per run, so `saved_search_seen` never re-alerts a swept doc (its claim row simply stops matching anything).
+
+Query consequence: `?dataset=_job` / `?dataset=_records` scope to job-result documents, and `?dataset=<app>` no longer matches them.
+
 ### Indexing a dataset from a compact result (`index_datasets`)
 
 An app whose result stays compact (counts, not arrays — the fleet convention) can still emit one search document per stored record by adding `"index_datasets": [{ "app", "dataset" }]` to its result. After indexing the result itself, the worker reads each named dataset's **revisions since the job started** (the change feed) and indexes only the records this run actually touched — `new`/`changed` keys are indexed from their revision snapshot, `removed` keys are deleted from the index. Doc id `"<app>:<dataset>:<key>"` — stable, so re-runs replace rather than duplicate; a key changed twice in one run is written once, from its final state. This is **delta-driven, cost O(changes) not O(corpus)**: the earlier version re-read and re-indexed the whole named dataset on every job completion. The trade-off is that a wiped index is refilled only as rows change — see [Maintenance](#maintenance). Load/index failures are logged, never fatal (search is a derived artifact). A dataset whose source health suppresses indexing is skipped for that run (see [resilient-extraction.md](resilient-extraction.md); inert while `[resilience] enforce = false`, the default). The grants apps use this to make every opportunity in `grants/unified` individually searchable (title/agency/status/url) without inlining thousands of records into the job result. These docs carry app `grants` (the virtual unified namespace), not the producing job's app — and **a saved search may scope to that virtual app**: saved-search scoping is evaluated against every namespace a run indexed under (the job's app *plus* each `index_datasets` app), so `app:"grants"` fires on a `grants-gov`/`ca-grants` run. Scoping is not widened beyond that — an unrelated `app` filter still skips the run, and a skip is logged at `debug` with the filter and the run's indexed apps.
@@ -16,11 +30,11 @@ An app whose result stays compact (counts, not arrays — the fleet convention) 
 - **Facets**: `apps` + `datasets` counts over the top-1000 matches (honest sample), sorted by count. `app=`/`dataset=` params filter by exact term. **Computed only when requested** (`SearchRequest.facets`, which `GET /search` sets): facets sample ≥1000 docs and decode each, so a facet-less query (the saved-search runner, and any caller that reads only hit ids) ranks and decodes just the `offset+limit` page window — no facet-sampling overread.
 - **Fuzzy** (`fuzzy=true`): edit-distance-1 on title+body (transposition = one edit). Quoted `"exact phrases"` parse as phrase queries in either mode.
 
-`GET /search/status` → `{enabled, doc_count}` — the number of documents currently in the index.
+`GET /search/status` → `{enabled, doc_count, disk_bytes, segment_count}`. `doc_count` is the logical document count; `disk_bytes` is the index directory's on-disk size (sum of its files, best-effort — an unreadable entry counts 0) and `segment_count` the searchable segments the reader currently sees. The physical pair exists because `doc_count` hides growth on an upserting corpus: flat `doc_count` with climbing bytes/segments means ghosts or merges falling behind. Both are `0` when `[search] enabled = false` (`NoSearch` measures nothing rather than guessing).
 
 ## Maintenance
 
-`DELETE /search/docs {ids}` removes documents by id; `DELETE /search/datasets/{app}/{dataset}` removes an app's dataset (app AND dataset conjunction — dataset names repeat across apps). Trait: `Search::{index, query, delete_ids, delete_dataset, doc_count, flush}`; `NoSearch` when `[search] enabled=false`. `index()` may defer its commit for throughput (a background committer flushes it), so a caller that must see its own writes — the saved-search runner, an offline backfill — calls `flush()` first.
+`DELETE /search/docs {ids}` removes documents by id; `DELETE /search/datasets/{app}/{dataset}` removes an app's dataset (app AND dataset conjunction — dataset names repeat across apps). Trait: `Search::{index, query, delete_ids, delete_dataset, doc_count, index_stats, flush}`; `NoSearch` when `[search] enabled=false`. `index()` may defer its commit for throughput (a background committer flushes it), so a caller that must see its own writes — the saved-search runner, an offline backfill — calls `flush()` first.
 
 **The index can go silently empty, and it does not self-heal.** On open, an index whose on-disk schema doesn't match this build's (a field was added, or `body` isn't stored) is **rebuilt EMPTY**; a lost/corrupt index dir or a spell of `[search] enabled = false` has the same effect. Queries keep returning `200` with fewer hits, so nothing looks broken. `GET /search/status` reporting `doc_count: 0` on an enabled index is the signal. Rebuild from the stored dataset records — **with the server stopped**, since Tantivy holds an exclusive writer lock on the index directory:
 
