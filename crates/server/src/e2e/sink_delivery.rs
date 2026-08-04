@@ -58,12 +58,17 @@ async fn file_sink_appends_ndjson_and_logs_the_delivery() {
     // wrote, never that the box was busy.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let content = loop {
-        if let Ok(content) = tokio::fs::read_to_string(&path).await {
-            break content;
+        // Existence is not delivery: under full-suite load this poll has
+        // landed BETWEEN the sink creating the file and finishing the write,
+        // reading zero lines. A delivered NDJSON batch ends in '\n' — wait for
+        // that, not for the inode.
+        match tokio::fs::read_to_string(&path).await {
+            Ok(content) if content.ends_with('\n') => break content,
+            _ => {}
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "file sink never wrote {}",
+            "file sink never wrote a complete line to {}",
             path.display()
         );
         tokio::time::sleep(Duration::from_millis(25)).await;
