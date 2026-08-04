@@ -11,13 +11,22 @@
 //!      `max_iterations` until a strict majority of fields match;
 //!   4. emits a complete **provision proposal** record into
 //!      `provisioner/proposals`: `{catalog_row (TOML-shaped Source), rule_set,
-//!      seeds, cadence, budget, sample_stats, confidence}`.
+//!      seeds, samples, cadence, budget, sample_stats, confidence, verdict}`.
 //!
 //! The app NEVER writes `catalog/data-sources.toml` and NEVER creates
 //! schedules: the emitted catalog row is always `status = "planned"` with an
 //! empty `cron`, so even a human pasting it verbatim into the catalog cannot
 //! make the reconciler start anything — going live is a deliberate human edit.
 //! That invariant is enforced by [`build_catalog_row`] and pinned by test.
+//!
+//! **The row is a claim, so every field of it must be true.** It reports the
+//! fetch tier that actually served the sample ([`catalog_engine`]), an `access`
+//! value from the documented vocabulary ([`catalog_access`]), confidence on the
+//! catalog's documented 1–5 scale ([`confidence_1_to_5`], not this app's
+//! internal 0–100 score), a `dataset` marked as unwritten ([`proposed_dataset`])
+//! and a `notes` line naming the dry-run verdict ([`row_notes`]) — because
+//! `catalog_toml` is the only artifact a reviewer may ever read, and it carries
+//! no record fields at all.
 
 use std::collections::BTreeMap;
 
@@ -320,6 +329,70 @@ pub fn confidence(dry: &DryRun) -> u8 {
 
 // ── proposal record ─────────────────────────────────────────────────────────
 
+/// Maps this app's internal 0–100 score onto the catalog's **documented 1–5**
+/// confidence scale (`docs/features/catalog.md`, ONBOARDING §10).
+///
+/// `Source.confidence` is an unvalidated `u8`, so writing the raw 0–100 score
+/// into it produced rows claiming `confidence = 87` in a column whose entire
+/// vocabulary is 1–5 — a value no hand-written row in
+/// `catalog/data-sources.toml` can be compared against, and one that reads as
+/// "wildly more trustworthy than anything else here" to a human skimming.
+///
+/// The floor is 1, never 0: 0 is not a point on the scale. A proposal that
+/// bound nothing is *least* trustworthy, not *unrated*.
+pub fn confidence_1_to_5(score_0_100: u8) -> u8 {
+    match score_0_100.min(100) {
+        0..=19 => 1,
+        20..=39 => 2,
+        40..=59 => 3,
+        60..=79 => 4,
+        _ => 5,
+    }
+}
+
+/// The catalog `access` value for a proposed source.
+///
+/// The documented vocabulary is `key-free · api-key · bulk · scrape`; the app
+/// used to emit `"public"`, which is in none of it. Everything this app can
+/// produce is by construction a web page it sampled and drafted CSS/`each`
+/// rules against — that is `scrape`, whatever the page's licensing. A `key-free`
+/// or `api-key` API and a `bulk` dump are human judgements about a *mechanism*
+/// this app never established, so it must not claim them.
+pub fn catalog_access() -> &'static str {
+    "scrape"
+}
+
+/// The `dataset` value for a proposed row.
+///
+/// The app used to write the bare proposal key here, naming a dataset that
+/// nothing writes and nothing will write until a human builds the app crate —
+/// indistinguishable, in the catalog, from a live source's real dataset. The
+/// `proposed:` prefix names the *intent* while being unmistakably not a
+/// resolvable dataset name (real ones are `<app>/<name>`).
+pub fn proposed_dataset(key: &str) -> String {
+    format!("proposed:{key}")
+}
+
+/// The row's `notes`, carrying the dry-run verdict in plain words.
+///
+/// A rejected proposal used to be emitted byte-identically to an accepted one:
+/// same `status`, same shape, the verdict living only in the record's
+/// `accepted` boolean — which `catalog_toml`, the fragment a human actually
+/// pastes, drops entirely. So the reviewer could not tell a rule set that bound
+/// everything from one that bound nothing.
+pub fn row_notes(prompt: &str, dry: &DryRun, score_0_100: u8) -> String {
+    let verdict = if dry.accepted { "ACCEPTED" } else { "REJECTED" };
+    format!(
+        "provisioner proposal — dry run {verdict} ({}/{} fields bound over {} sampled doc(s); \
+         score {score_0_100}/100 = confidence {}/5). UNPROVISIONED: no app crate, no dataset, \
+         nothing scheduled. Prompt: {prompt}",
+        dry.fields_matched,
+        dry.fields_total,
+        dry.docs,
+        confidence_1_to_5(score_0_100),
+    )
+}
+
 /// Stable, readable proposal key from the prompt: lowercase alnum runs joined
 /// by dashes, capped. Same prompt → same key, so re-compiles upsert (change
 /// detection sees a revised proposal, not a pile of near-duplicates).
@@ -359,14 +432,22 @@ pub fn proposal_key(prompt: &str) -> String {
 /// [`catalog_engine`] — not a hardcoded guess. A row that says `http` for a page
 /// only the browser tier could render sends the reviewer down a path we already
 /// know fails.
+///
+/// The row also carries the DRY-RUN VERDICT, because the pasteable TOML
+/// fragment is the only artifact a reviewer may ever look at: `confidence` on
+/// the documented 1–5 scale ([`confidence_1_to_5`]) and an accepted/rejected
+/// `notes` line ([`row_notes`]). `score_0_100` is this app's own score; `conf`
+/// on the row is its 1–5 projection.
 pub fn build_catalog_row(
     prompt: &str,
     primary: &Candidate,
-    conf: u8,
+    dry: &DryRun,
+    score_0_100: u8,
     fetch_engine: &str,
 ) -> Source {
+    let key = proposal_key(prompt);
     Source {
-        id: proposal_key(prompt),
+        id: key.clone(),
         // No app crate exists for a proposed source; the reviewer wires one
         // (typically crawl + extractor with the proposed rule set).
         app: String::new(),
@@ -375,13 +456,13 @@ pub fn build_catalog_row(
         url: primary.url.clone(),
         category: String::new(),
         engine: catalog_engine(fetch_engine).into(),
-        access: "public".into(),
+        access: catalog_access().into(),
         cadence: primary.cadence.clone(),
         cron: String::new(),      // never scheduled by this app
         status: "planned".into(), // never live from machine output
-        confidence: conf,
-        dataset: proposal_key(prompt),
-        notes: format!("compiled by provisioner from prompt: {prompt}"),
+        confidence: confidence_1_to_5(score_0_100),
+        dataset: proposed_dataset(&key),
+        notes: row_notes(prompt, dry, score_0_100),
         contract: None, // contracts are human-declared, never machine-proposed
     }
 }
@@ -422,7 +503,17 @@ pub fn build_proposal(
         "budget": budget_usd,
         "sample_stats": serde_json::to_value(dry).unwrap_or(Value::Null),
         "confidence": confidence(dry),
+        // The two confidence scales, both named, so neither can be mistaken for
+        // the other: this app scores 0–100, the catalog column is 1–5.
+        "confidence_scale": "0-100; catalog_row.confidence is the same judgement \
+                             on the catalog's documented 1-5 scale",
+        "catalog_confidence": row.confidence,
         "accepted": dry.accepted,
+        // A rejected proposal is emitted (the drafts and the misses are the
+        // useful part), but it must never be mistakable for an accepted one.
+        "verdict": if dry.accepted { "accepted" } else { "rejected" },
+        "provisioned": false,
+        "intended_dataset": row.dataset,
         "iterations": iterations,
         "cost_usd": cost_usd,
     })
@@ -543,10 +634,13 @@ impl ScrapeApp for Provisioner {
                 },
             ],
             output_shape: Some(
-                "{proposal_key, candidates, seeds, samples, iterations, accepted, confidence, \
-                 sample_stats, cost_usd, resumed_discovery} — `samples` records, per seed, \
-                 the fetch tier that actually served it, which body field carried it, its \
-                 byte count and the per-tier trace; the full proposal record is \
+                "{proposal_key, candidates, seeds, samples, iterations, accepted, verdict, \
+                 confidence, catalog_confidence, sample_stats, cost_usd, resumed_discovery} — \
+                 `samples` records, per seed, the fetch tier that actually served it, which \
+                 body field carried it, its byte count and the per-tier trace; `confidence` \
+                 is 0-100 and `catalog_confidence` its 1-5 catalog-scale projection; \
+                 a REJECTED dry run still emits a record, marked as such in \
+                 `verdict` and in the catalog row's own notes; the full proposal record is \
                  upserted into provisioner/proposals (stamped with the primary sampled URL \
                  as its source) and saved as the proposal.json artifact; \
                  nothing is written to the catalog and no schedule is created",
@@ -812,7 +906,7 @@ impl ScrapeApp for Provisioner {
             .map(|s| s.engine.as_str())
             .unwrap_or("http")
             .to_string();
-        let row = build_catalog_row(&prompt, primary, conf, &primary_engine);
+        let row = build_catalog_row(&prompt, primary, &dry, conf, &primary_engine);
         let proposal = build_proposal(
             &prompt,
             &row,
@@ -852,7 +946,9 @@ impl ScrapeApp for Provisioner {
             "samples": samples,
             "iterations": iterations,
             "accepted": dry.accepted,
+            "verdict": if dry.accepted { "accepted" } else { "rejected" },
             "confidence": conf,
+            "catalog_confidence": row.confidence,
             "sample_stats": serde_json::to_value(&dry)?,
             "cost_usd": cost_usd,
             "session_id": session_id,
@@ -944,7 +1040,13 @@ mod tests {
         assert_eq!(catalog_engine("archive"), "http");
         assert_eq!(catalog_engine("api_recipe"), "http");
         // And the row carries it, instead of always claiming "http".
-        let row = build_catalog_row("p", &cand("https://a.example"), 90, "browser");
+        let row = build_catalog_row(
+            "p",
+            &cand("https://a.example"),
+            &fixture_dry(),
+            90,
+            "browser",
+        );
         assert_eq!(row.engine, "browser");
         // …still a valid value of the documented catalog vocabulary.
         for tier in ["archive", "api_recipe", "http", "browser", "claude", "??"] {
@@ -1126,6 +1228,114 @@ mod tests {
         assert_eq!(confidence(&dry), 50);
     }
 
+    // ── proposal record honesty ─────────────────────────────────────────────
+
+    /// An accepted dry run over [`FIXTURE`], for row-shaping tests.
+    fn fixture_dry() -> DryRun {
+        let rules = ruleset(json!({"heading": {"type": "css", "selector": "h1"}}));
+        dry_run(&rules, &[FIXTURE.to_string()]).unwrap()
+    }
+
+    /// A rejected dry run over [`FIXTURE`] — nothing binds.
+    fn rejected_dry() -> DryRun {
+        let rules = ruleset(json!({
+            "author": {"type": "css", "selector": ".author"},
+            "date": {"type": "css", "selector": "time"}
+        }));
+        dry_run(&rules, &[FIXTURE.to_string()]).unwrap()
+    }
+
+    /// The row wrote this app's 0–100 score straight into a catalog column
+    /// documented as 1–5, so a proposal that bound half its fields claimed
+    /// `confidence = 50` next to hand-written rows scoring 1–5.
+    #[test]
+    fn row_confidence_is_the_catalog_1_to_5_scale_not_a_raw_0_to_100_score() {
+        assert_eq!(confidence_1_to_5(0), 1, "0 is not a point on the scale");
+        assert_eq!(confidence_1_to_5(19), 1);
+        assert_eq!(confidence_1_to_5(20), 2);
+        assert_eq!(confidence_1_to_5(50), 3);
+        assert_eq!(confidence_1_to_5(60), 4);
+        assert_eq!(confidence_1_to_5(80), 5);
+        assert_eq!(confidence_1_to_5(100), 5);
+        assert_eq!(
+            confidence_1_to_5(255),
+            5,
+            "out-of-range clamps, never wraps"
+        );
+        // Monotone and in range for every possible input.
+        for s in 0u8..=255 {
+            let c = confidence_1_to_5(s);
+            assert!((1..=5).contains(&c), "score {s} → out-of-vocabulary {c}");
+            if s > 0 {
+                assert!(confidence_1_to_5(s - 1) <= c, "not monotone at {s}");
+            }
+        }
+        // …and the row uses it.
+        let row = build_catalog_row("p", &cand("https://a.example"), &fixture_dry(), 100, "http");
+        assert_eq!(row.confidence, 5);
+    }
+
+    /// `access = "public"` is in none of the documented vocabulary
+    /// (`key-free · api-key · bulk · scrape`), so the field was unfilterable.
+    #[test]
+    fn row_access_is_documented_vocabulary_not_the_invented_public() {
+        let row = build_catalog_row("p", &cand("https://a.example"), &fixture_dry(), 80, "http");
+        assert_eq!(row.access, "scrape");
+        assert!(["key-free", "api-key", "bulk", "scrape"].contains(&row.access.as_str()));
+    }
+
+    /// The row named a dataset nothing writes — indistinguishable, in the
+    /// catalog, from a live source's real dataset.
+    #[test]
+    fn row_dataset_is_marked_unprovisioned_not_a_name_nothing_writes() {
+        let row = build_catalog_row(
+            "track widget prices",
+            &cand("https://a.example"),
+            &fixture_dry(),
+            80,
+            "http",
+        );
+        assert_eq!(row.dataset, "proposed:track-widget-prices");
+        // Unmistakably not a resolvable `<app>/<name>` dataset path.
+        assert!(!row.dataset.contains('/'));
+        assert!(row.dataset.starts_with("proposed:"));
+        assert!(row.notes.contains("UNPROVISIONED"));
+    }
+
+    /// A rejected proposal used to be emitted byte-identically to an accepted
+    /// one, with the verdict living only in a record field the pasteable TOML
+    /// fragment drops.
+    #[test]
+    fn a_rejected_proposal_is_visibly_rejected_not_shaped_like_an_accepted_one() {
+        let good = fixture_dry();
+        let bad = rejected_dry();
+        assert!(good.accepted && !bad.accepted);
+
+        let c = cand("https://a.example/widgets");
+        let ok_row = build_catalog_row("p", &c, &good, confidence(&good), "http");
+        let no_row = build_catalog_row("p", &c, &bad, confidence(&bad), "http");
+        assert!(ok_row.notes.contains("ACCEPTED"));
+        assert!(no_row.notes.contains("REJECTED"));
+        assert_ne!(ok_row.notes, no_row.notes);
+
+        // The verdict survives into the TOML fragment — the only artifact a
+        // reviewer may ever read.
+        assert!(catalog_toml(&no_row).contains("REJECTED"));
+
+        // …and into the record, as a word, not just a boolean.
+        let mk = |dry: &DryRun| {
+            let row = build_catalog_row("p", &c, dry, confidence(dry), "http");
+            build_proposal("p", &row, &json!({}), &[], &[], None, dry, 1, 0.0)
+        };
+        assert_eq!(mk(&good)["verdict"], json!("accepted"));
+        assert_eq!(mk(&bad)["verdict"], json!("rejected"));
+        assert_eq!(mk(&bad)["accepted"], json!(false));
+        assert_eq!(mk(&bad)["provisioned"], json!(false));
+        // Both confidence scales are present and labelled.
+        assert_eq!(mk(&good)["confidence"], json!(100));
+        assert_eq!(mk(&good)["catalog_confidence"], json!(5));
+    }
+
     // ── proposal record ─────────────────────────────────────────────────────
 
     #[test]
@@ -1133,7 +1343,13 @@ mod tests {
         let rules = ruleset(json!({"heading": {"type": "css", "selector": "h1"}}));
         let dry = dry_run(&rules, &[FIXTURE.to_string()]).unwrap();
         let c = cand("https://a.example/widgets");
-        let row = build_catalog_row("track widget prices weekly", &c, confidence(&dry), "http");
+        let row = build_catalog_row(
+            "track widget prices weekly",
+            &c,
+            &dry,
+            confidence(&dry),
+            "http",
+        );
         let p = build_proposal(
             "track widget prices weekly",
             &row,
@@ -1153,7 +1369,8 @@ mod tests {
         );
         for key in [
             "prompt", "catalog_row", "catalog_toml", "rule_set", "seeds", "samples", "cadence",
-            "budget", "sample_stats", "confidence", "accepted", "iterations", "cost_usd",
+            "budget", "sample_stats", "confidence", "confidence_scale", "catalog_confidence",
+            "accepted", "verdict", "provisioned", "intended_dataset", "iterations", "cost_usd",
         ] {
             assert!(p.get(key).is_some(), "proposal missing key {key}");
         }
@@ -1178,7 +1395,7 @@ mod tests {
         for cadence in ["daily", "weekly", "on-demand"] {
             let mut c = cand("https://a.example");
             c.cadence = cadence.into();
-            let row = build_catalog_row("some prompt", &c, 90, "http");
+            let row = build_catalog_row("some prompt", &c, &fixture_dry(), 90, "http");
             assert_eq!(row.status, "planned");
             assert_eq!(row.cron, "");
             assert!(!row.is_scheduled());
