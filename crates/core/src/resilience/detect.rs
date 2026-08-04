@@ -376,7 +376,7 @@ pub fn evaluate(cfg: &ResilienceConfig, input: &RunInput) -> RunEvaluation {
     // with shape and divergence corroborating it lands at ~0.49 and never trips,
     // which would leave the design's own highest-precision silent-corruption
     // signal unable to act. See `conclusive_rebind`.
-    let score = if let Some((field, base, run)) = conclusive_rebind(cfg, input) {
+    let score = if let Some((field, base, run)) = conclusive_rebind(cfg, input, s_shape) {
         reasons.push(Reason::new(
             "distinctness_collapse",
             Some(&field),
@@ -448,14 +448,15 @@ fn total_collapse(input: &RunInput) -> Option<(String, f64, f64)> {
 /// last guard is why the divergence signal exists — if the words on the page all
 /// changed and the markup did not, the site really did start saying the same
 /// thing everywhere, and that is not our bug.
-fn conclusive_rebind(cfg: &ResilienceConfig, input: &RunInput) -> Option<(String, f64, f64)> {
+fn conclusive_rebind(
+    cfg: &ResilienceConfig,
+    input: &RunInput,
+    s_shape: f64,
+) -> Option<(String, f64, f64)> {
     if input.docs < cfg.min_cohort_docs {
         return None;
     }
-    if matches!(
-        explain_divergence(cfg, input.drift),
-        Some(Diagnosis::ContentChanged)
-    ) {
+    if !content_change_ruled_out(cfg, input.drift, s_shape) {
         return None;
     }
     input.sketches.iter().find_map(|(field, sketch)| {
@@ -468,6 +469,42 @@ fn conclusive_rebind(cfg: &ResilienceConfig, input: &RunInput) -> Option<(String
         (base >= CONCLUSIVE_BASE_DISTINCT && run <= CONCLUSIVE_RUN_DISTINCT)
             .then(|| (field.clone(), base, run))
     })
+}
+
+/// Whether "the site legitimately started saying the same thing on every page"
+/// can be **ruled out** as the explanation for a cohort-wide collapse. The
+/// conclusive-rebind override forces the score to 1.0, so its whole safety
+/// argument rests on being able to rule that out.
+///
+/// The subtlety is that the escape hatch is not always *available*. It is a
+/// `ContentChanged` divergence, and divergence needs a per-key fingerprint from
+/// the previous run — so a listing whose keys rotate completely every run ("the
+/// 30 newest items") has `drift: None` on every single run, forever, and
+/// `explain_divergence` returns `None` there for lack of evidence rather than
+/// because the site held still. Read as "not a content change", that made
+/// precisely the sources with no divergence evidence the ones most exposed to the
+/// false positive the guard exists to prevent: a week where all 30 listings
+/// genuinely carry the same value scores 1.0 and walks the source toward
+/// quarantine.
+///
+/// With no divergence evidence the run must corroborate itself from the value
+/// domain instead: the collapsed values must also have left the shape this field
+/// has always produced (`s_shape > 0`). A rebind onto a template element — the
+/// case this override is for — moves the length/char-class profile as well, and
+/// the ordinary weighted terms still score a same-shaped collapse; they just do
+/// not convict on their own.
+fn content_change_ruled_out(
+    cfg: &ResilienceConfig,
+    drift: Option<CohortDrift>,
+    s_shape: f64,
+) -> bool {
+    match drift {
+        None => s_shape > 0.0,
+        Some(_) => !matches!(
+            explain_divergence(cfg, drift),
+            Some(Diagnosis::ContentChanged)
+        ),
+    }
 }
 
 /// Baseline distinctness a field must have held for its collapse to be
@@ -1240,6 +1277,66 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_key_rotating_source_is_not_convicted_by_a_guard_it_cannot_reach() {
+        // The override forces score 1.0, and its only escape hatch is a
+        // `ContentChanged` divergence — which needs a per-key fingerprint from
+        // the previous run. A listing whose keys rotate completely every run
+        // ("the 30 newest items") never has one, so `drift` is None forever and
+        // the guard is structurally unavailable to exactly the sources most
+        // exposed to the false positive it exists to prevent.
+        let base = healthy_baseline("price", 5);
+
+        // A cohort-wide collapse onto a value that is still perfectly
+        // price-shaped: this is what "every listing this week is $15.42" looks
+        // like, and with no divergence evidence it cannot be told apart from a
+        // rebind. It is scored by the ordinary terms and does not convict.
+        let same_shape = one("price", constant(30, "$15.42"));
+        let e = evaluate(&cfg(), &input(&same_shape, &base, &[], None, 30));
+        assert!(
+            e.score < 1.0 && !e.tripped(&cfg()),
+            "an unrulable content change must not be forced to 1.0: {:?}",
+            e.reasons
+        );
+        assert_eq!(e.diagnosis, Some(Diagnosis::SilentRebind), "still recorded");
+
+        // Two things must NOT change. First: give the same run divergence
+        // evidence that rules a content change out, and it convicts again.
+        let e = evaluate(
+            &cfg(),
+            &input(
+                &same_shape,
+                &base,
+                &[],
+                Some(CohortDrift {
+                    text: 0.01,
+                    dom: 0.01,
+                    value: 0.5,
+                    compared: 30,
+                }),
+                30,
+            ),
+        );
+        assert_eq!(e.score, 1.0);
+
+        // Second: a collapse that ALSO left the field's value domain corroborates
+        // itself, so the key-rotating source is still convicted of the rebind
+        // this override was built for — with no drift at all.
+        let e = evaluate(
+            &cfg(),
+            &input(
+                &one("price", constant(30, "Free shipping")),
+                &base,
+                &[],
+                None,
+                30,
+            ),
+        );
+        assert_eq!(e.score, 1.0);
+        assert!(content_change_ruled_out(&cfg(), None, 0.4));
+        assert!(!content_change_ruled_out(&cfg(), None, 0.0));
+    }
+
     // ---- signal 5: mined invariants ----------------------------------------
 
     #[test]
@@ -1369,6 +1466,93 @@ mod tests {
         // With no comparable keys there is no claim to make.
         let e = evaluate(&cfg(), &input(&run, &base, &[], None, 30));
         assert_eq!(e.score, 0.0);
+    }
+
+    #[test]
+    fn everything_moving_at_once_is_ambiguous_not_a_redesign() {
+        // The cell no test covered: words moved AND markup moved AND the output
+        // moved. A redesign is diagnosed only when the text held STILL; calling
+        // this one `markup_drift` would blame a site for a change we cannot
+        // attribute, and the design's answer is to corroborate first.
+        let base = healthy_baseline("price", 5);
+        let run = one("price", prices(30, 0));
+        let e = evaluate(
+            &cfg(),
+            &input(
+                &run,
+                &base,
+                &[],
+                Some(CohortDrift {
+                    text: 0.40,
+                    dom: 0.40,
+                    value: 0.40,
+                    compared: 30,
+                }),
+                30,
+            ),
+        );
+        assert_eq!(e.diagnosis, Some(Diagnosis::Ambiguous));
+        // Half of the divergence weight, and divergence is corroborative: with
+        // every field still matching, distinct and well-shaped, `ambiguous`
+        // cannot convict on its own.
+        assert!(e.score > 0.0 && !e.tripped(&cfg()), "{:?}", e.reasons);
+        assert_eq!(e.verdict, RunVerdict::Ok);
+
+        // The other way into this cell: the markup drift lands in the band
+        // *between* the two thresholds, so it neither held still nor moved. The
+        // text held still, which on its own would read as a redesign — with the
+        // markup unclassifiable it is not conclusive enough to say so.
+        let e = evaluate(
+            &cfg(),
+            &input(
+                &run,
+                &base,
+                &[],
+                Some(CohortDrift {
+                    text: 0.01,
+                    dom: 0.14,
+                    value: 0.40,
+                    compared: 30,
+                }),
+                30,
+            ),
+        );
+        assert_eq!(e.diagnosis, Some(Diagnosis::Ambiguous));
+    }
+
+    #[test]
+    fn miss_rate_scores_the_worst_field_not_the_last_one() {
+        // The worst-wins branch was only ever exercised with a single field, so
+        // nothing stopped a later, healthier field from overwriting a worse
+        // one's score — one broken column in a wide record is a break.
+        let mut base = Baseline::default();
+        for field in ["price", "title", "sku"] {
+            base.fields
+                .insert(field.into(), (0..5).map(|_| prices(30, 0)).collect());
+        }
+        // Deliberately under the total-collapse rate (0.9), which returns before
+        // the weighted terms are computed at all.
+        let run = BTreeMap::from([
+            ("price".to_string(), prices(30, 24)), // badly degraded
+            ("sku".to_string(), prices(30, 12)),   // degraded
+            ("title".to_string(), prices(30, 0)),  // perfect, and sorts last
+        ]);
+        let e = evaluate(&cfg(), &input(&run, &base, &[], None, 30));
+        let worst = e
+            .reasons
+            .iter()
+            .filter(|r| r.test == "miss_rate")
+            .map(|r| r.value)
+            .fold(0.0_f64, f64::max);
+        assert!((worst - 0.8).abs() < 1e-9, "{:?}", e.reasons);
+        // 0.30 x 0.8: the worst field carries the term, and a perfect field
+        // later in the map does not dilute it.
+        assert!(
+            e.score >= W_MISSRATE * 0.8 - 1e-9,
+            "the worst field must carry the term: {} {:?}",
+            e.score,
+            e.reasons
+        );
     }
 
     #[test]

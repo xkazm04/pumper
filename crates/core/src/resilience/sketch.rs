@@ -352,8 +352,8 @@ pub fn median(values: &[f64]) -> Option<f64> {
 ///   values are identical) falls back to the mean absolute deviation.
 /// - A baseline that has *never* varied — `distinct_ratio` of exactly 1.0 on
 ///   twenty consecutive runs is the common case — has no scale at all. Returning
-///   `None` there would disable the signal exactly where it is cleanest, so any
-///   departure beyond `tol` reads as infinitely significant.
+///   `None` there would disable the signal exactly where it is cleanest, so the
+///   tolerance stands in as the scale: see [`zero_scale_z`].
 pub fn robust_z(x: f64, baseline: &[f64], tol: f64) -> Option<f64> {
     if baseline.len() < MIN_BASELINE_RUNS {
         return None;
@@ -368,14 +368,41 @@ pub fn robust_z(x: f64, baseline: &[f64], tol: f64) -> Option<f64> {
     if mean_ad > 1e-12 {
         return Some((x - med) / (1.253_314 * mean_ad));
     }
-    let delta = x - med;
-    Some(if delta.abs() <= tol {
-        0.0
-    } else if delta > 0.0 {
-        f64::INFINITY
-    } else {
-        f64::NEG_INFINITY
-    })
+    Some(zero_scale_z(x - med, tol))
+}
+
+/// The largest magnitude [`zero_scale_z`] will report. A finite ceiling rather
+/// than infinity, because infinity is not a measurement: it says "infinitely
+/// significant" on a sample that contains no information about scale at all, it
+/// is the same number for a 0.03 departure and a 0.97 one, and it cannot be
+/// compared, averaged or logged usefully.
+///
+/// 25 is chosen to be far above any `mad_z` anyone would configure (the default
+/// is 3.5, the Iglewicz–Hoaglin criterion), so every departure that used to fire
+/// with an infinite z and is genuinely large still fires.
+pub const ZERO_SCALE_Z_CAP: f64 = 25.0;
+
+/// Significance of a departure from a baseline that has **never varied**.
+///
+/// With no observed run-to-run variation there is no scale to divide by, so the
+/// caller's tolerance becomes the scale: one tolerance of departure is one unit
+/// of significance, saturating at [`ZERO_SCALE_Z_CAP`]. That is a defensible
+/// floor and infinity was not — the old rule made *any* departure past the
+/// tolerance maximally significant, so a perfectly stable templated field (the
+/// common case, which is exactly what produces a zero-variance baseline) reported
+/// the same infinite z for three duplicate values in a cohort of thirty as for a
+/// total collapse.
+///
+/// A non-positive tolerance has no scale either; there the sign is all that can
+/// honestly be reported.
+pub fn zero_scale_z(delta: f64, tol: f64) -> f64 {
+    if delta.abs() <= tol.max(0.0) {
+        return 0.0;
+    }
+    if tol <= 0.0 {
+        return ZERO_SCALE_Z_CAP.copysign(delta);
+    }
+    (delta / tol).clamp(-ZERO_SCALE_Z_CAP, ZERO_SCALE_Z_CAP)
 }
 
 /// Baseline runs needed before a distributional comparison is attempted. Below
@@ -526,11 +553,38 @@ mod tests {
         // to 0.03 has to fire even though the sample has no variance to scale by.
         let flat = [1.0, 1.0, 1.0, 1.0];
         assert_eq!(robust_z(1.0, &flat, 0.02), Some(0.0));
-        assert_eq!(robust_z(0.03, &flat, 0.02), Some(f64::NEG_INFINITY));
+        assert_eq!(robust_z(0.03, &flat, 0.02), Some(-ZERO_SCALE_Z_CAP));
         // Float noise inside the tolerance is not an outlier.
         assert_eq!(robust_z(0.995, &flat, 0.02), Some(0.0));
         // Too short a baseline says nothing rather than guessing.
         assert_eq!(robust_z(0.03, &[1.0, 1.0], 0.02), None);
+    }
+
+    #[test]
+    fn a_flat_baseline_scores_a_small_departure_by_tolerance_not_as_infinite() {
+        // The false positive this closes: with an infinite z, a perfectly stable
+        // templated field — the very thing that produces a zero-variance
+        // baseline — reported maximal significance for three duplicate values in
+        // a cohort of thirty, exactly as it did for a total collapse.
+        let flat = [1.0, 1.0, 1.0, 1.0];
+        let small = robust_z(0.97, &flat, 0.02).unwrap();
+        assert!(small.is_finite());
+        assert!(
+            small.abs() < 3.5,
+            "a 3-in-30 duplicate rate must not clear the flag threshold: {small}"
+        );
+        // ...while the collapse it exists to catch is still far beyond it, and
+        // still a number rather than an infinity.
+        let collapse = robust_z(0.03, &flat, 0.02).unwrap();
+        assert!(collapse.is_finite() && collapse < -3.5);
+        // Departure is measured in tolerances, so it is monotone and comparable.
+        assert!(zero_scale_z(-0.10, 0.02) < zero_scale_z(-0.05, 0.02));
+        assert_eq!(zero_scale_z(0.0, 0.02), 0.0);
+        assert_eq!(zero_scale_z(0.02, 0.02), 0.0, "the tolerance is inclusive");
+        // A meaningless tolerance can only report a direction, never NaN.
+        assert_eq!(zero_scale_z(0.5, 0.0), ZERO_SCALE_Z_CAP);
+        assert_eq!(zero_scale_z(-0.5, -1.0), -ZERO_SCALE_Z_CAP);
+        assert_eq!(zero_scale_z(0.0, 0.0), 0.0);
     }
 
     #[test]

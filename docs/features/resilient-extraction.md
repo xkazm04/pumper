@@ -258,6 +258,14 @@ kinds of signal have different natural variance:**
    large *relative to how much this source normally drifts*", which is the only
    scale-free way to threshold a source that is naturally noisy.
 
+   **Zero-variance baselines.** A stable templated field produces a baseline that
+   has never varied at all (`distinct_ratio` of exactly 1.0 on twenty consecutive
+   runs is the common case), so there is no scale to divide by. The tolerance
+   stands in as the scale — one tolerance of departure is one unit of
+   significance, saturating at `ZERO_SCALE_Z_CAP` (25, far above any usable
+   `mad_z`). It used to be ±∞, which reported the same maximal significance for
+   three duplicate values in a cohort of thirty as for a total collapse.
+
 **Cohort formation.** The unit of analysis is a cohort of at least
 `[resilience] min_cohort_docs` (default 30) documents. *As built, a cohort is one
 run* — the sliding multi-run cohort described below is **not** implemented; a run
@@ -463,6 +471,18 @@ a baseline distinct-ratio near zero, so nothing fires on them. This one signal
 catches, in my estimate, the majority of real silent rebinds, and its false-
 positive rate on a genuinely per-record field is near zero because there is no
 benign reason for a per-record field to become constant across 30 documents.
+
+A collapse this severe overrides the weighted score to 1.0, so it is guarded: it
+must be possible to **rule out** "the site legitimately started saying the same
+thing everywhere". Normally that is a `content_changed` divergence — but
+divergence needs a per-key fingerprint from the previous run, and a listing whose
+keys rotate completely every run ("the 30 newest items") never has one, which
+left exactly those sources unable to reach the guard that protects them. With no
+divergence evidence the override now requires corroboration from the value domain
+instead: the collapsed values must also have left the shape the field has always
+produced. A same-shaped cohort-wide collapse on a key-rotating source is still
+*scored* by the ordinary distinctness term — it just no longer convicts on its
+own.
 
 **(b) Value-domain drift.** A price field that becomes `"Add to cart"` moves the
 char-class vector from 80% digit to 90% alpha. A date field that becomes a review
