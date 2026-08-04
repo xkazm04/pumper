@@ -114,3 +114,17 @@ search-backfill scope:
 # Build an example WASM plugin from plugins-src/<crate> (detached workspace).
 plugin crate:
     cd plugins-src/{{crate}} && cargo build --release --target wasm32-unknown-unknown
+
+# --- live verification --------------------------------------------------------
+
+# Reuses an existing debug build (set CARGO_TARGET_DIR to point at one) rather
+# than rebuilding; add -SkipBuild to fail instead of building if it's missing,
+# -KeepScratch to leave the scratch dir behind on exit for debugging.
+#
+# Boots the real binary against an isolated scratch config (port 18099, its
+# own DB/artifacts/search-index dir under the OS temp folder), drives one real
+# job end-to-end, curls the doctor/retention/enforcement-preview/openapi/
+# receipt surfaces, and tears down — see docs/features/http-api.md
+# "Smoke verification". PowerShell 7 (`pwsh`) required.
+smoke *args:
+    pwsh -NoProfile -File scripts/smoke.ps1 {{args}}

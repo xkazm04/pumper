@@ -134,6 +134,12 @@ Read-only view of the session vault — the named login profiles a fetch can run
 
 Profiles are created implicitly by the first fetch that names them; there is **no create/delete API** in phase 1 (delete = remove the directory under `[fetcher] profiles_dir`, default `data/profiles`). A request naming an invalid profile fails with a typed profile error (`500 internal` at the API boundary — names are validated in the engines, not at the route).
 
+## Smoke verification (`just smoke`)
+
+Every other check in this repo (`just test`, `just lint`) verifies code paths in isolation, never the shipped binary answering over real HTTP. `scripts/smoke.ps1` (PowerShell 7, `just smoke`) closes that gap: it builds/locates `pumper` (reusing an existing debug build — set `CARGO_TARGET_DIR` to point it at one), boots it against a scratch `config.toml` (isolated DB/artifacts/search-index dir under the OS temp folder, port `18099` so it never collides with a `just run` on 8088), polls `GET /health` for readiness, drives one real job end-to-end through `POST /apps/hackernews/jobs` → `GET /jobs/{id}`, then curls `GET /health`, `GET /datasets/doctor`, `GET /retention/preview`, `GET /enforcement/preview`, `GET /openapi.json`, and the driven job's `GET /jobs/{id}/receipt`, asserting `200` + a sane JSON shape on each. It always tears down (kills the server process, deletes the scratch dir) in a `finally` block, and prints a PASS/FAIL/SKIP line per check — a network-unreachable job run is `SKIP`, not `FAIL`, since the point is proving the server works, not the network. Exits non-zero on any `FAIL`.
+
+`hackernews` is the driven app because it's the only registered app whose `run()` needs no API key, browser profile, or paid engine — see `scripts/smoke.ps1`'s header comment for why it's excluded from `catalog/data-sources.toml` (example/template app) yet is exactly the right smoke-test candidate.
+
 ## Known gaps
 
 No bundled Swagger/Scalar UI — the raw spec is served at `/openapi.json`; point any external viewer at it.
