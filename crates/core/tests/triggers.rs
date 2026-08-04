@@ -178,6 +178,86 @@ async fn ingress_sources_and_external_triggers_roundtrip() {
     assert!(storage.get_ingress_source(&src.id).await.unwrap().is_none());
 }
 
+/// The decision ledger (migration 0036): fires and skips land in the same
+/// table, page newest-first, and are bounded by age — the anti-pattern being a
+/// ledger that only records successes (which is what `jobs.trigger_id` already
+/// was) or one that grows forever.
+#[tokio::test]
+async fn trigger_decision_ledger_records_skips_not_only_fires() {
+    use pumper_core::storage::{NewTriggerRun, TRIGGER_SET_ID};
+    let store = pumper_core::testing::TempStore::new("trigger-ledger-test").await;
+    let storage = &store.storage;
+
+    for (outcome, dataset) in [
+        ("fired", Some("unified")),
+        ("dedup", Some("unified")),
+        ("no_change_match", Some("orgs")),
+    ] {
+        storage
+            .record_trigger_run(&NewTriggerRun {
+                trigger_id: "T1",
+                outcome,
+                source_kind: "dataset",
+                source_job_id: Some("J1"),
+                dataset,
+                job_id: (outcome == "fired").then_some("HOP1"),
+                ..Default::default()
+            })
+            .await
+            .expect("record decision");
+    }
+    // A decision about the whole edge set (the set failed to load) is recorded
+    // against the sentinel, not against a trigger that was never reached.
+    storage
+        .record_trigger_run(&NewTriggerRun {
+            trigger_id: TRIGGER_SET_ID,
+            outcome: "eval_set_error",
+            source_kind: "dataset",
+            source_job_id: Some("J1"),
+            detail: Some("database is locked"),
+            ..Default::default()
+        })
+        .await
+        .unwrap();
+
+    let page = storage
+        .list_trigger_runs_page("T1", None, 10)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), 3, "the sentinel row belongs to no trigger");
+    let mut outcomes: Vec<&str> = page.iter().map(|r| r.outcome.as_str()).collect();
+    outcomes.sort();
+    assert_eq!(outcomes, ["dedup", "fired", "no_change_match"]);
+    let fired = page.iter().find(|r| r.outcome == "fired").unwrap();
+    assert_eq!(fired.job_id.as_deref(), Some("HOP1"));
+    assert_eq!(fired.dataset.as_deref(), Some("unified"));
+
+    let set = storage
+        .list_trigger_runs_page(TRIGGER_SET_ID, None, 10)
+        .await
+        .unwrap();
+    assert_eq!(set.len(), 1);
+    assert_eq!(set[0].detail.as_deref(), Some("database is locked"));
+
+    // Keyset paging walks the whole ledger exactly once.
+    let first = storage.list_trigger_runs_page("T1", None, 2).await.unwrap();
+    assert_eq!(first.len(), 2);
+    let after = (
+        pumper_core::datasets::ts(first[1].created_at),
+        first[1].id.clone(),
+    );
+    let second = storage
+        .list_trigger_runs_page("T1", Some(after), 2)
+        .await
+        .unwrap();
+    assert_eq!(second.len(), 1);
+    assert!(!first.iter().any(|r| r.id == second[0].id));
+
+    // Bounded: `0` days disables the prune, and a fresh row is never old.
+    assert_eq!(storage.prune_trigger_runs(0).await.unwrap(), 0);
+    assert_eq!(storage.prune_trigger_runs(1).await.unwrap(), 0);
+}
+
 /// M15: plugin_hooks JSON column round-trips through create/get, and an
 /// all-empty hooks object stores as NULL (no hooks).
 #[tokio::test]

@@ -909,6 +909,10 @@ async fn maybe_tick(hb: &mut Option<tokio::time::Interval>) {
 /// through `finalize` so their callback + terminal triggers fire like any other
 /// failure. Piggybacks the scheduler tick (`stale_after_secs == 0` disables it).
 pub async fn reap_once(state: &AppState) {
+    // The trigger decision ledger rides this tick (see `prune_trigger_ledger`)
+    // — before the `stale_after_secs == 0` early return, because a deployment
+    // with the reaper disabled still writes decisions.
+    prune_trigger_ledger(state).await;
     let stale = state.config.worker.stale_after_secs;
     if stale == 0 {
         return;
@@ -932,6 +936,66 @@ pub async fn reap_once(state: &AppState) {
                 finalize(state, id).await;
             }
         }
+    }
+}
+
+/// How long a trigger decision row lives. The ledger is DIAGNOSTIC — one row
+/// per candidate edge per source event, negatives included — which is a far
+/// higher write rate than the evidence ledgers in `LEDGER_TABLES`, and losing an
+/// old row loses no history anyone can act on. So unlike those it is bounded by
+/// default (they are opt-in precisely because deleting them IS data loss).
+const TRIGGER_RUN_RETENTION_DAYS: u64 = 14;
+
+/// How often the prune actually runs. The reaper tick is per
+/// `schedule_tick_secs` (seconds); a retention sweep at that rate would be pure
+/// write amplification for a bound measured in days.
+const TRIGGER_RUN_PRUNE_EVERY: Duration = Duration::from_secs(3600);
+
+/// Last completed prune, process-local. A restart re-arms it, which is the same
+/// posture the ingress rate-limit buckets take: for a janitorial bound, an extra
+/// sweep after a restart is free and a missed one is not.
+static LAST_TRIGGER_RUN_PRUNE: std::sync::Mutex<Option<std::time::Instant>> =
+    std::sync::Mutex::new(None);
+
+/// Whether the ledger prune is due. The anti-pattern: a sweep on every reaper
+/// tick, i.e. a `DELETE` every few seconds against a table bounded in days.
+fn prune_is_due(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    every: Duration,
+) -> bool {
+    match last {
+        None => true, // first tick after boot
+        Some(t) => now.duration_since(t) >= every,
+    }
+}
+
+/// Bounds `trigger_runs` by age, at most once per [`TRIGGER_RUN_PRUNE_EVERY`].
+/// Fail-open and quiet: a ledger that could not be pruned is a disk-space
+/// concern, never a reason to disturb the queue.
+async fn prune_trigger_ledger(state: &AppState) {
+    let now = std::time::Instant::now();
+    {
+        // The guard is dropped before the await: a std Mutex must never be held
+        // across one, and the claim is "this task owns the next sweep".
+        let mut last = LAST_TRIGGER_RUN_PRUNE.lock().expect("prune clock poisoned");
+        if !prune_is_due(*last, now, TRIGGER_RUN_PRUNE_EVERY) {
+            return;
+        }
+        *last = Some(now);
+    }
+    match state
+        .storage
+        .prune_trigger_runs(TRIGGER_RUN_RETENTION_DAYS)
+        .await
+    {
+        Ok(n) if n > 0 => info!(
+            pruned = n,
+            days = TRIGGER_RUN_RETENTION_DAYS,
+            "pruned old trigger decisions"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!("trigger decision ledger prune failed: {e}"),
     }
 }
 
@@ -1544,6 +1608,28 @@ fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
         body: rec.to_string(),
         // Job-result docs carry no record timestamp — index at completion time.
         indexed_at: chrono::Utc::now().timestamp(),
+    }
+}
+
+#[cfg(test)]
+mod ledger_prune_tests {
+    use super::{prune_is_due, TRIGGER_RUN_PRUNE_EVERY};
+    use std::time::{Duration, Instant};
+
+    /// The anti-pattern: a retention sweep on every reaper tick (seconds) for a
+    /// bound measured in days.
+    #[test]
+    fn prune_runs_once_per_interval_not_every_tick() {
+        let t0 = Instant::now();
+        assert!(
+            prune_is_due(None, t0, TRIGGER_RUN_PRUNE_EVERY),
+            "first tick"
+        );
+        let every = Duration::from_secs(60);
+        assert!(!prune_is_due(Some(t0), t0 + Duration::from_secs(1), every));
+        assert!(!prune_is_due(Some(t0), t0 + Duration::from_secs(59), every));
+        assert!(prune_is_due(Some(t0), t0 + every, every));
+        assert!(prune_is_due(Some(t0), t0 + Duration::from_secs(600), every));
     }
 }
 

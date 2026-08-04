@@ -405,10 +405,48 @@ pub fn external_trigger_obj(
 
 use std::collections::HashMap;
 
+use pumper_core::storage::{NewTriggerRun, TRIGGER_SET_ID};
 use pumper_core::EnqueueOptions;
 use tracing::{debug, info, warn};
 
 use crate::state::AppState;
+
+/// Records ONE decision in the ledger (`trigger_runs`, migration 0036).
+///
+/// Fail-open by construction: a ledger write that fails is logged loudly and
+/// swallowed. The hop it describes has already happened (or already been
+/// skipped) — refusing to fire because we could not write the note about firing
+/// would turn an observability table into a new failure mode for the pipeline.
+async fn record(state: &AppState, run: NewTriggerRun<'_>) {
+    if let Err(e) = state.storage.record_trigger_run(&run).await {
+        warn!(trigger = %run.trigger_id, outcome = %run.outcome,
+              "trigger decision ledger write failed (the decision itself stands): {e}");
+    }
+}
+
+/// The part of a decision that is fixed for one source event, so each call site
+/// spells out only the outcome and its detail.
+struct Ctx<'a> {
+    source_kind: &'a str,
+    source_job_id: Option<String>,
+    dataset: Option<&'a str>,
+    event_id: Option<&'a str>,
+}
+
+impl Ctx<'_> {
+    /// A ledger row for `trigger` with this context.
+    fn row<'r>(&'r self, trigger_id: &'r str, outcome: &'r str) -> NewTriggerRun<'r> {
+        NewTriggerRun {
+            trigger_id,
+            outcome,
+            source_kind: self.source_kind,
+            source_job_id: self.source_job_id.as_deref(),
+            dataset: self.dataset,
+            event_id: self.event_id,
+            ..Default::default()
+        }
+    }
+}
 
 /// Fires enabled dataset triggers matching this run's revision batch. One
 /// target job per trigger **per dataset** of the batch (idempotency-keyed),
@@ -423,11 +461,27 @@ pub async fn fire_dataset_triggers(
     batch: DatasetBatch<'_>,
     by_dataset: &HashMap<&str, Vec<&Revision>>,
 ) {
+    let source_job_id = job.id.to_string();
     let trigs = match state.storage.enabled_triggers("dataset", &job.app).await {
         Ok(t) if !t.is_empty() => t,
         Ok(_) => return,
         Err(e) => {
+            // A transient read error here silently drops EVERY edge of this
+            // run, which is exactly the failure the ledger exists to surface.
             warn!(job = %job.id, "failed to load dataset triggers: {e}");
+            let detail = e.to_string();
+            record(
+                state,
+                NewTriggerRun {
+                    trigger_id: TRIGGER_SET_ID,
+                    outcome: "eval_set_error",
+                    source_kind: "dataset",
+                    source_job_id: Some(&source_job_id),
+                    detail: Some(&detail),
+                    ..Default::default()
+                },
+            )
+            .await;
             return;
         }
     };
@@ -437,6 +491,12 @@ pub async fn fire_dataset_triggers(
     for dataset in datasets {
         let dataset = *dataset;
         let revs = &by_dataset[dataset];
+        let ctx = Ctx {
+            source_kind: "dataset",
+            source_job_id: Some(source_job_id.clone()),
+            dataset: Some(dataset),
+            event_id: None,
+        };
         for trigger in trigs.iter().filter(|t| t.covers_dataset(dataset)) {
             let matching: Vec<&Revision> = revs
                 .iter()
@@ -444,6 +504,7 @@ pub async fn fire_dataset_triggers(
                 .filter(|r| change_matches(trigger.on_change.as_deref(), &r.change))
                 .collect();
             if matching.is_empty() {
+                record(state, ctx.row(&trigger.id, "no_change_match")).await;
                 continue;
             }
             let (depth, chain) = match decide(&trigger.id, &job.params, &state.config.triggers) {
@@ -451,12 +512,14 @@ pub async fn fire_dataset_triggers(
                 FireDecision::SkipCycle => {
                     warn!(trigger = %trigger.id, job = %job.id,
                           "trigger skipped: cycle detected in provenance chain");
+                    record(state, ctx.row(&trigger.id, "cycle")).await;
                     continue;
                 }
                 FireDecision::SkipDepth => {
                     warn!(trigger = %trigger.id, job = %job.id,
                           max_depth = state.config.triggers.max_depth,
                           "trigger skipped: max chain depth reached");
+                    record(state, ctx.row(&trigger.id, "depth")).await;
                     continue;
                 }
             };
@@ -469,8 +532,8 @@ pub async fn fire_dataset_triggers(
                 &chain,
                 &state.config.triggers,
             );
-            let key = dataset_idempotency_key(&trigger.id, &job.id.to_string(), batch, dataset);
-            fired += enqueue_hop(state, trigger, job, obj, key).await;
+            let key = dataset_idempotency_key(&trigger.id, &source_job_id, batch, dataset);
+            fired += enqueue_hop(state, trigger, job, obj, key, &ctx).await;
         }
     }
     if fired > 0 {
@@ -480,17 +543,38 @@ pub async fn fire_dataset_triggers(
 
 /// Fires enabled terminal-job triggers matching this job's final status.
 pub async fn fire_terminal_triggers(state: &AppState, job: &Job) {
+    let source_job_id = job.id.to_string();
     let trigs = match state.storage.enabled_triggers("job", &job.app).await {
         Ok(t) if !t.is_empty() => t,
         Ok(_) => return,
         Err(e) => {
             warn!(job = %job.id, "failed to load job triggers: {e}");
+            let detail = e.to_string();
+            record(
+                state,
+                NewTriggerRun {
+                    trigger_id: TRIGGER_SET_ID,
+                    outcome: "eval_set_error",
+                    source_kind: "job",
+                    source_job_id: Some(&source_job_id),
+                    detail: Some(&detail),
+                    ..Default::default()
+                },
+            )
+            .await;
             return;
         }
+    };
+    let ctx = Ctx {
+        source_kind: "job",
+        source_job_id: Some(source_job_id.clone()),
+        dataset: None,
+        event_id: None,
     };
     let mut fired = 0;
     for trigger in &trigs {
         if !status_matches(trigger.on_status.as_deref(), job.status.as_str()) {
+            record(state, ctx.row(&trigger.id, "status_mismatch")).await;
             continue;
         }
         let (depth, chain) = match decide(&trigger.id, &job.params, &state.config.triggers) {
@@ -498,18 +582,20 @@ pub async fn fire_terminal_triggers(state: &AppState, job: &Job) {
             FireDecision::SkipCycle => {
                 warn!(trigger = %trigger.id, job = %job.id,
                       "trigger skipped: cycle detected in provenance chain");
+                record(state, ctx.row(&trigger.id, "cycle")).await;
                 continue;
             }
             FireDecision::SkipDepth => {
                 warn!(trigger = %trigger.id, job = %job.id,
                       max_depth = state.config.triggers.max_depth,
                       "trigger skipped: max chain depth reached");
+                record(state, ctx.row(&trigger.id, "depth")).await;
                 continue;
             }
         };
         let obj = terminal_trigger_obj(trigger, job, depth, &chain);
-        let key = idempotency_key(&trigger.id, &job.id.to_string());
-        fired += enqueue_hop(state, trigger, job, obj, key).await;
+        let key = idempotency_key(&trigger.id, &source_job_id);
+        fired += enqueue_hop(state, trigger, job, obj, key, &ctx).await;
     }
     if fired > 0 {
         state.notify.notify_one();
@@ -534,8 +620,27 @@ pub async fn fire_external_triggers(
         Ok(_) => return 0,
         Err(e) => {
             warn!(source = %source_id, "failed to load external triggers: {e}");
+            let detail = e.to_string();
+            record(
+                state,
+                NewTriggerRun {
+                    trigger_id: TRIGGER_SET_ID,
+                    outcome: "eval_set_error",
+                    source_kind: "external",
+                    event_id: Some(event_id),
+                    detail: Some(&detail),
+                    ..Default::default()
+                },
+            )
+            .await;
             return 0;
         }
+    };
+    let ctx = Ctx {
+        source_kind: "external",
+        source_job_id: None,
+        dataset: None,
+        event_id: Some(event_id),
     };
     let mut fired = 0;
     for trigger in &trigs {
@@ -546,19 +651,28 @@ pub async fn fire_external_triggers(
                 Ok(f) => f,
                 Err(_) => {
                     warn!(trigger = %trigger.id, "external trigger has unparseable filters; skipped");
+                    record(state, ctx.row(&trigger.id, "bad_filters")).await;
                     continue;
                 }
             },
             None => Vec::new(),
         };
         if !payload_matches(&filters, payload) {
+            record(state, ctx.row(&trigger.id, "filter_miss")).await;
             continue;
         }
         // Inbound events carry no provenance — every chain starts here.
         let (depth, chain) = match decide(&trigger.id, &Value::Null, &state.config.triggers) {
             FireDecision::Fire { depth, chain } => (depth, chain),
             // Unreachable from a fresh chain, but keep the guards uniform.
-            FireDecision::SkipCycle | FireDecision::SkipDepth => continue,
+            FireDecision::SkipCycle => {
+                record(state, ctx.row(&trigger.id, "cycle")).await;
+                continue;
+            }
+            FireDecision::SkipDepth => {
+                record(state, ctx.row(&trigger.id, "depth")).await;
+                continue;
+            }
         };
         let obj = external_trigger_obj(
             trigger,
@@ -571,19 +685,29 @@ pub async fn fire_external_triggers(
         );
         // Plugin predicate/transform hooks (fail-open, see `apply_plugin_hooks`).
         let Some(obj) = apply_plugin_hooks(state.plugins.as_ref(), trigger, obj).await else {
+            record(state, ctx.row(&trigger.id, "predicate_veto")).await;
             continue;
         };
         if !state.registry.contains_key(&trigger.target_app) {
             warn!(trigger = %trigger.id, app = %trigger.target_app,
                   "external trigger skipped: target app not registered");
+            record(
+                state,
+                NewTriggerRun {
+                    detail: Some(&trigger.target_app),
+                    ..ctx.row(&trigger.id, "target_unregistered")
+                },
+            )
+            .await;
             continue;
         }
+        let key = idempotency_key(&trigger.id, event_id);
         let opts = EnqueueOptions {
             params: merged_params(&trigger.params, obj),
             max_attempts: trigger.max_attempts,
             priority: trigger.priority,
             budget_usd: trigger.budget_usd,
-            idempotency_key: Some(idempotency_key(&trigger.id, event_id)),
+            idempotency_key: Some(key.clone()),
             trigger_id: Some(trigger.id.clone()),
             ..Default::default()
         };
@@ -591,17 +715,42 @@ pub async fn fire_external_triggers(
             Ok((hop, true)) => {
                 info!(trigger = %trigger.id, event = %event_id, target = %hop.id,
                       app = %trigger.target_app, "external trigger fired");
+                let hop_id = hop.id.to_string();
+                record(
+                    state,
+                    NewTriggerRun {
+                        job_id: Some(&hop_id),
+                        ..ctx.row(&trigger.id, "fired")
+                    },
+                )
+                .await;
                 fired += 1;
             }
             Ok((_, false)) => {
                 // Already fired for this event id — the redelivery case, which
                 // is the point of the key, but it must still be observable.
-                debug!(trigger = %trigger.id, event = %event_id,
-                       key = %idempotency_key(&trigger.id, event_id),
+                debug!(trigger = %trigger.id, event = %event_id, key = %key,
                        "external trigger hop suppressed: a job already exists for this event");
+                record(
+                    state,
+                    NewTriggerRun {
+                        detail: Some(&key),
+                        ..ctx.row(&trigger.id, "dedup")
+                    },
+                )
+                .await;
             }
             Err(e) => {
                 warn!(trigger = %trigger.id, event = %event_id, "external trigger enqueue failed: {e}");
+                let detail = e.to_string();
+                record(
+                    state,
+                    NewTriggerRun {
+                        detail: Some(&detail),
+                        ..ctx.row(&trigger.id, "enqueue_failed")
+                    },
+                )
+                .await;
             }
         }
     }
@@ -619,15 +768,25 @@ async fn enqueue_hop(
     source: &Job,
     obj: Value,
     key: String,
+    ctx: &Ctx<'_>,
 ) -> usize {
     // Plugin hooks first: a predicate may veto the hop, a transform may shape
     // the `_trigger` envelope. Both fail open (see `apply_plugin_hooks`).
     let Some(obj) = apply_plugin_hooks(state.plugins.as_ref(), trigger, obj).await else {
+        record(state, ctx.row(&trigger.id, "predicate_veto")).await;
         return 0;
     };
     if !state.registry.contains_key(&trigger.target_app) {
         warn!(trigger = %trigger.id, app = %trigger.target_app,
               "trigger skipped: target app not registered");
+        record(
+            state,
+            NewTriggerRun {
+                detail: Some(&trigger.target_app),
+                ..ctx.row(&trigger.id, "target_unregistered")
+            },
+        )
+        .await;
         return 0;
     }
     let opts = EnqueueOptions {
@@ -647,6 +806,16 @@ async fn enqueue_hop(
         Ok((hop, true)) => {
             info!(trigger = %trigger.id, source = %source.id, target = %hop.id,
                   app = %trigger.target_app, "trigger fired");
+            let hop_id = hop.id.to_string();
+            record(
+                state,
+                NewTriggerRun {
+                    job_id: Some(&hop_id),
+                    detail: Some(&key),
+                    ..ctx.row(&trigger.id, "fired")
+                },
+            )
+            .await;
             1
         }
         Ok((_, false)) => {
@@ -655,10 +824,27 @@ async fn enqueue_hop(
             // outside, so the key that suppressed it is part of the record.
             debug!(trigger = %trigger.id, source = %source.id, key = %key,
                    "trigger hop suppressed: a job already exists for this idempotency key");
+            record(
+                state,
+                NewTriggerRun {
+                    detail: Some(&key),
+                    ..ctx.row(&trigger.id, "dedup")
+                },
+            )
+            .await;
             0
         }
         Err(e) => {
             warn!(trigger = %trigger.id, source = %source.id, "trigger enqueue failed: {e}");
+            let detail = e.to_string();
+            record(
+                state,
+                NewTriggerRun {
+                    detail: Some(&detail),
+                    ..ctx.row(&trigger.id, "enqueue_failed")
+                },
+            )
+            .await;
             0
         }
     }

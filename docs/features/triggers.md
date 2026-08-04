@@ -31,7 +31,36 @@ The target job's params = template with `_trigger` merged over it (injected wins
 
 Handlers live in `crates/server/src/routes/triggers.rs`; the fire/decide logic in `crates/server/src/triggers.rs`.
 
-`GET/POST /triggers` (kind-aware validation), `DELETE /triggers/{id}`, `POST /triggers/{id}/enabled`, `POST /triggers/{id}/test` (dry-run against the most recent source job → `would_fire` + resolved params + reason; `?fire=true` enqueues for real, idempotency-bypassed), `GET /triggers/{id}/runs` (lineage via `jobs.trigger_id`).
+`GET/POST /triggers` (kind-aware validation), `DELETE /triggers/{id}`, `POST /triggers/{id}/enabled`, `POST /triggers/{id}/test` (dry-run against the most recent source job → `would_fire` + resolved params + reason; `?fire=true` enqueues for real, idempotency-bypassed), `GET /triggers/{id}/runs` (lineage **and** the decision ledger — below).
+
+## The decision ledger (`trigger_runs` table)
+
+Every evaluation of a trigger against one source event is recorded, fires and **skips** alike — the negatives were previously log-only or entirely silent, so "why did my pipeline not fire?" was unanswerable from the API.
+
+`GET /triggers/{id}/runs` → `{trigger_id, count, runs, decisions, next_cursor}`; **404** when the trigger does not exist (it used to answer `200 {count: 0}`, which reads as "never fired").
+
+- `runs` — the jobs this trigger enqueued (`jobs.trigger_id`), newest first, as before.
+- `decisions` — ledger rows, newest first, keyset-paged with `cursor` (`limit` clamped 1–500 for both). Each row: `{id, trigger_id, outcome, source_kind, source_job_id?, dataset?, event_id?, job_id?, detail?, created_at}`.
+
+| `outcome` | Meaning |
+|---|---|
+| `fired` | The hop was enqueued (`job_id` names it; `detail` is the idempotency key) |
+| `no_change_match` | No revision in that dataset's batch passed `on_change` |
+| `status_mismatch` | The source job's terminal status did not pass `on_status` |
+| `filter_miss` | The inbound payload did not satisfy the trigger's JSON-path filters |
+| `bad_filters` | The trigger's stored filter specs no longer parse |
+| `predicate_veto` | A predicate plugin returned `pass=false` (or failed with `on_error = "skip"`) |
+| `cycle` / `depth` | Provenance guards (`chain`, `[triggers] max_depth`) |
+| `target_unregistered` | `target_app` is not a registered app (`detail` = the app) |
+| `dedup` | A job already exists for this hop's idempotency key (`detail` = the key) |
+| `enqueue_failed` | The enqueue itself errored (`detail` = the error) |
+| `eval_set_error` | The evaluation set could not be loaded, dropping **every** edge of that source event. Recorded against the sentinel `trigger_id = "*"`, since no individual trigger was reached — read it with `GET /triggers/*/runs`… which 404s, so query the table directly for now (see gaps) |
+
+Ledger writes are **fail-open**: a write that fails is logged loudly and the hop proceeds regardless — the observability table must never become a failure mode for the pipeline.
+
+**Retention**: bounded by default at 14 days, swept at most hourly from the worker's reaper tick. Unlike the opt-in evidence ledgers (`cost_events`, `webhook_deliveries`, …) this one is diagnostic and high-write, so it bounds itself.
+
+**Known gaps**: the retention window is a constant, not a config key; `eval_set_error` rows are not reachable through `GET /triggers/{id}/runs` (their `trigger_id` is the `"*"` sentinel and that id is not a trigger); there is no cross-trigger "all decisions" list endpoint.
 
 `GET /triggers` takes an optional `app` filter and is **dual-mode**: bare `{triggers: [...]}` by default, or `{items, next_cursor}` when a `cursor` param is present (even empty) — an opaque keyset cursor. `limit` is clamped 1–500 in **both** modes, so an uncursored list can never stream the whole table.
 

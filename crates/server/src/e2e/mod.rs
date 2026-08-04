@@ -24,6 +24,7 @@ mod scheduler_overlap;
 mod shutdown_drain;
 mod sink_delivery;
 mod trigger_hops;
+mod trigger_ledger;
 mod webhook_contract;
 mod worker_fanout;
 mod worker_lifecycle;

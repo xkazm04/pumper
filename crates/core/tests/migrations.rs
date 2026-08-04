@@ -42,6 +42,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "source_runs",
     "sources",
     "tier_memory",
+    "trigger_runs",
     "triggers",
     "watches",
     "webhook_deliveries",

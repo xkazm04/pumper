@@ -982,6 +982,75 @@ impl Storage {
         rows.into_iter().map(Job::try_from).collect()
     }
 
+    // ---- Trigger decision ledger --------------------------------------------
+
+    /// Records ONE trigger decision (migration 0036). Callers are fail-open:
+    /// a decision that could not be recorded must never hold up the hop it
+    /// describes, so this returns the error rather than acting on it.
+    pub async fn record_trigger_run(&self, run: &NewTriggerRun<'_>) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO trigger_runs (id, trigger_id, outcome, source_kind, source_job_id, \
+             dataset, event_id, job_id, detail, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        )
+        .bind(&id)
+        .bind(run.trigger_id)
+        .bind(run.outcome)
+        .bind(run.source_kind)
+        .bind(run.source_job_id)
+        .bind(run.dataset)
+        .bind(run.event_id)
+        .bind(run.job_id)
+        .bind(run.detail)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// Keyset page of one trigger's decisions, newest first. `after` is the
+    /// previous page's last (created_at, id).
+    pub async fn list_trigger_runs_page(
+        &self,
+        trigger_id: &str,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<TriggerRun>> {
+        let (after_ts, after_id) = split_after(after);
+        let rows: Vec<TriggerRunRow> = sqlx::query_as(
+            "SELECT id, trigger_id, outcome, source_kind, source_job_id, dataset, event_id, \
+             job_id, detail, created_at FROM trigger_runs \
+             WHERE trigger_id = ?1 \
+             AND (?2 IS NULL OR created_at < ?2 OR (created_at = ?2 AND id < ?3)) \
+             ORDER BY created_at DESC, id DESC LIMIT ?4",
+        )
+        .bind(trigger_id)
+        .bind(after_ts)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(TriggerRun::try_from).collect()
+    }
+
+    /// Drops decisions older than `days`. The ledger is diagnostic — one row per
+    /// candidate edge per source event, negatives included — so unlike the
+    /// evidence ledgers in [`LEDGER_TABLES`] it is bounded by default and this
+    /// is called from the worker's reaper tick rather than by an operator knob.
+    pub async fn prune_trigger_runs(&self, days: u64) -> Result<u64> {
+        if days == 0 {
+            return Ok(0);
+        }
+        Ok(
+            sqlx::query("DELETE FROM trigger_runs WHERE created_at < ?1")
+                .bind(ts(cutoff(days)))
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
     // ---- Saved searches -----------------------------------------------------
 
     pub async fn create_saved_search(
@@ -2267,6 +2336,112 @@ impl TryFrom<TriggerRow> for Trigger {
                 .plugin_hooks
                 .as_deref()
                 .and_then(|s| serde_json::from_str(s).ok()),
+        })
+    }
+}
+
+// ---- Trigger decision ledger (migration 0036) -------------------------------
+
+/// One recorded trigger decision: what the evaluation of one edge against one
+/// source event concluded, fires and skips alike.
+#[derive(Debug, Clone, Serialize)]
+pub struct TriggerRun {
+    pub id: String,
+    /// The evaluated trigger, or [`TRIGGER_SET_ID`] for a decision about the
+    /// whole edge set rather than one trigger.
+    pub trigger_id: String,
+    /// `fired`, or one of the skip reasons in [`TRIGGER_OUTCOMES`].
+    pub outcome: String,
+    /// `dataset` | `job` | `external`.
+    pub source_kind: String,
+    pub source_job_id: Option<String>,
+    pub dataset: Option<String>,
+    pub event_id: Option<String>,
+    /// The hop that was enqueued (outcome `fired`).
+    pub job_id: Option<String>,
+    /// Free-text context: an error message, a plugin name, an idempotency key.
+    pub detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// The `trigger_id` a decision carries when it is about the evaluation SET, not
+/// about one trigger — the only such case is the set failing to load, which
+/// drops every edge of that source event at once.
+pub const TRIGGER_SET_ID: &str = "*";
+
+/// Every value `trigger_runs.outcome` may take. The API documents these as the
+/// skip-reason vocabulary, so the list is a contract, not a hint.
+pub const TRIGGER_OUTCOMES: &[&str] = &[
+    // The hop was enqueued.
+    "fired",
+    // The evaluation set could not be loaded — every edge of this source event
+    // was dropped (transient DB error). Recorded against `TRIGGER_SET_ID`.
+    "eval_set_error",
+    // No revision in this dataset's batch passed the trigger's `on_change`.
+    "no_change_match",
+    // The source job's terminal status did not pass `on_status`.
+    "status_mismatch",
+    // The inbound payload did not satisfy the trigger's JSON-path filters.
+    "filter_miss",
+    // The trigger's stored filter specs no longer parse.
+    "bad_filters",
+    // A predicate plugin returned `pass=false` (or failed with `on_error=skip`).
+    "predicate_veto",
+    // The trigger already appears in the source's provenance chain.
+    "cycle",
+    // `[triggers] max_depth` reached.
+    "depth",
+    // `target_app` is not a registered app.
+    "target_unregistered",
+    // A job already exists for this hop's idempotency key.
+    "dedup",
+    // The enqueue itself failed.
+    "enqueue_failed",
+];
+
+/// Insert shape for [`Storage::record_trigger_run`]. Borrowed and `Default`ing
+/// so each decision path names only the fields it actually knows.
+#[derive(Debug, Default)]
+pub struct NewTriggerRun<'a> {
+    pub trigger_id: &'a str,
+    pub outcome: &'a str,
+    pub source_kind: &'a str,
+    pub source_job_id: Option<&'a str>,
+    pub dataset: Option<&'a str>,
+    pub event_id: Option<&'a str>,
+    pub job_id: Option<&'a str>,
+    pub detail: Option<&'a str>,
+}
+
+#[derive(sqlx::FromRow)]
+struct TriggerRunRow {
+    id: String,
+    trigger_id: String,
+    outcome: String,
+    source_kind: String,
+    source_job_id: Option<String>,
+    dataset: Option<String>,
+    event_id: Option<String>,
+    job_id: Option<String>,
+    detail: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<TriggerRunRow> for TriggerRun {
+    type Error = Error;
+
+    fn try_from(r: TriggerRunRow) -> Result<TriggerRun> {
+        Ok(TriggerRun {
+            id: r.id,
+            trigger_id: r.trigger_id,
+            outcome: r.outcome,
+            source_kind: r.source_kind,
+            source_job_id: r.source_job_id,
+            dataset: r.dataset,
+            event_id: r.event_id,
+            job_id: r.job_id,
+            detail: r.detail,
+            created_at: parse_ts(&r.created_at)?,
         })
     }
 }

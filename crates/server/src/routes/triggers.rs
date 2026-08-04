@@ -407,28 +407,57 @@ pub(crate) async fn test_trigger(
 pub(crate) struct RunsQuery {
     #[serde(default = "default_limit")]
     limit: i64,
+    /// Opaque keyset cursor over `decisions` (the `runs` array is always the
+    /// newest `limit` jobs).
+    cursor: Option<String>,
 }
 
-/// Jobs this trigger fired, newest first — the lineage view.
+/// What this trigger did, fires and skips alike.
+///
+/// `runs` is the job lineage (`jobs.trigger_id`) — the jobs the trigger
+/// actually enqueued. `decisions` is the ledger (`trigger_runs`): one row per
+/// evaluation of this trigger against one source event, INCLUDING the negatives
+/// (`no_change_match`, `filter_miss`, `dedup`, `cycle`, `depth`,
+/// `target_unregistered`, `predicate_veto`, `bad_filters`, `enqueue_failed`),
+/// which are otherwise invisible. Decisions page with `cursor`.
 #[utoipa::path(
     get,
     path = "/triggers/{id}/runs",
     tag = "triggers",
     params(("id" = String, Path, description = "Trigger id"), RunsQuery),
-    responses((status = 200, description = "`{trigger_id, count, runs: [Job]}`"))
+    responses(
+        (status = 200, description = "`{trigger_id, count, runs: [Job], decisions: [TriggerRun], next_cursor}`"),
+        (status = 404, description = "Trigger not found", body = Object),
+    )
 )]
 pub(crate) async fn trigger_runs(
     State(state): State<AppState>,
     Path(id): Path<String>,
     Query(query): Query<RunsQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let jobs = state
+    // A deleted (or mistyped) trigger used to answer 200 `{count: 0}`, which
+    // reads as "this trigger has never fired" — the exact wrong answer for the
+    // question the endpoint exists to answer.
+    if state.storage.get_trigger(&id).await?.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "trigger not found".into()));
+    }
+    let limit = query.limit.clamp(1, 500);
+    let jobs = state.storage.jobs_by_trigger(&id, limit).await?;
+    let after = query.cursor.as_deref().and_then(parse_cursor);
+    let decisions = state
         .storage
-        .jobs_by_trigger(&id, query.limit.clamp(1, 500))
+        .list_trigger_runs_page(&id, after, limit)
         .await?;
-    Ok(Json(
-        json!({ "trigger_id": id, "count": jobs.len(), "runs": jobs }),
-    ))
+    let next_cursor = keyset_cursor(&decisions, limit, |d| {
+        format!("{}|{}", pumper_core::datasets::ts(d.created_at), d.id)
+    });
+    Ok(Json(json!({
+        "trigger_id": id,
+        "count": jobs.len(),
+        "runs": jobs,
+        "decisions": decisions,
+        "next_cursor": next_cursor,
+    })))
 }
 
 // ---- Webhook delivery log ----------------------------------------------------
