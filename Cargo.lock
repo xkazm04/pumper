@@ -296,6 +296,7 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+ "sha2",
  "tracing",
  "zip",
 ]
@@ -311,6 +312,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "tokio",
  "tracing",
 ]
 
@@ -333,6 +335,7 @@ dependencies = [
  "chrono",
  "pumper-core",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
 ]
@@ -358,6 +361,7 @@ dependencies = [
  "pumper-core",
  "pumper-engine-archive",
  "regex",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",
@@ -436,6 +440,7 @@ dependencies = [
  "futures",
  "pumper-core",
  "regex",
+ "serde",
  "serde_json",
 ]
 
@@ -880,6 +885,7 @@ version = "0.1.0"
 dependencies = [
  "pumper-core",
  "serde_json",
+ "sha2",
 ]
 
 [[package]]
@@ -5610,6 +5616,7 @@ dependencies = [
  "chrono",
  "pumper-core",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]
