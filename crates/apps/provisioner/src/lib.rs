@@ -23,7 +23,7 @@ use std::collections::BTreeMap;
 
 use async_trait::async_trait;
 use pumper_core::{
-    extract_one_with_report, salvage_json, AppContext, AppManifest, CostClass, Error,
+    extract_one_with_report, salvage_json, AppContext, AppManifest, CostClass, Error, FetchOutcome,
     FetchRequest, FetchStrategy, ManifestExample, ResearchRequest, Result, RuleSet, ScrapeApp,
     Source,
 };
@@ -130,6 +130,100 @@ fn normalize_cadence(s: Option<&str>) -> String {
             c.to_string()
         }
         _ => "weekly".to_string(),
+    }
+}
+
+// ── sampling ────────────────────────────────────────────────────────────────
+
+/// What one sampled candidate actually produced — recorded in the proposal so a
+/// reviewer can see *how* the sample was obtained, not just that it was.
+#[derive(Debug, Clone, Serialize)]
+pub struct SampleStat {
+    pub url: String,
+    /// The fetch tier that actually WON, straight from `FetchOutcome.engine`
+    /// (`archive` · `api_recipe` · `http` · `browser` · `claude`).
+    pub engine: String,
+    /// Which `FetchOutcome` field carried the body (`html` · `markdown` ·
+    /// `text`). A non-`html` sample means the rules were drafted against a
+    /// flattened body and CSS selectors are guesswork — worth seeing.
+    pub body_field: &'static str,
+    /// Size of the sampled body in bytes.
+    pub bytes: usize,
+    /// One `tier:verdict` token per attempted tier, in ladder order.
+    pub tiers: Vec<String>,
+}
+
+/// Picks the sampled body out of a [`FetchOutcome`] and says which field it
+/// came from, or `None` when the fetch produced nothing usable.
+///
+/// THE ORDER IS LOAD-BEARING, and it is the bug this function exists to guard.
+/// The http / browser / archive / recipe tiers return the body in `html` and
+/// leave `text` empty; only the claude tier fills `text`. A sampler that reads
+/// `text` first and never reads `html` therefore sees an EMPTY body on every
+/// normal fetch, skips every candidate, and hard-errors — after the metered
+/// discovery call has already been paid for.
+///
+/// `html` is also the field this app actually needs: the sample is drafted into
+/// CSS/`each` rules and dry-run through [`extract_one_with_report`], and a
+/// selector cannot bind against flattened Markdown or plain text. `markdown`
+/// and `text` are honest fallbacks for the claude tier (which has no DOM to
+/// give), never the preference.
+pub fn select_sample_body(outcome: &mut FetchOutcome) -> Option<(&'static str, String)> {
+    fn take(slot: &mut Option<String>) -> Option<String> {
+        slot.take().filter(|b| !b.trim().is_empty())
+    }
+    if let Some(b) = take(&mut outcome.html) {
+        return Some(("html", b));
+    }
+    if let Some(b) = take(&mut outcome.markdown) {
+        return Some(("markdown", b));
+    }
+    if let Some(b) = take(&mut outcome.text) {
+        return Some(("text", b));
+    }
+    None
+}
+
+/// Serializes a serde enum to its wire string (`FetchTier::Http` → `"http"`),
+/// so the trace summary speaks the same vocabulary as the fetch trace itself.
+fn wire_str<T: Serialize>(v: &T) -> String {
+    serde_json::to_value(v)
+        .ok()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .unwrap_or_else(|| "?".into())
+}
+
+/// Compacts a fetch's per-tier trace into `tier:verdict` tokens.
+fn tier_summary(outcome: &FetchOutcome) -> Vec<String> {
+    outcome
+        .trace
+        .iter()
+        .map(|t| format!("{}:{}", wire_str(&t.tier), wire_str(&t.verdict)))
+        .collect()
+}
+
+/// Maps the fetcher's winning tier onto the catalog's documented `engine`
+/// vocabulary (`http` · `browser` · `claude` · `bulk`).
+///
+/// The archive and API-recipe tiers have no catalog spelling of their own, and
+/// both are ordinary HTTP GETs from the point of view of a reviewer wiring an
+/// app for this row — so they report `http`. `bulk` is a human judgement about a
+/// downloadable dump; a page sample can never prove it, so this never emits it.
+pub fn catalog_engine(fetch_engine: &str) -> &'static str {
+    match fetch_engine {
+        "browser" => "browser",
+        "claude" => "claude",
+        _ => "http",
+    }
+}
+
+/// The artifact filename for a sample: only an `html` body earns the `.html`
+/// extension — a markdown/text body saved as `.html` would misrepresent it.
+fn sample_artifact_name(i: usize, body_field: &str) -> String {
+    match body_field {
+        "html" => format!("sample-{i}.html"),
+        "markdown" => format!("sample-{i}.md"),
+        _ => format!("sample-{i}.txt"),
     }
 }
 
@@ -260,7 +354,17 @@ pub fn proposal_key(prompt: &str) -> String {
 /// `cron` is ALWAYS empty, whatever the proposed cadence — the reconciler only
 /// schedules `live` sources with a cron, so nothing this app emits can start a
 /// pipeline. Going live is a human edit, never machine output.
-pub fn build_catalog_row(prompt: &str, primary: &Candidate, conf: u8) -> Source {
+///
+/// `engine` is the tier that ACTUALLY served the primary sample, mapped through
+/// [`catalog_engine`] — not a hardcoded guess. A row that says `http` for a page
+/// only the browser tier could render sends the reviewer down a path we already
+/// know fails.
+pub fn build_catalog_row(
+    prompt: &str,
+    primary: &Candidate,
+    conf: u8,
+    fetch_engine: &str,
+) -> Source {
     Source {
         id: proposal_key(prompt),
         // No app crate exists for a proposed source; the reviewer wires one
@@ -270,7 +374,7 @@ pub fn build_catalog_row(prompt: &str, primary: &Candidate, conf: u8) -> Source 
         name: primary.name.clone(),
         url: primary.url.clone(),
         category: String::new(),
-        engine: "http".into(),
+        engine: catalog_engine(fetch_engine).into(),
         access: "public".into(),
         cadence: primary.cadence.clone(),
         cron: String::new(),      // never scheduled by this app
@@ -298,6 +402,7 @@ pub fn build_proposal(
     row: &Source,
     rule_set: &Value,
     seeds: &[String],
+    samples: &[SampleStat],
     budget_usd: Option<f64>,
     dry: &DryRun,
     iterations: u32,
@@ -309,6 +414,10 @@ pub fn build_proposal(
         "catalog_toml": catalog_toml(row),
         "rule_set": rule_set,
         "seeds": seeds,
+        // How each seed was actually obtained: winning tier, body field, byte
+        // count, per-tier trace. The reviewer's evidence that the rules were
+        // drafted against a real page and not an empty string.
+        "samples": samples,
         "cadence": row.cadence,
         "budget": budget_usd,
         "sample_stats": serde_json::to_value(dry).unwrap_or(Value::Null),
@@ -434,8 +543,10 @@ impl ScrapeApp for Provisioner {
                 },
             ],
             output_shape: Some(
-                "{proposal_key, candidates, seeds, iterations, accepted, confidence, \
-                 sample_stats, cost_usd, resumed_discovery} — the full proposal record is \
+                "{proposal_key, candidates, seeds, samples, iterations, accepted, confidence, \
+                 sample_stats, cost_usd, resumed_discovery} — `samples` records, per seed, \
+                 the fetch tier that actually served it, which body field carried it, its \
+                 byte count and the per-tier trace; the full proposal record is \
                  upserted into provisioner/proposals (stamped with the primary sampled URL \
                  as its source) and saved as the proposal.json artifact; \
                  nothing is written to the catalog and no schedule is created",
@@ -540,9 +651,14 @@ impl ScrapeApp for Provisioner {
         // ── stage 2: sample candidates via the tiered fetcher ───────────────
         let mut seeds: Vec<String> = Vec::new();
         let mut bodies: Vec<String> = Vec::new();
+        let mut samples: Vec<SampleStat> = Vec::new();
         for (i, cand) in candidates.iter().enumerate() {
             let mut req = FetchRequest::new(&cand.url);
             req.strategy = FetchStrategy::Auto;
+            // The claude tier has no DOM to return; asking for Markdown is the
+            // only way its answer reaches `select_sample_body`'s fallback at
+            // all. Costs nothing on the html-bearing tiers.
+            req.to_markdown = true;
             // Sampling is shape-learning against an UNKNOWN third-party host —
             // exactly the case both cheap seams were built for: a learned API
             // recipe (M05) can replace a heavy render outright, and a recent
@@ -553,16 +669,25 @@ impl ScrapeApp for Provisioner {
             req.archive_max_age = (sample_archive_max_age > 0).then_some(sample_archive_max_age);
             match ctx.fetch(req).await {
                 Ok(mut outcome) => {
-                    let body = outcome
-                        .text
-                        .take()
-                        .or_else(|| outcome.markdown.take())
-                        .unwrap_or_default();
-                    if body.trim().is_empty() {
+                    let tiers = tier_summary(&outcome);
+                    let engine = outcome.engine.to_string();
+                    let Some((body_field, body)) = select_sample_body(&mut outcome) else {
+                        tracing::warn!(
+                            url = %cand.url,
+                            engine = %engine,
+                            "provisioner sample yielded no body on any field"
+                        );
                         continue;
-                    }
-                    ctx.save_artifact(&format!("sample-{i}.html"), body.as_bytes())
+                    };
+                    ctx.save_artifact(&sample_artifact_name(i, body_field), body.as_bytes())
                         .await?;
+                    samples.push(SampleStat {
+                        url: cand.url.clone(),
+                        engine,
+                        body_field,
+                        bytes: body.len(),
+                        tiers,
+                    });
                     seeds.push(cand.url.clone());
                     bodies.push(body);
                 }
@@ -679,9 +804,25 @@ impl ScrapeApp for Provisioner {
 
         // ── stage 4: emit the proposal (and ONLY the proposal) ──────────────
         let conf = confidence(&dry);
-        let row = build_catalog_row(&prompt, primary, conf);
+        // The primary sample is `samples[0]` by construction: `samples`,
+        // `seeds` and `bodies` are pushed together, and `primary` is resolved
+        // from `seeds.first()`.
+        let primary_engine = samples
+            .first()
+            .map(|s| s.engine.as_str())
+            .unwrap_or("http")
+            .to_string();
+        let row = build_catalog_row(&prompt, primary, conf, &primary_engine);
         let proposal = build_proposal(
-            &prompt, &row, &rules_value, &seeds, budget_usd, &dry, iterations, cost_usd,
+            &prompt,
+            &row,
+            &rules_value,
+            &seeds,
+            &samples,
+            budget_usd,
+            &dry,
+            iterations,
+            cost_usd,
         );
         // Provenance (M12): a proposal is derived from ONE page — the primary
         // candidate whose sampled body the rules were drafted and dry-run
@@ -708,6 +849,7 @@ impl ScrapeApp for Provisioner {
             "change": format!("{change:?}"),
             "candidates": candidates,
             "seeds": seeds,
+            "samples": samples,
             "iterations": iterations,
             "accepted": dry.accepted,
             "confidence": conf,
@@ -725,6 +867,93 @@ impl ScrapeApp for Provisioner {
 mod tests {
     use super::*;
     use pumper_core::Catalog;
+
+    fn outcome_with(
+        engine: &'static str,
+        html: Option<&str>,
+        markdown: Option<&str>,
+        text: Option<&str>,
+    ) -> FetchOutcome {
+        FetchOutcome {
+            url: "https://a.example/list".into(),
+            engine,
+            status: Some(200),
+            html: html.map(str::to_string),
+            markdown: markdown.map(str::to_string),
+            text: text.map(str::to_string),
+            escalations: Vec::new(),
+            trace: Vec::new(),
+            cost_usd: None,
+        }
+    }
+
+    // ── sampling ────────────────────────────────────────────────────────────
+
+    /// THE showstopper this app shipped with: the sampler read `text` then
+    /// `markdown` and never `html` — but every non-claude tier returns the body
+    /// in `html` — so a perfectly good fetch produced an empty body, every
+    /// candidate was skipped, and the run hard-errored AFTER paying for
+    /// discovery. HTML is also the only body a CSS rule can bind against.
+    #[test]
+    fn sample_body_prefers_html_not_only_text() {
+        // The http / browser / archive / recipe shape: body in `html`.
+        let mut http = outcome_with("http", Some("<h1>real page</h1>"), None, None);
+        assert_eq!(
+            select_sample_body(&mut http),
+            Some(("html", "<h1>real page</h1>".to_string())),
+            "an html-bearing fetch must never sample as empty"
+        );
+
+        // Even when a flattened body is ALSO present, the DOM wins — selectors
+        // cannot bind against Markdown.
+        let mut both = outcome_with("http", Some("<h1>x</h1>"), Some("# x"), Some("x"));
+        assert_eq!(select_sample_body(&mut both).unwrap().0, "html");
+
+        // The claude tier has no DOM; markdown (only present because the
+        // sampler asks for it) then text are the honest fallbacks.
+        let mut claude = outcome_with("claude", None, Some("# answer"), Some("answer"));
+        assert_eq!(
+            select_sample_body(&mut claude),
+            Some(("markdown", "# answer".to_string()))
+        );
+        let mut text_only = outcome_with("claude", None, None, Some("answer"));
+        assert_eq!(
+            select_sample_body(&mut text_only),
+            Some(("text", "answer".to_string()))
+        );
+
+        // Whitespace is not a body, and nothing is not a body.
+        let mut blank = outcome_with("http", Some("   \n "), None, Some(""));
+        assert!(select_sample_body(&mut blank).is_none());
+        assert!(select_sample_body(&mut outcome_with("http", None, None, None)).is_none());
+    }
+
+    #[test]
+    fn sample_artifacts_are_named_for_their_body_not_always_html() {
+        assert_eq!(sample_artifact_name(0, "html"), "sample-0.html");
+        assert_eq!(sample_artifact_name(1, "markdown"), "sample-1.md");
+        assert_eq!(sample_artifact_name(2, "text"), "sample-2.txt");
+    }
+
+    #[test]
+    fn catalog_engine_maps_the_real_tier_not_a_hardcoded_http() {
+        assert_eq!(catalog_engine("browser"), "browser");
+        assert_eq!(catalog_engine("claude"), "claude");
+        assert_eq!(catalog_engine("http"), "http");
+        // No catalog spelling of their own; both are HTTP GETs to a reviewer.
+        assert_eq!(catalog_engine("archive"), "http");
+        assert_eq!(catalog_engine("api_recipe"), "http");
+        // And the row carries it, instead of always claiming "http".
+        let row = build_catalog_row("p", &cand("https://a.example"), 90, "browser");
+        assert_eq!(row.engine, "browser");
+        // …still a valid value of the documented catalog vocabulary.
+        for tier in ["archive", "api_recipe", "http", "browser", "claude", "??"] {
+            assert!(
+                ["http", "browser", "claude", "bulk"].contains(&catalog_engine(tier)),
+                "{tier} mapped outside the documented engine vocabulary"
+            );
+        }
+    }
 
     #[test]
     fn discovery_checkpoint_round_trips_and_is_bound_to_its_prompt() {
@@ -904,19 +1133,26 @@ mod tests {
         let rules = ruleset(json!({"heading": {"type": "css", "selector": "h1"}}));
         let dry = dry_run(&rules, &[FIXTURE.to_string()]).unwrap();
         let c = cand("https://a.example/widgets");
-        let row = build_catalog_row("track widget prices weekly", &c, confidence(&dry));
+        let row = build_catalog_row("track widget prices weekly", &c, confidence(&dry), "http");
         let p = build_proposal(
             "track widget prices weekly",
             &row,
             &json!({"heading": {"type": "css", "selector": "h1"}}),
             &["https://a.example/widgets".to_string()],
+            &[SampleStat {
+                url: "https://a.example/widgets".into(),
+                engine: "http".into(),
+                body_field: "html",
+                bytes: FIXTURE.len(),
+                tiers: vec!["http:ok".into()],
+            }],
             Some(1.0),
             &dry,
             2,
             0.42,
         );
         for key in [
-            "prompt", "catalog_row", "catalog_toml", "rule_set", "seeds", "cadence",
+            "prompt", "catalog_row", "catalog_toml", "rule_set", "seeds", "samples", "cadence",
             "budget", "sample_stats", "confidence", "accepted", "iterations", "cost_usd",
         ] {
             assert!(p.get(key).is_some(), "proposal missing key {key}");
@@ -942,7 +1178,7 @@ mod tests {
         for cadence in ["daily", "weekly", "on-demand"] {
             let mut c = cand("https://a.example");
             c.cadence = cadence.into();
-            let row = build_catalog_row("some prompt", &c, 90);
+            let row = build_catalog_row("some prompt", &c, 90, "http");
             assert_eq!(row.status, "planned");
             assert_eq!(row.cron, "");
             assert!(!row.is_scheduled());
@@ -950,6 +1186,117 @@ mod tests {
             let parsed = Catalog::parse(&toml).unwrap();
             assert_eq!(parsed.live().count(), 0, "a proposal must never be live");
         }
+    }
+
+    // ── end-to-end run() over stubbed engines ───────────────────────────────
+
+    /// A listing page long enough to clear the fetcher's 250-char escalation
+    /// floor, so the http tier WINS and the (panicking) browser stub is never
+    /// reached — the same shape a real sample has.
+    const LISTING_PAGE: &str = r#"<html><head><title>Widget Price Index</title></head><body>
+        <h1>Widget Prices</h1>
+        <p>The widget price index is published every week and tracks the retail
+        price of the most commonly traded widget models across the domestic
+        market. Prices are collected from published retailer listings and are
+        stated in United States dollars, inclusive of any listed discount but
+        exclusive of shipping, handling and local sales tax. Figures are revised
+        whenever a retailer restates a previously published price.</p>
+        <div id="list">
+            <div class="card"><h3>Alpha</h3><span class="price">$10</span></div>
+            <div class="card"><h3>Beta</h3><span class="price">$20</span></div>
+            <div class="card"><h3>Gamma</h3><span class="price">$30</span></div>
+        </div></body></html>"#;
+
+    /// An `HttpClient` that serves [`LISTING_PAGE`] — the http tier, i.e. the
+    /// tier that puts the body in `html` and nowhere else.
+    struct ListingHost;
+
+    #[async_trait]
+    impl pumper_core::HttpClient for ListingHost {
+        async fn fetch(&self, req: pumper_core::HttpRequest) -> Result<pumper_core::HttpResponse> {
+            Ok(pumper_core::HttpResponse {
+                status: 200,
+                headers: std::collections::HashMap::new(),
+                body: LISTING_PAGE.to_string(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    /// The regression test the sample-stage bug slipped past: every unit test
+    /// fed `dry_run` a fixture string directly, so nothing ever exercised the
+    /// fetch → body → draft seam where the body was being dropped. This drives
+    /// the REAL `run()` over a stubbed http tier and a scripted model.
+    #[tokio::test]
+    async fn propose_end_to_end_samples_a_real_body_not_an_empty_one() {
+        use pumper_core::testing::{
+            engines_with, research_output, Dead, ScriptedResearcher, TempStore, TestContext,
+        };
+        use std::sync::Arc;
+
+        let researcher = Arc::new(
+            ScriptedResearcher::new()
+                .on(
+                    "Goal:",
+                    research_output(
+                        json!({"candidates": [{
+                            "url": "https://a.example/widgets",
+                            "name": "Widget Price Index",
+                            "cadence": "weekly",
+                            "expected_fields": ["name", "price"]
+                        }]})
+                        .to_string(),
+                    ),
+                )
+                .on(
+                    "Draft extraction rules",
+                    research_output(
+                        json!({
+                            "heading": {"type": "css", "selector": "h1"},
+                            "items": {"type": "each", "selector": ".card", "container": "#list",
+                                      "fields": {"name": {"type": "css", "selector": "h3"},
+                                                 "price": {"type": "css", "selector": ".price"}}}
+                        })
+                        .to_string(),
+                    ),
+                ),
+        );
+        let store = TempStore::new("provisioner-e2e").await;
+        let ctx = TestContext::new(&store.storage, "provisioner")
+            .params(json!({ "prompt": "track widget prices weekly" }))
+            .engines(engines_with(
+                Arc::new(ListingHost),
+                Arc::new(Dead),
+                researcher.clone(),
+            ))
+            .build();
+
+        let out = Provisioner
+            .run(ctx)
+            .await
+            .expect("a reachable candidate must not hard-error the compile");
+
+        // The bug's exact signature was "no candidate URL yielded a sampleable
+        // body" — a seed and a sized sample are what refute it.
+        assert_eq!(out["seeds"], json!(["https://a.example/widgets"]));
+        let sample = &out["samples"][0];
+        assert_eq!(sample["body_field"], json!("html"));
+        assert_eq!(sample["engine"], json!("http"));
+        assert_eq!(sample["bytes"].as_u64().unwrap(), LISTING_PAGE.len() as u64);
+        assert!(!sample["tiers"].as_array().unwrap().is_empty());
+
+        // …and the drafted rules really did bind against that body.
+        assert_eq!(out["accepted"], json!(true));
+        assert_eq!(out["iterations"], json!(1));
+
+        // The draft prompt was handed the actual page, not an empty string.
+        let calls = researcher.calls();
+        assert_eq!(calls.len(), 2, "one discovery call, one draft call");
+        assert!(
+            calls[1].prompt.contains("class=\"card\""),
+            "the drafting prompt must carry the sampled DOM"
+        );
     }
 
     #[test]
