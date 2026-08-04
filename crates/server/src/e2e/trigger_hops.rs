@@ -150,7 +150,7 @@ async fn view_materialization_hop_does_not_dedup_against_the_fanout_hop() {
         .await
         .unwrap();
 
-    let revs = vec![rev("d", "k1")];
+    let revs = [rev("d", "k1")];
     let mut by_dataset: HashMap<&str, Vec<&Revision>> = HashMap::new();
     by_dataset.insert("d", revs.iter().collect());
 
