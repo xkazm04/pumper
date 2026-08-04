@@ -70,7 +70,8 @@ impl ScrapeApp for CaGrants {
             })),
             examples: vec![
                 ManifestExample {
-                    description: "Daily sync of currently-open California grants (the scheduled default)",
+                    description:
+                        "Daily sync of currently-open California grants (the scheduled default)",
                     params: json!({ "status": "active", "limit": 1000, "maxPages": 25 }),
                 },
                 ManifestExample {
@@ -80,9 +81,13 @@ impl ScrapeApp for CaGrants {
             ],
             output_shape: Some(
                 "{source, status, total, fetched, pages, new, changed, unchanged, truncated, \
-                 unified: {new, changed, events}, swept, crossSourceDups, warnings[], \
+                 unified: {new, changed, events}, swept, crossSourceDups, \
+                 corpusPass: {ran, cycle, batchSwept, corpusSwept}, warnings[], \
                  index_datasets[]} — CKAN sync tallies over the `opportunities` dataset \
-                 (keyed by PortalID) plus the shared grants/unified cross-source layer",
+                 (keyed by PortalID) plus the shared grants/unified cross-source layer. \
+                 The corpus-wide sweep + duplicate link runs once per UTC-day cycle, on \
+                 whichever grant source gets there first; a run that did not own it reports \
+                 `crossSourceDups: null` (not 0) and `corpusPass.ran: false`",
             ),
             cost_class: CostClass::Free,
         }

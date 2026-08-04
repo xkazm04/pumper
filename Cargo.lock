@@ -2115,6 +2115,7 @@ dependencies = [
  "chrono",
  "pumper-core",
  "serde_json",
+ "tokio",
  "tracing",
 ]
 

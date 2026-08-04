@@ -57,6 +57,14 @@ pub const DETAILS_DATASET: &str = "opportunity_details";
 /// constant so every source links identically — a per-app literal drifts.
 pub const DUP_DISTANCE: u32 = 3;
 
+/// Cross-source bookkeeping for the shared layer (`grants/maintenance`). Today
+/// it holds exactly one row: which sync cycle last owned the corpus-wide pass
+/// (see [`claim_corpus_pass`]).
+pub const MAINTENANCE_DATASET: &str = "maintenance";
+
+/// The single key in [`MAINTENANCE_DATASET`] carrying the corpus-pass lease.
+pub const CORPUS_PASS_KEY: &str = "corpus_pass";
+
 /// The dataset every grant source keeps its OWN raw records in, and therefore
 /// the `(app, dataset)` pair the extraction-health ladder judges it on. All
 /// three sources use the same name; one constant so the health lookup below
@@ -107,8 +115,23 @@ fn indexable(state: SourceState) -> bool {
 /// What the shared cross-source finalize produced, for the source's result JSON.
 pub struct UnifiedOutcome {
     pub unified: UpsertSummary,
+    /// Rows this run retired to `closed`, batch + corpus pass.
     pub swept: usize,
-    pub cross_source_dups: usize,
+    /// The part of `swept` that came from this run's OWN freshly-fetched rows —
+    /// always computed, no query, so deadline freshness never depends on
+    /// owning the corpus pass.
+    pub batch_swept: usize,
+    /// The part of `swept` that came from the corpus-wide pass, or `None` when
+    /// another producer already owned this cycle's pass.
+    pub corpus_swept: Option<usize>,
+    /// Cross-source near-duplicate links written, or `None` when this run did
+    /// not own the corpus pass. `None`, not `0` — "we did not look" is not the
+    /// same claim as "there were none".
+    pub cross_source_dups: Option<usize>,
+    /// Whether this run owned (and therefore ran) this cycle's corpus-wide pass.
+    pub corpus_pass: bool,
+    /// The sync cycle this run belongs to (see [`corpus_cycle`]).
+    pub cycle: String,
     pub warnings: Vec<String>,
     /// Lifecycle events written to `grants/events` this run.
     pub events: usize,
@@ -142,7 +165,20 @@ impl UnifiedOutcome {
         );
         map.insert("swept".into(), json!(self.swept));
         map.insert("warnings".into(), json!(self.warnings));
+        // Null when this run did not own the corpus pass — see the field docs.
         map.insert("crossSourceDups".into(), json!(self.cross_source_dups));
+        // Which producer did the corpus-wide work this cycle, and what it cost.
+        // Without this block a `swept: 0, crossSourceDups: null` run would be
+        // indistinguishable from a broken one.
+        map.insert(
+            "corpusPass".into(),
+            json!({
+                "ran": self.corpus_pass,
+                "cycle": self.cycle,
+                "batchSwept": self.batch_swept,
+                "corpusSwept": self.corpus_swept,
+            }),
+        );
         // Per-opportunity search docs come from the unified dataset (compact
         // result, one indexed doc per grant) — see worker `dataset_search_docs`.
         // Withheld entirely when the source's health says so: the worker's own
@@ -185,27 +221,106 @@ pub async fn finalize_unified(
     // contribution actually landed in, so a quarantined run's radar diffs its
     // shadow rows rather than mixing shadow and canonical snapshots.
     let events = record_events(ctx, &unified, &dataset).await?;
-    // Lifecycle: flip past-due open/forecasted unified rows to closed — these
-    // upsert-only sources never see a delisting otherwise.
+    // Lifecycle, part 1 — THIS RUN'S OWN ROWS. Free: the batch is already in
+    // memory, so no query decides which of the rows we just published have
+    // already lapsed. Runs on EVERY producer, which is what keeps deadline
+    // freshness independent of who owns the corpus pass below: a source that
+    // re-lists an already-expired opportunity retires it in the same run,
+    // exactly as before this change. Writes into the dataset this
+    // contribution landed in (`unified`, or the shadow `unified@q`) so a
+    // quarantined run never corrects the canonical layer it did not write.
+    let now = chrono::Utc::now();
+    let batch_swept = sweep_batch(ctx, &dataset, trust, unified_items, now).await?;
+
+    // Lifecycle, part 2 — THE WHOLE CORPUS, once per cycle instead of once per
+    // producer. `sweep_closed` and `link_duplicates` are pure functions of the
+    // STORED corpus, identical and idempotent across the three producers, so
+    // running them 3×/day bought nothing: measured against the live store
+    // (2637 live unified rows — 1787 open, 511 forecasted, 339 closed) the two
+    // sweeps deserialize 2298 rows and the dup pass reads all 2637 key+simhash
+    // rows, all of it three times over. Exactly one producer per cycle now does
+    // it; the others skip and report `crossSourceDups: null`.
     //
     // Deliberately NOT gated on this source's health, and deliberately always
-    // against the canonical dataset: the sweep is derived from rows already
+    // against the canonical dataset: the pass is derived from rows already
     // stored for ALL sources, not from this run's fetch, so a broken ca-grants
     // run must not stop grants-gov's expired rows being retired — nor write its
     // corrections into a shadow dataset it did not read from.
-    let swept = sweep_closed(ctx).await?;
-    let cross_source_dups = link_duplicates(ctx, DUP_DISTANCE).await?;
+    let cycle = corpus_cycle(now);
+    let corpus_pass = claim_corpus_pass(ctx, &cycle).await?;
+    let (corpus_swept, cross_source_dups) = if corpus_pass {
+        (
+            Some(sweep_closed(ctx).await?),
+            Some(link_duplicates(ctx, DUP_DISTANCE).await?),
+        )
+    } else {
+        (None, None)
+    };
     let warnings = drift_warnings(unified_items);
     Ok(UnifiedOutcome {
         unified,
-        swept,
+        swept: batch_swept + corpus_swept.unwrap_or(0),
+        batch_swept,
+        corpus_swept,
         cross_source_dups,
+        corpus_pass,
+        cycle,
         warnings,
         events,
         state,
         dataset,
         trust,
     })
+}
+
+/// The sync cycle a run belongs to: the UTC calendar day.
+///
+/// The three producers are scheduled 09:00 / 09:30 / 10:00 UTC, so one UTC day
+/// contains exactly one pass of each — the calendar day IS the cycle, with no
+/// second schedule to keep in step with the three `schedule()` strings. A
+/// manually-enqueued extra run on the same day joins that day's cycle and
+/// (correctly) does not re-do the corpus work.
+pub fn corpus_cycle(now: chrono::DateTime<chrono::Utc>) -> String {
+    now.date_naive().to_string()
+}
+
+/// Claims this cycle's corpus-wide pass for the calling run. `true` = you own
+/// it and must do the work; `false` = another producer already did it today.
+///
+/// **Why this is race-free without a new primitive.** `upsert_stamped` runs its
+/// read → write → revision sequence inside a `BEGIN IMMEDIATE` transaction
+/// (`core/src/datasets.rs`), so concurrent writers of the same key serialize and
+/// the returned [`ChangeKind`] is a true compare-and-set result: the first
+/// producer of the cycle writes a NEW cycle value and gets `New`/`Changed`, and
+/// every later producer writes the identical value and gets `Unchanged`. Two
+/// jobs finishing at the same instant therefore cannot both sweep, and cannot
+/// interleave a partial link set.
+///
+/// **A skipped producer cannot strand the pass**: the claim is taken by whoever
+/// arrives FIRST, not by a designated source, so if grants-gov fails outright
+/// the 09:30 ca-grants run claims the cycle instead. Out-of-order arrival is
+/// likewise irrelevant — the pass reads the stored corpus, not the caller's
+/// batch.
+///
+/// **The one accepted trade-off**: the claim is taken BEFORE the work (the
+/// alternative — claiming after — would let two concurrent producers both run
+/// it, which is the race this exists to prevent). An owner that dies mid-pass
+/// forfeits its cycle. That costs at most one cycle of staleness on rows no
+/// source re-listed, because both passes are idempotent and every producer
+/// still sweeps its own batch (see [`sweep_batch`]).
+async fn claim_corpus_pass(ctx: &AppContext, cycle: &str) -> Result<bool> {
+    let kind = ctx
+        .datasets
+        .upsert_stamped(
+            UNIFIED_APP,
+            MAINTENANCE_DATASET,
+            CORPUS_PASS_KEY,
+            &json!({ "cycle": cycle }),
+            None,
+            Some(&stamp(ctx, None)),
+        )
+        .await?;
+    Ok(kind.is_fresh())
 }
 
 /// Normalizes a grants.gov Search2 `oppHits[]` entry. Award amounts are not
@@ -737,6 +852,68 @@ async fn record_events(ctx: &AppContext, summary: &UpsertSummary, dataset: &str)
     Ok(items.len())
 }
 
+/// The rows of THIS RUN's own normalized batch whose deadline has already
+/// lapsed, as `closed` updates. PURE — no store, no clock beyond `now`.
+///
+/// This is what makes coalescing the corpus-wide pass to one producer per cycle
+/// safe for freshness. A source that re-lists an opportunity whose deadline has
+/// passed publishes it as `open`; before this, the corpus sweep that ran
+/// immediately after that source's own sync caught it. Now that sweep may
+/// belong to an earlier producer, so the batch is swept here instead — at zero
+/// I/O, because the rows are already in memory.
+///
+/// Uses the same [`is_past_due_open`] predicate as [`sweep_closed`], so the two
+/// paths cannot disagree about what "lapsed" means.
+pub fn past_due_in_batch(
+    items: &[(String, Value)],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<(String, Value)> {
+    items
+        .iter()
+        .filter(|(_, v)| {
+            is_past_due_open(
+                v.get("status").and_then(Value::as_str),
+                v.get("close_date").and_then(Value::as_str),
+                v.get("close_at").and_then(Value::as_str),
+                now,
+            )
+        })
+        .map(|(k, v)| {
+            let mut updated = v.clone();
+            updated["status"] = Value::String("closed".to_string());
+            (k.clone(), updated)
+        })
+        .collect()
+}
+
+/// Writes [`past_due_in_batch`] back through the normal upsert path (so each
+/// retirement is a recorded `changed` revision) into the dataset this
+/// contribution landed in. Returns how many rows were retired.
+async fn sweep_batch(
+    ctx: &AppContext,
+    dataset: &str,
+    trust: Option<&'static str>,
+    items: &[(String, Value)],
+    now: chrono::DateTime<chrono::Utc>,
+) -> Result<usize> {
+    let updates = past_due_in_batch(items, now);
+    if updates.is_empty() {
+        return Ok(0);
+    }
+    // An inferred closure, not a source publish: no source_url is honest here.
+    // The trust stamp is the contribution's, because these ARE this run's rows.
+    ctx.datasets
+        .upsert_many_stamped(
+            UNIFIED_APP,
+            dataset,
+            &updates,
+            trust,
+            Some(&stamp(ctx, None)),
+        )
+        .await?;
+    Ok(updates.len())
+}
+
 /// Lifecycle sweep for the upsert-only unified dataset: these sources only
 /// report currently-listed opportunities, so a grant that closes or is delisted
 /// is simply absent from the next fetch — its `open`/`forecasted` row would
@@ -750,12 +927,11 @@ pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
     let now = chrono::Utc::now();
     // Load only the sweep candidates (status open/forecasted), not the whole
     // corpus. Over time most unified rows are already `closed` and can never flip
-    // again, yet the old full read deserialized every one of them on every sync —
-    // and `finalize_unified` runs this once per source, now three (grants-gov,
-    // ca-grants, eu-sedia), so the wasted scan was paid 3×/day. `list_filtered`
-    // also already excludes tombstoned rows. (Deduplicating the 3 invocations into
-    // one per sync cycle is a separate, larger change; making each cheap is the
-    // pragmatic win.)
+    // again, yet the old full read deserialized every one of them on every sync.
+    // `list_filtered` also already excludes tombstoned rows. The second half of
+    // that win — running this pass once per CYCLE instead of once per producer —
+    // is `claim_corpus_pass` in `finalize_unified`; this function is now called
+    // by exactly one producer per cycle.
     let mut rows = Vec::new();
     for status in ["open", "forecasted"] {
         let filter = [JsonFilter::Eq {
@@ -1723,7 +1899,11 @@ mod tests {
             UnifiedOutcome {
                 unified: UpsertSummary::default(),
                 swept: 0,
-                cross_source_dups: 0,
+                batch_swept: 0,
+                corpus_swept: Some(0),
+                cross_source_dups: Some(0),
+                corpus_pass: true,
+                cycle: "2026-08-04".to_string(),
                 warnings: vec![],
                 events: 0,
                 state,
@@ -1847,6 +2027,164 @@ mod tests {
         let (_, mut fresh) = normalize_grants_gov(&json!({ "id": "1" })).unwrap();
         assert!(!overlay_amounts(&mut fresh, &zeroed));
         assert_eq!(fresh["award_ceiling"], Value::Null);
+    }
+
+    // ---- the corpus-wide pass runs once per CYCLE, not once per producer (G-D) ----
+
+    /// A normalized unified row, as a producer's batch carries it.
+    fn row(
+        key: &str,
+        status: &str,
+        close_date: Option<&str>,
+        close_at: Option<&str>,
+    ) -> (String, Value) {
+        (
+            key.to_string(),
+            json!({
+                "source": key.split(':').next().unwrap(),
+                "source_id": key.split(':').nth(1).unwrap(),
+                "title": "T",
+                "status": status,
+                "close_date": close_date,
+                "close_at": close_at,
+            }),
+        )
+    }
+
+    #[test]
+    fn a_relisted_expired_grant_is_retired_by_its_own_run_not_the_corpus_pass() {
+        // The anti-pattern coalescing could have introduced: a source re-lists a
+        // grant that has already expired, the corpus pass for the cycle was
+        // already taken by an earlier producer, and the stale `open` row then
+        // survives a whole extra day. The batch sweep closes that hole at zero
+        // I/O, so freshness never depends on owning the pass.
+        let now = at("2026-07-13T12:00:01Z");
+        let batch = vec![
+            row("ca-grants:1", "open", Some("2026-07-12"), None), // lapsed
+            row("ca-grants:2", "open", Some("2026-08-01"), None), // still live
+            row("ca-grants:3", "forecasted", Some("2026-07-12"), None), // lapsed
+            row("ca-grants:4", "closed", Some("2026-01-01"), None), // already closed
+            row("ca-grants:5", "open", None, None),               // no deadline
+        ];
+        let swept = past_due_in_batch(&batch, now);
+        let keys: Vec<&str> = swept.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["ca-grants:1", "ca-grants:3"]);
+        // Retired rows carry `closed` and keep everything else they published.
+        assert_eq!(swept[0].1["status"], "closed");
+        assert_eq!(swept[0].1["close_date"], "2026-07-12");
+        assert_eq!(swept[0].1["title"], "T");
+
+        // It shares `is_past_due_open` with the corpus sweep, so the zoned/unzoned
+        // distinction the timezone fix bought applies here identically: a row
+        // still open in its own timezone is NOT retired early.
+        let ambiguous = vec![row("ca-grants:6", "open", Some("2026-07-12"), None)];
+        assert!(past_due_in_batch(&ambiguous, at("2026-07-13T11:59:59Z")).is_empty());
+        assert_eq!(
+            past_due_in_batch(&ambiguous, at("2026-07-13T12:00:01Z")).len(),
+            1
+        );
+    }
+
+    #[test]
+    fn a_cycle_is_the_utc_day_the_three_producers_share() {
+        // grants-gov 09:00, ca-grants 09:30, eu-sedia 10:00 UTC — one UTC day
+        // holds exactly one pass of each.
+        assert_eq!(corpus_cycle(at("2026-08-04T09:00:00Z")), "2026-08-04");
+        assert_eq!(corpus_cycle(at("2026-08-04T10:00:00Z")), "2026-08-04");
+        assert_eq!(corpus_cycle(at("2026-08-04T23:59:59Z")), "2026-08-04");
+        assert_ne!(
+            corpus_cycle(at("2026-08-04T23:59:59Z")),
+            corpus_cycle(at("2026-08-05T00:00:00Z"))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_corpus_pass_is_claimed_once_per_cycle_not_once_per_producer() {
+        let store = pumper_core::testing::TempStore::new("grants-corpus-pass").await;
+        let ctx = |app: &str| pumper_core::testing::TestContext::new(&store.storage, app).build();
+
+        // Sequential producers, in schedule order: only the first owns the pass.
+        let gov = ctx("grants-gov");
+        let ca = ctx("ca-grants");
+        let eu = ctx("eu-sedia");
+        assert!(claim_corpus_pass(&gov, "2026-08-04").await.unwrap());
+        assert!(!claim_corpus_pass(&ca, "2026-08-04").await.unwrap());
+        assert!(!claim_corpus_pass(&eu, "2026-08-04").await.unwrap());
+
+        // A NEW cycle is claimable again — coalescing must not become "never".
+        assert!(claim_corpus_pass(&eu, "2026-08-05").await.unwrap());
+        assert!(!claim_corpus_pass(&gov, "2026-08-05").await.unwrap());
+
+        // Out of order / a producer that never ran: whoever arrives FIRST owns
+        // the cycle, so a failed grants-gov cannot strand the sweep.
+        assert!(claim_corpus_pass(&ca, "2026-08-06").await.unwrap());
+        assert!(!claim_corpus_pass(&gov, "2026-08-06").await.unwrap());
+
+        // Concurrent finishers: `upsert_stamped` serializes under BEGIN
+        // IMMEDIATE, so exactly one of three simultaneous claims wins — two jobs
+        // finishing together must not double-sweep.
+        let (a, b, c) = tokio::join!(
+            claim_corpus_pass(&gov, "2026-08-07"),
+            claim_corpus_pass(&ca, "2026-08-07"),
+            claim_corpus_pass(&eu, "2026-08-07"),
+        );
+        let winners = [a.unwrap(), b.unwrap(), c.unwrap()]
+            .iter()
+            .filter(|w| **w)
+            .count();
+        assert_eq!(winners, 1, "exactly one producer may own a cycle");
+    }
+
+    #[tokio::test]
+    async fn later_producers_report_a_skipped_pass_as_null_not_as_zero_duplicates() {
+        let store = pumper_core::testing::TempStore::new("grants-finalize-coalesce").await;
+        let batch = |source: &str| {
+            vec![row(
+                &format!("{source}:1"),
+                "open",
+                Some("2099-01-01"),
+                None,
+            )]
+        };
+
+        let first = finalize_unified(
+            &pumper_core::testing::TestContext::new(&store.storage, "grants-gov").build(),
+            &batch("grants-gov"),
+            None,
+        )
+        .await
+        .unwrap();
+        let second = finalize_unified(
+            &pumper_core::testing::TestContext::new(&store.storage, "ca-grants").build(),
+            &batch("ca-grants"),
+            None,
+        )
+        .await
+        .unwrap();
+
+        // The first producer of the cycle does the corpus work…
+        assert!(first.corpus_pass);
+        assert!(first.corpus_swept.is_some());
+        assert!(first.cross_source_dups.is_some());
+        // …the second skips it, and says so rather than reporting a fabricated 0.
+        assert!(!second.corpus_pass);
+        assert_eq!(second.corpus_swept, None);
+        assert_eq!(second.cross_source_dups, None);
+        assert_eq!(second.cycle, first.cycle);
+
+        // Both still published their own rows — coalescing touches only the
+        // corpus-wide tail.
+        assert_eq!(first.unified.new.len(), 1);
+        assert_eq!(second.unified.new.len(), 1);
+
+        // And the result JSON stays legible: `crossSourceDups` is null (not 0)
+        // and `corpusPass` names who did the work.
+        let mut out = json!({});
+        second.merge_into(&mut out);
+        assert_eq!(out["crossSourceDups"], Value::Null);
+        assert_eq!(out["corpusPass"]["ran"], json!(false));
+        assert_eq!(out["corpusPass"]["corpusSwept"], Value::Null);
+        assert_eq!(out["corpusPass"]["batchSwept"], json!(0));
     }
 
     #[test]

@@ -113,7 +113,10 @@ impl ScrapeApp for EuSedia {
             output_shape: Some(
                 "{source, types[], statuses[], totalResults, fetched, enriched, pages, new, \
                  changed, unchanged, historyJoined, truncated, unified: {new, changed, events}, \
-                 swept, crossSourceDups, warnings[], index_datasets[]} — normalized topics in \
+                 swept, crossSourceDups, corpusPass: {ran, cycle, batchSwept, corpusSwept}, \
+                 warnings[], index_datasets[]} — the corpus-wide sweep + duplicate link runs \
+                 once per UTC-day cycle on whichever grant source gets there first, so a run \
+                 that did not own it reports `crossSourceDups: null` (not 0) — normalized topics in \
                  the `opportunities` dataset (keyed by topic identifier), Horizon topics \
                  carrying a `history` block joined from cordis/topic_stats",
             ),
