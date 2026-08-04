@@ -56,7 +56,9 @@ use serde_json::Value;
 use crate::extract::DocReport;
 use crate::simhash;
 
-pub use detect::{Baseline, CohortAdequacy, FetchHealth, InvariantCheck, Reason, RunEvaluation};
+pub use detect::{
+    Baseline, CohortAdequacy, FetchHealth, InvariantCheck, Reason, Recovery, RunEvaluation,
+};
 pub use invariants::{Invariant, InvariantKind};
 pub use sketch::FieldSketch;
 #[cfg(feature = "storage")]
@@ -78,11 +80,13 @@ pub enum SourceState {
     /// Repeatedly tripped. Writes still land in the live dataset but are stamped
     /// `provisional`, removals are no longer inferred, and pushes stop.
     Degraded,
-    /// Writes are diverted to a shadow dataset. Terminal without an operator.
+    /// Writes are diverted to a shadow dataset. Left only by evidence:
+    /// `[resilience] recovery_runs` consecutive judged clean runs promote it to
+    /// `Probation`, or an operator overrides it.
     Quarantined,
-    /// Recently repaired and being watched. Reachable only by an explicit
-    /// operator override today — automated repair, which would promote into it,
-    /// is not built.
+    /// Recovering and being watched: writes are live again but stamped
+    /// `provisional`. Another full clean streak earns `Healthy`; one tripped run
+    /// drops straight back to `Quarantined`.
     Probation,
     /// A dead source (permanently gone URLs), not a broken extractor. Set
     /// manually; nothing auto-retires.

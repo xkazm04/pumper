@@ -21,6 +21,7 @@
 | Per-field sketches + the statistics on them (§2.4) | **shipped** | `core::resilience::sketch` |
 | Mined invariants (§2.5) | **shipped** | `core::resilience::invariants` |
 | Health ladder with hysteresis (§2.7) | **shipped**, minus `retired` (manual only) | `core::resilience::detect::next_state` |
+| Automatic recovery `quarantined → probation → healthy` (§2.7) | **shipped** — `recovery_runs` consecutive clean *judged* runs per rung | `core::resilience::detect::{Recovery, next_state}` |
 | Per-source cohort adequacy + honest `unmonitored` (§2.4) | **shipped** — verdict `below_cohort`, `cohort: full\|shrunken\|chronic`, `monitored` on `GET /sources` | `core::resilience::detect::cohort_adequacy` |
 | Schema + persistence (§5) | **shipped** for the tables detection needs | migration `0020` |
 | Trust stamping, `sync_many` downgrade, push suppression, index skip, quarantine dataset (§7) | **shipped**, gated on `enforce` | `core::app`, `server::worker` |
@@ -373,14 +374,45 @@ healthy ──tripped──▶ suspect ──2 of last 3 tripped──▶ degrad
                         ▼                                ▼
                      healthy                        quarantined
                                                          │
-                                              repair promoted (§6)
+                                    recovery_runs consecutive clean JUDGED runs
                                                          ▼
-                                                    probation ──3 clean runs──▶ healthy
+                                                    probation ──recovery_runs again──▶ healthy
                                                          │
                                               any tripped run
                                                          ▼
-                                            auto-rollback → quarantined (cooldown)
+                                                    quarantined
 ```
+
+**The up-path is implemented** (`[resilience] recovery_runs`, default 3). It was
+not: `quarantined` used to be terminal without an operator, which on an
+unattended box means a source that breaks at 03:00 and self-heals at 04:00 keeps
+its writes diverted to `<ds>@q`, its pushes stopped and its revisions
+unindexed until a person notices. That was the main reason `enforce = true` was
+not adoptable.
+
+Three properties make the release safe:
+
+- **Only judged runs count.** `inconclusive`, `content_empty` and `below_cohort`
+  are not evidence, so a source cannot heal on runs nobody looked at — in
+  particular a source cannot shrink its cohort below the floor and quietly
+  recover.
+- **The streak is consecutive and per rung.** It is counted from the stored run
+  rows since `state_since` (never a column that could drift out of sync), stops at
+  the first tripped run, and each rung costs its own `recovery_runs` — so the full
+  climb out of quarantine is two streaks.
+- **Release is to `probation`, never straight to `healthy`.** Probation writes to
+  the live dataset but stamps every record `provisional`, so a premature release
+  is visible in the data and filtered out of the default `/changes` feed rather
+  than silent. One tripped run in probation goes straight back to `quarantined`.
+
+**The `<dataset>@q` shadow dataset is left exactly where it is on recovery** —
+not merged, not renamed, not deleted. Its records were produced by an extractor
+the system did not stand behind; merging them into the live dataset on recovery
+would launder precisely the data quarantine exists to keep out, and renaming
+would break the audit trail. It stays an ordinary dataset, so `GET
+/datasets/{app}/{ds}@q`, `/changes`, `/export` and `duplicates` all keep working
+on it, and an operator who wants that era back re-ingests it deliberately (the
+§8.2 `reextract` path, when it exists).
 
 `retired` is reached from any state when the fetch layer reports sustained
 permanent failure (404/410/DNS on ≥ 90% of URLs across 3 runs) — a dead source,
@@ -825,7 +857,7 @@ promoted one.
 | `suspect` | live dataset | `NULL` | fire | index | included | no |
 | `degraded` | live dataset, **`upsert_many` only** | `provisional` | **suppressed** | **skipped** | filtered out by default | scheduled |
 | `quarantined` | **shadow dataset `<ds>@q`** | `quarantined` | **suppressed** | **skipped** | not in live feed | active |
-| `probation` | live dataset | `provisional` | fire (payload carries `trust`) | index | included | shadow compare |
+| `probation` | live dataset | `provisional` | fire (payload carries `trust`) | index | filtered out by default (`provisional`) | shadow compare |
 | `retired` | none | — | — | — | — | no |
 
 `suspect` deliberately changes nothing downstream. A single tripped run is
@@ -890,7 +922,9 @@ the human reviewer: nobody approves anything, but somebody is told.
 
 > **Not built** (§8.1-8.3). There is nothing to promote or roll back without the
 > profile registry and repair. `POST /sources/{id}/state` is the whole operator
-> surface: it is the only way out of `quarantined`.
+> surface. It is no longer the *only* way out of `quarantined` — §2.7's
+> evidence-based recovery is — but it is the shortcut for an operator who already
+> knows the source is fixed.
 
 `[resilience.repair] mode`:
 
@@ -1000,6 +1034,7 @@ golden_docs_per_source  = 8
 golden_refresh_days     = 30
 golden_check_every_runs = 5
 sketch_retention_runs   = 60       # window_runs × 3; pruned by the retention janitor
+recovery_runs           = 3        # consecutive clean JUDGED runs per rung back up (§2.7)
 platform_change_ratio   = 0.5      # >half of sources tripping at once ⇒ it's us, §10.8
 
 [resilience.repair]
@@ -1021,7 +1056,9 @@ Config structs use `#[serde(default)]` plus a manual `Default` impl (both are
 required — see the `ClaudeConfig` note in `harness-learnings.md`), and
 `Config::validate()` rejects semantically-broken combinations:
 `degrade_score < quarantine_score`, `agreement_min ≤ candidates`,
-`min_cohort_docs ≥ 5`, `holdout_min_docs ≥ 5`, `fetch_ok_floor ∈ (0,1]`.
+`min_cohort_docs ≥ 5`, `holdout_min_docs ≥ 5`, `fetch_ok_floor ∈ (0,1]`,
+`recovery_runs > 0` (zero would let a quarantined source release itself on the
+first run that merely failed to trip).
 `enabled = false` is a complete no-op; `enforce = false` computes everything and
 gates nothing, which is the shipping default (§12.6).
 

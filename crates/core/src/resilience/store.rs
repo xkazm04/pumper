@@ -223,6 +223,37 @@ impl HealthStore {
         Ok(scores.iter().filter(|s| **s >= degrade_score).count() as u32)
     }
 
+    /// Consecutive clean **judged** runs since `since` (the source's
+    /// `state_since`), newest first — the evidence that climbs the ladder back
+    /// up.
+    ///
+    /// Scoped to runs *after* the transition (`created_at > since`, so the run
+    /// that caused the transition is never re-counted toward leaving it) and
+    /// stopped at the first tripped run, so a source that trips once mid-recovery
+    /// starts its streak over. Each rung therefore costs `recovery_runs` runs of
+    /// its own. Runs the
+    /// detector could not judge are excluded by the same verdict filter
+    /// `recent_trips` uses: a source must never heal on evidence nobody looked at.
+    async fn clean_streak_before(
+        &self,
+        id: &str,
+        since: &str,
+        degrade_score: f64,
+        limit: i64,
+    ) -> Result<u32> {
+        let scores: Vec<f64> = sqlx::query_scalar(
+            "SELECT score FROM source_runs WHERE source_id = ?1 \
+             AND verdict IN ('ok', 'broken', 'self_inflicted') AND created_at > ?2 \
+             ORDER BY created_at DESC LIMIT ?3",
+        )
+        .bind(id)
+        .bind(since)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(detect::consecutive_clean(&scores, degrade_score))
+    }
+
     /// The rolling baseline: per-field sketches from the last `window` runs this
     /// source was judged `ok`, newest first.
     pub async fn baseline(&self, id: &str, window: u32) -> Result<Baseline> {
@@ -729,13 +760,42 @@ impl Resilience {
             },
         );
 
-        // An unjudged run moves nothing: not the state, not the trip count.
+        // An unjudged run moves nothing: not the state, not the trip count, and
+        // not the recovery streak — a source cannot heal on a run nobody judged.
         let (state, trips) = if eval.verdict.judged() {
             let tripped = eval.tripped(&self.cfg);
             let prior = store.recent_trips(&id, 2, self.cfg.degrade_score).await?;
             let trips = prior + u32::from(tripped);
+            // The streak is counted from the run rows, not accumulated in a
+            // column, for the same reason `recent_trips` is: a counter drifts out
+            // of sync with the history it summarizes. `state_since` is read from
+            // the row as it stood *before* this run, so each rung costs a full
+            // streak of its own.
+            let clean_streak = if tripped {
+                0
+            } else {
+                store
+                    .clean_streak_before(
+                        &id,
+                        &source.state_since,
+                        self.cfg.degrade_score,
+                        self.cfg.recovery_runs as i64,
+                    )
+                    .await?
+                    + 1
+            };
+            let recovery = detect::Recovery {
+                clean_streak,
+                required: self.cfg.recovery_runs,
+            };
             (
-                detect::next_state(previous_state, tripped, eval.severe(&self.cfg), trips),
+                detect::next_state(
+                    previous_state,
+                    tripped,
+                    eval.severe(&self.cfg),
+                    trips,
+                    recovery,
+                ),
                 trips,
             )
         } else {

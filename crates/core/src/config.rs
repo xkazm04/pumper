@@ -360,6 +360,16 @@ pub struct ResilienceConfig {
     pub invariant_violation_ratio: f64,
     /// Runs of per-field sketches kept by the retention janitor.
     pub sketch_retention_runs: u32,
+    /// Consecutive **judged and clean** runs needed to climb one rung back up:
+    /// `quarantined` → `probation` → `healthy`. Counted since the last state
+    /// transition, so each rung costs the full streak, and a single tripped run
+    /// during `probation` drops straight back to `quarantined`.
+    ///
+    /// Runs the detector could not judge (`inconclusive`, `content_empty`,
+    /// `below_cohort`) do not count — a source cannot heal on evidence nobody
+    /// looked at. `0` would let a source un-quarantine itself on the first run
+    /// that happened not to trip, so it is rejected.
+    pub recovery_runs: u32,
 }
 
 impl Default for ResilienceConfig {
@@ -384,6 +394,11 @@ impl Default for ResilienceConfig {
             invariant_min_confidence: 0.99,
             invariant_violation_ratio: 0.2,
             sketch_retention_runs: 60,
+            // Three clean judged runs per rung, i.e. six to walk all the way back
+            // from quarantine. Symmetric with the descent (two of the last three
+            // to degrade, three consecutive to quarantine): recovery should cost
+            // at least what the fall did.
+            recovery_runs: 3,
         }
     }
 }
@@ -649,6 +664,16 @@ impl Config {
                     "[resilience] drift_low ({}) must be < drift_high ({})",
                     r.drift_low, r.drift_high
                 )));
+            }
+            // A zero-run recovery streak means a quarantined source releases
+            // itself on the first run that merely failed to trip — which is the
+            // exact behaviour quarantine exists to prevent.
+            if r.recovery_runs == 0 {
+                return Err(Error::Config(
+                    "[resilience] recovery_runs must be > 0 — a source would otherwise \
+                     un-quarantine itself on the first run that happened not to trip"
+                        .into(),
+                ));
             }
             // Sketches are the baseline substrate; keeping fewer than the window
             // means the baseline read silently sees a short window.
@@ -1376,7 +1401,9 @@ mod tests {
         assert_eq!(r.timeout_secs, 60);
         assert_eq!(r.max_body_bytes, DEFAULT_MAX_BODY_BYTES);
         // Disabled: the empty secret is inert.
-        Config::default().validate().expect("default [remote] is valid");
+        Config::default()
+            .validate()
+            .expect("default [remote] is valid");
     }
 
     #[test]
@@ -1598,6 +1625,16 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("sketch_retention_runs"));
+
+        // A zero recovery streak un-quarantines a source on the first run that
+        // merely failed to trip — the exact behaviour quarantine exists for.
+        let mut cfg = Config::default();
+        cfg.resilience.recovery_runs = 0;
+        assert!(cfg
+            .validate()
+            .unwrap_err()
+            .to_string()
+            .contains("recovery_runs"));
     }
 
     #[test]

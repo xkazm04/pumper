@@ -205,9 +205,11 @@ pub(crate) struct SourceStateBody {
 /// Manual state override: un-quarantine a source that has been fixed, or retire a
 /// dead one.
 ///
-/// This is the only way out of `quarantined`. Quarantine is deliberately terminal
-/// without an operator — a stuck source is an acceptable outcome, a source that
-/// silently un-quarantines itself and resumes pushing garbage downstream is not.
+/// The operator path out of `quarantined`, and the only way to `retired`. A
+/// source also leaves quarantine on its own after `[resilience] recovery_runs`
+/// consecutive clean *judged* runs — into `probation`, never straight to
+/// `healthy`, so a premature release is stamped `provisional` rather than silent.
+/// This endpoint is the shortcut for an operator who already knows it is fixed.
 #[utoipa::path(
     post,
     path = "/sources/{id}/state",

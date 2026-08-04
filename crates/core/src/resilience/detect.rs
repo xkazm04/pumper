@@ -746,18 +746,59 @@ fn diagnose(
         .or(divergence)
 }
 
+/// How much clean evidence a source has accumulated since its last transition —
+/// the only thing allowed to move it back *up* the ladder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Recovery {
+    /// Consecutive **judged** runs that did not trip, since the state last
+    /// changed, including this one. Runs nobody judged (`inconclusive`,
+    /// `content_empty`, `below_cohort`) are not in this count: a source must not
+    /// be able to heal on evidence that was never looked at.
+    pub clean_streak: u32,
+    /// `[resilience] recovery_runs` — the streak one rung costs.
+    pub required: u32,
+}
+
+impl Recovery {
+    /// Whether the streak has paid for a rung.
+    pub fn earned(&self) -> bool {
+        self.required > 0 && self.clean_streak >= self.required
+    }
+
+    /// The no-evidence value: nothing has been earned. Used by callers that only
+    /// care about the descent.
+    pub fn none() -> Self {
+        Self {
+            clean_streak: 0,
+            required: u32::MAX,
+        }
+    }
+}
+
+/// Consecutive clean runs at the head of a newest-first list of **judged** run
+/// scores. Stops at the first tripped run rather than counting clean runs in
+/// total: three clean runs with a break in the middle are not a recovery, they
+/// are a source that is still failing intermittently.
+pub fn consecutive_clean(newest_first_scores: &[f64], degrade_score: f64) -> u32 {
+    newest_first_scores
+        .iter()
+        .take_while(|s| **s < degrade_score)
+        .count() as u32
+}
+
 /// The hysteresis ladder. A single tripped run is dominated by transient causes,
 /// so nothing downstream changes until a source has tripped repeatedly — a
 /// system that quarantines on one bad run on an unattended box will spend its
 /// life quarantining.
 ///
 /// `trips_of_last3` counts tripped runs among the last three *judged* runs,
-/// including this one.
+/// including this one. `recovery` carries the clean-run streak that climbs back.
 pub fn next_state(
     current: SourceState,
     tripped: bool,
     severe: bool,
     trips_of_last3: u32,
+    recovery: Recovery,
 ) -> SourceState {
     use SourceState::*;
     match current {
@@ -791,15 +832,31 @@ pub fn next_state(
                 Degraded
             }
         }
-        // Quarantine is terminal without an operator: a stuck source is an
-        // acceptable outcome, a source that silently un-quarantines itself and
-        // resumes pushing garbage downstream is not.
-        Quarantined => Quarantined,
-        // Reachable only by an explicit operator override today (repair, which
-        // would promote into it, is not built). A tripped run drops it back.
+        // Quarantine releases itself only on *evidence*: `recovery_runs`
+        // consecutive judged runs that did not trip, since it was quarantined.
+        // The old rule was "terminal without an operator", which on an unattended
+        // box means a source that broke at 03:00 and healed at 04:00 stays
+        // quarantined — writes diverted, pushes stopped — until a person notices.
+        // That is the single biggest reason `enforce = true` is not adoptable.
+        // The release is deliberately not to `healthy`: it goes to `probation`,
+        // which still stamps every write `provisional`, so a premature release
+        // is visible in the data rather than silent.
+        Quarantined => {
+            if !tripped && recovery.earned() {
+                Probation
+            } else {
+                Quarantined
+            }
+        }
+        // Probation is the watched rung: another full clean streak earns
+        // `healthy`, and a single tripped run drops straight back to quarantine —
+        // no intermediate rungs, because this source has already proven it can
+        // break.
         Probation => {
             if tripped {
                 Quarantined
+            } else if recovery.earned() {
+                Healthy
             } else {
                 Probation
             }
@@ -1376,24 +1433,91 @@ mod tests {
 
     // ---- the ladder ---------------------------------------------------------
 
+    /// A recovery streak of `clean` against a requirement of 3 — the default.
+    fn streak(clean: u32) -> Recovery {
+        Recovery {
+            clean_streak: clean,
+            required: 3,
+        }
+    }
+
     #[test]
     fn one_bad_run_never_reaches_further_than_suspect() {
         use SourceState::*;
+        let down = Recovery::none();
         // A single tripped run is dominated by transient causes, and `suspect`
         // changes nothing downstream.
-        assert_eq!(next_state(Healthy, true, true, 1), Suspect);
+        assert_eq!(next_state(Healthy, true, true, 1, down), Suspect);
         // One clean run leaves it.
-        assert_eq!(next_state(Suspect, false, false, 0), Healthy);
+        assert_eq!(next_state(Suspect, false, false, 0, streak(1)), Healthy);
         // Two of the last three trips it down a rung.
-        assert_eq!(next_state(Suspect, true, false, 2), Degraded);
+        assert_eq!(next_state(Suspect, true, false, 2, down), Degraded);
         // Recovery steps back one rung, not straight to healthy.
-        assert_eq!(next_state(Degraded, false, false, 1), Suspect);
+        assert_eq!(next_state(Degraded, false, false, 1, streak(1)), Suspect);
         // Severe accelerates; three consecutive also gets there.
-        assert_eq!(next_state(Degraded, true, true, 2), Quarantined);
-        assert_eq!(next_state(Degraded, true, false, 3), Quarantined);
-        assert_eq!(next_state(Degraded, true, false, 2), Degraded);
-        // Quarantine never un-sticks itself.
-        assert_eq!(next_state(Quarantined, false, false, 0), Quarantined);
-        assert_eq!(next_state(Retired, true, true, 3), Retired);
+        assert_eq!(next_state(Degraded, true, true, 2, down), Quarantined);
+        assert_eq!(next_state(Degraded, true, false, 3, down), Quarantined);
+        assert_eq!(next_state(Degraded, true, false, 2, down), Degraded);
+        assert_eq!(next_state(Retired, true, true, 3, down), Retired);
+    }
+
+    #[test]
+    fn quarantine_releases_on_evidence_not_on_one_quiet_run() {
+        use SourceState::*;
+        // The whole point of the up-path: one run that merely failed to trip is
+        // not a repair. Below the required streak, quarantine holds.
+        assert_eq!(
+            next_state(Quarantined, false, false, 0, streak(1)),
+            Quarantined
+        );
+        assert_eq!(
+            next_state(Quarantined, false, false, 0, streak(2)),
+            Quarantined
+        );
+        // The full streak earns the *watched* rung, never `healthy` directly:
+        // probation still stamps every write `provisional`.
+        assert_eq!(
+            next_state(Quarantined, false, false, 0, streak(3)),
+            Probation
+        );
+        // A tripped run while quarantined resets nothing forward.
+        assert_eq!(
+            next_state(Quarantined, true, false, 1, streak(9)),
+            Quarantined
+        );
+
+        // Probation costs another full streak.
+        assert_eq!(next_state(Probation, false, false, 0, streak(1)), Probation);
+        assert_eq!(next_state(Probation, false, false, 0, streak(3)), Healthy);
+        // And one trip during probation goes straight back to quarantine — no
+        // intermediate rungs for a source that has already proven it can break.
+        assert_eq!(
+            next_state(Probation, true, false, 1, streak(2)),
+            Quarantined
+        );
+        assert_eq!(next_state(Probation, true, true, 1, streak(9)), Quarantined);
+
+        // `Recovery::none()` can never earn a rung, which is what makes it safe
+        // for callers that only model the descent.
+        assert!(!Recovery::none().earned());
+        assert_eq!(
+            next_state(Quarantined, false, false, 0, Recovery::none()),
+            Quarantined
+        );
+    }
+
+    #[test]
+    fn a_trip_mid_streak_restarts_recovery_and_does_not_merely_pause_it() {
+        // Counting clean runs *in total* would let a source that trips every
+        // other run accumulate its way out of quarantine. The streak stops at
+        // the first tripped run, newest first.
+        let d = 0.6;
+        assert_eq!(consecutive_clean(&[0.0, 0.1, 0.2, 0.0], d), 4);
+        assert_eq!(consecutive_clean(&[0.0, 0.1, 0.9, 0.0], d), 2);
+        assert_eq!(consecutive_clean(&[0.7, 0.0, 0.0, 0.0], d), 0);
+        assert_eq!(consecutive_clean(&[], d), 0);
+        // The threshold is inclusive on the tripping side: `score >= degrade`.
+        assert_eq!(consecutive_clean(&[0.6], d), 0);
+        assert_eq!(consecutive_clean(&[0.5999], d), 1);
     }
 }

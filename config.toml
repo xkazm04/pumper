@@ -205,6 +205,9 @@ invariant_min_support = 500      # records an invariant must hold over before it
 invariant_min_confidence = 0.99
 invariant_violation_ratio = 0.2  # fraction of a cohort that must break one to count
 sketch_retention_runs = 60       # runs of per-field sketches kept (>= window_runs)
+recovery_runs = 3                # consecutive clean JUDGED runs to climb one rung back up:
+                                 # quarantined -> probation -> healthy. Unjudged runs
+                                 # (inconclusive/content_empty/below_cohort) never heal a source.
 
 # Catalog GitOps reconciler — treats catalog/data-sources.toml as desired state
 # for the schedules table. Boot always runs a DRY-RUN and logs drift loudly;

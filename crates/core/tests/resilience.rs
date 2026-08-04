@@ -198,7 +198,9 @@ async fn a_redesign_walks_the_source_down_the_ladder_and_a_fix_walks_it_back() {
         baseline.pooled_misses("price")
     );
 
-    // Quarantine is terminal without an operator: a clean run does not release it.
+    // A single clean run does not release a quarantine — release costs
+    // `recovery_runs` consecutive judged clean runs (see
+    // `a_repaired_source_climbs_out_of_quarantine_without_an_operator`).
     let fixed = observe(&health, &cohort(30, "amount", ".amount", "sturdy")).await;
     assert_eq!(fixed.verdict, RunVerdict::Ok);
     assert_eq!(
@@ -223,6 +225,120 @@ async fn a_redesign_walks_the_source_down_the_ladder_and_a_fix_walks_it_back() {
         "a verdict must explain itself"
     );
     assert!(runs.iter().all(|r| r.build_id.as_deref() == Some("test")));
+}
+
+#[tokio::test]
+async fn a_repaired_source_climbs_out_of_quarantine_without_an_operator() {
+    let store = fresh_db("resilience-recovery").await;
+    let storage = &store.storage;
+    let health = Resilience::new(storage.pool(), &cfg());
+    let healthy = || cohort(30, "price", ".price", "sturdy");
+    let broken = || cohort(30, "amount", ".price", "sturdy");
+    let repaired = || cohort(30, "amount", ".amount", "sturdy");
+
+    for _ in 0..4 {
+        observe(&health, &healthy()).await;
+    }
+    for _ in 0..3 {
+        observe(&health, &broken()).await;
+    }
+    let store = health.store().unwrap();
+    assert_eq!(
+        store
+            .source("extractor/products")
+            .await
+            .unwrap()
+            .unwrap()
+            .state,
+        SourceState::Quarantined
+    );
+
+    // The site is fixed at 04:00 and nobody is awake. Two clean runs are not a
+    // repair — quarantine holds on anything less than the full streak.
+    for run in 0..2 {
+        let v = observe(&health, &repaired()).await;
+        assert_eq!(
+            v.verdict,
+            RunVerdict::Ok,
+            "clean run {run}: {:?}",
+            v.reasons
+        );
+        assert_eq!(
+            v.state,
+            SourceState::Quarantined,
+            "one quiet run must not release a quarantine"
+        );
+    }
+    // The third earns the *watched* rung, not `healthy`: probation still stamps
+    // every write `provisional`, so a premature release shows up in the data.
+    let v = observe(&health, &repaired()).await;
+    assert_eq!(v.state, SourceState::Probation);
+    assert_eq!(v.state.trust(), Some("provisional"));
+
+    // Regression during probation drops straight back to quarantine.
+    let v = observe(&health, &broken()).await;
+    assert_eq!(v.verdict, RunVerdict::Broken);
+    assert_eq!(v.state, SourceState::Quarantined, "{:?}", v.reasons);
+
+    // And the streak starts over: each rung costs its own `recovery_runs`, so
+    // the full climb back to healthy is two streaks, not one.
+    for _ in 0..2 {
+        assert_eq!(
+            observe(&health, &repaired()).await.state,
+            SourceState::Quarantined
+        );
+    }
+    assert_eq!(
+        observe(&health, &repaired()).await.state,
+        SourceState::Probation
+    );
+    for _ in 0..2 {
+        assert_eq!(
+            observe(&health, &repaired()).await.state,
+            SourceState::Probation
+        );
+    }
+    assert_eq!(
+        observe(&health, &repaired()).await.state,
+        SourceState::Healthy
+    );
+
+    // The quarantine-era shadow dataset is deliberately left where it is: its
+    // records were written by an extractor we did not stand behind, and merging
+    // them on recovery would launder exactly the data quarantine existed to keep
+    // out of the live dataset. It stays as an ordinary, inspectable dataset.
+    let runs = store.runs("extractor/products", 50).await.unwrap();
+    assert_eq!(runs.len(), 17);
+}
+
+#[tokio::test]
+async fn an_unjudged_run_cannot_heal_a_quarantined_source() {
+    let store = fresh_db("resilience-recovery-thin").await;
+    let storage = &store.storage;
+    let health = Resilience::new(storage.pool(), &cfg());
+    let store_ref = health.store().unwrap();
+    store_ref
+        .ensure_source("extractor", "products")
+        .await
+        .unwrap();
+    store_ref
+        .set_state_manual("extractor/products", SourceState::Quarantined, "test")
+        .await
+        .unwrap();
+
+    // Six documents against a floor of ten: below_cohort, every time. Recovery
+    // counts only runs the detector actually judged, so no number of these can
+    // release a quarantine — healing on evidence nobody looked at is how a
+    // source silently un-quarantines itself.
+    for _ in 0..6 {
+        let v = observe(&health, &cohort(6, "price", ".price", "sturdy")).await;
+        assert_eq!(v.verdict, RunVerdict::BelowCohort);
+        assert_eq!(v.state, SourceState::Quarantined);
+    }
+    // A judged clean run does start the streak.
+    let v = observe(&health, &cohort(10, "price", ".price", "sturdy")).await;
+    assert_eq!(v.verdict, RunVerdict::Ok);
+    assert_eq!(v.state, SourceState::Quarantined, "one is not three");
 }
 
 #[tokio::test]
