@@ -2,8 +2,6 @@
 //! streamed export (json/ndjson/csv), near-duplicate scan, the change feed, and
 //! per-record revision history.
 
-use std::convert::Infallible;
-
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
@@ -383,7 +381,7 @@ impl ExportFormat {
         ("filter" = Option<Vec<String>>, Query, description = "Repeatable `<path>:<op>:<value>` predicate, all ANDed (same grammar as `GET /datasets/{app}/{dataset}`). Pushed into SQL, so a filtered export streams only matching rows — a targeted export instead of the whole corpus."),
     ),
     responses(
-        (status = 200, description = "Streamed export as a JSON array, NDJSON, or CSV (per `format`); constant memory, no row cap. `content-disposition: attachment`."),
+        (status = 200, description = "Streamed export as a JSON array, NDJSON, or CSV (per `format`); constant memory, no row cap. `content-disposition: attachment`. A mid-stream store error aborts the connection without a clean end (no closing `]` for json) rather than emitting a truncated-but-valid-looking body; per-row serialization failures are counted and logged, not silently dropped."),
         (status = 400, description = "Unknown format, malformed `filter`, or bad `trust`/`removed` value", body = Object),
     )
 )]
@@ -420,10 +418,94 @@ pub(crate) async fn export_records(
     ))
 }
 
+/// One page's outcome inside the export walk: a batch of records, or a store
+/// error that must abort the whole export.
+enum ExportOutcome {
+    Batch(Vec<pumper_core::Record>),
+    Failed(pumper_core::Error),
+}
+
+/// Formats one page of records into `format`'s wire framing, appending to
+/// `chunk` and advancing `first` (the JSON array's leading-comma tracker).
+/// Returns how many rows in this batch FAILED to serialize — never dropped
+/// without a trace, always counted so the caller can log it. `serde_json`
+/// realistically never fails on a `Record` (its `data` is already a validated
+/// `Value`), but a silent `if let Ok(..)` here would still make an export
+/// under-report row-for-row without a signal, so failures are counted rather
+/// than assumed impossible.
+fn format_batch(
+    format: ExportFormat,
+    batch: &[pumper_core::Record],
+    first: &mut bool,
+) -> (String, usize) {
+    let mut chunk = String::new();
+    let mut failed = 0usize;
+    for record in batch {
+        match format {
+            ExportFormat::Csv => csv_row(&mut chunk, record),
+            ExportFormat::Ndjson | ExportFormat::Json => {
+                if append_row(&mut chunk, first, format, serde_json::to_string(record)) {
+                    failed += 1;
+                }
+            }
+        }
+    }
+    (chunk, failed)
+}
+
+/// Appends one already-attempted JSON serialization to `chunk` per `format`'s
+/// framing (`ndjson`: one object per line; `json`: comma-separated array
+/// elements). Returns `true` when `serialized` was `Err` — the row is skipped,
+/// never silently written as if it were empty. Takes the `Result` rather than
+/// re-serializing internally so a test can exercise the failure branch without
+/// needing a `Record` whose `Value` genuinely fails to serialize (in practice
+/// none does — `Value` cannot hold NaN/Infinity — but the failure path still
+/// needs a caller-visible signal instead of the vanished row this replaces).
+///
+/// `append_row_serialization_failure_is_counted_not_silently_dropped` pins this.
+fn append_row(
+    chunk: &mut String,
+    first: &mut bool,
+    format: ExportFormat,
+    serialized: Result<String, serde_json::Error>,
+) -> bool {
+    let Ok(line) = serialized else { return true };
+    match format {
+        ExportFormat::Ndjson => {
+            chunk.push_str(&line);
+            chunk.push('\n');
+        }
+        ExportFormat::Json => {
+            if !*first {
+                chunk.push(',');
+            }
+            *first = false;
+            chunk.push_str(&line);
+        }
+        ExportFormat::Csv => unreachable!("csv rows go through csv_row, never json serialization"),
+    }
+    false
+}
+
+/// Whether the export's closing JSON-array terminator (`]`) may be emitted.
+/// Only `true` for `json` when every page streamed successfully — a
+/// mid-stream store error must never be masked by a valid-looking closing
+/// bracket, which is exactly what made a truncated export indistinguishable
+/// from a complete one (200 OK, parseable JSON, silently missing the tail).
+///
+/// `export_terminator_not_emitted_after_mid_stream_abort` pins this.
+fn export_may_emit_terminator(format: ExportFormat, aborted: bool) -> bool {
+    matches!(format, ExportFormat::Json) && !aborted
+}
+
 /// Streams the whole dataset in keyset-paged batches — constant memory
-/// regardless of dataset size, with no row cap or silent truncation. `json`
-/// frames the batches as one array (`[`, comma-separated records, `]`); `ndjson`
-/// and `csv` stream line-oriented output.
+/// regardless of dataset size, with no row cap. `json` frames the batches as
+/// one array (`[`, comma-separated records, `]`); `ndjson` and `csv` stream
+/// line-oriented output. A mid-stream store read failure yields a stream
+/// `Err`, which axum/hyper surface as an aborted response (the connection
+/// closes without the chunked-encoding terminator) instead of a clean 200 —
+/// so a truncated export is detectable as a transfer failure, never a
+/// valid-looking short body.
 fn stream_export(
     state: AppState,
     app: String,
@@ -438,7 +520,7 @@ fn stream_export(
     let content_type = format.content_type();
     let stream = async_stream::stream! {
         match format {
-            ExportFormat::Csv => yield Ok::<_, Infallible>(axum::body::Bytes::from_static(
+            ExportFormat::Csv => yield Ok::<_, std::io::Error>(axum::body::Bytes::from_static(
                 b"key,first_seen,last_seen,updated_at,removed_at,data\n",
             )),
             ExportFormat::Json => yield Ok(axum::body::Bytes::from_static(b"[")),
@@ -447,48 +529,44 @@ fn stream_export(
         let trust = trust_filter(&trust).map(str::to_string);
         let mut after: Option<(String, String)> = None;
         let mut first = true;
+        let mut row_failures: usize = 0;
+        let mut aborted = false;
         loop {
-            let batch = match state
+            let outcome = match state
                 .datasets
                 .list_records_view(&app, &dataset, &filters, after.clone(), BATCH, trust.as_deref(), include_removed)
                 .await
             {
-                Ok(batch) => batch,
-                Err(e) => {
-                    tracing::warn!(app = %app, dataset = %dataset, "export stream aborted: {e}");
+                Ok(batch) => ExportOutcome::Batch(batch),
+                Err(e) => ExportOutcome::Failed(e),
+            };
+            let batch = match outcome {
+                ExportOutcome::Batch(batch) => batch,
+                ExportOutcome::Failed(e) => {
+                    aborted = true;
+                    // error, not warn: this is a truncated export in flight, not a
+                    // recoverable condition — the response is about to end without
+                    // its closing terminator specifically so the truncation is
+                    // detectable, and that fact belongs at error severity.
+                    tracing::error!(app = %app, dataset = %dataset, "export stream aborted mid-read, response truncated without a clean end: {e}");
+                    yield Err(std::io::Error::other(e.to_string()));
                     break;
                 }
             };
             let Some(last) = batch.last() else { break };
             after = Some((pumper_core::datasets::ts(last.updated_at), last.key.clone()));
             let short = (batch.len() as i64) < BATCH;
-            let mut chunk = String::new();
-            for record in &batch {
-                match format {
-                    ExportFormat::Csv => csv_row(&mut chunk, record),
-                    ExportFormat::Ndjson => {
-                        if let Ok(line) = serde_json::to_string(record) {
-                            chunk.push_str(&line);
-                            chunk.push('\n');
-                        }
-                    }
-                    ExportFormat::Json => {
-                        if let Ok(line) = serde_json::to_string(record) {
-                            if !first {
-                                chunk.push(',');
-                            }
-                            first = false;
-                            chunk.push_str(&line);
-                        }
-                    }
-                }
-            }
+            let (chunk, failed) = format_batch(format, &batch, &mut first);
+            row_failures += failed;
             yield Ok(axum::body::Bytes::from(chunk));
             if short {
                 break;
             }
         }
-        if let ExportFormat::Json = format {
+        if row_failures > 0 {
+            tracing::error!(app = %app, dataset = %dataset, row_failures, "export completed but {row_failures} record(s) failed to serialize and were skipped");
+        }
+        if export_may_emit_terminator(format, aborted) {
             yield Ok(axum::body::Bytes::from_static(b"]"));
         }
     };
@@ -702,4 +780,115 @@ pub(crate) async fn record_history(
     Ok(Json(
         json!({ "items": page.items, "next_cursor": page.next_cursor }),
     ))
+}
+
+#[cfg(test)]
+mod export_honesty_tests {
+    use super::*;
+
+    fn record(key: &str) -> pumper_core::Record {
+        let now = chrono::Utc::now();
+        pumper_core::Record {
+            key: key.to_string(),
+            data: json!({ "v": 1 }),
+            first_seen: now,
+            last_seen: now,
+            updated_at: now,
+            removed_at: None,
+            trust: "stable".to_string(),
+        }
+    }
+
+    /// A serde_json::Error the tests can hand `append_row` without needing a
+    /// `Record` whose `Value` genuinely fails to serialize (none does).
+    fn a_serde_json_error() -> serde_json::Error {
+        serde_json::from_str::<i32>("not a number").unwrap_err()
+    }
+
+    #[test]
+    fn append_row_success_appends_the_line_for_ndjson_and_json() {
+        let mut chunk = String::new();
+        let mut first = true;
+        let failed = append_row(
+            &mut chunk,
+            &mut first,
+            ExportFormat::Ndjson,
+            Ok(r#"{"key":"a"}"#.to_string()),
+        );
+        assert!(!failed);
+        assert_eq!(chunk, "{\"key\":\"a\"}\n");
+
+        let mut chunk = String::new();
+        let mut first = true;
+        append_row(
+            &mut chunk,
+            &mut first,
+            ExportFormat::Json,
+            Ok(r#"{"key":"a"}"#.to_string()),
+        );
+        append_row(
+            &mut chunk,
+            &mut first,
+            ExportFormat::Json,
+            Ok(r#"{"key":"b"}"#.to_string()),
+        );
+        assert_eq!(
+            chunk, r#"{"key":"a"},{"key":"b"}"#,
+            "json rows comma-joined"
+        );
+    }
+
+    /// The anti-pattern this defends: a row that fails to serialize used to be
+    /// silently skipped (`if let Ok(line) = ... { .. }` with no else), so an
+    /// export could under-count its own rows with no signal anywhere. A failed
+    /// row must be reported back to the caller, not swallowed.
+    #[test]
+    fn append_row_serialization_failure_is_counted_not_silently_dropped() {
+        let mut chunk = String::new();
+        let mut first = true;
+        let failed = append_row(
+            &mut chunk,
+            &mut first,
+            ExportFormat::Ndjson,
+            Err(a_serde_json_error()),
+        );
+        assert!(failed, "a failed serialization must be reported, not eaten");
+        assert!(
+            chunk.is_empty(),
+            "no partial/garbage bytes for a failed row"
+        );
+    }
+
+    #[test]
+    fn format_batch_counts_zero_failures_for_ordinary_records() {
+        let batch = vec![record("a"), record("b"), record("c")];
+        let mut first = true;
+        let (chunk, failed) = format_batch(ExportFormat::Ndjson, &batch, &mut first);
+        assert_eq!(failed, 0);
+        assert_eq!(chunk.lines().count(), 3);
+    }
+
+    /// The anti-pattern this defends: the export streamer used to yield the
+    /// json array's closing `]` unconditionally after the batch loop, even
+    /// when the loop `break`-ed out because a mid-stream store read failed —
+    /// producing a 200 OK with syntactically valid-but-truncated JSON,
+    /// indistinguishable from a genuinely complete (and possibly just short)
+    /// export.
+    #[test]
+    fn export_terminator_not_emitted_after_mid_stream_abort() {
+        assert!(
+            !export_may_emit_terminator(ExportFormat::Json, true),
+            "an aborted json export must not get the closing ']' — that is what \
+             made a truncated body look complete"
+        );
+        assert!(
+            export_may_emit_terminator(ExportFormat::Json, false),
+            "a json export that read every page cleanly still needs its ']'"
+        );
+        // ndjson/csv have no array terminator to begin with — the function must
+        // say so regardless of the abort flag, not accidentally start emitting
+        // one for a format that never had one.
+        assert!(!export_may_emit_terminator(ExportFormat::Ndjson, false));
+        assert!(!export_may_emit_terminator(ExportFormat::Csv, false));
+    }
 }

@@ -653,8 +653,22 @@ impl Datasets {
 
     /// Keyset page of a single record's revision history, newest first. `after`
     /// is the previous page's last (created_at-as-stored, revision); None starts
-    /// at the newest. Revisions are per-key monotonic, so `revision` is a unique,
-    /// stable tiebreak within the (app, dataset, key).
+    /// at the newest.
+    ///
+    /// Ordered `(created_at DESC, revision DESC)` — matching the keyset
+    /// predicate's leading column — not bare `revision DESC`. Revision numbers
+    /// are per-key monotonic *by write order*, but `created_at` is a wall-clock
+    /// stamp: an import that backdates timestamps, or plain clock skew across a
+    /// batch, can write a later revision with an earlier `created_at`. With the
+    /// old `ORDER BY revision DESC` a page boundary was cut by revision while
+    /// the predicate excluded rows by `created_at` first — a skewed row could
+    /// fall on the wrong side of the cut and be skipped or repeated across
+    /// pages. Leading both the ORDER BY and the predicate on `created_at` keeps
+    /// them in lockstep; `revision` still breaks ties within one `created_at`
+    /// (a whole upsert-chunk shares one stamp — see `docs/features/datasets.md`
+    /// § Conventions) and remains a unique, stable tiebreak within the
+    /// (app, dataset, key). The cursor format (`created_at|revision`) is
+    /// unchanged, so this is a pure ordering fix, not a cursor migration.
     pub async fn history_page(
         &self,
         app: &str,
@@ -671,7 +685,7 @@ impl Datasets {
                     job_id, source_url, artifact_sha, rules_hash \
              FROM record_revisions WHERE app = ?1 AND dataset = ?2 AND key = ?3 \
              AND (?4 IS NULL OR created_at < ?4 OR (created_at = ?4 AND revision < ?5)) \
-             ORDER BY revision DESC LIMIT ?6",
+             ORDER BY created_at DESC, revision DESC LIMIT ?6",
         )
         .bind(app)
         .bind(dataset)
@@ -690,6 +704,35 @@ impl Datasets {
             .flatten()
             .map(|r| format!("{}|{}", ts(r.created_at), r.revision));
         Ok(RevisionPage { items, next_cursor })
+    }
+
+    /// Test-only: overwrites one revision's `created_at`, so a test can
+    /// construct clock-skewed history — a later revision stamped earlier than
+    /// a prior one (an import backdate, or drifted clocks across a batch) —
+    /// deterministically, without waiting on real time. Compiled only behind
+    /// `test-support` (never in a normal build); see
+    /// `history_page_survives_clock_skew_without_skip_or_repeat`.
+    #[cfg(feature = "test-support")]
+    pub async fn set_revision_created_at_for_test(
+        &self,
+        app: &str,
+        dataset: &str,
+        key: &str,
+        revision: i64,
+        created_at: DateTime<Utc>,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE record_revisions SET created_at = ?1 \
+             WHERE app = ?2 AND dataset = ?3 AND key = ?4 AND revision = ?5",
+        )
+        .bind(ts(created_at))
+        .bind(app)
+        .bind(dataset)
+        .bind(key)
+        .bind(revision)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     /// Keyset page of the change feed (revisions across a dataset, or all of an

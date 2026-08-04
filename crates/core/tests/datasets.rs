@@ -1301,3 +1301,67 @@ async fn list_records_view_trust_and_removed_are_independent_toggles() {
         "trust=all must include the provisional row but removed=exclude still hides the tombstone"
     );
 }
+
+/// `history_page`'s keyset predicate leads on `created_at` (`created_at < ? OR
+/// (created_at = ? AND revision < ?)`), so the ORDER BY must lead on
+/// `created_at` too — otherwise a page cut by `revision` disagrees with a
+/// predicate that excludes by `created_at` first, and a revision whose
+/// timestamp is out of step with its revision number (clock skew, a backdating
+/// import) gets skipped or repeated across the page boundary. This writes 5
+/// revisions for one key, then deliberately scrambles their `created_at` so it
+/// does NOT move in step with `revision`, and walks the history one row per
+/// page — proving every revision appears exactly once regardless.
+#[tokio::test]
+async fn history_page_survives_clock_skew_without_skip_or_repeat() {
+    let store = fresh_db("datasets-history-skew").await;
+    let ds = Datasets::new(store.storage.pool());
+
+    for i in 1..=5 {
+        ds.upsert("app", "d", "k", &json!({ "v": i }))
+            .await
+            .unwrap();
+    }
+
+    // Scramble created_at so it is NOT monotonic with revision — revision 3
+    // (the middle write) is stamped the EARLIEST, revision 1 the LATEST,
+    // deliberately inverting the naive "revision order == time order"
+    // assumption a bare `ORDER BY revision DESC` would rely on.
+    let base = chrono::Utc::now();
+    let skewed = [
+        (1i64, base + chrono::Duration::seconds(50)),
+        (2, base + chrono::Duration::seconds(10)),
+        (3, base), // earliest
+        (4, base + chrono::Duration::seconds(40)),
+        (5, base + chrono::Duration::seconds(30)),
+    ];
+    for (revision, created_at) in skewed {
+        ds.set_revision_created_at_for_test("app", "d", "k", revision, created_at)
+            .await
+            .unwrap();
+    }
+
+    // Page one row at a time and collect every revision number seen.
+    let mut seen: Vec<i64> = Vec::new();
+    let mut after = None;
+    loop {
+        let page = ds.history_page("app", "d", "k", after, 1).await.unwrap();
+        seen.extend(page.items.iter().map(|r| r.revision));
+        match page.next_cursor.as_deref() {
+            Some(cursor) => {
+                let (t, r) = cursor.split_once('|').expect("cursor shape ts|revision");
+                after = Some((t.to_string(), r.parse().unwrap()));
+            }
+            None => break,
+        }
+        assert!(seen.len() <= 5, "paged past the known row count: {seen:?}");
+    }
+
+    let mut dedup = seen.clone();
+    dedup.sort_unstable();
+    dedup.dedup();
+    assert_eq!(
+        dedup,
+        vec![1, 2, 3, 4, 5],
+        "every skewed revision appears exactly once across page boundaries: {seen:?}"
+    );
+}

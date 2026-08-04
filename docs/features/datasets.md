@@ -36,7 +36,7 @@ A quarantined source writes to the shadow dataset `<ds>@q`, which is an ordinary
 ## Querying & export
 
 - `GET /datasets/{app}/{ds}?limit=&cursor=&trust=&removed=` — records newest-updated first; `cursor=` (even empty) switches to `{items, next_cursor}` keyset pagination (`updated_at|key`); absent = legacy bare array.
-- `GET /datasets/{app}/{ds}/export?format=json|ndjson|csv&trust=&removed=` — all three formats **stream** in keyset-paged 1000-row batches with content-disposition (CSV: fixed columns key/timestamps/data-as-JSON, RFC-4180 quoted); none is buffered or capped.
+- `GET /datasets/{app}/{ds}/export?format=json|ndjson|csv&trust=&removed=` — all three formats **stream** in keyset-paged 1000-row batches with content-disposition (CSV: fixed columns key/timestamps/data-as-JSON, RFC-4180 quoted); none is buffered or capped. A mid-stream store failure aborts the HTTP response without its clean terminator (no closing `]` for json) — chunked-encoding client libraries surface that as a transfer error, not a 200 with a plausible-looking short body — and is logged at `error`. A per-row JSON serialization failure is counted and logged at `error` rather than silently skipped.
 - `GET /apps/{name}/datasets` — dataset names per app. `GET /datasets/{app}/{ds}/duplicates?distance=` — SimHash near-duplicate pairs.
 
 ## Conventions
