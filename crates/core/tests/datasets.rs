@@ -1365,3 +1365,317 @@ async fn history_page_survives_clock_skew_without_skip_or_repeat() {
         "every skewed revision appears exactly once across page boundaries: {seen:?}"
     );
 }
+
+// ── derived: trust inheritance + provenance ──────────────────────────────────
+
+/// The laundering hole: derived rows used to be written with `trust = None`,
+/// and NULL trust *means* `stable` — so a provisional source produced a
+/// stable-looking derived row, and `?trust=stable` served it as something we
+/// stand behind.
+#[tokio::test]
+async fn provisional_source_derives_a_provisional_row_not_a_stable_one() {
+    let store = fresh_db("derived-trust-source").await;
+    let ds = store.datasets();
+    make_spec(&store.storage, "src", "tgt", &[], &[("n", "$.n")], None).await;
+
+    ds.upsert_many_trusted(
+        "app",
+        "src",
+        &[("k1".to_string(), json!({ "n": 1 }))],
+        Some("provisional"),
+    )
+    .await
+    .unwrap();
+
+    let derived = ds.get("app", "tgt", "k1").await.unwrap().unwrap();
+    assert_eq!(derived.data, json!({ "n": 1 }));
+    assert_eq!(
+        derived.trust, "provisional",
+        "a derived row may not be more trusted than the row it came from"
+    );
+    // And the revision carries the same stamp, so the era stays identifiable.
+    let rev = ds.history("app", "tgt", "k1", 1).await.unwrap();
+    assert_eq!(rev[0].trust, "provisional");
+
+    // A stable source stays stable — the floor is inherited, not invented.
+    ds.upsert_many("app", "src", &[("k2".to_string(), json!({ "n": 2 }))])
+        .await
+        .unwrap();
+    assert_eq!(
+        ds.get("app", "tgt", "k2").await.unwrap().unwrap().trust,
+        "stable"
+    );
+}
+
+/// A join is an input too: the derived row is as weak as the weakest side, so a
+/// stable source joined to a quarantined lookup row is quarantined.
+#[tokio::test]
+async fn lookup_join_drags_the_derived_row_down_to_the_joined_trust() {
+    let store = fresh_db("derived-trust-lookup").await;
+    let ds = store.datasets();
+    make_spec(
+        &store.storage,
+        "src",
+        "tgt",
+        &[],
+        &[("n", "$.n")],
+        Some(DerivedLookup {
+            dataset: "meta".into(),
+            key_expr: "$.meta".into(),
+            merge_as: "meta".into(),
+        }),
+    )
+    .await;
+
+    ds.upsert_many_trusted(
+        "app",
+        "meta",
+        &[("m1".to_string(), json!({ "label": "L" }))],
+        Some("quarantined"),
+    )
+    .await
+    .unwrap();
+    // The source write is fully stable.
+    ds.upsert_many(
+        "app",
+        "src",
+        &[("k1".to_string(), json!({ "n": 1, "meta": "m1" }))],
+    )
+    .await
+    .unwrap();
+
+    let derived = ds.get("app", "tgt", "k1").await.unwrap().unwrap();
+    assert_eq!(
+        derived.data["meta"],
+        json!({ "label": "L" }),
+        "join happened"
+    );
+    assert_eq!(
+        derived.trust, "quarantined",
+        "the joined side's trust must not be dropped on the floor"
+    );
+}
+
+/// Aggregates are a claim about a whole group, so one weak member makes the
+/// number weak — and the untouched group stays stable.
+#[tokio::test]
+async fn group_row_inherits_the_weakest_member_not_the_last_write() {
+    let store = fresh_db("derived-trust-group").await;
+    let ds = store.datasets();
+    make_group_spec(
+        &store.storage,
+        "sales",
+        "by_state",
+        &[],
+        &["$.state"],
+        &[("n", "count")],
+    )
+    .await
+    .unwrap();
+
+    ds.upsert_many(
+        "app",
+        "sales",
+        &[
+            ("a".to_string(), json!({ "state": "CA" })),
+            ("b".to_string(), json!({ "state": "NY" })),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ds.get("app", "by_state", "CA")
+            .await
+            .unwrap()
+            .unwrap()
+            .trust,
+        "stable"
+    );
+
+    // One provisional CA member arrives; the CA aggregate is now provisional
+    // even though the *last* write to the group was the stable one before it.
+    ds.upsert_many_trusted(
+        "app",
+        "sales",
+        &[("c".to_string(), json!({ "state": "CA" }))],
+        Some("provisional"),
+    )
+    .await
+    .unwrap();
+    let ca = ds.get("app", "by_state", "CA").await.unwrap().unwrap();
+    assert_eq!(ca.data["n"], json!(2));
+    assert_eq!(ca.trust, "provisional");
+    assert_eq!(
+        ds.get("app", "by_state", "NY")
+            .await
+            .unwrap()
+            .unwrap()
+            .trust,
+        "stable",
+        "an untouched group keeps its own trust"
+    );
+}
+
+/// The backfill is the same derivation by another door: it must inherit trust
+/// exactly like the live recompute, or "re-run the backfill" would be a way to
+/// launder a provisional corpus into stable derived rows.
+#[tokio::test]
+async fn backfill_inherits_trust_like_the_live_path() {
+    let store = fresh_db("derived-trust-backfill").await;
+    let ds = store.datasets();
+    // Rows exist BEFORE the spec, written provisional.
+    ds.upsert_many_trusted(
+        "app",
+        "src",
+        &[
+            ("k1".to_string(), json!({ "n": 1, "state": "CA" })),
+            ("k2".to_string(), json!({ "n": 2, "state": "CA" })),
+        ],
+        Some("provisional"),
+    )
+    .await
+    .unwrap();
+    ds.upsert_many(
+        "app",
+        "src",
+        &[("k3".to_string(), json!({ "n": 3, "state": "NY" }))],
+    )
+    .await
+    .unwrap();
+
+    let row_spec = make_spec(&store.storage, "src", "tgt", &[], &[("n", "$.n")], None).await;
+    let report = ds.backfill_derived(&row_spec, 2).await.unwrap();
+    assert_eq!(report.matched, 3);
+    assert_eq!(
+        ds.get("app", "tgt", "k1").await.unwrap().unwrap().trust,
+        "provisional"
+    );
+    assert_eq!(
+        ds.get("app", "tgt", "k3").await.unwrap().unwrap().trust,
+        "stable"
+    );
+
+    let group_spec = make_group_spec(
+        &store.storage,
+        "src",
+        "by_state",
+        &[],
+        &["$.state"],
+        &[("n", "count")],
+    )
+    .await
+    .unwrap();
+    ds.backfill_derived(&group_spec, 2).await.unwrap();
+    assert_eq!(
+        ds.get("app", "by_state", "CA")
+            .await
+            .unwrap()
+            .unwrap()
+            .trust,
+        "provisional",
+        "group backfill accumulates the weakest member trust"
+    );
+    assert_eq!(
+        ds.get("app", "by_state", "NY")
+            .await
+            .unwrap()
+            .unwrap()
+            .trust,
+        "stable"
+    );
+}
+
+/// Derived revisions used to carry NO provenance at all: nothing said which
+/// spec shaped the row or which run fed it. They now stamp the registered spec
+/// fingerprint (`rules_hash`, the 0030 idiom) and inherit the source write's
+/// job — and still refuse to claim replayability they don't have.
+#[tokio::test]
+async fn derived_revisions_stamp_the_spec_and_inherit_the_source_job() {
+    let store = fresh_db("derived-provenance").await;
+    let ds = store.datasets();
+    let spec = make_spec(&store.storage, "src", "tgt", &[], &[("n", "$.n")], None).await;
+
+    ds.upsert_many_stamped(
+        "app",
+        "src",
+        &[("k1".to_string(), json!({ "n": 1 }))],
+        None,
+        Some(&pumper_core::Provenance {
+            job_id: Some("job-7".into()),
+            source_url: Some("https://example.test/list".into()),
+            artifact_sha: Some("deadbeef".into()),
+            rules_hash: None,
+        }),
+    )
+    .await
+    .unwrap();
+
+    let expected = pumper_core::datasets::rules_hash(&pumper_core::derived_spec_fingerprint(&spec));
+    let rev = ds.history("app", "tgt", "k1", 1).await.unwrap();
+    let prov = &rev[0].provenance;
+    assert_eq!(prov.rules_hash.as_deref(), Some(expected.as_str()));
+    assert_eq!(
+        prov.job_id.as_deref(),
+        Some("job-7"),
+        "source job is lineage"
+    );
+    assert!(
+        prov.source_url.is_none() && prov.artifact_sha.is_none(),
+        "a derived row was not fetched and has no archived body — never borrow the source's"
+    );
+    assert!(!prov.replayable(), "no artifact means never a replay claim");
+    // The fingerprint is registered, so the doctor's unregistered-hash finding
+    // stays quiet and the derivation is inspectable after the fact.
+    let registered = ds.rules_by_hash(&expected).await.unwrap().unwrap();
+    assert_eq!(registered["kind"], json!("derived_spec"));
+    assert_eq!(registered["id"], json!(spec.id));
+}
+
+/// The silent-degradation path: an unparseable `lookup` column used to parse as
+/// `(None, None)`, turning a lookup/aggregate spec into a whole-record
+/// PASSTHROUGH that kept writing wrong-shaped rows. It must be skipped loudly
+/// instead — nothing written, nothing pretended.
+#[tokio::test]
+async fn corrupt_lookup_column_skips_the_spec_not_writes_a_passthrough() {
+    let store = fresh_db("derived-corrupt-join").await;
+    let ds = store.datasets();
+    let pool = store.storage.pool();
+    let spec = make_group_spec(
+        &store.storage,
+        "sales",
+        "by_state",
+        &[],
+        &["$.state"],
+        &[("n", "count")],
+    )
+    .await
+    .unwrap();
+
+    sqlx::query(r#"UPDATE derived SET lookup = '{"group_by": ' WHERE id = ?1"#)
+        .bind(&spec.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    ds.upsert_many(
+        "app",
+        "sales",
+        &[("a".to_string(), json!({ "state": "CA", "amount": 3 }))],
+    )
+    .await
+    .unwrap();
+
+    assert!(
+        ds.list("app", "by_state", 10).await.unwrap().is_empty(),
+        "a spec we cannot read must write NOTHING — not a passthrough copy of the source row"
+    );
+    // Loud on every surface that touches it: skipped in the run set and in the
+    // listing, and a hard error when asked for by id.
+    assert!(store
+        .storage
+        .list_derived_specs(Some("app"))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(store.storage.get_derived_spec(&spec.id).await.is_err());
+}

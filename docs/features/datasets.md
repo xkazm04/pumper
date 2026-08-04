@@ -87,6 +87,22 @@ append-only ledgers, and the configured windows. `days` defaults to the configur
 enabled. The preview and the janitor call the **same** plan builder, so they cannot
 disagree. Both walk the whole artifact tree — on-demand only, never a hot path.
 
+## Derived datasets (`/derived`)
+
+A derived spec recomputes one dataset from another as the source moves: `filters` (the `?filter=` grammar) → `project` (`{out_field: "$.path"}`) → an optional single-key `lookup` join, **or** a `group_by` + `aggregates` (`count` / `sum($.path)`) spec. Specs are CRUD'd on `/derived`; the recompute rides the normal upsert flow (and `detect_removed` for aggregate groups), so there is no separate scheduler and no second copy of change detection. Derived writes run at chain depth +1, capped by `[derived] max_depth`.
+
+**Trust is inherited, never re-minted.** A derived row carries the *weakest* trust of everything that fed it (`datasets::weakest_trust`, the one place that decides it — an unrecognized label ranks below every known one):
+
+- **row specs**: the source write's trust, weakened further by the record a `lookup` joined to;
+- **aggregate specs**: the weakest trust across the group's scanned members, live and in backfill alike — an aggregate is a claim about the whole group, so one `provisional` member makes the number `provisional`;
+- one batch may write more than one stamp: rows are grouped by inherited trust and each group is upserted with its own.
+
+Before this, derived rows were written with `trust = NULL`, and NULL **means** `stable` — a quarantined or provisional source laundered itself into stable-looking derived rows that `?trust=stable` served as trustworthy.
+
+**Provenance.** Every derived revision stamps `rules_hash` = the hash of the spec's canonical fingerprint (id + source/target + filters/project/lookup/group), registered in `rules_versions` exactly like an extractor's RuleSet (migration 0030), so the derivation that produced a row is inspectable and an edited spec hashes apart from rows written under its old shape. It also inherits the source write's `job_id`. `source_url`/`artifact_sha` stay **Null**: a derived row was not fetched and has no archived body, so it never claims to be replayable. **Existing derived rows are not restamped retroactively** — stamps are never rewritten in place; re-running `POST /derived/{id}/backfill` rewrites them through the normal write path.
+
+**An unreadable spec is skipped, loudly.** The stored `lookup` column holds either the lookup or the group shape; a value that is present and unparseable used to parse as "neither", silently demoting a lookup/aggregate spec to a whole-record **passthrough** that kept writing wrong-shaped rows. It is now an error: the spec is logged at `error` and skipped (it writes nothing), `GET /derived` omits it rather than failing the whole listing, and `GET /derived/{id}` returns an error for that id.
+
 ## `datasets doctor` — store integrity report
 
 `GET /datasets/doctor?skip_artifacts=` (`just doctor`) — **read-only**. Every query

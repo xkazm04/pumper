@@ -68,6 +68,38 @@ pub fn trust_label(stored: Option<&str>) -> String {
     }
 }
 
+/// How far down the trust ladder a label sits. Higher = less stood behind.
+///
+/// An UNRECOGNIZED label ranks below every known one on purpose: a value this
+/// build does not understand must never be treated as at-least-as-trustworthy
+/// as `stable`, because the only way that mistake surfaces is as a laundered
+/// row nobody audits.
+fn trust_rank(label: &str) -> u8 {
+    match label {
+        TRUST_STABLE => 0,
+        "provisional" => 1,
+        "quarantined" => 2,
+        _ => 3,
+    }
+}
+
+/// The weakest trust across a set of inputs — the stamp a value *derived* from
+/// all of them may carry. `None` (in or out) means `stable`, matching the
+/// column's NULL semantics and [`crate::resilience::SourceState::trust`].
+///
+/// Trust does not survive a join by majority vote: a derived row is only as
+/// stood-behind as the least stood-behind row that fed it, so one `provisional`
+/// input makes the whole output `provisional`. Deriving a `stable`-looking row
+/// out of a quarantined one is laundering, and this is the one function that
+/// decides it.
+pub fn weakest_trust<'a>(labels: impl IntoIterator<Item = Option<&'a str>>) -> Option<String> {
+    let weakest = labels
+        .into_iter()
+        .map(|l| trust_label(l))
+        .max_by_key(|l| trust_rank(l))?;
+    (weakest != TRUST_STABLE).then_some(weakest)
+}
+
 /// The `trust` predicate shared by the filtered read paths.
 ///
 /// One bound parameter, no dynamic SQL: `NULL` matches everything, `'stable'`
@@ -1082,7 +1114,7 @@ impl Datasets {
             // same flow. Fail-open: a broken spec must never fail the source
             // ingest, so derived errors are logged, not propagated.
             if summary.new.len() + summary.changed.len() > 0 {
-                self.apply_derived(app, dataset, items, &summary, depth)
+                self.apply_derived(app, dataset, items, &summary, depth, trust, prov)
                     .await;
             }
             Ok(summary)
@@ -2060,7 +2092,70 @@ impl Datasets {
         .bind(dataset)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(DerivedSpec::try_from).collect()
+        Ok(specs_from_rows(rows, "enabled_derived"))
+    }
+
+    /// The [`Provenance`] every revision of one derived batch carries: the
+    /// derivation itself (`rules_hash` = the registered
+    /// [`derived_spec_fingerprint`]) plus the producing job of the SOURCE write
+    /// that triggered it, so a derived row points back at both the spec that
+    /// shaped it and the run that fed it.
+    ///
+    /// `source_url`/`artifact_sha` stay Null on purpose: a derived row was not
+    /// fetched from anywhere and has no archived body, and inventing either
+    /// would make it claim to be [`Provenance::replayable`] when it is not.
+    /// Registration failure degrades to an unstamped `rules_hash` rather than
+    /// stamping a hash the `rules_versions` registry does not hold (which is
+    /// exactly what the doctor's `unregistered_rules` finding hunts).
+    async fn derived_provenance(
+        &self,
+        spec: &DerivedSpec,
+        source: Option<&Provenance>,
+    ) -> Provenance {
+        let fingerprint = derived_spec_fingerprint(spec);
+        let rules_hash = match self.register_rules(&fingerprint).await {
+            Ok(h) => Some(h),
+            Err(e) => {
+                tracing::warn!(spec = %spec.id, "derived: spec fingerprint not registered: {e}");
+                None
+            }
+        };
+        Provenance {
+            job_id: source.and_then(|p| p.job_id.clone()),
+            source_url: None,
+            artifact_sha: None,
+            rules_hash,
+        }
+    }
+
+    /// Writes one derived batch, splitting it by the trust each row inherited
+    /// so a single quarantined input cannot drag its whole batch down *and* a
+    /// stable-looking stamp can never cover a weaker row. One upsert per
+    /// distinct trust (almost always exactly one).
+    async fn upsert_derived_rows(
+        &self,
+        spec: &DerivedSpec,
+        rows: Vec<DerivedRowOut>,
+        prov: &Provenance,
+        depth: u32,
+    ) -> Result<UpsertSummary> {
+        let mut total = UpsertSummary::default();
+        for (trust, items) in partition_by_trust(rows) {
+            let s = self
+                .upsert_many_at_depth(
+                    &spec.source_app,
+                    &spec.target_dataset,
+                    &items,
+                    trust.as_deref(),
+                    Some(prov),
+                    depth,
+                )
+                .await?;
+            total.new.extend(s.new);
+            total.changed.extend(s.changed);
+            total.unchanged += s.unchanged;
+        }
+        Ok(total)
     }
 
     /// Feeds a batch's fresh keys through the matching enabled specs, upserting
@@ -2071,6 +2166,12 @@ impl Datasets {
     /// ingest that triggered it. The depth cap is what prevents an unbounded
     /// cascade: derived writes recurse through `upsert_many_at_depth`, and a
     /// hop that would exceed `derived_max_depth` is skipped loudly.
+    ///
+    /// `trust`/`prov` are the SOURCE write's stamps: derived rows inherit the
+    /// former (weakened further by anything they join to, see
+    /// [`weakest_trust`]) and carry a derivation-identifying twin of the
+    /// latter (see [`Datasets::derived_provenance`]).
+    #[allow(clippy::too_many_arguments)]
     async fn apply_derived(
         &self,
         app: &str,
@@ -2078,6 +2179,8 @@ impl Datasets {
         items: &[(String, Value)],
         summary: &UpsertSummary,
         depth: u32,
+        trust: Option<&str>,
+        prov: Option<&Provenance>,
     ) {
         let specs = match self.enabled_derived(app, dataset).await {
             Ok(s) if !s.is_empty() => s,
@@ -2106,19 +2209,26 @@ impl Datasets {
                 // Aggregate spec (v2): recompute only the groups this batch
                 // touched, from source truth. Same fail-open stance.
                 if let Err(e) = self
-                    .apply_derived_group(spec, group, &by_key, summary, depth)
+                    .apply_derived_group(spec, group, &by_key, summary, depth, prov)
                     .await
                 {
                     tracing::warn!(spec = %spec.id, "derived: group recompute failed: {e}");
                 }
                 continue;
             }
-            let mut out: Vec<(String, Value)> = Vec::new();
+            let filters = match parse_filter_specs(&spec.filters) {
+                Ok(f) => f,
+                Err(e) => {
+                    tracing::error!(spec = %spec.id, "derived: unparseable filters, spec skipped: {e}");
+                    continue;
+                }
+            };
+            let mut out: Vec<DerivedRowOut> = Vec::new();
             for key in summary.fresh_keys() {
                 let Some(data) = by_key.get(key.as_str()) else {
                     continue;
                 };
-                match self.derive_row(spec, key, data).await {
+                match self.derive_row(spec, &filters, key, data, trust).await {
                     Ok(Some(row)) => out.push(row),
                     Ok(None) => {}
                     Err(e) => {
@@ -2129,10 +2239,8 @@ impl Datasets {
             if out.is_empty() {
                 continue;
             }
-            if let Err(e) = self
-                .upsert_many_at_depth(app, &spec.target_dataset, &out, None, None, depth + 1)
-                .await
-            {
+            let stamp = self.derived_provenance(spec, prov).await;
+            if let Err(e) = self.upsert_derived_rows(spec, out, &stamp, depth + 1).await {
                 tracing::warn!(spec = %spec.id, target = %spec.target_dataset,
                                "derived: target upsert failed: {e}");
             }
@@ -2141,17 +2249,24 @@ impl Datasets {
 
     /// Applies one spec to one source record: filter → project → lookup-merge.
     /// `Ok(None)` = filtered out; the derived key is the source key (1:1).
+    ///
+    /// `filters` is passed in already parsed (once per batch, not once per
+    /// record), and `source_trust` is the trust of the record being derived
+    /// from; the returned row carries [`weakest_trust`] of that and of any
+    /// record it joined to.
     async fn derive_row(
         &self,
         spec: &DerivedSpec,
+        filters: &[JsonFilter],
         key: &str,
         data: &Value,
-    ) -> Result<Option<(String, Value)>> {
-        let filters = parse_filter_specs(&spec.filters)?;
-        if !filters_match(&filters, data) {
+        source_trust: Option<&str>,
+    ) -> Result<Option<DerivedRowOut>> {
+        if !filters_match(filters, data) {
             return Ok(None);
         }
         let mut value = project_value(&spec.project, data);
+        let mut joined_trust: Option<String> = None;
         if let Some(lookup) = &spec.lookup {
             // Single-key join: resolve the key expression against the SOURCE
             // record, fetch from the sibling dataset, merge under `merge_as`.
@@ -2160,6 +2275,7 @@ impl Datasets {
             if let Some(lk) = lookup_json_path(data, &lookup.key_expr).and_then(value_text) {
                 if let Some(rec) = self.get(&spec.source_app, &lookup.dataset, &lk).await? {
                     if rec.removed_at.is_none() {
+                        joined_trust = Some(rec.trust.clone());
                         if let Value::Object(map) = &mut value {
                             map.insert(lookup.merge_as.clone(), rec.data);
                         }
@@ -2167,7 +2283,8 @@ impl Datasets {
                 }
             }
         }
-        Ok(Some((key.to_string(), value)))
+        let trust = weakest_trust([source_trust, joined_trust.as_deref()]);
+        Ok(Some((key.to_string(), value, trust)))
     }
 
     /// Materializes one spec over the existing live source rows in bounded
@@ -2182,6 +2299,11 @@ impl Datasets {
         if let Some(group) = &spec.group {
             return self.backfill_derived_group(spec, group, batch).await;
         }
+        // Parsed ONCE for the whole backfill — the live path hoists it per
+        // batch and the group path always did; only this loop re-parsed the
+        // spec's filter grammar for every source record it scanned.
+        let filters = parse_filter_specs(&spec.filters)?;
+        let stamp = self.derived_provenance(spec, None).await;
         let mut report = DerivedBackfill::default();
         let mut after: Option<(String, String)> = None;
         loop {
@@ -2189,28 +2311,22 @@ impl Datasets {
                 .list_page(&spec.source_app, &spec.source_dataset, after, batch, None)
                 .await?;
             let n = page.len() as i64;
-            let mut items: Vec<(String, Value)> = Vec::new();
+            let mut items: Vec<DerivedRowOut> = Vec::new();
             for rec in &page {
                 if rec.removed_at.is_some() {
                     continue;
                 }
                 report.scanned += 1;
-                if let Some(row) = self.derive_row(spec, &rec.key, &rec.data).await? {
+                if let Some(row) = self
+                    .derive_row(spec, &filters, &rec.key, &rec.data, Some(&rec.trust))
+                    .await?
+                {
                     items.push(row);
                 }
             }
             report.matched += items.len() as u64;
             if !items.is_empty() {
-                let s = self
-                    .upsert_many_at_depth(
-                        &spec.source_app,
-                        &spec.target_dataset,
-                        &items,
-                        None,
-                        None,
-                        1,
-                    )
-                    .await?;
+                let s = self.upsert_derived_rows(spec, items, &stamp, 1).await?;
                 report.new += s.new.len() as u64;
                 report.changed += s.changed.len() as u64;
                 report.unchanged += s.unchanged as u64;
@@ -2232,6 +2348,7 @@ impl Datasets {
     /// because it re-reads the source rows of the group, never applies deltas;
     /// the `max_group_scan` bound is what keeps it honest — an oversized group
     /// gets a `stale: true` row instead of a number we didn't fully compute.
+    #[allow(clippy::too_many_arguments)]
     async fn apply_derived_group(
         &self,
         spec: &DerivedSpec,
@@ -2239,6 +2356,7 @@ impl Datasets {
         by_key: &std::collections::HashMap<&str, &Value>,
         summary: &UpsertSummary,
         depth: u32,
+        prov: Option<&Provenance>,
     ) -> Result<()> {
         let filters = parse_filter_specs(&spec.filters)?;
         let aggs = parse_aggregates(&group.aggregates)?;
@@ -2263,7 +2381,7 @@ impl Datasets {
                 }
             }
         }
-        self.recompute_groups(spec, group, &filters, &aggs, tuples, depth)
+        self.recompute_groups(spec, group, &filters, &aggs, tuples, depth, prov)
             .await
     }
 
@@ -2308,6 +2426,7 @@ impl Datasets {
 
     /// Recomputes each tuple's group row from the live source rows and upserts
     /// the batch into the target at `depth + 1`.
+    #[allow(clippy::too_many_arguments)]
     async fn recompute_groups(
         &self,
         spec: &DerivedSpec,
@@ -2316,11 +2435,12 @@ impl Datasets {
         aggs: &std::collections::BTreeMap<String, Aggregate>,
         tuples: std::collections::HashSet<Vec<String>>,
         depth: u32,
+        prov: Option<&Provenance>,
     ) -> Result<()> {
         if tuples.is_empty() {
             return Ok(());
         }
-        let mut out: Vec<(String, Value)> = Vec::new();
+        let mut out: Vec<DerivedRowOut> = Vec::new();
         for tuple in tuples {
             match self
                 .recompute_group_row(spec, group, filters, aggs, &tuple)
@@ -2335,15 +2455,9 @@ impl Datasets {
         if out.is_empty() {
             return Ok(());
         }
-        self.upsert_many_at_depth(
-            &spec.source_app,
-            &spec.target_dataset,
-            &out,
-            None,
-            None,
-            depth + 1,
-        )
-        .await?;
+        let stamp = self.derived_provenance(spec, prov).await;
+        self.upsert_derived_rows(spec, out, &stamp, depth + 1)
+            .await?;
         Ok(())
     }
 
@@ -2352,6 +2466,12 @@ impl Datasets {
     /// aggregate. Over the bound, the row is `{group fields, stale: true}` with
     /// NO aggregate fields — absent, not wrong. The derived key is the group
     /// values joined with `|` (escaped, see [`group_row_key`]).
+    ///
+    /// The row's trust is [`weakest_trust`] over the members that were scanned:
+    /// an aggregate is a claim about its whole group, so one provisional member
+    /// makes the number provisional. (An oversized group carries the weakest
+    /// trust of the rows we *looked at* — the row is already `stale: true` and
+    /// makes no aggregate claim.)
     async fn recompute_group_row(
         &self,
         spec: &DerivedSpec,
@@ -2359,7 +2479,7 @@ impl Datasets {
         filters: &[JsonFilter],
         aggs: &std::collections::BTreeMap<String, Aggregate>,
         tuple: &[String],
-    ) -> Result<(String, Value)> {
+    ) -> Result<DerivedRowOut> {
         let rows = self
             .group_source_rows(
                 &spec.source_app,
@@ -2370,6 +2490,7 @@ impl Datasets {
                 self.max_group_scan + 1,
             )
             .await?;
+        let trust = weakest_trust(rows.iter().map(|(_, t)| Some(t.as_str())));
         let mut data = serde_json::Map::new();
         for (path, value) in group.group_by.iter().zip(tuple) {
             data.insert(
@@ -2379,7 +2500,7 @@ impl Datasets {
         }
         if rows.len() as i64 > self.max_group_scan {
             data.insert("stale".into(), Value::Bool(true));
-            return Ok((group_row_key(tuple), Value::Object(data)));
+            return Ok((group_row_key(tuple), Value::Object(data), trust));
         }
         data.insert("stale".into(), Value::Bool(false));
         for (out, agg) in aggs {
@@ -2388,7 +2509,7 @@ impl Datasets {
                 Aggregate::Sum(path) => {
                     let sum: f64 = rows
                         .iter()
-                        .filter_map(|r| lookup_json_path(r, path).and_then(Value::as_f64))
+                        .filter_map(|(r, _)| lookup_json_path(r, path).and_then(Value::as_f64))
                         .sum();
                     // Whole sums render as integers so counts-of-cents style
                     // data doesn't grow a spurious `.0`.
@@ -2401,7 +2522,7 @@ impl Datasets {
             };
             data.insert(out.clone(), v);
         }
-        Ok((group_row_key(tuple), Value::Object(data)))
+        Ok((group_row_key(tuple), Value::Object(data), trust))
     }
 
     /// Live source rows of ONE group (spec filters ANDed with the group-value
@@ -2417,9 +2538,9 @@ impl Datasets {
         group_by: &[String],
         tuple: &[String],
         limit: i64,
-    ) -> Result<Vec<Value>> {
+    ) -> Result<Vec<(Value, String)>> {
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
-            "SELECT data FROM records WHERE removed_at IS NULL AND app = ",
+            "SELECT data, trust FROM records WHERE removed_at IS NULL AND app = ",
         );
         qb.push_bind(app);
         qb.push(" AND dataset = ");
@@ -2435,10 +2556,15 @@ impl Datasets {
         }
         qb.push(" LIMIT ");
         qb.push_bind(limit);
-        let raw: Vec<(String,)> = qb.build_query_as().fetch_all(&self.pool).await?;
+        let raw: Vec<(String, Option<String>)> = qb.build_query_as().fetch_all(&self.pool).await?;
         Ok(raw
             .into_iter()
-            .map(|(d,)| serde_json::from_str(&d).unwrap_or(Value::Null))
+            .map(|(d, t)| {
+                (
+                    serde_json::from_str(&d).unwrap_or(Value::Null),
+                    trust_label(t.as_deref()),
+                )
+            })
             .collect())
     }
 
@@ -2488,7 +2614,7 @@ impl Datasets {
                 }
             }
             if let Err(e) = self
-                .recompute_groups(spec, group, &filters, &aggs, tuples, 0)
+                .recompute_groups(spec, group, &filters, &aggs, tuples, 0, None)
                 .await
             {
                 tracing::warn!(spec = %spec.id, "derived: removal recompute failed: {e}");
@@ -2512,11 +2638,11 @@ impl Datasets {
         let filters = parse_filter_specs(&spec.filters)?;
         let aggs = parse_aggregates(&group.aggregates)?;
         let mut report = DerivedBackfill::default();
-        // tuple -> (count, per-aggregate sums keyed like `aggs`)
-        let mut groups: std::collections::HashMap<
-            Vec<String>,
-            (u64, std::collections::BTreeMap<String, f64>),
-        > = Default::default();
+        // tuple -> (count, per-aggregate sums keyed like `aggs`, weakest member
+        // trust). The trust accumulator is the streaming twin of
+        // `recompute_group_row`'s `weakest_trust` over the scanned members.
+        let mut groups: std::collections::HashMap<Vec<String>, GroupAccumulator> =
+            Default::default();
         let mut after: Option<(String, String)> = None;
         loop {
             let page = self
@@ -2536,6 +2662,7 @@ impl Datasets {
                 };
                 let entry = groups.entry(tuple).or_default();
                 entry.0 += 1;
+                entry.2 = weakest_trust([entry.2.as_deref(), Some(rec.trust.as_str())]);
                 for (out, agg) in &aggs {
                     if let Aggregate::Sum(path) = agg {
                         if let Some(v) = lookup_json_path(&rec.data, path).and_then(Value::as_f64) {
@@ -2549,8 +2676,8 @@ impl Datasets {
             }
             after = page.last().map(|r| (ts(r.updated_at), r.key.clone()));
         }
-        let mut out: Vec<(String, Value)> = Vec::new();
-        for (tuple, (count, sums)) in &groups {
+        let mut out: Vec<DerivedRowOut> = Vec::new();
+        for (tuple, (count, sums, trust)) in &groups {
             let mut data = serde_json::Map::new();
             for (path, value) in group.group_by.iter().zip(tuple) {
                 data.insert(
@@ -2573,13 +2700,12 @@ impl Datasets {
                 };
                 data.insert(name.clone(), v);
             }
-            out.push((group_row_key(tuple), Value::Object(data)));
+            out.push((group_row_key(tuple), Value::Object(data), trust.clone()));
         }
         report.matched = out.len() as u64;
         if !out.is_empty() {
-            let s = self
-                .upsert_many_at_depth(&spec.source_app, &spec.target_dataset, &out, None, None, 1)
-                .await?;
+            let stamp = self.derived_provenance(spec, None).await;
+            let s = self.upsert_derived_rows(spec, out, &stamp, 1).await?;
             report.new += s.new.len() as u64;
             report.changed += s.changed.len() as u64;
             report.unchanged += s.unchanged as u64;
@@ -2863,27 +2989,115 @@ pub(crate) struct DerivedRow {
     pub(crate) created_at: String,
 }
 
+/// Parses the stored `lookup` column into its two mutually-exclusive shapes.
+///
+/// The column holds either a [`DerivedLookup`] or a [`DerivedGroup`]; their
+/// required fields are disjoint, so the untagged parse is unambiguous. An
+/// absent/blank column is a plain filter/project spec.
+///
+/// **A value that is present and unparseable is an error, never `(None, None)`.**
+/// Swallowing the parse degraded a lookup/group spec into a *passthrough*: the
+/// spec kept running and kept writing rows of the wrong shape — an aggregate
+/// dataset silently refilled with raw source rows, with no error anywhere. A
+/// spec we cannot read is a spec we must not run.
+pub fn parse_stored_join(
+    raw: Option<&str>,
+) -> Result<(Option<DerivedLookup>, Option<DerivedGroup>)> {
+    #[derive(serde::Deserialize)]
+    #[serde(untagged)]
+    enum StoredJoin {
+        Lookup(DerivedLookup),
+        Group(DerivedGroup),
+    }
+    let Some(raw) = raw.map(str::trim).filter(|s| !s.is_empty()) else {
+        return Ok((None, None));
+    };
+    match serde_json::from_str::<StoredJoin>(raw) {
+        Ok(StoredJoin::Lookup(l)) => Ok((Some(l), None)),
+        Ok(StoredJoin::Group(g)) => Ok((None, Some(g))),
+        Err(e) => Err(Error::Parse(format!(
+            "derived spec's stored lookup/group column is unparseable ({e}); \
+             refusing to run it as a passthrough"
+        ))),
+    }
+}
+
+/// One group's streaming accumulator during an aggregate backfill: `(member
+/// count, per-aggregate sums keyed like the parsed aggregates, weakest member
+/// trust)`.
+type GroupAccumulator = (u64, std::collections::BTreeMap<String, f64>, Option<String>);
+
+/// One shaped derived row on its way to the target dataset: `(key, data,
+/// inherited trust)`, where the trust is `None` for `stable` exactly as the
+/// column's NULL means.
+pub(crate) type DerivedRowOut = (String, Value, Option<String>);
+
+/// Groups derived rows by the trust they inherited, so each group can be
+/// written with its own stamp. Ordered (BTreeMap) so the write order of a batch
+/// is deterministic.
+pub(crate) fn partition_by_trust(
+    rows: Vec<DerivedRowOut>,
+) -> std::collections::BTreeMap<Option<String>, Vec<(String, Value)>> {
+    let mut out: std::collections::BTreeMap<Option<String>, Vec<(String, Value)>> =
+        Default::default();
+    for (key, data, trust) in rows {
+        out.entry(trust).or_default().push((key, data));
+    }
+    out
+}
+
+/// Parses stored spec rows, dropping — **loudly** — any row this build cannot
+/// read. A corrupt spec must not run (that is [`parse_stored_join`]'s job) and
+/// must not take its siblings down with it: one unreadable row would otherwise
+/// fail the whole `enabled_derived` read and silently disable every other
+/// spec on the same source.
+pub(crate) fn specs_from_rows(rows: Vec<DerivedRow>, context: &str) -> Vec<DerivedSpec> {
+    rows.into_iter()
+        .filter_map(|r| {
+            let id = r.id.clone();
+            match DerivedSpec::try_from(r) {
+                Ok(spec) => Some(spec),
+                Err(e) => {
+                    tracing::error!(
+                        spec = %id,
+                        context,
+                        "derived: spec is unreadable and was SKIPPED (not run as a passthrough): {e}"
+                    );
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
+/// Canonical JSON identity of a derivation — every input that decides what the
+/// derived rows look like (the spec id, its source/target and its
+/// filter/project/lookup/group shape).
+///
+/// Hashed with [`rules_hash`] and registered in `rules_versions`, this is a
+/// derived revision's [`Provenance::rules_hash`]: the derived-dataset twin of
+/// the extractor's RuleSet stamp, and the same idiom (migration 0030) — the
+/// hash IS the identity, so re-registration is free and an edited spec hashes
+/// apart from the rows written under its previous shape.
+pub fn derived_spec_fingerprint(spec: &DerivedSpec) -> Value {
+    serde_json::json!({
+        "kind": "derived_spec",
+        "id": spec.id,
+        "source_app": spec.source_app,
+        "source_dataset": spec.source_dataset,
+        "target_dataset": spec.target_dataset,
+        "filters": spec.filters,
+        "project": spec.project,
+        "lookup": spec.lookup.as_ref().and_then(|l| serde_json::to_value(l).ok()),
+        "group": spec.group.as_ref().and_then(|g| serde_json::to_value(g).ok()),
+    })
+}
+
 impl TryFrom<DerivedRow> for DerivedSpec {
     type Error = Error;
 
     fn try_from(r: DerivedRow) -> Result<DerivedSpec> {
-        // The `lookup` column holds either shape; their required fields are
-        // disjoint, so the untagged parse is unambiguous.
-        #[derive(serde::Deserialize)]
-        #[serde(untagged)]
-        enum StoredJoin {
-            Lookup(DerivedLookup),
-            Group(DerivedGroup),
-        }
-        let (lookup, group) = match r
-            .lookup
-            .as_deref()
-            .and_then(|s| serde_json::from_str::<StoredJoin>(s).ok())
-        {
-            Some(StoredJoin::Lookup(l)) => (Some(l), None),
-            Some(StoredJoin::Group(g)) => (None, Some(g)),
-            None => (None, None),
-        };
+        let (lookup, group) = parse_stored_join(r.lookup.as_deref())?;
         Ok(DerivedSpec {
             id: r.id,
             source_app: r.source_app,
@@ -3457,6 +3671,100 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// A derived value is only as trusted as its weakest input — the whole
+    /// point of the function. Averaging, majority or "first wins" would let a
+    /// quarantined row wash into a stable-looking derived one.
+    #[test]
+    fn weakest_trust_is_the_floor_not_the_majority() {
+        // Stable in, stable out (expressed as None, the column's NULL).
+        assert_eq!(weakest_trust([None, Some("stable")]), None);
+        // One weak input decides the whole row, whichever side it arrives on.
+        assert_eq!(
+            weakest_trust([None, Some("provisional")]),
+            Some("provisional".to_string())
+        );
+        assert_eq!(
+            weakest_trust([Some("provisional"), None]),
+            Some("provisional".to_string())
+        );
+        // Quarantined beats provisional: the floor, not the last value seen.
+        assert_eq!(
+            weakest_trust([Some("provisional"), Some("quarantined"), None]),
+            Some("quarantined".to_string())
+        );
+        // An unknown label is treated as the weakest thing there is, never as
+        // "probably fine".
+        assert_eq!(
+            weakest_trust([Some("quarantined"), Some("martian")]),
+            Some("martian".to_string())
+        );
+        // Nothing in, nothing claimed.
+        assert_eq!(weakest_trust([]), None);
+    }
+
+    /// An unreadable `lookup`/`group` column must ERROR, because the old
+    /// `.ok()` turned it into `(None, None)` — a lookup/aggregate spec silently
+    /// demoted to a whole-record passthrough that kept writing wrong-shaped
+    /// rows into the target dataset.
+    #[test]
+    fn corrupt_stored_join_errors_not_silently_passthrough() {
+        // Absent / blank = an honest plain filter+project spec.
+        assert!(matches!(parse_stored_join(None), Ok((None, None))));
+        assert!(matches!(parse_stored_join(Some("   ")), Ok((None, None))));
+        // Both real shapes still parse.
+        let (lookup, group) =
+            parse_stored_join(Some(r#"{"dataset":"d","key_expr":"$.k","merge_as":"m"}"#)).unwrap();
+        assert!(lookup.is_some() && group.is_none());
+        let (lookup, group) = parse_stored_join(Some(
+            r#"{"group_by":["$.state"],"aggregates":{"n":"count"}}"#,
+        ))
+        .unwrap();
+        assert!(group.is_some() && lookup.is_none());
+        // Truncated JSON, and well-formed JSON of neither shape: both loud.
+        assert!(parse_stored_join(Some(r#"{"dataset":"d","key_e"#)).is_err());
+        assert!(parse_stored_join(Some(r#"{"nonsense":true}"#)).is_err());
+    }
+
+    /// The fingerprint must move when the derivation moves — otherwise rows
+    /// written under an edited spec claim the provenance of the old one.
+    #[test]
+    fn derived_fingerprint_tracks_the_shape_not_just_the_id() {
+        let base = DerivedSpec {
+            id: "d1".into(),
+            source_app: "app".into(),
+            source_dataset: "src".into(),
+            target_dataset: "tgt".into(),
+            filters: vec!["$.state:eq:CA".into()],
+            project: [("n".to_string(), "$.n".to_string())].into_iter().collect(),
+            lookup: None,
+            group: None,
+            enabled: true,
+            created_at: Utc::now(),
+        };
+        let h = rules_hash(&derived_spec_fingerprint(&base));
+        // `created_at`/`enabled` are not part of the derivation's identity.
+        let same = DerivedSpec {
+            enabled: false,
+            created_at: Utc::now(),
+            ..base.clone()
+        };
+        assert_eq!(rules_hash(&derived_spec_fingerprint(&same)), h);
+        // The filter set is.
+        let moved = DerivedSpec {
+            filters: vec!["$.state:eq:NY".into()],
+            ..base.clone()
+        };
+        assert_ne!(rules_hash(&derived_spec_fingerprint(&moved)), h);
+        // So is the projection.
+        let reshaped = DerivedSpec {
+            project: [("n".to_string(), "$.other".to_string())]
+                .into_iter()
+                .collect(),
+            ..base
+        };
+        assert_ne!(rules_hash(&derived_spec_fingerprint(&reshaped)), h);
+    }
 
     #[test]
     fn diff_reports_changed_added_and_dropped_fields() {

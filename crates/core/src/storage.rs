@@ -2003,7 +2003,11 @@ impl Storage {
         .bind(app)
         .fetch_all(&self.pool)
         .await?;
-        rows.into_iter().map(DerivedSpec::try_from).collect()
+        // An unreadable row is logged and skipped rather than failing the whole
+        // listing — CRUD (and cycle detection, which reads this) must keep
+        // working around one corrupt spec. `get_derived_spec` still errors when
+        // that exact spec is asked for by id.
+        Ok(crate::datasets::specs_from_rows(rows, "list_derived_specs"))
     }
 
     /// Per-spec kill-switch.
