@@ -12,9 +12,18 @@ The target job's params = template with `_trigger` merged over it (injected wins
 
 ## Guarantees
 
-- **At most once per source run**: idempotency key `trig:{trigger_id}:{source_job_id}`.
+- **At most once per source run *per dataset***. A run's revision batch is grouped by dataset and each group is evaluated separately, so a run writing three datasets fires **three** hops from one `source_dataset = '*'` trigger — each carrying only that dataset's keys. Keys:
+
+  | Hop | Idempotency key |
+  |---|---|
+  | Dataset hop (run fan-out) | `trig:{trigger_id}:{source_job_id}:ds:{dataset}` |
+  | Dataset hop (saved-search view materialization) | `trig:{trigger_id}:{source_job_id}:view:{saved_search_id}:ds:{dataset}` |
+  | Terminal-job hop | `trig:{trigger_id}:{source_job_id}` |
+  | External (ingress) hop | `trig:{trigger_id}:{event_id}` |
+
+  A materialized [saved-search view](search.md) fires its dataset triggers under the *view's* app while keeping the **source job's id** for provenance, so its key is scoped by the saved search — otherwise a view feeding the source job's own app would collide with the run's own hop. Datasets are walked in sorted order, so hop ordering within a run is stable rather than hash-random.
 - **Cycle guard**: the provenance `chain` (trigger ids) rides in `_trigger`; a repeated id skips the hop (warn log). `depth` capped by `[triggers] max_depth` (default 8).
-- **Fail-open**: evaluation errors, unregistered targets, and guard skips warn-log and never affect the source job. Batch fan-out: one target job per trigger per source run, carrying the whole capped batch.
+- **Fail-open**: evaluation errors, unregistered targets, and guard skips warn-log and never affect the source job. A dedup suppression logs at `debug` with the key that suppressed it.
 - Failed triggered jobs are ordinary failed jobs — `GET /jobs?status=failed` + `POST /jobs/{id}/retry` are the DLQ.
 - **Degrading sources don't fire.** Dataset triggers and watches read the same run revision batch, and it is filtered per dataset by extraction health before either is evaluated — a dataset whose source state suppresses outbound pushes is dropped, so no hop is enqueued from it. Per-dataset, so a break in one of an app's datasets doesn't stop the others; **no-op unless `[resilience] enforce` is on** (default off). See [events-webhooks.md](events-webhooks.md) and [resilient-extraction.md](resilient-extraction.md).
 

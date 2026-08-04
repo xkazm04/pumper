@@ -532,7 +532,11 @@ async fn gate_calls_precede_hook_calls_in_the_success_fanout() {
         "suppress_unhealthy(&state, &job.app, &mut by_dataset)",
         "enforce_contracts(&state, &job, &mut by_dataset)",
         "notify_watches(&state, &job, &by_dataset)",
-        "crate::triggers::fire_dataset_triggers(&state, &job, &by_dataset)",
+        // The run fan-out's `fire_dataset_triggers` call, pinned by its batch
+        // argument: the call itself now spans several lines (line breaks and
+        // indentation are rustfmt's and the checkout's to decide), while
+        // `DatasetBatch::Run` appears exactly once and only there.
+        "crate::triggers::DatasetBatch::Run,",
     ];
     let positions: Vec<usize> = expected.iter().map(|n| at(n)).collect();
     assert!(

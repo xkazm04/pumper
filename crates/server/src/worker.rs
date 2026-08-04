@@ -824,7 +824,13 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
             // `[contracts] enforce = true`.
             enforce_contracts(&state, &job, &mut by_dataset);
             notify_watches(&state, &job, &by_dataset).await;
-            crate::triggers::fire_dataset_triggers(&state, &job, &by_dataset).await;
+            crate::triggers::fire_dataset_triggers(
+                &state,
+                &job,
+                crate::triggers::DatasetBatch::Run,
+                &by_dataset,
+            )
+            .await;
         })
         .await;
 
@@ -1321,7 +1327,16 @@ async fn materialize_saved_search(
     view_job.app = mat.app.clone();
     let by_dataset = group_by_dataset(&changes);
     notify_watches(state, &view_job, &by_dataset).await;
-    crate::triggers::fire_dataset_triggers(state, &view_job, &by_dataset).await;
+    // The view's hops ride the SOURCE job's id (provenance), so their dedup keys
+    // are scoped by the saved search — otherwise a view whose target app is the
+    // job's own app collides with the run's own fan-out hop.
+    crate::triggers::fire_dataset_triggers(
+        state,
+        &view_job,
+        crate::triggers::DatasetBatch::View(&search.id),
+        &by_dataset,
+    )
+    .await;
 }
 
 /// Emits the terminal event and fires the result webhook, if configured.

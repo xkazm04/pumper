@@ -272,8 +272,51 @@ pub async fn apply_plugin_hooks(
 /// At-most-once-per-source-run dedup key (existing partial unique index).
 /// External triggers reuse it with the inbound event id as the source, so a
 /// redelivered webhook (same `x-pumper-delivery-id`) fires each trigger once.
+/// Terminal-job hops use it verbatim — a job has exactly one final status.
 pub fn idempotency_key(trigger_id: &str, source_job_id: &str) -> String {
     format!("trig:{trigger_id}:{source_job_id}")
+}
+
+/// Which dataset batch of a source run a hop is firing from. One job run can
+/// produce several batches — its own fan-out, plus one per saved-search view it
+/// materializes — and they are evaluated against the same source job id, so the
+/// scope is what keeps their idempotency keys apart.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatasetBatch<'a> {
+    /// The source job's own run fan-out (`worker::finalize_fanout`).
+    Run,
+    /// A saved-search view materialized during the run, by saved-search id.
+    View(&'a str),
+}
+
+impl DatasetBatch<'_> {
+    /// The key segment that separates one batch of a run from another.
+    fn key_scope(&self) -> String {
+        match self {
+            DatasetBatch::Run => String::new(),
+            DatasetBatch::View(id) => format!(":view:{id}"),
+        }
+    }
+}
+
+/// Dedup key for ONE dataset hop.
+///
+/// The anti-pattern this defends: a run that writes several datasets evaluates
+/// the same trigger once per dataset, and a key that omits the dataset makes
+/// every hop after the first look like a redelivery of the first — so exactly
+/// one arbitrary (HashMap-ordered) dataset ever fired. The dataset, and the
+/// batch the dataset came from, are both part of the identity of a hop.
+pub fn dataset_idempotency_key(
+    trigger_id: &str,
+    source_job_id: &str,
+    batch: DatasetBatch<'_>,
+    dataset: &str,
+) -> String {
+    format!(
+        "{}{}:ds:{dataset}",
+        idempotency_key(trigger_id, source_job_id),
+        batch.key_scope()
+    )
 }
 
 // ── external (ingress) matching ──────────────────────────────────────────────
@@ -363,17 +406,21 @@ pub fn external_trigger_obj(
 use std::collections::HashMap;
 
 use pumper_core::EnqueueOptions;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::state::AppState;
 
 /// Fires enabled dataset triggers matching this run's revision batch. One
-/// target job per trigger per source run (idempotency-keyed), carrying the
-/// capped key batch in `params._trigger`. Fail-open: evaluation errors are
-/// logged and never affect the source job.
+/// target job per trigger **per dataset** of the batch (idempotency-keyed),
+/// carrying that dataset's capped key list in `params._trigger`. Fail-open:
+/// evaluation errors are logged and never affect the source job.
+///
+/// Datasets are walked in sorted order so a multi-dataset run enqueues its hops
+/// in a stable sequence rather than in `HashMap` (RandomState) order.
 pub async fn fire_dataset_triggers(
     state: &AppState,
     job: &Job,
+    batch: DatasetBatch<'_>,
     by_dataset: &HashMap<&str, Vec<&Revision>>,
 ) {
     let trigs = match state.storage.enabled_triggers("dataset", &job.app).await {
@@ -385,7 +432,11 @@ pub async fn fire_dataset_triggers(
         }
     };
     let mut fired = 0;
-    for (dataset, revs) in by_dataset {
+    let mut datasets: Vec<&&str> = by_dataset.keys().collect();
+    datasets.sort_unstable();
+    for dataset in datasets {
+        let dataset = *dataset;
+        let revs = &by_dataset[dataset];
         for trigger in trigs.iter().filter(|t| t.covers_dataset(dataset)) {
             let matching: Vec<&Revision> = revs
                 .iter()
@@ -418,7 +469,8 @@ pub async fn fire_dataset_triggers(
                 &chain,
                 &state.config.triggers,
             );
-            fired += enqueue_hop(state, trigger, job, obj).await;
+            let key = dataset_idempotency_key(&trigger.id, &job.id.to_string(), batch, dataset);
+            fired += enqueue_hop(state, trigger, job, obj, key).await;
         }
     }
     if fired > 0 {
@@ -456,7 +508,8 @@ pub async fn fire_terminal_triggers(state: &AppState, job: &Job) {
             }
         };
         let obj = terminal_trigger_obj(trigger, job, depth, &chain);
-        fired += enqueue_hop(state, trigger, job, obj).await;
+        let key = idempotency_key(&trigger.id, &job.id.to_string());
+        fired += enqueue_hop(state, trigger, job, obj, key).await;
     }
     if fired > 0 {
         state.notify.notify_one();
@@ -540,7 +593,13 @@ pub async fn fire_external_triggers(
                       app = %trigger.target_app, "external trigger fired");
                 fired += 1;
             }
-            Ok((_, false)) => {} // already fired for this event id (redelivery)
+            Ok((_, false)) => {
+                // Already fired for this event id — the redelivery case, which
+                // is the point of the key, but it must still be observable.
+                debug!(trigger = %trigger.id, event = %event_id,
+                       key = %idempotency_key(&trigger.id, event_id),
+                       "external trigger hop suppressed: a job already exists for this event");
+            }
             Err(e) => {
                 warn!(trigger = %trigger.id, event = %event_id, "external trigger enqueue failed: {e}");
             }
@@ -552,9 +611,15 @@ pub async fn fire_external_triggers(
     fired
 }
 
-/// Enqueues one triggered hop (dedup-guarded). Returns 1 when a job was
-/// actually created, 0 when skipped/deduped/failed.
-async fn enqueue_hop(state: &AppState, trigger: &Trigger, source: &Job, obj: Value) -> usize {
+/// Enqueues one triggered hop under `key` (dedup-guarded). Returns 1 when a job
+/// was actually created, 0 when skipped/deduped/failed.
+async fn enqueue_hop(
+    state: &AppState,
+    trigger: &Trigger,
+    source: &Job,
+    obj: Value,
+    key: String,
+) -> usize {
     // Plugin hooks first: a predicate may veto the hop, a transform may shape
     // the `_trigger` envelope. Both fail open (see `apply_plugin_hooks`).
     let Some(obj) = apply_plugin_hooks(state.plugins.as_ref(), trigger, obj).await else {
@@ -570,7 +635,7 @@ async fn enqueue_hop(state: &AppState, trigger: &Trigger, source: &Job, obj: Val
         max_attempts: trigger.max_attempts,
         priority: trigger.priority,
         budget_usd: trigger.budget_usd,
-        idempotency_key: Some(idempotency_key(&trigger.id, &source.id.to_string())),
+        idempotency_key: Some(key.clone()),
         trigger_id: Some(trigger.id.clone()),
         // Reverse lineage: `trigger_id` says which trigger fired the hop, this
         // says which run's outcome did. `GET /jobs/{id}/receipt` reads it to
@@ -584,7 +649,14 @@ async fn enqueue_hop(state: &AppState, trigger: &Trigger, source: &Job, obj: Val
                   app = %trigger.target_app, "trigger fired");
             1
         }
-        Ok((_, false)) => 0, // already fired for this source run
+        Ok((_, false)) => {
+            // Not silent: a suppression that is CORRECT (a re-run of the same
+            // batch) and one that is a key collision look identical from the
+            // outside, so the key that suppressed it is part of the record.
+            debug!(trigger = %trigger.id, source = %source.id, key = %key,
+                   "trigger hop suppressed: a job already exists for this idempotency key");
+            0
+        }
         Err(e) => {
             warn!(trigger = %trigger.id, source = %source.id, "trigger enqueue failed: {e}");
             0
@@ -660,6 +732,47 @@ mod tests {
         assert_eq!(idempotency_key("T1", "J1"), "trig:T1:J1");
         assert_ne!(idempotency_key("T1", "J1"), idempotency_key("T1", "J2"));
         assert_ne!(idempotency_key("T1", "J1"), idempotency_key("T2", "J1"));
+    }
+
+    #[test]
+    fn dataset_hop_key_is_per_dataset_not_per_run() {
+        // The bug: two datasets of ONE run collapsing onto one key, so the
+        // second dataset's hop is dedup-suppressed as if it were a redelivery.
+        let a = dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "grants");
+        let b = dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "orgs");
+        assert_ne!(a, b, "one key per dataset, not one per run");
+        assert_eq!(a, "trig:T1:J1:ds:grants");
+        // Still per trigger and per source run.
+        assert_ne!(
+            a,
+            dataset_idempotency_key("T2", "J1", DatasetBatch::Run, "grants")
+        );
+        assert_ne!(
+            a,
+            dataset_idempotency_key("T1", "J2", DatasetBatch::Run, "grants")
+        );
+        // …and stable: the same (trigger, run, batch, dataset) always re-derives.
+        assert_eq!(
+            a,
+            dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "grants")
+        );
+    }
+
+    #[test]
+    fn view_hop_key_does_not_collide_with_the_run_fanout_hop() {
+        // A saved-search materialization re-badges the SOURCE job, so its hops
+        // carry the same job id as the run's own fan-out. Same trigger, same
+        // dataset, same job — only the batch differs, and that must be enough.
+        let run = dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "d");
+        let view = dataset_idempotency_key("T1", "J1", DatasetBatch::View("S1"), "d");
+        assert_ne!(run, view);
+        // Two views materialized by the same run are distinct too.
+        let other = dataset_idempotency_key("T1", "J1", DatasetBatch::View("S2"), "d");
+        assert_ne!(view, other);
+        // And a dataset hop never collides with the terminal-job hop of the
+        // same run (they belong to different trigger kinds, but the keyspace
+        // must not depend on that).
+        assert_ne!(run, idempotency_key("T1", "J1"));
     }
 
     // ── external (ingress) matching ──────────────────────────────────────────
