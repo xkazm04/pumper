@@ -9,3 +9,7 @@ async-trait.workspace = true
 serde_json.workspace = true
 chrono.workspace = true
 grants-common.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+pumper-core = { workspace = true, features = ["test-support"] }

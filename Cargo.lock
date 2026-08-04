@@ -377,6 +377,7 @@ dependencies = [
  "grants-common",
  "pumper-core",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

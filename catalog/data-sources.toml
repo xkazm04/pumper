@@ -45,7 +45,7 @@ cron = "0 0 9 * * *"
 status = "live"
 confidence = 5
 dataset = "opportunities"
-notes = "POST-only (bare GET = 403). Verified live: 1366 posted opps, dedup confirmed."
+notes = "POST-only (bare GET = 403). Verified live: 1366 posted opps, dedup confirmed. Scheduled runs also harvest fetchOpportunity details (harvestDetails default true since 2026-08-04, delta-only + capped) into grants/opportunity_details — the only source of federal award amounts, since Search2 publishes none. That stage is non-fatal to the listing: failures are counted in the result's detailsFailed."
 
 # Declared data contract (M20): the floor every publish must clear. Fields are
 # the raw Search2 hit shape live-verified 2026-07-30 (`id` arrives as string OR

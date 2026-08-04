@@ -17,12 +17,23 @@
 //! is why federal money is joined in from the detail corpus below rather than
 //! read from the listing.
 //!
-//! Detail harvest (`harvestDetails: true`, default OFF): for opportunities the
-//! sync just reported NEW or CHANGED (never the whole corpus), fetch the full
-//! announcement record and store it into `grants/opportunity_details` keyed by
-//! opportunity id, with a structured `requirements` block extracted from the
-//! synopsis fields and the NOFO attachment manifest (URLs + metadata only —
-//! v1 does NO PDF fetching or parsing; a later pass can pull the documents).
+//! Detail harvest (`harvestDetails`, default **ON** since 2026-08-04): for
+//! opportunities the sync just reported NEW or CHANGED (never the whole
+//! corpus), fetch the full announcement record and store it into
+//! `grants/opportunity_details` keyed by opportunity id, with a structured
+//! `requirements` block extracted from the synopsis fields and the NOFO
+//! attachment manifest (URLs + metadata only — v1 does NO PDF fetching or
+//! parsing; a later pass can pull the documents).
+//!
+//! The stage is **non-fatal to the listing sync but never silent**: the daily
+//! federal sync's primary obligation is the listing, so a fetchOpportunity
+//! outage or contract drift is COUNTED into the result's `detailsFailed` (plus
+//! a `details.errors[]` sample and a `warnings` entry) instead of failing the
+//! job, and a run of `DETAIL_CONSECUTIVE_FAILURE_ABORT` back-to-back failures
+//! stops the stage early rather than burning the whole cap on a dead endpoint.
+//! Because coverage is exactly what the harvest has SEEN, federal `min_award`
+//! coverage grows forward from the day the harvest was switched on — a
+//! corpus-wide backfill is a deliberate non-goal.
 //!
 //! fetchOpportunity contract (pinned 2026-07-30; the envelope, `data` shape and
 //! the money/count fields were VERIFIED LIVE 2026-08-04 against opportunities
@@ -81,8 +92,9 @@ impl ScrapeApp for GrantsGov {
          Params: {\"oppStatuses\": \"posted|forecasted\", \"keyword\": \"\", \
          \"eligibilities\": \"\" (pipe-separated grants.gov codes, e.g. 12|13|25|99 \
          for nonprofits), \"rows\": 1-1000, \"maxPages\": 1-100, \
-         \"harvestDetails\": false (fetchOpportunity details for new/changed \
-         opps into grants/opportunity_details), \"maxDetailsPerRun\": 1-500}"
+         \"harvestDetails\": true (fetchOpportunity details for new/changed \
+         opps into grants/opportunity_details; non-fatal — failures are counted \
+         in `detailsFailed`), \"maxDetailsPerRun\": 1-500}"
     }
 
     /// Daily full sync of open opportunities at 09:00 UTC. Scheduled runs use
@@ -92,8 +104,28 @@ impl ScrapeApp for GrantsGov {
         Some("0 0 9 * * *")
     }
 
+    /// Scheduled runs harvest details too (`harvestDetails: true`).
+    ///
+    /// The listing is this job's primary obligation; the detail harvest is a
+    /// secondary enrichment stage that exists so `grants/unified` (and therefore
+    /// `GET /grants?min_award=`) can see federal award amounts at all — Search2
+    /// publishes none. Turning it on in the default params is what makes that
+    /// coverage grow at all: the harvest is delta-only (new/changed keys) and
+    /// capped, so a daily run is tens of `fetchOpportunity` calls, never 25k.
+    ///
+    /// It is safe to schedule ONLY because the stage is non-fatal to the listing
+    /// (see [`detail_stage_is_broken`] and the harvest block in `run`): a
+    /// fetchOpportunity outage or contract drift is COUNTED into `detailsFailed`
+    /// and named in `warnings`, never allowed to take the federal listing sync
+    /// down with it — and never silently swallowed either.
     fn default_params(&self) -> Value {
-        json!({ "oppStatuses": "posted|forecasted", "rows": 1000, "maxPages": 25 })
+        json!({
+            "oppStatuses": "posted|forecasted",
+            "rows": 1000,
+            "maxPages": 25,
+            "harvestDetails": true,
+            "maxDetailsPerRun": 50
+        })
     }
 
     fn manifest(&self) -> AppManifest {
@@ -116,7 +148,7 @@ impl ScrapeApp for GrantsGov {
                     "digestDays": { "type": "integer", "minimum": 1 },
                     "harvestDetails": {
                         "type": "boolean",
-                        "description": "Fetch full opportunity details (fetchOpportunity) for opportunities this sync reported new/changed, into grants/opportunity_details. Default false."
+                        "description": "Fetch full opportunity details (fetchOpportunity) for opportunities this sync reported new/changed, into grants/opportunity_details. Default TRUE (scheduled runs harvest). The stage is non-fatal to the listing sync: failures are counted in `detailsFailed` and named in `warnings`."
                     },
                     "maxDetailsPerRun": {
                         "type": "integer", "minimum": 1, "maximum": 500,
@@ -153,10 +185,13 @@ impl ScrapeApp for GrantsGov {
             ],
             output_shape: Some(
                 "{hit_count, fetched, new, changed, unchanged, removed?, amountsFilled, \
-                 details?: {harvested, deltaTotal, capped}} — Search2 sync tallies over the \
+                 detailsFailed, details?: {harvested, deltaTotal, capped, attempted, failed, \
+                 abortedAfterConsecutiveFailures, errors}} — Search2 sync tallies over the \
                  `opportunities` dataset (keyed by opportunity id); detail harvest writes \
                  grants/opportunity_details; `amountsFilled` counts unified rows that got award \
-                 amounts joined in from that detail corpus (Search2 itself publishes none)",
+                 amounts joined in from that detail corpus (Search2 itself publishes none); \
+                 `detailsFailed` counts detail-stage failures, which degrade the enrichment \
+                 without failing the listing sync",
             ),
             cost_class: CostClass::Free,
         }
@@ -326,6 +361,13 @@ impl ScrapeApp for GrantsGov {
             .clamp(1, 500) as usize;
         let mut details_out: Option<Value> = None;
         let mut details_warning: Option<String> = None;
+        // Detail-stage failures, counted (never swallowed) so a broken secondary
+        // stage is visible in the result rather than only in a log line. Zero is
+        // a real claim here: the stage ran and nothing failed.
+        let mut details_failed: usize = 0;
+        // Appended to the result's `warnings` AFTER the unified merge (which
+        // sets that array), so a degradation is never overwritten by it.
+        let mut degradation_warnings: Vec<String> = Vec::new();
         if harvest_details {
             // Durable execution (M23). The harvest is the only genuinely long,
             // resumable unit here: one governor-paced fetchOpportunity call per
@@ -359,20 +401,58 @@ impl ScrapeApp for GrantsGov {
                 .filter(|k| !done.contains(k.as_str()))
                 .cloned()
                 .collect();
+            // NON-FATAL, LOUD. The detail stage may not take the listing sync
+            // down: the daily federal sync's primary obligation is the listing,
+            // and by this point it is already stored. But "non-fatal" must not
+            // become "invisible" — this repo runs on honest nulls and visible
+            // gaps, so every failure is counted into `details_failed`, the first
+            // few are named verbatim, and the run carries a `warnings` entry.
+            // The strict drift check inside `fetch_detail`/`extract_detail` is
+            // deliberately UNCHANGED: contract drift still produces a named
+            // error, it is now a visible degradation signal instead of a
+            // whole-job failure.
+            let mut errors: Vec<String> = Vec::new();
+            let mut consecutive = 0usize;
+            let mut aborted = false;
+            let mut attempted = 0usize;
             for key in &pending {
-                let detail = fetch_detail(&ctx, key, first_fetch).await?;
+                attempted += 1;
+                match fetch_detail(&ctx, key, first_fetch).await {
+                    Ok(detail) => {
+                        consecutive = 0;
+                        buffer.push((
+                            key.clone(),
+                            detail_record(key, by_key.get(key.as_str()).copied(), &detail),
+                        ));
+                    }
+                    Err(e) => {
+                        details_failed += 1;
+                        consecutive += 1;
+                        record_stage_error(&mut errors, format!("{key}: {e}"));
+                    }
+                }
                 first_fetch = false;
-                buffer.push((
-                    key.clone(),
-                    detail_record(key, by_key.get(key.as_str()).copied(), &detail),
-                ));
                 if buffer.len() >= DETAIL_FLUSH {
-                    flush_details(&ctx, &mut buffer, &mut done).await?;
+                    if let Err(e) = flush_details(&ctx, &mut buffer, &mut done).await {
+                        details_failed += buffer.len();
+                        record_stage_error(&mut errors, format!("detail flush failed: {e}"));
+                        buffer.clear();
+                    }
                     ctx.checkpoint(harvest_state(&delta, &done, capped, delta_total))
                         .await;
                 }
+                // A run of consecutive failures is contract drift or an outage,
+                // not flakiness: stop paying for it, but say so. Burning the
+                // whole cap against a dead endpoint would be its own waste.
+                if detail_stage_is_broken(consecutive) {
+                    aborted = true;
+                    break;
+                }
             }
-            flush_details(&ctx, &mut buffer, &mut done).await?;
+            if let Err(e) = flush_details(&ctx, &mut buffer, &mut done).await {
+                details_failed += buffer.len();
+                record_stage_error(&mut errors, format!("detail flush failed: {e}"));
+            }
             // Final snapshot is unthrottled: losing it costs a whole re-harvest.
             ctx.checkpoint_now(harvest_state(&delta, &done, capped, delta_total))
                 .await;
@@ -390,7 +470,17 @@ impl ScrapeApp for GrantsGov {
                 "deltaTotal": delta_total,
                 "capped": capped,
                 "resumedFrom": resumed_count,
+                // The degradation block: what the stage tried, what broke, and
+                // the first few reasons in the endpoint's own words.
+                "attempted": attempted,
+                "failed": details_failed,
+                "abortedAfterConsecutiveFailures": aborted,
+                "errors": errors,
             }));
+            if let Some(msg) = detail_stage_degradation(details_failed, attempted, aborted, &errors)
+            {
+                degradation_warnings.push(msg);
+            }
         }
 
         // Cross-source layer: normalize into grants/unified, sweep past-due rows
@@ -442,6 +532,10 @@ impl ScrapeApp for GrantsGov {
             // detail corpus this run — i.e. how much of the federal corpus
             // `min_award` can actually see.
             "amountsFilled": amounts_filled,
+            // Flat, greppable count of detail-stage failures this run. The stage
+            // is non-fatal to the listing, so this is the ONLY place a caller
+            // learns the enrichment degraded — it is never allowed to be absent.
+            "detailsFailed": details_failed,
             "truncated": truncated,
         });
         cross.merge_into(&mut out);
@@ -451,6 +545,9 @@ impl ScrapeApp for GrantsGov {
             }
         }
         if let Some(msg) = details_warning {
+            append_warning(&mut out, msg);
+        }
+        for msg in degradation_warnings {
             append_warning(&mut out, msg);
         }
         if truncated {
@@ -479,6 +576,65 @@ fn append_warning(out: &mut Value, msg: String) {
             }
         }
     }
+}
+
+/// Consecutive detail-stage failures after which the stage is treated as broken
+/// rather than flaky. Five in a row is not bad luck: it is a fetchOpportunity
+/// outage or a contract drift, and every remaining key would fail identically.
+const DETAIL_CONSECUTIVE_FAILURE_ABORT: usize = 5;
+
+/// How many failure reasons the result keeps verbatim. Enough to diagnose (the
+/// message names the opportunity id and the drift), bounded so a wholly-broken
+/// endpoint cannot turn the job result into a 50-entry error dump.
+const MAX_STAGE_ERRORS: usize = 3;
+
+/// Whether a run of back-to-back detail failures has proven the stage broken.
+///
+/// The anti-pattern this defends: burning the whole `maxDetailsPerRun` cap
+/// against a dead endpoint, one governor-paced round-trip at a time, because
+/// each individual failure was "non-fatal".
+fn detail_stage_is_broken(consecutive_failures: usize) -> bool {
+    consecutive_failures >= DETAIL_CONSECUTIVE_FAILURE_ABORT
+}
+
+/// Records a stage error, keeping at most [`MAX_STAGE_ERRORS`] verbatim.
+/// The COUNT is kept separately and is never truncated — losing the tally is
+/// what would turn a non-fatal stage into a silent one.
+fn record_stage_error(errors: &mut Vec<String>, msg: String) {
+    if errors.len() < MAX_STAGE_ERRORS {
+        errors.push(msg);
+    }
+}
+
+/// The human-readable warning for a degraded detail stage, or `None` when
+/// nothing failed.
+///
+/// Non-fatal is not the same as fine: a caller reading only `warnings` must
+/// still learn that the federal money join is running on a thinner corpus than
+/// it should be.
+fn detail_stage_degradation(
+    failed: usize,
+    attempted: usize,
+    aborted: bool,
+    errors: &[String],
+) -> Option<String> {
+    if failed == 0 {
+        return None;
+    }
+    let tail = if aborted {
+        format!(
+            " — stopped after {DETAIL_CONSECUTIVE_FAILURE_ABORT} consecutive failures \
+             (treated as an outage or contract drift, not flakiness)"
+        )
+    } else {
+        String::new()
+    };
+    Some(format!(
+        "detail harvest degraded: {failed} of {attempted} fetchOpportunity calls failed{tail}. \
+         The listing sync is unaffected; federal award amounts will be missing for those \
+         opportunities until a later run picks them up. First reasons: {}",
+        errors.join(" | ")
+    ))
 }
 
 /// Posted opportunities closing within `days` days, sorted soonest-first.
@@ -1170,6 +1326,192 @@ mod tests {
         assert_eq!(rec["title"], json!("Hit Title"));
         assert_eq!(rec["number"], json!("TEST-24-001"));
         assert_eq!(rec["agency"], json!("HHS"));
+    }
+
+    // ---- the detail stage is non-fatal to the listing, but never silent (G-F) ----
+
+    #[test]
+    fn scheduled_run_harvests_details_so_federal_amounts_can_ever_appear() {
+        // The overlay that fills `award_*` on federal unified rows reads the
+        // detail corpus; with the harvest off by default that corpus never
+        // grows on a scheduled run and `min_award` stays permanently empty over
+        // the largest source. The schedule uses `default_params` verbatim.
+        let p = GrantsGov.default_params();
+        assert_eq!(p["harvestDetails"], json!(true));
+        // Still delta-only and capped — enabling it must not turn the daily
+        // sweep into 25k fetchOpportunity calls.
+        assert_eq!(p["maxDetailsPerRun"], json!(50));
+        assert!(GrantsGov.schedule().is_some());
+    }
+
+    #[test]
+    fn drifted_detail_stage_degrades_loudly_it_does_not_fail_the_listing_sync() {
+        // The anti-pattern in the name is the pair of failures this guards:
+        // (a) a secondary enrichment stage taking the primary listing sync down
+        // with it, and (b) "non-fatal" quietly becoming "invisible".
+
+        // Nothing failed → no warning at all (silence is only correct here).
+        assert!(detail_stage_degradation(0, 50, false, &[]).is_none());
+
+        // A partial failure names the count, the denominator and the reason,
+        // and says in words that the listing is unaffected.
+        let errs = vec!["141593: grants.gov fetchOpportunity(141593) schema drift".to_string()];
+        let msg = detail_stage_degradation(3, 50, false, &errs).expect("degradation is reported");
+        assert!(msg.contains("3 of 50"), "{msg}");
+        assert!(msg.contains("listing sync is unaffected"), "{msg}");
+        assert!(msg.contains("schema drift"), "{msg}");
+        assert!(!msg.contains("stopped after"), "{msg}");
+
+        // A wholly-broken endpoint additionally says it stopped early, so a
+        // short `attempted` is never mistaken for a small delta.
+        let msg = detail_stage_degradation(5, 5, true, &errs).expect("degradation is reported");
+        assert!(
+            msg.contains("stopped after 5 consecutive failures"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn broken_detail_stage_stops_early_instead_of_burning_the_whole_cap() {
+        // Flaky is tolerated; broken is not paid for 50 times.
+        assert!(!detail_stage_is_broken(0));
+        assert!(!detail_stage_is_broken(4));
+        assert!(detail_stage_is_broken(5));
+        assert!(detail_stage_is_broken(50));
+
+        // The verbatim-reason list is bounded, but the tally that drives
+        // `detailsFailed` is counted separately and is never truncated.
+        let mut errors = Vec::new();
+        for i in 0..10 {
+            record_stage_error(&mut errors, format!("e{i}"));
+        }
+        assert_eq!(errors.len(), MAX_STAGE_ERRORS);
+        assert_eq!(errors[0], "e0");
+    }
+
+    #[test]
+    fn detail_drift_check_stays_strict_under_the_non_fatal_stage() {
+        // Making the STAGE non-fatal must not soften the CONTRACT check: a
+        // drifted envelope is still an error (now counted, not swallowed), and
+        // `extract_detail` still refuses to hand back an unrecognizable object.
+        assert!(extract_detail(&json!({ "data": { "unexpected": true } })).is_none());
+        assert!(extract_detail(&json!({ "data": Value::Null })).is_none());
+        // …while a real envelope still passes, so the strictness is not blanket.
+        assert!(extract_detail(&json!({ "errorcode": 0, "data": sample_detail() })).is_some());
+    }
+
+    /// A Search2 endpoint that always answers, paired with a fetchOpportunity
+    /// endpoint that is broken in the given way — the shape of the outage this
+    /// stage now has to survive.
+    struct ScriptedGrantsGov {
+        detail: DetailFailure,
+    }
+
+    #[derive(Clone, Copy)]
+    enum DetailFailure {
+        /// The envelope parses but `data` is unrecognizable — exactly what the
+        /// UNCHANGED strict drift check in `extract_detail` refuses.
+        Drift,
+        /// The endpoint is down.
+        Http500,
+    }
+
+    #[async_trait]
+    impl pumper_core::HttpClient for ScriptedGrantsGov {
+        async fn fetch(&self, req: HttpRequest) -> Result<pumper_core::HttpResponse> {
+            let (status, body) = if req.url.contains("search2") {
+                (
+                    200,
+                    json!({
+                        "errorcode": 0,
+                        "data": {
+                            "hitCount": 2,
+                            "oppHits": [
+                                { "id": "141593", "number": "P12AC10113", "title": "Vegetation interns",
+                                  "agency": "DOI", "oppStatus": "posted", "closeDate": "08/15/2099" },
+                                { "id": "357305", "number": "TEST-24-002", "title": "Rural Health",
+                                  "agency": "HHS", "oppStatus": "posted", "closeDate": "09/30/2099" }
+                            ]
+                        }
+                    })
+                    .to_string(),
+                )
+            } else {
+                match self.detail {
+                    DetailFailure::Drift => (
+                        200,
+                        json!({ "errorcode": 0, "data": { "renamed": true } }).to_string(),
+                    ),
+                    DetailFailure::Http500 => (500, "gateway is down".to_string()),
+                }
+            };
+            Ok(pumper_core::HttpResponse {
+                status,
+                headers: HashMap::new(),
+                body,
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    async fn run_with_broken_details(detail: DetailFailure) -> Value {
+        let store = pumper_core::testing::TempStore::new("grants-gov-details").await;
+        let engines = pumper_core::testing::engines_with(
+            std::sync::Arc::new(ScriptedGrantsGov { detail }),
+            std::sync::Arc::new(pumper_core::testing::Dead),
+            std::sync::Arc::new(pumper_core::testing::Dead),
+        );
+        let ctx = pumper_core::testing::TestContext::new(&store.storage, "grants-gov")
+            .params(GrantsGov.default_params())
+            .engines(engines)
+            .build();
+        GrantsGov
+            .run(ctx)
+            .await
+            .expect("a broken DETAIL stage must never fail the LISTING sync")
+    }
+
+    #[tokio::test]
+    async fn a_failing_detail_stage_leaves_the_listing_green_and_the_failure_counted() {
+        for (label, mode) in [
+            ("contract drift", DetailFailure::Drift),
+            ("endpoint down", DetailFailure::Http500),
+        ] {
+            let out = run_with_broken_details(mode).await;
+
+            // The listing — this job's primary obligation — completed in full.
+            assert_eq!(out["fetched"], json!(2), "{label}");
+            assert_eq!(out["new"], json!(2), "{label}");
+            assert_eq!(out["hitCount"], json!(2), "{label}");
+            assert_eq!(out["truncated"], json!(false), "{label}");
+            assert_eq!(out["unified"]["new"], json!(2), "{label}");
+
+            // …and the secondary stage's failure is COUNTED, not swallowed.
+            assert_eq!(out["detailsFailed"], json!(2), "{label}");
+            assert_eq!(out["details"]["attempted"], json!(2), "{label}");
+            assert_eq!(out["details"]["failed"], json!(2), "{label}");
+            assert_eq!(out["details"]["harvested"], json!(0), "{label}");
+            // …and named, so a reader of `warnings` alone still learns of it.
+            let warnings = out["warnings"].as_array().expect("warnings array");
+            assert!(
+                warnings.iter().any(|w| w
+                    .as_str()
+                    .is_some_and(|s| s.contains("detail harvest degraded"))),
+                "{label}: {warnings:?}"
+            );
+            // The drift case must still surface the strict check's own words —
+            // that check is unchanged, only its blast radius is.
+            if matches!(mode, DetailFailure::Drift) {
+                let errors = out["details"]["errors"].as_array().expect("errors array");
+                assert!(
+                    errors
+                        .iter()
+                        .any(|e| e.as_str().is_some_and(|s| s.contains("schema drift"))),
+                    "{errors:?}"
+                );
+            }
+        }
     }
 
     #[test]
