@@ -304,6 +304,71 @@ async fn a_bot_wall_run_changes_nothing_at_all() {
 }
 
 #[tokio::test]
+async fn a_chronically_thin_source_never_accrues_a_baseline_that_looks_monitored() {
+    let store = fresh_db("resilience-thin").await;
+    let storage = &store.storage;
+    let health = Resilience::new(storage.pool(), &cfg());
+
+    // Six documents a run against a floor of ten: this listing is simply small,
+    // and it will never be judged statistically. What must NOT happen is the
+    // self-referential history — those unjudged runs becoming the baseline the
+    // source is later measured against, which is what makes a silent rebind on a
+    // small source undetectable forever.
+    for run in 0..5 {
+        let v = observe(&health, &cohort(6, "price", ".price", "sturdy")).await;
+        assert_eq!(
+            v.verdict,
+            RunVerdict::BelowCohort,
+            "run {run}: {:?}",
+            v.reasons
+        );
+        assert_eq!(v.cohort, pumper_core::CohortAdequacy::Chronic);
+        assert!(!v.statistical_coverage);
+        assert_eq!(
+            v.state,
+            SourceState::Healthy,
+            "an unjudged run moves nothing"
+        );
+    }
+
+    let store = health.store().unwrap();
+    let baseline = store.baseline("extractor/products", 10).await.unwrap();
+    assert_eq!(
+        baseline.runs("price"),
+        0,
+        "runs nobody judged must never become the baseline they would be judged against"
+    );
+
+    // And the API says so: `state: healthy` on this row means *unwatched*, not
+    // *verified*, so the row carries the distinction rather than hiding it.
+    let source = store.source("extractor/products").await.unwrap().unwrap();
+    assert_eq!(source.state, SourceState::Healthy);
+    assert!(
+        !source.monitored,
+        "a source that has never formed a cohort must not read as monitored"
+    );
+    assert_eq!(
+        store.runs("extractor/products", 10).await.unwrap()[0].verdict,
+        "below_cohort"
+    );
+
+    // A source that does clear the floor is unaffected — same run, ten documents.
+    let v = observe(&health, &cohort(10, "price", ".price", "sturdy")).await;
+    assert_eq!(v.verdict, RunVerdict::Ok);
+    assert_eq!(v.cohort, pumper_core::CohortAdequacy::Full);
+    assert!(v.statistical_coverage);
+    assert!(
+        store
+            .source("extractor/products")
+            .await
+            .unwrap()
+            .unwrap()
+            .monitored,
+        "one judgeable cohort is what monitoring means"
+    );
+}
+
+#[tokio::test]
 async fn invariants_are_mined_from_live_records_and_then_checked() {
     let store = fresh_db("resilience-invariants").await;
     let storage = &store.storage;

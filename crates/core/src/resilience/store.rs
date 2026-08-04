@@ -51,6 +51,14 @@ pub struct SourceHealth {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_verdict_at: Option<String>,
     pub tripped_of_last3: i64,
+    /// Whether this source has ever produced a cohort large enough to be judged
+    /// statistically, over its retained runs.
+    ///
+    /// `false` is **not** the same as unhealthy — it means *unmonitored*: the
+    /// distributional tests have never applied, so `state: "healthy"` on this row
+    /// says only "nothing conclusive has fired", which for a source this thin is
+    /// close to saying nothing at all.
+    pub monitored: bool,
     pub updated_at: String,
 }
 
@@ -82,11 +90,18 @@ pub struct SourceRun {
 /// SQLite persistence for the health tables.
 pub struct HealthStore {
     pool: SqlitePool,
+    /// The cohort floor the `monitored` flag is computed against, carried here
+    /// so every read answers "is this source actually being watched" with the
+    /// same number the detector judged its runs by.
+    min_cohort_docs: u32,
 }
 
 impl HealthStore {
-    pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+    pub fn new(pool: SqlitePool, min_cohort_docs: u32) -> Self {
+        Self {
+            pool,
+            min_cohort_docs,
+        }
     }
 
     /// The source's row, creating it on first sight.
@@ -115,6 +130,7 @@ impl HealthStore {
     pub async fn source(&self, id: &str) -> Result<Option<SourceHealth>> {
         let row: Option<SourceRow> = sqlx::query_as(SOURCE_COLUMNS_SQL)
             .bind(id)
+            .bind(self.min_cohort_docs as i64)
             .fetch_optional(&self.pool)
             .await?;
         Ok(row.map(SourceHealth::from))
@@ -148,6 +164,7 @@ impl HealthStore {
         .bind(state)
         .bind(app)
         .bind(limit)
+        .bind(self.min_cohort_docs as i64)
         .fetch_all(&self.pool)
         .await?;
         Ok(rows.into_iter().map(SourceHealth::from).collect())
@@ -613,7 +630,9 @@ impl Resilience {
     pub fn new(pool: SqlitePool, cfg: &ResilienceConfig) -> Self {
         Self {
             cfg: cfg.clone(),
-            store: cfg.enabled.then(|| HealthStore::new(pool)),
+            store: cfg
+                .enabled
+                .then(|| HealthStore::new(pool, cfg.min_cohort_docs)),
         }
     }
 
@@ -756,6 +775,7 @@ impl Resilience {
             state,
             previous_state,
             statistical_coverage: eval.statistical_coverage,
+            cohort: eval.adequacy,
             reasons: eval.reasons,
             drift: eval.drift,
         }))
@@ -851,13 +871,23 @@ impl Resilience {
 
 // ---- row mapping -----------------------------------------------------------
 
+// `monitored` — "has this source ever produced a judgeable cohort" — is a
+// correlated EXISTS over its retained runs. Derived rather than stored for the
+// same reason `recent_trips` is: a cached flag drifts out of sync with the
+// history it claims to summarize, and retention moves that history underneath it.
 const SOURCE_COLUMNS_SQL: &str = "SELECT id, app, dataset, state, degradation_score, state_since, \
-     state_reason, last_verdict, last_verdict_at, tripped_of_last3, updated_at \
+     state_reason, last_verdict, last_verdict_at, tripped_of_last3, \
+     EXISTS (SELECT 1 FROM source_runs r WHERE r.source_id = sources.id AND r.docs >= ?2) \
+        AS monitored, \
+     updated_at \
      FROM sources WHERE id = ?1";
 
 const SOURCE_COLUMNS_LIST_SQL: &str =
     "SELECT id, app, dataset, state, degradation_score, state_since, state_reason, last_verdict, \
-     last_verdict_at, tripped_of_last3, updated_at FROM sources";
+     last_verdict_at, tripped_of_last3, \
+     EXISTS (SELECT 1 FROM source_runs r WHERE r.source_id = sources.id AND r.docs >= ?4) \
+        AS monitored, \
+     updated_at FROM sources";
 
 #[derive(sqlx::FromRow)]
 struct SourceRow {
@@ -871,6 +901,7 @@ struct SourceRow {
     last_verdict: Option<String>,
     last_verdict_at: Option<String>,
     tripped_of_last3: i64,
+    monitored: i64,
     updated_at: String,
 }
 
@@ -887,6 +918,7 @@ impl From<SourceRow> for SourceHealth {
             last_verdict: r.last_verdict,
             last_verdict_at: r.last_verdict_at,
             tripped_of_last3: r.tripped_of_last3,
+            monitored: r.monitored != 0,
             updated_at: r.updated_at,
         }
     }

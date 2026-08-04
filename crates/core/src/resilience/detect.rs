@@ -105,6 +105,70 @@ impl Baseline {
     fn distributional(&self, field: &str) -> bool {
         self.runs(field) >= MIN_BASELINE_RUNS
     }
+
+    /// The largest cohort any field in this window was sketched over — "how big
+    /// does this source's listing actually get". The maximum rather than the
+    /// median because the question is whether the source has *ever demonstrated*
+    /// it can reach the floor, and one demonstration settles it.
+    pub fn peak_docs(&self) -> u32 {
+        self.fields
+            .values()
+            .flat_map(|runs| runs.iter().map(|s| s.n))
+            .max()
+            .unwrap_or(0)
+    }
+}
+
+/// Whether a run's cohort was big enough to be judged, and — when it was not —
+/// what kind of small it was. The distinction is per source, which is the point:
+/// `min_cohort_docs` is one fleet-wide constant, and "12 documents" means
+/// something entirely different on a source that has never produced more than 14
+/// than on one that produced 4,000 yesterday.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CohortAdequacy {
+    /// At or above the floor: every distributional test applies.
+    Full,
+    /// Below the floor, but this source has cleared it before — today's run
+    /// shrank. Not judged, and worth looking at: the listing got smaller.
+    Shrunken,
+    /// Below the floor and it has never been above it in the whole baseline
+    /// window. The source is structurally too small to be judged statistically —
+    /// it is **unmonitored**, and `GET /sources` says so instead of showing it as
+    /// healthy.
+    Chronic,
+}
+
+impl CohortAdequacy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Full => "full",
+            Self::Shrunken => "shrunken",
+            Self::Chronic => "chronic",
+        }
+    }
+
+    /// Whether the distributional tests may run at all.
+    pub fn covered(self) -> bool {
+        matches!(self, Self::Full)
+    }
+}
+
+/// Classifies this run's cohort against the source's own history.
+///
+/// Deliberately never *lowers* the bar: a thin source does not become easier to
+/// trip by being chronically thin, it becomes honestly labelled as unmonitored.
+/// What the per-source view buys is the opposite of leniency — a run that cannot
+/// be judged now says so (`below_cohort`) instead of being recorded as a clean
+/// `ok` run and quietly becoming baseline material.
+pub fn cohort_adequacy(cfg: &ResilienceConfig, docs: u32, baseline: &Baseline) -> CohortAdequacy {
+    if docs >= cfg.min_cohort_docs {
+        CohortAdequacy::Full
+    } else if baseline.peak_docs() >= cfg.min_cohort_docs {
+        CohortAdequacy::Shrunken
+    } else {
+        CohortAdequacy::Chronic
+    }
 }
 
 /// How a run's fetch layer went. `ok` counts fetches with a winning tier verdict
@@ -193,6 +257,8 @@ pub struct RunEvaluation {
     /// source that never reaches the cohort floor is effectively unmonitored,
     /// and says so on `GET /sources` rather than hiding it.
     pub statistical_coverage: bool,
+    /// The same fact with its reason attached, decided per source.
+    pub adequacy: CohortAdequacy,
 }
 
 impl RunEvaluation {
@@ -211,6 +277,7 @@ impl RunEvaluation {
 /// Scores one run. See the module doc for the two overrides.
 pub fn evaluate(cfg: &ResilienceConfig, input: &RunInput) -> RunEvaluation {
     let mut reasons = Vec::new();
+    let adequacy = cohort_adequacy(cfg, input.docs, input.baseline);
 
     // ---- gate: fetch first, always ----------------------------------------
     let fetch_rate = input.fetch.rate();
@@ -228,6 +295,7 @@ pub fn evaluate(cfg: &ResilienceConfig, input: &RunInput) -> RunEvaluation {
             reasons,
             drift: input.drift,
             statistical_coverage: false,
+            adequacy,
         };
     }
 
@@ -245,7 +313,8 @@ pub fn evaluate(cfg: &ResilienceConfig, input: &RunInput) -> RunEvaluation {
             score: 1.0,
             reasons,
             drift: input.drift,
-            statistical_coverage: input.docs >= cfg.min_cohort_docs,
+            statistical_coverage: adequacy.covered(),
+            adequacy,
         };
     }
 
@@ -261,26 +330,32 @@ pub fn evaluate(cfg: &ResilienceConfig, input: &RunInput) -> RunEvaluation {
             score: 0.0,
             reasons,
             drift: input.drift,
-            statistical_coverage: input.docs >= cfg.min_cohort_docs,
+            statistical_coverage: adequacy.covered(),
+            adequacy,
         };
     }
 
     // ---- below the cohort floor, no distributional claim is honest ---------
-    let statistical_coverage = input.docs >= cfg.min_cohort_docs;
+    // And a claim that was never made must not become evidence: the run is
+    // recorded as `below_cohort`, which neither moves the state nor enters the
+    // baseline. Recording it as `ok` (what this did before) let a chronically
+    // thin source assemble a baseline out of runs nobody had judged.
+    let statistical_coverage = adequacy.covered();
     if !statistical_coverage {
         reasons.push(Reason::new(
-            "cohort_docs",
+            &format!("cohort_docs:{}", adequacy.as_str()),
             None,
             input.docs as f64,
             cfg.min_cohort_docs as f64,
         ));
         return RunEvaluation {
-            verdict: RunVerdict::Ok,
+            verdict: RunVerdict::BelowCohort,
             diagnosis: None,
             score: 0.0,
             reasons,
             drift: input.drift,
             statistical_coverage,
+            adequacy,
         };
     }
 
@@ -334,6 +409,7 @@ pub fn evaluate(cfg: &ResilienceConfig, input: &RunInput) -> RunEvaluation {
         reasons,
         drift: input.drift,
         statistical_coverage,
+        adequacy,
     }
 }
 
@@ -904,9 +980,10 @@ mod tests {
         );
 
         // Without a history there is nothing it stopped doing — a source's first
-        // run must never trip.
+        // run must never trip. It is not a clean run either: nothing judged it.
         let e = evaluate(&cfg(), &input(&gone, &Baseline::default(), &[], None, 6));
-        assert_eq!(e.verdict, RunVerdict::Ok);
+        assert_eq!(e.verdict, RunVerdict::BelowCohort);
+        assert!(!e.verdict.judged());
 
         // A field that always missed did not collapse.
         let mut always_missing = Baseline::default();
@@ -914,14 +991,62 @@ mod tests {
             .fields
             .insert("price".into(), (0..3).map(|_| prices(30, 30)).collect());
         let e = evaluate(&cfg(), &input(&gone, &always_missing, &[], None, 6));
-        assert_eq!(e.verdict, RunVerdict::Ok);
+        assert_eq!(e.verdict, RunVerdict::BelowCohort);
 
         // Four documents is too few for even this rule.
         let e = evaluate(
             &cfg(),
             &input(&one("price", prices(4, 4)), &base, &[], None, 4),
         );
-        assert_eq!(e.verdict, RunVerdict::Ok);
+        assert_eq!(e.verdict, RunVerdict::BelowCohort);
+        assert!(!e.tripped(&cfg()));
+    }
+
+    // ---- cohort adequacy, decided per source --------------------------------
+
+    #[test]
+    fn a_thin_run_is_unjudged_not_a_clean_run() {
+        // The self-referential-history bug this guards: a below-floor run used to
+        // be recorded as `ok`, which made it baseline material. A source that
+        // never reaches the floor then built its entire baseline out of runs
+        // nobody had judged, and measured itself against that.
+        let base = healthy_baseline("price", 5);
+        let thin = one("price", prices(6, 0));
+        let e = evaluate(&cfg(), &input(&thin, &base, &[], None, 6));
+        assert_eq!(e.verdict, RunVerdict::BelowCohort);
+        assert!(!e.verdict.baselines(), "an unjudged run is not evidence");
+        assert!(!e.verdict.judged(), "nor may it move the ladder");
+        assert_eq!(e.score, 0.0);
+        assert!(!e.statistical_coverage);
+
+        // A source that has cleared the floor before shrank; one that never has is
+        // structurally unmonitored. Same non-verdict, different fact about the
+        // source — and only the second belongs in an "unmonitored" list.
+        assert_eq!(e.adequacy, CohortAdequacy::Shrunken);
+        let never = evaluate(&cfg(), &input(&thin, &Baseline::default(), &[], None, 6));
+        assert_eq!(never.adequacy, CohortAdequacy::Chronic);
+
+        // A thin source is not made *easier* to trip by any of this: it is judged
+        // by exactly the rules it was before, i.e. only the assumption-free ones.
+        let collapsed = evaluate(
+            &cfg(),
+            &input(&one("price", prices(6, 6)), &base, &[], None, 6),
+        );
+        assert_eq!(
+            collapsed.verdict,
+            RunVerdict::Broken,
+            "total collapse still fires"
+        );
+
+        // And a full cohort is untouched by the whole mechanism.
+        let full = evaluate(
+            &cfg(),
+            &input(&one("price", prices(30, 0)), &base, &[], None, 30),
+        );
+        assert_eq!(full.adequacy, CohortAdequacy::Full);
+        assert_eq!(full.verdict, RunVerdict::Ok);
+        assert!(full.verdict.baselines());
+        assert!(full.statistical_coverage);
     }
 
     // ---- signal 3: Wilson-separated miss-rate rise --------------------------

@@ -37,9 +37,13 @@ pub(crate) struct SourcesQuery {
     tag = "sources",
     params(SourcesQuery),
     responses(
-        (status = 200, description = "`{enabled, enforcing, contracts_enforce, count, sources: \
-            [{id, app, dataset, state, degradation_score, state_since, last_verdict, \
-            tripped_of_last3, ..., contract?}]}`. \
+        (status = 200, description = "`{enabled, enforcing, contracts_enforce, count, unmonitored, \
+            sources: [{id, app, dataset, state, degradation_score, state_since, last_verdict, \
+            tripped_of_last3, monitored, ..., contract?}]}`. \
+            `monitored: false` means the source has never produced a cohort at or above \
+            `[resilience] min_cohort_docs`, so the distributional tests have never applied to \
+            it — `state: \"healthy\"` on such a row means *unwatched*, not *verified*, and \
+            `unmonitored` counts those rows. \
             `enforcing: false` means verdicts are recorded but nothing is gated. `contract` is \
             the latest declared-contract verdict (`{verdict: pass|warn|block, violations, ...}`) \
             for sources with a `[source.contract]` catalog block that have run since boot."),
@@ -61,6 +65,9 @@ pub(crate) async fn list_sources(
     // Declared-contract verdicts (M20) ride along per row: the inferred health
     // in this table and the declared floor are the two halves of "was the
     // output right", so they read together.
+    // Counted before the rows are flattened to JSON: a caller reading the table
+    // should see, in one number, how much of it is not actually being watched.
+    let unmonitored = sources.iter().filter(|s| !s.monitored).count();
     let sources: Vec<Value> = sources
         .iter()
         .map(|s| {
@@ -78,6 +85,7 @@ pub(crate) async fn list_sources(
         "enforcing": state.health.enforcing(),
         "contracts_enforce": state.config.contracts.enforce,
         "count": sources.len(),
+        "unmonitored": unmonitored,
         "sources": sources,
     })))
 }
@@ -93,8 +101,10 @@ pub(crate) async fn list_sources(
     responses(
         (status = 200, description = "`{source, runs, fields, invariants, statistical_coverage}`. \
             `fields` pairs the latest run's per-field sketch with its baseline; \
-            `statistical_coverage: false` means the source never reaches the cohort \
-            floor and is monitored only by the assumption-free rules."),
+            `statistical_coverage: false` means the *latest run* was below the cohort \
+            floor (recorded with verdict `below_cohort`: it moved neither the state nor \
+            the baseline), and `source.monitored: false` means no run ever cleared it, so \
+            the source is watched only by the assumption-free rules."),
         (status = 404, description = "Unknown source", body = Object),
         (status = 503, description = "Detection is disabled", body = Object),
     )

@@ -21,6 +21,7 @@
 | Per-field sketches + the statistics on them (§2.4) | **shipped** | `core::resilience::sketch` |
 | Mined invariants (§2.5) | **shipped** | `core::resilience::invariants` |
 | Health ladder with hysteresis (§2.7) | **shipped**, minus `retired` (manual only) | `core::resilience::detect::next_state` |
+| Per-source cohort adequacy + honest `unmonitored` (§2.4) | **shipped** — verdict `below_cohort`, `cohort: full\|shrunken\|chronic`, `monitored` on `GET /sources` | `core::resilience::detect::cohort_adequacy` |
 | Schema + persistence (§5) | **shipped** for the tables detection needs | migration `0020` |
 | Trust stamping, `sync_many` downgrade, push suppression, index skip, quarantine dataset (§7) | **shipped**, gated on `enforce` | `core::app`, `server::worker` |
 | `GET /sources`, `/sources/{id}`, `/sources/{id}/runs`, `POST /sources/{id}/state` (§8.4) | **shipped** | `server::routes` |
@@ -132,6 +133,10 @@ is below `[resilience] fetch_ok_floor` (default `0.7`), the run is recorded with
 verdict `inconclusive`: the source's state does not change, the run does **not**
 enter the rolling baseline, and no repair is dispatched. You cannot judge an
 extractor on documents you did not receive.
+
+The same rule, generalised: **a run that could not be judged never becomes
+evidence.** `inconclusive` (fetch), `content_empty` (the listing was there and
+empty) and `below_cohort` (§2.4) all move neither the state nor the baseline.
 
 This is the entire answer to "was the fetch transient?" and it is essentially
 free, because `TierTrace` already carries a typed `verdict` enum and
@@ -253,14 +258,37 @@ kinds of signal have different natural variance:**
    scale-free way to threshold a source that is naturally noisy.
 
 **Cohort formation.** The unit of analysis is a cohort of at least
-`[resilience] min_cohort_docs` (default 30) documents. A cohort is one run if the
-run is big enough, otherwise a sliding window of the most recent runs until the
-count is met (bounded by `window_runs`). This is the honest cost of a small
-source: a daily job producing 5 records takes ~6 days to form a cohort, so
-detection latency for it is about a week. Sources that never reach 30 documents
-in `window_runs` runs (e.g. `watch` on a single URL) get **golden-doc detection
-only** (§6.3) — exact, deterministic, no statistics — and are marked
-`statistical_coverage: false` on `GET /sources`.
+`[resilience] min_cohort_docs` (default 30) documents. *As built, a cohort is one
+run* — the sliding multi-run cohort described below is **not** implemented; a run
+below the floor is simply not judged.
+
+A below-floor run is recorded with verdict **`below_cohort`**, which — like
+`inconclusive` — moves neither the source's state nor its rolling baseline. That
+last half is load-bearing: such a run used to be recorded as `ok`, and `ok` is
+baseline material, so a source that never reached the floor assembled a baseline
+entirely out of runs nobody had judged and then measured itself against it. A
+self-referential history can never catch a silent rebind.
+
+Which *kind* of small a run was is decided **per source**, not by the fleet-wide
+constant alone (`detect::cohort_adequacy`), and rides on the verdict as
+`cohort: full | shrunken | chronic`:
+
+| `cohort` | Meaning | Consequence |
+|---|---|---|
+| `full` | at or above the floor | judged; every distributional test applies |
+| `shrunken` | below the floor, but this source has cleared it before | not judged — the listing got smaller, which is itself worth seeing |
+| `chronic` | below the floor and never above it in the retained window | not judged, and the source is **unmonitored** |
+
+Nothing here *lowers* the bar: a thin source is not made easier to trip, it is
+made honestly labelled. `GET /sources` carries `monitored` per row plus an
+`unmonitored` count, where `monitored: false` means no retained run ever cleared
+the floor — so `state: "healthy"` on that row means *unwatched*, not *verified*.
+`GET /sources/{id}` keeps `statistical_coverage` for the latest run.
+
+Sources that never reach the floor (e.g. `watch` on a single URL) were designed to
+get **golden-doc detection only** (§6.3) — exact, deterministic, no statistics —
+but golden docs are not built (§3.2), so today they are watched by the
+assumption-free rules alone and say so.
 
 Below the cohort floor exactly one rule still fires, because it needs no
 distributional assumption: **total collapse** — `miss_rate ≥ 0.9` with a baseline
@@ -1055,9 +1083,11 @@ degradation slower than 30 days per step could in principle walk the anchor too.
 that.
 
 **10.5 Small sources never form a cohort.** `watch` on one URL, `cms-fee-schedule`
-on a handful of rows. They get golden-doc detection only and are marked
-`statistical_coverage: false`. Honest cost, surfaced in the API rather than
-hidden.
+on a handful of rows. Golden-doc detection is not built, so today they are watched
+by the assumption-free rules only (total collapse, the fetch gate). Their runs are
+recorded `below_cohort` with `cohort: chronic`, they contribute nothing to a
+baseline, and `GET /sources` reports them `monitored: false` and counts them in
+`unmonitored`. Honest cost, surfaced in the API rather than hidden.
 
 **10.6 Artifact retention.** Golden bodies live in `data/golden/`, outside the
 per-job artifact dirs, precisely so that artifact retention

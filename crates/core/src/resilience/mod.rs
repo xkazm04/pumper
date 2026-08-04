@@ -56,7 +56,7 @@ use serde_json::Value;
 use crate::extract::DocReport;
 use crate::simhash;
 
-pub use detect::{Baseline, FetchHealth, InvariantCheck, Reason, RunEvaluation};
+pub use detect::{Baseline, CohortAdequacy, FetchHealth, InvariantCheck, Reason, RunEvaluation};
 pub use invariants::{Invariant, InvariantKind};
 pub use sketch::FieldSketch;
 #[cfg(feature = "storage")]
@@ -168,6 +168,15 @@ pub enum RunVerdict {
     /// The listing was found and held nothing. Healthy, but not baseline
     /// material.
     ContentEmpty,
+    /// The cohort was too small for this source to be judged. Says nothing about
+    /// the extractor, so — like `inconclusive` — it moves neither the state nor
+    /// the baseline.
+    ///
+    /// Before this variant existed a below-floor run was recorded as `ok`, which
+    /// made it baseline material: a source that never reaches the floor built a
+    /// baseline entirely out of runs nobody ever judged, and then measured itself
+    /// against it. See [`detect::CohortAdequacy`].
+    BelowCohort,
     Broken,
     /// Broken, and the cause is ours (rules, transforms or parser), not the
     /// site's.
@@ -180,6 +189,7 @@ impl RunVerdict {
             Self::Ok => "ok",
             Self::Inconclusive => "inconclusive",
             Self::ContentEmpty => "content_empty",
+            Self::BelowCohort => "below_cohort",
             Self::Broken => "broken",
             Self::SelfInflicted => "self_inflicted",
         }
@@ -323,6 +333,9 @@ pub struct SourceVerdict {
     pub state: SourceState,
     pub previous_state: SourceState,
     pub statistical_coverage: bool,
+    /// Why the run did or did not get statistical coverage — decided against
+    /// this source's own history, not against one fleet-wide constant.
+    pub cohort: CohortAdequacy,
     pub reasons: Vec<Reason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub drift: Option<CohortDrift>,
@@ -402,6 +415,16 @@ mod tests {
         assert!(!RunVerdict::Inconclusive.judged());
         assert!(!RunVerdict::ContentEmpty.judged());
         assert!(RunVerdict::Broken.judged());
+    }
+
+    #[test]
+    fn a_run_that_could_not_be_judged_is_not_baseline_material() {
+        // The self-referential-history bug: a cohort too small to judge used to
+        // be recorded as `ok`, so it fed the very baseline it would later be
+        // measured against. A run nobody judged teaches nothing.
+        assert!(!RunVerdict::BelowCohort.baselines());
+        assert!(!RunVerdict::BelowCohort.judged());
+        assert_eq!(RunVerdict::BelowCohort.as_str(), "below_cohort");
     }
 
     #[test]

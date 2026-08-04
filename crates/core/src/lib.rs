@@ -66,8 +66,8 @@ pub use doctor::{
     diagnose, DatasetCoverage, Finding, MissingBody, Severity, StoreFacts, TableGrowth,
 };
 pub use resilience::{
-    doc_signals, signals_batch, CohortDrift, Diagnosis, DocSignals, FetchHealth, ObservedDoc,
-    RunReport, RunVerdict, SourceState, SourceVerdict,
+    doc_signals, signals_batch, CohortAdequacy, CohortDrift, Diagnosis, DocSignals, FetchHealth,
+    ObservedDoc, RunReport, RunVerdict, SourceState, SourceVerdict,
 };
 #[cfg(feature = "storage")]
 pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
@@ -80,9 +80,9 @@ pub use retention::{
 #[cfg(feature = "storage")]
 pub use storage::{
     Delivery, EnqueueOptions, IngressSource, JobStages, JobTimingStats, LedgerPruned,
-    LedgerRetention, LedgerStat, NewDerivedSpec, NewSchedule, NewTrigger, PluginHook, RevisionCount,
-    SavedSearch, Schedule, SearchMaterialize, Storage, Trigger, TriggerPluginHooks, Watch,
-    YieldSummary, LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
+    LedgerRetention, LedgerStat, NewDerivedSpec, NewSchedule, NewTrigger, PluginHook,
+    RevisionCount, SavedSearch, Schedule, SearchMaterialize, Storage, Trigger, TriggerPluginHooks,
+    Watch, YieldSummary, LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
 };
 #[cfg(feature = "storage")]
 pub use tiers::{

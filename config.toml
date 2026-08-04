@@ -189,7 +189,9 @@ enforce = false             # false = compute and store every verdict, gate NOTH
                             # rate is acceptable on real data: on an unattended box a false
                             # quarantine that silently stops a working pipeline is worse than
                             # a detection that arrives a week late.
-min_cohort_docs = 30        # documents a run needs before distributional tests apply
+min_cohort_docs = 30        # documents a run needs before distributional tests apply. A run below
+                            # it is recorded `below_cohort`: not judged, and NOT baseline material
+                            # (a source that never reaches the floor reads `monitored: false`)
 window_runs = 20            # healthy runs pooled into the rolling baseline
 degrade_score = 0.6         # score at which a run counts as tripped
 quarantine_score = 0.85     # score at which it also counts as severe
