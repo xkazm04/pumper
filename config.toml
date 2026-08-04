@@ -240,7 +240,12 @@ enabled = false
 # and per-run freshness (operation) events to a DataHub GMS. Metadata only;
 # record data never leaves the local store. See docs/features/datahub.md.
 [datahub]
-enabled = true
+# OFF by default, and it must stay that way in the shipped config: with
+# enabled = true a default checkout emits to a localhost GMS that isn't there,
+# so EVERY successful job pays the metadata reads and then warns about a
+# connection refused. Opt in only once a GMS is actually running: set
+# enabled = true (+ gms_url/token), then POST /datahub/sync once to backfill.
+enabled = false
 gms_url = "http://localhost:8080"             # local docker quickstart (Cloud: https://<tenant>.acryl.io/gms)
 # token = "..."                               # or put DATAHUB_TOKEN in .env (quickstart needs none)
 # env = "PROD"                                # URN fabric segment

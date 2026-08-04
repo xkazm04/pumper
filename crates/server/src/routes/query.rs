@@ -524,12 +524,12 @@ pub(crate) async fn catalog_reconcile_apply(
     Ok(Json(json!({ "applied": applied, "plan": plan })))
 }
 
-/// DataHub emitter configuration and the most recent emission outcome.
+/// DataHub emitter configuration, emission history, and governance state.
 #[utoipa::path(
     get,
     path = "/datahub/status",
     tag = "datahub",
-    responses((status = 200, description = "`{enabled, gms_url, env, token_set, emit_schema, emit_profile, last_emission}` — last_emission is `{kind: job|sync, at, ok, entities?|error?}` or null before any emission."))
+    responses((status = 200, description = "`{enabled, gms_url, env, token_set, emit_schema, emit_profile, emit_flows, last_emission, emissions, govern}`. `emissions` = `{ok, failed, last, last_success, last_error, sync_running}` — successes and failures are counted and kept in SEPARATE slots, so a success cannot hide the last failure; entries are `{kind: job|sync, at, ok, entities?|error?}`. `last_emission` mirrors `emissions.last`. `govern` = `{enabled, interval_secs, paused_apps, last_poll}`, where last_poll is the most recent governance poll summary (`{at, ok, datasets_polled, poll_ms, budget_secs, schedules_disabled, syncs_enqueued, paused_apps, actions}`) or its error. All in-memory: a restart zeroes it."))
 )]
 pub(crate) async fn datahub_status(State(state): State<AppState>) -> Json<Value> {
     Json(crate::datahub::status(&state))
