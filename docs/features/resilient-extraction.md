@@ -445,6 +445,41 @@ per-record write — batch it through the existing chunked-transaction pattern
 Evaluation itself is O(fields × window_runs) arithmetic on ≤ 20 cached rows —
 microseconds. **Detection is free. Only repair costs money.**
 
+**One parse per document per run.** Fingerprinting needs a DOM and so does
+extraction, and until now each built its own: `signals_batch` re-ran
+`Html::parse_document` over every body immediately after extraction had parsed
+and dropped an identical tree. `resilience::extract_and_fingerprint_batch` fuses
+the two into one rayon closure — the DOM is built once, borrowed by the
+extractor and then by the fingerprinter, and dropped at the end of the same
+iteration, so peak DOM residency is unchanged (still one tree per rayon worker,
+never a batch of them). `scraper::Html` is `!Send`, which is why the fix is a
+fused batch and not an "extract, hand back the DOM" API: a DOM cannot leave the
+worker that built it.
+
+Measured on the ten tier-3 fixtures × 200 (2000 documents, 110 MB of HTML),
+release build, 3 runs each — `crates/core/tests/fingerprint_shared_dom.rs`,
+`just test-ignored`:
+
+| | wall clock | throughput | peak RSS |
+|---|---|---|---|
+| two parses (before) | 1.10–1.20 s | ~1750 docs/s | 317–325 MB |
+| one shared parse | 0.61–0.63 s | ~3220 docs/s | 199–201 MB |
+
+Memory went **down**, not up: sharing the tree costs nothing (the DOM's lifetime
+is one closure either way), and the change let the extractor stop cloning the
+whole batch of bodies — the clone existed only to keep them alive for the second
+parse. ~110 MB of the ~122 MB drop is that clone; the rest is not having a
+second parse pass in flight.
+
+The fingerprints are byte-identical before and after: `doc_signals` and the
+fused path are the same function body (`doc_signals_parsed`) with a different
+owner of the parse, and a differential test over the fixture corpus asserts
+equality of the fingerprints, the records and the per-field reports across four
+rule shapes (CSS, `each`, regex-only, JSON-only). That equality is the whole
+safety argument — `doc_fingerprints` rows are diffed against the *next* run, so
+drift would not fail loudly, it would register as a divergence on every key of
+every source.
+
 ---
 
 ## 3. The silent-corruption case — the real position

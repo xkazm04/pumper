@@ -8,9 +8,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::StreamExt;
 use pumper_core::{
-    extract_batch_with_report, signals_batch, AppContext, AppManifest, CompiledRuleSet, CostClass,
-    DocReport, Error, FetchHealth, FetchRequest, FetchStrategy, FieldStatus, ManifestExample,
-    ObservedDoc, Provenance, Record, Result, RuleSet, ScrapeApp, UpsertSummary,
+    extract_and_fingerprint_batch, extract_batch_with_report, AppContext, AppManifest,
+    CompiledRuleSet, CostClass, DocReport, DocSignals, Error, FetchHealth, FetchRequest,
+    FetchStrategy, FieldStatus, ManifestExample, ObservedDoc, Provenance, Record, Result, RuleSet,
+    ScrapeApp, UpsertSummary,
 };
 use app_crawl::reliability;
 use pumper_core::config::ArchiveConfig;
@@ -238,14 +239,34 @@ fn summarize_reports<'a>(
 }
 
 /// Runs the compiled rules over `docs` off the async runtime (rayon fan-out),
-/// returning each record paired with its per-field [`DocReport`].
+/// returning each record paired with its per-field [`DocReport`] — and, when
+/// `fingerprint` is set, the resilience [`DocSignals`] taken from the **same
+/// parse**.
+///
+/// `fingerprint` has to be decided here, before the fan-out: the DOM is dropped
+/// at the end of each rayon closure, so a consumer that asks afterwards can only
+/// be served by parsing the whole batch a second time — which is exactly what
+/// this replaced. `None` back means nobody asked, never "fingerprinting failed".
 async fn run_extraction(
     compiled: Arc<CompiledRuleSet>,
     docs: Vec<String>,
-) -> Result<Vec<(Value, DocReport)>> {
-    tokio::task::spawn_blocking(move || extract_batch_with_report(&compiled, &docs))
-        .await
-        .map_err(|e| Error::App(format!("extract task failed: {e}")))
+    fingerprint: bool,
+) -> Result<(Vec<(Value, DocReport)>, Option<Vec<DocSignals>>)> {
+    tokio::task::spawn_blocking(move || {
+        if !fingerprint {
+            return (extract_batch_with_report(&compiled, &docs), None);
+        }
+        let fused = extract_and_fingerprint_batch(&compiled, &docs);
+        let mut reported = Vec::with_capacity(fused.len());
+        let mut signals = Vec::with_capacity(fused.len());
+        for (values, report, sig) in fused {
+            reported.push((values, report));
+            signals.push(sig);
+        }
+        (reported, Some(signals))
+    })
+    .await
+    .map_err(|e| Error::App(format!("extract task failed: {e}")))
 }
 
 /// Shared tail for both input modes: extract the `(key, doc)` pairs in parallel,
@@ -273,14 +294,18 @@ async fn extract_and_upsert(
         metas.push((d.url, d.observed_at, d.fetched_via));
         docs.push(d.body);
     }
-    let reported = run_extraction(compiled, docs.clone()).await?;
+    // `docs` is MOVED, not cloned: fingerprinting now rides the extraction's own
+    // parse, so nothing downstream needs the bodies again (was: `docs.clone()`,
+    // a second full copy of every HTML body kept alive only so `observe` could
+    // re-parse them).
+    let (reported, signals) = run_extraction(compiled, docs, ctx.health.enabled()).await?;
     // Borrow the reports rather than deep-cloning each into a throwaway Vec.
     let (matched, total, worst) = summarize_reports(reported.iter().map(|(_, r)| r));
 
     // Health verdict FIRST, then the write: the state settled here is what the
     // upsert below gates on (trust stamp, quarantine dataset, removal
     // suppression). Judging afterwards would stamp a verdict that did not exist.
-    let verdict = observe(ctx, dataset, &keys, docs, &reported, fetch, &worst).await;
+    let verdict = observe(ctx, dataset, &keys, signals, &reported, fetch, &worst).await;
 
     // Provenance (M12). `rules_hash` is the batch's honest shared fact: ONE
     // registered RuleSet produced every record here, so stamping it batch-wide
@@ -371,7 +396,7 @@ async fn observe(
     ctx: &AppContext,
     dataset: &str,
     keys: &[String],
-    docs: Vec<String>,
+    signals: Option<Vec<DocSignals>>,
     reported: &[(Value, DocReport)],
     fetch: FetchHealth,
     worst: &[Value],
@@ -382,13 +407,11 @@ async fn observe(
     // Captured before `fetch` moves into the detector. Honest-Null when nothing
     // was fetched (source mode over stored bodies) — never a fabricated 1.0.
     let fetch_ok_rate = (fetch.attempted > 0).then(|| fetch.rate());
-    let values: Vec<Value> = reported.iter().map(|(v, _)| v.clone()).collect();
-    // Fingerprinting parses each body once more, on the same rayon path the
-    // extraction ran on — off the async runtime so it can't stall the reactor.
-    let signals = tokio::task::spawn_blocking(move || signals_batch(&docs, &values))
-        .await
-        .map_err(|e| Error::App(format!("fingerprint task failed: {e}")))
-        .ok()?;
+    // Fingerprinted during extraction, from the extraction's own DOM (one parse
+    // per document per run). `None` can only mean the extraction pass was told
+    // not to fingerprint, which is decided by the same `health.enabled()` the
+    // guard above reads.
+    let signals = signals?;
     let observed: Vec<ObservedDoc> = keys
         .iter()
         .zip(reported)

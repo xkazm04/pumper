@@ -83,6 +83,8 @@ Hot-swappable `.wasm` extractor modules loaded from the plugins dir (`plugins-sr
 
 Rule sets rot when sites change, and the quality report above only makes one run's misses visible — it cannot tell a broken selector from a genuinely absent field *in aggregate*. [resilient-extraction.md](resilient-extraction.md) covers the per-source degradation detector built on it: per-field sketches, a markup-shape fingerprint (`dom_simhash`) next to the existing text one, mined invariants, and a health ladder that stops a degrading source from tombstoning its dataset or pushing downstream.
 
+When health detection is on, the extractor runs `resilience::extract_and_fingerprint_batch` instead of `extract_batch_with_report`: same rayon fan-out, same records and reports, but the DOM each document is parsed into is **shared** with fingerprinting rather than rebuilt for it. Measured 1.8× faster and 38% lower peak RSS on a 2000-document / 110 MB batch, with byte-identical fingerprints — see [resilient-extraction.md §2.8](resilient-extraction.md#28-what-it-costs-at-this-scale). Rule sets with no CSS rule are unaffected in parse count: they never parsed HTML for extraction and still pay exactly one parse, the fingerprint's.
+
 ## Known gaps
 
 - Plugin fuel/memory telemetry isn't surfaced per-run (backlog). No schema-less/LLM-assisted extraction yet (backlog moonshots: NL→RuleSet, self-healing selectors). Only the `extractor` app reports runs to the health detector; `plugin` and the hardcoded-Rust apps do not yet.

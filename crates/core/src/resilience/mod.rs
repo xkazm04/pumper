@@ -285,24 +285,78 @@ const TEXT_FINGERPRINT_CAP: usize = 200_000;
 /// markup would make every markup change look like a content change and destroy
 /// the text-blind/structure-blind asymmetry the whole detector runs on.
 pub fn doc_signals(doc: &str, values: &Value) -> DocSignals {
-    let html = scraper::Html::parse_document(doc);
+    doc_signals_parsed(&scraper::Html::parse_document(doc), values)
+}
+
+/// [`doc_signals`] over a DOM the caller already built.
+///
+/// The **only** implementation of the three fingerprints — [`doc_signals`] is
+/// this function plus a parse. Sharing one body rather than duplicating the
+/// three calls is what makes "same document in, same fingerprint out" true by
+/// construction rather than by review: these values are persisted in
+/// `doc_fingerprints` and diffed against the next run, so a fingerprint that
+/// drifted with the parse strategy would silently corrupt every future
+/// divergence verdict.
+pub fn doc_signals_parsed(html: &scraper::Html, values: &Value) -> DocSignals {
     DocSignals {
         text_simhash: simhash::simhash(&crate::markdown::visible_text_capped(
-            &html,
+            html,
             TEXT_FINGERPRINT_CAP,
         )),
-        dom_simhash: simhash::dom_simhash(&html),
+        dom_simhash: simhash::dom_simhash(html),
         val_simhash: simhash::simhash_value(values),
     }
 }
 
 /// Fingerprints a whole batch across all cores — the same rayon path extraction
 /// itself runs on.
+///
+/// Parses each body itself, so it is the right call only when nobody else has
+/// the DOM. Runs that extract *and* fingerprint use
+/// [`extract_and_fingerprint_batch`], which shares one parse between the two.
 pub fn signals_batch(docs: &[String], values: &[Value]) -> Vec<DocSignals> {
     use rayon::prelude::*;
     docs.par_iter()
         .zip(values.par_iter())
         .map(|(doc, values)| doc_signals(doc, values))
+        .collect()
+}
+
+/// Extracts a batch **and** fingerprints it from the same DOM: one
+/// `Html::parse_document` per document per run, not two.
+///
+/// Extraction parses the body, drops the DOM, and fingerprinting used to build
+/// an identical one immediately afterwards — a full second DOM per document on
+/// the highest-volume path in the platform. Both consumers are per-document and
+/// both run on rayon, so the honest fix is to fuse them into one closure: the
+/// DOM is built once, borrowed by the extractor and then by the fingerprinter,
+/// and dropped at the end of the same iteration. Peak DOM residency is unchanged
+/// — still one DOM per rayon worker, never a batch of them — because the parse
+/// never outlives its closure.
+///
+/// `scraper::Html` is `!Send` (its tendrils are non-atomic), which is why this
+/// exists as a fused batch rather than as an "extract, return the DOM, hand it
+/// to the fingerprinter" API: a DOM cannot leave the worker that built it.
+///
+/// Ordering matches [`extract_batch_with_report`](crate::extract::extract_batch_with_report),
+/// and the fingerprints are byte-identical to [`doc_signals`] on the same body
+/// (both go through [`doc_signals_parsed`]).
+pub fn extract_and_fingerprint_batch(
+    rules: &crate::extract::CompiledRuleSet,
+    docs: &[String],
+) -> Vec<(Value, DocReport, DocSignals)> {
+    use rayon::prelude::*;
+    docs.par_iter()
+        .map(|doc| {
+            // Unconditional: the fingerprint needs the DOM even when no rule
+            // does (a JSON-only rule set still gets a text/DOM fingerprint, and
+            // always did — this changes where the parse happens, not whether).
+            let html = scraper::Html::parse_document(doc);
+            let (values, report) =
+                crate::extract::extract_one_parsed(rules, doc, true, Some(&html));
+            let signals = doc_signals_parsed(&html, &values);
+            (values, report, signals)
+        })
         .collect()
 }
 

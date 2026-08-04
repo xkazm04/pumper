@@ -66,8 +66,9 @@ pub use doctor::{
     diagnose, DatasetCoverage, Finding, MissingBody, Severity, StoreFacts, TableGrowth,
 };
 pub use resilience::{
-    doc_signals, signals_batch, CohortAdequacy, CohortDrift, Diagnosis, DocSignals, FetchHealth,
-    ObservedDoc, RunReport, RunVerdict, SourceState, SourceVerdict,
+    doc_signals, doc_signals_parsed, extract_and_fingerprint_batch, signals_batch, CohortAdequacy,
+    CohortDrift, Diagnosis, DocSignals, FetchHealth, ObservedDoc, RunReport, RunVerdict,
+    SourceState, SourceVerdict,
 };
 #[cfg(feature = "storage")]
 pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};

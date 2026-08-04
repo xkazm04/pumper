@@ -579,6 +579,26 @@ pub fn extract_one_with_report(rules: &CompiledRuleSet, doc: &str) -> (Value, Do
 
 fn extract_one_impl(rules: &CompiledRuleSet, doc: &str, want_report: bool) -> (Value, DocReport) {
     let html = rules.needs_html().then(|| Html::parse_document(doc));
+    extract_one_parsed(rules, doc, want_report, html.as_ref())
+}
+
+/// Extracts one document against a DOM the caller already built.
+///
+/// This is the seam that lets a second consumer of the same document — today,
+/// resilience fingerprinting — share the parse instead of building a second
+/// identical `Html`. `html` may be `None` only when the rule set has no CSS rule
+/// ([`CompiledRuleSet::needs_html`] is false); the CSS arms unwrap it, and that
+/// unwrap is exactly the invariant `extract_one_impl` upholds by parsing
+/// whenever `needs_html()` says a CSS rule exists.
+///
+/// Crate-internal: outside callers go through [`crate::resilience::extract_and_fingerprint_batch`],
+/// which owns the DOM for the whole document and hands it to both consumers.
+pub(crate) fn extract_one_parsed(
+    rules: &CompiledRuleSet,
+    doc: &str,
+    want_report: bool,
+    html: Option<&Html>,
+) -> (Value, DocReport) {
     let json = if rules.needs_json() {
         let mut bytes = doc.as_bytes().to_vec();
         simd_json::serde::from_slice::<Value>(&mut bytes).ok()
@@ -603,13 +623,7 @@ fn extract_one_impl(rules: &CompiledRuleSet, doc: &str, want_report: bool) -> (V
                 all,
                 html: as_html,
             } => (
-                css_extract(
-                    html.as_ref().unwrap(),
-                    selector,
-                    attr.as_deref(),
-                    *all,
-                    *as_html,
-                ),
+                css_extract(html.unwrap(), selector, attr.as_deref(), *all, *as_html),
                 true,
                 "",
                 false,
@@ -648,7 +662,7 @@ fn extract_one_impl(rules: &CompiledRuleSet, doc: &str, want_report: bool) -> (V
                 container,
             } => {
                 let (items, container_matched) =
-                    each_extract(html.as_ref().unwrap(), selector, fields, container.as_ref());
+                    each_extract(html.unwrap(), selector, fields, container.as_ref());
                 (Value::Array(items), true, "", container_matched)
             }
         };
