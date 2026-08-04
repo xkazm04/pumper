@@ -14,3 +14,8 @@ tracing.workspace = true
 # workspace deps — regex for money/date patterns, chrono for calendar validity).
 regex.workspace = true
 chrono.workspace = true
+
+[dev-dependencies]
+# The lifecycle tests build an index with a deliberately OLD schema, which needs
+# Tantivy's own schema builder (same version as the dependency above).
+tantivy.workspace = true

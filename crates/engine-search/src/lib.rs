@@ -14,17 +14,19 @@ use pumper_core::{
     SearchRequest, SearchResponse,
 };
 use std::ops::Bound;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
 
 use tantivy::collector::{Count, MultiCollector, TopDocs};
+use tantivy::directory::{DirectoryLock, MmapDirectory, INDEX_WRITER_LOCK};
 use tantivy::query::{BooleanQuery, Occur, Query, QueryParser, RangeQuery, TermQuery};
 use tantivy::schema::{
     Field, IndexRecordOption, Schema, Value, FAST, INDEXED, STORED, STRING, TEXT,
 };
-use tantivy::{doc, Index, IndexReader, IndexWriter, Order, TantivyDocument, Term};
+use tantivy::{doc, Directory, Index, IndexReader, IndexWriter, Order, TantivyDocument, Term};
 
 use pumper_core::SearchSort;
 
@@ -174,6 +176,201 @@ fn schema_is_current(index: &Index) -> bool {
     all_present && body_stored
 }
 
+// ---- Index lifecycle: opening, and the two destructive recoveries -----------
+
+/// Tantivy's index manifest. `Index::exists` is literally "does this file
+/// exist", so its presence — not a non-empty directory — is what makes
+/// `Index::create_in_dir` refuse to create.
+const META_FILE: &str = "meta.json";
+
+/// Why an existing index directory could not be opened, as far as recovery is
+/// concerned. Split from the Tantivy error so the decision is testable against a
+/// directory alone.
+#[derive(Debug, PartialEq, Eq)]
+enum OpenFailure {
+    /// No `meta.json`: never initialized (a fresh or previously emptied dir).
+    /// `create_in_dir` succeeds as-is — nothing to move aside.
+    Uninitialized,
+    /// `meta.json` present but unreadable/unparseable. `open_in_dir` fails AND
+    /// `create_in_dir` fails (it refuses a directory that already has a
+    /// `meta.json`), so without moving the directory aside the server cannot
+    /// boot at all.
+    Corrupt,
+}
+
+fn classify_open_failure(dir: &Path) -> OpenFailure {
+    if dir.join(META_FILE).exists() {
+        OpenFailure::Corrupt
+    } else {
+        OpenFailure::Uninitialized
+    }
+}
+
+/// The recovery an open decided on, computed while the (failed or outdated)
+/// `Index` handle is still alive so the handle can be dropped *before* anything
+/// touches the directory — on Windows an open handle makes remove/rename fail.
+enum Recovery {
+    /// Usable as opened.
+    None,
+    /// Opened fine, but the on-disk schema predates this build: wipe + recreate.
+    SchemaDrift,
+    /// Nothing there yet: plain create.
+    Fresh,
+    /// Present but unopenable (carries the Tantivy error text): quarantine.
+    Corrupt(String),
+}
+
+/// First free `<dir>.corrupt.<n>` sibling. A counter rather than a timestamp so
+/// the quarantine name is deterministic (tests can name it) and so two
+/// quarantines in the same second cannot collide.
+fn quarantine_path(dir: &Path) -> PathBuf {
+    let stem = dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("search-index")
+        .to_string();
+    (0u32..)
+        .map(|n| dir.with_file_name(format!("{stem}.corrupt.{n}")))
+        .find(|candidate| !candidate.exists())
+        .expect("a free .corrupt.<n> suffix always exists")
+}
+
+/// Takes the index directory's exclusive writer lock BEFORE anything
+/// destructive runs, and fails loudly (naming the conflict) when someone else
+/// holds it.
+///
+/// **What this lock does guarantee.** It is Tantivy's own `INDEX_WRITER_LOCK` —
+/// the same lock `Index::writer()` holds for the life of an `IndexWriter`, and
+/// on an `MmapDirectory` it is a *real OS advisory lock*
+/// (`try_lock_exclusive` — `flock` on Unix, `LockFileEx` on Windows) taken on an
+/// open handle to `.tantivy-writer.lock` inside the index dir, not merely the
+/// file's existence. So a new-schema binary started while an old-schema server
+/// is running finds the lock held by that server's writer and refuses to wipe
+/// the index under it, on every platform. Because the OS owns the lock, a
+/// crashed or `SIGKILL`ed holder releases it automatically: there is no stale
+/// lock to clear by hand, and the lock file being *present* means nothing on its
+/// own.
+///
+/// **What it does not.** It is advisory: it only excludes processes that ask for
+/// it — Tantivy writers and this function. A stray `rm -rf`, a backup tool, or a
+/// second copy of the directory is unaffected. It excludes *writers* only: a
+/// peer holding just an `IndexReader` takes no lock, so a wipe can still pull
+/// files out from under a reader-only process. And `flock`-family locks are
+/// unreliable on network filesystems (NFS/SMB), where two hosts may both believe
+/// they hold it — the local-first deployment this service targets is the case it
+/// is honest for.
+///
+/// **Platform asymmetry, honestly.** Holding the lock means holding an open file
+/// handle *inside* the index directory, and Windows refuses to rename or delete
+/// a directory that contains an open handle. That is why the destructive steps
+/// [`drain_dir`] the directory's contents in place instead of moving or removing
+/// the directory itself — on Unix either would work (an unlinked inode survives
+/// its open handles), but only draining works on both.
+fn claim_index_dir(dir: &Path, reason: &str) -> Result<DirectoryLock> {
+    let directory = MmapDirectory::open(dir)
+        .map_err(|e| Error::App(format!("open search index dir {}: {e}", dir.display())))?;
+    directory.acquire_lock(&INDEX_WRITER_LOCK).map_err(|e| {
+        Error::App(format!(
+            "refusing to rebuild the search index at {} ({reason}): its Tantivy writer lock \
+             ({}) is held by another process, so a pumper server (or the search-backfill / \
+             reindex bin) is using this index — rebuilding would delete the index under it. \
+             Stop that process and retry. The lock is an OS lock, so it cannot be left behind \
+             by a crash. ({e})",
+            dir.display(),
+            INDEX_WRITER_LOCK.filepath.display(),
+        ))
+    })
+}
+
+/// Empties `dir` **in place** — the directory itself, and the writer-lock file
+/// this process is holding inside it, stay put. With `into = Some(path)` each
+/// entry is moved there (quarantine) instead of deleted (wipe).
+///
+/// Draining rather than `remove_dir_all`/`rename` on the directory itself is
+/// what keeps the claim live across the destructive step: the lock's file lives
+/// inside `dir`, so moving or removing the directory would release the lock
+/// mid-rebuild — and on Windows would fail outright, because the lock handle is
+/// open.
+fn drain_dir(dir: &Path, into: Option<&Path>) -> std::io::Result<()> {
+    if let Some(into) = into {
+        std::fs::create_dir_all(into)?;
+    }
+    let lock_file = INDEX_WRITER_LOCK.filepath.as_os_str();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_name() == lock_file {
+            continue;
+        }
+        let path = entry.path();
+        match into {
+            Some(into) => std::fs::rename(&path, into.join(entry.file_name()))?,
+            None if entry.file_type()?.is_dir() => std::fs::remove_dir_all(&path)?,
+            None => std::fs::remove_file(&path)?,
+        }
+    }
+    Ok(())
+}
+
+/// Opens the index at `dir`, recovering from the two states that need a
+/// destructive step first. Every destructive branch is guarded by
+/// [`claim_index_dir`] and logs the loss it is about to take.
+fn open_or_recover(dir: &Path, schema: &Schema) -> Result<Index> {
+    std::fs::create_dir_all(dir)?;
+    let opened = Index::open_in_dir(dir);
+    let plan = match &opened {
+        Ok(index) if schema_is_current(index) => Recovery::None,
+        Ok(_) => Recovery::SchemaDrift,
+        Err(e) => match classify_open_failure(dir) {
+            OpenFailure::Uninitialized => Recovery::Fresh,
+            OpenFailure::Corrupt => Recovery::Corrupt(e.to_string()),
+        },
+    };
+    if matches!(plan, Recovery::None) {
+        return opened.map_err(|e| Error::App(format!("open search index: {e}")));
+    }
+    // Release the outdated/failed handle before touching the directory.
+    drop(opened);
+
+    match plan {
+        Recovery::None => unreachable!("returned above"),
+        Recovery::Fresh => Index::create_in_dir(dir, schema.clone())
+            .map_err(|e| Error::App(format!("create search index: {e}"))),
+        Recovery::SchemaDrift => {
+            let claim = claim_index_dir(dir, "the on-disk schema predates this build")?;
+            tracing::warn!(
+                dir = %dir.display(),
+                "search index schema outdated; rebuilding EMPTY — previously indexed \
+                 documents are gone. Rebuild from stored records with: \
+                 cargo run -p pumper-server --bin search-backfill"
+            );
+            drain_dir(dir, None)?;
+            let index = Index::create_in_dir(dir, schema.clone())
+                .map_err(|e| Error::App(format!("recreate search index: {e}")))?;
+            // Released before the caller opens the real writer, which takes this
+            // very lock.
+            drop(claim);
+            Ok(index)
+        }
+        Recovery::Corrupt(err) => {
+            let claim = claim_index_dir(dir, "its meta.json is present but unreadable")?;
+            let aside = quarantine_path(dir);
+            drain_dir(dir, Some(&aside))?;
+            tracing::error!(
+                dir = %dir.display(),
+                quarantined = %aside.display(),
+                "search index could not be opened ({err}); moved its files aside and \
+                 started an EMPTY index in their place — boot continues, but every previously \
+                 indexed document is gone until: \
+                 cargo run -p pumper-server --bin search-backfill"
+            );
+            let index = Index::create_in_dir(dir, schema.clone())
+                .map_err(|e| Error::App(format!("recreate search index: {e}")))?;
+            drop(claim);
+            Ok(index)
+        }
+    }
+}
+
 /// A document with its index-time entity enrichment already computed (M14):
 /// conservative regex-only extraction over title+body. No match = field ABSENT on
 /// the doc (a range filter then simply never matches it).
@@ -241,28 +438,11 @@ impl TantivyIndex {
         builder.add_i64_field("event_date", INDEXED | STORED | FAST);
         let schema = builder.build();
 
-        std::fs::create_dir_all(&cfg.dir)?;
-        let index = match Index::open_in_dir(&cfg.dir) {
-            Ok(index) if schema_is_current(&index) => index,
-            Ok(_) => {
-                // Older schema (missing a field this build added, or body not
-                // stored): rebuild EMPTY. Previously indexed docs are gone until
-                // re-indexed — the worker only refills a dataset when its app next
-                // runs, so rebuild explicitly.
-                tracing::warn!(
-                    dir = %cfg.dir.display(),
-                    "search index schema outdated; rebuilt EMPTY — previously indexed \
-                     documents are gone. Rebuild from stored records with: \
-                     cargo run -p pumper-server --bin search-backfill"
-                );
-                std::fs::remove_dir_all(&cfg.dir)?;
-                std::fs::create_dir_all(&cfg.dir)?;
-                Index::create_in_dir(&cfg.dir, schema.clone())
-                    .map_err(|e| Error::App(format!("recreate search index: {e}")))?
-            }
-            Err(_) => Index::create_in_dir(&cfg.dir, schema.clone())
-                .map_err(|e| Error::App(format!("create search index: {e}")))?,
-        };
+        // Opening is where the index's two destructive recoveries live (schema
+        // drift → wipe, corrupt meta.json → quarantine). Both are guarded by the
+        // directory's writer lock, so a new-schema binary can never delete a
+        // running server's index behind its back.
+        let index = open_or_recover(&cfg.dir, &schema)?;
         // Resolve fields from the index's own schema (robust across reopens).
         let s = index.schema();
         let field = |name: &str| {
@@ -687,5 +867,95 @@ impl Search for TantivyIndex {
         })
         .await
         .map_err(|e| Error::App(format!("query task panicked: {e}")))?
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_open_failure, drain_dir, quarantine_path, OpenFailure};
+    use std::path::PathBuf;
+
+    fn scratch(tag: &str) -> PathBuf {
+        static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "pumper-search-unit-{tag}-{}-{n}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    /// The anti-pattern: naming the quarantine after the wall clock, which makes
+    /// the path untestable and collides when two quarantines land in one second.
+    #[test]
+    fn quarantine_path_counts_up_instead_of_timestamping() {
+        let dir = scratch("quarantine");
+        let first = quarantine_path(&dir);
+        assert_eq!(
+            first.file_name().unwrap().to_str().unwrap(),
+            format!("{}.corrupt.0", dir.file_name().unwrap().to_str().unwrap()),
+            "the first quarantine is a deterministic sibling of the index dir"
+        );
+        assert_eq!(first.parent(), dir.parent(), "quarantine is a SIBLING");
+        std::fs::create_dir_all(&first).unwrap();
+        let second = quarantine_path(&dir);
+        assert!(
+            second.to_str().unwrap().ends_with(".corrupt.1"),
+            "an occupied suffix is skipped, never overwritten: {second:?}"
+        );
+        let _ = std::fs::remove_dir_all(&first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The anti-pattern: treating "couldn't open" as "corrupt" and quarantining a
+    /// directory that was simply never initialized (leaving a `.corrupt.N`
+    /// carcass on every first boot).
+    #[test]
+    fn empty_dir_is_uninitialized_not_corrupt() {
+        let dir = scratch("classify");
+        assert_eq!(classify_open_failure(&dir), OpenFailure::Uninitialized);
+        // A leftover lock file from a crash is still not a corrupt index.
+        std::fs::File::create(dir.join(".tantivy-writer.lock")).unwrap();
+        assert_eq!(classify_open_failure(&dir), OpenFailure::Uninitialized);
+        // Only a present meta.json makes `create_in_dir` refuse, which is what
+        // quarantining exists to unblock.
+        std::fs::write(dir.join("meta.json"), b"{ not json").unwrap();
+        assert_eq!(classify_open_failure(&dir), OpenFailure::Corrupt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The anti-pattern: `remove_dir_all`/`rename` on the index directory
+    /// itself, which takes the writer-lock file with it — releasing the claim
+    /// halfway through the rebuild (and failing outright on Windows, where the
+    /// lock's handle is open inside that directory).
+    #[test]
+    fn drain_keeps_the_lock_file_not_only_the_directory() {
+        let dir = scratch("drain");
+        std::fs::write(dir.join(".tantivy-writer.lock"), b"").unwrap();
+        std::fs::write(dir.join("meta.json"), b"{}").unwrap();
+        std::fs::create_dir_all(dir.join("seg")).unwrap();
+        std::fs::write(dir.join("seg/a.idx"), b"x").unwrap();
+
+        // Quarantine: everything moves aside except the lock.
+        let aside = quarantine_path(&dir);
+        drain_dir(&dir, Some(&aside)).unwrap();
+        assert!(dir.join(".tantivy-writer.lock").exists(), "claim survives");
+        assert!(!dir.join("meta.json").exists(), "the bad manifest is gone");
+        assert!(aside.join("meta.json").exists(), "…but preserved aside");
+        assert!(aside.join("seg/a.idx").exists(), "subdirectories move too");
+
+        // Wipe: everything is deleted except the lock.
+        std::fs::write(dir.join("meta.json"), b"{}").unwrap();
+        drain_dir(&dir, None).unwrap();
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            1,
+            "only the lock file is left"
+        );
+        assert!(dir.join(".tantivy-writer.lock").exists());
+        let _ = std::fs::remove_dir_all(&aside);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

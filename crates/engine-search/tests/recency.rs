@@ -31,7 +31,7 @@ async fn newest_sort_and_since_filter_use_indexed_at() {
     let index = TantivyIndex::new(&SearchConfig {
         enabled: true,
         dir: dir.clone(),
-    ..Default::default()
+        ..Default::default()
     })
     .unwrap();
 
@@ -91,7 +91,7 @@ async fn index_defers_commit_and_flush_makes_it_visible() {
     let index = TantivyIndex::new(&SearchConfig {
         enabled: true,
         dir: dir.clone(),
-    ..Default::default()
+        ..Default::default()
     })
     .unwrap();
 
@@ -121,7 +121,7 @@ async fn background_committer_flushes_without_explicit_flush() {
     let index = TantivyIndex::new(&SearchConfig {
         enabled: true,
         dir: dir.clone(),
-    ..Default::default()
+        ..Default::default()
     })
     .unwrap();
 
@@ -143,7 +143,7 @@ async fn offset_pages_and_total_is_the_match_count() {
     let index = TantivyIndex::new(&SearchConfig {
         enabled: true,
         dir: dir.clone(),
-    ..Default::default()
+        ..Default::default()
     })
     .unwrap();
     // 5 matching docs, newest-first ids e(500)..a(100).

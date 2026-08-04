@@ -45,7 +45,26 @@ Enrichment is computed **before** the index writer lock is taken (its own blocki
 
 `DELETE /search/docs {ids}` removes documents by id; `DELETE /search/datasets/{app}/{dataset}` removes an app's dataset (app AND dataset conjunction — dataset names repeat across apps). Trait: `Search::{index, query, delete_ids, delete_dataset, doc_count, index_stats, flush}`; `NoSearch` when `[search] enabled=false`. `index()` may defer its commit for throughput (a background committer flushes it), so a caller that must see its own writes — the saved-search runner, an offline backfill — calls `flush()` first.
 
-**The index can go silently empty, and it does not self-heal.** On open, an index whose on-disk schema doesn't match this build's (a field was added, or `body` isn't stored) is **rebuilt EMPTY**; a lost/corrupt index dir or a spell of `[search] enabled = false` has the same effect. Queries keep returning `200` with fewer hits, so nothing looks broken. `GET /search/status` reporting `doc_count: 0` on an enabled index is the signal. Rebuild from the stored dataset records — **with the server stopped**, since Tantivy holds an exclusive writer lock on the index directory:
+### Opening the index: four states, three recoveries
+
+`TantivyIndex::new` meets one of four directory states, and each has a defined outcome:
+
+| on disk | outcome |
+| --- | --- |
+| opens, schema matches this build | used as-is |
+| no `meta.json` (first boot, or a previously emptied dir) | fresh index created |
+| opens, but the schema predates this build (a field was added, or `body` isn't stored) | **wiped and rebuilt EMPTY**, `warn` log |
+| `meta.json` present but unreadable | the directory's **contents are moved aside** into the sibling `<dir>.corrupt.<n>` (a counter, not a timestamp), a fresh index is created in their place, `error` log naming the quarantined path — **boot proceeds** |
+
+The last row used to be an unbootable process: `open_in_dir` fails on the bad manifest and `create_in_dir` refuses a directory that already has a `meta.json`, so there was no path forward. Quarantine also preserves the evidence instead of deleting it — inspect or delete `<dir>.corrupt.<n>` yourself; nothing reclaims it.
+
+**Both destructive branches take the index directory's exclusive writer lock first.** That is Tantivy's own `INDEX_WRITER_LOCK` (`.tantivy-writer.lock`), the same lock a live `IndexWriter` holds for the life of the process — so a new-schema binary started while an old-schema server is running now **fails loudly, naming the lock and the directory**, instead of deleting the running server's index under it. What the lock can and cannot promise, honestly:
+
+- **Can:** exclude any other Tantivy writer (a server, `search-backfill`, `reindex`) on the same directory, on every platform. On an `MmapDirectory` this is a *real OS advisory lock* — `try_lock_exclusive`, i.e. `flock` on Unix and `LockFileEx` on Windows, taken on an open handle to the lock file. Because the kernel owns it, a crashed or `SIGKILL`ed holder releases it automatically: there is **no stale lock to clear by hand**, and the lock file merely *existing* means nothing.
+- **Cannot:** it is advisory — only processes that ask for it are excluded, so a stray `rm -rf`, a backup tool, or a second copy of the directory is unaffected. It excludes *writers* only: a peer holding just an `IndexReader` takes no lock, so a wipe can still pull files from under a reader-only process. And `flock`-family locks are unreliable over NFS/SMB; the guarantee is honest for the local-first deployment this service targets.
+- **Platform asymmetry:** holding the lock means holding an open handle *inside* the index directory, and Windows refuses to rename or delete a directory containing an open handle. So both destructive steps drain the directory's **contents** in place rather than moving or removing the directory itself — on Unix either would work (an unlinked inode outlives its handles), but only draining works on both, and only draining keeps the lock held for the whole rebuild.
+
+**The index can still go silently empty, and it does not self-heal.** A schema-drift wipe, a quarantined corrupt dir, or a spell of `[search] enabled = false` all leave an enabled index with nothing in it. Queries keep returning `200` with fewer hits, so nothing looks broken. `GET /search/status` reporting `doc_count: 0` on an enabled index is the signal. Rebuild from the stored dataset records — **with the server stopped**, since Tantivy holds that exclusive writer lock for the life of the process:
 
 ```bash
 cargo run -p pumper-server --bin search-backfill -- --app grants --dataset unified

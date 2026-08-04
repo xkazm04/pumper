@@ -30,7 +30,7 @@ async fn facets_are_computed_only_when_requested() {
     let index = TantivyIndex::new(&SearchConfig {
         enabled: true,
         dir: dir.clone(),
-    ..Default::default()
+        ..Default::default()
     })
     .unwrap();
     index

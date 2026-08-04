@@ -45,11 +45,20 @@ async fn amount_and_date_filters_over_extracted_fields() {
     index
         .index(vec![
             // amount 2_000_000, deadline Sep 1 2026.
-            doc("big", r#"grant award up to $2 million, close_date 2026-09-01"#),
+            doc(
+                "big",
+                r#"grant award up to $2 million, close_date 2026-09-01"#,
+            ),
             // amount 50_000, deadline Dec 1 2026.
-            doc("small", "grant award of $50,000, applications due 12/1/2026"),
+            doc(
+                "small",
+                "grant award of $50,000, applications due 12/1/2026",
+            ),
             // No currency marker, no deadline keyword → both fields ABSENT.
-            doc("bare", "grant program serving 3,000,000 residents since 2026-09-01"),
+            doc(
+                "bare",
+                "grant program serving 3,000,000 residents since 2026-09-01",
+            ),
         ])
         .await
         .unwrap();
