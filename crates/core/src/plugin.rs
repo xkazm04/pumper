@@ -27,6 +27,18 @@ pub trait Plugins: Send + Sync {
     /// Names of currently loaded plugins.
     fn list(&self) -> Vec<String>;
 
+    /// Whether `name` is currently loaded — i.e. whether [`run`](Plugins::run)
+    /// would find a module at all, as opposed to failing with "unknown
+    /// plugin". Callers whose failure semantics are FAIL-OPEN (trigger hooks)
+    /// need this: a trap and a plugin that was never deployed both end as a
+    /// passed-through event, and only the second one means "your build/install
+    /// step never ran". The default answers from [`list`](Plugins::list);
+    /// hosts with an index should override it — this sits on the per-event
+    /// hot path.
+    fn has(&self, name: &str) -> bool {
+        self.list().iter().any(|n| n == name)
+    }
+
     /// Per-plugin metadata for `GET /plugins`: each entry is at least
     /// `{"name": ...}`, enriched with a plugin's self-describing manifest
     /// (`{name, version, description, params_schema, output_schema}`) when it

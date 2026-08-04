@@ -26,7 +26,8 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just dev` | same, with `RUST_LOG=debug` |
 | `just reindex` | `cargo run -p pumper-server --bin reindex` |
 | `just search-backfill <scope>` | `cargo run -p pumper-server --bin search-backfill -- <scope>` |
-| `just plugin <crate>` | builds `plugins-src/<crate>` for `wasm32-unknown-unknown` |
+| `just plugin <crate>` | builds `plugins-src/<crate>` for `wasm32-unknown-unknown` (build only — does **not** install) |
+| `just plugins-install` | builds **and installs** the two trigger-hook plugins (`trigger-gate`, `delta-slim`) into `data/plugins/`; without it every configured trigger hook takes the fail-open unknown-plugin path — see `docs/features/trigger-plugins.md` |
 | `just doctor [port]` | `GET /datasets/doctor` — read-only store integrity report (server RUNNING) |
 | `just retention-preview [days]` | `GET /retention/preview` — reclaimable bytes, deletes nothing (server RUNNING) |
 | `just enforcement-preview [app]` | `GET /enforcement/preview` — what `[resilience] enforce = true` would have done, gates nothing (server RUNNING) |

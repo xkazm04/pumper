@@ -84,6 +84,14 @@
       ]
     },
     {
+      "doc": "docs/features/trigger-plugins.md",
+      "sourceGlobs": [
+        "crates/server/src/triggers.rs",
+        "plugins-src/trigger-gate/**",
+        "plugins-src/delta-slim/**"
+      ]
+    },
+    {
       "doc": "docs/features/http-api.md",
       "sourceGlobs": ["crates/server/src/routes/**"]
     },

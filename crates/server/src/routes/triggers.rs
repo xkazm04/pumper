@@ -418,8 +418,9 @@ pub(crate) struct RunsQuery {
 /// actually enqueued. `decisions` is the ledger (`trigger_runs`): one row per
 /// evaluation of this trigger against one source event, INCLUDING the negatives
 /// (`no_change_match`, `filter_miss`, `dedup`, `cycle`, `depth`,
-/// `target_unregistered`, `predicate_veto`, `bad_filters`, `enqueue_failed`),
-/// which are otherwise invisible. Decisions page with `cursor`.
+/// `target_unregistered`, `predicate_veto`, `plugin_missing`, `bad_filters`,
+/// `enqueue_failed`), which are otherwise invisible. Decisions page with
+/// `cursor`.
 #[utoipa::path(
     get,
     path = "/triggers/{id}/runs",

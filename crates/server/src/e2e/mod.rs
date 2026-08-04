@@ -28,6 +28,7 @@ mod sink_delivery;
 mod trigger_cache;
 mod trigger_hops;
 mod trigger_ledger;
+mod trigger_plugins;
 mod webhook_contract;
 mod worker_fanout;
 mod worker_lifecycle;

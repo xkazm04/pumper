@@ -2431,6 +2431,13 @@ pub const TRIGGER_OUTCOMES: &[&str] = &[
     "bad_filters",
     // A predicate plugin returned `pass=false` (or failed with `on_error=skip`).
     "predicate_veto",
+    // A CONFIGURED plugin hook names a module the host has not loaded, so the
+    // hook did nothing: the predicate did not gate and the transform did not
+    // shape. The hop itself still took the fail-open path — this row exists
+    // because "the gate passed" and "there was no gate" are otherwise
+    // indistinguishable. Usually means the build/install step never ran
+    // (`just plugins-install`). `detail` is the missing plugin name.
+    "plugin_missing",
     // The trigger already appears in the source's provenance chain.
     "cycle",
     // `[triggers] max_depth` reached.

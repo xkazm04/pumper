@@ -109,11 +109,40 @@ search-backfill scope:
     cargo run -p pumper-server --bin search-backfill -- {{scope}}
 
 # Install the resulting .wasm into data/plugins/ and `POST /plugins/reload` —
-# see README.md § WASM plugins for the copy step.
+# see README.md § WASM plugins for the copy step, or use `just plugins-install`
+# which does the build AND the copy for the trigger plugins.
 #
 # Build an example WASM plugin from plugins-src/<crate> (detached workspace).
 plugin crate:
     cd plugins-src/{{crate}} && cargo build --release --target wasm32-unknown-unknown
+
+# Builds AND installs the two trigger-hook plugins, which `just plugin` only
+# builds. Without this step every configured `plugins.predicate` /
+# `plugins.transform` hook hits the unknown-plugin path: predicates silently
+# pass and transforms silently no-op (fail-open by design — see
+# docs/features/trigger-plugins.md). Re-run after editing a plugin, then
+# `curl -X POST localhost:8088/plugins/reload` to hot-swap without a restart.
+#
+# Build trigger-gate + delta-slim for wasm32 and install them into data/plugins/.
+plugins-install:
+    #!/usr/bin/env sh
+    set -e
+    if ! rustup target list --installed 2>/dev/null | grep -q '^wasm32-unknown-unknown$'; then
+        echo "error: the wasm32-unknown-unknown target is not installed." >&2
+        echo "       run: rustup target add wasm32-unknown-unknown" >&2
+        exit 1
+    fi
+    mkdir -p data/plugins
+    # The installed file STEM is the plugin name the host loads and a trigger's
+    # `plugins.predicate.plugin` names — so it must be the hyphenated crate
+    # name, not cargo's underscored artifact name.
+    for crate in trigger-gate delta-slim; do
+        artifact=$(echo "$crate" | tr '-' '_')
+        ( cd "plugins-src/$crate" && cargo build --release --target wasm32-unknown-unknown )
+        cp "plugins-src/$crate/target/wasm32-unknown-unknown/release/$artifact.wasm" \
+           "data/plugins/$crate.wasm"
+        echo "installed data/plugins/$crate.wasm"
+    done
 
 # --- live verification --------------------------------------------------------
 

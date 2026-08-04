@@ -142,6 +142,12 @@ impl Plugins for WasmPluginHost {
         names
     }
 
+    /// Map lookup rather than the trait's default list-and-scan: trigger hooks
+    /// ask this per event, per hook.
+    fn has(&self, name: &str) -> bool {
+        self.modules.read().unwrap().contains_key(name)
+    }
+
     fn manifests(&self) -> Vec<Value> {
         let modules = self.modules.read().unwrap();
         let mut entries: Vec<(&String, &LoadedPlugin)> = modules.iter().collect();

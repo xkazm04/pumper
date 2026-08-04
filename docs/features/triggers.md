@@ -50,6 +50,7 @@ Every evaluation of a trigger against one source event is recorded, fires and **
 | `filter_miss` | The inbound payload did not satisfy the trigger's JSON-path filters |
 | `bad_filters` | The trigger's stored filter specs no longer parse |
 | `predicate_veto` | A predicate plugin returned `pass=false` (or failed with `on_error = "skip"`) |
+| `plugin_missing` | A **configured** hook names a plugin the host has not loaded, so the hook did nothing — the predicate did not gate, the transform did not shape (`detail` = the plugin name). The hop still fired: fail-open is the contract. Usually means `just plugins-install` was never run — see [trigger-plugins.md](trigger-plugins.md) |
 | `cycle` / `depth` | Provenance guards (`chain`, `[triggers] max_depth`) |
 | `target_unregistered` | `target_app` is not a registered app (`detail` = the app) |
 | `dedup` | A job already exists for this hop's idempotency key (`detail` = the key) |
@@ -64,7 +65,11 @@ Ledger writes are **fail-open**: a write that fails is logged loudly and the hop
 
 `GET /triggers` takes an optional `app` filter and is **dual-mode**: bare `{triggers: [...]}` by default, or `{items, next_cursor}` when a `cursor` param is present (even empty) — an opaque keyset cursor. `limit` is clamped 1–500 in **both** modes, so an uncursored list can never stream the whole table.
 
-`POST /triggers` body: `{name?, source_kind, source_app, source_dataset?, on_change?, on_status?, target_app, params?, budget_usd?, priority?, max_attempts?}`.
+`POST /triggers` body: `{name?, source_kind, source_app, source_dataset?, on_change?, on_status?, target_app, params?, budget_usd?, priority?, max_attempts?, filters?, plugins?}`. The `plugins` object attaches sandboxed WASM hooks — see [trigger-plugins.md](trigger-plugins.md).
+
+## Evaluation-set caching
+
+The set of enabled triggers for a scope — `(dataset|job, app)` or `(external, ingress source)` — is cached in memory with its filter specs already parsed, so a completion or inbound event with nothing configured performs **no** query. Coherence is a generation counter on the `triggers` table, bumped after every create / enable-toggle / delete: a CRUD operation is visible to the very next firing decision, and there is no stale window. The cache is per-process and in-memory only; nothing about it is configurable or observable through the API.
 
 ## Non-goals (by design)
 

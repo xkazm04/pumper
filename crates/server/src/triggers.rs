@@ -204,6 +204,27 @@ pub fn restamp_provenance(original: &Value, transformed: Value) -> Value {
     Value::Object(out)
 }
 
+/// Names a trigger's CONFIGURED hooks point at that the plugin host has not
+/// loaded, in hook order (predicate, then transform). Empty when the trigger
+/// has no hooks, or when every named module is present.
+///
+/// The anti-pattern this exists to expose: a configured predicate whose module
+/// was never built into `data/plugins/` takes the same fail-open path as a
+/// predicate that passed, so a gate nobody deployed is indistinguishable from
+/// a gate that said yes. The hop still fires — fail-open is the contract — but
+/// the caller can now say so at error level and in the decision ledger.
+pub fn missing_hook_plugins(plugins: &dyn pumper_core::Plugins, trigger: &Trigger) -> Vec<String> {
+    let Some(hooks) = &trigger.plugin_hooks else {
+        return Vec::new();
+    };
+    [hooks.predicate.as_ref(), hooks.transform.as_ref()]
+        .into_iter()
+        .flatten()
+        .filter(|h| !plugins.has(&h.plugin))
+        .map(|h| h.plugin.clone())
+        .collect()
+}
+
 /// Runs a trigger's plugin hooks over the built `_trigger` object.
 /// `None` = the predicate said skip; `Some(obj)` = the (possibly transformed)
 /// object to merge into target params. Every failure path is fail-open with a
@@ -410,7 +431,7 @@ use std::sync::{Arc, Mutex};
 use pumper_core::datasets::JsonFilter;
 use pumper_core::storage::{NewTriggerRun, TRIGGER_SET_ID};
 use pumper_core::{EnqueueOptions, Storage};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::state::AppState;
 
@@ -600,6 +621,30 @@ impl Ctx<'_> {
             event_id: self.event_id,
             ..Default::default()
         }
+    }
+}
+
+/// Reports every configured hook of `trigger` whose plugin is not loaded: one
+/// error-level log and one `plugin_missing` ledger row per missing module.
+///
+/// Deliberately NOT a gate. The hop proceeds into the fail-open path exactly
+/// as before — a mis-deployed plugin must not wedge a pipeline edge — but the
+/// silence is what made this bug survivable, and the silence is what ends.
+async fn report_missing_plugins(state: &AppState, trigger: &Trigger, ctx: &Ctx<'_>) {
+    for plugin in missing_hook_plugins(state.plugins.as_ref(), trigger) {
+        error!(trigger = %trigger.id, plugin = %plugin,
+               "trigger hook names a plugin that is not loaded: the hook did NOTHING \
+                (predicate did not gate / transform did not shape) and the hop takes the \
+                fail-open path. Build and install it with `just plugins-install`, then \
+                POST /plugins/reload");
+        record(
+            state,
+            NewTriggerRun {
+                detail: Some(&plugin),
+                ..ctx.row(&trigger.id, "plugin_missing")
+            },
+        )
+        .await;
     }
 }
 
@@ -839,6 +884,7 @@ pub async fn fire_external_triggers(
             &chain,
         );
         // Plugin predicate/transform hooks (fail-open, see `apply_plugin_hooks`).
+        report_missing_plugins(state, trigger, &ctx).await;
         let Some(obj) = apply_plugin_hooks(state.plugins.as_ref(), trigger, obj).await else {
             record(state, ctx.row(&trigger.id, "predicate_veto")).await;
             continue;
@@ -926,7 +972,9 @@ async fn enqueue_hop(
     ctx: &Ctx<'_>,
 ) -> usize {
     // Plugin hooks first: a predicate may veto the hop, a transform may shape
-    // the `_trigger` envelope. Both fail open (see `apply_plugin_hooks`).
+    // the `_trigger` envelope. Both fail open (see `apply_plugin_hooks`), and a
+    // hook whose plugin was never deployed says so loudly first.
+    report_missing_plugins(state, trigger, ctx).await;
     let Some(obj) = apply_plugin_hooks(state.plugins.as_ref(), trigger, obj).await else {
         record(state, ctx.row(&trigger.id, "predicate_veto")).await;
         return 0;
