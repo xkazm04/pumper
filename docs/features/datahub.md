@@ -54,8 +54,9 @@ Per pipeline (`emit_flows`):
   - `emissions.last` — the newest entry of either kind; mirrored as the back-compat top-level `last_emission`.
   - `emissions.sync_running` — whether a full sync currently holds the single backfill slot.
   - Entries are `{kind: job|sync, at, ok, entities?|error?}`; a batch that fails mid-emission reports how many entities already landed (`(partial: 25 of 60 entities already ingested) …`) because there is no rollback and, deliberately, no retry.
-  - `govern` — `{enabled, interval_secs, paused_apps, last_poll}`.
-  - Everything here is in-memory: a restart zeroes the counters and clears the paused set.
+  - `govern` — `{enabled, interval_secs, paused_apps, last_poll, recent_actions}`.
+  - Everything here is in-memory **except `govern.recent_actions`** (the durable audit trail, below): a restart zeroes the counters and clears the paused set.
+- **`GET /datahub/governance/preview`** — what a governance poll would do **right now**, doing none of it. See [Preview](#preview-get-datahubgovernancepreview).
 
 ## Governance actuator (`govern = true`)
 
@@ -69,6 +70,54 @@ Opt-in, default OFF, piggybacked on the scheduler tick. Each poll reads deprecat
 | tag **`cost:pause`** on any of the app's datasets | force that app's job budget to `$0` for **new** jobs | The budget governor then runs free tiers only — the Claude tier is skipped. Nothing running is cancelled, no job fails. Fully reversible: the paused set is recomputed wholesale each poll, so removing the tag resumes the app on the next poll. |
 | **failing assertions** (`health[].type == "ASSERTIONS" && status == "FAIL"`) | enqueue one immediate sync job for that dataset's app | `max_attempts = 2`, app default params, and an **hour-bucketed idempotency key** (`datahub-govern-sync:<app>:<dataset>:<YYYY-MM-DDTHH>`) so a persistently failing assertion enqueues at most one job per hour, not one per poll. Apps not in the registry are skipped with a warn. |
 
+### Preview (`GET /datahub/governance/preview`)
+
+The dry run. It reads the same remote state a poll reads and reports the plan that state maps to — and **writes nothing**: no schedule is disabled, no job enqueued, the paused set is untouched. It deliberately works with `govern = false`, because "what happens if I turn this on?" has to be answerable *before* the switch is flipped. `just enforcement-preview`'s sibling for the pull half.
+
+```
+GET /datahub/governance/preview
+{
+  "at": "...", "governing": false, "gms_url": "...", "env": "PROD",
+  "datasets_polled": 15, "poll_ms": 412, "budget_secs": 40,
+  "quiet": false,
+  "would": {
+    "disable_schedules": [{"app": "eu-sedia", "dataset": "calls", "evidence": "deprecation",
+                           "schedule_ids": ["catalog-eu-sedia"], "note": "..."}],
+    "pause_apps": ["ca-grants"],
+    "resume_apps": [],
+    "enqueue_syncs": [{"app": "grants-gov", "dataset": "opportunities", "evidence": "assertions",
+                       "registered": true, "idempotency_key": "datahub-govern-sync:...:2026-08-04T09", "note": "..."}]
+  },
+  "paused_now": [], "read_errors": [], "poll_would_abort": false,
+  "totals": {"schedules_disabled": 1, "apps_paused": 1, "syncs_enqueued": 1, "read_errors": 0}
+}
+```
+
+- `quiet: true` means a poll right now would change nothing.
+- `schedule_ids` names the **exact** catalog-managed rows a deprecation would disable. Hand-made schedules never appear, because they are never touched — a preview that guessed would be worse than no preview.
+- `idempotency_key` is the key the real enqueue would use, so you can check whether this hour's sync already exists.
+- Two honest differences from a real poll, both reported rather than hidden: a read error here is **collected** (`read_errors`) instead of aborting, and `poll_would_abort` says whether a real poll would therefore have done nothing at all. An empty plan with `poll_would_abort: true` is "blind", not "quiet".
+- **409** while `[datahub] enabled = false` (there is no GMS to read). `govern` may stay `false`.
+
+### Audit trail (durable)
+
+Every **executed** governance action is recorded in the `datahub_govern_actions` table (migration 0037) and emitted on the event bus. The anti-pattern this closes: an action lived only in `govern.last_poll` — the last poll's in-memory summary, erased by the next poll and by every restart — while its *effect* (a disabled schedule, a zeroed budget) was durable and unexplained.
+
+| column | meaning |
+| --- | --- |
+| `action` | `disable_schedule` · `enqueue_sync` · `pause_app` · `resume_app` |
+| `target` | the Pumper app acted on |
+| `dataset` | the dataset whose remote state was the evidence |
+| `subject` | the row produced or changed: a schedule id, a job id |
+| `evidence` | `deprecation` · `cost:pause` · `assertions` — what to go look at in DataHub |
+| `detail` | free text: the schedule's cron, the sync's idempotency key |
+| `created_at` | RFC 3339 UTC |
+
+- **Read it** on `GET /datahub/status` → `govern.recent_actions` (newest 20).
+- **Events**: each action is also emitted on `/events` as a `datahub_govern` status event whose `result` carries the same fields plus `audit_id`, so a remote-driven change shows up in the same stream as the job transitions it causes. The event is emitted even if the row could not be written — for a trail of things that are already true, visibility beats consistency.
+- **Retention**: age-bounded at **90 days**, pruned from the governance poll itself at most hourly (the table only grows while governance runs). Diagnostic, not evidence, like `trigger_runs`: an aged-out row loses the explanation, not the state.
+- Only *transitions* are audited for pauses: an app that was already paused is not news.
+
 **Failure posture, as it behaves today.** The first read error aborts the entire poll *before any action is planned* — an unreachable or absent DataHub is a clean no-op, and datasets DataHub has never seen read as all-false (only explicit remote state acts). The consequence to know: because `paused_apps` is only recomputed on a **successful** poll, a pause set before an outage **stays frozen for the duration of the outage** — the tag cannot be un-read while GMS is down. A restart clears it (in-memory only), so a dead DataHub after a restart means "no pauses" — fail-open in that direction, fail-frozen in the other.
 
 ## Verified against a live instance (quickstart v1.6, 2026-07-23)
@@ -81,6 +130,6 @@ The v1 ingestion envelope accepts all emitted aspects **including the timeseries
 - **No retry/DLQ, by design** (unlike webhooks): a failed emission is recorded (`emissions.last_error` + the `failed` counter) and never re-sent. Metadata is idempotent and fully re-derived on every run, so the next run — or a manual `/datahub/sync` — self-heals it; a queue would only buy staleness insurance. The cost is honest: a batch that fails halfway leaves the earlier batches ingested and the rest missing until the next emission.
 - Emitting all own-namespace datasets on success slightly over-claims freshness for apps whose runs deliberately touch only a subset of their datasets.
 - The lineage read-merge is not concurrency-safe across *writers* (two jobs finishing at once could interleave read-then-write on the same derived dataset). The full-sync overlap guard removes the sync-vs-sync case only.
-- Governance transitions are not previewed or audited: there is no dry-run of what a poll would do, and no history beyond the last poll summary. A deprecation-driven schedule disable is not undone by un-deprecating.
+- A deprecation-driven schedule disable is not undone by un-deprecating (the preview and the audit trail make it visible; they do not reverse it).
 - External upstream sources (`catalog/data-sources.toml`) are not modeled as DataHub entities — lineage starts at Pumper's own datasets.
 - Column lineage requires a declarative RuleSet in job params; code-driven apps get table-level lineage only.

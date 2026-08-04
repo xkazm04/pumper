@@ -25,10 +25,12 @@ use std::sync::Arc;
 
 use futures::StreamExt;
 use pumper_core::extract::{Rule, RuleSet};
-use pumper_core::{EnqueueOptions, Job, CATALOG_MANAGED_BY};
+use pumper_core::storage::NewDatahubGovernAction;
+use pumper_core::{EnqueueOptions, Job, Schedule, CATALOG_MANAGED_BY};
 use serde_json::{json, Map, Value};
 use tracing::{info, warn};
 
+use crate::events::JobEvent;
 use crate::state::AppState;
 
 /// Entities per ingestion POST — small batches so one oversized payload can't
@@ -1155,17 +1157,37 @@ fn record_govern(state: &AppState, summary: Value) {
     state.datahub_govern.lock().unwrap().last = Some(summary);
 }
 
-/// One governance poll: read remote state for every dataset URN, plan, apply.
-async fn govern_poll(state: AppState) {
+/// What the read half of one poll observed.
+///
+/// Errors are **collected, not thrown**: the poll's fail-closed rule (the first
+/// error means no action at all) is applied by its caller, so the same read
+/// path can serve `GET /datahub/governance/preview`, which must report what it
+/// could see AND what it could not rather than going dark on one bad URN.
+pub(crate) struct GovernRead {
+    pub(crate) metas: Vec<DatasetMeta>,
+    pub(crate) errors: Vec<String>,
+    pub(crate) datasets: usize,
+    pub(crate) elapsed: std::time::Duration,
+    pub(crate) budget_secs: u64,
+}
+
+/// Reads remote state for every Pumper dataset URN, bounded on both axes
+/// ([`POLL_CONCURRENCY`] in flight, [`POLL_TIMEOUT_SECS`] each).
+async fn read_govern_metas(state: &AppState) -> GovernRead {
+    let started = std::time::Instant::now();
     let all = match state.datasets.list_all_datasets().await {
         Ok(all) => all,
         Err(e) => {
-            warn!("datahub govern: dataset list failed, poll skipped: {e}");
-            return;
+            return GovernRead {
+                metas: Vec::new(),
+                errors: vec![format!("dataset list failed: {e}")],
+                datasets: 0,
+                elapsed: started.elapsed(),
+                budget_secs: 0,
+            }
         }
     };
     let env = state.config.datahub.env.clone();
-    let started = std::time::Instant::now();
     // Bounded-concurrency reads on the short-timeout client. Serial reads on
     // the 60s write client made a slow GMS a ~20-minute poll for 20 datasets;
     // the ceiling is now `worst_case_poll_secs(datasets)`.
@@ -1173,49 +1195,316 @@ async fn govern_poll(state: AppState) {
         .iter()
         .map(|(app, ds)| (app.clone(), ds.clone(), dataset_urn(&env, app, ds)))
         .collect();
-    let reads = futures::stream::iter(targets.into_iter().map(|(app, ds, urn)| {
-        let state = &state;
-        async move {
-            fetch_govern_meta(state, &urn)
-                .await
-                .map(|body| govern_meta(&app, &ds, &body))
-        }
+    let reads = futures::stream::iter(targets.into_iter().map(|(app, ds, urn)| async move {
+        fetch_govern_meta(state, &urn)
+            .await
+            .map(|body| govern_meta(&app, &ds, &body))
     }))
     .buffer_unordered(POLL_CONCURRENCY)
     .collect::<Vec<_>>()
     .await;
 
     let mut metas = Vec::with_capacity(all.len());
+    let mut errors = Vec::new();
     for read in reads {
         match read {
             Ok(meta) => metas.push(meta),
-            Err(e) => {
-                // Unreachable DataHub = clean no-op: abort before ANY action.
-                warn!("datahub govern: poll aborted, no actions taken: {e}");
-                record_govern(
-                    &state,
-                    json!({
-                        "at": pumper_core::datasets::ts(chrono::Utc::now()),
-                        "ok": false,
-                        "error": e,
-                    }),
-                );
-                return;
-            }
+            Err(e) => errors.push(e),
         }
     }
     // The bound is structural, not aspirational — say so when reality misses it
     // (a GMS answering just under the per-request timeout for every batch).
     let elapsed = started.elapsed();
-    let budget = worst_case_poll_secs(all.len());
-    if elapsed.as_secs() > budget {
+    let budget_secs = worst_case_poll_secs(all.len());
+    if elapsed.as_secs() > budget_secs {
         warn!(
             datasets = all.len(),
             elapsed_secs = elapsed.as_secs(),
-            budget_secs = budget,
+            budget_secs,
             "datahub govern: poll exceeded its worst-case read budget"
         );
     }
+    GovernRead {
+        metas,
+        errors,
+        datasets: all.len(),
+        elapsed,
+        budget_secs,
+    }
+}
+
+/// The schedules a deprecation disable would actually touch for one app: the
+/// M19 fence (`managed_by = "catalog"`) plus "currently enabled".
+///
+/// The fence also lives in SQL (`set_managed_schedule_enabled`), which is what
+/// makes it safe; this mirrors it so the **preview** can name the exact rows
+/// without writing anything — a preview that guessed would be worse than none.
+pub(crate) fn disable_targets<'a>(schedules: &'a [Schedule], app: &str) -> Vec<&'a Schedule> {
+    schedules
+        .iter()
+        .filter(|s| {
+            s.app == app && s.enabled && s.managed_by.as_deref() == Some(CATALOG_MANAGED_BY)
+        })
+        .collect()
+}
+
+/// SSE/`/events` status carried by every executed governance action, so the bus
+/// shows remote-driven changes alongside the job transitions they cause.
+pub(crate) const GOVERN_EVENT_STATUS: &str = "datahub_govern";
+
+/// How long an audit row lives. Diagnostic, like the trigger decision ledger:
+/// the *effects* (a disabled schedule, an enqueued job) are durable in their own
+/// tables, so an aged-out row loses the explanation, not the state. Longer than
+/// the trigger ledger's 14 days because the write rate is a handful of rows per
+/// incident, not one per evaluated edge.
+const AUDIT_RETENTION_DAYS: u64 = 90;
+/// How often the audit prune actually runs — a `DELETE` per poll against a
+/// table bounded in months would be pure write amplification.
+const AUDIT_PRUNE_EVERY: std::time::Duration = std::time::Duration::from_secs(3600);
+/// Last completed audit prune, process-local (the worker's ledger prune takes
+/// the same posture: a restart re-arms it, and an extra sweep is free).
+static LAST_AUDIT_PRUNE: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Whether the audit prune is due. Mirrors `worker::prune_is_due` — the same
+/// anti-pattern (a sweep on every tick against a table bounded in days) applies
+/// to any age-bounded ledger.
+pub(crate) fn audit_prune_due(
+    last: Option<std::time::Instant>,
+    now: std::time::Instant,
+    every: std::time::Duration,
+) -> bool {
+    match last {
+        None => true, // first poll after boot
+        Some(t) => now.duration_since(t) >= every,
+    }
+}
+
+/// Bounds `datahub_govern_actions` by age, at most once per
+/// [`AUDIT_PRUNE_EVERY`]. Rides the governance poll rather than the reaper: the
+/// table only grows while governance runs.
+async fn prune_audit_trail(state: &AppState) {
+    let now = std::time::Instant::now();
+    {
+        // Dropped before the await: a std Mutex must never be held across one.
+        let mut last = LAST_AUDIT_PRUNE.lock().expect("audit prune clock poisoned");
+        if !audit_prune_due(*last, now, AUDIT_PRUNE_EVERY) {
+            return;
+        }
+        *last = Some(now);
+    }
+    match state
+        .storage
+        .prune_datahub_govern_actions(AUDIT_RETENTION_DAYS)
+        .await
+    {
+        Ok(n) if n > 0 => info!(
+            pruned = n,
+            days = AUDIT_RETENTION_DAYS,
+            "pruned old DataHub governance actions"
+        ),
+        Ok(_) => {}
+        Err(e) => warn!("datahub govern: audit trail prune failed: {e}"),
+    }
+}
+
+/// Records ONE **executed** governance action: a durable row (migration 0037)
+/// plus an event on the same bus job transitions ride.
+///
+/// The anti-pattern this closes: governance actions existed only in
+/// `GovernState.last` — the last poll's in-memory summary, erased by the next
+/// poll and by every restart — while their effects (a disabled schedule, a
+/// zeroed budget) were durable. "Why is this schedule off?" had no answer.
+///
+/// Fail-open: the action has already happened when this is called, so a failed
+/// write is a warn, and the event is emitted either way (visibility beats
+/// consistency for an audit trail of things that are already true).
+async fn audit_action(state: &AppState, a: NewDatahubGovernAction<'_>) {
+    let id = match state.storage.record_datahub_govern_action(&a).await {
+        Ok(id) => Some(id),
+        Err(e) => {
+            warn!(
+                action = a.action,
+                target = a.target,
+                "datahub govern: audit row not recorded (the action still happened): {e}"
+            );
+            None
+        }
+    };
+    let mut event = JobEvent::new(
+        id.as_deref()
+            .and_then(|i| uuid::Uuid::parse_str(i).ok())
+            .unwrap_or_else(uuid::Uuid::nil),
+        a.target.to_string(),
+        GOVERN_EVENT_STATUS,
+    );
+    event.result = Some(json!({
+        "action": a.action,
+        "target": a.target,
+        "dataset": a.dataset,
+        "subject": a.subject,
+        "evidence": a.evidence,
+        "detail": a.detail,
+        "audit_id": id,
+    }));
+    state.events.emit(event);
+}
+
+/// The audit trail for `GET /datahub/status` — the durable half of the
+/// governance view.
+pub async fn recent_actions(state: &AppState, limit: i64) -> Value {
+    match state.storage.list_datahub_govern_actions(limit).await {
+        Ok(rows) => serde_json::to_value(rows).unwrap_or(Value::Null),
+        Err(e) => json!({ "error": format!("audit trail read failed: {e}") }),
+    }
+}
+
+/// **What a governance poll would do right now**, without doing any of it.
+///
+/// Read-only: it reads the same remote state a poll reads and reports the
+/// actions that state maps to. It disables nothing, enqueues nothing, and does
+/// not touch the paused set — which is why it deliberately works with
+/// `govern = false`. That is the whole point: the answer to "what happens if I
+/// turn this on?" must be available *before* turning it on.
+///
+/// Two honest differences from a real poll, both reported rather than hidden:
+/// a read error here is collected (`read_errors`) instead of aborting, and
+/// `poll_would_abort` says whether a real poll would therefore have done
+/// nothing at all.
+pub async fn governance_preview(state: &AppState) -> Value {
+    let cfg = &state.config.datahub;
+    let read = read_govern_metas(state).await;
+    let (actions, paused) = plan_govern_actions(&read.metas);
+    let schedules = match state.storage.list_schedules().await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!("datahub govern preview: schedules read failed: {e}");
+            Vec::new()
+        }
+    };
+
+    let mut disables: Vec<Value> = Vec::new();
+    let mut syncs: Vec<Value> = Vec::new();
+    for action in &actions {
+        match action {
+            GovernAction::DisableSchedules { app, dataset } => {
+                let targets = disable_targets(&schedules, app);
+                disables.push(json!({
+                    "app": app,
+                    "dataset": dataset,
+                    "evidence": "deprecation",
+                    "schedule_ids": targets.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
+                    "note": if targets.is_empty() {
+                        "no enabled catalog-managed schedule for this app — the disable would be a no-op"
+                    } else {
+                        "catalog-managed schedules only; hand-made schedules are never touched"
+                    },
+                }));
+            }
+            GovernAction::EnqueueSync { app, dataset } => {
+                let registered = state.registry.contains_key(app.as_str());
+                syncs.push(json!({
+                    "app": app,
+                    "dataset": dataset,
+                    "evidence": "assertions",
+                    "registered": registered,
+                    "idempotency_key": govern_sync_key(app, dataset, chrono::Utc::now()),
+                    "note": if registered {
+                        "one sync job, hour-bucketed so a persistent failure cannot storm"
+                    } else {
+                        "app is not registered on this instance — the sync would be skipped"
+                    },
+                }));
+            }
+        }
+    }
+
+    let mut paused_now: Vec<String> = {
+        let g = state.datahub_govern.lock().unwrap();
+        g.paused_apps.iter().cloned().collect()
+    };
+    paused_now.sort();
+    let mut would_pause: Vec<String> = paused.iter().cloned().collect();
+    would_pause.sort();
+    let mut would_resume: Vec<String> = paused_now
+        .iter()
+        .filter(|a| !paused.contains(*a))
+        .cloned()
+        .collect();
+    would_resume.sort();
+    let planned_disables = disables
+        .iter()
+        .filter(|d| !d["schedule_ids"].as_array().is_none_or(|a| a.is_empty()))
+        .count();
+    // "Quiet" is about CHANGE, not level: an app that is already paused and
+    // would stay paused is not something a poll would do to you.
+    let newly_paused = would_pause
+        .iter()
+        .filter(|a| !paused_now.contains(a))
+        .count();
+    let quiet =
+        planned_disables == 0 && syncs.is_empty() && newly_paused == 0 && would_resume.is_empty();
+
+    json!({
+        "at": pumper_core::datasets::ts(chrono::Utc::now()),
+        "governing": cfg.govern,
+        "gms_url": cfg.gms_url,
+        "env": cfg.env,
+        "datasets_polled": read.datasets,
+        "poll_ms": read.elapsed.as_millis() as u64,
+        "budget_secs": read.budget_secs,
+        "quiet": quiet,
+        "would": {
+            "disable_schedules": disables,
+            "pause_apps": would_pause,
+            "resume_apps": would_resume,
+            "enqueue_syncs": syncs,
+        },
+        "paused_now": paused_now,
+        "read_errors": read.errors,
+        "poll_would_abort": !read.errors.is_empty(),
+        "totals": {
+            "schedules_disabled": planned_disables,
+            "apps_paused": would_pause.len(),
+            "syncs_enqueued": syncs.len(),
+            "read_errors": read.errors.len(),
+        },
+    })
+}
+
+/// The hour-bucketed idempotency key of a governance-driven sync: a persistently
+/// failing assertion enqueues at most one job per hour, not one per poll. Shared
+/// with the preview so the previewed key IS the key that would be used.
+pub(crate) fn govern_sync_key(
+    app: &str,
+    dataset: &str,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    format!(
+        "datahub-govern-sync:{app}:{dataset}:{}",
+        now.format("%Y-%m-%dT%H")
+    )
+}
+
+/// One governance poll: read remote state for every dataset URN, plan, apply.
+async fn govern_poll(state: AppState) {
+    prune_audit_trail(&state).await;
+    let read = read_govern_metas(&state).await;
+    if let Some(e) = read.errors.first() {
+        // Unreachable DataHub = clean no-op: abort before ANY action.
+        warn!("datahub govern: poll aborted, no actions taken: {e}");
+        record_govern(
+            &state,
+            json!({
+                "at": pumper_core::datasets::ts(chrono::Utc::now()),
+                "ok": false,
+                "error": e,
+            }),
+        );
+        return;
+    }
+    let metas = read.metas;
+    let elapsed = read.elapsed;
+    let budget = read.budget_secs;
 
     let (actions, paused) = plan_govern_actions(&metas);
     let mut log: Vec<String> = Vec::new();
@@ -1223,17 +1512,44 @@ async fn govern_poll(state: AppState) {
     let mut syncs = 0usize;
 
     // Pause set: recomputed wholesale, so removing the tag resumes the app.
-    {
+    // The transitions (not the level) are what gets audited — an app that was
+    // already paused is not news.
+    let (newly_paused, newly_resumed) = {
         let mut g = state.datahub_govern.lock().unwrap();
-        for app in paused.difference(&g.paused_apps) {
-            warn!(app = %app, "datahub govern: cost:pause tag — Claude-tier PAUSED (budget $0) for new jobs");
-            log.push(format!("paused {app} (cost:pause tag)"));
-        }
-        for app in g.paused_apps.difference(&paused) {
-            info!(app = %app, "datahub govern: cost:pause tag removed — Claude-tier resumed");
-            log.push(format!("resumed {app} (cost:pause tag removed)"));
-        }
+        let entered: Vec<String> = paused.difference(&g.paused_apps).cloned().collect();
+        let left: Vec<String> = g.paused_apps.difference(&paused).cloned().collect();
         g.paused_apps = paused.clone();
+        (entered, left)
+    };
+    for app in &newly_paused {
+        warn!(app = %app, "datahub govern: cost:pause tag — Claude-tier PAUSED (budget $0) for new jobs");
+        log.push(format!("paused {app} (cost:pause tag)"));
+        audit_action(
+            &state,
+            NewDatahubGovernAction {
+                action: "pause_app",
+                target: app,
+                evidence: "cost:pause",
+                detail: Some("Claude-tier budget forced to $0 for new jobs"),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+    for app in &newly_resumed {
+        info!(app = %app, "datahub govern: cost:pause tag removed — Claude-tier resumed");
+        log.push(format!("resumed {app} (cost:pause tag removed)"));
+        audit_action(
+            &state,
+            NewDatahubGovernAction {
+                action: "resume_app",
+                target: app,
+                evidence: "cost:pause",
+                detail: Some("tag removed — normal budgets resume"),
+                ..Default::default()
+            },
+        )
+        .await;
     }
 
     let schedules = if actions
@@ -1253,11 +1569,7 @@ async fn govern_poll(state: AppState) {
             GovernAction::DisableSchedules { app, dataset } => {
                 // M19 fence: only rows tagged managed_by = "catalog" — the SQL
                 // itself refuses anything else, hand-made schedules are sacred.
-                for s in schedules.iter().filter(|s| {
-                    s.app == *app
-                        && s.enabled
-                        && s.managed_by.as_deref() == Some(CATALOG_MANAGED_BY)
-                }) {
+                for s in disable_targets(&schedules, app) {
                     match state
                         .storage
                         .set_managed_schedule_enabled(&s.id, false, CATALOG_MANAGED_BY)
@@ -1271,6 +1583,18 @@ async fn govern_poll(state: AppState) {
                                 s.id
                             ));
                             disabled += 1;
+                            audit_action(
+                                &state,
+                                NewDatahubGovernAction {
+                                    action: "disable_schedule",
+                                    target: app,
+                                    dataset: Some(dataset),
+                                    subject: Some(&s.id),
+                                    evidence: "deprecation",
+                                    detail: Some(&s.cron),
+                                },
+                            )
+                            .await;
                         }
                         Ok(false) => {
                             warn!(id = %s.id, "datahub govern: disable fenced off (not catalog-managed)")
@@ -1291,14 +1615,11 @@ async fn govern_poll(state: AppState) {
                     .unwrap_or(Value::Null);
                 // Hour-bucketed idempotency: a persistently failing assertion
                 // enqueues at most one sync per hour, not one per poll.
-                let key = format!(
-                    "datahub-govern-sync:{app}:{dataset}:{}",
-                    chrono::Utc::now().format("%Y-%m-%dT%H")
-                );
+                let key = govern_sync_key(app, dataset, chrono::Utc::now());
                 let opts = EnqueueOptions {
                     params,
                     max_attempts: 2,
-                    idempotency_key: Some(key),
+                    idempotency_key: Some(key.clone()),
                     ..Default::default()
                 };
                 match state.storage.enqueue(app, opts).await {
@@ -1311,6 +1632,19 @@ async fn govern_poll(state: AppState) {
                         ));
                         state.notify.notify_one();
                         syncs += 1;
+                        let job_id = job.id.to_string();
+                        audit_action(
+                            &state,
+                            NewDatahubGovernAction {
+                                action: "enqueue_sync",
+                                target: app,
+                                dataset: Some(dataset),
+                                subject: Some(&job_id),
+                                evidence: "assertions",
+                                detail: Some(&key),
+                            },
+                        )
+                        .await;
                     }
                     Err(e) => warn!(app = %app, "datahub govern: sync enqueue failed: {e}"),
                 }
@@ -1321,7 +1655,7 @@ async fn govern_poll(state: AppState) {
     let summary = json!({
         "at": pumper_core::datasets::ts(chrono::Utc::now()),
         "ok": true,
-        "datasets_polled": all.len(),
+        "datasets_polled": read.datasets,
         "poll_ms": elapsed.as_millis() as u64,
         "budget_secs": budget,
         "schedules_disabled": disabled,
@@ -1361,6 +1695,22 @@ pub fn status(state: &AppState) -> Value {
         "emissions": emissions,
         "govern": govern,
     })
+}
+
+/// How many audit rows `GET /datahub/status` carries. The full trail is bounded
+/// by age, not by this; the status view is a window, not the ledger.
+const STATUS_ACTIONS: i64 = 20;
+
+/// [`status`] plus the **durable** governance audit trail
+/// (`govern.recent_actions`). The in-memory half is erased by a restart; the
+/// actions it describes are not, which is exactly why they are stored.
+pub async fn status_json(state: &AppState) -> Value {
+    let mut out = status(state);
+    let actions = recent_actions(state, STATUS_ACTIONS).await;
+    if let Some(govern) = out.get_mut("govern").and_then(Value::as_object_mut) {
+        govern.insert("recent_actions".into(), actions);
+    }
+    out
 }
 
 /// The emission half of [`status`]: counters plus the two independent slots.
@@ -1665,6 +2015,70 @@ mod tests {
         // 20 datasets: 5 batches × 10s = 50s, against 20 × 60s = 20 minutes.
         assert_eq!(worst_case_poll_secs(20), 50);
         assert!(worst_case_poll_secs(20) < 20 * 60);
+    }
+
+    fn schedule(id: &str, app: &str, enabled: bool, managed_by: Option<&str>) -> Schedule {
+        Schedule {
+            id: id.into(),
+            app: app.into(),
+            cron: "0 * * * *".into(),
+            params: json!({}),
+            enabled,
+            priority: 0,
+            timezone: None,
+            misfire_policy: "fire_once".into(),
+            max_attempts: None,
+            managed_by: managed_by.map(str::to_string),
+            last_run: None,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The anti-pattern a preview could reintroduce: naming rows the SQL fence
+    /// would refuse anyway. A hand-made schedule is sacred — it must not appear
+    /// in the disable set, previewed or executed.
+    #[test]
+    fn disable_targets_skip_hand_made_and_already_disabled_schedules() {
+        let schedules = vec![
+            schedule("catalog-a", "a", true, Some(CATALOG_MANAGED_BY)),
+            schedule("hand-a", "a", true, None),
+            schedule("catalog-a-off", "a", false, Some(CATALOG_MANAGED_BY)),
+            schedule("catalog-b", "b", true, Some(CATALOG_MANAGED_BY)),
+        ];
+        let ids: Vec<&str> = disable_targets(&schedules, "a")
+            .iter()
+            .map(|s| s.id.as_str())
+            .collect();
+        assert_eq!(ids, vec!["catalog-a"]);
+        assert!(disable_targets(&schedules, "c").is_empty());
+    }
+
+    /// The anti-pattern: one sync per poll for a persistently failing assertion
+    /// — a 300s poll turning one broken dataset into 12 jobs an hour.
+    #[test]
+    fn sync_key_buckets_by_hour_not_by_poll() {
+        let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().to_utc();
+        let a = govern_sync_key("app", "ds", at("2026-08-04T10:00:00Z"));
+        let b = govern_sync_key("app", "ds", at("2026-08-04T10:59:59Z"));
+        let c = govern_sync_key("app", "ds", at("2026-08-04T11:00:00Z"));
+        assert_eq!(a, b);
+        assert_ne!(a, c);
+        assert!(a.ends_with("2026-08-04T10"), "{a}");
+    }
+
+    /// The anti-pattern: a retention `DELETE` on every poll against a table
+    /// bounded in months.
+    #[test]
+    fn audit_prune_runs_hourly_not_on_every_poll() {
+        let now = std::time::Instant::now();
+        let hour = std::time::Duration::from_secs(3600);
+        assert!(audit_prune_due(None, now, hour), "first poll after boot");
+        assert!(!audit_prune_due(Some(now), now, hour));
+        assert!(audit_prune_due(
+            now.checked_sub(hour),
+            now,
+            std::time::Duration::from_secs(3600)
+        ));
     }
 
     #[test]

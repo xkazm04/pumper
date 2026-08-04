@@ -100,6 +100,14 @@ enforcement-preview app='':
     if [ -n "{{app}}" ]; then q="?app={{app}}"; else q=""; fi
     curl -s "http://127.0.0.1:8088/enforcement/preview$q"
 
+# What the DataHub governance actuator would do RIGHT NOW: which schedules it
+# would disable, which apps it would pause, which syncs it would enqueue.
+# Writes nothing, and deliberately works with `[datahub] govern = false` —
+# it is the answer to the question that gates turning governance on.
+# Needs the server RUNNING and `[datahub] enabled = true`.
+datahub-preview port='8088':
+    curl -s "http://127.0.0.1:{{port}}/datahub/governance/preview"
+
 # A scope is required, e.g.
 #   just search-backfill "--app grants --dataset unified"
 #   just search-backfill --all

@@ -16,7 +16,7 @@
 //!   rejected rather than doubling the GMS load and racing the lineage
 //!   read-merge.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -34,6 +34,23 @@ struct MockGms {
     addr: SocketAddr,
     batches: Arc<Mutex<Vec<Vec<Value>>>>,
     graphql: Arc<Mutex<usize>>,
+    /// Remote governance state per `"<app>.<dataset>"`, matched against the URN
+    /// in the GraphQL variables. Absent ⇒ `dataset: null`, i.e. a dataset
+    /// DataHub has never seen (all signals false).
+    remote: Arc<Mutex<HashMap<String, Value>>>,
+}
+
+/// A DataHub `dataset` node carrying the three signals governance reads.
+fn remote_state(deprecated: bool, cost_pause: bool, failing: bool) -> Value {
+    json!({
+        "deprecation": {"deprecated": deprecated},
+        "tags": {"tags": if cost_pause {
+            json!([{"tag": {"urn": "urn:li:tag:cost:pause"}}])
+        } else {
+            json!([])
+        }},
+        "health": [{"type": "ASSERTIONS", "status": if failing { "FAIL" } else { "PASS" }}],
+    })
 }
 
 impl MockGms {
@@ -47,13 +64,16 @@ impl MockGms {
     async fn spawn_with(statuses: Vec<u16>, delay: Duration, graphql_delay: Duration) -> Self {
         let batches: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
         let graphql: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
+        let remote: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
         let script = Arc::new(Mutex::new(VecDeque::from(statuses)));
 
         let batches_h = batches.clone();
         let graphql_h = graphql.clone();
+        let remote_h = remote.clone();
         let handler = move |req: axum::extract::Request| {
             let batches = batches_h.clone();
             let graphql = graphql_h.clone();
+            let remote = remote_h.clone();
             let script = script.clone();
             async move {
                 let is_graphql = req.uri().path().contains("/api/graphql");
@@ -68,9 +88,22 @@ impl MockGms {
                 if is_graphql {
                     *graphql.lock().unwrap() += 1;
                     tokio::time::sleep(graphql_delay).await;
+                    // Answer from the scripted remote state for whichever
+                    // dataset URN this read asked about.
+                    let urn = serde_json::from_slice::<Value>(&body)
+                        .ok()
+                        .and_then(|q| q["variables"]["urn"].as_str().map(String::from))
+                        .unwrap_or_default();
+                    let dataset = remote
+                        .lock()
+                        .unwrap()
+                        .iter()
+                        .find(|(k, _)| urn.contains(&format!(",{k},")))
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or(Value::Null);
                     return (
                         axum::http::StatusCode::OK,
-                        json!({"data": {"dataset": null}}).to_string(),
+                        json!({ "data": { "dataset": dataset } }).to_string(),
                     );
                 }
                 if !delay.is_zero() {
@@ -95,12 +128,21 @@ impl MockGms {
             addr,
             batches,
             graphql,
+            remote,
         }
     }
 
     /// Governance GraphQL reads received so far.
     fn graphql_reads(&self) -> usize {
         *self.graphql.lock().unwrap()
+    }
+
+    /// Scripts the remote state of one `"<app>.<dataset>"`.
+    fn set_remote(&self, app_dataset: &str, state: Value) {
+        self.remote
+            .lock()
+            .unwrap()
+            .insert(app_dataset.to_string(), state);
     }
 
     fn url(&self) -> String {
@@ -271,6 +313,216 @@ async fn a_second_sync_during_one_in_flight_is_rejected_not_run() {
         crate::datahub::full_sync(&state).await,
         SyncOutcome::Ran(_)
     ));
+}
+
+// ── governance: preview + durable audit ─────────────────────────────────────
+
+/// A state wired to `gms` with the governance actuator in the requested mode.
+/// `govern = false` is a real case, not a placeholder: the preview must work
+/// before the switch is flipped.
+async fn govern_state_for(
+    gms: &MockGms,
+    govern: bool,
+) -> (AppState, pumper_core::testing::TempStore) {
+    let url = gms.url();
+    test_state_with(vec![Arc::new(FakeApp)], move |c| {
+        c.datahub.enabled = true;
+        c.datahub.gms_url = url;
+        c.datahub.govern = govern;
+        c.datahub.emit_flows = false;
+    })
+    .await
+}
+
+/// Runs one governance poll to completion. The interval is aged first so this
+/// works for the second and third poll of a test, not just the first.
+async fn poll_once(state: &AppState, gms: &MockGms) {
+    let before = gms.graphql_reads();
+    {
+        let mut g = state.datahub_govern.lock().unwrap();
+        g.last_poll = std::time::Instant::now().checked_sub(Duration::from_secs(3600));
+    }
+    crate::datahub::govern_tick(state);
+    wait_for(
+        "the governance poll to finish",
+        Duration::from_secs(15),
+        || {
+            let reads = gms.graphql_reads();
+            let idle = !state.datahub_govern.lock().unwrap().in_flight;
+            async move { reads > before && idle }
+        },
+    )
+    .await;
+}
+
+/// The one catalog-managed schedule governance is allowed to touch, plus a
+/// hand-made one it must never touch.
+async fn seed_schedules(state: &AppState) -> (String, String) {
+    let managed = state
+        .storage
+        .create_managed_schedule("fake", "0 * * * *", pumper_core::CATALOG_MANAGED_BY)
+        .await
+        .expect("catalog schedule");
+    let hand = state
+        .storage
+        .create_schedule(pumper_core::NewSchedule {
+            app: "fake",
+            cron: "30 * * * *",
+            params: json!({}),
+            priority: 0,
+            timezone: None,
+            misfire_policy: "fire_once",
+            max_attempts: None,
+        })
+        .await
+        .expect("hand-made schedule");
+    (managed.id, hand.id)
+}
+
+/// The anti-pattern: the first poll after `govern = true` acting immediately,
+/// with no way to see what it was about to do. The preview reads the same remote
+/// state and reports the same plan — while `govern` is still OFF, and while
+/// touching nothing.
+#[tokio::test]
+async fn preview_reports_what_governance_would_do_without_doing_any_of_it() {
+    let gms = MockGms::spawn(vec![], Duration::ZERO).await;
+    let (state, _store) = govern_state_for(&gms, false).await;
+    seed_datasets(&state, 2).await;
+    gms.set_remote("fake.d0", remote_state(true, true, false));
+    gms.set_remote("fake.d1", remote_state(false, false, true));
+    let (managed, hand) = seed_schedules(&state).await;
+
+    let p = crate::datahub::governance_preview(&state).await;
+    assert_eq!(p["governing"], false, "the preview must not need govern on");
+    assert_eq!(p["quiet"], false, "preview: {p}");
+    assert_eq!(p["poll_would_abort"], false);
+
+    let disable = &p["would"]["disable_schedules"][0];
+    assert_eq!(disable["app"], "fake");
+    assert_eq!(disable["dataset"], "d0");
+    assert_eq!(
+        disable["schedule_ids"],
+        json!([managed]),
+        "only the catalog-managed row may be named; the hand-made one ({hand}) is sacred"
+    );
+    assert_eq!(p["would"]["pause_apps"], json!(["fake"]));
+    let sync = &p["would"]["enqueue_syncs"][0];
+    assert_eq!(
+        (&sync["app"], &sync["dataset"]),
+        (&json!("fake"), &json!("d1"))
+    );
+    assert_eq!(sync["registered"], true);
+    assert!(sync["idempotency_key"]
+        .as_str()
+        .unwrap()
+        .starts_with("datahub-govern-sync:fake:d1:"));
+
+    // …and nothing happened: the schedule is still on, nothing is paused, and
+    // the audit trail is empty because no action was executed.
+    assert!(
+        state
+            .storage
+            .get_schedule(&managed)
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled,
+        "a preview must not disable anything"
+    );
+    assert_eq!(
+        crate::datahub::status(&state)["govern"]["paused_apps"],
+        json!([])
+    );
+    assert!(state
+        .storage
+        .list_datahub_govern_actions(10)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+/// A GMS that cannot be read aborts a real poll entirely. The preview must say
+/// so out loud rather than reporting an empty plan that looks like "all quiet".
+#[tokio::test]
+async fn a_read_error_is_reported_by_the_preview_not_silently_quiet() {
+    // A GMS nobody is listening on: every governance read fails.
+    let (state, _store) = test_state_with(vec![Arc::new(FakeApp)], |c| {
+        c.datahub.enabled = true;
+        c.datahub.gms_url = "http://127.0.0.1:1".into();
+        c.datahub.emit_flows = false;
+    })
+    .await;
+    seed_datasets(&state, 1).await;
+    let p = crate::datahub::governance_preview(&state).await;
+    assert_eq!(p["totals"]["read_errors"], 1, "preview: {p}");
+    assert_eq!(
+        p["poll_would_abort"], true,
+        "a real poll aborts on the first read error — the preview must say so"
+    );
+    assert_eq!(p["quiet"], true);
+}
+
+/// The anti-pattern: an executed governance action living ONLY in
+/// `GovernState.last` — erased by the next poll and by every restart, while the
+/// schedule it disabled stays disabled with no recorded reason.
+#[tokio::test]
+async fn an_executed_action_is_audited_durably_not_only_in_memory() {
+    let gms = MockGms::spawn(vec![], Duration::ZERO).await;
+    let (state, _store) = govern_state_for(&gms, true).await;
+    seed_datasets(&state, 1).await;
+    gms.set_remote("fake.d0", remote_state(true, true, false));
+    let (managed, _hand) = seed_schedules(&state).await;
+
+    let mut events = state.events.subscribe();
+    poll_once(&state, &gms).await;
+
+    // The action happened…
+    assert!(
+        !state
+            .storage
+            .get_schedule(&managed)
+            .await
+            .unwrap()
+            .unwrap()
+            .enabled,
+        "the deprecation must have disabled the catalog-managed schedule"
+    );
+    // …and left a durable row naming what, on which app, and on what evidence.
+    let rows = state.storage.list_datahub_govern_actions(10).await.unwrap();
+    let disable = rows
+        .iter()
+        .find(|r| r.action == "disable_schedule")
+        .expect("a disable must be audited");
+    assert_eq!(disable.target, "fake");
+    assert_eq!(disable.dataset.as_deref(), Some("d0"));
+    assert_eq!(disable.subject.as_deref(), Some(managed.as_str()));
+    assert_eq!(disable.evidence, "deprecation");
+    let pause = rows
+        .iter()
+        .find(|r| r.action == "pause_app")
+        .expect("entering the paused set must be audited");
+    assert_eq!(pause.evidence, "cost:pause");
+
+    // The trail is on the status surface…
+    let status = crate::datahub::status_json(&state).await;
+    assert_eq!(
+        status["govern"]["recent_actions"]
+            .as_array()
+            .map(Vec::len)
+            .unwrap_or(0),
+        rows.len()
+    );
+    // …and every executed action also reached the event bus.
+    let mut seen = Vec::new();
+    while let Ok((_, ev)) = events.try_recv() {
+        if ev.status == crate::datahub::GOVERN_EVENT_STATUS {
+            seen.push(ev.result.clone().unwrap_or(Value::Null));
+        }
+    }
+    assert!(
+        seen.iter().any(|e| e["action"] == "disable_schedule"),
+        "governance actions must reach the bus, not only the log: {seen:?}"
+    );
 }
 
 /// The anti-pattern: `govern_tick` stamping `last_poll` when the poll STARTED,

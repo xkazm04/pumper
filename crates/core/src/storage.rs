@@ -1091,6 +1091,70 @@ impl Storage {
         )
     }
 
+    // ---- DataHub governance audit trail (migration 0037) --------------------
+
+    /// Records ONE executed governance action. Callers are fail-open: the action
+    /// has already happened when this is called, so a failed audit write is a
+    /// warn, never a reason to pretend it didn't.
+    pub async fn record_datahub_govern_action(
+        &self,
+        a: &NewDatahubGovernAction<'_>,
+    ) -> Result<String> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO datahub_govern_actions \
+             (id, action, target, dataset, subject, evidence, detail, created_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        )
+        .bind(&id)
+        .bind(a.action)
+        .bind(a.target)
+        .bind(a.dataset)
+        .bind(a.subject)
+        .bind(a.evidence)
+        .bind(a.detail)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(id)
+    }
+
+    /// The newest governance actions, newest first — the durable answer to "why
+    /// is this schedule disabled?" that survives the restart `GovernState.last`
+    /// does not.
+    pub async fn list_datahub_govern_actions(
+        &self,
+        limit: i64,
+    ) -> Result<Vec<DatahubGovernAction>> {
+        let rows: Vec<DatahubGovernActionRow> = sqlx::query_as(
+            "SELECT id, action, target, dataset, subject, evidence, detail, created_at \
+             FROM datahub_govern_actions ORDER BY created_at DESC, id DESC LIMIT ?1",
+        )
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(DatahubGovernAction::try_from)
+            .collect()
+    }
+
+    /// Drops governance actions older than `days`. Diagnostic like
+    /// [`prune_trigger_runs`](Self::prune_trigger_runs): the *effects* (a
+    /// disabled schedule, an enqueued job) are durable in their own tables, so
+    /// an aged-out audit row loses explanation, not state.
+    pub async fn prune_datahub_govern_actions(&self, days: u64) -> Result<u64> {
+        if days == 0 {
+            return Ok(0);
+        }
+        Ok(
+            sqlx::query("DELETE FROM datahub_govern_actions WHERE created_at < ?1")
+                .bind(ts(cutoff(days)))
+                .execute(&self.pool)
+                .await?
+                .rows_affected(),
+        )
+    }
+
     // ---- Saved searches -----------------------------------------------------
 
     pub async fn create_saved_search(
@@ -2491,6 +2555,97 @@ impl TryFrom<TriggerRunRow> for TriggerRun {
             dataset: r.dataset,
             event_id: r.event_id,
             job_id: r.job_id,
+            detail: r.detail,
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+// ---- DataHub governance audit trail (migration 0037) ------------------------
+
+/// One executed DataHub governance action, with the remote evidence that caused
+/// it. Durable — unlike the in-memory last-poll summary, which a restart erases
+/// while the disabled schedule it explains stays disabled.
+#[derive(Debug, Clone, Serialize)]
+pub struct DatahubGovernAction {
+    pub id: String,
+    /// One of [`DATAHUB_GOVERN_ACTIONS`].
+    pub action: String,
+    /// The Pumper app acted on.
+    pub target: String,
+    /// The dataset whose remote state was the evidence, when the action came
+    /// from one dataset's signal.
+    pub dataset: Option<String>,
+    /// The row produced or changed: a schedule id, a job id.
+    pub subject: Option<String>,
+    /// The remote signal: one of [`DATAHUB_GOVERN_EVIDENCE`].
+    pub evidence: String,
+    pub detail: Option<String>,
+    pub created_at: DateTime<Utc>,
+}
+
+/// Every value `datahub_govern_actions.action` may take. Documented on
+/// `GET /datahub/status`, so the list is a contract, not a hint.
+pub const DATAHUB_GOVERN_ACTIONS: &[&str] = &[
+    // A catalog-managed schedule was disabled (dataset deprecated in DataHub).
+    "disable_schedule",
+    // An immediate sync job was enqueued (failing assertion in DataHub).
+    "enqueue_sync",
+    // An app entered the paused set (`cost:pause` tag) — new jobs run free
+    // tiers only.
+    "pause_app",
+    // An app left the paused set (tag removed) — normal budgets resume.
+    "resume_app",
+    // The paused set was dropped because governance had been blind for longer
+    // than the staleness window: pauses expire loudly instead of freezing at $0.
+    "expire_pause",
+];
+
+/// Every value `datahub_govern_actions.evidence` may take — what an operator
+/// should go and look at in DataHub.
+pub const DATAHUB_GOVERN_EVIDENCE: &[&str] = &[
+    "deprecation",
+    "cost:pause",
+    "assertions",
+    // Not a remote signal: the ABSENCE of one for too long (see `expire_pause`).
+    "stale",
+];
+
+/// Insert shape for [`Storage::record_datahub_govern_action`]. Borrowed and
+/// `Default`ing so each action names only the fields it knows.
+#[derive(Debug, Default)]
+pub struct NewDatahubGovernAction<'a> {
+    pub action: &'a str,
+    pub target: &'a str,
+    pub dataset: Option<&'a str>,
+    pub subject: Option<&'a str>,
+    pub evidence: &'a str,
+    pub detail: Option<&'a str>,
+}
+
+#[derive(sqlx::FromRow)]
+struct DatahubGovernActionRow {
+    id: String,
+    action: String,
+    target: String,
+    dataset: Option<String>,
+    subject: Option<String>,
+    evidence: String,
+    detail: Option<String>,
+    created_at: String,
+}
+
+impl TryFrom<DatahubGovernActionRow> for DatahubGovernAction {
+    type Error = Error;
+
+    fn try_from(r: DatahubGovernActionRow) -> Result<DatahubGovernAction> {
+        Ok(DatahubGovernAction {
+            id: r.id,
+            action: r.action,
+            target: r.target,
+            dataset: r.dataset,
+            subject: r.subject,
+            evidence: r.evidence,
             detail: r.detail,
             created_at: parse_ts(&r.created_at)?,
         })

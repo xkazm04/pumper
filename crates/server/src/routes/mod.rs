@@ -246,6 +246,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(promote_proposal))
         .routes(routes!(datahub_status))
         .routes(routes!(datahub_sync))
+        .routes(routes!(datahub_governance_preview))
         .routes(routes!(openapi_json))
         // Document-bodied routes, with their own scoped body ceiling.
         .merge(large_body_router())
@@ -517,6 +518,7 @@ mod api_spec_tests {
         "POST /provisioner/proposals/{key}/promote",
         "GET /datahub/status",
         "POST /datahub/sync",
+        "GET /datahub/governance/preview",
         "GET /openapi.json",
     ];
 

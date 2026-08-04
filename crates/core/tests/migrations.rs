@@ -22,6 +22,7 @@ const EXPECTED_TABLES: &[&str] = &[
     "api_recipes",
     "checkpoints",
     "cost_events",
+    "datahub_govern_actions",
     "derived",
     "doc_fingerprints",
     "field_invariants",

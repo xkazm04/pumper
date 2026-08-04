@@ -529,10 +529,41 @@ pub(crate) async fn catalog_reconcile_apply(
     get,
     path = "/datahub/status",
     tag = "datahub",
-    responses((status = 200, description = "`{enabled, gms_url, env, token_set, emit_schema, emit_profile, emit_flows, last_emission, emissions, govern}`. `emissions` = `{ok, failed, last, last_success, last_error, sync_running}` — successes and failures are counted and kept in SEPARATE slots, so a success cannot hide the last failure; entries are `{kind: job|sync, at, ok, entities?|error?}`. `last_emission` mirrors `emissions.last`. `govern` = `{enabled, interval_secs, paused_apps, last_poll}`, where last_poll is the most recent governance poll summary (`{at, ok, datasets_polled, poll_ms, budget_secs, schedules_disabled, syncs_enqueued, paused_apps, actions}`) or its error. All in-memory: a restart zeroes it."))
+    responses((status = 200, description = "`{enabled, gms_url, env, token_set, emit_schema, emit_profile, emit_flows, last_emission, emissions, govern}`. `emissions` = `{ok, failed, last, last_success, last_error, sync_running}` — successes and failures are counted and kept in SEPARATE slots, so a success cannot hide the last failure; entries are `{kind: job|sync, at, ok, entities?|error?}`. `last_emission` mirrors `emissions.last`. `govern` = `{enabled, interval_secs, paused_apps, last_poll, recent_actions}`, where last_poll is the most recent governance poll summary (`{at, ok, datasets_polled, poll_ms, budget_secs, schedules_disabled, syncs_enqueued, paused_apps, actions}`) or its error, and `recent_actions` is the newest 20 rows of the DURABLE audit trail (`{id, action, target, dataset, subject, evidence, detail, created_at}`, age-bounded at 90 days). Everything except `recent_actions` is in-memory: a restart zeroes it."))
 )]
 pub(crate) async fn datahub_status(State(state): State<AppState>) -> Json<Value> {
-    Json(crate::datahub::status(&state))
+    Json(crate::datahub::status_json(&state).await)
+}
+
+/// **What the DataHub governance actuator would do right now**, without doing
+/// any of it. Reads the same remote state a poll reads; disables nothing,
+/// enqueues nothing, pauses nothing.
+///
+/// Deliberately works with `[datahub] govern = false` — it is the answer to the
+/// only question that gates turning governance on, and that answer has to be
+/// available before the switch is flipped.
+#[utoipa::path(
+    get,
+    path = "/datahub/governance/preview",
+    tag = "datahub",
+    responses(
+        (status = 200, description = "`{at, governing, gms_url, env, datasets_polled, poll_ms, budget_secs, quiet, would: {disable_schedules: [{app, dataset, evidence, schedule_ids, note}], pause_apps, resume_apps, enqueue_syncs: [{app, dataset, evidence, registered, idempotency_key, note}]}, paused_now, read_errors, poll_would_abort, totals}`. \
+            `quiet: true` means a poll right now would change nothing. `schedule_ids` names the exact catalog-managed rows a deprecation would disable (hand-made schedules are never listed — they are never touched). Unlike a real poll, a read error here does not abort: it is reported in `read_errors`, and `poll_would_abort` says whether a real poll would consequently have done nothing at all. Writes nothing."),
+        (status = 409, description = "[datahub] is disabled in config (no GMS to read)", body = Object),
+    )
+)]
+pub(crate) async fn datahub_governance_preview(
+    State(state): State<AppState>,
+) -> Result<Json<Value>, ApiError> {
+    if !state.config.datahub.enabled {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "[datahub] is disabled — set enabled = true and gms_url in config (govern may stay \
+             false: this preview reads DataHub but acts on nothing)"
+                .into(),
+        ));
+    }
+    Ok(Json(crate::datahub::governance_preview(&state).await))
 }
 
 /// One-shot metadata backfill: pushes every stored dataset (entity, properties,

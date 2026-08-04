@@ -31,6 +31,7 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just doctor [port]` | `GET /datasets/doctor` — read-only store integrity report (server RUNNING) |
 | `just retention-preview [days]` | `GET /retention/preview` — reclaimable bytes, deletes nothing (server RUNNING) |
 | `just enforcement-preview [app]` | `GET /enforcement/preview` — what `[resilience] enforce = true` would have done, gates nothing (server RUNNING) |
+| `just datahub-preview [port]` | `GET /datahub/governance/preview` — what the DataHub governance poll would do right now, writes nothing (server RUNNING) |
 | `just smoke [args]` | `pwsh -File scripts/smoke.ps1` — boots the real binary against a scratch config, drives one real job end-to-end, and curls the doctor/retention/enforcement-preview/openapi/receipt surfaces; PASS/FAIL/SKIP per check, tears down after itself |
 
 `--bin pumper` is **required**: the `pumper-server` package ships three binaries
