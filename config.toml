@@ -254,6 +254,7 @@ gms_url = "http://localhost:8080"             # local docker quickstart (Cloud: 
 # emit_flows = true                           # M25: schedules as dataFlow, runs as dataJob (in/out edges), trigger DAG + RuleSet column lineage
 # govern = false                              # M26: OPT-IN pull loop — DataHub deprecation / cost:pause tags / failing assertions act on the fleet
 # govern_interval_secs = 300                  # governance poll cadence (min 30)
+# govern_pause_max_stale_secs = 900           # cost:pause expires (loudly) after this long with no SUCCESSFUL poll; 0 = freeze until DataHub is readable again
 
 # Information economics (M04) — GET /economics joins the cost ledger with
 # per-job yield (job_yield) into $/new-record and $/changed-record per app over

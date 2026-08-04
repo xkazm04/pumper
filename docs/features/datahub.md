@@ -20,6 +20,7 @@ Implementation: `crates/server/src/datahub.rs`; config: `[datahub]` in `crates/c
 | `emit_flows` | `true` | Pipeline topology: schedules/triggers as `dataFlow`, runs as `dataJob` with in/out edges, trigger DAG as dataset lineage, and RuleSet-derived column lineage. |
 | `govern` | `false` | The pull half — see [Governance actuator](#governance-actuator-govern--true). Remote state acting on an unattended box is opt-in. |
 | `govern_interval_secs` | `300` | Seconds between governance polls, clamped to a 30s minimum. Measured from the previous poll's **completion**. |
+| `govern_pause_max_stale_secs` | `900` | How long the `cost:pause` set may survive **without a successful poll** before it expires loudly (3× the default interval). `0` keeps the old behavior: pauses freeze until governance can see DataHub again. See [Outage staleness](#outage-staleness-governance-that-has-gone-blind). |
 
 ## What gets emitted
 
@@ -66,7 +67,7 @@ Opt-in, default OFF, piggybacked on the scheduler tick. Each poll reads deprecat
 
 | DataHub signal | Action | Blast radius |
 | --- | --- | --- |
-| dataset **deprecated** | disable that dataset's app's schedules | **One deprecated dataset disables ALL of that app's catalog-managed schedules**, not just the ones feeding that dataset. Fenced to `managed_by = "catalog"` in SQL (M19) — hand-made schedules are never touched. **Not automatically reversible:** un-deprecating in DataHub does *not* re-enable them; re-enable via `POST /catalog/reconcile` (which sets `enabled = 1` for catalog-managed rows) or the schedule API. Conversely, with `[catalog] auto_reconcile = true` the **boot** reconcile re-enables them silently — the two actuators disagree, and the last one to run wins. |
+| dataset **deprecated** | disable that dataset's app's schedules, **once per transition** | **One deprecated dataset disables ALL of that app's catalog-managed schedules**, not just the ones feeding that dataset — the app is the unit, because the signal is read per dataset but schedules are not tied to datasets. Fenced to `managed_by = "catalog"` in SQL (M19) — hand-made schedules are never touched, and `GET /datahub/governance/preview` names the exact ids. **Acted on the change, not the level:** the disable fires when the deprecation appears; while the flag stands, a `POST /schedules/{id}/enabled` re-enable is **respected** (and survives a restart — see [Transition semantics](#transition-semantics-governance-acts-on-change-not-on-level)). **Not automatically reversible:** un-deprecating does *not* re-enable them; re-enable via `POST /catalog/reconcile` or the schedule API. With `[catalog] auto_reconcile = true` the **boot** reconcile re-enables them silently — the two actuators disagree, and the last one to run wins. |
 | tag **`cost:pause`** on any of the app's datasets | force that app's job budget to `$0` for **new** jobs | The budget governor then runs free tiers only — the Claude tier is skipped. Nothing running is cancelled, no job fails. Fully reversible: the paused set is recomputed wholesale each poll, so removing the tag resumes the app on the next poll. |
 | **failing assertions** (`health[].type == "ASSERTIONS" && status == "FAIL"`) | enqueue one immediate sync job for that dataset's app | `max_attempts = 2`, app default params, and an **hour-bucketed idempotency key** (`datahub-govern-sync:<app>:<dataset>:<YYYY-MM-DDTHH>`) so a persistently failing assertion enqueues at most one job per hour, not one per poll. Apps not in the registry are skipped with a warn. |
 
@@ -118,7 +119,29 @@ Every **executed** governance action is recorded in the `datahub_govern_actions`
 - **Retention**: age-bounded at **90 days**, pruned from the governance poll itself at most hourly (the table only grows while governance runs). Diagnostic, not evidence, like `trigger_runs`: an aged-out row loses the explanation, not the state.
 - Only *transitions* are audited for pauses: an app that was already paused is not news.
 
-**Failure posture, as it behaves today.** The first read error aborts the entire poll *before any action is planned* — an unreachable or absent DataHub is a clean no-op, and datasets DataHub has never seen read as all-false (only explicit remote state acts). The consequence to know: because `paused_apps` is only recomputed on a **successful** poll, a pause set before an outage **stays frozen for the duration of the outage** — the tag cannot be un-read while GMS is down. A restart clears it (in-memory only), so a dead DataHub after a restart means "no pauses" — fail-open in that direction, fail-frozen in the other.
+### Transition semantics: governance acts on CHANGE, not on level
+
+The deprecation → disable action fires on the **transition** (not deprecated → deprecated), and the level it last acted on is persisted per app in `datahub_govern_levels` (migration 0038).
+
+- **A manual re-enable is respected.** `POST /schedules/{id}/enabled` after a governance disable stands until DataHub changes its mind. Previously the still-standing flag re-disabled it on the next poll (≤ `govern_interval_secs`), forever, with no override.
+- **A restart does not flap.** The memory is in SQLite, so a fresh process seeing a deprecation it has already acted on does nothing. That is why the level lives in its own table rather than in the age-pruned audit trail: pruning the memory would resurrect the flap.
+- **Un-deprecating re-arms, it does not undo.** When the flag clears, the recorded level clears too (no action taken — the schedule stays as it is), so a *later* re-deprecation is a fresh transition and acts again.
+- **Suppression is visible**: the poll summary counts `schedules_suppressed` and names each no-op in `actions`; the preview marks the entry `suppressed: true` with an empty `schedule_ids`.
+- Fail-closed: if the level memory cannot be read, the poll disables **nothing** that cycle rather than assuming a clean slate and stomping a re-enable.
+- The other two actions stay level-based on purpose. `cost:pause` is already reversible by construction (the set is recomputed wholesale, so removing the tag resumes), and a sync for a *still-failing* assertion is the healing attempt itself — bounded by the hour-bucketed idempotency key, not by a transition.
+
+### Outage staleness: governance that has gone blind
+
+The first read error aborts the entire poll *before any action is planned* — an unreachable or absent DataHub is a clean no-op, and datasets DataHub has never seen read as all-false (only explicit remote state acts).
+
+That fail-closed read had one asymmetric consequence: because `paused_apps` could only be recomputed on a **successful** poll, an app paused just before an outage stayed at budget `$0` for the entire outage, with no way to un-read the tag — enforcement of state nobody could refute.
+
+Now the pause set has a shelf life. When no poll has succeeded for `govern_pause_max_stale_secs` (default 900s = 3× the default interval), the set **expires loudly** on the next failed poll: a `warn` naming how long governance has been blind, an `expire_pause` audit row per app with `evidence: "stale"`, and the matching bus event. Normal budgets resume. Nothing is lost — the very next successful poll re-reads the tags and re-pauses whatever is still tagged.
+
+- `GET /datahub/status` → `govern.secs_since_successful_poll` and `govern.pause_max_stale_secs` show how close the set is to expiring.
+- A short blip changes nothing: expiry needs the *window*, not merely a failed poll.
+- `govern_pause_max_stale_secs = 0` opts out (freeze until governance can see again).
+- Direction of the trade: expiring is fail-open on **spend**, which is the same direction the module already leaned (a restart cleared the pause set anyway, in-memory as it is). Keeping a $0 budget indefinitely on the strength of a tag nobody can re-read is enforcement without observation; a paused app that resumes normal budgets still runs its own configured budget cap.
 
 ## Verified against a live instance (quickstart v1.6, 2026-07-23)
 

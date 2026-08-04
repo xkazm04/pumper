@@ -1155,6 +1155,48 @@ impl Storage {
         )
     }
 
+    // ---- DataHub governance level memory (migration 0038) -------------------
+
+    /// The last-acted remote level of `signal`, per target. Absent target =
+    /// never acted on (treated as "off"), so a first sighting is a transition.
+    ///
+    /// This is what makes governance a *transition* follower: without it, a
+    /// standing deprecation re-disabled an operator's re-enabled schedule on
+    /// every poll, and a restart re-disabled it once more.
+    pub async fn datahub_govern_levels(
+        &self,
+        signal: &str,
+    ) -> Result<std::collections::HashMap<String, bool>> {
+        let rows: Vec<(String, i64)> =
+            sqlx::query_as("SELECT target, level FROM datahub_govern_levels WHERE signal = ?1")
+                .bind(signal)
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows.into_iter().map(|(t, l)| (t, l != 0)).collect())
+    }
+
+    /// Records the level governance has now acted on for `(signal, target)`.
+    pub async fn set_datahub_govern_level(
+        &self,
+        signal: &str,
+        target: &str,
+        level: bool,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO datahub_govern_levels (signal, target, level, updated_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(signal, target) DO UPDATE SET level = excluded.level, \
+             updated_at = excluded.updated_at",
+        )
+        .bind(signal)
+        .bind(target)
+        .bind(level as i64)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     // ---- Saved searches -----------------------------------------------------
 
     pub async fn create_saved_search(

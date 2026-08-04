@@ -38,6 +38,9 @@ struct MockGms {
     /// in the GraphQL variables. Absent ⇒ `dataset: null`, i.e. a dataset
     /// DataHub has never seen (all signals false).
     remote: Arc<Mutex<HashMap<String, Value>>>,
+    /// While set, every governance read fails — a DataHub outage, which is the
+    /// only way to reach the poll's abort path.
+    outage: Arc<Mutex<bool>>,
 }
 
 /// A DataHub `dataset` node carrying the three signals governance reads.
@@ -65,15 +68,18 @@ impl MockGms {
         let batches: Arc<Mutex<Vec<Vec<Value>>>> = Arc::new(Mutex::new(Vec::new()));
         let graphql: Arc<Mutex<usize>> = Arc::new(Mutex::new(0));
         let remote: Arc<Mutex<HashMap<String, Value>>> = Arc::new(Mutex::new(HashMap::new()));
+        let outage: Arc<Mutex<bool>> = Arc::new(Mutex::new(false));
         let script = Arc::new(Mutex::new(VecDeque::from(statuses)));
 
         let batches_h = batches.clone();
         let graphql_h = graphql.clone();
         let remote_h = remote.clone();
+        let outage_h = outage.clone();
         let handler = move |req: axum::extract::Request| {
             let batches = batches_h.clone();
             let graphql = graphql_h.clone();
             let remote = remote_h.clone();
+            let outage = outage_h.clone();
             let script = script.clone();
             async move {
                 let is_graphql = req.uri().path().contains("/api/graphql");
@@ -88,6 +94,12 @@ impl MockGms {
                 if is_graphql {
                     *graphql.lock().unwrap() += 1;
                     tokio::time::sleep(graphql_delay).await;
+                    if *outage.lock().unwrap() {
+                        return (
+                            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                            "GMS down".to_string(),
+                        );
+                    }
                     // Answer from the scripted remote state for whichever
                     // dataset URN this read asked about.
                     let urn = serde_json::from_slice::<Value>(&body)
@@ -129,12 +141,18 @@ impl MockGms {
             batches,
             graphql,
             remote,
+            outage,
         }
     }
 
     /// Governance GraphQL reads received so far.
     fn graphql_reads(&self) -> usize {
         *self.graphql.lock().unwrap()
+    }
+
+    /// Takes GMS down (or brings it back) for the governance read path.
+    fn set_outage(&self, down: bool) {
+        *self.outage.lock().unwrap() = down;
     }
 
     /// Scripts the remote state of one `"<app>.<dataset>"`.
@@ -522,6 +540,162 @@ async fn an_executed_action_is_audited_durably_not_only_in_memory() {
     assert!(
         seen.iter().any(|e| e["action"] == "disable_schedule"),
         "governance actions must reach the bus, not only the log: {seen:?}"
+    );
+}
+
+// ── governance: reversible + outage-safe ────────────────────────────────────
+
+async fn schedule_enabled(state: &AppState, id: &str) -> bool {
+    state
+        .storage
+        .get_schedule(id)
+        .await
+        .expect("schedule read")
+        .expect("schedule exists")
+        .enabled
+}
+
+/// The anti-pattern: governance acting on the LEVEL of the deprecation flag, so
+/// an operator who re-enabled a schedule had it disabled again within the poll
+/// interval — forever, with no override. Governance now acts on the CHANGE.
+#[tokio::test]
+async fn a_manual_re_enable_survives_the_next_poll_until_datahub_changes() {
+    let gms = MockGms::spawn(vec![], Duration::ZERO).await;
+    let (state, _store) = govern_state_for(&gms, true).await;
+    seed_datasets(&state, 1).await;
+    gms.set_remote("fake.d0", remote_state(true, false, false));
+    let (managed, _hand) = seed_schedules(&state).await;
+
+    // Poll 1: the transition disables it.
+    poll_once(&state, &gms).await;
+    assert!(!schedule_enabled(&state, &managed).await);
+
+    // The operator disagrees and turns it back on.
+    state
+        .storage
+        .set_managed_schedule_enabled(&managed, true, pumper_core::CATALOG_MANAGED_BY)
+        .await
+        .expect("operator re-enable");
+
+    // Poll 2, with the deprecation flag STILL standing: respected.
+    poll_once(&state, &gms).await;
+    assert!(
+        schedule_enabled(&state, &managed).await,
+        "an unchanged deprecation must not undo an operator's re-enable"
+    );
+
+    // DataHub un-deprecates, then deprecates again: THAT is a change, and
+    // governance acts on it.
+    gms.set_remote("fake.d0", remote_state(false, false, false));
+    poll_once(&state, &gms).await;
+    assert!(schedule_enabled(&state, &managed).await);
+    gms.set_remote("fake.d0", remote_state(true, false, false));
+    poll_once(&state, &gms).await;
+    assert!(
+        !schedule_enabled(&state, &managed).await,
+        "a NEW deprecation must act again"
+    );
+}
+
+/// The invariant a restart must not break: the last-acted level is persisted
+/// (migration 0038), not in-memory, so a fresh process does not re-disable a
+/// schedule the remote merely still wants disabled.
+#[tokio::test]
+async fn a_restart_does_not_re_disable_a_schedule_the_operator_re_enabled() {
+    let gms = MockGms::spawn(vec![], Duration::ZERO).await;
+    let (state, _store) = govern_state_for(&gms, true).await;
+    seed_datasets(&state, 1).await;
+    gms.set_remote("fake.d0", remote_state(true, false, false));
+    let (managed, _hand) = seed_schedules(&state).await;
+
+    poll_once(&state, &gms).await;
+    assert!(!schedule_enabled(&state, &managed).await);
+    state
+        .storage
+        .set_managed_schedule_enabled(&managed, true, pumper_core::CATALOG_MANAGED_BY)
+        .await
+        .expect("operator re-enable");
+
+    // A restart: same store, brand-new governance memory.
+    let restarted = AppState {
+        datahub_govern: Default::default(),
+        ..state.clone()
+    };
+    poll_once(&restarted, &gms).await;
+    assert!(
+        schedule_enabled(&restarted, &managed).await,
+        "after a restart, an UNCHANGED deprecation must not disable the schedule again"
+    );
+}
+
+/// The anti-pattern: the poll aborting on the first read error before it can
+/// recompute `paused_apps`, so an app paused just before a DataHub outage sat
+/// at budget $0 for the whole outage — the tag could not be un-read while GMS
+/// was down, and only a restart cleared it.
+#[tokio::test]
+async fn a_pause_expires_loudly_when_the_outage_outlasts_the_staleness_window() {
+    let gms = MockGms::spawn(vec![], Duration::ZERO).await;
+    let (state, _store) = govern_state_for(&gms, true).await;
+    seed_datasets(&state, 1).await;
+    gms.set_remote("fake.d0", remote_state(false, true, false));
+
+    poll_once(&state, &gms).await;
+    assert_eq!(
+        crate::datahub::status(&state)["govern"]["paused_apps"],
+        json!(["fake"])
+    );
+    assert_eq!(
+        crate::datahub::effective_budget(&state, "fake", Some(5.0)),
+        Some(0.0),
+        "the pause must really be zeroing the budget"
+    );
+
+    // GMS goes down. One poll inside the staleness window keeps the pause —
+    // a blip must not un-pause anything.
+    gms.set_outage(true);
+    poll_once(&state, &gms).await;
+    assert_eq!(
+        crate::datahub::status(&state)["govern"]["paused_apps"],
+        json!(["fake"]),
+        "a short outage must not drop the pause"
+    );
+
+    // The outage outlasts `govern_pause_max_stale_secs` (900s by default).
+    {
+        let mut g = state.datahub_govern.lock().unwrap();
+        g.last_success = std::time::Instant::now().checked_sub(Duration::from_secs(3600));
+    }
+    poll_once(&state, &gms).await;
+    assert_eq!(
+        crate::datahub::status(&state)["govern"]["paused_apps"],
+        json!([]),
+        "governance that has gone blind must stop enforcing, not freeze at $0 forever"
+    );
+    assert_eq!(
+        crate::datahub::effective_budget(&state, "fake", Some(5.0)),
+        Some(5.0)
+    );
+    // Loudly: an audit row names the expiry and why.
+    let rows = state
+        .storage
+        .list_datahub_govern_actions(20)
+        .await
+        .expect("audit rows");
+    let expiry = rows
+        .iter()
+        .find(|r| r.action == "expire_pause")
+        .expect("the expiry must be audited, not silent");
+    assert_eq!(
+        (expiry.target.as_str(), expiry.evidence.as_str()),
+        ("fake", "stale")
+    );
+
+    // And it is not permanent: once GMS answers again, the tag re-pauses.
+    gms.set_outage(false);
+    poll_once(&state, &gms).await;
+    assert_eq!(
+        crate::datahub::status(&state)["govern"]["paused_apps"],
+        json!(["fake"])
     );
 }
 

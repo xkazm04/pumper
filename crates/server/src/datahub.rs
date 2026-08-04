@@ -961,7 +961,12 @@ pub struct GovernState {
     pub(crate) last_poll: Option<std::time::Instant>,
     /// A poll is running right now; no other tick may start one.
     pub(crate) in_flight: bool,
-    paused_apps: HashSet<String>,
+    /// When a poll last **succeeded** (read every dataset and applied its
+    /// plan). Distinct from `last_poll`, which a failed poll also stamps: the
+    /// pause set is only trustworthy for as long as governance can still see,
+    /// and this is what [`pauses_are_stale`] measures.
+    pub(crate) last_success: Option<std::time::Instant>,
+    pub(crate) paused_apps: HashSet<String>,
     last: Option<Value>,
 }
 
@@ -1103,6 +1108,63 @@ pub(crate) fn plan_govern_actions(metas: &[DatasetMeta]) -> (Vec<GovernAction>, 
         }
     }
     (actions, paused)
+}
+
+// ── transition semantics: act on CHANGE, not on level ───────────────────────
+//
+// The anti-pattern: governance acting on the *level* of a remote signal. A
+// standing deprecation re-disabled the app's catalog-managed schedules on every
+// poll, so an operator's `POST /schedules/{id}/enabled` was undone within the
+// interval — forever, with no override — and a restart re-disabled it once
+// more. Acting on the TRANSITION (off → on) means a manual re-enable stands
+// until DataHub itself changes its mind, and the last-acted level is persisted
+// (migration 0038) so a restart is not a fresh transition.
+
+/// The signal whose last-acted level is persisted. Only the deprecation →
+/// disable action is transition-gated: it is the one that overrides an
+/// operator's explicit decision and is not undone by the remote state clearing.
+/// `cost:pause` is already level-correct (the set is recomputed wholesale, so
+/// removing the tag resumes), and a sync for a *still-failing* assertion is the
+/// healing attempt itself — bounded by the hour-bucketed key, not by a
+/// transition.
+pub(crate) const SIGNAL_DEPRECATION: &str = "deprecation";
+
+/// Per-app observed level of the deprecation signal: on iff ANY dataset of the
+/// app is deprecated. Every app that was READ appears, including with `false` —
+/// that is what lets a cleared deprecation be recorded and re-arm the next one.
+pub(crate) fn deprecation_levels(
+    metas: &[DatasetMeta],
+) -> std::collections::BTreeMap<String, bool> {
+    let mut levels: std::collections::BTreeMap<String, bool> = Default::default();
+    for m in metas {
+        let entry = levels.entry(m.app.clone()).or_insert(false);
+        *entry |= m.deprecated;
+    }
+    levels
+}
+
+/// Splits observed levels against the last-acted ones into the apps governance
+/// should ACT on and the `(app, level)` rows it must persist.
+///
+/// Pure, and the whole invariant lives here: act only on `false → true`, write
+/// only on change, and — because `acted` comes from SQLite — a restart with an
+/// unchanged remote level produces neither.
+pub(crate) fn level_transitions(
+    observed: &std::collections::BTreeMap<String, bool>,
+    acted: &std::collections::HashMap<String, bool>,
+) -> (Vec<String>, Vec<(String, bool)>) {
+    let mut act = Vec::new();
+    let mut writes = Vec::new();
+    for (app, level) in observed {
+        let previous = acted.get(app).copied().unwrap_or(false);
+        if *level != previous {
+            writes.push((app.clone(), *level));
+            if *level {
+                act.push(app.clone());
+            }
+        }
+    }
+    (act, writes)
 }
 
 /// Read-path client: same shape as [`client`], but with the short
@@ -1382,18 +1444,40 @@ pub async fn governance_preview(state: &AppState) -> Value {
         }
     };
 
+    // The same transition gate the poll applies, so the preview does not
+    // promise a disable that would in fact be suppressed as already-acted.
+    let observed = deprecation_levels(&read.metas);
+    let acted = state
+        .storage
+        .datahub_govern_levels(SIGNAL_DEPRECATION)
+        .await
+        .unwrap_or_else(|e| {
+            warn!("datahub govern preview: last-acted level read failed: {e}");
+            Default::default()
+        });
+    let (act_apps, _) = level_transitions(&observed, &acted);
+
     let mut disables: Vec<Value> = Vec::new();
     let mut syncs: Vec<Value> = Vec::new();
     for action in &actions {
         match action {
             GovernAction::DisableSchedules { app, dataset } => {
-                let targets = disable_targets(&schedules, app);
+                let suppressed = !act_apps.contains(app);
+                let targets = if suppressed {
+                    Vec::new()
+                } else {
+                    disable_targets(&schedules, app)
+                };
                 disables.push(json!({
                     "app": app,
                     "dataset": dataset,
                     "evidence": "deprecation",
                     "schedule_ids": targets.iter().map(|s| s.id.clone()).collect::<Vec<_>>(),
-                    "note": if targets.is_empty() {
+                    "suppressed": suppressed,
+                    "note": if suppressed {
+                        "this deprecation was already acted on — governance acts on the CHANGE, so \
+                         a manual re-enable stands until DataHub changes again"
+                    } else if targets.is_empty() {
                         "no enabled catalog-managed schedule for this app — the disable would be a no-op"
                     } else {
                         "catalog-managed schedules only; hand-made schedules are never touched"
@@ -1485,6 +1569,67 @@ pub(crate) fn govern_sync_key(
     )
 }
 
+/// How long the pause set may survive without a successful poll, per config.
+/// `None` = expiry disabled (`govern_pause_max_stale_secs = 0`): pauses freeze
+/// until governance can see again, which is the pre-M27 behavior.
+pub(crate) fn pause_stale_after(secs: u64) -> Option<std::time::Duration> {
+    (secs > 0).then(|| std::time::Duration::from_secs(secs))
+}
+
+/// Whether a pause set held through a DataHub outage has gone stale.
+///
+/// The anti-pattern: the poll aborts on the first read error *before*
+/// recomputing `paused_apps`, so an app paused just before an outage stayed
+/// budget-$0 for the entire outage — the tag could not be un-read while GMS was
+/// down, and only a restart cleared it. Enforcement that has gone blind must
+/// expire, loudly, rather than freeze forever on state nobody can refute.
+pub(crate) fn pauses_are_stale(
+    since_success: Option<std::time::Duration>,
+    max_stale: Option<std::time::Duration>,
+) -> bool {
+    match (since_success, max_stale) {
+        (Some(elapsed), Some(max)) => elapsed >= max,
+        // No successful poll since boot means nothing was ever paused by this
+        // process — there is nothing to expire.
+        _ => false,
+    }
+}
+
+/// Drops the pause set when governance has been blind for too long, saying so
+/// in the log, the audit trail and on the bus. Called on the failure path of a
+/// poll, which is the only path where `paused_apps` cannot be recomputed.
+async fn expire_stale_pauses(state: &AppState, error: &str) {
+    let max_stale = pause_stale_after(state.config.datahub.govern_pause_max_stale_secs);
+    let (expired, blind_for) = {
+        let mut g = state.datahub_govern.lock().unwrap();
+        let since = g.last_success.map(|t| t.elapsed());
+        if g.paused_apps.is_empty() || !pauses_are_stale(since, max_stale) {
+            return;
+        }
+        (std::mem::take(&mut g.paused_apps), since)
+    };
+    let secs = blind_for.map(|d| d.as_secs()).unwrap_or_default();
+    for app in &expired {
+        warn!(
+            app = %app, blind_for_secs = secs,
+            "datahub govern: no successful poll for longer than [datahub] govern_pause_max_stale_secs \
+             — cost:pause EXPIRED, normal budgets resume (governance cannot see DataHub: {error})"
+        );
+        let detail = format!("no successful poll for {secs}s (last error: {error})");
+        audit_action(
+            state,
+            NewDatahubGovernAction {
+                action: "expire_pause",
+                target: app,
+                evidence: "stale",
+                detail: Some(&detail),
+                ..Default::default()
+            },
+        )
+        .await;
+    }
+}
+
 /// One governance poll: read remote state for every dataset URN, plan, apply.
 async fn govern_poll(state: AppState) {
     prune_audit_trail(&state).await;
@@ -1492,6 +1637,9 @@ async fn govern_poll(state: AppState) {
     if let Some(e) = read.errors.first() {
         // Unreachable DataHub = clean no-op: abort before ANY action.
         warn!("datahub govern: poll aborted, no actions taken: {e}");
+        // …except letting go of what can no longer be observed: a pause set
+        // held through a long outage expires instead of freezing at $0.
+        expire_stale_pauses(&state, e).await;
         record_govern(
             &state,
             json!({
@@ -1510,6 +1658,28 @@ async fn govern_poll(state: AppState) {
     let mut log: Vec<String> = Vec::new();
     let mut disabled = 0usize;
     let mut syncs = 0usize;
+    let mut suppressed = 0usize;
+
+    // Transition gate for the deprecation → disable action. Read FIRST, and
+    // fail CLOSED: if the memory cannot be read, acting on the level would
+    // re-disable schedules an operator re-enabled, so this poll disables
+    // nothing rather than guessing that nothing was acted on before.
+    let observed = deprecation_levels(&metas);
+    let acted = match state
+        .storage
+        .datahub_govern_levels(SIGNAL_DEPRECATION)
+        .await
+    {
+        Ok(acted) => Some(acted),
+        Err(e) => {
+            warn!("datahub govern: last-acted level read failed, disables skipped this poll: {e}");
+            None
+        }
+    };
+    let (act_apps, level_writes) = match &acted {
+        Some(acted) => level_transitions(&observed, acted),
+        None => (Vec::new(), Vec::new()),
+    };
 
     // Pause set: recomputed wholesale, so removing the tag resumes the app.
     // The transitions (not the level) are what gets audited — an app that was
@@ -1567,6 +1737,18 @@ async fn govern_poll(state: AppState) {
     for action in &actions {
         match action {
             GovernAction::DisableSchedules { app, dataset } => {
+                // Transition, not level: a deprecation that was already acted
+                // on does nothing now, so an operator's re-enable stands until
+                // DataHub changes. A restart does not re-fire it either — the
+                // last-acted level is in SQLite, not in memory.
+                if !act_apps.contains(app) {
+                    suppressed += 1;
+                    log.push(format!(
+                        "no-op for {app} (deprecation on {app}/{dataset} already acted on; \
+                         a manual re-enable is respected until DataHub changes)"
+                    ));
+                    continue;
+                }
                 // M19 fence: only rows tagged managed_by = "catalog" — the SQL
                 // itself refuses anything else, hand-made schedules are sacred.
                 for s in disable_targets(&schedules, app) {
@@ -1652,6 +1834,24 @@ async fn govern_poll(state: AppState) {
         }
     }
 
+    // Remember the levels this poll acted on (and the ones that cleared), so
+    // the next poll — and the next process — sees a transition only when
+    // DataHub actually changed. Written after the actions, and fail-open per
+    // row: an unwritten level costs one repeated disable, never a lost action.
+    for (app, level) in &level_writes {
+        if let Err(e) = state
+            .storage
+            .set_datahub_govern_level(SIGNAL_DEPRECATION, app, *level)
+            .await
+        {
+            warn!(app = %app, "datahub govern: last-acted level not recorded: {e}");
+        }
+    }
+
+    // This poll saw DataHub: the pause set is fresh, so the staleness clock
+    // restarts here (and only here — a failed poll must not refresh it).
+    state.datahub_govern.lock().unwrap().last_success = Some(std::time::Instant::now());
+
     let summary = json!({
         "at": pumper_core::datasets::ts(chrono::Utc::now()),
         "ok": true,
@@ -1659,6 +1859,7 @@ async fn govern_poll(state: AppState) {
         "poll_ms": elapsed.as_millis() as u64,
         "budget_secs": budget,
         "schedules_disabled": disabled,
+        "schedules_suppressed": suppressed,
         "syncs_enqueued": syncs,
         "paused_apps": paused.iter().collect::<Vec<_>>(),
         "actions": log,
@@ -1679,6 +1880,11 @@ pub fn status(state: &AppState) -> Value {
         json!({
             "enabled": cfg.govern,
             "interval_secs": cfg.govern_interval_secs,
+            "pause_max_stale_secs": cfg.govern_pause_max_stale_secs,
+            // How long governance has been blind. Once this passes
+            // `pause_max_stale_secs`, the pause set expires instead of
+            // freezing at $0 for the length of the outage.
+            "secs_since_successful_poll": g.last_success.map(|t| t.elapsed().as_secs()),
             "paused_apps": g.paused_apps.iter().collect::<Vec<_>>(),
             "last_poll": g.last,
         })
@@ -2064,6 +2270,98 @@ mod tests {
         assert_eq!(a, b);
         assert_ne!(a, c);
         assert!(a.ends_with("2026-08-04T10"), "{a}");
+    }
+
+    fn levels(pairs: &[(&str, bool)]) -> std::collections::HashMap<String, bool> {
+        pairs.iter().map(|(a, l)| (a.to_string(), *l)).collect()
+    }
+
+    /// The anti-pattern: governance acting on the LEVEL of the deprecation
+    /// signal, so an operator's `POST /schedules/{id}/enabled` was undone on the
+    /// next poll — forever, with no override — because the flag still stood.
+    #[test]
+    fn a_manual_re_enable_is_respected_until_the_remote_state_changes() {
+        let observed = deprecation_levels(&[meta("a", "d1", true, false, false)]);
+
+        // First sighting: off → on is a transition. Act, and remember it.
+        let (act, writes) = level_transitions(&observed, &levels(&[]));
+        assert_eq!(act, vec!["a".to_string()]);
+        assert_eq!(writes, vec![("a".to_string(), true)]);
+
+        // Same level next poll (the operator has since re-enabled the
+        // schedule): nothing to do, and nothing to re-write.
+        let (act, writes) = level_transitions(&observed, &levels(&[("a", true)]));
+        assert!(act.is_empty(), "an unchanged deprecation must not re-act");
+        assert!(writes.is_empty());
+
+        // DataHub un-deprecates: no action (the disable is not undone), but the
+        // memory clears so the NEXT deprecation is a transition again.
+        let cleared = deprecation_levels(&[meta("a", "d1", false, false, false)]);
+        let (act, writes) = level_transitions(&cleared, &levels(&[("a", true)]));
+        assert!(act.is_empty());
+        assert_eq!(writes, vec![("a".to_string(), false)]);
+        let (act, _) = level_transitions(&observed, &levels(&[("a", false)]));
+        assert_eq!(act, vec!["a".to_string()], "re-deprecation must act again");
+    }
+
+    /// The invariant a restart must not break: the last-acted level is durable,
+    /// so a schedule the remote STILL wants disabled is not disabled a second
+    /// time by a fresh process (which is the flap this whole mechanism exists
+    /// to prevent).
+    #[test]
+    fn a_restart_does_not_reflap_an_unchanged_deprecation() {
+        let observed = deprecation_levels(&[
+            meta("a", "d1", true, false, false),
+            meta("a", "d2", false, false, false),
+        ]);
+        // Whatever the in-memory state was, `acted` comes from SQLite.
+        let persisted = levels(&[("a", true)]);
+        let (act, writes) = level_transitions(&observed, &persisted);
+        assert!(
+            act.is_empty() && writes.is_empty(),
+            "a restart must not re-act on a level DataHub has not changed"
+        );
+    }
+
+    /// An app's level is on iff ANY of its datasets is deprecated, and every
+    /// app that was READ appears — including at `false`, which is what lets a
+    /// cleared deprecation be recorded.
+    #[test]
+    fn deprecation_level_is_per_app_and_includes_the_quiet_ones() {
+        let m = deprecation_levels(&[
+            meta("a", "d1", false, false, false),
+            meta("a", "d2", true, false, false),
+            meta("b", "d3", false, true, true),
+        ]);
+        assert_eq!(m.get("a"), Some(&true));
+        assert_eq!(m.get("b"), Some(&false));
+    }
+
+    /// The anti-pattern: the poll aborting before it can recompute
+    /// `paused_apps`, so an app paused just before a DataHub outage stayed at
+    /// budget $0 for the whole outage with no way to un-read the tag.
+    #[test]
+    fn pauses_expire_when_governance_goes_blind_not_freeze_at_zero_forever() {
+        let max = pause_stale_after(900);
+        assert_eq!(max, Some(std::time::Duration::from_secs(900)));
+        // Fresh enough: the pause still reflects something recently observed.
+        assert!(!pauses_are_stale(
+            Some(std::time::Duration::from_secs(899)),
+            max
+        ));
+        // Blind past the window: expire.
+        assert!(pauses_are_stale(
+            Some(std::time::Duration::from_secs(900)),
+            max
+        ));
+        // Never polled successfully ⇒ nothing this process paused ⇒ nothing to
+        // expire; and `0` opts out of expiry entirely.
+        assert!(!pauses_are_stale(None, max));
+        assert_eq!(pause_stale_after(0), None);
+        assert!(!pauses_are_stale(
+            Some(std::time::Duration::from_secs(86_400)),
+            None
+        ));
     }
 
     /// The anti-pattern: a retention `DELETE` on every poll against a table

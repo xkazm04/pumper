@@ -466,6 +466,17 @@ pub struct DatahubConfig {
     pub govern: bool,
     /// Seconds between governance polls (min 30; only meaningful with `govern`).
     pub govern_interval_secs: u64,
+    /// How long the `cost:pause` set may survive **without a successful poll**
+    /// before it expires loudly (warn + audit row + event). Default 900s = 3×
+    /// the default interval.
+    ///
+    /// The failure this bounds: the poll aborts on the first read error, so
+    /// during a DataHub outage the paused set can never be recomputed — an app
+    /// paused just before the outage stayed budget-$0 for as long as the outage
+    /// lasted, with no way to un-read the tag. Governance that has gone blind
+    /// must stop enforcing what it can no longer observe. `0` disables expiry
+    /// (pauses freeze until the next successful poll — the old behavior).
+    pub govern_pause_max_stale_secs: u64,
 }
 
 impl Default for DatahubConfig {
@@ -480,6 +491,7 @@ impl Default for DatahubConfig {
             emit_flows: true,
             govern: false,
             govern_interval_secs: 300,
+            govern_pause_max_stale_secs: 900,
         }
     }
 }
