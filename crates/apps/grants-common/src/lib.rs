@@ -209,7 +209,10 @@ pub async fn finalize_unified(
 }
 
 /// Normalizes a grants.gov Search2 `oppHits[]` entry. Award amounts are not
-/// present in Search2 results, so the money fields stay null for this source.
+/// present in Search2 results (live-verified 2026-08-04 — see
+/// [`detail_amounts`]), so the money fields start null here and are filled from
+/// the detail corpus by [`enrich_with_detail_amounts`] where a detail record
+/// exists.
 pub fn normalize_grants_gov(hit: &Value) -> Option<(String, Value)> {
     let id = str_of(hit, &["id", "number"])?;
     // Search2 publishes `MM/DD/YYYY` — a bare date with no timezone, so
@@ -438,6 +441,108 @@ pub async fn sync_unified(
             Some(&stamp(ctx, source_url)),
         )
         .await
+}
+
+/// The award amounts a stored `grants/opportunity_details` record carries, as
+/// `(award_floor, award_ceiling, total_funding)`.
+///
+/// **Live-verified 2026-08-04** against `api.grants.gov/v1/api/fetchOpportunity`:
+/// the Search2 hit really does carry no money (its keys are exactly
+/// `id, number, title, agencyCode, agency, openDate, closeDate, oppStatus,
+/// docType, cfdaList`), but the detail record's `synopsis` block carries
+/// `awardFloor`, `awardCeiling` and `estimatedFunding` — as **strings**, with the
+/// literal `"none"` where the agency published no figure (opportunity 357305 =
+/// `"none"`/`"none"`; opportunity 141593 = `awardCeiling "55746"`,
+/// `estimatedFunding "55746"`, `awardFloor "none"`).
+///
+/// The detail app already parses those three through
+/// [`money_scalar`] into `requirements.{award_floor, award_ceiling,
+/// estimated_total_funding}`, so `"none"`, `"$0"` and prose all arrive here as
+/// `Null` — this function only reads what that parse produced and never
+/// re-implements it.
+pub fn detail_amounts(detail: &Value) -> (Value, Value, Value) {
+    let req = detail.get("requirements").unwrap_or(&Value::Null);
+    let num = |f: &str| match req.get(f) {
+        Some(Value::Number(n)) if n.as_f64().is_some_and(|v| v > 0.0) => req[f].clone(),
+        _ => Value::Null,
+    };
+    (
+        num("award_floor"),
+        num("award_ceiling"),
+        num("estimated_total_funding"),
+    )
+}
+
+/// Fills a normalized unified record's money fields from its detail record.
+/// Returns whether anything landed.
+///
+/// **Fill-only, never overwrite.** A field the normalizer already populated
+/// (ca-grants publishes amounts in the listing itself) is left alone, and a
+/// detail record with no figure leaves the field `Null` — the honest-Null rule
+/// holds end to end, so a federal opportunity whose agency published no ceiling
+/// stays unmatched by `min_award` rather than matching a fabricated 0.
+pub fn overlay_amounts(unified: &mut Value, detail: &Value) -> bool {
+    let (floor, ceiling, total) = detail_amounts(detail);
+    let mut filled = false;
+    for (field, value) in [
+        ("award_floor", floor),
+        ("award_ceiling", ceiling),
+        ("total_funding", total),
+    ] {
+        if value.is_null() || !unified.get(field).map(Value::is_null).unwrap_or(true) {
+            continue;
+        }
+        unified[field] = value;
+        filled = true;
+    }
+    filled
+}
+
+/// Overlays award amounts from the shared `grants/opportunity_details` corpus
+/// onto a run's normalized unified items, in place. Returns how many items
+/// gained at least one amount.
+///
+/// This is what makes `GET /grants?min_award=` reach the federal corpus at all:
+/// Grants.gov Search2 publishes no money, so every grants-gov unified row was
+/// permanently `Null` on all three money fields and the filter — over the
+/// largest source — could never match. The amounts exist one endpoint away, in
+/// detail records this machine already stores; this reads them from the store
+/// (no re-fetch) and joins on the detail record's own `unified_key`.
+///
+/// Coverage is therefore exactly the detail corpus: opportunities the detail
+/// harvest has seen. Everything else keeps `Null`, honestly.
+pub async fn enrich_with_detail_amounts(
+    ctx: &AppContext,
+    items: &mut [(String, Value)],
+) -> Result<usize> {
+    if items.is_empty() {
+        return Ok(0);
+    }
+    let details = ctx
+        .datasets
+        .list(UNIFIED_APP, DETAILS_DATASET, 1_000_000)
+        .await?;
+    if details.is_empty() {
+        return Ok(0);
+    }
+    let by_key: std::collections::HashMap<&str, &Value> = details
+        .iter()
+        .filter_map(|r| {
+            r.data
+                .get("unified_key")
+                .and_then(Value::as_str)
+                .map(|k| (k, &r.data))
+        })
+        .collect();
+    let mut filled = 0;
+    for (key, unified) in items.iter_mut() {
+        if let Some(detail) = by_key.get(key.as_str()) {
+            if overlay_amounts(unified, detail) {
+                filled += 1;
+            }
+        }
+    }
+    Ok(filled)
 }
 
 /// The v1 amendment-radar taxonomy: semantic lifecycle transitions on fields
@@ -1646,6 +1751,102 @@ mod tests {
         assert!(degraded.get("index_datasets").is_none());
         assert_eq!(degraded["unified"]["dataset"], "unified");
         assert_eq!(degraded["unified"]["trust"], "provisional");
+    }
+
+    // ---- federal award amounts from the detail corpus (G-B) ----
+
+    /// A `grants/opportunity_details` record as `grants-gov::detail_record`
+    /// writes it, with the `requirements` money parsed by `money_scalar` from a
+    /// REAL fetchOpportunity `synopsis` (opportunity 141593, fetched
+    /// 2026-08-04: `awardCeiling "55746"`, `estimatedFunding "55746"`,
+    /// `awardFloor "none"`).
+    fn detail_141593() -> Value {
+        json!({
+            "opportunity_id": "141593",
+            "unified_key": "grants-gov:141593",
+            "requirements": {
+                "award_floor": money_scalar(&json!({ "awardFloor": "none" }), &["awardFloor"]),
+                "award_ceiling": money_scalar(&json!({ "awardCeiling": "55746" }), &["awardCeiling"]),
+                "estimated_total_funding":
+                    money_scalar(&json!({ "estimatedFunding": "55746" }), &["estimatedFunding"]),
+            }
+        })
+    }
+
+    #[test]
+    fn federal_amounts_come_from_the_detail_corpus_not_a_fabricated_zero() {
+        // The live synopsis strings survive the shared money parser intact…
+        let (floor, ceiling, total) = detail_amounts(&detail_141593());
+        assert_eq!(ceiling, json!(55_746.0));
+        assert_eq!(total, json!(55_746.0));
+        // …and "none" is Null, never 0 — a fabricated zero would make this
+        // opportunity match `min_award=0` and mis-rank against real figures.
+        assert_eq!(floor, Value::Null);
+
+        // Overlay onto the normalized Search2 hit, whose money is always Null.
+        let hit = json!({
+            "id": "141593", "number": "P12AC10113", "title": "Vegetation interns",
+            "agency": "DOI", "oppStatus": "posted", "closeDate": "08/15/2026"
+        });
+        let (key, mut unified) = normalize_grants_gov(&hit).unwrap();
+        assert_eq!(key, "grants-gov:141593");
+        assert_eq!(
+            unified["award_ceiling"],
+            Value::Null,
+            "Search2 has no money"
+        );
+        assert!(overlay_amounts(&mut unified, &detail_141593()));
+        assert_eq!(unified["award_ceiling"], json!(55_746.0));
+        assert_eq!(unified["total_funding"], json!(55_746.0));
+        // The unpublished floor stays Null: this is where `min_award` legitimately
+        // does not match, and that is upstream reality, not a gap to paper over.
+        assert_eq!(unified["award_floor"], Value::Null);
+
+        // An all-"none" detail (opportunity 357305, same live fetch) fills nothing.
+        let empty = json!({
+            "unified_key": "grants-gov:357305",
+            "requirements": { "award_floor": Value::Null, "award_ceiling": Value::Null,
+                              "estimated_total_funding": Value::Null }
+        });
+        let (_, mut untouched) = normalize_grants_gov(&hit).unwrap();
+        assert!(!overlay_amounts(&mut untouched, &empty));
+        assert_eq!(untouched["award_ceiling"], Value::Null);
+
+        // A detail record with no `requirements` block at all is inert, not a panic.
+        assert!(!overlay_amounts(
+            &mut untouched,
+            &json!({ "unified_key": "x" })
+        ));
+    }
+
+    #[test]
+    fn overlay_fills_but_never_overwrites_a_published_amount() {
+        // ca-grants publishes amounts in the listing itself; a detail record must
+        // never be able to replace a figure the source already gave us.
+        let rec = json!({
+            "PortalID": "CA-99", "Title": "Wildfire Prevention",
+            "EstAmounts": "Between $100,000 and $10,000,000",
+            "EstAvailFunds": "$5,000,000"
+        });
+        let (_, mut unified) = normalize_ca_grants(&rec).unwrap();
+        let detail = json!({
+            "unified_key": "ca-grants:CA-99",
+            "requirements": { "award_floor": 1.0, "award_ceiling": 2.0,
+                              "estimated_total_funding": 3.0 }
+        });
+        assert!(!overlay_amounts(&mut unified, &detail));
+        assert_eq!(unified["award_floor"], json!(100_000.0));
+        assert_eq!(unified["award_ceiling"], json!(10_000_000.0));
+        assert_eq!(unified["total_funding"], json!(5_000_000.0));
+
+        // Zero and negative figures in a detail record are not amounts.
+        let zeroed = json!({
+            "requirements": { "award_ceiling": 0.0, "award_floor": -1.0,
+                              "estimated_total_funding": 0 }
+        });
+        let (_, mut fresh) = normalize_grants_gov(&json!({ "id": "1" })).unwrap();
+        assert!(!overlay_amounts(&mut fresh, &zeroed));
+        assert_eq!(fresh["award_ceiling"], Value::Null);
     }
 
     #[test]

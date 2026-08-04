@@ -11,7 +11,11 @@
 //! Contract notes (verified 2026-07-03): `https://api.grants.gov/v1/api/search2`
 //! is **POST-only** — a bare GET returns 403. The body is JSON; pagination is
 //! `startRecordNum` + `rows`; results live under `data.oppHits[]` with
-//! `data.hitCount` as the total.
+//! `data.hitCount` as the total. A hit carries EXACTLY
+//! `id, number, title, agencyCode, agency, openDate, closeDate, oppStatus,
+//! docType, cfdaList` (re-verified live 2026-08-04) — **no award amounts**, which
+//! is why federal money is joined in from the detail corpus below rather than
+//! read from the listing.
 //!
 //! Detail harvest (`harvestDetails: true`, default OFF): for opportunities the
 //! sync just reported NEW or CHANGED (never the whole corpus), fetch the full
@@ -20,8 +24,10 @@
 //! synopsis fields and the NOFO attachment manifest (URLs + metadata only —
 //! v1 does NO PDF fetching or parsing; a later pass can pull the documents).
 //!
-//! fetchOpportunity contract (ASSUMED, pinned 2026-07-30 — NOT yet verified
-//! live; the defensive parse in `extract_detail` is the tripwire, and the raw
+//! fetchOpportunity contract (pinned 2026-07-30; the envelope, `data` shape and
+//! the money/count fields were VERIFIED LIVE 2026-08-04 against opportunities
+//! 357305 and 141593 — the attachment block and its download-URL pattern remain
+//! ASSUMED. The defensive parse in `extract_detail` is the tripwire, and the raw
 //! first response is kept as the `detail1.json` artifact):
 //!   POST https://api.grants.gov/v1/api/fetchOpportunity
 //!   body: `{"opportunityId": <the Search2 hit id, sent as a JSON number when
@@ -31,7 +37,10 @@
 //!   agency fields, a `synopsis` object (posted) or `forecast` object
 //!   (forecasted) with applicantTypes[] (objects with `description` or bare
 //!   strings), applicantEligibilityDesc, costSharing (bool or "Yes"/"No"),
-//!   awardFloor / awardCeiling / estimatedFunding (numbers or "$"-strings),
+//!   awardFloor / awardCeiling / estimatedFunding (LIVE-VERIFIED 2026-08-04: they
+//!   are decimal STRINGS — `"55746"` — with the literal `"none"` where the agency
+//!   published no figure, alongside `*Formatted` siblings like `"55,746"`. The
+//!   shared `money_scalar` maps `"none"` to Null, never 0),
 //!   numberOfAwards (LIVE-VERIFIED 2026-07-30; `expectedNumberOfAwards` does not
 //!   appear in real payloads — read as fallback only), responseDate (may be null
 //!   on already-awarded listings whose prose lives in responseDateDesc) — and
@@ -143,9 +152,11 @@ impl ScrapeApp for GrantsGov {
                 },
             ],
             output_shape: Some(
-                "{hit_count, fetched, new, changed, unchanged, removed?, details?: {harvested, \
-                 deltaTotal, capped}} — Search2 sync tallies over the `opportunities` dataset \
-                 (keyed by opportunity id); detail harvest writes grants/opportunity_details",
+                "{hit_count, fetched, new, changed, unchanged, removed?, amountsFilled, \
+                 details?: {harvested, deltaTotal, capped}} — Search2 sync tallies over the \
+                 `opportunities` dataset (keyed by opportunity id); detail harvest writes \
+                 grants/opportunity_details; `amountsFilled` counts unified rows that got award \
+                 amounts joined in from that detail corpus (Search2 itself publishes none)",
             ),
             cost_class: CostClass::Free,
         }
@@ -328,13 +339,15 @@ impl ScrapeApp for GrantsGov {
             let (delta, capped, delta_total) = match &resumed {
                 Some(state) => (state.delta.clone(), state.capped, state.delta_total),
                 None => {
-                    let (delta, capped) =
-                        capped_delta(&summary.new, &summary.changed, max_details);
+                    let (delta, capped) = capped_delta(&summary.new, &summary.changed, max_details);
                     (delta, capped, summary.new.len() + summary.changed.len())
                 }
             };
-            let mut done: HashSet<String> =
-                resumed.map(|s| s.done).unwrap_or_default().into_iter().collect();
+            let mut done: HashSet<String> = resumed
+                .map(|s| s.done)
+                .unwrap_or_default()
+                .into_iter()
+                .collect();
             let resumed_count = done.len();
 
             let by_key: HashMap<&str, &Value> =
@@ -382,10 +395,18 @@ impl ScrapeApp for GrantsGov {
 
         // Cross-source layer: normalize into grants/unified, sweep past-due rows
         // closed, and link SimHash near-duplicates syndicated across portals.
-        let unified_items: Vec<(String, Value)> = hits
+        let mut unified_items: Vec<(String, Value)> = hits
             .iter()
             .filter_map(grants_common::normalize_grants_gov)
             .collect();
+        // Money join: Search2 publishes no award amounts (live-verified), so a
+        // federal unified row is permanently null on all three money fields and
+        // `GET /grants?min_award=` can never match it. The figures live in the
+        // `synopsis` block of the fetchOpportunity detail records this machine
+        // already stores, so overlay them from the store — no extra fetch, and
+        // an opportunity with no stored detail keeps its honest Null.
+        let amounts_filled =
+            grants_common::enrich_with_detail_amounts(&ctx, &mut unified_items).await?;
         let cross =
             grants_common::finalize_unified(&ctx, &unified_items, Some(SEARCH2_URL)).await?;
 
@@ -417,6 +438,10 @@ impl ScrapeApp for GrantsGov {
             "digestDays": digest_days,
             "closingSoonCount": closing_soon.len(),
             "closingSoon": closing_soon.iter().take(25).collect::<Vec<_>>(),
+            // How many unified rows got award amounts joined in from the stored
+            // detail corpus this run — i.e. how much of the federal corpus
+            // `min_award` can actually see.
+            "amountsFilled": amounts_filled,
             "truncated": truncated,
         });
         cross.merge_into(&mut out);
@@ -569,7 +594,10 @@ fn restored_harvest(state: Option<&Value>) -> Option<HarvestState> {
     }
     Some(HarvestState {
         done: strings("done"),
-        capped: state.get("capped").and_then(Value::as_bool).unwrap_or(false),
+        capped: state
+            .get("capped")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
         delta_total: state
             .get("deltaTotal")
             .and_then(Value::as_u64)
@@ -1103,13 +1131,18 @@ mod tests {
         assert!(restored_harvest(None).is_none());
         // Another app's / another version's snapshot.
         assert!(restored_harvest(Some(&json!({ "frontier": [] }))).is_none());
-        assert!(restored_harvest(Some(&json!({ "v": 99, "stage": "details", "delta": ["a"] })))
-            .is_none());
-        assert!(restored_harvest(Some(&json!({ "v": 1, "stage": "listing", "delta": ["a"] })))
-            .is_none());
+        assert!(restored_harvest(Some(
+            &json!({ "v": 99, "stage": "details", "delta": ["a"] })
+        ))
+        .is_none());
+        assert!(
+            restored_harvest(Some(&json!({ "v": 1, "stage": "listing", "delta": ["a"] })))
+                .is_none()
+        );
         // A snapshot with nothing left to do is not a resume.
-        assert!(restored_harvest(Some(&json!({ "v": 1, "stage": "details", "delta": [] })))
-            .is_none());
+        assert!(
+            restored_harvest(Some(&json!({ "v": 1, "stage": "details", "delta": [] }))).is_none()
+        );
         // Missing optional fields default rather than failing.
         let partial = json!({ "v": 1, "stage": "details", "delta": ["a", "b"] });
         let restored = restored_harvest(Some(&partial)).expect("tolerated");
