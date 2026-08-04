@@ -21,6 +21,7 @@ Filtering follows push-versus-pull: **pushes suppress, pulls filter**. A webhook
 - `GET /datasets/{app}/{ds}/changes?trust=` defaults to **`stable`** — accepts `all`, `provisional`, `quarantined`.
 - `GET /datasets/{app}/{ds}?trust=` defaults to **`all`**: each record carries its own stamp, so the raw dataset view stays complete.
 - `/export` is never filtered (a complete copy by definition; the stamp rides in the payload).
+- `GET /grants?trust=` defaults to **`all`**, same vocabulary. The filtered (`JsonFilter`) read path gained a trust-aware variant (`Datasets::list_filtered_trust`) for it; `list_filtered` is that variant with no trust filter, and both emit the one shared `TRUST_PREDICATE` rather than a second hand-written copy.
 
 A quarantined source writes to the shadow dataset `<ds>@q`, which is an ordinary dataset — listing, changes, export and duplicates all work on it unchanged.
 

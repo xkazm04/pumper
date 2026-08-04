@@ -2114,6 +2114,7 @@ dependencies = [
  "chrono",
  "pumper-core",
  "serde_json",
+ "tracing",
 ]
 
 [[package]]

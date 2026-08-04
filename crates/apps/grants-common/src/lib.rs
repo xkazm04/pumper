@@ -8,6 +8,7 @@
 //! near-duplicates (the same grant syndicated on two portals) are linked via
 //! SimHash into `grants/duplicate_links`.
 
+use pumper_core::resilience::{write_dataset, SourceState};
 use pumper_core::{AppContext, Provenance, Result, UpsertSummary};
 use serde_json::{json, Value};
 
@@ -56,6 +57,53 @@ pub const DETAILS_DATASET: &str = "opportunity_details";
 /// constant so every source links identically — a per-app literal drifts.
 pub const DUP_DISTANCE: u32 = 3;
 
+/// The dataset every grant source keeps its OWN raw records in, and therefore
+/// the `(app, dataset)` pair the extraction-health ladder judges it on. All
+/// three sources use the same name; one constant so the health lookup below
+/// cannot drift from the datasets the apps actually write.
+pub const SOURCE_DATASET: &str = "opportunities";
+
+/// Where one source's contribution to the SHARED `grants/unified` dataset goes,
+/// and what trust stamp it carries, given that source's own health state.
+///
+/// **Design decision — the unit of gating is the contribution, not the dataset.**
+/// `grants/unified` is written by three independent sources. Gating the dataset
+/// would mean one broken source (say ca-grants) quarantining the whole canonical
+/// layer and taking grants-gov and eu-sedia down with it, which is strictly
+/// worse than the disease. So health is resolved for the SOURCE's own pair
+/// (`<source-app>/opportunities`) and the standard ladder is then applied to the
+/// shared dataset: `degraded` keeps writing to `grants/unified` but stamps the
+/// rows `provisional`; `quarantined` diverts them to the shadow dataset
+/// `grants/unified@q` and leaves the canonical layer holding that source's last
+/// healthy rows.
+///
+/// This cannot be delegated to [`AppContext::upsert_many`], which resolves health
+/// for the write's own `(app, dataset)`: `("grants", "unified")` is a VIRTUAL
+/// pair that no `observe_extraction` ever judges, so it always reads `Healthy`
+/// and gates nothing. Resolving the source pair here is the whole point.
+///
+/// Vocabulary is the existing one — [`write_dataset`] for the shadow-dataset
+/// name and [`SourceState::trust`] for the stamp — so consumers filter these
+/// rows with the same `trust` predicate (`stable` | `provisional` |
+/// `quarantined`) they use everywhere else. There is deliberately no second
+/// grants-specific trust vocabulary.
+pub fn contribution_target(state: SourceState) -> (String, Option<&'static str>) {
+    (write_dataset(UNIFIED_DATASET, state), state.trust())
+}
+
+/// Whether this run's unified contribution may be offered to the full-text
+/// search index.
+///
+/// The worker gates `index_datasets` on the health of the spec's own
+/// `(app, dataset)` — which for the virtual `("grants", "unified")` pair is
+/// structurally inert (see [`contribution_target`]). The honest place for the
+/// gate is therefore the producer, against the source's own verdict: a degrading
+/// or quarantined source does not get its rows into the index that saved-search
+/// alerts fire from.
+fn indexable(state: SourceState) -> bool {
+    !state.skips_search_index()
+}
+
 /// What the shared cross-source finalize produced, for the source's result JSON.
 pub struct UnifiedOutcome {
     pub unified: UpsertSummary,
@@ -64,6 +112,13 @@ pub struct UnifiedOutcome {
     pub warnings: Vec<String>,
     /// Lifecycle events written to `grants/events` this run.
     pub events: usize,
+    /// The source's own extraction-health state this run was gated on.
+    pub state: SourceState,
+    /// The dataset this run's contribution actually landed in — `unified`, or
+    /// the shadow `unified@q` when the source is quarantined.
+    pub dataset: String,
+    /// The trust stamp the contribution carries (`None` = `stable`).
+    pub trust: Option<&'static str>,
 }
 
 impl UnifiedOutcome {
@@ -77,6 +132,12 @@ impl UnifiedOutcome {
                 "new": self.unified.new.len(),
                 "changed": self.unified.changed.len(),
                 "events": self.events,
+                // Where this contribution landed and how much it is stood behind
+                // — so a diverted or provisional run is legible in the job
+                // result, not only in the store.
+                "dataset": self.dataset,
+                "trust": self.trust.unwrap_or(pumper_core::TRUST_STABLE),
+                "sourceState": self.state.as_str(),
             }),
         );
         map.insert("swept".into(), json!(self.swept));
@@ -84,10 +145,14 @@ impl UnifiedOutcome {
         map.insert("crossSourceDups".into(), json!(self.cross_source_dups));
         // Per-opportunity search docs come from the unified dataset (compact
         // result, one indexed doc per grant) — see worker `dataset_search_docs`.
-        map.insert(
-            "index_datasets".into(),
-            json!([{ "app": UNIFIED_APP, "dataset": UNIFIED_DATASET }]),
-        );
+        // Withheld entirely when the source's health says so: the worker's own
+        // gate on ("grants","unified") can never fire (see `indexable`).
+        if indexable(self.state) {
+            map.insert(
+                "index_datasets".into(),
+                json!([{ "app": UNIFIED_APP, "dataset": self.dataset }]),
+            );
+        }
     }
 }
 
@@ -107,15 +172,27 @@ pub async fn finalize_unified(
     unified_items: &[(String, Value)],
     source_url: Option<&str>,
 ) -> Result<UnifiedOutcome> {
-    let unified = sync_unified(ctx, unified_items, source_url).await?;
+    // Resolve THIS source's health once, before any write, and gate the whole
+    // contribution on it (see `contribution_target`).
+    let state = ctx.health.enforced_state(&ctx.app, SOURCE_DATASET).await;
+    let (dataset, trust) = contribution_target(state);
+    let unified = sync_unified(ctx, unified_items, source_url, state).await?;
     // Amendment radar: classify source-observed changes into typed lifecycle
     // events. Runs BEFORE the sweep so the two newest revisions per changed key
     // are guaranteed to be (prior source snapshot, new source snapshot) — a
     // sweep write in between would make "old" our own inferred closure instead
-    // of what the source last published.
-    let events = record_events(ctx, &unified).await?;
+    // of what the source last published. Reads history from the dataset the
+    // contribution actually landed in, so a quarantined run's radar diffs its
+    // shadow rows rather than mixing shadow and canonical snapshots.
+    let events = record_events(ctx, &unified, &dataset).await?;
     // Lifecycle: flip past-due open/forecasted unified rows to closed — these
     // upsert-only sources never see a delisting otherwise.
+    //
+    // Deliberately NOT gated on this source's health, and deliberately always
+    // against the canonical dataset: the sweep is derived from rows already
+    // stored for ALL sources, not from this run's fetch, so a broken ca-grants
+    // run must not stop grants-gov's expired rows being retired — nor write its
+    // corrections into a shadow dataset it did not read from.
     let swept = sweep_closed(ctx).await?;
     let cross_source_dups = link_duplicates(ctx, DUP_DISTANCE).await?;
     let warnings = drift_warnings(unified_items);
@@ -125,6 +202,9 @@ pub async fn finalize_unified(
         cross_source_dups,
         warnings,
         events,
+        state,
+        dataset,
+        trust,
     })
 }
 
@@ -306,17 +386,33 @@ fn sedia_close_date(deadline: &Value, today: chrono::NaiveDate) -> Option<String
 /// Upserts normalized grants into the cross-source unified dataset, stamping
 /// each revision with this job's id and (when the caller can name one honestly)
 /// the source listing URL the batch was fetched from.
+///
+/// `state` is the CALLING SOURCE's extraction-health state; it decides the
+/// target dataset and the trust stamp via [`contribution_target`]. Callers must
+/// resolve it before the write — judging afterwards would stamp trust from a
+/// verdict that did not exist yet.
 pub async fn sync_unified(
     ctx: &AppContext,
     items: &[(String, Value)],
     source_url: Option<&str>,
+    state: SourceState,
 ) -> Result<UpsertSummary> {
+    let (dataset, trust) = contribution_target(state);
+    if state != SourceState::Healthy {
+        tracing::warn!(
+            app = %ctx.app,
+            state = state.as_str(),
+            %dataset,
+            trust = trust.unwrap_or(pumper_core::TRUST_STABLE),
+            "grants/unified contribution gated on source health"
+        );
+    }
     ctx.datasets
         .upsert_many_stamped(
             UNIFIED_APP,
-            UNIFIED_DATASET,
+            &dataset,
             items,
-            None,
+            trust,
             Some(&stamp(ctx, source_url)),
         )
         .await
@@ -464,15 +560,12 @@ pub fn classify_events(old: &Value, new: &Value, observed_on: chrono::NaiveDate)
 /// one the upsert diffed against), classify, and append the typed events into
 /// `grants/events`. Brand-new keys have no prior snapshot and are skipped —
 /// first sight is not an amendment. Returns the number of events written.
-async fn record_events(ctx: &AppContext, summary: &UpsertSummary) -> Result<usize> {
+async fn record_events(ctx: &AppContext, summary: &UpsertSummary, dataset: &str) -> Result<usize> {
     let now = chrono::Utc::now();
     let today = now.date_naive();
     let mut items: Vec<(String, Value)> = Vec::new();
     for key in &summary.changed {
-        let revs = ctx
-            .datasets
-            .history(UNIFIED_APP, UNIFIED_DATASET, key, 2)
-            .await?;
+        let revs = ctx.datasets.history(UNIFIED_APP, dataset, key, 2).await?;
         let (Some(newest), Some(prior)) = (revs.first(), revs.get(1)) else {
             continue;
         };
@@ -1199,6 +1292,86 @@ mod tests {
         let mut retitled = old.clone();
         retitled["title"] = json!("Renamed");
         assert!(classify_events(&old, &retitled, on(2026, 7, 30)).is_empty());
+    }
+
+    // ---- source-health gating of the shared unified layer (G-A) ----
+
+    #[test]
+    fn quarantined_source_contribution_is_not_silently_canonical() {
+        // A healthy source writes the canonical dataset with no stamp (NULL ==
+        // "stable") — today's behavior, unchanged.
+        assert_eq!(
+            contribution_target(SourceState::Healthy),
+            ("unified".to_string(), None)
+        );
+        // Suspect is deliberately inert everywhere else; it must be inert here too.
+        assert_eq!(
+            contribution_target(SourceState::Suspect),
+            ("unified".to_string(), None)
+        );
+        // Degrading: still canonical (other sources need the dataset), but the
+        // rows are distinguishable by the EXISTING trust vocabulary.
+        assert_eq!(
+            contribution_target(SourceState::Degraded),
+            ("unified".to_string(), Some("provisional"))
+        );
+        // Quarantined: diverted to the shadow dataset, never mixed into the layer
+        // every consumer reads, and stamped on top of that.
+        assert_eq!(
+            contribution_target(SourceState::Quarantined),
+            ("unified@q".to_string(), Some("quarantined"))
+        );
+        // The gating is per-CONTRIBUTION: nothing here can rename or divert the
+        // dataset for the sources that are still fine — the target is a pure
+        // function of one source's own state, computed per run.
+        assert_ne!(
+            contribution_target(SourceState::Quarantined).0,
+            contribution_target(SourceState::Healthy).0
+        );
+    }
+
+    #[test]
+    fn degrading_contribution_is_not_offered_to_the_search_index() {
+        // The worker's gate on the virtual ("grants","unified") pair can never
+        // fire, so the producer withholds the spec instead of decorating it.
+        assert!(indexable(SourceState::Healthy));
+        assert!(indexable(SourceState::Suspect));
+        assert!(!indexable(SourceState::Degraded));
+        assert!(!indexable(SourceState::Quarantined));
+
+        let outcome = |state: SourceState| {
+            let (dataset, trust) = contribution_target(state);
+            UnifiedOutcome {
+                unified: UpsertSummary::default(),
+                swept: 0,
+                cross_source_dups: 0,
+                warnings: vec![],
+                events: 0,
+                state,
+                dataset,
+                trust,
+            }
+        };
+        let mut healthy = json!({});
+        outcome(SourceState::Healthy).merge_into(&mut healthy);
+        assert_eq!(
+            healthy["index_datasets"],
+            json!([{ "app": "grants", "dataset": "unified" }])
+        );
+        assert_eq!(healthy["unified"]["trust"], "stable");
+
+        let mut quarantined = json!({});
+        outcome(SourceState::Quarantined).merge_into(&mut quarantined);
+        assert!(quarantined.get("index_datasets").is_none());
+        assert_eq!(quarantined["unified"]["dataset"], "unified@q");
+        assert_eq!(quarantined["unified"]["trust"], "quarantined");
+        assert_eq!(quarantined["unified"]["sourceState"], "quarantined");
+
+        let mut degraded = json!({});
+        outcome(SourceState::Degraded).merge_into(&mut degraded);
+        assert!(degraded.get("index_datasets").is_none());
+        assert_eq!(degraded["unified"]["dataset"], "unified");
+        assert_eq!(degraded["unified"]["trust"], "provisional");
     }
 
     #[test]

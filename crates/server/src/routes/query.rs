@@ -9,6 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use utoipa::IntoParams;
 
+use crate::routes::datasets::{default_trust_all, trust_filter};
 use crate::routes::error::{default_limit, keyset_cursor, parse_cursor, ApiError};
 use crate::state::AppState;
 
@@ -55,6 +56,17 @@ pub(crate) struct GrantsQuery {
     closing_after: Option<String>,
     /// Minimum money: keeps records whose `award_ceiling` OR `total_funding` is >= this.
     min_award: Option<f64>,
+    /// Trust filter over the shared corpus: `all` (default — every record carries
+    /// its own `trust` field), `stable`, `provisional` or `quarantined`.
+    ///
+    /// `grants/unified` is written by three independent sources, and each run's
+    /// contribution is stamped with THAT source's extraction health
+    /// (`grants_common::contribution_target`): a degrading source's rows land here
+    /// stamped `provisional`, a quarantined source's are diverted out to
+    /// `grants/unified@q` entirely. `trust=stable` is how a consumer asks for only
+    /// the rows we stand behind — the same vocabulary as `/datasets` and `/changes`.
+    #[serde(default = "default_trust_all")]
+    trust: String,
     #[serde(default = "default_limit")]
     limit: i64,
     /// Opaque keyset cursor; presence (even empty) switches to `{items, next_cursor}`.
@@ -143,17 +155,18 @@ pub(crate) async fn list_grants(
 ) -> Result<Json<Value>, ApiError> {
     let filters = grant_filters(&query)?;
     let limit = query.limit.clamp(1, GRANTS_MAX_LIMIT);
+    let trust = trust_filter(&query.trust);
     let Some(cursor) = &query.cursor else {
         let grants = state
             .datasets
-            .list_filtered(GRANTS_APP, GRANTS_DATASET, &filters, None, limit)
+            .list_filtered_trust(GRANTS_APP, GRANTS_DATASET, &filters, None, limit, trust)
             .await?;
         return Ok(Json(json!({ "grants": grants })));
     };
     let after = parse_cursor(cursor);
     let items = state
         .datasets
-        .list_filtered(GRANTS_APP, GRANTS_DATASET, &filters, after, limit)
+        .list_filtered_trust(GRANTS_APP, GRANTS_DATASET, &filters, after, limit, trust)
         .await?;
     let next_cursor = keyset_cursor(&items, limit, |r| {
         format!("{}|{}", pumper_core::datasets::ts(r.updated_at), r.key)

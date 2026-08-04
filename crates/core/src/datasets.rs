@@ -84,6 +84,24 @@ fn trust_predicate(n: usize) -> String {
     TRUST_PREDICATE.replace("?T", &format!("?{n}"))
 }
 
+/// Appends `AND <TRUST_PREDICATE>` to a dynamically-built query, binding the
+/// filter value into each of its `?T` slots. A no-op when `trust` is `None`.
+///
+/// Splits the ONE predicate constant rather than restating it: a hand-written
+/// second copy for the QueryBuilder paths is exactly the divergence
+/// [`TRUST_PREDICATE`]'s doc warns about — a consumer that believes it filtered
+/// and did not.
+fn push_trust_filter(qb: &mut sqlx::QueryBuilder<'_, sqlx::Sqlite>, trust: Option<&str>) {
+    let Some(t) = trust else { return };
+    let mut parts = TRUST_PREDICATE.split("?T");
+    qb.push(" AND ");
+    qb.push(parts.next().unwrap_or(""));
+    for part in parts {
+        qb.push_bind(t.to_string());
+        qb.push(part);
+    }
+}
+
 /// One entry in a record's revision history: what changed, when, and the
 /// field-level diff versus the previous revision.
 #[derive(Debug, Clone, Serialize)]
@@ -1574,6 +1592,28 @@ impl Datasets {
         after: Option<(String, String)>,
         limit: i64,
     ) -> Result<Vec<Record>> {
+        self.list_filtered_trust(app, dataset, filters, after, limit, None)
+            .await
+    }
+
+    /// [`list_filtered`](Self::list_filtered) additionally restricted to one
+    /// trust level (`stable` | `provisional` | `quarantined`; `None` = every
+    /// row). Uses the same [`TRUST_PREDICATE`] as the record list and the change
+    /// feed, so `stable` keeps the `NULL`-means-stable equivalence.
+    ///
+    /// Needed by shared datasets that several sources write into — `grants/unified`
+    /// is written by three apps, so a run gated to `provisional` by ITS source's
+    /// health leaves provisional rows sitting next to stable ones in the dataset
+    /// every consumer reads.
+    pub async fn list_filtered_trust(
+        &self,
+        app: &str,
+        dataset: &str,
+        filters: &[JsonFilter],
+        after: Option<(String, String)>,
+        limit: i64,
+        trust: Option<&str>,
+    ) -> Result<Vec<Record>> {
         let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             "SELECT key, data, first_seen, last_seen, updated_at, removed_at, trust \
              FROM records WHERE removed_at IS NULL AND app = ",
@@ -1583,6 +1623,7 @@ impl Datasets {
         qb.push_bind(dataset);
 
         push_json_filters(&mut qb, filters);
+        push_trust_filter(&mut qb, trust);
 
         if let Some((after_ts, after_key)) = &after {
             qb.push(" AND (updated_at < ");
@@ -3370,6 +3411,34 @@ mod tests {
             sql.starts_with("(?3 IS NULL OR"),
             "no filter must match everything: {sql}"
         );
+    }
+
+    #[test]
+    fn the_builder_trust_filter_is_the_predicate_not_a_second_copy() {
+        // The QueryBuilder paths must emit the SAME predicate as the static-SQL
+        // ones. A hand-written second copy is how "filtered" and "not filtered"
+        // silently diverge, so this asserts the generated fragment is
+        // TRUST_PREDICATE with its ?T slots bound.
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT 1 WHERE x = 1");
+        push_trust_filter(&mut qb, Some("stable"));
+        let sql = qb.sql().to_string();
+        let expected = format!(
+            "SELECT 1 WHERE x = 1 AND {}",
+            TRUST_PREDICATE
+                .replace("?T", "?")
+                // QueryBuilder numbers its binds from 1.
+                .replacen('?', "?1", 1)
+        );
+        // Placeholders are numbered ?1..?3 in order; compare the shape.
+        assert_eq!(sql.matches('?').count(), 3, "{sql}");
+        assert!(sql.contains("COALESCE(trust, 'stable')"), "{sql}");
+        assert!(sql.starts_with("SELECT 1 WHERE x = 1 AND ("), "{sql}");
+        assert!(expected.contains("COALESCE(trust, 'stable')"));
+
+        // None must add nothing at all — an unfiltered read stays unfiltered.
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new("SELECT 1 WHERE x = 1");
+        push_trust_filter(&mut qb, None);
+        assert_eq!(qb.sql(), "SELECT 1 WHERE x = 1");
     }
 
     // ── derived: pure helpers ────────────────────────────────────────────────

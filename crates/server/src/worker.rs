@@ -1452,6 +1452,14 @@ async fn dataset_search_docs(
         // A degrading source never poisons the search index. Because indexing is
         // delta-driven from the change feed, the skipped revisions are picked up
         // by the next healthy run's window — or by `search-backfill`.
+        //
+        // Scope note: this gate reads the health of the SPEC's own pair. For a
+        // VIRTUAL pair — one no app ever calls `observe_extraction` for, such as
+        // `("grants","unified")`, which three source apps write into — there is
+        // no verdict to read and `enforced_state` always answers `Healthy`. Those
+        // producers gate themselves by withholding the spec (see
+        // `grants_common::indexable`); this check is the backstop for specs that
+        // name a pair the health ladder actually judges.
         let health = state.health.enforced_state(app, dataset).await;
         if health.skips_search_index() {
             warn!(%app, %dataset, state = health.as_str(), "search indexing skipped: source health");
