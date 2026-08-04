@@ -46,13 +46,58 @@ impl ScrapeApp for SchemaApp {
 }
 
 async fn mcp_state(allow_enqueue: bool) -> (AppState, pumper_core::testing::TempStore) {
-    let (mut state, store) = test_state(vec![Arc::new(FakeApp), Arc::new(SchemaApp)]).await;
+    let (state, store, _) = mcp_state_recording(allow_enqueue).await;
+    (state, store)
+}
+
+/// A `Search` that answers nothing and remembers the last `SearchRequest` it was
+/// handed — the only way to assert that a tool's arguments reached the query
+/// layer intact rather than being silently dropped on the floor.
+#[derive(Default)]
+struct RecordingSearch {
+    last: std::sync::Mutex<Option<pumper_core::SearchRequest>>,
+}
+
+#[async_trait::async_trait]
+impl pumper_core::Search for RecordingSearch {
+    async fn index(&self, _docs: Vec<pumper_core::SearchDoc>) -> Result<()> {
+        Ok(())
+    }
+    async fn query(&self, req: pumper_core::SearchRequest) -> Result<pumper_core::SearchResponse> {
+        *self.last.lock().unwrap() = Some(req);
+        Ok(pumper_core::SearchResponse::default())
+    }
+    async fn delete_ids(&self, _ids: &[String]) -> Result<()> {
+        Ok(())
+    }
+    async fn delete_dataset(&self, _app: &str, _dataset: &str) -> Result<()> {
+        Ok(())
+    }
+    async fn doc_count(&self) -> Result<u64> {
+        Ok(0)
+    }
+}
+
+async fn mcp_state_recording(
+    allow_enqueue: bool,
+) -> (
+    AppState,
+    pumper_core::testing::TempStore,
+    Arc<RecordingSearch>,
+) {
+    let search = Arc::new(RecordingSearch::default());
+    let (mut state, store) = super::harness::test_state_indexed(
+        vec![Arc::new(FakeApp), Arc::new(SchemaApp)],
+        search.clone(),
+        |_| {},
+    )
+    .await;
     let mut config = (*state.config).clone();
     config.mcp.enabled = true;
     config.mcp.allow_enqueue = allow_enqueue;
     config.mcp.max_job_budget_usd = 1.0;
     state.config = Arc::new(config);
-    (state, store)
+    (state, store, search)
 }
 
 fn call(name: &str, args: Value) -> Value {
@@ -256,6 +301,133 @@ async fn query_dataset_tool_reuses_the_filter_grammar() {
     assert_eq!(resp["error"]["code"], -32601);
     let resp = handle_rpc(&state, &call("nope", json!({}))).await.unwrap();
     assert_eq!(resp["error"]["code"], -32602);
+}
+
+/// The `search` tool's declared params. The anti-pattern this pins: the tool
+/// advertising a strict subset of `GET /search` (it used to offer only
+/// q/limit/app/dataset), so an agent could not page, sort, or use the entity
+/// filters the REST surface has had since M14. EXPECTED-diff idiom — changing
+/// the tool's surface must change this list.
+const EXPECTED_SEARCH_PARAMS: &[&str] = &[
+    "amount_gte",
+    "amount_lte",
+    "app",
+    "dataset",
+    "date_after",
+    "date_before",
+    "fuzzy",
+    "limit",
+    "offset",
+    "q",
+    "since",
+    "sort",
+];
+
+#[tokio::test]
+async fn search_tool_advertises_the_whole_http_query_surface_not_a_subset() {
+    let (state, _store) = mcp_state(false).await;
+    let resp = handle_rpc(
+        &state,
+        &json!({ "jsonrpc": "2.0", "id": 1, "method": "tools/list" }),
+    )
+    .await
+    .unwrap();
+    let tool = resp["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "search")
+        .unwrap()
+        .clone();
+    let mut params: Vec<&str> = tool["inputSchema"]["properties"]
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(String::as_str)
+        .collect();
+    params.sort_unstable();
+    assert_eq!(params, EXPECTED_SEARCH_PARAMS);
+    // The vocabulary an agent must not have to guess at.
+    assert_eq!(
+        tool["inputSchema"]["properties"]["sort"]["enum"][0],
+        "score"
+    );
+    assert_eq!(
+        tool["inputSchema"]["properties"]["sort"]["enum"][1],
+        "newest"
+    );
+    assert_eq!(
+        tool["inputSchema"]["properties"]["offset"]["maximum"],
+        crate::routes::SEARCH_MAX_OFFSET,
+        "the advertised offset ceiling is the one the builder enforces"
+    );
+}
+
+/// The anti-pattern: the tool accepting the new arguments in its schema but
+/// dropping them on the way to the index (`fuzzy: false, since: None, …`
+/// hardcoded), so the agent's filter silently does nothing.
+#[tokio::test]
+async fn search_tool_arguments_reach_the_query_not_the_floor() {
+    let (state, _store, search) = mcp_state_recording(false).await;
+    let resp = handle_rpc(
+        &state,
+        &call(
+            "search",
+            json!({
+                "q": "rural health", "limit": 5, "offset": 10, "app": "grants",
+                "dataset": "unified", "fuzzy": true, "sort": "newest",
+                "since": 1_700_000_000i64, "amount_gte": 100_000, "amount_lte": 5_000_000,
+                "date_after": 1_800_000_000i64, "date_before": 1_900_000_000i64
+            }),
+        ),
+    )
+    .await
+    .unwrap();
+    structured(&resp);
+    let req = search.last.lock().unwrap().clone().expect("query ran");
+    assert_eq!(req.q, "rural health");
+    assert_eq!((req.limit, req.offset), (5, 10));
+    assert_eq!(req.app.as_deref(), Some("grants"));
+    assert_eq!(req.dataset.as_deref(), Some("unified"));
+    assert!(req.fuzzy);
+    assert_eq!(req.sort, pumper_core::SearchSort::Newest);
+    assert_eq!(req.since, Some(1_700_000_000));
+    assert_eq!(req.amount_gte, Some(100_000));
+    assert_eq!(req.amount_lte, Some(5_000_000));
+    assert_eq!(req.date_after, Some(1_800_000_000));
+    assert_eq!(req.date_before, Some(1_900_000_000));
+    assert!(
+        !req.facets,
+        "the tool returns hits only — facets cost a >=1000-doc sample"
+    );
+
+    // Defaults match the HTTP route's, because they come from the same builder.
+    handle_rpc(&state, &call("search", json!({ "q": "grants" })))
+        .await
+        .unwrap();
+    let req = search.last.lock().unwrap().clone().unwrap();
+    assert_eq!((req.limit, req.offset), (20, 0));
+    assert_eq!(req.sort, pumper_core::SearchSort::Score);
+}
+
+/// The shared builder's rejections must surface as readable tool errors, not as
+/// a silent fallback or a protocol error.
+#[tokio::test]
+async fn search_tool_rejects_a_bad_sort_and_a_blank_query_like_the_http_route() {
+    let (state, _store, search) = mcp_state_recording(false).await;
+    for (args, needle) in [
+        (json!({ "q": "x", "sort": "sideways" }), "sideways"),
+        (json!({ "q": "   " }), "q"),
+    ] {
+        let resp = handle_rpc(&state, &call("search", args)).await.unwrap();
+        assert_eq!(resp["result"]["isError"], true);
+        let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(needle), "{text}");
+    }
+    assert!(
+        search.last.lock().unwrap().is_none(),
+        "a refused request never reaches the index"
+    );
 }
 
 #[tokio::test]

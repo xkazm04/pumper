@@ -27,6 +27,10 @@ pub(crate) use jobs::merge_params;
 // endpoint and the loop that actually deletes MUST compute the same plan, so
 // there is exactly one implementation and both call it.
 pub(crate) use retention::artifact_retention_plan;
+// The search query surface's parsing/clamping, re-exported for the MCP `search`
+// tool (`crate::mcp`) so the agent-facing tool and `GET /search` share one
+// grammar — same defaults, same clamps, same `sort` vocabulary.
+pub(crate) use search::{build_search_request, SearchInput, SEARCH_MAX_OFFSET};
 
 mod datasets;
 mod derived;

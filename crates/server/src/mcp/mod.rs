@@ -32,6 +32,9 @@ use serde_json::{json, Value};
 
 use crate::state::AppState;
 use axum::http::StatusCode;
+// Deepest `search` page an agent may ask for — the HTTP route's own cap, so the
+// tool schema advertises the same ceiling the request builder enforces.
+use crate::routes::SEARCH_MAX_OFFSET;
 
 /// Protocol revisions this server speaks. The client's requested version is
 /// echoed when supported; otherwise the newest supported one is offered.
@@ -171,15 +174,65 @@ fn server_tools(state: &AppState) -> Vec<Value> {
         json!({
             "name": "search",
             "description": "Full-text search (BM25) across everything indexed from job \
-                results, with highlighted snippets. Scope with app/dataset.",
+                results, with highlighted snippets. Scope with app/dataset, page with \
+                offset, order by relevance or index time, and filter on the entity fields \
+                extracted at index time (money amount, deadline date). Same query surface \
+                as GET /search; app/dataset facets are the one thing this tool does not \
+                return.",
             "inputSchema": {
                 "type": "object",
                 "required": ["q"],
                 "properties": {
                     "q": { "type": "string", "minLength": 1 },
                     "limit": { "type": "integer", "minimum": 1, "maximum": SEARCH_LIMIT_CAP },
-                    "app": { "type": "string" },
-                    "dataset": { "type": "string" }
+                    "app": { "type": "string", "description": "Restrict hits to one app." },
+                    "dataset": {
+                        "type": "string",
+                        "description": "Restrict hits to one dataset. Job-result documents \
+                            live under the reserved '_job' / '_records' names."
+                    },
+                    "offset": {
+                        "type": "integer", "minimum": 0, "maximum": SEARCH_MAX_OFFSET,
+                        "description": "Skip this many ranked hits before `limit` \
+                            (page 2 = offset equal to limit). Clamped."
+                    },
+                    "fuzzy": {
+                        "type": "boolean",
+                        "description": "Typo tolerance (edit distance 1). Quoted phrases \
+                            stay exact."
+                    },
+                    "sort": {
+                        "type": "string", "enum": ["score", "newest"],
+                        "description": "Ordering: 'score' (BM25 relevance, default) or \
+                            'newest' (most recently indexed first)."
+                    },
+                    "since": {
+                        "type": "integer",
+                        "description": "Only hits indexed at/after this unix-seconds \
+                            instant — a \"what's new\" feed."
+                    },
+                    "amount_gte": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Only hits whose index-time-extracted money amount \
+                            (whole US dollars) is >= this. Documents with no extracted \
+                            amount never match."
+                    },
+                    "amount_lte": {
+                        "type": "integer", "minimum": 0,
+                        "description": "Only hits whose extracted amount is <= this \
+                            (whole US dollars)."
+                    },
+                    "date_after": {
+                        "type": "integer",
+                        "description": "Only hits whose extracted deadline (unix seconds) \
+                            is at/after this. Documents with no extracted deadline never \
+                            match."
+                    },
+                    "date_before": {
+                        "type": "integer",
+                        "description": "Only hits whose extracted deadline is at/before \
+                            this (unix seconds)."
+                    }
                 },
                 "additionalProperties": false
             }
@@ -358,31 +411,36 @@ async fn tool_query_dataset(state: &AppState, args: &Value) -> Result<Value, Str
     }))
 }
 
+/// The MCP `search` tool. Every param maps through the HTTP route's own
+/// [`crate::routes::build_search_request`] — the tool used to expose a strict
+/// subset (q/limit/app/dataset), so an agent could not page, sort, or filter
+/// what the REST surface has filtered on since M14. Facets stay off: this tool
+/// returns hits only, and computing them costs a ≥1000-doc sample.
 async fn tool_search(state: &AppState, args: &Value) -> Result<Value, String> {
-    let q = require_str(args, "q")?;
-    if q.trim().is_empty() {
-        return Err("'q' must be non-empty".into());
-    }
-    let limit = args
-        .get("limit")
-        .and_then(Value::as_u64)
-        .unwrap_or(20)
-        .clamp(1, SEARCH_LIMIT_CAP as u64) as usize;
-    let req = pumper_core::SearchRequest {
-        q: q.to_string(),
-        limit,
-        app: args.get("app").and_then(Value::as_str).map(String::from),
-        dataset: args
-            .get("dataset")
-            .and_then(Value::as_str)
-            .map(String::from),
-        fuzzy: false,
-        sort: pumper_core::SearchSort::Score,
-        since: None,
-        offset: 0,
+    let q = require_str(args, "q")?.to_string();
+    let str_arg = |key: &str| args.get(key).and_then(Value::as_str).map(String::from);
+    let req = crate::routes::build_search_request(crate::routes::SearchInput {
+        q: q.clone(),
+        // The tool schema's own cap; `build_search_request` clamps again.
+        limit: args
+            .get("limit")
+            .and_then(Value::as_u64)
+            .map(|v| v.min(SEARCH_LIMIT_CAP as u64) as usize),
+        app: str_arg("app"),
+        dataset: str_arg("dataset"),
+        fuzzy: args.get("fuzzy").and_then(Value::as_bool).unwrap_or(false),
+        sort: str_arg("sort"),
+        since: args.get("since").and_then(Value::as_i64),
+        offset: args
+            .get("offset")
+            .and_then(Value::as_u64)
+            .map(|v| v as usize),
+        amount_gte: args.get("amount_gte").and_then(Value::as_u64),
+        amount_lte: args.get("amount_lte").and_then(Value::as_u64),
+        date_after: args.get("date_after").and_then(Value::as_i64),
+        date_before: args.get("date_before").and_then(Value::as_i64),
         facets: false,
-        ..Default::default()
-    };
+    })?;
     let results = state.search.query(req).await.map_err(|e| e.to_string())?;
     Ok(json!({
         "query": q,

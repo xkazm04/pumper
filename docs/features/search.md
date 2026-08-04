@@ -22,13 +22,21 @@ An app whose result stays compact (counts, not arrays — the fleet convention) 
 
 ## Query surface
 
-`GET /search?q=&limit=&offset=&app=&dataset=&fuzzy=&sort=&since=` → `{query, total, count, hits, facets}`.
+`GET /search?q=&limit=&offset=&app=&dataset=&fuzzy=&sort=&since=&amount_gte=&amount_lte=&date_after=&date_before=` → `{query, total, count, hits, facets}`. The MCP `search` tool takes the same params through the same parser — see [below](#the-mcp-search-tool-same-surface-minus-facets).
 
 - **Params.** `q` required (400 on empty). `limit` default 20, clamped 1–100. `offset` skips ranked hits before `limit` (page 2 = `offset=limit`), clamped to **10 000** — deep Tantivy offsets get progressively costlier. `sort` = `score` (BM25 relevance, the default) or `newest` (most recently indexed first — recency over relevance on a changing corpus); any other value is a 400. `since=<unix-seconds>` keeps only hits indexed at/after that instant (a "what's new" feed), backed by the `indexed_at` fast field.
 - **Counts.** `total` is the **exact** number of matching documents, independent of `limit`/`offset` — the denominator for paging (it was previously the page size). `count` is the returned page size.
 - **Hits** with highlighted `snippet` (matched terms in `<b>`, generated from the stored body). Hit fields are read directly off the stored doc (`get_first`), not via a full-doc JSON round-trip.
 - **Facets**: `apps` + `datasets` counts over the top-1000 matches (honest sample), sorted by count. `app=`/`dataset=` params filter by exact term. **Computed only when requested** (`SearchRequest.facets`, which `GET /search` sets): facets sample ≥1000 docs and decode each, so a facet-less query (the saved-search runner, and any caller that reads only hit ids) ranks and decodes just the `offset+limit` page window — no facet-sampling overread.
 - **Fuzzy** (`fuzzy=true`): edit-distance-1 on title+body (transposition = one edit). Quoted `"exact phrases"` parse as phrase queries in either mode.
+
+### The MCP `search` tool: same surface, minus facets
+
+When `[mcp] enabled = true`, the `search` tool exposes **the same query surface** as `GET /search`: `q`, `limit`, `offset`, `app`, `dataset`, `fuzzy`, `sort`, `since`, `amount_gte`/`amount_lte`, `date_after`/`date_before`. It previously offered only `q`/`limit`/`app`/`dataset`, so an agent could not page, order by recency, or use the entity filters at all.
+
+Parsing is not duplicated: both callers build their `SearchRequest` through one `build_search_request` in `crates/server/src/routes/search.rs`, so defaults (`limit` 20), clamps (`limit` 1–100, `offset` ≤ 10 000), and the `sort` vocabulary are identical — an unknown `sort` is refused on both surfaces rather than silently falling back to relevance (a 400 over HTTP, an `isError` tool result over MCP). The tool's JSON Schema advertises the same ceilings the builder enforces, and an inventory test fails if the two lists drift.
+
+The one deliberate difference: the tool returns `{query, total, count, hits}` with **no facets**. Facets sample ≥1000 documents and decode each, which is pure cost for a caller that reads hits.
 
 ### Entity-typed filters (`amount`, `event_date`)
 
@@ -76,10 +84,24 @@ A scope is required so a broad rebuild is always deliberate. The backfill uses t
 
 ## Saved searches (standing alerts)
 
-`saved_searches` + `saved_search_seen` tables. `GET/POST /searches`, `DELETE /searches/{id}`, `POST /searches/{id}/enabled`. Body: `{query, app?, dataset?, url, secret?}` (400 on an empty `query` or a non-`http(s)` `url`). `GET /searches` is **dual-mode**: bare `{searches: [...]}` by default, or `{items, next_cursor}` when a `cursor` param is present (even empty) — an opaque keyset cursor. `limit` is clamped 1–500 in **both** modes, so an uncursored list can never stream the whole table. After each job's results are indexed, the worker runs enabled saved searches (scoped by their filters) and webhooks a **`search.matched`** event containing only never-before-seen matches — `INSERT OR IGNORE` claim on `(search_id, doc_id)` guarantees exactly-once alerting, including when several source apps publish into one virtual app and each of their runs re-evaluates the same search. **App scoping:** a search with `app` unset runs on every job; a search with `app` set runs when that app is among the run's indexed namespaces — `job.app` plus every `index_datasets` app (see [`index_datasets`](#indexing-a-dataset-from-a-compact-result-index_datasets)). A search that is skipped, matches nothing, or matches only already-alerted docs says so at `debug` rather than passing silently. Deliveries flow through the logged webhook path (DLQ + replay — see [events-webhooks.md](events-webhooks.md)).
+`saved_searches` + `saved_search_seen` tables. `GET/POST /searches`, `DELETE /searches/{id}`, `POST /searches/{id}/enabled`. Body: `{query, app?, dataset?, url, secret?, materialize?}` (400 on an empty `query` or a non-`http(s)` `url`). `GET /searches` is **dual-mode**: bare `{searches: [...]}` by default, or `{items, next_cursor}` when a `cursor` param is present (even empty) — an opaque keyset cursor. `limit` is clamped 1–500 in **both** modes, so an uncursored list can never stream the whole table. After each job's results are indexed, the worker runs enabled saved searches (scoped by their filters) and webhooks a **`search.matched`** event containing only never-before-seen matches — `INSERT OR IGNORE` claim on `(search_id, doc_id)` guarantees exactly-once alerting, including when several source apps publish into one virtual app and each of their runs re-evaluates the same search. **App scoping:** a search with `app` unset runs on every job; a search with `app` set runs when that app is among the run's indexed namespaces — `job.app` plus every `index_datasets` app (see [`index_datasets`](#indexing-a-dataset-from-a-compact-result-index_datasets)). A search that is skipped, matches nothing, or matches only already-alerted docs says so at `debug` rather than passing silently. Deliveries flow through the logged webhook path (DLQ + replay — see [events-webhooks.md](events-webhooks.md)).
+
+### Materializing a saved search into a dataset (M13, "queries as datasets")
+
+`materialize: {app, dataset}` on a saved search turns it into a **standing view**: after each run's alerting, the worker re-runs the query (facets off) and upserts its current result set into that dataset, one record per hit.
+
+- **Record key** = the search doc id. **Value** = `{title, snippet, url, score, source: {app, dataset, key}}` — `score` rounded to one decimal so a BM25 wobble is not a change, and `source.key` is the hit's key inside its own dataset (the doc id minus its `<app>:<dataset>:` prefix).
+- **Falling out of the results is a removal**: keys absent from this run's result set are tombstoned via the normal `detect_removed` path, so the view emits `new` / `changed` / `removed` deltas like any scraped dataset. An **empty** result set never wipes the view (removal guard).
+- Those deltas then drive the same machinery as any dataset — watches, dataset triggers, `?filter=`, export — fired under the **view's** app, not the producing job's.
+- **`[search] max_materialize_results`** (default `500`, `config.toml`) caps it on both axes: the query's `limit` and the per-run removal detection. A broad query stays a bounded view rather than an unbounded copy of the corpus.
+- **Refused shape:** `materialize` targeting the same `app`+`dataset` the search is scoped to is a 400 — the view would re-materialize its own records if that dataset were ever indexed.
+- Materialization is best-effort throughout: a failing view logs at `warn` and never touches the job outcome or the alert path.
 
 ## Known gaps
 
-- No semantic/hybrid search and no autocomplete (backlog). Facets are a top-1000 sample, not exact counts (`total` is exact).
+- No semantic/hybrid search and no autocomplete (backlog). Facets are a top-1000 sample, not exact counts (`total` is exact); the MCP `search` tool returns no facets at all.
 - `offset` paging is capped at 10 000; there is no deep-paging cursor over search hits.
-- A wiped index refills only as records change — recovery is the manual `search-backfill` bin, not an automatic rebuild.
+- A wiped or quarantined index refills only as records change — recovery is the manual `search-backfill` bin, not an automatic rebuild. Nothing reclaims a `<dir>.corrupt.<n>` quarantine.
+- **`amount` is US-dollar only.** Extraction requires a `$`/`usd` marker, so `€`, `£`, `CZK`, and every other currency is invisible to `amount_gte`/`amount_lte` — and a non-USD figure is never converted, just skipped.
+- **Both entity fields are document-level, not per-item**: one `amount` (the largest in the doc) and one `event_date` (the earliest upcoming deadline) per document. A document listing several awards or several deadlines is filterable only by its maximum amount and its nearest date; the others are not queryable.
+- Materialized views carry the display fields above, not the source record's full payload — join back through `source.{app, dataset, key}` for that.
