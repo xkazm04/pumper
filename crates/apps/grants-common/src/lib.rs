@@ -212,6 +212,9 @@ pub async fn finalize_unified(
 /// present in Search2 results, so the money fields stay null for this source.
 pub fn normalize_grants_gov(hit: &Value) -> Option<(String, Value)> {
     let id = str_of(hit, &["id", "number"])?;
+    // Search2 publishes `MM/DD/YYYY` — a bare date with no timezone, so
+    // `close_at` stays Null and the sweep takes its conservative path.
+    let close_raw = str_of(hit, &["closeDate"]);
     let unified = json!({
         "source": "grants-gov",
         "source_id": id,
@@ -219,7 +222,8 @@ pub fn normalize_grants_gov(hit: &Value) -> Option<(String, Value)> {
         "agency": str_of(hit, &["agency", "agencyCode"]),
         "status": norm_status(str_of(hit, &["oppStatus"]).as_deref()),
         "open_date": str_of(hit, &["openDate"]).as_deref().and_then(norm_date),
-        "close_date": str_of(hit, &["closeDate"]).as_deref().and_then(norm_date),
+        "close_date": close_raw.as_deref().and_then(norm_date),
+        "close_at": norm_instant(close_raw.as_deref()),
         "award_floor": Value::Null,
         "award_ceiling": Value::Null,
         "total_funding": Value::Null,
@@ -249,6 +253,10 @@ pub fn normalize_grants_gov(hit: &Value) -> Option<(String, Value)> {
 pub fn normalize_ca_grants(rec: &Value) -> Option<(String, Value)> {
     let id = str_of(rec, &["PortalID", "GrantID"])?;
     let (award_floor, award_ceiling) = money_range(rec, &["EstAmounts"]);
+    // The portal publishes `2026-11-02 23:59:00` — a wall clock with NO offset
+    // (it is Pacific, but the feed never says so), so `close_at` stays Null
+    // rather than being read as UTC. See `deadline_end_utc`.
+    let close_raw = str_of(rec, &["ApplicationDeadline", "CloseDate", "Deadline"]);
     let unified = json!({
         "source": "ca-grants",
         "source_id": id,
@@ -256,9 +264,8 @@ pub fn normalize_ca_grants(rec: &Value) -> Option<(String, Value)> {
         "agency": str_of(rec, &["AgencyDept", "Agency", "Department"]),
         "status": norm_status(str_of(rec, &["Status"]).as_deref()),
         "open_date": str_of(rec, &["OpenDate", "ApplicationOpenDate"]).as_deref().and_then(norm_date),
-        "close_date": str_of(rec, &["ApplicationDeadline", "CloseDate", "Deadline"])
-            .as_deref()
-            .and_then(norm_date),
+        "close_date": close_raw.as_deref().and_then(norm_date),
+        "close_at": norm_instant(close_raw.as_deref()),
         "award_floor": award_floor,
         "award_ceiling": award_ceiling,
         "total_funding": money_scalar(rec, &["EstAvailFunds"]),
@@ -291,7 +298,9 @@ pub fn normalize_ca_grants(rec: &Value) -> Option<(String, Value)> {
 ///   were ca-grants dollars. (Revisit once unified gains a `currency` field.)
 pub fn normalize_eu_sedia(rec: &Value) -> Option<(String, Value)> {
     let id = str_of(rec, &["identifier"])?;
-    let today = chrono::Utc::now().date_naive();
+    let now = chrono::Utc::now();
+    let (close_date, close_at) =
+        sedia_deadline(rec.get("deadlineDate").unwrap_or(&Value::Null), now);
     let unified = json!({
         "source": "eu-sedia",
         "source_id": id,
@@ -299,7 +308,10 @@ pub fn normalize_eu_sedia(rec: &Value) -> Option<(String, Value)> {
         "agency": sedia_agency(rec),
         "status": sedia_status(str_of(rec, &["status"]).as_deref()),
         "open_date": str_of(rec, &["startDate"]).as_deref().and_then(norm_date),
-        "close_date": sedia_close_date(rec.get("deadlineDate").unwrap_or(&Value::Null), today),
+        "close_date": close_date,
+        // The only source that publishes a timezone today — kept verbatim so the
+        // sweep retires the topic at its real instant, not at UTC midnight.
+        "close_at": close_at,
         // EUR, and unified has no currency dimension — Null, never fabricated USD.
         "award_floor": Value::Null,
         "award_ceiling": Value::Null,
@@ -355,32 +367,42 @@ fn sedia_status(code: Option<&str>) -> Value {
     }
 }
 
-/// The unified `close_date` for a SEDIA topic. `deadlineDate` is kept whole
-/// because multi-stage/multi-cutoff calls carry several dates: the effective
-/// deadline is the earliest cutoff still upcoming, and once every cutoff is past
-/// the latest one (so `sweep_closed` can retire the topic). Taking `[0]` blindly
-/// would flip a still-open two-stage call to `closed` the moment its first cutoff
-/// passes. Accepts an array or a lone value; unparseable/absent → `None`.
-fn sedia_close_date(deadline: &Value, today: chrono::NaiveDate) -> Option<String> {
-    let mut dates: Vec<chrono::NaiveDate> = match deadline {
-        Value::Array(a) => a
-            .iter()
-            .filter_map(Value::as_str)
-            .filter_map(parse_date)
-            .collect(),
-        Value::String(s) => parse_date(s).into_iter().collect(),
+/// The unified deadline for a SEDIA topic: `(close_date, close_at)`.
+///
+/// `deadlineDate` is kept whole because multi-stage/multi-cutoff calls carry
+/// several dates: the effective deadline is the earliest cutoff still upcoming,
+/// and once every cutoff is past the latest one (so `sweep_closed` can retire the
+/// topic). Taking `[0]` blindly would flip a still-open two-stage call to
+/// `closed` the moment its first cutoff passes.
+///
+/// SEDIA publishes each cutoff as a **zoned** timestamp (`…T17:00:00Z`), so the
+/// selection is made on real instants and the chosen one is kept verbatim in
+/// `close_at` rather than being truncated to a date. That is the difference
+/// between retiring a 17:00Z topic at 17:00Z and retiring it at midnight.
+/// Accepts an array or a lone value; unparseable/absent → `(None, Null)`.
+fn sedia_deadline(deadline: &Value, now: chrono::DateTime<chrono::Utc>) -> (Option<String>, Value) {
+    let raw: Vec<&str> = match deadline {
+        Value::Array(a) => a.iter().filter_map(Value::as_str).collect(),
+        Value::String(s) => vec![s.as_str()],
         _ => Vec::new(),
     };
-    if dates.is_empty() {
-        return None;
+    // (lapse instant, original string) — the instant orders, the string is what
+    // we keep, so no precision is lost by the sort.
+    let mut cutoffs: Vec<(chrono::DateTime<chrono::Utc>, &str)> = raw
+        .into_iter()
+        .filter_map(|s| lapses_at(s).map(|end| (end, s)))
+        .collect();
+    if cutoffs.is_empty() {
+        return (None, Value::Null);
     }
-    dates.sort_unstable();
-    let chosen = dates
+    cutoffs.sort_unstable_by_key(|(end, _)| *end);
+    let chosen = cutoffs
         .iter()
-        .find(|d| **d >= today)
+        .find(|(end, _)| *end >= now)
         .copied()
-        .unwrap_or_else(|| *dates.last().unwrap());
-    Some(chosen.to_string())
+        .unwrap_or_else(|| *cutoffs.last().unwrap())
+        .1;
+    (norm_date(chosen), norm_instant(Some(chosen)))
 }
 
 /// Upserts normalized grants into the cross-source unified dataset, stamping
@@ -482,13 +504,16 @@ pub struct GrantEvent {
 ///   fire daily.
 /// - `ClosedEarly` requires a still-future deadline for the same reason in
 ///   mirror image: closing at/after the deadline is normal expiry, not news.
-pub fn classify_events(old: &Value, new: &Value, observed_on: chrono::NaiveDate) -> Vec<GrantEvent> {
+pub fn classify_events(
+    old: &Value,
+    new: &Value,
+    observed_on: chrono::NaiveDate,
+) -> Vec<GrantEvent> {
     let mut events = Vec::new();
     let str_field = |v: &Value, f: &str| -> Option<String> {
         v.get(f).and_then(Value::as_str).map(String::from)
     };
-    let date_field =
-        |v: &Value, f: &str| v.get(f).and_then(Value::as_str).and_then(parse_date);
+    let date_field = |v: &Value, f: &str| v.get(f).and_then(Value::as_str).and_then(parse_date);
 
     // Deadline movement — both sides must parse.
     let old_close = date_field(old, "close_date");
@@ -617,7 +642,7 @@ async fn record_events(ctx: &AppContext, summary: &UpsertSummary, dataset: &str)
 /// a partial-view source). Returns the number of rows swept to `closed`.
 pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
     use pumper_core::datasets::JsonFilter;
-    let today = chrono::Utc::now().date_naive();
+    let now = chrono::Utc::now();
     // Load only the sweep candidates (status open/forecasted), not the whole
     // corpus. Over time most unified rows are already `closed` and can never flip
     // again, yet the old full read deserialized every one of them on every sync —
@@ -642,7 +667,11 @@ pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
     for rec in rows {
         let status = rec.data.get("status").and_then(Value::as_str);
         let close_date = rec.data.get("close_date").and_then(Value::as_str);
-        if !is_past_due_open(status, close_date, today) {
+        // `close_at` is the zoned deadline where the source published one; rows
+        // predating the field (and sources that publish no timezone) simply have
+        // None and take the conservative date-only path.
+        let close_at = rec.data.get("close_at").and_then(Value::as_str);
+        if !is_past_due_open(status, close_date, close_at, now) {
             continue;
         }
         let mut updated = rec.data.clone();
@@ -665,16 +694,26 @@ pub async fn sweep_closed(ctx: &AppContext) -> Result<usize> {
 }
 
 /// The sweep decision for one row: an `open`/`forecasted` opportunity whose
-/// `close_date` parses and is strictly before `today` should flip to `closed`.
-/// A missing/unparseable close date, a future/today date, or any other status
-/// is left untouched (a deadline that is exactly today has not passed).
+/// deadline has **provably lapsed** should flip to `closed`.
+///
+/// "Provably" is the fix. The old predicate compared `close_date` against
+/// `Utc::now().date_naive()`, so a grant closing 23:59 America/Los_Angeles was
+/// retired at 16:59 local — still open in its own source's timezone, and gone
+/// from `GET /grants?status=open` and `closing-soon`. Now the row is judged
+/// against a real instant from [`deadline_end_utc`]: exact where the source
+/// published a timezone (`close_at`), and end-of-day-anywhere-on-Earth where it
+/// did not.
+///
+/// A missing/unparseable deadline, a not-yet-lapsed one, or any other status is
+/// left untouched.
 fn is_past_due_open(
     status: Option<&str>,
     close_date: Option<&str>,
-    today: chrono::NaiveDate,
+    close_at: Option<&str>,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     matches!(status, Some("open") | Some("forecasted"))
-        && close_date.and_then(parse_date).is_some_and(|d| d < today)
+        && deadline_end_utc(close_date, close_at).is_some_and(|end| now > end)
 }
 
 /// Fraction of a run's normalized opportunities missing their `title` above
@@ -731,7 +770,13 @@ pub async fn link_duplicates(ctx: &AppContext, max_distance: u32) -> Result<usiz
     if !items.is_empty() {
         // A SimHash pairing over the stored corpus — job lineage only.
         ctx.datasets
-            .upsert_many_stamped(UNIFIED_APP, DUP_DATASET, &items, None, Some(&stamp(ctx, None)))
+            .upsert_many_stamped(
+                UNIFIED_APP,
+                DUP_DATASET,
+                &items,
+                None,
+                Some(&stamp(ctx, None)),
+            )
             .await?;
     }
     Ok(items.len())
@@ -914,6 +959,79 @@ fn norm_date(s: &str) -> Option<String> {
     parse_date(s).map(|d| d.to_string())
 }
 
+/// The companion of [`parse_date`] that keeps what `parse_date` throws away: an
+/// exact instant, but ONLY when the source string carries an explicit UTC offset
+/// (`…Z`, `…+02:00`). A bare date or an offset-less datetime
+/// (`2026-11-02 23:59:00`, the CA portal's shape) is deliberately `None` — we do
+/// not know its timezone, and inventing one would be exactly the fabrication the
+/// rest of this crate refuses.
+pub fn parse_instant(s: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    let s = s.trim();
+    if s.is_empty() {
+        return None;
+    }
+    chrono::DateTime::parse_from_rfc3339(s)
+        .ok()
+        .map(|dt| dt.with_timezone(&chrono::Utc))
+}
+
+/// Canonical `close_at`: the source's deadline as an RFC3339 UTC instant when —
+/// and only when — the source published a timezone. `Null` otherwise, which is
+/// the honest answer for grants.gov and the CA portal and is what makes
+/// [`deadline_end_utc`] take its conservative branch.
+fn norm_instant(s: Option<&str>) -> Value {
+    s.and_then(parse_instant)
+        .map(|dt| Value::String(dt.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)))
+        .unwrap_or(Value::Null)
+}
+
+/// Hour (UTC) on the day AFTER an offset-less deadline date at which that date
+/// is over *everywhere on Earth*.
+///
+/// End of day `D` in UTC-12 — the westernmost civil offset (Baker Island /
+/// "anywhere on Earth") — is `D+1T11:59:59Z`. Midday `D+1` UTC is therefore the
+/// first instant at which no inhabited timezone can still be on date `D`.
+const AMBIGUOUS_DEADLINE_UTC_HOUR: u32 = 12;
+
+/// When a published deadline actually lapses, as a UTC instant.
+///
+/// Two cases, and the split is the whole point:
+/// - The source gave a **zoned** timestamp (`close_at`) → that exact instant.
+///   SEDIA publishes `…T17:00:00Z`, so its topics retire to the second.
+/// - The source gave only a **date** → the conservative end, midday UTC the
+///   following day (see [`AMBIGUOUS_DEADLINE_UTC_HOUR`]). grants.gov publishes
+///   `MM/DD/YYYY` and the CA portal an offset-less `23:59:00`, so neither tells
+///   us its timezone. A grant closing 23:59 America/Los_Angeles is already
+///   "yesterday" in UTC, and retiring it there would hide money that is still
+///   claimable — so ambiguity resolves toward **keeping the grant open**, at the
+///   cost of at most one extra day of a genuinely-expired row.
+///
+/// `None` when neither field parses — an unknown deadline is never a lapsed one.
+fn deadline_end_utc(
+    close_date: Option<&str>,
+    close_at: Option<&str>,
+) -> Option<chrono::DateTime<chrono::Utc>> {
+    if let Some(instant) = close_at.and_then(parse_instant) {
+        return Some(instant);
+    }
+    close_date.and_then(parse_date).map(end_of_ambiguous_day)
+}
+
+/// A date-only deadline `D` → `D+1T12:00:00Z`, the moment `D` is over in every
+/// inhabited timezone.
+fn end_of_ambiguous_day(d: chrono::NaiveDate) -> chrono::DateTime<chrono::Utc> {
+    use chrono::TimeZone;
+    let next = d.succ_opt().unwrap_or(d);
+    chrono::Utc.from_utc_datetime(&next.and_hms_opt(AMBIGUOUS_DEADLINE_UTC_HOUR, 0, 0).unwrap())
+}
+
+/// When a single published deadline string lapses, whatever shape it has:
+/// exact when it is zoned, conservatively end-of-ambiguous-day when it is a bare
+/// date. Used to order SEDIA's multi-stage cutoffs by real time.
+fn lapses_at(raw: &str) -> Option<chrono::DateTime<chrono::Utc>> {
+    parse_instant(raw).or_else(|| parse_date(raw).map(end_of_ambiguous_day))
+}
+
 /// Canonical status vocabulary: open | forecasted | closed (unknowns lowercase
 /// through so nothing is silently lost).
 fn norm_status(s: Option<&str>) -> Value {
@@ -945,6 +1063,8 @@ mod tests {
         assert_eq!(key, "grants-gov:356037");
         assert_eq!(v["status"], "open");
         assert_eq!(v["close_date"], "2026-08-15");
+        // Search2 gives a bare date — no timezone to record, so no fabricated one.
+        assert_eq!(v["close_at"], Value::Null);
         assert_eq!(v["award_ceiling"], Value::Null);
         // ALN joined from cfdaList; categories/eligibilities empty for this source.
         assert_eq!(v["aln"], "93.912, 93.913");
@@ -969,6 +1089,9 @@ mod tests {
         assert_eq!(key, "ca-grants:CA-99");
         assert_eq!(v["status"], "open");
         assert_eq!(v["close_date"], "2026-11-02");
+        // `23:59:00` with no offset is a wall clock, not an instant — Null, so
+        // the sweep keeps the row open through the ambiguous day.
+        assert_eq!(v["close_at"], Value::Null);
         assert_eq!(v["total_funding"], json!(5_000_000.0));
         // EstAmounts range → floor/ceiling.
         assert_eq!(v["award_floor"], json!(100_000.0));
@@ -1045,23 +1168,142 @@ mod tests {
         assert!(parse_date("—").is_none());
     }
 
+    /// `YYYY-MM-DDTHH:MM:SSZ` → the instant. Test sugar only.
+    fn at(s: &str) -> chrono::DateTime<chrono::Utc> {
+        parse_instant(s).unwrap()
+    }
+
     #[test]
     fn sweep_predicate_flips_only_past_due_open_or_forecasted() {
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 13).unwrap();
+        // Same cases as before the timezone fix, re-anchored on an instant: a
+        // date-only deadline lapses at midday UTC the following day, so "past
+        // due" now means a day older than it used to.
+        let now = at("2026-07-13T12:00:01Z");
         // Past-due open / forecasted → flip.
-        assert!(is_past_due_open(Some("open"), Some("2026-07-12"), today));
+        assert!(is_past_due_open(
+            Some("open"),
+            Some("2026-07-12"),
+            None,
+            now
+        ));
         assert!(is_past_due_open(
             Some("forecasted"),
             Some("07/12/2026"),
-            today
+            None,
+            now
         ));
         // Deadline exactly today has not passed → leave.
-        assert!(!is_past_due_open(Some("open"), Some("2026-07-13"), today));
+        assert!(!is_past_due_open(
+            Some("open"),
+            Some("2026-07-13"),
+            None,
+            now
+        ));
         // Future, already-closed, missing/unparseable date → leave.
-        assert!(!is_past_due_open(Some("open"), Some("2026-08-01"), today));
-        assert!(!is_past_due_open(Some("closed"), Some("2026-01-01"), today));
-        assert!(!is_past_due_open(Some("open"), None, today));
-        assert!(!is_past_due_open(Some("open"), Some("n/a"), today));
+        assert!(!is_past_due_open(
+            Some("open"),
+            Some("2026-08-01"),
+            None,
+            now
+        ));
+        assert!(!is_past_due_open(
+            Some("closed"),
+            Some("2026-01-01"),
+            None,
+            now
+        ));
+        assert!(!is_past_due_open(Some("open"), None, None, now));
+        assert!(!is_past_due_open(Some("open"), Some("n/a"), None, now));
+    }
+
+    #[test]
+    fn sweep_does_not_retire_a_grant_still_open_in_its_own_timezone() {
+        // A grant closing on 2026-07-12 with NO published timezone. It is still
+        // 2026-07-12 somewhere on Earth until 12:00Z on 2026-07-13.
+        let open_row =
+            |now: &str| is_past_due_open(Some("open"), Some("2026-07-12"), None, at(now));
+
+        // THE BUG: 00:30Z on the 13th is 17:30 on the 12th in Los Angeles — the
+        // applicant still has six and a half hours. The old date-only compare
+        // retired it here and it vanished from ?status=open and closing-soon.
+        assert!(!open_row("2026-07-13T00:30:00Z"));
+        // Hours either side of the boundary.
+        assert!(!open_row("2026-07-13T11:59:59Z")); // still 07-12 in UTC-12
+        assert!(open_row("2026-07-13T12:00:01Z")); // over everywhere
+                                                   // And a whole day later, unambiguously.
+        assert!(open_row("2026-07-14T00:00:00Z"));
+    }
+
+    #[test]
+    fn sweep_uses_the_published_instant_when_the_source_gives_one() {
+        // Timezone BEHIND UTC: 23:59 on 11-02 in UTC-07:00 == 06:59Z on 11-03.
+        let behind = |now: &str| {
+            is_past_due_open(
+                Some("open"),
+                Some("2026-11-02"),
+                Some("2026-11-02T23:59:00-07:00"),
+                at(now),
+            )
+        };
+        assert!(!behind("2026-11-03T05:00:00Z")); // an hour before it lapses
+        assert!(!behind("2026-11-03T06:59:00Z")); // exactly at the deadline
+        assert!(behind("2026-11-03T07:00:00Z")); // an hour after
+
+        // Timezone AHEAD of UTC: 23:59 on 11-02 in +09:00 == 14:59Z on 11-02 —
+        // it lapses BEFORE UTC midnight, so the exact instant retires it a day
+        // earlier than the conservative date-only rule would.
+        let ahead = |now: &str| {
+            is_past_due_open(
+                Some("open"),
+                Some("2026-11-02"),
+                Some("2026-11-02T23:59:00+09:00"),
+                at(now),
+            )
+        };
+        assert!(!ahead("2026-11-02T14:00:00Z"));
+        assert!(ahead("2026-11-02T15:00:00Z"));
+        // Same row without the zoned field would still be open at that instant —
+        // which is exactly the precision `close_at` buys.
+        assert!(!is_past_due_open(
+            Some("open"),
+            Some("2026-11-02"),
+            None,
+            at("2026-11-02T15:00:00Z")
+        ));
+
+        // An unparseable/offset-less close_at must NOT be read as UTC — it falls
+        // back to the conservative date rule rather than inventing a zone.
+        let naive = |now: &str| {
+            is_past_due_open(
+                Some("open"),
+                Some("2026-11-02"),
+                Some("2026-11-02 23:59:00"),
+                at(now),
+            )
+        };
+        assert!(!naive("2026-11-03T06:00:00Z"));
+        assert!(naive("2026-11-03T12:00:01Z"));
+    }
+
+    #[test]
+    fn parse_instant_refuses_to_invent_a_timezone() {
+        assert_eq!(
+            parse_instant("2026-11-02T23:59:00Z").unwrap().to_rfc3339(),
+            "2026-11-02T23:59:00+00:00"
+        );
+        assert_eq!(
+            parse_instant("2026-11-02T23:59:00-07:00")
+                .unwrap()
+                .to_rfc3339(),
+            "2026-11-03T06:59:00+00:00"
+        );
+        // Offset-less shapes are None — never silently UTC.
+        assert!(parse_instant("2026-11-02 23:59:00").is_none());
+        assert!(parse_instant("2026-11-02T23:59:00").is_none());
+        assert!(parse_instant("2026-11-02").is_none());
+        assert!(parse_instant("08/15/2026").is_none());
+        assert!(parse_instant("").is_none());
+        assert!(parse_instant("Deadline—see website").is_none());
     }
 
     #[test]
@@ -1101,6 +1343,8 @@ mod tests {
         assert_eq!(v["total_funding"], Value::Null);
         // Multi-stage deadline: the earliest cutoff still upcoming wins, not [0].
         assert_eq!(v["close_date"], stage2.split('T').next().unwrap());
+        // …and its published 17:00Z instant survives instead of being truncated.
+        assert_eq!(v["close_at"], json!(stage2));
         assert_eq!(v["agency"], "Horizon Europe — HORIZON-CL4-2026-01");
         assert_eq!(v["categories"], json!(["HORIZON-RIA", "2021-2027"]));
         assert_eq!(v["aln"], Value::Null);
@@ -1118,29 +1362,59 @@ mod tests {
 
     #[test]
     fn eu_sedia_close_date_prefers_earliest_upcoming_else_latest_past() {
-        let today = chrono::NaiveDate::from_ymd_opt(2026, 7, 16).unwrap();
+        let now = at("2026-07-16T00:00:00Z");
         let d = |s: &str| Value::String(s.to_string());
+        let date = |v: &Value| sedia_deadline(v, now).0;
         // All future → earliest.
         let all_future = json!([d("2026-09-01"), d("2026-08-01")]);
-        assert_eq!(
-            sedia_close_date(&all_future, today).as_deref(),
-            Some("2026-08-01")
-        );
-        // Mixed → earliest that is >= today (a passed first cutoff is skipped).
+        assert_eq!(date(&all_future).as_deref(), Some("2026-08-01"));
+        // Mixed → earliest that is >= now (a passed first cutoff is skipped).
         let mixed = json!([d("2026-03-01"), d("2026-09-01")]);
-        assert_eq!(
-            sedia_close_date(&mixed, today).as_deref(),
-            Some("2026-09-01")
-        );
+        assert_eq!(date(&mixed).as_deref(), Some("2026-09-01"));
         // All past → latest (so the sweep can retire it).
         let all_past = json!([d("2026-01-01"), d("2026-05-01")]);
-        assert_eq!(
-            sedia_close_date(&all_past, today).as_deref(),
-            Some("2026-05-01")
-        );
+        assert_eq!(date(&all_past).as_deref(), Some("2026-05-01"));
         // Absent / unparseable → None (forecasted topics legitimately lack one).
-        assert_eq!(sedia_close_date(&Value::Null, today), None);
-        assert_eq!(sedia_close_date(&json!([d("n/a")]), today), None);
+        assert_eq!(sedia_deadline(&Value::Null, now), (None, Value::Null));
+        assert_eq!(sedia_deadline(&json!([d("n/a")]), now), (None, Value::Null));
+        // Date-only cutoffs carry no zone, so close_at stays Null.
+        assert_eq!(sedia_deadline(&all_future, now).1, Value::Null);
+    }
+
+    #[test]
+    fn eu_sedia_keeps_the_published_instant_instead_of_truncating_it() {
+        // The multi-stage array is zoned; the selection runs on instants and the
+        // chosen cutoff survives as `close_at` with its time-of-day intact.
+        let now = at("2026-07-16T00:00:00Z");
+        let deadline = json!(["2026-03-01T17:00:00Z", "2026-09-01T17:00:00Z"]);
+        let (close_date, close_at) = sedia_deadline(&deadline, now);
+        assert_eq!(close_date.as_deref(), Some("2026-09-01"));
+        assert_eq!(close_at, json!("2026-09-01T17:00:00Z"));
+
+        // Boundary: at 16:59:59Z on the cutoff day the topic has not lapsed; a
+        // second after 17:00Z it has — to the second, not to UTC midnight.
+        let picked = sedia_deadline(&deadline, at("2026-09-01T16:59:59Z"));
+        assert_eq!(picked.1, json!("2026-09-01T17:00:00Z"));
+        assert!(!is_past_due_open(
+            Some("open"),
+            picked.0.as_deref(),
+            picked.1.as_str(),
+            at("2026-09-01T16:59:59Z")
+        ));
+        assert!(is_past_due_open(
+            Some("open"),
+            picked.0.as_deref(),
+            picked.1.as_str(),
+            at("2026-09-01T17:00:01Z")
+        ));
+        // Without the instant, the same row would linger until midday the 2nd —
+        // the conservative price of an unzoned source.
+        assert!(!is_past_due_open(
+            Some("open"),
+            picked.0.as_deref(),
+            None,
+            at("2026-09-01T17:00:01Z")
+        ));
     }
 
     #[test]
