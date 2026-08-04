@@ -1,0 +1,9 @@
+{
+  "key": "ca-grants|GR-0002",
+  "data": { "title": "Delisted Program", "status": "closed", "amount": 10000 },
+  "first_seen": "2026-05-01T00:00:00.000000Z",
+  "last_seen": "2026-06-01T00:00:00.000000Z",
+  "updated_at": "2026-07-15T00:00:00.000000Z",
+  "removed_at": "2026-07-15T00:00:00.000000Z",
+  "trust": "stable"
+}

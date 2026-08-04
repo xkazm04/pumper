@@ -892,3 +892,126 @@ mod export_honesty_tests {
         assert!(!export_may_emit_terminator(ExportFormat::Csv, false));
     }
 }
+
+/// Pins the wire shape `clients/typescript` (`@pumper/sync`) is built against.
+/// The fixtures under `clients/typescript/test/fixtures/*.json` are the one
+/// shared contract: this module asserts the server's *actual* serialization of
+/// `Record`/`Revision` covers every field a fixture has, so a Rust-side field
+/// rename/removal breaks here; `clients/typescript/test/conformance.test.ts`
+/// asserts the SDK's parsers accept the same fixtures, so a TypeScript-side
+/// regression breaks there. Neither half proves the two are wired together
+/// over real HTTP — that needs a live-server run — but a shape drift between
+/// them (the actual regression class this SDK went through: `removed=`
+/// gaining a default, `trust=` gaining teeth on `/export`) cannot land on one
+/// side without failing its half of this pin.
+#[cfg(test)]
+mod sdk_fixture_conformance_tests {
+    use chrono::{DateTime, Utc};
+    use pumper_core::datasets::{Provenance, Revision};
+    use serde_json::Value;
+
+    // Paths are relative to this file's directory (crates/server/src/routes/).
+    const RECORD_FIXTURE: &str =
+        include_str!("../../../../clients/typescript/test/fixtures/record.json");
+    const RECORD_REMOVED_FIXTURE: &str =
+        include_str!("../../../../clients/typescript/test/fixtures/record-removed.json");
+    const REVISION_PAGE_FIXTURE: &str =
+        include_str!("../../../../clients/typescript/test/fixtures/revision-page.json");
+
+    fn parse_ts(s: &str) -> DateTime<Utc> {
+        DateTime::parse_from_rfc3339(s).unwrap().with_timezone(&Utc)
+    }
+
+    /// Every key the fixture (== what the SDK's `PumperRecord`/`PumperRevision`
+    /// types declare) expects must be present on the server's actual
+    /// serialization — this is the direction that matters: an SDK field the
+    /// server no longer emits is a silent `undefined` on the consumer side,
+    /// which is exactly the failure mode ("silently mirrors nothing") the
+    /// restoration brief called out for the old `records` field.
+    fn assert_covers(fixture: &Value, actual: &Value, what: &str) {
+        let (Value::Object(f), Value::Object(a)) = (fixture, actual) else {
+            panic!("{what}: fixture and actual must both be JSON objects");
+        };
+        for key in f.keys() {
+            assert!(
+                a.contains_key(key),
+                "{what}: server no longer serializes field '{key}' that the SDK fixture (and its \
+                 TypeScript type) expects — this is the drift class that made the old SDK read a \
+                 field the API stopped returning"
+            );
+        }
+    }
+
+    #[test]
+    fn record_fixture_fields_are_a_subset_of_the_actual_record_shape() {
+        let fixture: Value = serde_json::from_str(RECORD_FIXTURE).unwrap();
+        let now = Utc::now();
+        let record = pumper_core::Record {
+            key: "k".into(),
+            data: serde_json::json!({"x": 1}),
+            first_seen: now,
+            last_seen: now,
+            updated_at: now,
+            removed_at: None,
+            trust: "stable".into(),
+        };
+        let actual = serde_json::to_value(&record).unwrap();
+        assert_covers(&fixture, &actual, "live record");
+        assert_eq!(fixture["removed_at"], Value::Null, "live fixture must model removed_at: null");
+    }
+
+    #[test]
+    fn removed_record_fixture_models_a_non_null_removed_at() {
+        let fixture: Value = serde_json::from_str(RECORD_REMOVED_FIXTURE).unwrap();
+        assert_ne!(
+            fixture["removed_at"],
+            Value::Null,
+            "the tombstone fixture must exercise removed_at: Some(_), the shape \
+             PumperClient.exportRecords relies on to detect a removal during a snapshot"
+        );
+        // parses as a real timestamp, not a placeholder string
+        parse_ts(fixture["removed_at"].as_str().unwrap());
+    }
+
+    #[test]
+    fn revision_page_fixture_fields_are_a_subset_of_the_actual_revision_shape() {
+        let fixture: Value = serde_json::from_str(REVISION_PAGE_FIXTURE).unwrap();
+        let items = fixture["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2, "fixture must cover both a data-carrying and a removed revision");
+
+        let now = Utc::now();
+        let changed = Revision {
+            app: "a".into(),
+            dataset: "d".into(),
+            key: "k".into(),
+            revision: 1,
+            change: "changed".into(),
+            data: Some(serde_json::json!({"x": 1})),
+            diff: Some(serde_json::json!({"$.x": {"from": 0, "to": 1}})),
+            created_at: now,
+            trust: "stable".into(),
+            provenance: Provenance::default(),
+        };
+        let removed = Revision {
+            change: "removed".into(),
+            data: None,
+            diff: None,
+            ..changed.clone()
+        };
+
+        let actual_changed = serde_json::to_value(&changed).unwrap();
+        let actual_removed = serde_json::to_value(&removed).unwrap();
+
+        let fixture_changed = items.iter().find(|r| r["change"] == "changed").unwrap();
+        let fixture_removed = items.iter().find(|r| r["change"] == "removed").unwrap();
+
+        assert_covers(fixture_changed, &actual_changed, "'changed' revision");
+        assert_covers(fixture_removed, &actual_removed, "'removed' revision");
+
+        // The lifecycle invariant `sync.ts` depends on: a 'removed' revision
+        // never carries a post-image, so the SDK never dereferences `.data` on
+        // a tombstone.
+        assert_eq!(fixture_removed["data"], Value::Null);
+        assert_ne!(fixture_changed["data"], Value::Null);
+    }
+}

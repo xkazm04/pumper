@@ -6,6 +6,40 @@ export→normalize→upsert loop over the HTTP API. Implementation:
 `clients/typescript/` (zero runtime deps; global `fetch` + WebStreams, Node ≥ 20).
 Full usage in [`clients/typescript/README.md`](../../clients/typescript/README.md).
 
+> **Restored.** This package was accidentally deleted by `27dba84`
+> ("vibeman(moonshot): batch-7 integration + lockfile") while this doc, the
+> `README.md`/`CLAUDE.md` references, and `context-map.json` kept describing
+> it as shipped. It has been restored from `27dba84~1` and reconciled with the
+> dataset-read surface as it stands today (`trust=`/`removed=` now apply
+> uniformly to every read shape, `?removed=` defaults to `exclude` — see
+> [datasets.md § Tombstones](datasets.md#tombstones-removed_at)). The fixes:
+> - `PumperClient.exportRecords` now explicitly requests
+>   `trust=all&removed=include`. Before this change, `/export` ignored both
+>   params and always returned every trust tier and every tombstone; today it
+>   honors them, and its `removed=` default flipped to `exclude`. Without the
+>   explicit override, `PumperSync`'s cold-start snapshot would silently stop
+>   seeing previously-removed keys and could never tombstone them through a
+>   fresh sink — a correctness regression, not a build break, so nothing would
+>   have caught it short of this fix.
+> - `PumperClient.changesPage` now explicitly requests `trust=stable` (the
+>   server's own default, unchanged by this reconciliation — stated for
+>   parity with the export fix above, and to keep the wire request pinned by
+>   the conformance test below rather than implicit).
+> - `PumperRecord`/`PumperRevision` gained the `trust: string` field, present
+>   on the wire since before the deletion but missing from the hand-written
+>   types.
+>
+> A conformance test pins this contract:
+> `clients/typescript/test/conformance.test.ts` (fixture-driven: shape
+> assertions + the query params each client method sends) paired with
+> `crates/server/src/routes/datasets.rs::sdk_fixture_conformance_tests`
+> (asserts the server's actual `Record`/`Revision` serialization covers the
+> same fixture fields). Both sides load
+> `clients/typescript/test/fixtures/*.json`, so a field rename on either side
+> fails its half of the pin — this does **not** prove live HTTP wire
+> compatibility end-to-end (no server was booted for it); it proves both
+> sides agree on the shape.
+
 ## What it does
 
 - **Consumes canonical datasets** (`GET /datasets/{app}/{ds}/export` and
@@ -42,7 +76,8 @@ re-processes idempotently (upsert by key) rather than skipping.
   `baseUrl?` (default `$PUMPER_URL` → `http://127.0.0.1:8088`), `timeoutMs?`,
   `maxBytes?`, `onProgress?`, `signal?`.
 - `PumperClient` — stateless low-level reads: `exportRecords(ds, filter?, signal?)`
-  (async generator) and `changesPage(ds, since, cursor, limit?)`.
+  (async generator, requests `trust=all&removed=include`) and
+  `changesPage(ds, since, cursor, limit?, trust?)` (defaults `trust="stable"`).
 - `memoryWatermark()`, `kvWatermark(kv)` — `WatermarkStore` implementations.
 - `PumperHttpError` — carries Pumper's `{error, code}` envelope; branch on `.code`.
 

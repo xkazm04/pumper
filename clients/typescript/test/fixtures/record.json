@@ -1,0 +1,9 @@
+{
+  "key": "ca-grants|GR-0001",
+  "data": { "title": "Community Resilience Fund", "status": "open", "amount": 250000 },
+  "first_seen": "2026-07-01T00:00:00.000000Z",
+  "last_seen": "2026-08-01T00:00:00.000000Z",
+  "updated_at": "2026-08-01T00:00:00.000000Z",
+  "removed_at": null,
+  "trust": "stable"
+}
