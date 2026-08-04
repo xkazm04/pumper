@@ -45,13 +45,45 @@ the source's secret. Two bases are accepted (verification is constant-time):
   exactly GitHub's `x-hub-signature-256` computation, and that header is
   accepted as an alias for `x-pumper-signature`.
 
-When the sender supplies `x-pumper-delivery-id`, it becomes the event id
-(non-UUID ids are mapped through a deterministic UUIDv5), so a **redelivered**
-webhook re-verifies but cannot double-fire any trigger — idempotency is keyed
-`trig:{trigger_id}:{event_id}`.
+### Event ids and the replay posture
+
+The event id scopes trigger idempotency (`trig:{trigger_id}:{event_id}`), so
+**what the event id is derived from decides what counts as a replay.** Every
+derivation is deterministic — a UUID-shaped id is never minted at random:
+
+| Sender supplies | Event id |
+|---|---|
+| `x-pumper-delivery-id` that parses as a UUID | that UUID, verbatim |
+| `x-pumper-delivery-id` that does not | `SHA-256("{source_id}:{delivery_id}")`, first 16 bytes |
+| no delivery id | `SHA-256(source_id ++ "\0body\0" ++ body)`, first 16 bytes |
+
+(Truncated SHA-256 wearing the UUID shape — **not** UUIDv5: no version or
+variant bits are stamped. Earlier revisions of this page claimed UUIDv5.)
+
+Consequences, stated plainly:
+
+- A **redelivery** (same delivery id) re-verifies but cannot double-fire.
+- An **exact replay with no delivery id** — the case the bare/GitHub scheme
+  cannot otherwise detect, since it carries neither timestamp nor nonce, so a
+  captured body verifies forever — now derives the same event id and therefore
+  dedupes: `202` with `triggers_fired: 0` and no new job. Byte-identical
+  re-sends from a legitimate sender collapse the same way; that is the correct
+  reading of "same event", but if your sender legitimately emits identical
+  bodies for distinct events, give it a delivery id.
+- A **timestamped (pumper-scheme) capture** is additionally bounded by
+  `max_skew_secs`, checked *before* the MAC.
+- Nothing about this changes senders that supply delivery ids.
 
 A `202` response returns `{event_id, seq, triggers_fired}`; `seq` is the
 event's position in the `/events` replay ring.
+
+### Refusal gates, in the order they are applied
+
+`409` ingress disabled → `404` unknown source → `403` source disabled →
+`429` rate limit → `413` body over `max_body_bytes` → `401` missing/invalid
+signature or stale timestamp → `400` body is not JSON. The rate limit sits
+*above* the crypto deliberately: a flood of bad signatures must burn the same
+bucket as good traffic.
 
 ## External triggers
 

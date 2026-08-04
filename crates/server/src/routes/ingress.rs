@@ -47,15 +47,41 @@ fn bucket_step(tokens: f64, elapsed_secs: f64, per_min: u32) -> (f64, bool) {
     }
 }
 
-/// Deterministic event id for a non-UUID sender delivery id: the first 16
-/// bytes of SHA-256 over `"{source_id}:{delivery_id}"`. Stable per delivery
-/// (so redeliveries dedupe) and distinct across sources.
-fn derived_event_id(source_id: &str, delivery_id: &str) -> Uuid {
+/// The first 16 bytes of SHA-256 over the given parts, as a UUID. Truncated
+/// SHA-256, NOT a UUIDv5 — no version/variant bits are stamped, so this is an
+/// opaque 128-bit identifier that merely wears the UUID shape.
+fn digest_uuid(parts: &[&[u8]]) -> Uuid {
     use sha2::{Digest, Sha256};
-    let digest = Sha256::digest(format!("{source_id}:{delivery_id}").as_bytes());
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(part);
+    }
     let mut bytes = [0u8; 16];
-    bytes.copy_from_slice(&digest[..16]);
+    bytes.copy_from_slice(&hasher.finalize()[..16]);
     Uuid::from_bytes(bytes)
+}
+
+/// Deterministic event id for a non-UUID sender delivery id, from
+/// `"{source_id}:{delivery_id}"`. Stable per delivery (so redeliveries dedupe)
+/// and distinct across sources.
+fn derived_event_id(source_id: &str, delivery_id: &str) -> Uuid {
+    digest_uuid(&[format!("{source_id}:{delivery_id}").as_bytes()])
+}
+
+/// Deterministic event id for a delivery that carries NO id of its own, from
+/// the source id and the exact body bytes.
+///
+/// The anti-pattern this defends: minting a fresh `Uuid::new_v4()` for such a
+/// delivery. The bare (GitHub-style) signature scheme has no timestamp and no
+/// nonce, so a captured signed body verifies forever — and with a random event
+/// id every replay got a fresh trigger idempotency key and enqueued fresh jobs,
+/// bounded only by the rate limiter. Deriving from the body makes an exact
+/// replay dedupe against the delivery it copies.
+///
+/// The separator is NUL-delimited, which a header value cannot contain, so no
+/// delivery id can ever be crafted to produce a body-derived id.
+fn body_event_id(source_id: &str, body: &[u8]) -> Uuid {
+    digest_uuid(&[source_id.as_bytes(), b"\0body\0", body])
 }
 
 /// Consumes one token for `source_id`, creating a full bucket on first sight.
@@ -202,6 +228,9 @@ pub(crate) async fn set_ingress_source_enabled(
 ///
 /// The delivery id (when sent) becomes the event id, which scopes trigger
 /// idempotency: a redelivered webhook re-verifies but cannot double-fire.
+/// Without one, the event id is derived from the body ([`body_event_id`]), so a
+/// captured body replayed against the bare (timestamp-less) scheme dedupes
+/// instead of enqueueing fresh work on every replay.
 #[utoipa::path(
     post,
     path = "/ingest/{id}",
@@ -314,10 +343,11 @@ pub(crate) async fn ingest(
         .map_err(|e| ApiError(StatusCode::BAD_REQUEST, format!("body is not JSON: {e}")))?;
 
     // Event id: the sender's delivery id when given (stable across redeliveries
-    // — that stability is what makes trigger idempotency hold), else fresh.
+    // — that stability is what makes trigger idempotency hold), else derived
+    // from the body, which gives an unidentified delivery the same stability.
     let event_uuid = Uuid::parse_str(delivery_id).unwrap_or_else(|_| {
         if delivery_id.is_empty() {
-            Uuid::new_v4()
+            body_event_id(&source.id, &body)
         } else {
             // Non-UUID delivery ids (GitHub's are UUIDs, others may not be)
             // still need a stable mapping: derive one from source + id.
@@ -370,6 +400,24 @@ mod tests {
         let (tokens, ok) = bucket_step(0.0, 3600.0, 3);
         assert!(ok);
         assert!(tokens <= 3.0, "refill capped at per_min, got {tokens}");
+    }
+
+    /// The anti-pattern: no delivery id → `Uuid::new_v4()`, so the SAME signed
+    /// body replayed twice got two event ids, two idempotency keys and two
+    /// jobs. The bare scheme has no timestamp to expire, so that is unbounded.
+    #[test]
+    fn body_derived_event_id_is_stable_across_replays_not_random() {
+        let body = br#"{"ref":"refs/heads/main"}"#;
+        assert_eq!(body_event_id("s1", body), body_event_id("s1", body));
+        // Different body or different source → a different event.
+        assert_ne!(body_event_id("s1", body), body_event_id("s1", b"{}"));
+        assert_ne!(body_event_id("s1", body), body_event_id("s2", body));
+        // …and it is a distinct namespace from a delivery-id derivation, so no
+        // header value can be crafted to impersonate a body-derived event.
+        assert_ne!(
+            body_event_id("s1", body),
+            derived_event_id("s1", std::str::from_utf8(body).unwrap())
+        );
     }
 
     #[test]
