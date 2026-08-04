@@ -330,6 +330,45 @@ try {
                 ($j.PSObject.Properties.Name -contains 'cost') -and
                 ($j.PSObject.Properties.Name -contains 'unknown')
             }
+
+            Test-JsonEndpoint -Name 'GET /search/status' -Path '/search/status' -Assert {
+                param($j)
+                ($j.PSObject.Properties.Name -contains 'doc_count') -and
+                ($j.PSObject.Properties.Name -contains 'disk_bytes') -and
+                ($j.PSObject.Properties.Name -contains 'segment_count')
+            }
+
+            # Raw check: the no-cursor response is a bare JSON array, and
+            # PowerShell's pipeline unrolls an empty `[]` to $null before any
+            # shape assertion could see it — so assert on the raw body.
+            try {
+                $resp = Invoke-WebRequest -Uri "$baseUrl/provisioner/proposals" -UseBasicParsing -TimeoutSec 15
+                if ($resp.StatusCode -eq 200 -and $resp.Content.Trim().StartsWith('[')) {
+                    Add-Result -Name 'GET /provisioner/proposals' -Status 'PASS'
+                } else {
+                    Add-Result -Name 'GET /provisioner/proposals' -Status 'FAIL' `
+                        -Detail "HTTP $($resp.StatusCode), body starts '$($resp.Content.Substring(0, [Math]::Min(20, $resp.Content.Length)))'"
+                }
+            } catch {
+                Add-Result -Name 'GET /provisioner/proposals' -Status 'FAIL' -Detail $_.Exception.Message
+            }
+
+            # The scratch config ships [datahub] disabled, so the governance
+            # preview must answer 409 — a 200 here would mean the bridge is on
+            # against a GMS that does not exist.
+            try {
+                $resp = Invoke-WebRequest -Uri "$baseUrl/datahub/governance/preview" -UseBasicParsing -TimeoutSec 15
+                Add-Result -Name 'GET /datahub/governance/preview (disabled -> 409)' -Status 'FAIL' `
+                    -Detail "expected 409, got HTTP $($resp.StatusCode)"
+            } catch {
+                $code = $_.Exception.Response.StatusCode.value__
+                if ($code -eq 409) {
+                    Add-Result -Name 'GET /datahub/governance/preview (disabled -> 409)' -Status 'PASS'
+                } else {
+                    Add-Result -Name 'GET /datahub/governance/preview (disabled -> 409)' -Status 'FAIL' `
+                        -Detail "expected 409, got: $($_.Exception.Message)"
+                }
+            }
         } else {
             Add-Result -Name 'job runs to completion (hackernews)' -Status 'SKIP' -Detail 'no job id to poll (enqueue failed)'
             Add-Result -Name 'GET /jobs/{id}/receipt' -Status 'SKIP' -Detail 'no job id to fetch a receipt for'
