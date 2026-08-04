@@ -9,6 +9,7 @@
 //! network beyond loopback, no real engines.
 
 mod body_limit;
+mod dataset_reads;
 mod durable;
 mod dynamic_apps;
 mod fanout_offslot;

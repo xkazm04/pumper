@@ -26,7 +26,7 @@ The global 1 MiB is sized from what the POST surface actually accepts — all ha
 | Jobs | `GET /jobs?app=&status=&limit=&cursor=` (cursor ⇒ `{items,next_cursor}`) · `GET /jobs/{id}` (adds a `progress` field with the latest live snapshot while running) · `DELETE /jobs/{id}` (cancel: queued synchronously, or a `running` job via its cancellation token — response adds `running:true`; 404 no job, 409 already terminal) · `POST /jobs/{id}/retry` (404 no job, 409 wrong state) · `POST /jobs/retry` bulk (body `{status=failed\|cancelled, app?, limit≤500}` ⇒ `{retried,ids}`; 400 bad status) · `POST /jobs/{id}/reset` (re-queue a `running` job; 404 no job, 409 not running) · `GET /jobs/{id}/stream` (SSE) · `GET /jobs/{id}/costs` · `GET /jobs/{id}/receipt` (one run's cost + stage timings + what it changed; 404 no job) |
 | Costs | `GET /costs?app=&since=` |
 | Schedules | `GET /schedules?limit=&cursor=` · `POST /schedules` (`{app, cron, params?, priority?, timezone?, misfire_policy?, max_attempts?}` — `timezone` IANA/chrono-tz default UTC, `misfire_policy` `fire_once`\|`skip` default `fire_once`, `max_attempts` default server 3; unknown `timezone`/`misfire_policy` → 400) · `DELETE /schedules/{id}` · `POST /schedules/{id}/enabled` |
-| Datasets | `GET /datasets/{app}/{ds}?limit=&cursor=&filter=&trust=` · `GET .../export?format=json\|ndjson\|csv&filter=` (all stream; see below) · `GET .../duplicates?distance=` (413 above 10k records) · `GET .../changes?since=&limit=&cursor=&trust=` (defaults to `trust=stable`) · `GET .../history?key=&limit=&cursor=` |
+| Datasets | `GET /datasets/{app}/{ds}?limit=&cursor=&filter=&trust=&removed=` (`trust` defaults `all`, `removed` defaults `exclude` — see below) · `GET .../export?format=json\|ndjson\|csv&filter=&trust=&removed=` (all stream; see below) · `GET .../duplicates?distance=` (413 above 10k records) · `GET .../changes?since=&limit=&cursor=&trust=` (defaults to `trust=stable`) · `GET .../history?key=&limit=&cursor=` |
 | Watches | `GET /watches?app=&limit=&cursor=` · `POST /watches` · `DELETE /watches/{id}` · `POST /watches/{id}/enabled` |
 | Webhook deliveries | `GET /webhooks/deliveries?status=&limit=&cursor=` · `GET /webhooks/deliveries/{id}` · `POST /webhooks/deliveries/{id}/replay` |
 | Triggers | `GET /triggers?app=&limit=&cursor=` · `POST /triggers` · `DELETE /triggers/{id}` · `POST /triggers/{id}/enabled` · `POST /triggers/{id}/test?fire=` · `GET /triggers/{id}/runs` |
@@ -48,17 +48,19 @@ Conventions: enable/disable is always `POST …/{id}/enabled {"enabled": bool}`;
 
 ## Dataset export & scan limits
 
-`GET /datasets/{app}/{ds}/export` streams in all three formats — constant memory, no row cap, no truncation — by walking the dataset in keyset-paged batches:
+`GET /datasets/{app}/{ds}/export` streams in all three formats — constant memory, no row cap — by walking the dataset in keyset-paged batches:
 - `format=json` (default): a single streamed JSON **array** `[{record},…]` (`content-type: application/json`). This is a bare array, not the former `{app,dataset,count,records}` envelope — the count can't be known before streaming.
 - `format=ndjson`: one JSON object per line (`application/x-ndjson`).
 - `format=csv`: RFC-4180 rows under a fixed `key,first_seen,last_seen,updated_at,removed_at,data` header (`text/csv`).
 
-All three send `content-disposition: attachment; filename="{ds}.{ext}"`.
+All three send `content-disposition: attachment; filename="{ds}.{ext}"`. `trust=` (default `all`) and `removed=` (default `exclude`) apply to export exactly as they do to `GET /datasets/{app}/{ds}` (below) — an export is a complete copy *by default*, but an explicit `trust=`/`removed=` now actually narrows it instead of being silently ignored.
 
 **Generic `filter` predicate.** Both `GET /datasets/{app}/{ds}` and `.../export` take a repeatable `filter` query param, all ANDed and pushed into SQL (so a filtered read/export never deserializes rows SQLite can skip, and a filtered export streams only matching rows instead of the whole corpus). Grammar per param — `<path>:<op>:<value>` where `path` is a JSON path (`$.state`) and `op` is one of:
 - `eq` — exact text match · `contains` — case-insensitive substring · `gte`/`lte` — text (lexicographic) `>=`/`<=` · `numgte` — numeric `>=` on **any** of `path`'s comma-separated fields (an OR).
 
-The value keeps any `:` after the op (so timestamps/URLs pass through). Example: `?filter=$.state:eq:CA&filter=$.employees:numgte:50`. A malformed spec (missing op/value, non-`$.` path, unknown op, non-numeric `numgte`) returns `400 bad_request`. This is the same `JsonFilter` engine the `/grants` route exposes with typed params — the `filter` grammar generalizes it to every app's datasets. When a filter is present on `GET /datasets/{app}/{ds}`, only **live** records match (a tombstoned row never appears); the unfiltered first page keeps the legacy behaviour (all records).
+The value keeps any `:` after the op (so timestamps/URLs pass through). Example: `?filter=$.state:eq:CA&filter=$.employees:numgte:50`. A malformed spec (missing op/value, non-`$.` path, unknown op, non-numeric `numgte`) returns `400 bad_request`. This is the same `JsonFilter` engine the `/grants` route exposes with typed params — the `filter` grammar generalizes it to every app's datasets.
+
+**`removed=include|exclude`, default `exclude`.** Tombstoned records (`removed_at` set) are left out of every read shape — default, cursor-paged, filtered, and export — unless `removed=include` is passed. This is a **behavior change**: previously the unfiltered page and its cursor form always included removed records, `?filter=` silently switched to excluding them, and `/export`'s formats disagreed with each other too. `trust=` (see [datasets.md § Trust](datasets.md#trust)) is likewise now honored identically across all four shapes — presence of `filter=` no longer changes what either param means.
 
 `GET /datasets/{app}/{ds}/duplicates` runs an in-memory SimHash sweep (banded candidate lookup, exact-Hamming verified), so it is bounded: datasets over **10,000 records** return `413 too_large` (the message carries the actual count and the cap) rather than pinning a core. Narrow the dataset or run the scan offline. Banding only filters at small distances — above `distance=5` the scan degrades to the pairwise walk, which the 10k cap keeps bounded.
 

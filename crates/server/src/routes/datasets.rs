@@ -44,9 +44,17 @@ pub(crate) struct RecordsQuery {
     cursor: Option<String>,
     /// Trust filter: `all` (default here — every record carries its own `trust`
     /// field, so the raw dataset view stays complete), `stable`, `provisional` or
-    /// `quarantined`.
+    /// `quarantined`. Applies to every read shape on this route — default,
+    /// cursor-paged, and `filter=`-narrowed alike.
     #[serde(default = "default_trust_all")]
     trust: String,
+    /// Tombstone inclusion: `exclude` (default) or `include`. Matches the
+    /// filtered read path and `/grants` — before this param existed the
+    /// unfiltered page always included removed records while a filtered one
+    /// never did, so adding `?filter=` silently changed what "the dataset"
+    /// meant. See docs/features/datasets.md § Querying & export.
+    #[serde(default = "default_removed_exclude")]
+    removed: String,
 }
 
 /// `GET /datasets/...` returns everything by default: the records carry their own
@@ -65,6 +73,30 @@ pub(crate) fn default_trust_stable() -> String {
 /// Maps the query value to the store's filter: `all` means no predicate.
 pub(crate) fn trust_filter(raw: &str) -> Option<&str> {
     (raw != "all").then_some(raw)
+}
+
+/// Default for `?removed=` on every `/datasets/{app}/{ds}` read shape: exclude
+/// tombstones. Matches `list_filtered`/`list_filtered_trust` (and `/grants`,
+/// which is built on the latter) — this is the one place that used to
+/// disagree, because the unfiltered `list`/`list_page` paths always included
+/// removed rows while the filtered path never did.
+pub(crate) fn default_removed_exclude() -> String {
+    "exclude".to_string()
+}
+
+/// Parses `?removed=` into the boolean `list_records_view` wants. Anything but
+/// `include`/`exclude` is the client's mistake, not a silent fallback — a typo
+/// here (`?removed=all`) must not quietly resolve to "excluded" and hide the
+/// records the caller was asking to see.
+pub(crate) fn parse_removed(raw: &str) -> Result<bool, ApiError> {
+    match raw {
+        "include" => Ok(true),
+        "exclude" => Ok(false),
+        other => Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            format!("removed '{other}' must be 'include' or 'exclude'"),
+        )),
+    }
 }
 
 /// Pulls the repeatable `filter` query params out of the raw pair list. axum's
@@ -182,11 +214,11 @@ pub(crate) fn parse_filters(
         ("app" = String, Path, description = "App name"),
         ("dataset" = String, Path, description = "Dataset name"),
         RecordsQuery,
-        ("filter" = Option<Vec<String>>, Query, description = "Repeatable `<path>:<op>:<value>` predicate, all ANDed (e.g. `$.state:eq:CA`, `$.amount:numgte:1000`). ops: eq | contains | gte | lte | numgte. Pushed into SQL; when present, only live records match."),
+        ("filter" = Option<Vec<String>>, Query, description = "Repeatable `<path>:<op>:<value>` predicate, all ANDed (e.g. `$.state:eq:CA`, `$.amount:numgte:1000`). ops: eq | contains | gte | lte | numgte. Pushed into SQL."),
     ),
     responses(
-        (status = 200, description = "Dual-mode: bare `[Record]` array, or `{items, next_cursor}` when `cursor` is present."),
-        (status = 400, description = "Malformed `filter` spec", body = Object),
+        (status = 200, description = "Dual-mode: bare `[Record]` array, or `{items, next_cursor}` when `cursor` is present. Every shape honors `trust=` and `removed=` identically — default, cursor-paged, and `filter=`-narrowed."),
+        (status = 400, description = "Malformed `filter` or `removed` value", body = Object),
     )
 )]
 pub(crate) async fn list_records(
@@ -197,31 +229,40 @@ pub(crate) async fn list_records(
 ) -> Result<Json<Value>, ApiError> {
     let limit = query.limit.clamp(1, 1000);
     let filters = parse_filters(&filter_specs(&pairs))?;
+    let trust = trust_filter(&query.trust);
+    let include_removed = parse_removed(&query.removed)?;
+    // One function for every shape on this route (default, cursor, filtered):
+    // `list_records_view` honors `trust=`/`removed=` identically regardless of
+    // whether `filter=` is present, closing the read-path split where adding a
+    // `filter=` used to silently change both.
     let Some(cursor) = &query.cursor else {
-        // Unfiltered first page keeps the legacy `list` (includes removed rows);
-        // a filtered query uses the live-only keyset scan.
-        let records = if filters.is_empty() {
-            state.datasets.list(&app, &dataset, limit).await?
-        } else {
-            state
-                .datasets
-                .list_filtered(&app, &dataset, &filters, None, limit)
-                .await?
-        };
+        let records = state
+            .datasets
+            .list_records_view(
+                &app,
+                &dataset,
+                &filters,
+                None,
+                limit,
+                trust,
+                include_removed,
+            )
+            .await?;
         return Ok(Json(json!(records)));
     };
     let after = parse_cursor(cursor);
-    let records = if filters.is_empty() {
-        state
-            .datasets
-            .list_page(&app, &dataset, after, limit, trust_filter(&query.trust))
-            .await?
-    } else {
-        state
-            .datasets
-            .list_filtered(&app, &dataset, &filters, after, limit)
-            .await?
-    };
+    let records = state
+        .datasets
+        .list_records_view(
+            &app,
+            &dataset,
+            &filters,
+            after,
+            limit,
+            trust,
+            include_removed,
+        )
+        .await?;
     let next_cursor = keyset_cursor(&records, limit, |r| {
         format!("{}|{}", pumper_core::datasets::ts(r.updated_at), r.key)
     });
@@ -291,6 +332,16 @@ pub(crate) async fn delete_record_route(
 pub(crate) struct ExportQuery {
     /// 'json' (default) | 'ndjson' | 'csv'. All three stream in constant memory.
     format: Option<String>,
+    /// Trust filter, same vocabulary and default (`all`) as `GET
+    /// /datasets/{app}/{ds}` — an export is a complete copy by default (every
+    /// record carries its own `trust` field), but it now honors an explicit
+    /// `trust=stable` etc. instead of silently ignoring it.
+    #[serde(default = "default_trust_all")]
+    trust: String,
+    /// Tombstone inclusion, same vocabulary and default (`exclude`) as `GET
+    /// /datasets/{app}/{ds}`.
+    #[serde(default = "default_removed_exclude")]
+    removed: String,
 }
 
 #[derive(Clone, Copy)]
@@ -329,11 +380,11 @@ impl ExportFormat {
         ("app" = String, Path, description = "App name"),
         ("dataset" = String, Path, description = "Dataset name"),
         ExportQuery,
-        ("filter" = Option<Vec<String>>, Query, description = "Repeatable `<path>:<op>:<value>` predicate, all ANDed (same grammar as `GET /datasets/{app}/{dataset}`). Pushed into SQL, so a filtered export streams only matching live rows — a targeted export instead of the whole corpus."),
+        ("filter" = Option<Vec<String>>, Query, description = "Repeatable `<path>:<op>:<value>` predicate, all ANDed (same grammar as `GET /datasets/{app}/{dataset}`). Pushed into SQL, so a filtered export streams only matching rows — a targeted export instead of the whole corpus."),
     ),
     responses(
         (status = 200, description = "Streamed export as a JSON array, NDJSON, or CSV (per `format`); constant memory, no row cap. `content-disposition: attachment`."),
-        (status = 400, description = "Unknown format or malformed `filter` spec", body = Object),
+        (status = 400, description = "Unknown format, malformed `filter`, or bad `trust`/`removed` value", body = Object),
     )
 )]
 pub(crate) async fn export_records(
@@ -353,9 +404,20 @@ pub(crate) async fn export_records(
             ))
         }
     };
-    // Validate filters up front so a bad spec is a clean 400, not a mid-stream abort.
+    // Validate filters/trust/removed up front so a bad spec is a clean 400,
+    // not a mid-stream abort.
     let filters = parse_filters(&filter_specs(&pairs))?;
-    Ok(stream_export(state, app, dataset, format, filters))
+    let trust = query.trust.clone();
+    let include_removed = parse_removed(&query.removed)?;
+    Ok(stream_export(
+        state,
+        app,
+        dataset,
+        format,
+        filters,
+        trust,
+        include_removed,
+    ))
 }
 
 /// Streams the whole dataset in keyset-paged batches — constant memory
@@ -368,6 +430,8 @@ fn stream_export(
     dataset: String,
     format: ExportFormat,
     filters: Vec<pumper_core::datasets::JsonFilter>,
+    trust: String,
+    include_removed: bool,
 ) -> Response {
     const BATCH: i64 = 1_000;
     let filename = format!("attachment; filename=\"{dataset}.{}\"", format.extension());
@@ -380,18 +444,15 @@ fn stream_export(
             ExportFormat::Json => yield Ok(axum::body::Bytes::from_static(b"[")),
             ExportFormat::Ndjson => {}
         }
+        let trust = trust_filter(&trust).map(str::to_string);
         let mut after: Option<(String, String)> = None;
         let mut first = true;
         loop {
-            // Same keyset cursor tuple drives both paths; `list_filtered` pushes the
-            // predicates into SQL so an unmatched row is never deserialized.
-            let batch = match if filters.is_empty() {
-                // An export is a complete copy by definition, so it is never trust
-                // filtered — each record carries its stamp in the payload.
-                state.datasets.list_page(&app, &dataset, after.clone(), BATCH, None).await
-            } else {
-                state.datasets.list_filtered(&app, &dataset, &filters, after.clone(), BATCH).await
-            } {
+            let batch = match state
+                .datasets
+                .list_records_view(&app, &dataset, &filters, after.clone(), BATCH, trust.as_deref(), include_removed)
+                .await
+            {
                 Ok(batch) => batch,
                 Err(e) => {
                     tracing::warn!(app = %app, dataset = %dataset, "export stream aborted: {e}");

@@ -1232,3 +1232,72 @@ async fn provenance_coverage_counts_whole_chain() {
     let (total, with_job, replayable) = ds.provenance_coverage("app", "d", "k").await.unwrap();
     assert_eq!((total, with_job, replayable), (3, 2, 1));
 }
+
+/// `list_records_view` is the one function the `/datasets/{app}/{ds}` read
+/// surface (default, cursor, filtered, export) now shares. Trust and tombstone
+/// inclusion are independent toggles — this pins that they don't leak into
+/// each other: a `stable`-only, tombstone-excluding read must not return a
+/// provisional row or a removed row, and `include_removed` must not silently
+/// widen the trust filter either.
+#[tokio::test]
+async fn list_records_view_trust_and_removed_are_independent_toggles() {
+    let store = fresh_db("datasets-list-records-view").await;
+    let ds = Datasets::new(store.storage.pool());
+
+    ds.upsert_trusted("app", "d", "stable-live", &json!({"v": 1}), None)
+        .await
+        .unwrap();
+    ds.upsert_trusted(
+        "app",
+        "d",
+        "provisional-live",
+        &json!({"v": 2}),
+        Some("provisional"),
+    )
+    .await
+    .unwrap();
+    ds.upsert_trusted("app", "d", "stable-removed", &json!({"v": 3}), None)
+        .await
+        .unwrap();
+    ds.tombstone_keys("app", "d", &["stable-removed".to_string()])
+        .await
+        .unwrap();
+
+    // Default view: stable trust only, tombstones excluded.
+    let live_stable = ds
+        .list_records_view("app", "d", &[], None, 10, Some("stable"), false)
+        .await
+        .unwrap();
+    let keys: Vec<&str> = live_stable.iter().map(|r| r.key.as_str()).collect();
+    assert_eq!(
+        keys,
+        vec!["stable-live"],
+        "trust=stable, removed=exclude must show neither the provisional nor the tombstoned row"
+    );
+
+    // include_removed=true widens tombstones back in, but must not touch trust.
+    let with_removed = ds
+        .list_records_view("app", "d", &[], None, 10, Some("stable"), true)
+        .await
+        .unwrap();
+    let mut keys: Vec<&str> = with_removed.iter().map(|r| r.key.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["stable-live", "stable-removed"],
+        "removed=include must surface the tombstone without pulling in the provisional row"
+    );
+
+    // trust=None (all) with tombstones excluded must not surface the removed row.
+    let all_trust_live = ds
+        .list_records_view("app", "d", &[], None, 10, None, false)
+        .await
+        .unwrap();
+    let mut keys: Vec<&str> = all_trust_live.iter().map(|r| r.key.as_str()).collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        vec!["provisional-live", "stable-live"],
+        "trust=all must include the provisional row but removed=exclude still hides the tombstone"
+    );
+}

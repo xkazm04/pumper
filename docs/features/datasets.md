@@ -19,16 +19,24 @@ Stored `NULL` **means** `stable`. That is a semantic default, not a sentinel: ev
 Filtering follows push-versus-pull: **pushes suppress, pulls filter**. A webhook cannot be recalled, so watches/triggers are dropped at the source; a pull API is re-readable, so it filters and stays inspectable.
 
 - `GET /datasets/{app}/{ds}/changes?trust=` defaults to **`stable`** — accepts `all`, `provisional`, `quarantined`.
-- `GET /datasets/{app}/{ds}?trust=` defaults to **`all`**: each record carries its own stamp, so the raw dataset view stays complete.
-- `/export` is never filtered (a complete copy by definition; the stamp rides in the payload).
-- `GET /grants?trust=` defaults to **`all`**, same vocabulary. The filtered (`JsonFilter`) read path gained a trust-aware variant (`Datasets::list_filtered_trust`) for it; `list_filtered` is that variant with no trust filter, and both emit the one shared `TRUST_PREDICATE` rather than a second hand-written copy.
+- `GET /datasets/{app}/{ds}?trust=` defaults to **`all`**: each record carries its own stamp, so the raw dataset view stays complete. Honored identically whether or not `filter=` is present — see the read-path unification below.
+- `GET /datasets/{app}/{ds}/export?trust=` defaults to **`all`** (a complete copy by default; the stamp rides in the payload) but now honors an explicit value instead of silently ignoring it.
+- `GET /grants?trust=` defaults to **`all`**, same vocabulary.
+
+All four read shapes — the plain list, its cursor page, a `filter=`-narrowed read, and `/export` — share one function, `Datasets::list_records_view`, which applies the one shared `TRUST_PREDICATE` (and the tombstone toggle below) so none of them can drift from what the others call "stable" or "live". `list_filtered`/`list_filtered_trust` remain as a separate, narrower entry point used by `/grants` and a handful of apps that only ever want the live, unfiltered-by-tombstone view.
 
 A quarantined source writes to the shadow dataset `<ds>@q`, which is an ordinary dataset — listing, changes, export and duplicates all work on it unchanged.
 
+## Tombstones (`removed_at`)
+
+`GET /datasets/{app}/{ds}` and `.../export` both take **`removed=include|exclude`**, default **`exclude`** — tombstoned records (`removed_at` set) are left out unless asked for.
+
+> **Behavior change.** Before this, the unfiltered `GET /datasets/{app}/{ds}` page (no `cursor=`, no `filter=`) and its cursor-paged form always **included** removed records, while adding `?filter=` silently switched to **excluding** them (and so did `/export`'s json-array format, inconsistently with its own ndjson/csv). A client that started filtering — or started paging — got a materially different dataset with no other change on its end. `removed=` is now the one explicit knob, `exclude` is the one default across every shape, and it matches what `/grants` (built on the same live-only path) already did. Pass `removed=include` to get the old always-included behavior back.
+
 ## Querying & export
 
-- `GET /datasets/{app}/{ds}?limit=&cursor=&trust=` — records newest-updated first; `cursor=` (even empty) switches to `{items, next_cursor}` keyset pagination (`updated_at|key`); absent = legacy bare array. Removed records included with `removed_at` set.
-- `GET /datasets/{app}/{ds}/export?format=json|ndjson|csv` — `json` buffered (100k cap); `ndjson`/`csv` **stream** in keyset-paged 1000-row batches with content-disposition (CSV: fixed columns key/timestamps/data-as-JSON, RFC-4180 quoted).
+- `GET /datasets/{app}/{ds}?limit=&cursor=&trust=&removed=` — records newest-updated first; `cursor=` (even empty) switches to `{items, next_cursor}` keyset pagination (`updated_at|key`); absent = legacy bare array.
+- `GET /datasets/{app}/{ds}/export?format=json|ndjson|csv&trust=&removed=` — all three formats **stream** in keyset-paged 1000-row batches with content-disposition (CSV: fixed columns key/timestamps/data-as-JSON, RFC-4180 quoted); none is buffered or capped.
 - `GET /apps/{name}/datasets` — dataset names per app. `GET /datasets/{app}/{ds}/duplicates?distance=` — SimHash near-duplicate pairs.
 
 ## Conventions

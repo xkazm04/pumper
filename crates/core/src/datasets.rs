@@ -1642,6 +1642,63 @@ impl Datasets {
         rows.into_iter().map(Record::try_from).collect()
     }
 
+    /// Unified keyset page for the `GET /datasets/{app}/{ds}` read surface —
+    /// default, cursor, filtered, and export all route through this one
+    /// function so they cannot disagree about what `trust=` or a tombstone
+    /// means. `filters` may be empty (no predicate, matching plain `list_page`);
+    /// `trust` is [`TRUST_PREDICATE`] as everywhere else; `include_removed`
+    /// toggles whether tombstoned rows (`removed_at` set) are returned.
+    ///
+    /// Before this existed, the route layer had three call sites — the
+    /// no-cursor path (`list`, no trust support, tombstones always included),
+    /// the cursor path (`list_page`, trust supported, tombstones always
+    /// included), and the filtered path (`list_filtered`, no trust support,
+    /// tombstones always excluded) — that each answered "is this row live?"
+    /// and "does trust apply?" differently depending on which query params a
+    /// caller happened to pass. That is exactly the divergence
+    /// [`TRUST_PREDICATE`]'s own doc warns against, just one query param over.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn list_records_view(
+        &self,
+        app: &str,
+        dataset: &str,
+        filters: &[JsonFilter],
+        after: Option<(String, String)>,
+        limit: i64,
+        trust: Option<&str>,
+        include_removed: bool,
+    ) -> Result<Vec<Record>> {
+        let mut qb = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT key, data, first_seen, last_seen, updated_at, removed_at, trust \
+             FROM records WHERE app = ",
+        );
+        qb.push_bind(app);
+        qb.push(" AND dataset = ");
+        qb.push_bind(dataset);
+        if !include_removed {
+            qb.push(" AND removed_at IS NULL");
+        }
+
+        push_json_filters(&mut qb, filters);
+        push_trust_filter(&mut qb, trust);
+
+        if let Some((after_ts, after_key)) = &after {
+            qb.push(" AND (updated_at < ");
+            qb.push_bind(after_ts.as_str());
+            qb.push(" OR (updated_at = ");
+            qb.push_bind(after_ts.as_str());
+            qb.push(" AND key < ");
+            qb.push_bind(after_key.as_str());
+            qb.push("))");
+        }
+
+        qb.push(" ORDER BY updated_at DESC, key DESC LIMIT ");
+        qb.push_bind(limit);
+
+        let rows: Vec<RecordRow> = qb.build_query_as().fetch_all(&self.pool).await?;
+        rows.into_iter().map(Record::try_from).collect()
+    }
+
     /// Live records matching `filters`, ordered ascending by a JSON path (then
     /// key for determinism) with the LIMIT applied to the *sorted* rows in SQL.
     ///
