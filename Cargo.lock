@@ -475,6 +475,7 @@ dependencies = [
  "pumper-core",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]

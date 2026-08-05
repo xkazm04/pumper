@@ -256,7 +256,8 @@ impl ScrapeApp for Research {
                     }),
                 },
                 ManifestExample {
-                    description: "Follow-up question against a prior run's accumulated session context",
+                    description:
+                        "Follow-up question against a prior run's accumulated session context",
                     params: json!({
                         "query": "And how did those thresholds change in the last 3 years?",
                         "session_id": "prior-run-session-id",
@@ -650,5 +651,112 @@ mod tests {
     fn partial_truncation_is_char_boundary_safe() {
         assert_eq!(truncate_chars("héllo", 3), "hél");
         assert_eq!(truncate_chars("short", 100), "short");
+    }
+
+    // ── run() loop, wired through TestContext/ScriptedResearcher ───────────
+
+    mod run_loop {
+        use super::*;
+        use pumper_core::testing::{
+            engines_with, research_output, Dead, ScriptedResearcher, TempStore, TestContext,
+        };
+        use pumper_core::{AppContext, Storage};
+        use std::sync::Arc;
+
+        async fn ctx_with_researcher(
+            storage: &Storage,
+            params: Value,
+            researcher: Arc<dyn pumper_core::Researcher>,
+        ) -> AppContext {
+            TestContext::new(storage, "research")
+                .params(params)
+                .engines(engines_with(Arc::new(Dead), Arc::new(Dead), researcher))
+                .build()
+        }
+
+        #[tokio::test]
+        async fn a_shaped_reply_completes_on_the_first_step() {
+            let store = TempStore::new("research-completed").await;
+            let researcher = Arc::new(
+                ScriptedResearcher::new()
+                    .always_text(r#"{"summary":"s","key_findings":["f"],"sources":[]}"#),
+            );
+            let ctx = ctx_with_researcher(
+                &store.storage,
+                json!({"query": "what happened"}),
+                researcher,
+            )
+            .await;
+            let result = Research.run(ctx).await.unwrap();
+            assert_eq!(result["stop_reason"], json!("completed"));
+            assert_eq!(result["structured"], json!(true));
+            assert_eq!(result["steps"], json!(1));
+        }
+
+        #[tokio::test]
+        async fn an_unshaped_reply_with_no_session_id_stops_immediately() {
+            // research_output() defaults session_id to None: the loop's
+            // "nothing to resume" exit, not a step cap or budget wall.
+            let store = TempStore::new("research-nosession").await;
+            let researcher =
+                Arc::new(ScriptedResearcher::new().on("", research_output("not json at all")));
+            let ctx = ctx_with_researcher(
+                &store.storage,
+                json!({"query": "q", "turns_per_step": 1}),
+                researcher,
+            )
+            .await;
+            let result = Research.run(ctx).await.unwrap();
+            assert_eq!(result["stop_reason"], json!("no_session"));
+            assert_eq!(result["structured"], json!(false));
+            assert_eq!(result["steps"], json!(1));
+        }
+
+        #[tokio::test]
+        async fn step_cap_is_recorded_when_the_agent_never_shapes_a_report() {
+            // A resumable session that never returns the promised shape must
+            // stop at MAX_STEPS, not loop forever — and the result must say
+            // why, distinct from a budget or turn-budget exit.
+            let store = TempStore::new("research-stepcap").await;
+            let mut out = research_output("still thinking, not json");
+            out.session_id = Some("sess-forever".into());
+            let researcher = Arc::new(ScriptedResearcher::new().on("", out));
+            let ctx = ctx_with_researcher(
+                &store.storage,
+                json!({"query": "q", "turns_per_step": 1}),
+                researcher.clone(),
+            )
+            .await;
+            let result = Research.run(ctx).await.unwrap();
+            assert_eq!(result["stop_reason"], json!("step_cap"));
+            assert_eq!(result["structured"], json!(false));
+            assert_eq!(result["steps"], json!(MAX_STEPS));
+            assert_eq!(researcher.call_count(), MAX_STEPS as usize);
+        }
+
+        #[tokio::test]
+        async fn budget_exhaustion_between_steps_stops_the_loop_and_keeps_the_partial() {
+            // First step spends the whole job budget; the pre-step budget
+            // check before step 2 must break the loop rather than call the
+            // researcher again.
+            let store = TempStore::new("research-budget").await;
+            let mut out = research_output("partial findings, not json");
+            out.session_id = Some("sess-1".into());
+            out.cost_usd = Some(1.0);
+            let researcher = Arc::new(ScriptedResearcher::new().on("", out));
+            let ctx = TestContext::new(&store.storage, "research")
+                .params(json!({"query": "q", "turns_per_step": 1}))
+                .engines(engines_with(
+                    Arc::new(Dead),
+                    Arc::new(Dead),
+                    researcher.clone(),
+                ))
+                .budget_usd(1.0)
+                .build();
+            let result = Research.run(ctx).await.unwrap();
+            assert_eq!(result["stop_reason"], json!("budget_exhausted"));
+            assert_eq!(result["steps"], json!(1));
+            assert_eq!(researcher.call_count(), 1);
+        }
     }
 }
