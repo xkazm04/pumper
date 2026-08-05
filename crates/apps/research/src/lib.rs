@@ -142,6 +142,40 @@ enum StepPlan {
     Exhausted,
 }
 
+/// Why the loop stopped, surfaced in the result so a caller can tell a
+/// finished report from a truncated one instead of inferring it from
+/// `structured: false`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopReason {
+    /// `final_parsed` matched the promised shape — a real finish.
+    Completed,
+    /// Hit [`MAX_STEPS`] before the report ever parsed.
+    StepCap,
+    /// The turn budget (`max_turns`) ran out.
+    TurnsExhausted,
+    /// The job's `$` budget hit zero between steps.
+    BudgetExhausted,
+    /// A step returned no session id to resume, so continuing would restart
+    /// from zero instead of building on prior context.
+    NoSession,
+    /// Neither a turn cap nor a per-step chunk was set — the original
+    /// single-call behavior, not a truncation.
+    SingleCall,
+}
+
+impl StopReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            StopReason::Completed => "completed",
+            StopReason::StepCap => "step_cap",
+            StopReason::TurnsExhausted => "turns_exhausted",
+            StopReason::BudgetExhausted => "budget_exhausted",
+            StopReason::NoSession => "no_session",
+            StopReason::SingleCall => "single_call",
+        }
+    }
+}
+
 fn next_step_turns(max_turns: Option<u32>, per_step: Option<u32>, used: u64) -> StepPlan {
     match max_turns {
         Some(total) => {
@@ -232,8 +266,11 @@ impl ScrapeApp for Research {
             ],
             output_shape: Some(
                 "{summary, key_findings: [..], sources: [..], session_id, cost_usd, steps, \
-                 resumed_from_checkpoint} — structured research output; `session_id` is \
-                 resumable; `cost_usd` is cumulative across resumed attempts",
+                 resumed_from_checkpoint, stop_reason} — structured research output; \
+                 `session_id` is resumable; `cost_usd` is cumulative across resumed attempts; \
+                 `stop_reason` explains why the loop ended (completed, step_cap, \
+                 turns_exhausted, budget_exhausted, no_session, single_call) — `structured: \
+                 false` alone can't distinguish a truncated report from other causes",
             ),
             cost_class: CostClass::Claude,
         }
@@ -319,6 +356,9 @@ impl ScrapeApp for Research {
         let mut final_parsed: Option<Value> = None;
         let mut last_text = state.partial.clone().unwrap_or_default();
         let mut duration_ms: u64 = 0;
+        // The step-cap check below is the loop's own initial value, so no
+        // branch leaves `stop_reason` unset.
+        let mut stop_reason = StopReason::StepCap;
 
         loop {
             if state.steps_done >= MAX_STEPS {
@@ -326,7 +366,10 @@ impl ScrapeApp for Research {
             }
             let step_turns = match next_step_turns(max_turns, turns_per_step, state.turns_used) {
                 StepPlan::Run(t) => t,
-                StepPlan::Exhausted => break,
+                StepPlan::Exhausted => {
+                    stop_reason = StopReason::TurnsExhausted;
+                    break;
+                }
             };
             // Between steps, stop gracefully at the budget ceiling and return
             // the partial (checkpointed) findings instead of erroring the job.
@@ -335,6 +378,7 @@ impl ScrapeApp for Research {
             if state.steps_done > 0 {
                 if let Some(remaining) = ctx.remaining_budget_usd().await? {
                     if remaining <= 0.0 {
+                        stop_reason = StopReason::BudgetExhausted;
                         break;
                     }
                 }
@@ -387,6 +431,7 @@ impl ScrapeApp for Research {
             let parsed = output.json.clone().or_else(|| salvage_json(&output.text));
             if parsed.as_ref().is_some_and(is_report_shaped) {
                 final_parsed = parsed;
+                stop_reason = StopReason::Completed;
                 break;
             }
 
@@ -399,10 +444,12 @@ impl ScrapeApp for Research {
 
             if state.session_id.is_none() {
                 // No session to resume — looping would restart from zero.
+                stop_reason = StopReason::NoSession;
                 break;
             }
             if max_turns.is_none() && turns_per_step.is_none() {
                 // Uncapped single-call mode (pre-port behavior).
+                stop_reason = StopReason::SingleCall;
                 break;
             }
         }
@@ -423,6 +470,7 @@ impl ScrapeApp for Research {
             "duration_ms": duration_ms,
             "num_turns": state.turns_used,
             "session_id": state.session_id,
+            "stop_reason": stop_reason.as_str(),
         });
 
         // Final checkpoint carries the whole result: a crash between here and
