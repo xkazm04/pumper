@@ -884,13 +884,23 @@ impl Extractor {
         // requests but places no global cap, so a 5000-URL/800-host list would
         // otherwise open thousands of sockets at once (fd exhaustion). Cap the
         // in-flight fetches like the sibling `crawl` app does (default 16).
-        let fetcher = ctx.engines.fetch.clone();
+        //
+        // Every fetch goes through the METERED chokepoint `ctx.fetch`, never the
+        // raw `ctx.engines.fetch`: the raw fetcher skips the cost ledger, the
+        // per-job budget clamp (so `strategy: "auto_with_research"` under a $1
+        // budget — or the $0 a DataHub `cost:pause` forces — could spend
+        // unbounded Claude money invisibly), the learned tier router, and the
+        // VCR cassette (so a recorded run of this app silently hit the live
+        // network on replay). Guarded by `crates/core/tests/fetch_chokepoint.rs`.
+        //
+        // The futures borrow `&ctx` — nothing is spawned, so there is no
+        // `'static` bound to satisfy; `.cloned()` on the URLs stays load-bearing
+        // for closure inference (see the sibling note in `app-plugin`).
         let fetches = urls.iter().cloned().map(|url| {
-            let f = fetcher.clone();
             let mut req = FetchRequest::new(&url);
             req.strategy = strategy;
             async move {
-                match f.fetch(req).await {
+                match ctx.fetch(req).await {
                     // The health gate needs to know whether the *fetch layer* was
                     // healthy, which is the winning tier's structured verdict — not
                     // whether a body came back non-empty. A bot wall returns plenty

@@ -41,6 +41,8 @@ Apps are `ScrapeApp` implementations under `crates/apps/*`, registered in `crate
 
 Params defensively parsed from `ctx.params` with documented defaults; stable record keys; `upsert_many` for partial batches vs `sync_many` for full snapshots (removal detection); metered `ctx.fetch`/`ctx.research`; big payloads to artifacts; compact result JSON with new/changed counts (feeds cost-per-fresh-record and trigger summaries).
 
+**`ctx.fetch`, not `ctx.engines.fetch`.** A page fetch goes through `AppContext::fetch`, which meters the call (one cost event per URL, with the winning engine), clamps an `auto_with_research` fetch to the job's remaining `budget_usd` — soft-downgrading to the free tiers when there is none rather than failing — trains the learned tier router, and records/replays the fetch into the job's VCR cassette. Driving `ctx.engines.{fetch,http,browser}` directly loses all four. The raw engines stay public because a dozen callers legitimately need them (a JSON API that wants conditional GET or a byte body, the self-metering crawler, jobless server-side callers), so the guard is an inventory: **every** raw-engine call site is pinned with a count and a reason in `crates/core/tests/fetch_chokepoint.rs`, and adding one fails that test. If your app fetches a *page*, use `ctx.fetch`; if it calls an *API*, add your justified entry to the inventory.
+
 ## Output guards (agentic trades apps)
 
 All four trades apps (`trade-wages`, `homewyse-pricing`, `state-tax`, `valuation-multiples`) share output guards via the `trades-common` crate:

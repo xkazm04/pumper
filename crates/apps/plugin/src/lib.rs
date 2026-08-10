@@ -446,8 +446,17 @@ impl Plugin {
         // URL at once. `buffered` preserves order for the positional zip below.
         let concurrency = concurrency(ctx);
         let plugin_params = plugin_params(ctx);
-        let fetcher = ctx.engines.fetch.clone();
         let plugins = ctx.plugins.clone();
+        // Every fetch goes through the METERED chokepoint `ctx.fetch`, never the
+        // raw `ctx.engines.fetch`: the raw fetcher skips the cost ledger, the
+        // per-job budget clamp (so `strategy: "auto_with_research"` under a $1
+        // budget — or the $0 a DataHub `cost:pause` forces — could spend
+        // unbounded Claude money invisibly), the learned tier router, and the
+        // VCR cassette (so a recorded run of this app silently hit the live
+        // network on replay). The futures borrow `&ctx`; nothing is spawned, so
+        // there is no `'static` bound to satisfy. Guarded by
+        // `crates/core/tests/fetch_chokepoint.rs`.
+        //
         // clippy::redundant_iter_cloned — the `cloned()` looks redundant (the body
         // only ever takes `&url`), but it is load-bearing for inference: with
         // `Item = &String`/`&str` the closure must implement `FnOnce` for ANY
@@ -457,14 +466,13 @@ impl Plugin {
         // `.iter()` and `.iter().map(String::as_str)` fail to compile.
         #[allow(clippy::redundant_iter_cloned)]
         let tasks = urls.iter().cloned().map(|url| {
-            let f = fetcher.clone();
             let p = plugins.clone();
             let name = plugin.to_string();
             let pp = plugin_params.clone();
             let mut req = FetchRequest::new(&url);
             req.strategy = strategy;
             async move {
-                let doc = match f.fetch(req).await {
+                let doc = match ctx.fetch(req).await {
                     Ok(out) => out.html.or(out.text).unwrap_or_default(),
                     Err(e) => return json!({ "error": format!("fetch: {e}") }),
                 };
