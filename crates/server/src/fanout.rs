@@ -22,6 +22,14 @@
 //!   of vanishing with the process.
 //! - **Loud.** A panicking unit is caught and logged with its job id rather
 //!   than dying inside an unobserved `JoinHandle`.
+//!
+//! The type is deliberately reusable: the server runs **two** instances. The
+//! worker's (`AppState::fanout`) carries a finished job's derived work; a
+//! second one (`AppState::deliveries`, sized by `crate::webhook`) carries
+//! outbound webhook deliveries, which used to be bare `tokio::spawn`s outside
+//! any lifecycle. They are separate instances rather than one shared pool
+//! because their backpressure means different things — see the sizing rationale
+//! on `webhook::DELIVERY_CONCURRENCY`.
 
 use std::future::Future;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -105,12 +113,22 @@ impl FanoutPool {
     where
         F: Future<Output = ()> + Send + 'static,
     {
+        self.run_tagged(what, job.to_string(), unit).await
+    }
+
+    /// [`FanoutPool::run`] for units that are not identified by a job id — a
+    /// webhook delivery is tagged `<kind>:<ref_id>`, a replay by its delivery
+    /// id. Same guarantees; only the log label differs.
+    pub async fn run_tagged<F>(&self, what: &'static str, tag: String, unit: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         if placement(self.concurrency, self.inflight(), self.max_queued) == Placement::Inline {
             if self.concurrency > 0 {
                 warn!(
-                    %job, stage = what, inflight = self.inflight(), max = self.max_queued,
-                    "fan-out backlog full; running this job's fan-out inline (it holds a \
-                     worker permit until it finishes) rather than dropping it"
+                    unit = %tag, stage = what, inflight = self.inflight(), max = self.max_queued,
+                    "fan-out backlog full; running this unit inline on its caller (a job's \
+                     fan-out then holds a worker permit until it finishes) rather than dropping it"
                 );
             }
             unit.await;
@@ -125,9 +143,9 @@ impl FanoutPool {
             let caught = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(unit)).await;
             if caught.is_err() {
                 error!(
-                    %job, stage = what,
-                    "job fan-out panicked; the job's own outcome is already persisted, but its \
-                     derived work (index / hooks / alerts) did not complete"
+                    unit = %tag, stage = what,
+                    "fan-out unit panicked; whatever produced it is already persisted, but this \
+                     derived/outbound work (index / hooks / alerts / delivery) did not complete"
                 );
             }
             drop(ticket);

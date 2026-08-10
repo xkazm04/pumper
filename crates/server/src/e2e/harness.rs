@@ -217,6 +217,14 @@ pub struct TestReceiver {
 
 impl TestReceiver {
     pub async fn spawn(statuses: Vec<u16>) -> Self {
+        Self::spawn_slow(statuses, Duration::ZERO).await
+    }
+
+    /// A receiver that holds each request open for `delay` before recording it
+    /// and answering — the fixture for "shutdown happened while POSTs were in
+    /// flight". The hit is recorded *after* the delay, so a recorded hit proves
+    /// the handler ran to completion rather than merely being entered.
+    pub async fn spawn_slow(statuses: Vec<u16>, delay: Duration) -> Self {
         let hits: Arc<Mutex<Vec<Hit>>> = Arc::new(Mutex::new(Vec::new()));
         let script = Arc::new(Mutex::new(VecDeque::from(statuses)));
 
@@ -239,6 +247,9 @@ impl TestReceiver {
                     .await
                     .unwrap_or_default()
                     .to_vec();
+                if !delay.is_zero() {
+                    tokio::time::sleep(delay).await;
+                }
                 hits.lock().unwrap().push((headers, body));
                 let status = script.lock().unwrap().pop_front().unwrap_or(200);
                 axum::http::StatusCode::from_u16(status).unwrap()
@@ -265,8 +276,13 @@ impl TestReceiver {
         self.hits.lock().unwrap().clone()
     }
 
-    /// Polls until at least `n` requests arrived (webhook dispatch is
-    /// fire-and-forget, so arrival is asynchronous), then returns them all.
+    /// Polls until at least `n` requests arrived, then returns them all.
+    ///
+    /// Prefer [`TestReceiver::hits_so_far`] after a drain: deliveries run on
+    /// `AppState::deliveries`, so `worker::run_one` (or an explicit
+    /// `state.deliveries.drain(..)`) is a real synchronization point. This poll
+    /// is only for the paths that have no such point — a raw dispatch whose
+    /// arrival is genuinely concurrent with the assertion.
     pub async fn wait_hits(&self, n: usize, timeout: Duration) -> Vec<Hit> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {

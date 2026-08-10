@@ -3,8 +3,17 @@
 //! don't have to poll; dataset watches receive `dataset.changed` events the
 //! same way. If a secret was supplied, the body is signed with HMAC-SHA256 and
 //! sent as `X-Pumper-Signature: sha256=<hex>` so the receiver can verify
-//! authenticity. Every delivery is logged to `webhook_deliveries` — failed
-//! rows are the dead-letter queue, replayable via the API.
+//! authenticity. Every delivery is logged to `webhook_deliveries` — `dead` rows
+//! are the dead-letter queue, replayable via the API.
+//!
+//! ## Lifecycle
+//!
+//! Every send runs on a [`crate::fanout::FanoutPool`] instance dedicated to
+//! deliveries ([`DELIVERY_CONCURRENCY`]). It used to be a bare `tokio::spawn`
+//! per delivery, which put outbound POSTs *outside* the process's drainable
+//! lifecycle: a graceful shutdown exited with requests mid-flight, and a test
+//! had no synchronization point to wait on — only a deadline poll. On the pool
+//! they are bounded, drained by the worker's shutdown drain, and panic-contained.
 //!
 //! ## Sinks (M22)
 //!
@@ -28,7 +37,6 @@
 //! and report `(delivered, attempts, last_error)` like the built-ins.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
@@ -52,77 +60,95 @@ const DRAIN_MAX_RETRIES: i64 = 5;
 /// a just-recovered receiver.
 const DRAIN_BATCH: i64 = 20;
 
-/// Spawns a best-effort, logged delivery of a terminal job to its callback.
-pub fn dispatch(client: reqwest::Client, storage: Arc<Storage>, job: Job) {
+/// Concurrency of the delivery pool (`AppState::deliveries`).
+///
+/// A **dedicated** [`crate::fanout::FanoutPool`] instance, not the worker's, for
+/// three reasons:
+///
+/// 1. **Sizing.** The worker pool is `[worker] fanout_concurrency` (default 4) —
+///    one slot per finished job's whole derived-work unit. One job can dispatch
+///    many deliveries (every watch × every changed dataset), each an HTTP round
+///    trip at the client's 15s timeout. Sharing would let one watch burst park
+///    every worker fan-out slot behind a slow receiver.
+/// 2. **Backpressure meaning.** At the ceiling a `FanoutPool` runs the unit
+///    *inline on its caller*. For a job's fan-out that costs a scrape permit —
+///    a designed trade. For a delivery the caller is either a fan-out unit
+///    (which would then serialize the rest of the job's work behind one
+///    receiver) or the scheduler's drain tick (which must stay fire-and-forget).
+///    Separate ceilings keep one from triggering the other's inline path.
+/// 3. **Escape hatch.** `fanout_concurrency = 0` is the documented "everything
+///    inline" control arm; it must not silently turn every webhook into a
+///    45s-worst-case blocking call inside the job's fan-out.
+///
+/// 16 outbound POSTs in flight is well inside one `reqwest` client's pool and
+/// keeps a single slow receiver from serializing the rest. Not a config key:
+/// per-deployment delivery throughput is a separate, deferred concern.
+pub(crate) const DELIVERY_CONCURRENCY: usize = 16;
+
+/// Backlog ceiling of the delivery pool. Above it a dispatch runs inline on its
+/// caller — slow, never dropped (same contract as the worker pool). Deliberately
+/// far above the worker pool's 64: `DRAIN_BATCH` (20) plus a fan-out burst must
+/// never reach it in normal operation, because for the scheduler's drain tick
+/// "inline" means the tick waits on a delivery.
+pub(crate) const DELIVERY_MAX_QUEUED: usize = 1024;
+
+/// Queues a best-effort, logged delivery of a terminal job to its callback.
+pub async fn dispatch(state: &AppState, job: Job) {
     let Some(url) = job.callback_url.clone() else {
         return;
     };
     let secret = job.callback_secret.clone();
     let id = job.id.to_string();
-    dispatch_event(
-        client,
-        storage,
-        "job",
-        &id,
-        &url,
-        "job.terminal",
-        &job,
-        secret,
-    );
+    dispatch_event(state, "job", &id, &url, "job.terminal", &job, secret).await;
 }
 
-/// Spawns a best-effort, logged delivery of a `dataset.changed` event through
+/// Queues a best-effort, logged delivery of a `dataset.changed` event through
 /// the watch's configured sink. Body shaping happens here (once, so the logged
 /// body is exactly what the DLQ drain re-sends); transport branching happens
 /// in [`deliver`].
-pub fn dispatch_change(
-    client: reqwest::Client,
-    storage: Arc<Storage>,
-    watch: Watch,
-    payload: serde_json::Value,
-) {
+pub async fn dispatch_change(state: &AppState, watch: Watch, payload: serde_json::Value) {
     match watch.sink.as_str() {
         "file" => {
             // The pseudo-URL names the file from the watch id ONLY — never
             // user input — and the transport re-validates it before writing.
             let url = file_sink_url(&watch.id);
             dispatch_event(
-                client,
-                storage,
+                state,
                 "change",
                 &watch.id,
                 &url,
                 "dataset.changed",
                 &payload,
                 None,
-            );
+            )
+            .await;
         }
         "slack" => {
             let body = slack_summary(&payload);
             dispatch_event(
-                client,
-                storage,
+                state,
                 "change",
-                &watch.id.clone(),
-                &watch.url.clone(),
+                &watch.id,
+                &watch.url,
                 "dataset.changed",
                 &body,
                 watch.secret.clone(),
-            );
+            )
+            .await;
         }
         // "webhook" and anything unrecognized (fail toward the original,
         // most-informative behavior rather than dropping the event).
         _ => {
             dispatch_event(
-                client,
-                storage,
+                state,
                 "change",
-                &watch.id.clone(),
-                &watch.url.clone(),
+                &watch.id,
+                &watch.url,
                 "dataset.changed",
                 &payload,
                 watch.secret.clone(),
-            );
+            )
+            .await;
         }
     }
 }
@@ -174,20 +200,18 @@ fn slack_summary(payload: &serde_json::Value) -> serde_json::Value {
     })
 }
 
-/// Spawns a best-effort, logged delivery of an arbitrary event — the generic
+/// Queues a best-effort, logged delivery of an arbitrary event — the generic
 /// entry point for new event kinds (e.g. saved-search matches).
 //
-// clippy::too_many_arguments (8/7) — the eight are the webhook wire contract
-// itself (transport, storage, kind, ref_id, url, event, payload, secret); every
-// one is independently supplied by the caller, so collapsing them behind a
-// default-able struct would let a caller silently omit `secret` (unsigned
-// delivery) or `ref_id` (unattributable log line). Allowed at this one site
-// rather than bulk-suppressed. FOLLOW-UP: introduce a `DispatchEvent` builder
-// with `secret`/`ref_id` as required constructor args, then drop this allow.
-#[allow(clippy::too_many_arguments)]
-pub fn dispatch_event(
-    client: reqwest::Client,
-    storage: Arc<Storage>,
+// The seven arguments are the webhook wire contract itself (state, kind, ref_id,
+// url, event, payload, secret); every one is independently supplied by the
+// caller, so collapsing them behind a default-able struct would let a caller
+// silently omit `secret` (unsigned delivery) or `ref_id` (unattributable log
+// line). The transport + storage handles used to be two more parameters here;
+// they now come from `state`, which is what brought this back under clippy's
+// threshold and let the old `#[allow(clippy::too_many_arguments)]` go.
+pub async fn dispatch_event(
+    state: &AppState,
     kind: &str,
     ref_id: &str,
     url: &str,
@@ -202,29 +226,23 @@ pub fn dispatch_event(
             return;
         }
     };
-    spawn_logged(
-        client,
-        storage,
+    queue_logged(
+        state,
         kind.to_string(),
         ref_id.to_string(),
         url.to_string(),
         event.to_string(),
         body,
         secret,
-    );
+    )
+    .await;
 }
 
-/// Spawns a best-effort, logged `job.failed` delivery to the global failure
+/// Queues a best-effort, logged `job.failed` delivery to the global failure
 /// subscriber (`[webhooks] failure_url`). Fires on PERMANENT failure only — a
 /// job's own `callback_url` already receives the terminal job JSON, so this is
 /// the cross-app firehose path, not a per-job duplicate.
-pub fn dispatch_failure(
-    client: reqwest::Client,
-    storage: Arc<Storage>,
-    url: &str,
-    secret: Option<String>,
-    job: &Job,
-) {
+pub async fn dispatch_failure(state: &AppState, url: &str, secret: Option<String>, job: &Job) {
     let payload = serde_json::json!({
         "event": "job.failed",
         "job_id": job.id,
@@ -234,48 +252,79 @@ pub fn dispatch_failure(
         "schedule_id": job.schedule_id,
     });
     dispatch_event(
-        client,
-        storage,
+        state,
         "failure",
         &job.id.to_string(),
         url,
         "job.failed",
         &payload,
         secret,
-    );
+    )
+    .await;
 }
 
 /// Re-sends a logged delivery (the dead-letter replay path). The caller has
-/// already resolved the signing secret from the delivery's source.
-pub fn replay(
-    client: reqwest::Client,
-    storage: Arc<Storage>,
+/// already resolved the signing secret from the delivery's source, and has
+/// already **claimed** the row.
+///
+/// Returns as soon as the send is queued on the delivery pool, never when the
+/// send completes: this is called both from the replay route (which answers 202)
+/// and from [`drain_due`] on the scheduler tick, and the tick must not block on
+/// a receiver.
+pub async fn replay(
+    state: &AppState,
     delivery_id: String,
     url: String,
     event: String,
     body: Vec<u8>,
     secret: Option<String>,
 ) {
-    tokio::spawn(async move {
-        let outcome = deliver(
-            &storage,
-            &client,
-            &url,
-            &event,
-            &delivery_id,
-            &body,
-            secret.as_deref(),
-        )
+    let storage = state.storage.clone();
+    let client = state.webhook_client.clone();
+    let tag = delivery_id.clone();
+    state
+        .deliveries
+        .run_tagged("webhook-replay", tag, async move {
+            let outcome = deliver(
+                &storage,
+                &client,
+                &url,
+                &event,
+                &delivery_id,
+                &body,
+                secret.as_deref(),
+            )
+            .await;
+            log_outcome(&storage, &delivery_id, &url, outcome).await;
+        })
         .await;
-        log_outcome(&storage, &delivery_id, &url, outcome).await;
-    });
 }
 
-/// Creates the log row, runs the delivery loop, records the outcome.
-#[allow(clippy::too_many_arguments)]
-fn spawn_logged(
-    client: reqwest::Client,
-    storage: Arc<Storage>,
+/// Renders the outcome of a delivery that has **no log row** to record it
+/// against (see [`queue_logged`]'s `create_delivery` failure branch).
+///
+/// The anti-pattern this replaces: `let _ = deliver(...)`. Storage was down, so
+/// the send went out and its result was thrown away — the one delivery in the
+/// system whose fate nothing anywhere could report, not the DLQ, not the log,
+/// not `/metrics`. A `warn!` line carrying attempts and the last error is the
+/// honest ceiling when the durable store is the thing that failed.
+fn unlogged_outcome_summary(outcome: &(bool, i64, Option<String>)) -> String {
+    let (delivered, attempts, last_error) = outcome;
+    if *delivered {
+        format!("delivered after {attempts} attempt(s)")
+    } else {
+        format!(
+            "NOT delivered after {attempts} attempt(s), and it is not in the DLQ (the log write \
+             is what failed): {}",
+            last_error.as_deref().unwrap_or("no error recorded")
+        )
+    }
+}
+
+/// Creates the log row, runs the delivery loop, records the outcome — as one
+/// tracked unit on the delivery pool.
+async fn queue_logged(
+    state: &AppState,
     kind: String,
     ref_id: String,
     url: String,
@@ -283,48 +332,59 @@ fn spawn_logged(
     body: Vec<u8>,
     secret: Option<String>,
 ) {
-    tokio::spawn(async move {
-        let delivery_id = match storage
-            .create_delivery(
-                &kind,
-                &ref_id,
-                &url,
-                &event,
-                &String::from_utf8_lossy(&body),
-            )
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(url = %url, "delivery log write failed (sending anyway): {e}");
-                // No persisted id — send with a generated one so the receiver still
-                // gets an idempotency key (this delivery just isn't in the log/DLQ).
-                let fallback_id = uuid::Uuid::new_v4().to_string();
-                let _ = deliver(
-                    &storage,
-                    &client,
+    let storage = state.storage.clone();
+    let client = state.webhook_client.clone();
+    let tag = format!("{kind}:{ref_id}");
+    state
+        .deliveries
+        .run_tagged("webhook", tag, async move {
+            let delivery_id = match storage
+                .create_delivery(
+                    &kind,
+                    &ref_id,
                     &url,
                     &event,
-                    &fallback_id,
-                    &body,
-                    secret.as_deref(),
+                    &String::from_utf8_lossy(&body),
                 )
-                .await;
-                return;
-            }
-        };
-        let outcome = deliver(
-            &storage,
-            &client,
-            &url,
-            &event,
-            &delivery_id,
-            &body,
-            secret.as_deref(),
-        )
+                .await
+            {
+                Ok(id) => id,
+                Err(e) => {
+                    warn!(url = %url, "delivery log write failed (sending anyway): {e}");
+                    // No persisted id — send with a generated one so the receiver still
+                    // gets an idempotency key (this delivery just isn't in the log/DLQ).
+                    let fallback_id = uuid::Uuid::new_v4().to_string();
+                    let outcome = deliver(
+                        &storage,
+                        &client,
+                        &url,
+                        &event,
+                        &fallback_id,
+                        &body,
+                        secret.as_deref(),
+                    )
+                    .await;
+                    warn!(
+                        url = %url, delivery = %fallback_id, kind = %kind, ref_id = %ref_id,
+                        "unlogged webhook delivery finished: {}",
+                        unlogged_outcome_summary(&outcome)
+                    );
+                    return;
+                }
+            };
+            let outcome = deliver(
+                &storage,
+                &client,
+                &url,
+                &event,
+                &delivery_id,
+                &body,
+                secret.as_deref(),
+            )
+            .await;
+            log_outcome(&storage, &delivery_id, &url, outcome).await;
+        })
         .await;
-        log_outcome(&storage, &delivery_id, &url, outcome).await;
-    });
 }
 
 async fn log_outcome(
@@ -507,14 +567,14 @@ pub async fn drain_due(state: &AppState) {
         }
         let secret = resolve_secret(&state.storage, &state.config.webhooks, &delivery).await;
         replay(
-            state.webhook_client.clone(),
-            state.storage.clone(),
+            state,
             delivery.id.clone(),
             delivery.url.clone(),
             delivery.event.clone(),
             delivery.body.into_bytes(),
             secret,
-        );
+        )
+        .await;
     }
 }
 
@@ -810,7 +870,34 @@ mod tests {
         assert_eq!(replay_gate("pending", true), ReplayGate::InFlight);
         assert_eq!(replay_gate("delivered", false), ReplayGate::NotReplayable);
         assert_eq!(replay_gate("delivered", true), ReplayGate::Allowed);
-        assert_eq!(replay_gate("brand-new-status", true), ReplayGate::NotReplayable);
+        assert_eq!(
+            replay_gate("brand-new-status", true),
+            ReplayGate::NotReplayable
+        );
+    }
+
+    /// The anti-pattern: `let _ = deliver(...)` on the branch where the log row
+    /// could not be written — the send happened and its result was dropped on
+    /// the floor, so the ONE delivery with no DLQ row also had no report.
+    #[test]
+    fn unlogged_fallback_reports_outcome_not_silence() {
+        let failed = unlogged_outcome_summary(&(false, 3, Some("non-2xx: 503".into())));
+        assert!(failed.contains('3'), "attempts are in the line: {failed}");
+        assert!(
+            failed.contains("503"),
+            "last error is in the line: {failed}"
+        );
+        assert!(
+            failed.contains("NOT delivered") && failed.contains("not in the DLQ"),
+            "says both what happened and why it isn't recoverable: {failed}"
+        );
+        // A missing error string must not render as an empty tail.
+        let no_error = unlogged_outcome_summary(&(false, 1, None));
+        assert!(no_error.contains("no error recorded"), "{no_error}");
+        // The success case is still reported — "it went out" is the fact an
+        // operator needs when the log row is missing.
+        let ok = unlogged_outcome_summary(&(true, 2, None));
+        assert!(ok.starts_with("delivered after 2"), "{ok}");
     }
 
     #[test]

@@ -598,14 +598,14 @@ pub(crate) async fn replay_delivery(
     let secret =
         crate::webhook::resolve_secret(&state.storage, &state.config.webhooks, &delivery).await;
     crate::webhook::replay(
-        state.webhook_client.clone(),
-        state.storage.clone(),
+        &state,
         delivery.id.clone(),
         delivery.url.clone(),
         delivery.event.clone(),
         delivery.body.into_bytes(),
         secret,
-    );
+    )
+    .await;
     Ok((
         StatusCode::ACCEPTED,
         Json(json!({ "id": id, "replaying": true })),

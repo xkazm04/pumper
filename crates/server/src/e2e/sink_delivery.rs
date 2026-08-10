@@ -3,9 +3,14 @@
 //! incoming-webhook message — both logged in `webhook_deliveries` under the
 //! same machinery as plain webhooks (the delivery id in the file envelope is
 //! the proof: it resolves to a `delivered` log row).
+//!
+//! These assertions used to be deadline polls (raised to 30s after repeated
+//! flakes) because deliveries were detached `tokio::spawn`s with nothing to wait
+//! on. They now ride `AppState::deliveries`, which `worker::run_one` drains — so
+//! when `run_sync_job` returns, every delivery this job produced is *finished*.
+//! The polls are gone, not re-tuned: a hang here is now a deadlock, not a race.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use pumper_core::EnqueueOptions;
 use serde_json::json;
@@ -13,7 +18,8 @@ use serde_json::json;
 use super::harness::{test_state, FakeApp, TestReceiver};
 use crate::worker;
 
-/// Enqueues a scripted 2-record sync on the fake app and runs it.
+/// Enqueues a scripted 2-record sync on the fake app and runs it. Returns only
+/// after the job's fan-out AND every delivery it queued have completed.
 async fn run_sync_job(state: &crate::state::AppState) {
     state
         .storage
@@ -52,27 +58,15 @@ async fn file_sink_appends_ndjson_and_logs_the_delivery() {
         .path()
         .join("sinks")
         .join(format!("{}.ndjson", watch.id));
-    // Generous on purpose: this budget bounds a HANG, it does not measure
-    // latency. At 5s it flaked under full-suite parallel load while passing in
-    // isolation every time — a blown deadline here must mean the sink never
-    // wrote, never that the box was busy.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    let content = loop {
-        // Existence is not delivery: under full-suite load this poll has
-        // landed BETWEEN the sink creating the file and finishing the write,
-        // reading zero lines. A delivered NDJSON batch ends in '\n' — wait for
-        // that, not for the inode.
-        match tokio::fs::read_to_string(&path).await {
-            Ok(content) if content.ends_with('\n') => break content,
-            _ => {}
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "file sink never wrote a complete line to {}",
-            path.display()
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    };
+    // No poll: `run_sync_job` drained the delivery pool, so the append either
+    // happened or never will.
+    let content = tokio::fs::read_to_string(&path)
+        .await
+        .unwrap_or_else(|e| panic!("file sink never wrote {}: {e}", path.display()));
+    assert!(
+        content.ends_with('\n'),
+        "a drained delivery leaves a COMPLETE NDJSON line, not a partial write: {content:?}"
+    );
 
     let lines: Vec<&str> = content.lines().collect();
     assert_eq!(lines.len(), 1, "one change batch → one NDJSON line");
@@ -85,25 +79,18 @@ async fn file_sink_appends_ndjson_and_logs_the_delivery() {
     // Same machinery as webhooks: the envelope's delivery id resolves to a
     // `delivered` row whose url is the file:// pseudo-URL (DLQ-replayable).
     let delivery_id = envelope["delivery_id"].as_str().expect("delivery id");
-    // Generous on purpose: this budget bounds a HANG, it does not measure
-    // latency. At 5s it flaked under full-suite parallel load while passing in
-    // isolation every time — a blown deadline here must mean the sink never
-    // wrote, never that the box was busy.
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
-    loop {
-        if let Some(d) = state.storage.get_delivery(delivery_id).await.unwrap() {
-            if d.status == "delivered" {
-                assert_eq!(d.url, format!("file://{}.ndjson", watch.id));
-                assert_eq!(d.kind, "change");
-                break;
-            }
-        }
-        assert!(
-            tokio::time::Instant::now() < deadline,
-            "file-sink delivery row never became delivered"
-        );
-        tokio::time::sleep(Duration::from_millis(25)).await;
-    }
+    let d = state
+        .storage
+        .get_delivery(delivery_id)
+        .await
+        .unwrap()
+        .expect("the envelope's delivery id resolves to a log row");
+    assert_eq!(
+        d.status, "delivered",
+        "a drained delivery has recorded its outcome"
+    );
+    assert_eq!(d.url, format!("file://{}.ndjson", watch.id));
+    assert_eq!(d.kind, "change");
 }
 
 #[tokio::test]
@@ -118,7 +105,10 @@ async fn slack_sink_posts_a_compact_summary_message() {
 
     run_sync_job(&state).await;
 
-    let hits = rx.wait_hits(1, Duration::from_secs(5)).await;
+    // Drained, not polled: the POST is complete by the time `run_sync_job`
+    // returns, so an empty `hits` here means it never went out.
+    let hits = rx.hits_so_far();
+    assert_eq!(hits.len(), 1, "one change batch → one slack post");
     let (headers, body) = &hits[0];
     assert_eq!(headers["content-type"], "application/json");
     let msg: serde_json::Value = serde_json::from_slice(body).expect("slack JSON body");

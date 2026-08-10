@@ -125,7 +125,13 @@ pub(crate) async fn run_one(state: &AppState) -> bool {
             // for it: `run_one` promises "one job, fully processed", and every
             // test that asserts on a webhook, a trigger hop or an index write
             // depends on that promise.
+            //
+            // In this order: the fan-out is what QUEUES webhook deliveries, so
+            // draining deliveries first would just race the ones it is about to
+            // enqueue. Draining second is what makes "the delivery arrived" a
+            // synchronization point rather than a deadline poll.
             state.fanout.drain(Duration::from_secs(60)).await;
+            state.deliveries.drain(Duration::from_secs(60)).await;
             true
         }
         _ => false,
@@ -202,23 +208,53 @@ async fn drain(state: &AppState, semaphore: &Arc<Semaphore>, concurrency: usize)
 
 /// Second half of the drain: a job's fan-out no longer holds a worker permit,
 /// so re-acquiring every permit above no longer proves the queue is idle. Wait
-/// for the pool too, and — this is the point — **say so** when it doesn't
+/// for the pools too, and — this is the point — **say so** when they don't
 /// finish, instead of letting the process exit over silently-unsent webhooks.
+///
+/// Two pools, in dependency order. The job fan-out is what *queues* webhook
+/// deliveries, so it drains first; draining deliveries first would race the ones
+/// the fan-out is about to enqueue and declare victory over an empty pool.
 async fn drain_fanout(state: &AppState, grace: Duration) {
-    let inflight = state.fanout.inflight();
+    drain_pool(
+        &state.fanout,
+        grace,
+        "job fan-out",
+        "those jobs' index/hook/alert work did not finish (their results are persisted)",
+    )
+    .await;
+    drain_pool(
+        &state.deliveries,
+        grace,
+        "webhook deliveries",
+        "those rows stay 'pending' and are returned to the retry ladder by the stale-pending \
+         reclaim on the next boot — nothing is lost, but it is late",
+    )
+    .await;
+}
+
+/// Drains one pool within `grace`, reporting stragglers with what their loss
+/// actually costs. Shared by both pools so neither can quietly skip the "say
+/// what was abandoned" half.
+async fn drain_pool(
+    pool: &crate::fanout::FanoutPool,
+    grace: Duration,
+    what: &'static str,
+    consequence: &'static str,
+) {
+    let inflight = pool.inflight();
     if inflight == 0 {
         return;
     }
-    info!(inflight, "draining in-flight job fan-out");
-    let left = state.fanout.drain(grace).await;
+    info!(inflight, pool = what, "draining in-flight work");
+    let left = pool.drain(grace).await;
     if left > 0 {
         warn!(
             abandoned = left,
-            "shutdown reached its deadline with job fan-out still running; those jobs' \
-             index/hook/alert work did not finish (their results are persisted)"
+            pool = what,
+            "shutdown reached its deadline with work still running: {consequence}"
         );
     } else {
-        info!("job fan-out drained cleanly");
+        info!(pool = what, "drained cleanly");
     }
 }
 
@@ -1178,12 +1214,7 @@ async fn notify_watches(
                 "count": revs.len(),
                 "changes": revs,
             });
-            webhook::dispatch_change(
-                state.webhook_client.clone(),
-                state.storage.clone(),
-                watch.clone(),
-                payload,
-            );
+            webhook::dispatch_change(state, watch.clone(), payload).await;
         }
     }
 }
@@ -1319,15 +1350,15 @@ async fn notify_saved_searches(state: &AppState, job: &Job, indexed_apps: &[Stri
             "matches": matches,
         });
         webhook::dispatch_event(
-            state.webhook_client.clone(),
-            state.storage.clone(),
+            state,
             "search",
             &search.id,
             &search.url,
             "search.matched",
             &payload,
             search.secret.clone(),
-        );
+        )
+        .await;
     }
 }
 
@@ -1451,11 +1482,7 @@ async fn finalize_with_stages(
     event.error = job.error.clone();
     event.stages = stages;
     publish(state, event);
-    webhook::dispatch(
-        state.webhook_client.clone(),
-        state.storage.clone(),
-        job.clone(),
-    );
+    webhook::dispatch(state, job.clone()).await;
     // Permanent-failure firehose: a job that exhausted its attempts (app error,
     // timeout, or a reaped stale lease — all land here via `finalize`) notifies
     // the global `[webhooks] failure_url` subscriber, if configured. Retryable
@@ -1463,12 +1490,12 @@ async fn finalize_with_stages(
     if job.status == JobStatus::Failed {
         if let Some(url) = &state.config.webhooks.failure_url {
             webhook::dispatch_failure(
-                state.webhook_client.clone(),
-                state.storage.clone(),
+                state,
                 url,
                 state.config.webhooks.failure_secret.clone(),
                 &job,
-            );
+            )
+            .await;
         }
     }
     // Terminal-job triggers: the job's final status is an event other apps can

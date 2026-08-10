@@ -68,6 +68,14 @@ pub struct AppState {
     /// event) runs on, so that work no longer holds one of the worker's scrape
     /// permits. Drained on shutdown — see `crate::fanout`.
     pub fanout: Arc<crate::fanout::FanoutPool>,
+    /// Bounded pool every outbound webhook delivery runs on — fresh dispatches,
+    /// DLQ drain retries and manual replays alike. Deliveries used to be bare
+    /// `tokio::spawn`s, i.e. outside the process's lifecycle entirely: shutdown
+    /// exited with POSTs in flight and tests could only poll on a deadline.
+    /// A SEPARATE instance from `fanout` on purpose — see the sizing rationale on
+    /// `crate::webhook::DELIVERY_CONCURRENCY`. Drained on shutdown right after
+    /// `fanout` (which is what produces deliveries).
+    pub deliveries: Arc<crate::fanout::FanoutPool>,
     /// Dedicated client for firing result webhooks.
     pub webhook_client: reqwest::Client,
     /// Fan-out of job status transitions to SSE subscribers, with a bounded
@@ -184,6 +192,10 @@ impl AppState {
             fanout: Arc::new(crate::fanout::FanoutPool::new(
                 fanout_concurrency,
                 fanout_max_queued,
+            )),
+            deliveries: Arc::new(crate::fanout::FanoutPool::new(
+                crate::webhook::DELIVERY_CONCURRENCY,
+                crate::webhook::DELIVERY_MAX_QUEUED,
             )),
             webhook_client,
             events,

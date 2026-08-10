@@ -35,11 +35,13 @@ async fn status_and_retry(pool: &SqlitePool, id: &str) -> (String, i64) {
 /// died mid-send: `status='pending'`, no `next_retry_at`, and an `updated_at`
 /// from before the crash.
 async fn backdate(pool: &SqlitePool, id: &str) {
-    sqlx::query("UPDATE webhook_deliveries SET updated_at = '2000-01-01T00:00:00.000000Z' WHERE id = ?1")
-        .bind(id)
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE webhook_deliveries SET updated_at = '2000-01-01T00:00:00.000000Z' WHERE id = ?1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
 }
 
 async fn next_retry_at(pool: &SqlitePool, id: &str) -> Option<String> {
@@ -201,10 +203,16 @@ async fn stale_pending_reclaimed_not_stuck_forever() {
         "a pending row is invisible to the drain — that is the bug"
     );
 
-    assert_eq!(storage.reclaim_stale_deliveries(STALE_SECS).await.unwrap(), 1);
+    assert_eq!(
+        storage.reclaim_stale_deliveries(STALE_SECS).await.unwrap(),
+        1
+    );
     let (status, rc) = status_and_retry(&pool, &id).await;
     assert_eq!(status, "failed", "reclaimed back into the retry ladder");
-    assert_eq!(rc, 0, "reclaim must not consume a retry — the drain claim does");
+    assert_eq!(
+        rc, 0,
+        "reclaim must not consume a retry — the drain claim does"
+    );
     assert!(next_retry_at(&pool, &id).await.is_some(), "and marked due");
 
     // …and it now walks the normal ladder end to end, ending prunable ('dead').
@@ -239,7 +247,10 @@ async fn fresh_pending_not_reclaimed() {
         .create_delivery("job", &Uuid::new_v4().to_string(), "https://x/h", "e", "{}")
         .await
         .unwrap();
-    assert_eq!(storage.reclaim_stale_deliveries(STALE_SECS).await.unwrap(), 0);
+    assert_eq!(
+        storage.reclaim_stale_deliveries(STALE_SECS).await.unwrap(),
+        0
+    );
     assert_eq!(status_and_retry(&pool, &id).await.0, "pending");
 
     // A row claimed by a drain retry moments ago is equally off-limits.
@@ -249,7 +260,10 @@ async fn fresh_pending_not_reclaimed() {
         .unwrap();
     make_due(&pool, &id).await;
     assert!(storage.begin_delivery_retry(&id).await.unwrap());
-    assert_eq!(storage.reclaim_stale_deliveries(STALE_SECS).await.unwrap(), 0);
+    assert_eq!(
+        storage.reclaim_stale_deliveries(STALE_SECS).await.unwrap(),
+        0
+    );
     assert_eq!(status_and_retry(&pool, &id).await.0, "pending");
 }
 
