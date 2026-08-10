@@ -4,8 +4,10 @@
 //! Recipes are written by the discovery pass over `capture_network` renders
 //! (`AppContext::xray`, `pumper_core::recipes`) and stay `validated: false`
 //! until a successful replay proves them. This route is the read surface; the
-//! fetcher's pre-HTTP "api" branch that would *consume* validated recipes is a
-//! documented seam in `pumper_core::recipes`, deliberately not wired yet.
+//! fetcher's pre-HTTP "api_recipe" tier that consumes them IS wired
+//! (`Fetcher::try_recipe`, opt-in via `[recipes] enabled` or
+//! `FetchRequest.use_recipes`). What is NOT wired is discovery: no app calls
+//! `xray` yet, so this table stays empty until a discovery caller ships.
 
 use axum::extract::{Query, State};
 use axum::Json;
