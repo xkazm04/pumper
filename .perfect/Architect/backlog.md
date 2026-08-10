@@ -5,11 +5,13 @@ Status values: `proposed | approved | in-progress | shipped | abandoned | blocke
 
 ## Pending
 - **[2026-07-26] Tier-2/3 bug-class guards — the tail** — type: structural-bug-class, risk: 1, effort: m, payoff: 3, reach: 3 classes
-  Remaining from [[Architect/decisions/2026-07-26-prose-only-bug-class-guards]]: (i) raw-engine
-  metering test (the crawl app's `ctx.meter`/`learn_tier` lines are deletable with a green suite);
-  (f) `sync_many` allowlist inventory test (EXPECTED-diff style over app sources);
+  Remaining from [[Architect/decisions/2026-07-26-prose-only-bug-class-guards]]: (f) `sync_many`
+  allowlist inventory test (EXPECTED-diff style over app sources);
   (a) extract + test the remaining silent-success predicates (8 apps still inline them).
-  Status: proposed
+  ~~(i) raw-engine metering test~~ — SHIPPED 2026-08-11 via /perfect round 9
+  `6237cc8` (crates/core/tests/fetch_chokepoint.rs pins every raw-engine call site
+  with counts + reasons; extractor/plugin migrated onto the metered chokepoint).
+  Status: proposed (f, a remain)
 
 ## Shipped
 - **[2026-07-26] App-coverage tail: 10 zero-test app crates** — [[Architect/decisions/2026-07-26-app-coverage-tail]] (commits 31799a0, 9ee77c4; resume run; 32 tests, 5 extractions)

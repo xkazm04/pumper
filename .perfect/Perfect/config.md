@@ -53,6 +53,27 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   resource-destructive actions even when they are obviously regenerable.
 
 ## Skill improvement log
+- 2026-08-11 (round 9): **First CONCURRENT two-lot wave on the one-branch shape — the
+  partition rule proved itself both ways.** Round 8 honestly went sequential (worker.rs
+  overlap); round 9's write sets were genuinely disjoint and two opus lots ran
+  concurrently with zero collisions, both finishing within ~1h of each other. The one
+  cross-lot artifact was benign and structural: `git commit --only <Class-B file>`
+  commits the WORKING-TREE content, so a sibling's just-added `mod` line rode along in
+  the other lot's commit (a69420a doesn't build in isolation; the tip does). If
+  commit-level bisectability ever matters, the fix is "stage Class-B hunks via a
+  temp-index", not more isolation.
+- 2026-08-11 (round 9): **Builder refutations of Director acceptance criteria are now
+  the loop's highest-value review input** — two of six criteria were wrong as written
+  (governance-pause message can't live in core; the save_penalties either/or was a
+  false pair because of a partial-list caller the evidence missed) and both builders
+  shipped the RIGHT thing with the reasoning recorded. Keep writing criteria as
+  intent + options with tradeoffs, never prescriptions.
+- 2026-08-11 (round 9): **A no-human round rejects honestly when the slate is
+  correctness-shaped**: 6 accepts / 5 rejects across 2 contexts, all-robustness pool.
+  The taste log's own precedents decided every reject (no volume consumer, existing
+  surface answers it, unvalidatable heuristic churn). One reject was deferred-banked
+  as the context's next anchor (recipe-discovery-wiring) — the bank is becoming the
+  real feature pipeline; re-verify banked seeds at proposal time (decay rule).
 - 2026-08-10 (round 8): **Sequential lots on ONE shared branch worked exactly as the
   revised skill predicted** — zero conflicts, warm incremental rebuilds (post-wave
   `cargo check` in 1.9s), no cherry-picks, ff-merge available at the end. The honest
