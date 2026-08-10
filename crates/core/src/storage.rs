@@ -1531,8 +1531,49 @@ impl Storage {
         Ok(res.rows_affected())
     }
 
-    /// Deliveries, newest first, optionally filtered by status (`failed` is the
-    /// dead-letter view). Bodies excluded — fetch one by id for the payload.
+    /// Whole-log delivery health in ONE aggregate pass — the source for the
+    /// `pumper_webhook_*` metrics.
+    ///
+    /// Deliberately one query rather than four counts plus a min: `/metrics` is
+    /// scraped on an interval, and the numbers must describe the same instant to
+    /// be comparable (a `dead` count from after a transition next to a `failed`
+    /// count from before it is worse than no gauge at all).
+    pub async fn delivery_health(&self) -> Result<DeliveryHealth> {
+        let row: DeliveryHealthRow = sqlx::query_as(
+            "SELECT \
+               COALESCE(SUM(status = 'pending'), 0)   AS pending, \
+               COALESCE(SUM(status = 'delivered'), 0) AS delivered, \
+               COALESCE(SUM(status = 'failed'), 0)    AS failed, \
+               COALESCE(SUM(status = 'dead'), 0)      AS dead, \
+               COALESCE(SUM(attempts), 0)             AS attempts, \
+               MIN(CASE WHEN status IN ('pending', 'failed') THEN created_at END) \
+                 AS oldest_undelivered \
+             FROM webhook_deliveries",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(DeliveryHealth {
+            pending: row.pending,
+            delivered: row.delivered,
+            failed: row.failed,
+            dead: row.dead,
+            attempts: row.attempts,
+            oldest_undelivered: row
+                .oldest_undelivered
+                .as_deref()
+                .map(parse_ts)
+                .transpose()?,
+        })
+    }
+
+    /// Deliveries, newest first, optionally filtered by status. The four states
+    /// are `pending` (in flight), `delivered` (accepted), `failed` (**still on
+    /// the retry ladder**, with a scheduled `next_retry_at`) and `dead` (the
+    /// ladder gave up — this is the dead-letter view an operator wants).
+    /// Bodies excluded — fetch one by id for the payload.
+    ///
+    /// `status` is validated by the caller (the route answers 400 on anything
+    /// outside those four); an unknown value here simply matches no rows.
     pub async fn list_deliveries(&self, status: Option<&str>, limit: i64) -> Result<Vec<Delivery>> {
         let rows: Vec<DeliveryRow> = sqlx::query_as(
             "SELECT id, kind, ref_id, url, event, '' AS body, status, attempts, last_error, \
@@ -2839,6 +2880,50 @@ pub struct Delivery {
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// Whole-log delivery health, all read at one instant — see
+/// [`Storage::delivery_health`].
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct DeliveryHealth {
+    /// In flight right now (a first send, a drain retry, or a manual replay).
+    pub pending: i64,
+    /// Accepted by the receiver.
+    pub delivered: i64,
+    /// Failed and **still on the retry ladder** — not the dead-letter queue.
+    pub failed: i64,
+    /// The ladder gave up: the dead-letter queue.
+    pub dead: i64,
+    /// Send attempts summed across the whole log, retries included.
+    pub attempts: i64,
+    /// Creation time of the oldest delivery the receiver has not accepted.
+    ///
+    /// Over `pending` + `failed` only. `dead` is deliberately excluded: it is
+    /// terminal, so including it would pin the derived age gauge at the age of
+    /// the oldest dead row forever and destroy the only signal the operator
+    /// actually watches — "is my undelivered backlog getting older right now".
+    pub oldest_undelivered: Option<DateTime<Utc>>,
+}
+
+impl DeliveryHealth {
+    /// Age in whole seconds of [`DeliveryHealth::oldest_undelivered`], or 0 when
+    /// nothing is undelivered. Takes `now` rather than reading the clock so the
+    /// arithmetic is directly testable, and clamps at 0 — a row stamped in the
+    /// future (clock skew) is "brand new", never negative age.
+    pub fn oldest_undelivered_secs(&self, now: DateTime<Utc>) -> i64 {
+        self.oldest_undelivered
+            .map_or(0, |at| (now - at).num_seconds().max(0))
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct DeliveryHealthRow {
+    pending: i64,
+    delivered: i64,
+    failed: i64,
+    dead: i64,
+    attempts: i64,
+    oldest_undelivered: Option<String>,
 }
 
 #[derive(sqlx::FromRow)]

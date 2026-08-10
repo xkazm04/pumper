@@ -13,7 +13,7 @@ These documents describe the **implemented** product surface of pumper — a loc
 | Declarative extraction & WASM plugins | [extraction.md](extraction.md) | `crates/core/src/{extract,markdown,plugin}.rs`, `crates/engine-wasm/`, `crates/apps/{extractor,plugin}/`, `plugins-src/` |
 | Extraction health (degradation detection) | [resilient-extraction.md](resilient-extraction.md) | `crates/core/src/resilience/`, migration 0020 |
 | Full-text search & saved searches | [search.md](search.md) | `crates/core/src/search.rs`, `crates/engine-search/` |
-| Events & webhooks | [events-webhooks.md](events-webhooks.md) | `crates/server/src/{webhook,events}.rs` |
+| Events & webhooks | [events-webhooks.md](events-webhooks.md) | `crates/server/src/{webhook,events}.rs`; delivery-log routes live in `routes/triggers.rs`, the `pumper_webhook_*` gauges in `routes/meta.rs` |
 | Reactive pipelines (triggers) | [triggers.md](triggers.md) | `crates/server/src/triggers.rs`, migration 0014 |
 | Trigger plugins (sandboxed WASM hooks) | [trigger-plugins.md](trigger-plugins.md) | `crates/server/src/triggers.rs`, `crates/engine-wasm/`, `plugins-src/{trigger-gate,delta-slim}/` |
 | HTTP API | [http-api.md](http-api.md) | `crates/server/src/routes/` |

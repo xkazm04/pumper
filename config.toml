@@ -23,6 +23,13 @@ artifacts_dir = "data/artifacts"
 # `revision_retention_keep_min` per record so diffs/history stay usable.
 # revision_retention_days = 90
 # revision_retention_keep_min = 5
+# Webhook delivery-log retention (both OFF by default, both prune only terminal
+# rows — `pending`/`failed` are the live retry queue and are never touched).
+# Two knobs, not one: successful history ages out safely, while a `dead` row is
+# failure EVIDENCE, so discarding it is a separate, deliberate decision.
+# `GET /retention/preview` shows what a sweep would reclaim, deleting nothing.
+# webhook_delivery_retention_days = 30     # `delivered` rows older than N days
+# webhook_dead_letter_retention_days = 90  # `dead` (retry-exhausted) rows
 
 [http]
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"

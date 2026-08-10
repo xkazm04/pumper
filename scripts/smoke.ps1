@@ -353,6 +353,66 @@ try {
                 Add-Result -Name 'GET /provisioner/proposals' -Status 'FAIL' -Detail $_.Exception.Message
             }
 
+            # Raw check: /metrics is Prometheus TEXT, not JSON, and the webhook
+            # gauges must be present even with an empty delivery log (a gauge
+            # that only appears once it is non-zero is a gauge you can't alert
+            # on). Assert on the raw body, series by series.
+            try {
+                $resp = Invoke-WebRequest -Uri "$baseUrl/metrics" -UseBasicParsing -TimeoutSec 15
+                $body = $resp.Content
+                $wanted = @(
+                    'pumper_webhook_deliveries{status="pending"}',
+                    'pumper_webhook_deliveries{status="delivered"}',
+                    'pumper_webhook_deliveries{status="failed"}',
+                    'pumper_webhook_deliveries{status="dead"}',
+                    'pumper_webhook_oldest_undelivered_seconds',
+                    'pumper_webhook_delivery_attempts_total',
+                    'pumper_webhook_deliveries_succeeded_total'
+                )
+                $missing = @($wanted | Where-Object { -not $body.Contains($_) })
+                if ($resp.StatusCode -eq 200 -and $missing.Count -eq 0) {
+                    Add-Result -Name 'GET /metrics carries the webhook delivery series' -Status 'PASS'
+                } else {
+                    Add-Result -Name 'GET /metrics carries the webhook delivery series' -Status 'FAIL' `
+                        -Detail "HTTP $($resp.StatusCode), missing: $($missing -join ', ')"
+                }
+            } catch {
+                Add-Result -Name 'GET /metrics carries the webhook delivery series' -Status 'FAIL' -Detail $_.Exception.Message
+            }
+
+            # A bogus ?status= must be a 400 naming the allowed values, NOT an
+            # empty 200 — "no such deliveries" and "no such state" are opposite
+            # answers on the endpoint that exists to surface undelivered hooks.
+            try {
+                $resp = Invoke-WebRequest -Uri "$baseUrl/webhooks/deliveries?status=dead-letter" -UseBasicParsing -TimeoutSec 15
+                Add-Result -Name 'GET /webhooks/deliveries?status=<bogus> -> 400' -Status 'FAIL' `
+                    -Detail "expected 400, got HTTP $($resp.StatusCode) with body '$($resp.Content)'"
+            } catch {
+                $code = $_.Exception.Response.StatusCode.value__
+                if ($code -eq 400) {
+                    Add-Result -Name 'GET /webhooks/deliveries?status=<bogus> -> 400' -Status 'PASS'
+                } else {
+                    Add-Result -Name 'GET /webhooks/deliveries?status=<bogus> -> 400' -Status 'FAIL' `
+                        -Detail "expected 400, got: $($_.Exception.Message)"
+                }
+            }
+
+            # ...and every real state is still accepted. Raw-body check: an
+            # empty `deliveries` array unrolls to $null through the pipeline,
+            # so a shape assertion on the parsed object can't tell 200-empty
+            # from a failure.
+            try {
+                $resp = Invoke-WebRequest -Uri "$baseUrl/webhooks/deliveries?status=dead" -UseBasicParsing -TimeoutSec 15
+                if ($resp.StatusCode -eq 200 -and $resp.Content.Contains('"deliveries"')) {
+                    Add-Result -Name 'GET /webhooks/deliveries?status=dead (the DLQ view)' -Status 'PASS'
+                } else {
+                    Add-Result -Name 'GET /webhooks/deliveries?status=dead (the DLQ view)' -Status 'FAIL' `
+                        -Detail "HTTP $($resp.StatusCode), body '$($resp.Content.Substring(0, [Math]::Min(80, $resp.Content.Length)))'"
+                }
+            } catch {
+                Add-Result -Name 'GET /webhooks/deliveries?status=dead (the DLQ view)' -Status 'FAIL' -Detail $_.Exception.Message
+            }
+
             # The scratch config ships [datahub] disabled, so the governance
             # preview must answer 409 — a 200 here would mean the bridge is on
             # against a GMS that does not exist.

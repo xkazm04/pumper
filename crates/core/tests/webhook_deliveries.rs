@@ -323,3 +323,149 @@ async fn delivered_replay_needs_force_not_a_bare_post() {
     assert!(storage.begin_delivery_replay(&id, true).await.unwrap());
     assert_eq!(status_and_retry(&pool, &id).await.0, "pending");
 }
+
+/// Backdates a row's `created_at`, so the "oldest undelivered" age is a known
+/// number instead of "a few milliseconds".
+async fn backdate_created(pool: &SqlitePool, id: &str, stamp: &str) {
+    sqlx::query("UPDATE webhook_deliveries SET created_at = ?2 WHERE id = ?1")
+        .bind(id)
+        .bind(stamp)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// The anti-pattern: `/metrics` had no webhook series at all, so a bridge that
+/// had been failing every delivery for six hours looked exactly like a healthy
+/// one. Every number the gauges need comes from ONE aggregate pass — four
+/// separate counts would each describe a different instant.
+#[tokio::test]
+async fn delivery_health_counts_every_state_in_one_pass() {
+    let store = fresh_db("delivery-health").await;
+    let storage = &store.storage;
+
+    // Empty log: all zeros, and no age (not "unknown", not a stale value).
+    let empty = storage.delivery_health().await.unwrap();
+    assert_eq!(
+        (
+            empty.pending,
+            empty.delivered,
+            empty.failed,
+            empty.dead,
+            empty.attempts
+        ),
+        (0, 0, 0, 0, 0)
+    );
+    assert!(empty.oldest_undelivered.is_none());
+    assert_eq!(empty.oldest_undelivered_secs(chrono::Utc::now()), 0);
+
+    // One row per state, with distinct attempt counts so the sum is unambiguous.
+    // A freshly created row IS the `pending` state — nothing to do to it.
+    storage
+        .create_delivery("job", &Uuid::new_v4().to_string(), "u", "e", "{}")
+        .await
+        .unwrap();
+    let delivered = storage
+        .create_delivery("job", &Uuid::new_v4().to_string(), "u", "e", "{}")
+        .await
+        .unwrap();
+    storage
+        .finish_delivery(&delivered, true, 2, None)
+        .await
+        .unwrap();
+    let failed = storage
+        .create_delivery("job", &Uuid::new_v4().to_string(), "u", "e", "{}")
+        .await
+        .unwrap();
+    storage
+        .fail_delivery(&failed, 3, Some("boom"), MAX_RETRIES, BACKOFF)
+        .await
+        .unwrap();
+    let dead = storage
+        .create_delivery("job", &Uuid::new_v4().to_string(), "u", "e", "{}")
+        .await
+        .unwrap();
+    storage
+        .fail_delivery(&dead, 3, Some("boom"), 0, BACKOFF)
+        .await
+        .unwrap();
+
+    let health = storage.delivery_health().await.unwrap();
+    assert_eq!(health.pending, 1);
+    assert_eq!(health.delivered, 1);
+    assert_eq!(
+        health.failed, 1,
+        "`failed` is retrying, NOT the dead-letter"
+    );
+    assert_eq!(health.dead, 1, "`dead` is the dead-letter queue");
+    assert_eq!(health.attempts, 2 + 3 + 3, "attempts sum across the log");
+}
+
+/// The gauge an operator alerts on. It must track the oldest row that has NOT
+/// been accepted — and must ignore `dead`, which is terminal: counting it would
+/// pin the age at the oldest dead row forever, so the alert could never clear.
+#[tokio::test]
+async fn oldest_undelivered_ignores_delivered_and_dead_not_just_delivered() {
+    let store = fresh_db("delivery-health-age").await;
+    let storage = &store.storage;
+    let pool = storage.pool();
+
+    // The oldest rows in the table are terminal ones — neither may set the age.
+    let old_delivered = storage
+        .create_delivery("job", &Uuid::new_v4().to_string(), "u", "e", "{}")
+        .await
+        .unwrap();
+    backdate_created(&pool, &old_delivered, "2001-01-01T00:00:00.000000Z").await;
+    storage
+        .finish_delivery(&old_delivered, true, 1, None)
+        .await
+        .unwrap();
+    let old_dead = storage
+        .create_delivery("job", &Uuid::new_v4().to_string(), "u", "e", "{}")
+        .await
+        .unwrap();
+    backdate_created(&pool, &old_dead, "2002-01-01T00:00:00.000000Z").await;
+    storage
+        .fail_delivery(&old_dead, 1, Some("gone"), 0, BACKOFF)
+        .await
+        .unwrap();
+    assert_eq!(
+        storage
+            .delivery_health()
+            .await
+            .unwrap()
+            .oldest_undelivered_secs(chrono::Utc::now()),
+        0,
+        "terminal rows (delivered/dead) never make the backlog look old"
+    );
+
+    // A still-retrying row DOES, and so does a newer pending one — but the
+    // gauge reports the OLDEST of them.
+    let failed = storage
+        .create_delivery("job", &Uuid::new_v4().to_string(), "u", "e", "{}")
+        .await
+        .unwrap();
+    storage
+        .fail_delivery(&failed, 1, Some("boom"), MAX_RETRIES, BACKOFF)
+        .await
+        .unwrap();
+    backdate_created(&pool, &failed, "2020-01-01T00:00:00.000000Z").await;
+    storage
+        .create_delivery("job", &Uuid::new_v4().to_string(), "u", "e", "{}")
+        .await
+        .unwrap();
+
+    let health = storage.delivery_health().await.unwrap();
+    let oldest = health
+        .oldest_undelivered
+        .expect("an undelivered row exists");
+    assert_eq!(
+        oldest.to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        "2020-01-01T00:00:00Z",
+        "the retrying row is older than the fresh pending one"
+    );
+    assert!(
+        health.oldest_undelivered_secs(chrono::Utc::now()) > 86_400,
+        "and the age is the real elapsed time, not a placeholder"
+    );
+}

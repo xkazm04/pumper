@@ -463,9 +463,36 @@ pub(crate) async fn trigger_runs(
 
 // ---- Webhook delivery log ----------------------------------------------------
 
+/// The delivery states that actually exist, in lifecycle order. The single
+/// source of truth for the `?status=` filter, its error message, and the docs.
+pub(crate) const DELIVERY_STATUSES: [&str; 4] = ["pending", "delivered", "failed", "dead"];
+
+/// Validates the `?status=` filter against [`DELIVERY_STATUSES`].
+///
+/// The anti-pattern this closes: the filter was passed straight through to a
+/// `WHERE status = ?` bind, so `?status=dead-letter` (or a typo, or the
+/// long-documented-but-wrong value) answered `200 {"count": 0}` — which reads
+/// as "you have no dead deliveries", the exact opposite of the truth, on the
+/// endpoint whose whole job is to tell you otherwise. An unknown status is a
+/// caller mistake and must say so.
+pub(crate) fn validate_delivery_status(status: Option<&str>) -> Result<Option<&str>, String> {
+    match status {
+        // An explicitly empty `?status=` means "no filter", matching how the
+        // other list routes treat an empty query value.
+        None | Some("") => Ok(None),
+        Some(s) if DELIVERY_STATUSES.contains(&s) => Ok(Some(s)),
+        Some(s) => Err(format!(
+            "unknown delivery status '{s}' (expected one of: {})",
+            DELIVERY_STATUSES.join(", ")
+        )),
+    }
+}
+
 #[derive(Deserialize, IntoParams)]
 pub(crate) struct DeliveriesQuery {
-    /// 'pending' | 'delivered' | 'failed' — `failed` is the dead-letter view.
+    /// `pending` (in flight) | `delivered` (accepted) | `failed` (**still
+    /// retrying** on the backoff ladder) | `dead` (the ladder gave up — this is
+    /// the dead-letter view). Anything else is a 400.
     status: Option<String>,
     #[serde(default = "default_limit")]
     limit: i64,
@@ -478,18 +505,20 @@ pub(crate) struct DeliveriesQuery {
     path = "/webhooks/deliveries",
     tag = "webhooks",
     params(DeliveriesQuery),
-    responses((status = 200, description = "Dual-mode: `{count, deliveries}`, or `{items, next_cursor}` when `cursor` is present. `?status=failed` is the dead-letter view."))
+    responses(
+        (status = 200, description = "Dual-mode: `{count, deliveries}`, or `{items, next_cursor}` when `cursor` is present. `?status=dead` is the dead-letter view (the retry ladder gave up); `?status=failed` is still-retrying, NOT the DLQ."),
+        (status = 400, description = "Unknown `status` (allowed: pending, delivered, failed, dead)", body = Object),
+    )
 )]
 pub(crate) async fn list_deliveries(
     State(state): State<AppState>,
     Query(query): Query<DeliveriesQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = query.limit.clamp(1, 500);
+    let status = validate_delivery_status(query.status.as_deref())
+        .map_err(|msg| ApiError(StatusCode::BAD_REQUEST, msg))?;
     let Some(cursor) = &query.cursor else {
-        let deliveries = state
-            .storage
-            .list_deliveries(query.status.as_deref(), limit)
-            .await?;
+        let deliveries = state.storage.list_deliveries(status, limit).await?;
         return Ok(Json(
             json!({ "count": deliveries.len(), "deliveries": deliveries }),
         ));
@@ -497,7 +526,7 @@ pub(crate) async fn list_deliveries(
     let after = parse_cursor(cursor);
     let items = state
         .storage
-        .list_deliveries_page(query.status.as_deref(), after, limit)
+        .list_deliveries_page(status, after, limit)
         .await?;
     let next_cursor = keyset_cursor(&items, limit, |d| {
         format!("{}|{}", pumper_core::datasets::ts(d.created_at), d.id)
@@ -610,4 +639,59 @@ pub(crate) async fn replay_delivery(
         StatusCode::ACCEPTED,
         Json(json!({ "id": id, "replaying": true })),
     ))
+}
+
+#[cfg(test)]
+mod delivery_status_tests {
+    use super::*;
+
+    /// The anti-pattern the validator exists for: an unknown `?status=` used to
+    /// bind straight into `WHERE status = ?`, so a typo — or the value the docs
+    /// wrongly named for months — answered `200 {"count": 0}`. "No rows" and
+    /// "you asked for a state that doesn't exist" are opposite answers on the
+    /// endpoint whose job is to surface undelivered webhooks.
+    #[test]
+    fn bogus_status_rejected_not_empty_list() {
+        for bad in ["dead-letter", "DEAD", "faild", "queued", "succeeded", "'"] {
+            let err = validate_delivery_status(Some(bad))
+                .expect_err("an unknown status must be a 400, not an empty 200");
+            assert!(err.contains(bad), "names what was rejected: {err}");
+            // The message has to carry the way out, not just the complaint.
+            for allowed in DELIVERY_STATUSES {
+                assert!(
+                    err.contains(allowed),
+                    "names the allowed value {allowed}: {err}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_real_state_passes_including_dead() {
+        for good in DELIVERY_STATUSES {
+            assert_eq!(validate_delivery_status(Some(good)), Ok(Some(good)));
+        }
+    }
+
+    /// Absent and explicitly-empty both mean "no filter" — an empty `?status=`
+    /// is what a form or a shell variable expansion sends, and turning that into
+    /// a 400 would break callers who mean "everything".
+    #[test]
+    fn absent_and_empty_mean_unfiltered() {
+        assert_eq!(validate_delivery_status(None), Ok(None));
+        assert_eq!(validate_delivery_status(Some("")), Ok(None));
+    }
+
+    /// The state set is the contract shared by the filter, the error message,
+    /// the OpenAPI description and docs/features/events-webhooks.md. Adding a
+    /// state without updating them is the drift this pins.
+    #[test]
+    fn the_documented_state_set_is_the_one_the_filter_enforces() {
+        assert_eq!(
+            DELIVERY_STATUSES,
+            ["pending", "delivered", "failed", "dead"],
+            "storage writes exactly these four (create_delivery / finish_delivery / \
+             fail_delivery / begin_delivery_retry)"
+        );
+    }
 }

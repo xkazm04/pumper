@@ -144,9 +144,137 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
         "pumper_schedules{{enabled=\"false\"}} {}\n",
         schedules.len() - enabled
     ));
+    out.push_str(&webhook_metrics(
+        &state.storage.delivery_health().await?,
+        chrono::Utc::now(),
+    ));
 
     *state.metrics_cache.lock().await = Some((std::time::Instant::now(), out.clone()));
     Ok(metrics_response(out))
+}
+
+/// Renders the webhook-delivery block of `/metrics` from one health snapshot.
+///
+/// Split out from [`metrics`] and pure (`now` is passed in) because this is the
+/// answer to "has everything been failing for six hours?", and until it existed
+/// the only way to ask was to hand-poll `GET /webhooks/deliveries` — with the
+/// docs naming the wrong status.
+///
+/// Gauges, not process counters: every number is DB-derived, so the retention
+/// janitor can lower `_total` series. The existing `pumper_job_failures_total`
+/// sets that precedent and states it in its HELP; these do the same rather than
+/// pretending to be monotonic.
+fn webhook_metrics(
+    health: &pumper_core::DeliveryHealth,
+    now: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "# HELP pumper_webhook_deliveries Webhook deliveries by status: pending = in flight, \
+         failed = still on the retry ladder, dead = dead-letter queue, delivered = accepted\n\
+         # TYPE pumper_webhook_deliveries gauge\n",
+    );
+    for (status, n) in [
+        ("pending", health.pending),
+        ("delivered", health.delivered),
+        ("failed", health.failed),
+        ("dead", health.dead),
+    ] {
+        out.push_str(&format!(
+            "pumper_webhook_deliveries{{status=\"{status}\"}} {n}\n"
+        ));
+    }
+    out.push_str(
+        "# HELP pumper_webhook_oldest_undelivered_seconds Age of the oldest delivery the \
+         receiver has not accepted (pending + failed; 0 when none). Excludes dead, which is \
+         terminal and would pin this gauge forever\n\
+         # TYPE pumper_webhook_oldest_undelivered_seconds gauge\n",
+    );
+    out.push_str(&format!(
+        "pumper_webhook_oldest_undelivered_seconds {}\n",
+        health.oldest_undelivered_secs(now)
+    ));
+    out.push_str(
+        "# HELP pumper_webhook_delivery_attempts_total Send attempts across the delivery log, \
+         retries included (DB-derived, so retention pruning can lower it)\n\
+         # TYPE pumper_webhook_delivery_attempts_total counter\n",
+    );
+    out.push_str(&format!(
+        "pumper_webhook_delivery_attempts_total {}\n",
+        health.attempts
+    ));
+    out.push_str(
+        "# HELP pumper_webhook_deliveries_succeeded_total Deliveries the receiver accepted — \
+         one per delivered row, its final attempt being the successful one (DB-derived)\n\
+         # TYPE pumper_webhook_deliveries_succeeded_total counter\n",
+    );
+    out.push_str(&format!(
+        "pumper_webhook_deliveries_succeeded_total {}\n",
+        health.delivered
+    ));
+    out
+}
+
+#[cfg(test)]
+mod webhook_metric_tests {
+    use super::*;
+    use pumper_core::DeliveryHealth;
+
+    fn at(secs: i64) -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::from_timestamp(secs, 0).expect("valid timestamp")
+    }
+
+    /// The anti-pattern: `/metrics` exported jobs, costs and schedules and NOT
+    /// one webhook series, so "every delivery has been failing for six hours"
+    /// was invisible to a dashboard. Every gauge an operator would alert on has
+    /// to be in the body.
+    #[test]
+    fn metrics_carry_every_delivery_status_not_just_a_total() {
+        let health = DeliveryHealth {
+            pending: 1,
+            delivered: 7,
+            failed: 2,
+            dead: 3,
+            attempts: 19,
+            oldest_undelivered: Some(at(1_000)),
+        };
+        let body = webhook_metrics(&health, at(21_600 + 1_000));
+        for expect in [
+            "pumper_webhook_deliveries{status=\"pending\"} 1",
+            "pumper_webhook_deliveries{status=\"delivered\"} 7",
+            "pumper_webhook_deliveries{status=\"failed\"} 2",
+            "pumper_webhook_deliveries{status=\"dead\"} 3",
+            "pumper_webhook_oldest_undelivered_seconds 21600",
+            "pumper_webhook_delivery_attempts_total 19",
+            "pumper_webhook_deliveries_succeeded_total 7",
+        ] {
+            assert!(body.contains(expect), "missing {expect:?} in:\n{body}");
+        }
+        // Every series is declared: an undeclared metric is a scrape warning.
+        assert_eq!(body.matches("# HELP ").count(), 4);
+        assert_eq!(body.matches("# TYPE ").count(), 4);
+    }
+
+    /// An empty backlog must read 0, never "unknown" or a stale age — a gauge
+    /// that keeps its last value once the queue clears is an alert that never
+    /// resolves.
+    #[test]
+    fn an_empty_backlog_reports_zero_age_not_a_stale_one() {
+        let body = webhook_metrics(&DeliveryHealth::default(), at(9_999));
+        assert!(body.contains("pumper_webhook_oldest_undelivered_seconds 0\n"));
+        assert!(body.contains("pumper_webhook_deliveries{status=\"dead\"} 0\n"));
+    }
+
+    /// Clock skew (a row stamped in the future) must not render a negative age,
+    /// which Prometheus would happily graph as a spike downward.
+    #[test]
+    fn future_stamped_row_reads_zero_not_negative() {
+        let health = DeliveryHealth {
+            oldest_undelivered: Some(at(5_000)),
+            ..Default::default()
+        };
+        assert_eq!(health.oldest_undelivered_secs(at(4_000)), 0);
+    }
 }
 
 // ---- Apps -----------------------------------------------------------------

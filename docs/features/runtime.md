@@ -88,6 +88,8 @@ Every join is an index seek on the job id — a receipt is a per-job audit view,
 
 `GET /metrics` (Prometheus text, cached ~5s): `pumper_jobs{status}` gauges, `pumper_job_failures_total{app}` (permanently-failed jobs per app — **DB-derived** from the current `failed` row count, so it resets/decreases if failed jobs are retried or purged rather than being a strictly monotonic process counter), `pumper_job_duration_seconds` + `pumper_job_queue_wait_seconds` summaries (`_sum`/`_count`/`_max`), `pumper_cost_usd{app,engine}`, `pumper_apps`, `pumper_schedules{enabled}`.
 
+Webhook delivery health, all four read in one aggregate pass so they describe the same instant, and all DB-derived like `pumper_job_failures_total` (the retention sweep can lower the `_total` series): `pumper_webhook_deliveries{status="pending|delivered|failed|dead"}`, `pumper_webhook_oldest_undelivered_seconds` (oldest `pending`+`failed` row; `0` when none, `dead` excluded so the gauge can clear — **the series to alert on**), `pumper_webhook_delivery_attempts_total`, `pumper_webhook_deliveries_succeeded_total`. See [events-webhooks.md § Metrics](events-webhooks.md#metrics).
+
 ## Known gaps
 
 - No auth on the HTTP API (deliberate local power mode; API-key auth is a parked product decision).
