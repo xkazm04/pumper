@@ -65,6 +65,19 @@ Each schedule carries three cron-maturity fields (`schedules` table cols `timezo
 - APIs: `GET /jobs/{id}/costs` (events, total, cost-per-fresh-record), `GET /costs?app=&since=` (app×engine rollup), `pumper_cost_usd{app,engine}` gauges on `/metrics`.
 - Research cache: identical `ResearchRequest`s within `claude.research_cache_ttl_secs` (default 24h, 0 disables) are served from disk at zero cost, logged as `cache_hit (saved ~$X)` events. `resume_session` requests bypass.
 
+## Record & replay (VCR)
+
+Two job params make a run reproducible. `record: true` persists every fetch and research call that goes through `AppContext` into `data/artifacts/<app>/<job_id>/cassette.ndjson`. `replay_of: "<job_id>"` re-runs the app serving those recorded responses instead: no network, no politeness delay, no tier learning, `$0` spend (each seam records a `vcr_replay` cost event at `0.0`), and a request that was never recorded is a typed **replay miss** — replay never silently falls through to a live fetch. The two are mutually exclusive (a replay's cassette *is* the record); a contradictory pair, or a `replay_of` whose cassette is missing, fails the job permanently before it runs.
+
+**Which attempt's recording survives.** A job can run more than once — retry, reaper re-queue, graceful-shutdown suspend — and all its attempts share one cassette path. The rule: *the cassette records the job's work, and work survives exactly when a durable checkpoint does.*
+
+- An attempt that starts **fresh** (no checkpoint restored) discards the earlier cassette before it runs. Otherwise a failed attempt's partial recording shadowed the successful attempt's complete one (entries load first-wins), and the replay reproduced the run that FAILED while reporting itself deterministic.
+- An attempt that **resumes** from a checkpoint appends, because it will not re-fetch what the earlier attempt recorded. The shutdown-suspend re-queue does not even burn an attempt: a suspended recording **resumes, it does not restart**.
+
+The whole-cassette size cap (128 MiB; 4 MiB per entry) is seeded from the file actually on disk, so it binds on real bytes across attempts rather than resetting each time. An over-cap entry is written as an identity-only marker carrying `recorded_truncated` — replaying it is an honest miss, never a silent gap. Recording is best-effort telemetry: a write failure warn-logs and never fails the job. Cassettes are exempt from artifact retention unless `[storage] artifact_retention_include_cassettes` is set.
+
+**Limits.** The seam is `AppContext::fetch` / `AppContext::research`, so an app that drives an engine raw cannot be recorded or replayed (the inventory of those is in `crates/core/tests/fetch_chokepoint.rs`). A browser render replays as its final response equivalent — the recorded post-render HTML — not by re-running JS or page actions.
+
 ## Job receipt
 
 `GET /jobs/{id}/receipt` — one read-only document answering "what did this job cost me and what did it actually change?", joining the surfaces that previously had to be joined by hand. Blocks: `job` (status, attempts, lineage, `wall_ms`), `stages` (the per-stage timings above), `cost` (total, calls, per-engine, the job's `budget_usd`), `yield` (what the result reported, per dataset), `changes` (what the revision log records, per app/dataset/change kind), `verdicts` (extraction-health verdicts *this run* produced, plus its in-memory contract verdicts), `artifacts` (file names + byte sizes read from `data/artifacts/<app>/<job_id>/`), `deliveries` (webhook deliveries keyed to this job) and `trigger_hops` (the jobs this run's outcome enqueued).

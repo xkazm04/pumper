@@ -16,6 +16,25 @@
 //! no politeness delay, and spend $0 (every metered seam records a
 //! `vcr_replay` cost event at 0.0).
 //!
+//! ## Attempts: one cassette, the attempt that actually did the work
+//!
+//! A job can run more than once (retry, reaper re-queue, shutdown suspend), and
+//! all its attempts share ONE cassette path. Which attempt's recording survives
+//! is decided by [`CassetteStart`], on one rule: **the cassette records the
+//! job's work, and work survives exactly when a durable checkpoint does.**
+//!
+//! - An attempt that starts fresh (no checkpoint restored) discards the earlier
+//!   cassette. Otherwise a failed attempt's *partial* recording shadows the
+//!   successful attempt's complete one (entries load first-wins), and the replay
+//!   reproduces the run that FAILED while claiming determinism.
+//! - An attempt that resumes from a checkpoint appends to it, because it will
+//!   not re-fetch what the earlier attempt already recorded. This is also the
+//!   shutdown-suspend path, which re-queues without even burning an attempt: a
+//!   suspended recording **resumes**, it does not restart.
+//!
+//! The total-size cap is seeded from the cassette actually on disk, so it binds
+//! on real bytes rather than resetting to zero on every attempt.
+//!
 //! ## Documented limitations
 //! - The seam is [`crate::AppContext::fetch`] / [`crate::AppContext::research`]
 //!   — the choke point every well-behaved app uses. Apps that drive engines
@@ -256,33 +275,135 @@ fn engine_tier(s: &str) -> Option<(&'static str, FetchTier)> {
 
 // ── Recording ───────────────────────────────────────────────────────────────
 
+/// What a new [`Recorder`] does with the cassette an EARLIER attempt of the
+/// same job left behind — the whole of the retry-poisoning fix.
+///
+/// The cassette records a job's **work**, and work survives a new attempt
+/// exactly when a durable checkpoint does. That is the rule, and it decides
+/// both cases:
+///
+/// - No checkpoint restored → the attempt re-does everything, so the earlier
+///   recording is dead work. Keeping it was the bug: append-mode plus
+///   first-recording-wins loading meant a failed attempt 1's *partial* entries
+///   shadowed attempt 2's complete ones, and the replay reproduced the failed
+///   run's data while claiming determinism.
+/// - A checkpoint restored (a retry that resumes, or a shutdown-suspend
+///   re-queue, which does not even burn an attempt) → the attempt deliberately
+///   SKIPS the work already done, so wiping its recordings would punch holes in
+///   the cassette for fetches the job really made. Keep and append.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CassetteStart {
+    /// Discard any earlier cassette for this job and start empty.
+    Fresh,
+    /// Keep the earlier cassette and append, seeding the size cap from the
+    /// bytes already on disk.
+    Resume,
+}
+
 /// Appends cassette entries to a job's `artifacts_dir/cassette.ndjson`,
 /// enforcing the per-entry and total size caps. Best-effort: failures warn-log
 /// and never fail the job (recording is telemetry; the job's real work is not).
+///
+/// One recorder is built per **attempt**, and [`CassetteStart`] decides what it
+/// inherits from the previous one.
 pub struct Recorder {
     dir: PathBuf,
     entry_cap: usize,
     total_cap: usize,
-    written: tokio::sync::Mutex<usize>,
+    start: CassetteStart,
+    /// Bytes in this job's cassette. `None` until the [`CassetteStart`] policy
+    /// has been applied — that lazy init is what makes the cap bind on the
+    /// file's REAL size instead of a fresh in-memory zero on every attempt.
+    written: tokio::sync::Mutex<Option<u64>>,
 }
 
 impl Recorder {
+    /// A recorder for a fresh attempt: any cassette an earlier attempt left is
+    /// discarded (see [`CassetteStart`]).
     pub fn new(artifacts_dir: PathBuf) -> Self {
         Self::with_caps(artifacts_dir, ENTRY_CAP_BYTES, TOTAL_CAP_BYTES)
     }
 
+    /// A recorder for an attempt that RESUMED from a durable checkpoint: the
+    /// earlier attempt's entries are kept and appended to, because the resumed
+    /// run will not re-fetch what they recorded.
+    pub fn resuming(artifacts_dir: PathBuf) -> Self {
+        Self::with_caps_starting(
+            artifacts_dir,
+            ENTRY_CAP_BYTES,
+            TOTAL_CAP_BYTES,
+            CassetteStart::Resume,
+        )
+    }
+
     /// Caps override — tests exercise the truncation paths with tiny caps.
     pub fn with_caps(artifacts_dir: PathBuf, entry_cap: usize, total_cap: usize) -> Self {
+        Self::with_caps_starting(artifacts_dir, entry_cap, total_cap, CassetteStart::Fresh)
+    }
+
+    /// Caps + start policy — the full constructor the presets above cover.
+    pub fn with_caps_starting(
+        artifacts_dir: PathBuf,
+        entry_cap: usize,
+        total_cap: usize,
+        start: CassetteStart,
+    ) -> Self {
         Self {
             dir: artifacts_dir,
             entry_cap: entry_cap.max(1),
             total_cap: total_cap.max(1),
-            written: tokio::sync::Mutex::new(0),
+            start,
+            written: tokio::sync::Mutex::new(None),
         }
     }
 
     pub fn cassette_path(&self) -> PathBuf {
         self.dir.join(CASSETTE_FILE)
+    }
+
+    /// Applies the [`CassetteStart`] policy now, before the run makes its first
+    /// fetch. [`record`](Self::record) applies it lazily anyway (so a recorder
+    /// used without this call is still correct — the guarantee must not depend
+    /// on a caller remembering), but a run that ends up fetching NOTHING would
+    /// then leave the previous attempt's cassette in place and let a replay
+    /// reproduce a run this attempt never made. Call it once at attempt start.
+    pub async fn prepare(&self) {
+        let mut written = self.written.lock().await;
+        self.ensure_started(&mut written).await;
+    }
+
+    /// The one place the start policy is applied. Idempotent: once `written` is
+    /// `Some`, this attempt's cassette is already in the state it asked for.
+    async fn ensure_started(&self, written: &mut Option<u64>) {
+        if written.is_some() {
+            return;
+        }
+        let path = self.cassette_path();
+        let bytes = match self.start {
+            CassetteStart::Fresh => {
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => tracing::debug!(
+                        "vcr: discarded a previous attempt's cassette at {}",
+                        path.display()
+                    ),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    // Fail open, like every other recording failure: an
+                    // undeletable cassette must not fail the job. The append
+                    // below then adds to it, which is the OLD behaviour — worse
+                    // than a clean start, but never worse than losing the run.
+                    Err(e) => tracing::warn!(
+                        "vcr: could not clear the previous attempt's cassette at {}: {e}",
+                        path.display()
+                    ),
+                }
+                0
+            }
+            // The cap must bind on what is actually on disk. Seeding from a
+            // fresh zero was how the 128 MiB total cap was defeated across
+            // attempts: each attempt believed it had the whole budget again.
+            CassetteStart::Resume => tokio::fs::metadata(&path).await.map_or(0, |m| m.len()),
+        };
+        *written = Some(bytes);
     }
 
     /// Appends one entry, applying the caps. An over-cap entry (or any entry
@@ -299,7 +420,9 @@ impl Recorder {
             }
         };
         let mut written = self.written.lock().await;
-        if line.len() > self.entry_cap || *written + line.len() > self.total_cap {
+        self.ensure_started(&mut written).await;
+        let so_far = written.unwrap_or(0);
+        if line.len() > self.entry_cap || so_far + line.len() as u64 > self.total_cap as u64 {
             entry.body = None;
             entry.recorded_truncated = true;
             line = match serde_json::to_string(&entry) {
@@ -315,7 +438,7 @@ impl Recorder {
             tracing::warn!("vcr: cassette write failed: {e}");
             return;
         }
-        *written += line.len();
+        *written = Some(so_far + line.len() as u64);
     }
 
     async fn append(&self, line: &str) -> std::io::Result<()> {

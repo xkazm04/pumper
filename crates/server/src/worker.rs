@@ -426,7 +426,9 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         .artifacts_dir
         .join(&job.app)
         .join(job.id.to_string());
-    let vcr = if let Some(replay_id) = replay_of {
+    // Replay is resolved first and on its own, because its failure mode is a
+    // pre-run refusal (`return`) — nothing below may have run yet.
+    let replay_vcr = if let Some(replay_id) = replay_of {
         // Cassettes live beside the recorded job's other artifacts, under the
         // SAME app (a job can only replay a run of its own app — the fetches
         // it makes are the ones that app's code makes).
@@ -443,7 +445,7 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                     entries = cassette.len(),
                     "vcr replay: serving fetches from recorded cassette ($0, no network)"
                 );
-                pumper_core::Vcr::Replay(Arc::new(cassette))
+                Some(pumper_core::Vcr::Replay(Arc::new(cassette)))
             }
             Err(e) => {
                 warn!(job = %job.id, replay_of = %replay_id, "vcr replay unavailable: {e}");
@@ -455,11 +457,47 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                 return;
             }
         }
-    } else if vcr_record {
-        info!(job = %job.id, "vcr record: persisting fetches to this job's cassette");
-        pumper_core::Vcr::Record(Arc::new(pumper_core::Recorder::new(artifacts_dir.clone())))
     } else {
-        pumper_core::Vcr::Off
+        None
+    };
+
+    // Durable execution: hand this attempt the last persisted checkpoint (if
+    // any), with the poisoned-blob escape — a checkpoint whose every restored
+    // attempt has failed is discarded so the job can start fresh instead of
+    // dying to the same state `max_resume_failures` more times.
+    //
+    // Below every pre-run refusal above, because it BUMPS the resume counter: a
+    // job that never runs must not spend one of its restore attempts.
+    let restored = load_restore(&state, &job).await;
+
+    let vcr = match replay_vcr {
+        Some(replay) => replay,
+        // A retry must not inherit the failed attempt's half-written cassette:
+        // entries load first-wins, so attempt 1's partial recording would
+        // shadow attempt 2's complete one and the replay would reproduce the
+        // run that FAILED. A *resumed* attempt is the opposite case — it skips
+        // the work already recorded, so its cassette is appended to, not wiped.
+        // Restoring a checkpoint is exactly what tells the two apart, which is
+        // why this sits below `load_restore`.
+        None if vcr_record => {
+            let resuming = restored.is_some();
+            info!(
+                job = %job.id,
+                resuming,
+                "vcr record: persisting fetches to this job's cassette"
+            );
+            let recorder = if resuming {
+                pumper_core::Recorder::resuming(artifacts_dir.clone())
+            } else {
+                pumper_core::Recorder::new(artifacts_dir.clone())
+            };
+            // Apply the start policy NOW, so an attempt that ends up fetching
+            // nothing still cannot leave a previous attempt's cassette standing
+            // in for a run it never made.
+            recorder.prepare().await;
+            pumper_core::Vcr::Record(Arc::new(recorder))
+        }
+        None => pumper_core::Vcr::Off,
     };
 
     info!(job = %job.id, app = %job.app, attempt = job.attempts, "job started");
@@ -475,11 +513,6 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             0.0
         }
     };
-    // Durable execution: hand this attempt the last persisted checkpoint (if
-    // any), with the poisoned-blob escape — a checkpoint whose every restored
-    // attempt has failed is discarded so the job can start fresh instead of
-    // dying to the same state `max_resume_failures` more times.
-    let restored = load_restore(&state, &job).await;
     let ctx = AppContext {
         job_id: job.id,
         app: job.app.clone(),
