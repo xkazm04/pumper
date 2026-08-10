@@ -47,6 +47,21 @@ export interface PumperRevision<T = unknown> {
    *  `PumperRecord.trust`, and because `/changes?trust=` filters on exactly
    *  this value server-side. */
   trust: string;
+  /** Derivation stamp of the write that produced this revision. Every field is
+   *  honest-Null: `null` means UNKNOWN, never a fabricated value. The server
+   *  flattens these onto the revision and never omits them, so all four keys
+   *  are always present on the wire.
+   *
+   *  Pinned here because a real consumer reads them: pumper's own `peer` app
+   *  (`crates/apps/peer`, `mirror_provenance`) mirrors a feed by carrying the
+   *  ORIGIN's `source_url`/`rules_hash` through verbatim and deliberately
+   *  dropping `artifact_sha` — the sha means "archived body on disk", which a
+   *  mirror does not hold. A rename on either side silently breaks every
+   *  mirror's provenance, which is why these are typed rather than ignored. */
+  job_id: string | null;
+  source_url: string | null;
+  artifact_sha: string | null;
+  rules_hash: string | null;
 }
 
 /** A keyset page of the change feed (cursor-mode response shape). */

@@ -116,6 +116,10 @@
       "sourceGlobs": ["crates/server/src/datahub.rs"]
     },
     {
+      "doc": "docs/features/peering.md",
+      "sourceGlobs": ["crates/apps/peer/**"]
+    },
+    {
       "doc": "docs/features/sdk-typescript.md",
       "sourceGlobs": ["clients/typescript/src/**"]
     }

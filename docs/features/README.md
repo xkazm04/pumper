@@ -21,6 +21,7 @@ These documents describe the **implemented** product surface of pumper — a loc
 | Data-source catalog | [catalog.md](catalog.md) | `catalog/`, `crates/core/src/catalog.rs` |
 | DataHub metadata emitter | [datahub.md](datahub.md) | `crates/server/src/datahub.rs` |
 | TypeScript consumer SDK (`@pumper/sync`) | [sdk-typescript.md](sdk-typescript.md) | `clients/typescript/` |
+| Dataset peering (mirror another node) | [peering.md](peering.md) | `crates/apps/peer/`, consuming `crates/server/src/routes/datasets.rs` § changes feed |
 | App fleet & domain datasets | [apps.md](apps.md) | `crates/apps/*` |
 
 ## Operations

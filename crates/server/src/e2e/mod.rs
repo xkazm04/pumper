@@ -22,6 +22,7 @@ mod job_receipt;
 mod mcp;
 mod mcp_live;
 mod panic_containment;
+mod peer_mirror;
 mod provisioner_lifecycle;
 mod router;
 mod scheduler_overlap;

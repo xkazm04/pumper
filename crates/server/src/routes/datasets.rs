@@ -1065,7 +1065,16 @@ mod sdk_fixture_conformance_tests {
             diff: Some(serde_json::json!({"$.x": {"from": 0, "to": 1}})),
             created_at: now,
             trust: "stable".into(),
-            provenance: Provenance::default(),
+            // A FULLY populated stamp, because `Provenance` is `#[serde(flatten)]`
+            // with no `skip_serializing_if`: every field is emitted (as `null`
+            // when unknown), so the four provenance keys are part of the wire
+            // shape whether or not a producer knows them.
+            provenance: Provenance {
+                job_id: Some("job-uuid".into()),
+                source_url: Some("https://origin.example/x".into()),
+                artifact_sha: Some("sha".into()),
+                rules_hash: Some("rules".into()),
+            },
         };
         let removed = Revision {
             change: "removed".into(),
@@ -1088,5 +1097,58 @@ mod sdk_fixture_conformance_tests {
         // a tombstone.
         assert_eq!(fixture_removed["data"], Value::Null);
         assert_ne!(fixture_changed["data"], Value::Null);
+    }
+
+    /// The four provenance fields, pinned by NAME on both wire shapes.
+    ///
+    /// **Consumer: `app_peer::mirror_provenance`.** The `peer` app reads
+    /// `source_url`, `rules_hash` and `artifact_sha` straight off these feed
+    /// items to stamp each mirrored record (carrying the origin's derivation
+    /// through, and deliberately dropping the sha). A rename or removal on the
+    /// wire silently breaks every mirror's provenance — mirrored records would
+    /// go back to claiming unknown origins — and until these fields were in the
+    /// fixture, nothing failed: `assert_covers` is one-way (fixture ⊆ actual),
+    /// so fields the fixture omitted were unpinned in BOTH directions. Do not
+    /// prune them as unused.
+    #[test]
+    fn provenance_fields_are_pinned_on_the_wire_for_the_peer_app() {
+        let fixture: Value = serde_json::from_str(REVISION_PAGE_FIXTURE).unwrap();
+        let items = fixture["items"].as_array().unwrap();
+        const PROVENANCE: [&str; 4] = ["job_id", "source_url", "artifact_sha", "rules_hash"];
+
+        for item in items {
+            for field in PROVENANCE {
+                assert!(
+                    item.get(field).is_some(),
+                    "revision fixture is missing '{field}': the peer app's \
+                     mirror_provenance reads it off exactly this shape"
+                );
+            }
+        }
+
+        // `Provenance` is flattened with no `skip_serializing_if`, so a revision
+        // that knows nothing still emits all four as `null` — "unknown", never
+        // absent. One fixture item must model each side of that.
+        let known = items
+            .iter()
+            .find(|r| r["change"] == "changed")
+            .expect("a data-carrying revision");
+        assert_eq!(
+            known["artifact_sha"].as_str().map(str::len),
+            Some(64),
+            "one item must carry a real artifact_sha — the field the mirror \
+             deliberately does NOT copy, so its presence upstream is load-bearing"
+        );
+        assert!(known["source_url"].is_string() && known["rules_hash"].is_string());
+        let unknown = items
+            .iter()
+            .find(|r| r["change"] == "removed")
+            .expect("a tombstone revision");
+        assert_eq!(
+            unknown["source_url"],
+            Value::Null,
+            "and one must model honest-Null provenance, which the mirror keeps as \
+             unknown rather than inventing the feed URL"
+        );
     }
 }

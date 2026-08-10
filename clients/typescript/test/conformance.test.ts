@@ -64,6 +64,28 @@ test("revision fixture covers both a data-carrying and a removed (data: null) re
   assert.equal(typeof page.next_cursor, "string", "opaque cursor token, not parsed by the SDK");
 });
 
+test("revision fixture carries the four provenance fields the peer app mirrors", () => {
+  // Consumer: pumper's own `peer` app (`crates/apps/peer`, `mirror_provenance`)
+  // reads source_url/rules_hash/artifact_sha straight off these feed items to
+  // stamp mirrored records. Until these fields were in the fixture they were
+  // unpinned on BOTH sides — the Rust half asserts fixture ⊆ actual, so a field
+  // the fixture omitted could be renamed server-side with every test green, and
+  // every mirror would silently lose the origin's provenance. Do not prune.
+  const page = revisionPage();
+  const [changed, removed] = page.items as [PumperRevision, PumperRevision];
+  for (const field of ["job_id", "source_url", "artifact_sha", "rules_hash"]) {
+    assert.ok(field in changed, `revision fixture missing provenance field '${field}'`);
+    assert.ok(field in removed, `tombstone revision missing provenance field '${field}'`);
+  }
+  // The server flattens Provenance with no skip-if-none, so an unknown field is
+  // present-and-null, never absent. Both shapes must be modelled.
+  assert.equal(typeof changed.source_url, "string");
+  assert.equal(typeof changed.rules_hash, "string");
+  assert.equal(typeof changed.artifact_sha, "string", "one item carries a real archived-body sha");
+  assert.equal(removed.source_url, null, "and one models honest-Null (unknown) provenance");
+  assert.equal(removed.artifact_sha, null);
+});
+
 // ---- Client wire contract: query params sent per route ---------------------
 
 function fakeFetch(body: string, contentType: string): typeof fetch {
