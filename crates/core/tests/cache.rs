@@ -27,6 +27,7 @@ async fn put_honors_explicit_ttl() {
         &CacheConfig {
             enabled: true,
             ttl_secs: 3600,
+            ..CacheConfig::default()
         },
     );
 
@@ -90,6 +91,7 @@ async fn get_stale_exposes_validators_and_refresh_revives() {
         &CacheConfig {
             enabled: true,
             ttl_secs: 3600,
+            ..CacheConfig::default()
         },
     );
 

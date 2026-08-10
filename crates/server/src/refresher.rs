@@ -64,10 +64,11 @@ pub fn tick(state: &AppState) {
 
 async fn run_pass(state: &AppState) -> anyhow::Result<()> {
     let cfg = &state.config.refresher;
-    // Bound the append-only observation log while we're here (indexed delete).
-    if let Err(e) = state.cache.prune_revalidations(cfg.retention_days).await {
-        warn!("cache refresher: revalidation prune failed: {e}");
-    }
+    // The revalidation log is bounded by the always-on store janitor
+    // (`main::store_janitor`, `[refresher] retention_days`), NOT here: the
+    // demand path appends to it whether or not this pass ever runs, so pruning
+    // from inside the pass left the log unbounded on the shipping default
+    // (`enabled = false`) and re-pruned it every scheduler tick when it was on.
 
     let now = Utc::now();
     let horizon = cfg.horizon_secs as f64;

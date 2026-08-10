@@ -59,8 +59,15 @@ pub struct RefresherConfig {
     pub global_per_tick: usize,
     /// Max background revalidations per host per tick.
     pub per_host_per_tick: usize,
-    /// Revalidation-log retention (days); older observations are pruned by the
-    /// tick so the append-only log stays bounded.
+    /// Revalidation-log retention (days); older observations are pruned so the
+    /// append-only `revalidations` log stays bounded.
+    ///
+    /// Applied by the **always-on hourly store janitor**, not by the refresher
+    /// pass — the demand path (a `304` on an expired entry) appends to this log
+    /// whether or not the refresher runs, so gating its only pruner behind
+    /// `enabled = false` left the log growing forever on the shipping default.
+    /// The key stays here because this log exists for the refresher's freshness
+    /// model.
     pub retention_days: u32,
 }
 
@@ -1349,6 +1356,22 @@ pub struct CacheConfig {
     pub enabled: bool,
     /// Default time-to-live for cached responses.
     pub ttl_secs: u64,
+    /// Hard ceiling on stored `http_cache` entries; the hourly janitor evicts
+    /// the oldest-confirmed rows past it. `0` = unbounded (the old behaviour).
+    ///
+    /// A ceiling is needed because expiry alone never bounded this table: a
+    /// `304` revalidation pushes `expires_at` (and `created_at`) forward, so an
+    /// entry the refresher — or a `watch`-style poller — keeps confirming never
+    /// expires and never gets purged.
+    ///
+    /// Default 20 000. The arithmetic behind that number: one row holds a whole
+    /// response body, real HTML/JSON pages land around 50–100 KB, so the
+    /// steady-state ceiling is roughly 1–2 GB of `pumper.db` — generous for a
+    /// local-first service that normally holds far less (with the default 1h
+    /// TTL, only live entries survive the hourly purge), and finite enough that
+    /// an unattended box cannot fill a disk. A cache of huge bodies (`[http]
+    /// max_body_bytes` allows 16 MiB) should lower it.
+    pub max_rows: u64,
 }
 
 impl Default for CacheConfig {
@@ -1356,6 +1379,7 @@ impl Default for CacheConfig {
         Self {
             enabled: true,
             ttl_secs: 3600,
+            max_rows: 20_000,
         }
     }
 }

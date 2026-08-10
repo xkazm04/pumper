@@ -68,6 +68,22 @@ profiles_dir = "data/profiles"
 [cache]
 enabled = true
 ttl_secs = 3600
+# Hard ceiling on stored entries; the always-on hourly janitor evicts the
+# OLDEST-CONFIRMED rows past it (age is `created_at`, which a 304 revalidation
+# moves forward — so what the refresher keeps confirming is what the janitor
+# keeps). 0 = unbounded.
+#
+# Why a ceiling at all: expiry alone never bounded this table, because a
+# continuously-revalidated entry keeps pushing its own expires_at out and so is
+# never "expired" for the purge to find.
+#
+# Why 20 000: one row holds a whole response body, and real HTML/JSON pages land
+# around 50-100 KB, so the ceiling is roughly 1-2 GB of pumper.db — generous for
+# a local-first service (with the default 1h TTL only live entries normally
+# survive the hourly purge anyway) and finite enough that an unattended box
+# cannot fill a disk. Lower it if you cache large bodies ([http] max_body_bytes
+# allows up to 16 MiB each).
+max_rows = 20000
 
 # Background cache refresher (M02 self-refreshing mirror) — piggybacks on the
 # scheduler tick to conditionally revalidate cached entries just before their
@@ -80,7 +96,10 @@ enabled = false
 # horizon_secs = 300        # revalidate keys whose predicted change is within this window
 # global_per_tick = 10      # max background revalidations per scheduler tick
 # per_host_per_tick = 2     # max per host per tick
-# retention_days = 30       # revalidation-log retention
+# retention_days = 30       # `revalidations` log retention. Applied by the ALWAYS-ON hourly
+#                           # store janitor, not by the refresher pass: the demand path appends
+#                           # to this log on every conditional GET whether or not the refresher
+#                           # runs, so the knob takes effect even with enabled = false.
 
 # Tier-zero archive engine (Wayback Machine CDX, v1). When enabled AND a fetch
 # sets `archive_max_age` (seconds), the tiered fetcher tries a stored

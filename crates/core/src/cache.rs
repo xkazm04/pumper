@@ -22,10 +22,17 @@ pub struct StaleEntry {
     pub last_modified: Option<String>,
 }
 
+/// Rows one [`HttpCache::evict_over_cap`] pass may delete. The janitor shares
+/// its pool with live fetches, so a cache that is wildly over its cap converges
+/// over a few hourly passes instead of holding one enormous write transaction.
+const EVICT_MAX_PER_PASS: i64 = 5_000;
+
 pub struct HttpCache {
     pool: SqlitePool,
     enabled: bool,
     default_ttl: Duration,
+    /// `[cache] max_rows`: hard ceiling on stored entries (`0` = unbounded).
+    max_rows: u64,
 }
 
 impl HttpCache {
@@ -34,7 +41,15 @@ impl HttpCache {
             pool,
             enabled: cfg.enabled,
             default_ttl: Duration::from_secs(cfg.ttl_secs),
+            max_rows: cfg.max_rows,
         }
+    }
+
+    /// The configured row ceiling (`0` = unbounded) — the janitor reads it here
+    /// rather than re-deriving it from config, so the store and its bound can
+    /// never disagree.
+    pub fn max_rows(&self) -> u64 {
+        self.max_rows
     }
 
     pub fn enabled(&self) -> bool {
@@ -295,6 +310,44 @@ impl HttpCache {
             .await?;
         Ok(result.rows_affected())
     }
+
+    /// Enforces the `[cache] max_rows` ceiling, evicting **oldest-confirmed
+    /// first**. Returns rows removed; `0` rows for an unbounded (`max_rows = 0`)
+    /// or under-cap store.
+    ///
+    /// The anti-pattern this exists to defend
+    /// (`http_cache_row_cap_evicts_oldest_not_freshest`): expiry was the only
+    /// bound this table had, and [`refresh`](Self::refresh) pushes `expires_at`
+    /// out on every 304 — so a continuously-revalidated entry never expired and
+    /// `pumper.db` grew monotonically on an unattended box.
+    ///
+    /// Age is measured on `created_at`, which `refresh` also moves forward, so
+    /// eviction picks the entries whose bodies were confirmed *least recently*
+    /// — the refresher keeps what it works on alive rather than fighting the
+    /// janitor for it. Bounded at [`EVICT_MAX_PER_PASS`] deletions per call
+    /// (the count is served from the `expires_at` index; the eviction itself is
+    /// a `LIMIT`ed subselect, never a whole-table rewrite).
+    pub async fn evict_over_cap(&self) -> Result<u64> {
+        if self.max_rows == 0 {
+            return Ok(0);
+        }
+        let max_rows = self.max_rows.min(i64::MAX as u64) as i64;
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM http_cache")
+            .fetch_one(&self.pool)
+            .await?;
+        let over = rows - max_rows;
+        if over <= 0 {
+            return Ok(0);
+        }
+        let result = sqlx::query(
+            "DELETE FROM http_cache WHERE key IN ( \
+               SELECT key FROM http_cache ORDER BY created_at ASC, key ASC LIMIT ?1)",
+        )
+        .bind(over.min(EVICT_MAX_PER_PASS))
+        .execute(&self.pool)
+        .await?;
+        Ok(result.rows_affected())
+    }
 }
 
 fn ts(dt: DateTime<Utc>) -> String {
@@ -494,6 +547,21 @@ impl ResearchCache {
         .execute(&self.pool)
         .await?;
         Ok(())
+    }
+
+    /// Deletes entries past their TTL; returns the number removed.
+    ///
+    /// Research answers are the most expensive bytes in the store (they cost
+    /// real money to produce) and were also the only cache with **no purge path
+    /// at all** — an expired row was unreadable via [`get`](Self::get) yet kept
+    /// its full text and JSON on disk forever. Same shape and same janitor
+    /// cadence as `HttpCache::purge_expired`, and indexed on `expires_at`.
+    pub async fn purge_expired(&self) -> Result<u64> {
+        let result = sqlx::query("DELETE FROM research_cache WHERE expires_at <= ?1")
+            .bind(ts(Utc::now()))
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected())
     }
 }
 

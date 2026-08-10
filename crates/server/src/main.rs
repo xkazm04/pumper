@@ -283,8 +283,22 @@ fn load_dotenv() {
 ///   zeroes a host's strikes but left the row behind forever, so this table grew
 ///   by one permanent row per host ever fetched. A row that still says
 ///   *anything* is never touched (see `TierMemory::prune_stale`).
+/// - **Expired `research_cache` entries** — the most expensive bytes in the
+///   store, and previously the only cache with no purge path at all.
+/// - **The `revalidations` log** past `[refresher] retention_days`. The demand
+///   path appends to it on every conditional GET, but its only pruner used to
+///   live inside the refresher pass — unreachable at the shipping
+///   `[refresher] enabled = false`.
+/// - **`http_cache` rows past `[cache] max_rows`**, oldest-confirmed first. A
+///   continuously-revalidated entry keeps pushing its own `expires_at` out, so
+///   expiry alone never bounded this table.
+///
+/// Every pass is bounded work: three indexed deletes plus one `LIMIT`ed
+/// eviction. Nothing here is data an operator would miss, which is what lets it
+/// run without an opt-in.
 async fn store_janitor(state: AppState) {
     let interval = std::time::Duration::from_secs(3600);
+    let revalidation_days = state.config.refresher.retention_days;
     loop {
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
@@ -294,6 +308,31 @@ async fn store_janitor(state: AppState) {
             Ok(n) if n > 0 => tracing::info!(purged = n, "store janitor evicted expired entries"),
             Ok(_) => {}
             Err(e) => tracing::warn!("cache purge failed: {e}"),
+        }
+        match state.research_cache.purge_expired().await {
+            Ok(n) if n > 0 => {
+                tracing::info!(purged = n, "store janitor evicted expired research answers")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("research cache purge failed: {e}"),
+        }
+        match state.cache.prune_revalidations(revalidation_days).await {
+            Ok(n) if n > 0 => tracing::info!(
+                pruned = n,
+                days = revalidation_days,
+                "store janitor pruned the revalidation log"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("revalidation prune failed: {e}"),
+        }
+        match state.cache.evict_over_cap().await {
+            Ok(n) if n > 0 => tracing::info!(
+                evicted = n,
+                max_rows = state.cache.max_rows(),
+                "store janitor evicted over-cap cache entries"
+            ),
+            Ok(_) => {}
+            Err(e) => tracing::warn!("cache cap eviction failed: {e}"),
         }
         match state.tiers.prune_stale().await {
             Ok(n) if n > 0 => {

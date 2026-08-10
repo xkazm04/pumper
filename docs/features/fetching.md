@@ -39,6 +39,21 @@ Optional fields (`http_status`, `content_chars`, `cache_hit`, `cost_usd`, `detai
 - **http** (`engine-http`): reqwest + cookie jar, retries w/ backoff, fronted by the content-addressed TTL `http_cache` (GET-only; `HttpRequest.no_cache` bypasses) and the governor. **Conditional GET:** `HttpRequest.etag` / `HttpRequest.if_modified_since` (serde-defaulted) are sent as `If-None-Match` / `If-Modified-Since` (explicit `headers` still win); a `304 Not Modified` is passed through with its status intact and is **never** written to the cache over the prior full response (powers the crawler's revisit mode — [crawling.md](crawling.md)).
 - **Cache revalidation.** When a cacheable GET misses because its entry **expired** (but the caller isn't running its own conditional GET), the engine reads the stale entry's stored `ETag` / `Last-Modified` and re-sends as a conditional GET instead of re-downloading the whole body. A `304` **refreshes** the entry's TTL in place (no body rewrite; `created_at` moves forward so the `max_age` read-staleness cap still measures from the last confirmed fetch) and serves the stored body as a `cache_hit`; a `200` stores and returns the changed body. This turns the `watch`/poll workload's common "unchanged page past its TTL" case from a full body transfer + parse into a few-hundred-byte round trip. The caller-owns-the-validator path (crawler revisit) is untouched — it still gets the raw `304`.
 
+#### Cache growth bounds (always-on janitor)
+
+An hourly janitor (`main::store_janitor`) bounds the caches with **no opt-in** — unlike `[storage]` retention, which deletes accrued value and therefore ships off. Nothing it removes is data an operator would miss:
+
+| store | bound | key |
+| --- | --- | --- |
+| `http_cache` | expired entries, **plus** the oldest-confirmed rows past a row ceiling | `[cache] ttl_secs`, `[cache] max_rows` (default 20 000; `0` = unbounded) |
+| `research_cache` | expired entries | `[claude] research_cache_ttl_secs` |
+| `revalidations` | observations older than the retention window | `[refresher] retention_days` (default 30) |
+| `tier_memory` | rows with no pin/strikes/penalty past the TTL | `[fetcher] host_memory_ttl_secs` |
+
+Why each existed unbounded: a **continuously-revalidated** `http_cache` entry keeps pushing its own `expires_at` (and `created_at`) forward, so expiry alone never reclaimed it — the row cap is the backstop, and because it measures age on `created_at` it evicts what has been confirmed *least* recently, so it does not fight the refresher for the entries the refresher is keeping warm. `research_cache` had **no purge path at all** (an expired answer was unreadable yet still on disk). The `revalidations` log is appended by the *demand* path on every conditional GET, but its only pruner used to sit inside the refresher pass — unreachable at the shipping `[refresher] enabled = false`, which is why that knob is now applied by the janitor regardless of `enabled`.
+
+Each pass is bounded work: indexed deletes plus one `LIMIT`ed eviction (≤5 000 rows per pass, so a wildly over-cap store converges over a few passes instead of holding one enormous write transaction).
+
 #### HTTP request controls (body cap, timeout, retry policy)
 
 - **Body size cap.** The response body is read in streamed chunks and aborted the instant the cumulative size would exceed the cap — one huge/hostile URL can't balloon memory. Over-limit yields a typed `Error::Http` naming the cap and URL. Cap = `HttpRequest.max_body_bytes` (per-request `Option<u64>`) else `[http] max_body_bytes` (default **16 MiB** — comfortably above the largest real pages we fetch, e.g. SEDIA clean-text / census blobs in the low single-digit MiB).
