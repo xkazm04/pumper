@@ -79,7 +79,8 @@ impl ScrapeApp for StateTax {
             })),
             examples: vec![
                 ManifestExample {
-                    description: "Compile a tax year (free no-op when that vintage is already held)",
+                    description:
+                        "Compile a tax year (free no-op when that vintage is already held)",
                     params: json!({ "year": DEFAULT_YEAR }),
                 },
                 ManifestExample {

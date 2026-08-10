@@ -254,8 +254,7 @@ impl ScrapeApp for StateLicensing {
             // + structured-output schema + model/effort) before the metered call,
             // so a stored bond/fee figure stays explainable once the live prompt
             // moves on. Per trade, because the prompt is per trade.
-            let prov =
-                trades_common::research_provenance(&ctx, "state-licensing", &request).await;
+            let prov = trades_common::research_provenance(&ctx, "state-licensing", &request).await;
 
             // Per-trade artifact name so five calls don't overwrite one file.
             let artifact = format!("research-{}.json", artifact_slug(label));
@@ -470,7 +469,12 @@ fn parse_trade_records(
         let bond = validate::num(s, "bond_amount_usd");
         let insurance = validate::num(s, "insurance_min_liability_usd");
         validate::require_nonnegative(&mut reasons, "license_cost_usd", license_cost);
-        validate::require_at_most(&mut reasons, "license_cost_usd", license_cost, MAX_LICENSE_COST_USD);
+        validate::require_at_most(
+            &mut reasons,
+            "license_cost_usd",
+            license_cost,
+            MAX_LICENSE_COST_USD,
+        );
         validate::require_nonnegative(&mut reasons, "bond_amount_usd", bond);
         validate::require_at_most(&mut reasons, "bond_amount_usd", bond, MAX_BOND_USD);
         validate::require_nonnegative(&mut reasons, "insurance_min_liability_usd", insurance);
@@ -495,10 +499,18 @@ fn parse_trade_records(
         // Honest grain marker: every figure here is state-level; county/city
         // texture only ever appears as local_variation + notes.
         rec["grain"] = json!("state");
-        if rec.get("local_variation").and_then(Value::as_bool).is_none() {
+        if rec
+            .get("local_variation")
+            .and_then(Value::as_bool)
+            .is_none()
+        {
             rec["local_variation"] = Value::Null;
         }
-        if rec.get("workers_comp_required").and_then(Value::as_bool).is_none() {
+        if rec
+            .get("workers_comp_required")
+            .and_then(Value::as_bool)
+            .is_none()
+        {
             rec["workers_comp_required"] = Value::Null;
         }
         present.insert(st);
@@ -625,8 +637,7 @@ mod tests {
             "insurance_min_liability_usd",
         ] {
             assert_eq!(
-                s["properties"]["states"]["items"]["properties"][f]["type"],
-                "number",
+                s["properties"]["states"]["items"]["properties"][f]["type"], "number",
                 "field {f}"
             );
         }
@@ -635,7 +646,10 @@ mod tests {
     #[test]
     fn requirement_level_normalizes_common_variants_and_rejects_junk() {
         assert_eq!(normalize_requirement_level("none"), Some("none"));
-        assert_eq!(normalize_requirement_level("No state license"), Some("none"));
+        assert_eq!(
+            normalize_requirement_level("No state license"),
+            Some("none")
+        );
         assert_eq!(
             normalize_requirement_level("registration"),
             Some("registration")
@@ -704,7 +718,11 @@ mod tests {
         let (records, rejected, present) =
             parse_trade_records(&data, "Plumbing", "47-2152", "2026");
         assert_eq!(rejected.len(), 3, "TX level, FL negative, NV over-cap");
-        assert_eq!(records.len(), 1, "OH's honest $0 for a no-license state passes");
+        assert_eq!(
+            records.len(),
+            1,
+            "OH's honest $0 for a no-license state passes"
+        );
         assert!(present.contains("OH") && !present.contains("TX"));
     }
 

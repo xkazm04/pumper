@@ -58,7 +58,10 @@ const DEFAULT_AGE_QUESTION: &str = "OWNRAGE";
 /// ONLY — 3/4-digit requests return HTTP 204 (not published at that grain).
 /// The blend joins by the trade group's 2-digit sector prefix.
 const DEFAULT_SECTORS: &[(&str, &str)] = &[
-    ("23", "Construction (incl. plumbing, HVAC, electrical trades)"),
+    (
+        "23",
+        "Construction (incl. plumbing, HVAC, electrical trades)",
+    ),
     (
         "56",
         "Administrative & support and waste management services (incl. landscaping, pool)",
@@ -136,7 +139,8 @@ impl ScrapeApp for CensusNesd {
             })),
             examples: vec![
                 ManifestExample {
-                    description: "Annual refresh: owner-age bands for both trade sectors, all states",
+                    description:
+                        "Annual refresh: owner-age bands for both trade sectors, all states",
                     params: json!({ "year": DEFAULT_YEAR }),
                 },
                 ManifestExample {
@@ -191,27 +195,27 @@ impl ScrapeApp for CensusNesd {
                 .map(|(_, l)| l.to_string())
                 .unwrap_or_else(|| c.to_string())
         };
-        let sectors: Vec<(String, String)> =
-            match ctx.params.get("naics").and_then(Value::as_array) {
-                Some(arr) => arr
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .map(|c| (c.to_string(), label_for(c)))
+        let sectors: Vec<(String, String)> = match ctx.params.get("naics").and_then(Value::as_array)
+        {
+            Some(arr) => arr
+                .iter()
+                .filter_map(Value::as_str)
+                .map(|c| (c.to_string(), label_for(c)))
+                .collect(),
+            None => match trades_common::taxonomy::registry_naics(&ctx, 2).await? {
+                Some(codes) => codes
+                    .into_iter()
+                    .map(|c| {
+                        let l = label_for(&c);
+                        (c, l)
+                    })
                     .collect(),
-                None => match trades_common::taxonomy::registry_naics(&ctx, 2).await? {
-                    Some(codes) => codes
-                        .into_iter()
-                        .map(|c| {
-                            let l = label_for(&c);
-                            (c, l)
-                        })
-                        .collect(),
-                    None => DEFAULT_SECTORS
-                        .iter()
-                        .map(|(c, l)| (c.to_string(), l.to_string()))
-                        .collect(),
-                },
-            };
+                None => DEFAULT_SECTORS
+                    .iter()
+                    .map(|(c, l)| (c.to_string(), l.to_string()))
+                    .collect(),
+            },
+        };
 
         let api_key = census_common::api_key(&ctx, "census-nesd")?;
 
@@ -250,7 +254,11 @@ impl ScrapeApp for CensusNesd {
                 // echoed QDESC_LABEL column keeps the parse unchanged.
                 "https://api.census.gov/data/{year}/absnesdo?get=OWNNOPD,OWNNOPD_PCT,OWNCHAR,OWNCHAR_LABEL,OWNER_SEX_LABEL,OWNER_ETH_LABEL,OWNER_RACE_LABEL,OWNER_VET_LABEL&{for_clause}&{naics_var}={naics}&QDESC_LABEL={age_question}&key={api_key}"
             );
-            let resp = ctx.engines.http.fetch(HttpRequest::get(url.clone())).await?;
+            let resp = ctx
+                .engines
+                .http
+                .fetch(HttpRequest::get(url.clone()))
+                .await?;
             // HTTP 204 No Content is contract-VALID: NES-D per-state data only
             // exists at 2-digit sector grain, so a finer (or unpublished) code
             // is simply "not published at this grain" — a stat, never an error.
@@ -317,11 +325,15 @@ impl ScrapeApp for CensusNesd {
                         "Census NES-D NAICS {naics}: no OWNCHAR_LABEL column in {header:?}"
                     ))
                 })?,
-                demo_labels: ["OWNER_SEX_LABEL", "OWNER_ETH_LABEL", "OWNER_RACE_LABEL",
-                    "OWNER_VET_LABEL"]
-                    .iter()
-                    .filter_map(|n| idx(n))
-                    .collect(),
+                demo_labels: [
+                    "OWNER_SEX_LABEL",
+                    "OWNER_ETH_LABEL",
+                    "OWNER_RACE_LABEL",
+                    "OWNER_VET_LABEL",
+                ]
+                .iter()
+                .filter_map(|n| idx(n))
+                .collect(),
                 state: idx("state").ok_or_else(|| {
                     Error::App(format!(
                         "Census NES-D NAICS {naics}: no state column in {header:?}"
@@ -595,7 +607,14 @@ mod tests {
     }
 
     fn rollup(data: &[[&str; 10]]) -> AgeRollup {
-        map_age_rows(&rows(data), &cols(), "23", "Construction", "2021", "OWNRAGE")
+        map_age_rows(
+            &rows(data),
+            &cols(),
+            "23",
+            "Construction",
+            "2021",
+            "OWNRAGE",
+        )
     }
 
     #[test]

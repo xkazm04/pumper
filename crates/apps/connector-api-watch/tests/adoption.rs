@@ -44,7 +44,10 @@ async fn a_checkpointed_connector_is_never_re_fetched_or_re_summarized() {
     let out = ConnectorApiWatch.run(ctx).await.unwrap();
 
     assert_eq!(out["resumed_from_checkpoint"], true);
-    assert_eq!(out["scanned"], 1, "the done connector still counts as scanned");
+    assert_eq!(
+        out["scanned"], 1,
+        "the done connector still counts as scanned"
+    );
     // The prior attempt's findings are carried into this attempt's changes.json
     // hand-off — a resume must not silently drop events it already paid for.
     assert_eq!(out["changed"], 1);

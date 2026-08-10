@@ -68,7 +68,8 @@ impl ScrapeApp for ValuationMultiples {
             })),
             examples: vec![
                 ManifestExample {
-                    description: "Refresh SDE + revenue multiples (free no-op if valued within 90 days)",
+                    description:
+                        "Refresh SDE + revenue multiples (free no-op if valued within 90 days)",
                     params: json!({ "year": DEFAULT_YEAR }),
                 },
                 ManifestExample {
@@ -341,7 +342,8 @@ mod tests {
         // Median above the high end of the band: implausible, must not upsert.
         bad["sde_multiple_median"] = json!(4.0);
         let data = json!({ "trades": [bad, multiples_entry("Plumbing")] });
-        let (records, rejected, _) = collect_valuation_records(&taxonomy::seed_entries(), &data, "2025");
+        let (records, rejected, _) =
+            collect_valuation_records(&taxonomy::seed_entries(), &data, "2025");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].0, "US:Plumbing");
         assert_eq!(rejected.len(), 1);
@@ -357,7 +359,8 @@ mod tests {
         // "HVAC/R" must key as US:HVAC with the stored `trade` field agreeing,
         // stamped state=US + year so the ingest lifts market = "US".
         let data = json!({ "trades": [multiples_entry("HVAC/R")] });
-        let (records, rejected, unknown) = collect_valuation_records(&taxonomy::seed_entries(), &data, "2025");
+        let (records, rejected, unknown) =
+            collect_valuation_records(&taxonomy::seed_entries(), &data, "2025");
         assert!(rejected.is_empty());
         assert!(unknown.is_empty());
         let (key, rec) = &records[0];
@@ -372,7 +375,8 @@ mod tests {
         let mut bad = multiples_entry("Roofing");
         bad["revenue_multiple"] = json!(-0.5);
         let data = json!({ "trades": [bad] });
-        let (records, rejected, unknown) = collect_valuation_records(&taxonomy::seed_entries(), &data, "2025");
+        let (records, rejected, unknown) =
+            collect_valuation_records(&taxonomy::seed_entries(), &data, "2025");
         // Unknown label is flagged even when the record is rejected on values.
         assert!(records.is_empty());
         assert_eq!(rejected[0].key, "US:Roofing");

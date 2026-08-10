@@ -899,7 +899,9 @@ mod tests {
             DocMeta::live("https://a/y".into()),
         ];
         assert_eq!(
-            batch_provenance(&one, Some("deadbeef")).source_url.as_deref(),
+            batch_provenance(&one, Some("deadbeef"))
+                .source_url
+                .as_deref(),
             Some("https://a/x")
         );
         // Naming one URL of many would be a fabrication on the other records.

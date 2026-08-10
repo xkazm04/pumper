@@ -105,9 +105,7 @@ fn is_json_mime(mime: &str) -> bool {
 /// keeps this dependency-free (no PSL); a cross-site CDN or tracker never
 /// shares the page's registrable tail this way.
 fn same_site(page_host: &str, call_host: &str) -> bool {
-    let a = page_host
-        .trim_start_matches("www.")
-        .to_lowercase();
+    let a = page_host.trim_start_matches("www.").to_lowercase();
     let b = call_host.trim_start_matches("www.").to_lowercase();
     if a.is_empty() || b.is_empty() {
         return false;
@@ -982,7 +980,13 @@ mod tests {
         ] {
             assert!(is_json_mime(yes), "{yes:?} is JSON");
         }
-        for no in ["text/html", "application/javascript", "image/png", "", "json"] {
+        for no in [
+            "text/html",
+            "application/javascript",
+            "image/png",
+            "",
+            "json",
+        ] {
             assert!(!is_json_mime(no), "{no:?} is not JSON");
         }
     }
@@ -992,9 +996,15 @@ mod tests {
         assert!(same_site("example.com", "example.com"));
         assert!(same_site("www.example.com", "api.example.com"));
         assert!(same_site("example.com", "api.v2.example.com"));
-        assert!(same_site("app.example.com", "example.com"), "page on subdomain, API on apex");
+        assert!(
+            same_site("app.example.com", "example.com"),
+            "page on subdomain, API on apex"
+        );
         assert!(!same_site("example.com", "tracker.io"));
-        assert!(!same_site("example.com", "notexample.com"), "suffix needs a dot boundary");
+        assert!(
+            !same_site("example.com", "notexample.com"),
+            "suffix needs a dot boundary"
+        );
         assert!(!same_site("", "example.com"));
         assert!(!same_site("example.com", ""));
     }
@@ -1055,7 +1065,10 @@ mod tests {
             matches!(&ev.would_submit, PageAction::Click { selector } if selector == "#submit"),
             "the irreversible action is reported, never executed"
         );
-        assert!(ev.screenshot_path.is_none(), "no screenshot claim without capture support");
+        assert!(
+            ev.screenshot_path.is_none(),
+            "no screenshot claim without capture support"
+        );
         assert_eq!(ev.dom_html, "<form>...</form>");
     }
 }

@@ -5,16 +5,16 @@
 
 use std::sync::Arc;
 
+use app_crawl::reliability;
 use async_trait::async_trait;
 use futures::StreamExt;
+use pumper_core::config::ArchiveConfig;
 use pumper_core::{
     extract_and_fingerprint_batch, extract_batch_with_report, AppContext, AppManifest,
     CompiledRuleSet, CostClass, DocReport, DocSignals, Error, FetchHealth, FetchRequest,
     FetchStrategy, FieldStatus, ManifestExample, ObservedDoc, Provenance, Record, Result, RuleSet,
     ScrapeApp, UpsertSummary,
 };
-use app_crawl::reliability;
-use pumper_core::config::ArchiveConfig;
 use pumper_engine_archive::ArchiveEngine;
 use serde_json::{json, Value};
 
@@ -347,9 +347,7 @@ async fn extract_and_upsert(
 /// The one source URL every document in this batch came from, or `None` when
 /// the batch spans several (or none). Honest-Null by construction: a batch-level
 /// `source_url` may only be claimed when it is true of every record in it.
-fn single_source_url(
-    metas: &[(String, Option<String>, Option<&'static str>)],
-) -> Option<String> {
+fn single_source_url(metas: &[(String, Option<String>, Option<&'static str>)]) -> Option<String> {
     let first = metas.first()?.0.as_str();
     metas
         .iter()
@@ -467,8 +465,7 @@ async fn observe(
                     )
                 })
                 .collect();
-            reliability::record_observations(&ctx.datasets, &ctx.job_id.to_string(), deltas)
-                .await;
+            reliability::record_observations(&ctx.datasets, &ctx.job_id.to_string(), deltas).await;
             Some(json!(v))
         }
         Ok(None) => None,
@@ -492,8 +489,7 @@ fn observation_host(key: &str) -> Option<String> {
     // (`https://x.com@2026-01-01`) can't misparse the date as the host.
     let key = match key.rsplit_once('@') {
         Some((prefix, suffix))
-            if suffix.len() == 10
-                && suffix.chars().all(|c| c.is_ascii_digit() || c == '-') =>
+            if suffix.len() == 10 && suffix.chars().all(|c| c.is_ascii_digit() || c == '-') =>
         {
             prefix
         }
@@ -1327,7 +1323,12 @@ impl Extractor {
             ctx.engines.http.clone(),
         );
         let list = engine
-            .list_snapshots(&p.target, p.from.as_deref(), p.to.as_deref(), p.max_snapshots)
+            .list_snapshots(
+                &p.target,
+                p.from.as_deref(),
+                p.to.as_deref(),
+                p.max_snapshots,
+            )
             .await?;
         let found = list.snapshots.len();
         let truncated = list.truncated;
@@ -1346,7 +1347,8 @@ impl Extractor {
                     return (snap, Err("unparseable capture timestamp".to_string()));
                 };
                 let observed = dt.to_rfc3339();
-                let url = pumper_engine_archive::snapshot_url(&base, &snap.timestamp, &snap.original);
+                let url =
+                    pumper_engine_archive::snapshot_url(&base, &snap.timestamp, &snap.original);
                 match http.fetch(pumper_core::HttpRequest::get(url)).await {
                     Ok(resp) if resp.is_success() && !resp.body.is_empty() => {
                         (snap, Ok((observed, resp.body)))
@@ -1388,7 +1390,11 @@ impl Extractor {
         }
         // Snapshots enumerate oldest-first but the fan-out completes out of
         // order; restore chronology so same-day re-captures upsert newest-last.
-        keyed.sort_by(|a, b| a.key.cmp(&b.key).then_with(|| a.observed_at.cmp(&b.observed_at)));
+        keyed.sort_by(|a, b| {
+            a.key
+                .cmp(&b.key)
+                .then_with(|| a.observed_at.cmp(&b.observed_at))
+        });
 
         let fetched = keyed.len();
         let out = extract_and_upsert(ctx, compiled, dataset, keyed, fetch, rules_hash).await?;
@@ -1666,10 +1672,15 @@ mod tests {
         assert_eq!(p.max_snapshots, DEFAULT_MAX_SNAPSHOTS);
         assert_eq!(p.base_url, "https://web.archive.org");
         // Non-digit bounds are rejected before any network call.
-        assert!(parse_archive_params(&obj(json!({"url": "https://a/x", "from": "2019-06"}))).is_err());
-        assert!(parse_archive_params(&obj(json!({"url": "https://a/x", "to": "yesterday"}))).is_err());
+        assert!(
+            parse_archive_params(&obj(json!({"url": "https://a/x", "from": "2019-06"}))).is_err()
+        );
+        assert!(
+            parse_archive_params(&obj(json!({"url": "https://a/x", "to": "yesterday"}))).is_err()
+        );
         // The per-run cap clamps into 1..=ceiling — never unbounded.
-        let p = parse_archive_params(&obj(json!({"url": "https://a/x", "max_snapshots": 0}))).unwrap();
+        let p =
+            parse_archive_params(&obj(json!({"url": "https://a/x", "max_snapshots": 0}))).unwrap();
         assert_eq!(p.max_snapshots, 1);
         let p = parse_archive_params(&obj(json!({"url": "https://a/x", "max_snapshots": 999999})))
             .unwrap();

@@ -173,7 +173,11 @@ impl ScrapeApp for Cordis {
         // Resume cursor: continue where the last run stopped so the corpus is
         // covered over successive runs. An explicit `startPage` param overrides.
         let cursor_start = match ctx.datasets.get(&ctx.app, "state", "cursor").await? {
-            Some(rec) => rec.data.get("next_page").and_then(Value::as_u64).unwrap_or(1),
+            Some(rec) => rec
+                .data
+                .get("next_page")
+                .and_then(Value::as_u64)
+                .unwrap_or(1),
             None => 1,
         };
         let start_page = ctx
@@ -340,7 +344,10 @@ impl ScrapeApp for Cordis {
         // Re-aggregate topic families over the WHOLE stored corpus (not just
         // this run's window) so stats stay consistent while the cursor sweeps.
         // Change detection makes untouched families free.
-        let corpus = ctx.datasets.list(&ctx.app, "projects", AGGREGATE_LIMIT).await?;
+        let corpus = ctx
+            .datasets
+            .list(&ctx.app, "projects", AGGREGATE_LIMIT)
+            .await?;
         let corpus_values: Vec<&Value> = corpus.iter().map(|r| &r.data).collect();
         let stats = aggregate_topic_stats(&corpus_values);
         let families = stats.len();
@@ -541,7 +548,11 @@ fn extract_associations(detail: &Value) -> Associations {
                     continue;
                 };
                 let is_coordinator = atype.to_ascii_lowercase().contains("coordinator");
-                let role = if is_coordinator { "coordinator" } else { "participant" };
+                let role = if is_coordinator {
+                    "coordinator"
+                } else {
+                    "participant"
+                };
                 if is_coordinator && out.coordinator.is_none() {
                     out.coordinator = Some(name.to_string());
                 }
@@ -736,7 +747,10 @@ mod tests {
         assert_eq!(hits.len(), 2);
         assert_eq!(hits[0]["id"], "101070522");
         // Numeric ids must enumerate too.
-        assert_eq!(scalar_string(hits[1].get("id")).as_deref(), Some("101059379"));
+        assert_eq!(
+            scalar_string(hits[1].get("id")).as_deref(),
+            Some("101059379")
+        );
     }
 
     #[test]
@@ -939,8 +953,18 @@ mod tests {
 
     #[test]
     fn aggregate_groups_years_into_one_family_and_averages_known_only() {
-        let a = proj("HORIZON-CL4-2022-DATA-01", Some(4_000_000.0), "FHG", &["TNO"]);
-        let b = proj("HORIZON-CL4-2024-DATA-01", Some(2_000_000.0), "TNO", &["FHG"]);
+        let a = proj(
+            "HORIZON-CL4-2022-DATA-01",
+            Some(4_000_000.0),
+            "FHG",
+            &["TNO"],
+        );
+        let b = proj(
+            "HORIZON-CL4-2024-DATA-01",
+            Some(2_000_000.0),
+            "TNO",
+            &["FHG"],
+        );
         let c = proj("HORIZON-CL4-2024-DATA-01", None, "VTT", &[]);
         let d = proj("ERASMUS-EDU-2024-X", Some(1.0), "NOPE", &[]); // no family
         let refs: Vec<&Value> = vec![&a, &b, &c, &d];

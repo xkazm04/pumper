@@ -4,8 +4,8 @@
 
 use async_trait::async_trait;
 use pumper_core::{
-    AppContext, AppManifest, CostClass, Error, FetchRequest, FetchStrategy, ManifestExample, Result,
-    ScrapeApp,
+    AppContext, AppManifest, CostClass, Error, FetchRequest, FetchStrategy, ManifestExample,
+    Result, ScrapeApp,
 };
 use serde_json::{json, Value};
 

@@ -148,7 +148,13 @@ fn extraction_counters(m: &mut Map<String, Value>, obs: &ExtractionObs) {
     m.insert("fetch_ok_rate".into(), json!(obs.fetch_ok_rate));
     m.insert(
         "worst_fields".into(),
-        Value::Array(obs.worst_fields.iter().take(WORST_FIELDS_KEPT).cloned().collect()),
+        Value::Array(
+            obs.worst_fields
+                .iter()
+                .take(WORST_FIELDS_KEPT)
+                .cloned()
+                .collect(),
+        ),
     );
     m.insert("verdict_scope".into(), json!("source"));
     let worst = m
@@ -381,7 +387,10 @@ mod tests {
 
     #[test]
     fn obs_key_is_host_at_date() {
-        assert_eq!(obs_key("example.com", "2026-07-30"), "example.com@2026-07-30");
+        assert_eq!(
+            obs_key("example.com", "2026-07-30"),
+            "example.com@2026-07-30"
+        );
     }
 
     #[test]
@@ -466,14 +475,19 @@ mod tests {
 
     #[test]
     fn fold_index_accumulates_and_scores() {
-        let idx = fold_index(None, "example.com", "2026-07-30", &HostDelta::Crawl(crawl_obs()));
+        let idx = fold_index(
+            None,
+            "example.com",
+            "2026-07-30",
+            &HostDelta::Crawl(crawl_obs()),
+        );
         assert_eq!(idx["observations"], 1);
         assert_eq!(idx["first_date"], "2026-07-30");
         assert_eq!(idx["crawl"]["fetches"], 10);
         let s = &idx["scrapeability"];
         assert_eq!(s["formula"], FORMULA);
         assert_eq!(s["low_confidence"], true); // 1 < 3 observations
-        // Components without extraction evidence: no extraction_health key.
+                                               // Components without extraction evidence: no extraction_health key.
         assert!(s["components"].get("extraction_health").is_none());
         // fetch_ok 0.8, bot 0.9, cond 0.4, avail 1.0 over weights .45/.25/.10/.05
         // = (.36+.225+.04+.05)/.85 = 0.7941 → 79.4

@@ -223,116 +223,116 @@ impl ScrapeApp for ConnectorApiWatch {
             // the block, so the connector is marked done + checkpointed exactly
             // once, whatever path it took.
             'connector: {
-            // Prior content (for diffing) BEFORE we upsert the new content.
-            let prior_markdown = match ctx.datasets.get(&ctx.app, DATASET, &entry.slug).await {
-                Ok(Some(rec)) => rec
-                    .data
-                    .get("markdown")
-                    .and_then(Value::as_str)
-                    .map(String::from),
-                _ => None,
-            };
+                // Prior content (for diffing) BEFORE we upsert the new content.
+                let prior_markdown = match ctx.datasets.get(&ctx.app, DATASET, &entry.slug).await {
+                    Ok(Some(rec)) => rec
+                        .data
+                        .get("markdown")
+                        .and_then(Value::as_str)
+                        .map(String::from),
+                    _ => None,
+                };
 
-            // Through the metered chokepoint, not `engines.fetch` raw: this call
-            // site was invisible to the cost ledger, taught the tier router
-            // nothing, and could not be recorded/replayed by VCR. A change
-            // detector must NEVER set `archive_max_age` — a stale archived body
-            // would manufacture a "no change" verdict — so the archive tier stays
-            // off here by construction.
-            let outcome = match ctx
-                .fetch(FetchRequest {
-                    url: entry.docs_url.clone(),
-                    to_markdown: true,
-                    ..FetchRequest::new(&entry.docs_url)
-                })
-                .await
-            {
-                Ok(o) => o,
-                Err(e) => {
-                    tracing::warn!(slug = %entry.slug, "fetch failed: {e}");
+                // Through the metered chokepoint, not `engines.fetch` raw: this call
+                // site was invisible to the cost ledger, taught the tier router
+                // nothing, and could not be recorded/replayed by VCR. A change
+                // detector must NEVER set `archive_max_age` — a stale archived body
+                // would manufacture a "no change" verdict — so the archive tier stays
+                // off here by construction.
+                let outcome = match ctx
+                    .fetch(FetchRequest {
+                        url: entry.docs_url.clone(),
+                        to_markdown: true,
+                        ..FetchRequest::new(&entry.docs_url)
+                    })
+                    .await
+                {
+                    Ok(o) => o,
+                    Err(e) => {
+                        tracing::warn!(slug = %entry.slug, "fetch failed: {e}");
+                        state
+                            .errors
+                            .push(json!({ "connector": entry.slug, "error": e.to_string() }));
+                        break 'connector;
+                    }
+                };
+                let markdown = outcome.markdown.clone().unwrap_or_default();
+                if markdown.trim().is_empty() {
                     state
                         .errors
-                        .push(json!({ "connector": entry.slug, "error": e.to_string() }));
+                        .push(json!({ "connector": entry.slug, "error": "empty document" }));
                     break 'connector;
                 }
-            };
-            let markdown = outcome.markdown.clone().unwrap_or_default();
-            if markdown.trim().is_empty() {
-                state
-                    .errors
-                    .push(json!({ "connector": entry.slug, "error": "empty document" }));
-                break 'connector;
-            }
-            let hash = sha256(&markdown);
+                let hash = sha256(&markdown);
 
-            let record = json!({
-                "docs_url": entry.docs_url,
-                "label": entry.label,
-                "hash": hash.clone(),
-                "markdown": markdown,
-                "engine": outcome.engine,
-            });
-            // Provenance (M12): one record, one known source URL (post-redirect)
-            // and the sha256 of the exact body stored in it. No RuleSet produced
-            // this record (it is the whole document), so `rules_hash` stays Null.
-            let kind = ctx
-                .upsert_with_provenance(
-                    DATASET,
-                    &entry.slug,
-                    &record,
-                    Provenance {
-                        source_url: Some(outcome.url.clone()),
-                        artifact_sha: Some(hash),
-                        ..Provenance::default()
-                    },
-                )
-                .await
-                .unwrap_or(ChangeKind::Unchanged);
-
-            // Only a CHANGED record (not a first-seen baseline) is a real event.
-            if kind != ChangeKind::Changed {
-                break 'connector;
-            }
-            let Some(prev) = prior_markdown else {
-                break 'connector;
-            };
-            let (added, removed) = line_diff(&prev, &markdown);
-            if added.is_empty() && removed.is_empty() {
-                // hash flipped on noise (whitespace/reorder) — not substantive
-                break 'connector;
-            }
-
-            let detected_at = chrono::Utc::now().to_rfc3339();
-            let (summary, tags, severity) = if summarize {
-                summarize_change(&ctx, entry, &added, &removed)
+                let record = json!({
+                    "docs_url": entry.docs_url,
+                    "label": entry.label,
+                    "hash": hash.clone(),
+                    "markdown": markdown,
+                    "engine": outcome.engine,
+                });
+                // Provenance (M12): one record, one known source URL (post-redirect)
+                // and the sha256 of the exact body stored in it. No RuleSet produced
+                // this record (it is the whole document), so `rules_hash` stays Null.
+                let kind = ctx
+                    .upsert_with_provenance(
+                        DATASET,
+                        &entry.slug,
+                        &record,
+                        Provenance {
+                            source_url: Some(outcome.url.clone()),
+                            artifact_sha: Some(hash),
+                            ..Provenance::default()
+                        },
+                    )
                     .await
-                    .unwrap_or_else(|e| {
-                        tracing::warn!(slug = %entry.slug, "summarize failed: {e}");
-                        (
-                            fallback_summary(&added, &removed),
-                            Vec::new(),
-                            "minor".into(),
-                        )
-                    })
-            } else {
-                (
-                    fallback_summary(&added, &removed),
-                    Vec::new(),
-                    "minor".into(),
-                )
-            };
+                    .unwrap_or(ChangeKind::Unchanged);
 
-            state.changes.push(json!({
-                "connector": entry.slug,
-                "label": entry.label,
-                "docs_url": entry.docs_url,
-                "detected_at": detected_at,
-                "summary": summary,
-                "tags": tags,
-                "severity": severity,
-                "lines_added": added.len(),
-                "lines_removed": removed.len(),
-            }));
+                // Only a CHANGED record (not a first-seen baseline) is a real event.
+                if kind != ChangeKind::Changed {
+                    break 'connector;
+                }
+                let Some(prev) = prior_markdown else {
+                    break 'connector;
+                };
+                let (added, removed) = line_diff(&prev, &markdown);
+                if added.is_empty() && removed.is_empty() {
+                    // hash flipped on noise (whitespace/reorder) — not substantive
+                    break 'connector;
+                }
+
+                let detected_at = chrono::Utc::now().to_rfc3339();
+                let (summary, tags, severity) = if summarize {
+                    summarize_change(&ctx, entry, &added, &removed)
+                        .await
+                        .unwrap_or_else(|e| {
+                            tracing::warn!(slug = %entry.slug, "summarize failed: {e}");
+                            (
+                                fallback_summary(&added, &removed),
+                                Vec::new(),
+                                "minor".into(),
+                            )
+                        })
+                } else {
+                    (
+                        fallback_summary(&added, &removed),
+                        Vec::new(),
+                        "minor".into(),
+                    )
+                };
+
+                state.changes.push(json!({
+                    "connector": entry.slug,
+                    "label": entry.label,
+                    "docs_url": entry.docs_url,
+                    "detected_at": detected_at,
+                    "summary": summary,
+                    "tags": tags,
+                    "severity": severity,
+                    "lines_added": added.len(),
+                    "lines_removed": removed.len(),
+                }));
             }
 
             // Connector finished (changed, unchanged, or failed) — persist the

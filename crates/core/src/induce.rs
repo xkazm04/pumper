@@ -160,8 +160,14 @@ pub fn induce(docs: &[String], opts: &InduceOptions) -> Result<Option<Induction>
     // Pass 2: analyze each candidate's field slots; keep the best.
     let mut best: Option<CandidateResult> = None;
     for (sig, _) in &candidates {
-        let Some(c) = analyze_candidate(&pages, sig, min_instances, min_support, need_pages, max_fields)
-        else {
+        let Some(c) = analyze_candidate(
+            &pages,
+            sig,
+            min_instances,
+            min_support,
+            need_pages,
+            max_fields,
+        ) else {
             continue;
         };
         let better = match &best {
@@ -506,9 +512,19 @@ mod tests {
 
     fn corpus() -> Vec<String> {
         vec![
-            page(&[("Alpha", "$10"), ("Beta", "$20"), ("Gamma", "$30"), ("Delta", "$40")]),
+            page(&[
+                ("Alpha", "$10"),
+                ("Beta", "$20"),
+                ("Gamma", "$30"),
+                ("Delta", "$40"),
+            ]),
             page(&[("Epsilon", "$11"), ("Zeta", "$21"), ("Eta", "$31")]),
-            page(&[("Theta", "$12"), ("Iota", "$22"), ("Kappa", "$32"), ("Lambda", "$42")]),
+            page(&[
+                ("Theta", "$12"),
+                ("Iota", "$22"),
+                ("Kappa", "$32"),
+                ("Lambda", "$42"),
+            ]),
         ]
     }
 
@@ -614,7 +630,9 @@ mod tests {
         let docs = vec![doc.clone(), doc.clone(), doc];
         let ind = induce(&docs, &InduceOptions::default()).unwrap().unwrap();
         assert_eq!(ind.container.selector, "div.item");
-        assert!(!serde_json::to_string(&ind.rules).unwrap().contains("1a2b3c4d"));
+        assert!(!serde_json::to_string(&ind.rules)
+            .unwrap()
+            .contains("1a2b3c4d"));
     }
 
     #[test]

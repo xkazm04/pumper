@@ -96,12 +96,19 @@ async fn post_proxy(
     }
     let resp = router
         .clone()
-        .oneshot(builder.body(Body::from(serde_json::to_vec(&body).unwrap())).unwrap())
+        .oneshot(
+            builder
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap(),
+        )
         .await
         .unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 #[tokio::test]
@@ -118,7 +125,10 @@ async fn proxy_runs_the_request_through_the_local_stack_and_returns_the_envelope
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(body["status"], 200);
-    assert_eq!(body["body"], "<html>fetched by the node's local stack</html>");
+    assert_eq!(
+        body["body"],
+        "<html>fetched by the node's local stack</html>"
+    );
     assert_eq!(body["final_url"], "https://target.example/page");
     assert_eq!(body["headers"]["x-origin"], "node-local");
 
@@ -173,8 +183,12 @@ async fn missing_or_wrong_secret_is_401_and_never_fetches() {
     assert_eq!(status, StatusCode::UNAUTHORIZED, "{body}");
     assert_eq!(body["code"], "unauthorized");
 
-    let (status, _) =
-        post_proxy(&router, Some("wrong"), json!({ "url": "https://t.example/" })).await;
+    let (status, _) = post_proxy(
+        &router,
+        Some("wrong"),
+        json!({ "url": "https://t.example/" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
     assert!(
@@ -191,8 +205,12 @@ async fn disabled_fabric_is_404_even_with_the_right_secret() {
     let (state, _store) = proxy_state(http.clone(), remote).await;
     let router = routes::router(state);
 
-    let (status, _) =
-        post_proxy(&router, Some("sesame"), json!({ "url": "https://t.example/" })).await;
+    let (status, _) = post_proxy(
+        &router,
+        Some("sesame"),
+        json!({ "url": "https://t.example/" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::NOT_FOUND);
     assert!(http.seen().is_empty());
 }
@@ -208,8 +226,12 @@ async fn local_engine_failure_surfaces_as_502() {
     }
     let (state, _store) = proxy_state(Arc::new(FailingHttp), enabled_remote()).await;
     let router = routes::router(state);
-    let (status, body) =
-        post_proxy(&router, Some("sesame"), json!({ "url": "https://t.example/" })).await;
+    let (status, body) = post_proxy(
+        &router,
+        Some("sesame"),
+        json!({ "url": "https://t.example/" }),
+    )
+    .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
     assert_eq!(body["code"], "bad_gateway");
 }
@@ -231,7 +253,10 @@ impl HttpClient for PlainClient {
         if let Some(body) = &req.body {
             builder = builder.body(body.clone());
         }
-        let resp = builder.send().await.map_err(|e| Error::Http(e.to_string()))?;
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| Error::Http(e.to_string()))?;
         let status = resp.status().as_u16();
         let final_url = resp.url().to_string();
         let body = resp.text().await.map_err(|e| Error::Http(e.to_string()))?;
@@ -287,7 +312,10 @@ async fn remote_engine_round_trips_through_a_live_node() {
     assert_eq!(resp.status, 200);
     assert_eq!(resp.body, "<html>fetched by the node's local stack</html>");
     assert_eq!(resp.final_url, "https://target.example/page");
-    assert_eq!(resp.headers.get("x-origin").map(String::as_str), Some("node-local"));
+    assert_eq!(
+        resp.headers.get("x-origin").map(String::as_str),
+        Some("node-local")
+    );
     // And the node's local stack really served it.
     assert_eq!(node_http.seen().len(), 1);
     assert_eq!(node_http.seen()[0].url, "https://target.example/page");

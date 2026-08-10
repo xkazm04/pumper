@@ -121,13 +121,7 @@ impl ArchiveEngine {
             }
         }
         let max = max.max(1);
-        let req = HttpRequest::get(cdx_range_query_url(
-            &self.base_url,
-            url,
-            from,
-            to,
-            max + 1,
-        ));
+        let req = HttpRequest::get(cdx_range_query_url(&self.base_url, url, from, to, max + 1));
         let resp = self.inner.fetch(req).await?;
         if !resp.is_success() {
             return Err(Error::Http(format!(
@@ -321,9 +315,8 @@ impl HttpClient for ArchiveEngine {
                 req.url, cdx_resp.status
             )));
         }
-        let snap = parse_cdx_first_line(&cdx_resp.body).ok_or_else(|| {
-            Error::Http(format!("no archive snapshot recorded for {}", req.url))
-        })?;
+        let snap = parse_cdx_first_line(&cdx_resp.body)
+            .ok_or_else(|| Error::Http(format!("no archive snapshot recorded for {}", req.url)))?;
         let captured = snapshot_datetime(&snap.timestamp).ok_or_else(|| {
             Error::Http(format!(
                 "unparseable archive capture timestamp '{}' for {}",
@@ -400,7 +393,11 @@ mod tests {
 
     #[test]
     fn cdx_query_url_appends_to_bound_when_asked() {
-        let u = cdx_query_url("https://web.archive.org", "https://example.com/", Some("2019"));
+        let u = cdx_query_url(
+            "https://web.archive.org",
+            "https://example.com/",
+            Some("2019"),
+        );
         assert!(u.ends_with("&to=2019"));
         let u = cdx_query_url("https://web.archive.org", "https://example.com/", None);
         assert!(!u.contains("&to="));
@@ -463,7 +460,13 @@ mod tests {
         assert!(u.contains("&from=2019"));
         assert!(u.contains("&to=20200630"));
         // Bounds are optional independently.
-        let u = cdx_range_query_url("https://web.archive.org", "https://example.com/", None, None, 5);
+        let u = cdx_range_query_url(
+            "https://web.archive.org",
+            "https://example.com/",
+            None,
+            None,
+            5,
+        );
         assert!(!u.contains("&from=") && !u.contains("&to="));
     }
 
@@ -513,10 +516,19 @@ mod tests {
         ];
         let list = select_snapshots(rows, 10);
         assert!(!list.truncated);
-        let ts: Vec<&str> = list.snapshots.iter().map(|s| s.timestamp.as_str()).collect();
+        let ts: Vec<&str> = list
+            .snapshots
+            .iter()
+            .map(|s| s.timestamp.as_str())
+            .collect();
         assert_eq!(
             ts,
-            ["20190101000000", "20190301000000", "20190401000000", "20190501000000"]
+            [
+                "20190101000000",
+                "20190301000000",
+                "20190401000000",
+                "20190501000000"
+            ]
         );
     }
 
@@ -531,7 +543,9 @@ mod tests {
         assert_eq!(list.snapshots.len(), 3);
         // …even when dedup shrinks the result below the cap — the index still
         // held more rows than the caller allowed to be fetched.
-        let dup: Vec<CdxSnapshot> = (0..4).map(|i| snap(&format!("2019010100000{i}"), Some("SAME"))).collect();
+        let dup: Vec<CdxSnapshot> = (0..4)
+            .map(|i| snap(&format!("2019010100000{i}"), Some("SAME")))
+            .collect();
         let list = select_snapshots(dup, 3);
         assert!(list.truncated);
         assert_eq!(list.snapshots.len(), 1);
@@ -558,7 +572,11 @@ mod tests {
         assert_eq!(list.snapshots.len(), 2, "digest-deduped");
         assert!(!list.truncated);
         let seen = inner.seen.lock().unwrap();
-        assert_eq!(seen.len(), 1, "exactly one CDX request, via the inner transport");
+        assert_eq!(
+            seen.len(),
+            1,
+            "exactly one CDX request, via the inner transport"
+        );
         assert!(seen[0].contains("&from=2019") && seen[0].contains("&to=2020"));
         assert!(seen[0].contains("limit=11"), "requests max + 1 rows");
     }
@@ -574,7 +592,10 @@ mod tests {
             .list_snapshots("https://example.com/", Some("last-year"), None, 10)
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("bad archive 'from' bound"), "{err}");
+        assert!(
+            err.to_string().contains("bad archive 'from' bound"),
+            "{err}"
+        );
         assert!(inner.seen.lock().unwrap().is_empty());
     }
 
@@ -598,7 +619,11 @@ mod tests {
         // No window = any age.
         assert!(within_window(now - chrono::Duration::days(3650), now, None));
         // Future capture (clock skew) never falls through.
-        assert!(within_window(now + chrono::Duration::minutes(5), now, Some(60)));
+        assert!(within_window(
+            now + chrono::Duration::minutes(5),
+            now,
+            Some(60)
+        ));
     }
 
     // --- engine behavior over a scripted inner client ---
@@ -660,7 +685,10 @@ mod tests {
             resp.headers.get(FETCHED_VIA_HEADER).map(String::as_str),
             Some("archive")
         );
-        let ts = resp.headers.get(SNAPSHOT_TS_HEADER).expect("snapshot ts set");
+        let ts = resp
+            .headers
+            .get(SNAPSHOT_TS_HEADER)
+            .expect("snapshot ts set");
         chrono::DateTime::parse_from_rfc3339(ts).expect("RFC 3339 snapshot ts");
         // Exactly two inner requests: CDX index, then the raw id_ snapshot.
         let seen = inner.seen.lock().unwrap();
@@ -722,7 +750,10 @@ mod tests {
             seen: std::sync::Mutex::new(Vec::new()),
         });
         // archive_max_age: None — a raw-engine caller taking whatever exists.
-        let resp = engine.fetch(HttpRequest::get("https://example.com/")).await.unwrap();
+        let resp = engine
+            .fetch(HttpRequest::get("https://example.com/"))
+            .await
+            .unwrap();
         assert_eq!(resp.body, "decade-old body");
         assert_eq!(
             resp.headers.get(SNAPSHOT_TS_HEADER).map(String::as_str),
@@ -767,12 +798,15 @@ mod tests {
             enabled: true,
             base_url: "https://web.archive.org".into(),
         };
-        let engine = ArchiveEngine::new(&cfg, Arc::new(PlainClient(
-            reqwest::Client::builder()
-                .user_agent("pumper-live-test")
-                .build()
-                .unwrap(),
-        )));
+        let engine = ArchiveEngine::new(
+            &cfg,
+            Arc::new(PlainClient(
+                reqwest::Client::builder()
+                    .user_agent("pumper-live-test")
+                    .build()
+                    .unwrap(),
+            )),
+        );
         // example.com is captured constantly; a 10-year window can't flake.
         let mut req = HttpRequest::get("https://example.com/");
         req.archive_max_age = Some(10 * 365 * 24 * 3600);
@@ -795,12 +829,15 @@ mod tests {
             enabled: true,
             base_url: "https://web.archive.org".into(),
         };
-        let engine = ArchiveEngine::new(&cfg, Arc::new(PlainClient(
-            reqwest::Client::builder()
-                .user_agent("pumper-live-test")
-                .build()
-                .unwrap(),
-        )));
+        let engine = ArchiveEngine::new(
+            &cfg,
+            Arc::new(PlainClient(
+                reqwest::Client::builder()
+                    .user_agent("pumper-live-test")
+                    .build()
+                    .unwrap(),
+            )),
+        );
         let list = engine
             .list_snapshots("https://example.com/", Some("2020"), Some("2021"), 5)
             .await

@@ -299,7 +299,10 @@ mod tests {
         assert_eq!(resp.status, 200);
         assert_eq!(resp.body, "<html>remote body</html>");
         assert_eq!(resp.final_url, "https://target.example/page");
-        assert_eq!(resp.headers.get("x-served-by").map(String::as_str), Some("node"));
+        assert_eq!(
+            resp.headers.get("x-served-by").map(String::as_str),
+            Some("node")
+        );
     }
 
     #[tokio::test]
@@ -346,7 +349,10 @@ mod tests {
             Arc::new(DeadLocal),
         );
         for _ in 0..4 {
-            engine.fetch(HttpRequest::get("https://t.example/")).await.unwrap();
+            engine
+                .fetch(HttpRequest::get("https://t.example/"))
+                .await
+                .unwrap();
         }
         let hosts: Vec<String> = transport.seen().iter().map(|r| r.url.clone()).collect();
         assert_eq!(

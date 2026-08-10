@@ -454,7 +454,13 @@ impl TierMemory {
 mod weather_tests {
     use super::*;
 
-    fn profile(host: &str, pin: Option<&str>, strikes: i64, penalty_ms: i64, obs: i64) -> HostProfile {
+    fn profile(
+        host: &str,
+        pin: Option<&str>,
+        strikes: i64,
+        penalty_ms: i64,
+        obs: i64,
+    ) -> HostProfile {
         HostProfile {
             host: host.into(),
             preferred_tier: pin.map(str::to_string),
@@ -466,7 +472,13 @@ mod weather_tests {
         }
     }
 
-    fn entry(host: &str, pin: Option<&str>, strikes: i64, penalty_ms: i64, obs: i64) -> WeatherEntry {
+    fn entry(
+        host: &str,
+        pin: Option<&str>,
+        strikes: i64,
+        penalty_ms: i64,
+        obs: i64,
+    ) -> WeatherEntry {
         WeatherEntry {
             host: host.into(),
             preferred_tier: pin.map(str::to_string),
@@ -497,10 +509,16 @@ mod weather_tests {
         let local = profile("a.com", Some("browser"), 3, 0, 2);
         // A remote entry without a pin, however well-observed, changes nothing.
         let plan = plan_weather_import(Some(&local), 0, &entry("a.com", None, 0, 0, 1000));
-        assert!(plan.is_noop(), "unpinned remote must not touch a local pin: {plan:?}");
+        assert!(
+            plan.is_noop(),
+            "unpinned remote must not touch a local pin: {plan:?}"
+        );
         // A remote pin over an existing local pin is also a no-op (nothing to raise).
-        let plan =
-            plan_weather_import(Some(&local), 0, &entry("a.com", Some("browser"), 3, 0, 1000));
+        let plan = plan_weather_import(
+            Some(&local),
+            0,
+            &entry("a.com", Some("browser"), 3, 0, 1000),
+        );
         assert!(!plan.adopt_pin && plan.raise_strikes.is_none());
     }
 

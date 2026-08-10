@@ -19,7 +19,10 @@ async fn get_json(router: &axum::Router, uri: &str) -> (StatusCode, Value) {
         .unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 async fn post_json(router: &axum::Router, uri: &str, body: &Value) -> (StatusCode, Value) {
@@ -37,7 +40,10 @@ async fn post_json(router: &axum::Router, uri: &str, body: &Value) -> (StatusCod
         .unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 /// Pins `pinned.example` (3 losses) and gives `thin.example` a single loss —
@@ -152,13 +158,19 @@ async fn apply_merges_conservatively() {
     // Adopted pin, with the imported penalty capped at the 60s severity cap.
     let new = tiers.get("new.example").await.unwrap().unwrap();
     assert_eq!(new.preferred_tier.as_deref(), Some("browser"));
-    assert_eq!(new.observations, 0, "imports never fabricate local evidence");
+    assert_eq!(
+        new.observations, 0,
+        "imports never fabricate local evidence"
+    );
     assert_eq!(
         governor.penalty("new.example").await,
         std::time::Duration::from_secs(60),
         "imported penalty must be capped"
     );
-    assert_eq!(new.penalty_ms, 60_000, "capped penalty persisted to the snapshot");
+    assert_eq!(
+        new.penalty_ms, 60_000,
+        "capped penalty persisted to the snapshot"
+    );
 
     // The local pin survived the remote all-clear.
     let pinned = tiers.get("pinned.example").await.unwrap().unwrap();
@@ -167,7 +179,10 @@ async fn apply_merges_conservatively() {
     // Strikes rose to the sub-threshold cap; no pin without local confirmation.
     let thin = tiers.get("thin.example").await.unwrap().unwrap();
     assert_eq!(thin.http_strikes, 2);
-    assert_eq!(thin.preferred_tier, None, "imported strikes alone must not pin");
+    assert_eq!(
+        thin.preferred_tier, None,
+        "imported strikes alone must not pin"
+    );
 
     // Re-importing the same bundle is idempotent: everything is now dominated.
     let (_, body) = post_json(&router, "/host-weather/import?apply=true", &b).await;

@@ -223,7 +223,11 @@ struct ObsConfig {
 }
 
 fn parse_config(ctx: &AppContext) -> Result<ObsConfig> {
-    let obs = ctx.params.get("observatory").cloned().unwrap_or(Value::Null);
+    let obs = ctx
+        .params
+        .get("observatory")
+        .cloned()
+        .unwrap_or(Value::Null);
     let obs_obj = obs.as_object();
     let plugins: Vec<String> = obs_obj
         .and_then(|m| m.get("plugins"))
@@ -290,9 +294,7 @@ async fn gather_candidates(
         .list(&cfg.src_app, &cfg.src_dataset, SOURCE_LIST_LIMIT)
         .await?;
     for r in live {
-        if r.removed_at.is_some()
-            || r.data.get("gone").and_then(Value::as_bool).unwrap_or(false)
-        {
+        if r.removed_at.is_some() || r.data.get("gone").and_then(Value::as_bool).unwrap_or(false) {
             continue;
         }
         let url = r

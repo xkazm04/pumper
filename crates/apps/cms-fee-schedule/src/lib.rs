@@ -312,10 +312,7 @@ fn parse_pprrvu(csv: &str, release: &str) -> Result<ParsedSchedule> {
             ));
         };
         let cells = split_csv_line(line);
-        if cells
-            .iter()
-            .any(|c| c.trim().eq_ignore_ascii_case("HCPCS"))
-        {
+        if cells.iter().any(|c| c.trim().eq_ignore_ascii_case("HCPCS")) {
             break locate_columns(&cells).map_err(Error::App)?;
         }
     };
@@ -371,7 +368,11 @@ fn find_pprrvu_entry(names: &[String]) -> Option<String> {
     names
         .iter()
         .find(|n| {
-            let file = n.rsplit(['/', '\\']).next().unwrap_or(n).to_ascii_uppercase();
+            let file = n
+                .rsplit(['/', '\\'])
+                .next()
+                .unwrap_or(n)
+                .to_ascii_uppercase();
             file.starts_with("PPRRVU") && file.ends_with(".CSV")
         })
         .cloned()
@@ -539,7 +540,12 @@ async fn ingest_release(ctx: &AppContext, release: Release) -> Result<Value> {
         .await?;
     let prev_release = prior
         .iter()
-        .find_map(|r| r.data.get("release").and_then(Value::as_str).map(String::from))
+        .find_map(|r| {
+            r.data
+                .get("release")
+                .and_then(Value::as_str)
+                .map(String::from)
+        })
         .filter(|prev| *prev != release_id);
     let cf_before = prior
         .iter()
@@ -922,7 +928,10 @@ mod tests {
         assert_eq!(cols.status, Some(3));
         assert_eq!(cols.work, 5);
         assert_eq!(cols.pe_nonfac, 6);
-        assert_eq!(cols.pe_fac, 8, "facility PE must not match the NON-FAC column");
+        assert_eq!(
+            cols.pe_fac, 8,
+            "facility PE must not match the NON-FAC column"
+        );
         assert_eq!(cols.mp, 10);
         assert_eq!(cols.conv, 13);
     }
@@ -977,11 +986,7 @@ G0008,,\"Admin influenza virus vac\",X,,0.00,0.61,,NA,,0.01,0.62,0.62,32.3465\n\
         let err = parse_pprrvu("just,some,cells\n1,2,3\n", "RVU26B").unwrap_err();
         assert!(err.to_string().contains("drift"), "{err}");
         // Header present but nothing parsed as a code row is also drift.
-        let header_only = PPRRVU_SAMPLE
-            .lines()
-            .take(3)
-            .collect::<Vec<_>>()
-            .join("\n");
+        let header_only = PPRRVU_SAMPLE.lines().take(3).collect::<Vec<_>>().join("\n");
         let err = parse_pprrvu(&header_only, "RVU26B").unwrap_err();
         assert!(err.to_string().contains("zero data rows"), "{err}");
     }
@@ -1067,7 +1072,14 @@ G0008,,\"Admin influenza virus vac\",X,,0.00,0.61,,NA,,0.01,0.62,0.62,32.3465\n\
             ("NEW01".to_string(), rvu(1.0, 1.0, 0.5, 0.1, "brand new")),
         ]
         .into();
-        let diff = diff_schedules(&prev, &next, "RVU26B", Some("RVU26A"), Some(32.74), Some(32.35));
+        let diff = diff_schedules(
+            &prev,
+            &next,
+            "RVU26B",
+            Some("RVU26A"),
+            Some(32.74),
+            Some(32.35),
+        );
         assert_eq!(diff["codes_total"], json!(3));
         assert_eq!(diff["added"], json!(1));
         assert_eq!(diff["removed"], json!(1));
@@ -1108,10 +1120,7 @@ G0008,,\"Admin influenza virus vac\",X,,0.00,0.61,,NA,,0.01,0.62,0.62,32.3465\n\
             next.insert(key, rvu(1.0 + (i as f64) * 0.01 + 0.01, 1.0, 0.5, 0.1, "x"));
         }
         let diff = diff_schedules(&prev, &next, "RVU26B", Some("RVU26A"), None, None);
-        assert_eq!(
-            diff["top_movers"].as_array().unwrap().len(),
-            TOP_MOVERS_CAP
-        );
+        assert_eq!(diff["top_movers"].as_array().unwrap().len(), TOP_MOVERS_CAP);
         assert_eq!(diff["changed"], json!(TOP_MOVERS_CAP + 15));
     }
 

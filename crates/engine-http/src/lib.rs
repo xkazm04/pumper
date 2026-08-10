@@ -487,7 +487,11 @@ async fn read_body_capped(
 
 /// The raw-bytes half of [`read_body_capped`]: chunked read with the same hard
 /// size cap, no decoding. Shared by the text path and [`HttpEngine::fetch_bytes`].
-async fn read_bytes_capped(mut response: reqwest::Response, cap: u64, url: &str) -> Result<Vec<u8>> {
+async fn read_bytes_capped(
+    mut response: reqwest::Response,
+    cap: u64,
+    url: &str,
+) -> Result<Vec<u8>> {
     let mut buf: Vec<u8> = Vec::new();
     while let Some(chunk) = response
         .chunk()

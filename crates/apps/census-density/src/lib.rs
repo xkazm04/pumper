@@ -125,11 +125,13 @@ impl ScrapeApp for CensusDensity {
             })),
             examples: vec![
                 ManifestExample {
-                    description: "All states, default trade codes, saturation normalized per household",
+                    description:
+                        "All states, default trade codes, saturation normalized per household",
                     params: json!({ "year": DEFAULT_YEAR, "geo": "state" }),
                 },
                 ManifestExample {
-                    description: "County grain inside three states (a states filter is mandatory for county)",
+                    description:
+                        "County grain inside three states (a states filter is mandatory for county)",
                     params: json!({
                         "year": DEFAULT_YEAR,
                         "geo": "county",
@@ -258,7 +260,11 @@ impl ScrapeApp for CensusDensity {
 
         for (naics, label) in &trades {
             let url = build_url(&year, &geo, &states, naics, &naics_var, &api_key);
-            let resp = ctx.engines.http.fetch(HttpRequest::get(url.clone())).await?;
+            let resp = ctx
+                .engines
+                .http
+                .fetch(HttpRequest::get(url.clone()))
+                .await?;
             if !resp.is_success() {
                 return Err(Error::App(format!(
                     "Census CBP {year} NAICS {naics}: HTTP {} (body starts: {})",
@@ -766,8 +772,7 @@ pub fn blend_market(
     let mut age_bands: BTreeMap<(String, String), Vec<(String, i64)>> = BTreeMap::new();
     let mut age_year: BTreeMap<(String, String), String> = BTreeMap::new();
     for r in owner_age {
-        let (Some(sector), Some(st)) = (str_field(r, "sector"), str_field(r, "state_fips"))
-        else {
+        let (Some(sector), Some(st)) = (str_field(r, "sector"), str_field(r, "state_fips")) else {
             continue;
         };
         let (Some(band), Some(owners)) = (
@@ -885,9 +890,7 @@ pub fn blend_market(
                 .map(|y| Value::from(y.clone()))
                 .unwrap_or(Value::Null);
             let succession_receipts = match (pct_55, c.solo_receipts_thousands) {
-                (Some(p), Some(rcpt)) => {
-                    Value::from((p * rcpt as f64 * 1000.0).round() as i64)
-                }
+                (Some(p), Some(rcpt)) => Value::from((p * rcpt as f64 * 1000.0).round() as i64),
                 _ => Value::Null,
             };
             // FORMATION: NATIONAL sector-grain velocity joined by the naics4's
@@ -1229,7 +1232,10 @@ mod tests {
         assert!(items[0].1["succession_grain"].is_null());
         assert!(items[0].1["succession_receipts"].is_null());
         // NES-D present but receipts unreported → share yes, dollars Null.
-        let ages = vec![band("23", "06", "55 to 64", 1), band("23", "06", "25 to 54", 1)];
+        let ages = vec![
+            band("23", "06", "55 to 64", 1),
+            band("23", "06", "25 to 54", 1),
+        ];
         let items = blend_market(&employers, &solos, &BTreeMap::new(), &ages, &[]);
         assert_eq!(items[0].1["pct_owners_55plus"], json!(0.5));
         assert!(items[0].1["succession_receipts"].is_null());

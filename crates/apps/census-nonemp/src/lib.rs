@@ -203,7 +203,11 @@ impl ScrapeApp for CensusNonemp {
             let url = format!(
                 "https://api.census.gov/data/{year}/nonemp?get=NAME,NESTAB,NRCPTOT&{for_clause}&{naics_var}={naics}&key={api_key}"
             );
-            let resp = ctx.engines.http.fetch(HttpRequest::get(url.clone())).await?;
+            let resp = ctx
+                .engines
+                .http
+                .fetch(HttpRequest::get(url.clone()))
+                .await?;
             // 204 No Content (fully suppressed) or a non-JSON body → record a note,
             // don't fail the whole run.
             if resp.status == 204 || resp.body.trim().is_empty() {

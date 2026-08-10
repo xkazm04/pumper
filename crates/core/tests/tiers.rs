@@ -100,7 +100,10 @@ async fn observations_count_outcomes_and_gate_the_weather_export() {
     // 1 outcome; and a skip-path record (browser win, no http attempt) that
     // must not count because it teaches nothing.
     tiers.record("thin.example", "claude", true).await.unwrap();
-    tiers.record("thin.example", "browser", false).await.unwrap();
+    tiers
+        .record("thin.example", "browser", false)
+        .await
+        .unwrap();
     // Penalty-only snapshot rows never accrue observations.
     tiers
         .save_penalties(&[("penalty.example".into(), 1000)])
@@ -111,7 +114,12 @@ async fn observations_count_outcomes_and_gate_the_weather_export() {
     assert_eq!(deep.observations, 3);
     assert_eq!(deep.http_strikes, 0, "win reset strikes, kept observations");
     assert_eq!(
-        tiers.get("thin.example").await.unwrap().unwrap().observations,
+        tiers
+            .get("thin.example")
+            .await
+            .unwrap()
+            .unwrap()
+            .observations,
         1
     );
 

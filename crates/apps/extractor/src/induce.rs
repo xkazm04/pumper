@@ -200,8 +200,8 @@ pub(crate) async fn run_induce(ctx: &AppContext, induce: &Map<String, Value>) ->
 
     // The one write this mode performs: a per-job FILE artifact (not a dataset
     // record) carrying the candidate rules + evidence, durable for review.
-    let evidence = serde_json::to_value(&ind)
-        .map_err(|e| Error::App(format!("serialize induction: {e}")))?;
+    let evidence =
+        serde_json::to_value(&ind).map_err(|e| Error::App(format!("serialize induction: {e}")))?;
     let bytes = serde_json::to_vec_pretty(&evidence)
         .map_err(|e| Error::App(format!("serialize induction: {e}")))?;
     ctx.save_artifact("induced-ruleset.json", &bytes).await?;

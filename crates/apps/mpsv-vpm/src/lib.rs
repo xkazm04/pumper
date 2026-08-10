@@ -785,7 +785,13 @@ impl ScrapeApp for MpsvVpm {
                 // Unfiltered by trust — same posture as the trends scan: a
                 // silently shortened ratio window is a wrong nowcast, not a
                 // safe one.
-                .changes_since(GAP_APP, Some(GAP_DATASET), None, NOWCAST_REVISION_SCAN, None)
+                .changes_since(
+                    GAP_APP,
+                    Some(GAP_DATASET),
+                    None,
+                    NOWCAST_REVISION_SCAN,
+                    None,
+                )
                 .await?;
             if gap_revs.len() as i64 >= NOWCAST_REVISION_SCAN {
                 tracing::warn!(
@@ -982,27 +988,30 @@ impl ScrapeApp for MpsvVpm {
             .unwrap_or(REPOST_WINDOW_DAYS_DEFAULT)
             .max(1);
         let ledger_date = ref_date.unwrap_or_else(|| chrono::Utc::now().date_naive());
-        let prior_ledger: Option<Ledger> =
-            match ctx.datasets.get(&ctx.app, LEDGER_DATASET, "current").await? {
-                Some(rec) => match ctx.read_source_artifact(&ctx.app, &rec).await {
-                    Ok(body) => match serde_json::from_str::<Ledger>(&body) {
-                        Ok(l) => Some(l),
-                        Err(e) => {
-                            tracing::warn!(
-                                "mpsv-vpm: prior vacancy ledger unparseable ({e}) — restarting ledger"
-                            );
-                            None
-                        }
-                    },
+        let prior_ledger: Option<Ledger> = match ctx
+            .datasets
+            .get(&ctx.app, LEDGER_DATASET, "current")
+            .await?
+        {
+            Some(rec) => match ctx.read_source_artifact(&ctx.app, &rec).await {
+                Ok(body) => match serde_json::from_str::<Ledger>(&body) {
+                    Ok(l) => Some(l),
                     Err(e) => {
                         tracing::warn!(
-                            "mpsv-vpm: prior vacancy ledger unreadable ({e}) — restarting ledger"
+                            "mpsv-vpm: prior vacancy ledger unparseable ({e}) — restarting ledger"
                         );
                         None
                     }
                 },
-                None => None,
-            };
+                Err(e) => {
+                    tracing::warn!(
+                        "mpsv-vpm: prior vacancy ledger unreadable ({e}) — restarting ledger"
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
         let had_prior = prior_ledger.is_some();
         let diff = diff_ledger(
             prior_ledger,
@@ -1027,8 +1036,12 @@ impl ScrapeApp for MpsvVpm {
             }
             *live_counts.entry((ug, "ALL".to_string())).or_default() += 1;
         }
-        let lifecycle_items =
-            aggregate_lifecycle(&diff.ledger.closed, &live_counts, min_count, repost_window_days);
+        let lifecycle_items = aggregate_lifecycle(
+            &diff.ledger.closed,
+            &live_counts,
+            min_count,
+            repost_window_days,
+        );
         let lifecycle = ctx
             .datasets
             .upsert_many_stamped(
@@ -1244,7 +1257,10 @@ fn ratio_observations<'a>(datas: impl Iterator<Item = Option<&'a Value>>, n: usi
     datas
         .filter_map(|d| {
             let d = d?;
-            let posted = d.get("postedMedian").and_then(Value::as_f64).filter(|v| *v > 0.0)?;
+            let posted = d
+                .get("postedMedian")
+                .and_then(Value::as_f64)
+                .filter(|v| *v > 0.0)?;
             let official = d
                 .get("officialMedian")
                 .and_then(Value::as_f64)
@@ -1568,12 +1584,30 @@ struct OpenEntry {
 
 impl From<OpenTuple> for OpenEntry {
     fn from((id, czisco, kraj, band, ico, first_seen, last_seen, seen_count): OpenTuple) -> Self {
-        Self { id, czisco, kraj, band, ico, first_seen, last_seen, seen_count }
+        Self {
+            id,
+            czisco,
+            kraj,
+            band,
+            ico,
+            first_seen,
+            last_seen,
+            seen_count,
+        }
     }
 }
 impl From<OpenEntry> for OpenTuple {
     fn from(e: OpenEntry) -> Self {
-        (e.id, e.czisco, e.kraj, e.band, e.ico, e.first_seen, e.last_seen, e.seen_count)
+        (
+            e.id,
+            e.czisco,
+            e.kraj,
+            e.band,
+            e.ico,
+            e.first_seen,
+            e.last_seen,
+            e.seen_count,
+        )
     }
 }
 
@@ -1607,12 +1641,30 @@ struct ClosedEntry {
 
 impl From<ClosedTuple> for ClosedEntry {
     fn from((id, czisco, kraj, band, ico, closed_at, days_open, repost_id): ClosedTuple) -> Self {
-        Self { id, czisco, kraj, band, ico, closed_at, days_open, repost_id }
+        Self {
+            id,
+            czisco,
+            kraj,
+            band,
+            ico,
+            closed_at,
+            days_open,
+            repost_id,
+        }
     }
 }
 impl From<ClosedEntry> for ClosedTuple {
     fn from(e: ClosedEntry) -> Self {
-        (e.id, e.czisco, e.kraj, e.band, e.ico, e.closed_at, e.days_open, e.repost_id)
+        (
+            e.id,
+            e.czisco,
+            e.kraj,
+            e.band,
+            e.ico,
+            e.closed_at,
+            e.days_open,
+            e.repost_id,
+        )
     }
 }
 
@@ -1693,8 +1745,7 @@ fn diff_ledger(
     let mut closed: Vec<ClosedEntry> = prior_closed
         .into_iter()
         .filter(|c| {
-            NaiveDate::parse_from_str(&c.closed_at, "%Y-%m-%d")
-                .is_ok_and(|d| d >= window_start)
+            NaiveDate::parse_from_str(&c.closed_at, "%Y-%m-%d").is_ok_and(|d| d >= window_start)
         })
         .collect();
 
@@ -1776,7 +1827,11 @@ fn diff_ledger(
     }
 
     LedgerDiff {
-        ledger: Ledger { run_date: today_s, open, closed },
+        ledger: Ledger {
+            run_date: today_s,
+            open,
+            closed,
+        },
         new_now,
         ongoing,
         closed_now,
@@ -2194,7 +2249,13 @@ mod tests {
         let m = MpsvVpm.manifest();
         let schema = m.params_schema.expect("schema declared");
         let props = schema["properties"].as_object().expect("properties");
-        for key in ["url", "maxRecords", "minCount", "aresMaxLookups", "nowcastWindow"] {
+        for key in [
+            "url",
+            "maxRecords",
+            "minCount",
+            "aresMaxLookups",
+            "nowcastWindow",
+        ] {
             assert!(props.contains_key(key), "schema must declare '{key}'");
         }
         let declared = |params: &Value, what: &str| {
@@ -2212,8 +2273,14 @@ mod tests {
     #[test]
     fn ares_checkpoint_round_trips_records_and_budget() {
         let records = vec![
-            ("00000001".to_string(), json!({ "ico": "00000001", "name": "A" })),
-            ("00000002".to_string(), json!({ "ico": "00000002", "name": "B" })),
+            (
+                "00000001".to_string(),
+                json!({ "ico": "00000001", "name": "A" }),
+            ),
+            (
+                "00000002".to_string(),
+                json!({ "ico": "00000002", "name": "B" }),
+            ),
         ];
         let snapshot = AresCheckpoint::to_value(&records, 5, 3);
         let restored = AresCheckpoint::from_value(&snapshot).expect("decodes");
@@ -2230,8 +2297,8 @@ mod tests {
         for bad in [
             json!({}),
             json!({ "phase": "crawl", "records": {} }),
-            json!({ "phase": "ares" }),                 // no records object
-            json!({ "phase": "ares", "records": [] }),  // wrong records type
+            json!({ "phase": "ares" }),                // no records object
+            json!({ "phase": "ares", "records": [] }), // wrong records type
             json!("nonsense"),
         ] {
             assert!(
@@ -2439,7 +2506,9 @@ mod tests {
 
     // ── salary nowcast (ratio-carry) ────────────────────────────────────────
 
-    fn anchor_map(entries: &[((&str, &str), (i32, u32, u32))]) -> HashMap<(String, String), NaiveDate> {
+    fn anchor_map(
+        entries: &[((&str, &str), (i32, u32, u32))],
+    ) -> HashMap<(String, String), NaiveDate> {
         entries
             .iter()
             .map(|((g, s), (y, m, d))| {
@@ -2678,7 +2747,13 @@ mod tests {
             .collect()
     }
 
-    fn open_e(id: &str, isco: &str, ico: Option<&str>, first_seen: &str, last_seen: &str) -> OpenEntry {
+    fn open_e(
+        id: &str,
+        isco: &str,
+        ico: Option<&str>,
+        first_seen: &str,
+        last_seen: &str,
+    ) -> OpenEntry {
         OpenEntry {
             id: id.to_string(),
             czisco: isco.to_string(),
@@ -2710,7 +2785,10 @@ mod tests {
     #[test]
     fn diff_first_run_everything_new_nothing_closed() {
         let today = today_map(vec![
-            ("1", tp("CzIsco/5223", Some("Kraj/108"), Some("40k"), Some("123"))),
+            (
+                "1",
+                tp("CzIsco/5223", Some("Kraj/108"), Some("40k"), Some("123")),
+            ),
             ("2", tp("CzIsco/9329", None, None, None)),
         ]);
         let r = diff_ledger(None, &today, d("2026-07-30"), 3, 30);
@@ -2719,7 +2797,11 @@ mod tests {
         assert!(!r.carried);
         assert_eq!(r.ledger.open.len(), 2);
         assert!(r.ledger.closed.is_empty());
-        assert!(r.ledger.open.iter().all(|e| e.first_seen == "2026-07-30" && e.seen_count == 1));
+        assert!(r
+            .ledger
+            .open
+            .iter()
+            .all(|e| e.first_seen == "2026-07-30" && e.seen_count == 1));
     }
 
     #[test]
@@ -2804,7 +2886,13 @@ mod tests {
     fn repost_matches_on_ico_isco_kraj_band_within_window_and_links_ids() {
         let prior = ledger(
             "2026-07-29",
-            vec![open_e("old", "CzIsco/5223", Some("123"), "2026-07-01", "2026-07-29")],
+            vec![open_e(
+                "old",
+                "CzIsco/5223",
+                Some("123"),
+                "2026-07-01",
+                "2026-07-29",
+            )],
             vec![],
         );
         // Day 1: "old" disappears → closed.
@@ -2925,7 +3013,7 @@ mod tests {
         let all = &items[0].1;
         assert_eq!(all["closedCount"], 4); // Kraj/116 closure still counts here
         assert_eq!(all["churnPct"], 10.0); // 4 vs 40
-        // Unknown live cell → no fabricated churn.
+                                           // Unknown live cell → no fabricated churn.
         let no_live = aggregate_lifecycle(&closed, &HashMap::new(), 3, 30);
         assert!(no_live[0].1["churnPct"].is_null());
         assert!(no_live[0].1["liveCount"].is_null());
@@ -2935,7 +3023,13 @@ mod tests {
     fn ledger_serializes_rows_as_compact_tuples_and_round_trips() {
         let l = ledger(
             "2026-07-30",
-            vec![open_e("1", "CzIsco/5223", Some("123"), "2026-07-20", "2026-07-30")],
+            vec![open_e(
+                "1",
+                "CzIsco/5223",
+                Some("123"),
+                "2026-07-20",
+                "2026-07-30",
+            )],
             vec![ClosedEntry {
                 id: "2".to_string(),
                 czisco: "CzIsco/9329".to_string(),
@@ -2949,7 +3043,9 @@ mod tests {
         );
         let s = serde_json::to_string(&l).unwrap();
         // Rows are arrays, not objects — field names must not repeat 300k times.
-        assert!(s.contains(r#"["1","CzIsco/5223","Kraj/108","40k","123","2026-07-20","2026-07-30",1]"#));
+        assert!(
+            s.contains(r#"["1","CzIsco/5223","Kraj/108","40k","123","2026-07-20","2026-07-30",1]"#)
+        );
         assert!(s.contains(r#"["2","CzIsco/9329",null,null,null,"2026-07-30",3,null]"#));
         let back: Ledger = serde_json::from_str(&s).unwrap();
         assert_eq!(back.open, l.open);

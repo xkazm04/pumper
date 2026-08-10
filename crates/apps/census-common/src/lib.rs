@@ -269,7 +269,10 @@ mod tests {
             p.source_url.as_deref(),
             Some("https://x/data?get=A&key=REDACTED")
         );
-        assert_eq!(p.artifact_sha.as_deref(), Some(&*artifact_sha(b"[[\"a\"]]")));
+        assert_eq!(
+            p.artifact_sha.as_deref(),
+            Some(&*artifact_sha(b"[[\"a\"]]"))
+        );
         // No RuleSet produced these records — a fabricated hash would claim
         // replayability the app cannot deliver.
         assert!(p.rules_hash.is_none());
@@ -357,7 +360,10 @@ mod tests {
         .expect("share");
         assert!((share - 0.4).abs() < 1e-9);
         // All bands suppressed/structural → None, not 0.0.
-        assert_eq!(owner_age_share_55plus(&bands(&[("Total reporting", 90)])), None);
+        assert_eq!(
+            owner_age_share_55plus(&bands(&[("Total reporting", 90)])),
+            None
+        );
         assert_eq!(owner_age_share_55plus(&[]), None);
     }
 

@@ -170,7 +170,12 @@ mod tests {
         assert_eq!(e2[0].1["to_url"], "https://a.example/z");
         assert_eq!(g.deduped, 2);
         // Different from-page to the same target is a DIFFERENT edge.
-        let e3 = g.page_edges("https://a.example/p", 1, &links(&["https://a.example/x"]), "j");
+        let e3 = g.page_edges(
+            "https://a.example/p",
+            1,
+            &links(&["https://a.example/x"]),
+            "j",
+        );
         assert_eq!(e3.len(), 1);
     }
 
@@ -184,7 +189,12 @@ mod tests {
         assert_eq!(edges.len(), OUT_DEGREE_CAP);
         assert_eq!(g.dropped_out_degree, 25);
         // The cap is per PAGE: the next page emits fine.
-        let e2 = g.page_edges("https://a.example/2", 1, &links(&["https://a.example/q"]), "j");
+        let e2 = g.page_edges(
+            "https://a.example/2",
+            1,
+            &links(&["https://a.example/q"]),
+            "j",
+        );
         assert_eq!(e2.len(), 1);
         assert_eq!(g.dropped_out_degree, 25);
     }
@@ -193,10 +203,19 @@ mod tests {
     fn top_linked_ranks_by_in_degree_with_stable_ties() {
         let mut g = EdgeGraph::default();
         // Three pages link to /hub, one links to /leaf.
-        for from in ["https://a.example/1", "https://a.example/2", "https://a.example/3"] {
+        for from in [
+            "https://a.example/1",
+            "https://a.example/2",
+            "https://a.example/3",
+        ] {
             g.page_edges(from, 1, &links(&["https://a.example/hub"]), "j");
         }
-        g.page_edges("https://a.example/4", 1, &links(&["https://a.example/leaf"]), "j");
+        g.page_edges(
+            "https://a.example/4",
+            1,
+            &links(&["https://a.example/leaf"]),
+            "j",
+        );
         let top = g.top_linked();
         assert_eq!(top[0]["url"], "https://a.example/hub");
         assert_eq!(top[0]["links_in"], 3);
@@ -218,8 +237,18 @@ mod tests {
     #[test]
     fn deduped_edges_do_not_inflate_in_degree() {
         let mut g = EdgeGraph::default();
-        g.page_edges("https://a.example/", 0, &links(&["https://a.example/x"]), "j");
-        g.page_edges("https://a.example/", 0, &links(&["https://a.example/x"]), "j");
+        g.page_edges(
+            "https://a.example/",
+            0,
+            &links(&["https://a.example/x"]),
+            "j",
+        );
+        g.page_edges(
+            "https://a.example/",
+            0,
+            &links(&["https://a.example/x"]),
+            "j",
+        );
         let top = g.top_linked();
         assert_eq!(top.len(), 1);
         assert_eq!(top[0]["links_in"], 1);

@@ -1,0 +1,7 @@
+# Pinned so rustfmt output is identical across every machine/session that edits
+# this repo — fmt drift from version skew reached ~190 files before this pin
+# (.perfect/Perfect/config.md, round-7 skill log). Bump deliberately, and re-run
+# a repo-wide `cargo fmt` in the same commit as any bump.
+[toolchain]
+channel = "1.96.1"
+components = ["rustfmt", "clippy"]

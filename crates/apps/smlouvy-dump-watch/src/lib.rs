@@ -311,7 +311,10 @@ mod tests {
             .expect("object")
             .keys()
         {
-            assert!(props.contains_key(k), "default_params param '{k}' undeclared");
+            assert!(
+                props.contains_key(k),
+                "default_params param '{k}' undeclared"
+            );
         }
     }
 

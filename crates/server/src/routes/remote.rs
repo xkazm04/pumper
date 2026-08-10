@@ -95,7 +95,10 @@ pub(crate) async fn fetch_proxy(
     // The LOCAL stack: `engines.http` is the real HttpEngine — governor
     // spacing, learned penalties, cache, retries, profile jars all included.
     let resp = state.engines.http.fetch(req).await.map_err(|e| {
-        ApiError(StatusCode::BAD_GATEWAY, format!("proxied fetch failed: {e}"))
+        ApiError(
+            StatusCode::BAD_GATEWAY,
+            format!("proxied fetch failed: {e}"),
+        )
     })?;
     let value = serde_json::to_value(&resp)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;

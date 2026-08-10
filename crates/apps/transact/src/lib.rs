@@ -120,8 +120,13 @@ impl ScrapeApp for Transact {
 
         // Cost provenance: browser flows are free, but a transact run should
         // still be visible in the job's cost trail like any engine use.
-        ctx.meter("browser", Some(&evidence.url), 0.0, Some("transact_dry_run"))
-            .await;
+        ctx.meter(
+            "browser",
+            Some(&evidence.url),
+            0.0,
+            Some("transact_dry_run"),
+        )
+        .await;
 
         // Big payloads to artifacts (repo convention): the DOM snapshot and the
         // full evidence bundle live beside the job, not inside jobs.result.
@@ -140,8 +145,11 @@ impl ScrapeApp for Transact {
             "nav_timed_out": evidence.nav_timed_out,
             "dom_artifact": "dom.html",
         });
-        ctx.save_artifact("evidence.json", serde_json::to_vec_pretty(&bundle)?.as_slice())
-            .await?;
+        ctx.save_artifact(
+            "evidence.json",
+            serde_json::to_vec_pretty(&bundle)?.as_slice(),
+        )
+        .await?;
 
         Ok(json!({
             "dry_run": evidence.dry_run,
@@ -236,7 +244,10 @@ mod tests {
         // proving the rejection happens BEFORE any engine call.
         let ctx = ctx_with_browser(&store.storage, params, Arc::new(Dead)).await;
         let err = Transact.run(ctx).await.unwrap_err();
-        assert!(matches!(err, Error::Transact(_)), "typed rejection, got {err:?}");
+        assert!(
+            matches!(err, Error::Transact(_)),
+            "typed rejection, got {err:?}"
+        );
         assert!(
             err.to_string().contains("human-approval"),
             "error must point at the approval design: {err}"
@@ -271,7 +282,10 @@ mod tests {
         assert_eq!(out["steps_completed"], json!(2));
         assert_eq!(out["would_submit"]["action"], json!("click"));
         assert_eq!(out["would_submit"]["selector"], json!("#confirm-submit"));
-        assert!(out["next_slice"].as_str().unwrap().contains("human approval"));
+        assert!(out["next_slice"]
+            .as_str()
+            .unwrap()
+            .contains("human approval"));
 
         // The engine saw the profile + key, and the submit action was carried
         // as data, never appended to the executable steps.
@@ -281,14 +295,22 @@ mod tests {
         assert_eq!(seen[0].idempotency_key, "newsletter-1");
         assert!(!seen[0].submit);
         assert_eq!(seen[0].steps.len(), 2);
-        assert!(matches!(&seen[0].submit_action, PageAction::Click { selector } if selector == "#confirm-submit"));
+        assert!(
+            matches!(&seen[0].submit_action, PageAction::Click { selector } if selector == "#confirm-submit")
+        );
 
         // Evidence bundle artifacts landed.
         let evidence = std::fs::read_to_string(artifacts_dir.join("evidence.json")).unwrap();
         let evidence: Value = serde_json::from_str(&evidence).unwrap();
         assert_eq!(evidence["dry_run"], json!(true));
-        assert_eq!(evidence["would_submit"]["selector"], json!("#confirm-submit"));
-        assert_eq!(evidence["filled_fields"][0]["value"], json!("team@example.com"));
+        assert_eq!(
+            evidence["would_submit"]["selector"],
+            json!("#confirm-submit")
+        );
+        assert_eq!(
+            evidence["filled_fields"][0]["value"],
+            json!("team@example.com")
+        );
         let dom = std::fs::read_to_string(artifacts_dir.join("dom.html")).unwrap();
         assert_eq!(dom, "<form>confirm</form>");
     }

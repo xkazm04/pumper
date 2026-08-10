@@ -31,9 +31,12 @@ async fn seed_pages(store: &TempStore) -> std::path::PathBuf {
     )
     .await
     .unwrap();
-    tokio::fs::write(dir.join("b.html"), b"<h1>B</h1><span class=\"price\">8</span>")
-        .await
-        .unwrap();
+    tokio::fs::write(
+        dir.join("b.html"),
+        b"<h1>B</h1><span class=\"price\">8</span>",
+    )
+    .await
+    .unwrap();
     store
         .datasets()
         .upsert_many(
@@ -118,11 +121,19 @@ async fn replay_diffs_candidate_against_baseline_and_writes_no_datasets() {
         vec![("crawl".to_string(), "pages".to_string())],
         "replay must not write datasets"
     );
-    assert!(out.get("new").is_none(), "no upsert summary in replay output");
+    assert!(
+        out.get("new").is_none(),
+        "no upsert summary in replay output"
+    );
 
     // The report landed as a job artifact and round-trips.
-    let artifact = root.join("extractor").join("job").join("replay-report.json");
-    let bytes = tokio::fs::read(&artifact).await.expect("replay-report.json");
+    let artifact = root
+        .join("extractor")
+        .join("job")
+        .join("replay-report.json");
+    let bytes = tokio::fs::read(&artifact)
+        .await
+        .expect("replay-report.json");
     let report: Value = serde_json::from_slice(&bytes).unwrap();
     assert_eq!(report["mode"], "replay");
     assert_eq!(report["fields"][0]["field"], "price");
@@ -137,7 +148,9 @@ async fn replay_versions_all_bisects_the_boundary_where_a_field_broke() {
     let dir = root.join("crawl").join(&job);
     tokio::fs::create_dir_all(&dir).await.unwrap();
     // Jan: h1 present. Mar: markup changed, h1 gone. Live: still gone.
-    tokio::fs::write(dir.join("p.r1.html"), b"<h1>old</h1>").await.unwrap();
+    tokio::fs::write(dir.join("p.r1.html"), b"<h1>old</h1>")
+        .await
+        .unwrap();
     tokio::fs::write(dir.join("p.r2.html"), b"<div class=\"t\">new</div>")
         .await
         .unwrap();

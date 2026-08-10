@@ -957,7 +957,11 @@ mod sdk_fixture_conformance_tests {
         };
         let actual = serde_json::to_value(&record).unwrap();
         assert_covers(&fixture, &actual, "live record");
-        assert_eq!(fixture["removed_at"], Value::Null, "live fixture must model removed_at: null");
+        assert_eq!(
+            fixture["removed_at"],
+            Value::Null,
+            "live fixture must model removed_at: null"
+        );
     }
 
     #[test]
@@ -977,7 +981,11 @@ mod sdk_fixture_conformance_tests {
     fn revision_page_fixture_fields_are_a_subset_of_the_actual_revision_shape() {
         let fixture: Value = serde_json::from_str(REVISION_PAGE_FIXTURE).unwrap();
         let items = fixture["items"].as_array().unwrap();
-        assert_eq!(items.len(), 2, "fixture must cover both a data-carrying and a removed revision");
+        assert_eq!(
+            items.len(),
+            2,
+            "fixture must cover both a data-carrying and a removed revision"
+        );
 
         let now = Utc::now();
         let changed = Revision {

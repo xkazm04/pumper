@@ -180,7 +180,10 @@ mod dynamic_tests {
         assert_eq!(entry["params_schema"]["type"], "object");
         // And the degraded shape: no description, no schema.
         let bare = dynamic_entry("bare", &json!({}));
-        assert!(bare["description"].as_str().unwrap().contains("no description"));
+        assert!(bare["description"]
+            .as_str()
+            .unwrap()
+            .contains("no description"));
         assert_eq!(bare["has_params_schema"], false);
         assert!(bare["params_schema"].is_null());
     }

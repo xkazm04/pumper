@@ -55,9 +55,7 @@ pub(crate) fn parse_replay_params(
         .get("rules")
         .cloned()
         .ok_or_else(|| "replay.rules (the candidate rule set) is required".to_string())
-        .and_then(|v| {
-            serde_json::from_value(v).map_err(|e| format!("bad replay.rules: {e}"))
-        })?;
+        .and_then(|v| serde_json::from_value(v).map_err(|e| format!("bad replay.rules: {e}")))?;
     let baseline: Option<RuleSet> = replay
         .get("baseline_rules")
         .cloned()
@@ -334,10 +332,7 @@ pub(crate) fn bisect_field(
 /// The replay runner: load stored bodies (latest or full version history),
 /// run candidate (+ optional baseline) rules over them, and return the diff
 /// report. Never writes a dataset — see the module doc.
-pub(crate) async fn run_replay(
-    ctx: &AppContext,
-    replay: &Map<String, Value>,
-) -> Result<Value> {
+pub(crate) async fn run_replay(ctx: &AppContext, replay: &Map<String, Value>) -> Result<Value> {
     let p = parse_replay_params(replay).map_err(Error::App)?;
     let candidate = Arc::new(p.candidate.compile()?);
     let baseline = p
@@ -547,22 +542,34 @@ mod tests {
         // Baseline: price matched on both; title matched on a only.
         let base = [
             report(
-                &[("price", FieldStatus::Matched), ("title", FieldStatus::Matched)],
+                &[
+                    ("price", FieldStatus::Matched),
+                    ("title", FieldStatus::Matched),
+                ],
                 json!({"price": "9", "title": "A"}),
             ),
             report(
-                &[("price", FieldStatus::Matched), ("title", FieldStatus::Empty)],
+                &[
+                    ("price", FieldStatus::Matched),
+                    ("title", FieldStatus::Empty),
+                ],
                 json!({"price": "8", "title": null}),
             ),
         ];
         // Candidate: price lost on b, changed on a; title added on b.
         let cand = [
             report(
-                &[("price", FieldStatus::Matched), ("title", FieldStatus::Matched)],
+                &[
+                    ("price", FieldStatus::Matched),
+                    ("title", FieldStatus::Matched),
+                ],
                 json!({"price": "9.00", "title": "A"}),
             ),
             report(
-                &[("price", FieldStatus::Empty), ("title", FieldStatus::Matched)],
+                &[
+                    ("price", FieldStatus::Empty),
+                    ("title", FieldStatus::Matched),
+                ],
                 json!({"price": null, "title": "B"}),
             ),
         ];
@@ -641,9 +648,15 @@ mod tests {
         let boundaries = bisect_field("f", &keys, &cand);
         assert_eq!(boundaries.len(), 1, "{boundaries:?}");
         assert_eq!(boundaries[0]["url"], "http://p");
-        assert_eq!(boundaries[0]["from"]["observed_at"], "2026-01-01T00:00:00+00:00");
+        assert_eq!(
+            boundaries[0]["from"]["observed_at"],
+            "2026-01-01T00:00:00+00:00"
+        );
         assert_eq!(boundaries[0]["from"]["matched"], true);
-        assert_eq!(boundaries[0]["to"]["observed_at"], "2026-03-01T00:00:00+00:00");
+        assert_eq!(
+            boundaries[0]["to"]["observed_at"],
+            "2026-03-01T00:00:00+00:00"
+        );
         assert_eq!(boundaries[0]["to"]["matched"], false);
     }
 }

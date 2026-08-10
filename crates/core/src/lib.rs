@@ -67,6 +67,8 @@ pub use datasets::{
 pub use doctor::{
     diagnose, DatasetCoverage, Finding, MissingBody, Severity, StoreFacts, TableGrowth,
 };
+#[cfg(feature = "storage")]
+pub use resilience::preview::{preview_fleet, FleetPreview, SourcePreview};
 pub use resilience::{
     doc_signals, doc_signals_parsed, extract_and_fingerprint_batch, signals_batch, CohortAdequacy,
     CohortDrift, Diagnosis, DocSignals, FetchHealth, ObservedDoc, RunReport, RunVerdict,
@@ -74,8 +76,6 @@ pub use resilience::{
 };
 #[cfg(feature = "storage")]
 pub use resilience::{HealthStore, Resilience, SourceHealth, SourceRun};
-#[cfg(feature = "storage")]
-pub use resilience::preview::{preview_fleet, FleetPreview, SourcePreview};
 #[cfg(feature = "storage")]
 pub use retention::{
     artifact_is_reclaimable, artifact_usage, delete_artifacts, keep_reason,

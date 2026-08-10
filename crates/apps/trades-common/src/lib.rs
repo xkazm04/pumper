@@ -562,7 +562,11 @@ pub mod taxonomy {
     /// The compile-time fallback taxonomy: the five enum trades as entries, in
     /// canonical prompt order.
     pub fn seed_entries() -> Vec<TradeEntry> {
-        Trade::ALL.iter().copied().map(TradeEntry::from_trade).collect()
+        Trade::ALL
+            .iter()
+            .copied()
+            .map(TradeEntry::from_trade)
+            .collect()
     }
 
     /// The seed entry as a `trades/taxonomy` dataset record (enabled, source
@@ -587,7 +591,11 @@ pub mod taxonomy {
     /// unusable (no label) — a malformed row must degrade to "ignored", never
     /// poison the whole taxonomy.
     fn parse_entry(data: &Value) -> Option<(TradeEntry, bool)> {
-        let label = data.get("trade").and_then(Value::as_str)?.trim().to_string();
+        let label = data
+            .get("trade")
+            .and_then(Value::as_str)?
+            .trim()
+            .to_string();
         if label.is_empty() {
             return None;
         }
@@ -630,7 +638,10 @@ pub mod taxonomy {
         };
         // Governance default: a record must OPT IN with enabled:true. Absent
         // or false ⇒ not part of the live taxonomy (proposer writes false).
-        let enabled = data.get("enabled").and_then(Value::as_bool).unwrap_or(false);
+        let enabled = data
+            .get("enabled")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         Some((entry, enabled))
     }
 
@@ -646,8 +657,7 @@ pub mod taxonomy {
         if records.is_empty() {
             return seeds;
         }
-        let parsed: Vec<(TradeEntry, bool)> =
-            records.iter().filter_map(parse_entry).collect();
+        let parsed: Vec<(TradeEntry, bool)> = records.iter().filter_map(parse_entry).collect();
         // Override / remove seeds by label.
         let mut out: Vec<TradeEntry> = Vec::new();
         for seed in seeds.drain(..) {
@@ -834,10 +844,8 @@ pub mod taxonomy {
             // A registry materialized purely from seed_record rows must merge
             // to the identical taxonomy — the "dataset present but only seeds"
             // state changes nothing.
-            let recs: Vec<serde_json::Value> = Trade::ALL
-                .iter()
-                .map(|t| seed_record(*t).1)
-                .collect();
+            let recs: Vec<serde_json::Value> =
+                Trade::ALL.iter().map(|t| seed_record(*t).1).collect();
             assert_eq!(merge_taxonomy(&recs), seed_entries());
         }
 
@@ -898,15 +906,24 @@ pub mod taxonomy {
                 source: "approved".into(),
             });
             // Legacy inputs behave exactly as canonicalize() always has.
-            assert_eq!(canonicalize_in(&entries, "plumber"), ("Plumbing".into(), true));
+            assert_eq!(
+                canonicalize_in(&entries, "plumber"),
+                ("Plumbing".into(), true)
+            );
             assert_eq!(
                 canonicalize_in(&entries, "pool landscaping"),
                 canonicalize("pool landscaping"),
                 "enum keyword precedence preserved"
             );
             // New registry trade now resolves.
-            assert_eq!(canonicalize_in(&entries, "Roof repair"), ("Roofing".into(), true));
-            assert_eq!(canonicalize_in(&entries, "Chimneys"), ("Chimneys".into(), false));
+            assert_eq!(
+                canonicalize_in(&entries, "Roof repair"),
+                ("Roofing".into(), true)
+            );
+            assert_eq!(
+                canonicalize_in(&entries, "Chimneys"),
+                ("Chimneys".into(), false)
+            );
         }
 
         #[test]

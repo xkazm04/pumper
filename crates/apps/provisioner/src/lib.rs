@@ -34,12 +34,12 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use pumper_core::datasets::Provenance;
 use pumper_core::{
     extract_one_with_report, salvage_json, AppContext, AppManifest, CoercionStatus, CostClass,
     DocReport, Error, FetchOutcome, FetchRequest, FetchStrategy, ManifestExample, ResearchRequest,
     Result, Rule, RuleSet, ScrapeApp, Source,
 };
-use pumper_core::datasets::Provenance;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
@@ -490,7 +490,10 @@ fn each_item_counts(rules: &RuleSet, values: &Value) -> BTreeMap<String, usize> 
         .map(|(name, _)| {
             (
                 name.clone(),
-                values.get(name).and_then(Value::as_array).map_or(0, Vec::len),
+                values
+                    .get(name)
+                    .and_then(Value::as_array)
+                    .map_or(0, Vec::len),
             )
         })
         .collect()
@@ -914,7 +917,8 @@ impl ScrapeApp for Provisioner {
             })),
             examples: vec![
                 ManifestExample {
-                    description: "Compile a source proposal from one sentence, with a spend ceiling",
+                    description:
+                        "Compile a source proposal from one sentence, with a spend ceiling",
                     params: json!({
                         "prompt": "track Czech senior Rust developer salary listings weekly",
                         "budget_usd": 1.0
@@ -986,38 +990,38 @@ impl ScrapeApp for Provisioner {
             (cp.session_id, cp.candidates)
         } else {
             let discovery_schema = json!({
-            "type": "object",
-            "required": ["candidates"],
-            "properties": {
-                "candidates": {
-                    "type": "array",
-                    "items": {
-                        "type": "object",
-                        "required": ["url"],
-                        "properties": {
-                            "url": { "type": "string" },
-                            "name": { "type": "string" },
-                            "cadence": { "type": "string" },
-                            "expected_fields": {
-                                "type": "array", "items": { "type": "string" }
+                "type": "object",
+                "required": ["candidates"],
+                "properties": {
+                    "candidates": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["url"],
+                            "properties": {
+                                "url": { "type": "string" },
+                                "name": { "type": "string" },
+                                "cadence": { "type": "string" },
+                                "expected_fields": {
+                                    "type": "array", "items": { "type": "string" }
+                                }
                             }
                         }
                     }
                 }
-            }
-        });
-        let mut discover = ResearchRequest::new(format!(
-            "You are provisioning a web data source. For the goal below, identify \
+            });
+            let mut discover = ResearchRequest::new(format!(
+                "You are provisioning a web data source. For the goal below, identify \
              the 1-3 BEST public web pages that carry the data (listing/index pages \
              preferred over articles), what fields each yields, and how often the \
              data changes.\n\nGoal: {prompt}\n\nRespond with ONLY a JSON object: \
              {{\"candidates\": [{{\"url\": string, \"name\": string, \
              \"cadence\": \"daily|weekly|monthly|quarterly|annual|on-demand\", \
              \"expected_fields\": string[]}}]}}"
-        ))
-        .with_role("research");
-        discover.max_budget_usd = budget_usd;
-        discover.json_schema = Some(discovery_schema);
+            ))
+            .with_role("research");
+            discover.max_budget_usd = budget_usd;
+            discover.json_schema = Some(discovery_schema);
             let out = ctx.research(discover).await?;
             cost_usd += out.cost_usd.unwrap_or(0.0);
             let session_id = out.session_id.clone();
@@ -1393,7 +1397,9 @@ mod tests {
 
         // A checkpoint from a DIFFERENT prompt must never be adopted — it would
         // silently compile the wrong source.
-        assert!(DiscoveryCheckpoint::from_blob(Some(&blob), &proposal_key("something else")).is_none());
+        assert!(
+            DiscoveryCheckpoint::from_blob(Some(&blob), &proposal_key("something else")).is_none()
+        );
     }
 
     #[test]
@@ -1861,9 +1867,24 @@ mod tests {
             0.42,
         );
         for key in [
-            "prompt", "catalog_row", "catalog_toml", "rule_set", "seeds", "samples", "cadence",
-            "budget", "sample_stats", "confidence", "confidence_scale", "catalog_confidence",
-            "accepted", "verdict", "provisioned", "status", "intended_dataset", "iterations",
+            "prompt",
+            "catalog_row",
+            "catalog_toml",
+            "rule_set",
+            "seeds",
+            "samples",
+            "cadence",
+            "budget",
+            "sample_stats",
+            "confidence",
+            "confidence_scale",
+            "catalog_confidence",
+            "accepted",
+            "verdict",
+            "provisioned",
+            "status",
+            "intended_dataset",
+            "iterations",
             "cost_usd",
         ] {
             assert!(p.get(key).is_some(), "proposal missing key {key}");

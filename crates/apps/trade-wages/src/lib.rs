@@ -467,7 +467,11 @@ async fn propose_trade(
                 .get(taxonomy::TAXONOMY_APP, taxonomy::TAXONOMY_DATASET, &key)
                 .await?
             {
-                let src = prior.data.get("source").and_then(Value::as_str).unwrap_or("");
+                let src = prior
+                    .data
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
                 if src != "proposed" {
                     return Ok(json!({
                         "source": "agentic/taxonomy-propose",
@@ -680,7 +684,8 @@ mod tests {
         // "Plumbers" (a model phrasing) must land on the same key as "Plumbing"
         // and the stored `trade` field must agree with the key.
         let data = json!({ "trades": [wage_entry("Plumbers")] });
-        let (records, rejected, unknown) = collect_wage_records(&taxonomy::seed_entries(), &data, "2024");
+        let (records, rejected, unknown) =
+            collect_wage_records(&taxonomy::seed_entries(), &data, "2024");
         assert!(rejected.is_empty());
         assert!(unknown.is_empty());
         let (key, rec) = &records[0];

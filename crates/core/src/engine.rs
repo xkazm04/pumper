@@ -818,7 +818,9 @@ mod tests {
         assert!(!req.submit);
         assert!(req.validate().is_ok());
         assert_eq!(req.steps.len(), 3);
-        assert!(matches!(&req.submit_action, PageAction::Click { selector } if selector == "#confirm-submit"));
+        assert!(
+            matches!(&req.submit_action, PageAction::Click { selector } if selector == "#confirm-submit")
+        );
     }
 
     #[test]
@@ -830,8 +832,14 @@ mod tests {
         // caller at the human-approval design rather than a dead end.
         assert!(matches!(err, Error::Transact(_)), "got {err:?}");
         let msg = err.to_string();
-        assert!(msg.contains("human-approval"), "message must name the next slice: {msg}");
-        assert!(msg.contains("dry-run"), "message must explain what v1 does: {msg}");
+        assert!(
+            msg.contains("human-approval"),
+            "message must name the next slice: {msg}"
+        );
+        assert!(
+            msg.contains("dry-run"),
+            "message must explain what v1 does: {msg}"
+        );
     }
 
     #[test]
@@ -865,7 +873,10 @@ mod tests {
             ],
             until_selector_count_stable: None,
         });
-        assert_eq!(req.fill_selectors(), vec!["#email".to_string(), "#org".to_string()]);
+        assert_eq!(
+            req.fill_selectors(),
+            vec!["#email".to_string(), "#org".to_string()]
+        );
     }
 
     #[test]
@@ -873,7 +884,10 @@ mod tests {
         // A hostile selector's quotes/backslashes stay inside the JSON literal.
         let sels = vec![r#"input[name="a\"b"]"#.to_string()];
         let js = filled_fields_js(&sels);
-        assert!(js.contains(r#"\"a\\\"b\""#), "selector must be JSON-escaped: {js}");
+        assert!(
+            js.contains(r#"\"a\\\"b\""#),
+            "selector must be JSON-escaped: {js}"
+        );
         // The evaluate result decodes into typed fields.
         let evaluated = serde_json::json!([
             {"selector": "#email", "value": "a@b.c", "found": true},
@@ -885,7 +899,14 @@ mod tests {
         assert!(!fields[1].found);
         // A failed/malformed evaluate degrades to not-found rows, never an error.
         let fields = parse_filled_fields(&["#email".into()], None);
-        assert_eq!(fields, vec![FilledField { selector: "#email".into(), value: None, found: false }]);
+        assert_eq!(
+            fields,
+            vec![FilledField {
+                selector: "#email".into(),
+                value: None,
+                found: false
+            }]
+        );
         let fields = parse_filled_fields(&["#email".into()], Some(&serde_json::json!("nonsense")));
         assert!(!fields[0].found);
     }

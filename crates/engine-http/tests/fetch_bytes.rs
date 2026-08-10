@@ -49,8 +49,13 @@ async fn new_engine(root: &Path) -> HttpEngine {
     let governor = Arc::new(Governor::new(&GovernorConfig::default()));
     // Leak the pool with the engine for the test's lifetime.
     std::mem::forget(storage);
-    HttpEngine::new(&HttpConfig::default(), governor, cache, root.join("profiles"))
-        .expect("engine")
+    HttpEngine::new(
+        &HttpConfig::default(),
+        governor,
+        cache,
+        root.join("profiles"),
+    )
+    .expect("engine")
 }
 
 fn temp_root(tag: &str) -> std::path::PathBuf {

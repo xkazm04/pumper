@@ -79,7 +79,8 @@ impl ScrapeApp for HomewysePricing {
                     params: json!({ "locality": DEFAULT_LOCALITY, "year": DEFAULT_YEAR }),
                 },
                 ManifestExample {
-                    description: "Force fresh metro pricing regardless of how recently it was priced",
+                    description:
+                        "Force fresh metro pricing regardless of how recently it was priced",
                     params: json!({
                         "locality": "Phoenix, AZ",
                         "year": DEFAULT_YEAR,

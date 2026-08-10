@@ -31,15 +31,16 @@ async fn request(router: &axum::Router, req: Request<Body>) -> (StatusCode, Valu
     let resp = router.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
-    (status, serde_json::from_slice(&bytes).unwrap_or(Value::Null))
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(Value::Null),
+    )
 }
 
 #[tokio::test]
 async fn dynamic_app_is_listed_read_only_and_enqueue_is_rejected() {
-    let app_dir = std::env::temp_dir().join(format!(
-        "pumper-e2e-dynamic-apps-{}",
-        std::process::id()
-    ));
+    let app_dir =
+        std::env::temp_dir().join(format!("pumper-e2e-dynamic-apps-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&app_dir);
     std::fs::create_dir_all(&app_dir).unwrap();
     std::fs::write(
@@ -63,16 +64,28 @@ async fn dynamic_app_is_listed_read_only_and_enqueue_is_rejected() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let apps = body["apps"].as_array().unwrap();
-    let fake = apps.iter().find(|a| a["name"] == "fake").expect("static app listed");
-    assert!(fake.get("dynamic").is_none(), "static entries are unchanged");
-    let quotes = apps.iter().find(|a| a["name"] == "quotes").expect("dynamic app listed");
+    let fake = apps
+        .iter()
+        .find(|a| a["name"] == "fake")
+        .expect("static app listed");
+    assert!(
+        fake.get("dynamic").is_none(),
+        "static entries are unchanged"
+    );
+    let quotes = apps
+        .iter()
+        .find(|a| a["name"] == "quotes")
+        .expect("dynamic app listed");
     assert_eq!(quotes["dynamic"], true);
     assert_eq!(quotes["runnable"], false);
     assert_eq!(quotes["ready"], false);
     assert_eq!(quotes["description"], "quote scraper");
     assert_eq!(quotes["params_schema"]["type"], "object");
     assert!(
-        quotes["reason"].as_str().unwrap().contains("component-model host"),
+        quotes["reason"]
+            .as_str()
+            .unwrap()
+            .contains("component-model host"),
         "reason explains what is missing"
     );
 
@@ -87,7 +100,11 @@ async fn dynamic_app_is_listed_read_only_and_enqueue_is_rejected() {
     .await;
     assert_eq!(status, StatusCode::OK);
     assert!(
-        body["tools"].as_array().unwrap().iter().all(|t| t["name"] != "quotes"),
+        body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|t| t["name"] != "quotes"),
         "dynamic apps are excluded from ?format=tools"
     );
 
@@ -102,7 +119,10 @@ async fn dynamic_app_is_listed_read_only_and_enqueue_is_rejected() {
     .await;
     assert_eq!(status, StatusCode::CONFLICT);
     let msg = body["error"].as_str().unwrap();
-    assert!(msg.contains("not runnable") && msg.contains("component-model host"), "{msg}");
+    assert!(
+        msg.contains("not runnable") && msg.contains("component-model host"),
+        "{msg}"
+    );
 
     // A name known to neither surface stays a plain 404.
     let (status, _) = request(

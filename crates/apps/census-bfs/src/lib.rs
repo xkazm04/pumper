@@ -54,7 +54,10 @@ const DEFAULT_FROM_YEAR: &str = "2022";
 /// support / waste (landscaping, pool, building services).
 const DEFAULT_SECTORS: &[(&str, &str)] = &[
     ("NAICS23", "Construction"),
-    ("NAICS56", "Administrative & support and waste management services"),
+    (
+        "NAICS56",
+        "Administrative & support and waste management services",
+    ),
 ];
 
 #[async_trait]
@@ -556,8 +559,7 @@ mod tests {
                 "us",
             ],
             vec![
-                "50183", "BA_BA", "NAICS23", "no", "2025-01", "NAICS23", "BA_BA", "no",
-                "0", "1",
+                "50183", "BA_BA", "NAICS23", "no", "2025-01", "NAICS23", "BA_BA", "no", "0", "1",
             ],
         ]
         .into_iter()
@@ -565,8 +567,11 @@ mod tests {
         .collect();
         let header = rows.first().cloned().unwrap();
         let idx = |name: &str| header.iter().position(|h| h.as_str() == name);
-        let (i_val, i_time, i_sa) =
-            (idx("cell_value").unwrap(), idx("time").unwrap(), idx("seasonally_adj"));
+        let (i_val, i_time, i_sa) = (
+            idx("cell_value").unwrap(),
+            idx("time").unwrap(),
+            idx("seasonally_adj"),
+        );
         assert_eq!((i_val, i_time, i_sa), (0, 4, Some(3)));
         let out = parse_series_rows(&rows, i_val, i_time, i_sa);
         assert_eq!(out, vec![("2025-01".to_string(), 50183.0)]);
