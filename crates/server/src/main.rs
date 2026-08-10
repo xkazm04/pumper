@@ -165,7 +165,7 @@ async fn run() -> anyhow::Result<()> {
 
     let worker = tokio::spawn(worker::run(state.clone()));
     tokio::spawn(scheduler::run(state.clone()));
-    tokio::spawn(cache_janitor(state.clone()));
+    tokio::spawn(store_janitor(state.clone()));
     tokio::spawn(retention_janitor(state.clone()));
 
     let addr = format!("{}:{}", state.config.server.host, state.config.server.port);
@@ -271,8 +271,19 @@ fn load_dotenv() {
     }
 }
 
-/// Evicts expired cache entries hourly so the on-disk cache doesn't grow forever.
-async fn cache_janitor(state: AppState) {
+/// The **always-on** hourly janitor: the stores whose growth is derived state
+/// nobody would miss, so bounding them needs no opt-in (unlike
+/// [`retention_janitor`], which deletes accrued *value* and is therefore
+/// off by default).
+///
+/// - **Expired `http_cache` entries** — a TTL that has passed is, by definition,
+///   not servable.
+/// - **Stale `tier_memory` rows** — rows carrying no pin, no strikes and no
+///   penalty, both clocks past `[fetcher] host_memory_ttl_secs`. An HTTP win
+///   zeroes a host's strikes but left the row behind forever, so this table grew
+///   by one permanent row per host ever fetched. A row that still says
+///   *anything* is never touched (see `TierMemory::prune_stale`).
+async fn store_janitor(state: AppState) {
     let interval = std::time::Duration::from_secs(3600);
     loop {
         tokio::select! {
@@ -280,9 +291,16 @@ async fn cache_janitor(state: AppState) {
             _ = tokio::time::sleep(interval) => {}
         }
         match state.cache.purge_expired().await {
-            Ok(n) if n > 0 => tracing::info!(purged = n, "cache janitor evicted expired entries"),
+            Ok(n) if n > 0 => tracing::info!(purged = n, "store janitor evicted expired entries"),
             Ok(_) => {}
             Err(e) => tracing::warn!("cache purge failed: {e}"),
+        }
+        match state.tiers.prune_stale().await {
+            Ok(n) if n > 0 => {
+                tracing::info!(pruned = n, "store janitor reclaimed stale host memory")
+            }
+            Ok(_) => {}
+            Err(e) => tracing::warn!("host memory prune failed: {e}"),
         }
     }
 }

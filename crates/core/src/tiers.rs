@@ -33,6 +33,35 @@ pub const WEATHER_IMPORT_PENALTY_CAP_MS: u64 = 60_000;
 /// RFC-3339 timestamp sorts after it, so nothing is ever considered stale.
 const NEVER_STALE: &str = "0000-01-01T00:00:00.000000Z";
 
+/// Rows one [`TierMemory::prune_stale`] pass may reclaim. The GC shares the
+/// SQLite pool with the write-behind snapshot and the live fetch path, so a
+/// pass is one bounded statement rather than "delete everything that qualifies"
+/// — a backlog drains over the next few passes instead of holding a long write
+/// transaction once.
+const PRUNE_BATCH: i64 = 1_000;
+
+/// Whether a persisted penalty snapshot is still worth restoring into the
+/// governor on boot.
+///
+/// The anti-pattern this exists to defend: a host that was penalized months ago
+/// (and has not been fetched since) used to be resurrected at FULL penalty on
+/// every boot, because the restore query only asked `penalty_ms > 0`. A learned
+/// penalty is an observation with an expiry date exactly like a strike, so it
+/// ages on the same `[fetcher] host_memory_ttl_secs` clock — `cutoff` is the
+/// same [`TierMemory::stale_cutoff`] the pin/strike reads use (and the
+/// never-stale sentinel when aging is disabled).
+///
+/// An undatable row (`penalty_updated_at IS NULL`, i.e. nothing ever wrote a
+/// snapshot for it) is NOT restored: we cannot say how old it is, and the
+/// honest default for unknown-age caution is to re-learn it from live evidence.
+pub(crate) fn penalty_is_restorable(
+    penalty_ms: i64,
+    penalty_updated_at: Option<&str>,
+    cutoff: &str,
+) -> bool {
+    penalty_ms > 0 && penalty_updated_at.is_some_and(|at| at >= cutoff)
+}
+
 /// One host's learned state — the row behind `GET /hosts`.
 #[derive(Debug, Clone, Serialize)]
 pub struct HostProfile {
@@ -185,9 +214,14 @@ impl TierMemory {
         Ok(res.rows_affected() > 0)
     }
 
-    /// Write-behind snapshot of the governor's learned penalties. Upserts each
-    /// `(host, penalty_ms)` without touching `updated_at` (strike aging) or the
-    /// strike/pin columns — a penalty-only host gets a fresh row.
+    /// **Additive** penalty write: upserts each `(host, penalty_ms)` without
+    /// touching `updated_at` (strike aging), the strike/pin columns, or any host
+    /// outside the list — a penalty-only host gets a fresh row.
+    ///
+    /// This is the seam for *partial* writes that know about a few hosts and
+    /// nothing about the rest (the host-weather import). The periodic
+    /// write-behind uses [`persist_penalty_snapshot`](Self::persist_penalty_snapshot)
+    /// instead, because it DOES know about the rest.
     pub async fn save_penalties(&self, penalties: &[(String, u64)]) -> Result<()> {
         if penalties.is_empty() {
             return Ok(());
@@ -195,34 +229,118 @@ impl TierMemory {
         let now = ts(Utc::now());
         let mut tx = self.pool.begin().await?;
         for (host, penalty_ms) in penalties {
-            sqlx::query(
-                "INSERT INTO tier_memory (host, http_strikes, preferred, updated_at, penalty_ms, penalty_updated_at) \
-                 VALUES (?1, 0, NULL, ?2, ?3, ?2) \
-                 ON CONFLICT(host) DO UPDATE SET \
-                   penalty_ms = excluded.penalty_ms, penalty_updated_at = excluded.penalty_updated_at",
-            )
-            .bind(host.to_lowercase())
-            .bind(&now)
-            .bind(*penalty_ms as i64)
-            .execute(&mut *tx)
-            .await?;
+            upsert_penalty(&mut tx, host, *penalty_ms, &now).await?;
         }
         tx.commit().await?;
         Ok(())
     }
 
-    /// Restores persisted penalties on boot: every host with a non-zero learned
-    /// penalty, to be seeded back into the in-memory governor.
+    /// **Authoritative** write-behind pass: `snapshot` is the COMPLETE set of
+    /// hosts the live governor currently penalizes, so every persisted penalty
+    /// absent from it has decayed back to zero and is zeroed here.
+    ///
+    /// The anti-pattern this exists to defend (`zombie_penalty_not_resurrected_on_boot`):
+    /// the old pass upserted only the snapshot's own entries, so a host that
+    /// recovered — whose penalty the governor halved away to nothing — kept its
+    /// last non-zero `penalty_ms` row forever and was restored at FULL penalty
+    /// on every boot. A recovered host stayed throttled indefinitely, and the
+    /// only escape was a manual `DELETE /hosts/{host}/memory`.
+    ///
+    /// Zero-then-rewrite (rather than a `NOT IN (…)` list) keeps this one
+    /// bounded statement plus |snapshot| upserts in a single transaction, with
+    /// no query whose size grows with the number of penalized hosts. The zeroing
+    /// stamps `penalty_updated_at`: "we last wrote this penalty — as zero — now",
+    /// which is what starts the row's GC clock ([`prune_stale`](Self::prune_stale)).
+    pub async fn persist_penalty_snapshot(&self, snapshot: &[(String, u64)]) -> Result<()> {
+        let now = ts(Utc::now());
+        let mut tx = self.pool.begin().await?;
+        // Every stored penalty is presumed decayed; the upserts below re-assert
+        // the ones the governor still holds. Touches only already-penalized rows.
+        sqlx::query(
+            "UPDATE tier_memory SET penalty_ms = 0, penalty_updated_at = ?1 WHERE penalty_ms > 0",
+        )
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+        for (host, penalty_ms) in snapshot {
+            upsert_penalty(&mut tx, host, *penalty_ms, &now).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Restores persisted penalties on boot: every host whose learned penalty is
+    /// non-zero AND still within the aging horizon (see
+    /// [`penalty_is_restorable`]), to be seeded back into the in-memory governor.
     pub async fn load_penalties(&self) -> Result<Vec<(String, u64)>> {
-        let rows: Vec<(String, i64)> =
-            sqlx::query_as("SELECT host, penalty_ms FROM tier_memory WHERE penalty_ms > 0")
-                .fetch_all(&self.pool)
-                .await?;
+        let cutoff = self.stale_cutoff();
+        let rows: Vec<(String, i64, Option<String>)> = sqlx::query_as(
+            "SELECT host, penalty_ms, penalty_updated_at FROM tier_memory WHERE penalty_ms > 0",
+        )
+        .fetch_all(&self.pool)
+        .await?;
         Ok(rows
             .into_iter()
-            .map(|(h, ms)| (h, ms.max(0) as u64))
+            .filter(|(_, ms, at)| penalty_is_restorable(*ms, at.as_deref(), &cutoff))
+            .map(|(h, ms, _)| (h, ms.max(0) as u64))
             .collect())
     }
+
+    /// Reclaims tier-memory rows that no longer say anything: no browser pin, no
+    /// strikes, no learned penalty, and both clocks (`updated_at` for the tier
+    /// outcome, `penalty_updated_at` for the snapshot) past the aging horizon.
+    ///
+    /// Nothing else ever reclaimed this table: an http win zeroes a host's
+    /// strikes and clears its pin but leaves the row, so a long-lived server
+    /// accrued one permanent row per host it ever fetched. Returns rows removed,
+    /// bounded by [`PRUNE_BATCH`] per pass.
+    ///
+    /// A row that still carries a pin, strikes, or a penalty is NEVER touched,
+    /// however old — that is exactly the state `GET /hosts` reports (aging is a
+    /// routing decision applied on read, not a display one), so the GC can only
+    /// remove rows the diagnostics would have shown as empty. With aging
+    /// disabled (`ttl_secs == 0`) nothing is stale and the pass is a no-op.
+    pub async fn prune_stale(&self) -> Result<u64> {
+        if self.ttl_secs == 0 {
+            return Ok(0);
+        }
+        let cutoff = self.stale_cutoff();
+        let res = sqlx::query(
+            "DELETE FROM tier_memory WHERE host IN ( \
+               SELECT host FROM tier_memory \
+                WHERE preferred IS NULL AND http_strikes <= 0 AND penalty_ms <= 0 \
+                  AND updated_at < ?1 \
+                  AND (penalty_updated_at IS NULL OR penalty_updated_at < ?1) \
+                LIMIT ?2)",
+        )
+        .bind(&cutoff)
+        .bind(PRUNE_BATCH)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+}
+
+/// The one penalty upsert both write paths share, so an additive write and an
+/// authoritative one can never drift into touching different columns.
+async fn upsert_penalty(
+    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    host: &str,
+    penalty_ms: u64,
+    now: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO tier_memory (host, http_strikes, preferred, updated_at, penalty_ms, penalty_updated_at) \
+         VALUES (?1, 0, NULL, ?2, ?3, ?2) \
+         ON CONFLICT(host) DO UPDATE SET \
+           penalty_ms = excluded.penalty_ms, penalty_updated_at = excluded.penalty_updated_at",
+    )
+    .bind(host.to_lowercase())
+    .bind(now)
+    .bind(penalty_ms.min(i64::MAX as u64) as i64)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
 }
 
 #[derive(sqlx::FromRow)]
@@ -563,6 +681,48 @@ mod weather_tests {
         );
         assert!(plan.is_noop());
         assert_eq!(plan.host, "a.com");
+    }
+}
+
+#[cfg(test)]
+mod penalty_age_tests {
+    use super::*;
+
+    /// The predicate behind the boot restore. A penalty is state we *learned*,
+    /// and learned state expires: only a dated, still-fresh, non-zero snapshot
+    /// comes back.
+    #[test]
+    fn stale_penalty_is_not_restorable_but_a_fresh_one_is() {
+        let cutoff = "2026-08-01T00:00:00.000000Z";
+        // Fresh + non-zero => restored.
+        assert!(penalty_is_restorable(
+            5_000,
+            Some("2026-08-09T12:00:00.000000Z"),
+            cutoff
+        ));
+        // Exactly at the cutoff is still inside the window (the reads use >=).
+        assert!(penalty_is_restorable(5_000, Some(cutoff), cutoff));
+        // Older than the aging horizon => the host recovered long ago as far as
+        // we can tell; it must NOT come back throttled.
+        assert!(!penalty_is_restorable(
+            5_000,
+            Some("2026-06-01T00:00:00.000000Z"),
+            cutoff
+        ));
+        // Zeroed (decayed) rows never restore, whatever their age.
+        assert!(!penalty_is_restorable(
+            0,
+            Some("2026-08-09T12:00:00.000000Z"),
+            cutoff
+        ));
+        // Undatable rows are not restorable — unknown age is not fresh.
+        assert!(!penalty_is_restorable(5_000, None, cutoff));
+        // Aging disabled: the sentinel cutoff restores every dated penalty.
+        assert!(penalty_is_restorable(
+            5_000,
+            Some("2020-01-01T00:00:00.000000Z"),
+            NEVER_STALE
+        ));
     }
 }
 

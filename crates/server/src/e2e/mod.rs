@@ -8,6 +8,7 @@
 //! over `AppState::from_parts` + `pumper_core::testing` — no Chrome, no
 //! network beyond loopback, no real engines.
 
+mod app_fetch_chokepoint;
 mod body_limit;
 mod datahub_bridge;
 mod dataset_reads;
@@ -16,6 +17,7 @@ mod dynamic_apps;
 mod fanout_offslot;
 mod fetch_proxy;
 mod harness;
+mod host_memory_reset;
 mod host_weather;
 mod ingress_gates;
 mod job_receipt;

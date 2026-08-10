@@ -41,6 +41,13 @@ pub struct AppState {
     /// Live politeness governor — exposed so the `/hosts` diagnostics can read
     /// the current learned penalty and `DELETE /hosts/{host}/memory` can clear it.
     pub governor: Arc<Governor>,
+    /// Serializes the host write-behind pass against `DELETE /hosts/{host}/memory`.
+    /// Both read the live governor and then write `tier_memory`; without a shared
+    /// lock a pass that snapshotted *before* an operator's reset could commit
+    /// afterwards and re-create the row the reset just deleted. Held only for the
+    /// duration of one bounded transaction (see
+    /// [`persist_host_penalties`] and `routes::runtime::reset_host_memory`).
+    pub host_memory_lock: Arc<tokio::sync::Mutex<()>>,
     pub engines: Arc<EngineSet>,
     /// Sandboxed WASM plugin host.
     pub plugins: Arc<dyn Plugins>,
@@ -186,6 +193,7 @@ impl AppState {
             plugins,
             search,
             registry: Arc::new(registry),
+            host_memory_lock: Arc::new(tokio::sync::Mutex::new(())),
             dynamic_apps,
             trigger_cache: Arc::new(crate::triggers::TriggerEvalCache::new()),
             notify: Arc::new(Notify::new()),
@@ -333,19 +341,13 @@ impl AppState {
         if persist_secs > 0 {
             let governor = state.governor.clone();
             let tiers = state.tiers.clone();
+            let lock = state.host_memory_lock.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(persist_secs));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tick.tick().await;
-                    let snapshot: Vec<(String, u64)> = governor
-                        .snapshot_penalties()
-                        .into_iter()
-                        .map(|(host, penalty)| {
-                            (host, penalty.as_millis().min(u64::MAX as u128) as u64)
-                        })
-                        .collect();
-                    if let Err(e) = tiers.save_penalties(&snapshot).await {
+                    if let Err(e) = persist_host_penalties(&governor, &tiers, &lock).await {
                         tracing::warn!("host penalty write-behind failed: {e}");
                     }
                 }
@@ -354,4 +356,26 @@ impl AppState {
 
         Ok(state)
     }
+}
+
+/// One write-behind pass: snapshot the governor's live learned penalties and
+/// persist them **authoritatively** — hosts whose penalty decayed to zero are
+/// zeroed in the store rather than left behind as zombies for the next boot to
+/// resurrect (see `TierMemory::persist_penalty_snapshot`).
+///
+/// Extracted from the loop so the reset path and the tests drive the exact pass
+/// the server runs; takes `host_memory_lock` so a reset can never be undone by a
+/// pass that snapshotted before it.
+pub(crate) async fn persist_host_penalties(
+    governor: &Governor,
+    tiers: &TierMemory,
+    lock: &tokio::sync::Mutex<()>,
+) -> pumper_core::Result<()> {
+    let _guard = lock.lock().await;
+    let snapshot: Vec<(String, u64)> = governor
+        .snapshot_penalties()
+        .into_iter()
+        .map(|(host, penalty)| (host, penalty.as_millis().min(u64::MAX as u128) as u64))
+        .collect();
+    tiers.persist_penalty_snapshot(&snapshot).await
 }

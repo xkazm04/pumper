@@ -117,13 +117,39 @@ pub(crate) async fn delete_host_memory(
     Path(host): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     let host = host.to_lowercase();
-    let forgot = state.tiers.forget(&host).await?;
-    let cleared = state.governor.clear(&host);
-    if forgot || cleared {
+    if reset_host_memory(&state, &host).await? {
         Ok(Json(json!({ "host": host, "reset": true })))
     } else {
         Err(ApiError(StatusCode::NOT_FOUND, "unknown host".into()))
     }
+}
+
+/// Forgets one host's learned state — the live governor penalty **and** the
+/// persisted `tier_memory` row. Returns whether either existed.
+///
+/// Two things make this survive the 60s write-behind pass, and both are
+/// load-bearing:
+///
+/// 1. **Order.** The LIVE governor state is cleared FIRST, the row second. The
+///    old order (row, then live) left a window where a pass landing between the
+///    halves still saw a live penalty for the host and re-inserted the row that
+///    had just been deleted — the operator's reset silently undone, with no
+///    error anywhere. Cleared-first, a pass landing between the halves finds
+///    nothing to write.
+/// 2. **The shared lock.** A pass that snapshotted *before* the reset could
+///    still commit after it, so both take `AppState::host_memory_lock`; the pass
+///    holds it across snapshot→commit, which makes the two mutually exclusive.
+///
+/// Guarded by `write_behind_between_reset_halves_does_not_resurrect_the_row`
+/// and `reset_survives_a_racing_write_behind_pass`.
+pub(crate) async fn reset_host_memory(
+    state: &AppState,
+    host: &str,
+) -> Result<bool, pumper_core::Error> {
+    let _guard = state.host_memory_lock.lock().await;
+    let cleared = state.governor.clear(host);
+    let forgot = state.tiers.forget(host).await?;
+    Ok(forgot || cleared)
 }
 
 // ---- Cache freshness (M02 self-refreshing mirror) ---------------------------
