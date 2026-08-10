@@ -461,107 +461,12 @@ impl Fetcher {
 
         // --- HTTP tier --- (skip_http only applies to escalating strategies;
         // an explicit Http strategy is the caller's call.)
-        let try_http = req.strategy == FetchStrategy::Http
-            || (!req.skip_http
-                && matches!(
-                    req.strategy,
-                    FetchStrategy::Auto | FetchStrategy::AutoWithResearch
-                ));
-        if try_http {
-            let mut http_req = HttpRequest::get(&req.url);
-            http_req.no_cache = req.no_cache;
-            http_req.ttl_override = req.ttl_override;
-            http_req.profile = req.profile.clone();
-            let started = Instant::now();
-            match self.live_http().fetch(http_req).await {
-                Ok(resp) => {
-                    let latency_ms = elapsed_ms(started);
-                    // Convert to Markdown at most once, and only when a decision
-                    // (escalation) or the caller (to_markdown) actually needs it.
-                    // The `Http` strategy returns regardless, so it skips the
-                    // conversion entirely unless Markdown was requested.
-                    let needs_count = matches!(
-                        req.strategy,
-                        FetchStrategy::Auto | FetchStrategy::AutoWithResearch
-                    );
-                    // Bot-wall / challenge detection only matters when there's a
-                    // higher tier to escalate to (the `Http` strategy hands the
-                    // body back for the caller to inspect).
-                    let wall = needs_count
-                        .then(|| http_bot_wall(resp.status, &resp.body))
-                        .flatten();
-                    // Build the Markdown document only when the caller wants it.
-                    // For the escalation decision alone, count text with an
-                    // early-exit capped counter instead of materializing (then
-                    // discarding) a full-page Markdown String.
-                    let markdown = req.to_markdown.then(|| html_to_markdown(&resp.body));
-                    let text_len = match &markdown {
-                        Some(md) => Some(md.chars().count()),
-                        None if needs_count => Some(text_len_capped(&resp.body, min_chars)),
-                        None => None,
-                    };
-                    let cache_hit = Some(resp.cache_hit);
-                    let enough = wall.is_none()
-                        && resp.is_success()
-                        && text_len.is_none_or(|n| n >= min_chars);
-                    if enough || req.strategy == FetchStrategy::Http {
-                        trace.push(TierTrace {
-                            tier: FetchTier::Http,
-                            verdict: TierVerdict::Ok,
-                            http_status: Some(resp.status),
-                            content_chars: text_len,
-                            cache_hit,
-                            latency_ms,
-                            cost_usd: None,
-                            detail: None,
-                        });
-                        return Ok(outcome(
-                            "http",
-                            &req,
-                            Some(resp.status),
-                            resp.body,
-                            markdown,
-                            escalations,
-                            trace,
-                        ));
-                    }
-                    let (verdict, detail) = match wall {
-                        Some(reason) => {
-                            escalations.push(format!(
-                                "http tier blocked: {reason} (status {})",
-                                resp.status
-                            ));
-                            (TierVerdict::Blocked, Some(reason))
-                        }
-                        None => {
-                            escalations.push(format!(
-                                "http tier thin: status {}, {} chars of text",
-                                resp.status,
-                                text_len.unwrap_or(0)
-                            ));
-                            (TierVerdict::Thin, None)
-                        }
-                    };
-                    trace.push(TierTrace {
-                        tier: FetchTier::Http,
-                        verdict,
-                        http_status: Some(resp.status),
-                        content_chars: text_len,
-                        cache_hit,
-                        latency_ms,
-                        cost_usd: None,
-                        detail,
-                    });
-                }
-                Err(e) if req.strategy == FetchStrategy::Http => return Err(e),
-                Err(e) => trace_tier_error(
-                    &mut escalations,
-                    &mut trace,
-                    FetchTier::Http,
-                    "http",
-                    &e,
-                    started,
-                ),
+        if http_tier_attempted(req.strategy, req.skip_http) {
+            if let Some(out) = self
+                .try_http_tier(&req, min_chars, &mut escalations, &mut trace)
+                .await?
+            {
+                return Ok(out);
             }
         }
 
@@ -667,14 +572,37 @@ impl Fetcher {
                     });
                 }
                 Err(e) if req.strategy == FetchStrategy::Browser => return Err(e),
-                Err(e) => trace_tier_error(
-                    &mut escalations,
-                    &mut trace,
-                    FetchTier::Browser,
-                    "browser",
-                    &e,
-                    started,
-                ),
+                Err(e) => {
+                    trace_tier_error(
+                        &mut escalations,
+                        &mut trace,
+                        FetchTier::Browser,
+                        "browser",
+                        &e,
+                        started,
+                    );
+                    // A dead browser must not take the whole ladder down with
+                    // it — least of all on the hosts the learned router pinned
+                    // to the browser, which is exactly where traffic is
+                    // concentrated. Un-skip the http tier and try it now.
+                    if browser_failure_falls_back_to_http(
+                        req.strategy,
+                        req.skip_http,
+                        TierVerdict::Error,
+                    ) {
+                        escalations.push(
+                            "http tier un-skipped: browser engine failed, retrying the tier the \
+                             router had skipped"
+                                .to_string(),
+                        );
+                        if let Some(out) = self
+                            .try_http_tier(&req, min_chars, &mut escalations, &mut trace)
+                            .await?
+                        {
+                            return Ok(out);
+                        }
+                    }
+                }
             }
         }
 
@@ -690,35 +618,164 @@ impl Fetcher {
             let mut research = ResearchRequest::new(prompt);
             research.max_budget_usd = req.max_budget_usd;
             let started = Instant::now();
-            let out = self.claude.research(research).await?;
-            trace.push(TierTrace {
-                tier: FetchTier::Claude,
-                verdict: TierVerdict::Ok,
-                http_status: None,
-                content_chars: Some(out.text.chars().count()),
-                cache_hit: None,
-                latency_ms: elapsed_ms(started),
-                cost_usd: out.cost_usd,
-                detail: None,
-            });
-            return Ok(FetchOutcome {
-                url: req.url,
-                engine: "claude",
-                status: None,
-                html: None,
-                markdown: req.to_markdown.then(|| out.text.clone()),
-                text: Some(out.text),
-                escalations,
-                trace,
-                cost_usd: out.cost_usd,
-            });
+            // Every other tier traces its engine error and lets the ladder end
+            // on the exhaustion error; the Claude tier used to `?` the raw
+            // engine error out instead, so the last tier's failure erased the
+            // whole trail of what the earlier tiers found.
+            match self.claude.research(research).await {
+                Ok(out) => {
+                    trace.push(TierTrace {
+                        tier: FetchTier::Claude,
+                        verdict: TierVerdict::Ok,
+                        http_status: None,
+                        content_chars: Some(out.text.chars().count()),
+                        cache_hit: None,
+                        latency_ms: elapsed_ms(started),
+                        cost_usd: out.cost_usd,
+                        detail: None,
+                    });
+                    return Ok(FetchOutcome {
+                        url: req.url,
+                        engine: "claude",
+                        status: None,
+                        html: None,
+                        markdown: req.to_markdown.then(|| out.text.clone()),
+                        text: Some(out.text),
+                        escalations,
+                        trace,
+                        cost_usd: out.cost_usd,
+                    });
+                }
+                Err(e) => trace_tier_error(
+                    &mut escalations,
+                    &mut trace,
+                    FetchTier::Claude,
+                    "claude",
+                    &e,
+                    started,
+                ),
+            }
         }
 
         Err(Error::App(format!(
-            "all fetch tiers exhausted for {}: {}",
+            "all fetch tiers exhausted for {} (attempted: {}): {}",
             req.url,
+            attempted_tiers(&trace),
             escalations.join("; ")
         )))
+    }
+
+    /// One attempt at the HTTP tier, at either of its two positions in the
+    /// ladder: its normal cheap-first slot, or the fallback slot after a browser
+    /// engine failure on a host the router had pinned past it.
+    ///
+    /// `Ok(Some(outcome))` = this tier produced the result; `Ok(None)` = it was
+    /// thin/blocked/errored and the caller climbs (both the human trail line and
+    /// the structured trace entry are already appended). `Err` only for the
+    /// explicit `Http` strategy, which has nothing to climb to.
+    ///
+    /// Extracted so the fallback runs the *same* attempt — acceptance bar,
+    /// Markdown handling, trace shape and all — rather than a second, subtly
+    /// different copy. The request is still governed inside `HttpEngine::send`,
+    /// so a fallback attempt is spaced like any other.
+    async fn try_http_tier(
+        &self,
+        req: &FetchRequest,
+        min_chars: usize,
+        escalations: &mut Vec<String>,
+        trace: &mut Vec<TierTrace>,
+    ) -> Result<Option<FetchOutcome>> {
+        let mut http_req = HttpRequest::get(&req.url);
+        http_req.no_cache = req.no_cache;
+        http_req.ttl_override = req.ttl_override;
+        http_req.profile = req.profile.clone();
+        let started = Instant::now();
+        match self.live_http().fetch(http_req).await {
+            Ok(resp) => {
+                let latency_ms = elapsed_ms(started);
+                // Convert to Markdown at most once, and only when a decision
+                // (escalation) or the caller (to_markdown) actually needs it.
+                // The `Http` strategy returns regardless, so it skips the
+                // conversion entirely unless Markdown was requested.
+                let needs_count = matches!(
+                    req.strategy,
+                    FetchStrategy::Auto | FetchStrategy::AutoWithResearch
+                );
+                // Bot-wall / challenge detection only matters when there's a
+                // higher tier to escalate to (the `Http` strategy hands the
+                // body back for the caller to inspect).
+                let wall = needs_count
+                    .then(|| http_bot_wall(resp.status, &resp.body))
+                    .flatten();
+                // Build the Markdown document only when the caller wants it.
+                // For the escalation decision alone, count text with an
+                // early-exit capped counter instead of materializing (then
+                // discarding) a full-page Markdown String.
+                let markdown = req.to_markdown.then(|| html_to_markdown(&resp.body));
+                let text_len = match &markdown {
+                    Some(md) => Some(md.chars().count()),
+                    None if needs_count => Some(text_len_capped(&resp.body, min_chars)),
+                    None => None,
+                };
+                let cache_hit = Some(resp.cache_hit);
+                let enough =
+                    wall.is_none() && resp.is_success() && text_len.is_none_or(|n| n >= min_chars);
+                if enough || req.strategy == FetchStrategy::Http {
+                    trace.push(TierTrace {
+                        tier: FetchTier::Http,
+                        verdict: TierVerdict::Ok,
+                        http_status: Some(resp.status),
+                        content_chars: text_len,
+                        cache_hit,
+                        latency_ms,
+                        cost_usd: None,
+                        detail: None,
+                    });
+                    return Ok(Some(outcome(
+                        "http",
+                        req,
+                        Some(resp.status),
+                        resp.body,
+                        markdown,
+                        std::mem::take(escalations),
+                        std::mem::take(trace),
+                    )));
+                }
+                let (verdict, detail) = match wall {
+                    Some(reason) => {
+                        escalations.push(format!(
+                            "http tier blocked: {reason} (status {})",
+                            resp.status
+                        ));
+                        (TierVerdict::Blocked, Some(reason))
+                    }
+                    None => {
+                        escalations.push(format!(
+                            "http tier thin: status {}, {} chars of text",
+                            resp.status,
+                            text_len.unwrap_or(0)
+                        ));
+                        (TierVerdict::Thin, None)
+                    }
+                };
+                trace.push(TierTrace {
+                    tier: FetchTier::Http,
+                    verdict,
+                    http_status: Some(resp.status),
+                    content_chars: text_len,
+                    cache_hit,
+                    latency_ms,
+                    cost_usd: None,
+                    detail,
+                });
+                Ok(None)
+            }
+            Err(e) if req.strategy == FetchStrategy::Http => Err(e),
+            Err(e) => {
+                trace_tier_error(escalations, trace, FetchTier::Http, "http", &e, started);
+                Ok(None)
+            }
+        }
     }
 
     /// One attempt at the API-recipe tier. `Some(outcome)` means the recipe
@@ -879,6 +936,69 @@ fn trace_tier_error(
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+/// Whether the ladder attempts the http tier at its normal cheap-first slot.
+/// `skip_http` (set by the learned tier router for hosts where HTTP keeps
+/// losing) only applies to the escalating strategies — an explicit `Http`
+/// strategy is the caller's call and always runs.
+fn http_tier_attempted(strategy: FetchStrategy, skip_http: bool) -> bool {
+    strategy == FetchStrategy::Http
+        || (!skip_http
+            && matches!(
+                strategy,
+                FetchStrategy::Auto | FetchStrategy::AutoWithResearch
+            ))
+}
+
+/// Whether a failed browser attempt should fall back to the http tier that was
+/// skipped before it.
+///
+/// The anti-pattern (`browser_down_does_not_kill_pinned_hosts`): with Chrome
+/// down, every escalating fetch failed outright — and hosts the learned router
+/// had pinned to the browser skipped the *working* http tier on the way, so the
+/// router amplified the outage exactly where it concentrates traffic. A dead
+/// engine is not evidence that the cheap tier is dead too.
+///
+/// Deliberately narrow:
+/// - **Engine errors only.** A `Blocked` or `Thin` browser verdict is a real
+///   observation about the page (the router pinned this host to the browser
+///   *because* http kept losing), so re-running http there would just spend a
+///   politeness slot to re-learn what we already know.
+/// - **Escalating strategies only.** An explicit `Browser` strategy asked for a
+///   JS render; a static body is not that, so it keeps its fail-fast.
+/// - The fetcher cannot tell a router-set `skip_http` from a caller-set one —
+///   nothing in `FetchRequest` records who set it — so both fall back. That is
+///   the safe direction: the alternative is a caller-pinned host losing its
+///   whole ladder to an unrelated engine outage, and the cost of being wrong is
+///   one extra governed HTTP request on a fetch that was about to fail anyway.
+fn browser_failure_falls_back_to_http(
+    strategy: FetchStrategy,
+    skip_http: bool,
+    verdict: TierVerdict,
+) -> bool {
+    verdict == TierVerdict::Error
+        && matches!(
+            strategy,
+            FetchStrategy::Auto | FetchStrategy::AutoWithResearch
+        )
+        && !http_tier_attempted(strategy, skip_http)
+}
+
+/// The tiers that actually ran, in trace order, for the exhaustion error — so a
+/// failed fetch names the ladder it climbed instead of only the last reason.
+fn attempted_tiers(trace: &[TierTrace]) -> String {
+    let mut names: Vec<&'static str> = Vec::new();
+    for t in trace {
+        let name = t.tier.as_str();
+        if !names.contains(&name) {
+            names.push(name);
+        }
+    }
+    if names.is_empty() {
+        return "none".to_string();
+    }
+    names.join(", ")
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1422,6 +1542,281 @@ mod tests {
             Duration::from_secs(2),
             "healthy browser render must decay the penalty"
         );
+    }
+
+    // --- Browser-down ladder degradation ---
+
+    /// Chrome is not running / crashed / the CDP handshake died: an ENGINE
+    /// error, not a verdict about the page.
+    struct DownBrowser;
+    #[async_trait]
+    impl Browser for DownBrowser {
+        async fn render(&self, _req: RenderRequest) -> Result<RenderedPage> {
+            Err(Error::Browser("chrome launch failed: no such file".into()))
+        }
+    }
+
+    /// The ladder as `AppContext::fetch` builds it for a host the learned router
+    /// pinned to the browser tier: `skip_http` set, escalating strategy.
+    fn pinned_host_request(strategy: FetchStrategy) -> FetchRequest {
+        let mut req = FetchRequest::new("https://pinned.example/page");
+        req.strategy = strategy;
+        req.skip_http = true;
+        req
+    }
+
+    fn ladder(http: Arc<dyn HttpClient>, browser: Arc<dyn Browser>) -> Fetcher {
+        Fetcher::new(
+            http,
+            browser,
+            Arc::new(StubResearcher),
+            enabled_governor(),
+            &FetcherConfig {
+                min_content_chars: 100,
+                ..FetcherConfig::default()
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn browser_down_does_not_kill_pinned_hosts() {
+        // The exact production shape: Chrome is down AND the router pinned this
+        // host past the http tier, so the learned router was amplifying the
+        // outage on precisely the hosts it concentrates traffic on.
+        let fetcher = ladder(Arc::new(StubHttp), Arc::new(DownBrowser));
+        let out = fetcher
+            .fetch(pinned_host_request(FetchStrategy::Auto))
+            .await
+            .expect("a working http tier must still serve the fetch");
+
+        assert_eq!(out.engine, "http");
+        // Chronological trace: the browser attempt, then the fallback.
+        let tiers: Vec<_> = out.trace.iter().map(|t| (t.tier, t.verdict)).collect();
+        assert_eq!(
+            tiers,
+            vec![
+                (FetchTier::Browser, TierVerdict::Error),
+                (FetchTier::Http, TierVerdict::Ok),
+            ],
+            "the fallback attempt belongs after the browser failure, in real order"
+        );
+        assert!(out
+            .escalations
+            .iter()
+            .any(|e| e.contains("http tier un-skipped")));
+
+        // Tier learning stays honest: `AppContext::fetch` derives an HTTP loss
+        // from any Http entry with a thin/blocked/error verdict. A fallback WIN
+        // must not read as a loss — otherwise a browser outage would deepen the
+        // very pin that caused it.
+        let http_lost = out.trace.iter().any(|t| {
+            t.tier == FetchTier::Http
+                && matches!(
+                    t.verdict,
+                    TierVerdict::Thin | TierVerdict::Blocked | TierVerdict::Error
+                )
+        });
+        assert!(!http_lost, "an http win must never read as an http loss");
+    }
+
+    #[tokio::test]
+    async fn browser_down_falls_back_under_research_strategy_too() {
+        // Same fallback on AutoWithResearch — and it wins there BEFORE the
+        // paid tier is reached, so an engine outage doesn't start spending.
+        let fetcher = ladder(Arc::new(StubHttp), Arc::new(DownBrowser));
+        let out = fetcher
+            .fetch(pinned_host_request(FetchStrategy::AutoWithResearch))
+            .await
+            .unwrap();
+        assert_eq!(out.engine, "http");
+        assert!(
+            out.trace.iter().all(|t| t.tier != FetchTier::Claude),
+            "the free tier answered; the paid tier must not have run"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_blocked_does_not_fall_back_to_http() {
+        // A bot-wall is a verdict about the PAGE, and the router pinned this
+        // host because http kept losing on it. Falling back would spend a
+        // politeness slot to re-learn what we already know — so the ladder
+        // climbs instead (DeadHttp panics if the fallback fires).
+        let wall = "<html><head><title>Just a moment...</title></head><body>\
+            <div class=\"cf-browser-verification\">Checking your browser.</div></body></html>";
+        let fetcher = ladder(
+            Arc::new(DeadHttp),
+            Arc::new(StubBrowser { html: wall.into() }),
+        );
+        let out = fetcher
+            .fetch(pinned_host_request(FetchStrategy::AutoWithResearch))
+            .await
+            .unwrap();
+        assert_eq!(out.engine, "claude");
+        assert!(out.trace.iter().all(|t| t.tier != FetchTier::Http));
+    }
+
+    #[tokio::test]
+    async fn explicit_browser_strategy_still_fails_fast() {
+        // The caller asked for a JS render; a static body is not that. Its
+        // fail-fast is deliberate and survives the fallback change.
+        let fetcher = ladder(Arc::new(DeadHttp), Arc::new(DownBrowser));
+        let mut req = FetchRequest::new("https://pinned.example/page");
+        req.strategy = FetchStrategy::Browser;
+        let err = fetcher.fetch(req).await.expect_err("must not fall back");
+        assert!(
+            matches!(err, Error::Browser(_)),
+            "the browser engine error surfaces as-is: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn browser_error_without_a_skipped_http_tier_does_not_refetch() {
+        // The http tier already ran at its normal slot (thin) and the browser
+        // then errored: falling back would fetch the same URL twice.
+        struct ThinHttp;
+        #[async_trait]
+        impl HttpClient for ThinHttp {
+            async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+                Ok(HttpResponse {
+                    status: 200,
+                    headers: std::collections::HashMap::new(),
+                    body: "<html><body>tiny</body></html>".into(),
+                    final_url: req.url,
+                    cache_hit: false,
+                })
+            }
+        }
+        let fetcher = ladder(Arc::new(ThinHttp), Arc::new(DownBrowser));
+        let err = fetcher
+            .fetch(FetchRequest::new("https://plain.example/page"))
+            .await
+            .expect_err("nothing left to climb to under Auto");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("attempted: http, browser"),
+            "the exhaustion error names the ladder it climbed: {msg}"
+        );
+        assert_eq!(
+            msg.matches("http tier thin").count(),
+            1,
+            "the http tier must be attempted exactly once: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_engine_error_traces_and_exhausts() {
+        // The paid tier's engine error is traced like every other tier's, and
+        // the ladder ends on the exhaustion error carrying the whole trail —
+        // instead of `?`-ing the raw engine error out and erasing what the
+        // cheaper tiers found.
+        struct FailingResearcher;
+        #[async_trait]
+        impl Researcher for FailingResearcher {
+            async fn research(&self, _req: ResearchRequest) -> Result<ResearchOutput> {
+                Err(Error::Claude("claude binary not found on PATH".into()))
+            }
+        }
+        // The host is unreachable outright, so the browser fallback's http
+        // attempt fails too and the ladder genuinely runs out of tiers.
+        struct DownHttp;
+        #[async_trait]
+        impl HttpClient for DownHttp {
+            async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
+                Err(Error::Http("dns error: no such host".into()))
+            }
+        }
+        let fetcher = Fetcher::new(
+            Arc::new(DownHttp),
+            Arc::new(DownBrowser),
+            Arc::new(FailingResearcher),
+            enabled_governor(),
+            &FetcherConfig {
+                min_content_chars: 100,
+                ..FetcherConfig::default()
+            },
+        );
+        let mut req = pinned_host_request(FetchStrategy::AutoWithResearch);
+        req.url = "https://dead.example/page".into();
+        let err = fetcher.fetch(req).await.expect_err("every tier failed");
+        let msg = err.to_string();
+        assert!(matches!(err, Error::App(_)), "{msg}");
+        assert!(msg.contains("all fetch tiers exhausted"), "{msg}");
+        assert!(
+            msg.contains("attempted: browser, http, claude"),
+            "every tier that ran — including the browser-down http fallback — \
+             is named: {msg}"
+        );
+        assert!(msg.contains("browser tier failed"), "{msg}");
+        assert!(
+            msg.contains("claude tier failed: claude engine: claude binary not found"),
+            "the claude engine's own message survives: {msg}"
+        );
+    }
+
+    #[test]
+    fn fallback_decision_is_engine_errors_on_skipped_ladders_only() {
+        use FetchStrategy::*;
+        // The whole point: an engine error with the http tier skipped.
+        assert!(browser_failure_falls_back_to_http(
+            Auto,
+            true,
+            TierVerdict::Error
+        ));
+        assert!(browser_failure_falls_back_to_http(
+            AutoWithResearch,
+            true,
+            TierVerdict::Error
+        ));
+        // Page verdicts are observations, not outages.
+        for verdict in [TierVerdict::Blocked, TierVerdict::Thin, TierVerdict::Ok] {
+            assert!(!browser_failure_falls_back_to_http(Auto, true, verdict));
+        }
+        // The http tier already ran: no second fetch of the same URL.
+        assert!(!browser_failure_falls_back_to_http(
+            Auto,
+            false,
+            TierVerdict::Error
+        ));
+        // Explicit strategies keep their own semantics.
+        assert!(!browser_failure_falls_back_to_http(
+            Browser,
+            true,
+            TierVerdict::Error
+        ));
+        assert!(!browser_failure_falls_back_to_http(
+            Http,
+            true,
+            TierVerdict::Error
+        ));
+
+        // …and the slot predicate it is built on.
+        assert!(http_tier_attempted(Http, true), "explicit Http always runs");
+        assert!(http_tier_attempted(Auto, false));
+        assert!(!http_tier_attempted(Auto, true));
+        assert!(!http_tier_attempted(Browser, false));
+    }
+
+    #[test]
+    fn attempted_tiers_lists_each_tier_once_in_trace_order() {
+        let entry = |tier| TierTrace {
+            tier,
+            verdict: TierVerdict::Error,
+            http_status: None,
+            content_chars: None,
+            cache_hit: None,
+            latency_ms: 0,
+            cost_usd: None,
+            detail: None,
+        };
+        assert_eq!(attempted_tiers(&[]), "none");
+        // The fallback adds a SECOND http entry; the summary must not repeat it.
+        let trace = vec![
+            entry(FetchTier::Http),
+            entry(FetchTier::Browser),
+            entry(FetchTier::Http),
+            entry(FetchTier::Claude),
+        ];
+        assert_eq!(attempted_tiers(&trace), "http, browser, claude");
     }
 
     // --- API-recipe tier (pre-archive, double-opt-in) ---
