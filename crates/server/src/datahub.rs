@@ -985,17 +985,29 @@ impl Drop for PollGuard {
     }
 }
 
-/// The budget a job actually runs with: `cost:pause` (from the last governance
-/// poll) forces `$0`, which [`pumper_core::AppContext`]'s budget governor turns
-/// into free-tiers-only. One-line hook in the worker's `AppContext` build.
-pub fn effective_budget(state: &AppState, app: &str, requested: Option<f64>) -> Option<f64> {
-    if state
+/// Whether `app`'s paid work is currently held by a governance `cost:pause`
+/// tag, as of the last governance poll.
+///
+/// Extracted from [`effective_budget`] because the pause has TWO consumers now:
+/// the budget it forces, and the *reason* a refusal must give. The forced `$0`
+/// is indistinguishable at the core seam from a genuinely spent budget, so
+/// without this the worker reported a governance hold as "job budget of $0.00
+/// exhausted" — a confusing lie that sends an operator hunting for a spend that
+/// never happened.
+pub fn is_cost_paused(state: &AppState, app: &str) -> bool {
+    state
         .datahub_govern
         .lock()
         .unwrap()
         .paused_apps
         .contains(app)
-    {
+}
+
+/// The budget a job actually runs with: `cost:pause` (from the last governance
+/// poll) forces `$0`, which [`pumper_core::AppContext`]'s budget governor turns
+/// into free-tiers-only. One-line hook in the worker's `AppContext` build.
+pub fn effective_budget(state: &AppState, app: &str, requested: Option<f64>) -> Option<f64> {
+    if is_cost_paused(state, app) {
         warn!(
             app,
             "datahub govern: cost:pause tag active — Claude-tier budget forced to $0 for this job"

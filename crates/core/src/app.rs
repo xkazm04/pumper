@@ -249,14 +249,18 @@ impl AppContext {
 
     /// Errors when the job's spend ceiling is already reached — the abort
     /// switch for metered Claude calls. Returns the remaining headroom.
+    ///
+    /// The refusal is [`Error::BudgetExhausted`], not a generic app error: it is
+    /// the ONE deterministic failure a job can hit, and the worker fails it
+    /// permanently rather than retrying it (see [`Error::is_terminal_for_job`]).
+    /// Nothing else in this method may produce that variant — a ledger read
+    /// failure propagates as itself and stays retryable.
     async fn require_budget(&self) -> Result<Option<f64>> {
-        match self.remaining_budget_usd().await? {
-            Some(remaining) if remaining <= 0.0 => Err(Error::App(format!(
-                "job budget of ${:.2} exhausted — aborting before further metered spend",
-                self.budget_usd.unwrap_or(0.0)
-            ))),
-            other => Ok(other),
+        let remaining = self.remaining_budget_usd().await?;
+        if budget_is_exhausted(remaining) {
+            return Err(budget_exhausted_error(self.budget_usd));
         }
+        Ok(remaining)
     }
 
     /// Metered tiered fetch: same as `engines.fetch.fetch(...)` but records a
@@ -312,19 +316,18 @@ impl AppContext {
             req.strategy,
             crate::fetcher::FetchStrategy::AutoWithResearch
         ) {
-            match self.remaining_budget_usd().await? {
-                Some(remaining) if remaining <= 0.0 => {
-                    req.strategy = crate::fetcher::FetchStrategy::Auto;
-                    budget_note = Some(format!(
-                        "claude tier skipped: job budget of ${:.2} exhausted",
-                        self.budget_usd.unwrap_or(0.0)
-                    ));
-                }
-                Some(remaining) => {
-                    req.max_budget_usd =
-                        Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
-                }
-                None => {}
+            // Same `budget_is_exhausted` predicate the hard refusal uses — one
+            // definition of "out of money", two responses: `research` errors,
+            // `fetch` downgrades. They must never disagree about the boundary.
+            let remaining = self.remaining_budget_usd().await?;
+            if budget_is_exhausted(remaining) {
+                req.strategy = crate::fetcher::FetchStrategy::Auto;
+                budget_note = Some(format!(
+                    "claude tier skipped: job budget of ${:.2} exhausted",
+                    self.budget_usd.unwrap_or(0.0)
+                ));
+            } else if let Some(remaining) = remaining {
+                req.max_budget_usd = Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
             }
         }
         let url = req.url.clone();
@@ -683,6 +686,29 @@ fn build_id() -> Option<String> {
     Some(std::env::var("PUMPER_BUILD_ID").unwrap_or_else(|_| env!("CARGO_PKG_VERSION").to_string()))
 }
 
+/// Whether a job with `remaining` headroom is out of money.
+///
+/// `None` is an **unlimited** budget, never exhausted — the case a naive
+/// `remaining.unwrap_or(0.0) <= 0.0` gets exactly backwards, turning every
+/// unbudgeted job into a permanently-failing one. Extracted so the two seams
+/// that consult it (the hard [`AppContext::research`] refusal and the soft
+/// [`AppContext::fetch`] Claude-tier downgrade) cannot drift apart, and so the
+/// boundary itself is testable without a database.
+fn budget_is_exhausted(remaining: Option<f64>) -> bool {
+    matches!(remaining, Some(r) if r <= 0.0)
+}
+
+/// The refusal a metered seam raises once the ceiling is reached. Built here so
+/// the message and the [`Error::BudgetExhausted`] classification are minted in
+/// ONE place — a hand-rolled `Error::App("...budget...")` elsewhere would read
+/// identically to a human and be retried into the ground by the worker.
+fn budget_exhausted_error(budget_usd: Option<f64>) -> Error {
+    Error::BudgetExhausted(format!(
+        "job budget of ${:.2} exhausted — aborting before further metered spend",
+        budget_usd.unwrap_or(0.0)
+    ))
+}
+
 /// Rejects a string that is not a single safe path segment (empty, `.`/`..`,
 /// contains a separator, or absolute) — the path-traversal guard when composing a
 /// filesystem path from untrusted record/param data.
@@ -840,7 +866,34 @@ pub trait ScrapeApp: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::safe_path_segment;
+    use super::{budget_exhausted_error, budget_is_exhausted, safe_path_segment};
+
+    /// The boundary both metered seams share. `None` = unlimited, and the
+    /// anti-pattern is treating it as `0.0`: that would refuse every job
+    /// enqueued without a `budget_usd`, which is most of them.
+    #[test]
+    fn unlimited_budget_is_not_exhausted_only_a_spent_ceiling_is() {
+        assert!(!budget_is_exhausted(None), "no ceiling = never exhausted");
+        assert!(!budget_is_exhausted(Some(0.01)));
+        assert!(!budget_is_exhausted(Some(f64::MAX)));
+        assert!(budget_is_exhausted(Some(0.0)), "reached the ceiling");
+        // `remaining_budget_usd` clamps at 0, but overspend must not read as
+        // headroom if a caller ever hands the raw difference in.
+        assert!(budget_is_exhausted(Some(-1.0)));
+    }
+
+    /// A budget refusal must carry the typed classification, not just words
+    /// that look like one — the worker branches on the variant, and a
+    /// look-alike `Error::App` would be retried into the ground.
+    #[test]
+    fn budget_refusal_is_typed_not_just_worded() {
+        let err = budget_exhausted_error(Some(1.5));
+        assert!(err.is_terminal_for_job());
+        assert!(
+            err.to_string().contains("$1.50") && err.to_string().contains("exhausted"),
+            "the message must still name the ceiling: {err}"
+        );
+    }
 
     /// The ONE artifact path-traversal guard shared by extractor + plugin
     /// (`read_source_artifact`). Gutting it to `Ok(())` must turn this red —

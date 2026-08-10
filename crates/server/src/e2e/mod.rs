@@ -10,6 +10,7 @@
 
 mod app_fetch_chokepoint;
 mod body_limit;
+mod budget_terminal;
 mod datahub_bridge;
 mod dataset_reads;
 mod durable;

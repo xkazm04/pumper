@@ -8,6 +8,7 @@ use tokio::sync::{Mutex, Semaphore};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
+use crate::datahub::is_cost_paused;
 use crate::events::JobEvent;
 use crate::state::AppState;
 use crate::webhook;
@@ -660,6 +661,24 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                 .await;
             return;
         }
+        Outcome::Finished(Err(e)) if e.is_terminal_for_job() => {
+            // Deterministic failure: retrying re-seeds this job's spend from
+            // the ledger and re-refuses on the first metered call, so the
+            // backoff ladder buys nothing and burns every remaining attempt
+            // producing the same refusal. Fail it ONCE, with the honest reason.
+            let reason = terminal_failure_reason(&e, &job.app, is_cost_paused(&state, &job.app));
+            warn!(job = %job.id, error = %reason, "job failed permanently (not retryable)");
+            match state
+                .storage
+                .fail_permanently(job.id, job.attempts, &reason)
+                .await
+            {
+                Ok(true) => {}
+                // Stale (job reset/reaped mid-run): the live attempt owns it.
+                Ok(false) => return,
+                Err(pe) => error!(job = %job.id, "failed to persist terminal failure: {pe}"),
+            }
+        }
         Outcome::Finished(Err(e)) => {
             warn!(job = %job.id, error = %e, "job failed");
             match state
@@ -715,6 +734,30 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         }
     }
     finalize(&state, job.id).await;
+}
+
+/// The stored `error` for a job the runtime refuses to retry.
+///
+/// Budget exhaustion normally reads honestly ("job budget of $2.00 exhausted").
+/// But a DataHub `cost:pause` tag on the app's datasets forces the job's budget
+/// to `$0` ([`crate::datahub::effective_budget`]), and the core seam that
+/// refuses has no idea why — so a *governance hold* surfaced as "job budget of
+/// $0.00 exhausted", which is a lie in the one direction that costs an operator
+/// the most time: it describes money that was never spent and points away from
+/// the tag that is actually holding the work.
+///
+/// The server is the only layer that knows about the pause, so the substitution
+/// happens here rather than in `pumper-core`.
+fn terminal_failure_reason(err: &pumper_core::Error, app: &str, cost_paused: bool) -> String {
+    match err {
+        pumper_core::Error::BudgetExhausted(_) if cost_paused => format!(
+            "paused by governance: a DataHub `cost:pause` tag on {app}'s datasets holds this \
+             app's paid work, so the job ran with a $0 Claude budget and refused the first \
+             metered call. Nothing was spent and no budget was exhausted — clear the tag (the \
+             next governance poll releases the pause) and re-run."
+        ),
+        other => other.to_string(),
+    }
 }
 
 /// Milliseconds since `t`, saturating — a duration can't be negative and an
@@ -1786,6 +1829,51 @@ fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
         body: rec.to_string(),
         // Job-result docs carry no record timestamp — index at completion time.
         indexed_at: chrono::Utc::now().timestamp(),
+    }
+}
+
+#[cfg(test)]
+mod terminal_failure_tests {
+    use super::terminal_failure_reason;
+    use pumper_core::Error;
+
+    /// The anti-pattern this defends: a governance hold reported as an
+    /// exhausted budget. "job budget of $0.00 exhausted" describes a spend that
+    /// never happened and points an operator at the wrong knob — the money, not
+    /// the `cost:pause` tag that is actually holding the app.
+    #[test]
+    fn governance_pause_says_paused_not_budget_exhausted() {
+        let err = Error::BudgetExhausted("job budget of $0.00 exhausted".into());
+        let reason = terminal_failure_reason(&err, "cordis", true);
+        assert!(
+            reason.contains("cost:pause") && reason.contains("cordis"),
+            "the refusal must name the pause and the app: {reason}"
+        );
+        assert!(
+            !reason.contains("$0.00 exhausted"),
+            "and must not still claim an exhausted budget: {reason}"
+        );
+    }
+
+    /// A real exhausted budget keeps its real message — the substitution is
+    /// scoped to the pause, not a blanket rewrite.
+    #[test]
+    fn a_genuinely_spent_budget_still_says_so() {
+        let err = Error::BudgetExhausted("job budget of $2.00 exhausted".into());
+        let reason = terminal_failure_reason(&err, "cordis", false);
+        assert_eq!(reason, err.to_string());
+        assert!(reason.contains("$2.00"));
+    }
+
+    /// A paused app whose job fails for an unrelated reason must report THAT
+    /// reason. The pause is not an explanation for everything.
+    #[test]
+    fn a_paused_app_reports_its_own_unrelated_failure() {
+        let err = Error::App("the source returned nonsense".into());
+        assert_eq!(
+            terminal_failure_reason(&err, "cordis", true),
+            err.to_string()
+        );
     }
 }
 
