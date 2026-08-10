@@ -49,9 +49,12 @@
     Don't delete the scratch dir on exit (for debugging a failure).
 
 .PARAMETER SkipBuild
-    Fail instead of building if the binary isn't already present at the
-    resolved path, rather than invoking `cargo build`. Useful in CI where the
-    build is a separate, cached step.
+    Run whatever binary is already present at the resolved path (failing if
+    there is none) instead of building. Useful in CI where the build is a
+    separate, cached step. Without it the script always runs `cargo build`
+    first — an up-to-date incremental build is a no-op costing seconds, and it
+    guarantees the smoke run exercises THIS tree's code rather than silently
+    reusing a stale binary.
 #>
 [CmdletBinding()]
 param(
@@ -141,12 +144,17 @@ Write-Host "scratch   : $Scratch"
 Write-Host "port      : $Port"
 Write-Host ""
 
-if (-not (Test-Path $BinPath)) {
-    if ($SkipBuild) {
+if ($SkipBuild) {
+    if (-not (Test-Path $BinPath)) {
         Add-Result -Name 'binary present' -Status 'FAIL' -Detail "not found at $BinPath and -SkipBuild set"
         exit 1
     }
-    Write-Host "Binary not found at $BinPath — building once (cargo build -p pumper-server --bin pumper)..."
+} else {
+    # Always build: an up-to-date incremental build is a no-op costing seconds,
+    # and skipping it silently smoke-tests a STALE binary when one is lying
+    # around (found the hard way in round 8 — the checks passed against code
+    # that wasn't the tree's).
+    Write-Host "Building pumper (cargo build -p pumper-server --bin pumper; incremental no-op when fresh)..."
     Push-Location $RepoRoot
     try {
         & cargo build -p pumper-server --bin pumper
