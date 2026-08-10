@@ -527,26 +527,76 @@ pub(crate) async fn get_delivery(
         .ok_or_else(|| ApiError(StatusCode::NOT_FOUND, "delivery not found".into()))
 }
 
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct ReplayQuery {
+    /// Re-send a delivery that already reached `delivered`. Off by default so a
+    /// duplicate the receiver never asked for is always a deliberate act.
+    #[serde(default)]
+    force: bool,
+}
+
 /// Re-sends a logged delivery, re-signing with the source's current secret
-/// (job callback secret or watch secret) when it still exists.
+/// (job callback secret, watch secret, saved-search secret, or the configured
+/// `[webhooks] failure_secret`) when it still exists.
+///
+/// Guarded on two levels — the row must be in a replayable state, and the send
+/// only happens after the row is atomically **claimed**, so a manual replay can
+/// neither duplicate an in-flight delivery nor race the auto-drain for the same
+/// row.
 #[utoipa::path(
     post,
     path = "/webhooks/deliveries/{id}/replay",
     tag = "webhooks",
-    params(("id" = String, Path, description = "Delivery id")),
+    params(("id" = String, Path, description = "Delivery id"), ReplayQuery),
     responses(
-        (status = 202, description = "Replay scheduled (`{id, replaying: true}`)"),
+        (status = 202, description = "Replay claimed and scheduled (`{id, replaying: true}`)"),
         (status = 404, description = "Delivery not found", body = Object),
+        (status = 409, description = "Not replayable: the row is in flight (`pending`), already claimed by the auto-drain, or `delivered` without `?force=true`", body = Object),
     )
 )]
 pub(crate) async fn replay_delivery(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    Query(query): Query<ReplayQuery>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    use crate::webhook::ReplayGate;
     let Some(delivery) = state.storage.get_delivery(&id).await? else {
         return Err(ApiError(StatusCode::NOT_FOUND, "delivery not found".into()));
     };
-    let secret = crate::webhook::resolve_secret(&state.storage, &delivery).await;
+    match crate::webhook::replay_gate(&delivery.status, query.force) {
+        ReplayGate::Allowed => {}
+        ReplayGate::InFlight => {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                "delivery is in flight (status 'pending'); a sender already owns it".into(),
+            ))
+        }
+        ReplayGate::NotReplayable => {
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!(
+                    "delivery status '{}' is not replayable (pass ?force=true to re-send a \
+                     delivered one)",
+                    delivery.status
+                ),
+            ))
+        }
+    }
+    // The claim, not the check above, is the authority: it flips the row to
+    // `pending` in one statement, so a drain tick that grabbed it between the
+    // read and here loses this race and we answer 409 instead of double-sending.
+    if !state
+        .storage
+        .begin_delivery_replay(&id, query.force)
+        .await?
+    {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "delivery was claimed by another replay or by the auto-drain".into(),
+        ));
+    }
+    let secret =
+        crate::webhook::resolve_secret(&state.storage, &state.config.webhooks, &delivery).await;
     crate::webhook::replay(
         state.webhook_client.clone(),
         state.storage.clone(),

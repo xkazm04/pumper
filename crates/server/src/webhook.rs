@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use hmac::{Hmac, Mac};
+use pumper_core::config::WebhooksConfig;
 use pumper_core::{Delivery, Job, Storage, Watch};
 use sha2::Sha256;
 use tracing::{debug, warn};
@@ -358,12 +359,38 @@ async fn log_outcome(
     }
 }
 
-/// Resolves the signing secret for a delivery from its source (the job's callback
-/// secret or the watch's secret), so a replay re-signs with the current secret.
-/// Best-effort: a missing/deleted source or an unparseable job id yields `None`
-/// (the delivery is simply re-sent unsigned). Shared by the manual replay route
-/// and the auto-drain so they can't drift.
-pub async fn resolve_secret(storage: &Storage, delivery: &Delivery) -> Option<String> {
+/// Resolves the signing secret for a delivery from its source, so a drain retry
+/// or a manual replay re-signs with the **current** secret.
+///
+/// Every kind pumper writes must be resolvable here, or that kind's retries go
+/// out UNSIGNED and a verifying receiver 401s them all the way down the retry
+/// ladder to `dead` — a delivery the operator can see, replay, and still never
+/// get accepted. The four kinds and where their secret lives:
+///
+/// | kind      | `ref_id`        | secret source                       |
+/// |-----------|-----------------|-------------------------------------|
+/// | `job`     | job id          | the job's `callback_secret` (DB)    |
+/// | `change`  | watch id        | the watch's `secret` (DB)           |
+/// | `search`  | saved-search id | the saved search's `secret` (DB)    |
+/// | `failure` | job id          | `[webhooks] failure_secret` (config)|
+///
+/// `failure` is the reason this takes a config handle: its secret is the only
+/// one that is NOT a row, so it has to be threaded in explicitly rather than
+/// looked up. The handle is the `[webhooks]` section only — `Storage` stays
+/// config-free.
+///
+/// Best-effort: a deleted source, an unparseable id, or an unknown kind yields
+/// `None` (the delivery is re-sent unsigned, which is what it was sent as).
+/// Unknown kinds resolve to `None` rather than falling through to a watch
+/// lookup — looking up an arbitrary `ref_id` in `watches` can only ever hit by
+/// accident, and signing with an unrelated watch's secret is worse than not
+/// signing. Shared by the manual replay route and the auto-drain so they can't
+/// drift.
+pub async fn resolve_secret(
+    storage: &Storage,
+    webhooks: &WebhooksConfig,
+    delivery: &Delivery,
+) -> Option<String> {
     match delivery.kind.as_str() {
         "job" => {
             let job_id = uuid::Uuid::parse_str(&delivery.ref_id).ok()?;
@@ -374,19 +401,92 @@ pub async fn resolve_secret(storage: &Storage, delivery: &Delivery) -> Option<St
                 .flatten()
                 .and_then(|j| j.callback_secret)
         }
-        _ => storage
+        "change" => storage
             .get_watch(&delivery.ref_id)
             .await
             .ok()
             .flatten()
             .and_then(|w| w.secret),
+        "search" => storage
+            .get_saved_search(&delivery.ref_id)
+            .await
+            .ok()
+            .flatten()
+            .and_then(|s| s.secret),
+        "failure" => webhooks.failure_secret.clone(),
+        _ => None,
     }
 }
 
-/// One auto-drain pass: re-send failed deliveries whose backoff is due. Claims
-/// each row atomically (so a concurrent tick can't double-send), resolves its
-/// secret, and hands it to [`replay`]. Piggybacked on the scheduler tick.
+/// Whether a **manually** requested replay of a delivery in `status` may
+/// proceed. Extracted because the route used to have no gate at all: it re-sent
+/// `delivered` rows (a duplicate the receiver never asked for), `pending` rows
+/// (a second sender racing the first, and racing its outcome write), and raced
+/// the auto-drain for `failed` rows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ReplayGate {
+    /// Replayable: `failed`/`dead`, or `delivered` under an explicit `force`.
+    Allowed,
+    /// In flight — an initial send or a drain retry owns this row right now.
+    InFlight,
+    /// Terminal-and-successful (`delivered`) without `force`, or a status this
+    /// build doesn't know.
+    NotReplayable,
+}
+
+pub(crate) fn replay_gate(status: &str, force: bool) -> ReplayGate {
+    match status {
+        // `dead` is exactly the row a human replays: the ladder gave up on it.
+        "failed" | "dead" => ReplayGate::Allowed,
+        "delivered" if force => ReplayGate::Allowed,
+        "delivered" => ReplayGate::NotReplayable,
+        "pending" => ReplayGate::InFlight,
+        _ => ReplayGate::NotReplayable,
+    }
+}
+
+/// How long a delivery may sit `pending` before [`reclaim_stale`] decides no
+/// process is still working on it.
+///
+/// Worst case for one in-process delivery: `MAX_ATTEMPTS` (3) sends at the
+/// webhook client's 15s timeout, plus the linear backoff sleeps between them
+/// (0s + 2s + 4s) = **51s**. Ten minutes is ~11.8× that, so a delivery that is
+/// merely slow is never double-sent; only one that no longer has a sender is
+/// reclaimed. (Deliberately generous: a duplicate send is a real cost to the
+/// receiver, while a reclaim delayed by minutes costs nothing — the row was
+/// already stranded.)
+pub(crate) const STALE_PENDING_SECS: i64 = 600;
+
+/// Returns crash-interrupted `pending` deliveries to the retry ladder.
+///
+/// Runs at the head of [`drain_due`] rather than in the retention janitor: the
+/// janitor ticks every 6 hours **and returns immediately unless some retention
+/// knob is enabled** (all are off by default), so a default deployment would
+/// never reclaim anything. The drain tick, in contrast, is exactly the loop that
+/// consumes what this produces.
+async fn reclaim_stale(state: &AppState) {
+    match state
+        .storage
+        .reclaim_stale_deliveries(STALE_PENDING_SECS)
+        .await
+    {
+        Ok(0) => {}
+        Ok(n) => warn!(
+            reclaimed = n,
+            stale_after_secs = STALE_PENDING_SECS,
+            "webhook drain: returned interrupted deliveries to the retry ladder (their sender \
+             died before recording an outcome)"
+        ),
+        Err(e) => warn!("webhook drain: stale-pending reclaim failed: {e}"),
+    }
+}
+
+/// One auto-drain pass: reclaim stranded rows, then re-send failed deliveries
+/// whose backoff is due. Claims each row atomically (so a concurrent tick can't
+/// double-send), resolves its secret, and hands it to [`replay`]. Piggybacked on
+/// the scheduler tick.
 pub async fn drain_due(state: &AppState) {
+    reclaim_stale(state).await;
     let due = match state.storage.due_deliveries(DRAIN_BATCH).await {
         Ok(due) => due,
         Err(e) => {
@@ -395,7 +495,8 @@ pub async fn drain_due(state: &AppState) {
         }
     };
     for delivery in due {
-        // Atomic claim: skip if another tick already took it.
+        // Atomic claim: skip if another tick already took it. Note this claim
+        // covers `failed` ONLY — the drain must never resurrect a `dead` row.
         match state.storage.begin_delivery_retry(&delivery.id).await {
             Ok(true) => {}
             Ok(false) => continue,
@@ -404,7 +505,7 @@ pub async fn drain_due(state: &AppState) {
                 continue;
             }
         }
-        let secret = resolve_secret(&state.storage, &delivery).await;
+        let secret = resolve_secret(&state.storage, &state.config.webhooks, &delivery).await;
         replay(
             state.webhook_client.clone(),
             state.storage.clone(),
@@ -561,6 +662,168 @@ pub(crate) fn verify_signature(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pumper_core::testing::TempStore;
+
+    /// A `Delivery` shell carrying only what [`resolve_secret`] reads.
+    fn delivery(kind: &str, ref_id: &str) -> Delivery {
+        Delivery {
+            id: "d-1".into(),
+            kind: kind.into(),
+            ref_id: ref_id.into(),
+            url: "https://x/hook".into(),
+            event: "e".into(),
+            body: "{}".into(),
+            status: "failed".into(),
+            attempts: 1,
+            last_error: None,
+            created_at: chrono::Utc::now(),
+            updated_at: chrono::Utc::now(),
+        }
+    }
+
+    fn webhooks_with_failure_secret(secret: Option<&str>) -> WebhooksConfig {
+        WebhooksConfig {
+            failure_secret: secret.map(str::to_string),
+            ..Default::default()
+        }
+    }
+
+    /// The anti-pattern: a `search` delivery's retries went out UNSIGNED because
+    /// `resolve_secret` fell through to a watch lookup that could never hit a
+    /// saved-search id — so a verifying receiver 401'd the whole ladder to
+    /// `dead`.
+    #[tokio::test]
+    async fn search_replay_signed_not_unsigned() {
+        let store = TempStore::new("resolve-search").await;
+        let search = store
+            .storage
+            .create_saved_search("q", None, None, "https://x/hook", Some("s3-search"), None)
+            .await
+            .expect("create saved search");
+        let cfg = WebhooksConfig::default();
+        assert_eq!(
+            resolve_secret(&store.storage, &cfg, &delivery("search", &search.id)).await,
+            Some("s3-search".to_string())
+        );
+    }
+
+    /// The anti-pattern: `failure` deliveries are signed on first send (the
+    /// dispatcher has the config) but their retries were not, because the secret
+    /// is the one that lives in config rather than in a row.
+    #[tokio::test]
+    async fn failure_replay_signed_not_unsigned() {
+        let store = TempStore::new("resolve-failure").await;
+        let cfg = webhooks_with_failure_secret(Some("s3-failure"));
+        let job_id = uuid::Uuid::new_v4().to_string();
+        assert_eq!(
+            resolve_secret(&store.storage, &cfg, &delivery("failure", &job_id)).await,
+            Some("s3-failure".to_string()),
+            "the failure secret comes from [webhooks], not from the job row"
+        );
+        // No secret configured → unsigned, exactly as the first send was.
+        assert_eq!(
+            resolve_secret(
+                &store.storage,
+                &WebhooksConfig::default(),
+                &delivery("failure", &job_id)
+            )
+            .await,
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn job_and_change_kinds_resolve_their_row_secrets() {
+        let store = TempStore::new("resolve-job-change").await;
+        let cfg = WebhooksConfig::default();
+
+        let job = store
+            .storage
+            .enqueue(
+                "fake",
+                pumper_core::EnqueueOptions {
+                    callback_url: Some("https://x/hook".into()),
+                    callback_secret: Some("s3-job".into()),
+                    max_attempts: 1,
+                    ..Default::default()
+                },
+            )
+            .await
+            .expect("enqueue");
+        assert_eq!(
+            resolve_secret(&store.storage, &cfg, &delivery("job", &job.id.to_string())).await,
+            Some("s3-job".to_string())
+        );
+
+        let watch = store
+            .storage
+            .create_watch("fake", "*", "https://x/hook", Some("s3-watch"), "webhook")
+            .await
+            .expect("create watch");
+        assert_eq!(
+            resolve_secret(&store.storage, &cfg, &delivery("change", &watch.id)).await,
+            Some("s3-watch".to_string())
+        );
+    }
+
+    /// A deleted source must yield `None` (re-send unsigned) rather than an
+    /// error or a stale secret — and an unknown kind must NOT fall through to a
+    /// watch lookup, which could only ever match by accident and would sign with
+    /// an unrelated subscriber's secret.
+    #[tokio::test]
+    async fn deleted_source_and_unknown_kind_resolve_none_not_a_watch_lookup() {
+        let store = TempStore::new("resolve-missing").await;
+        let cfg = webhooks_with_failure_secret(Some("s3-failure"));
+        for d in [
+            delivery("job", &uuid::Uuid::new_v4().to_string()),
+            delivery("job", "not-a-uuid"),
+            delivery("change", "watch-that-was-deleted"),
+            delivery("search", "search-that-was-deleted"),
+        ] {
+            assert_eq!(
+                resolve_secret(&store.storage, &cfg, &d).await,
+                None,
+                "deleted/unparseable source for kind {:?}",
+                d.kind
+            );
+        }
+        // An unknown kind gets nothing — not the failure secret, not a watch's.
+        let watch = store
+            .storage
+            .create_watch("fake", "*", "https://x/hook", Some("s3-watch"), "webhook")
+            .await
+            .expect("create watch");
+        assert_eq!(
+            resolve_secret(&store.storage, &cfg, &delivery("mystery", &watch.id)).await,
+            None
+        );
+    }
+
+    /// The anti-pattern the gate exists for: `POST /replay` re-sent whatever row
+    /// it was handed — a `delivered` one (an unrequested duplicate) and a
+    /// `pending` one (a second sender racing the first).
+    #[test]
+    fn replay_gate_blocks_delivered_and_inflight_not_only_missing_rows() {
+        assert_eq!(replay_gate("failed", false), ReplayGate::Allowed);
+        assert_eq!(replay_gate("dead", false), ReplayGate::Allowed);
+        assert_eq!(replay_gate("pending", false), ReplayGate::InFlight);
+        assert_eq!(replay_gate("pending", true), ReplayGate::InFlight);
+        assert_eq!(replay_gate("delivered", false), ReplayGate::NotReplayable);
+        assert_eq!(replay_gate("delivered", true), ReplayGate::Allowed);
+        assert_eq!(replay_gate("brand-new-status", true), ReplayGate::NotReplayable);
+    }
+
+    #[test]
+    fn stale_pending_threshold_clears_the_worst_case_in_process_delivery() {
+        // 3 attempts x 15s client timeout + backoff sleeps (0 + 2 + 4).
+        let worst_case_secs = (MAX_ATTEMPTS as i64) * 15 + 2 + 4;
+        assert_eq!(worst_case_secs, 51);
+        assert!(
+            STALE_PENDING_SECS >= worst_case_secs * 10,
+            "reclaim must not race a merely-slow delivery: {STALE_PENDING_SECS}s vs \
+             {worst_case_secs}s worst case"
+        );
+    }
 
     #[test]
     fn verify_inverts_sign() {

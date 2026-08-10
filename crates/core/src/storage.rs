@@ -1464,6 +1464,73 @@ impl Storage {
         Ok(res.rows_affected() > 0)
     }
 
+    /// Atomically claims a delivery for a **manual** replay. Deliberately a
+    /// separate claim from [`Storage::begin_delivery_retry`] rather than a
+    /// widened one: the auto-drain must never be able to resurrect a `dead` row
+    /// (that is what "dead" means — the ladder gave up and stopped), while an
+    /// operator asking for a replay by id explicitly may.
+    ///
+    /// Claimable states: `failed` and `dead`; `delivered` only under `force`,
+    /// so a re-send of something the receiver already accepted is never
+    /// accidental. `pending` is never claimable — the row is in flight, and a
+    /// second sender would duplicate it *and* race its outcome write.
+    ///
+    /// Returns `false` when the row is gone or in a state this claim doesn't
+    /// cover — the caller answers 409 rather than pretending it scheduled work.
+    pub async fn begin_delivery_replay(&self, id: &str, force: bool) -> Result<bool> {
+        let res = sqlx::query(
+            "UPDATE webhook_deliveries SET status = 'pending', retry_count = retry_count + 1, \
+             next_retry_at = NULL, updated_at = ?2 WHERE id = ?1 \
+             AND (status IN ('failed', 'dead') OR (?3 = 1 AND status = 'delivered'))",
+        )
+        .bind(id)
+        .bind(now())
+        .bind(force as i64)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected() > 0)
+    }
+
+    /// Returns crash-interrupted deliveries to the retry ladder.
+    ///
+    /// A `pending` row is one of two things: a delivery created by
+    /// `create_delivery` whose send is still running, or a row a drain tick
+    /// claimed via [`Storage::begin_delivery_retry`]. Either way the *only*
+    /// thing that ever moves it out of `pending` is the in-process outcome
+    /// write. Kill the process in that window and the row is stranded forever:
+    /// `due_deliveries` scans `failed` only, so nothing re-sends it, and
+    /// `prune_ledgers` touches only `delivered`/`dead`, so nothing reclaims it
+    /// either — an unbounded leak of undelivered payloads.
+    ///
+    /// This flips such rows back to `failed` and marks them immediately due, so
+    /// the next drain tick picks them up and they walk the normal ladder to
+    /// `delivered` or `dead`. `retry_count` is deliberately NOT bumped here —
+    /// the subsequent drain claim bumps it, so a crash-looping row still reaches
+    /// `dead` after the usual number of retries instead of cycling forever.
+    ///
+    /// `older_than_secs` must be comfortably longer than the worst-case
+    /// in-process delivery, or a live send gets a duplicate sender. See
+    /// `crate::webhook::STALE_PENDING_SECS` in the server for the shipped value
+    /// and its margin.
+    ///
+    /// `last_error` is overwritten with the reclaim reason: for a stranded row
+    /// "no outcome was ever recorded" is the actionable fact, and the attempt
+    /// history remains in `attempts`/`retry_count`.
+    pub async fn reclaim_stale_deliveries(&self, older_than_secs: i64) -> Result<u64> {
+        let cutoff = Utc::now() - chrono::Duration::seconds(older_than_secs.max(1));
+        let stamp = now();
+        let res = sqlx::query(
+            "UPDATE webhook_deliveries SET status = 'failed', next_retry_at = ?2, \
+             last_error = 'interrupted: reclaimed after no delivery outcome was recorded', \
+             updated_at = ?2 WHERE status = 'pending' AND updated_at < ?1",
+        )
+        .bind(ts(cutoff))
+        .bind(stamp)
+        .execute(&self.pool)
+        .await?;
+        Ok(res.rows_affected())
+    }
+
     /// Deliveries, newest first, optionally filtered by status (`failed` is the
     /// dead-letter view). Bodies excluded — fetch one by id for the payload.
     pub async fn list_deliveries(&self, status: Option<&str>, limit: i64) -> Result<Vec<Delivery>> {
