@@ -529,7 +529,7 @@ async fn gate_calls_precede_hook_calls_in_the_success_fanout() {
     };
     // EXPECTED order — the pipeline run after a successful job.
     let expected = [
-        "suppress_unhealthy(&state, &job.app, &mut by_dataset)",
+        "suppress_unhealthy(&state, &mut by_dataset)",
         "enforce_contracts(&state, &job, &mut by_dataset)",
         "notify_watches(&state, &job, &by_dataset)",
         // The run fan-out's `fire_dataset_triggers` call, pinned by its batch

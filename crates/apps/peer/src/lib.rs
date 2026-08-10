@@ -33,10 +33,29 @@
 //! older revisions of the same key are skipped. `removed` revisions ARE
 //! carried by the feed and are applied as real local tombstones (via
 //! `Datasets::tombstone_keys` — removal by NAME, which writes `removed_at` + a
-//! `removed` revision) — so downstream triggers on the mirror see removals too.
+//! `removed` revision).
 //! It is deliberately NOT `detect_removed`: this app knows exactly which keys
 //! died, so inferring them from a synthetic full snapshot (what v1 did) only
 //! bought a way around the degrading-source removal guard.
+//!
+//! ## What propagates downstream (and what used not to)
+//!
+//! A mirror is only useful if it behaves like local data. Each run declares
+//! `index_datasets` for every `(namespace, dataset)` it wrote
+//! ([`mirrored_specs`]), which is what puts those namespaces into
+//! `worker::run_indexed_apps` — the one existing seam every downstream mechanism
+//! is scoped by. Through it, a mirrored write or tombstone now reaches:
+//! - **watches** on `peer_{origin}/{dataset}` (`dataset.changed`, whose payload
+//!   `app` is the namespace, not `peer`),
+//! - **dataset triggers** scoped to that namespace,
+//! - **full-text search** indexing, and therefore **saved-search alerts**.
+//!
+//! None of it happened before: the run's change batch was scoped to `job.app`
+//! (`"peer"`) while every write landed under the namespace, so each mechanism
+//! keyed on the job app saw an empty run. This module used to claim removals
+//! reached downstream triggers; that only became true once the batch was
+//! widened. Nothing in the worker special-cases `peer` — the mirror rides the
+//! same seam `grants/unified` does.
 //!
 //! ## Provenance of a mirrored record (M12)
 //!
@@ -185,7 +204,8 @@ impl ScrapeApp for Peer {
                  status: ok|not_modified|drift|error, pulled, new, changed, unchanged, \
                  skipped_older_revisions, skipped_malformed, origin_provenance_kept, \
                  origin_artifact_sha_dropped, tombstones_applied, tombstones_deferred, capped, \
-                 walk_resumed, walk_completed, since, note?, error?}], tombstones: string }. \
+                 walk_resumed, walk_completed, since, note?, error?}], \
+                 index_datasets: [{app, dataset}], tombstones: string }. \
                  A run where EVERY dataset errored fails the job instead of returning this.",
             ),
             cost_class: CostClass::Free,
@@ -276,6 +296,15 @@ impl ScrapeApp for Peer {
         Ok(json!({
             "peer": base,
             "max_records": max_records,
+            // The namespaces this run actually wrote under. Declaring them is
+            // what makes a mirror behave like local data: the worker widens the
+            // run's change batch, its search indexing and its saved-search scope
+            // to every app named here, so watches, dataset triggers and standing
+            // alerts on `peer_<origin>/<dataset>` all see mirrored writes. Every
+            // dataset that got this far has a namespace, including one whose
+            // walk found nothing — an empty window is not a reason to drop the
+            // namespace from the run's declared surface.
+            "index_datasets": mirrored_specs(&reports),
             // `ok` only when every dataset came back clean; `partial` the moment
             // one errored or froze on drift. All-errored never reaches here.
             "status": if outcome == RunOutcome::Partial { "partial" } else { "ok" },
@@ -775,6 +804,41 @@ fn merge_deferred_tombstones(pending: &[String], fresh: &[String]) -> Vec<String
         .filter(|k| seen.insert(k.as_str()))
         .take(PENDING_TOMBSTONE_CAP)
         .cloned()
+        .collect()
+}
+
+/// The `index_datasets` specs for a run: one `{app, dataset}` per mirrored
+/// `(namespace, dataset)` pair, de-duplicated, in report order.
+///
+/// This is the whole of the mirror-visibility fix on this side. The run writes
+/// under `peer_<origin>` but the job's app is `peer`, so every downstream
+/// mechanism keyed on the job app — the change batch behind watches and dataset
+/// triggers, search indexing, saved-search alerts — saw nothing. Declaring the
+/// namespaces here routes all of them through the EXISTING widening seam
+/// (`worker::run_indexed_apps`), with no special-casing of `peer` anywhere in
+/// the worker.
+///
+/// Errored datasets are skipped: they have no namespace to name, and a run must
+/// not claim a namespace it did not write. `not_modified` and empty-window
+/// datasets ARE included — the namespace is real, and declaring it costs one
+/// bounded revision query.
+fn mirrored_specs(reports: &[Value]) -> Vec<Value> {
+    let mut seen: HashSet<(String, String)> = HashSet::new();
+    reports
+        .iter()
+        .filter_map(|r| {
+            let namespace = r.get("namespace").and_then(Value::as_str)?;
+            // The report's `dataset` is the REMOTE `app/dataset` spec verbatim;
+            // the local dataset name is its second half, trimmed exactly as
+            // `parse_dataset_spec` trimmed it before writing.
+            let dataset = r
+                .get("dataset")
+                .and_then(Value::as_str)
+                .and_then(|s| s.split_once('/'))
+                .map(|(_, ds)| ds.trim())?;
+            seen.insert((namespace.to_string(), dataset.to_string()))
+                .then(|| json!({ "app": namespace, "dataset": dataset }))
+        })
         .collect()
 }
 
@@ -1349,6 +1413,49 @@ mod tests {
     fn drift_alone_does_not_fail_the_job() {
         assert_eq!(run_outcome(&["drift"]), RunOutcome::Partial);
         assert_eq!(run_outcome(&["drift", "drift"]), RunOutcome::Partial);
+    }
+
+    /// The anti-pattern: a run that declares nothing. Writes landed under
+    /// `peer_<origin>` while the job's app stayed `peer`, so the worker's change
+    /// batch, search indexing and saved-search scope — all keyed on the job app
+    /// via `run_indexed_apps` — saw an empty run, and NOTHING downstream ever
+    /// fired on a mirrored record.
+    #[test]
+    fn mirrored_namespaces_are_declared_not_invisible() {
+        let report = |spec: &str, ns: &str, status: &str| json!({"dataset": spec, "namespace": ns, "status": status});
+        let specs = mirrored_specs(&[
+            report("hackernews/stories", "peer_hackernews", "ok"),
+            report("hackernews/comments", "peer_hackernews", "not_modified"),
+        ]);
+        assert_eq!(
+            specs,
+            vec![
+                json!({"app": "peer_hackernews", "dataset": "stories"}),
+                json!({"app": "peer_hackernews", "dataset": "comments"}),
+            ],
+            "the LOCAL namespace and the LOCAL dataset name — not the remote spec"
+        );
+    }
+
+    /// A run must not claim a namespace it did not write, and must not name one
+    /// twice (the worker would run the same widened query per duplicate).
+    #[test]
+    fn errored_datasets_declare_nothing_and_repeats_collapse() {
+        // An errored dataset never reached `pull_one`'s report shape: no
+        // namespace, so nothing to index.
+        let specs = mirrored_specs(&[json!({"dataset": "a/b", "status": "error", "error": "x"})]);
+        assert!(specs.is_empty(), "a failed pull declares no namespace");
+
+        // Two specs resolving to the same (namespace, dataset) appear once.
+        let dupe = json!({"dataset": "hn/stories", "namespace": "ns", "status": "ok"});
+        assert_eq!(mirrored_specs(&[dupe.clone(), dupe]).len(), 1);
+
+        // Whitespace in a spec is trimmed exactly as `parse_dataset_spec` trims
+        // it, so the declared dataset matches the one actually written.
+        assert_eq!(
+            mirrored_specs(&[json!({"dataset": "hn / stories ", "namespace": "ns"})]),
+            vec![json!({"app": "ns", "dataset": "stories"})]
+        );
     }
 
     #[test]

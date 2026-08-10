@@ -354,10 +354,15 @@ pub(crate) async fn test_trigger(
                 "latest source run produced no matching changes",
             )));
         }
+        // The preview reads the trigger's own source app, so the revisions it
+        // matched carry that app — take it from the revision rather than from
+        // the source job, whose app may be a producer feeding this namespace.
+        let app = matching[0].app.clone();
         let dataset = matching[0].dataset.clone();
         crate::triggers::dataset_trigger_obj(
             &trigger,
             &source,
+            &app,
             &dataset,
             &matching,
             depth,

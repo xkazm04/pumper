@@ -823,6 +823,10 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
     // (counts, not arrays) can additionally name datasets to index per-record
     // via `index_datasets` — see `dataset_search_docs`.
     let index_specs = crate::datahub::index_dataset_specs(&result);
+    // Every app namespace this run wrote under: its own, plus the virtual apps
+    // its `index_datasets` names. Computed once here because BOTH the hook batch
+    // below and the saved-search scope further down are defined by it.
+    let indexed_apps = run_indexed_apps(&job.app, &index_specs);
     stages
         .time(Stage::Index, async {
             let mut docs = search_docs(&job.app, job.id, &result);
@@ -856,17 +860,18 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
 
     stages
         .time(Stage::Hooks, async {
-            // One revision batch for this run, shared by watches + triggers.
-            let changes = load_run_changes(&state, &job).await;
+            // One revision batch for this run, shared by watches + triggers —
+            // across every app namespace the run wrote under, not just its own.
+            let changes = load_run_changes(&state, &job, &indexed_apps).await;
             if changes.is_empty() {
                 return;
             }
-            let mut by_dataset = group_by_dataset(&changes);
+            let mut by_dataset = group_by_app_dataset(&changes);
             // A degrading source never pushes. A webhook is irreversible once
             // sent, so a source we no longer stand behind is dropped here,
             // before the hooks — this ordering IS the enforcement, and if it
             // moves below them the guarantee is gone.
-            suppress_unhealthy(&state, &job.app, &mut by_dataset).await;
+            suppress_unhealthy(&state, &mut by_dataset).await;
             // Declared data contracts (M20): the same choke point, the
             // declared complement to the inferred gate above. Verdicts are
             // always recorded; datasets are dropped only under
@@ -887,7 +892,6 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
     // under — the job's own app AND the virtual apps named by
     // `index_datasets` (e.g. `grants`), which is the app those docs
     // actually carry. See `run_indexed_apps`.
-    let indexed_apps = run_indexed_apps(&job.app, &index_specs);
     stages
         .time(
             Stage::Alerts,
@@ -1050,32 +1054,68 @@ async fn prune_trigger_ledger(state: &AppState) {
     }
 }
 
-/// Everything this run wrote: revisions after the attempt's start. Fail-open
-/// (empty on error) — side effects never block the job outcome.
-async fn load_run_changes(state: &AppState, job: &Job) -> Vec<pumper_core::Revision> {
-    match state
-        // Unfiltered by trust: push suppression is decided per source in
-        // `suppress_unhealthy`, not by filtering rows, so a partially-degraded
-        // app's healthy datasets still deliver.
-        .datasets
-        .changes_since(&job.app, None, job.started_at, 1000, None)
-        .await
-    {
-        Ok(changes) => changes,
-        Err(e) => {
-            warn!(job = %job.id, "failed to load run changes: {e}");
-            Vec::new()
+/// Everything this run wrote: revisions after the attempt's start, across every
+/// app namespace the run put records under (`run_indexed_apps` — the job's own
+/// app plus the virtual apps its `index_datasets` names). Fail-open (a failed
+/// app is skipped, not fatal) — side effects never block the job outcome.
+///
+/// **Why this is scoped by more than `job.app`.** A run's writes and its job app
+/// are not the same thing. `ca-grants` writes `grants/unified`; `peer` writes
+/// `peer_<origin>/<dataset>`. Keying the hook batch on `job.app` alone made
+/// every such write invisible to watches and dataset triggers — a mirror could
+/// not be watched at all, and the peer app's own module doc claimed otherwise.
+/// Round 6 fixed exactly this class for saved searches (`search_covers_run` over
+/// `run_indexed_apps`); this is the same reasoning applied to the one layer that
+/// still scoped by the job app alone.
+///
+/// **This is a deliberate semantic widening for ALL virtual-app runs**, not just
+/// peering: a watch on `grants` now fires on the `ca-grants` run that wrote
+/// `grants/unified`, where before only a watch on `ca-grants` did. That is the
+/// correct reading — the watch names the namespace the records actually live in,
+/// which is the only namespace they can be read back from.
+///
+/// **Cost.** One `changes_since` per declared app, so the query count is bounded
+/// by the run's own spec count (`index_datasets` is a short declared list, and
+/// `run_indexed_apps` de-duplicates it). The 1000-row cap is deliberately PER
+/// APP rather than shared: a noisy source app must not be able to starve a
+/// quiet virtual app of its hook batch.
+async fn load_run_changes(
+    state: &AppState,
+    job: &Job,
+    indexed_apps: &[String],
+) -> Vec<pumper_core::Revision> {
+    let mut all = Vec::new();
+    for app in indexed_apps {
+        match state
+            // Unfiltered by trust: push suppression is decided per source in
+            // `suppress_unhealthy`, not by filtering rows, so a partially-degraded
+            // app's healthy datasets still deliver.
+            .datasets
+            .changes_since(app, None, job.started_at, 1000, None)
+            .await
+        {
+            Ok(changes) => all.extend(changes),
+            Err(e) => warn!(job = %job.id, %app, "failed to load run changes: {e}"),
         }
     }
+    all
 }
 
-fn group_by_dataset(
+/// Groups a run's revisions by **(app, dataset)**, not by dataset name.
+///
+/// The app half is load-bearing now that one batch spans several namespaces: two
+/// apps in the same run can own identically-named datasets (`grants/unified` and
+/// a source app's own `unified`), and collapsing them would hand one app's
+/// revisions to the other's watches and triggers. Each `Revision` already
+/// carries its own `app`, so the key is read from the row rather than assumed
+/// from the job.
+fn group_by_app_dataset(
     changes: &[pumper_core::Revision],
-) -> HashMap<&str, Vec<&pumper_core::Revision>> {
-    let mut by_dataset: HashMap<&str, Vec<&pumper_core::Revision>> = HashMap::new();
+) -> HashMap<(&str, &str), Vec<&pumper_core::Revision>> {
+    let mut by_dataset: HashMap<(&str, &str), Vec<&pumper_core::Revision>> = HashMap::new();
     for rev in changes {
         by_dataset
-            .entry(rev.dataset.as_str())
+            .entry((rev.app.as_str(), rev.dataset.as_str()))
             .or_default()
             .push(rev);
     }
@@ -1090,14 +1130,15 @@ fn group_by_dataset(
 /// `[resilience] enforce` is on.
 async fn suppress_unhealthy(
     state: &AppState,
-    app: &str,
-    by_dataset: &mut HashMap<&str, Vec<&pumper_core::Revision>>,
+    by_dataset: &mut HashMap<(&str, &str), Vec<&pumper_core::Revision>>,
 ) {
     if !state.health.enforcing() {
         return;
     }
-    let datasets: Vec<&str> = by_dataset.keys().copied().collect();
-    for dataset in datasets {
+    // The app comes from the batch key, not from the job: a run can write under
+    // several namespaces, and each pair's health is judged on its own terms.
+    let pairs: Vec<(&str, &str)> = by_dataset.keys().copied().collect();
+    for (app, dataset) in pairs {
         let health = state.health.enforced_state(app, dataset).await;
         if health.suppresses_pushes() {
             warn!(
@@ -1107,7 +1148,7 @@ async fn suppress_unhealthy(
                 "pushes suppressed: source health is degraded, and a delivered webhook \
                  cannot be recalled"
             );
-            by_dataset.remove(dataset);
+            by_dataset.remove(&(app, dataset));
         }
     }
 }
@@ -1127,7 +1168,7 @@ async fn suppress_unhealthy(
 fn enforce_contracts(
     state: &AppState,
     job: &Job,
-    by_dataset: &mut HashMap<&str, Vec<&pumper_core::Revision>>,
+    by_dataset: &mut HashMap<(&str, &str), Vec<&pumper_core::Revision>>,
 ) {
     let catalog = match pumper_core::Catalog::load() {
         Ok(c) => c,
@@ -1137,12 +1178,15 @@ fn enforce_contracts(
         }
     };
     let enforce = state.config.contracts.enforce;
-    let datasets: Vec<&str> = by_dataset.keys().copied().collect();
-    for dataset in datasets {
-        let Some((_, contract)) = catalog.contract_for(&job.app, dataset) else {
+    // Keyed by the batch's own app: a contract is declared on an `<app>/<dataset>`
+    // pair, so a run writing into a virtual namespace is judged against THAT
+    // pair's contract, not against its job app's.
+    let pairs: Vec<(&str, &str)> = by_dataset.keys().copied().collect();
+    for (app, dataset) in pairs {
+        let Some((_, contract)) = catalog.contract_for(app, dataset) else {
             continue;
         };
-        let revs = &by_dataset[dataset];
+        let revs = &by_dataset[&(app, dataset)];
         let records: Vec<&serde_json::Value> = revs
             .iter()
             .filter(|r| r.change != "removed")
@@ -1164,59 +1208,97 @@ fn enforce_contracts(
             .contract_verdicts
             .lock()
             .expect("contract verdict lock")
-            .insert(format!("{}/{}", job.app, dataset), outcome);
+            .insert(format!("{app}/{dataset}"), outcome);
         match verdict {
             pumper_core::ContractVerdict::Pass => {}
             pumper_core::ContractVerdict::Warn => warn!(
-                app = %job.app,
+                %app,
                 dataset,
                 ?violations,
                 "data contract violated (warn-only: [contracts] enforce = false)"
             ),
             pumper_core::ContractVerdict::Block => {
                 warn!(
-                    app = %job.app,
+                    %app,
                     dataset,
                     ?violations,
                     "pushes suppressed: declared data contract violated"
                 );
-                by_dataset.remove(dataset);
+                by_dataset.remove(&(app, dataset));
             }
         }
     }
 }
 
-/// Fires `dataset.changed` webhooks at every enabled watch whose dataset saw
-/// new/changed/removed revisions during this job run. Best-effort: delivery
-/// failures never affect the job outcome.
+/// Fires `dataset.changed` webhooks at every enabled watch whose `(app, dataset)`
+/// pair saw new/changed/removed revisions during this job run. Best-effort:
+/// delivery failures never affect the job outcome.
+///
+/// Watches are loaded per APP of the batch, not once for `job.app`, because a run
+/// can write under several namespaces (see [`load_run_changes`]). Each watch is
+/// then offered only the entries of its own app — that scoping is what makes one
+/// dispatch per (watch, app, dataset) and no more. Without it, a watch on the
+/// virtual app with `dataset = "*"` would also match the job app's own datasets
+/// and fire twice for one run.
 async fn notify_watches(
     state: &AppState,
     job: &Job,
-    by_dataset: &HashMap<&str, Vec<&pumper_core::Revision>>,
+    by_dataset: &HashMap<(&str, &str), Vec<&pumper_core::Revision>>,
 ) {
-    let watches = match state.storage.enabled_watches(&job.app).await {
-        Ok(w) if !w.is_empty() => w,
-        Ok(_) => return,
-        Err(e) => {
-            warn!(job = %job.id, "failed to load watches: {e}");
-            return;
-        }
-    };
-
-    for (dataset, revs) in by_dataset {
-        for watch in watches.iter().filter(|w| w.covers(dataset)) {
-            let payload = serde_json::json!({
-                "event": "dataset.changed",
-                "watch_id": watch.id,
-                "job_id": job.id,
-                "app": job.app,
-                "dataset": dataset,
-                "count": revs.len(),
-                "changes": revs,
-            });
-            webhook::dispatch_change(state, watch.clone(), payload).await;
+    let mut apps: Vec<&str> = by_dataset.keys().map(|(app, _)| *app).collect();
+    apps.sort_unstable();
+    apps.dedup();
+    for app in apps {
+        let watches = match state.storage.enabled_watches(app).await {
+            Ok(w) if !w.is_empty() => w,
+            Ok(_) => continue,
+            Err(e) => {
+                warn!(job = %job.id, %app, "failed to load watches: {e}");
+                continue;
+            }
+        };
+        // Sorted so a multi-dataset run dispatches in a stable sequence rather
+        // than in `HashMap` (RandomState) order — matching `fire_dataset_triggers`.
+        let mut datasets: Vec<(&str, &str)> = by_dataset
+            .keys()
+            .copied()
+            .filter(|(entry_app, _)| *entry_app == app)
+            .collect();
+        datasets.sort_unstable();
+        for pair in datasets {
+            let (_, dataset) = pair;
+            let revs = &by_dataset[&pair];
+            for watch in watches
+                .iter()
+                .filter(|w| watch_covers_entry(w, app, dataset))
+            {
+                let payload = serde_json::json!({
+                    "event": "dataset.changed",
+                    "watch_id": watch.id,
+                    "job_id": job.id,
+                    // The app the records actually live under — which for a
+                    // virtual-app write is NOT the job's app, and is the only
+                    // namespace the consumer can read them back from.
+                    "app": app,
+                    "dataset": dataset,
+                    "count": revs.len(),
+                    "changes": revs,
+                });
+                webhook::dispatch_change(state, watch.clone(), payload).await;
+            }
         }
     }
+}
+
+/// Whether a watch covers one `(app, dataset)` entry of a run's batch.
+///
+/// Both halves matter. The dataset half is the watch's own `*`/exact filter. The
+/// APP half is what a single-namespace batch used to give for free and a widened
+/// one does not: a watch belongs to exactly one app, so offering it another app's
+/// entries would both fire it for data it never asked for and — for a `dataset =
+/// "*"` watch on a run that wrote two namespaces — fire it twice for one run.
+fn watch_covers_entry(watch: &pumper_core::Watch, app: &str, dataset: &str) -> bool {
+    watch.app == app && watch.covers(dataset)
 }
 
 /// Every app namespace this run's documents landed under: the job's own app,
@@ -1431,18 +1513,19 @@ async fn materialize_saved_search(
     if changes.is_empty() {
         return;
     }
-    // Watches and dataset triggers are looked up per app; re-badge the job so
-    // the lookups target the view's app while provenance keeps the real job id.
-    let mut view_job = job.clone();
-    view_job.app = mat.app.clone();
-    let by_dataset = group_by_dataset(&changes);
-    notify_watches(state, &view_job, &by_dataset).await;
+    // Watches and dataset triggers are looked up per app OF THE BATCH, and the
+    // batch is keyed by each revision's own app — so the view's app is targeted
+    // without re-badging the job. (This used to need a `view_job` clone with
+    // `app = mat.app`; the widened batch keying makes that unnecessary, and the
+    // real job now flows through, so provenance and lookup no longer disagree.)
+    let by_dataset = group_by_app_dataset(&changes);
+    notify_watches(state, job, &by_dataset).await;
     // The view's hops ride the SOURCE job's id (provenance), so their dedup keys
     // are scoped by the saved search — otherwise a view whose target app is the
     // job's own app collides with the run's own fan-out hop.
     crate::triggers::fire_dataset_triggers(
         state,
-        &view_job,
+        job,
         crate::triggers::DatasetBatch::View(&search.id),
         &by_dataset,
     )
@@ -1988,6 +2071,101 @@ mod panic_error_tests {
             panic_error(&*payload, None),
             "panicked: <non-string panic payload>"
         );
+    }
+}
+
+#[cfg(test)]
+mod hook_scope_tests {
+    use super::{group_by_app_dataset, watch_covers_entry};
+    use pumper_core::datasets::{Provenance, Revision};
+    use serde_json::json;
+
+    fn rev(app: &str, dataset: &str, key: &str) -> Revision {
+        Revision {
+            app: app.into(),
+            dataset: dataset.into(),
+            key: key.into(),
+            revision: 1,
+            change: "new".into(),
+            data: Some(json!({ "k": key })),
+            diff: None,
+            created_at: chrono::Utc::now(),
+            trust: "stable".into(),
+            provenance: Provenance::default(),
+        }
+    }
+
+    fn watch(app: &str, dataset: &str) -> pumper_core::Watch {
+        pumper_core::Watch {
+            id: format!("w-{app}-{dataset}"),
+            app: app.into(),
+            dataset: dataset.into(),
+            url: "http://sink".into(),
+            secret: None,
+            sink: "webhook".into(),
+            enabled: true,
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    /// The anti-pattern: keying the run batch on dataset NAME alone. A run that
+    /// writes `ca-grants/unified` and `grants/unified` would collapse both into
+    /// one entry, handing one namespace's revisions to the other's watches.
+    #[test]
+    fn identically_named_datasets_in_two_apps_are_not_conflated() {
+        let revs = vec![
+            rev("ca-grants", "unified", "a"),
+            rev("grants", "unified", "b"),
+            rev("grants", "unified", "c"),
+        ];
+        let by = group_by_app_dataset(&revs);
+        assert_eq!(by.len(), 2, "two namespaces, two entries — not one");
+        assert_eq!(by[&("ca-grants", "unified")].len(), 1);
+        assert_eq!(by[&("grants", "unified")].len(), 2);
+    }
+
+    /// The double-fire the widened batch made possible: a `dataset = "*"` watch
+    /// on the virtual app would match EVERY entry of a multi-namespace run — its
+    /// own and the job app's — and fire twice for one run. The app half of the
+    /// predicate is what keeps it to exactly one.
+    #[test]
+    fn wildcard_watch_fires_once_per_run_not_once_per_namespace() {
+        let revs = vec![
+            rev("ca-grants", "opportunities", "a"),
+            rev("grants", "unified", "b"),
+        ];
+        let by = group_by_app_dataset(&revs);
+        let w = watch("grants", "*");
+        let matched: Vec<&str> = {
+            let mut m: Vec<&str> = by
+                .keys()
+                .filter(|(app, ds)| watch_covers_entry(&w, app, ds))
+                .map(|(app, _)| *app)
+                .collect();
+            m.sort_unstable();
+            m
+        };
+        assert_eq!(
+            matched,
+            vec!["grants"],
+            "a wildcard watch still sees only its OWN app's entries"
+        );
+    }
+
+    /// Both halves of the predicate, stated directly.
+    #[test]
+    fn watch_covers_its_own_app_only_and_respects_its_dataset_filter() {
+        let exact = watch("peer_hn", "stories");
+        assert!(watch_covers_entry(&exact, "peer_hn", "stories"));
+        // Right dataset, wrong namespace — the mirror's watch must not fire on
+        // the origin-shaped app of the same name.
+        assert!(!watch_covers_entry(&exact, "hackernews", "stories"));
+        // Right namespace, wrong dataset.
+        assert!(!watch_covers_entry(&exact, "peer_hn", "comments"));
+
+        let wildcard = watch("peer_hn", "*");
+        assert!(watch_covers_entry(&wildcard, "peer_hn", "anything"));
+        assert!(!watch_covers_entry(&wildcard, "other_ns", "anything"));
     }
 }
 

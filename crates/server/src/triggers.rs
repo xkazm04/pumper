@@ -92,9 +92,16 @@ pub fn merged_params(template: &Value, trigger_obj: Value) -> Value {
 
 /// The `_trigger` object for a dataset-change hop. Keys are capped at
 /// `cfg.key_cap`; `count` stays exact — targets fetch full data by key.
+///
+/// `app` is the namespace the CHANGED RECORDS live under, which is not always
+/// the source job's app: a `ca-grants` run's hop off `grants/unified` must tell
+/// its target `grants`, because that is the only app the target can read those
+/// keys back from. (`source_job_id` still carries the real provenance.)
+#[allow(clippy::too_many_arguments)]
 pub fn dataset_trigger_obj(
     trigger: &Trigger,
     source_job: &Job,
+    app: &str,
     dataset: &str,
     revs: &[&Revision],
     depth: u32,
@@ -109,7 +116,7 @@ pub fn dataset_trigger_obj(
     json!({
         "trigger_id": trigger.id,
         "source_kind": "dataset",
-        "app": source_job.app,
+        "app": app,
         "dataset": dataset,
         "kind": trigger.on_change.as_deref().unwrap_or("any"),
         "count": revs.len(),
@@ -327,14 +334,21 @@ impl DatasetBatch<'_> {
 /// every hop after the first look like a redelivery of the first — so exactly
 /// one arbitrary (HashMap-ordered) dataset ever fired. The dataset, and the
 /// batch the dataset came from, are both part of the identity of a hop.
+///
+/// `app` joins them for the same reason, one namespace up: a run's batch now
+/// spans every namespace it wrote under, so two apps owning identically-named
+/// datasets in one run (`grants/unified` alongside a source app's own
+/// `unified`) would otherwise produce the same key and silently drop the second
+/// hop as a redelivery of the first.
 pub fn dataset_idempotency_key(
     trigger_id: &str,
     source_job_id: &str,
     batch: DatasetBatch<'_>,
+    app: &str,
     dataset: &str,
 ) -> String {
     format!(
-        "{}{}:ds:{dataset}",
+        "{}{}:ds:{app}/{dataset}",
         idempotency_key(trigger_id, source_job_id),
         batch.key_scope()
     )
@@ -659,38 +673,54 @@ pub async fn fire_dataset_triggers(
     state: &AppState,
     job: &Job,
     batch: DatasetBatch<'_>,
-    by_dataset: &HashMap<&str, Vec<&Revision>>,
+    by_dataset: &HashMap<(&str, &str), Vec<&Revision>>,
 ) {
     let source_job_id = job.id.to_string();
-    let trigs = match eval_set(state, EvalScope::Dataset(&job.app)).await {
-        Ok(t) if !t.is_empty() => t,
-        Ok(_) => return,
-        Err(e) => {
-            // A transient read error here silently drops EVERY edge of this
-            // run, which is exactly the failure the ledger exists to surface.
-            warn!(job = %job.id, "failed to load dataset triggers: {e}");
-            let detail = e.to_string();
-            record(
-                state,
-                NewTriggerRun {
-                    trigger_id: TRIGGER_SET_ID,
-                    outcome: "eval_set_error",
-                    source_kind: "dataset",
-                    source_job_id: Some(&source_job_id),
-                    detail: Some(&detail),
-                    ..Default::default()
-                },
-            )
-            .await;
-            return;
-        }
-    };
     let mut fired = 0;
-    let mut datasets: Vec<&&str> = by_dataset.keys().collect();
-    datasets.sort_unstable();
-    for dataset in datasets {
-        let dataset = *dataset;
-        let revs = &by_dataset[dataset];
+    // Sorted by (app, dataset) so a multi-namespace run enqueues its hops in a
+    // stable sequence rather than in `HashMap` (RandomState) order.
+    let mut pairs: Vec<(&str, &str)> = by_dataset.keys().copied().collect();
+    pairs.sort_unstable();
+    // The trigger set is loaded per APP of the batch. A run can write under
+    // several namespaces (`ca-grants` -> `grants/unified`, `peer` ->
+    // `peer_<origin>/<ds>`); scoping every hop to `job.app` gave those writes
+    // zero trigger coverage. `eval_set` is cached per (kind, app), so the extra
+    // lookups are bounded by the run's declared namespace count, not per dataset.
+    let mut current: Option<(&str, EvalSet)> = None;
+    for (app, dataset) in pairs {
+        let trigs = match &current {
+            Some((cached, set)) if *cached == app => set.clone(),
+            _ => match eval_set(state, EvalScope::Dataset(app)).await {
+                Ok(t) => {
+                    current = Some((app, t.clone()));
+                    t
+                }
+                Err(e) => {
+                    // A transient read error here silently drops EVERY edge of
+                    // this app, which is exactly what the ledger exists to
+                    // surface. Other apps in the batch still get their chance.
+                    warn!(job = %job.id, %app, "failed to load dataset triggers: {e}");
+                    let detail = e.to_string();
+                    record(
+                        state,
+                        NewTriggerRun {
+                            trigger_id: TRIGGER_SET_ID,
+                            outcome: "eval_set_error",
+                            source_kind: "dataset",
+                            source_job_id: Some(&source_job_id),
+                            detail: Some(&detail),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                    continue;
+                }
+            },
+        };
+        if trigs.is_empty() {
+            continue;
+        }
+        let revs = &by_dataset[&(app, dataset)];
         let ctx = Ctx {
             source_kind: "dataset",
             source_job_id: Some(source_job_id.clone()),
@@ -730,13 +760,14 @@ pub async fn fire_dataset_triggers(
             let obj = dataset_trigger_obj(
                 trigger,
                 job,
+                app,
                 dataset,
                 &matching,
                 depth,
                 &chain,
                 &state.config.triggers,
             );
-            let key = dataset_idempotency_key(&trigger.id, &source_job_id, batch, dataset);
+            let key = dataset_idempotency_key(&trigger.id, &source_job_id, batch, app, dataset);
             fired += enqueue_hop(state, trigger, job, obj, key, &ctx).await;
         }
     }
@@ -1127,36 +1158,49 @@ mod tests {
     fn dataset_hop_key_is_per_dataset_not_per_run() {
         // The bug: two datasets of ONE run collapsing onto one key, so the
         // second dataset's hop is dedup-suppressed as if it were a redelivery.
-        let a = dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "grants");
-        let b = dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "orgs");
+        let a = dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "src", "grants");
+        let b = dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "src", "orgs");
         assert_ne!(a, b, "one key per dataset, not one per run");
-        assert_eq!(a, "trig:T1:J1:ds:grants");
+        assert_eq!(a, "trig:T1:J1:ds:src/grants");
         // Still per trigger and per source run.
         assert_ne!(
             a,
-            dataset_idempotency_key("T2", "J1", DatasetBatch::Run, "grants")
+            dataset_idempotency_key("T2", "J1", DatasetBatch::Run, "src", "grants")
         );
         assert_ne!(
             a,
-            dataset_idempotency_key("T1", "J2", DatasetBatch::Run, "grants")
+            dataset_idempotency_key("T1", "J2", DatasetBatch::Run, "src", "grants")
         );
-        // …and stable: the same (trigger, run, batch, dataset) always re-derives.
+        // …and stable: the same (trigger, run, batch, app, dataset) re-derives.
         assert_eq!(
             a,
-            dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "grants")
+            dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "src", "grants")
+        );
+    }
+
+    /// One run's batch now spans every namespace it wrote under, so two apps
+    /// owning an identically-named dataset in the SAME run would collapse onto
+    /// one key and the second hop would be dropped as a redelivery of the first.
+    #[test]
+    fn dataset_hop_key_is_per_app_not_just_per_dataset_name() {
+        let own = dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "ca-grants", "unified");
+        let virt = dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "grants", "unified");
+        assert_ne!(
+            own, virt,
+            "same dataset name in two namespaces of one run must be two hops"
         );
     }
 
     #[test]
     fn view_hop_key_does_not_collide_with_the_run_fanout_hop() {
-        // A saved-search materialization re-badges the SOURCE job, so its hops
-        // carry the same job id as the run's own fan-out. Same trigger, same
+        // A saved-search materialization rides the SOURCE job, so its hops carry
+        // the same job id as the run's own fan-out. Same trigger, same app, same
         // dataset, same job — only the batch differs, and that must be enough.
-        let run = dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "d");
-        let view = dataset_idempotency_key("T1", "J1", DatasetBatch::View("S1"), "d");
+        let run = dataset_idempotency_key("T1", "J1", DatasetBatch::Run, "src", "d");
+        let view = dataset_idempotency_key("T1", "J1", DatasetBatch::View("S1"), "src", "d");
         assert_ne!(run, view);
         // Two views materialized by the same run are distinct too.
-        let other = dataset_idempotency_key("T1", "J1", DatasetBatch::View("S2"), "d");
+        let other = dataset_idempotency_key("T1", "J1", DatasetBatch::View("S2"), "src", "d");
         assert_ne!(view, other);
         // And a dataset hop never collides with the terminal-job hop of the
         // same run (they belong to different trigger kinds, but the keyspace

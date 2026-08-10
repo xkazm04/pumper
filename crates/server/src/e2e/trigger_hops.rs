@@ -86,9 +86,12 @@ async fn multi_dataset_run_fires_one_hop_per_dataset_not_one_per_run() {
         .unwrap();
 
     let revs = vec![rev("alpha", "a1"), rev("beta", "b1"), rev("gamma", "g1")];
-    let mut by_dataset: HashMap<&str, Vec<&Revision>> = HashMap::new();
+    let mut by_dataset: HashMap<(&str, &str), Vec<&Revision>> = HashMap::new();
     for r in &revs {
-        by_dataset.entry(r.dataset.as_str()).or_default().push(r);
+        by_dataset
+            .entry((r.app.as_str(), r.dataset.as_str()))
+            .or_default()
+            .push(r);
     }
 
     fire_dataset_triggers(&state, &source, DatasetBatch::Run, &by_dataset).await;
@@ -102,11 +105,11 @@ async fn multi_dataset_run_fires_one_hop_per_dataset_not_one_per_run() {
     assert_eq!(
         fired.iter().map(|(_, k)| k.as_str()).collect::<Vec<_>>(),
         vec![
-            format!("trig:{}:{job}:ds:alpha", trigger.id),
-            format!("trig:{}:{job}:ds:beta", trigger.id),
-            format!("trig:{}:{job}:ds:gamma", trigger.id),
+            format!("trig:{}:{job}:ds:src/alpha", trigger.id),
+            format!("trig:{}:{job}:ds:src/beta", trigger.id),
+            format!("trig:{}:{job}:ds:src/gamma", trigger.id),
         ],
-        "and its own dedup key"
+        "and its own dedup key, namespaced by the app the records live under"
     );
 
     // Deterministic: re-evaluating the identical batch adds nothing — the
@@ -151,8 +154,8 @@ async fn view_materialization_hop_does_not_dedup_against_the_fanout_hop() {
         .unwrap();
 
     let revs = [rev("d", "k1")];
-    let mut by_dataset: HashMap<&str, Vec<&Revision>> = HashMap::new();
-    by_dataset.insert("d", revs.iter().collect());
+    let mut by_dataset: HashMap<(&str, &str), Vec<&Revision>> = HashMap::new();
+    by_dataset.insert(("src", "d"), revs.iter().collect());
 
     // Same trigger, same source job, same dataset — only the batch differs.
     fire_dataset_triggers(&state, &source, DatasetBatch::Run, &by_dataset).await;
@@ -168,9 +171,9 @@ async fn view_materialization_hop_does_not_dedup_against_the_fanout_hop() {
     assert_eq!(
         keys,
         vec![
-            format!("trig:{}:{job}:ds:d", trigger.id),
-            format!("trig:{}:{job}:view:S1:ds:d", trigger.id),
-            format!("trig:{}:{job}:view:S2:ds:d", trigger.id),
+            format!("trig:{}:{job}:ds:src/d", trigger.id),
+            format!("trig:{}:{job}:view:S1:ds:src/d", trigger.id),
+            format!("trig:{}:{job}:view:S2:ds:src/d", trigger.id),
         ],
         "the run fan-out and each view materialization are distinct hops"
     );
