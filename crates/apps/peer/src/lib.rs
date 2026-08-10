@@ -50,11 +50,21 @@
 //!
 //! One record per (peer URL, remote dataset, namespace), key
 //! `{url}|{app}/{dataset}|{namespace}`, value:
-//! `{ since, walk: {next_cursor, newest, seen[]}|null, etag, etag_since, ... }`.
+//! `{ since, walk: {next_cursor, newest, seen[]}|null, pending_tombstones[],
+//! etag, etag_since, ... }`.
 //! - `since` advances to the newest `created_at` observed **only when a walk
-//!   completes** (feed exhausted). A capped run persists `walk` instead and the
+//!   completes cleanly** (feed exhausted AND nothing skipped as unreadable —
+//!   see [`walk_may_advance`]). A capped run persists `walk` instead and the
 //!   next run resumes the same frozen walk mid-flight — `max_records` is a
 //!   per-run budget, never a data-loss mechanism.
+//! - `since` is stored as the honest observed maximum but sent on the wire
+//!   rewound by one microsecond ([`inclusive_since`]), because the origin's
+//!   predicate is strict `>` and a whole upsert-chunk shares one stamp. Without
+//!   that, revisions committed at the boundary stamp after page 1 was served
+//!   were excluded forever.
+//! - `pending_tombstones` holds removals a run REFUSED to apply (they would have
+//!   emptied the mirror). They are retried every run until they can be applied —
+//!   a refusal is "not yet", never "never".
 //! - `seen` (the applied-key set) persists across a resumed walk so an older
 //!   revision fetched by a later run can't overwrite the newer state a
 //!   previous run already applied. It is capped ([`SEEN_CAP`]); a walk too
@@ -75,7 +85,8 @@
 use std::collections::HashSet;
 
 use async_trait::async_trait;
-use pumper_core::datasets::Provenance;
+use chrono::{DateTime, Duration, Utc};
+use pumper_core::datasets::{ts, Provenance};
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, HttpRequest, ManifestExample, Result, ScrapeApp,
 };
@@ -94,6 +105,11 @@ const MAX_DATASETS: usize = 20;
 /// abandoned (since NOT advanced) rather than risking an older revision
 /// overwriting newer applied state on resume.
 const SEEN_CAP: usize = 20_000;
+/// Largest deferred-tombstone backlog a state record may carry. A refusal that
+/// grows past this is not a transient origin hiccup any more; the overflow is
+/// dropped from the backlog and said so in the note, rather than growing one
+/// state record without bound.
+const PENDING_TOMBSTONE_CAP: usize = 10_000;
 
 pub struct Peer;
 
@@ -165,10 +181,12 @@ impl ScrapeApp for Peer {
                 },
             ],
             output_shape: Some(
-                "{ peer, datasets: [{dataset, namespace, status: ok|not_modified|error, pulled, \
-                 new, changed, unchanged, origin_provenance_kept, \
-                 origin_artifact_sha_dropped, tombstones_applied, capped, walk_resumed, \
-                 walk_completed, since, note?, error?}], tombstones: string }",
+                "{ peer, max_records, status: ok|partial, datasets: [{dataset, namespace, \
+                 status: ok|not_modified|drift|error, pulled, new, changed, unchanged, \
+                 skipped_older_revisions, skipped_malformed, origin_provenance_kept, \
+                 origin_artifact_sha_dropped, tombstones_applied, tombstones_deferred, capped, \
+                 walk_resumed, walk_completed, since, note?, error?}], tombstones: string }. \
+                 A run where EVERY dataset errored fails the job instead of returning this.",
             ),
             cost_class: CostClass::Free,
         }
@@ -231,9 +249,36 @@ impl ScrapeApp for Peer {
             reports.push(report);
         }
 
+        // Run honesty: a per-dataset failure used to be a `{"status":"error"}`
+        // object inside an `Ok` result, so total failure read as a green job.
+        let statuses: Vec<&str> = reports
+            .iter()
+            .map(|r| r.get("status").and_then(Value::as_str).unwrap_or("error"))
+            .collect();
+        let outcome = run_outcome(&statuses);
+        if outcome == RunOutcome::Failed {
+            let why: Vec<String> = reports
+                .iter()
+                .map(|r| {
+                    format!(
+                        "{}: {}",
+                        r.get("dataset").and_then(Value::as_str).unwrap_or("?"),
+                        r.get("error").and_then(Value::as_str).unwrap_or("unknown")
+                    )
+                })
+                .collect();
+            return Err(Error::App(format!(
+                "every requested dataset failed to mirror from {base} — nothing was pulled: {}",
+                why.join("; ")
+            )));
+        }
+
         Ok(json!({
             "peer": base,
             "max_records": max_records,
+            // `ok` only when every dataset came back clean; `partial` the moment
+            // one errored or froze on drift. All-errored never reaches here.
+            "status": if outcome == RunOutcome::Partial { "partial" } else { "ok" },
             "datasets": reports,
             // Honesty note pinned in the result: the upstream feed DOES carry
             // tombstones ('removed' revisions), and this puller applies them
@@ -291,7 +336,11 @@ async fn pull_one(
         if page_limit == 0 {
             break; // capped mid-walk; cursor points at the resume position
         }
-        let url = build_changes_url(&feed_url, st.since.as_deref(), &cursor, page_limit);
+        // The stored resume point is rewound one microsecond on the wire so the
+        // origin's strict `created_at > since` includes revisions that share the
+        // boundary stamp — see `inclusive_since`.
+        let wire_since = st.since.as_deref().map(inclusive_since);
+        let url = build_changes_url(&feed_url, wire_since.as_deref(), &cursor, page_limit);
         let mut req = HttpRequest::get(&url);
         // The feed is a live surface: the TTL response cache must not serve a
         // stale page of a cursor walk.
@@ -391,8 +440,15 @@ async fn pull_one(
     // snapshot. It produced the right rows, but it re-entered full-snapshot
     // *inference* — which this app never needed — and in doing so reached past
     // the degrading-source removal guard that every `sync_many` caller gets.
+    //
+    // A refused batch is DEFERRED, not dropped: it merges with any backlog a
+    // previous run left behind and, if still refused, is written back to
+    // `PeerState` so the next run retries it. Before this, the refusal advanced
+    // `since` past the removals and they were never revisited.
     let mut tombstones_applied = 0usize;
-    if !tombstone_keys.is_empty() {
+    let mut tombstones_deferred = 0usize;
+    let candidates = merge_deferred_tombstones(&st.pending_tombstones, &tombstone_keys);
+    if !candidates.is_empty() {
         let count = ctx.datasets.record_count(&namespace, &dataset).await?;
         let live: Vec<String> = ctx
             .datasets
@@ -402,27 +458,45 @@ async fn pull_one(
             .filter(|r| r.removed_at.is_none())
             .map(|r| r.key)
             .collect();
-        if tombstones_would_empty_the_mirror(&live, &tombstone_keys) {
+        if tombstones_would_empty_the_mirror(&live, &candidates) {
+            tombstones_deferred = candidates.len();
             notes.push(format!(
-                "{} tombstone(s) NOT applied: they would empty the entire local \
-                 mirror, which this app refuses (delete explicitly if intended)",
-                tombstone_keys.len()
+                "{tombstones_deferred} tombstone(s) NOT applied: they would empty the \
+                 entire local mirror, which this app refuses (delete explicitly if \
+                 intended). They are HELD and retried next run — removals are pending, \
+                 the mirror is not converged"
             ));
+            st.pending_tombstones = candidates;
         } else {
             tombstones_applied = ctx
                 .datasets
-                .tombstone_keys(&namespace, &dataset, &tombstone_keys)
+                .tombstone_keys(&namespace, &dataset, &candidates)
                 .await?
                 .len();
+            st.pending_tombstones.clear();
         }
     }
 
-    // Advance / persist cursor state.
-    if completed {
+    // Advance / persist cursor state. `walk_may_advance` is the gate: a walk
+    // that reached the end of the feed but skipped items it could not parse must
+    // NOT move the resume point past them.
+    let drifted = skipped_malformed > 0;
+    if walk_may_advance(completed, skipped_malformed) {
         if let Some(n) = newest {
             st.since = Some(n);
         }
         st.walk = None;
+    } else if drifted {
+        // Abandon the suspended walk too: with `since` frozen, the next run
+        // re-reads the whole window from the last good resume point, so a
+        // half-finished cursor into a drifted feed is worse than useless.
+        st.walk = None;
+        notes.push(format!(
+            "{skipped_malformed} feed item(s) could not be read (schema drift?); the resume \
+             point is FROZEN at {} and this window will be re-read next run — no revision is \
+             skipped, but the mirror is not converged until the shape is understood",
+            st.since.as_deref().unwrap_or("<beginning of feed>")
+        ));
     } else if seen.len() <= SEEN_CAP {
         walk.next_cursor = cursor;
         walk.newest = newest;
@@ -446,7 +520,16 @@ async fn pull_one(
     Ok(json!({
         "dataset": spec,
         "namespace": namespace,
-        "status": if not_modified { "not_modified" } else { "ok" },
+        // `drift` outranks `not_modified`/`ok`: a run that could not read part
+        // of the feed has not converged, and the resume point says so by not
+        // moving. It is not `error` — the revisions it COULD read did land.
+        "status": if drifted {
+            "drift"
+        } else if not_modified {
+            "not_modified"
+        } else {
+            "ok"
+        },
         "pulled": pulled,
         "new": applied_new,
         "changed": applied_changed,
@@ -460,6 +543,9 @@ async fn pull_one(
         "origin_provenance_kept": origin_provenance_kept,
         "origin_artifact_sha_dropped": origin_artifact_sha_dropped,
         "tombstones_applied": tombstones_applied,
+        // Removals the mirror is holding rather than dropping (see
+        // `merge_deferred_tombstones`). Non-zero means "not converged yet".
+        "tombstones_deferred": tombstones_deferred,
         "capped": !completed,
         "walk_resumed": resumed,
         "walk_completed": completed,
@@ -494,12 +580,20 @@ struct PeerState {
     dataset: String,
     #[serde(default)]
     namespace: String,
-    /// RFC 3339 `created_at` high-water mark of the last COMPLETED walk,
-    /// passed verbatim as `?since=`.
+    /// RFC 3339 `created_at` high-water mark of the last COMPLETED walk. Sent
+    /// as `?since=` through [`inclusive_since`], NOT verbatim — the stored value
+    /// stays the honest observed maximum (it is what the run report shows), and
+    /// the one-microsecond rewind that makes the origin's strict `>` inclusive
+    /// is applied at request time only.
     #[serde(default)]
     since: Option<String>,
     #[serde(default)]
     walk: Option<WalkState>,
+    /// Tombstones a previous run REFUSED (they would have emptied the mirror),
+    /// carried forward so the removals are retried instead of dropped. See
+    /// [`merge_deferred_tombstones`].
+    #[serde(default)]
+    pending_tombstones: Vec<String>,
     /// Origin `ETag` of the fresh-walk first page, replayed as If-None-Match.
     #[serde(default)]
     etag: Option<String>,
@@ -608,6 +702,116 @@ fn plan_actions(items: &[Value], seen: &mut HashSet<String>) -> PullPlan {
         }
     }
     plan
+}
+
+/// The `?since=` value to send so the origin's STRICT `created_at > since`
+/// predicate behaves **inclusively** for `resume_point`.
+///
+/// The loss window this closes. The feed orders `(created_at DESC, rowid DESC)`
+/// and a whole upsert-chunk shares ONE `created_at` (see
+/// `docs/features/datasets.md` § Conventions). A walk that reads page 1 and
+/// stores its newest stamp as the resume point therefore excludes — permanently
+/// — every revision carrying that same stamp that was committed *after* the page
+/// was served: `created_at > newest` can never return them, on this run or any
+/// future one. A mirror's one promise is convergence, so a boundary that can
+/// silently drop a whole chunk is the wrong boundary.
+///
+/// Stored stamps are fixed-width RFC 3339 micros ([`pumper_core::datasets::ts`]),
+/// so rewinding the resume point by exactly one microsecond turns `> (t - 1µs)`
+/// into `>= t`: no representable stamp can fall in the open interval, so this is
+/// an exact inclusive boundary and not a fuzzy safety window.
+///
+/// **Bounded cost.** Re-including the boundary makes every run re-fetch the
+/// revisions sharing that one stamp — at most one upsert-chunk per dataset per
+/// run, never unbounded, and it shrinks to nothing as soon as the origin writes
+/// a newer stamp. Re-applying them is free: identical content upserts as
+/// `ChangeKind::Unchanged`, which writes no revision, so the mirror's own feed
+/// does not grow and downstream watches do not re-fire.
+///
+/// An unparseable resume point is passed through verbatim rather than dropped:
+/// the origin answers 400 on it, which is louder than silently restarting the
+/// walk from the top.
+fn inclusive_since(resume_point: &str) -> String {
+    match DateTime::parse_from_rfc3339(resume_point) {
+        Ok(dt) => ts(dt.with_timezone(&Utc) - Duration::microseconds(1)),
+        Err(_) => resume_point.to_string(),
+    }
+}
+
+/// Whether a finished walk may advance the durable resume point.
+///
+/// Schema drift must HALT the walk, not silently discard the items it could not
+/// read. `plan_actions` counts an item it cannot parse (`key`/`change` missing,
+/// an unknown change kind, a new/changed revision with no snapshot) and moves
+/// on; that is right for one bad row, but if the walk then completes and `since`
+/// advances past those revisions, a field rename on the origin (`key` →
+/// `record_key`) is permanent, silent, total data loss with a green run.
+///
+/// Freezing the resume point instead makes the drift self-healing: nothing is
+/// lost, the same window is re-read on the next run, and the moment the origin
+/// (or this crate) is fixed the backlog applies. The cost is re-walking that
+/// window every run while the drift persists — which is loud, cheap relative to
+/// losing the data, and reported as `status:"drift"` with the count.
+fn walk_may_advance(completed: bool, skipped_malformed: usize) -> bool {
+    completed && skipped_malformed == 0
+}
+
+/// Merges the tombstones a previous run REFUSED to apply with this run's, in
+/// stable order, de-duplicated and capped at [`PENDING_TOMBSTONE_CAP`].
+///
+/// The refusal ([`tombstones_would_empty_the_mirror`]) used to add a note and
+/// then let the walk complete and `since` advance — so the removals it declined
+/// were never seen again by any run. A refusal is a "not yet", not a "never":
+/// carrying the keys in `PeerState` is what makes the next run (when the origin
+/// has more live records again, or the operator has intervened) able to apply
+/// them.
+///
+/// Deferred keys come FIRST so the oldest backlog survives the cap.
+fn merge_deferred_tombstones(pending: &[String], fresh: &[String]) -> Vec<String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    pending
+        .iter()
+        .chain(fresh.iter())
+        .filter(|k| seen.insert(k.as_str()))
+        .take(PENDING_TOMBSTONE_CAP)
+        .cloned()
+        .collect()
+}
+
+/// The run-level verdict over the per-dataset statuses.
+///
+/// The anti-pattern: `pull_one`'s errors were caught into
+/// `{"status":"error"}` objects inside an `Ok` result, so a peer whose origin
+/// had been unreachable for a week showed a wall of green in the job history —
+/// the one place an operator looks. A run is only `ok` when every dataset it was
+/// asked for actually came back clean.
+#[derive(Debug, PartialEq, Eq)]
+enum RunOutcome {
+    /// Every dataset is `ok`/`not_modified`.
+    Ok,
+    /// At least one dataset is degraded (errored, or drift-frozen), but not all
+    /// errored — data did land, so the job succeeds and says `partial`.
+    Partial,
+    /// EVERY dataset errored: nothing was mirrored, so the job itself must fail.
+    /// Deliberately not "all datasets degraded" — a drifted dataset still
+    /// applied the revisions it could read, which is not a failed run.
+    Failed,
+}
+
+fn run_outcome(statuses: &[&str]) -> RunOutcome {
+    if statuses.is_empty() {
+        return RunOutcome::Ok;
+    }
+    if statuses.iter().all(|s| *s == "error") {
+        return RunOutcome::Failed;
+    }
+    if statuses
+        .iter()
+        .any(|s| !matches!(*s, "ok" | "not_modified"))
+    {
+        return RunOutcome::Partial;
+    }
+    RunOutcome::Ok
 }
 
 /// Whether applying `dead` would leave the local mirror with no live record.
@@ -1022,6 +1226,129 @@ mod tests {
         ));
         // Nothing live: no data to lose, so nothing to refuse.
         assert!(!tombstones_would_empty_the_mirror(&[], &live(&["a"])));
+    }
+
+    // ── Loss windows (each test is named for the loss it defends against) ───
+
+    /// THE loss window: the feed's `since` predicate is strict (`created_at >
+    /// ?`), the feed is ordered by `created_at` and a whole upsert-chunk shares
+    /// one stamp. Storing page-1's newest stamp as the resume point and sending
+    /// it verbatim excludes, permanently, every revision committed at that same
+    /// stamp after the page was served.
+    #[test]
+    fn equal_stamp_revisions_not_lost() {
+        let boundary = "2026-07-31T10:00:00.123456Z";
+        let wire = inclusive_since(boundary);
+        // Exactly one microsecond back — an EXACT inclusive boundary, because
+        // stored stamps are fixed-width micros and nothing can fall between.
+        assert_eq!(wire, "2026-07-31T10:00:00.123455Z");
+        // The origin compares stamps as fixed-width strings, so this ordering
+        // IS the server-side predicate: a revision stamped exactly at the
+        // boundary now passes `created_at > since`, where before it could not.
+        assert!(
+            boundary > wire.as_str(),
+            "a same-stamp revision must now be returned, not skipped forever"
+        );
+        // ...and nothing older leaks back in: the previous representable
+        // microsecond is still excluded.
+        assert!("2026-07-31T10:00:00.123455Z" <= wire.as_str());
+
+        // Rewinding across a second/minute/hour/day boundary is real arithmetic,
+        // not string surgery.
+        assert_eq!(
+            inclusive_since("2026-08-01T00:00:00.000000Z"),
+            "2026-07-31T23:59:59.999999Z"
+        );
+        // Offset stamps normalize to the stored UTC form on the way out.
+        assert_eq!(
+            inclusive_since("2026-07-31T12:00:00.000000+02:00"),
+            "2026-07-31T09:59:59.999999Z"
+        );
+        // Garbage passes through so the origin answers 400 — louder than a
+        // silent restart from the top of the feed.
+        assert_eq!(inclusive_since("not-a-stamp"), "not-a-stamp");
+    }
+
+    /// Schema drift used to DISCARD: malformed items were counted, the walk
+    /// completed anyway, and `since` advanced past the revisions that were
+    /// never applied. A `key` → `record_key` rename on the origin was therefore
+    /// total, permanent, silent data loss with a green run.
+    #[test]
+    fn drift_freezes_cursor_not_advances() {
+        // The clean case still advances — freezing on nothing would strand
+        // every mirror.
+        assert!(walk_may_advance(true, 0));
+        // Anything unreadable freezes the resume point, however small.
+        assert!(!walk_may_advance(true, 1));
+        assert!(!walk_may_advance(true, 900));
+        // A capped (suspended) walk never advanced in the first place.
+        assert!(!walk_may_advance(false, 0));
+        assert!(!walk_may_advance(false, 3));
+    }
+
+    /// A refused tombstone batch used to vanish: the note said "not applied",
+    /// then `since` advanced past those `removed` revisions and no later run
+    /// ever saw them again. The mirror kept records the origin had deleted,
+    /// forever, and said `status:"ok"` about it.
+    #[test]
+    fn deferred_tombstones_retried_not_dropped() {
+        let v = |ks: &[&str]| ks.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+
+        // A backlog carried into a run merges with that run's own removals.
+        assert_eq!(
+            merge_deferred_tombstones(&v(&["a", "b"]), &v(&["c"])),
+            v(&["a", "b", "c"])
+        );
+        // Re-seeing a deferred key does not duplicate it.
+        assert_eq!(
+            merge_deferred_tombstones(&v(&["a", "b"]), &v(&["b", "c"])),
+            v(&["a", "b", "c"])
+        );
+        // Nothing pending is the ordinary case: this run's list, untouched.
+        assert_eq!(merge_deferred_tombstones(&[], &v(&["x"])), v(&["x"]));
+        assert!(merge_deferred_tombstones(&[], &[]).is_empty());
+
+        // The backlog is capped, and the OLDEST deferrals survive the cap —
+        // dropping the long-pending ones is what would make the loss permanent.
+        let pending: Vec<String> = (0..PENDING_TOMBSTONE_CAP)
+            .map(|i| format!("p{i}"))
+            .collect();
+        let merged = merge_deferred_tombstones(&pending, &v(&["fresh"]));
+        assert_eq!(merged.len(), PENDING_TOMBSTONE_CAP);
+        assert_eq!(merged[0], "p0", "the oldest deferral is kept, not evicted");
+        assert!(!merged.contains(&"fresh".to_string()));
+    }
+
+    /// A week of total failure used to be a wall of green in the job history:
+    /// `pull_one`'s errors became `{"status":"error"}` objects inside an `Ok`.
+    #[test]
+    fn all_datasets_errored_fails_the_job_not_reports_ok() {
+        assert_eq!(run_outcome(&["error"]), RunOutcome::Failed);
+        assert_eq!(run_outcome(&["error", "error"]), RunOutcome::Failed);
+        // One survivor means data DID land — the job succeeds, degraded.
+        assert_eq!(run_outcome(&["error", "ok"]), RunOutcome::Partial);
+    }
+
+    /// The other half: one bad dataset must never be reported as a clean run.
+    #[test]
+    fn one_degraded_dataset_is_partial_not_ok() {
+        assert_eq!(run_outcome(&["ok", "error"]), RunOutcome::Partial);
+        assert_eq!(run_outcome(&["ok", "drift"]), RunOutcome::Partial);
+        assert_eq!(run_outcome(&["not_modified", "drift"]), RunOutcome::Partial);
+        // Only genuinely-clean statuses make a clean run.
+        assert_eq!(run_outcome(&["ok", "not_modified"]), RunOutcome::Ok);
+        assert_eq!(run_outcome(&["ok"]), RunOutcome::Ok);
+        // No datasets at all is not a failure (`run` rejects an empty list
+        // earlier) — and must not divide-by-zero into `Failed`.
+        assert_eq!(run_outcome(&[]), RunOutcome::Ok);
+    }
+
+    /// Drift is NOT an error: the revisions the run could read did land, so a
+    /// wholly-drifted run must not fail the job — it must freeze and say so.
+    #[test]
+    fn drift_alone_does_not_fail_the_job() {
+        assert_eq!(run_outcome(&["drift"]), RunOutcome::Partial);
+        assert_eq!(run_outcome(&["drift", "drift"]), RunOutcome::Partial);
     }
 
     #[test]

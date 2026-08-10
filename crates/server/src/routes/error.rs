@@ -84,6 +84,57 @@ pub(crate) fn parse_cursor(cursor: &str) -> Option<(String, String)> {
         .map(|(t, k)| (t.to_string(), k.to_string()))
 }
 
+/// Strict `?cursor=` parse for the routes where silently ignoring a cursor is
+/// **data loss** rather than a cosmetic reset — the change feed and record
+/// history, i.e. the two surfaces `@pumper/sync` and the `peer` app walk.
+///
+/// Blank (`?cursor=`) still means "start at the first page": on those routes the
+/// param's mere PRESENCE is what selects `{items, next_cursor}` mode, and the
+/// peering puller sends it empty on every fresh walk. Anything non-blank that is
+/// not a `<created_at>|<tiebreak>` pair is the caller's mistake and is a 400.
+///
+/// The anti-pattern this replaces: [`parse_cursor`] collapses "malformed" into
+/// the same `None` as "absent", so a corrupted cursor restarted the walk at the
+/// NEWEST revision with a 200 and no signal anywhere. For a mirror that is not a
+/// reset, it is a livelock — every page dedupes against the already-applied key
+/// set, the per-run budget burns, and the walk re-suspends near the top of the
+/// feed forever while the run still reports `status:"ok"`.
+///
+/// Deliberately scoped: the other cursor routes (`/jobs`, `/watches`, …) are
+/// browse surfaces where restarting at page 1 is visible to a human and costs
+/// nothing, so they keep the lenient parse.
+pub(crate) fn parse_cursor_arg(cursor: &str) -> Result<Option<(String, String)>, ApiError> {
+    if cursor.trim().is_empty() {
+        return Ok(None); // first page
+    }
+    parse_cursor(cursor)
+        .map(Some)
+        .ok_or_else(|| ApiError(StatusCode::BAD_REQUEST, bad_cursor_message(cursor)))
+}
+
+/// The one malformed-cursor 400 body, so the shape reads identically on every
+/// route that parses a cursor strictly.
+pub(crate) fn bad_cursor_message(cursor: &str) -> String {
+    format!(
+        "invalid 'cursor' {}: expected the opaque `<created_at>|<tiebreak>` token this API \
+         returns in 'next_cursor' (e.g. `2026-07-26T00:00:00.000000Z|41`). Send the param empty \
+         or omit it to start at the first page.",
+        echo_arg(cursor)
+    )
+}
+
+/// Quotes a caller-supplied value back into an error body without letting a
+/// hostile (or merely enormous) query string become the response.
+fn echo_arg(raw: &str) -> String {
+    const MAX: usize = 64;
+    let shown: String = raw.chars().take(MAX).filter(|c| !c.is_control()).collect();
+    if raw.chars().count() > MAX {
+        format!("'{shown}…'")
+    } else {
+        format!("'{shown}'")
+    }
+}
+
 /// Next-page cursor for a keyset page: `Some` only when the page came back full
 /// (so more rows may remain), built from the last item. Mirrors the inline
 /// pattern on `/jobs` and `/datasets/...`.
@@ -105,7 +156,8 @@ pub(crate) struct EnabledBody {
 
 #[cfg(test)]
 mod tests {
-    use super::{keyset_cursor, parse_cursor};
+    use super::{keyset_cursor, parse_cursor, parse_cursor_arg};
+    use axum::http::StatusCode;
 
     /// ALL cursor encoding goes through `keyset_cursor` (9 call sites). Its
     /// contract: a cursor exists only when the page came back full, and it is
@@ -132,5 +184,52 @@ mod tests {
         );
         // No separator => not a valid keyset cursor.
         assert_eq!(parse_cursor("garbage"), None);
+    }
+
+    /// The anti-pattern this defends: a malformed cursor used to decode to the
+    /// same `None` as an absent one, so the feed answered 200 with PAGE ONE —
+    /// the newest revisions — and no consumer could tell its walk had been
+    /// silently rewound to the top.
+    #[test]
+    fn bad_cursor_400_not_page_one() {
+        let err = parse_cursor_arg("garbage").expect_err("a separator-less cursor must not pass");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert!(
+            err.1.contains("next_cursor") && err.1.contains("<created_at>|<tiebreak>"),
+            "the 400 must name the expected format, not just say 'invalid': {}",
+            err.1
+        );
+        assert!(
+            err.1.contains("'garbage'"),
+            "and echo what was sent: {}",
+            err.1
+        );
+    }
+
+    /// Absent and blank are NOT the malformed case: `?cursor=` is the documented
+    /// way to select paged mode from the first page, and the `peer` app sends
+    /// exactly that on every fresh walk. Turning it into a 400 would break every
+    /// mirror's first pull.
+    #[test]
+    fn blank_cursor_is_the_first_page_not_an_error() {
+        assert_eq!(parse_cursor_arg("").unwrap(), None);
+        assert_eq!(parse_cursor_arg("   ").unwrap(), None);
+        assert_eq!(
+            parse_cursor_arg("2026-07-26T00:00:00.000000Z|41").unwrap(),
+            Some(("2026-07-26T00:00:00.000000Z".into(), "41".into()))
+        );
+    }
+
+    /// A hostile cursor must not turn the error body into an echo chamber.
+    #[test]
+    fn bad_cursor_message_truncates_and_strips_control_chars() {
+        let err = parse_cursor_arg(&"z".repeat(5_000)).expect_err("still malformed");
+        assert!(
+            err.1.len() < 400,
+            "error body stayed bounded: {}",
+            err.1.len()
+        );
+        let err = parse_cursor_arg("bad\ncursor\u{0}").expect_err("still malformed");
+        assert!(!err.1.contains('\n') && !err.1.contains('\u{0}'));
     }
 }

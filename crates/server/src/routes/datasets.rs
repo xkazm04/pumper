@@ -10,13 +10,27 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use utoipa::IntoParams;
 
-use crate::routes::error::{default_limit, keyset_cursor, parse_cursor, parse_since, ApiError};
+use crate::routes::error::{
+    bad_cursor_message, default_limit, keyset_cursor, parse_cursor, parse_cursor_arg, parse_since,
+    ApiError,
+};
 use crate::state::AppState;
 
-/// Cursor variant for revision feeds whose tiebreak is numeric (a rowid or a
-/// per-key revision number). A malformed or empty cursor pages from the top.
-fn parse_cursor_i64(cursor: &str) -> Option<(String, i64)> {
-    parse_cursor(cursor).and_then(|(t, k)| k.parse().ok().map(|n| (t, n)))
+/// Cursor variant for the revision feeds whose tiebreak is numeric (a rowid or
+/// a per-key revision number): `/changes` and `/history`.
+///
+/// Strict, via [`parse_cursor_arg`] — blank means "first page", anything else
+/// unparseable is a 400. A non-numeric tiebreak (`t|abc`) is exactly as
+/// malformed as a missing separator and gets the same body, so a client sees
+/// one cursor error shape across both routes.
+fn parse_cursor_i64_arg(cursor: &str) -> Result<Option<(String, i64)>, ApiError> {
+    let Some((ts, tiebreak)) = parse_cursor_arg(cursor)? else {
+        return Ok(None);
+    };
+    tiebreak
+        .parse::<i64>()
+        .map(|n| Some((ts, n)))
+        .map_err(|_| ApiError(StatusCode::BAD_REQUEST, bad_cursor_message(cursor)))
 }
 
 #[utoipa::path(
@@ -686,7 +700,10 @@ pub(crate) struct ChangesQuery {
         ("dataset" = String, Path, description = "Dataset name"),
         ChangesQuery,
     ),
-    responses((status = 200, description = "Dual-mode: `{app, dataset, count, changes}` (clamped 1000), or `{items, next_cursor}` when `cursor` is present (pages the full feed)."))
+    responses(
+        (status = 200, description = "Dual-mode: `{app, dataset, count, changes}` (clamped 1000), or `{items, next_cursor}` when `cursor` is present (pages the full feed)."),
+        (status = 400, description = "Malformed `since` (not RFC 3339) or `cursor` (not the `<created_at>|<rowid>` token from `next_cursor`). A blank `cursor=` is valid and starts at the first page.", body = Object),
+    )
 )]
 pub(crate) async fn dataset_changes(
     State(state): State<AppState>,
@@ -714,7 +731,7 @@ pub(crate) async fn dataset_changes(
             "changes": changes,
         })));
     };
-    let after = parse_cursor_i64(cursor);
+    let after = parse_cursor_i64_arg(cursor)?;
     let page = state
         .datasets
         .changes_page(
@@ -752,7 +769,10 @@ pub(crate) struct HistoryQuery {
         ("dataset" = String, Path, description = "Dataset name"),
         HistoryQuery,
     ),
-    responses((status = 200, description = "Dual-mode: `{app, dataset, key, count, revisions}` (clamped 500), or `{items, next_cursor}` when `cursor` is present."))
+    responses(
+        (status = 200, description = "Dual-mode: `{app, dataset, key, count, revisions}` (clamped 500), or `{items, next_cursor}` when `cursor` is present."),
+        (status = 400, description = "Malformed `cursor` (not the `<created_at>|<revision>` token from `next_cursor`). A blank `cursor=` is valid and starts at the first page.", body = Object),
+    )
 )]
 pub(crate) async fn record_history(
     State(state): State<AppState>,
@@ -772,7 +792,7 @@ pub(crate) async fn record_history(
             "revisions": revisions,
         })));
     };
-    let after = parse_cursor_i64(cursor);
+    let after = parse_cursor_i64_arg(cursor)?;
     let page = state
         .datasets
         .history_page(&app, &dataset, &query.key, after, query.limit.clamp(1, 500))
@@ -780,6 +800,53 @@ pub(crate) async fn record_history(
     Ok(Json(
         json!({ "items": page.items, "next_cursor": page.next_cursor }),
     ))
+}
+
+#[cfg(test)]
+mod cursor_arg_tests {
+    use super::*;
+
+    /// The anti-pattern: `/changes` and `/history` used to decode a corrupt
+    /// cursor to `None` — indistinguishable from "no cursor" — and answer 200
+    /// with page one. A mirror walking the feed then restarted at the newest
+    /// revision every run, re-deduped everything it had already applied, and
+    /// reported `capped:true, new:0` forever with no error to look at.
+    #[test]
+    fn bad_cursor_400_not_page_one() {
+        for bad in [
+            "garbage",
+            "no-separator",
+            "2026-07-26T00:00:00.000000Z|abc",
+            "|",
+        ] {
+            let err = parse_cursor_i64_arg(bad).err().unwrap_or_else(|| {
+                panic!("{bad:?} must be rejected, not silently paged from the top")
+            });
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "for {bad:?}");
+            assert!(
+                err.1.contains("next_cursor"),
+                "names the format for {bad:?}"
+            );
+        }
+    }
+
+    /// A non-numeric tiebreak is as malformed as a missing separator — both
+    /// routes' tiebreaks (feed rowid, history revision) are integers, and
+    /// `t|abc` used to fall through `.ok()` to page one just like `garbage`.
+    #[test]
+    fn numeric_tiebreak_required_but_a_real_cursor_round_trips() {
+        assert_eq!(parse_cursor_i64_arg("").unwrap(), None);
+        assert_eq!(
+            parse_cursor_i64_arg("2026-07-26T00:00:00.000000Z|41").unwrap(),
+            Some(("2026-07-26T00:00:00.000000Z".into(), 41))
+        );
+        // Negative rowids never occur, but they parse — the guard is on SHAPE,
+        // not on plausibility, so it can never reject a cursor the API issued.
+        assert_eq!(
+            parse_cursor_i64_arg("2026-07-26T00:00:00.000000Z|-1").unwrap(),
+            Some(("2026-07-26T00:00:00.000000Z".into(), -1))
+        );
+    }
 }
 
 #[cfg(test)]
