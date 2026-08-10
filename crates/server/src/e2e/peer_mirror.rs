@@ -404,6 +404,60 @@ async fn an_origin_tombstone_propagates_to_a_mirror_tombstone() {
     assert_eq!(removed, vec!["doomed".to_string()]);
 }
 
+/// The refusal path, end to end: tombstones that would empty the mirror are
+/// HELD in `pending_tombstones` and applied by a later run once the origin has
+/// live data again. The refusal used to add a note while `since` advanced past
+/// the removals — no run ever saw them again, so the mirror kept serving
+/// records the origin had deleted, forever, with `status:"ok"`.
+#[tokio::test]
+async fn refused_tombstones_are_retried_until_they_can_apply() {
+    let (origin, _origin_store, base) = origin_node().await;
+    let (mirror, _mirror_store) = mirror_node().await;
+
+    origin_sync(&origin, &[("a", json!({"v": 1})), ("b", json!({"v": 1}))]).await;
+    pull(&mirror, &base, json!({})).await;
+    assert_eq!(
+        mirrored_keys(&mirror).await,
+        vec!["a".to_string(), "b".into()]
+    );
+
+    // The origin removes EVERYTHING — by name, the one path that can genuinely
+    // empty a feed (a full-snapshot sync refuses an empty batch outright).
+    origin
+        .datasets
+        .tombstone_keys(ORIGIN_APP, DATASET, &["a".to_string(), "b".to_string()])
+        .await
+        .expect("tombstone the whole origin dataset");
+
+    let refusing = report(&pull(&mirror, &base, json!({})).await);
+    assert_eq!(refusing["tombstones_applied"], 0, "report: {refusing}");
+    assert_eq!(
+        refusing["tombstones_deferred"], 2,
+        "refused, but HELD for retry — not dropped: {refusing}"
+    );
+    assert_eq!(
+        mirrored_keys(&mirror).await,
+        vec!["a".to_string(), "b".into()],
+        "the mirror refuses to empty itself on a feed that removes everything"
+    );
+
+    // The origin recovers with a live record. This run's window carries no
+    // `removed` revisions at all — the walk advanced past them last run — so
+    // ONLY the deferred backlog in `PeerState` can still deliver these removals.
+    origin_sync(&origin, &[("c", json!({"v": 1}))]).await;
+    let recovered = report(&pull(&mirror, &base, json!({})).await);
+    assert_eq!(
+        recovered["tombstones_applied"], 2,
+        "the deferred removals applied once they no longer empty the mirror: {recovered}"
+    );
+    assert_eq!(recovered["tombstones_deferred"], 0);
+    assert_eq!(
+        mirrored_keys(&mirror).await,
+        vec!["c".to_string()],
+        "converged: the mirror matches the origin again"
+    );
+}
+
 /// The loss window `inclusive_since` closes, at the level where it actually
 /// bites. A revision stamped EXACTLY at the mirror's resume point but committed
 /// after that point was recorded is excluded forever by the origin's strict
