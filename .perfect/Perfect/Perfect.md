@@ -4,16 +4,37 @@ repo: pumper
 updated: 2026-08-11
 pool: 0
 pool_target: 10
-shipped_total: 92
-cursor: "browser-transact"
-last_session: "[[sessions/2026-08-10-2]]"
+shipped_total: 98
+cursor: "extraction-core (round-11 propose; scout brief banked)"
+last_session: "[[sessions/2026-08-11]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **0/10** · phase: **Propose (round 10)** · cursor: **browser-transact** (opp 6; then api-surface, extraction-core); app-runtime + tiered-fetcher on cooldown until round 11; webhook-delivery + dataset-peering off cooldown at round 10. Rounds 1–9: **92/92 accepted directions shipped**, zero failed, zero dropped (rejections recorded per round).
+**State**: pool **0** · phase: **Propose (round 11)** · round-11 cursor: **extraction-core** (scout brief banked in the context note — re-verify seeds first); app-runtime + tiered-fetcher off cooldown (fetcher anchor: recipe-discovery-wiring); webhook-delivery + dataset-peering off cooldown (anchors banked); browser-transact + api-surface on cooldown until round 12 (anchors: evidence-access endpoint · EventBus lock sweep / metrics-hot-path / doc-coverage test). Rounds 1–10: **98/98 accepted directions shipped**, zero failed, zero dropped (rejections recorded per round).
+
+### Round-10 pool — ALL 6 SHIPPED (2026-08-11, gate: director-self-gated, Athena-dispatched)
+browser-transact, 3/5 (REJECTED-deferred: evidence-access endpoint — banked anchor, write-set
+collision with the api lot; REJECTED: flow-budget param — subsumed/no consumer):
+1. [[transact-evidence-honesty]] — robustness · M (steps_completed counts attempts; selector_found
+   discarded; submit target never assessed; DOM-cap destroys evidence post-act)
+2. [[transact-secret-redaction]] — robustness · S (passwords republished into evidence/result/SSE/webhooks)
+3. [[transact-retry-safety]] — robustness · M (deterministic refusals retried; door lets garbage through;
+   typo'd profile runs logged-out)
+
+api-surface, 3/5 (REJECTED-deferred: metrics-hot-path, doc-coverage test — both banked):
+4. [[api-bounded-shutdown]] — robustness · M (one SSE tab = shutdown hangs to SIGKILL; 3 loops escape lifecycle)
+5. [[api-error-contract]] — robustness · M (403/429/503 code "internal"; 500 bodies leak sqlx/path/URL text)
+6. [[api-panic-containment]] — robustness · M (panic = connection reset; poisoned mutex = routes dead forever)
+
+### Wave plan (round 10) — ONE branch `perfect/2026-08-11`, main checkout, 2 CONCURRENT lots
+Write sets disjoint: **Lot T** (opus) = 1,2,3 → apps/transact, engine-browser/lib.rs,
+core/{engine.rs,error.rs,testing.rs}, docs/features/apps.md · **Lot A** (opus) = 4,5,6 →
+server/{main.rs,state.rs,refresher.rs,datahub.rs,mcp/live.rs}, server/routes/{mod,error,events,
+health,ingress,jobs,query,receipt}.rs, root Cargo.toml (tower-http), docs/features/http-api.md.
+Server e2e mod registrations = Class B for both lots (re-read + unique anchor).
 
 ### Round-9 pool — ALL 6 SHIPPED (2026-08-11, gate: director-self-gated, Athena-dispatched)
 app-runtime, 3/5 (REJECTED: fetch-hot-path-batching — no volume consumer;
@@ -267,6 +288,7 @@ spend — was killed at the challenge gate, `worker.rs:528-545` already keeps th
 
 ## Shipped ledger
 
+- 2026-08-11 · **Round 10 (6/6 + 2 Director commits, AUTONOMOUS director-self-gated, resumed)** — browser-transact 3/5, api-surface 3/5; 2 rejected outright, 3 rejected-deferred (banked). Session died post-gate pre-build; continuation session re-verified the evidence anchors and ran the recorded wave plan unchanged. Master `95713f0` → `c630a3f` (ff; second concurrent two-lot wave, disjoint write sets, zero collisions). transact: 428d2e9 (evidence bundle distinguishes a total miss from a clean run — per-step outcomes, successes-only count, submit-target probe, profile + DOM truncate-don't-destroy), f0ddec5 (secrets masked in-page + decode-side re-enforcement; end-to-end no-sentinel proof), 8e17ca7 (Error::Transact terminal; door tightened schema+app-side — builder discovered trigger enqueues bypass the validator entirely; missing profile refuses pre-Chrome). api: c9c2c68 (shutdown terminates bounded with the politeness snapshot flushed post-drain; all 3 SSE surfaces end on the token), 0cfc366 (error-code map complete + inventory-enforced; client_facing exhaustive table; 500 bodies redacted+logged; RowNotFound reasoned-stays-500), 4855fcd (CatchPanicLayer in the driven stack; lock_advisory ×5 + no-lock-unwrap sweep; preview clamp). Director: 684d2c7 (core prelude), c630a3f (smoke +4 checks). **Final gate: 1314/0 full workspace + live smoke 21/21 on the merged master's own binary.** Cumulative: 98/98.
 - 2026-08-11 · **Round 9 (6/6 + 2 Director commits, AUTONOMOUS director-self-gated)** — app-runtime 3/5, tiered-fetcher 3/6; 4 rejected outright, 1 rejected-deferred (recipe-discovery-wiring banked as the fetcher anchor). Master `d80dc17` → `4e3647a` (ff; first CONCURRENT two-lot wave on the one-branch shape — disjoint write sets held, zero collisions). app-runtime: 6237cc8 (fetch chokepoint — the last paid-spend/determinism bypass closed; 16-site raw-engine inventory with counts), f918006 (budget exhaustion terminal — fails once, attempts un-burned; governance pauses say so), 4e3647a (VCR cassettes survive retries via the checkpoint-coupled Fresh/Resume rule). tiered-fetcher: a69420a (zombie penalties dead — authoritative snapshot, aged restore, locked reset, tier_memory GC), 65f893e (dead browser degrades the ladder; claude tier traces-and-exhausts), ca4bbe9 (revalidations/research_cache/http_cache all bounded by the always-on store_janitor). Director: cdcbc31 (smoke always builds — stale-binary class dead), 53c30c0 (recipes doc honesty). **Final gate: 1265/0 full workspace + live smoke 17/17 on the merged master's own binary.** Cumulative: 92/92.
 - 2026-08-10 · **Round 8 (6/6 + 2 Director commits, AUTONOMOUS director-self-gated)** — webhook-delivery 3/5 accepted, dataset-peering 3/5 accepted; 2 rejected outright, 2 rejected-deferred (banked). Master `f079c48` → `06b1deb` (sibling agentic-research commits in between; wave forked from Director fmt pin `1fa3b23`). Webhooks: 4d753fc (DLQ recoverable — all 4 kinds signed, replay gated+claimed, stale-pending reclaimed; builder died pre-commit, Director recovered), 614e7e3 (deliveries inside the FanoutPool lifecycle — 4-session flake class structurally dead), c3d1f52 (delivery_health + 4 /metrics series + honest DLQ docs + smoke 15→17). Peering: 54bf16a (five silent-loss windows closed; 1µs-exact inclusive resume; strict cursor 400s), 4ea11b7 (mirror behaves like local data — hook batch widened across run_indexed_apps, (app,dataset)-keyed, wildcard double-fire pinned), 5a7347f (first two-node e2e in repo history — 8 proofs over a live socket; provenance conformance pinned both ways; peering.md born), bb1c462 (chrono lock). Director: 1fa3b23 (toolchain pin + repo-wide fmt re-baseline), 06b1deb (refusal→retry→apply e2e the review found missing). **Final gate: 1219/0 full workspace + TS 7/7 + live smoke 17/17 on the merged master's own binary.** Cumulative: 86/86.
 - 2026-07-13 · US Trades: d83edfd (metering), d95ba60 (output guards), a458c2a (trades-common unified) — gates green on master.

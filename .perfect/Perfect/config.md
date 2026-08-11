@@ -53,6 +53,29 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   resource-destructive actions even when they are obviously regenerable.
 
 ## Skill improvement log
+- 2026-08-11 (round 10): **The vault's in-flight session note made a mid-round death
+  nearly free.** The proposing session died after gating but before any builder
+  commit; the continuation session reconstructed the entire state from Perfect.md's
+  wave plan + the 6 direction notes + `git log master..perfect/*` in under five
+  minutes, re-verified four evidence anchors, and ran the recorded plan unchanged.
+  The write-after-every-phase rule is doing exactly what it was designed to do —
+  keep the "if resuming:" instructions in the session note's `next:` while a wave
+  is in flight.
+- 2026-08-11 (round 10): **A builder refutation flipped a criterion's THEORY, not
+  just its letter**: the brief framed app-side unknown-field checking as defense in
+  depth behind the schema; the builder proved trigger-fired enqueues never touch the
+  validator, making the app-side check the ONLY guard on that path. Acceptance
+  criteria that say "verify X first" keep paying — the verification WAS the design
+  input. Also the second straight round where e2e-location knowledge mattered
+  (crates/server has src/e2e/, not tests/) — put that in the next api brief up front.
+- 2026-08-11 (round 10): **Windows can't deliver Ctrl-C to a detached process**, so
+  the smoke harness cannot drive the graceful-shutdown path it most wants to prove;
+  it stays e2e-proven only, and the smoke script now says so where a future round
+  would look. If live proof is ever wanted: a conhost-attached child + 
+  GenerateConsoleCtrlEvent shim is the only route — weigh it as its own S direction.
+- 2026-08-11 (round 10): Second concurrent two-lot wave, zero collisions again; the
+  partition rule is now 2-for-2 and cost nothing. Cross-lot Class-B rides didn't
+  occur this round (e2e/mod.rs edits were both single-line appends, seconds apart).
 - 2026-08-11 (round 9): **First CONCURRENT two-lot wave on the one-branch shape — the
   partition rule proved itself both ways.** Round 8 honestly went sequential (worker.rs
   overlap); round 9's write sets were genuinely disjoint and two opus lots ran
