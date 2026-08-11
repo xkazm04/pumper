@@ -23,6 +23,8 @@ Axum server (default port 8088, `[server]` config). **Local power mode: no auth*
 
 **5xx bodies are deliberately generic** (`internal error`, `upstream engine failure`) and do not vary with the cause: raw SQLite/sqlx text, filesystem paths under the data dir, and upstream URLs used to reach the client verbatim. That detail is logged server-side at `error` (and reaches Sentry when configured) against the same status — branch on `code`, read the server log for the cause. The two 4xx cases whose messages are built from server-side paths (`profile`, replay-miss) are likewise fixed strings that name the *parameter* at fault rather than the path.
 
+**A panicking handler is contained**, not dropped: it answers `500 internal` in this same envelope (a `CatchPanicLayer` sitting closest to the handlers, inside the trace span so the panic is logged with its method and URI). Previously the connection was reset with no status and no body — indistinguishable from the process having died — and nothing was logged. The panic's own text stays server-side. This is the HTTP layer only; the worker's separate containment (a panicking app fails its job through the normal attempt-fenced path) is unchanged.
+
 The one 413 that is **not** in this envelope is the request-body ceiling below — it is refused by the extractor before any handler runs, so it comes back as axum's own plain-text rejection with status `413`. Branch on the status, not the body, if you need to catch both.
 
 ## Request body limits

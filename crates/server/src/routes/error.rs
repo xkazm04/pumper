@@ -138,6 +138,68 @@ impl From<pumper_core::Error> for ApiError {
     }
 }
 
+/// The human message for a caught panic payload.
+///
+/// `panic!` produces exactly two payload shapes — a `&'static str` for a literal
+/// message and a `String` for a formatted one — and anything else is an
+/// explicit `panic_any`, which this service never does. Mirrors the worker's own
+/// panic containment so a handler panic and an app panic read alike in the logs.
+pub(crate) fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "non-string panic payload".to_string()
+    }
+}
+
+/// Locks an **advisory in-memory cache** that is shared with the worker,
+/// recovering rather than propagating if a previous holder panicked while
+/// holding it.
+///
+/// The anti-pattern this replaces: `.lock().unwrap()` on the request path. A
+/// `std::sync::Mutex` is poisoned *permanently* by one panic anywhere — and
+/// these mutexes are held by the worker too, so a single panicking worker task
+/// turned `/sources`, `/catalog/health`, `/jobs/{id}/receipt`, `DELETE
+/// /jobs/{id}` and `POST /ingest/{id}` into connection-reset generators for the
+/// rest of the process's life. Poisoning is a *warning about the data*, and the
+/// question is whether this particular data can be trusted after an interrupted
+/// write. For every site that uses this helper, it can:
+///
+/// - `contract_verdicts` — per-run telemetry, a `HashMap<String, Value>`
+///   rebuilt by the next run of each source. Worst case: one stale verdict, on
+///   a surface that already documents itself as "null-absent before the first
+///   contracted run since boot".
+/// - `job_cancels` — advisory routing for `DELETE /jobs/{id}`. Worst case: a
+///   stale token, and firing one is already harmless because the worker matches
+///   the attempt number before honouring it. The fallback (cancelling a
+///   `queued` job synchronously) is unaffected.
+/// - the ingress rate-limit buckets — `(tokens, last_seen)` pairs. Worst case:
+///   one source's bucket is off by a fraction of a refill window.
+///
+/// None of them can be left *half-written*: the guard makes each update atomic
+/// with respect to readers, so recovery hands back a structurally sound map.
+/// A lock protecting something where an interrupted write really is corrupting
+/// must NOT use this — it should propagate, which is what poisoning is for.
+pub(crate) fn lock_advisory<'a, T>(
+    mutex: &'a std::sync::Mutex<T>,
+    what: &'static str,
+) -> std::sync::MutexGuard<'a, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => {
+            tracing::warn!(
+                cache = what,
+                "recovering a poisoned advisory cache lock — some earlier task panicked while \
+                 holding it. The cached data is structurally sound and is reused; the panic \
+                 itself was reported where it happened"
+            );
+            poisoned.into_inner()
+        }
+    }
+}
+
 /// Parses an optional RFC-3339 `since` query param. A malformed value is the
 /// client's mistake, so it is a 400 — not the blanket 500 a bare `?` would give.
 pub(crate) fn parse_since(
@@ -464,6 +526,132 @@ mod contract_tests {
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(msg, REPLAY_MISS_MESSAGE);
         assert!(!msg.contains("/srv/"), "no cassette path: {msg:?}");
+    }
+
+    /// The anti-pattern, and the reason this helper exists: one panic anywhere
+    /// poisons a `std::sync::Mutex` **permanently**, and these caches are held
+    /// by the worker as well as the routes — so a single panicking worker task
+    /// turned five endpoints into connection-reset generators for the rest of
+    /// the process's life. Recovery must be per-lock and forever, not a retry.
+    #[test]
+    fn a_poisoned_advisory_lock_is_not_a_permanent_500() {
+        use std::collections::HashMap;
+        use std::sync::Mutex;
+
+        let cache: Mutex<HashMap<&str, i32>> = Mutex::new(HashMap::new());
+        super::lock_advisory(&cache, "test").insert("before", 1);
+
+        // A holder dies mid-use, exactly as a panicking worker hook would.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let mut guard = cache.lock().expect("not poisoned yet");
+            guard.insert("during", 2);
+            panic!("holder died");
+        }));
+        assert!(caught.is_err(), "the holder really did unwind");
+        assert!(cache.is_poisoned(), "and the lock really is poisoned");
+        assert!(
+            cache.lock().is_err(),
+            "so a bare `.lock().unwrap()` here would panic — the 500 generator"
+        );
+
+        // Every subsequent request still works, and the data is intact — both
+        // the write from before the panic and the one that completed during it.
+        for _ in 0..3 {
+            let guard = super::lock_advisory(&cache, "test");
+            assert_eq!(guard.get("before"), Some(&1));
+            assert_eq!(guard.get("during"), Some(&2));
+        }
+        super::lock_advisory(&cache, "test").insert("after", 3);
+        assert_eq!(super::lock_advisory(&cache, "test").get("after"), Some(&3));
+    }
+
+    /// Both payload shapes `panic!` can produce reach the log intact — a panic
+    /// whose message is swallowed is barely better than the reset it replaced.
+    #[test]
+    fn panic_message_reads_both_payload_shapes_not_just_literals() {
+        let literal: Box<dyn std::any::Any + Send> = Box::new("index out of bounds");
+        assert_eq!(
+            super::panic_message(literal.as_ref()),
+            "index out of bounds"
+        );
+
+        let formatted: Box<dyn std::any::Any + Send> = Box::new(format!("row {} missing", 7));
+        assert_eq!(super::panic_message(formatted.as_ref()), "row 7 missing");
+
+        // Anything else is still described rather than dropped.
+        let exotic: Box<dyn std::any::Any + Send> = Box::new(42u8);
+        assert_eq!(
+            super::panic_message(exotic.as_ref()),
+            "non-string panic payload"
+        );
+    }
+
+    /// The convention, enforced as an inventory rather than as a sentence:
+    /// **no request-path code unwraps a lock result.** A single `.lock()
+    /// .unwrap()` reintroduced anywhere under `src/routes` or `src/mcp` re-arms
+    /// the permanent-500 failure for whatever endpoint owns it.
+    ///
+    /// `tokio::sync::Mutex` (`.lock().await`) is unaffected and deliberately not
+    /// matched: it cannot be poisoned, because it does not unlock on unwind.
+    #[test]
+    fn no_route_unwraps_a_lock_result() {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut offenders: Vec<String> = Vec::new();
+        let mut scanned = 0usize;
+        for area in ["routes", "mcp"] {
+            scan_for_lock_unwraps(&src.join(area), &mut offenders, &mut scanned);
+        }
+        assert!(
+            scanned > 20,
+            "only {scanned} files had any production body — the truncation below has eaten the \
+             surface this is supposed to police"
+        );
+        assert!(
+            offenders.is_empty(),
+            "request-path code unwraps a poisonable lock — route it through \
+             `lock_advisory` (or, if an interrupted write really would corrupt the data, \
+             propagate deliberately and say why): {offenders:#?}"
+        );
+    }
+
+    fn scan_for_lock_unwraps(dir: &Path, offenders: &mut Vec<String>, scanned: &mut usize) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                scan_for_lock_unwraps(&path, offenders, scanned);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read source");
+            // Production code only. The rule is about the REQUEST PATH, and a
+            // `#[cfg(test)]` block is not on it — this very file's poison
+            // fixture has to lock-and-unwrap to create the poisoned state.
+            // Every module in this tree puts its test block last (checked: no
+            // route file defines a function after its first one), so truncating
+            // at the first column-0 marker keeps all shipped code.
+            let body: Vec<&str> = source
+                .lines()
+                .take_while(|l| *l != "#[cfg(test)]")
+                .filter(|l| !l.trim_start().starts_with("//"))
+                .map(str::trim)
+                .collect();
+            if body.is_empty() {
+                continue;
+            }
+            *scanned += 1;
+            // Whitespace-normalized, so the multi-line `.lock()\n.unwrap()`
+            // shape rustfmt produces is caught just like the one-liner.
+            let flat = body.join(" ").replace(" .", ".").replace(". ", ".");
+            for bad in [".lock().unwrap()", ".lock().expect("] {
+                if flat.contains(bad) {
+                    offenders.push(format!("{} contains `{bad}`", path.display()));
+                }
+            }
+        }
     }
 
     /// A reasoned NON-mapping, pinned so nobody "fixes" it later: a

@@ -264,10 +264,7 @@ fn stage_gap_reason(job: &Job) -> String {
 /// filtering on the stamped `job_id` is what keeps a neighbouring run's verdict
 /// out of this receipt.
 fn contract_verdicts_for(state: &AppState, id: Uuid) -> Vec<Value> {
-    let map = state
-        .contract_verdicts
-        .lock()
-        .expect("contract verdict lock");
+    let map = super::error::lock_advisory(&state.contract_verdicts, "contract_verdicts");
     let wanted = id.to_string();
     let mut out: Vec<Value> = map
         .iter()

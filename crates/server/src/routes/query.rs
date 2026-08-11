@@ -345,10 +345,7 @@ pub(crate) async fn catalog_health(State(state): State<AppState>) -> Result<Json
         // verdict recorded by the worker (in-memory; null until the first run
         // after boot).
         if let Some(contract) = &s.contract {
-            let latest = state
-                .contract_verdicts
-                .lock()
-                .expect("contract verdict lock")
+            let latest = super::error::lock_advisory(&state.contract_verdicts, "contract_verdicts")
                 .get(&format!("{}/{}", s.app, s.dataset))
                 .cloned();
             row.insert(

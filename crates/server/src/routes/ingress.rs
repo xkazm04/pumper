@@ -87,10 +87,10 @@ fn body_event_id(source_id: &str, body: &[u8]) -> Uuid {
 /// Consumes one token for `source_id`, creating a full bucket on first sight.
 fn rate_limit_allow(source_id: &str, per_min: u32) -> bool {
     let now = Instant::now();
-    let mut buckets = BUCKETS
-        .get_or_init(|| Mutex::new(HashMap::new()))
-        .lock()
-        .unwrap();
+    let mut buckets = super::error::lock_advisory(
+        BUCKETS.get_or_init(|| Mutex::new(HashMap::new())),
+        "ingress_rate_buckets",
+    );
     let entry = buckets
         .entry(source_id.to_string())
         .or_insert((per_min as f64, now));

@@ -9,6 +9,7 @@
 //! generated from — and exposes [`router`] for `main.rs`.
 
 use axum::extract::DefaultBodyLimit;
+use axum::response::IntoResponse;
 use axum::Router;
 use utoipa::OpenApi;
 use utoipa_axum::router::OpenApiRouter;
@@ -271,23 +272,6 @@ pub fn router(state: AppState) -> Router {
     } else {
         router
     };
-    // gzip/br responses when the client sends accept-encoding — record JSON is
-    // highly repetitive (identical keys per row, ISO timestamps) so it compresses
-    // ~5-10x, a real win for remote consumers and the streamed export path.
-    // CompressionLayer's default predicate skips already-small and SSE
-    // (`text/event-stream`) responses, so /events and /jobs/{id}/stream keep their
-    // incremental KeepAlive delivery; it wraps the body stream (no full buffering),
-    // so the export path stays constant-memory. Localhost clients that don't send
-    // accept-encoding are unaffected.
-    let router = router
-        .layer(tower_http::compression::CompressionLayer::new())
-        .layer(tower_http::trace::TraceLayer::new_for_http())
-        // Outermost of the three, so it is the first thing an inbound request
-        // meets. `DefaultBodyLimit` works by putting the limit in the request
-        // extensions for `Json`/`Bytes` to read, and the *innermost* layer wins
-        // — which is precisely why `large_body_router`'s per-route override
-        // survives this global one instead of being clobbered by it.
-        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES));
     // CORS is OFF by default (same-origin only). A permissive allow-all on an
     // unauthenticated, mutating, data-bearing API lets any site the operator
     // visits drive it cross-origin (DNS-rebinding defeats the localhost
@@ -299,17 +283,86 @@ pub fn router(state: AppState) -> Router {
         .iter()
         .filter_map(|o| o.parse().ok())
         .collect();
-    let router = if origins.is_empty() {
+    with_middleware(router, origins).with_state(state)
+}
+
+/// The shared middleware stack, applied to whatever router is handed in.
+///
+/// Extracted so a test can drive the **exact** stack the server runs over a
+/// deliberately-panicking route — proving the panic layer is present here, not
+/// merely present in a stack the test built to look like this one.
+///
+/// **Ordering.** `Router::layer` makes the LAST-applied layer the outermost, so
+/// this reads inside-out: `CatchPanic` sits closest to the handlers, then
+/// compression, then trace, then the body limit. Deliberately:
+/// - **CatchPanic innermost.** Its response is an ordinary response, so
+///   compression and tracing then treat it like any other — the panic gets
+///   logged inside the `TraceLayer` span that carries the method and URI, which
+///   is the only thing that tells you *which route* blew up. Wrapping it the
+///   other way round would leave the panic outside the span, and would also put
+///   the compression layer's own state on the unwind path.
+/// - **`DefaultBodyLimit` outermost**, unchanged: it works by putting the limit
+///   into the request extensions for `Json`/`Bytes` to read, and the *innermost*
+///   limit wins — which is precisely why `large_body_router`'s per-route
+///   override survives this global one instead of being clobbered by it.
+///
+/// This is the HTTP layer only. The worker's own panic containment (a panicking
+/// app fails its job through the attempt-fenced `fail()` path) runs in a spawned
+/// task that never passes through this stack, and is unaffected.
+pub(crate) fn with_middleware<S>(
+    router: Router<S>,
+    cors_origins: Vec<axum::http::HeaderValue>,
+) -> Router<S>
+where
+    S: Clone + Send + Sync + 'static,
+{
+    // gzip/br responses when the client sends accept-encoding — record JSON is
+    // highly repetitive (identical keys per row, ISO timestamps) so it compresses
+    // ~5-10x, a real win for remote consumers and the streamed export path.
+    // CompressionLayer's default predicate skips already-small and SSE
+    // (`text/event-stream`) responses, so /events and /jobs/{id}/stream keep their
+    // incremental KeepAlive delivery; it wraps the body stream (no full buffering),
+    // so the export path stays constant-memory. Localhost clients that don't send
+    // accept-encoding are unaffected.
+    let router = router
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            panic_response,
+        ))
+        .layer(tower_http::compression::CompressionLayer::new())
+        .layer(tower_http::trace::TraceLayer::new_for_http())
+        .layer(DefaultBodyLimit::max(BODY_LIMIT_BYTES));
+    if cors_origins.is_empty() {
         router
     } else {
         router.layer(
             tower_http::cors::CorsLayer::new()
-                .allow_origin(origins)
+                .allow_origin(cors_origins)
                 .allow_methods(tower_http::cors::Any)
                 .allow_headers(tower_http::cors::Any),
         )
-    };
-    router.with_state(state)
+    }
+}
+
+/// Turns a caught handler panic into the service's standard error envelope.
+///
+/// The anti-pattern this replaces: with no catch layer, a panic anywhere on a
+/// request path unwound out of the connection task, so the client got a reset
+/// with no status and no body — indistinguishable from the server having died —
+/// and `tracing` recorded nothing at all. Now it is one `error!` (inside the
+/// trace span, so the method and URI come with it, and it reaches Sentry) plus
+/// a `500 {"error", "code"}` body shaped exactly like every other failure.
+fn panic_response(payload: Box<dyn std::any::Any + Send + 'static>) -> axum::response::Response {
+    let message = error::panic_message(payload.as_ref());
+    tracing::error!(
+        panic = %message,
+        "a request handler panicked; the connection is answered with a 500 envelope instead of \
+         being dropped. This is a BUG in the handler — the payload above is the only record of it"
+    );
+    error::ApiError(
+        axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+        error::INTERNAL_MESSAGE.to_string(),
+    )
+    .into_response()
 }
 
 #[cfg(test)]

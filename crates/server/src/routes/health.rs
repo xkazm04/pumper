@@ -249,14 +249,30 @@ pub(crate) async fn enforcement_preview(
         store,
         state.health.enforcing(),
         query.app.as_deref(),
-        query
-            .runs
-            .unwrap_or(pumper_core::resilience::preview::DEFAULT_REPLAY_RUNS),
+        preview_runs(query.runs),
         query.limit.unwrap_or(500).clamp(1, 500),
     )
     .await?;
     Ok(Json(serde_json::to_value(preview).unwrap_or(Value::Null)))
 }
+
+/// Resolves `?runs=` to the bound this route's own param documentation promises
+/// (default 60, 1..=1000), matching the `limit` clamp beside it.
+///
+/// `preview_fleet` clamps identically today, so this is not a live unbounded
+/// read — it is the promise being made *where it is documented*, at the boundary
+/// the caller talks to, instead of depending on a core internal that a refactor
+/// could drop without any test noticing. The clamp is silent on purpose: an
+/// out-of-range `runs` is a browse-surface convenience, not the data-loss case
+/// that earns a 400 (see `parse_cursor_arg`).
+pub(crate) fn preview_runs(requested: Option<i64>) -> i64 {
+    requested
+        .unwrap_or(pumper_core::resilience::preview::DEFAULT_REPLAY_RUNS)
+        .clamp(1, MAX_REPLAY_RUNS)
+}
+
+/// The documented ceiling on `?runs=` — see [`preview_runs`].
+const MAX_REPLAY_RUNS: i64 = 1000;
 
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct SourceStateBody {
@@ -323,10 +339,7 @@ pub(crate) async fn set_source_state(
 /// the first contracted run since boot. None when no verdict exists — sources
 /// without a declared contract simply carry no `contract` key.
 fn contract_verdict(state: &AppState, id: &str) -> Option<Value> {
-    state
-        .contract_verdicts
-        .lock()
-        .expect("contract verdict lock")
+    super::error::lock_advisory(&state.contract_verdicts, "contract_verdicts")
         .get(id)
         .cloned()
 }
@@ -341,4 +354,29 @@ fn health_store(state: &AppState) -> Result<&pumper_core::HealthStore, ApiError>
             "extraction-health detection is disabled ([resilience] enabled = false)".into(),
         )
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{preview_runs, MAX_REPLAY_RUNS};
+    use pumper_core::resilience::preview::DEFAULT_REPLAY_RUNS;
+
+    /// The anti-pattern: a caller-supplied `runs` passing through the route
+    /// untouched while the param's own documentation promised `default 60, max
+    /// 1000`. The bound has to be expressed where it is documented, not left to
+    /// a core internal a refactor could quietly drop.
+    #[test]
+    fn preview_runs_honours_the_documented_bound_not_the_raw_param() {
+        assert_eq!(preview_runs(None), DEFAULT_REPLAY_RUNS);
+        assert_eq!(preview_runs(Some(120)), 120);
+        assert_eq!(preview_runs(Some(MAX_REPLAY_RUNS)), MAX_REPLAY_RUNS);
+        // Above the ceiling, and the pathological end of it.
+        assert_eq!(preview_runs(Some(50_000)), MAX_REPLAY_RUNS);
+        assert_eq!(preview_runs(Some(i64::MAX)), MAX_REPLAY_RUNS);
+        // Below the floor: zero and negative are a "replay nothing" that would
+        // report a confidently empty preview.
+        assert_eq!(preview_runs(Some(0)), 1);
+        assert_eq!(preview_runs(Some(-7)), 1);
+        assert_eq!(preview_runs(Some(i64::MIN)), 1);
+    }
 }

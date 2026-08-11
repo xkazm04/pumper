@@ -369,10 +369,7 @@ pub(crate) async fn cancel_job(
     // Otherwise it may be running here: fire its cancellation token. The worker
     // task races it against the app future and persists `cancelled` + emits the
     // terminal event, so we don't touch storage or emit from the request path.
-    let token = state
-        .job_cancels
-        .lock()
-        .unwrap()
+    let token = super::error::lock_advisory(&state.job_cancels, "job_cancels")
         .get(&id)
         .map(|(_, t)| t.clone());
     if let Some(token) = token {
