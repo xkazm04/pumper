@@ -18,6 +18,19 @@
 //! The idempotency key and session profile are threaded through NOW so the
 //! seam is right: the key is recorded with every evidence bundle, and the
 //! profile binds the flow to a vault identity exactly like a render.
+//!
+//! ## Secrets
+//!
+//! The filled-field summary proves a field was filled without republishing what
+//! was typed into it: password inputs (and credential/card `autocomplete`
+//! fields) are masked **in the page** by `pumper_core::filled_fields_js`, so the
+//! plaintext never reaches this process, `evidence.json`, `jobs.result`, an SSE
+//! event or a webhook payload. Only `{found, redacted, value_len}` survives.
+//!
+//! The job's **params** are a different matter: they still hold whatever the
+//! caller put in a `type` step's `text`, because that is the job model's
+//! storage posture for every app (params are persisted verbatim). Redacting
+//! them is a job-model change, not a transact one.
 
 use async_trait::async_trait;
 use pumper_core::{
@@ -102,7 +115,9 @@ impl ScrapeApp for Transact {
                  steps: {requested, attempted, completed, deadline_hit, outcomes: [ok|\
                  selector_missing|action_failed|partial]}, steps_completed (= steps.completed, \
                  SUCCESSES not attempts), wait_for_selector_found, \
-                 filled_fields: [{selector, value, found}], would_submit: PageAction, submit_target: {selector, found, visible, enabled, \
+                 filled_fields: [{selector, value (null when redacted/empty), found, redacted, \
+                 value_len, truncated}], would_submit: PageAction, \
+                 submit_target: {selector, found, visible, enabled, \
                  tag, label}, dom_truncated, nav_timed_out, \
                  artifacts: {evidence: \"evidence.json\", dom: \"dom.html\"}, next_slice: \"...\"}",
             ),
@@ -200,7 +215,7 @@ impl ScrapeApp for Transact {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use pumper_core::engine::{StepOutcome, SubmitTarget};
+    use pumper_core::engine::{parse_filled_fields, StepOutcome, SubmitTarget};
     use pumper_core::testing::{engines_with, Dead, TempStore, TestContext};
     use pumper_core::{
         Browser, Error, PageAction, RenderRequest, RenderedPage, Storage, TransactEvidence,
@@ -270,11 +285,19 @@ mod tests {
                 step_outcomes: self.outcomes.clone(),
                 steps_deadline_hit: false,
                 wait_for_selector_found: Some(completed > 0),
-                filled_fields: vec![pumper_core::FilledField {
-                    selector: "#email".into(),
-                    value: Some("team@example.com".into()),
-                    found: completed > 0,
-                }],
+                // Built through the REAL decode path, from a probe result that
+                // (as a drifting page might) still carries the password's
+                // plaintext alongside `redacted: true`. Nothing downstream of
+                // `parse_filled_fields` may ever see it.
+                filled_fields: parse_filled_fields(
+                    &["#email".to_string(), "#password".to_string()],
+                    Some(&json!([
+                        {"selector": "#email", "value": "team@example.com",
+                         "found": completed > 0, "value_len": 16},
+                        {"selector": "#password", "value": "hunter2-secret",
+                         "found": completed > 0, "redacted": true, "value_len": 14},
+                    ])),
+                ),
                 submit_target: req.submit_action.selector().map(|s| SubmitTarget {
                     selector: s.to_string(),
                     found: self.submit_found,
@@ -382,6 +405,43 @@ mod tests {
         );
         let dom = std::fs::read_to_string(artifacts_dir.join("dom.html")).unwrap();
         assert_eq!(dom, "<form>confirm</form>");
+    }
+
+    /// The anti-pattern, end to end: a flow that types a password republished
+    /// that password into `evidence.json` on disk AND into `jobs.result` —
+    /// whence every SSE subscriber, webhook payload and HMAC callback. The
+    /// bundle must prove the field was filled without carrying what was typed.
+    #[tokio::test]
+    async fn password_value_not_republished_into_the_evidence_or_result() {
+        let store = TempStore::new("transact-secret").await;
+        let ctx = ctx_with_browser(
+            &store.storage,
+            dry_run_params(),
+            Arc::new(ScriptedBrowser::healthy()),
+        )
+        .await;
+        let artifacts_dir = ctx.artifacts_dir.clone();
+        let out = Transact.run(ctx).await.unwrap();
+
+        let result_json = serde_json::to_string(&out).unwrap();
+        let bundle_raw = std::fs::read_to_string(artifacts_dir.join("evidence.json")).unwrap();
+        for (surface, text) in [("job result", &result_json), ("evidence.json", &bundle_raw)] {
+            assert!(
+                !text.contains("hunter2-secret"),
+                "{surface} republished the secret: {text}"
+            );
+        }
+
+        // The reviewer still learns the field was filled, and how long it was.
+        let pw = &out["filled_fields"][1];
+        assert_eq!(pw["selector"], json!("#password"));
+        assert_eq!(pw["found"], json!(true));
+        assert_eq!(pw["redacted"], json!(true));
+        assert_eq!(pw["value"], Value::Null);
+        assert_eq!(pw["value_len"], json!(14));
+        // Non-secret fields are untouched.
+        assert_eq!(out["filled_fields"][0]["value"], json!("team@example.com"));
+        assert_eq!(out["filled_fields"][0]["redacted"], json!(false));
     }
 
     /// The anti-pattern: a flow whose every selector 404'd produced an evidence

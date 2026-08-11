@@ -425,15 +425,121 @@ impl TransactRequest {
 
 /// The live DOM value of one filled field at the moment the flow stopped —
 /// what a reviewer checks before ever approving a live submit.
+///
+/// The three trailing fields are `#[serde(default)]`, so payloads written before
+/// they existed (`{selector, value, found}`) still decode unchanged.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct FilledField {
     /// The `Type` step's selector.
     pub selector: String,
-    /// The element's current value (`.value`, falling back to text content).
-    /// `None` when the element was not found at capture time.
+    /// The element's current value (`.value`, falling back to text content),
+    /// capped at [`FILLED_VALUE_MAX_CHARS`]. `None` when the element was not
+    /// found, when it was empty, **or when it was redacted** (see `redacted` —
+    /// a `None` value with `found: true` is never ambiguous because of it).
     pub value: Option<String>,
     /// Whether the element existed in the DOM at capture time.
     pub found: bool,
+    /// `true` when the element is a secret input (see [`is_sensitive_input`])
+    /// and its value was dropped **in the page**, before the result ever
+    /// crossed into the job's evidence, result, SSE stream or webhooks.
+    #[serde(default)]
+    pub redacted: bool,
+    /// Length (in JS characters) of the value as it stood on the page, before
+    /// redaction or truncation — a non-reversible "the field was filled, with
+    /// this much" hint. `None` when the element was not found.
+    #[serde(default)]
+    pub value_len: Option<usize>,
+    /// `true` when `value` holds only the first [`FILLED_VALUE_MAX_CHARS`]
+    /// characters (a textarea can't balloon the result payload).
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl FilledField {
+    /// The honest "we looked and the element was not there" row.
+    pub fn not_found(selector: impl Into<String>) -> Self {
+        Self {
+            selector: selector.into(),
+            value: None,
+            found: false,
+            redacted: false,
+            value_len: None,
+            truncated: false,
+        }
+    }
+}
+
+/// Max characters of a captured field value kept in the evidence bundle. A
+/// filled `<textarea>` is unbounded page-controlled input, and the summary
+/// exists to prove a field was filled — not to mirror its contents into
+/// `jobs.result` (and thence every SSE subscriber and webhook payload).
+pub const FILLED_VALUE_MAX_CHARS: usize = 512;
+
+/// `autocomplete` tokens whose value is a credential or payment secret. Kept in
+/// Rust and **compiled into the capture JS** by [`filled_fields_js`], so the
+/// browser-side predicate and the Rust-side twin ([`is_sensitive_input`]) can
+/// never drift apart.
+pub const SENSITIVE_AUTOCOMPLETE_TOKENS: &[&str] = &[
+    "current-password",
+    "new-password",
+    "one-time-code",
+    "cc-number",
+    "cc-csc",
+    "cc-exp",
+    "cc-exp-month",
+    "cc-exp-year",
+];
+
+/// Whether an input's live value is a secret that must never be republished.
+///
+/// The anti-pattern this defends: a flow that types a password captured that
+/// password's live value into `filled_fields[].value`, which lands in
+/// `evidence.json` on disk, the persisted job result, every SSE subscriber and
+/// every webhook/HMAC callback payload. The evidence must prove the field was
+/// filled without republishing what was typed into it.
+///
+/// `input_type` is the element's `type` attribute; `autocomplete` its
+/// `autocomplete` attribute (a whitespace/comma-separated token list). Both are
+/// matched case-insensitively.
+pub fn is_sensitive_input(input_type: &str, autocomplete: &str) -> bool {
+    if input_type.trim().eq_ignore_ascii_case("password") {
+        return true;
+    }
+    autocomplete
+        .split([' ', '\t', '\n', '\r', ','])
+        .filter(|t| !t.is_empty())
+        .any(|token| {
+            SENSITIVE_AUTOCOMPLETE_TOKENS
+                .iter()
+                .any(|s| token.eq_ignore_ascii_case(s))
+        })
+}
+
+/// Enforces the capture contract on ONE decoded field, whatever the page (or a
+/// drifting/hand-written evaluate result) claimed: a field marked `redacted`
+/// carries no value, and every surviving value is capped at
+/// [`FILLED_VALUE_MAX_CHARS`] with `value_len` preserving the real length.
+///
+/// Defense in depth, not the primary guard — the masking happens in the page
+/// (see [`filled_fields_js`]) so the plaintext never reaches this process at
+/// all. This is what makes that guarantee unbypassable from the decode side.
+pub fn redact_field(mut field: FilledField) -> FilledField {
+    if let Some(value) = field.value.take() {
+        let len = value.chars().count();
+        if field.value_len.is_none() {
+            field.value_len = Some(len);
+        }
+        if field.redacted {
+            // A redacted field NEVER carries a value, however it arrived.
+            field.truncated = false;
+        } else if len > FILLED_VALUE_MAX_CHARS {
+            field.value = Some(value.chars().take(FILLED_VALUE_MAX_CHARS).collect());
+            field.truncated = true;
+        } else {
+            field.value = Some(value);
+        }
+    }
+    field
 }
 
 /// The evidence bundle a dry-run transact emits instead of acting: everything
@@ -497,15 +603,42 @@ pub struct TransactEvidence {
 /// JS expression that reads the live values of `selectors` — the evidence
 /// bundle's filled-field summary. Selectors are JSON-encoded into the script,
 /// so quotes/backslashes in a CSS selector cannot break out of the literal.
+///
+/// **Secrets are masked here, in the page.** A password (or a credential/card
+/// `autocomplete` field — see [`SENSITIVE_AUTOCOMPLETE_TOKENS`]) yields
+/// `{value: null, redacted: true, value_len: <n>}`: the plaintext never leaves
+/// the tab, so it cannot reach `evidence.json`, `jobs.result`, an SSE event or a
+/// webhook payload even in principle. Everything else is capped at
+/// [`FILLED_VALUE_MAX_CHARS`] with `truncated` set, so a filled `<textarea>`
+/// cannot balloon the job's result payload.
 pub fn filled_fields_js(selectors: &[String]) -> String {
     let sels = serde_json::to_string(selectors).unwrap_or_else(|_| "[]".into());
+    // Compiled from the Rust const so the two predicates cannot drift.
+    let sensitive =
+        serde_json::to_string(SENSITIVE_AUTOCOMPLETE_TOKENS).unwrap_or_else(|_| "[]".into());
+    let cap = FILLED_VALUE_MAX_CHARS;
     format!(
-        "(() => {{ const sels = {sels}; return sels.map(s => {{ \
-           const el = document.querySelector(s); \
-           if (!el) return {{selector: s, value: null, found: false}}; \
-           const v = ('value' in el && el.value !== undefined && el.value !== '') \
-             ? String(el.value) : (el.textContent || null); \
-           return {{selector: s, value: v, found: true}}; }}); }})()"
+        "(() => {{ const sels = {sels}; const CAP = {cap}; const SENS = {sensitive}; \
+           const secret = (el) => {{ \
+             const t = String((el.getAttribute && el.getAttribute('type')) || el.type || '') \
+               .toLowerCase(); \
+             if (t === 'password') return true; \
+             const ac = String((el.getAttribute && el.getAttribute('autocomplete')) || '') \
+               .toLowerCase(); \
+             return ac.split(/[\\s,]+/).some(tok => tok && SENS.indexOf(tok) >= 0); }}; \
+           return sels.map(s => {{ \
+             const el = document.querySelector(s); \
+             if (!el) return {{selector: s, value: null, found: false, redacted: false, \
+               value_len: null, truncated: false}}; \
+             const raw = ('value' in el && el.value !== undefined && el.value !== null \
+               && el.value !== '') ? String(el.value) : String(el.textContent || ''); \
+             const len = raw.length; \
+             if (secret(el)) return {{selector: s, value: null, found: true, redacted: true, \
+               value_len: len, truncated: false}}; \
+             if (len > CAP) return {{selector: s, value: raw.slice(0, CAP), found: true, \
+               redacted: false, value_len: len, truncated: true}}; \
+             return {{selector: s, value: (len === 0 ? null : raw), found: true, \
+               redacted: false, value_len: len, truncated: false}}; }}); }})()"
     )
 }
 
@@ -601,20 +734,17 @@ pub fn parse_transact_probe(
 /// Decodes the result of [`filled_fields_js`] back into typed fields. A missing
 /// or malformed result (evaluate failed, page navigated away) degrades to
 /// "nothing found" rows rather than failing the whole evidence bundle.
+///
+/// Every decoded row passes through [`redact_field`], so the capture contract
+/// (a redacted field carries no value; values are length-capped) holds on the
+/// decode side too — not only where the page happened to honor it.
 pub fn parse_filled_fields(selectors: &[String], evaluated: Option<&Value>) -> Vec<FilledField> {
     if let Some(v) = evaluated {
         if let Ok(fields) = serde_json::from_value::<Vec<FilledField>>(v.clone()) {
-            return fields;
+            return fields.into_iter().map(redact_field).collect();
         }
     }
-    selectors
-        .iter()
-        .map(|s| FilledField {
-            selector: s.clone(),
-            value: None,
-            found: false,
-        })
-        .collect()
+    selectors.iter().map(FilledField::not_found).collect()
 }
 
 /// One same-origin JSON response observed by the browser tier while rendering a
@@ -1117,16 +1247,102 @@ mod tests {
         assert!(!fields[1].found);
         // A failed/malformed evaluate degrades to not-found rows, never an error.
         let fields = parse_filled_fields(&["#email".into()], None);
-        assert_eq!(
-            fields,
-            vec![FilledField {
-                selector: "#email".into(),
-                value: None,
-                found: false
-            }]
-        );
+        assert_eq!(fields, vec![FilledField::not_found("#email")]);
         let fields = parse_filled_fields(&["#email".into()], Some(&serde_json::json!("nonsense")));
         assert!(!fields[0].found);
+    }
+
+    /// The anti-pattern this exists to kill: a flow that types a password
+    /// captured that password's live value into `filled_fields[].value`, which
+    /// lands in `evidence.json` on disk, the persisted job result, every SSE
+    /// subscriber, and every webhook/HMAC callback payload. The summary must
+    /// prove the field was filled WITHOUT republishing what was typed into it.
+    #[test]
+    fn password_value_not_republished() {
+        // The predicate: password inputs and credential/card autocomplete hints.
+        assert!(is_sensitive_input("password", ""));
+        assert!(is_sensitive_input("PASSWORD", ""));
+        assert!(is_sensitive_input("text", "current-password"));
+        assert!(is_sensitive_input("text", "section-a billing cc-number"));
+        assert!(is_sensitive_input("tel", "ONE-TIME-CODE"));
+        for benign in [("text", ""), ("email", "email"), ("text", "cc-type")] {
+            assert!(
+                !is_sensitive_input(benign.0, benign.1),
+                "{benign:?} is not a secret — over-redacting blinds the reviewer"
+            );
+        }
+
+        // The capture script masks in the PAGE: the plaintext never leaves it.
+        let js = filled_fields_js(&["#pw".into()]);
+        assert!(js.contains("'password'"), "type check compiled in: {js}");
+        assert!(
+            js.contains("current-password") && js.contains("cc-number"),
+            "the token list is compiled from the Rust const, so it can't drift"
+        );
+        assert!(js.contains("redacted: true"));
+
+        // Decode-side enforcement: even if a page (or a drifting script) hands
+        // back a value ALONGSIDE redacted:true, the value is dropped.
+        let evaluated = serde_json::json!([
+            {"selector": "#pw", "value": "hunter2", "found": true,
+             "redacted": true, "value_len": 7, "truncated": false}
+        ]);
+        let fields = parse_filled_fields(&["#pw".into()], Some(&evaluated));
+        assert_eq!(fields[0].value, None, "the secret is never republished");
+        assert!(
+            fields[0].redacted,
+            "but the reviewer still sees it was filled"
+        );
+        assert_eq!(fields[0].value_len, Some(7), "with a length-only hint");
+        assert!(fields[0].found);
+        assert!(
+            !serde_json::to_string(&fields).unwrap().contains("hunter2"),
+            "no serialization of the bundle may carry the plaintext"
+        );
+    }
+
+    /// The sibling leak: a filled `<textarea>` is unbounded page-controlled
+    /// input, and mirroring it whole into `jobs.result` balloons every payload
+    /// derived from it.
+    #[test]
+    fn oversized_field_value_not_republished_whole() {
+        let long = "x".repeat(FILLED_VALUE_MAX_CHARS + 100);
+        let evaluated = serde_json::json!([
+            {"selector": "#bio", "value": long, "found": true}
+        ]);
+        let fields = parse_filled_fields(&["#bio".into()], Some(&evaluated));
+        assert_eq!(fields[0].value.as_deref().unwrap().chars().count(), 512);
+        assert!(fields[0].truncated, "the cut is visible, not silent");
+        assert_eq!(
+            fields[0].value_len,
+            Some(FILLED_VALUE_MAX_CHARS + 100),
+            "the real length is still reported"
+        );
+        // Exactly at the cap is kept whole (strict-over, like every other cap).
+        let at_cap = "y".repeat(FILLED_VALUE_MAX_CHARS);
+        let evaluated = serde_json::json!([{"selector": "#bio", "value": at_cap, "found": true}]);
+        let fields = parse_filled_fields(&["#bio".into()], Some(&evaluated));
+        assert!(!fields[0].truncated);
+        // Multi-byte values are cut on CHARACTERS, never mid-codepoint.
+        let wide = "é".repeat(FILLED_VALUE_MAX_CHARS + 1);
+        let evaluated = serde_json::json!([{"selector": "#bio", "value": wide, "found": true}]);
+        let fields = parse_filled_fields(&["#bio".into()], Some(&evaluated));
+        assert_eq!(fields[0].value.as_deref().unwrap().chars().count(), 512);
+    }
+
+    /// Old payloads (`{selector, value, found}`) predate the redaction fields
+    /// and must keep decoding — the shape grew, it did not break.
+    #[test]
+    fn filled_field_stays_backward_compatible_on_the_wire() {
+        let old: FilledField =
+            serde_json::from_str(r##"{"selector":"#email","value":"a@b.c","found":true}"##)
+                .unwrap();
+        assert_eq!(old.value.as_deref(), Some("a@b.c"));
+        assert!(!old.redacted && !old.truncated && old.value_len.is_none());
+        // And the new shape round-trips through JSON unchanged.
+        let round: FilledField =
+            serde_json::from_value(serde_json::to_value(redact_field(old)).unwrap()).unwrap();
+        assert_eq!(round.value_len, Some(5));
     }
 
     /// The anti-pattern: the executor counted every action it *reached* as
