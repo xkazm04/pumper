@@ -15,6 +15,7 @@ mod datahub_bridge;
 mod dataset_reads;
 mod durable;
 mod dynamic_apps;
+mod error_contract;
 mod fanout_offslot;
 mod fetch_proxy;
 mod harness;

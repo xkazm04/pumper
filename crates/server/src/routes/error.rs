@@ -20,20 +20,46 @@ pub(crate) const MAX_ATTEMPTS_CAP: i64 = 20;
 pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) String);
 
 /// Stable machine-readable code derived from the HTTP status, sent alongside the
-/// human `error` string so consumers can branch without string-matching. Kept in
-/// lockstep with the statuses the handlers actually emit.
+/// human `error` string so consumers can branch without string-matching.
+///
+/// This map is kept honest by `every_status_a_handler_emits_has_a_code` below,
+/// which scans the route sources for `StatusCode::` uses and diffs them against
+/// an EXPECTED inventory — the doc sentence that used to claim "kept in lockstep"
+/// was simply false, and 403/429/503 all shipped as `"internal"` for months.
+///
+/// One code is *not* the status's own name: `402` has exactly one producer in
+/// this service — [`pumper_core::Error::BudgetExhausted`] — and `budget_exhausted`
+/// is what a client can act on, where `payment_required` would suggest billing.
 pub(crate) fn error_code(status: StatusCode) -> &'static str {
     match status {
         StatusCode::BAD_REQUEST => "bad_request",
         StatusCode::UNAUTHORIZED => "unauthorized",
-        StatusCode::BAD_GATEWAY => "bad_gateway",
+        StatusCode::PAYMENT_REQUIRED => "budget_exhausted",
+        StatusCode::FORBIDDEN => "forbidden",
         StatusCode::NOT_FOUND => "not_found",
         StatusCode::CONFLICT => "conflict",
         StatusCode::PAYLOAD_TOO_LARGE => "too_large",
         StatusCode::UNPROCESSABLE_ENTITY => "unprocessable",
+        StatusCode::TOO_MANY_REQUESTS => "rate_limited",
+        StatusCode::BAD_GATEWAY => "bad_gateway",
+        StatusCode::SERVICE_UNAVAILABLE => "unavailable",
         _ => "internal",
     }
 }
+
+/// The body a 500 shows the client. Deliberately says nothing: the detail is in
+/// the log line the [`From`] impl writes, keyed by the same status.
+pub(crate) const INTERNAL_MESSAGE: &str = "internal error";
+/// The body a 502 shows the client. Naming the failing host or the upstream URL
+/// (query string and all) is exactly the leak this replaces.
+pub(crate) const UPSTREAM_MESSAGE: &str = "upstream engine failure";
+/// Profile errors carry the profile *directory* they failed to open, so the
+/// message is fixed and names the parameter instead.
+pub(crate) const PROFILE_MESSAGE: &str =
+    "invalid or unusable session profile — check the 'profile' parameter";
+/// Replay misses carry the cassette path and the unmatched request.
+pub(crate) const REPLAY_MISS_MESSAGE: &str =
+    "the recorded cassette cannot serve this request (missing, unrecorded, or truncated)";
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
@@ -42,16 +68,73 @@ impl IntoResponse for ApiError {
     }
 }
 
+/// The status a core error deserves at the HTTP boundary, and the message the
+/// **client** is allowed to see.
+///
+/// Pure, so the table is a thing you can read and test rather than a `_ => 500`.
+/// Two independent decisions per variant:
+///
+/// **Status.** Client-fault and upstream-fault variants are named as such
+/// instead of being flattened into 500, which told a caller "the server is
+/// broken" for a refusal that was about their own request. Deliberately NOT
+/// remapped: [`pumper_core::Error::Storage`], including its `RowNotFound` case.
+/// Every 404 this API returns is raised explicitly by a handler that checked;
+/// a `RowNotFound` arriving here means a `fetch_one` was used where
+/// `fetch_optional` belonged, and dressing that bug as a tidy 404 would hide it
+/// forever. It stays a 500, which is what a bug is.
+///
+/// **Disclosure.** A 4xx message describes the caller's own input, so it travels
+/// verbatim. A 5xx message is this process describing its insides — raw
+/// sqlx/SQLite text, absolute paths under the data dir, upstream URLs — and is
+/// replaced by a fixed string; the `code` carries everything a client could
+/// branch on anyway. `Profile` and `ReplayMiss` are 4xx *by cause* but their
+/// messages are built from server-side paths, so they are redacted too.
+pub(crate) fn client_facing(e: &pumper_core::Error) -> (StatusCode, String) {
+    use pumper_core::Error as E;
+    match e {
+        // Definitionally the caller's input: a malformed query/filter/rule.
+        E::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
+        // An authored refusal ("we understood, and we decline to act"), not a
+        // validation failure and not a breakage — 422 keeps the three apart.
+        E::Transact(msg) => (StatusCode::UNPROCESSABLE_ENTITY, msg.clone()),
+        // A fact about the job's own ledger. Terminal by construction (see
+        // `Error::is_terminal_for_job`), so a client must be able to tell it
+        // from a 500 they should retry. The message is about money, not internals.
+        E::BudgetExhausted(msg) => (StatusCode::PAYMENT_REQUIRED, msg.clone()),
+        // Caused by the caller's `profile` parameter; message names a directory.
+        E::Profile(_) => (StatusCode::BAD_REQUEST, PROFILE_MESSAGE.into()),
+        // The referenced recording cannot satisfy the request — a conflict
+        // between stored state and what was asked of it, not a missing route.
+        E::ReplayMiss(_) => (StatusCode::CONFLICT, REPLAY_MISS_MESSAGE.into()),
+        // Somebody else's failure, reported as such rather than as ours.
+        E::Http(_) | E::Browser(_) | E::Claude(_) => {
+            (StatusCode::BAD_GATEWAY, UPSTREAM_MESSAGE.into())
+        }
+        // Genuinely unexpected here. Listed one by one rather than caught by a
+        // wildcard so a new core variant has to be given a home on purpose.
+        E::Storage(_)
+        | E::Parse(_)
+        | E::Config(_)
+        | E::App(_)
+        | E::Io(_)
+        | E::Json(_)
+        | E::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_MESSAGE.into()),
+    }
+}
+
 impl From<pumper_core::Error> for ApiError {
     fn from(e: pumper_core::Error) -> Self {
-        // A BadRequest is the one core error that is definitionally the client's
-        // fault (a malformed query/filter/rule) → 400. Everything else is
-        // unexpected at the request boundary → 500; the client-distinguishable
-        // outcomes (404/409/400) are otherwise raised explicitly by the handlers.
-        match e {
-            pumper_core::Error::BadRequest(msg) => Self(StatusCode::BAD_REQUEST, msg),
-            other => Self(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
+        let (status, message) = client_facing(&e);
+        // The detail the client no longer receives has to go somewhere, or a
+        // redacted 500 is an unfixable one. `error!` for 5xx (which is also what
+        // reaches Sentry); `debug!` for the 4xx redactions, which are ordinary
+        // client mistakes and would be pure noise at a higher level.
+        if status.is_server_error() {
+            tracing::error!(status = status.as_u16(), error = %e, "request failed");
+        } else {
+            tracing::debug!(status = status.as_u16(), error = %e, "request refused");
         }
+        Self(status, message)
     }
 }
 
@@ -152,6 +235,248 @@ pub(crate) fn keyset_cursor<T>(
 #[derive(Deserialize, ToSchema)]
 pub(crate) struct EnabledBody {
     pub(crate) enabled: bool,
+}
+
+#[cfg(test)]
+mod contract_tests {
+    use super::{
+        client_facing, error_code, ApiError, INTERNAL_MESSAGE, PROFILE_MESSAGE,
+        REPLAY_MISS_MESSAGE, UPSTREAM_MESSAGE,
+    };
+    use axum::http::StatusCode;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    /// Every `StatusCode::…` constant the HTTP surface names, with the `code`
+    /// clients branch on — `None` for the success statuses, which carry no
+    /// error envelope.
+    ///
+    /// The EXPECTED-diff idiom (as in `routes::mod`'s spec-coverage test): the
+    /// scan below reads the route sources and diffs the statuses actually in use
+    /// against this list, so a handler that starts emitting a new status is
+    /// *forced* to give it a code. The doc comment on `error_code` used to claim
+    /// this was "kept in lockstep" by hand; it wasn't, and 403/429/503 shipped
+    /// as `"internal"` — the exact three cases where a client most needs to tell
+    /// "you were refused" from "we broke".
+    const EXPECTED_STATUS_USE: &[(&str, u16, Option<&str>)] = &[
+        ("OK", 200, None),
+        ("CREATED", 201, None),
+        ("ACCEPTED", 202, None),
+        ("BAD_REQUEST", 400, Some("bad_request")),
+        ("UNAUTHORIZED", 401, Some("unauthorized")),
+        ("PAYMENT_REQUIRED", 402, Some("budget_exhausted")),
+        ("FORBIDDEN", 403, Some("forbidden")),
+        ("NOT_FOUND", 404, Some("not_found")),
+        ("CONFLICT", 409, Some("conflict")),
+        ("PAYLOAD_TOO_LARGE", 413, Some("too_large")),
+        ("UNPROCESSABLE_ENTITY", 422, Some("unprocessable")),
+        ("TOO_MANY_REQUESTS", 429, Some("rate_limited")),
+        ("INTERNAL_SERVER_ERROR", 500, Some("internal")),
+        ("BAD_GATEWAY", 502, Some("bad_gateway")),
+        ("SERVICE_UNAVAILABLE", 503, Some("unavailable")),
+    ];
+
+    /// Collects the status constants named in every `.rs` file under the HTTP
+    /// surface. Rooted at `CARGO_MANIFEST_DIR` (a compile-time absolute path)
+    /// rather than the CWD, and walking the directories rather than an
+    /// `include_str!` list, so a NEW route module is covered the moment it
+    /// exists instead of when someone remembers to add it here.
+    ///
+    /// Comment lines are skipped: prose that merely *mentions* a status is not
+    /// a handler emitting one, and without this the test fails on its own
+    /// documentation (it did).
+    fn statuses_in_use() -> BTreeSet<String> {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found = BTreeSet::new();
+        for area in ["routes", "mcp"] {
+            scan(&src.join(area), &mut found);
+        }
+        assert!(
+            found.len() > 5,
+            "the scan found almost nothing — it is looking in the wrong place, and a test that \
+             cannot see the handlers cannot police them"
+        );
+        found
+    }
+
+    fn scan(dir: &Path, found: &mut BTreeSet<String>) {
+        let entries =
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()));
+        for entry in entries {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                scan(&path, found);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read source");
+            for line in source.lines().filter(|l| !l.trim_start().starts_with("//")) {
+                for (at, marker) in line.match_indices("StatusCode::") {
+                    let name: String = line[at + marker.len()..]
+                        .chars()
+                        .take_while(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || *c == '_')
+                        .collect();
+                    // Empty for method calls like `StatusCode::from_u16`.
+                    if !name.is_empty() {
+                        found.insert(name);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn every_status_a_handler_emits_has_a_code() {
+        let listed: BTreeSet<String> = EXPECTED_STATUS_USE
+            .iter()
+            .map(|(name, ..)| name.to_string())
+            .collect();
+        let in_use = statuses_in_use();
+
+        let unlisted: Vec<_> = in_use.difference(&listed).collect();
+        assert!(
+            unlisted.is_empty(),
+            "handlers emit statuses this contract has never heard of (add them to \
+             EXPECTED_STATUS_USE *and* to `error_code`, or they ship as \"internal\"): {unlisted:?}"
+        );
+        let stale: Vec<_> = listed.difference(&in_use).collect();
+        assert!(
+            stale.is_empty(),
+            "EXPECTED_STATUS_USE lists statuses no handler emits any more — drop them: {stale:?}"
+        );
+
+        for (name, number, code) in EXPECTED_STATUS_USE {
+            let status = StatusCode::from_u16(*number).expect("a real status");
+            // Close the name↔number loop, so a mistyped pair can't silently
+            // assert the wrong status's code.
+            let derived = status
+                .canonical_reason()
+                .expect("a canonical reason")
+                .to_ascii_uppercase()
+                .replace(['-', ' '], "_");
+            assert_eq!(&derived, name, "{number} is not {name}");
+            if let Some(code) = code {
+                assert_eq!(&error_code(status), code, "wrong code for {name}");
+            }
+        }
+    }
+
+    /// The three that shipped wrong, pinned by name rather than by "not
+    /// internal": a rate-limited push, a disabled ingress source, and the
+    /// detection-off 503 are precisely the refusals a client is supposed to
+    /// handle differently from a server fault.
+    #[test]
+    fn refusals_are_not_reported_as_internal_errors() {
+        assert_eq!(error_code(StatusCode::FORBIDDEN), "forbidden");
+        assert_eq!(error_code(StatusCode::TOO_MANY_REQUESTS), "rate_limited");
+        assert_eq!(error_code(StatusCode::SERVICE_UNAVAILABLE), "unavailable");
+    }
+
+    /// The anti-pattern: `other.to_string()` went verbatim into the response
+    /// body, so a 500 handed an unauthenticated caller raw SQLite text, absolute
+    /// paths inside the data dir, and upstream URLs with their query strings.
+    #[test]
+    fn internal_failures_are_generic_not_raw_store_or_path_text() {
+        let leaky = [
+            pumper_core::Error::Io(std::io::Error::other(
+                "opening /srv/pumper/data/pumper.db: permission denied",
+            )),
+            pumper_core::Error::Other(anyhow::anyhow!(
+                "GET https://api.vendor.example/v2/x?api_key=s3cret failed"
+            )),
+            pumper_core::Error::Storage(sqlx::Error::RowNotFound),
+            pumper_core::Error::Config("missing key in /etc/pumper/config.toml".into()),
+        ];
+        for e in leaky {
+            let raw = e.to_string();
+            let err = ApiError::from(e);
+            assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+            assert_eq!(
+                err.1, INTERNAL_MESSAGE,
+                "the body must not vary with the cause"
+            );
+            assert_ne!(err.1, raw);
+            for leak in ["pumper.db", "api_key", "s3cret", "/srv/", "/etc/", "sqlx"] {
+                assert!(
+                    !err.1.contains(leak),
+                    "{leak:?} reached the client in {:?}",
+                    err.1
+                );
+            }
+        }
+    }
+
+    /// Somebody else's outage is a 502, not a confession that this server is
+    /// broken — and the body still names no host or URL.
+    #[test]
+    fn upstream_engine_failures_are_502_not_500() {
+        for e in [
+            pumper_core::Error::Http("connect https://slow.example/a?k=v: timed out".into()),
+            pumper_core::Error::Browser("chrome crashed rendering https://x.example".into()),
+            pumper_core::Error::Claude("cli exited 1".into()),
+        ] {
+            let err = ApiError::from(e);
+            assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+            assert_eq!(error_code(err.0), "bad_gateway");
+            assert_eq!(err.1, UPSTREAM_MESSAGE);
+            assert!(!err.1.contains("example"), "no upstream host: {:?}", err.1);
+        }
+    }
+
+    /// The client-fault variants: each one is a 4xx naming what the caller can
+    /// do about it, rather than the blanket 500 that told them to file a bug.
+    #[test]
+    fn client_fault_variants_are_4xx_not_500() {
+        let (status, msg) = client_facing(&pumper_core::Error::BadRequest("bad filter".into()));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            msg, "bad filter",
+            "a validation message is the caller's own"
+        );
+
+        let (status, msg) = client_facing(&pumper_core::Error::Transact(
+            "live submit is refused in this slice".into(),
+        ));
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+        assert!(msg.contains("live submit"), "the refusal explains itself");
+
+        let (status, msg) = client_facing(&pumper_core::Error::BudgetExhausted(
+            "$0.50 ceiling reached".into(),
+        ));
+        assert_eq!(status, StatusCode::PAYMENT_REQUIRED);
+        assert_eq!(error_code(status), "budget_exhausted");
+        assert!(msg.contains("0.50"), "the ceiling is the whole explanation");
+
+        // 4xx by cause, but redacted: these two build their messages from
+        // server-side paths (the profile dir, the cassette file).
+        let (status, msg) = client_facing(&pumper_core::Error::Profile(
+            "opening /srv/pumper/data/profiles/x/cookies.json: denied".into(),
+        ));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(msg, PROFILE_MESSAGE);
+        assert!(msg.contains("'profile'"), "it names the parameter at fault");
+
+        let (status, msg) = client_facing(&pumper_core::Error::ReplayMiss(
+            "no recorded response in /srv/pumper/data/cassettes/a.json".into(),
+        ));
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(msg, REPLAY_MISS_MESSAGE);
+        assert!(!msg.contains("/srv/"), "no cassette path: {msg:?}");
+    }
+
+    /// A reasoned NON-mapping, pinned so nobody "fixes" it later: a
+    /// `RowNotFound` reaching this boundary means a handler used `fetch_one`
+    /// where `fetch_optional` belonged. Every real 404 is raised explicitly by a
+    /// handler that looked; dressing this one up as a tidy 404 would turn a bug
+    /// into a plausible-looking answer and hide it permanently.
+    #[test]
+    fn row_not_found_stays_500_not_a_fabricated_404() {
+        let err = ApiError::from(pumper_core::Error::Storage(sqlx::Error::RowNotFound));
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_ne!(err.0, StatusCode::NOT_FOUND);
+    }
 }
 
 #[cfg(test)]

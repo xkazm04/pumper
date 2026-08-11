@@ -111,8 +111,12 @@ async fn ingest_refuses_before_it_verifies_anything() {
         .unwrap();
     let id = src.id.clone();
     let router = routes::router(state);
-    let (status, _) = ingest_bare(&router, &id, b"{}").await;
+    let (status, body) = ingest_bare(&router, &id, b"{}").await;
     assert_eq!(status, StatusCode::FORBIDDEN);
+    // The `code` is what a sender branches on, and this one shipped as
+    // "internal" — telling an integrator their push had broken the server when
+    // in fact the operator had switched their source off.
+    assert_eq!(body["code"], "forbidden", "{body}");
 }
 
 #[tokio::test]
@@ -140,8 +144,12 @@ async fn per_source_rate_limit_answers_429_once_the_burst_is_spent() {
         assert_eq!(status, StatusCode::ACCEPTED, "{b}");
     }
     let body = json!({ "i": 99 }).to_string().into_bytes();
-    let (status, _) = ingest_bare(&router, &id, &body).await;
+    let (status, body) = ingest_bare(&router, &id, &body).await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS);
+    // A rate limit is the one refusal a sender is expected to handle
+    // automatically (back off and re-send); reporting it as "internal" made
+    // that indistinguishable from a server fault it should escalate instead.
+    assert_eq!(body["code"], "rate_limited", "{body}");
 }
 
 #[tokio::test]

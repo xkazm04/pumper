@@ -4,7 +4,26 @@ Axum server (default port 8088, `[server]` config). **Local power mode: no auth*
 
 **Canonical machine-readable surface: `GET /openapi.json`** — a generated OpenAPI 3.1 document covering every route below, with typed request bodies and query params (response bodies are described inline; the ad-hoc JSON envelopes are documented in prose per endpoint). The spec and the router are generated from the same source (`utoipa` `#[utoipa::path]` annotations + `OpenApiRouter`), so a route cannot be added without appearing in the spec; a path-coverage test fails CI if the two ever diverge. Use it for client codegen and CLI agents; the table below is the human summary.
 
-**Errors:** `{"error": "<message>", "code": "<code>"}` with the matching HTTP status. `code` is a stable machine-readable string derived from the status — branch on it instead of the human message: `bad_request` (400, validation), `not_found` (404), `conflict` (409, wrong state), `too_large` (413), `internal` (500). Not-found, wrong-state, and bad-input are raised explicitly by handlers; unexpected engine/storage failures are `internal`/500. The one 413 that is **not** in this envelope is the request-body ceiling below — it is refused by the extractor before any handler runs, so it comes back as axum's own plain-text rejection with status `413`. Branch on the status, not the body, if you need to catch both.
+**Errors:** `{"error": "<message>", "code": "<code>"}` with the matching HTTP status. `code` is a stable machine-readable string — branch on it instead of the human message. The complete map, which an inventory test diffs against the statuses the handlers actually emit (so a new status cannot ship without a code):
+
+| status | `code` | meaning |
+| --- | --- | --- |
+| 400 | `bad_request` | validation — a malformed query, filter, rule, id, or an unusable `profile` |
+| 401 | `unauthorized` | missing/wrong signature on `POST /ingest/{id}` |
+| 402 | `budget_exhausted` | the job's `budget_usd` ceiling is already reached. **Deterministic** — retrying re-reads the same ledger and refuses again |
+| 403 | `forbidden` | the ingress source exists but is disabled |
+| 404 | `not_found` | no such job/dataset/record/source |
+| 409 | `conflict` | wrong state for the operation (a terminal job, a disabled subsystem, a cassette that cannot serve a replay) |
+| 413 | `too_large` | body over a documented per-route ceiling |
+| 422 | `unprocessable` | understood and deliberately refused (e.g. a transact flow this slice will not run) |
+| 429 | `rate_limited` | per-source ingress rate limit — back off and re-send |
+| 500 | `internal` | an unexpected failure in this service |
+| 502 | `bad_gateway` | an upstream/engine failure (HTTP, browser, Claude) |
+| 503 | `unavailable` | the subsystem is switched off in config — e.g. the five source-health routes with `[resilience] enabled = false` |
+
+**5xx bodies are deliberately generic** (`internal error`, `upstream engine failure`) and do not vary with the cause: raw SQLite/sqlx text, filesystem paths under the data dir, and upstream URLs used to reach the client verbatim. That detail is logged server-side at `error` (and reaches Sentry when configured) against the same status — branch on `code`, read the server log for the cause. The two 4xx cases whose messages are built from server-side paths (`profile`, replay-miss) are likewise fixed strings that name the *parameter* at fault rather than the path.
+
+The one 413 that is **not** in this envelope is the request-body ceiling below — it is refused by the extractor before any handler runs, so it comes back as axum's own plain-text rejection with status `413`. Branch on the status, not the body, if you need to catch both.
 
 ## Request body limits
 
@@ -162,7 +181,7 @@ Read-only view of the session vault — the named login profiles a fetch can run
 
 - `GET /profiles` — `{profiles: [{name, has_cookies, has_browser_dir, last_used}]}`, alphabetical by `name`. `has_cookies` = a persistent HTTP jar (`cookies.json`) exists; `has_browser_dir` = a Chrome user-data-dir (`browser/`) exists; `last_used` = newest mtime across the profile dir and those two artifacts (RFC 3339, `null` if unreadable). An absent vault dir returns an **empty list, not an error** — it is created by the first profiled fetch. Entries whose names aren't valid profiles (or aren't directories) are ignored.
 
-Profiles are created implicitly by the first fetch that names them; there is **no create/delete API** in phase 1 (delete = remove the directory under `[fetcher] profiles_dir`, default `data/profiles`). A request naming an invalid profile fails with a typed profile error (`500 internal` at the API boundary — names are validated in the engines, not at the route).
+Profiles are created implicitly by the first fetch that names them; there is **no create/delete API** in phase 1 (delete = remove the directory under `[fetcher] profiles_dir`, default `data/profiles`). A request naming an invalid profile fails with a typed profile error, surfaced as `400 bad_request` at the API boundary (names are validated in the engines, not at the route, but the *cause* is the caller's parameter — it was previously reported as `500 internal`, which told the caller to file a bug about their own typo). The message names the `profile` parameter rather than the profile directory it failed to open.
 
 ## Smoke verification (`just smoke`)
 
