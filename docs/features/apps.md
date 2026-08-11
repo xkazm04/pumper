@@ -46,6 +46,17 @@ Apps are `ScrapeApp` implementations under `crates/apps/*`, registered in `crate
 
 **Artifacts:** `evidence.json` (the bundle) + `dom.html` (the DOM snapshot at the stop point). The job result carries the same fields minus the DOM.
 
+### Refusals happen at the door, and they fail once
+
+For an app that ACTS on live pages the retry ladder is a hazard, and a permissive front door is worse. Four rules:
+
+- **`submit: true` is a 422 at enqueue**, not a failed job minutes later — the schema pins it with `const: false`. (`TransactRequest::validate` still refuses it too; the engine re-validates a third time. Stop-before-submit stays structural regardless.)
+- **A blank `idempotency_key` is a 422** — the schema requires a non-whitespace character (`pattern: "\\S"`), matching what `validate` has always enforced at run time.
+- **Unknown top-level params are a 422** (`additionalProperties: false`). A typo'd `"step"` (singular) used to pass the schema, get silently dropped by the deserializer, run a **zero-step flow**, and emit a perfectly plausible landing-page bundle a human might approve off. Keys starting with `_` are exempt (`patternProperties: {"^_": {}}`) because the trigger runtime injects a `_trigger` envelope into a target job's params. Since **trigger-fired enqueues bypass the enqueue-time schema validator entirely** (they go straight to the queue), the app re-checks the same rule at run time with the same underscore allowlist — so a triggered job is neither broken by the rule nor exempt from it.
+- **A flow under a profile the vault does not hold is refused before Chrome starts.** Renders create a profile dir on first use — that is the documented onboarding path (`headless = false`, log in once). For a flow that acts, that default was a trap: a typo'd name silently produced an empty, **logged-out** Chrome profile, and the flow ran against a login wall. The error names the profile and points at `GET /profiles` (`has_browser_dir` is the field that matters). Running with no profile at all is still valid.
+
+All of these are typed `Error::Transact`, which is now **terminal for the job**: a deterministic refusal fails ONCE instead of riding the whole backoff ladder re-deriving itself on every attempt. A failure *during* a flow (Chrome died, the page never loaded) is an `Error::Browser` and stays retryable — that boundary is what keeps the classification honest. See [runtime.md](runtime.md).
+
 ### The bundle answers a reviewer's questions, not the executor's
 
 The whole product is a bundle a human reads before approving a live submit, so every field is written to be **falsifiable**:

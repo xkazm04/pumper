@@ -87,6 +87,14 @@ impl Browser for Dead {
     async fn render(&self, _: RenderRequest) -> Result<RenderedPage> {
         panic!("no rendering in a write-path test")
     }
+
+    /// Overridden so `Dead` keeps its contract — *any* engine call is a test bug
+    /// and panics. The trait default returns a typed `Error::Browser` instead,
+    /// which quietly turned "the app reached the browser" into an ordinary error
+    /// a test could mistake for the refusal it was asserting on.
+    async fn transact(&self, _: crate::TransactRequest) -> Result<crate::TransactEvidence> {
+        panic!("no transacting in a write-path test")
+    }
 }
 #[async_trait]
 impl Researcher for Dead {

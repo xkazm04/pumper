@@ -423,6 +423,74 @@ impl TransactRequest {
     }
 }
 
+/// Top-level param keys a [`TransactRequest`] understands. Pinned against the
+/// struct itself by `transact_fields_match_the_request_struct` (serde is the
+/// source of truth), so a new field can't be added without landing here too.
+pub const TRANSACT_FIELDS: &[&str] = &[
+    "url",
+    "profile",
+    "steps",
+    "submit_action",
+    "submit",
+    "idempotency_key",
+    "wait_for_selector",
+    "extra_wait_ms",
+    "max_body_bytes",
+];
+
+/// Param keys a transact job carries that [`TransactRequest`] does not
+/// understand.
+///
+/// The anti-pattern: serde silently drops unknown fields, so a typo'd `"step"`
+/// (singular) passed the params schema, deserialized into an EMPTY step list,
+/// and ran a zero-step flow that produced a perfectly plausible landing-page
+/// evidence bundle — the worst failure mode for an app a human approves off.
+///
+/// `#[serde(deny_unknown_fields)]` is deliberately NOT used: the trigger runtime
+/// injects a `_trigger` envelope into a target job's params, and trigger-fired
+/// enqueues go straight to the queue without the enqueue-time schema validator,
+/// so denying unknown fields at the struct would break every triggered transact.
+/// Underscore-prefixed keys are host-owned and always allowed; everything else
+/// must be a field the request declares.
+pub fn unknown_transact_fields(params: &Value) -> Vec<String> {
+    let Some(obj) = params.as_object() else {
+        return Vec::new();
+    };
+    obj.keys()
+        .filter(|k| !k.starts_with('_') && !TRANSACT_FIELDS.contains(&k.as_str()))
+        .cloned()
+        .collect()
+}
+
+/// Refuses a transact flow whose session profile the vault does not hold.
+///
+/// Renders **create** a profile dir on first use — that is the documented
+/// onboarding path (run once with `[browser] headless = false`, log in by
+/// hand). For a flow that ACTS, that default is a trap: a typo'd profile name
+/// silently births an empty, logged-OUT Chrome profile, the flow runs against a
+/// login wall, and the evidence bundle looks perfectly plausible while
+/// describing entirely the wrong page. `exists` is whether the profile's Chrome
+/// user-data-dir is already there (`GET /profiles` reports it as
+/// `has_browser_dir`); "no profile at all" stays valid and unaffected.
+///
+/// Typed [`Error::Transact`], not [`Error::Profile`], on purpose: this is a
+/// transact-flow policy rather than a generic profile problem (renders keep
+/// create-on-first-use), and it makes the refusal terminal for the job — see
+/// [`Error::is_terminal_for_job`] — instead of riding the retry ladder.
+pub fn require_existing_profile(name: &str, exists: bool) -> Result<()> {
+    if exists {
+        return Ok(());
+    }
+    Err(Error::Transact(format!(
+        "session profile '{name}' has no browser session in the vault, and a transact flow will \
+         not create one: an empty profile is a LOGGED-OUT browser, so the flow would run against \
+         a login wall and still emit a plausible-looking evidence bundle of the wrong page. \
+         Check `GET /profiles` for the profiles you have (`has_browser_dir: true` is the one this \
+         needs); establish this one by rendering under it once with `[browser] headless = false` \
+         and logging in, then re-run the flow."
+    )))
+}
+
 /// The live DOM value of one filled field at the moment the flow stopped —
 /// what a reviewer checks before ever approving a live submit.
 ///
@@ -1202,6 +1270,78 @@ mod tests {
         let mut req = dry_run_flow();
         req.profile = Some("acme_login".into());
         assert!(req.validate().is_ok());
+    }
+
+    /// The EXPECTED-diff idiom: serde is the source of truth for what a
+    /// `TransactRequest` accepts, so the allowlist is compared against a
+    /// serialized request's own keys. Adding a field without listing it here
+    /// would make the new field itself "unknown" and rejected at the door.
+    #[test]
+    fn transact_fields_match_the_request_struct() {
+        let req = dry_run_flow();
+        let serialized = serde_json::to_value(&req).unwrap();
+        let mut actual: Vec<String> = serialized
+            .as_object()
+            .expect("a request serializes to an object")
+            .keys()
+            .cloned()
+            .collect();
+        actual.sort();
+        let mut expected: Vec<String> = TRANSACT_FIELDS.iter().map(|s| s.to_string()).collect();
+        expected.sort();
+        assert_eq!(
+            actual, expected,
+            "TRANSACT_FIELDS drifted from TransactRequest — update the const"
+        );
+    }
+
+    /// The anti-pattern: serde silently drops what it does not know, so a
+    /// typo'd `"step"` passed the schema, deserialized into an EMPTY step list,
+    /// and ran a zero-step flow that produced a plausible landing-page bundle.
+    #[test]
+    fn unknown_field_not_silently_dropped() {
+        let params = serde_json::json!({
+            "url": "https://x/", "idempotency_key": "k",
+            "submit_action": {"action": "click", "selector": "#go"},
+            "step": [{"action": "click", "selector": "#next"}],
+            "sumbit": false
+        });
+        let mut unknown = unknown_transact_fields(&params);
+        unknown.sort();
+        assert_eq!(unknown, vec!["step".to_string(), "sumbit".to_string()]);
+        // Proof of the harm: the typo'd flow really does deserialize to zero
+        // steps, which is why "silently dropped" was never survivable here.
+        let req: TransactRequest = serde_json::from_value(params).unwrap();
+        assert!(req.steps.is_empty());
+
+        // Host-injected envelopes are allowed: trigger-fired jobs carry
+        // `_trigger` in their params and bypass the enqueue-time validator, so
+        // denying unknown keys outright would break every triggered transact.
+        let triggered = serde_json::json!({
+            "url": "https://x/", "idempotency_key": "k",
+            "submit_action": {"action": "click", "selector": "#go"},
+            "_trigger": {"depth": 1, "chain": ["T1"]}
+        });
+        assert!(unknown_transact_fields(&triggered).is_empty());
+        assert!(serde_json::from_value::<TransactRequest>(triggered).is_ok());
+        // A non-object payload has no keys to judge (serde rejects it anyway).
+        assert!(unknown_transact_fields(&serde_json::json!("nope")).is_empty());
+    }
+
+    /// The anti-pattern: `Some(profile)` went straight to `create_dir_all`, so a
+    /// typo'd profile name silently created an empty, logged-OUT Chrome profile
+    /// and the flow ran against a login wall — emitting a plausible evidence
+    /// bundle of entirely the wrong page.
+    #[test]
+    fn missing_profile_not_silently_created() {
+        assert!(require_existing_profile("portal_login", true).is_ok());
+        let err = require_existing_profile("prtal_login", false).unwrap_err();
+        // Typed Transact => terminal for the job: a refusal fails ONCE.
+        assert!(matches!(err, Error::Transact(_)), "got {err:?}");
+        assert!(err.is_terminal_for_job());
+        let msg = err.to_string();
+        assert!(msg.contains("prtal_login"), "names the profile: {msg}");
+        assert!(msg.contains("/profiles"), "names the surface: {msg}");
     }
 
     #[test]

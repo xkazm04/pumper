@@ -33,8 +33,9 @@
 //! them is a job-model change, not a transact one.
 
 use async_trait::async_trait;
+use pumper_core::engine::{unknown_transact_fields, TRANSACT_FIELDS};
 use pumper_core::{
-    AppContext, AppManifest, CostClass, ManifestExample, Result, ScrapeApp, TransactRequest,
+    AppContext, AppManifest, CostClass, Error, ManifestExample, Result, ScrapeApp, TransactRequest,
 };
 use serde_json::{json, Value};
 
@@ -61,12 +62,22 @@ impl ScrapeApp for Transact {
             params_schema: Some(json!({
                 "type": "object",
                 "required": ["url", "idempotency_key", "submit_action"],
+                // The door, not the run: a `submit: true`, a blank key or a
+                // typo'd param used to enqueue fine and fail (or worse,
+                // half-run) minutes later. Enqueue validates this schema, so
+                // they are 422s before a job row exists.
+                "patternProperties": {
+                    // Host-injected envelopes (`_trigger`) stay legal.
+                    "^_": {}
+                },
+                "additionalProperties": false,
                 "properties": {
                     "url": { "type": "string", "description": "Page the flow starts on." },
                     "idempotency_key": {
-                        "type": "string", "minLength": 1,
+                        "type": "string", "minLength": 1, "pattern": "\\S",
                         "description": "Caller-chosen key recorded with the evidence bundle; \
-                                        will dedup live submissions in the next slice."
+                                        must contain a non-whitespace character. Will dedup \
+                                        live submissions in the next slice."
                     },
                     "profile": {
                         "type": "string",
@@ -84,9 +95,9 @@ impl ScrapeApp for Transact {
                                         evidence as would_submit, NEVER executed in this slice."
                     },
                     "submit": {
-                        "type": "boolean", "default": false,
-                        "description": "Must be false: true is rejected until the \
-                                        human-approval slice exists."
+                        "type": "boolean", "const": false, "default": false,
+                        "description": "Must be false — `true` is rejected at the door (422), \
+                                        not at run time, until the human-approval slice exists."
                     },
                     "wait_for_selector": { "type": "string" },
                     "extra_wait_ms": { "type": "integer", "minimum": 0 },
@@ -128,10 +139,26 @@ impl ScrapeApp for Transact {
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
+        // A misspelled key is not a harmless no-op for a flow that ACTS: serde
+        // drops it silently, so `"step"` (singular) runs a ZERO-step flow and
+        // still hands back a plausible landing-page bundle. The schema rejects
+        // it at enqueue; this is the app-side twin that also covers the paths
+        // which bypass enqueue-time validation (trigger-fired jobs).
+        let unknown = unknown_transact_fields(&ctx.params);
+        if !unknown.is_empty() {
+            return Err(Error::Transact(format!(
+                "unknown transact params {unknown:?}: a misspelled key is silently dropped by \
+                 the deserializer, so the flow would run WITHOUT those steps and still emit an \
+                 evidence bundle a human might approve off. Known keys: {TRANSACT_FIELDS:?} \
+                 (host-injected keys starting with '_', e.g. `_trigger`, are allowed)."
+            )));
+        }
         let req: TransactRequest = serde_json::from_value(ctx.params.clone())?;
         // Reject before ANY browser work: submit:true, empty idempotency key,
-        // and bad profile names are typed errors, not partial executions. The
-        // engine re-validates too (defense in depth).
+        // and bad profile names are typed errors, not partial executions. Each
+        // is deterministic, so `Error::Transact` is terminal for the job — a
+        // refusal fails ONCE instead of riding the retry ladder. The engine
+        // re-validates too (defense in depth).
         req.validate()?;
 
         let evidence = ctx.engines.browser.transact(req).await?;
@@ -334,8 +361,8 @@ mod tests {
         let store = TempStore::new("transact-reject").await;
         let mut params = dry_run_params();
         params["submit"] = json!(true);
-        // Dead engines: reaching the browser at all would panic the test —
-        // proving the rejection happens BEFORE any engine call.
+        // Dead engines: `Dead::transact` panics, so reaching the browser at all
+        // fails the test — proving the rejection happens BEFORE any engine call.
         let ctx = ctx_with_browser(&store.storage, params, Arc::new(Dead)).await;
         let err = Transact.run(ctx).await.unwrap_err();
         assert!(
@@ -405,6 +432,77 @@ mod tests {
         );
         let dom = std::fs::read_to_string(artifacts_dir.join("dom.html")).unwrap();
         assert_eq!(dom, "<form>confirm</form>");
+    }
+
+    /// The anti-pattern: a typo'd `"step"` (singular) passed the schema, serde
+    /// silently dropped it, and the flow ran ZERO steps — then emitted a
+    /// perfectly plausible landing-page evidence bundle a human might approve
+    /// off. Rejected before any engine call (`Dead::transact` would panic).
+    #[tokio::test]
+    async fn unknown_field_not_silently_dropped() {
+        let store = TempStore::new("transact-typo").await;
+        let mut params = dry_run_params();
+        params["step"] = params["steps"].clone();
+        params["steps"] = json!([]);
+        let ctx = ctx_with_browser(&store.storage, params, Arc::new(Dead)).await;
+        let err = Transact.run(ctx).await.unwrap_err();
+        assert!(matches!(err, Error::Transact(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("step"),
+            "the error names the offending key: {err}"
+        );
+        // Deterministic => terminal: a refusal must fail ONCE, not ride the
+        // backoff ladder re-deriving itself on every attempt.
+        assert!(err.is_terminal_for_job());
+    }
+
+    /// Trigger-fired jobs carry a `_trigger` envelope in their params AND skip
+    /// the enqueue-time schema validator, so an over-eager unknown-field
+    /// rejection would break every triggered transact.
+    #[tokio::test]
+    async fn trigger_envelope_is_not_an_unknown_field() {
+        let store = TempStore::new("transact-trigger").await;
+        let mut params = dry_run_params();
+        params["_trigger"] = json!({ "depth": 1, "chain": ["T1"] });
+        let ctx =
+            ctx_with_browser(&store.storage, params, Arc::new(ScriptedBrowser::healthy())).await;
+        let out = Transact.run(ctx).await.expect("triggered flows still run");
+        assert_eq!(out["dry_run"], json!(true));
+    }
+
+    /// The door, not the run: `submit: true`, a blank idempotency key and an
+    /// unknown top-level key must be 422s at enqueue (the server validates this
+    /// schema before a job row exists), never a job that fails minutes later.
+    #[test]
+    fn the_manifest_schema_closes_the_door_on_bad_params() {
+        let schema = Transact.manifest().params_schema.expect("declared");
+        assert_eq!(
+            schema["properties"]["submit"]["const"],
+            json!(false),
+            "submit: true must not validate"
+        );
+        assert_eq!(
+            schema["additionalProperties"],
+            json!(false),
+            "a typo'd key must not pass the door"
+        );
+        assert!(
+            schema["patternProperties"]["^_"].is_object(),
+            "host-injected `_trigger` must still pass"
+        );
+        assert_eq!(
+            schema["properties"]["idempotency_key"]["pattern"],
+            json!("\\S"),
+            "an all-whitespace key must not pass"
+        );
+        // Every property the schema declares is one the request understands,
+        // so `additionalProperties: false` can never reject a legal field.
+        for key in schema["properties"].as_object().unwrap().keys() {
+            assert!(
+                TRANSACT_FIELDS.contains(&key.as_str()),
+                "schema declares '{key}', which TransactRequest does not accept"
+            );
+        }
     }
 
     /// The anti-pattern, end to end: a flow that types a password republished

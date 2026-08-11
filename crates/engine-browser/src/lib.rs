@@ -54,8 +54,8 @@ use chromiumoxide::cdp::browser_protocol::network::{
 use futures::StreamExt;
 use pumper_core::config::BrowserConfig;
 use pumper_core::engine::{
-    interaction_outcome, parse_transact_probe, pass_fully_succeeded, summarize_steps,
-    transact_probe_js, CapturedCall, PageAction, StepOutcome,
+    interaction_outcome, parse_transact_probe, pass_fully_succeeded, require_existing_profile,
+    summarize_steps, transact_probe_js, CapturedCall, PageAction, StepOutcome,
 };
 use pumper_core::{
     lru_touch_evict, profile_browser_dir, Browser, Error, RenderRequest, RenderedPage, Result,
@@ -685,6 +685,15 @@ impl Browser for BrowserEngine {
         // re-validates so a raw caller can't slip `submit: true` past the app
         // layer. Typed Error::Transact, never a silent downgrade to dry-run.
         req.validate()?;
+        // A flow that ACTS must run under an identity that already exists.
+        // `acquire` would otherwise `create_dir_all` a typo'd profile into a
+        // fresh, logged-OUT Chrome and produce a plausible bundle of a login
+        // wall. Checked BEFORE any Chrome work — nothing is launched, nothing
+        // is created. "No profile" stays valid.
+        if let Some(name) = &req.profile {
+            let browser_dir = profile_browser_dir(&self.profiles_dir, name)?;
+            require_existing_profile(name, browser_dir.is_dir())?;
+        }
         let fill = req.fill_selectors();
         let submit_selector = req.submit_action.selector().map(str::to_string);
         let mut render = RenderRequest::new(&req.url);
@@ -1254,6 +1263,35 @@ mod tests {
         // The rest of the bundle survived intact — that is the whole point.
         assert_eq!(ev.steps_completed, 2);
         assert_eq!(ev.submit_target.expect("assessed").found, Some(true));
+    }
+
+    /// The anti-pattern, at the engine seam: a typo'd profile went straight to
+    /// `create_dir_all` inside `acquire`, silently birthing an empty, logged-OUT
+    /// Chrome profile — the flow then ran against a login wall. The refusal must
+    /// happen BEFORE any Chrome is launched or any directory is created, so this
+    /// test needs no browser at all.
+    #[tokio::test]
+    async fn missing_profile_not_silently_created_by_a_flow() {
+        // A vault root we own by name and clear first, so "the dir is not there
+        // afterwards" is a statement about THIS run.
+        let vault = std::env::temp_dir().join("pumper-transact-missing-profile-vault");
+        let _ = std::fs::remove_dir_all(&vault);
+        let engine = BrowserEngine::new(&cfg(), &vault);
+
+        let err = engine
+            .transact(flow_with_two_steps()) // profile: "portal_login"
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Transact(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("portal_login"),
+            "the error names the profile: {err}"
+        );
+        assert!(
+            !vault.join("portal_login").exists(),
+            "the refusal must not create the profile it refused — and it must \
+             happen before any Chrome is launched, which is why this test needs none"
+        );
     }
 
     #[test]
