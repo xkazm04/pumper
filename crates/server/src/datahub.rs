@@ -1026,6 +1026,13 @@ pub fn govern_tick(state: &AppState) {
     if !cfg.enabled || !cfg.govern {
         return;
     }
+    // No new poll starts during shutdown: its whole product is in-memory
+    // governance state (`cost:pause`d apps, the last summary) that nothing will
+    // read again, so a GMS round trip here would be a network call whose answer
+    // the process is guaranteed to throw away.
+    if state.shutdown.is_cancelled() {
+        return;
+    }
     let interval = std::time::Duration::from_secs(cfg.govern_interval_secs.max(30));
     let guard = {
         let mut g = state.datahub_govern.lock().unwrap();
@@ -1040,7 +1047,18 @@ pub fn govern_tick(state: &AppState) {
         // Moved in, so the flag clears (and completion is stamped) whenever the
         // poll ends — including on panic.
         let _guard = guard;
-        govern_poll(state).await
+        let shutdown = state.shutdown.clone();
+        // Cancellation-aware: this was a bare spawn outside the shutdown token,
+        // so a slow GraphQL round trip could still be open after the drain
+        // returned. Abandoning mid-poll costs nothing durable — a poll writes
+        // only in-memory state, and the next boot re-derives all of it from
+        // DataHub on its first tick.
+        tokio::select! {
+            _ = shutdown.cancelled() => {
+                warn!("datahub govern: shutdown signalled; abandoning the poll");
+            }
+            _ = govern_poll(state.clone()) => {}
+        }
     });
 }
 

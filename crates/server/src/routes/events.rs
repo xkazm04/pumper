@@ -33,13 +33,17 @@ pub(crate) async fn stream_events(
 ) -> Sse<impl futures::Stream<Item = Result<Event, Infallible>>> {
     let after = last_event_id(&headers);
     let mut rx = state.events.subscribe();
+    let shutdown = state.shutdown.clone();
     let (initial, mut last_seq) = resume(&state, after, |_| true);
     let stream = async_stream::stream! {
         for ev in initial {
             yield Ok(ev);
         }
         loop {
-            match rx.recv().await {
+            let Some(received) = next_or_shutdown(&mut rx, &shutdown).await else {
+                break;
+            };
+            match received {
                 Ok((seq, event)) => {
                     if seq <= last_seq {
                         continue; // already replayed (overlap window)
@@ -57,6 +61,31 @@ pub(crate) async fn stream_events(
         }
     };
     Sse::new(stream).keep_alive(KeepAlive::default())
+}
+
+/// The next bus event, or `None` when the process is shutting down.
+///
+/// The anti-pattern this replaces: awaiting `rx.recv()` bare, so the stream
+/// ended only on `RecvError::Closed` — which needs the broadcast **sender** to
+/// drop, and the sender lives in every `AppState` clone (worker, scheduler,
+/// janitors, the router itself). `Closed` therefore never arrives while the
+/// process is alive, `KeepAlive` kept the socket healthy, and one attached
+/// dashboard was enough to make `axum::serve`'s graceful shutdown wait forever.
+/// Selecting on the shutdown token ends the stream cleanly instead: the
+/// generator returns, axum finishes the response body, and the client sees an
+/// ordinary end-of-stream rather than a connection reset.
+///
+/// `biased` so a pending shutdown wins over a backlog of buffered events — a
+/// stopping process must not have to drain the bus first.
+pub(crate) async fn next_or_shutdown<T: Clone>(
+    rx: &mut tokio::sync::broadcast::Receiver<T>,
+    shutdown: &tokio_util::sync::CancellationToken,
+) -> Option<Result<T, RecvError>> {
+    tokio::select! {
+        biased;
+        _ = shutdown.cancelled() => None,
+        received = rx.recv() => Some(received),
+    }
 }
 
 /// SSE stream scoped to one job; closes once the job reaches a terminal state.
@@ -83,6 +112,7 @@ pub(crate) async fn stream_job(
     } else {
         None
     };
+    let shutdown = state.shutdown.clone();
     let (replayed, mut last_seq) = resume(&state, after, move |ev| ev.job_id == id);
     let stream = async_stream::stream! {
         for ev in replayed {
@@ -98,7 +128,13 @@ pub(crate) async fn stream_job(
             }
         }
         loop {
-            match rx.recv().await {
+            // Self-terminating at the job's terminal event, but only if one ever
+            // arrives — a job whose worker is already draining never sends it,
+            // so this stream needs the same shutdown exit as `/events`.
+            let Some(received) = next_or_shutdown(&mut rx, &shutdown).await else {
+                break;
+            };
+            match received {
                 Ok((seq, event)) => {
                     if seq <= last_seq {
                         continue;

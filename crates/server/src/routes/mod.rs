@@ -20,6 +20,10 @@ use crate::state::AppState;
 // (`crate::triggers` sits outside `routes` and cannot reach the private
 // `datasets` submodule directly). One parser, both surfaces — no drift.
 pub(crate) use datasets::parse_filters;
+// The bus-receive-or-shutdown step, re-exported for the MCP live stream
+// (`crate::mcp::live`): both SSE surfaces have to end on the shutdown token, and
+// one implementation means neither can silently regain the unbounded `recv()`.
+pub(crate) use events::next_or_shutdown;
 // The defaults-merge, re-exported for the MCP enqueue tool (`crate::mcp`) so a
 // job enqueued by an agent gets byte-identical params to one POSTed over HTTP.
 pub(crate) use jobs::merge_params;

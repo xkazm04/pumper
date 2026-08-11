@@ -14,7 +14,10 @@ mod triggers;
 mod webhook;
 mod worker;
 
+use std::time::Duration;
+
 use pumper_core::Config;
+use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
@@ -34,6 +37,28 @@ const SENTRY_DEFAULT_ENVIRONMENT: &str = "local";
 /// (`build_id()` in crates/core/src/app.rs) so a Sentry release and a health run
 /// row name the same build. Commit sha in CI, crate version otherwise.
 const BUILD_ID_ENV: &str = "PUMPER_BUILD_ID";
+
+/// How long in-flight HTTP work gets to finish after the shutdown token fires,
+/// before the process stops waiting for it and moves on to the worker drain.
+///
+/// **Why this bound has to exist at all.** `axum::serve`'s graceful shutdown
+/// resolves only once *every* connection has closed. One attached `/events`
+/// dashboard was therefore enough to make that await never return: the SSE loop
+/// ended only on `RecvError::Closed`, which needs the broadcast sender to drop,
+/// and the sender lives in every `AppState` clone (worker, scheduler, janitors,
+/// router). The process could only be killed, which skipped the worker drain and
+/// the host-politeness snapshot. The streams now end on the token
+/// ([`routes::events`], [`mcp::live`]) *and* the wait is bounded, because
+/// "terminates" must not depend on every client behaving.
+///
+/// **Why a constant rather than a config key.** The number an operator actually
+/// tunes is `[worker] shutdown_drain_secs` — how long a *job* gets — and it is
+/// unaffected by this: the two windows run concurrently (both start when the
+/// token fires), so the total stop time is the max of them, not the sum. This
+/// one only covers request handlers, which are milliseconds outside the
+/// streaming export path. Ten seconds is generous for that and leaves the
+/// default worst case (25s drain) far inside systemd's 90s `TimeoutStopSec`.
+const HTTP_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// What [`sentry_plan`] decided to do with the environment it was handed.
 ///
@@ -172,16 +197,76 @@ async fn run() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!("pumper listening on http://{addr}");
     let shutdown = state.shutdown.clone();
-    axum::serve(listener, routes::router(state))
-        .with_graceful_shutdown(async move { shutdown.cancelled().await })
-        .await?;
+    let server = tokio::spawn({
+        let shutdown = shutdown.clone();
+        let router = routes::router(state.clone());
+        async move {
+            axum::serve(listener, router)
+                .with_graceful_shutdown(async move { shutdown.cancelled().await })
+                .await
+        }
+    });
+
+    // Bounded: after the token fires, in-flight connections get
+    // `HTTP_SHUTDOWN_GRACE` and then the process proceeds regardless. The worker
+    // has been draining in parallel since the same instant — this wait does not
+    // delay it, it only stops the process from hanging on a client.
+    let http_error = match await_bounded(server, &shutdown, HTTP_SHUTDOWN_GRACE).await {
+        Some(Ok(Ok(()))) => {
+            tracing::info!("http server stopped; awaiting worker drain");
+            None
+        }
+        Some(Ok(Err(e))) => Some(anyhow::Error::new(e).context("http server")),
+        Some(Err(e)) => Some(anyhow::Error::new(e).context("http server task")),
+        None => {
+            tracing::warn!(
+                grace_secs = HTTP_SHUTDOWN_GRACE.as_secs(),
+                "http connections still open at the shutdown grace deadline; abandoning them \
+                 so the worker drain and the politeness snapshot still run"
+            );
+            None
+        }
+    };
 
     // The HTTP server has stopped accepting; wait for the worker to finish
     // draining (or re-queuing) in-flight jobs before exiting.
-    tracing::info!("http server stopped; awaiting worker drain");
     let _ = worker.await;
+    // Last, because the drain is the last thing that can teach the governor a
+    // penalty: a job finishing during the drain must be in the snapshot too.
+    state::final_host_penalty_flush(&state).await;
     tracing::info!("shutdown complete");
-    Ok(())
+    match http_error {
+        Some(e) => Err(e),
+        None => Ok(()),
+    }
+}
+
+/// Awaits `task`, but never longer than `grace` past the moment `shutdown`
+/// fires.
+///
+/// `Some(join result)` means the task finished on its own; `None` means the
+/// grace window elapsed first, and the task was **aborted** so it cannot keep
+/// running behind the rest of the shutdown sequence.
+///
+/// The anti-pattern this makes impossible: awaiting a future whose completion is
+/// gated on remote peers hanging up. A graceful HTTP shutdown is exactly that
+/// shape — it is done when the last connection closes, which a client is under
+/// no obligation to ever do.
+async fn await_bounded<T>(
+    mut task: tokio::task::JoinHandle<T>,
+    shutdown: &CancellationToken,
+    grace: Duration,
+) -> Option<Result<T, tokio::task::JoinError>> {
+    tokio::select! {
+        joined = &mut task => Some(joined),
+        _ = async {
+            shutdown.cancelled().await;
+            tokio::time::sleep(grace).await;
+        } => {
+            task.abort();
+            None
+        }
+    }
 }
 
 /// Completes on the first Ctrl-C or platform terminate signal (SIGTERM on Unix,
@@ -520,5 +605,84 @@ mod sentry_tests {
             panic!("a valid dsn must enable reporting");
         };
         assert_eq!(opts.release.as_deref(), Some(env!("CARGO_PKG_VERSION")));
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::{await_bounded, HTTP_SHUTDOWN_GRACE};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// The whole point of the bound: a task that will never finish on its own
+    /// must not hold the shutdown sequence open. `axum::serve`'s graceful
+    /// shutdown is exactly that task whenever a client keeps a connection —
+    /// an SSE dashboard — open, and the process used to die only to SIGKILL,
+    /// skipping the worker drain and the politeness snapshot.
+    #[tokio::test]
+    async fn an_endless_task_is_abandoned_at_the_grace_deadline_not_awaited_forever() {
+        let shutdown = CancellationToken::new();
+        let ran = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn({
+            let ran = ran.clone();
+            async move {
+                ran.store(true, Ordering::SeqCst);
+                std::future::pending::<()>().await;
+            }
+        });
+        shutdown.cancel();
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            await_bounded(task, &shutdown, Duration::from_millis(50)),
+        )
+        .await
+        .expect("await_bounded must itself return within the bound");
+        assert!(out.is_none(), "an endless task is reported as abandoned");
+        assert!(ran.load(Ordering::SeqCst), "the task really did start");
+    }
+
+    /// The mirror risk, and the more damaging one: cutting off work that was
+    /// about to finish. Inside the window the task's own result is returned
+    /// untouched, so a clean stop still means a clean stop.
+    #[tokio::test]
+    async fn a_task_that_finishes_inside_the_window_is_joined_not_aborted() {
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            "drained"
+        });
+        shutdown.cancel();
+        let out = await_bounded(task, &shutdown, Duration::from_secs(5)).await;
+        assert_eq!(
+            out.expect("finished on its own").expect("no panic"),
+            "drained"
+        );
+    }
+
+    /// Before the token fires there is no deadline at all — the grace window is
+    /// measured from cancellation, never from the call. Otherwise a long-lived
+    /// server would be torn down `grace` after boot.
+    #[tokio::test]
+    async fn the_window_starts_at_cancellation_not_at_the_call() {
+        let shutdown = CancellationToken::new();
+        let task = tokio::spawn(async {
+            tokio::time::sleep(Duration::from_millis(120)).await;
+            7u8
+        });
+        // Grace is far shorter than the task, but the token stays unfired for
+        // longer than both, so the task still completes normally.
+        let out = await_bounded(task, &shutdown, Duration::from_millis(10)).await;
+        assert_eq!(out.expect("joined").expect("no panic"), 7);
+    }
+
+    /// The shipped window is a real, non-zero bound. A zero would make every
+    /// stop abandon in-flight requests; an unbounded one is the bug this const
+    /// exists to prevent.
+    #[test]
+    fn the_shipped_grace_is_bounded_and_non_zero() {
+        assert!(HTTP_SHUTDOWN_GRACE > Duration::ZERO);
+        assert!(HTTP_SHUTDOWN_GRACE <= Duration::from_secs(30));
     }
 }

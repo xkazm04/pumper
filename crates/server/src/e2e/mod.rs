@@ -29,6 +29,7 @@ mod peer_mirror;
 mod provisioner_lifecycle;
 mod router;
 mod scheduler_overlap;
+mod shutdown_bounds;
 mod shutdown_drain;
 mod sink_delivery;
 mod trigger_cache;

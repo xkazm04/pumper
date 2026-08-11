@@ -72,13 +72,23 @@ pub(crate) async fn handle_get(
     // Subscribe before replaying so no event slips through the gap between
     // "read the ring" and "listen live"; the overlap is deduped by `last_seq`.
     let mut rx = state.events.subscribe();
+    let shutdown = state.shutdown.clone();
     let (initial, mut last_seq) = replay_backlog(&state, after, &filter);
     let stream = async_stream::stream! {
         for ev in initial {
             yield Ok(ev);
         }
         loop {
-            match rx.recv().await {
+            // Ends on the shutdown token, at a frame boundary: the generator
+            // returns between complete SSE events, so the client sees a clean
+            // end-of-stream (its cue to reconnect with `Last-Event-ID`, which
+            // the replay ring already serves) and never a truncated JSON-RPC
+            // frame. Same helper as the plain `/events` feed — see
+            // `routes::next_or_shutdown` for why a bare `recv()` never ends.
+            let Some(received) = crate::routes::next_or_shutdown(&mut rx, &shutdown).await else {
+                break;
+            };
+            match received {
                 Ok((seq, event)) => {
                     if seq <= last_seq {
                         continue; // already replayed (overlap window)

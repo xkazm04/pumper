@@ -46,6 +46,12 @@ The global 1 MiB is sized from what the POST surface actually accepts — all ha
 | Retention | `GET /retention/preview?days=` (**read-only dry run**: reclaimable artifact bytes per app, split reclaimable/pinned/cassette, plus ledger row counts and the configured windows — deletes nothing. See [datasets.md § Retention](datasets.md)) |
 | Meta | `GET /openapi.json` (OpenAPI 3.1 spec for all routes) |
 
+## Shutdown behaviour (what a client sees on Ctrl-C / `systemctl stop`)
+
+Every SSE surface — `GET /events`, `GET /jobs/{id}/stream`, and the MCP live stream `GET /mcp` — **ends cleanly** when the process starts shutting down: the response body finishes normally at an event boundary, so a client sees an ordinary end-of-stream (and a complete final frame), never a connection reset or a truncated JSON-RPC message. `Last-Event-ID` resume is unaffected: reconnect against the restarted process with the last id you saw and the replay ring serves the gap, or answers `reset` if it is already too old.
+
+In-flight non-streaming requests get a **10-second grace window** measured from the shutdown signal; anything still open after that is abandoned so the job drain and the host-politeness snapshot still run. A long `GET /datasets/{app}/{ds}/export` is therefore the one request that can be cut off by a stop — it ends without its clean terminator, which client libraries surface as a transfer error (see [Dataset export](#dataset-export--scan-limits)), never as a short 200. The grace window is a constant, not a config key; the knob operators tune is `[worker] shutdown_drain_secs` (how long an in-flight **job** gets), and the two windows run concurrently, so total stop time is the larger of them rather than their sum.
+
 Conventions: enable/disable is always `POST …/{id}/enabled {"enabled": bool}`; every list endpoint is dual-mode — without `cursor=` it returns its legacy shape (bare array or `{watches|triggers|searches|changes|revisions|deliveries: [...]}`, unbounded except where a legacy `limit` already applied), and with `cursor=` present (even empty, for page 1) it returns `{items, next_cursor}` and pages by keyset. Cursors are opaque `<stored-ts>|<tiebreak>` tokens (`next_cursor` is `null` on the last page); pass the previous response's `next_cursor` back as `cursor=`. The `changes`/`history` feeds page the full revision set — the legacy no-cursor shapes still clamp at 1000/500 rows, but `cursor=` reaches everything past that. Details of each area live in the sibling feature docs.
 
 ## Dataset export & scan limits

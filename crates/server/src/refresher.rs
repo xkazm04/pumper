@@ -45,6 +45,13 @@ pub fn tick(state: &AppState) {
     if !state.config.refresher.enabled {
         return;
     }
+    // Nothing new STARTS during shutdown. A pass is pure speculative outbound
+    // traffic whose only product is a warmer cache, so beginning one while the
+    // process is stopping spends a host's politeness budget on a mirror that is
+    // about to be closed.
+    if state.shutdown.is_cancelled() {
+        return;
+    }
     if RUNNING
         .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
         .is_err()
@@ -54,7 +61,20 @@ pub fn tick(state: &AppState) {
     }
     let state = state.clone();
     tokio::spawn(async move {
-        let result = run_pass(&state).await;
+        let shutdown = state.shutdown.clone();
+        // Cancellation-aware: a bare spawn here escaped the shutdown token
+        // entirely, so a pass' revalidations could still be on the wire after
+        // the drain returned — a network call outliving the process that made
+        // it, with nothing left to read the answer. Abandoning mid-pass is safe:
+        // each revalidation commits (or doesn't) on its own, and the freshness
+        // model re-selects whatever this pass didn't reach on the next tick.
+        let result = tokio::select! {
+            _ = shutdown.cancelled() => {
+                debug!("cache refresher: shutdown signalled; abandoning the pass");
+                Ok(())
+            }
+            result = run_pass(&state) => result,
+        };
         RUNNING.store(false, Ordering::Release);
         if let Err(e) = result {
             warn!("cache refresher pass failed: {e}");

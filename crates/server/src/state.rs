@@ -342,15 +342,26 @@ impl AppState {
             let governor = state.governor.clone();
             let tiers = state.tiers.clone();
             let lock = state.host_memory_lock.clone();
+            let shutdown = state.shutdown.clone();
             tokio::spawn(async move {
                 let mut tick = tokio::time::interval(Duration::from_secs(persist_secs));
                 tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
-                    tick.tick().await;
+                    // Shutdown-aware: a bare loop here outlived the token and
+                    // could commit a snapshot taken before the drain on top of
+                    // the authoritative final pass below.
+                    tokio::select! {
+                        _ = shutdown.cancelled() => break,
+                        _ = tick.tick() => {}
+                    }
                     if let Err(e) = persist_host_penalties(&governor, &tiers, &lock).await {
                         tracing::warn!("host penalty write-behind failed: {e}");
                     }
                 }
+                // The final pass is deliberately NOT here: it runs in
+                // `main::run` after the worker drain (see
+                // [`final_host_penalty_flush`]), so a penalty learned by a job
+                // that finished *during* the drain is in the snapshot too.
             });
         }
 
@@ -378,4 +389,28 @@ pub(crate) async fn persist_host_penalties(
         .map(|(host, penalty)| (host, penalty.as_millis().min(u64::MAX as u128) as u64))
         .collect();
     tiers.persist_penalty_snapshot(&snapshot).await
+}
+
+/// The last write-behind pass of the process's life, run by `main::run` once the
+/// worker drain has returned.
+///
+/// The anti-pattern this closes: the periodic loop was the ONLY writer, so the
+/// politeness state on disk after a clean stop was whatever the last tick — up
+/// to `[fetcher] host_penalty_persist_secs` ago — happened to see. A host the
+/// process had spent the previous minute learning to back off from came back at
+/// full speed on the next boot, and the harder the run had been on a host, the
+/// more of that lesson a stop threw away. (Before the shutdown bound landed the
+/// process usually died to SIGKILL, so in practice this pass never ran at all.)
+///
+/// No-op when write-behind is switched off (`host_penalty_persist_secs = 0`):
+/// that setting means "do not persist politeness", and a shutdown must not be
+/// the one code path that quietly ignores it.
+pub(crate) async fn final_host_penalty_flush(state: &AppState) {
+    if state.config.fetcher.host_penalty_persist_secs == 0 {
+        return;
+    }
+    match persist_host_penalties(&state.governor, &state.tiers, &state.host_memory_lock).await {
+        Ok(()) => tracing::info!("persisted the final host-politeness snapshot"),
+        Err(e) => tracing::warn!("final host penalty flush failed: {e}"),
+    }
 }
