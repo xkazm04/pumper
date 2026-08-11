@@ -229,6 +229,99 @@ pub enum PageAction {
     },
 }
 
+impl PageAction {
+    /// The CSS selector this action targets, when it has one. Scrolls, fixed
+    /// waits and `Repeat` target no element, so they have none — a transact
+    /// whose `submit_action` is one of those has no submit target to assess.
+    pub fn selector(&self) -> Option<&str> {
+        match self {
+            PageAction::Click { selector }
+            | PageAction::Type { selector, .. }
+            | PageAction::WaitForSelector { selector, .. } => Some(selector),
+            PageAction::ScrollBottom
+            | PageAction::ScrollBy { .. }
+            | PageAction::WaitMs { .. }
+            | PageAction::Repeat { .. } => None,
+        }
+    }
+}
+
+/// What one executed [`PageAction`] actually did.
+///
+/// The anti-pattern this exists to kill: the executor counted every action it
+/// *reached* as "completed", so a flow whose three selectors all 404'd reported
+/// `steps_completed: 3` — an evidence bundle that cannot distinguish a clean run
+/// from a total miss is worse than no bundle, because a human approves off it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StepOutcome {
+    /// The action ran and the page accepted it.
+    Ok,
+    /// The action's CSS selector matched nothing (a click/type target that is
+    /// not on the page, or a `wait_for_selector` that never appeared).
+    SelectorMissing,
+    /// The element was found but the interaction itself failed (a click that
+    /// CDP refused, a `type` that errored, a scroll `evaluate` that threw).
+    ActionFailed,
+    /// **Coarse, `Repeat`-only**: the block ran but not every inner step of
+    /// every iteration succeeded (or an iteration was cut by the deadline).
+    /// Inner outcomes are deliberately NOT rolled up per step — one outcome per
+    /// block, so the evidence never claims granularity it does not have.
+    Partial,
+}
+
+impl StepOutcome {
+    pub fn is_ok(self) -> bool {
+        matches!(self, StepOutcome::Ok)
+    }
+}
+
+/// Outcome of an action that must first find its element and then act on it.
+/// Keeps "the selector was not there" (a flow/site mismatch a reviewer must
+/// see) distinct from "the element was there and the interaction failed".
+pub fn interaction_outcome(found: bool, acted: bool) -> StepOutcome {
+    match (found, acted) {
+        (false, _) => StepOutcome::SelectorMissing,
+        (true, false) => StepOutcome::ActionFailed,
+        (true, true) => StepOutcome::Ok,
+    }
+}
+
+/// Whether one pass over a step list fully succeeded: every requested step ran
+/// (none skipped at the deadline) and every one of them reported `Ok`. The
+/// rollup a `Repeat` block's single coarse outcome is built from.
+pub fn pass_fully_succeeded(requested: usize, outcomes: &[StepOutcome]) -> bool {
+    outcomes.len() == requested && outcomes.iter().all(|o| o.is_ok())
+}
+
+/// Requested-vs-attempted-vs-succeeded for one executed step list — all three
+/// recoverable from the evidence bundle, so "we asked for 3, ran 2, one worked"
+/// can never be reported as "3 completed".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StepSummary {
+    /// Steps the caller asked for.
+    pub requested: usize,
+    /// Steps the executor actually reached (fewer than `requested` iff the
+    /// flow's time budget ran out mid-list).
+    pub attempted: usize,
+    /// Steps that reported [`StepOutcome::Ok`] — the honest "completed" count.
+    pub completed: usize,
+    /// `true` when the deadline stopped the list before every step was reached.
+    pub deadline_hit: bool,
+}
+
+/// Rolls a per-step outcome list into a [`StepSummary`]. `outcomes` carries one
+/// entry per step the executor *attempted*, in order.
+pub fn summarize_steps(requested: usize, outcomes: &[StepOutcome]) -> StepSummary {
+    let attempted = outcomes.len();
+    StepSummary {
+        requested,
+        attempted,
+        completed: outcomes.iter().filter(|o| o.is_ok()).count(),
+        deadline_hit: attempted < requested,
+    }
+}
+
 // ---- Transact (M06, v1 slice: dry-run ONLY) --------------------------------
 //
 // A *transact flow* is a declarative multi-step interaction (navigate → fill →
@@ -352,17 +445,46 @@ pub struct TransactEvidence {
     pub dry_run: bool,
     /// The caller's idempotency key, threaded through verbatim.
     pub idempotency_key: String,
+    /// The session-vault profile the flow actually ran under, or `None` when it
+    /// ran profile-less (the shared default Chrome). A reviewer approving a
+    /// live submit is approving it *as this identity*, so the bundle names it.
+    pub profile: Option<String>,
     /// Flow start URL and where the page actually ended up.
     pub url: String,
     pub final_url: Option<String>,
-    /// How many reversible steps executed (a `Repeat` counts as one).
+    /// Reversible steps the caller asked for (a `Repeat` counts as one).
+    pub steps_requested: usize,
+    /// Steps the executor actually reached; below `steps_requested` iff the
+    /// flow's time budget ran out mid-list.
+    pub steps_attempted: usize,
+    /// Steps that **succeeded** — never a count of attempts. A flow whose
+    /// selectors all missed reports `0` here with `steps_attempted` intact.
     pub steps_completed: usize,
+    /// Per-step outcome, one entry per *attempted* step, in order.
+    pub step_outcomes: Vec<StepOutcome>,
+    /// `true` when the deadline stopped the step list before its end.
+    pub steps_deadline_hit: bool,
+    /// Outcome of the transact-level `wait_for_selector` (the confirmation
+    /// state the flow was told to wait for): `Some(true)` it appeared,
+    /// `Some(false)` it never did, `None` none was requested.
+    pub wait_for_selector_found: Option<bool>,
     /// Live DOM values of every field the flow typed into.
     pub filled_fields: Vec<FilledField>,
     /// The exact irreversible action that was NOT performed.
     pub would_submit: PageAction,
-    /// Full DOM snapshot at the stop point (size-capped by the engine).
+    /// State of `would_submit`'s target element on the FINAL page — the one
+    /// question a reviewer most needs answered before approving. `None` when
+    /// the submit action targets no selector at all (a scroll/wait/repeat).
+    pub submit_target: Option<SubmitTarget>,
+    /// DOM snapshot at the stop point. Truncated (never dropped) when over the
+    /// size cap — see `dom_truncated`.
     pub dom_html: String,
+    /// Byte size of the DOM **as captured from the page**, before truncation.
+    pub dom_bytes: usize,
+    /// `true` when `dom_html` holds only a prefix of the captured DOM because
+    /// it exceeded `max_body_bytes`. The flow already acted by capture time, so
+    /// an over-cap DOM degrades the snapshot rather than destroying the bundle.
+    pub dom_truncated: bool,
     /// Path to a screenshot of the stop state, when the engine can produce
     /// one. The current browser engine does not yet expose screenshot capture
     /// through its render path, so this is `None` — an honest gap, not a stub.
@@ -385,6 +507,95 @@ pub fn filled_fields_js(selectors: &[String]) -> String {
              ? String(el.value) : (el.textContent || null); \
            return {{selector: s, value: v, found: true}}; }}); }})()"
     )
+}
+
+/// State of the irreversible action's target element on the page the flow
+/// stopped at. "Does the button I would click actually exist, and could it be
+/// clicked?" — the question a reviewer needs answered before approving.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SubmitTarget {
+    /// `would_submit`'s CSS selector.
+    pub selector: String,
+    /// `Some(true)` the element was on the final page, `Some(false)` it was
+    /// not, `None` the probe could not run (evaluate failed / page navigated
+    /// away) — an honest "we don't know", never a fabricated "not found".
+    pub found: Option<bool>,
+    /// Rendered (non-zero box, not `display:none`/`visibility:hidden`/opacity 0).
+    #[serde(default)]
+    pub visible: Option<bool>,
+    /// Not `disabled` and not `aria-disabled="true"`.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Lowercased tag name (`button`, `input`, …).
+    #[serde(default)]
+    pub tag: Option<String>,
+    /// Trimmed visible label (inner text / value / `aria-label`), capped.
+    #[serde(default)]
+    pub label: Option<String>,
+}
+
+/// Max characters of a submit target's label kept in the evidence.
+const SUBMIT_LABEL_MAX_CHARS: usize = 120;
+
+/// JS expression that assesses one selector's element (exists / visible /
+/// enabled / tag / label), or the literal `null` when there is no selector to
+/// assess. The selector is JSON-encoded into the script, so quotes and
+/// backslashes in a CSS selector cannot break out of the literal.
+pub fn submit_target_js(selector: Option<&str>) -> String {
+    let Some(selector) = selector else {
+        return "null".to_string();
+    };
+    let sel = serde_json::to_string(selector).unwrap_or_else(|_| "\"\"".into());
+    let cap = SUBMIT_LABEL_MAX_CHARS;
+    format!(
+        "(() => {{ const s = {sel}; const el = document.querySelector(s); \
+           if (!el) return {{selector: s, found: false, visible: null, enabled: null, \
+             tag: null, label: null}}; \
+           const r = el.getBoundingClientRect(); const cs = window.getComputedStyle(el); \
+           const visible = (r.width > 0 || r.height > 0) && cs.visibility !== 'hidden' \
+             && cs.display !== 'none' && cs.opacity !== '0'; \
+           const enabled = el.disabled !== true && el.getAttribute('aria-disabled') !== 'true'; \
+           const label = String(el.innerText || el.value || el.getAttribute('aria-label') || '') \
+             .trim().slice(0, {cap}); \
+           return {{selector: s, found: true, visible: visible, enabled: enabled, \
+             tag: String(el.tagName || '').toLowerCase(), label: label}}; }})()"
+    )
+}
+
+/// The transact evidence probe: ONE `evaluate` expression that captures both
+/// the filled-field summary and the submit target's state, since the render
+/// path exposes a single evaluate slot. Shape:
+/// `{fields: [FilledField...], submit_target: SubmitTarget|null}`.
+pub fn transact_probe_js(fill_selectors: &[String], submit_selector: Option<&str>) -> String {
+    let fields = filled_fields_js(fill_selectors);
+    let target = submit_target_js(submit_selector);
+    format!("(() => ({{ fields: {fields}, submit_target: {target} }}))()")
+}
+
+/// Decodes a [`transact_probe_js`] result into its typed halves. Every failure
+/// mode degrades honestly instead of failing the bundle: fields fall back to
+/// "nothing found" rows, and an unassessable target reports `found: None`
+/// ("we could not look") rather than `found: false` ("it is not there").
+pub fn parse_transact_probe(
+    fill_selectors: &[String],
+    submit_selector: Option<&str>,
+    evaluated: Option<&Value>,
+) -> (Vec<FilledField>, Option<SubmitTarget>) {
+    let fields = parse_filled_fields(fill_selectors, evaluated.and_then(|v| v.get("fields")));
+    let target = submit_selector.map(|selector| {
+        evaluated
+            .and_then(|v| v.get("submit_target"))
+            .and_then(|t| serde_json::from_value::<SubmitTarget>(t.clone()).ok())
+            .unwrap_or(SubmitTarget {
+                selector: selector.to_string(),
+                found: None,
+                visible: None,
+                enabled: None,
+                tag: None,
+                label: None,
+            })
+    });
+    (fields, target)
 }
 
 /// Decodes the result of [`filled_fields_js`] back into typed fields. A missing
@@ -500,10 +711,17 @@ pub struct RenderedPage {
     /// Count of subresources (images/fonts/media) dropped by request interception
     /// for this render. `0` when blocking is off or the render opted out.
     pub blocked_resources: usize,
-    /// Number of scripted [`PageAction`]s that ran before capture (a `Repeat`
-    /// counts as one). `0` when none were requested — lets a caller see that an
-    /// infinite-scroll script actually executed rather than silently no-op'd.
+    /// Number of scripted [`PageAction`]s the executor **reached** before
+    /// capture (a `Repeat` counts as one). `0` when none were requested — lets a
+    /// caller see that an infinite-scroll script actually executed rather than
+    /// silently no-op'd. Deliberately an *attempt* count: the render ladder has
+    /// always read it that way. For "how many worked", see [`Self::action_outcomes`].
     pub actions_completed: usize,
+    /// Per-action outcome, one entry per attempted action, in order (so
+    /// `action_outcomes.len() == actions_completed`). Empty when no actions were
+    /// requested. Renders may ignore it; the transact path turns it into the
+    /// evidence bundle's honest requested/attempted/succeeded accounting.
+    pub action_outcomes: Vec<StepOutcome>,
     /// Same-origin JSON responses captured during the render. Empty unless the
     /// request set [`RenderRequest::capture_network`]; size-capped by the engine.
     pub network: Vec<CapturedCall>,
@@ -909,6 +1127,153 @@ mod tests {
         );
         let fields = parse_filled_fields(&["#email".into()], Some(&serde_json::json!("nonsense")));
         assert!(!fields[0].found);
+    }
+
+    /// The anti-pattern: the executor counted every action it *reached* as
+    /// completed, so three missed selectors read as "3 steps completed".
+    /// Attempts, successes and the requested count are three different numbers.
+    #[test]
+    fn attempted_steps_not_counted_as_completed() {
+        use StepOutcome::*;
+        // Every step missed: attempted 3, completed 0 — never 3.
+        let s = summarize_steps(3, &[SelectorMissing, SelectorMissing, SelectorMissing]);
+        assert_eq!((s.requested, s.attempted, s.completed), (3, 3, 0));
+        assert!(!s.deadline_hit, "the list ran to its end, it just failed");
+        // Mixed run: only the Ok rows count.
+        let s = summarize_steps(4, &[Ok, ActionFailed, Ok, Partial]);
+        assert_eq!((s.requested, s.attempted, s.completed), (4, 4, 2));
+        // Deadline cut the list short: attempted < requested is the ONLY signal
+        // for that, so it is reported explicitly.
+        let s = summarize_steps(5, &[Ok, Ok]);
+        assert_eq!((s.requested, s.attempted, s.completed), (5, 2, 2));
+        assert!(s.deadline_hit);
+        // A clean run is unambiguous.
+        let s = summarize_steps(2, &[Ok, Ok]);
+        assert_eq!((s.requested, s.attempted, s.completed), (2, 2, 2));
+        assert!(!s.deadline_hit);
+        // No steps requested is not a failure.
+        assert_eq!(summarize_steps(0, &[]).completed, 0);
+        assert!(!summarize_steps(0, &[]).deadline_hit);
+    }
+
+    #[test]
+    fn interaction_outcome_separates_a_missing_selector_from_a_failed_action() {
+        assert_eq!(interaction_outcome(true, true), StepOutcome::Ok);
+        assert_eq!(interaction_outcome(true, false), StepOutcome::ActionFailed);
+        assert_eq!(
+            interaction_outcome(false, false),
+            StepOutcome::SelectorMissing
+        );
+        // "not found" wins even if the caller claims it acted — it cannot have.
+        assert_eq!(
+            interaction_outcome(false, true),
+            StepOutcome::SelectorMissing
+        );
+        assert!(StepOutcome::Ok.is_ok());
+        for not_ok in [
+            StepOutcome::SelectorMissing,
+            StepOutcome::ActionFailed,
+            StepOutcome::Partial,
+        ] {
+            assert!(!not_ok.is_ok(), "{not_ok:?} is not a success");
+        }
+        // The taxonomy is a stable wire contract (evidence.json + job results).
+        assert_eq!(
+            serde_json::to_value(StepOutcome::SelectorMissing).unwrap(),
+            serde_json::json!("selector_missing")
+        );
+    }
+
+    #[test]
+    fn a_repeat_pass_only_counts_clean_when_every_inner_step_succeeded() {
+        use StepOutcome::*;
+        assert!(pass_fully_succeeded(2, &[Ok, Ok]));
+        assert!(pass_fully_succeeded(0, &[]));
+        // One inner miss taints the whole pass (the block outcome is coarse).
+        assert!(!pass_fully_succeeded(2, &[Ok, SelectorMissing]));
+        // Deadline cut the pass short: fewer outcomes than requested steps.
+        assert!(!pass_fully_succeeded(3, &[Ok, Ok]));
+    }
+
+    #[test]
+    fn only_element_targeting_actions_expose_a_selector() {
+        assert_eq!(
+            PageAction::Click {
+                selector: "#go".into()
+            }
+            .selector(),
+            Some("#go")
+        );
+        assert_eq!(
+            PageAction::Type {
+                selector: "#email".into(),
+                text: "a".into()
+            }
+            .selector(),
+            Some("#email")
+        );
+        assert_eq!(
+            PageAction::WaitForSelector {
+                selector: "#panel".into(),
+                timeout_ms: None
+            }
+            .selector(),
+            Some("#panel")
+        );
+        assert_eq!(PageAction::ScrollBottom.selector(), None);
+        assert_eq!(PageAction::ScrollBy { pixels: 10 }.selector(), None);
+        assert_eq!(PageAction::WaitMs { ms: 5 }.selector(), None);
+        assert_eq!(
+            PageAction::Repeat {
+                times: 2,
+                steps: vec![],
+                until_selector_count_stable: None
+            }
+            .selector(),
+            None
+        );
+    }
+
+    /// The anti-pattern: the evidence echoed `would_submit` back verbatim and
+    /// never asked whether that button is on the final page — the single
+    /// question a reviewer needs answered before approving a live submit.
+    #[test]
+    fn submit_target_probe_reports_unknown_not_missing_when_it_cannot_look() {
+        let js = transact_probe_js(&["#email".into()], Some(r#"button[data-x="a\"b"]"#));
+        assert!(
+            js.contains("fields:"),
+            "one evaluate carries both halves: {js}"
+        );
+        assert!(js.contains("submit_target:"));
+        assert!(
+            js.contains(r#"\"a\\\"b\""#),
+            "the submit selector is JSON-escaped into the literal: {js}"
+        );
+
+        // A live probe result decodes into both halves.
+        let evaluated = serde_json::json!({
+            "fields": [{"selector": "#email", "value": "a@b.c", "found": true}],
+            "submit_target": {"selector": "#submit", "found": true, "visible": true,
+                              "enabled": false, "tag": "button", "label": "Confirm"}
+        });
+        let (fields, target) =
+            parse_transact_probe(&["#email".into()], Some("#submit"), Some(&evaluated));
+        assert_eq!(fields[0].value.as_deref(), Some("a@b.c"));
+        let target = target.expect("a selector was assessed");
+        assert_eq!(target.found, Some(true));
+        assert_eq!(target.enabled, Some(false), "a disabled button is reported");
+        assert_eq!(target.label.as_deref(), Some("Confirm"));
+
+        // Probe failed (evaluate threw / page navigated): "we could not look",
+        // NOT "the button is not there" — the two must never be conflated.
+        let (fields, target) = parse_transact_probe(&["#email".into()], Some("#submit"), None);
+        assert!(!fields[0].found);
+        assert_eq!(target.expect("still reported").found, None);
+
+        // No selector to assess at all (a scroll/wait submit action).
+        let (_, target) = parse_transact_probe(&[], None, Some(&evaluated));
+        assert!(target.is_none());
+        assert_eq!(submit_target_js(None), "null");
     }
 
     #[test]

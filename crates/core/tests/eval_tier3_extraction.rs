@@ -368,6 +368,7 @@ impl Browser for Empty {
             selector_found: None,
             blocked_resources: 0,
             actions_completed: 0,
+            action_outcomes: Vec::new(),
             network: Vec::new(),
         })
     }

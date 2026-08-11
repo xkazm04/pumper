@@ -53,10 +53,13 @@ use chromiumoxide::cdp::browser_protocol::network::{
 };
 use futures::StreamExt;
 use pumper_core::config::BrowserConfig;
-use pumper_core::engine::{CapturedCall, PageAction};
+use pumper_core::engine::{
+    interaction_outcome, parse_transact_probe, pass_fully_succeeded, summarize_steps,
+    transact_probe_js, CapturedCall, PageAction, StepOutcome,
+};
 use pumper_core::{
-    filled_fields_js, lru_touch_evict, parse_filled_fields, profile_browser_dir, Browser, Error,
-    RenderRequest, RenderedPage, Result, TransactEvidence, TransactRequest,
+    lru_touch_evict, profile_browser_dir, Browser, Error, RenderRequest, RenderedPage, Result,
+    TransactEvidence, TransactRequest,
 };
 use tokio::sync::{Mutex, Semaphore};
 use tracing::{info, warn};
@@ -559,12 +562,13 @@ impl Browser for BrowserEngine {
         // pages the one-shot render can't reach. Run after the settle and before
         // `evaluate`, under a total-time deadline of one nav timeout so a `Repeat`
         // can't run forever.
-        let actions_completed = if req.actions.is_empty() {
-            0
+        let action_outcomes = if req.actions.is_empty() {
+            Vec::new()
         } else {
             let deadline = tokio::time::Instant::now() + nav_timeout;
             execute_actions(&page, &req.actions, deadline).await
         };
+        let actions_completed = action_outcomes.len();
 
         let evaluated = match &req.evaluate {
             Some(js) => match page.evaluate(js.as_str()).await {
@@ -664,6 +668,7 @@ impl Browser for BrowserEngine {
             selector_found,
             blocked_resources,
             actions_completed,
+            action_outcomes,
             network,
         })
     }
@@ -681,37 +686,81 @@ impl Browser for BrowserEngine {
         // layer. Typed Error::Transact, never a silent downgrade to dry-run.
         req.validate()?;
         let fill = req.fill_selectors();
+        let submit_selector = req.submit_action.selector().map(str::to_string);
         let mut render = RenderRequest::new(&req.url);
         render.profile = req.profile.clone();
         render.wait_for_selector = req.wait_for_selector.clone();
         render.extra_wait_ms = req.extra_wait_ms;
-        render.max_body_bytes = req.max_body_bytes;
+        // The transact path caps the DOM ITSELF (truncate-and-flag below), so
+        // the render's fail-closed cap is disabled for this call only. An
+        // over-cap DOM must not destroy the evidence for a flow that has
+        // already navigated, filled and clicked — the read-only render path
+        // keeps failing closed, because there nothing has happened yet.
+        render.max_body_bytes = Some(0);
         // Only the reversible steps are executed. `submit_action` is
         // deliberately NOT appended — stop-before-submit is structural.
         render.actions = req.steps.clone();
-        render.evaluate = Some(filled_fields_js(&fill));
+        render.evaluate = Some(transact_probe_js(&fill, submit_selector.as_deref()));
         let page = self.render(render).await?;
-        Ok(evidence_from_render(req, &fill, page))
+        let cap = req.max_body_bytes.unwrap_or(self.cfg.max_html_bytes);
+        Ok(evidence_from_render(req, &fill, page, cap))
     }
+}
+
+/// Truncates `html` to at most `cap` bytes, on a UTF-8 char boundary, reporting
+/// whether anything was cut. `cap == 0` disables the cap (mirrors
+/// [`over_html_cap`]). Pure, so the truncate-don't-destroy contract is testable
+/// without Chrome.
+fn truncate_to_cap(html: String, cap: u64) -> (String, bool) {
+    if !over_html_cap(html.len() as u64, cap) {
+        return (html, false);
+    }
+    let mut end = cap as usize;
+    while end > 0 && !html.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut html = html;
+    html.truncate(end);
+    (html, true)
 }
 
 /// Assembles the dry-run evidence bundle from a completed render. Pure, so the
 /// stop-before-submit contract (`dry_run: true`, `would_submit` untouched, no
-/// screenshot claim the engine can't honor) is testable without Chrome.
+/// screenshot claim the engine can't honor) and the honest step accounting are
+/// testable without Chrome.
 fn evidence_from_render(
     req: TransactRequest,
     fill_selectors: &[String],
     page: RenderedPage,
+    dom_cap_bytes: u64,
 ) -> TransactEvidence {
+    let submit_selector = req.submit_action.selector().map(str::to_string);
+    let (filled_fields, submit_target) = parse_transact_probe(
+        fill_selectors,
+        submit_selector.as_deref(),
+        page.evaluated.as_ref(),
+    );
+    let steps = summarize_steps(req.steps.len(), &page.action_outcomes);
+    let dom_bytes = page.html.len();
+    let (dom_html, dom_truncated) = truncate_to_cap(page.html, dom_cap_bytes);
     TransactEvidence {
         dry_run: true,
         idempotency_key: req.idempotency_key,
+        profile: req.profile,
         url: req.url,
         final_url: page.final_url,
-        steps_completed: page.actions_completed,
-        filled_fields: parse_filled_fields(fill_selectors, page.evaluated.as_ref()),
+        steps_requested: steps.requested,
+        steps_attempted: steps.attempted,
+        steps_completed: steps.completed,
+        step_outcomes: page.action_outcomes,
+        steps_deadline_hit: steps.deadline_hit,
+        wait_for_selector_found: page.selector_found,
+        filled_fields,
         would_submit: req.submit_action,
-        dom_html: page.html,
+        submit_target,
+        dom_html,
+        dom_bytes,
+        dom_truncated,
         // Honest gap: the render path does not expose screenshot capture yet;
         // claiming a path here would be a lie the reviewer acts on.
         screenshot_path: None,
@@ -749,47 +798,69 @@ async fn count_matches(page: &chromiumoxide::Page, selector: &str) -> u64 {
         .unwrap_or(0)
 }
 
-/// Runs a scripted [`PageAction`] list in order, stopping at `deadline`. Returns
-/// the count of top-level actions that ran (a `Repeat` counts as one). Boxed so
-/// `Repeat` can recurse into its steps. Every step is best-effort — a failed
-/// click/selector is logged and skipped, never aborting the render.
+/// Runs a scripted [`PageAction`] list in order, stopping at `deadline`.
+/// Returns **one [`StepOutcome`] per top-level action the executor reached**, in
+/// order (a `Repeat` counts as one, with a coarse rolled-up outcome). Boxed so
+/// `Repeat` can recurse into its steps. Every step is still best-effort — a
+/// failed click/selector is logged and skipped, never aborting the render — but
+/// the failure is now *recorded* instead of silently counted as progress.
+///
+/// The anti-pattern this replaces: `completed += 1` sat outside every match arm,
+/// so a flow whose three selectors all missed reported three completed steps,
+/// and the evidence bundle a human approves off could not tell that run apart
+/// from a clean one. `outcomes.len()` is the attempt count callers used to get;
+/// `outcomes.iter().filter(is_ok)` is the honest success count.
 fn execute_actions<'a>(
     page: &'a chromiumoxide::Page,
     actions: &'a [PageAction],
     deadline: tokio::time::Instant,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = usize> + Send + 'a>> {
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Vec<StepOutcome>> + Send + 'a>> {
     Box::pin(async move {
-        let mut completed = 0usize;
+        let mut outcomes: Vec<StepOutcome> = Vec::with_capacity(actions.len());
         for action in actions {
             if tokio::time::Instant::now() >= deadline {
                 warn!("page actions hit the time budget; capturing current DOM");
                 break;
             }
-            match action {
+            let outcome = match action {
                 PageAction::ScrollBottom => {
-                    let _ = page
+                    let ok = page
                         .evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        .await;
+                        .await
+                        .is_ok();
+                    interaction_outcome(true, ok)
                 }
                 PageAction::ScrollBy { pixels } => {
-                    let _ = page.evaluate(format!("window.scrollBy(0, {pixels})")).await;
+                    let ok = page
+                        .evaluate(format!("window.scrollBy(0, {pixels})"))
+                        .await
+                        .is_ok();
+                    interaction_outcome(true, ok)
                 }
                 PageAction::Click { selector } => match page.find_element(selector).await {
                     Ok(el) => {
-                        if let Err(e) = el.click().await {
+                        let clicked = el.click().await;
+                        if let Err(e) = &clicked {
                             warn!(selector = %selector, "page action click failed: {e}");
                         }
+                        interaction_outcome(true, clicked.is_ok())
                     }
-                    Err(_) => warn!(selector = %selector, "page action click: selector not found"),
+                    Err(_) => {
+                        warn!(selector = %selector, "page action click: selector not found");
+                        interaction_outcome(false, false)
+                    }
                 },
                 PageAction::Type { selector, text } => {
                     if let Ok(el) = page.find_element(selector).await {
                         let _ = el.click().await;
-                        if let Err(e) = el.type_str(text).await {
+                        let typed = el.type_str(text).await;
+                        if let Err(e) = &typed {
                             warn!(selector = %selector, "page action type failed: {e}");
                         }
+                        interaction_outcome(true, typed.is_ok())
                     } else {
                         warn!(selector = %selector, "page action type: selector not found");
+                        interaction_outcome(false, false)
                     }
                 }
                 PageAction::WaitForSelector {
@@ -800,10 +871,13 @@ fn execute_actions<'a>(
                         .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms))
                         .unwrap_or(deadline)
                         .min(deadline);
-                    wait_for_selector(page, selector, d).await;
+                    // A selector that never appears is a MISS, not progress:
+                    // that is exactly the confirmation state a reviewer checks.
+                    interaction_outcome(wait_for_selector(page, selector, d).await, true)
                 }
                 PageAction::WaitMs { ms } => {
                     tokio::time::sleep(Duration::from_millis(*ms)).await;
+                    StepOutcome::Ok
                 }
                 PageAction::Repeat {
                     times,
@@ -811,13 +885,21 @@ fn execute_actions<'a>(
                     until_selector_count_stable,
                 } => {
                     let mut last_count: Option<u64> = None;
+                    // Coarse by design: one outcome for the whole block. Only a
+                    // pass where every inner step ran AND succeeded keeps it Ok.
+                    let mut every_pass_clean = true;
                     for _ in 0..*times {
                         if tokio::time::Instant::now() >= deadline {
+                            every_pass_clean = false;
                             break;
                         }
-                        execute_actions(page, steps, deadline).await;
+                        let inner = execute_actions(page, steps, deadline).await;
+                        if !pass_fully_succeeded(steps.len(), &inner) {
+                            every_pass_clean = false;
+                        }
                         // Stop early once the tracked selector's match count stops
-                        // growing — "scroll until no new rows load".
+                        // growing — "scroll until no new rows load". This is a
+                        // success condition, not a failure.
                         if let Some(sel) = until_selector_count_stable {
                             let count = count_matches(page, sel).await;
                             if last_count.is_some_and(|prev| count <= prev) {
@@ -826,11 +908,16 @@ fn execute_actions<'a>(
                             last_count = Some(count);
                         }
                     }
+                    if every_pass_clean {
+                        StepOutcome::Ok
+                    } else {
+                        StepOutcome::Partial
+                    }
                 }
-            }
-            completed += 1;
+            };
+            outcomes.push(outcome);
         }
-        completed
+        outcomes
     })
 }
 
@@ -1038,27 +1125,12 @@ mod tests {
     /// path is claimed (the render path can't produce one yet).
     #[test]
     fn transact_evidence_is_dry_run_with_the_would_be_action_verbatim() {
-        let req: TransactRequest = serde_json::from_str(
-            r##"{"url":"https://portal.example/signup",
-                 "idempotency_key":"signup-1",
-                 "steps":[{"action":"type","selector":"#email","text":"a@b.c"}],
-                 "submit_action":{"action":"click","selector":"#submit"}}"##,
-        )
-        .unwrap();
+        let req = flow_with_two_steps();
         let fill = req.fill_selectors();
-        let page = RenderedPage {
-            html: "<form>...</form>".into(),
-            final_url: Some("https://portal.example/signup?step=confirm".into()),
-            evaluated: Some(serde_json::json!([
-                {"selector": "#email", "value": "a@b.c", "found": true}
-            ])),
-            actions_completed: 1,
-            ..Default::default()
-        };
-        let ev = evidence_from_render(req, &fill, page);
+        let ev = evidence_from_render(req, &fill, clean_page(), 0);
         assert!(ev.dry_run);
         assert_eq!(ev.idempotency_key, "signup-1");
-        assert_eq!(ev.steps_completed, 1);
+        assert_eq!(ev.steps_completed, 2);
         assert_eq!(ev.filled_fields.len(), 1);
         assert_eq!(ev.filled_fields[0].value.as_deref(), Some("a@b.c"));
         assert!(
@@ -1070,5 +1142,136 @@ mod tests {
             "no screenshot claim without capture support"
         );
         assert_eq!(ev.dom_html, "<form>...</form>");
+        assert_eq!(ev.dom_bytes, "<form>...</form>".len());
+        assert!(!ev.dom_truncated);
+        assert_eq!(ev.profile.as_deref(), Some("portal_login"));
+    }
+
+    fn flow_with_two_steps() -> TransactRequest {
+        serde_json::from_str(
+            r##"{"url":"https://portal.example/signup",
+                 "idempotency_key":"signup-1",
+                 "profile":"portal_login",
+                 "wait_for_selector":"#confirm",
+                 "steps":[{"action":"type","selector":"#email","text":"a@b.c"},
+                          {"action":"click","selector":"#next"}],
+                 "submit_action":{"action":"click","selector":"#submit"}}"##,
+        )
+        .unwrap()
+    }
+
+    /// A render where both steps worked and the probe answered.
+    fn clean_page() -> RenderedPage {
+        RenderedPage {
+            html: "<form>...</form>".into(),
+            final_url: Some("https://portal.example/signup?step=confirm".into()),
+            evaluated: Some(serde_json::json!({
+                "fields": [{"selector": "#email", "value": "a@b.c", "found": true}],
+                "submit_target": {"selector": "#submit", "found": true, "visible": true,
+                                  "enabled": true, "tag": "button", "label": "Confirm"}
+            })),
+            selector_found: Some(true),
+            actions_completed: 2,
+            action_outcomes: vec![StepOutcome::Ok, StepOutcome::Ok],
+            ..Default::default()
+        }
+    }
+
+    /// The anti-pattern this direction exists to kill: a flow whose selectors
+    /// all missed produced a bundle a reviewer could not tell from a clean run.
+    #[test]
+    fn failed_selectors_not_reported_as_completed_steps() {
+        let req = flow_with_two_steps();
+        let fill = req.fill_selectors();
+        let page = RenderedPage {
+            html: "<html>login wall</html>".into(),
+            final_url: Some("https://portal.example/login".into()),
+            evaluated: Some(serde_json::json!({
+                "fields": [{"selector": "#email", "value": null, "found": false}],
+                "submit_target": {"selector": "#submit", "found": false, "visible": null,
+                                  "enabled": null, "tag": null, "label": null}
+            })),
+            selector_found: Some(false),
+            actions_completed: 2,
+            action_outcomes: vec![StepOutcome::SelectorMissing, StepOutcome::SelectorMissing],
+            ..Default::default()
+        };
+        let bad = evidence_from_render(req, &fill, page, 0);
+        let good = evidence_from_render(flow_with_two_steps(), &fill, clean_page(), 0);
+
+        // Both asked for and attempted two steps; only one COMPLETED any.
+        assert_eq!((bad.steps_requested, bad.steps_attempted), (2, 2));
+        assert_eq!(bad.steps_completed, 0, "nothing succeeded");
+        assert_eq!(good.steps_completed, 2);
+        assert!(!bad.steps_deadline_hit, "the list ran, it just failed");
+        assert_eq!(
+            bad.step_outcomes,
+            vec![StepOutcome::SelectorMissing; 2],
+            "per-step outcomes carry WHY"
+        );
+        // The confirmation state and the submit target tell the runs apart...
+        assert_eq!(bad.wait_for_selector_found, Some(false));
+        assert_eq!(good.wait_for_selector_found, Some(true));
+        assert_eq!(bad.submit_target.as_ref().unwrap().found, Some(false));
+        assert_eq!(good.submit_target.as_ref().unwrap().found, Some(true));
+        // ...while `would_submit` alone cannot: it is identical in both.
+        assert_eq!(
+            serde_json::to_value(&bad.would_submit).unwrap(),
+            serde_json::to_value(&good.would_submit).unwrap()
+        );
+    }
+
+    #[test]
+    fn deadline_cut_steps_are_visible_as_attempted_below_requested() {
+        let req = flow_with_two_steps();
+        let fill = req.fill_selectors();
+        let page = RenderedPage {
+            html: "<form>...</form>".into(),
+            actions_completed: 1,
+            action_outcomes: vec![StepOutcome::Ok],
+            ..Default::default()
+        };
+        let ev = evidence_from_render(req, &fill, page, 0);
+        assert_eq!((ev.steps_requested, ev.steps_attempted), (2, 1));
+        assert!(ev.steps_deadline_hit, "step 2 never ran");
+        // The probe never answered, so the target is "unknown", not "missing".
+        assert_eq!(ev.submit_target.expect("selector exists").found, None);
+    }
+
+    /// The anti-pattern: an over-cap DOM failed the whole job AFTER the flow had
+    /// already navigated, filled and clicked — destroying every trace of what a
+    /// live page was just made to do. The transact path truncates and flags.
+    #[test]
+    fn over_cap_dom_truncated_not_evidence_destroyed() {
+        let req = flow_with_two_steps();
+        let fill = req.fill_selectors();
+        let mut page = clean_page();
+        page.html = "abcdefghij".repeat(10); // 100 bytes
+        let ev = evidence_from_render(req, &fill, page, 40);
+        assert!(ev.dom_truncated);
+        assert_eq!(ev.dom_bytes, 100, "the CAPTURED size is reported in full");
+        assert_eq!(ev.dom_html.len(), 40, "the stored snapshot is the prefix");
+        // The rest of the bundle survived intact — that is the whole point.
+        assert_eq!(ev.steps_completed, 2);
+        assert_eq!(ev.submit_target.expect("assessed").found, Some(true));
+    }
+
+    #[test]
+    fn truncate_to_cap_respects_char_boundaries_and_a_zero_cap() {
+        // Under/at the cap: untouched.
+        assert_eq!(truncate_to_cap("abc".into(), 10), ("abc".into(), false));
+        assert_eq!(truncate_to_cap("abc".into(), 3), ("abc".into(), false));
+        // 0 disables the cap (mirrors `over_html_cap`).
+        assert_eq!(truncate_to_cap("abc".into(), 0), ("abc".into(), false));
+        // Over the cap: cut, flagged.
+        assert_eq!(truncate_to_cap("abcdef".into(), 3), ("abc".into(), true));
+        // A cut that lands mid-codepoint walks back to a boundary rather than
+        // panicking (String::truncate would).
+        let (out, cut) = truncate_to_cap("aé".into(), 2); // 'é' is 2 bytes
+        assert!(cut);
+        assert_eq!(out, "a");
+        let (out, cut) = truncate_to_cap("é".into(), 1);
+        assert!(cut);
+        assert_eq!(out, "", "no valid prefix => empty, still flagged");
     }
 }

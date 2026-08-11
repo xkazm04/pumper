@@ -98,10 +98,13 @@ impl ScrapeApp for Transact {
                 }),
             }],
             output_shape: Some(
-                "{dry_run: true, idempotency_key, url, final_url, steps_completed, \
-                 filled_fields: [{selector, value, found}], would_submit: PageAction, \
-                 nav_timed_out, artifacts: {evidence: \"evidence.json\", dom: \"dom.html\"}, \
-                 next_slice: \"...\"}",
+                "{dry_run: true, idempotency_key, profile, url, final_url, \
+                 steps: {requested, attempted, completed, deadline_hit, outcomes: [ok|\
+                 selector_missing|action_failed|partial]}, steps_completed (= steps.completed, \
+                 SUCCESSES not attempts), wait_for_selector_found, \
+                 filled_fields: [{selector, value, found}], would_submit: PageAction, submit_target: {selector, found, visible, enabled, \
+                 tag, label}, dom_truncated, nav_timed_out, \
+                 artifacts: {evidence: \"evidence.json\", dom: \"dom.html\"}, next_slice: \"...\"}",
             ),
             // Browser-only by design: the flow never escalates to a metered
             // engine, so per CostClass's own contract runs are Free.
@@ -132,15 +135,36 @@ impl ScrapeApp for Transact {
         // full evidence bundle live beside the job, not inside jobs.result.
         ctx.save_artifact("dom.html", evidence.dom_html.as_bytes())
             .await?;
+        // The steps block is the bundle's honesty core: requested / attempted /
+        // completed are three different numbers, and only `completed` counts
+        // steps that actually worked. A flow whose selectors all missed reports
+        // `completed: 0` with `outcomes: ["selector_missing", ...]`.
+        let steps = json!({
+            "requested": evidence.steps_requested,
+            "attempted": evidence.steps_attempted,
+            "completed": evidence.steps_completed,
+            "deadline_hit": evidence.steps_deadline_hit,
+            "outcomes": evidence.step_outcomes,
+        });
         let bundle = json!({
             "generated_at": chrono::Utc::now().to_rfc3339(),
             "dry_run": evidence.dry_run,
             "idempotency_key": evidence.idempotency_key,
+            "profile": evidence.profile,
             "url": evidence.url,
             "final_url": evidence.final_url,
+            "steps": steps.clone(),
             "steps_completed": evidence.steps_completed,
+            "wait_for_selector_found": evidence.wait_for_selector_found,
             "filled_fields": evidence.filled_fields,
             "would_submit": evidence.would_submit,
+            "submit_target": evidence.submit_target,
+            "dom": {
+                "artifact": "dom.html",
+                "bytes_captured": evidence.dom_bytes,
+                "bytes_stored": evidence.dom_html.len(),
+                "truncated": evidence.dom_truncated,
+            },
             "screenshot_path": evidence.screenshot_path,
             "nav_timed_out": evidence.nav_timed_out,
             "dom_artifact": "dom.html",
@@ -154,11 +178,16 @@ impl ScrapeApp for Transact {
         Ok(json!({
             "dry_run": evidence.dry_run,
             "idempotency_key": evidence.idempotency_key,
+            "profile": evidence.profile,
             "url": evidence.url,
             "final_url": evidence.final_url,
+            "steps": steps,
             "steps_completed": evidence.steps_completed,
+            "wait_for_selector_found": evidence.wait_for_selector_found,
             "filled_fields": evidence.filled_fields,
             "would_submit": evidence.would_submit,
+            "submit_target": evidence.submit_target,
+            "dom_truncated": evidence.dom_truncated,
             "nav_timed_out": evidence.nav_timed_out,
             "artifacts": { "evidence": "evidence.json", "dom": "dom.html" },
             "next_slice": "live submission requires human approval: pending-approval \
@@ -171,6 +200,7 @@ impl ScrapeApp for Transact {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pumper_core::engine::{StepOutcome, SubmitTarget};
     use pumper_core::testing::{engines_with, Dead, TempStore, TestContext};
     use pumper_core::{
         Browser, Error, PageAction, RenderRequest, RenderedPage, Storage, TransactEvidence,
@@ -191,8 +221,32 @@ mod tests {
 
     /// A browser that answers `transact` with canned evidence and records the
     /// request; `render` is a test bug (the app must use the transact seam).
+    /// `outcomes` scripts what each step "did", so a healthy flow and a flow
+    /// whose every selector missed can be compared through the same app code.
     struct ScriptedBrowser {
         seen: std::sync::Mutex<Vec<TransactRequest>>,
+        outcomes: Vec<StepOutcome>,
+        submit_found: Option<bool>,
+    }
+
+    impl ScriptedBrowser {
+        /// Every step succeeded and the submit button is on the page.
+        fn healthy() -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+                outcomes: vec![StepOutcome::Ok, StepOutcome::Ok],
+                submit_found: Some(true),
+            }
+        }
+
+        /// Every selector missed and the submit target is nowhere to be seen.
+        fn all_selectors_missing() -> Self {
+            Self {
+                seen: std::sync::Mutex::new(Vec::new()),
+                outcomes: vec![StepOutcome::SelectorMissing, StepOutcome::SelectorMissing],
+                submit_found: Some(false),
+            }
+        }
     }
 
     #[async_trait]
@@ -203,19 +257,36 @@ mod tests {
 
         async fn transact(&self, req: TransactRequest) -> pumper_core::Result<TransactEvidence> {
             req.validate()?;
+            let completed = self.outcomes.iter().filter(|o| o.is_ok()).count();
             let evidence = TransactEvidence {
                 dry_run: true,
                 idempotency_key: req.idempotency_key.clone(),
+                profile: req.profile.clone(),
                 url: req.url.clone(),
                 final_url: Some(format!("{}?step=confirm", req.url)),
-                steps_completed: req.steps.len(),
+                steps_requested: req.steps.len(),
+                steps_attempted: self.outcomes.len(),
+                steps_completed: completed,
+                step_outcomes: self.outcomes.clone(),
+                steps_deadline_hit: false,
+                wait_for_selector_found: Some(completed > 0),
                 filled_fields: vec![pumper_core::FilledField {
                     selector: "#email".into(),
                     value: Some("team@example.com".into()),
-                    found: true,
+                    found: completed > 0,
                 }],
+                submit_target: req.submit_action.selector().map(|s| SubmitTarget {
+                    selector: s.to_string(),
+                    found: self.submit_found,
+                    visible: self.submit_found,
+                    enabled: self.submit_found,
+                    tag: Some("button".into()),
+                    label: Some("Confirm".into()),
+                }),
                 would_submit: req.submit_action.clone(),
                 dom_html: "<form>confirm</form>".into(),
+                dom_bytes: "<form>confirm</form>".len(),
+                dom_truncated: false,
                 screenshot_path: None,
                 nav_timed_out: false,
             };
@@ -267,9 +338,7 @@ mod tests {
     #[tokio::test]
     async fn dry_run_threads_key_and_profile_and_saves_the_evidence_bundle() {
         let store = TempStore::new("transact-dryrun").await;
-        let browser = Arc::new(ScriptedBrowser {
-            seen: std::sync::Mutex::new(Vec::new()),
-        });
+        let browser = Arc::new(ScriptedBrowser::healthy());
         let mut params = dry_run_params();
         params["profile"] = json!("portal_login");
         let ctx = ctx_with_browser(&store.storage, params, browser.clone()).await;
@@ -313,5 +382,72 @@ mod tests {
         );
         let dom = std::fs::read_to_string(artifacts_dir.join("dom.html")).unwrap();
         assert_eq!(dom, "<form>confirm</form>");
+    }
+
+    /// The anti-pattern: a flow whose every selector 404'd produced an evidence
+    /// bundle **indistinguishable** from a clean run — same `steps_completed`,
+    /// no per-step outcomes, no word on whether the submit button even exists.
+    /// A human approves a live submit off this bundle, so the two runs must not
+    /// read the same.
+    #[tokio::test]
+    async fn failed_flow_evidence_not_identical_to_a_clean_flow() {
+        async fn run_with(tag: &str, browser: Arc<ScriptedBrowser>) -> (Value, Value) {
+            let store = TempStore::new(tag).await;
+            let mut params = dry_run_params();
+            params["profile"] = json!("portal_login");
+            params["wait_for_selector"] = json!("#confirm-panel");
+            let ctx = ctx_with_browser(&store.storage, params, browser).await;
+            let artifacts_dir = ctx.artifacts_dir.clone();
+            let out = Transact.run(ctx).await.unwrap();
+            let bundle: Value = serde_json::from_str(
+                &std::fs::read_to_string(artifacts_dir.join("evidence.json")).unwrap(),
+            )
+            .unwrap();
+            (out, bundle)
+        }
+
+        let (good, good_bundle) =
+            run_with("transact-ok", Arc::new(ScriptedBrowser::healthy())).await;
+        let (bad, bad_bundle) = run_with(
+            "transact-miss",
+            Arc::new(ScriptedBrowser::all_selectors_missing()),
+        )
+        .await;
+
+        // Same two steps requested and attempted in both runs...
+        assert_eq!(good["steps"]["requested"], json!(2));
+        assert_eq!(bad["steps"]["requested"], json!(2));
+        assert_eq!(bad["steps"]["attempted"], json!(2));
+        // ...but only successes count as completed.
+        assert_eq!(good["steps_completed"], json!(2));
+        assert_eq!(
+            bad["steps_completed"],
+            json!(0),
+            "a flow whose selectors all missed completed NOTHING"
+        );
+        assert_eq!(
+            bad["steps"]["outcomes"],
+            json!(["selector_missing", "selector_missing"])
+        );
+
+        // The confirmation state and the submit target are honest, not echoed.
+        assert_eq!(good["wait_for_selector_found"], json!(true));
+        assert_eq!(bad["wait_for_selector_found"], json!(false));
+        assert_eq!(good["submit_target"]["found"], json!(true));
+        assert_eq!(bad["submit_target"]["found"], json!(false));
+        // `would_submit` is identical in both — which is exactly why echoing it
+        // alone could never tell the runs apart.
+        assert_eq!(good["would_submit"], bad["would_submit"]);
+
+        // The persisted bundles differ too (this is the artifact a human reads).
+        assert_ne!(good_bundle["steps"], bad_bundle["steps"]);
+        assert_ne!(good_bundle["submit_target"], bad_bundle["submit_target"]);
+        // The identity the flow ran under, and the DOM's size, are recorded.
+        assert_eq!(good_bundle["profile"], json!("portal_login"));
+        assert_eq!(good_bundle["dom"]["truncated"], json!(false));
+        assert_eq!(
+            good_bundle["dom"]["bytes_captured"],
+            json!("<form>confirm</form>".len())
+        );
     }
 }
