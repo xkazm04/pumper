@@ -437,6 +437,58 @@ try {
                         -Detail "expected 409, got: $($_.Exception.Message)"
                 }
             }
+
+            # Round 10: the transact door refuses garbage AT ENQUEUE. Each bad
+            # payload must be a 422 whose envelope carries code "unprocessable"
+            # — a 202 here means the schema tightening regressed and a flow
+            # would burn a browser run to rediscover the refusal. (The graceful
+            # -shutdown bound cannot be driven from this script: Windows has no
+            # way to deliver Ctrl-C to a detached hidden process, so that path
+            # stays proven at the e2e layer only.)
+            function Test-TransactDoor {
+                param([string]$Name, [hashtable]$JobParams)
+                try {
+                    $resp = Invoke-WebRequest -Method Post -Uri "$baseUrl/apps/transact/jobs" `
+                        -Body (@{ params = $JobParams } | ConvertTo-Json -Depth 8) `
+                        -ContentType 'application/json' -UseBasicParsing -TimeoutSec 10
+                    Add-Result -Name $Name -Status 'FAIL' `
+                        -Detail "expected 422, got HTTP $($resp.StatusCode) — the door let it through"
+                } catch {
+                    $code = $_.Exception.Response.StatusCode.value__
+                    $body = ''
+                    try { $body = $_.ErrorDetails.Message } catch {}
+                    if ($code -eq 422 -and $body -like '*"unprocessable"*') {
+                        Add-Result -Name $Name -Status 'PASS'
+                    } else {
+                        Add-Result -Name $Name -Status 'FAIL' `
+                            -Detail "expected 422 + code 'unprocessable', got HTTP $code body '$body'"
+                    }
+                }
+            }
+            $transactBase = @{
+                url             = 'https://example.com/form'
+                idempotency_key = 'smoke-door-1'
+                submit_action   = @{ action = 'click'; selector = '#go' }
+            }
+            $withSubmit = $transactBase.Clone(); $withSubmit.submit = $true
+            Test-TransactDoor -Name 'POST /apps/transact/jobs submit:true -> 422' -JobParams $withSubmit
+            $withBlankKey = $transactBase.Clone(); $withBlankKey.idempotency_key = '   '
+            Test-TransactDoor -Name 'POST /apps/transact/jobs blank idempotency_key -> 422' -JobParams $withBlankKey
+            $withTypo = $transactBase.Clone(); $withTypo.step = @(@{ action = 'click'; selector = '#next' })
+            Test-TransactDoor -Name "POST /apps/transact/jobs typo'd 'step' key -> 422" -JobParams $withTypo
+
+            # ...and the manifest DECLARES the closed door, so a consumer
+            # reading the tool definition sees the same contract the door
+            # enforces (a regression here ships a lying schema even if the
+            # server-side validator still rejects).
+            Test-JsonEndpoint -Name 'GET /apps?format=tools declares the closed transact door' `
+                -Path '/apps?format=tools' -Assert {
+                param($j)
+                $t = @($j.tools | Where-Object { $_.name -eq 'transact' })[0]
+                if (-not $t) { return $false }
+                ($t.inputSchema.properties.submit.const -eq $false) -and
+                ($t.inputSchema.additionalProperties -eq $false)
+            }
         } else {
             Add-Result -Name 'job runs to completion (hackernews)' -Status 'SKIP' -Detail 'no job id to poll (enqueue failed)'
             Add-Result -Name 'GET /jobs/{id}/receipt' -Status 'SKIP' -Detail 'no job id to fetch a receipt for'
