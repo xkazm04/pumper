@@ -68,7 +68,7 @@ Ledger writes are **fail-open**: a write that fails is logged loudly and the hop
 
 `app` filters on `source_app` and is **validated**: an unmatchable value is a `400` naming the accepted ones, not a `200` with an empty list (which reads as "you have no triggers on that source" — the opposite answer). The accepted set is deliberately wider than the watch namespaces, because a `source_kind = "external"` trigger's `source_app` is an ingress source id: registered apps + virtual namespaces (see [events-webhooks.md § Watchable namespaces](events-webhooks.md#watch-namespaces)) + ingress source ids + `*` + every `source_app` already stored. That last term is what keeps a filter over existing rows working however the create rules tighten.
 
-`POST /triggers` body: `{name?, source_kind, source_app, source_dataset?, on_change?, on_status?, target_app, params?, budget_usd?, priority?, max_attempts?, filters?, plugins?}`. The `plugins` object attaches sandboxed WASM hooks — see [trigger-plugins.md](trigger-plugins.md).
+`POST /triggers` body: `{name?, source_kind, source_app, source_dataset?, on_change?, on_status?, target_app, params?, budget_usd?, priority?, max_attempts?, filters?, plugins?}`. The `plugins` object attaches sandboxed WASM hooks — see [trigger-plugins.md](trigger-plugins.md). `budget_usd` must be **> 0** (422 otherwise): omitting it means "no ceiling", so `0` cannot also mean "spend nothing" — and a silently-dropped `0` here would be worse than one bad job, because the value is stored on the trigger row and replayed into every hop it fires.
 
 ## Evaluation-set caching
 

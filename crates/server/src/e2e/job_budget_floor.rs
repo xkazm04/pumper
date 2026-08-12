@@ -60,6 +60,59 @@ async fn budget_zero_is_rejected_not_unlimited() {
     );
 }
 
+/// Same floor at the trigger door — where the dropped value was WORSE than one
+/// bad job: `budget_usd` is stored on the trigger row and replayed into every
+/// hop it fires, so `0` silently becoming `None` was a standing unlimited-spend
+/// generator.
+#[tokio::test]
+async fn trigger_budget_zero_is_rejected_not_a_standing_unlimited_generator() {
+    let (state, _store) = test_state(vec![Arc::new(FakeApp)]).await;
+    let router = routes::router(state.clone());
+
+    let post = |body: Value| {
+        let router = router.clone();
+        async move {
+            let req = Request::builder()
+                .method("POST")
+                .uri("/triggers")
+                .header("content-type", "application/json")
+                .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                .unwrap();
+            let resp = router.oneshot(req).await.unwrap();
+            let status = resp.status();
+            let bytes = resp.into_body().collect().await.unwrap().to_bytes();
+            let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
+            (status, body)
+        }
+    };
+
+    let trigger = |budget: Value| {
+        json!({
+            "source_kind": "job",
+            "source_app": "fake",
+            "target_app": "fake",
+            "budget_usd": budget,
+        })
+    };
+
+    let (status, body) = post(trigger(json!(0.0))).await;
+    assert_eq!(
+        status,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "a zero trigger budget must be refused, not stored as unlimited: {body}"
+    );
+    let triggers = state.storage.list_triggers(None).await.unwrap();
+    assert!(
+        triggers.is_empty(),
+        "the refused trigger must not exist: {triggers:?}"
+    );
+
+    // A real ceiling still creates, stored verbatim for every future hop.
+    let (status, body) = post(trigger(json!(0.5))).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    assert_eq!(body["budget_usd"], 0.5, "{body}");
+}
+
 #[tokio::test]
 async fn a_real_ceiling_and_an_omitted_one_both_still_enqueue() {
     let (state, _store) = test_state(vec![Arc::new(FakeApp)]).await;

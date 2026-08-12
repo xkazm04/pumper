@@ -603,6 +603,50 @@ mod control_event_tests {
 mod budget_tests {
     use super::validate_budget_usd;
 
+    /// Convention guard: the idiom this fix replaced must be EXTINCT, not just
+    /// fixed where it was found — `.filter(|b| *b > 0.0)` silently rewrites a
+    /// caller's "spend nothing" into "no ceiling", and it already spread once
+    /// (jobs door → triggers door) before being caught. Whitespace is stripped
+    /// before matching so rustfmt wrapping cannot hide a site (the round-11
+    /// chokepoint-guard lesson).
+    #[test]
+    fn budget_filter_antipattern_is_extinct() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        // Built from parts so this definition cannot match itself in the scan.
+        let needle = format!("budget_usd.{}", "filter(|b|*b>0.0)");
+        let needle = needle.as_str();
+        let mut offenders = Vec::new();
+        let mut stack = vec![root];
+        while let Some(dir) = stack.pop() {
+            for entry in std::fs::read_dir(&dir).expect("readable src dir") {
+                let path = entry.expect("dir entry").path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|e| e == "rs") {
+                    let source = std::fs::read_to_string(&path).expect("readable source");
+                    // Comment-stripped view, then whitespace-stripped: doc
+                    // comments legitimately QUOTE the anti-pattern (this
+                    // module's own docs do), and rustfmt wrapping must not
+                    // hide a real site — the round-11 chokepoint-guard lesson,
+                    // both halves.
+                    let flat: String = source
+                        .lines()
+                        .filter(|l| !l.trim_start().starts_with("//"))
+                        .flat_map(str::split_whitespace)
+                        .collect();
+                    if flat.contains(needle) {
+                        offenders.push(path);
+                    }
+                }
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "budget_usd may only pass a door through validate_budget_usd — \
+             the silent zero-means-unlimited filter is back in: {offenders:?}"
+        );
+    }
+
     /// The anti-pattern: `budget_usd: 0.0` filtered away to `None`, which at
     /// this door means NO ceiling — so "spend nothing" enqueued the one job
     /// shape that can spend without limit.

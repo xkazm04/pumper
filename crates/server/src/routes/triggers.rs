@@ -106,7 +106,12 @@ pub(crate) struct CreateTriggerBody {
     target_app: String,
     /// Static params template; `_trigger` is merged over it at fire time.
     params: Option<Value>,
-    /// The TARGET's spend ceiling (never inherited from the source).
+    /// The TARGET's spend ceiling (never inherited from the source). Must be
+    /// **> 0** — see `jobs::validate_budget_usd`: omitting it means "no
+    /// ceiling", so `0` cannot also mean "spend nothing" and is refused (422).
+    /// Worse here than at the jobs door: the value is stored on the trigger row
+    /// and replayed into EVERY hop it fires, so a silently-dropped `0` would be
+    /// a standing unlimited-spend generator, not one bad job.
     budget_usd: Option<f64>,
     priority: Option<i64>,
     max_attempts: Option<i64>,
@@ -253,7 +258,10 @@ pub(crate) async fn create_trigger(
             on_status,
             target_app: &body.target_app,
             params: &params,
-            budget_usd: body.budget_usd.filter(|b| *b > 0.0),
+            // Same floor as the jobs door: a non-positive ceiling is refused,
+            // not silently dropped to None (= unlimited on every future hop).
+            budget_usd: super::jobs::validate_budget_usd(body.budget_usd)
+                .map_err(|msg| ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg))?,
             priority: body.priority.unwrap_or(0),
             max_attempts: body.max_attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS_CAP),
             filters,
