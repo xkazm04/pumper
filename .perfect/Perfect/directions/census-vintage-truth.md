@@ -3,12 +3,12 @@ slug: census-vintage-truth
 type: perfect/direction
 context: "[[us-business-census]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 8a9c038
 ---
 ## What & why
 The blend looks fresh weekly while resting on 2021/2022 vintages; a re-run with
@@ -65,4 +65,28 @@ about WHAT it aggregates and WHEN it is from.
 - No trades-common edits (write-set boundary).
 
 ## Build record
-(to fill during build)
+Builder: Lot C (opus). Commit **8a9c038**. Director verdict **KEEP** (diff read in full).
+- AC1 OK — the design decision is RECORDED with both options argued. Rejected vintage-in-key
+  (it multiplies every dataset by its history, forces every reader to learn a "pick the
+  latest" rule, and no `sync_many` is reachable for these namespaces so old-keyed rows would
+  linger anyway); chose a per-dataset watermark in a `vintages` dataset that REFUSES an older
+  year before any write. `vintage_verdict` is pure and tested (years compared as NUMBERS, so
+  a non-padded vintage cannot sort wrong; Unorderable never blocks — "a guard that cannot
+  judge must not refuse"); the guard itself is driven against a real store.
+  `params.allow_vintage_rewind` keeps the deliberate case possible and then moves the
+  watermark DOWN to follow the data rather than leaving a high-water mark of runs.
+- AC2 OK — `{geo}|{denominator_kind}|{place}` with `key_grain` stamped on the record. The
+  migration story is stated honestly: legacy rows cannot be tombstoned from the app, because
+  `RemovalGuard` is `sync_many`-only and scoped to the app's OWN namespace, which
+  `census` is not. The blend is defended instead via `base_index` (state grain only,
+  newest first), so a legacy row cannot shadow a current one.
+- AC3 OK — per-input `vintages` block, each half honest-Null when absent. Deliberately NO
+  derivation timestamp on the record: it would enter the change hash and mark every row
+  changed on every re-derive. A test pins the absence, not just the presence.
+- AC4 OK — `covering_naics` in census-common: keep the aggregate, drop the components, with
+  the reasoning recorded (keeping components instead trades a visible double-count for an
+  invisible shortfall across unrequested siblings). Dropped codes are emitted on the record,
+  so the correction is visible rather than silent. trades-common untouched as briefed.
+- AC5 OK — calendar windows replace positional ones (`months_contiguous`); a gapped series
+  emits no velocity and says why; `accel_basis` labels the x4-on-NSA; `as_of_age_months`
+  plus `stale_sectors` and a run warning.

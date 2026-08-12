@@ -3,12 +3,12 @@ slug: nowcast-honesty-floor
 type: perfect/direction
 context: "[[czech-labor-market]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 1fa1e59
 ---
 ## What & why
 `cz-labour/salary_nowcast` is the context's highest-risk derived product:

@@ -3,12 +3,12 @@ slug: census-blend-first-class
 type: perfect/direction
 context: "[[us-business-census]]"
 lens: feature
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 3989fba
 ---
 ## What & why
 The two product datasets of the census fleet — `census/market_blend` and
@@ -60,4 +60,20 @@ fires; I search saturation, it's there; I audit a blend row to its inputs."
   unindexed unless the builder argues otherwise with numbers.
 
 ## Build record
-(to fill during build)
+Builder: Lot C (opus). Commit **3989fba**. Director verdict **KEEP** (diff read in full).
+- AC1 OK — index_datasets on all four apps via `census_common::with_product_index`, each with
+  a wiring guard test whose needle is split so it cannot match itself.
+- AC2 OK — `derived_provenance` (job_id + `derived://census/{ds}?inputs=...&as_of=...`,
+  never replayable); store-backed tests read the stamps back off real revisions.
+- AC3 OK — `read_hit_cap` (`>=`, fails safe) measured on the RAW read BEFORE tombstone
+  filtering: filtering first would hide a capped read behind a smaller live count.
+  `params.blend_read_limit` makes the boundary drivable; a test asserts exactly at the cap.
+- AC4 **BLOCKED, honestly** — and the builder REFUTED my brief. cordis `topic_stats` is NOT a
+  precedent (cordis writes under its own app namespace). The coverage test requires a live
+  row's `app` to be a REGISTERED app; both consumers key on the pair the data lands under
+  (`census/...`); so the only functional row shape is the one the test refuses. Filing it
+  under a producing app would compile and would be a lie. Gap documented in
+  catalog/data-sources.toml with the server-side fix named. The refutation is correct and
+  load-bearing — my brief's precedent claim was wrong.
+- AC5 OK — apps.md / datasets.md / resilient-extraction.md corrected. The last one carried a
+  FALSE claim that census apps can be quarantined; no census app calls observe_extraction.

@@ -57,4 +57,25 @@ CATALOG_EXEMPT (routes/mod.rs:406-408).
   retryable, API-key-in-cache-key (cache-miss-on-rotation only).
 
 ## Shipped
-- (none yet on the 46-map — r15 wave in flight)
+- **r15 (2026-08-12) — 3/3 shipped, landed in master `e131bae` (ff).** Full gate 1602/0.
+  - [[census-blend-first-class]] → `3989fba` — the two products became reachable at all:
+    `index_datasets` on all four apps (before this, `run_indexed_apps` meant no watch, trigger
+    or saved search on app `census` could EVER fire), real `derived_provenance` instead of
+    `Provenance::default()`, and a capped input read now flags `blend_complete: false` instead
+    of blending a window as if it were the corpus.
+  - [[census-suppression-honesty]] → `dd5e0e1` — the $0-succession-receipt fabrication chain
+    is dead end to end (the repo's own flagged-not-fixed test flipped and renamed after the
+    anti-pattern), one shared `is_empty_answer` guard across the fleet pinned by inventory
+    test, and suppression is counted per trade and per run instead of absorbed.
+  - [[census-vintage-truth]] → `8a9c038` — a backwards re-run is refused before it writes
+    (per-dataset watermark, pure `vintage_verdict`, `allow_vintage_rewind` escape hatch),
+    saturation keys carry their grain, blend rows name every input's vintage, mixed-grain
+    NAICS stops double-counting, and velocity windows became calendar windows.
+  - Director `e131bae` — the employer-side twin of the suppression fabrication (national
+    benchmarks divided across mismatched place sets). Found by reading the diff, not by a
+    failing test.
+- **Seam gaps reported by this wave (Class C, not fixed here — banked):** the catalog coverage
+  test refuses a virtual-namespace row while both consumers key on exactly that pair (the same
+  wall czech-labor-market hit — this is now TWICE, so the server-side fix has earned its slot);
+  no census app calls `observe_extraction`, so the whole resilience ladder is inert for this
+  fleet; `census/saturation` legacy rows have no reachable tombstone path.

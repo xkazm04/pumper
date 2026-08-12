@@ -3,12 +3,12 @@ slug: census-suppression-honesty
 type: perfect/direction
 context: "[[us-business-census]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: dd5e0e1
 ---
 ## What & why
 Suppressed Census cells currently FABRICATE data: a withheld `NRCPTOT` becomes
@@ -57,4 +57,21 @@ run says how partial it was; one empty API answer doesn't zero out the scrape.
   (scout found none) before removing the field on suppression.
 
 ## Build record
-(to fill during build)
+Builder: Lot C (opus). Commit **dd5e0e1**. Director verdict **KEEP + one Director follow-up**.
+- AC1 OK — the flagged-not-fixed test is FLIPPED and renamed
+  `suppressed_receipts_are_null_not_a_fabricated_zero`; a second test drives the suppression
+  across the app boundary into `blend_market` and pins `succession_receipts` Null.
+- AC2 OK — `census_common::is_empty_answer` used by all four apps, pinned by an inventory
+  test that reads the sibling crates' source; raw http call sites unmoved, chokepoint green.
+- AC3 OK — per-trade and per-run suppression counters; `normalize_places` extracted from the
+  `filter_map` whose `return None` was the silent drop, now counted BY REASON.
+- AC4 OK — `total_market_per_10k_basis` is emitted together with the value.
+- AC5 OK — genuine zeros pinned as measured zeros in both parsers.
+- **Director finding, fixed in e131bae:** the builder fixed the solo side and left the
+  employer twin. CBP suppresses per CELL, so `national_avg_wage` summed reported payroll
+  over reported employees across DIFFERENT sets of places — a state reporting EMP with PAYANN
+  withheld added its whole workforce to the denominator and nothing to the numerator, so the
+  published national wage moved with Census's disclosure rules rather than with the labour
+  market (39,333 instead of 50,000 on the case now pinned). Fixed as `PairedTotals` +
+  `national_benchmarks`; `employees` / `annual_payroll_thousands` are Null-not-0 on a
+  withheld cell. The test discriminates on both benchmarks.

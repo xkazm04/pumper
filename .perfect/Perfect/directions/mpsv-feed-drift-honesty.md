@@ -3,12 +3,12 @@ slug: mpsv-feed-drift-honesty
 type: perfect/direction
 context: "[[czech-labor-market]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 19f37e2
 ---
 ## What & why
 Two confirmed-unfixed bughunt findings (2026-07-14) plus the structural reason

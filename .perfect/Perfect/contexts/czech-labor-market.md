@@ -51,4 +51,31 @@ daily, both CostClass::Free. Encoding + retry handled at the engine layer.
   source integration, bigger than one session, no steer asking for it.
 
 ## Shipped
-- (pre-46-map: role_trends, salary gap — w6+w9 old map. r15 wave in flight.)
+- (pre-46-map: role_trends, salary gap — w6+w9 old map.)
+- **r15 (2026-08-12) — 3/3 shipped, landed in master `e131bae` (ff).** Full gate 1602/0,
+  live smoke 34/34.
+  - [[nowcast-honesty-floor]] → `1fa1e59` — closes the round-4 note verbatim. A
+    division-derived salary projection had exactly one output guard (`ratio<=0`); it now
+    refuses in causal order (implausible divisor → out-of-band projection → thin evidence)
+    and the refusal is a **null on a shipped row**, because nothing tombstones this dataset
+    and a dropped key would linger at yesterday's published number. The row IS the retraction.
+    The ISPV anchor is judged, not merely stamped (400d, costs exactly one confidence level).
+  - [[mpsv-feed-drift-honesty]] → `19f37e2` — both bughunt-confirmed data bugs closed by
+    name: schema drift stops deserializing to a clean `stored: 0` success (missing key vs
+    present-but-empty are distinguished, judged by per-feed floors with url-override and
+    maxRecords exemptions), and the region roll-up is hoisted above the czisco gate so
+    unclassified postings stop being silently excluded from "the true regional distribution".
+    First `run()`-level tests in both apps — the structural reason these survived so long.
+  - [[labour-datasets-visible]] → `fdc8c3d` — 12 datasets were undiscoverable. The visible
+    half is search; the load-bearing half is that `load_run_changes` is scoped by
+    `run_indexed_apps`, so `cz-labour` revisions were never even LOADED after a run and no
+    watch or trigger on the shared namespace could fire at all. Every exclusion is reasoned
+    and pinned by inventory test; the e2e was verified DISCRIMINATING (remove the declaration
+    and both tests fail); the remaining bootstrap gap is pinned by a test that names its
+    one-line fix.
+- **Seam gaps reported (Class C, banked):** `catalog_tests` refuses a declared virtual
+  namespace, so no contract can evaluate `cz-labour/*` — the SAME wall us-business-census hit
+  the same day. Two independent contexts blocked on one server-side seam is the strongest
+  signal this round produced; it fronts a future slate together with
+  `registry::VIRTUAL_NAMESPACES` seeding (which also closes the cz-labour watch bootstrap
+  404) and the `load_run_changes` 1000-row cap, newly load-bearing for this namespace.

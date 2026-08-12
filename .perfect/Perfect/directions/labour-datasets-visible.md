@@ -3,12 +3,12 @@ slug: labour-datasets-visible
 type: perfect/direction
 context: "[[czech-labor-market]]"
 lens: feature
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: fdc8c3d
 ---
 ## What & why
 Twelve datasets, zero discovery: neither mpsv app emits `index_datasets`, so no
