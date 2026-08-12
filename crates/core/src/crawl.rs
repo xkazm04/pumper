@@ -14,7 +14,7 @@
 //! (capped at `MAX_FRONTIER`) and the kept-page SimHash fingerprints (8 bytes
 //! each) — both bounded, neither the page bodies.
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -482,8 +482,23 @@ pub struct CrawlStats {
     /// challenge marker) and therefore NOT kept — see `fetcher::http_bot_wall`.
     pub skipped_botwall: usize,
     /// robots.txt fetches that failed at the transport layer (fail-open to
-    /// allow-all, but surfaced rather than hidden).
+    /// allow-all, but surfaced rather than hidden). Equals the number of origins
+    /// crawled without verified rules — see `robots_unverified_hosts`.
     pub robots_fetch_failures: usize,
+    /// The origins (`scheme://host[:port]`) whose robots.txt could not be fetched
+    /// at all, and which were therefore crawled under a fail-open **assumption**
+    /// rather than under verified rules. Empty = every host's rules were read.
+    ///
+    /// Failing open on a transport failure is the right default and is not up for
+    /// change — but a run that fails open and then reports `respect_robots: true`
+    /// with `skipped_robots: 0` *looks* compliant when it is not, and politeness
+    /// is the one bug class in a scraper whose cost lands on someone else's
+    /// server. A bare count reads as noise; naming the origins is the point.
+    ///
+    /// A non-2xx robots response (e.g. `404` "no robots") is a legitimate
+    /// allow-all and deliberately does NOT appear here. Sorted and capped at
+    /// [`MAX_UNVERIFIED_HOSTS`]; `robots_fetch_failures` carries the full count.
+    pub robots_unverified_hosts: Vec<String>,
     /// Checkpoint saves that failed to persist (write/rename error).
     pub checkpoint_errors: usize,
     /// True when this run restored frontier state from a checkpoint.
@@ -648,11 +663,27 @@ impl Frontier {
             .collect()
     }
 
-    /// Restores queued URLs + seen-set from a checkpoint (bypasses the dedup
-    /// check; `seen` is authoritative). Per-host `taken` counts are not persisted,
-    /// so the per-host budget restarts for the resumed run.
-    fn restore(&mut self, queue: Vec<(String, u32)>, seen: Vec<String>) {
+    /// Per-host pages already handed out, for checkpointing.
+    fn taken(&self) -> &HashMap<String, usize> {
+        &self.taken
+    }
+
+    /// Restores queued URLs + seen-set + per-host `taken` counts from a
+    /// checkpoint (bypasses the dedup check; `seen` is authoritative).
+    ///
+    /// Anti-pattern the `taken` half defends — *the budget that resets on every
+    /// resume*. `max_pages_per_host` is documented as host fairness, but on a
+    /// long crawl its real job is politeness, and durable execution silently
+    /// multiplied it by the retry count: a `max_pages_per_host: 100` crawl reaped
+    /// and re-claimed four times fetched up to 500 pages from one host.
+    fn restore(
+        &mut self,
+        queue: Vec<(String, u32)>,
+        seen: Vec<String>,
+        taken: HashMap<String, usize>,
+    ) {
         self.seen = seen.into_iter().collect();
+        self.taken = taken;
         for (url, depth) in queue {
             self.enqueue(url, depth);
         }
@@ -770,7 +801,7 @@ pub async fn crawl(
     if let Some(state) = &cfg.resume_state {
         match Checkpoint::from_value(state) {
             CheckpointLoad::Loaded(cp) => {
-                frontier.restore(cp.queue, cp.seen);
+                frontier.restore(cp.queue, cp.seen, cp.taken);
                 dedup_index = SimHashIndex::from_hashes(cfg.dedup_distance, cp.kept_hashes);
                 resumed = true;
             }
@@ -784,10 +815,13 @@ pub async fn crawl(
         }
     }
 
-    let mut seed_hosts: HashSet<String> = HashSet::new();
+    // Origins (scheme+host+port), not bare hosts: robots.txt and /sitemap.xml
+    // both belong to an ORIGIN, and probing them over a scheme the crawl is not
+    // using is how an http-only site ends up crawled with no rules at all.
+    let mut seed_origins: HashSet<String> = HashSet::new();
     for seed in &cfg.seeds {
-        if let Some(host) = host_of(seed) {
-            seed_hosts.insert(host);
+        if let Some(origin) = origin_of(seed) {
+            seed_origins.insert(origin);
         }
         frontier.push(canonicalize_str(seed), 0);
     }
@@ -830,8 +864,8 @@ pub async fn crawl(
             }
             for (_, seed) in scored {
                 let url = canonicalize_str(&seed.url);
-                if let Some(host) = host_of(&url) {
-                    seed_hosts.insert(host);
+                if let Some(origin) = origin_of(&url) {
+                    seed_origins.insert(origin);
                 }
                 conditional.insert(
                     url.clone(),
@@ -853,6 +887,7 @@ pub async fn crawl(
     }
 
     let mut robots: HashMap<String, RobotRules> = HashMap::new();
+    let mut robots_audit = RobotsAudit::default();
     let mut hosts: HashSet<String> = HashSet::new();
     let mut stats = CrawlStats {
         resumed,
@@ -873,9 +908,9 @@ pub async fn crawl(
 
     // Expand seeds from each seed host's sitemaps before crawling.
     if cfg.sitemap_seeds {
-        let hosts: Vec<String> = seed_hosts.iter().cloned().collect();
-        for host in hosts {
-            let declared = robots_for(&mut robots, &http, &host, &mut stats.robots_fetch_failures)
+        let origins: Vec<String> = seed_origins.iter().cloned().collect();
+        for origin in origins {
+            let declared = robots_for(&mut robots, &http, &origin, &mut robots_audit)
                 .await
                 .sitemaps
                 .clone();
@@ -884,7 +919,7 @@ pub async fn crawl(
                 break;
             }
             stats.sitemap_seeded +=
-                seed_from_sitemaps(&http, &host, &declared, &mut frontier, &filter, budget).await;
+                seed_from_sitemaps(&http, &origin, &declared, &mut frontier, &filter, budget).await;
         }
     }
 
@@ -899,14 +934,16 @@ pub async fn crawl(
             };
             let host = host_of(&url).unwrap_or_default();
             let mut crawl_delay = None;
-            if cfg.respect_robots && !host.is_empty() {
-                let rules =
-                    robots_for(&mut robots, &http, &host, &mut stats.robots_fetch_failures).await;
-                if !rules.allowed(&url) {
+            // Robots are looked up by ORIGIN, so the probe uses the very scheme
+            // (and port) this fetch is about to use — see [`robots_url`].
+            if let Some(origin) = cfg.respect_robots.then(|| origin_of(&url)).flatten() {
+                let rules = robots_for(&mut robots, &http, &origin, &mut robots_audit).await;
+                let allowed = rules.allowed(&url);
+                crawl_delay = rules.crawl_delay;
+                if !allowed {
                     stats.skipped_robots += 1;
                     continue;
                 }
-                crawl_delay = rules.crawl_delay;
             }
             if let Some(delay) = crawl_delay {
                 let now = tokio::time::Instant::now();
@@ -1145,6 +1182,9 @@ pub async fn crawl(
     stats.frontier_remaining = frontier.len() + in_flight_urls.len();
     stats.frontier_dropped = frontier.dropped();
     stats.skipped_host_budget = frontier.skipped_host_budget();
+    // Compliance evidence: how many origins failed open, and WHICH ones.
+    stats.robots_fetch_failures = robots_audit.unverified_count();
+    stats.robots_unverified_hosts = robots_audit.unverified_hosts();
     // Final, unthrottled save so the persisted state reflects the true end of the
     // run (an incomplete crawl's remaining frontier is the resume point). Flushes
     // the sink first — see [`flush_then_checkpoint`].
@@ -1216,7 +1256,8 @@ fn top_n_by_count(map: HashMap<String, usize>, n: usize) -> HashMap<String, usiz
 
 /// Current checkpoint schema version. Bumped when the persisted shape changes;
 /// a mismatch triggers a clean fresh start rather than a silently-wrong resume.
-const CHECKPOINT_VERSION: u32 = 1;
+/// v2 added the per-host `taken` budget counts.
+const CHECKPOINT_VERSION: u32 = 2;
 
 /// Result of attempting to restore a checkpoint.
 enum CheckpointLoad {
@@ -1240,6 +1281,10 @@ struct Checkpoint {
     queue: Vec<(String, u32)>,
     seen: Vec<String>,
     kept_hashes: Vec<u64>,
+    /// Pages already handed out per host, so `max_pages_per_host` is a budget for
+    /// the CRAWL rather than for each attempt of it.
+    #[serde(default)]
+    taken: HashMap<String, usize>,
 }
 
 impl Checkpoint {
@@ -1383,6 +1428,7 @@ async fn save_checkpoint(
         queue: checkpoint_queue(frontier, in_flight),
         seen: frontier.seen.iter().cloned().collect(),
         kept_hashes: kept_hashes.to_vec(),
+        taken: frontier.taken().clone(),
     };
     match serde_json::to_value(&cp) {
         Ok(state) => sink.save(state, force).await,
@@ -1618,29 +1664,96 @@ fn host_of(url: &str) -> Option<String> {
     Url::parse(url).ok()?.host_str().map(str::to_owned)
 }
 
+/// Scheme + host + port of a URL — the identity a robots.txt actually belongs to,
+/// and therefore the robots cache key. `None` for anything that is not an
+/// http(s) URL. `Url` normalizes default ports away, so `https://x` and
+/// `https://x:443` are the same origin while `http://x` and `https://x` are not.
+fn origin_of(url: &str) -> Option<String> {
+    let parsed = Url::parse(url).ok()?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return None;
+    }
+    let host = parsed.host_str()?;
+    Some(match parsed.port() {
+        Some(port) => format!("{}://{host}:{port}", parsed.scheme()),
+        None => format!("{}://{host}", parsed.scheme()),
+    })
+}
+
+/// The robots.txt URL governing a page URL: **the scheme the crawl is actually
+/// using for that host**, that host, and its port.
+///
+/// Anti-pattern this defends — *the https-only robots probe*. The URL used to be
+/// `https://{host}/robots.txt` with the seed's own scheme ignored and the bare
+/// host as the cache key. For an `http`-only origin that probe fails at the
+/// transport layer, which fails open to allow-all, and the crawl then walks every
+/// `Disallow:` path while reporting `respect_robots: true` and
+/// `skipped_robots: 0`. The site owner finds out before the operator does.
+fn robots_url(page_url: &str) -> Option<String> {
+    Some(format!("{}/robots.txt", origin_of(page_url)?))
+}
+
+/// Cap on the named unverified-robots origins carried in the result; the full
+/// count stays in `robots_fetch_failures`. Same idiom as [`MAX_FAILED_HOSTS`].
+const MAX_UNVERIFIED_HOSTS: usize = 50;
+
+/// Evidence about how robots.txt compliance was actually achieved this run, so
+/// the result can distinguish hosts crawled under **verified** rules from hosts
+/// crawled under a **failed-open assumption**.
+#[derive(Default)]
+struct RobotsAudit {
+    /// Origins whose robots.txt fetch failed at the transport layer. A
+    /// `BTreeSet` so the reported list is deduped and deterministic.
+    unverified: BTreeSet<String>,
+}
+
+impl RobotsAudit {
+    /// Records that `origin` was crawled without its rules ever being read.
+    fn failed_open(&mut self, origin: &str) {
+        self.unverified.insert(origin.to_string());
+    }
+
+    /// How many origins were crawled without verified rules (one fetch per
+    /// origin, so this is also the robots fetch-failure count).
+    fn unverified_count(&self) -> usize {
+        self.unverified.len()
+    }
+
+    /// The named origins, deterministic and capped.
+    fn unverified_hosts(&self) -> Vec<String> {
+        self.unverified
+            .iter()
+            .take(MAX_UNVERIFIED_HOSTS)
+            .cloned()
+            .collect()
+    }
+}
+
 async fn robots_for<'a>(
     cache: &'a mut HashMap<String, RobotRules>,
     http: &Arc<dyn HttpClient>,
-    host: &str,
-    fetch_failures: &mut usize,
+    origin: &str,
+    audit: &mut RobotsAudit,
 ) -> &'a RobotRules {
-    if !cache.contains_key(host) {
-        let url = format!("https://{host}/robots.txt");
+    if !cache.contains_key(origin) {
+        // `origin` is already an origin string, so this is `{origin}/robots.txt`;
+        // the fallback is unreachable for anything the callers pass.
+        let url = robots_url(origin).unwrap_or_else(|| format!("{origin}/robots.txt"));
         let rules = match http.fetch(HttpRequest::get(&url)).await {
             Ok(resp) if resp.is_success() => RobotRules::parse(&resp.body),
             // A non-2xx (e.g. 404 "no robots") is a legitimate allow-all.
             Ok(_) => RobotRules::allow_all(),
-            // A transport failure is NOT "no robots" — fail open, but count it
-            // instead of silently pretending the host allowed everything.
+            // A transport failure is NOT "no robots" — fail open, but name the
+            // origin instead of silently pretending it allowed everything.
             Err(e) => {
-                *fetch_failures += 1;
-                tracing::debug!(%host, "crawl: robots.txt fetch failed: {e}");
+                audit.failed_open(origin);
+                tracing::debug!(%origin, "crawl: robots.txt fetch failed: {e}");
                 RobotRules::allow_all()
             }
         };
-        cache.insert(host.to_string(), rules);
+        cache.insert(origin.to_string(), rules);
     }
-    cache.get(host).unwrap()
+    cache.get(origin).unwrap()
 }
 
 /// robots.txt rules for the `*` user-agent: ordered Allow/Disallow patterns
@@ -1807,14 +1920,16 @@ fn parse_sitemap_entries(xml: &str) -> Vec<SitemapEntry> {
 /// deep. Returns how many URLs were pushed.
 async fn seed_from_sitemaps(
     http: &Arc<dyn HttpClient>,
-    host: &str,
+    origin: &str,
     declared: &[String],
     frontier: &mut Frontier,
     filter: &UrlFilter,
     budget: usize,
 ) -> usize {
+    // The fallback probe uses the seed's own scheme/port, for the same reason
+    // [`robots_url`] does: an http-only origin has no https sitemap either.
     let roots: Vec<String> = if declared.is_empty() {
-        vec![format!("https://{host}/sitemap.xml")]
+        vec![format!("{origin}/sitemap.xml")]
     } else {
         declared
             .iter()
@@ -3009,6 +3124,206 @@ mod tests {
         assert_eq!(top.get("b").copied(), Some(5));
         assert_eq!(top.get("c").copied(), Some(3));
         assert!(!top.contains_key("a"), "smallest dropped");
+    }
+
+    #[test]
+    fn robots_is_probed_over_the_pages_own_scheme_not_always_https() {
+        // The scheme the crawl is USING decides where robots.txt lives.
+        assert_eq!(
+            robots_url("http://ex.com/a/b").as_deref(),
+            Some("http://ex.com/robots.txt")
+        );
+        assert_eq!(
+            robots_url("https://ex.com/a/b").as_deref(),
+            Some("https://ex.com/robots.txt")
+        );
+        // A non-default port is part of the origin: :8080 has its own robots.txt.
+        assert_eq!(
+            robots_url("http://ex.com:8080/x").as_deref(),
+            Some("http://ex.com:8080/robots.txt")
+        );
+        // `Url` normalizes default ports, so both spellings are one origin...
+        assert_eq!(
+            robots_url("https://ex.com:443/x"),
+            robots_url("https://ex.com/x")
+        );
+        // ...while the two schemes are DIFFERENT origins, i.e. different cache
+        // keys — one host can serve different rules (or nothing) on each.
+        assert_ne!(origin_of("http://ex.com/x"), origin_of("https://ex.com/x"));
+        // Nothing to probe for a non-http(s) or unparseable URL.
+        assert_eq!(robots_url("ftp://ex.com/x"), None);
+        assert_eq!(robots_url("not a url"), None);
+    }
+
+    #[tokio::test]
+    async fn an_http_only_host_is_not_crawled_under_a_failed_open_robots_assumption_silently() {
+        // The seed is http://, but robots was probed at https:// regardless. For
+        // an http-only origin that fails at the transport layer, which fails open
+        // to allow-all — so the crawl walked every `Disallow:` path while
+        // reporting `respect_robots: true` and `skipped_robots: 0`.
+        let mut pages = HashMap::new();
+        pages.insert(
+            "http://ex.com/".to_string(),
+            (
+                200,
+                "<html><body><a href=\"/admin/secret\">a</a><a href=\"/pub\">b</a></body></html>"
+                    .to_string(),
+            ),
+        );
+        pages.insert(
+            "http://ex.com/admin/secret".to_string(),
+            (
+                200,
+                "<html><body><p>private area</p></body></html>".to_string(),
+            ),
+        );
+        pages.insert(
+            "http://ex.com/pub".to_string(),
+            (
+                200,
+                "<html><body><p>public area</p></body></html>".to_string(),
+            ),
+        );
+        pages.insert(
+            "http://ex.com/robots.txt".to_string(),
+            (200, "User-agent: *\nDisallow: /admin\n".to_string()),
+        );
+        // https:// is simply not reachable for this origin.
+        let mut fail = HashSet::new();
+        fail.insert("https://ex.com/robots.txt".to_string());
+        let http = Arc::new(MockHttp {
+            pages,
+            fail,
+            ..Default::default()
+        });
+
+        let mut cfg = test_cfg(&["http://ex.com/"]);
+        cfg.respect_robots = true;
+        let stats = crawl(http, cfg, None, None, None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stats.skipped_robots, 1,
+            "the Disallow: /admin rule was actually read and obeyed"
+        );
+        assert_eq!(stats.kept, 2, "index + /pub, never /admin/secret");
+        assert_eq!(
+            stats.robots_fetch_failures, 0,
+            "nothing failed open — the rules were verified over http"
+        );
+        assert!(
+            stats.robots_unverified_hosts.is_empty(),
+            "a verified host is not reported as unverified: {:?}",
+            stats.robots_unverified_hosts
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_robots_fetch_is_named_not_just_counted() {
+        // Failing open on a transport failure is correct and stays. What must not
+        // survive is the run LOOKING compliant afterwards.
+        let mut pages = HashMap::new();
+        pages.insert(
+            "http://ex.com/".to_string(),
+            (
+                200,
+                "<html><body><p>only page</p></body></html>".to_string(),
+            ),
+        );
+        let mut fail = HashSet::new();
+        fail.insert("http://ex.com/robots.txt".to_string());
+        let http = Arc::new(MockHttp {
+            pages,
+            fail,
+            ..Default::default()
+        });
+        let mut cfg = test_cfg(&["http://ex.com/"]);
+        cfg.respect_robots = true;
+        let stats = crawl(http, cfg, None, None, None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.kept, 1, "fail-open still allows the crawl");
+        assert_eq!(stats.skipped_robots, 0);
+        assert_eq!(stats.robots_fetch_failures, 1);
+        assert_eq!(
+            stats.robots_unverified_hosts,
+            vec!["http://ex.com".to_string()],
+            "the origin crawled without rules is NAMED, not just counted"
+        );
+
+        // A 404 "no robots" is a legitimate allow-all and must NOT be reported as
+        // an unverified assumption — that distinction is the whole point.
+        let mut pages = HashMap::new();
+        pages.insert(
+            "https://ok.com/".to_string(),
+            (
+                200,
+                "<html><body><p>only page</p></body></html>".to_string(),
+            ),
+        );
+        let http = Arc::new(MockHttp {
+            pages,
+            ..Default::default()
+        });
+        let mut cfg = test_cfg(&["https://ok.com/"]);
+        cfg.respect_robots = true;
+        let stats = crawl(http, cfg, None, None, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(stats.robots_fetch_failures, 0);
+        assert!(stats.robots_unverified_hosts.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_resumed_crawl_does_not_hand_a_host_a_fresh_page_budget() {
+        // `taken` was not persisted, so a job reaped and re-claimed four times
+        // fetched up to 4x `max_pages_per_host` from one host. The cap is
+        // documented as host fairness, but on a long crawl its real job is
+        // politeness — and durable execution silently multiplied it.
+        let mut frontier = Frontier::new(Some(2));
+        for i in 0..5 {
+            frontier.push(format!("https://a.com/{i}"), 0);
+        }
+        assert!(frontier.pop().is_some());
+        assert!(frontier.pop().is_some());
+        assert!(
+            frontier.pop().is_none(),
+            "budget of 2 is spent for this run"
+        );
+
+        // Re-push the dropped backlog so the resumed run has work to refuse.
+        let mut frontier = Frontier::new(Some(2));
+        for i in 0..5 {
+            frontier.push(format!("https://a.com/{i}"), 0);
+        }
+        frontier.pop();
+        frontier.pop();
+
+        let saved = Arc::new(SyncMutex::new(Vec::new()));
+        let sink: Arc<dyn crate::app::CheckpointSink> = Arc::new(CollectCheckpoints {
+            saves: saved.clone(),
+            log: None,
+        });
+        assert!(save_checkpoint(&sink, &frontier, &HashMap::new(), &[], true).await);
+        let (state, _) = saved.lock().unwrap().pop().expect("saved");
+        let CheckpointLoad::Loaded(cp) = Checkpoint::from_value(&state) else {
+            panic!("the checkpoint must load at the current version");
+        };
+        assert_eq!(cp.taken.get("a.com").copied(), Some(2), "budget persisted");
+
+        let mut resumed = Frontier::new(Some(2));
+        resumed.restore(cp.queue, cp.seen, cp.taken);
+        assert!(
+            resumed.pop().is_none(),
+            "the resumed run does not get a fresh allowance for a host it already spent"
+        );
+        assert_eq!(
+            resumed.skipped_host_budget(),
+            3,
+            "the refused backlog is still reported honestly"
+        );
     }
 
     #[test]
