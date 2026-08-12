@@ -1805,17 +1805,40 @@ pub(crate) const JOB_RESULT_DATASET: &str = "_job";
 /// a legitimate corpus and are never swept.
 pub(crate) const JOB_RECORD_DATASET: &str = "_records";
 
+/// Whether a result's echoed record arrays (`records`/`stories`/`items`) should
+/// be indexed here at all.
+///
+/// A result that names `index_datasets` gets its records indexed from the
+/// dataset **change feed** ([`dataset_search_docs`]): stable
+/// `<app>:<dataset>:<key>` ids, re-index in place, removals honoured. Its
+/// `records` array is now a bounded SAMPLE of the run (the extractor echoes a
+/// prefix, capped by `records_echo`) — indexing that echo here too would
+/// double-index the first N records of every run under a second id
+/// (`<app>:<url>` in `_records`), and the duplicates would then diverge: the
+/// echo copy is never re-indexed or removed when the dataset row changes.
+fn echo_indexing_delegated(result: &Value) -> bool {
+    result.get("index_datasets").is_some()
+}
+
 /// Builds full-text search documents from a job's result: each element of a
-/// `records`/`stories`/`items` array, or the whole result as one document.
+/// `records`/`stories`/`items` array — unless `index_datasets` delegates those
+/// records to the delta-driven dataset indexer — or the whole result as one
+/// document.
 fn search_docs(app: &str, job_id: Uuid, result: &Value) -> Vec<SearchDoc> {
     let mut docs = Vec::new();
-    for key in ["records", "stories", "items"] {
-        if let Some(arr) = result.get(key).and_then(Value::as_array) {
-            for (i, rec) in arr.iter().enumerate() {
-                docs.push(record_doc(app, job_id, i, rec));
+    if !echo_indexing_delegated(result) {
+        for key in ["records", "stories", "items"] {
+            if let Some(arr) = result.get(key).and_then(Value::as_array) {
+                for (i, rec) in arr.iter().enumerate() {
+                    docs.push(record_doc(app, job_id, i, rec));
+                }
             }
         }
     }
+    // The whole-result fallback stays OUTSIDE the delegation guard: an
+    // `index_datasets` run still mints its one `_job` snapshot doc, so the run
+    // itself (mode, counts, health) remains findable even though its records
+    // are indexed from the dataset.
     if docs.is_empty() {
         docs.push(SearchDoc {
             id: format!("{app}:{job_id}"),
@@ -2089,6 +2112,35 @@ mod job_result_doc_tests {
     };
     use serde_json::json;
     use uuid::Uuid;
+
+    /// The anti-pattern: a result that declares `index_datasets` has its records
+    /// indexed from the dataset change feed — indexing the echoed `records`
+    /// prefix here too double-indexed the first N records of every run under a
+    /// second, never-updated id.
+    #[test]
+    fn echoed_prefix_not_double_indexed_when_dataset_declared() {
+        let job = Uuid::new_v4();
+        let result = json!({
+            "records": [{"url": "https://x/1"}, {"url": "https://x/2"}],
+            "index_datasets": [{"app": "extractor", "dataset": "extracted"}],
+        });
+        let docs = search_docs("extractor", job, &result);
+        // The echo is skipped; the run still mints its one `_job` snapshot doc,
+        // so the run itself stays findable.
+        assert_eq!(docs.len(), 1, "echo delegated, fallback kept: {docs:?}");
+        assert_eq!(docs[0].dataset, JOB_RESULT_DATASET);
+        assert!(
+            !docs.iter().any(|d| d.dataset == JOB_RECORD_DATASET),
+            "no `_records` doc may shadow the dataset-indexed copy"
+        );
+
+        // Without the declaration the echo is still the only coverage — the
+        // legacy path is untouched.
+        let undeclared = json!({"records": [{"url": "https://x/1"}]});
+        let docs = search_docs("hackernews", job, &undeclared);
+        assert_eq!(docs.len(), 1);
+        assert_eq!(docs[0].dataset, JOB_RECORD_DATASET);
+    }
 
     /// The anti-pattern: stamping `dataset = <app>` on documents that came from a
     /// job result, which put a dataset that does not exist into `/search` facets
