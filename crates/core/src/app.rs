@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::cache::ResearchCache;
 use crate::costs::{CostLedger, SpentTotal};
-use crate::datasets::{ChangeKind, Datasets, Provenance, Record, UpsertSummary};
+use crate::datasets::{ChangeKind, Datasets, DerivedPaths, Provenance, Record, UpsertSummary};
 use crate::engine::{EngineSet, ResearchOutput, ResearchRequest};
 use crate::fetcher::{FetchOutcome, FetchRequest};
 use crate::plugin::Plugins;
@@ -581,10 +581,31 @@ impl AppContext {
         items: &[(String, Value)],
         prov: Provenance,
     ) -> Result<UpsertSummary> {
+        self.upsert_many_with_derived(dataset, items, prov, &DerivedPaths::NONE)
+            .await
+    }
+
+    /// [`upsert_many_with_provenance`](Self::upsert_many_with_provenance)
+    /// declaring which record paths this producer **derived** from another
+    /// dataset rather than observed at its own source — see [`DerivedPaths`].
+    ///
+    /// Use it when an app writes a joined block into its own records before
+    /// upserting (eu-sedia's CORDIS `history`): without it, the joined
+    /// dataset's own cadence marks every joined record `changed`, and watches,
+    /// triggers, webhooks and the yield ledger cannot tell that churn from a
+    /// real publication at the source. Records and revisions still carry the
+    /// full value; only the change-detection hash narrows.
+    pub async fn upsert_many_with_derived(
+        &self,
+        dataset: &str,
+        items: &[(String, Value)],
+        prov: Provenance,
+        derived: &DerivedPaths,
+    ) -> Result<UpsertSummary> {
         let (dataset, trust) = self.write_target(dataset).await;
         let prov = self.stamp(prov);
         self.datasets
-            .upsert_many_stamped(&self.app, &dataset, items, trust, Some(&prov))
+            .upsert_many_derived(&self.app, &dataset, items, trust, Some(&prov), derived)
             .await
     }
 

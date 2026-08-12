@@ -1070,7 +1070,7 @@ impl Datasets {
         items: &[(String, Value)],
         trust: Option<&str>,
     ) -> Result<UpsertSummary> {
-        self.upsert_many_at_depth(app, dataset, items, trust, None, 0)
+        self.upsert_many_at_depth(app, dataset, items, trust, None, &DerivedPaths::NONE, 0)
             .await
     }
 
@@ -1089,7 +1089,23 @@ impl Datasets {
         trust: Option<&str>,
         prov: Option<&Provenance>,
     ) -> Result<UpsertSummary> {
-        self.upsert_many_at_depth(app, dataset, items, trust, prov, 0)
+        self.upsert_many_at_depth(app, dataset, items, trust, prov, &DerivedPaths::NONE, 0)
+            .await
+    }
+
+    /// [`upsert_many_stamped`](Self::upsert_many_stamped) declaring which record
+    /// paths are **derived** — see [`DerivedPaths`]. Opt-in per write; passing
+    /// [`DerivedPaths::NONE`] is byte-for-byte the plain batch upsert.
+    pub async fn upsert_many_derived(
+        &self,
+        app: &str,
+        dataset: &str,
+        items: &[(String, Value)],
+        trust: Option<&str>,
+        prov: Option<&Provenance>,
+        derived: &DerivedPaths,
+    ) -> Result<UpsertSummary> {
+        self.upsert_many_at_depth(app, dataset, items, trust, prov, derived, 0)
             .await
     }
 
@@ -1097,6 +1113,7 @@ impl Datasets {
     /// ingest, +1 per derived hop. Boxed because the derived hook recurses
     /// (derived writes are themselves upserts that can match further specs);
     /// the recursion is bounded by `derived_max_depth`.
+    #[allow(clippy::too_many_arguments)]
     fn upsert_many_at_depth<'a>(
         &'a self,
         app: &'a str,
@@ -1104,11 +1121,12 @@ impl Datasets {
         items: &'a [(String, Value)],
         trust: Option<&'a str>,
         prov: Option<&'a Provenance>,
+        derived: &'a DerivedPaths,
         depth: u32,
     ) -> futures::future::BoxFuture<'a, Result<UpsertSummary>> {
         Box::pin(async move {
             let summary = self
-                .upsert_many_inner(app, dataset, items, trust, prov)
+                .upsert_many_inner(app, dataset, items, trust, prov, derived)
                 .await?;
             // Fresh keys flow through matching enabled derived specs in the
             // same flow. Fail-open: a broken spec must never fail the source
@@ -1129,6 +1147,7 @@ impl Datasets {
         items: &[(String, Value)],
         trust: Option<&str>,
         prov: Option<&Provenance>,
+        derived: &DerivedPaths,
     ) -> Result<UpsertSummary> {
         let mut summary = UpsertSummary::default();
         if items.is_empty() {
@@ -1138,7 +1157,7 @@ impl Datasets {
         // SimHashing are pure CPU; doing them inside `BEGIN IMMEDIATE` — as the
         // per-record loop did — billed every other app's writer for this batch's
         // CPU, and on a large sync that dominates the lock hold time.
-        let prints = fingerprint_batch(items);
+        let prints = fingerprint_batch(items, derived);
         let mut conn = self.pool.acquire().await?;
         for (chunk, prints) in items.chunks(UPSERT_CHUNK).zip(prints.chunks(UPSERT_CHUNK)) {
             sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
@@ -2148,6 +2167,10 @@ impl Datasets {
                     &items,
                     trust.as_deref(),
                     Some(prov),
+                    // A derived-spec recompute writes exactly what the spec
+                    // projects — nothing in it is "someone else's join" — so it
+                    // hashes its whole value, as it always has.
+                    &DerivedPaths::NONE,
                     depth,
                 )
                 .await?;
@@ -3628,6 +3651,109 @@ struct PlannedWrite {
     diff: Option<Value>,
     /// Revision number this write appends (0 and unused for Unchanged).
     revision: i64,
+    /// Unchanged by change detection, but the stored bytes differ — only
+    /// reachable when the writer declared [`DerivedPaths`], because otherwise
+    /// an equal hash *is* equal bytes. The record body is rewritten so readers
+    /// see the fresh derived data; no revision is appended, and the verdict
+    /// stays [`ChangeKind::Unchanged`].
+    refresh: bool,
+}
+
+/// Record paths a producer declares **derived**: written into the record for
+/// readers, but recomputed from *another* dataset rather than observed at this
+/// record's own source. Excluded from the change-detection hash, so a movement
+/// in them is not a change *in this record*.
+///
+/// The disease this cures: eu-sedia writes a `history` block joined from
+/// cordis's weekly rollup into every Horizon topic before upsert. Hashing the
+/// whole value meant every cordis run marked every joined topic `changed` in
+/// the next eu-sedia run — and watches, triggers, webhooks, the revision trail
+/// and the yield ledger all read that as a real SEDIA publication.
+///
+/// **Opt-in per write, default off.** [`DerivedPaths::NONE`] hashes exactly
+/// what the store has always hashed, so every producer that declares nothing is
+/// byte-identical. Declaring a path changes three things and nothing else:
+/// - the hash covers the value *minus* those paths;
+/// - the stored `data` (and the revision snapshot) still carry the **full**
+///   value — this is a change-detection seam, not a projection;
+/// - a write whose only movement is derived rewrites the record body without
+///   appending a revision, so reads stay fresh while the change feed stays
+///   quiet. `updated_at` moves with the body, `last_seen` as always.
+///
+/// Paths are `.`-separated and resolved through objects only (`history`,
+/// `history.stats`). A path that is absent from a value is a no-op.
+///
+/// **Transition cost.** The first write after a producer adopts this re-hashes
+/// every stored record whose hash included a now-derived path, so those records
+/// report `changed` **once** — bounded by the number of records carrying the
+/// path — and settle from then on.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DerivedPaths(Vec<String>);
+
+impl DerivedPaths {
+    /// Declare nothing — the default every existing write path passes.
+    pub const NONE: DerivedPaths = DerivedPaths(Vec::new());
+
+    pub fn new<I, S>(paths: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        DerivedPaths(
+            paths
+                .into_iter()
+                .map(Into::into)
+                .filter(|p| !p.is_empty())
+                .collect(),
+        )
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// The value change detection hashes: `value` with every declared path
+    /// removed.
+    ///
+    /// Borrowed — and therefore byte-identical to hashing `value` itself — when
+    /// nothing is declared or nothing matched. That equivalence is the whole
+    /// safety argument for adding this to a shared write path.
+    fn hash_input<'v>(&self, value: &'v Value) -> std::borrow::Cow<'v, Value> {
+        if self.0.is_empty() {
+            return std::borrow::Cow::Borrowed(value);
+        }
+        let mut stripped = value.clone();
+        let mut removed_any = false;
+        for path in &self.0 {
+            removed_any |= remove_path(&mut stripped, path);
+        }
+        if removed_any {
+            std::borrow::Cow::Owned(stripped)
+        } else {
+            std::borrow::Cow::Borrowed(value)
+        }
+    }
+}
+
+/// Removes the `.`-separated `path` from `value`, walking objects only.
+/// Returns whether anything was actually removed — an absent path is a no-op,
+/// never an error.
+fn remove_path(value: &mut Value, path: &str) -> bool {
+    let mut cursor = value;
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let Value::Object(map) = cursor else {
+            return false;
+        };
+        if segments.peek().is_none() {
+            return map.remove(segment).is_some();
+        }
+        match map.get_mut(segment) {
+            Some(next) => cursor = next,
+            None => return false,
+        }
+    }
+    false
 }
 
 /// Everything about a record that can be derived from its value alone: the
@@ -3640,19 +3766,27 @@ struct PlannedWrite {
 /// through this batch's hashing, which on a large sync is most of the lock hold.
 #[derive(Debug, Clone)]
 struct Fingerprint {
+    /// Hash of the **change-detection input** — the value minus any declared
+    /// [`DerivedPaths`]. Equal to `hash_value(json)` whenever nothing is
+    /// declared, which is every existing producer.
     hash: String,
     sim: i64,
+    /// The **full** value as stored: derived paths included.
     json: String,
 }
 
 /// Fingerprints a whole batch. Hash canonicalization is untouched — the same
-/// [`hash_value`] / [`crate::simhash::simhash_value`] over the same value — so
-/// stored hashes and fingerprints stay comparable with everything written before.
-fn fingerprint_batch(items: &[(String, Value)]) -> Vec<Fingerprint> {
+/// [`hash_value`] / [`crate::simhash::simhash_value`] — so stored hashes and
+/// fingerprints stay comparable with everything written before.
+///
+/// The SimHash stays over the **full** value on purpose: it is a similarity
+/// fingerprint of the record as stored, and `/duplicates` compares stored
+/// records. Only change detection gets the narrowed input.
+fn fingerprint_batch(items: &[(String, Value)], derived: &DerivedPaths) -> Vec<Fingerprint> {
     items
         .iter()
         .map(|(_, value)| Fingerprint {
-            hash: hash_value(value),
+            hash: hash_value(&derived.hash_input(value)),
             sim: crate::simhash::simhash_value(value) as i64,
             json: value.to_string(),
         })
@@ -3688,6 +3822,14 @@ fn plan_chunk(
             Some(_) => ChangeKind::Changed,
             None => ChangeKind::New,
         };
+        // Unchanged by change detection, yet the stored bytes differ: the only
+        // way that happens is a declared derived path moving. Refresh the body
+        // so readers get the current derived data, without a revision — the
+        // change feed must not learn about it. With no derived paths declared an
+        // equal hash IS equal bytes, so this is always false for every existing
+        // producer.
+        let refresh =
+            kind == ChangeKind::Unchanged && previous.is_some_and(|p| p.data != print.json);
         let diff = match (kind, previous) {
             (ChangeKind::Changed, Some(p)) => {
                 let old: Value = serde_json::from_str(&p.data).unwrap_or(Value::Null);
@@ -3700,7 +3842,7 @@ fn plan_chunk(
         } else {
             next_revision_for(next_revision, key)
         };
-        if kind != ChangeKind::Unchanged {
+        if kind != ChangeKind::Unchanged || refresh {
             state.insert(
                 key.clone(),
                 KeyState {
@@ -3715,6 +3857,7 @@ fn plan_chunk(
             kind,
             diff,
             revision,
+            refresh,
         });
     }
     plans
@@ -3741,6 +3884,9 @@ fn next_revision_for(next: &mut std::collections::HashMap<String, i64>, key: &st
 /// point: a key that goes Changed then Unchanged inside one batch must still
 /// have its new content written. Taking the last occurrence would keep the stale
 /// row and silently drop the change the revision chain already recorded.
+///
+/// A derived-only `refresh` counts as a content write here (the body has to be
+/// rewritten) even though its verdict is Unchanged and it appends no revision.
 fn collapse_record_writes<'p>(
     chunk: &'p [(String, Value)],
     plans: &'p [PlannedWrite],
@@ -3751,7 +3897,7 @@ fn collapse_record_writes<'p>(
     let mut seen_unchanged: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for plan in plans {
         let key = chunk[plan.idx].0.as_str();
-        if plan.kind == ChangeKind::Unchanged {
+        if plan.kind == ChangeKind::Unchanged && !plan.refresh {
             if !at.contains_key(key) && seen_unchanged.insert(key) {
                 unchanged_only.push(key);
             }

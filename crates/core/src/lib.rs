@@ -60,8 +60,8 @@ pub use datasets::{
     parse_aggregate, parse_aggregates, parse_backfill_cursor, parse_filter_spec,
     parse_filter_specs, parse_stored_join, project_value, trust_label, validate_group,
     weakest_trust, Aggregate, BackfillOpts, ChangeKind, Datasets, DerivedBackfill, DerivedGroup,
-    DerivedLookup, DerivedSpec, DupPair, Provenance, Record, ReplayableRevision, Revision,
-    RevisionPage, UpsertSummary, DEFAULT_BACKFILL_MAX_ROWS, TRUST_STABLE,
+    DerivedLookup, DerivedPaths, DerivedSpec, DupPair, Provenance, Record, ReplayableRevision,
+    Revision, RevisionPage, UpsertSummary, DEFAULT_BACKFILL_MAX_ROWS, TRUST_STABLE,
 };
 #[cfg(feature = "storage")]
 pub use doctor::{

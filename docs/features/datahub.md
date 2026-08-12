@@ -82,7 +82,7 @@ GET /datahub/governance/preview
   "datasets_polled": 15, "poll_ms": 412, "budget_secs": 40,
   "quiet": false,
   "would": {
-    "disable_schedules": [{"app": "eu-sedia", "dataset": "calls", "evidence": "deprecation",
+    "disable_schedules": [{"app": "eu-sedia", "dataset": "opportunities", "evidence": "deprecation",
                            "schedule_ids": ["catalog-eu-sedia"], "note": "..."}],
     "pause_apps": ["ca-grants"],
     "resume_apps": [],

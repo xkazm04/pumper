@@ -10,6 +10,34 @@ Persistent, queryable record store (`records` table): apps upsert typed JSON rec
 - **Removal by name** (not inferred): `Datasets::tombstone_keys(app, dataset, keys)` tombstones exactly the keys given — same `removed_at` + `removed` revision, same change-feed signal — for callers that already hold the per-record removal fact (the `peer` app applying an origin feed's `removed` revisions — see [peering.md](peering.md)). Nothing is inferred from a snapshot, so no guard applies; a caller who wants "everything except this list" wants `sync_many`.
 - **APIs**: `GET /datasets/{app}/{ds}/changes?since=&limit=&trust=` (change feed, newest first, diffs included), `GET /datasets/{app}/{ds}/history?key=` (per-record revision trail).
 
+### Derived paths — a producer can say which fields aren't its own news
+
+Some apps write a block **joined from another dataset** into their own records before upserting: `eu-sedia` embeds `cordis/topic_stats` into every Horizon topic as `history` (see [apps.md](apps.md)). Hashing the whole value made the *joined* dataset's cadence look like a change at the source — every weekly cordis rollup marked every joined topic `changed` in the next daily eu-sedia run, and watches, triggers, webhooks, the revision trail and the `job_yield` ledger all counted it as a real SEDIA publication.
+
+A producer may now declare those paths at the write:
+
+```rust
+ctx.upsert_many_with_derived(
+    "opportunities", &records, prov,
+    &DerivedPaths::new(["history"]),   // `.`-separated, objects only, absent = no-op
+).await?;
+// Datasets::upsert_many_derived(app, ds, items, trust, prov, &derived) is the store-level entry point.
+```
+
+It is **producer-facing only — no HTTP API change** — and narrows exactly one thing:
+
+| | with a declared derived path |
+| --- | --- |
+| change-detection hash | over the value **minus** those paths |
+| stored `data`, revision snapshots, `/export`, `?filter=` | the **full** value, unchanged — this is a hash seam, not a projection |
+| SimHash / `/duplicates` | over the **full** value, unchanged (it fingerprints the record as stored) |
+| a write whose *only* movement is derived | body rewritten (so reads stay fresh), **no revision**, verdict `unchanged`, `updated_at` moves with the body |
+| removal detection, revival, trust, provenance, derived specs | untouched |
+
+**Opt-in per write, default off.** `DerivedPaths::NONE` is what every existing call site passes, and `declaring_no_derived_paths_is_byte_identical_to_the_plain_upsert` (`crates/core/tests/derived_change.rs`) pins that all four batch entry points still produce the identical stored hash — the safety argument for touching a shared write path is asserted, not assumed. The batch path (`upsert_many_*`) carries the seam; the single-record `upsert_stamped` has no derived variant, because the writers that need one are exactly the full-corpus batch producers.
+
+**One-time transition cost, by design.** Records whose stored hash was computed over the full value re-hash the first time their producer adopts the seam, so they report `changed` **once** — bounded by the number of records carrying the declared path (for eu-sedia: `historyJoined`, the joined Horizon topics) — and settle from then on. Budget one noisy run per adopting producer, not a corpus rewrite.
+
 ## Trust
 
 Records and revisions carry a `trust` stamp recording how much the write is stood behind: `stable`, `provisional` (written while its source was degrading) or `quarantined`. Stamping comes from extraction health — see [resilient-extraction.md](resilient-extraction.md) — and only happens when `[resilience] enforce = true`.

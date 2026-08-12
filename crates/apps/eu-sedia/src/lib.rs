@@ -29,8 +29,8 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use pumper_core::{
-    html_to_markdown, AppContext, AppManifest, CostClass, Error, HttpMethod, HttpRequest,
-    ManifestExample, Provenance, Record, Result, ScrapeApp,
+    html_to_markdown, AppContext, AppManifest, CostClass, DerivedPaths, Error, HttpMethod,
+    HttpRequest, ManifestExample, Provenance, Record, Result, ScrapeApp,
 };
 use serde_json::{json, Value};
 
@@ -264,14 +264,19 @@ impl ScrapeApp for EuSedia {
         // the paging query-string differs), so the batch-level `source_url` is
         // honest. `rules_hash` stays Null deliberately — `normalize` is Rust
         // code, not a registered RuleSet, so there is nothing replayable to pin.
+        //
+        // `history` is declared DERIVED: it is joined from cordis's weekly
+        // rollup, not observed at SEDIA, so its movement must not report the
+        // topic as changed. See [`derived_paths`].
         let summary = ctx
-            .upsert_many_with_provenance(
+            .upsert_many_with_derived(
                 "opportunities",
                 &records,
                 Provenance {
                     source_url: Some(SEDIA_URL.to_string()),
                     ..Provenance::default()
                 },
+                &derived_paths(),
             )
             .await?;
 
@@ -325,6 +330,23 @@ impl ScrapeApp for EuSedia {
 /// because two things have to agree about it: the join below, and the
 /// derived-path declaration at the upsert.
 const HISTORY_FIELD: &str = "history";
+
+/// The record paths this app **derives** rather than observes at SEDIA.
+///
+/// Only [`HISTORY_FIELD`]: it is joined from `cordis/topic_stats`, which is
+/// rebuilt on a weekly schedule of its own. Hashing it as part of the record
+/// meant every cordis run marked every joined Horizon topic `changed` in the
+/// next daily eu-sedia run — so watches, triggers, webhooks, the revision trail
+/// and the yield ledger all counted a CORDIS rollup as a SEDIA publication.
+/// Declaring it excludes it from the change-detection hash **only**: the stored
+/// record and every revision still carry the full block.
+///
+/// One-time cost of the declaration: the first run after deploy re-hashes the
+/// topics whose stored hash included `history`, so up to `historyJoined`
+/// records report `changed` once, then settle.
+fn derived_paths() -> DerivedPaths {
+    DerivedPaths::new([HISTORY_FIELD])
+}
 
 /// The `history` block for one open topic, or `None` when there is nothing
 /// honest to attach.
@@ -780,6 +802,74 @@ mod history_join_tests {
             ghost.data.get("history").is_none(),
             "a removed family must leave no history behind: {}",
             ghost.data
+        );
+    }
+
+    /// THE anti-pattern this seam exists for. cordis rewrites `topic_stats`
+    /// weekly; eu-sedia re-embeds it daily. Hashing the whole record meant every
+    /// cordis run marked every joined Horizon topic `changed` in the next
+    /// eu-sedia run — a webhook, a trigger and a yield-ledger line for a SEDIA
+    /// publication that never happened.
+    #[tokio::test]
+    async fn derived_churn_does_not_mark_a_source_topic_changed() {
+        let store = TempStore::new("eu-sedia-derived").await;
+        let ds = store.datasets();
+        let stats = |count: u64| {
+            json!({
+                "family": "HORIZON-CL4-DATA-01", "project_count": count,
+                "top_participants": [],
+                "coverage": { "corpus_aggregated": 1_200, "corpus_total": 23_361,
+                              "corpus_swept": false }
+            })
+        };
+        let run = || async {
+            let engines = engines_with(Arc::new(ScriptedSedia), Arc::new(Dead), Arc::new(Dead));
+            let ctx = TestContext::new(&store.storage, "eu-sedia")
+                .params(json!({ "pageSize": 100, "maxPages": 1 }))
+                .engines(engines)
+                .build();
+            EuSedia.run(ctx).await.expect("run")
+        };
+        let key = "HORIZON-CL4-2026-DATA-01";
+
+        ds.upsert("cordis", "topic_stats", "HORIZON-CL4-DATA-01", &stats(3))
+            .await
+            .unwrap();
+        let first = run().await;
+        assert_eq!(first["new"], 2);
+        assert_eq!(first["historyJoined"], 1);
+
+        // A week later cordis's rollup moves. SEDIA published nothing.
+        ds.upsert("cordis", "topic_stats", "HORIZON-CL4-DATA-01", &stats(4))
+            .await
+            .unwrap();
+        let second = run().await;
+        assert_eq!(second["historyJoined"], 1);
+        assert_eq!(
+            second["changed"], 0,
+            "a CORDIS rollup is not a SEDIA publication: {second}"
+        );
+        assert_eq!(second["unchanged"], 2);
+
+        // The declaration names exactly the field the join writes — if those
+        // ever drift, the seam silently stops working.
+        assert_eq!(derived_paths(), DerivedPaths::new([HISTORY_FIELD]));
+        // …and the stored record still carries the CURRENT joined numbers, so
+        // quiet change detection did not buy a stale read.
+        let rec = ds
+            .get("eu-sedia", "opportunities", key)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(rec.data.get(HISTORY_FIELD).is_some());
+        assert_eq!(rec.data["history"]["stats"]["project_count"], 4);
+        assert_eq!(
+            ds.history("eu-sedia", "opportunities", key, 10)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "no second revision for a derived-only movement"
         );
     }
 }

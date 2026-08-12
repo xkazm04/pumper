@@ -324,6 +324,7 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+ "tokio",
  "url",
 ]
 
@@ -348,6 +349,7 @@ dependencies = [
  "grants-common",
  "pumper-core",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
