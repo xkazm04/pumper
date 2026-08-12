@@ -123,6 +123,22 @@ Both modes share the extraction + quality-report path and report aggregate quali
 
 The manifest's `output_shape` names these keys mode by mode and is pinned by a test against a real run, because it used to promise `{extracted, errors, removed?}` — three keys no mode has ever emitted.
 
+#### The `records` echo is a sample, and `index_datasets` is why that is safe
+
+`urls`/`source`/`archive` return `records` — **a bounded prefix**, not the corpus. `records_echo` sets the bound (default **100**, ceiling **1000**, `0` = counts only); when it bites, the result carries `records_truncated: true` and `records_total` (the honest count of records written). `backfill` returns no echo at all, as it never did.
+
+Why: the echo used to be *every* record. A 10,000-record run wrote a multi-MB JSON blob into the `jobs` row, and that blob then rode the `job.succeeded` webhook, the SSE event and `GET /jobs/{id}/receipt` — permanently, restating data already durably in the dataset. The write path also deep-cloned every record purely to build it; the clone is now paid only for the records actually echoed.
+
+Bounding it is safe because search coverage moves to the mature path. Every write mode's result declares:
+
+```json
+"index_datasets": [{ "app": "extractor", "dataset": "<the dataset actually written>" }]
+```
+
+The worker indexes those datasets **delta-driven from the change feed** (`dataset_search_docs`): one document per record the run touched, with stable `<app>:<dataset>:<key>` ids that re-index in place and honour removals — strictly better than the old id-per-job-result-element documents. The declaration is **withheld** when the source's own extraction-health verdict says its rows do not belong in the index (`degraded`/`quarantined`), because the worker's gate reads the health of the *spec's* pair and a diverted `<dataset>@q` is a pair nothing ever judges — the same producer-side gate `grants-common` uses.
+
+`records` remains the quick sample a human or agent wants when reading a job result; the dataset (`GET /datasets/extractor/<dataset>`) is the record of truth.
+
 ### Replay-CI (`replay` param)
 
 `{"replay": {"rules": …, "baseline_rules"?: …, "against": {app, dataset, url_pattern?, versions, max_pages}, "bisect_field"?: …}}` runs a **candidate** rule set over stored bodies and diffs it against a baseline — strictly read-only (job result + a `replay-report.json` artifact, never a dataset record). The report carries `fields` (per top-level field: `match_rate`, `baseline_match_rate`, `delta`, and bounded `added`/`lost`/`changed` value samples), `regressions`/`regressed_urls` per URL, and `bisect` (the adjacent observation pair where a field's match flipped).

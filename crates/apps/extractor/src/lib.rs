@@ -116,6 +116,33 @@ fn parse_source_limit(source: &serde_json::Map<String, Value>) -> i64 {
         .unwrap_or(SOURCE_LIST_LIMIT)
 }
 
+/// How many extracted records a write mode echoes into its persisted job
+/// result by default, and the ceiling `records_echo` clamps to.
+///
+/// The echo used to be EVERY record. A 10,000-record run wrote a multi-MB JSON
+/// blob into the `jobs` row, and that blob then rode the `job.succeeded`
+/// webhook, the SSE event and the receipt — forever, for data that is already
+/// durably in the dataset. A bounded prefix keeps the result a *sample* (which
+/// is what a human or agent reading a job result actually wants) while the
+/// dataset stays the record of truth; `index_datasets` is what keeps the full
+/// set searchable (see [`ExtractOutcome::merge_into`]).
+const DEFAULT_RECORDS_ECHO: usize = 100;
+const MAX_RECORDS_ECHO: usize = 1000;
+
+/// Pure param parse for the records echo: `records_echo`, clamped into
+/// `0..=`[`MAX_RECORDS_ECHO`], defaulting to [`DEFAULT_RECORDS_ECHO`].
+///
+/// `0` is legal and means "counts only" — a caller streaming from the dataset
+/// has no use for the echo at all. There is deliberately no "unbounded" option:
+/// the whole point is that the persisted result has a size bound.
+fn parse_records_echo(params: &Value) -> usize {
+    params
+        .get("records_echo")
+        .and_then(Value::as_u64)
+        .map(|n| (n as usize).min(MAX_RECORDS_ECHO))
+        .unwrap_or(DEFAULT_RECORDS_ECHO)
+}
+
 /// Whether a capped dataset sweep may have left records behind.
 ///
 /// THE ANTI-PATTERN THIS CLOSES: a full page means the CAP decided where the
@@ -527,6 +554,7 @@ async fn extract_and_upsert(
     keyed: Vec<SourceDoc>,
     fetch: FetchHealth,
     rules_hash: Option<&str>,
+    echo: usize,
 ) -> Result<ExtractOutcome> {
     // Split keys/meta from bodies without copying the bodies — `keyed` is owned
     // and dropped here anyway (was: `.iter().map(|(_,d)| d.clone())`, deep-cloning
@@ -585,36 +613,41 @@ async fn extract_and_upsert(
         ..Provenance::default()
     };
 
-    let mut records: Vec<Value> = Vec::with_capacity(reported.len());
     let items: Vec<(String, Value)> = keys
         .into_iter()
         .zip(metas)
         .zip(reported)
         .map(|((key, (url, observed_at, fetched_via)), (mut rec, _))| {
             tag_record(&mut rec, url, observed_at, fetched_via);
-            records.push(rec.clone());
             (key, rec)
         })
         .collect();
+    // The echo is a bounded PREFIX, and the clone is paid only for the records
+    // that will actually be echoed. It used to be `records.push(rec.clone())`
+    // inside the map above: a full deep copy of every record on the write path
+    // of every mode, kept alive purely so the job result could restate data the
+    // dataset already holds.
+    let records_total = items.len();
+    let records: Vec<Value> = items.iter().take(echo).map(|(_, v)| v.clone()).collect();
     // Where this batch is ABOUT to land, read at the same point the write path
     // reads it (after `observe` settled the state, before the upsert). A
     // quarantined source is diverted to the shadow `<dataset>@q` inside
     // `upsert_many_with_provenance`, and until now no field of the result said
     // which of the two the caller should go looking in.
-    let written = pumper_core::resilience::write_dataset(
-        dataset,
-        ctx.health.enforced_state(&ctx.app, dataset).await,
-    );
+    let state = ctx.health.enforced_state(&ctx.app, dataset).await;
+    let written = pumper_core::resilience::write_dataset(dataset, state);
     let summary = ctx
         .upsert_many_with_provenance(dataset, &items, prov)
         .await?;
     Ok(ExtractOutcome {
         records,
+        records_total,
         quality,
         base_url_missing,
         summary,
         health: verdict,
         dataset: written,
+        indexable: !state.skips_search_index(),
     })
 }
 
@@ -714,7 +747,11 @@ fn tag_record(
 /// What one extraction pass produced: the records, the aggregate quality signal,
 /// the write summary, the source-health verdict, and where the batch landed.
 struct ExtractOutcome {
+    /// A BOUNDED prefix of the records written (see [`parse_records_echo`]) —
+    /// a sample for the reader, never the corpus.
     records: Vec<Value>,
+    /// How many records the batch actually wrote, echoed or not.
+    records_total: usize,
     /// This batch's quality counters — poolable, so a multi-batch mode reports
     /// the same breakdown a single-batch mode does.
     quality: QualityRollup,
@@ -726,6 +763,47 @@ struct ExtractOutcome {
     /// The dataset this batch ACTUALLY landed in: the requested name, or the
     /// shadow `<dataset>@q` when enforcement diverted a quarantined source.
     dataset: String,
+    /// Whether this batch's rows may be offered to the full-text index.
+    ///
+    /// Gated HERE, in the producer, against the SOURCE's own verdict — the
+    /// worker's gate reads the health of the spec's own pair, and once a
+    /// quarantined source is diverted the spec names `<dataset>@q`, a pair no
+    /// `observe_extraction` ever judges (so it always reads `Healthy`). Same
+    /// reasoning, same vocabulary, as `grants_common::indexable`.
+    indexable: bool,
+}
+
+impl ExtractOutcome {
+    /// The result keys every single-batch write mode shares.
+    ///
+    /// `index_datasets` is the load-bearing one: it routes this run's records
+    /// to the worker's **delta-driven** dataset indexer
+    /// (`dataset_search_docs`), which reads the change feed for the named
+    /// `(app, dataset)` and mints stable `<app>:<dataset>:<key>` doc ids that
+    /// re-index in place and honour removals. Without it the only search
+    /// coverage came from the result's `records` array — so bounding that echo
+    /// without declaring this would silently shrink the index to the first N
+    /// records of each run.
+    fn merge_into(mut self, app: &str, result: &mut Value) {
+        let Value::Object(map) = result else { return };
+        let echoed = self.records.len();
+        map.insert(
+            "records".into(),
+            Value::Array(std::mem::take(&mut self.records)),
+        );
+        map.insert("records_total".into(), json!(self.records_total));
+        map.insert(
+            "records_truncated".into(),
+            json!(self.records_total > echoed),
+        );
+        map.insert("dataset".into(), json!(self.dataset));
+        if self.indexable {
+            map.insert(
+                "index_datasets".into(),
+                json!([{ "app": app, "dataset": self.dataset }]),
+            );
+        }
+    }
 }
 
 /// Reports this run to the health detector and renders its verdict for the job
@@ -1085,6 +1163,12 @@ impl ScrapeApp for Extractor {
                         "maximum": 64,
                         "description": "Max in-flight fetches (default 16, ceiling 64). The ceiling is enforced twice — refused here at the door, clamped in code for callers that reach the app another way — so the two layers can never disagree."
                     },
+                    "records_echo": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1000,
+                        "description": "How many extracted records the persisted job result echoes (default 100, ceiling 1000, 0 = counts only). The echo is a SAMPLE — the records themselves are in the dataset, and the result reports records_total + records_truncated. Not applicable to backfill mode, which never echoes."
+                    },
                     "dataset": { "type": "string", "description": "Output dataset name (default \"extracted\")." }
                 },
                 "additionalProperties": true
@@ -1363,9 +1447,20 @@ impl Extractor {
 
         let requested = urls.len();
         let fetched = keyed.len();
-        let out =
-            extract_and_upsert(ctx, compiled, dataset, keyed, fetch, registration.hash()).await?;
+        let out = extract_and_upsert(
+            ctx,
+            compiled,
+            dataset,
+            keyed,
+            fetch,
+            registration.hash(),
+            parse_records_echo(&ctx.params),
+        )
+        .await?;
 
+        // `dataset`, `records`, `records_total`, `records_truncated` and
+        // `index_datasets` are added by `ExtractOutcome::merge_into` below —
+        // one definition of the write-mode contract, not three.
         let mut result = json!({
             "mode": "urls",
             "requested": requested,
@@ -1373,7 +1468,6 @@ impl Extractor {
             "skipped": failed.len(),
             "failed": failed,
             "fetch_ok_rate": fetch.rate(),
-            "dataset": out.dataset,
             "new": out.summary.new.len(),
             "changed": out.summary.changed.len(),
             "unchanged": out.summary.unchanged,
@@ -1381,10 +1475,10 @@ impl Extractor {
             "fields_total": out.quality.total,
             "worst_fields": out.quality.worst_fields(),
             "base_url_missing": out.base_url_missing,
-            "health": out.health,
-            "records": out.records,
+            "health": out.health.clone(),
         });
         registration.merge_into(&mut result);
+        out.merge_into(&ctx.app, &mut result);
         Ok(result)
     }
 
@@ -1585,11 +1679,13 @@ impl Extractor {
             keyed,
             FetchHealth::default(),
             registration.hash(),
+            parse_records_echo(&ctx.params),
         )
         .await?;
 
         let missing_count = missing.len();
         missing.truncate(MISSING_ECHO_LIMIT);
+        // See `run_urls_mode`: the shared write-mode keys come from `merge_into`.
         let mut result = json!({
             "mode": "source",
             "source": {"app": src_app, "dataset": src_dataset},
@@ -1599,7 +1695,6 @@ impl Extractor {
             "loaded": loaded,
             "missing": missing_count,
             "missing_keys": missing,
-            "dataset": out.dataset,
             "new": out.summary.new.len(),
             "changed": out.summary.changed.len(),
             "unchanged": out.summary.unchanged,
@@ -1607,10 +1702,10 @@ impl Extractor {
             "fields_total": out.quality.total,
             "worst_fields": out.quality.worst_fields(),
             "base_url_missing": out.base_url_missing,
-            "health": out.health,
-            "records": out.records,
+            "health": out.health.clone(),
         });
         registration.merge_into(&mut result);
+        out.merge_into(&ctx.app, &mut result);
         Ok(result)
     }
 
@@ -1668,8 +1763,10 @@ impl Extractor {
         // Every dataset this run's batches actually landed in. Normally one; a
         // health flip mid-scan can split a backfill across `<dataset>` and the
         // shadow `<dataset>@q`, and a result naming only one of them would send
-        // the reader to the wrong table.
+        // the reader to the wrong table. `indexed` is the subset the source's
+        // own verdict allows into the search index (see `ExtractOutcome`).
         let mut written: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+        let mut indexed: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         loop {
             let batch = ctx
                 .datasets
@@ -1725,6 +1822,10 @@ impl Extractor {
                     keyed,
                     FetchHealth::default(),
                     registration.hash(),
+                    // Backfill has never echoed records and must not start: it
+                    // is the mode that fans over a WHOLE archive. Zero here is
+                    // also what makes the write path clone-free for it.
+                    0,
                 )
                 .await?;
                 new += out.summary.new.len();
@@ -1736,6 +1837,9 @@ impl Extractor {
                 quality.merge(&out.quality);
                 if out.health.is_some() {
                     health = out.health;
+                }
+                if out.indexable {
+                    indexed.insert(out.dataset.clone());
                 }
                 written.insert(out.dataset);
             }
@@ -1787,6 +1891,17 @@ impl Extractor {
             "health": health,
         });
         registration.merge_into(&mut result);
+        // Search coverage for a mode that never echoed a record: the worker's
+        // delta indexer reads the change feed for these pairs. Withheld when the
+        // source's verdict says its rows do not belong in the index.
+        if !indexed.is_empty() {
+            result["index_datasets"] = Value::Array(
+                indexed
+                    .iter()
+                    .map(|ds| json!({ "app": ctx.app, "dataset": ds }))
+                    .collect(),
+            );
+        }
         Ok(result)
     }
 
@@ -1890,11 +2005,20 @@ impl Extractor {
         });
 
         let fetched = keyed.len();
-        let out =
-            extract_and_upsert(ctx, compiled, dataset, keyed, fetch, registration.hash()).await?;
+        let out = extract_and_upsert(
+            ctx,
+            compiled,
+            dataset,
+            keyed,
+            fetch,
+            registration.hash(),
+            parse_records_echo(&ctx.params),
+        )
+        .await?;
 
         let failed_count = failed.len();
         failed.truncate(MISSING_ECHO_LIMIT);
+        // See `run_urls_mode`: the shared write-mode keys come from `merge_into`.
         let mut result = json!({
             "mode": "archive",
             "target": p.target,
@@ -1907,7 +2031,6 @@ impl Extractor {
             "failed": failed_count,
             "failed_snapshots": failed,
             "fetch_ok_rate": fetch.rate(),
-            "dataset": out.dataset,
             "new": out.summary.new.len(),
             "changed": out.summary.changed.len(),
             "unchanged": out.summary.unchanged,
@@ -1915,10 +2038,10 @@ impl Extractor {
             "fields_total": out.quality.total,
             "worst_fields": out.quality.worst_fields(),
             "base_url_missing": out.base_url_missing,
-            "health": out.health,
-            "records": out.records,
+            "health": out.health.clone(),
         });
         registration.merge_into(&mut result);
+        out.merge_into(&ctx.app, &mut result);
         Ok(result)
     }
 }

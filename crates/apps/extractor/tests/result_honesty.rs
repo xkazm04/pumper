@@ -274,6 +274,9 @@ async fn output_shape_promises_only_keys_a_real_run_returns() {
         "health",
         "rules_hash",
         "records",
+        "records_total",
+        "records_truncated",
+        "index_datasets",
     ];
     const SOURCE_MODE_KEYS: &[&str] = &[
         "source",
