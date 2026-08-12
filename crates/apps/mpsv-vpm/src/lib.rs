@@ -28,7 +28,12 @@
 //!     quarterly-to-annual ISPV publication lag. Each row carries the ratio
 //!     used, observation count, dispersion, a high|med|low confidence, and the
 //!     ISPV anchor date + staleness. A group with no stored gap history emits
-//!     no row — never extrapolated from nothing.
+//!     no row — never extrapolated from nothing. HONESTY FLOOR: a cell whose
+//!     ratio or projected median is implausible, or that rests on a single
+//!     observation, ships with `nowcast_median: null` + `withheld: <reason>` +
+//!     `confidence: "none"` rather than a number; and an ISPV anchor older than
+//!     `NOWCAST_ANCHOR_STALE_DAYS` sets `anchor_stale` and costs one confidence
+//!     level.
 //!
 //! The raw 188 MB feed is parsed into a typed subset (bounded memory) and
 //! aggregated in-process; only the small aggregates are persisted. A full
@@ -97,6 +102,30 @@ const NOWCAST_HIGH_MIN_OBS: usize = 6;
 const NOWCAST_HIGH_MAX_SPREAD: f64 = 0.10;
 const NOWCAST_MED_MIN_OBS: usize = 3;
 const NOWCAST_MED_MAX_SPREAD: f64 = 0.25;
+/// Evidence floor for PUBLISHING a nowcast number. A single stored ratio
+/// observation is one day's posted-vs-official reading — the ratio's median is
+/// then that day, and the "projection" is a rename of one sample. Cells below
+/// this floor still emit a row (so the cell's absence of evidence is legible,
+/// and so a previously-published number is actively overwritten rather than
+/// left lingering), but with `nowcast_median: null` — see [`nowcast_withheld`].
+const NOWCAST_MIN_OBSERVATIONS: usize = 2;
+/// Plausible band for the ratio-carry divisor (`posted median ÷ official
+/// median`). Czech posted salaries advertise a base against ISPV's gross
+/// earnings, so the real relationship lives around 0.6–1.3; a cell whose stored
+/// history claims postings pay a QUARTER (or four times) the official median is
+/// not describing a wage relationship — it is a mis-join, a unit slip, or a
+/// corrupted revision. Dividing by such a ratio mints a "projected median" that
+/// is wrong by the same factor, with full numeric authority.
+const NOWCAST_RATIO_MIN: f64 = 0.25;
+const NOWCAST_RATIO_MAX: f64 = 4.0;
+/// Beyond this anchor age the nowcast's official-grade claim is degraded.
+/// `updated_at` on a `wages` row moves only when the official number CHANGES
+/// (an unchanged upsert bumps `last_seen`, not `updated_at`), so this measures
+/// "the official figure has not moved since", not "we have not fetched". ISPV
+/// revises on a quarterly-to-annual cycle: 400 days is a full annual revision
+/// plus a quarter of slack — an anchor that has missed that has missed the only
+/// event that could have corrected it.
+const NOWCAST_ANCHOR_STALE_DAYS: i64 = 400;
 
 /// ARES business register — key-free JSON REST lookup of one economic subject
 /// by IČO. Enriches the employers behind this run's vacancy samples.
@@ -151,7 +180,10 @@ impl ScrapeApp for MpsvVpm {
          `cz-labour/salary_nowcast` (deterministic ratio-carry: median \
          posted-vs-ISPV ratio over the last `nowcastWindow` stored gap \
          observations applied to today's posted median, with confidence \
-         high|med|low and ISPV-anchor staleness; no gap history = no row), \
+         high|med|low and ISPV-anchor staleness; no gap history = no row, and \
+         an implausible ratio/median or a single-observation cell ships \
+         `nowcast_median: null` + `withheld` + `confidence: \"none\"` instead of \
+         a number), \
          and enriches sampled employers from the key-free ARES business register \
          into `employers` (keyed by IČO: name, legal form, founded, kraj, CZ-NACE). \
          Keeps a per-posting survival ledger diffed daily into \
@@ -838,6 +870,12 @@ impl ScrapeApp for MpsvVpm {
                     .filter(|(_, v)| v["confidence"] == level)
                     .count()
             };
+            let withheld_count = |reason: &str| {
+                nowcast_items
+                    .iter()
+                    .filter(|(_, v)| v["withheld"] == reason)
+                    .count()
+            };
             json!({
                 "method": "ratio_carry",
                 "cells": nowcast_items.len(),
@@ -848,6 +886,16 @@ impl ScrapeApp for MpsvVpm {
                 "confidenceHigh": confidence_count("high"),
                 "confidenceMed": confidence_count("med"),
                 "confidenceLow": confidence_count("low"),
+                // Rows that shipped WITHOUT a number, by the guard that refused
+                // it — a run whose nowcast quietly emptied is legible here, not
+                // only as a drop in `confidenceHigh`.
+                "withheldThinEvidence": withheld_count("thin_evidence"),
+                "withheldImplausibleRatio": withheld_count("implausible_ratio"),
+                "withheldOutOfBand": withheld_count("out_of_band"),
+                "anchorStale": nowcast_items
+                    .iter()
+                    .filter(|(_, v)| v["anchor_stale"] == true)
+                    .count(),
             })
         };
 
@@ -1297,6 +1345,66 @@ fn nowcast_confidence(observations: usize, spread: f64) -> &'static str {
     }
 }
 
+/// Why a computed nowcast must NOT ship its number, or `None` when it may.
+///
+/// The nowcast is a DIVISION (`posted median ÷ ratio_used`) whose only
+/// output-side guard used to be `ratio_used <= 0.0`. Every other way the ratio
+/// can be garbage — a corrupted or mis-joined revision history producing 0.02 or
+/// 40 — sailed through and minted an arbitrarily implausible "projected median"
+/// that then persisted with the same numeric authority as a good one. These are
+/// the three ways the number is not publishable, in causal order:
+///
+/// 1. `implausible_ratio` — the divisor is outside
+///    [`NOWCAST_RATIO_MIN`]..=[`NOWCAST_RATIO_MAX`] (or non-finite). The CAUSE.
+/// 2. `out_of_band` — the projected median falls outside the same
+///    [`SALARY_MIN`]..=[`SALARY_MAX`] admission band every posted salary point
+///    had to clear to be counted at all. A projected "salary" the app would have
+///    refused to ingest cannot be a salary it publishes.
+/// 3. `thin_evidence` — fewer than [`NOWCAST_MIN_OBSERVATIONS`] stored ratio
+///    observations back the divisor.
+///
+/// Withholding is `nowcast_median: null` on a row that still ships, NOT a
+/// dropped row: these datasets are written with `upsert_many` (partial upsert,
+/// no tombstoning), so a dropped key would LINGER at yesterday's published
+/// number — silently keeping exactly the value the guard exists to retract.
+fn nowcast_withheld(
+    observations: usize,
+    ratio_used: f64,
+    nowcast_median: f64,
+) -> Option<&'static str> {
+    if !ratio_used.is_finite() || !(NOWCAST_RATIO_MIN..=NOWCAST_RATIO_MAX).contains(&ratio_used) {
+        return Some("implausible_ratio");
+    }
+    if !nowcast_median.is_finite() || !(SALARY_MIN..=SALARY_MAX).contains(&nowcast_median) {
+        return Some("out_of_band");
+    }
+    if observations < NOWCAST_MIN_OBSERVATIONS {
+        return Some("thin_evidence");
+    }
+    None
+}
+
+/// Whether the ISPV anchor behind a nowcast is stale enough to judge, not merely
+/// to stamp (see [`NOWCAST_ANCHOR_STALE_DAYS`]).
+fn anchor_is_stale(staleness_days: i64) -> bool {
+    staleness_days > NOWCAST_ANCHOR_STALE_DAYS
+}
+
+/// Confidence after judging the anchor's age: a stale anchor costs exactly one
+/// level (`high` → `med`, `med` → `low`), never more. The ratio history can be
+/// long and tight — that is what [`nowcast_confidence`] measures — and still be
+/// carrying today's posted median onto an official figure nobody has restated
+/// within a year. Dispersion cannot see that; only the anchor date can.
+fn degrade_for_stale_anchor(confidence: &'static str, staleness_days: i64) -> &'static str {
+    if !anchor_is_stale(staleness_days) {
+        return confidence;
+    }
+    match confidence {
+        "high" => "med",
+        _ => "low",
+    }
+}
+
 /// Newest ISPV anchor date per (unit group × sphere): when the official row the
 /// nowcast leans on was last (re)written to the store — the vintage whose
 /// staleness the nowcast record must disclose.
@@ -1330,6 +1438,15 @@ fn ispv_anchor_dates(rows: &[pumper_core::Record]) -> HashMap<(String, String), 
 /// ratio history, no ISPV anchor row, or fewer than `min_salaries` posted
 /// points today — a missing nowcast is honest; a fabricated one is not.
 /// Keys `{unitGroup}|{sfera}`, sorted for deterministic upserts.
+///
+/// HONESTY FLOOR (see [`nowcast_withheld`]): a row whose divisor or projected
+/// median is implausible, or whose evidence is a single observation, still ships
+/// — with `nowcast_median: null`, `withheld: "<reason>"` and
+/// `confidence: "none"`. The row is the retraction: dropping the key instead
+/// would leave yesterday's published number in place, since this dataset is
+/// written with a partial `upsert_many` and nothing tombstones it.
+/// `anchor_stale` judges the ISPV vintage the projection leans on, and a stale
+/// anchor costs one confidence level ([`degrade_for_stale_anchor`]).
 fn compute_salary_nowcast(
     posted: &HashMap<(String, String), Cell>,
     ratios_by_key: &HashMap<String, Vec<f64>>,
@@ -1359,23 +1476,41 @@ fn compute_salary_nowcast(
         let mut sorted = ratios.clone();
         sorted.sort_by(f64::total_cmp);
         let ratio_used = median_f64(&sorted);
-        if ratio_used <= 0.0 {
-            continue;
-        }
+        let projected = posted_median as f64 / ratio_used;
+        let withheld = nowcast_withheld(ratios.len(), ratio_used, projected);
+        // `spread` divides by the ratio, so it is only meaningful once the ratio
+        // itself is; a withheld row reports no dispersion rather than a ratio of
+        // a garbage number.
         let spread = (sorted[sorted.len() - 1] - sorted[0]) / ratio_used;
+        let staleness_days = (today - *anchor).num_days();
+        // A withheld row has no number, so it has no confidence IN a number —
+        // reporting "high" beside a null would be the contradiction this guard
+        // exists to prevent.
+        let confidence = match withheld {
+            Some(_) => "none",
+            None => {
+                degrade_for_stale_anchor(nowcast_confidence(ratios.len(), spread), staleness_days)
+            }
+        };
         items.push((
             key,
             json!({
                 "isco4": group,
                 "sfera": sfera,
                 "posted_median": posted_median,
-                "nowcast_median": (posted_median as f64 / ratio_used).round() as i64,
-                "ratio_used": (ratio_used * 10_000.0).round() / 10_000.0,
+                "nowcast_median": withheld.is_none().then(|| projected.round() as i64),
+                // Null when there is no number, naming which guard refused it.
+                "withheld": withheld,
+                "ratio_used": ratio_used
+                    .is_finite()
+                    .then(|| (ratio_used * 10_000.0).round() / 10_000.0),
                 "observations": ratios.len(),
-                "dispersion": (spread * 1_000.0).round() / 1_000.0,
-                "confidence": nowcast_confidence(ratios.len(), spread),
+                "dispersion": (withheld.is_none() && spread.is_finite())
+                    .then(|| (spread * 1_000.0).round() / 1_000.0),
+                "confidence": confidence,
                 "ispv_anchor_date": anchor.to_string(),
-                "staleness_days": (today - *anchor).num_days(),
+                "staleness_days": staleness_days,
+                "anchor_stale": anchor_is_stale(staleness_days),
                 "method": "ratio_carry",
             }),
         ));
@@ -2642,6 +2777,178 @@ mod tests {
             .map(|(k, _)| k)
             .collect();
         assert_eq!(keys, vec!["1120|MZDOVA", "9329|MZDOVA"]);
+    }
+
+    // ── nowcast honesty floor ───────────────────────────────────────────────
+
+    /// The anti-pattern: `ratio_used <= 0.0` was the ONLY output-side guard, so
+    /// any positive-but-garbage divisor surviving the window minted an
+    /// arbitrarily implausible "projected median" that then persisted with full
+    /// numeric authority.
+    #[test]
+    fn garbage_ratio_withholds_the_number_instead_of_minting_an_implausible_median() {
+        let posted = posted_map(vec![(
+            ("5223", "MZDOVA"),
+            cell(&[40_000.0, 50_000.0, 60_000.0]),
+        )]);
+        // A corrupted history: postings supposedly pay 2% of the official median.
+        // Unguarded, 50 000 / 0.02 = 2 500 000 CZK/month ships as a "projection".
+        let ratios = ratios_map(&[("5223|MZDOVA", &[0.02, 0.02, 0.02])]);
+        let anchors = anchor_map(&[(("5223", "MZDOVA"), (2026, 7, 1))]);
+        let today = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let items = compute_salary_nowcast(&posted, &ratios, &anchors, today, 3);
+        assert_eq!(items.len(), 1, "the row must still ship as the retraction");
+        let v = &items[0].1;
+        assert!(v["nowcast_median"].is_null());
+        assert_eq!(v["withheld"], "implausible_ratio");
+        assert_eq!(v["confidence"], "none");
+        // The evidence for the refusal stays readable; the dispersion of a
+        // garbage ratio does not.
+        assert_eq!(v["ratio_used"], 0.02);
+        assert_eq!(v["observations"], 3);
+        assert!(v["dispersion"].is_null());
+        // And the honest half of the row survives, so the cell is still legible.
+        assert_eq!(v["posted_median"], 50_000);
+    }
+
+    /// A plausible-looking ratio can still project outside the very band every
+    /// posted salary point had to clear to be counted (`SALARY_MIN..=SALARY_MAX`).
+    #[test]
+    fn projection_outside_the_salary_admission_band_is_withheld_not_published() {
+        // posted median 5 000 (the band floor) ÷ ratio 4.0 → 1 250 CZK/month.
+        let posted = posted_map(vec![(("9329", "MZDOVA"), cell(&[5_000.0, 5_000.0]))]);
+        let ratios = ratios_map(&[("9329|MZDOVA", &[4.0, 4.0, 4.0])]);
+        let anchors = anchor_map(&[(("9329", "MZDOVA"), (2026, 7, 1))]);
+        let today = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let items = compute_salary_nowcast(&posted, &ratios, &anchors, today, 1);
+        assert_eq!(items.len(), 1);
+        let v = &items[0].1;
+        assert!(v["nowcast_median"].is_null());
+        assert_eq!(v["withheld"], "out_of_band");
+        assert_eq!(v["confidence"], "none");
+    }
+
+    /// A 1-observation cell used to ship a number indistinguishable in effect
+    /// from a 6-observation one — same field, same authority, only a `low` label
+    /// and an `observations` count no consumer is forced to read.
+    #[test]
+    fn one_observation_cell_withholds_its_number_not_ships_it_as_merely_low() {
+        let posted = posted_map(vec![
+            (("5223", "MZDOVA"), cell(&[50_000.0])),
+            (("1120", "MZDOVA"), cell(&[100_000.0])),
+        ]);
+        let ratios = ratios_map(&[
+            ("5223|MZDOVA", &[1.25]),                         // one reading
+            ("1120|MZDOVA", &[1.2, 1.2, 1.2, 1.2, 1.2, 1.2]), // six
+        ]);
+        let anchors = anchor_map(&[
+            (("5223", "MZDOVA"), (2026, 7, 1)),
+            (("1120", "MZDOVA"), (2026, 7, 1)),
+        ]);
+        let today = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let items = compute_salary_nowcast(&posted, &ratios, &anchors, today, 1);
+        let by_key: HashMap<&str, &Value> = items.iter().map(|(k, v)| (k.as_str(), v)).collect();
+        let thin = by_key["5223|MZDOVA"];
+        assert!(thin["nowcast_median"].is_null());
+        assert_eq!(thin["withheld"], "thin_evidence");
+        assert_eq!(thin["confidence"], "none");
+        // The well-evidenced cell is unaffected — the floor is a floor, not a mute.
+        let thick = by_key["1120|MZDOVA"];
+        assert_eq!(thick["nowcast_median"], 83_333);
+        assert!(thick["withheld"].is_null());
+        assert_eq!(thick["confidence"], "high");
+    }
+
+    /// The withheld row must still be EMITTED. `salary_nowcast` is written with
+    /// `upsert_many` (partial upsert, no tombstoning), so a suppressed key that
+    /// simply stopped being emitted would linger at yesterday's number — keeping
+    /// exactly the value the guard exists to retract.
+    #[test]
+    fn withheld_cell_emits_its_key_so_a_prior_number_is_overwritten_not_left_lingering() {
+        let posted = posted_map(vec![(("5223", "MZDOVA"), cell(&[50_000.0]))]);
+        let ratios = ratios_map(&[("5223|MZDOVA", &[0.001])]);
+        let anchors = anchor_map(&[(("5223", "MZDOVA"), (2026, 7, 1))]);
+        let today = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let keys: Vec<String> = compute_salary_nowcast(&posted, &ratios, &anchors, today, 1)
+            .into_iter()
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(keys, vec!["5223|MZDOVA"]);
+    }
+
+    #[test]
+    fn nowcast_withheld_names_the_ratio_cause_before_the_out_of_band_symptom() {
+        // A garbage ratio ALSO throws the median out of band; the cause is the
+        // useful answer, so it must win.
+        assert_eq!(
+            nowcast_withheld(6, 0.02, 2_500_000.0),
+            Some("implausible_ratio")
+        );
+        // Non-finite divisors (a zero ratio survived as `inf` before) are the
+        // same class, not a panic and not a published `inf`.
+        assert_eq!(
+            nowcast_withheld(6, f64::INFINITY, 0.0),
+            Some("implausible_ratio")
+        );
+        assert_eq!(
+            nowcast_withheld(6, 0.0, f64::INFINITY),
+            Some("implausible_ratio")
+        );
+        // Plausible ratio, impossible projection.
+        assert_eq!(nowcast_withheld(6, 4.0, 1_250.0), Some("out_of_band"));
+        // Plausible everything, but one reading behind it.
+        assert_eq!(nowcast_withheld(1, 1.25, 40_000.0), Some("thin_evidence"));
+        // The publishable case.
+        assert_eq!(nowcast_withheld(2, 1.25, 40_000.0), None);
+        // Band edges are inclusive on both guards.
+        assert_eq!(nowcast_withheld(2, NOWCAST_RATIO_MIN, SALARY_MAX), None);
+        assert_eq!(nowcast_withheld(2, NOWCAST_RATIO_MAX, SALARY_MIN), None);
+    }
+
+    #[test]
+    fn stale_ispv_anchor_degrades_confidence_and_flags_the_row_not_only_stamps_it() {
+        let posted = posted_map(vec![(("1120", "MZDOVA"), cell(&[100_000.0]))]);
+        // Six perfectly tight observations — `nowcast_confidence` alone says high.
+        let ratios = ratios_map(&[("1120|MZDOVA", &[1.2, 1.2, 1.2, 1.2, 1.2, 1.2])]);
+        let anchors = anchor_map(&[(("1120", "MZDOVA"), (2024, 6, 1))]);
+        let today = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let items = compute_salary_nowcast(&posted, &ratios, &anchors, today, 1);
+        let v = &items[0].1;
+        assert_eq!(v["nowcast_median"], 83_333);
+        assert_eq!(v["anchor_stale"], true);
+        assert_eq!(v["confidence"], "med", "a stale anchor costs one level");
+        assert!(v["staleness_days"].as_i64().unwrap() > NOWCAST_ANCHOR_STALE_DAYS);
+    }
+
+    #[test]
+    fn degrade_for_stale_anchor_costs_exactly_one_level_and_only_when_stale() {
+        // Fresh anchor: untouched.
+        assert_eq!(degrade_for_stale_anchor("high", 0), "high");
+        assert_eq!(
+            degrade_for_stale_anchor("high", NOWCAST_ANCHOR_STALE_DAYS),
+            "high",
+            "the threshold itself is not yet stale"
+        );
+        // Stale: one level, and no further.
+        let stale = NOWCAST_ANCHOR_STALE_DAYS + 1;
+        assert_eq!(degrade_for_stale_anchor("high", stale), "med");
+        assert_eq!(degrade_for_stale_anchor("med", stale), "low");
+        assert_eq!(degrade_for_stale_anchor("low", stale), "low");
+        assert!(!anchor_is_stale(NOWCAST_ANCHOR_STALE_DAYS));
+        assert!(anchor_is_stale(stale));
+    }
+
+    /// A fresh anchor must not silently gain the flag — the negative half of the
+    /// staleness judgment, which is what keeps `anchor_stale` meaningful.
+    #[test]
+    fn fresh_anchor_keeps_full_confidence_and_is_not_flagged() {
+        let posted = posted_map(vec![(("1120", "MZDOVA"), cell(&[100_000.0]))]);
+        let ratios = ratios_map(&[("1120|MZDOVA", &[1.2, 1.2, 1.2, 1.2, 1.2, 1.2])]);
+        let anchors = anchor_map(&[(("1120", "MZDOVA"), (2026, 7, 1))]);
+        let today = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let v = &compute_salary_nowcast(&posted, &ratios, &anchors, today, 1)[0].1;
+        assert_eq!(v["anchor_stale"], false);
+        assert_eq!(v["confidence"], "high");
     }
 
     #[test]
