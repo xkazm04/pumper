@@ -2,19 +2,58 @@
 type: perfect/home
 repo: pumper
 updated: 2026-08-12
-pool: 0
-pool_target: per-dispatch (r13 cap 6)
+pool: 6
+pool_target: per-dispatch (r14 cap 6)
 shipped_total: 116
-coverage: "22/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; wasm-plugin-host banked slate-grade fronts r14; 24 others never proposed"
-cursor: "round 14 PROPOSE: wasm-plugin-host first (banked slate-grade brief from the r13 scout — re-verify seeds), then eu-grants, us-business-census, czech-labor-market, web-crawler, crawler-core, engine-contracts (opp 5); never-proposed before re-mining"
-last_session: "[[sessions/2026-08-12-5]]"
+coverage: "24/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; wasm-plugin-host + eu-grants gated r14; us-business-census banked slate-grade fronts r15; 22 others never proposed"
+cursor: "round 14 BUILD in flight (wasm-plugin-host 3 + eu-grants 3, branch perfect/2026-08-12-r14) → then r15 PROPOSE: us-business-census first (banked slate-grade r14 prefetch brief — re-verify seeds), then czech-labor-market, web-crawler, crawler-core, engine-contracts (opp 5); never-proposed before re-mining"
+last_session: "[[sessions/2026-08-12-6]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **0** · phase: **round 13 SHIPPED — round 14 propose next** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round).
+**State**: pool **6** · phase: **round 14 BUILD** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round).
+
+### Round-14 pool — 6 accepted 2026-08-12 (gate: director-self-gated, SWEEP round)
+wasm-plugin-host, 3/5 (REJECTED-deferred: plugin-app run-door validation — it is
+plugin-runner's door, banked there as that context's anchor; REJECTED: plugins-src
+SDK dedup — example-code duplication, no user moment):
+1. [[wasm-ledger-honesty]] — robustness · M (ledger cannot represent trap/fuel/
+   malformed outcomes; error-under-skip records as ordinary veto; has() true for
+   no-ABI modules; dry-run lies both ways; plugin_missing row-per-event amplification)
+2. [[wasm-sandbox-admission]] — robustness · M (permit not captured by spawn_blocking
+   → cancelled caller over-admits stores; 5 raw RwLock unwraps = poisoned lock kills
+   host; Error::App strings + observatory string-matching; hardcoded probe budgets)
+3. [[wasm-fuel-telemetry]] — feature · M (fuel set, never read back; extraction.md:180
+   documented known gap; observatory substitutes elapsed_ms)
+
+eu-grants, 3/5 (REJECTED-deferred banked: sedia-rekey-guard — dormant until SEDIA
+drifts; sedia-durable-sweep — default scale ~7 pages, failure costs one free re-run;
+runner-up noted: eu-money parser unification — contained divergence):
+4. [[cordis-sweep-honesty]] — robustness · M (one short page ⇒ corpus_swept:true +
+   cursor reset wiping weeks of the 23k walk; total:0 drift hole; maxProjects
+   truncation tail skipped a whole cycle)
+5. [[topic-stats-honesty]] — robustness · M (partial-corpus stats with no as_of/
+   coverage embedded as truth; ghost families forever via upsert_many on a complete
+   recompute; 200k limit silent; registry lies cordis is a grants publisher)
+6. [[derived-change-honesty]] — robustness · M (weekly cordis churn marks every
+   joined topic "changed" daily; core opt-in seam: derived paths excluded from the
+   change hash, eu-sedia adopts for history)
+
+### Wave plan (round 14) — ONE branch `perfect/2026-08-12-r14`, main checkout, 2 CONCURRENT lots
+Write sets disjoint: **Lot W** (opus) = 1,2,3 → crates/engine-wasm/* (lib, tests),
+core/src/{error,plugin,storage}.rs (Error variant, Plugins trait, outcome allowlist),
+core/tests/triggers.rs, server/src/triggers.rs, server/src/state.rs,
+server/routes/{triggers,error,runtime}.rs, server/e2e/trigger_plugins.rs,
+apps/plugin/src/{lib,observatory}.rs, docs/features/{trigger-plugins,triggers,
+extraction}.md · **Lot E** (opus) = 4,5,6 → apps/cordis/*, apps/eu-sedia/*,
+core/src/{datasets,app}.rs (derived-paths hash seam), core/tests (new datasets test
+file — NOT triggers.rs), server/src/registry.rs (cordis publisher rider),
+docs/features/{apps,datasets,datahub}.md, catalog/data-sources.toml.
+Class B both lots: server/e2e/mod.rs (W only expected), routes/mod.rs EXPECTED (W if
+outcomes touch route inventory). core/ files split by name — zero shared files.
 
 ### Round-13 pool — ALL 6 SHIPPED (2026-08-12, gate: director-self-gated, SWEEP round; original session died mid-build, TWO continuation sessions recovered + landed)
 claude-engine, 3/5 (REJECTED: concurrency-cap — no volume consumer, r9 precedent;
@@ -247,26 +286,26 @@ old-map notes got `superseded_by:` aliases (broad-crawler, declarative-extractio
 fetch-engines, http-api-routes, job-worker-cron-scheduler, tiered-fetcher-politeness,
 us-grant-opportunities, us-trades-wages-tax-valuation) — history preserved, none retired.
 
-**Covered (22)**: dataset-storage r4 · job-worker r4 · source-resilience r5 ·
+**Covered (24)**: dataset-storage r4 · job-worker r4 · source-resilience r5 ·
 grants-unified-layer r5 · trigger-pipeline r6 · dataset-api r6 · source-provisioner r7 ·
 search-engine r7 · datahub-bridge r7 · webhook-delivery r8 · dataset-peering r8 ·
 app-runtime r9 · tiered-fetcher r9 · browser-transact r10 · api-surface r10 ·
 extraction-core r11 (3 shipped) · automation-api r11 (3 shipped) ·
 archive-engine r11 (nothing-clears-the-bar verdict recorded) ·
 declarative-extractor r12 (3 shipped) · job-search-api r12 (3 shipped) ·
-**claude-engine r13 (3 shipped)** · **cron-scheduler r13 (3 shipped)**.
-(The r12 wrap updated the frontmatter count but not this list — drift fixed 2026-08-12-5.)
+claude-engine r13 (3 shipped) · cron-scheduler r13 (3 shipped) ·
+**wasm-plugin-host r14 (3 gated)** · **eu-grants r14 (3 gated)**.
 
-**Never-proposed queue (24 after r13's two proposals, opportunity-ranked)**:
+**Never-proposed queue (22 after r14's two proposals, opportunity-ranked)**:
 | Opp | Contexts |
 |---:|---|
-| 6 | wasm-plugin-host (banked slate-grade brief, r13 scout — front of r14) |
-| 5 | eu-grants · us-business-census · czech-labor-market · web-crawler · crawler-core · engine-contracts |
-| 4 | vcr-testing · http-engine · browser-engine · remote-engine (banked anchor) · us-federal-grants · us-state-grants · czech-procurement · trades-operator-economics · trades-pricing · agentic-research · connector-api-watch · page-monitor · maintenance-tooling (banked CONFIRMED anchor) · plugin-runner |
+| 6 | us-business-census (banked slate-grade brief, r14 prefetch scout — front of r15) |
+| 5 | czech-labor-market · web-crawler · crawler-core · engine-contracts |
+| 4 | vcr-testing · http-engine · browser-engine · remote-engine (banked anchor) · us-federal-grants · us-state-grants · czech-procurement · trades-operator-economics · trades-pricing · agentic-research · connector-api-watch · page-monitor · maintenance-tooling (banked CONFIRMED anchor) · plugin-runner (banked anchor, r14) |
 | 3 | wasm-plugin-examples (banked anchor) · data-pipeline-catalog (banked anchor) |
 | 2 | hackernews-example (banked anchor) |
 
-(r13 in flight: claude-engine + cron-scheduler left this queue 2026-08-12.)
+(r14 in flight: wasm-plugin-host + eu-grants left this queue 2026-08-12.)
 
 ## Queue — round 4 (re-scored 2026-08-03 over the 46-context map)
 
