@@ -28,6 +28,13 @@ pub(crate) use events::next_or_shutdown;
 // The defaults-merge, re-exported for the MCP enqueue tool (`crate::mcp`) so a
 // job enqueued by an agent gets byte-identical params to one POSTed over HTTP.
 pub(crate) use jobs::merge_params;
+// The poison-recovering lock helper, re-exported for the BACKGROUND loops
+// (`crate::worker`, `crate::datahub`) — they hold the same class of advisory
+// in-memory caches the request path does, but sit outside `routes` and so
+// cannot reach the private `error` submodule directly. One helper, both
+// surfaces: a poisoned advisory cache must not be able to kill the scheduler
+// tick any more than it may permanently 500 an endpoint.
+pub(crate) use error::lock_advisory;
 // The retention plan builder, re-exported for `main.rs`'s janitor: the dry-run
 // endpoint and the loop that actually deletes MUST compute the same plan, so
 // there is exactly one implementation and both call it.

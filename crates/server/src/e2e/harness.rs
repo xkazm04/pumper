@@ -114,6 +114,40 @@ impl WorkerLoop {
     }
 }
 
+/// The **real** scheduler loop (`scheduler::run`) running in the background,
+/// with a deterministic shutdown — the mirror of [`WorkerLoop`].
+///
+/// The tick loop had no harness at all: every scheduler test drove `reconcile`
+/// directly, so the loop *around* it (panic containment, the shutdown check
+/// between phases, the piggybacked reaper/DLQ/refresher/DataHub calls, the exit)
+/// was untested. That loop is the process heartbeat, so "untested" meant a
+/// contained-or-not panic, a missed cancellation, or a loop that never exits
+/// would all have shipped silently.
+pub struct SchedulerLoop {
+    handle: tokio::task::JoinHandle<()>,
+}
+
+impl SchedulerLoop {
+    /// Spawns `scheduler::run` against this state. Nothing test-only is
+    /// injected: this is the same entry point `main` uses.
+    pub fn start(state: &AppState) -> Self {
+        Self {
+            handle: tokio::spawn(crate::scheduler::run(state.clone())),
+        }
+    }
+
+    /// Fires the shutdown token and waits for the loop to exit. Panics if it
+    /// doesn't — `main` now JOINS this task, so a loop that won't stop is a
+    /// hung shutdown, not a detached background thread nobody waits on.
+    pub async fn shutdown(self, state: &AppState, timeout: Duration) {
+        state.shutdown.cancel();
+        tokio::time::timeout(timeout, self.handle)
+            .await
+            .expect("scheduler loop must exit within the deadline")
+            .expect("scheduler loop task must not panic");
+    }
+}
+
 /// Polls `check` every 10ms until it returns true, then returns. Panics with
 /// `what` on timeout. Condition-driven rather than a fixed sleep, so the tests
 /// are neither flaky nor slower than the thing they wait for.

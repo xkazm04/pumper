@@ -60,6 +60,24 @@ const BUILD_ID_ENV: &str = "PUMPER_BUILD_ID";
 /// default worst case (25s drain) far inside systemd's 90s `TimeoutStopSec`.
 const HTTP_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
 
+/// How long the scheduler tick gets to finish after the shutdown token fires.
+///
+/// **Why joining it at all.** The scheduler task was spawned and its handle
+/// dropped, so shutdown tore it down mid-`await` — between `enqueue` and
+/// `touch_schedule` a scheduled job existed with its schedule's `last_run`
+/// unmoved, and the same firing ran again on the next boot. Joining lets the
+/// tick reach its own exit point, where the reconcile loop has already stopped
+/// enqueuing (it checks the token between schedules).
+///
+/// **Why bounded rather than a bare `.await` like the worker.** Two of the four
+/// piggybacked jobs are network-bound (the webhook dead-letter drain runs
+/// in-line, by design), so a tick's duration is not a property this process
+/// controls. The worker's drain is bounded by `[worker] shutdown_drain_secs`
+/// from the inside; this loop has no such internal bound, so the bound lives
+/// here. Concurrent with the HTTP grace and the worker drain — all three start
+/// when the token fires — so it adds nothing to the common stop time.
+const SCHEDULER_SHUTDOWN_GRACE: Duration = Duration::from_secs(10);
+
 /// What [`sentry_plan`] decided to do with the environment it was handed.
 ///
 /// Modelled as three cases rather than an `Option` so the *malformed*-DSN case
@@ -189,7 +207,9 @@ async fn run() -> anyhow::Result<()> {
     });
 
     let worker = tokio::spawn(worker::run(state.clone()));
-    tokio::spawn(scheduler::run(state.clone()));
+    // Joined at shutdown (see `SCHEDULER_SHUTDOWN_GRACE`) — an unjoined handle
+    // meant the tick was torn down mid-await instead of finishing cleanly.
+    let scheduler = tokio::spawn(scheduler::run(state.clone()));
     tokio::spawn(store_janitor(state.clone()));
     tokio::spawn(retention_janitor(state.clone()));
 
@@ -231,6 +251,17 @@ async fn run() -> anyhow::Result<()> {
     // The HTTP server has stopped accepting; wait for the worker to finish
     // draining (or re-queuing) in-flight jobs before exiting.
     let _ = worker.await;
+    // And let the scheduler's current tick finish rather than dying mid-await
+    // between an `enqueue` and its `touch_schedule`.
+    if await_bounded(scheduler, &shutdown, SCHEDULER_SHUTDOWN_GRACE)
+        .await
+        .is_none()
+    {
+        tracing::warn!(
+            grace_secs = SCHEDULER_SHUTDOWN_GRACE.as_secs(),
+            "scheduler tick still running at the shutdown grace deadline; abandoning it"
+        );
+    }
     // Last, because the drain is the last thing that can teach the governor a
     // penalty: a job finishing during the drain must be in the snapshot too.
     state::final_host_penalty_flush(&state).await;

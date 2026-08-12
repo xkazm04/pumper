@@ -48,6 +48,8 @@ pub async fn run(state: AppState) {
     // when [catalog] auto_reconcile = true (default OFF). Failures are non-fatal
     // — a broken catalog must not stop the scheduler from serving existing rows.
     boot_reconcile(&state).await;
+    // So a contained panic's `file:line:col` survives into the log line below.
+    crate::worker::install_panic_location_hook();
     // Parsed crons cached across ticks, keyed by expression string, so we don't
     // re-parse every schedule's cron on every tick (an edited cron is a new key and
     // re-parses). Lives here so it outlives a single reconcile.
@@ -56,28 +58,41 @@ pub async fn run(state: AppState) {
         if state.shutdown.is_cancelled() {
             break;
         }
-        if let Err(e) = reconcile(&state, &mut cron_cache, Utc::now()).await {
-            error!("scheduler reconcile failed: {e}");
+        let now = Utc::now();
+        // Panic containment. This task IS the process heartbeat — cron, the
+        // stuck-job reaper, the webhook dead-letter drain, the cache refresher
+        // and the DataHub governance poll all ride it — and it is spawned
+        // unjoined, so before this an unwind anywhere inside a tick killed all
+        // five permanently while the HTTP server kept answering, with no log
+        // line and no restart.
+        //
+        // Containment sits HERE rather than at the spawn boundary (supervised
+        // respawn) on purpose: respawning `run` would re-run `boot_reconcile`
+        // and throw away the cross-tick `cron_cache`, i.e. a panic would
+        // silently change scheduling behaviour. Catching around the tick body
+        // keeps every cross-tick fact and costs one `AssertUnwindSafe`.
+        //
+        // `AssertUnwindSafe` over the future: the only state that outlives a
+        // tick is `cron_cache`, a pure memo of parsed cron expressions mutated
+        // by one non-async `entry().or_insert()` that no unwind can interleave.
+        // Everything else is read fresh from `state` on the next tick.
+        let ticked = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tick_once(
+            &state,
+            &mut cron_cache,
+            now,
+        )))
+        .await;
+        if let Err(payload) = ticked {
+            error!(
+                "scheduler tick PANICKED and was contained; the loop continues (cron, the \
+                 stuck-job reaper, the webhook dead-letter drain, the cache refresher and the \
+                 DataHub governance poll all ride this tick): {}",
+                crate::worker::panic_error(
+                    &*payload,
+                    crate::worker::take_panic_location().as_deref()
+                )
+            );
         }
-        // Piggyback the scheduler tick to run the stuck-job reaper: re-queue
-        // running jobs whose heartbeat lease has gone stale (a hung task on a
-        // live server). Cheap — one indexed scan of `running` jobs.
-        crate::worker::reap_once(&state).await;
-        // Also piggyback the webhook dead-letter drain: re-send failed deliveries
-        // whose backoff is due, so a receiver outage longer than the in-process
-        // retry loop doesn't mean permanent silent event loss.
-        if state.config.webhooks.auto_retry {
-            crate::webhook::drain_due(&state).await;
-        }
-        // And the cache refresher ([refresher], default OFF): revalidate cached
-        // entries whose learned change cadence says a change is near — spawned
-        // (non-blocking) and strictly idle-slot via Governor::try_acquire, so
-        // it can neither delay this loop nor crowd out live traffic.
-        crate::refresher::tick(&state);
-        // And the DataHub governance pull ([datahub] govern, default OFF):
-        // interval-gated and spawned — deprecations/tags/assertions in DataHub
-        // become schedule disables, Claude-tier pauses, and immediate syncs.
-        crate::datahub::govern_tick(&state);
         // Stop enqueuing new scheduled work as soon as shutdown is signalled.
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
@@ -87,20 +102,136 @@ pub async fn run(state: AppState) {
     info!("scheduler stopped");
 }
 
+/// One tick: the cron reconcile plus the four periodic jobs that ride this loop
+/// rather than owning a timer of their own.
+async fn tick_once(
+    state: &AppState,
+    cron_cache: &mut HashMap<String, CronSchedule>,
+    now: DateTime<Utc>,
+) {
+    match reconcile(state, cron_cache, now).await {
+        Ok(tally) => {
+            if tally.acted() {
+                info!(?tally, "scheduler pass");
+            }
+        }
+        Err(e) => error!("scheduler reconcile failed: {e}"),
+    }
+    // Piggyback the scheduler tick to run the stuck-job reaper: re-queue
+    // running jobs whose heartbeat lease has gone stale (a hung task on a
+    // live server). Cheap — one indexed scan of `running` jobs. The hourly
+    // trigger-decision-ledger prune is nested inside it.
+    crate::worker::reap_once(state).await;
+    // Also piggyback the webhook dead-letter drain: re-send failed deliveries
+    // whose backoff is due, so a receiver outage longer than the in-process
+    // retry loop doesn't mean permanent silent event loss.
+    if state.config.webhooks.auto_retry {
+        crate::webhook::drain_due(state).await;
+    }
+    // And the cache refresher ([refresher], default OFF): revalidate cached
+    // entries whose learned change cadence says a change is near — spawned
+    // (non-blocking) and strictly idle-slot via Governor::try_acquire, so
+    // it can neither delay this loop nor crowd out live traffic.
+    crate::refresher::tick(state);
+    // And the DataHub governance pull ([datahub] govern, default OFF):
+    // interval-gated and spawned — deprecations/tags/assertions in DataHub
+    // become schedule disables, Claude-tier pauses, and immediate syncs.
+    crate::datahub::govern_tick(state);
+}
+
+/// What one schedule's step did this pass.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StepOutcome {
+    /// Nothing was due.
+    Idle,
+    /// A job was enqueued.
+    Fired,
+    /// `misfire_policy = "skip"` advanced past missed firings; nothing ran.
+    Skipped,
+    /// The overlap guard held the firing (a previous run still owns the slot).
+    Held,
+    /// A door gate refused the row (unparseable cron, unregistered app, invalid
+    /// params). Nothing is recorded, so fixing the row makes the firing happen.
+    Refused,
+}
+
+/// What one reconcile pass did, in aggregate.
+///
+/// Exists so per-schedule failure is *countable* rather than fatal: before this,
+/// a single schedule's storage error propagated out of the loop with `?` and
+/// every alphabetically-later schedule (rows come back `ORDER BY app`) silently
+/// never fired, while `GET /schedules` still answered `health: "ok"`.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct PassTally {
+    pub considered: usize,
+    pub fired: usize,
+    pub skipped: usize,
+    pub held: usize,
+    pub refused: usize,
+    pub failed: usize,
+    /// The shutdown token fired mid-pass, so the remaining schedules were left
+    /// for the next boot rather than enqueued into a draining queue.
+    pub stopped_early: bool,
+}
+
+impl PassTally {
+    /// Folds ONE schedule's step result into the pass.
+    ///
+    /// The anti-pattern this replaces: `?` on a per-schedule storage call inside
+    /// the reconcile loop. This function **cannot** propagate — an `Err` is
+    /// logged with the schedule's id and counted, and the caller keeps looping —
+    /// which is the whole isolation guarantee, expressed as a signature.
+    fn absorb(&mut self, id: &str, app: &str, result: anyhow::Result<StepOutcome>) {
+        self.considered += 1;
+        match result {
+            Ok(StepOutcome::Idle) => {}
+            Ok(StepOutcome::Fired) => self.fired += 1,
+            Ok(StepOutcome::Skipped) => self.skipped += 1,
+            Ok(StepOutcome::Held) => self.held += 1,
+            Ok(StepOutcome::Refused) => self.refused += 1,
+            Err(e) => {
+                self.failed += 1;
+                error!(
+                    id = %id, app = %app,
+                    "schedule step failed; the pass CONTINUES with the remaining schedules: {e}"
+                );
+            }
+        }
+    }
+
+    /// Whether this pass did anything worth a log line.
+    fn acted(&self) -> bool {
+        self.fired + self.skipped + self.held + self.refused + self.failed > 0 || self.stopped_early
+    }
+}
+
 /// `now` is a parameter (the same rule `decide` follows) so a test can drive a
 /// reconcile pass deterministically without waiting for wall-clock time.
 pub(crate) async fn reconcile(
     state: &AppState,
     cron_cache: &mut HashMap<String, CronSchedule>,
-    now: chrono::DateTime<Utc>,
-) -> anyhow::Result<()> {
+    now: DateTime<Utc>,
+) -> anyhow::Result<PassTally> {
     // A firing more than two ticks late was missed while the scheduler was down
     // (a healthy tick catches a due firing within one interval). This is the
     // grace window that separates an on-time run from a backlog misfire.
     let grace = chrono::Duration::seconds(state.config.worker.schedule_tick_secs.max(1) as i64 * 2);
+    let mut tally = PassTally::default();
     for schedule in state.storage.list_schedules().await? {
         if !schedule.enabled {
             continue;
+        }
+        // Shutdown is honoured BETWEEN schedules: the token can fire while the
+        // pass is half-way down the table, and enqueuing into a queue that is
+        // already draining just re-queues work at the next boot with a
+        // `last_run` that claims it ran.
+        if state.shutdown.is_cancelled() {
+            tally.stopped_early = true;
+            info!(
+                considered = tally.considered,
+                "shutdown signalled mid-pass; enqueuing no further scheduled work"
+            );
+            break;
         }
         let cron = if let Some(cron) = cron_cache.get(&schedule.cron) {
             cron
@@ -109,94 +240,120 @@ pub(crate) async fn reconcile(
                 Ok(cron) => cron_cache.entry(schedule.cron.clone()).or_insert(cron),
                 Err(e) => {
                     warn!(id = %schedule.id, cron = %schedule.cron, "invalid cron: {e}");
+                    tally.absorb(&schedule.id, &schedule.app, Ok(StepOutcome::Refused));
                     continue;
                 }
             }
         };
-        let tz = parse_tz(schedule.timezone.as_deref());
-        // Next firing after this schedule's cron reference (see the shared
-        // `schedule_reference`, which `project_next_run` uses too).
-        let reference = schedule_reference(&schedule);
-        let misfire_skip = schedule.misfire_policy == "skip";
-
-        match decide(cron, tz, reference, now, misfire_skip, grace) {
-            Action::Idle => continue,
-            Action::Skip { missed } => {
-                info!(
-                    id = %schedule.id, app = %schedule.app, missed,
-                    "misfire policy 'skip': advancing past missed firings without enqueuing"
-                );
-                // NOT `touch_schedule`: nothing ran, so `last_run` must not move.
-                // The advance is recorded as a skip (with its eaten-firing count),
-                // which `schedule_reference` then honours — see migration 0039.
-                state
-                    .storage
-                    .record_schedule_skip(&schedule.id, now, missed)
-                    .await?;
-            }
-            Action::Fire { collapsed } => {
-                if !state.registry.contains_key(&schedule.app) {
-                    warn!(app = %schedule.app, "schedule references unregistered app; skipping");
-                    continue;
-                }
-                // Overlap guard: don't stack a second run while the previous one
-                // is still queued/running. last_run is NOT touched, so the missed
-                // firing stays due and fires on the first tick after it finishes.
-                // The SAME read + predicate `GET /schedules` reports as
-                // `health: "overlapping"` — see `latest_run`.
-                if latest_run(state, &schedule.id).await?.holds_slot {
-                    info!(id = %schedule.id, app = %schedule.app, "previous scheduled run still active; skipping tick");
-                    continue;
-                }
-
-                // Door parity: a schedule whose effective params fail the app's
-                // declared schema is SKIPPED, not enqueued — the same 422 the
-                // HTTP door answers, moved to the only place a legacy row can
-                // still be caught. `last_run` is deliberately NOT touched (as
-                // with an unregistered app), so fixing the row makes the
-                // schedule fire again instead of having silently eaten firings.
-                // Visible on `GET /schedules` as `health: "invalid_params"`.
-                let params = match validate_schedule_params(
-                    &state.registry,
-                    &schedule.app,
-                    &schedule.params,
-                ) {
-                    Ok(params) => params,
-                    Err(msg) => {
-                        warn!(
-                            id = %schedule.id, app = %schedule.app,
-                            "schedule params fail the app's declared schema; not enqueuing \
-                             (GET /schedules shows health=invalid_params): {msg}"
-                        );
-                        continue;
-                    }
-                };
-                let max_attempts = schedule
-                    .max_attempts
-                    .unwrap_or(DEFAULT_SCHEDULE_MAX_ATTEMPTS);
-                let opts = EnqueueOptions {
-                    params,
-                    max_attempts,
-                    priority: schedule.priority,
-                    schedule_id: Some(schedule.id.clone()),
-                    ..Default::default()
-                };
-                match state.storage.enqueue(&schedule.app, opts).await {
-                    Ok(job) => {
-                        if collapsed > 0 {
-                            info!(id = %schedule.id, app = %schedule.app, job = %job.id, collapsed, "scheduled run fired (missed firings collapsed into one)");
-                        } else {
-                            info!(id = %schedule.id, app = %schedule.app, job = %job.id, "scheduled run fired");
-                        }
-                        state.storage.touch_schedule(&schedule.id, now).await?;
-                        state.notify.notify_one();
-                    }
-                    Err(e) => error!(id = %schedule.id, "failed to enqueue scheduled job: {e}"),
-                }
-            }
-        }
+        // Per-schedule panic containment, inside the per-tick one: an app whose
+        // `default_params()` unwinds is reached INLINE from here (through
+        // `validate_schedule_params`), and one such app must not cost every
+        // other schedule its pass.
+        let step = reconcile_one(state, &schedule, cron, grace, now);
+        let outcome =
+            match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(step)).await {
+                Ok(outcome) => outcome,
+                Err(payload) => Err(anyhow::anyhow!(
+                    "{}",
+                    crate::worker::panic_error(
+                        &*payload,
+                        crate::worker::take_panic_location().as_deref()
+                    )
+                )),
+            };
+        tally.absorb(&schedule.id, &schedule.app, outcome);
     }
-    Ok(())
+    Ok(tally)
+}
+
+/// One schedule's whole step: decide, gate, act.
+///
+/// Extracted from the reconcile loop so the failure of *this* schedule is a
+/// value the caller absorbs ([`PassTally::absorb`]) rather than a `?` that ends
+/// the pass — and so the step is drivable directly from a test.
+pub(crate) async fn reconcile_one(
+    state: &AppState,
+    schedule: &Schedule,
+    cron: &CronSchedule,
+    grace: chrono::Duration,
+    now: DateTime<Utc>,
+) -> anyhow::Result<StepOutcome> {
+    let tz = parse_tz(schedule.timezone.as_deref());
+    // Next firing after this schedule's cron reference (see the shared
+    // `schedule_reference`, which `project_next_run` uses too).
+    let reference = schedule_reference(schedule);
+    let misfire_skip = schedule.misfire_policy == "skip";
+
+    let collapsed = match decide(cron, tz, reference, now, misfire_skip, grace) {
+        Action::Idle => return Ok(StepOutcome::Idle),
+        Action::Fire { collapsed } => collapsed,
+        Action::Skip { missed } => {
+            info!(
+                id = %schedule.id, app = %schedule.app, missed,
+                "misfire policy 'skip': advancing past missed firings without enqueuing"
+            );
+            // NOT `touch_schedule`: nothing ran, so `last_run` must not move.
+            // The advance is recorded as a skip (with its eaten-firing count),
+            // which `schedule_reference` then honours — see migration 0039.
+            state
+                .storage
+                .record_schedule_skip(&schedule.id, now, missed)
+                .await?;
+            return Ok(StepOutcome::Skipped);
+        }
+    };
+
+    if !state.registry.contains_key(&schedule.app) {
+        warn!(app = %schedule.app, "schedule references unregistered app; skipping");
+        return Ok(StepOutcome::Refused);
+    }
+    // Overlap guard: don't stack a second run while the previous one
+    // is still queued/running. last_run is NOT touched, so the missed
+    // firing stays due and fires on the first tick after it finishes.
+    // The SAME read + predicate `GET /schedules` reports as
+    // `health: "overlapping"` — see `latest_run`.
+    if latest_run(state, &schedule.id).await?.holds_slot {
+        info!(id = %schedule.id, app = %schedule.app, "previous scheduled run still active; skipping tick");
+        return Ok(StepOutcome::Held);
+    }
+
+    // Door parity: a schedule whose effective params fail the app's declared
+    // schema is SKIPPED, not enqueued — the same 422 the HTTP door answers,
+    // moved to the only place a legacy row can still be caught. `last_run` is
+    // deliberately NOT touched (as with an unregistered app), so fixing the row
+    // makes the schedule fire again instead of having silently eaten firings.
+    // Visible on `GET /schedules` as `health: "invalid_params"`.
+    let params = match validate_schedule_params(&state.registry, &schedule.app, &schedule.params) {
+        Ok(params) => params,
+        Err(msg) => {
+            warn!(
+                id = %schedule.id, app = %schedule.app,
+                "schedule params fail the app's declared schema; not enqueuing \
+                 (GET /schedules shows health=invalid_params): {msg}"
+            );
+            return Ok(StepOutcome::Refused);
+        }
+    };
+
+    let max_attempts = schedule
+        .max_attempts
+        .unwrap_or(DEFAULT_SCHEDULE_MAX_ATTEMPTS);
+    let opts = EnqueueOptions {
+        params,
+        max_attempts,
+        priority: schedule.priority,
+        schedule_id: Some(schedule.id.clone()),
+        ..Default::default()
+    };
+    let job = state.storage.enqueue(&schedule.app, opts).await?;
+    if collapsed > 0 {
+        info!(id = %schedule.id, app = %schedule.app, job = %job.id, collapsed, "scheduled run fired (missed firings collapsed into one)");
+    } else {
+        info!(id = %schedule.id, app = %schedule.app, job = %job.id, "scheduled run fired");
+    }
+    state.storage.touch_schedule(&schedule.id, now).await?;
+    state.notify.notify_one();
+    Ok(StepOutcome::Fired)
 }
 
 // ---- Catalog reconcile (M19) ----------------------------------------------
@@ -763,6 +920,57 @@ mod tests {
         assert!(!matches_active("last.holds_slot"));
         let existential_twin = concat!("schedule_has", "_active_job");
         assert!("state.storage.schedule_has_active_job(&id)".contains(existential_twin));
+    }
+
+    /// The starvation bug, at the level it lived: one schedule's storage error
+    /// propagated out of the reconcile loop with `?`, so the pass ended there
+    /// and every alphabetically-later schedule (`list_schedules` orders by app)
+    /// silently never fired — while `GET /schedules` still answered `ok`.
+    ///
+    /// [`PassTally::absorb`] cannot propagate: an `Err` is counted and the
+    /// caller keeps looping. Driving the fold over an ordered mix proves the
+    /// schedules *after* the failure still get their turn.
+    #[test]
+    fn one_bad_schedule_does_not_starve_the_rest() {
+        let mut tally = PassTally::default();
+        let steps: Vec<(&str, anyhow::Result<StepOutcome>)> = vec![
+            ("a-early", Ok(StepOutcome::Fired)),
+            (
+                "m-broken",
+                Err(anyhow::anyhow!("database is locked (5) on touch_schedule")),
+            ),
+            ("z-late", Ok(StepOutcome::Skipped)),
+        ];
+        for (id, result) in steps {
+            tally.absorb(id, "demo", result);
+        }
+        assert_eq!(
+            tally,
+            PassTally {
+                considered: 3,
+                fired: 1,
+                skipped: 1,
+                failed: 1,
+                ..PassTally::default()
+            },
+            "the schedule after the failing one must still have been stepped"
+        );
+        assert!(tally.acted(), "a pass with any outcome is worth a log line");
+    }
+
+    /// Every outcome the step can produce lands in exactly one counter — an
+    /// `Idle` pass in particular must stay silent, or the log line the tally
+    /// drives fires every tick for a table of not-yet-due schedules.
+    #[test]
+    fn an_idle_pass_is_silent_not_logged_every_tick() {
+        let mut tally = PassTally::default();
+        for _ in 0..3 {
+            tally.absorb("s", "demo", Ok(StepOutcome::Idle));
+        }
+        assert_eq!(tally.considered, 3);
+        assert!(!tally.acted());
+        tally.absorb("s", "demo", Ok(StepOutcome::Held));
+        assert!(tally.acted(), "a held firing IS worth saying out loud");
     }
 
     #[test]

@@ -45,7 +45,18 @@ A long-running app reports compact progress snapshots through `AppContext::progr
 
 ## Scheduler
 
-DB-backed cron (6-field, with seconds) reconciled every `schedule_tick_secs`. Two other periodic jobs ride the same tick rather than owning a timer: the **stuck-job reaper** (above) and the **webhook dead-letter drain** (`[webhooks] auto_retry`, see [events-webhooks.md](events-webhooks.md)). Apps can declare a static schedule (`ScrapeApp::schedule`, seeded idempotently); runtime CRUD via `GET/POST /schedules`, `DELETE /schedules/{id}`, `POST /schedules/{id}/enabled`. **Overlap guard:** a schedule whose **most recent** run is still queued/running skips the tick without touching `last_run`, so exactly one catch-up run fires when it frees up. The guard and the `health` field on `GET /schedules` are the same read and the same predicate (`scheduler::latest_run` → `run_holds_slot`), so the API's answer is the scheduler's answer.
+DB-backed cron (6-field, with seconds) reconciled every `schedule_tick_secs`. Apps can declare a static schedule (`ScrapeApp::schedule`, seeded idempotently); runtime CRUD via `GET/POST /schedules`, `DELETE /schedules/{id}`, `POST /schedules/{id}/enabled`. **Overlap guard:** a schedule whose **most recent** run is still queued/running skips the tick without touching `last_run`, so exactly one catch-up run fires when it frees up. The guard and the `health` field on `GET /schedules` are the same read and the same predicate (`scheduler::latest_run` → `run_holds_slot`), so the API's answer is the scheduler's answer.
+
+**What the tick actually is.** This loop is the process's only periodic timer, so four other jobs ride it rather than owning one of their own — in this order, after the cron reconcile:
+
+1. the **stuck-job reaper** (above), with the **trigger-decision-ledger prune** nested inside it (hourly, not per tick — see [triggers.md](triggers.md));
+2. the **webhook dead-letter drain** (`[webhooks] auto_retry`, see [events-webhooks.md](events-webhooks.md)) — runs in-line, so a slow receiver parks the tick;
+3. the **cache refresher** (`[refresher]`, default OFF, see [fetching.md](fetching.md)) — spawned, idle-slot only;
+4. the **DataHub governance poll** (`[datahub] govern`, default OFF, see [datahub.md](datahub.md)) — interval-gated and spawned.
+
+Before the first tick the loop runs one **boot catalog reconcile**: it always plans and logs drift between `catalog/data-sources.toml` and the `schedules` table, and applies it only under `[catalog] auto_reconcile = true` (default OFF). An unreadable catalog is a warning, never a reason not to serve the rows that already exist.
+
+Because everything above shares one task, the tick is **contained rather than fragile**: a panic anywhere inside it is caught, logged loudly (`scheduler tick PANICKED and was contained`) and the loop continues; one schedule's storage error is logged with its id, counted, and the pass continues with the remaining schedules instead of ending there (rows come back ordered by app, so a `?` mid-loop used to mean every later schedule silently stopped firing while `GET /schedules` still said `ok`). On shutdown the loop stops enqueuing between schedules, and the process **joins** the task so a tick finishes rather than being torn down between an `enqueue` and its `touch_schedule`.
 
 > The guard used to be existential over *all* of a schedule's jobs while `health` read only the newest. `POST /jobs/{id}/retry` on an **old** job of a schedule re-queues it without moving `created_at`, and nothing clears `schedule_id` — so the guard stayed satisfied forever, the schedule silently stopped firing, and `GET /schedules` still said `ok`. `POST /jobs/retry` with `{app}` could wedge every schedule of that app in one call. Keying both on the newest firing keeps "don't stack a run on top of mine" and drops the wedge.
 

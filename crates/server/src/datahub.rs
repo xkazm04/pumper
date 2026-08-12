@@ -1035,7 +1035,15 @@ pub fn govern_tick(state: &AppState) {
     }
     let interval = std::time::Duration::from_secs(cfg.govern_interval_secs.max(30));
     let guard = {
-        let mut g = state.datahub_govern.lock().unwrap();
+        // Advisory, not propagating: this is the only govern-state lock taken
+        // INLINE on the scheduler tick (everything else below runs inside the
+        // spawned poll), and the state behind it — an in-flight flag, the last
+        // poll instant, the last summary — is re-derived from DataHub on the
+        // next poll. It used to `.unwrap()`, so one panic while any holder had
+        // it turned every later tick into a poisoning panic: cron, the stuck-job
+        // reaper and the webhook dead-letter drain all die with it, silently,
+        // while HTTP keeps answering.
+        let mut g = crate::routes::lock_advisory(&state.datahub_govern, "datahub_govern");
         if !poll_due(g.in_flight, g.last_poll.map(|t| t.elapsed()), interval) {
             return;
         }

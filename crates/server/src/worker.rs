@@ -456,7 +456,7 @@ const PANIC_ERROR_PREFIX: &str = "panicked: ";
 /// formatted one; anything else (a `panic_any`) has no printable form, so we
 /// say so rather than inventing a message. `location` is the `file:line:col`
 /// captured by [`install_panic_location_hook`] when available.
-fn panic_error(payload: &(dyn std::any::Any + Send), location: Option<&str>) -> String {
+pub(crate) fn panic_error(payload: &(dyn std::any::Any + Send), location: Option<&str>) -> String {
     let msg = payload
         .downcast_ref::<&'static str>()
         .map(|s| (*s).to_string())
@@ -482,7 +482,7 @@ thread_local! {
 /// `PanicHookInfo` and is otherwise lost. Chaining (rather than replacing) the
 /// previous hook keeps the default backtrace logging and anything a host binary
 /// installed (e.g. Sentry) intact.
-fn install_panic_location_hook() {
+pub(crate) fn install_panic_location_hook() {
     static ONCE: std::sync::Once = std::sync::Once::new();
     ONCE.call_once(|| {
         let previous = std::panic::take_hook();
@@ -498,7 +498,7 @@ fn install_panic_location_hook() {
 
 /// Takes (and clears) the location recorded by the most recent panic on this
 /// thread.
-fn take_panic_location() -> Option<String> {
+pub(crate) fn take_panic_location() -> Option<String> {
     LAST_PANIC_LOCATION.with(|slot| slot.borrow_mut().take())
 }
 
@@ -1230,7 +1230,15 @@ async fn prune_trigger_ledger(state: &AppState) {
     {
         // The guard is dropped before the await: a std Mutex must never be held
         // across one, and the claim is "this task owns the next sweep".
-        let mut last = LAST_TRIGGER_RUN_PRUNE.lock().expect("prune clock poisoned");
+        //
+        // Advisory, not propagating: this clock is a janitorial `Option<Instant>`
+        // that a restart re-arms anyway, so an interrupted write cannot leave it
+        // half-formed. It used to `.expect()`, and it is reached INLINE from the
+        // scheduler tick (`reap_once`) — one poisoning panic anywhere in the
+        // process would therefore have killed cron, the reaper and the webhook
+        // dead-letter drain for the rest of the process's life while HTTP kept
+        // serving.
+        let mut last = crate::routes::lock_advisory(&LAST_TRIGGER_RUN_PRUNE, "trigger_run_prune");
         if !prune_is_due(*last, now, TRIGGER_RUN_PRUNE_EVERY) {
             return;
         }
