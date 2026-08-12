@@ -861,6 +861,11 @@ pub async fn crawl(
         ..Default::default()
     };
     let mut in_flight = FuturesUnordered::new();
+    // URL → depth of every fetch currently in flight. `pop` takes a URL OUT of the
+    // queue and INTO `seen` in one step, so between the pop and its outcome the
+    // URL lives nowhere a checkpoint can see it — see [`checkpoint_queue`], which
+    // merges this set back in on every save.
+    let mut in_flight_urls: HashMap<String, u32> = HashMap::new();
     // Per-host earliest-next-fetch, driven by robots.txt Crawl-delay.
     let mut next_allowed: HashMap<String, tokio::time::Instant> = HashMap::new();
     // Last intermediate checkpoint save. Time-based, not page-based (see below).
@@ -925,7 +930,40 @@ pub async fn crawl(
             } else {
                 None
             };
+            in_flight_urls.insert(url.clone(), depth);
             in_flight.push(async move { fetch_one(http, url, depth, same_domain, cond).await });
+        }
+
+        // Periodic checkpoint, gated by wall-clock rather than page count, and
+        // evaluated ONCE PER LOOP TURN — i.e. after EVERY fetch outcome, not only
+        // after a kept page. It used to sit inside the kept-page branch, below the
+        // `continue`s for Failed / BotWall / NotModified / Gone / duplicate, so a
+        // revisit sweep over 10k mostly-`304` pages produced zero intermediate
+        // checkpoints: killed at 95% it lost 95%.
+        //
+        // `save_checkpoint` serializes the WHOLE frontier (up to MAX_FRONTIER
+        // seen-strings + queue + kept hashes) — O(frontier), not O(delta) — so
+        // firing it every N pages made total checkpoint work O(pages/N × frontier):
+        // a 100k-page crawl did thousands of full ~10 MB rewrites (tens of GB of
+        // write amplification) for state that moved by a handful of pages, and each
+        // inline save stalled every in-flight fetch. A minimum interval decouples
+        // save count from crawl size; the final save below still captures the true
+        // end state, and the frontier's own seen-set makes a resume idempotent.
+        if checkpointer.is_some() && last_checkpoint.elapsed() >= CHECKPOINT_MIN_INTERVAL {
+            if !flush_then_checkpoint(
+                &mut sink,
+                &mut sink_buf,
+                checkpointer.as_ref(),
+                &frontier,
+                &in_flight_urls,
+                dedup_index.hashes(),
+                false,
+            )
+            .await
+            {
+                stats.checkpoint_errors += 1;
+            }
+            last_checkpoint = tokio::time::Instant::now();
         }
 
         if in_flight.is_empty() {
@@ -939,6 +977,10 @@ pub async fn crawl(
         let Some(result) = in_flight.next().await else {
             break;
         };
+        // Retire the URL from the in-flight set: from here its outcome is either
+        // handed to the sink or deliberately dropped, so the next checkpoint must
+        // not re-queue it.
+        in_flight_urls.remove(fetch_outcome_url(&result));
         let fetched = match result {
             CrawlFetch::Page(f) => f,
             CrawlFetch::Failed(url) => {
@@ -967,9 +1009,7 @@ pub async fn crawl(
                         let cadence = known.cadence.observe_unchanged(epoch_now());
                         sink_buf.push(unchanged_record(url, cadence));
                         if sink_buf.len() >= PAGE_SINK_STRIDE {
-                            if let Some(s) = sink.as_mut() {
-                                s.emit(std::mem::take(&mut sink_buf)).await;
-                            }
+                            flush_page_sink(&mut sink, &mut sink_buf).await;
                         }
                     }
                 }
@@ -985,9 +1025,7 @@ pub async fn crawl(
                 if sink.is_some() {
                     sink_buf.push(gone_record(url, status));
                     if sink_buf.len() >= PAGE_SINK_STRIDE {
-                        if let Some(s) = sink.as_mut() {
-                            s.emit(std::mem::take(&mut sink_buf)).await;
-                        }
+                        flush_page_sink(&mut sink, &mut sink_buf).await;
                     }
                 }
                 continue;
@@ -1057,29 +1095,8 @@ pub async fn crawl(
                     links: fetched.links.clone(),
                 });
                 if sink_buf.len() >= PAGE_SINK_STRIDE {
-                    if let Some(s) = sink.as_mut() {
-                        s.emit(std::mem::take(&mut sink_buf)).await;
-                    }
+                    flush_page_sink(&mut sink, &mut sink_buf).await;
                 }
-            }
-            // Periodic checkpoint, gated by wall-clock rather than page count.
-            // `save_checkpoint` serializes the WHOLE frontier (up to MAX_FRONTIER
-            // seen-strings + queue + kept hashes) — O(frontier), not O(delta) — so
-            // firing it every N kept pages made total checkpoint work
-            // O(pages/N × frontier): a 100k-page crawl did thousands of full ~10 MB
-            // rewrites (tens of GB of write amplification) for state that moved by a
-            // handful of pages, and each inline save stalled every in-flight fetch.
-            // A minimum interval decouples save count from crawl size; the final
-            // save below still captures the true end state, and the frontier's own
-            // seen-set makes a resume idempotent, so widening the worst-case resume
-            // loss from N pages to a few seconds is safe.
-            if checkpointer.is_some() && last_checkpoint.elapsed() >= CHECKPOINT_MIN_INTERVAL {
-                if let Some(sink) = &checkpointer {
-                    if !save_checkpoint(sink, &frontier, dedup_index.hashes(), false).await {
-                        stats.checkpoint_errors += 1;
-                    }
-                }
-                last_checkpoint = tokio::time::Instant::now();
             }
         }
 
@@ -1116,23 +1133,30 @@ pub async fn crawl(
         }
     }
 
-    // Flush any kept pages still buffered below the batch stride.
-    if let Some(s) = sink.as_mut() {
-        if !sink_buf.is_empty() {
-            s.emit(std::mem::take(&mut sink_buf)).await;
-        }
-    }
-
     stats.hosts = hosts.len();
-    stats.frontier_remaining = frontier.len();
+    // Unresolved in-flight URLs are still WORK, not coverage: the `max_pages`
+    // break abandons up to `concurrency - 1` of them, and they are already in
+    // `seen`, so the resume point is the queue plus that set. Reporting only
+    // `frontier.len()` here understated the remaining work by exactly the URLs
+    // the run had buried.
+    stats.frontier_remaining = frontier.len() + in_flight_urls.len();
     stats.frontier_dropped = frontier.dropped();
     stats.skipped_host_budget = frontier.skipped_host_budget();
-    // Final, unthrottled save so the persisted state reflects the true end of
-    // the run (an incomplete crawl's remaining frontier is the resume point).
-    if let Some(sink) = &checkpointer {
-        if !save_checkpoint(sink, &frontier, dedup_index.hashes(), true).await {
-            stats.checkpoint_errors += 1;
-        }
+    // Final, unthrottled save so the persisted state reflects the true end of the
+    // run (an incomplete crawl's remaining frontier is the resume point). Flushes
+    // the sink first — see [`flush_then_checkpoint`].
+    if !flush_then_checkpoint(
+        &mut sink,
+        &mut sink_buf,
+        checkpointer.as_ref(),
+        &frontier,
+        &in_flight_urls,
+        dedup_index.hashes(),
+        true,
+    )
+    .await
+    {
+        stats.checkpoint_errors += 1;
     }
     // Final snapshot so a subscriber's last progress event reflects the true end
     // state (the throttle may have suppressed the last periodic tick).
@@ -1146,7 +1170,18 @@ pub async fn crawl(
 /// instead of page count. The final save on exit is unconditional, so this only
 /// affects mid-crawl resume granularity (a few seconds of re-crawl, which the
 /// seen-set makes idempotent).
+#[cfg(not(test))]
 const CHECKPOINT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Test seam. What the tests here assert about checkpointing is the **placement**
+/// of the interval check — it used to sit inside the kept-page branch, so a run
+/// of 304s/duplicates/failures never checkpointed at all — not the pacing value,
+/// which is one comparison. A millisecond interval lets a test drive the real
+/// `crawl()` loop across several intermediate saves in a tenth of a second
+/// instead of half a minute. (`tokio`'s `test-util` clock, which would let the
+/// production value stand, is not enabled for this crate.)
+#[cfg(test)]
+const CHECKPOINT_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(20);
 
 /// Stable, filesystem-safe artifact filename for a page, addressed by its URL
 /// rather than a per-run sequence number. The frontier de-duplicates URLs, so
@@ -1219,20 +1254,104 @@ impl Checkpoint {
     }
 }
 
-/// Serializes the frontier state and hands it to the durable checkpoint sink.
+/// The queue a checkpoint must persist: everything still in the frontier PLUS
+/// every URL currently in flight.
+///
+/// Anti-pattern this defends — *an in-flight URL is not a crawled URL*.
+/// [`Frontier::pop`] removes a URL from its host bucket and inserts it into
+/// `seen` in one step, so while its fetch is outstanding the URL exists in
+/// neither the queue nor the sink. Persisting only `frontier.queued()` wrote
+/// those URLs as seen-but-not-queued, and [`Frontier::restore`] treats `seen` as
+/// authoritative — so every `max_pages` break (which abandons up to
+/// `concurrency - 1` outstanding fetches) and every kill buried them
+/// permanently, in a resume that then reported success. Merging them back in
+/// costs at most `concurrency` extra queue entries and makes the resume
+/// idempotent: they are re-fetched, and the seen-set stops nothing else.
+///
+/// Duplicates are impossible: a URL in flight was popped out of its bucket, and
+/// `push` early-returns on anything already in `seen`, so it cannot be back in
+/// the queue while its fetch is outstanding.
+fn checkpoint_queue(frontier: &Frontier, in_flight: &HashMap<String, u32>) -> Vec<(String, u32)> {
+    let mut queue = frontier.queued();
+    queue.extend(in_flight.iter().map(|(url, depth)| (url.clone(), *depth)));
+    queue
+}
+
+/// The URL of a fetch outcome, whatever its disposition — the key that retires
+/// it from the in-flight set.
+fn fetch_outcome_url(fetch: &CrawlFetch) -> &str {
+    match fetch {
+        CrawlFetch::Page(f) => &f.url,
+        CrawlFetch::Failed(url)
+        | CrawlFetch::BotWall(url, _)
+        | CrawlFetch::NotModified(url)
+        | CrawlFetch::Gone(url, _) => url,
+    }
+}
+
+/// Hands every buffered page record to the [`PageSink`]. The single drain point,
+/// used both at [`PAGE_SINK_STRIDE`] and — mandatorily — before every checkpoint.
+async fn flush_page_sink(sink: &mut Option<Box<dyn PageSink>>, buf: &mut Vec<CrawlPageRecord>) {
+    if buf.is_empty() {
+        return;
+    }
+    match sink.as_mut() {
+        Some(s) => s.emit(std::mem::take(buf)).await,
+        // No sink to hand them to; don't let the buffer grow unbounded.
+        None => buf.clear(),
+    }
+}
+
+/// The ONE path that persists crawl state. Invariant, stated once and enforced
+/// here: **the checkpoint never claims a page the sink has not been handed.**
+///
+/// Anti-pattern this defends — *checkpoint-before-flush*. Kept pages reach the
+/// `pages` dataset only every [`PAGE_SINK_STRIDE`] records, while the checkpoint
+/// fires on a wall clock and serializes `frontier.seen` *and* the kept
+/// fingerprints — both of which already contain the still-buffered page. A kill
+/// in that window left the body orphaned on disk with no record pointing at it,
+/// its URL marked seen (so a resume never re-fetched it), and its fingerprint
+/// live in the restored dup index (so near-dups of a page that no longer exists
+/// in the dataset kept being suppressed). Flushing first collapses the window:
+/// worst case a page is emitted twice, which the sink upserts idempotently.
+///
+/// The same ordering is what makes the `gone` / `unchanged_304` / `revisited`
+/// counters honest — those markers ride the same buffer, so a run could report
+/// `gone: 40` with zero `gone: true` rows written. No second mechanism needed.
+///
 /// Best-effort: checkpointing must never fail the crawl, but a failure is not
 /// swallowed — returns `false` (warn-logged) so the caller can surface a
-/// `checkpoint_errors` count in the result. The sink throttles its own
-/// persistence; `force` bypasses that for the final end-of-run snapshot.
+/// `checkpoint_errors` count in the result.
+async fn flush_then_checkpoint(
+    sink: &mut Option<Box<dyn PageSink>>,
+    sink_buf: &mut Vec<CrawlPageRecord>,
+    checkpointer: Option<&Arc<dyn crate::app::CheckpointSink>>,
+    frontier: &Frontier,
+    in_flight: &HashMap<String, u32>,
+    kept_hashes: &[u64],
+    force: bool,
+) -> bool {
+    flush_page_sink(sink, sink_buf).await;
+    match checkpointer {
+        Some(cp) => save_checkpoint(cp, frontier, in_flight, kept_hashes, force).await,
+        None => true,
+    }
+}
+
+/// Serializes the frontier state and hands it to the durable checkpoint sink.
+/// Callers go through [`flush_then_checkpoint`], never here directly — the sink
+/// flush has to happen first. The sink throttles its own persistence; `force`
+/// bypasses that for the final end-of-run snapshot.
 async fn save_checkpoint(
     sink: &Arc<dyn crate::app::CheckpointSink>,
     frontier: &Frontier,
+    in_flight: &HashMap<String, u32>,
     kept_hashes: &[u64],
     force: bool,
 ) -> bool {
     let cp = Checkpoint {
         version: CHECKPOINT_VERSION,
-        queue: frontier.queued(),
+        queue: checkpoint_queue(frontier, in_flight),
         seen: frontier.seen.iter().cloned().collect(),
         kept_hashes: kept_hashes.to_vec(),
     };
@@ -1752,11 +1871,18 @@ mod tests {
         etags: HashMap<String, String>,
         /// `ETag` header value returned on a 200 (stored into the page record).
         resp_etags: HashMap<String, String>,
+        /// Simulated per-fetch latency, so a test can put real (small) wall-clock
+        /// duration on a run and cross a time-gated code path such as
+        /// [`CHECKPOINT_MIN_INTERVAL`].
+        delay: Option<std::time::Duration>,
     }
 
     #[async_trait]
     impl HttpClient for MockHttp {
         async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            if let Some(d) = self.delay {
+                tokio::time::sleep(d).await;
+            }
             if self.fail.contains(&req.url) {
                 return Err(crate::Error::App(format!(
                     "simulated transport failure: {}",
@@ -1796,14 +1922,35 @@ mod tests {
         }
     }
 
-    /// A [`PageSink`] that accumulates every emitted record for assertions.
+    /// One thing the crawl did, in the order it did it. End-state assertions
+    /// cannot see an ORDERING defect: the checkpoint-before-flush window is
+    /// invisible unless a test can ask "at the moment THIS state was persisted,
+    /// had the sink already been handed the pages it claims?".
+    enum CrawlEvent {
+        /// SimHashes of the records handed to the [`PageSink`] in one batch.
+        Emitted(Vec<u64>),
+        /// The raw state blob handed to the checkpoint seam.
+        Saved(serde_json::Value),
+    }
+
+    type EventLog = Arc<SyncMutex<Vec<CrawlEvent>>>;
+
+    /// A [`PageSink`] that accumulates every emitted record for assertions, and
+    /// optionally appends to a shared ordered [`CrawlEvent`] trace.
+    #[derive(Default)]
     struct CollectSink {
         records: Arc<SyncMutex<Vec<CrawlPageRecord>>>,
+        log: Option<EventLog>,
     }
 
     #[async_trait]
     impl PageSink for CollectSink {
         async fn emit(&mut self, batch: Vec<CrawlPageRecord>) {
+            if let Some(log) = &self.log {
+                log.lock().unwrap().push(CrawlEvent::Emitted(
+                    batch.iter().map(|r| r.simhash).collect(),
+                ));
+            }
             self.records.lock().unwrap().extend(batch);
         }
     }
@@ -1858,6 +2005,7 @@ mod tests {
         let records = Arc::new(SyncMutex::new(Vec::new()));
         let sink = Box::new(CollectSink {
             records: records.clone(),
+            log: None,
         });
 
         let stats = crawl(
@@ -1984,6 +2132,7 @@ mod tests {
         let records = Arc::new(SyncMutex::new(Vec::new()));
         let sink = Box::new(CollectSink {
             records: records.clone(),
+            log: None,
         });
 
         let mut cfg = test_cfg(&[]);
@@ -2195,16 +2344,116 @@ mod tests {
         assert!(!index.is_near_dup(!0u64));
     }
 
-    /// Collects every state blob handed to the checkpoint seam, so tests can
-    /// assert on what the crawl persists.
-    struct CollectCheckpoints(Arc<SyncMutex<Vec<serde_json::Value>>>);
+    /// Collects every `(state, force)` pair handed to the checkpoint seam, so
+    /// tests can assert both on what the crawl persists AND on whether a save was
+    /// an intermediate one (`force == false`) or the final snapshot.
+    #[derive(Default)]
+    struct CollectCheckpoints {
+        saves: Arc<SyncMutex<Vec<(serde_json::Value, bool)>>>,
+        log: Option<EventLog>,
+    }
 
     #[async_trait]
     impl crate::app::CheckpointSink for CollectCheckpoints {
-        async fn save(&self, state: serde_json::Value, _force: bool) -> bool {
-            self.0.lock().unwrap().push(state);
+        async fn save(&self, state: serde_json::Value, force: bool) -> bool {
+            if let Some(log) = &self.log {
+                log.lock().unwrap().push(CrawlEvent::Saved(state.clone()));
+            }
+            self.saves.lock().unwrap().push((state, force));
             true
         }
+    }
+
+    /// The crawl-driving fixture all the resume/dedup/politeness tests share: a
+    /// [`MockHttp`] site, a collecting [`PageSink`] and a collecting checkpoint
+    /// sink, so a test can assert on the RECORDS a run emitted (not just its
+    /// counters) and on the state it persisted. The bug class these directions
+    /// close — pages that are counted but never handed to the sink — is invisible
+    /// to any test that drives `crawl()` with `sink: None`, which is what every
+    /// resume test used to do.
+    struct CrawlHarness {
+        records: Arc<SyncMutex<Vec<CrawlPageRecord>>>,
+        checkpoints: Arc<SyncMutex<Vec<(serde_json::Value, bool)>>>,
+        /// Interleaved sink-emit / checkpoint-save trace, in happened-before order.
+        log: EventLog,
+    }
+
+    impl CrawlHarness {
+        fn new() -> Self {
+            Self {
+                records: Arc::new(SyncMutex::new(Vec::new())),
+                checkpoints: Arc::new(SyncMutex::new(Vec::new())),
+                log: Arc::new(SyncMutex::new(Vec::new())),
+            }
+        }
+
+        fn sink(&self) -> Box<dyn PageSink> {
+            Box::new(CollectSink {
+                records: self.records.clone(),
+                log: Some(self.log.clone()),
+            })
+        }
+
+        fn checkpointer(&self) -> Arc<dyn crate::app::CheckpointSink> {
+            Arc::new(CollectCheckpoints {
+                saves: self.checkpoints.clone(),
+                log: Some(self.log.clone()),
+            })
+        }
+
+        /// URLs of every record handed to the sink so far, in emit order.
+        fn record_urls(&self) -> Vec<String> {
+            self.records
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|r| r.url.clone())
+                .collect()
+        }
+
+        /// The last state the crawl persisted — the blob a resume is handed.
+        fn last_state(&self) -> serde_json::Value {
+            self.checkpoints
+                .lock()
+                .unwrap()
+                .last()
+                .map(|(state, _)| state.clone())
+                .expect("at least the final checkpoint was saved")
+        }
+
+        /// True when at least one save was an INTERMEDIATE (non-forced) one, i.e.
+        /// the run was resumable before it ended.
+        fn saved_mid_run(&self) -> bool {
+            self.checkpoints
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(_, force)| !*force)
+        }
+    }
+
+    /// A site of `n` distinct child pages hanging off `https://ex.com/`.
+    fn linked_site(n: usize) -> HashMap<String, (u16, String)> {
+        let mut pages = HashMap::new();
+        let links: String = (0..n)
+            .map(|i| format!("<a href=\"/p{i}\">p{i}</a>"))
+            .collect();
+        pages.insert(
+            "https://ex.com/".to_string(),
+            (200, format!("<html><body>{links}</body></html>")),
+        );
+        for i in 0..n {
+            pages.insert(
+                format!("https://ex.com/p{i}"),
+                (
+                    200,
+                    format!(
+                        "<html><body><p>the unique body of child page number {i}</p></body></html>"
+                    ),
+                ),
+            );
+        }
+        pages
     }
 
     #[tokio::test]
@@ -2230,9 +2479,13 @@ mod tests {
         let mut frontier = Frontier::new(None);
         frontier.push("https://x.com/".into(), 0);
         let saved = Arc::new(SyncMutex::new(Vec::new()));
-        let sink: Arc<dyn crate::app::CheckpointSink> = Arc::new(CollectCheckpoints(saved.clone()));
-        assert!(save_checkpoint(&sink, &frontier, &[7u64], true).await);
-        let state = saved.lock().unwrap().pop().expect("one checkpoint saved");
+        let sink: Arc<dyn crate::app::CheckpointSink> = Arc::new(CollectCheckpoints {
+            saves: saved.clone(),
+            log: None,
+        });
+        assert!(save_checkpoint(&sink, &frontier, &HashMap::new(), &[7u64], true).await);
+        let (state, forced) = saved.lock().unwrap().pop().expect("one checkpoint saved");
+        assert!(forced, "the explicit save is a forced one");
         match Checkpoint::from_value(&state) {
             CheckpointLoad::Loaded(cp) => {
                 assert_eq!(cp.version, CHECKPOINT_VERSION);
@@ -2276,14 +2529,21 @@ mod tests {
         let mut cfg = test_cfg(&["https://ex.com/"]);
         cfg.max_pages = 1;
         cfg.concurrency = 1;
-        let saved = Arc::new(SyncMutex::new(Vec::new()));
-        let sink: Arc<dyn crate::app::CheckpointSink> = Arc::new(CollectCheckpoints(saved.clone()));
-        let stats = crawl(http.clone(), cfg, None, None, None, None, Some(sink))
-            .await
-            .unwrap();
+        let harness = CrawlHarness::new();
+        let stats = crawl(
+            http.clone(),
+            cfg,
+            None,
+            None,
+            None,
+            None,
+            Some(harness.checkpointer()),
+        )
+        .await
+        .unwrap();
         assert_eq!(stats.kept, 1);
         assert!(!stats.resumed);
-        let state = saved.lock().unwrap().last().cloned().expect("final save");
+        let state = harness.last_state();
 
         // Run 2: restoring that state resumes (seen-set intact — the seed is not
         // re-enqueued) and reports `resumed`.
@@ -2298,6 +2558,238 @@ mod tests {
         assert_eq!(
             stats.kept, 2,
             "resume crawls only the remaining frontier, not the already-seen seed"
+        );
+    }
+
+    #[test]
+    fn checkpoint_queue_merges_in_flight_not_only_the_queue() {
+        // `pop` takes a URL out of the queue AND into `seen` in one step, so a
+        // checkpoint built from `queued()` alone writes outstanding fetches as
+        // seen-but-not-queued — unreachable on every future resume.
+        let mut frontier = Frontier::new(None);
+        frontier.push("https://ex.com/queued".into(), 0);
+        frontier.push("https://ex.com/flying".into(), 2);
+        let (flying, depth) = {
+            // Pop until we get the URL we want to simulate as in flight.
+            let mut popped = frontier.pop().unwrap();
+            if popped.0 != "https://ex.com/flying" {
+                frontier.push("https://ex.com/other".into(), 0); // keep the queue non-empty
+                popped = frontier.pop().unwrap();
+            }
+            popped
+        };
+        let mut in_flight = HashMap::new();
+        in_flight.insert(flying.clone(), depth);
+
+        let queue = checkpoint_queue(&frontier, &in_flight);
+        assert!(
+            queue.iter().any(|(u, d)| *u == flying && *d == depth),
+            "the in-flight URL (and its depth) is persisted: {queue:?}"
+        );
+        assert_eq!(
+            queue.len(),
+            frontier.queued().len() + 1,
+            "exactly the in-flight set is added, no duplicates"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_page_capped_crawl_does_not_bury_the_urls_it_had_in_flight() {
+        // The `max_pages` break abandons up to `concurrency - 1` outstanding
+        // fetches. Those URLs are already in `seen`, so unless the checkpoint
+        // hands them back the resume can NEVER reach them — the incremental
+        // "max_pages: 50, run it five times" sweep silently loses coverage.
+        //
+        // AC5's assertion: records emitted before the stop ∪ records emitted
+        // after the resume == every page of the site.
+        let http = Arc::new(MockHttp {
+            pages: linked_site(8),
+            ..Default::default()
+        });
+
+        // Run 1: stop at 3 kept pages with 4 concurrent fetches in flight.
+        let run1 = CrawlHarness::new();
+        let mut cfg = test_cfg(&["https://ex.com/"]);
+        cfg.max_pages = 3;
+        cfg.concurrency = 4;
+        let stats1 = crawl(
+            http.clone(),
+            cfg,
+            None,
+            Some(run1.sink()),
+            None,
+            None,
+            Some(run1.checkpointer()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats1.kept, 3, "the page cap stopped the run");
+        assert_eq!(
+            run1.record_urls().len(),
+            stats1.kept,
+            "every kept page reached the sink before the run ended"
+        );
+
+        // Run 2: resume from the persisted state and drain the rest.
+        let run2 = CrawlHarness::new();
+        let mut cfg = test_cfg(&["https://ex.com/"]);
+        cfg.concurrency = 4;
+        cfg.resume_state = Some(run1.last_state());
+        let stats2 = crawl(
+            http,
+            cfg,
+            None,
+            Some(run2.sink()),
+            None,
+            None,
+            Some(run2.checkpointer()),
+        )
+        .await
+        .unwrap();
+        assert!(stats2.resumed);
+
+        let mut seen: Vec<String> = run1.record_urls();
+        seen.extend(run2.record_urls());
+        seen.sort();
+        seen.dedup();
+        let mut expected: Vec<String> = std::iter::once("https://ex.com/".to_string())
+            .chain((0..8).map(|i| format!("https://ex.com/p{i}")))
+            .collect();
+        expected.sort();
+        assert_eq!(
+            seen, expected,
+            "no page is fetched-then-buried: the two runs' records cover the whole site"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_mostly_304_run_is_not_left_without_an_intermediate_checkpoint() {
+        // The interval save used to live inside the kept-page branch, below the
+        // `continue`s for Failed / BotWall / NotModified / Gone / duplicate. A
+        // revisit sweep whose outcomes are all `304` therefore produced ZERO
+        // intermediate checkpoints: killed at 95% it lost 95% of its progress.
+        //
+        // A small per-fetch delay puts real wall-clock on the run so it crosses
+        // the (test-shortened) CHECKPOINT_MIN_INTERVAL several times.
+        let n = 80usize;
+        let urls: Vec<String> = (0..n).map(|i| format!("https://ex.com/k{i}")).collect();
+        let etags: HashMap<String, String> =
+            urls.iter().map(|u| (u.clone(), "v1".to_string())).collect();
+        let http = Arc::new(MockHttp {
+            etags,
+            delay: Some(std::time::Duration::from_millis(5)),
+            ..Default::default()
+        });
+        let source = Box::new(SeedSource(
+            urls.iter()
+                .map(|u| RevisitSeed::bare(u.clone(), Some("v1".into()), None))
+                .collect(),
+        ));
+
+        let harness = CrawlHarness::new();
+        let mut cfg = test_cfg(&[]);
+        cfg.revisit = true;
+        cfg.concurrency = 4;
+        let stats = crawl(
+            http,
+            cfg,
+            None,
+            Some(harness.sink()),
+            Some(source),
+            None,
+            Some(harness.checkpointer()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.unchanged_304, n, "every known page answered 304");
+        assert_eq!(stats.kept, 0, "no body was downloaded");
+        assert!(
+            harness.saved_mid_run(),
+            "a long run of non-kept outcomes still checkpoints mid-run"
+        );
+        let intermediate = harness
+            .checkpoints
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(_, force)| !*force)
+            .count();
+        assert!(
+            intermediate >= 2,
+            "checkpoints keep firing THROUGHOUT a non-kept run, not once: {intermediate}"
+        );
+        // Marker honesty: the counter can't exceed the rows the sink was handed.
+        assert_eq!(
+            harness.record_urls().len(),
+            stats.unchanged_304,
+            "every counted 304 produced a cadence marker in the sink"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_checkpoint_is_not_saved_before_its_pages_reach_the_sink() {
+        // Kept pages reach the dataset only every PAGE_SINK_STRIDE records, while
+        // the checkpoint fires on a wall clock and serializes `seen` + the kept
+        // fingerprints — both of which ALREADY contain the still-buffered page. A
+        // kill in that window orphaned the body on disk (no record points at it),
+        // marked the URL seen so no resume ever refetched it, and left its
+        // fingerprint suppressing near-dups of a page the dataset never got.
+        //
+        // The invariant, checked at every save in happened-before order: the
+        // checkpoint never claims a page the sink has not been handed.
+        let http = Arc::new(MockHttp {
+            pages: linked_site(40),
+            delay: Some(std::time::Duration::from_millis(5)),
+            ..Default::default()
+        });
+        let harness = CrawlHarness::new();
+        let mut cfg = test_cfg(&["https://ex.com/"]);
+        cfg.concurrency = 4;
+        let stats = crawl(
+            http,
+            cfg,
+            None,
+            Some(harness.sink()),
+            None,
+            None,
+            Some(harness.checkpointer()),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stats.kept, 41, "seed + 40 children, all distinct");
+        // The whole run stays under PAGE_SINK_STRIDE, so nothing flushes on its
+        // own — every flush that happens is one a checkpoint forced.
+        assert!(stats.kept < PAGE_SINK_STRIDE);
+
+        let mut handed: HashSet<u64> = HashSet::new();
+        let mut saves = 0usize;
+        for event in harness.log.lock().unwrap().iter() {
+            match event {
+                CrawlEvent::Emitted(hashes) => handed.extend(hashes),
+                CrawlEvent::Saved(state) => {
+                    saves += 1;
+                    let CheckpointLoad::Loaded(cp) = Checkpoint::from_value(state) else {
+                        panic!("every persisted state must load");
+                    };
+                    for h in &cp.kept_hashes {
+                        assert!(
+                            handed.contains(h),
+                            "checkpoint #{saves} claims fingerprint {h:#x}, \
+                             but the sink had not been handed that page yet"
+                        );
+                    }
+                }
+            }
+        }
+        assert!(
+            harness.saved_mid_run(),
+            "the assertion above must cover at least one INTERMEDIATE save"
+        );
+        assert_eq!(
+            harness.records.lock().unwrap().len(),
+            stats.kept,
+            "and every kept page ends up in the sink exactly once"
         );
     }
 
