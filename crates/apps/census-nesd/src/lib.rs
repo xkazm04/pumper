@@ -130,6 +130,10 @@ impl ScrapeApp for CensusNesd {
                         "type": "string",
                         "description": "QDESC_LABEL predicate selecting the owner-age question (default OWNRAGE). Pinning it is required — without it the API returns an unstable question subset."
                     },
+                    "allow_vintage_rewind": {
+                        "type": "boolean",
+                        "description": "Permit a run whose `year` is OLDER than the vintage this app already holds. Default false: these records are keyed without the year, so an older run overwrites current data and publishes the regression as a forward change (a `changed` revision, every watch/trigger on the dataset, a search re-index). Set true only when re-pointing the store at an older vintage is the intent."
+                    },
                     "api_key": {
                         "type": "string",
                         "description": "Free Census API key; falls back to env CENSUS_API_KEY."
@@ -220,6 +224,11 @@ impl ScrapeApp for CensusNesd {
         };
 
         let api_key = census_common::api_key(&ctx, "census-nesd")?;
+
+        // Vintage watermark, BEFORE any write: NES-D records are keyed without
+        // the year, so a run with an older `year` overwrites current data with
+        // older data and publishes the regression as a forward change.
+        let vintage = census_common::guard_vintage(&ctx, "owner_age", &year).await?;
 
         let for_clause = if states.is_empty() || states == "*" {
             "for=state:*".to_string()
@@ -397,6 +406,9 @@ impl ScrapeApp for CensusNesd {
             );
         }
 
+        // The store now holds this vintage — move the watermark.
+        census_common::record_vintage(&ctx, "owner_age", &year).await?;
+
         // Re-derive the blended `census/market_blend` (adds/refreshes the
         // succession fields). Degrades gracefully when the other Census apps
         // have never run.
@@ -411,6 +423,7 @@ impl ScrapeApp for CensusNesd {
         Ok(census_common::with_product_index(json!({
             "source": format!("census/absnesdo/{year}"),
             "year": year,
+            "vintage": vintage,
             "grain": "naics_sector",
             "sectors": sector_summaries,
             "sectors_not_published": not_published,

@@ -95,6 +95,10 @@ impl ScrapeApp for CensusNonemp {
                         "minItems": 1,
                         "description": "4-digit NAICS trade codes. 6-digit × state is disclosure-suppressed for nonemployers (HTTP 204). Default: the enabled trades/taxonomy registry codes, else 2382 + 5617."
                     },
+                    "allow_vintage_rewind": {
+                        "type": "boolean",
+                        "description": "Permit a run whose `year` is OLDER than the vintage this app already holds. Default false: these records are keyed without the year, so an older run overwrites current data and publishes the regression as a forward change (a `changed` revision, every watch/trigger on the dataset, a search re-index). Set true only when re-pointing the store at an older vintage is the intent."
+                    },
                     "api_key": {
                         "type": "string",
                         "description": "Free Census API key; falls back to env CENSUS_API_KEY."
@@ -179,6 +183,11 @@ impl ScrapeApp for CensusNonemp {
         };
 
         let api_key = census_common::api_key(&ctx, "census-nonemp")?;
+
+        // Vintage watermark, BEFORE any write: NES records are keyed without the
+        // year, so a run with an older `year` overwrites current data with older
+        // data and publishes the regression as a forward change.
+        let vintage = census_common::guard_vintage(&ctx, "nonemployers", &year).await?;
 
         let for_clause = if states.is_empty() || states == "*" {
             "for=state:*".to_string()
@@ -343,6 +352,9 @@ impl ScrapeApp for CensusNonemp {
             }));
         }
 
+        // The store now holds this vintage — move the watermark.
+        census_common::record_vintage(&ctx, "nonemployers", &year).await?;
+
         // Re-derive the blended employer+solo `census/market_blend` dataset
         // (shared logic lives in app-census-density). BOTH Census apps trigger
         // the blend after their own upserts because they run annually and
@@ -360,6 +372,7 @@ impl ScrapeApp for CensusNonemp {
         Ok(census_common::with_product_index(json!({
             "source": format!("census/nonemp/{year}"),
             "year": year,
+            "vintage": vintage,
             "trades": trade_summaries,
             "market_blend": market_blend,
             // What the API declined to tell us this run, so a shrinking corpus

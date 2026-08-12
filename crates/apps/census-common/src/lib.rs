@@ -91,6 +91,221 @@ pub fn derived_provenance(ctx: &AppContext, dataset: &str, inputs: &[&str]) -> P
     }
 }
 
+// ---------------------------------------------------------------------------
+// Vintage watermark — the guard against a backwards re-run.
+//
+// Every census source is a fixed annual VINTAGE (CBP 2022, NES 2021, NES-D
+// 2021) keyed WITHOUT the year: `{naics}:{state_fips}`. So `params.year=2019`
+// on an already-2022 store does not add history, it OVERWRITES current data
+// with older data — and, because change detection only sees "the numbers
+// moved", publishes the regression as a FORWARD change: a `changed` revision,
+// a webhook, every watch and trigger on the dataset, and a search re-index.
+//
+// The design decision (2026-08-12), of the two the brief offered:
+//   (a) put the vintage in the record KEY so vintages coexist — rejected. It
+//       multiplies every dataset by its history, forces every reader (the
+//       blend, `/datasets`, exports, the SDK) to learn a "pick the latest
+//       vintage" rule, and there is no `sync_many` reachable for these
+//       namespaces, so the old-keyed rows would linger anyway.
+//   (b) keep one row per cell, pin the vintage as a FIELD (already true — every
+//       record carries `year`) and add a per-dataset watermark that refuses an
+//       older-year run. CHOSEN: it makes the dangerous case loud and costs one
+//       row per dataset.
+//
+// A rewind stays POSSIBLE — `params.allow_vintage_rewind = true` — because
+// re-pointing a store at an older vintage is a legitimate operator action. It
+// just cannot happen by accident, which is how it happened before.
+// ---------------------------------------------------------------------------
+
+/// Per-app dataset holding one vintage watermark per guarded dataset, keyed by
+/// the dataset name. Lives in the app's OWN namespace (not `census`), because a
+/// watermark is a fact about that app's ingest.
+pub const VINTAGE_DATASET: &str = "vintages";
+
+/// How a requested vintage compares to the one already held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VintageVerdict {
+    /// Nothing held yet — any vintage is the first.
+    FirstRun,
+    /// Newer than what is held: the ordinary annual refresh.
+    Advance,
+    /// The same vintage again: a re-run, which is exactly what a scheduled
+    /// annual job does for most of the year.
+    Rerun,
+    /// OLDER than what is held — the dangerous one.
+    Rewind,
+    /// One of the two vintages is not a plain year, so they cannot be ordered.
+    /// Never blocks: a guard that cannot judge must not refuse.
+    Unorderable,
+}
+
+/// Compare a requested vintage with the stored watermark. Pure.
+pub fn vintage_verdict(requested: &str, held: Option<&str>) -> VintageVerdict {
+    let Some(held) = held else {
+        return VintageVerdict::FirstRun;
+    };
+    match (requested.trim().parse::<u32>(), held.trim().parse::<u32>()) {
+        (Ok(r), Ok(h)) if r > h => VintageVerdict::Advance,
+        (Ok(r), Ok(h)) if r == h => VintageVerdict::Rerun,
+        (Ok(_), Ok(_)) => VintageVerdict::Rewind,
+        _ => VintageVerdict::Unorderable,
+    }
+}
+
+/// Whether the run asked to be allowed to write an older vintage over a newer
+/// one (`params.allow_vintage_rewind`).
+pub fn rewind_allowed(ctx: &AppContext) -> bool {
+    ctx.params
+        .get("allow_vintage_rewind")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// Reads `dataset`'s vintage watermark and decides whether this run may write.
+///
+/// Returns the block the run result reports; **errors** on an unapproved
+/// [`VintageVerdict::Rewind`] before a single row is written, naming the escape
+/// hatch. Fail-open on a store read error is deliberately NOT offered: the
+/// whole point is that the write does not happen when we cannot prove it is
+/// safe — a read failure propagates like any other.
+pub async fn guard_vintage(ctx: &AppContext, dataset: &str, year: &str) -> Result<Value> {
+    let held = ctx
+        .datasets
+        .get(&ctx.app, VINTAGE_DATASET, dataset)
+        .await?
+        .and_then(|r| {
+            r.data
+                .get("year")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+    let verdict = vintage_verdict(year, held.as_deref());
+    let allowed = rewind_allowed(ctx);
+    if verdict == VintageVerdict::Rewind && !allowed {
+        return Err(Error::App(format!(
+            "{}/{dataset} holds vintage {} and this run asked for {year}: writing it would \
+             OVERWRITE current data with older data and publish the regression as a forward \
+             change (a `changed` revision, every watch/trigger on the dataset, a search \
+             re-index). Refused. Pass params.allow_vintage_rewind = true if re-pointing the \
+             store at {year} is what you mean.",
+            ctx.app,
+            held.as_deref().unwrap_or("?"),
+        )));
+    }
+    Ok(json!({
+        "dataset": dataset,
+        "requested": year,
+        "held": held,
+        "verdict": match verdict {
+            VintageVerdict::FirstRun => "first_run",
+            VintageVerdict::Advance => "advance",
+            VintageVerdict::Rerun => "rerun",
+            VintageVerdict::Rewind => "rewind_allowed",
+            VintageVerdict::Unorderable => "unorderable",
+        },
+        "rewind_allowed": allowed,
+    }))
+}
+
+/// Moves `dataset`'s watermark to `year` after a successful write.
+///
+/// Always set to the run's own vintage, including an APPROVED rewind: the store
+/// now holds that vintage, so the watermark must describe the data rather than
+/// the high-water mark of runs that once happened.
+pub async fn record_vintage(ctx: &AppContext, dataset: &str, year: &str) -> Result<()> {
+    ctx.upsert(
+        VINTAGE_DATASET,
+        dataset,
+        &json!({ "dataset": dataset, "year": year }),
+    )
+    .await?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Mixed-grain NAICS.
+// ---------------------------------------------------------------------------
+
+/// From the NAICS codes contributing to ONE roll-up cell, the codes that may be
+/// **summed**: a code that is a strict prefix of another COVERS it, so the
+/// covered (finer) codes are dropped.
+///
+/// The bug this kills: a `trades/taxonomy` registry entry listing both `"2382"`
+/// and `"238220"` makes census-density fetch the 4-digit AGGREGATE and one of
+/// its 6-digit COMPONENTS as two separate CBP requests, stored as two records
+/// (`2382:06`, `238220:06`). The blend truncates both to naics4 `2382` and adds
+/// them — the aggregate plus a part of itself, in the cell whose grain IS the
+/// aggregate. Nothing in `trades-common` validates grain, and the double count
+/// is invisible: it looks like a state with more plumbers.
+///
+/// **Keep the aggregate, drop the components** (the choice, recorded): the
+/// roll-up cell's grain is the 4-digit group, and the 4-digit row IS the
+/// complete total for it. Keeping the components instead would under-count
+/// every sibling code that was not requested (2382 also covers 238290), i.e.
+/// trade a visible double-count for an invisible shortfall.
+///
+/// Returns `(counted, dropped)`, both sorted — the dropped list is emitted on
+/// the record, because a silently corrected input is its own kind of lie.
+pub fn covering_naics(codes: &std::collections::BTreeSet<String>) -> (Vec<String>, Vec<String>) {
+    let mut counted = Vec::new();
+    let mut dropped = Vec::new();
+    for code in codes {
+        // Covered when some OTHER code in the set is a strict prefix of it.
+        let covered = codes
+            .iter()
+            .any(|other| other != code && code.starts_with(other.as_str()));
+        if covered {
+            dropped.push(code.clone());
+        } else {
+            counted.push(code.clone());
+        }
+    }
+    (counted, dropped)
+}
+
+// ---------------------------------------------------------------------------
+// Month arithmetic for the BFS monthly series (`YYYY-MM`).
+// ---------------------------------------------------------------------------
+
+/// `YYYY-MM` → months since year 0, or `None` when the period is not a
+/// well-formed month. The common scale every comparison below runs on.
+pub fn month_index(period: &str) -> Option<i32> {
+    let (y, m) = period.trim().split_once('-')?;
+    let (y, m) = (y.parse::<i32>().ok()?, m.parse::<i32>().ok()?);
+    (1..=12).contains(&m).then_some(y * 12 + (m - 1))
+}
+
+/// Whether `periods` are consecutive calendar months with no gap, in the order
+/// given. An empty or single-element window is trivially contiguous; a period
+/// that is not a well-formed month makes the window non-contiguous (we cannot
+/// prove it is).
+pub fn months_contiguous(periods: &[String]) -> bool {
+    let mut prev: Option<i32> = None;
+    for p in periods {
+        let Some(i) = month_index(p) else {
+            return false;
+        };
+        if let Some(prev) = prev {
+            if i != prev + 1 {
+                return false;
+            }
+        }
+        prev = Some(i);
+    }
+    true
+}
+
+/// Whole months from `period` to `now_month`, or `None` when either is not a
+/// well-formed month. Negative when the period is in the future.
+pub fn months_between(period: &str, now_month: &str) -> Option<i32> {
+    Some(month_index(now_month)? - month_index(period)?)
+}
+
+/// The current calendar month as `YYYY-MM` (UTC).
+pub fn current_month() -> String {
+    chrono::Utc::now().format("%Y-%m").to_string()
+}
+
 /// Parses a Census numeric cell.
 ///
 /// Missing, non-numeric, and **negative** values are treated as suppressed
@@ -329,13 +544,89 @@ pub fn bfs_sector_category(naics: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        artifact_sha, bfs_sector_category, census_num, http_provenance, is_55_plus_age_band,
-        is_empty_answer, is_reported_age_band, merge_summary, owner_age_share_55plus,
-        product_index_datasets, redact_key, state_abbr, with_product_index, MARKET_APP,
-        MARKET_BLEND_DATASET, SATURATION_DATASET,
+        artifact_sha, bfs_sector_category, census_num, covering_naics, http_provenance,
+        is_55_plus_age_band, is_empty_answer, is_reported_age_band, merge_summary, months_between,
+        months_contiguous, owner_age_share_55plus, product_index_datasets, redact_key, state_abbr,
+        with_product_index, MARKET_APP, MARKET_BLEND_DATASET, SATURATION_DATASET,
     };
     use pumper_core::UpsertSummary;
     use serde_json::json;
+
+    /// The anti-pattern: a re-run with an OLDER `year` rewriting current data
+    /// backwards and publishing the regression as a forward change. The verdict
+    /// must name that case distinctly from the two harmless ones.
+    #[test]
+    fn an_older_vintage_is_a_rewind_not_an_ordinary_change() {
+        use super::{vintage_verdict, VintageVerdict as V};
+        assert_eq!(vintage_verdict("2022", None), V::FirstRun);
+        assert_eq!(vintage_verdict("2022", Some("2021")), V::Advance);
+        assert_eq!(vintage_verdict("2022", Some("2022")), V::Rerun);
+        // The dangerous one.
+        assert_eq!(vintage_verdict("2019", Some("2022")), V::Rewind);
+        assert_eq!(vintage_verdict("2021", Some("2022")), V::Rewind);
+        // Years are compared as NUMBERS: a lexicographic compare would be right
+        // here by luck and wrong the moment a vintage is not zero-padded.
+        assert_eq!(vintage_verdict("999", Some("2022")), V::Rewind);
+        assert_eq!(vintage_verdict("10000", Some("2022")), V::Advance);
+        // Unorderable never blocks — a guard that cannot judge must not refuse.
+        assert_eq!(vintage_verdict("2021Q3", Some("2022")), V::Unorderable);
+        assert_eq!(vintage_verdict("2022", Some("latest")), V::Unorderable);
+    }
+
+    /// The anti-pattern: a mixed-grain registry entry (`"2382"` AND `"238220"`)
+    /// summing an aggregate with a component of itself inside the naics4 cell
+    /// whose grain IS the aggregate — a silent double count that reads as a
+    /// state with more plumbers.
+    #[test]
+    fn a_covering_aggregate_drops_its_components_instead_of_double_summing() {
+        let set = |v: &[&str]| -> std::collections::BTreeSet<String> {
+            v.iter().map(|s| s.to_string()).collect()
+        };
+        // The literal case: 2382 covers 238220 and 238210.
+        let (counted, dropped) = covering_naics(&set(&["2382", "238210", "238220"]));
+        assert_eq!(counted, vec!["2382".to_string()]);
+        assert_eq!(dropped, vec!["238210".to_string(), "238220".to_string()]);
+        // No aggregate present → every component counts (the normal case).
+        let (counted, dropped) = covering_naics(&set(&["238210", "238220"]));
+        assert_eq!(counted, vec!["238210".to_string(), "238220".to_string()]);
+        assert!(dropped.is_empty());
+        // Three grains: only the coarsest survives.
+        let (counted, _) = covering_naics(&set(&["23", "2382", "238220"]));
+        assert_eq!(counted, vec!["23".to_string()]);
+        // A shared prefix that is not a CODE in the set covers nothing.
+        let (counted, dropped) = covering_naics(&set(&["238210", "238290"]));
+        assert_eq!(counted.len(), 2);
+        assert!(dropped.is_empty());
+        assert_eq!(covering_naics(&set(&[])), (vec![], vec![]));
+    }
+
+    /// The anti-pattern: 12 values that happen to sit next to each other in a
+    /// vector treated as "the trailing twelve months" when three of those
+    /// months are missing from the series.
+    #[test]
+    fn a_gapped_window_is_not_contiguous_months() {
+        let months = |v: &[&str]| -> Vec<String> { v.iter().map(|s| s.to_string()).collect() };
+        assert!(months_contiguous(&months(&[
+            "2024-11", "2024-12", "2025-01"
+        ])));
+        assert!(months_contiguous(&months(&["2025-01"])));
+        assert!(months_contiguous(&[]));
+        // A missing month.
+        assert!(!months_contiguous(&months(&["2024-11", "2025-01"])));
+        // A year boundary that skips December.
+        assert!(!months_contiguous(&months(&["2024-11", "2025-02"])));
+        // Out of order is not contiguous either — the caller must sort first.
+        assert!(!months_contiguous(&months(&["2025-01", "2024-12"])));
+        // Malformed periods cannot be proven contiguous.
+        assert!(!months_contiguous(&months(&["2024-13", "2024-14"])));
+        assert!(!months_contiguous(&months(&["2024", "2024-01"])));
+
+        assert_eq!(months_between("2026-06", "2026-08"), Some(2));
+        assert_eq!(months_between("2025-12", "2026-01"), Some(1));
+        assert_eq!(months_between("2026-08", "2026-08"), Some(0));
+        assert_eq!(months_between("2026-09", "2026-08"), Some(-1));
+        assert_eq!(months_between("nope", "2026-08"), None);
+    }
 
     /// The anti-pattern: a bare `204 No Content` — a contract-VALID "nothing
     /// published at this grain" — read as a broken payload, because 204 is

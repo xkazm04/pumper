@@ -128,12 +128,16 @@ impl ScrapeApp for CensusBfs {
             ],
             output_shape: Some(
                 "{source, from_year, sectors: [{sector, label, monthly_cells, \
-                 velocity_records}], empty_series, market_blend, index_datasets, \
-                 formations: {records, new, changed, unchanged}, formation_velocity: \
-                 {records, new, changed, unchanged}} — every record is US-national \
-                 NAICS-sector grain (grain=naics_sector_national); t12m fields stay Null \
-                 until 12 months exist; `empty_series` names the sector/measure requests \
-                 the API served nothing for",
+                 velocity_records, as_of_period, as_of_age_months, window_contiguous}], \
+                 stale_sectors, empty_series, market_blend, index_datasets, formations: \
+                 {records, new, changed, unchanged}, formation_velocity: {records, new, \
+                 changed, unchanged}, warnings?} — every record is US-national \
+                 NAICS-sector grain (grain=naics_sector_national); t12m/YoY/accel stay \
+                 Null until 12 (resp. 24) CONSECUTIVE months exist, so a gapped series \
+                 yields no velocity and reports window_contiguous=false; accel_pct \
+                 carries accel_basis (a x4 annualization of an unadjusted quarter); \
+                 `empty_series` names the sector/measure requests the API served nothing \
+                 for and `stale_sectors` those whose newest month is over 3 months old",
             ),
             cost_class: CostClass::Free,
         }
@@ -173,6 +177,14 @@ impl ScrapeApp for CensusBfs {
         let mut sector_summaries: Vec<Value> = Vec::new();
         // `{sector}/{data_type_code}` pairs the API served nothing for.
         let mut empty_series: Vec<String> = Vec::new();
+        // Read once so every sector's staleness is measured against the same
+        // month (a run that straddles midnight on the 1st would otherwise
+        // report two different ages for one release).
+        let now_month = census_common::current_month();
+        // Sectors whose newest published month is older than this many months —
+        // reported as run warnings, because a stalled BFS release silently
+        // turns the blend's only current signal back into stock data.
+        let mut stale_sectors: Vec<Value> = Vec::new();
 
         for (sector, label) in &sectors {
             // period → (applications, high-propensity). National series — the
@@ -297,17 +309,49 @@ impl ScrapeApp for CensusBfs {
                         "accel_pct": v.accel_pct.map(Value::from).unwrap_or(Value::Null),
                         "t12m_high_propensity":
                             hp_t12m.map(Value::from).unwrap_or(Value::Null),
+                        // A gapped series yields no trailing figures at all —
+                        // and says so, rather than emitting a window that spans
+                        // more calendar time than it claims.
+                        "window_contiguous": v.window_contiguous,
+                        "prior_window_contiguous": v.prior_window_contiguous,
+                        // What `accel_pct` rests on: a ×4 annualization of the
+                        // last quarter of a NOT-seasonally-adjusted series.
+                        "accel_basis": v.accel_pct.map(|_| Value::from(ACCEL_BASIS))
+                            .unwrap_or(Value::Null),
+                        // How old the newest published month is. BFS is the
+                        // fleet's only "current" input, so a stalled release is
+                        // the one thing that turns the blend's formation block
+                        // back into stock data without any other signal.
+                        "as_of_age_months": v.as_of.as_deref()
+                            .and_then(|p| census_common::months_between(p, &now_month))
+                            .map(Value::from).unwrap_or(Value::Null),
                         "seasonally_adj": "no",
                         "grain": "naics_sector_national",
                     }),
                 ));
             }
 
+            let as_of_age = v
+                .as_of
+                .as_deref()
+                .and_then(|p| census_common::months_between(p, &now_month));
+            if let Some(age) = as_of_age {
+                if age > STALE_AFTER_MONTHS {
+                    stale_sectors.push(json!({
+                        "sector": sector,
+                        "as_of_period": v.as_of,
+                        "as_of_age_months": age,
+                    }));
+                }
+            }
             sector_summaries.push(json!({
                 "sector": sector,
                 "label": label,
                 "monthly_cells": cells.len(),
                 "velocity_records": sector_velocity,
+                "as_of_period": v.as_of,
+                "as_of_age_months": as_of_age.map(Value::from).unwrap_or(Value::Null),
+                "window_contiguous": v.window_contiguous,
             }));
         }
 
@@ -325,10 +369,15 @@ impl ScrapeApp for CensusBfs {
         // `with_product_index` puts `census/market_blend` + `census/saturation`
         // in the worker's index + hook scope for this run — see
         // `census_common::product_index_datasets`.
-        Ok(census_common::with_product_index(json!({
+        let mut out = census_common::with_product_index(json!({
             "source": "census/eits-bfs",
             "from_year": from_year,
             "sectors": sector_summaries,
+            // Sectors whose newest published month is older than the release
+            // cadence allows for. BFS refreshes weekly, so this is either a
+            // Census publication pause or a broken request — either way the
+            // blend's `formation` block is no longer a current signal.
+            "stale_sectors": stale_sectors,
             // Sector × measure requests the API served nothing for — an empty
             // answer is a fact about the release, not an absence of formations.
             "empty_series": empty_series,
@@ -345,9 +394,28 @@ impl ScrapeApp for CensusBfs {
                 "changed": velocity.changed.len(),
                 "unchanged": velocity.unchanged,
             },
-        })))
+        }));
+        if let (false, Value::Object(map)) = (stale_sectors.is_empty(), &mut out) {
+            map.insert(
+                "warnings".into(),
+                json!([format!(
+                    "{} BFS sector series have not published a new month in over \
+                     {STALE_AFTER_MONTHS} months — the `formation` block on \
+                     census/market_blend is no longer a current signal even though the \
+                     blend is re-derived weekly",
+                    stale_sectors.len()
+                )]),
+            );
+        }
+        Ok(out)
     }
 }
+
+/// How many months behind the current month a BFS series may fall before the
+/// run flags it. BFS publishes monthly data weekly, and the newest month is
+/// naturally 1–2 months back at any moment, so 3 is the first age that means
+/// something stopped rather than that a release is pending.
+const STALE_AFTER_MONTHS: i32 = 3;
 
 /// Parse EITS series rows into `(period, value)` tuples (national series —
 /// there is no state column; BFS geography is `us` only). Rows with a
@@ -382,32 +450,60 @@ fn parse_series_rows(
         .collect()
 }
 
+/// How `accel_pct` is computed, carried on every record that has one.
+///
+/// The number is `(sum of the last 3 months × 4 − t12m) / t12m`, over a series
+/// pulled with `seasonally_adj=no`. Both halves of that matter and neither was
+/// stated anywhere: **×4 annualizes a quarter**, so any month with a genuine
+/// seasonal shape (construction formations in Q1 vs Q3) produces double-digit
+/// "acceleration" from the calendar alone. Labelling it is the honest fix — the
+/// alternative, seasonally adjusting ourselves, would be inventing an
+/// adjustment Census deliberately publishes separately.
+pub const ACCEL_BASIS: &str = "last3_months_x4_vs_t12m, not_seasonally_adjusted";
+
 /// Trailing-window formation velocity for one national sector series.
 #[derive(Debug, Default, PartialEq)]
 pub struct Velocity {
     pub months_available: usize,
     /// Latest period in the series (`YYYY-MM`).
     pub as_of: Option<String>,
-    /// Sum of the latest 12 monthly values; `None` until 12 months exist —
-    /// a partial window must not masquerade as an annual rate.
+    /// Sum of the latest 12 monthly values; `None` until 12 CONSECUTIVE months
+    /// exist — a partial (or gapped) window must not masquerade as an annual
+    /// rate.
     pub t12m: Option<f64>,
-    /// Sum of months 13–24 back; `None` until 24 months exist.
+    /// Sum of months 13–24 back; `None` until 24 consecutive months exist.
     pub prior12m: Option<f64>,
     /// (t12m − prior12m) / prior12m, in % — `None` when the prior window is
-    /// incomplete or zero.
+    /// incomplete, gapped, or zero.
     pub yoy_delta_pct: Option<f64>,
     /// Recent momentum vs the trailing year: (last-3-months annualized −
-    /// t12m) / t12m, in % — positive = formations accelerating.
+    /// t12m) / t12m, in % — positive = formations accelerating. See
+    /// [`ACCEL_BASIS`] for what the number rests on.
     pub accel_pct: Option<f64>,
+    /// Whether the trailing-12 window is 12 CONSECUTIVE calendar months.
+    /// `false` means a month is missing from the series and every trailing
+    /// figure above is withheld.
+    pub window_contiguous: bool,
+    /// Whether the 24-month window backing `yoy_delta_pct` is contiguous.
+    pub prior_window_contiguous: bool,
 }
 
 /// Pure velocity math over `(period "YYYY-MM", value)` samples (any order;
 /// sorted lexicographically, which is chronological for zero-padded periods).
+///
+/// **Windows are calendar windows, not positional ones.** The previous version
+/// took the last 12 *elements* of the vector and called them the trailing twelve
+/// months: a suppressed or unreleased month silently shifted the window a year
+/// back and the annual rate was computed over 13+ months of calendar time with
+/// nothing saying so. A gapped window now yields NO trailing figures and says
+/// why (`window_contiguous: false`).
 pub fn compute_velocity(months: &[(String, f64)]) -> Velocity {
     let mut m: Vec<(String, f64)> = months.to_vec();
     m.sort_by(|a, b| a.0.cmp(&b.0));
     let n = m.len();
     let round1 = |x: f64| (x * 10.0).round() / 10.0;
+    let periods =
+        |from: usize| -> Vec<String> { m[from..n].iter().map(|(p, _)| p.clone()).collect() };
 
     let mut v = Velocity {
         months_available: n,
@@ -415,13 +511,17 @@ pub fn compute_velocity(months: &[(String, f64)]) -> Velocity {
         ..Velocity::default()
     };
     if n >= 12 {
+        v.window_contiguous = census_common::months_contiguous(&periods(n - 12));
+        v.prior_window_contiguous = n >= 24 && census_common::months_contiguous(&periods(n - 24));
+    }
+    if n >= 12 && v.window_contiguous {
         let t12m: f64 = m[n - 12..].iter().map(|(_, x)| x).sum();
         v.t12m = Some(round1(t12m));
         let last3: f64 = m[n - 3..].iter().map(|(_, x)| x).sum();
         if t12m > 0.0 {
             v.accel_pct = Some(round1((last3 * 4.0 - t12m) / t12m * 100.0));
         }
-        if n >= 24 {
+        if v.prior_window_contiguous {
             let prior: f64 = m[n - 24..n - 12].iter().map(|(_, x)| x).sum();
             v.prior12m = Some(round1(prior));
             if prior > 0.0 {
@@ -551,6 +651,52 @@ mod tests {
         assert_eq!(v.t12m, Some(1200.0));
         assert_eq!(v.prior12m, None);
         assert_eq!(v.yoy_delta_pct, None);
+    }
+
+    /// The anti-pattern: 12 values that merely sit next to each other in the
+    /// vector treated as "the trailing twelve months". A month the API withheld
+    /// (or has not published) shifted the window a year back, so an ANNUAL rate
+    /// was computed over 13+ months of calendar time — and, joined onto the
+    /// blend, read as a national formation surge.
+    #[test]
+    fn a_gapped_window_emits_no_velocity_and_says_why() {
+        // 24 contiguous months with one month removed from the trailing year.
+        let mut s = two_years();
+        s.retain(|(p, _)| p != "2024-05");
+        let v = compute_velocity(&s);
+        assert_eq!(v.months_available, 23);
+        assert!(!v.window_contiguous, "2024-05 is missing");
+        assert_eq!(v.t12m, None, "no annual rate over a gapped year");
+        assert_eq!(v.accel_pct, None);
+        assert_eq!(v.yoy_delta_pct, None);
+        assert_eq!(v.prior12m, None);
+        // The latest period is still reported — it is a fact about the series.
+        assert_eq!(v.as_of.as_deref(), Some("2024-12"));
+
+        // A gap in the PRIOR year keeps t12m (that window is intact) but not YoY.
+        let mut s = two_years();
+        s.retain(|(p, _)| p != "2023-05");
+        let v = compute_velocity(&s);
+        assert!(v.window_contiguous);
+        assert!(!v.prior_window_contiguous);
+        assert_eq!(v.t12m, Some(1320.0));
+        assert_eq!(v.yoy_delta_pct, None);
+        assert_eq!(v.prior12m, None);
+    }
+
+    /// The `accel_pct` number annualizes ONE quarter (×4) of a series pulled
+    /// `seasonally_adj=no`, so a seasonal trade like construction shows
+    /// double-digit "acceleration" from the calendar alone. The label must ride
+    /// with the number.
+    #[test]
+    fn acceleration_names_its_annualization_and_its_unadjusted_basis() {
+        assert!(ACCEL_BASIS.contains("last3_months_x4"));
+        assert!(ACCEL_BASIS.contains("not_seasonally_adjusted"));
+        // The record emits the label only when there IS an acceleration figure.
+        let v = compute_velocity(&two_years());
+        assert!(v.accel_pct.is_some());
+        let partial = compute_velocity(&series(&[("2024-01", 100.0)]));
+        assert!(partial.accel_pct.is_none());
     }
 
     #[test]

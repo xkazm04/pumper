@@ -119,6 +119,10 @@ impl ScrapeApp for CensusDensity {
                     },
                     "acs_dataset": { "type": "string", "description": "ACS dataset path for the denominator (default acs/acs5)." },
                     "acs_year": { "type": "string", "description": "ACS vintage for the denominator (defaults to `year`)." },
+                    "allow_vintage_rewind": {
+                        "type": "boolean",
+                        "description": "Permit a run whose `year` is OLDER than the vintage this app already holds. Default false: these records are keyed without the year, so an older run overwrites current data and publishes the regression as a forward change (a `changed` revision, every watch/trigger on the dataset, a search re-index). Set true only when re-pointing the store at an older vintage is the intent."
+                    },
                     "api_key": { "type": "string", "description": "Free Census API key; falls back to env CENSUS_API_KEY." }
                 },
                 "additionalProperties": true
@@ -246,6 +250,11 @@ impl ScrapeApp for CensusDensity {
 
         // Key: param → env. Census requires it (keyless 302 → missing_key.html).
         let api_key = census_common::api_key(&ctx, "census-density")?;
+
+        // Vintage watermark, BEFORE any write: CBP records are keyed without the
+        // year, so a run with an older `year` overwrites current data with older
+        // data and publishes the regression as a forward change.
+        let vintage = census_common::guard_vintage(&ctx, "establishments", &year).await?;
 
         if geo == "county" && (states.is_empty() || states == "*") {
             return Err(Error::App(
@@ -471,6 +480,9 @@ impl ScrapeApp for CensusDensity {
             json!({ "skipped": "normalize=false" })
         };
 
+        // The store now holds this vintage — move the watermark.
+        census_common::record_vintage(&ctx, "establishments", &year).await?;
+
         // Blend the employer counts just upserted with census-nonemp's solo
         // counts into the shared `census/market_blend` dataset. Degrades
         // gracefully — a blend failure (or the other app never having run)
@@ -487,6 +499,7 @@ impl ScrapeApp for CensusDensity {
             "source": format!("census/cbp/{year}"),
             "geo": geo,
             "year": year,
+            "vintage": vintage,
             "trades": trade_summaries,
             "top_places_overall": top_overall,
             "top_places_by_saturation": saturation,
@@ -792,6 +805,32 @@ pub struct SaturationWrite<'a> {
     pub year: &'a str,
 }
 
+/// The dimensions a saturation key carries, stamped on every record so a reader
+/// can tell a current row from a legacy `{place}`-keyed one.
+pub const SATURATION_KEY_GRAIN: &str = "geo|denominator_kind|place";
+
+/// A saturation record's key: `{geo}|{denominator_kind}|{place}`.
+///
+/// The key used to be the bare place, which made the record's OWN dimensions
+/// invisible to the store: a `denominator=population` run rewrote the
+/// `denominator=households` ranking under the same keys, and change detection
+/// reported the substitution as an ordinary movement in the numbers — every
+/// state "changed", for a re-parameterisation, not a market shift. (State and
+/// county runs did not in fact collide, since `place_of` already distinguishes
+/// `CA` from `CA·037` — but nothing in the key SAID so, and a future geography
+/// whose label is not place-unique would have collided silently.)
+///
+/// MIGRATION: legacy `{place}`-keyed rows are not rewritten and cannot be
+/// tombstoned from here — `detect_removed` needs a `RemovalGuard` only
+/// `AppContext::sync_many` can mint, and that is scoped to the app's OWN
+/// namespace, which `census` is not. They linger until an operator removes them
+/// (`DELETE /datasets/census/saturation/records/{place}`). They cannot corrupt
+/// the blend: [`blend_market`]'s base join takes the most recently updated row
+/// per place, and every run rewrites the new-keyed rows.
+pub fn saturation_key(geo: &str, denom_kind: &str, place: &str) -> String {
+    format!("{geo}|{denom_kind}|{place}")
+}
+
 /// The FULL saturation ranking as dataset records — not just the top 60 the
 /// result JSON shows, so the headline metric is queryable by the launch-ranking
 /// UI, triggers and exports, and change-detection can see it move.
@@ -804,10 +843,11 @@ pub fn saturation_records(
     rows.iter()
         .map(|(p, e, base, per_10k)| {
             (
-                p.clone(),
+                saturation_key(w.geo, w.denom_kind, p),
                 json!({
                     "place": p,
                     "geo": w.geo,
+                    "key_grain": SATURATION_KEY_GRAIN,
                     "combined_establishments": e,
                     "base": base,
                     "denominator_kind": w.denom_kind,
@@ -909,19 +949,7 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
         truncated.push("census/saturation");
     }
     let bases = live(bases_raw);
-    let base_by_place: BTreeMap<String, (i64, String)> = bases
-        .iter()
-        .filter_map(|r| {
-            let place = r.get("place").and_then(Value::as_str)?.to_string();
-            let base = r.get("base").and_then(Value::as_i64)?;
-            let kind = r
-                .get("denominator_kind")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string();
-            Some((place, (base, kind)))
-        })
-        .collect();
+    let base_by_place = base_index(&bases);
 
     // Optional succession + formation inputs, read by app/dataset NAME (no
     // crate dependency — census-nesd/census-bfs depend on this crate for the
@@ -1007,6 +1035,56 @@ const BLEND_INPUTS: [&str; 5] = [
     "census-bfs/formation_velocity",
 ];
 
+/// One place's per-capita base, as the blend reads it back out of `saturation`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PlaceBase {
+    pub base: i64,
+    pub denominator_kind: String,
+    /// ACS vintage the base came from — carried onto the blend row's `vintages`
+    /// block. `None` on a legacy row written before the field existed.
+    pub acs_year: Option<String>,
+}
+
+/// place → base for the blend's per-capita join.
+///
+/// `saturation` now holds one row per (geo, denominator, place), so a place can
+/// appear several times — with DIFFERENT bases. Two rules make the pick
+/// deterministic instead of "whichever the map iterator wrote last":
+///  - **state rows only**: the blend's cells are state-grain, and a county
+///    row's base would be a fraction of the state's;
+///  - **first wins**, and `Datasets::list` returns `updated_at DESC`, so the
+///    most recently written denominator is the one in force. That is also what
+///    keeps a legacy `{place}`-keyed row from shadowing a current one.
+pub fn base_index(bases: &[Value]) -> BTreeMap<String, PlaceBase> {
+    let mut out: BTreeMap<String, PlaceBase> = BTreeMap::new();
+    for r in bases {
+        // Legacy rows predate `geo`; treat a missing one as state (the only
+        // grain that existed then) rather than dropping it.
+        if r.get("geo").and_then(Value::as_str).unwrap_or("state") != "state" {
+            continue;
+        }
+        let (Some(place), Some(base)) = (
+            r.get("place").and_then(Value::as_str),
+            r.get("base").and_then(Value::as_i64),
+        ) else {
+            continue;
+        };
+        out.entry(place.to_string()).or_insert(PlaceBase {
+            base,
+            denominator_kind: r
+                .get("denominator_kind")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string(),
+            acs_year: r
+                .get("acs_year")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        });
+    }
+    out
+}
+
 /// Pure blend: employer state rows (6-digit NAICS, from `establishments`) +
 /// solo state rows (4-digit NAICS, from `nonemployers`) → one record per
 /// (4-digit NAICS group × state FIPS), keyed `{naics4}:{state_fips}`.
@@ -1024,7 +1102,7 @@ const BLEND_INPUTS: [&str; 5] = [
 pub fn blend_market(
     employers: &[Value],
     solos: &[Value],
-    base_by_place: &BTreeMap<String, (i64, String)>,
+    base_by_place: &BTreeMap<String, PlaceBase>,
     owner_age: &[Value],
     formation_velocity: &[Value],
 ) -> Vec<(String, Value)> {
@@ -1033,8 +1111,12 @@ pub fn blend_market(
     struct Cell {
         state: Option<String>,
         trade: Option<String>,
-        employer_estab: Option<i64>,
-        employer_naics: BTreeSet<String>,
+        /// Per-CONTRIBUTING-CODE establishment counts, resolved to a single sum
+        /// only at emit time — see `census_common::covering_naics`. Summing as
+        /// we go was the double-count bug: a registry listing both `2382` and
+        /// `238220` produced two stored records that both roll up into cell
+        /// `2382`, i.e. the aggregate plus a part of itself.
+        employer_by_naics: BTreeMap<String, i64>,
         employer_year: Option<String>,
         solo_estab: Option<i64>,
         /// Present only when the solo side reported receipts — the succession
@@ -1089,8 +1171,7 @@ pub fn blend_market(
         // 6-digit → 4-digit trade group (codes shorter than 4 pass through).
         let naics4: String = naics.chars().take(4).collect();
         let cell = cells.entry((naics4, st)).or_default();
-        *cell.employer_estab.get_or_insert(0) += num_field(e, "establishments");
-        cell.employer_naics.insert(naics);
+        *cell.employer_by_naics.entry(naics).or_insert(0) += num_field(e, "establishments");
         cell.employer_year = cell.employer_year.take().or_else(|| str_field(e, "year"));
         cell.state
             .get_or_insert_with(|| str_field(e, "place").unwrap_or_default());
@@ -1118,12 +1199,22 @@ pub fn blend_market(
     cells
         .into_iter()
         .map(|((naics4, st_fips), c)| {
-            let coverage = match (c.employer_estab.is_some(), c.solo_estab.is_some()) {
+            // Mixed-grain resolution BEFORE the sum: keep the covering
+            // aggregate, drop the components it already contains.
+            let contributing: BTreeSet<String> = c.employer_by_naics.keys().cloned().collect();
+            let (counted_naics, dropped_naics) = census_common::covering_naics(&contributing);
+            let employer_estab: Option<i64> = (!counted_naics.is_empty()).then(|| {
+                counted_naics
+                    .iter()
+                    .filter_map(|n| c.employer_by_naics.get(n))
+                    .sum()
+            });
+            let coverage = match (employer_estab.is_some(), c.solo_estab.is_some()) {
                 (true, true) => "both",
                 (true, false) => "employer_only",
                 _ => "solo_only",
             };
-            let employer = c.employer_estab.unwrap_or(0);
+            let employer = employer_estab.unwrap_or(0);
             let solo = c.solo_estab.unwrap_or(0);
             let total = employer + solo;
             let solo_share = if total > 0 {
@@ -1143,18 +1234,22 @@ pub fn blend_market(
             // compares a total market against half of one. The value and the
             // basis are emitted together — a consumer that reads one sees the
             // other.
-            let (base, denom_kind, total_market_per_10k, per_10k_basis) =
-                match c.state.as_deref().and_then(|st| base_by_place.get(st)) {
-                    Some((b, kind)) if *b > 0 => (
-                        Value::from(*b),
-                        Value::from(kind.clone()),
-                        Value::from(
-                            ((total as f64 / *b as f64) * 10_000.0 * 100.0).round() / 100.0,
-                        ),
-                        Value::from(per_10k_basis(coverage)),
+            let place_base = c.state.as_deref().and_then(|st| base_by_place.get(st));
+            let (base, denom_kind, total_market_per_10k, per_10k_basis) = match place_base {
+                Some(b) if b.base > 0 => (
+                    Value::from(b.base),
+                    Value::from(b.denominator_kind.clone()),
+                    Value::from(
+                        ((total as f64 / b.base as f64) * 10_000.0 * 100.0).round() / 100.0,
                     ),
-                    _ => (Value::Null, Value::Null, Value::Null, Value::Null),
-                };
+                    Value::from(per_10k_basis(coverage)),
+                ),
+                _ => (Value::Null, Value::Null, Value::Null, Value::Null),
+            };
+            let base_acs_year = place_base
+                .and_then(|b| b.acs_year.clone())
+                .map(Value::from)
+                .unwrap_or(Value::Null);
             // SUCCESSION: 55+ owner share across reported NES-D bands of the
             // naics4's 2-digit SECTOR (NES-D's per-state grain — 2382 joins
             // through 23), and the wave in dollars against the solo side's
@@ -1204,13 +1299,31 @@ pub fn blend_market(
                     })
                 })
                 .unwrap_or(Value::Null);
+            // The four input vintages, read off the values already computed so
+            // the block cannot drift from the fields it summarizes.
+            let employer_vintage = c
+                .employer_year
+                .clone()
+                .map(Value::from)
+                .unwrap_or(Value::Null);
+            let solo_vintage = c.solo_year.clone().map(Value::from).unwrap_or(Value::Null);
+            let owner_age_vintage = owner_age_year.clone();
+            let formation_as_of = formation
+                .get("as_of_period")
+                .cloned()
+                .unwrap_or(Value::Null);
             let value = json!({
                 "naics4": naics4,
                 "trade": c.trade,
                 "state": c.state,
                 "state_fips": st_fips,
                 "employer_establishments": employer,
-                "employer_naics": c.employer_naics.into_iter().collect::<Vec<_>>(),
+                "employer_naics": counted_naics,
+                // Codes present in the store but NOT counted, because a coarser
+                // code in the same cell already contains them. Empty in the
+                // normal single-grain case; non-empty means the taxonomy is
+                // mixed-grain and the correction is on the record, not silent.
+                "employer_naics_covered": dropped_naics,
                 "employer_year": c.employer_year,
                 "solo_operators": solo,
                 "solo_year": c.solo_year,
@@ -1226,6 +1339,24 @@ pub fn blend_market(
                 "succession_receipts": succession_receipts,
                 "formation": formation,
                 "coverage": coverage,
+                // WHAT THIS ROW IS MADE OF, by vintage. The blend is re-derived
+                // by four apps — weekly, once BFS runs — so `updated_at` moves
+                // constantly while the market data underneath is 2021/2022
+                // stock. Without this block a consumer reading freshness off the
+                // envelope concludes the numbers are current; they are not, and
+                // now the record says which year each input came from.
+                //
+                // Deliberately NO derivation timestamp: it would land in the
+                // change-detection hash and mark every row `changed` on every
+                // re-derive. The as-of of the derivation lives on the revision's
+                // provenance stamp instead (`census_common::derived_provenance`).
+                "vintages": {
+                    "employer_cbp_year": employer_vintage,
+                    "solo_nes_year": solo_vintage,
+                    "owner_age_nesd_year": owner_age_vintage,
+                    "formation_bfs_as_of": formation_as_of,
+                    "base_acs_year": base_acs_year,
+                },
             });
             (format!("{naics4}:{st_fips}"), value)
         })
@@ -1548,8 +1679,8 @@ mod tests {
     #[test]
     fn per_10k_carries_the_coverage_it_was_computed_over() {
         let bases = BTreeMap::from([
-            ("CA".to_string(), (10_000i64, "households".to_string())),
-            ("TX".to_string(), (10_000i64, "households".to_string())),
+            ("CA".to_string(), test_base(10_000)),
+            ("TX".to_string(), test_base(10_000)),
         ]);
         // A `both` cell: employer + solo over the base.
         let both = blend_market(
@@ -1608,12 +1739,24 @@ mod tests {
         );
         assert_eq!(recs.len(), 1);
         let (key, v) = &recs[0];
-        assert_eq!(key, "CA");
+        // The key carries its own grain: a `population` run no longer rewrites
+        // the `households` ranking under the same keys.
+        assert_eq!(key, "state|households|CA");
+        assert_eq!(v["key_grain"], SATURATION_KEY_GRAIN);
+        assert_eq!(v["place"], "CA");
         assert_eq!(v["combined_establishments"], 400);
         assert_eq!(v["base"], 10_000);
         assert_eq!(v["denominator_kind"], "households");
         assert_eq!(v["per_10k"], json!(400.0));
         assert_eq!(v["acs_year"], "2022");
+    }
+
+    fn test_base(base: i64) -> PlaceBase {
+        PlaceBase {
+            base,
+            denominator_kind: "households".into(),
+            acs_year: Some("2022".into()),
+        }
     }
 
     fn emp(naics: &str, geo: &str, place: &str, st: &str, estab: i64) -> Value {
@@ -1700,7 +1843,7 @@ mod tests {
         let solos = vec![solo("2382", "CA", "06", 300)];
         // Base known for CA (households = 10,000): 400 operators / 10k * 10k = 400.
         let mut bases = BTreeMap::new();
-        bases.insert("CA".to_string(), (10_000i64, "households".to_string()));
+        bases.insert("CA".to_string(), test_base(10_000));
         let items = blend_market(&employers, &solos, &bases, &[], &[]);
         let v = &items[0].1;
         assert_eq!(v["base"], 10_000);
@@ -1850,7 +1993,7 @@ mod tests {
         assert_eq!(sum.new.len(), 1);
         let revs = ctx
             .datasets
-            .history(MARKET_APP, SATURATION_DATASET, "CA", 10)
+            .history(MARKET_APP, SATURATION_DATASET, "state|households|CA", 10)
             .await
             .expect("history");
         let p = &revs.first().expect("one revision").provenance;
@@ -1894,6 +2037,223 @@ mod tests {
         );
         // The blend still ran — a truncated read is reported, not fatal.
         assert_eq!(out["blended"], 1);
+    }
+
+    /// The anti-pattern: a re-run with an older `year` rewriting current data
+    /// backwards, and change detection publishing the regression as a FORWARD
+    /// change — a `changed` revision, every watch and trigger on
+    /// `establishments`, a search re-index, all saying "the market moved".
+    #[tokio::test]
+    async fn an_older_year_rerun_is_refused_before_it_rewrites_current_data() {
+        let store = pumper_core::testing::TempStore::new("census-vintage").await;
+        let ctx2022 = pumper_core::testing::TestContext::new(&store.storage, "census-density")
+            .params(json!({ "year": "2022" }))
+            .build();
+        // First run of any vintage is always allowed.
+        let first = census_common::guard_vintage(&ctx2022, "establishments", "2022")
+            .await
+            .expect("first run");
+        assert_eq!(first["verdict"], "first_run");
+        assert_eq!(first["held"], Value::Null);
+        census_common::record_vintage(&ctx2022, "establishments", "2022")
+            .await
+            .expect("watermark");
+
+        // The same vintage again — the ordinary scheduled re-run.
+        let again = census_common::guard_vintage(&ctx2022, "establishments", "2022")
+            .await
+            .expect("rerun");
+        assert_eq!(again["verdict"], "rerun");
+        assert_eq!(again["held"], "2022");
+
+        // An OLDER vintage: refused, with the escape hatch named.
+        let ctx2019 = pumper_core::testing::TestContext::new(&store.storage, "census-density")
+            .params(json!({ "year": "2019" }))
+            .build();
+        let err = census_common::guard_vintage(&ctx2019, "establishments", "2019")
+            .await
+            .expect_err("a rewind must be refused");
+        let msg = err.to_string();
+        assert!(msg.contains("holds vintage 2022"), "{msg}");
+        assert!(msg.contains("allow_vintage_rewind"), "{msg}");
+
+        // ...unless it is asked for explicitly, and then the watermark follows
+        // the data rather than staying at a high-water mark of runs.
+        let forced = pumper_core::testing::TestContext::new(&store.storage, "census-density")
+            .params(json!({ "year": "2019", "allow_vintage_rewind": true }))
+            .build();
+        let ok = census_common::guard_vintage(&forced, "establishments", "2019")
+            .await
+            .expect("an approved rewind proceeds");
+        assert_eq!(ok["verdict"], "rewind_allowed");
+        census_common::record_vintage(&forced, "establishments", "2019")
+            .await
+            .expect("watermark");
+        let after = census_common::guard_vintage(&ctx2022, "establishments", "2022")
+            .await
+            .expect("advance");
+        assert_eq!(after["verdict"], "advance");
+        assert_eq!(after["held"], "2019");
+        // The guard is per DATASET — one app's other datasets are untouched.
+        let other = census_common::guard_vintage(&ctx2019, "owner_age", "2019")
+            .await
+            .expect("independent watermark");
+        assert_eq!(other["verdict"], "first_run");
+    }
+
+    /// The anti-pattern: two runs at different grains overwriting each other's
+    /// saturation ranking under the same bare `{place}` keys, with change
+    /// detection reporting the substitution as movement in the numbers.
+    #[test]
+    fn saturation_keys_separate_the_grains_that_used_to_overwrite_each_other() {
+        let rows = vec![("CA".to_string(), 400i64, 10_000i64, 400.0)];
+        let write = |geo, denom| {
+            saturation_records(
+                &rows,
+                &SaturationWrite {
+                    geo,
+                    denom_kind: denom,
+                    acs_dataset: "acs/acs5",
+                    acs_year: "2022",
+                    year: "2022",
+                },
+            )[0]
+            .0
+            .clone()
+        };
+        let households = write("state", "households");
+        let population = write("state", "population");
+        let county = write("county", "households");
+        assert_eq!(households, "state|households|CA");
+        assert_ne!(
+            households, population,
+            "two denominators are two rankings, not one row rewritten"
+        );
+        assert_ne!(households, county, "two geographies are two rankings");
+        assert_eq!(
+            saturation_key("state", "owner_occupied", "CA·037"),
+            "state|owner_occupied|CA·037"
+        );
+    }
+
+    /// The blend's base join must be deterministic now that a place can carry
+    /// several saturation rows: state grain only, most recent first — which is
+    /// also what keeps a LEGACY `{place}`-keyed row from shadowing a current one.
+    #[test]
+    fn the_base_join_takes_the_newest_state_row_per_place() {
+        let sat = |geo: &str, kind: &str, base: i64, acs: &str| {
+            json!({ "place": "CA", "geo": geo, "base": base,
+                    "denominator_kind": kind, "acs_year": acs })
+        };
+        // `Datasets::list` is updated_at DESC, so index 0 is the newest write.
+        let idx = base_index(&[
+            sat("state", "population", 40_000, "2022"),
+            sat("state", "households", 10_000, "2021"),
+        ]);
+        assert_eq!(
+            idx["CA"],
+            PlaceBase {
+                base: 40_000,
+                denominator_kind: "population".into(),
+                acs_year: Some("2022".into()),
+            }
+        );
+        // A county row never supplies a state cell's base.
+        let county_only = base_index(&[sat("county", "households", 500, "2022")]);
+        assert!(county_only.is_empty());
+        // A legacy row with no `geo` is read as state (the only grain that
+        // existed when it was written) rather than dropped.
+        let legacy = base_index(&[json!({ "place": "CA", "base": 9_000 })]);
+        assert_eq!(legacy["CA"].base, 9_000);
+        assert_eq!(legacy["CA"].acs_year, None);
+    }
+
+    /// The anti-pattern: a mixed-grain taxonomy (`"2382"` AND `"238220"`)
+    /// double-summing the aggregate with a component of itself in the cell whose
+    /// grain IS the aggregate — a state that looks like it has 50% more
+    /// plumbers, with nothing anywhere saying why.
+    #[test]
+    fn a_covering_naics_is_not_double_summed_with_its_components() {
+        let employers = vec![
+            emp("2382", "state", "CA", "06", 150),   // the aggregate
+            emp("238220", "state", "CA", "06", 100), // a component OF it
+            emp("238210", "state", "CA", "06", 50),  // another component
+        ];
+        let solos = vec![solo("2382", "CA", "06", 300)];
+        let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &[]);
+        assert_eq!(items.len(), 1);
+        let v = &items[0].1;
+        // 150, not 300: the aggregate is the total for the cell.
+        assert_eq!(v["employer_establishments"], 150);
+        assert_eq!(v["employer_naics"], json!(["2382"]));
+        assert_eq!(v["employer_naics_covered"], json!(["238210", "238220"]));
+        assert_eq!(v["total_market"], 450);
+
+        // Single-grain (the normal case) is untouched, and reports no coverage.
+        let plain = blend_market(
+            &[
+                emp("238220", "state", "CA", "06", 100),
+                emp("238210", "state", "CA", "06", 50),
+            ],
+            &solos,
+            &BTreeMap::new(),
+            &[],
+            &[],
+        );
+        assert_eq!(plain[0].1["employer_establishments"], 150);
+        assert_eq!(plain[0].1["employer_naics"], json!(["238210", "238220"]));
+        assert_eq!(plain[0].1["employer_naics_covered"], json!([]));
+    }
+
+    /// The anti-pattern: `updated_at` moving weekly (four apps re-derive the
+    /// blend) over 2021/2022 stock data, so a consumer reading freshness off the
+    /// envelope concludes the market numbers are current.
+    #[test]
+    fn blend_rows_name_the_vintage_of_every_input() {
+        let bases = BTreeMap::from([("CA".to_string(), test_base(10_000))]);
+        let ages = vec![
+            band("23", "06", "55 to 64", 40),
+            band("23", "06", "25 to 54", 60),
+        ];
+        let velocity = vec![json!({
+            "sector": "NAICS23", "geo": "US", "t12m_applications": 1320.0,
+            "as_of_period": "2026-06", "grain": "naics_sector_national",
+        })];
+        let items = blend_market(
+            &[emp("238220", "state", "CA", "06", 100)],
+            &[solo("2382", "CA", "06", 300)],
+            &bases,
+            &ages,
+            &velocity,
+        );
+        assert_eq!(
+            items[0].1["vintages"],
+            json!({
+                "employer_cbp_year": "2022",
+                "solo_nes_year": "2021",
+                "owner_age_nesd_year": "2021",
+                "formation_bfs_as_of": "2026-06",
+                "base_acs_year": "2022",
+            })
+        );
+        // Absent inputs are Null in the block, never a fabricated vintage — and
+        // the block itself is always present, so a reader cannot mistake "no
+        // vintage recorded" for "no such field in this build".
+        let bare = blend_market(
+            &[emp("238220", "state", "CA", "06", 100)],
+            &[solo("2382", "CA", "06", 300)],
+            &BTreeMap::new(),
+            &[],
+            &[],
+        );
+        let v = &bare[0].1["vintages"];
+        assert_eq!(v["employer_cbp_year"], "2022");
+        assert!(v["owner_age_nesd_year"].is_null());
+        assert!(v["formation_bfs_as_of"].is_null());
+        assert!(v["base_acs_year"].is_null());
+        // No derivation timestamp: it would enter the change-detection hash and
+        // mark every row `changed` on every re-derive.
+        assert!(v.get("derived_at").is_none() && bare[0].1.get("derived_at").is_none());
     }
 
     #[test]
