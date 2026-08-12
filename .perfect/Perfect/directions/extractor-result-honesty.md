@@ -3,12 +3,12 @@ slug: extractor-result-honesty
 type: perfect/direction
 context: "[[declarative-extractor]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 4c9092a
 ---
 
 ## What & why
@@ -53,4 +53,16 @@ victim moment:
   working; do NOT rename existing keys.
 
 ## Build record
-(pending)
+- Builder (Lot X, opus) commit `4c9092a`. Director review: **keep** — output_shape
+  rewritten key-for-key and PINNED by an EXPECTED-diff test over a real run;
+  `sweep_truncated(returned, limit)` judged on the store's page BEFORE the removed
+  filter (the right denominator); `source.limit` param makes truncation testable with 3
+  fixtures; `QualityRollup` poolable + checkpoint-serialized (serde defaults, no version
+  bump) → backfill gains worst_fields with cumulative denominators; VERDICTS deliberately
+  not pooled (a verdict is a state — final batch's verdict reported, reasoning in code);
+  `RulesRegistration::from_outcome` → honest-null rules_hash + error in result; every
+  write mode reports the dataset ACTUALLY written via the same
+  `resilience::write_dataset` the write path uses (truthful by construction, @q
+  included). Builder refutation: backfill never echoed records — didn't "restore" a key
+  it never had, said so in the doc. Bonus in-scope: source-mode missing_keys got the
+  100-entry echo cap its siblings had.

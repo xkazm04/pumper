@@ -3,12 +3,12 @@ slug: search-degraded-honesty
 type: perfect/direction
 context: "[[job-search-api]]"
 lens: robustness
-status: accepted
+status: shipped
 size: S
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 63db76f
 ---
 
 ## What & why
@@ -46,4 +46,13 @@ the search response itself.
 - Non-goal: auto-heal / auto-backfill (the maintenance bins own recovery, server stopped).
 
 ## Build record
-(pending)
+- Builder (Lot J, opus) commit `63db76f`. Director review: **keep** — named pure
+  `index_degraded_reason(enabled, doc_count)` with THREE degraded states (disabled /
+  wiped-or-never-populated / count-unreadable — the last deliberately NOT folded into 0,
+  per the repo's never-report-unmeasured-as-zero rule); new shared `run_search` renderer
+  extends r7's build_search_request sharing to the ANSWER shape, so /search and the MCP
+  tool cannot diverge on honesty; doc_count verified cheap (segment metadata on the same
+  searcher — carried unconditionally, not just on empty pages); MCP tool description
+  teaches agents to read `index.reason` before concluding from zero hits; e2e separates
+  empty-page from empty-index with scriptable Search impls + a populated control.
+  Reasons name the exact recovery command. Docs (search.md, http-api.md) updated.

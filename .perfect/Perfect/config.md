@@ -53,6 +53,26 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   resource-destructive actions even when they are obviously regenerable.
 
 ## Skill improvement log
+- 2026-08-12 (round 12): **The report-don't-touch seam for out-of-set changes worked
+  end-to-end for the first time at full depth**: Lot X predicted the worker.rs
+  double-index its own change would create, specified the exact guard + the fallback
+  that must stay outside it + the stale-doc rollout consequence, and the Director
+  applied it as a reviewed commit at quiescence. The write-set boundary produced a
+  BETTER analysis than shared ownership would have — the builder had to reason about
+  the seam instead of just editing it. Keep worker.rs-style shared chokepoints
+  Director-only when two lots orbit them.
+- 2026-08-12 (round 12): **The doors-audit acceptance criterion caught a second
+  instance of the bug being fixed** (triggers door, stored + replayed per hop — worse
+  than the original). An audit criterion ("inventory EVERY surface that accepts X")
+  turns one fix into a class kill; pair it with an extinction scan so the convention
+  is enforced, not remembered. Also: my extinction scan failed twice on first runs
+  (doc-comment quote, then its own needle literal) — a source-scanning guard needs a
+  comment-stripped view AND a self-match check, now proven twice (r11 chokepoint, r12
+  budget).
+- 2026-08-12 (round 12): **First deathless round since r7** — both opus lots ran ~65min
+  concurrently to final report. The concurrent two-lot partition is now 4-for-4 with
+  zero collisions. Committing the propose-state BEFORE launching builders (b121216)
+  cost nothing and would have made a death near-free; keep it as a standing step.
 - 2026-08-12 (round 11): **Second mid-build death, and the recovery bill was ~30 minutes
   with zero work lost** — but only because both dead builders had COMMITTED nothing while
   having FINISHED their first direction in the working tree. The wip-snapshot →

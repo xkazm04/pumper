@@ -67,3 +67,11 @@ Pre-verified anchors, strongest first:
 
 ## Shipped
 - (inherited via those contexts)
+- 2026-08-12 (r12): [[job-budget-floor]] → `acba9f4` (+ Director `6f6efdb`: the SAME bug
+  at the trigger door — stored + replayed into every hop — plus the
+  budget_filter_antipattern_is_extinct convention scan; builder caught NaN/∞ beyond the
+  brief) · [[job-control-event-honesty]] → `e638efc` (control events carry the real app
+  via RETURNING; a user cancel outranks the drain — claim-under-mutex-before-fire;
+  the microsecond-loser answers suspended:true, never a lie; refuted the brief's
+  "/events has an app filter" claim) · [[search-degraded-honesty]] → `63db76f` (index
+  block on every search answer via shared run_search; 3 degraded states; MCP parity).

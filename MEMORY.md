@@ -61,10 +61,11 @@ elsewhere gets wrong.
    **EMPTY** whenever the on-disk schema doesn't match the build's (a field was added,
    or `body` isn't stored) — queries keep returning `200` with fewer hits, which looks
    healthy. The worker's incremental path is delta-driven off the change feed, so it
-   only refills rows that change from then on. `GET /search/status` → `doc_count: 0` on
-   an enabled index is the signal; the recovery is
-   `cargo run -p pumper-server --bin search-backfill` **with the server stopped**
-   (Tantivy holds an exclusive writer lock).
+   only refills rows that change from then on. Since r12 (`63db76f`) every search
+   answer carries `index: {enabled, doc_count, degraded, reason}`, so the wiped state
+   is visible on the query itself; `GET /search/status` remains the telemetry view.
+   The recovery is `cargo run -p pumper-server --bin search-backfill` **with the
+   server stopped** (Tantivy holds an exclusive writer lock).
 
 5. **Startup is CWD-relative and the `.env` loader never clobbers.**
    `crates/server/src/main.rs` reads `./.env` before anything touches the environment,

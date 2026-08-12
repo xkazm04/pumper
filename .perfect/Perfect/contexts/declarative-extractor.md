@@ -68,3 +68,11 @@ Pre-verified anchors, strongest first:
 
 ## Shipped
 - (inherited — see [[declarative-extraction-engine]])
+- 2026-08-12 (r12): [[extractor-mode-door]] → `aac6dd5` (one mode per job — refused at the
+  door via oneOf AND in the app via resolve_run_mode; concurrency clamped to the schema's
+  64) · [[extractor-result-honesty]] → `4c9092a` (truthful output_shape pinned by
+  EXPECTED-diff; sweep truncation signal + source.limit; backfill gains health +
+  worst_fields via poolable QualityRollup; registration failure surfaces; every write
+  mode names the dataset actually written, @q included) · [[extractor-records-echo]] →
+  `742cd44` (+ Director `e9c3c32` worker guard: echo bounded 100/1000/0, index_datasets
+  on all write modes gated producer-side, double-index closed, clone gone).

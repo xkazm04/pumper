@@ -3,12 +3,12 @@ slug: job-control-event-honesty
 type: perfect/direction
 context: "[[job-search-api]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: e638efc
 ---
 
 ## What & why
@@ -54,4 +54,24 @@ Two ways the job-control surface tells watchers something false:
 - Non-goal: changing bulk-retry semantics, the fence, or the reaper.
 
 ## Build record
-(pending)
+- Builder (Lot J, opus) commit `e638efc`. Director review: **keep** — (a) `retry_bulk` →
+  `(Uuid, String)` pairs and `cancel` → `Option<String>` via RETURNING in the SAME
+  statement (no follow-up get racing the transition it describes); `requeued_events` is
+  the extracted pure builder; wire shapes unchanged. (b) Shipped the CANCEL-WINS outcome:
+  pure `cancel_kind(user_requested, shutting_down)`; the door claims intent UNDER the
+  job_cancels mutex immediately before firing the token — that ordering closes the
+  fire/mark gap; `resolve_cancel` records a committed suspend so the microsecond-loser
+  path answers `{cancelled: false, suspended: true, note}` instead of lying (pinned at
+  unit level); e2e with a real 6s drain window proves cancel-wins deterministically, 5/5.
+  Accepted deviation: CANCEL_INTENTS as a worker.rs module static (state.rs was out of
+  set) — poison-tolerant, lock order job_cancels→intents documented, bounded by in-flight
+  count via the attempt-matched cleanup. BANKED follow-up: move it onto AppState.
+- Builder refutation (load-bearing): "/events SSE has an app filter" was FALSE —
+  `GET /events` streams with `|_| true`, no app filter exists; the blindness was confined
+  to mcp/live.rs. Fix and docs worded accordingly.
+- Bonus doors-audit find → Director commit `6f6efdb`: POST /triggers had the IDENTICAL
+  budget filter, worse (stored on the row, replayed into every hop). Same
+  validate_budget_usd wired; e2e at the trigger door; `budget_filter_antipattern_is_extinct`
+  comment-stripped whitespace-stripped scan makes the convention enforced, not remembered
+  (scan failed twice on first runs — doc-comment quote, then its own needle — both fixed
+  in the scan, not the assertion).

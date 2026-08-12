@@ -3,12 +3,12 @@ slug: extractor-records-echo
 type: perfect/direction
 context: "[[declarative-extractor]]"
 lens: optimization
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 742cd44
 ---
 
 ## What & why
@@ -54,4 +54,23 @@ route) FIRST, then bound the echo.
 - Non-goal: touching the dataset write path or upsert semantics.
 
 ## Build record
-(pending)
+- Builder (Lot X, opus) commit `742cd44`. Director review: **keep** — records_echo
+  (default 100, ceiling 1000, 0 = counts-only, NO unbounded option by design); clone
+  paid only for the echoed prefix; backfill echoes 0 → clone-free write path;
+  `index_datasets` declared on all four write modes, GATED producer-side on the source's
+  own verdict (`indexable: !state.skips_search_index()` — the worker's gate reads the
+  spec pair's health, and `<dataset>@q` is a pair nothing judges, so producer-side is
+  the only honest gate; same vocabulary as grants_common::indexable); coverage proof
+  in-crate: capped echo (1 of 5) still yields 5 change-feed revisions with snapshots.
+- **Director-applied follow-up LANDED as `e9c3c32`** (at Lot J quiescence): guard
+  `search_docs`'s records/stories/items loop with `if result.get("index_datasets")
+  .is_none()` — else the echoed prefix double-indexes (`_records` + dataset path). Keep
+  the `docs.is_empty()` whole-result fallback OUTSIDE the guard (grants/peer runs keep
+  their `_job` doc). Expected consequence: extractor runs mint a `_job` doc → one
+  `delete_dataset(app, "_job")` sweep per run, same shape as other index_datasets apps.
+  Rollout note: previously-indexed `extractor:_records` docs are never swept — one-call
+  recovery `DELETE /search/datasets/extractor/_records`; reindex does NOT clear them.
+- Banked (builder find): `versions_for` also reads with SOURCE_LIST_LIMIT — a URL with
+  >10k archived versions truncates silently; same class as the sweep cap. And: an e2e
+  "capped-echo run yields N dataset-scoped docs, zero _records docs" once the worker
+  guard lands.

@@ -3,12 +3,12 @@ slug: job-budget-floor
 type: perfect/direction
 context: "[[job-search-api]]"
 lens: robustness
-status: accepted
+status: shipped
 size: S
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: acba9f4
 ---
 
 ## What & why
@@ -40,4 +40,9 @@ round-9's budget-exhaustion-terminal: budgets are load-bearing safety rails here
 - Non-goal: changing budget enforcement semantics mid-run.
 
 ## Build record
-(pending)
+- Builder (Lot J, opus) commit `acba9f4`. Director review: **keep** — named
+  `validate_budget_usd` with the doctrine test pair; caught TWO cases beyond the brief:
+  NaN (old filter silently dropped it to None = unlimited) and INFINITY (old filter
+  passed it as a "ceiling"); 422 message educates (research app's own max_budget_usd:0,
+  MCP rail's real-$0 semantics); e2e proves the refusal enqueues nothing; omitted field
+  stays "no ceiling" — the fix narrows nothing. Docs (http-api.md, runtime.md) updated.
