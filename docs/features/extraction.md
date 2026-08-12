@@ -75,11 +75,29 @@ API (`extract.rs`):
 
 **Who reads `each` today**: the `extractor` app's `worst_fields` roll-up and the replay-CI `inner_fields` rows (both below). The resilience per-field sketches, the `provisioner` accept gate and the DataHub/reliability *scoring* still key off `report.fields` only, so listing rot shows up in a run's result and in the host reliability record's echoed `worst_fields` — but does not yet move a health score or a provisioning verdict.
 
-### Input modes
+### Modes — exactly one per job, enforced
 
-The `extractor` app takes **either** `urls` **or** `source` (exactly one):
+The `extractor` app has **four** modes, each declared by its own params root:
 
-- **`urls`** (`"mode": "urls"`) — fetch each URL live (tiered, `strategy` param). Failed/empty fetches are attributed in `failed` and skipped, never upserted as all-null records. Fetch fan-out is **bounded** by the `concurrency` param (default 16, matching `crawl`): the per-host governor serializes same-host requests but caps nothing globally, so without this a large `urls` list would open one socket per URL at once (fd exhaustion). The `plugin` app takes the same `concurrency` param, using order-preserving buffering since it zips results back to keys positionally.
+| mode | roots | writes records? |
+| --- | --- | --- |
+| urls | `rules` + `urls` | yes |
+| source | `rules` + `source` | yes |
+| replay | `replay` | no (report + artifact) |
+| induce | `induce` | no (report + artifact) |
+
+**Any other combination is refused**, at two layers that must agree:
+
+- the app's params schema, so the shared enqueue check (`POST /apps/extractor/jobs`, `POST /schedules`, the trigger fire paths, MCP `enqueue_job`) answers **422** before a job exists;
+- `resolve_run_mode` inside the app, for anything that reaches `run()` without a door.
+
+The error names **every** conflicting root: `conflicting extractor modes: replay + rules + urls — a job runs exactly ONE mode`.
+
+**This is a behavior change for callers that relied on the old silent precedence.** The roots used to be tested in a fixed order — `replay` > `induce` > `rules`, and inside write mode `source` > `urls` — and the first match ran while the rest were ignored with a `200`. A job submitted as `{rules, urls, replay}` ran a **read-only replay** and wrote nothing, and no field of the result said so. Such a job is now refused instead of quietly doing something else. A `rules` with neither `urls` nor `source` (and an input list with no `rules`) is likewise a 422 at the door rather than a burnt job attempt.
+
+A JSON `null` counts as absent, so a params template that spells "not this run" as `"replay": null` still enqueues.
+
+- **`urls`** (`"mode": "urls"`) — fetch each URL live (tiered, `strategy` param). Failed/empty fetches are attributed in `failed` and skipped, never upserted as all-null records. Fetch fan-out is **bounded** by the `concurrency` param (default 16, matching `crawl`, **ceiling 64**): the per-host governor serializes same-host requests but caps nothing globally, so without this a large `urls` list would open one socket per URL at once (fd exhaustion). The ceiling is declared once and enforced twice — the schema's `maximum` refuses `concurrency: 65` at the door, and the code clamps it for any caller that reaches the app another way, so the two layers cannot disagree about what the bound is. The `plugin` app takes the same `concurrency` param, using order-preserving buffering since it zips results back to keys positionally.
   Every URL in the fan-out is fetched through the **metered chokepoint** (`AppContext::fetch`), never the raw tiered fetcher. That is what makes a `urls`-mode run of `extractor`/`plugin`: (a) **metered** — one cost event per URL carrying the winning engine and the URL, visible on `GET /jobs/{id}/costs` and `/economics`; (b) **budget-clamped** — with `strategy: "auto_with_research"` and no `budget_usd` headroom left (including the `$0` a DataHub `cost:pause` forces), the paid Claude tier is *skipped*, not failed: the fetch soft-downgrades to the free tiers and says so in the cost event's `detail` and the outcome's `escalations`; (c) **tier-learned** — per-host HTTP wins/losses train the router; and (d) **VCR-faithful** — a job enqueued with `record: true` writes one cassette entry per URL, and `replay_of` serves those bytes with no network and `$0` spend. `crates/core/tests/fetch_chokepoint.rs` pins the raw-engine call sites so a new bypass fails CI.
 - **`source: {app, dataset, keys?}`** (`"mode": "source"`) — read stored bodies from a dataset instead of re-fetching. Each record must carry `artifact_path` (a body basename) and `job_id` (the origin job); the body is resolved at `data/artifacts/<source.app>/<job_id>/<artifact_path>` (the shared artifacts root, two levels above the extractor's own per-job dir). This is the crawl→extract seam: the crawl already wrote every kept page's body to disk, so re-extracting reads it instead of double-fetching. `keys` precedence: explicit `source.keys` → the firing trigger's `_trigger.keys` (dataset-trigger fan-out) → all live records (not removed, not `gone`), capped at 10,000. Records with no `artifact_path`/`job_id`, or an unreadable file, are counted in `missing` and listed per key in `missing_keys` — never silently null.
 

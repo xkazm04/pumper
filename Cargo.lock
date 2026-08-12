@@ -358,6 +358,7 @@ dependencies = [
  "async-trait",
  "chrono",
  "futures",
+ "jsonschema",
  "pumper-core",
  "pumper-engine-archive",
  "regex",

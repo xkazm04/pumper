@@ -24,3 +24,8 @@ app-crawl = { path = "../crawl" }
 [dev-dependencies]
 uuid.workspace = true
 pumper-core = { workspace = true, features = ["test-support"] }
+# The manifest's params schema is the enqueue door's contract. The server's
+# `mcp::validate_app_params` compiles it with this exact crate, so the mode
+# exclusivity is proved here against the real validator rather than by reading
+# the JSON (`tests/mode_door.rs`).
+jsonschema.workspace = true

@@ -167,21 +167,110 @@ fn pick_as_of(observed: &[String], as_of: &str) -> std::result::Result<Option<us
 /// Default in-flight fetch cap, matching `CrawlConfig.concurrency`.
 const DEFAULT_FETCH_CONCURRENCY: usize = 16;
 
-/// Read the `concurrency` param (max in-flight fetches), clamped to `>= 1` and
-/// defaulting to [`DEFAULT_FETCH_CONCURRENCY`]. Bounds the URL-list fan-out so a
-/// large `urls` list can't open one socket per URL at once.
+/// Hard ceiling on the in-flight fetch fan-out, whatever the caller asks for.
+///
+/// Every in-flight fetch holds a socket (and, on the browser tier, a tab), and
+/// the per-host governor serializes hosts but caps nothing globally — so a
+/// `concurrency: 100000` on a wide URL list is an fd-exhaustion request. The
+/// same number is declared as the schema's `maximum`, so the enqueue door
+/// refuses what this clamp would otherwise silently rewrite: **one bound, two
+/// layers, never two different answers**.
+const MAX_FETCH_CONCURRENCY: usize = 64;
+
+/// Read the `concurrency` param (max in-flight fetches), clamped into
+/// `1..=`[`MAX_FETCH_CONCURRENCY`] and defaulting to
+/// [`DEFAULT_FETCH_CONCURRENCY`]. Bounds the URL-list fan-out so a large `urls`
+/// list can't open one socket per URL at once.
 fn fetch_concurrency(ctx: &AppContext) -> usize {
     parse_concurrency(&ctx.params)
 }
 
-/// Pure param parse for [`fetch_concurrency`] — clamps `concurrency` to `>= 1`,
-/// defaulting to [`DEFAULT_FETCH_CONCURRENCY`].
+/// Pure param parse for [`fetch_concurrency`] — clamps `concurrency` into
+/// `1..=`[`MAX_FETCH_CONCURRENCY`], defaulting to
+/// [`DEFAULT_FETCH_CONCURRENCY`].
 fn parse_concurrency(params: &Value) -> usize {
     params
         .get("concurrency")
         .and_then(Value::as_u64)
-        .map(|n| n.max(1) as usize)
+        .map(|n| (n.max(1) as usize).min(MAX_FETCH_CONCURRENCY))
         .unwrap_or(DEFAULT_FETCH_CONCURRENCY)
+}
+
+/// The one mode a run executes. A params object may declare exactly one; see
+/// [`resolve_run_mode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunMode {
+    /// `replay` — read-only rule-set CI over stored bodies.
+    Replay,
+    /// `induce` — read-only wrapper induction over stored bodies.
+    Induce,
+    /// `rules` + `urls` — fetch live and extract.
+    Urls,
+    /// `rules` + `source` — extract stored bodies (incl. backfill / archive).
+    Source,
+}
+
+/// Every param root that declares a mode, in the order a conflict names them.
+///
+/// `rules` is in the set even though it is not a mode by itself: it is the
+/// marker of "this job intends to WRITE records", and a `rules` sitting next to
+/// a `replay` (which carries its own `replay.rules`) is exactly the confusion
+/// this check exists to refuse.
+const MODE_ROOTS: [&str; 5] = ["replay", "induce", "rules", "source", "urls"];
+
+/// The read-only modes — each one owns the whole params object.
+const READ_ONLY_ROOTS: [&str; 2] = ["replay", "induce"];
+
+/// Resolves the ONE mode a params object requests, or names every conflicting
+/// root it carries.
+///
+/// THE ANTI-PATTERN THIS CLOSES: `run()` used to test the roots in a fixed order
+/// — `replay` > `induce` > `rules`, and inside rules-mode `source` > `urls` —
+/// and execute the first that matched, returning `200` for the rest. A caller
+/// who submitted `{rules, urls, replay}` believed an extraction had written
+/// records; only a read-only replay ran, and nothing in the result said so. The
+/// manifest's own prose already called these "mutually exclusive"; first-match
+/// precedence is not exclusivity, it is a silent-wrong-result.
+///
+/// A JSON `null` counts as absent: `{"replay": null}` is how a params template
+/// spells "not this run", and treating it as a declaration would refuse jobs
+/// that ask for nothing at all.
+fn resolve_run_mode(params: &Value) -> std::result::Result<RunMode, String> {
+    let declared: Vec<&'static str> = MODE_ROOTS
+        .iter()
+        .copied()
+        .filter(|k| params.get(*k).is_some_and(|v| !v.is_null()))
+        .collect();
+    let conflict = || {
+        Err(format!(
+            "conflicting extractor modes: {} — a job runs exactly ONE mode \
+             (replay | induce | rules+urls | rules+source)",
+            declared.join(" + ")
+        ))
+    };
+    let has = |k: &str| declared.contains(&k);
+    // A read-only root tolerates no company at all — not another read-only
+    // root, and not the write roots whose records it would never produce.
+    if READ_ONLY_ROOTS.iter().any(|k| has(k)) && declared.len() > 1 {
+        return conflict();
+    }
+    // Inside write mode the two input roots are the exclusive pair: `source`
+    // used to win and the `urls` list was never fetched.
+    if has("source") && has("urls") {
+        return conflict();
+    }
+    if has("replay") {
+        return Ok(RunMode::Replay);
+    }
+    if has("induce") {
+        return Ok(RunMode::Induce);
+    }
+    if has("source") {
+        return Ok(RunMode::Source);
+    }
+    // `rules` alone (or nothing at all) resolves to urls mode, which reports the
+    // missing input list itself — the enqueue door already refuses the shape.
+    Ok(RunMode::Urls)
 }
 
 /// Running totals for one INNER field of an `each` listing, pooled across every
@@ -651,16 +740,55 @@ impl ScrapeApp for Extractor {
             params_schema: Some(json!({
                 "$schema": "https://json-schema.org/draft/2020-12/schema",
                 "type": "object",
-                "anyOf": [
-                    { "required": ["rules"] },
-                    { "required": ["replay"] },
-                    { "required": ["induce"] }
+                // EXACTLY ONE mode per job, enforced at the enqueue door rather
+                // than left to the app's dispatch order. `anyOf` used to admit
+                // the very combinations the prose below calls mutually
+                // exclusive — `{rules, urls, replay}` validated, enqueued, and
+                // ran a read-only replay while the caller believed records were
+                // written. Each branch names its own roots as `required` and
+                // forbids every other root, so a conflicting object matches ZERO
+                // branches and `oneOf` reports it. Mirrored by
+                // `resolve_run_mode`, which is the guard for every door that
+                // does not validate (and the one that names all the conflicts).
+                "oneOf": [
+                    {
+                        "title": "replay mode (read-only)",
+                        "required": ["replay"],
+                        "not": { "anyOf": [
+                            { "required": ["induce"] }, { "required": ["rules"] },
+                            { "required": ["urls"] },   { "required": ["source"] }
+                        ]}
+                    },
+                    {
+                        "title": "induce mode (read-only)",
+                        "required": ["induce"],
+                        "not": { "anyOf": [
+                            { "required": ["replay"] }, { "required": ["rules"] },
+                            { "required": ["urls"] },   { "required": ["source"] }
+                        ]}
+                    },
+                    {
+                        "title": "urls mode (fetch live, write records)",
+                        "required": ["rules", "urls"],
+                        "not": { "anyOf": [
+                            { "required": ["replay"] }, { "required": ["induce"] },
+                            { "required": ["source"] }
+                        ]}
+                    },
+                    {
+                        "title": "source mode (stored bodies, write records)",
+                        "required": ["rules", "source"],
+                        "not": { "anyOf": [
+                            { "required": ["replay"] }, { "required": ["induce"] },
+                            { "required": ["urls"] }
+                        ]}
+                    }
                 ],
                 "properties": {
                     "rules": {
                         "type": "object",
                         "minProperties": 1,
-                        "description": "field -> rule; each rule is {\"type\": \"css|regex|json|xpath|const\", ...type-specific keys}"
+                        "description": "Write mode: field -> rule; each rule is {\"type\": \"css|regex|json|xpath|const\", ...type-specific keys}. Pair with exactly one of `urls`/`source`. REFUSED alongside `replay`/`induce`, which carry their own rules."
                     },
                     "replay": {
                         "type": "object",
@@ -700,7 +828,7 @@ impl ScrapeApp for Extractor {
                                 "description": "Walk each URL's version series and report every boundary observation pair where this field's match flipped. Requires against.versions: \"all\"."
                             }
                         },
-                        "description": "Replay-CI: STRICTLY read-only — runs rules over stored bodies, emits result JSON + a replay-report.json artifact, never writes a dataset record. Mutually exclusive with urls/source."
+                        "description": "Replay-CI: STRICTLY read-only — runs rules over stored bodies, emits result JSON + a replay-report.json artifact, never writes a dataset record. REFUSED alongside rules/urls/source/induce — the exclusivity is enforced at the door and in the app, not resolved by precedence."
                     },
                     "induce": {
                         "type": "object",
@@ -735,13 +863,13 @@ impl ScrapeApp for Extractor {
                             "max_fields": { "type": "integer", "minimum": 1, "maximum": 32, "description": "Cap on emitted field slots (default 12)." },
                             "max_pages": { "type": "integer", "minimum": 1, "maximum": 500, "description": "Page cap per induction run (default 50)." }
                         },
-                        "description": "Zero-shot wrapper induction: STRICTLY read-only — statistically mines a CANDIDATE each-shaped rule set (repeating tag+class container, field slots whose text varies while structure stays fixed) from stored same-template pages. No LLM. Emits result JSON + an induced-ruleset.json artifact for human review; chain to `replay` for validation. Never writes a dataset record. Mutually exclusive with rules/urls/source."
+                        "description": "Zero-shot wrapper induction: STRICTLY read-only — statistically mines a CANDIDATE each-shaped rule set (repeating tag+class container, field slots whose text varies while structure stays fixed) from stored same-template pages. No LLM. Emits result JSON + an induced-ruleset.json artifact for human review; chain to `replay` for validation. Never writes a dataset record. REFUSED alongside rules/urls/source/replay — the exclusivity is enforced at the door and in the app, not resolved by precedence."
                     },
                     "urls": {
                         "type": "array",
                         "items": { "type": "string", "pattern": "^https?://" },
                         "minItems": 1,
-                        "description": "URL mode: fetch these and extract. Mutually exclusive with `source`."
+                        "description": "URL mode: fetch these and extract. REFUSED alongside `source`, `replay` or `induce` — not silently outranked by them."
                     },
                     "source": {
                         "type": "object",
@@ -805,10 +933,15 @@ impl ScrapeApp for Extractor {
                                 "description": "Backfill only: regex a version's URL must match to be extracted."
                             }
                         },
-                        "description": "Source mode: read stored bodies of these records (no re-fetch)."
+                        "description": "Source mode: read stored bodies of these records (no re-fetch). REFUSED alongside `urls`, `replay` or `induce`."
                     },
                     "strategy": { "type": "string", "enum": ["http", "browser", "auto"] },
-                    "concurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
+                    "concurrency": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 64,
+                        "description": "Max in-flight fetches (default 16, ceiling 64). The ceiling is enforced twice — refused here at the door, clamped in code for callers that reach the app another way — so the two layers can never disagree."
+                    },
                     "dataset": { "type": "string", "description": "Output dataset name (default \"extracted\")." }
                 },
                 "additionalProperties": true
@@ -908,18 +1041,26 @@ impl ScrapeApp for Extractor {
     }
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
-        // Replay-CI mode: candidate rules over stored bodies, read-only diff
-        // report (no dataset writes) — its own param root, its own runner.
-        if let Some(replay) = ctx.params.get("replay").and_then(Value::as_object) {
-            let replay = replay.clone();
-            return replay::run_replay(&ctx, &replay).await;
-        }
-        // Induce mode: statistically mine a CANDIDATE rule set from stored
-        // same-template pages — read-only (result + artifact, no dataset
-        // writes) — its own param root, its own runner.
-        if let Some(induce) = ctx.params.get("induce").and_then(Value::as_object) {
-            let induce = induce.clone();
-            return induce::run_induce(&ctx, &induce).await;
+        // ONE mode per job, decided before any work — a params object carrying
+        // several mode roots is refused here rather than silently executing the
+        // first one that matches (see `resolve_run_mode`).
+        let mode = resolve_run_mode(&ctx.params).map_err(Error::App)?;
+        let mode_object = |root: &str| -> Result<serde_json::Map<String, Value>> {
+            ctx.params
+                .get(root)
+                .and_then(Value::as_object)
+                .cloned()
+                .ok_or_else(|| Error::App(format!("param '{root}' must be an object")))
+        };
+        match mode {
+            // Replay-CI mode: candidate rules over stored bodies, read-only diff
+            // report (no dataset writes) — its own param root, its own runner.
+            RunMode::Replay => return replay::run_replay(&ctx, &mode_object("replay")?).await,
+            // Induce mode: statistically mine a CANDIDATE rule set from stored
+            // same-template pages — read-only (result + artifact, no dataset
+            // writes) — its own param root, its own runner.
+            RunMode::Induce => return induce::run_induce(&ctx, &mode_object("induce")?).await,
+            RunMode::Urls | RunMode::Source => {}
         }
         let rules_json = ctx
             .params
@@ -951,8 +1092,8 @@ impl ScrapeApp for Extractor {
             .to_string();
 
         // Two input modes: fetch live `urls`, or read stored bodies from a
-        // crawl→dataset `source`. Exactly one is required.
-        if ctx.params.get("source").is_some() {
+        // crawl→dataset `source`. Exactly one, already resolved above.
+        if mode == RunMode::Source {
             self.run_source_mode(&ctx, compiled, &dataset, rules_hash.as_deref())
                 .await
         } else {
@@ -1974,6 +2115,143 @@ mod tests {
         assert_eq!(
             parse_concurrency(&json!({ "concurrency": "lots" })),
             DEFAULT_FETCH_CONCURRENCY
+        );
+    }
+
+    #[test]
+    fn concurrency_clamps_down_not_only_up() {
+        // THE REFUTED BEHAVIOR: the clamp was `n.max(1)` only, so
+        // `concurrency: 100000` over a wide URL list asked for 100000 in-flight
+        // sockets — the exact fd exhaustion the bound exists to prevent.
+        use super::{parse_concurrency, MAX_FETCH_CONCURRENCY};
+        use serde_json::json;
+        assert_eq!(
+            parse_concurrency(&json!({ "concurrency": 100_000 })),
+            MAX_FETCH_CONCURRENCY
+        );
+        assert_eq!(
+            parse_concurrency(&json!({ "concurrency": u64::MAX })),
+            MAX_FETCH_CONCURRENCY
+        );
+        // At the ceiling is honored exactly — the clamp is not off by one.
+        assert_eq!(
+            parse_concurrency(&json!({ "concurrency": MAX_FETCH_CONCURRENCY })),
+            MAX_FETCH_CONCURRENCY
+        );
+    }
+
+    /// The code clamp and the schema `maximum` are ONE bound. If they drift, a
+    /// job refused at the door and a job clamped in code stop agreeing about
+    /// what `concurrency` means.
+    #[test]
+    fn the_concurrency_ceiling_is_declared_once_not_twice() {
+        use super::{Extractor, MAX_FETCH_CONCURRENCY};
+        use pumper_core::ScrapeApp;
+        let schema = Extractor.manifest().params_schema.expect("params schema");
+        let c = &schema["properties"]["concurrency"];
+        assert_eq!(c["maximum"], serde_json::json!(MAX_FETCH_CONCURRENCY));
+        assert_eq!(c["minimum"], serde_json::json!(1));
+    }
+}
+
+#[cfg(test)]
+mod run_mode_tests {
+    use super::{resolve_run_mode, RunMode};
+    use serde_json::json;
+
+    fn rules() -> serde_json::Value {
+        json!({ "title": { "type": "css", "selector": "h1" } })
+    }
+
+    #[test]
+    fn each_mode_resolves_to_itself() {
+        assert_eq!(
+            resolve_run_mode(&json!({ "replay": { "rules": rules() } })).unwrap(),
+            RunMode::Replay
+        );
+        assert_eq!(
+            resolve_run_mode(&json!({ "induce": { "url_pattern": "^https://a/" } })).unwrap(),
+            RunMode::Induce
+        );
+        assert_eq!(
+            resolve_run_mode(&json!({ "rules": rules(), "urls": ["https://a/"] })).unwrap(),
+            RunMode::Urls
+        );
+        assert_eq!(
+            resolve_run_mode(
+                &json!({ "rules": rules(), "source": {"app":"crawl","dataset":"pages"} })
+            )
+            .unwrap(),
+            RunMode::Source
+        );
+        // `rules` with neither input still resolves — urls mode reports the
+        // missing list itself, with the message it always had.
+        assert_eq!(
+            resolve_run_mode(&json!({ "rules": rules() })).unwrap(),
+            RunMode::Urls
+        );
+    }
+
+    #[test]
+    fn mode_conflict_rejected_not_first_match_win() {
+        // THE REFUTED BEHAVIOR: replay outranked everything, so this params
+        // object ran a READ-ONLY replay and returned 200 while the caller
+        // believed an extraction had written records into `extracted`.
+        let both = json!({
+            "rules": rules(),
+            "urls": ["https://a/"],
+            "replay": { "rules": rules() },
+        });
+        let err = resolve_run_mode(&both).expect_err("first-match precedence is not exclusivity");
+        // The error names EVERY conflicting root, not just the pair that lost.
+        let named = err.split(" — ").next().unwrap_or_default();
+        for root in ["replay", "rules", "urls"] {
+            assert!(named.contains(root), "conflict must name `{root}`: {err}");
+        }
+        assert!(
+            !named.contains("source"),
+            "no root invented (the tail may still list the legal shapes): {err}"
+        );
+    }
+
+    #[test]
+    fn every_conflicting_pair_is_refused() {
+        let value = |root: &str| match root {
+            "rules" => rules(),
+            "urls" => json!(["https://a/"]),
+            "source" => json!({ "app": "crawl", "dataset": "pages" }),
+            _ => json!({ "rules": rules() }),
+        };
+        // Every pair of mode roots that cannot coexist. `rules`+`urls` and
+        // `rules`+`source` are the two legal pairs and are deliberately absent.
+        let pairs = [
+            ("replay", "induce"),
+            ("replay", "rules"),
+            ("replay", "urls"),
+            ("replay", "source"),
+            ("induce", "rules"),
+            ("induce", "urls"),
+            ("induce", "source"),
+            ("urls", "source"),
+        ];
+        for (a, b) in pairs {
+            let params = json!({ a: value(a), b: value(b) });
+            let err = resolve_run_mode(&params)
+                .expect_err(&format!("`{a}` + `{b}` must be refused, not ranked"));
+            assert!(err.contains(a) && err.contains(b), "{a}+{b}: {err}");
+        }
+    }
+
+    #[test]
+    fn an_explicit_null_root_is_absent_not_a_declaration() {
+        // A params template that spells "not this run" as `null` must not be
+        // read as requesting two modes.
+        let params = json!({ "rules": rules(), "urls": ["https://a/"], "replay": null });
+        assert_eq!(resolve_run_mode(&params).unwrap(), RunMode::Urls);
+        // ...and an all-null object still resolves rather than erroring oddly.
+        assert_eq!(
+            resolve_run_mode(&json!({ "replay": null, "induce": null })).unwrap(),
+            RunMode::Urls
         );
     }
 }
