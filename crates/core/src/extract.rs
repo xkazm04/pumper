@@ -16,6 +16,7 @@ use regex::Regex;
 use scraper::{ElementRef, Html, Selector};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
+use url::Url;
 
 use crate::{Error, Result};
 
@@ -117,6 +118,12 @@ pub enum Transform {
     },
     /// HTML fragment → clean Markdown (pair with a `css` rule's `html: true`).
     ToMarkdown,
+    /// Resolve a URL against the **document's own URL** (RFC 3986), turning the
+    /// `/item/123` an `a[href]` really contains into the absolute link every
+    /// downstream consumer needs. Absolute values pass through; protocol-relative
+    /// ones take the document's scheme. Needs the extraction to have been given a
+    /// document URL — see [`DocReport::base_url_missing`].
+    UrlAbsolute,
     /// Replace a **blank** result (`null`, a whitespace-only string, or an empty
     /// array — the same predicate [`FieldStatus`] calls empty) with this value.
     Default {
@@ -280,6 +287,7 @@ enum CompiledTransform {
     RegexReplace { re: Regex, replacement: String },
     Split { sep: String, index: Option<usize> },
     ToMarkdown,
+    UrlAbsolute,
     Default { value: Value },
 }
 
@@ -302,6 +310,7 @@ impl CompiledTransform {
             },
             Transform::Split { sep, index } => Self::Split { sep, index },
             Transform::ToMarkdown => Self::ToMarkdown,
+            Transform::UrlAbsolute => Self::UrlAbsolute,
             Transform::Default { value } => Self::Default { value },
         })
     }
@@ -313,18 +322,26 @@ impl CompiledTransform {
     /// on `Value::Null`, which left a matched-but-empty `""` (or an empty array)
     /// reported as `empty` while the declared default never applied: the status
     /// system said "this field produced nothing" and the value said `""`.
-    fn apply(&self, value: Value) -> Value {
+    ///
+    /// `base` is the document's own URL, the one piece of context a transform
+    /// cannot derive from its input ([`Self::UrlAbsolute`] needs it). It is
+    /// passed IN per call rather than captured at compile time because one
+    /// `CompiledRuleSet` is shared by reference across a whole rayon batch of
+    /// documents with different URLs — binding it into the compiled set would
+    /// mean recompiling every selector once per document. Transforms therefore
+    /// stay pure functions of `(value, base)`, testable without a document.
+    fn apply(&self, value: Value, base: Option<&Url>) -> Value {
         match (self, value) {
             (Self::Default { value: d }, v) if is_blank(&v) => d.clone(),
             (Self::Default { .. }, v) => v,
             (t, Value::Array(items)) => {
-                Value::Array(items.into_iter().map(|v| t.apply_scalar(v)).collect())
+                Value::Array(items.into_iter().map(|v| t.apply_scalar(v, base)).collect())
             }
-            (t, v) => t.apply_scalar(v),
+            (t, v) => t.apply_scalar(v, base),
         }
     }
 
-    fn apply_scalar(&self, value: Value) -> Value {
+    fn apply_scalar(&self, value: Value, base: Option<&Url>) -> Value {
         match self {
             Self::Trim => map_str(value, |s| Value::String(s.trim().to_string())),
             Self::Lowercase => map_str(value, |s| Value::String(s.to_lowercase())),
@@ -362,9 +379,45 @@ impl CompiledTransform {
             Self::ToMarkdown => map_str(value, |s| {
                 Value::String(crate::markdown::html_fragment_to_markdown(s))
             }),
+            Self::UrlAbsolute => map_str(value, |s| Value::String(absolutize(s, base))),
             Self::Default { .. } => value, // handled in apply()
         }
     }
+}
+
+/// Resolves one extracted URL against the document's own URL (RFC 3986, via
+/// `url::Url::join` — never string concatenation, which gets `../`, query-only
+/// and scheme-relative references wrong).
+///
+/// - Already absolute (`https://…`, and non-http schemes like `mailto:`) → the
+///   reference wins, unchanged but normalized.
+/// - Protocol-relative (`//cdn.example.com/x`) → takes the document's scheme.
+/// - Relative (`/a`, `../b`, `c`, `?q=1`, `#frag`) → resolved the way a browser
+///   resolves the same href.
+///
+/// Anything that cannot be resolved — no base, an unparseable base, a join
+/// error — comes back **unchanged**, never null: a relative URL is still the
+/// truth the page contained, and blanking it would forge a miss out of a real
+/// value. A blank value is likewise returned as-is: `base.join("")` is the base
+/// itself, which would turn "this field found nothing" into "this field found
+/// the page you were already on" — the exact fabrication this whole module
+/// exists to prevent.
+fn absolutize(raw: &str, base: Option<&Url>) -> String {
+    let trimmed = raw.trim();
+    let Some(base) = base.filter(|_| !trimmed.is_empty()) else {
+        return raw.to_string();
+    };
+    match base.join(trimmed) {
+        Ok(resolved) => resolved.to_string(),
+        Err(_) => raw.to_string(),
+    }
+}
+
+/// Parses a document's own URL into the base [`absolutize`] resolves against.
+/// A URL that will not parse is `None` — the same honest degradation as no URL
+/// at all, surfaced by [`DocReport::base_url_missing`] rather than guessed at.
+fn parse_base(url: Option<&str>) -> Option<Url> {
+    Url::parse(url?.trim()).ok()
 }
 
 /// Applies `f` when the value is a string; passes anything else through.
@@ -499,6 +552,29 @@ impl CompiledRuleSet {
             .iter()
             .any(|(_, r, _)| matches!(r, CompiledRule::Xpath { .. }))
     }
+
+    /// True when some field — at any `each` depth — carries a transform that
+    /// needs the document's own URL (`url_absolute`).
+    ///
+    /// This is what lets a caller decide *before* the fan-out whether it has to
+    /// route documents through the base-carrying extraction path, instead of
+    /// discovering per document that a transform had nothing to resolve
+    /// against.
+    pub fn needs_doc_url(&self) -> bool {
+        fields_need_doc_url(&self.fields)
+    }
+}
+
+fn fields_need_doc_url(fields: &[(String, CompiledRule, Vec<CompiledTransform>)]) -> bool {
+    fields.iter().any(|(_, rule, transforms)| {
+        transforms
+            .iter()
+            .any(|t| matches!(t, CompiledTransform::UrlAbsolute))
+            || match rule {
+                CompiledRule::Each { fields, .. } => fields_need_doc_url(fields),
+                _ => false,
+            }
+    })
 }
 
 /// Per-field extraction outcome — the quality signal that separates a broken
@@ -671,24 +747,60 @@ pub struct DocReport {
     /// means "unknown", never "fine".
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub each: BTreeMap<String, InnerFieldStats>,
+    /// True when the rule set has a `url_absolute` transform but this
+    /// extraction was given no document URL to resolve against — every such
+    /// field kept its raw, possibly relative, value.
+    ///
+    /// The alternative to saying so is the failure mode this flag exists to
+    /// forbid: a `url` field that reads `/item/123` on some runs and
+    /// `https://site/item/123` on others, with nothing in the record marking
+    /// which. `false` (the serialized absence) means the question does not
+    /// arise — either a base was supplied, or nothing asked for one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub base_url_missing: bool,
+}
+
+/// `skip_serializing_if` predicate: a `false` flag is the uninteresting case,
+/// so it stays off the wire and old consumers see byte-identical reports.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Extracts one document into a JSON object. HTML is parsed at most once (only
 /// if any CSS rule needs it); the JSON body is parsed at most once with
 /// simd-json (only if any JSON rule needs it).
 pub fn extract_one(rules: &CompiledRuleSet, doc: &str) -> Value {
-    extract_one_impl(rules, doc, false).0
+    extract_one_impl(rules, doc, false, None).0
 }
 
 /// Like [`extract_one`] but also returns a per-field [`DocReport`] classifying
 /// each field as matched / empty / error.
 pub fn extract_one_with_report(rules: &CompiledRuleSet, doc: &str) -> (Value, DocReport) {
-    extract_one_impl(rules, doc, true)
+    extract_one_impl(rules, doc, true, None)
 }
 
-fn extract_one_impl(rules: &CompiledRuleSet, doc: &str, want_report: bool) -> (Value, DocReport) {
+/// [`extract_one_with_report`] told where the document came from: `base` is the
+/// document's own URL, which `url_absolute` transforms resolve against.
+///
+/// `None` (or a URL that will not parse) is honest, not fatal: those transforms
+/// pass their values through unchanged and the report says so via
+/// [`DocReport::base_url_missing`].
+pub fn extract_one_with_report_at(
+    rules: &CompiledRuleSet,
+    doc: &str,
+    base: Option<&str>,
+) -> (Value, DocReport) {
+    extract_one_impl(rules, doc, true, parse_base(base).as_ref())
+}
+
+fn extract_one_impl(
+    rules: &CompiledRuleSet,
+    doc: &str,
+    want_report: bool,
+    base: Option<&Url>,
+) -> (Value, DocReport) {
     let html = rules.needs_html().then(|| Html::parse_document(doc));
-    extract_one_parsed(rules, doc, want_report, html.as_ref())
+    extract_one_parsed_at(rules, doc, want_report, html.as_ref(), base)
 }
 
 /// Extracts one document against a DOM the caller already built.
@@ -702,11 +814,28 @@ fn extract_one_impl(rules: &CompiledRuleSet, doc: &str, want_report: bool) -> (V
 ///
 /// Crate-internal: outside callers go through [`crate::resilience::extract_and_fingerprint_batch`],
 /// which owns the DOM for the whole document and hands it to both consumers.
+///
+/// That shared-DOM path carries no document URL, so a rule set with a
+/// `url_absolute` transform run through it reports
+/// [`DocReport::base_url_missing`]. Callers that need both fingerprints AND
+/// resolved URLs check [`CompiledRuleSet::needs_doc_url`] and take
+/// [`extract_batch_with_report_at`] instead.
 pub(crate) fn extract_one_parsed(
     rules: &CompiledRuleSet,
     doc: &str,
     want_report: bool,
     html: Option<&Html>,
+) -> (Value, DocReport) {
+    extract_one_parsed_at(rules, doc, want_report, html, None)
+}
+
+/// [`extract_one_parsed`] with the document's own URL, already parsed.
+pub(crate) fn extract_one_parsed_at(
+    rules: &CompiledRuleSet,
+    doc: &str,
+    want_report: bool,
+    html: Option<&Html>,
+    base: Option<&Url>,
 ) -> (Value, DocReport) {
     let json = if rules.needs_json() {
         let mut bytes = doc.as_bytes().to_vec();
@@ -721,7 +850,13 @@ pub(crate) fn extract_one_parsed(
     };
 
     let mut obj = Map::with_capacity(rules.fields.len());
-    let mut report = DocReport::default();
+    // Decided BEFORE any field runs: a rule set that asks to resolve URLs and
+    // was handed no document to resolve against has already lost, whatever the
+    // selectors then find.
+    let mut report = DocReport {
+        base_url_missing: want_report && base.is_none() && rules.needs_doc_url(),
+        ..DocReport::default()
+    };
     for (name, rule, transforms) in &rules.fields {
         // (raw value, whether the rule's required parse was available, error
         // detail, whether an `each` container selector matched). `detail` is a
@@ -791,6 +926,7 @@ pub(crate) fn extract_one_parsed(
                         fields,
                         container.as_ref(),
                         &mut acc,
+                        base,
                     );
                     if let Some(acc) = acc {
                         acc.flatten_into(name, fields, &mut report.each);
@@ -809,7 +945,7 @@ pub(crate) fn extract_one_parsed(
             report.fields.insert(name.clone(), status);
         }
         for t in transforms {
-            value = t.apply(value);
+            value = t.apply(value, base);
         }
         // Post-transform status: only meaningful where the selector matched and a
         // transform chain then ran. A field that matched nothing has nothing to
@@ -897,11 +1033,12 @@ fn each_extract(
     fields: &[(String, CompiledRule, Vec<CompiledTransform>)],
     container: Option<&Selector>,
     acc: &mut Option<EachAcc>,
+    base: Option<&Url>,
 ) -> (Vec<Value>, bool) {
     match container {
         None => (
             html.select(selector)
-                .map(|el| extract_scoped(el, fields, acc))
+                .map(|el| extract_scoped(el, fields, acc, base))
                 .collect(),
             false,
         ),
@@ -912,7 +1049,7 @@ fn each_extract(
                 found = true;
                 items.extend(
                     root.select(selector)
-                        .map(|el| extract_scoped(el, fields, acc)),
+                        .map(|el| extract_scoped(el, fields, acc, base)),
                 );
             }
             (items, found)
@@ -929,11 +1066,12 @@ fn each_scoped(
     fields: &[(String, CompiledRule, Vec<CompiledTransform>)],
     container: Option<&Selector>,
     acc: &mut Option<EachAcc>,
+    base: Option<&Url>,
 ) -> (Vec<Value>, bool) {
     match container {
         None => (
             root.select(selector)
-                .map(|el| extract_scoped(el, fields, acc))
+                .map(|el| extract_scoped(el, fields, acc, base))
                 .collect(),
             false,
         ),
@@ -945,7 +1083,7 @@ fn each_scoped(
                 items.extend(
                     inner
                         .select(selector)
-                        .map(|el| extract_scoped(el, fields, acc)),
+                        .map(|el| extract_scoped(el, fields, acc, base)),
                 );
             }
             (items, found)
@@ -966,6 +1104,29 @@ pub fn extract_batch_with_report(
 ) -> Vec<(Value, DocReport)> {
     docs.par_iter()
         .map(|doc| extract_one_with_report(rules, doc))
+        .collect()
+}
+
+/// [`extract_batch_with_report`] with each document's own URL, so
+/// `url_absolute` transforms resolve against the page they came from.
+///
+/// `bases` is **positional**: `bases[i]` is the URL document `i` was fetched
+/// from. A short (or empty) slice means the remaining documents have no URL —
+/// so passing `&[]` is exactly [`extract_batch_with_report`], and a mixed batch
+/// (live URLs plus bodies whose origin was never recorded) degrades per
+/// document rather than all-or-nothing. Each base is parsed once per document,
+/// inside the rayon closure that uses it.
+pub fn extract_batch_with_report_at(
+    rules: &CompiledRuleSet,
+    docs: &[String],
+    bases: &[Option<String>],
+) -> Vec<(Value, DocReport)> {
+    docs.par_iter()
+        .enumerate()
+        .map(|(i, doc)| {
+            let base = bases.get(i).and_then(Option::as_deref);
+            extract_one_with_report_at(rules, doc, base)
+        })
         .collect()
 }
 
@@ -1098,6 +1259,7 @@ fn extract_scoped(
     root: ElementRef,
     fields: &[(String, CompiledRule, Vec<CompiledTransform>)],
     acc: &mut Option<EachAcc>,
+    base: Option<&Url>,
 ) -> Value {
     if let Some(a) = acc.as_mut() {
         a.fit(fields.len());
@@ -1141,11 +1303,23 @@ fn extract_scoped(
                         if nested.is_none() {
                             *nested = Some(EachAcc::default());
                         }
-                        each_scoped(root, selector, inner_fields, container.as_ref(), nested)
+                        each_scoped(
+                            root,
+                            selector,
+                            inner_fields,
+                            container.as_ref(),
+                            nested,
+                            base,
+                        )
                     }
-                    None => {
-                        each_scoped(root, selector, inner_fields, container.as_ref(), &mut None)
-                    }
+                    None => each_scoped(
+                        root,
+                        selector,
+                        inner_fields,
+                        container.as_ref(),
+                        &mut None,
+                        base,
+                    ),
                 };
                 (Value::Array(items), true, "", matched)
             }
@@ -1168,7 +1342,7 @@ fn extract_scoped(
             ));
         }
         for t in transforms {
-            value = t.apply(value);
+            value = t.apply(value, base);
         }
         obj.insert(name.clone(), value);
     }
@@ -1802,7 +1976,7 @@ mod tests {
             json!({}),
         ] {
             let blank = is_blank(&v);
-            let filled = d.apply(v.clone()) == json!("FILLED");
+            let filled = d.apply(v.clone(), None) == json!("FILLED");
             assert_eq!(blank, filled, "default/is_blank diverged on {v}");
         }
     }
@@ -1878,6 +2052,148 @@ mod tests {
         // Non-strings pass through untouched; a miss stays a miss.
         assert_eq!(out["num"], json!(7));
         assert_eq!(out["miss"], json!(null));
+    }
+
+    #[test]
+    fn url_absolute_resolves_against_the_document_url() {
+        // THE REFUTED BEHAVIOR: a listing scrape pulling `a[href]` yielded
+        // "/item/123" — a string that means nothing outside the page it came
+        // from, and that every downstream consumer (crawl seeding, watch
+        // targets, peer mirrors, external clients) had to re-derive a base for.
+        use super::extract_one_with_report_at;
+        let rules = ruleset(json!({
+            "products": {"type": "each", "selector": ".card", "fields": {
+                "url": {"type": "css", "selector": "a", "attr": "href",
+                        "transforms": [{"op": "url_absolute"}]}
+            }},
+            "canonical": {"type": "css", "selector": "link", "attr": "href",
+                          "transforms": [{"op": "url_absolute"}]},
+            "all_links": {"type": "css", "selector": ".card a", "attr": "href", "all": true,
+                          "transforms": [{"op": "url_absolute"}]}
+        }));
+        let doc = r#"<link href="?ref=canon">
+            <div class="card"><a href="/item/1">a</a></div>
+            <div class="card"><a href="../up">b</a></div>
+            <div class="card"><a href="//cdn.example.com/x">c</a></div>
+            <div class="card"><a href="https://other.test/z">d</a></div>
+            <div class="card"><a href="mailto:x@y.test">e</a></div>
+            <div class="card"><a>f</a></div>"#;
+        let (values, report) =
+            extract_one_with_report_at(&rules, doc, Some("https://shop.test/cat/page"));
+        let urls: Vec<&str> = values["products"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|i| i["url"].as_str().unwrap_or("<null>"))
+            .collect();
+        assert_eq!(
+            urls,
+            vec![
+                "https://shop.test/item/1",  // root-relative
+                "https://shop.test/up",      // dot-segment, resolved not concatenated
+                "https://cdn.example.com/x", // protocol-relative takes the scheme
+                "https://other.test/z",      // already absolute: unchanged
+                "mailto:x@y.test",           // non-http scheme: unchanged
+                "<null>",                    // no href: still a miss, not a base URL
+            ]
+        );
+        // A query-only reference resolves against the page, and `all: true`
+        // arrays are mapped element-wise like every other transform.
+        assert_eq!(
+            values["canonical"],
+            json!("https://shop.test/cat/page?ref=canon")
+        );
+        assert_eq!(values["all_links"][0], json!("https://shop.test/item/1"));
+        assert_eq!(values["all_links"].as_array().unwrap().len(), 6);
+        assert!(!report.base_url_missing);
+        assert!(serde_json::to_value(&report)
+            .unwrap()
+            .get("base_url_missing")
+            .is_none());
+    }
+
+    #[test]
+    fn missing_base_keeps_the_raw_value_and_says_so() {
+        // The failure this forbids: a `url` field reading "/item/1" on some
+        // runs and "https://shop.test/item/1" on others, with nothing in the
+        // record marking which. Degrade to a no-op, and REPORT the no-op.
+        use super::{extract_one_with_report, extract_one_with_report_at};
+        let rules = ruleset(json!({
+            "url": {"type": "css", "selector": "a", "attr": "href",
+                    "transforms": [{"op": "url_absolute"}]}
+        }));
+        let doc = r#"<a href="/item/1">x</a>"#;
+
+        let (values, report) = extract_one_with_report(&rules, doc);
+        assert_eq!(values["url"], json!("/item/1"), "never blanked");
+        assert!(report.base_url_missing);
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["base_url_missing"],
+            json!(true)
+        );
+
+        // A base that will not parse is the same honest degradation.
+        let (values, report) = extract_one_with_report_at(&rules, doc, Some("not a url"));
+        assert_eq!(values["url"], json!("/item/1"));
+        assert!(report.base_url_missing);
+
+        // A rule set that never asks to resolve URLs never raises the flag,
+        // with or without a base.
+        let plain = ruleset(json!({"t": {"type": "css", "selector": "a", "attr": "href"}}));
+        let (_, r) = extract_one_with_report(&plain, doc);
+        assert!(!r.base_url_missing);
+        assert!(!plain.needs_doc_url());
+        assert!(rules.needs_doc_url());
+        // ...including when the transform hides inside a nested `each`.
+        let nested = ruleset(json!({
+            "rows": {"type": "each", "selector": ".r", "fields": {
+                "sub": {"type": "each", "selector": ".s", "fields": {
+                    "u": {"type": "css", "selector": "a", "attr": "href",
+                          "transforms": [{"op": "url_absolute"}]}}}}}
+        }));
+        assert!(nested.needs_doc_url());
+    }
+
+    #[test]
+    fn absolutize_never_fabricates_a_url_from_nothing() {
+        // `base.join("")` is the base itself — so a blank value would come back
+        // as "the page you were already on", turning a miss into a confident
+        // wrong answer. Blank in, blank out.
+        use super::{absolutize, parse_base};
+        let base = parse_base(Some("https://shop.test/cat/page"));
+        assert!(base.is_some());
+        for blank in ["", "   "] {
+            assert_eq!(absolutize(blank, base.as_ref()), blank);
+        }
+        // Whitespace around a real href is markup noise, not part of the URL.
+        assert_eq!(absolutize("  /a  ", base.as_ref()), "https://shop.test/a");
+        // No base at all: the raw value survives verbatim.
+        assert_eq!(absolutize("/a", None), "/a");
+        // A base that is not a URL parses to None rather than being guessed at.
+        assert!(parse_base(Some("shop.test/cat")).is_none());
+        assert!(parse_base(None).is_none());
+        // A fragment-only reference stays on the same page.
+        assert_eq!(
+            absolutize("#sec", base.as_ref()),
+            "https://shop.test/cat/page#sec"
+        );
+    }
+
+    #[test]
+    fn url_absolute_round_trips_through_serde() {
+        // The transform rides the same rule JSON apps, the preview endpoint and
+        // the rules registry all persist.
+        let wire = json!({
+            "u": {"type": "css", "selector": "a", "attr": "href",
+                  "transforms": [{"op": "url_absolute"}]}
+        });
+        let rules: RuleSet = serde_json::from_value(wire).unwrap();
+        assert!(rules.compile().is_ok());
+        let back = serde_json::to_value(&rules).unwrap();
+        assert_eq!(back["u"]["transforms"], json!([{"op": "url_absolute"}]));
+        // ...and back in again, so the registry's stored form still compiles.
+        let again: RuleSet = serde_json::from_value(back).unwrap();
+        assert!(again.compile().unwrap().needs_doc_url());
     }
 
     #[test]

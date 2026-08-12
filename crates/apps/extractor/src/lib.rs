@@ -9,11 +9,11 @@ use app_crawl::reliability;
 use async_trait::async_trait;
 use futures::StreamExt;
 use pumper_core::config::ArchiveConfig;
+use pumper_core::extract::extract_batch_with_report_at;
 use pumper_core::{
-    extract_and_fingerprint_batch, extract_batch_with_report, AppContext, AppManifest,
-    CompiledRuleSet, CostClass, DocReport, DocSignals, Error, FetchHealth, FetchRequest,
-    FetchStrategy, FieldStatus, ManifestExample, ObservedDoc, Provenance, Record, Result, RuleSet,
-    ScrapeApp, UpsertSummary,
+    extract_and_fingerprint_batch, signals_batch, AppContext, AppManifest, CompiledRuleSet,
+    CostClass, DocReport, DocSignals, Error, FetchHealth, FetchRequest, FetchStrategy, FieldStatus,
+    ManifestExample, ObservedDoc, Provenance, Record, Result, RuleSet, ScrapeApp, UpsertSummary,
 };
 use pumper_engine_archive::ArchiveEngine;
 use serde_json::{json, Value};
@@ -313,14 +313,30 @@ fn summarize_reports<'a>(
 /// at the end of each rayon closure, so a consumer that asks afterwards can only
 /// be served by parsing the whole batch a second time — which is exactly what
 /// this replaced. `None` back means nobody asked, never "fingerprinting failed".
+/// `bases` is positional alongside `docs`: the URL each document was fetched
+/// from, which `url_absolute` transforms resolve against.
 async fn run_extraction(
     compiled: Arc<CompiledRuleSet>,
     docs: Vec<String>,
+    bases: Vec<Option<String>>,
     fingerprint: bool,
 ) -> Result<(Vec<(Value, DocReport)>, Option<Vec<DocSignals>>)> {
     tokio::task::spawn_blocking(move || {
         if !fingerprint {
-            return (extract_batch_with_report(&compiled, &docs), None);
+            return (extract_batch_with_report_at(&compiled, &docs, &bases), None);
+        }
+        // The fused extract+fingerprint path shares ONE DOM per document, but
+        // its seam (`extract_and_fingerprint_batch`) carries no per-document
+        // URL. A rule set that resolves URLs therefore takes the base-carrying
+        // extraction and fingerprints in a second pass: one extra parse per
+        // document, paid ONLY by rule sets that opted into `url_absolute` and
+        // have the health detector on. The alternative — reusing the fused path
+        // — would emit relative URLs whenever health happened to be enabled,
+        // which is a config flag silently changing what a dataset contains.
+        if compiled.needs_doc_url() {
+            let reported = extract_batch_with_report_at(&compiled, &docs, &bases);
+            let values: Vec<Value> = reported.iter().map(|(v, _)| v.clone()).collect();
+            return (reported, Some(signals_batch(&docs, &values)));
         }
         let fused = extract_and_fingerprint_batch(&compiled, &docs);
         let mut reported = Vec::with_capacity(fused.len());
@@ -360,13 +376,30 @@ async fn extract_and_upsert(
         metas.push((d.url, d.observed_at, d.fetched_via));
         docs.push(d.body);
     }
+    // Each document's own URL travels with it into extraction, so `url_absolute`
+    // resolves an item's `/item/123` href against the page it was scraped from.
+    // A key that is not an absolute URL (a source dataset keyed by id rather
+    // than link) parses to no base in core, and the report says so rather than
+    // resolving against something invented here.
+    let bases: Vec<Option<String>> = metas
+        .iter()
+        .map(|(url, _, _)| (!url.trim().is_empty()).then(|| url.clone()))
+        .collect();
     // `docs` is MOVED, not cloned: fingerprinting now rides the extraction's own
     // parse, so nothing downstream needs the bodies again (was: `docs.clone()`,
     // a second full copy of every HTML body kept alive only so `observe` could
     // re-parse them).
-    let (reported, signals) = run_extraction(compiled, docs, ctx.health.enabled()).await?;
+    let (reported, signals) = run_extraction(compiled, docs, bases, ctx.health.enabled()).await?;
     // Borrow the reports rather than deep-cloning each into a throwaway Vec.
     let (matched, total, worst) = summarize_reports(reported.iter().map(|(_, r)| r));
+    let base_url_missing = docs_missing_base(reported.iter().map(|(_, r)| r));
+    if base_url_missing > 0 {
+        tracing::warn!(
+            docs = base_url_missing,
+            dataset,
+            "url_absolute had no document URL to resolve against; those links stayed relative"
+        );
+    }
 
     // Health verdict FIRST, then the write: the state settled here is what the
     // upsert below gates on (trust stamp, quarantine dataset, removal
@@ -405,9 +438,22 @@ async fn extract_and_upsert(
         matched,
         total,
         worst,
+        base_url_missing,
         summary,
         health: verdict,
     })
+}
+
+/// Documents whose rule set asked to resolve URLs but had no document URL to
+/// resolve against — every `url_absolute` field in them kept its raw, possibly
+/// relative, value.
+///
+/// Named and counted rather than left implicit because the alternative is the
+/// worst kind of quiet: a `url` column that holds `/item/1` for one run and
+/// `https://shop/item/1` for the next, with the job result claiming a clean
+/// pass either way.
+fn docs_missing_base<'a>(reports: impl IntoIterator<Item = &'a DocReport>) -> u64 {
+    reports.into_iter().filter(|r| r.base_url_missing).count() as u64
 }
 
 /// The one source URL every document in this batch came from, or `None` when
@@ -449,6 +495,9 @@ struct ExtractOutcome {
     matched: u64,
     total: u64,
     worst: Vec<Value>,
+    /// Documents extracted without a base URL by a rule set that needed one
+    /// ([`docs_missing_base`]).
+    base_url_missing: u64,
     summary: UpsertSummary,
     health: Option<Value>,
 }
@@ -1021,6 +1070,7 @@ impl Extractor {
             "fields_matched": out.matched,
             "fields_total": out.total,
             "worst_fields": out.worst,
+            "base_url_missing": out.base_url_missing,
             "health": out.health,
             "records": out.records,
         }))
@@ -1225,6 +1275,7 @@ impl Extractor {
             "fields_matched": out.matched,
             "fields_total": out.total,
             "worst_fields": out.worst,
+            "base_url_missing": out.base_url_missing,
             "health": out.health,
             "records": out.records,
         }))
@@ -1269,6 +1320,7 @@ impl Extractor {
         let mut missing: Vec<Value> = Vec::new();
         let (mut new, mut changed, mut unchanged) = (st.new, st.changed, st.unchanged);
         let (mut fields_matched, mut fields_total) = (st.fields_matched, st.fields_total);
+        let mut base_url_missing = st.base_url_missing;
         loop {
             let batch = ctx
                 .datasets
@@ -1331,6 +1383,7 @@ impl Extractor {
                 unchanged += out.summary.unchanged;
                 fields_matched += out.matched;
                 fields_total += out.total;
+                base_url_missing += out.base_url_missing;
             }
             // Cursor + tallies AFTER the batch's writes committed, so a resume
             // never re-does a page and never double-counts one.
@@ -1346,6 +1399,7 @@ impl Extractor {
                 unchanged,
                 fields_matched,
                 fields_total,
+                base_url_missing,
             };
             ctx.checkpoint(st.to_value()).await;
             if short {
@@ -1370,6 +1424,7 @@ impl Extractor {
             "unchanged": unchanged,
             "fields_matched": fields_matched,
             "fields_total": fields_total,
+            "base_url_missing": base_url_missing,
         }))
     }
 
@@ -1495,6 +1550,7 @@ impl Extractor {
             "fields_matched": out.matched,
             "fields_total": out.total,
             "worst_fields": out.worst,
+            "base_url_missing": out.base_url_missing,
             "health": out.health,
             "records": out.records,
         }))
@@ -1537,6 +1593,11 @@ struct BackfillState {
     fields_matched: u64,
     #[serde(default)]
     fields_total: u64,
+    /// Cumulative [`docs_missing_base`] across the resumed scan. `#[serde(default)]`
+    /// like every sibling, so a checkpoint written before this field existed
+    /// resumes at 0 rather than restarting the whole backfill.
+    #[serde(default)]
+    base_url_missing: u64,
 }
 
 impl BackfillState {
@@ -1772,6 +1833,19 @@ mod tests {
         let (matched, total, worst) = summarize_reports(reports.iter());
         assert_eq!((matched, total), (2, 2));
         assert!(worst.is_empty());
+    }
+
+    #[test]
+    fn docs_missing_base_counts_documents_not_fields() {
+        // One flag per DOCUMENT, whatever the rule set's width: the question is
+        // "did this page have a URL to resolve against", asked once per page.
+        use super::docs_missing_base;
+        let mut with = report(&[("a", FieldStatus::Matched), ("b", FieldStatus::Matched)]);
+        with.base_url_missing = true;
+        let without = report(&[("a", FieldStatus::Matched)]);
+        assert_eq!(docs_missing_base([&with, &without, &with]), 2);
+        assert_eq!(docs_missing_base([&without]), 0);
+        assert_eq!(docs_missing_base(std::iter::empty()), 0);
     }
 
     #[test]

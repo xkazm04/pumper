@@ -363,6 +363,11 @@ pub(crate) struct PreviewBody {
     /// URL to fetch (HTTP tier only — no browser/Claude escalation) and run the
     /// rules against. Provide exactly one of `html` or `url`.
     url: Option<String>,
+    /// The document's own URL, which `url_absolute` transforms resolve relative
+    /// links against. Defaults to `url` when fetching; supply it with `html` to
+    /// preview a rule set against a body you pasted in. Without it a rule set
+    /// using `url_absolute` still runs, but the report says `base_url_missing`.
+    base_url: Option<String>,
 }
 
 /// Compiles a `RuleSet` and runs it against one document without enqueuing a
@@ -374,14 +379,16 @@ pub(crate) struct PreviewBody {
 ///
 /// `url` mode fetches through the shared HTTP tier only (`FetchStrategy::Http`):
 /// a preview never spends money on the Claude tier or waits on a browser render,
-/// and is bounded by a modest time and body budget.
+/// and is bounded by a modest time and body budget. The fetched `url` doubles as
+/// the document base for `url_absolute`; an `html` body can name one with
+/// `base_url`.
 #[utoipa::path(
     post,
     path = "/extract/preview",
     tag = "extract",
     request_body = PreviewBody,
     responses(
-        (status = 200, description = "`{values, report, fields_matched, fields_total}` — extracted values plus the report: `report.fields` is the per-field match status (`matched`|`empty`|`container_empty`|`error`) and `report.coercion` the post-transform outcome (`coerced`|`coercion_failed`|`no_transforms`) for fields with a transform chain."),
+        (status = 200, description = "`{values, report, fields_matched, fields_total}` — extracted values plus the report: `report.fields` is the per-field match status (`matched`|`empty`|`container_empty`|`error`), `report.coercion` the post-transform outcome (`coerced`|`coercion_failed`|`no_transforms`) for fields with a transform chain, and `report.base_url_missing` is present only when a `url_absolute` transform had no document URL to resolve against (pass `base_url`, or `url`, to supply one)."),
         (status = 400, description = "Bad request: not exactly one of html|url, non-object `rules`, non-http(s) url, fetch failure/timeout, or rule compile errors — the body then carries a `fields: [{field, error}]` list covering every bad field.", body = Object),
         (status = 413, description = "Fetched body over the preview size budget", body = Object),
     )
@@ -390,6 +397,10 @@ pub(crate) async fn extract_preview(
     State(state): State<AppState>,
     Json(body): Json<PreviewBody>,
 ) -> Result<Response, ApiError> {
+    // The document's own URL: explicit `base_url` wins, else the URL being
+    // fetched IS the base. A pasted `html` body with neither has no honest base,
+    // and the report says so rather than the preview inventing one.
+    let base = preview_base(body.base_url.as_deref(), body.url.as_deref());
     // Exactly one document source.
     let doc = match (body.html, body.url) {
         (Some(_), Some(_)) => {
@@ -453,7 +464,8 @@ pub(crate) async fn extract_preview(
     let compiled = (pumper_core::RuleSet { fields })
         .compile()
         .map_err(ApiError::from)?;
-    let (values, report) = pumper_core::extract_one_with_report(&compiled, &doc);
+    let (values, report) =
+        pumper_core::extract::extract_one_with_report_at(&compiled, &doc, base.as_deref());
     let fields_total = report.fields.len();
     let fields_matched = report
         .fields
@@ -472,6 +484,18 @@ pub(crate) async fn extract_preview(
         "fields_total": fields_total,
     }))
     .into_response())
+}
+
+/// The base a preview resolves `url_absolute` against: an explicit `base_url`
+/// first, else the URL being fetched (a fetched page IS its own base), else
+/// nothing.
+///
+/// Extracted so the precedence is a tested fact rather than an inline `or`: a
+/// preview that silently picked the wrong base would be worse than one with no
+/// base at all, because the rules would look correct here and resolve
+/// differently in the job.
+fn preview_base(base_url: Option<&str>, url: Option<&str>) -> Option<String> {
+    base_url.or(url).map(str::to_string)
 }
 
 /// Fetches a preview document through the shared HTTP tier only, under a modest
@@ -509,4 +533,31 @@ async fn fetch_preview_doc(state: &AppState, url: &str) -> Result<String, ApiErr
         ));
     }
     Ok(html)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::preview_base;
+
+    #[test]
+    fn preview_base_prefers_the_explicit_one_over_the_fetched_url() {
+        // A fetched page IS its own base, so `url` mode needs no extra param —
+        // but an explicit `base_url` must win, because previewing a rule set for
+        // a page you already have (or a mirror of it) is the whole reason the
+        // field exists.
+        assert_eq!(
+            preview_base(Some("https://real.test/p"), Some("https://mirror.test/p")),
+            Some("https://real.test/p".into())
+        );
+        assert_eq!(
+            preview_base(None, Some("https://shop.test/cat")),
+            Some("https://shop.test/cat".into())
+        );
+        assert_eq!(
+            preview_base(Some("https://shop.test/cat"), None),
+            Some("https://shop.test/cat".into())
+        );
+        // Pasted html with no base named: no base is invented for it.
+        assert_eq!(preview_base(None, None), None);
+    }
 }

@@ -25,7 +25,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use scraper::{ElementRef, Html, Selector};
 use serde::Serialize;
 
-use crate::extract::{FieldRule, Rule, RuleSet};
+use crate::extract::{FieldRule, Rule, RuleSet, Transform};
 use crate::simhash::build_hash_stem;
 use crate::Result;
 
@@ -197,7 +197,7 @@ pub fn induce(docs: &[String], opts: &InduceOptions) -> Result<Option<Induction>
                     all: false,
                     html: false,
                 },
-                transforms: Vec::new(),
+                transforms: induced_transforms(f.attr.as_deref()),
             },
         );
     }
@@ -480,6 +480,26 @@ fn assign_names(fields: &mut [FieldSupport]) {
     }
 }
 
+/// The transform chain an induced slot gets for free.
+///
+/// A link slot is induced from a *raw* `href`, which on most listings is
+/// relative (`/item/123`) — a value that means nothing once it leaves the page
+/// it was scraped from. Every induced rule set was therefore shipping a `_url`
+/// field its user had to notice and fix by hand. URL-bearing attributes get a
+/// `url_absolute` transform emitted with them; every other slot keeps the empty
+/// chain, because induction suggests structure, not opinions.
+fn induced_transforms(attr: Option<&str>) -> Vec<Transform> {
+    match attr {
+        Some(a) if URL_ATTRS.contains(&a) => vec![Transform::UrlAbsolute],
+        _ => Vec::new(),
+    }
+}
+
+/// Attributes whose value is a URL reference (RFC 3986) rather than free text.
+/// `href` is the only one induction emits today ([`analyze_candidate`] collects
+/// anchor hrefs); the list is the seam for `src`/`data-href` when it does.
+const URL_ATTRS: [&str; 3] = ["href", "src", "poster"];
+
 fn round3(v: f64) -> f64 {
     (v * 1000.0).round() / 1000.0
 }
@@ -575,6 +595,38 @@ mod tests {
         assert_eq!(items[0]["heading"], json!("Alpha"));
         assert_eq!(items[0]["price"], json!("$10"));
         assert_eq!(items[0]["more_url"], json!("/item/Alpha"));
+    }
+
+    #[test]
+    fn induced_href_fields_are_absolute_not_relative() {
+        // An induced rule set used to hand back `"/item/Alpha"` — a link that
+        // means nothing off the page it came from, which every user had to
+        // notice and patch by hand. The href slot now carries `url_absolute`.
+        use crate::extract::extract_one_with_report_at;
+        let ind = induce(&corpus(), &InduceOptions::default())
+            .unwrap()
+            .unwrap();
+        let wire = serde_json::to_value(&ind.rules).unwrap();
+        assert_eq!(
+            wire["items"]["fields"]["more_url"]["transforms"],
+            json!([{"op": "url_absolute"}]),
+            "{wire}"
+        );
+        // Text slots keep the empty chain — induction suggests structure, not
+        // opinions about values.
+        assert_eq!(wire["items"]["fields"]["heading"].get("transforms"), None);
+        assert_eq!(wire["items"]["fields"]["price"].get("transforms"), None);
+
+        // End to end: induce, then run against the very page it came from.
+        let compiled = ind.rules.compile().unwrap();
+        assert!(compiled.needs_doc_url());
+        let (out, report) =
+            extract_one_with_report_at(&compiled, &corpus()[0], Some("https://shop.test/list/p1"));
+        assert_eq!(
+            out["items"][0]["more_url"],
+            json!("https://shop.test/item/Alpha")
+        );
+        assert!(!report.base_url_missing);
     }
 
     #[test]

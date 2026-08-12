@@ -11,9 +11,8 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use pumper_core::{
-    extract_batch_with_report, AppContext, DocReport, Error, FieldStatus, Record, Result, RuleSet,
-};
+use pumper_core::extract::extract_batch_with_report_at;
+use pumper_core::{AppContext, DocReport, Error, FieldStatus, Record, Result, RuleSet};
 use serde_json::{json, Map, Value};
 
 use crate::{versions_for, MISSING_ECHO_LIMIT, SOURCE_LIST_LIMIT};
@@ -497,14 +496,20 @@ pub(crate) async fn run_replay(ctx: &AppContext, replay: &Map<String, Value>) ->
         }
     }
 
+    // Each stored body keeps its own URL as the extraction base — the crawl
+    // dataset's keys ARE canonical URLs — so a candidate rule set using
+    // `url_absolute` is replayed exactly as it will run in production, instead
+    // of being judged against relative values CI would never have produced.
+    let bases: Vec<Option<String>> = keys.iter().map(|k| Some(k.url.clone())).collect();
+
     // Both rule sets run over the IDENTICAL document vector, off the async
     // runtime (rayon fan-out inside), so reports stay index-aligned.
     let base_for_task = baseline.clone();
     let (cand_reports, base_reports) = tokio::task::spawn_blocking(move || {
-        let c = extract_batch_with_report(&candidate, &docs);
+        let c = extract_batch_with_report_at(&candidate, &docs, &bases);
         let b = base_for_task
             .as_ref()
-            .map(|b| extract_batch_with_report(b, &docs));
+            .map(|b| extract_batch_with_report_at(b, &docs, &bases));
         (c, b)
     })
     .await

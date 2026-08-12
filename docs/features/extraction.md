@@ -12,7 +12,25 @@ A `RuleSet` maps output fields to rules, compiled once and run over document bat
 - `each` — **repeating container** for list pages: `{"type":"each","selector":".card","fields":{…}}` runs `fields` **scoped to each matched element**, yielding one object per match (`Value::Array` of objects). This is the correct list-page shape — unlike `css` + `all: true`, which returns independent parallel arrays that silently mis-zip the moment one item is missing a field. Inner fields may be `css` (selects descendants of the element), `regex` (over the element's own HTML), `const`, or a nested `each`; `json`/`xpath` inner rules are rejected at compile. Each item's fields stay bound together, so a missing `.price` is a `null` on *its own* item. (The extractor still upserts one dataset record per document; fanning an `each` array out into one record per item is a separable follow-on.)
   - Optional `container` — the **enclosing listing element** (`{"type":"each","selector":".job","container":"#listing"}`). Items are then selected inside it, and an empty result splits into two distinguishable statuses: `container_empty` (the listing was found and held nothing — a job board with no postings this week) versus `empty` (the listing itself is gone — the selector broke). Without `container` both collapse into `empty`, and no later analysis can undo the conflation. A nested `each`'s own `container` resolves inside its item.
 
-**Transforms**: each field takes an optional `transforms` chain applied after the rule (element-wise over arrays): `trim`, `lowercase`, `uppercase`, `to_number`, `to_int`, `to_bool`, `regex_replace {pattern, replacement}` (`$1`-style capture references), `split {sep, index?}`, `to_markdown` (HTML fragment → clean Markdown; pair with a `css` rule's `html: true`), `default {value}`. Backward compatible — plain rule JSON still parses (serde-flattened `FieldRule`).
+**Transforms**: each field takes an optional `transforms` chain applied after the rule (element-wise over arrays): `trim`, `lowercase`, `uppercase`, `to_number`, `to_int`, `to_bool`, `regex_replace {pattern, replacement}` (`$1`-style capture references), `split {sep, index?}`, `to_markdown` (HTML fragment → clean Markdown; pair with a `css` rule's `html: true`), `url_absolute`, `default {value}`. Backward compatible — plain rule JSON still parses (serde-flattened `FieldRule`).
+
+### `url_absolute` — links that work outside the page they came from
+
+`{"type":"css","selector":"a","attr":"href","transforms":[{"op":"url_absolute"}]}` resolves an extracted URL against **the document's own URL** (RFC 3986, via the `url` crate — never string concatenation, which gets `../`, query-only and scheme-relative references wrong):
+
+| input on `https://shop.test/cat/page` | output |
+| --- | --- |
+| `/item/1` | `https://shop.test/item/1` |
+| `../item/2` | `https://shop.test/item/2` |
+| `//cdn.shop.test/x` | `https://cdn.shop.test/x` (protocol-relative takes the page's scheme) |
+| `https://other.test/z`, `mailto:a@b` | unchanged (already absolute) |
+| `?page=1` / `#sec` | resolved against the page |
+
+**Without a base URL it is a reported no-op, never a guess.** A value that cannot be resolved — no document URL, a document URL that will not parse, or a join error — comes back **unchanged**, never null: a relative URL is still the truth the page contained. A *blank* value stays blank (joining `""` against a base yields the base itself, which would turn "this field found nothing" into "this field found the page you were already on"). When the rule set asks for `url_absolute` and the extraction had no base, `report.base_url_missing: true` says so — the alternative is a `url` column that is relative on some runs and absolute on others with nothing marking which.
+
+Where the base comes from: the `extractor` app passes each document's own URL (the fetched URL in `urls` mode, the record key in `source`/backfill modes, the original URL for a Wayback capture), replay-CI passes each stored body's URL, and `POST /extract/preview` uses `base_url` or the `url` it fetched. A source dataset whose keys are ids rather than links has no base, and the run reports `base_url_missing` (a count of such documents). Two known limits: the base is the **requested** URL, not the post-redirect one (`FetchOutcome` carries `url = the request`; the HTTP engine's `final_url` is not plumbed through the tiered fetcher), and an archived Wayback body whose hrefs were rewritten by the archive resolves them against the original URL, matching its `_url` provenance.
+
+`induce` emits `url_absolute` automatically on URL-bearing attribute slots (`href`/`src`/`poster`), so an induced rule set hands back usable links rather than a `_url` field the user has to fix by hand.
 
 `default` fires on a **blank** result — `null`, a whitespace-only string, or an empty array — which is the same predicate that decides the `empty` status below, so the two cannot disagree. (It used to fire only on `null`: a selector that matched an empty `<span>` reported `empty` *and* kept the `""`, so the declared default silently never applied.) Falsey values are data, not absence: `0` and `false` are never replaced.
 
@@ -51,8 +69,9 @@ API (`extract.rs`):
 
 - `extract_one_with_report(rules, doc) -> (Value, DocReport)`
 - `extract_batch_with_report(rules, docs) -> Vec<(Value, DocReport)>`
+- `extract_one_with_report_at(rules, doc, base: Option<&str>)` / `extract_batch_with_report_at(rules, docs, bases: &[Option<String>])` — the same, told the document's own URL for `url_absolute`. `bases` is positional and may be short (or `&[]`), so a mixed batch degrades per document rather than all-or-nothing. `CompiledRuleSet::needs_doc_url()` answers "does this rule set need a base at all", before the fan-out.
 
-`DocReport` is `{fields: {field -> {status, detail?}}, coercion: {field -> status}, each: {dotted.path -> {items, matched, empty, container_empty, error}}}` (`FieldStatus` is a `status`-tagged enum; `coercion` and `each` are omitted when empty). All are serde-stable for downstream serialization. **Wire note**: `DocReport` was a serde-*transparent* field map before the coercion status existed, so a reader of `POST /extract/preview` now finds the statuses one level down under `report.fields`.
+`DocReport` is `{fields: {field -> {status, detail?}}, coercion: {field -> status}, each: {dotted.path -> {items, matched, empty, container_empty, error}}, base_url_missing?: true}` (`FieldStatus` is a `status`-tagged enum; `coercion`/`each` are omitted when empty and `base_url_missing` when false). All are serde-stable for downstream serialization. **Wire note**: `DocReport` was a serde-*transparent* field map before the coercion status existed, so a reader of `POST /extract/preview` now finds the statuses one level down under `report.fields`.
 
 **Who reads `each` today**: the `extractor` app's `worst_fields` roll-up and the replay-CI `inner_fields` rows (both below). The resilience per-field sketches, the `provisioner` accept gate and the DataHub/reliability *scoring* still key off `report.fields` only, so listing rot shows up in a run's result and in the host reliability record's echoed `worst_fields` — but does not yet move a health score or a provisioning verdict.
 
@@ -75,6 +94,7 @@ Both modes share the extraction + quality-report path and report aggregate quali
   - **item scope** (inner fields of an `each` listing, keyed `products.price`): the same four keys plus `{scope: "item", items, hits, dead}`. Here `miss_rate` is misses ÷ listing **items**, which is why `scope` is on the row; `dead: true` means the selector bound on no item at all (listing rot) as opposed to a sparse field.
 
   `fields_matched`/`fields_total` stay document-scoped on purpose: they are the run's rule-level match rate, and folding item counts in would let one wide listing outvote every other field in the rule set. Records are tagged `_url` = source URL / record key.
+- both: `base_url_missing` — how many documents a `url_absolute` rule set ran over with no document URL to resolve against (`0` for every other rule set). Those documents' links stayed exactly as the page wrote them; the count is what keeps that from reading as a clean run. Also carried in the `backfill` checkpoint, so a resumed scan keeps a cumulative figure.
 - both: `health` — the extraction-health verdict for this run (`{verdict, diagnosis, score, state, previous_state, statistical_coverage, reasons, drift}`), or `null` when detection is off. urls mode also reports `fetch_ok_rate`. See [resilient-extraction.md](resilient-extraction.md).
 
 ### Replay-CI (`replay` param)
@@ -87,12 +107,13 @@ Both modes share the extraction + quality-report path and report aggregate quali
 
 ## RuleSet preview (`POST /extract/preview`)
 
-Test a `RuleSet` against one document **without enqueuing a job** — the fast feedback loop for authoring selectors, so a typo is caught before a job fetches everything. Body: `{rules, html}` **or** `{rules, url}` (exactly one of `html`/`url`; both or neither → `400 bad_request`).
+Test a `RuleSet` against one document **without enqueuing a job** — the fast feedback loop for authoring selectors, so a typo is caught before a job fetches everything. Body: `{rules, html}` **or** `{rules, url}` (exactly one of `html`/`url`; both or neither → `400 bad_request`), plus optional `base_url`.
 
 - `rules` — a bare `{field: rule}` map (the same shape apps take), e.g. `{"title": {"type":"css","selector":"h1"}}`. Rules are compiled **field-by-field** (each as a single-field `RuleSet`), so **every** bad field is reported at once, not just the first. On any failure the response is `400 bad_request` with a per-field `fields: [{field, error}]` list covering deserialize errors (unknown rule `type`, missing keys) and compile errors (bad CSS selector / regex / XPath). A non-object `rules` is `400`.
 - `url` mode fetches through the shared **HTTP tier only** (`FetchStrategy::Http` — no browser render, and never the paid Claude tier), under a modest budget: a 15s fetch timeout (exceeded → `400`) and an 8 MiB body cap (over → `413 too_large`). A non-`http(s)` url or a fetch failure is `400`.
+- `base_url` — the document's own URL for `url_absolute` (see above). Defaults to `url` when fetching (a fetched page IS its own base); supply it with `html` to preview link rules against a body you pasted in. An explicit `base_url` wins over `url`, so a rule set can be previewed against a mirror of the real page.
 
-On success (`200`): `{values, report, fields_matched, fields_total}` — the extracted values plus the report (`report.fields`: each field `matched`|`empty`|`container_empty`|`error`; `report.coercion`: `coerced`|`coercion_failed`|`no_transforms`, see above), so a selector that silently matches nothing — or matches the wrong thing — is visible immediately. `fields_matched`/`fields_total` are the matched-over-attempted counts.
+On success (`200`): `{values, report, fields_matched, fields_total}` — the extracted values plus the report (`report.fields`: each field `matched`|`empty`|`container_empty`|`error`; `report.coercion`: `coerced`|`coercion_failed`|`no_transforms`, see above; `report.base_url_missing`: present only when a `url_absolute` transform had no base), so a selector that silently matches nothing — or matches the wrong thing — is visible immediately. `fields_matched`/`fields_total` are the matched-over-attempted counts.
 
 ## HTML → Markdown
 
