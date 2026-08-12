@@ -599,6 +599,40 @@ try {
                 ($names -contains 'enabled') -and ($names -contains 'doc_count') -and
                 ($names -contains 'degraded') -and ($names -contains 'reason')
             }
+
+            # Round 13: schedules were the last work-creating door without the
+            # budget floor. Same contract as the jobs/trigger doors: 0 is a
+            # refusal, never a silent "no ceiling" stored on a row that replays
+            # it into every firing forever.
+            Test-DoorRefusal -Name 'POST /schedules budget_usd:0 -> 422' `
+                -Path '/schedules' `
+                -Body @{ app = 'hackernews'; cron = '0 0 3 * * *'; budget_usd = 0.0 } `
+                -Expect 422 -BodyLike '*NO spend ceiling*'
+            # ...and the late door (the only way a code-seeded/catalog row ever
+            # gets a ceiling) answers 404 honestly for a row that isn't there.
+            Test-DoorRefusal -Name 'POST /schedules/{id}/budget unknown id -> 404' `
+                -Path '/schedules/definitely-not-a-schedule/budget' `
+                -Body @{ budget_usd = 1.5 } `
+                -Expect 404 -BodyLike '*not found*'
+            # A real ceiling round-trips: created with one, listed with one.
+            try {
+                $resp = Invoke-WebRequest -Method Post -Uri "$baseUrl/schedules" `
+                    -Body (@{ app = 'hackernews'; cron = '0 0 3 * * *'; budget_usd = 0.75 } | ConvertTo-Json) `
+                    -ContentType 'application/json' -UseBasicParsing -TimeoutSec 10
+                $row = $resp.Content | ConvertFrom-Json
+                if ($resp.StatusCode -eq 201 -and $row.budget_usd -eq 0.75) {
+                    Add-Result -Name 'POST /schedules stores + returns budget_usd' -Status 'PASS'
+                } else {
+                    Add-Result -Name 'POST /schedules stores + returns budget_usd' -Status 'FAIL' `
+                        -Detail "HTTP $($resp.StatusCode), budget_usd '$($row.budget_usd)'"
+                }
+                # Clean up so the scratch schedule can't fire mid-teardown.
+                Invoke-WebRequest -Method Delete -Uri "$baseUrl/schedules/$($row.id)" `
+                    -UseBasicParsing -TimeoutSec 10 | Out-Null
+            } catch {
+                Add-Result -Name 'POST /schedules stores + returns budget_usd' -Status 'FAIL' `
+                    -Detail $_.Exception.Message
+            }
         } else {
             Add-Result -Name 'job runs to completion (hackernews)' -Status 'SKIP' -Detail 'no job id to poll (enqueue failed)'
             Add-Result -Name 'GET /jobs/{id}/receipt' -Status 'SKIP' -Detail 'no job id to fetch a receipt for'
