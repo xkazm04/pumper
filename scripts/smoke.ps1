@@ -520,11 +520,10 @@ try {
             Test-DoorRefusal -Name 'POST /schedules invalid params -> 422' -Path '/schedules' `
                 -Body @{ app = 'transact'; cron = '0 0 0 * * *'; params = @{ bogus_key = 1 } } `
                 -Expect 422 -BodyLike '*"unprocessable"*'
-            # The ca-grants/unified trap: accepted-and-dead before round 11; now
-            # a 400 that names the namespace the records actually land under.
-            Test-DoorRefusal -Name 'POST /watches ca-grants/unified trap -> 400 naming grants' -Path '/watches' `
-                -Body @{ app = 'ca-grants'; dataset = 'unified'; sink = 'file' } `
-                -Expect 400 -BodyLike '*grants*'
+            # (The ca-grants/unified trap-400 is store-derived — it needs a
+            # 'unified' dataset to exist under 'grants' — so a fresh scratch DB
+            # legitimately answers 201 and the trap stays e2e-proven only. The
+            # state-independent honesty surface is `last_delivery` below.)
             # The virtual namespace every grant revision lands under is watchable.
             try {
                 $resp = Invoke-WebRequest -Method Post -Uri "$baseUrl/watches" `
@@ -554,6 +553,15 @@ try {
                     Add-Result -Name 'GET /watches?app=bogus -> 400' -Status 'FAIL' `
                         -Detail "expected 400, got HTTP $code"
                 }
+            }
+            # A never-fired watch says so: `last_delivery` is an explicit null,
+            # not an omitted key — the surface that reveals an accepted-but-dead
+            # watch (the trap the create-door cannot catch on an empty store).
+            Test-JsonEndpoint -Name 'GET /watches carries explicit last_delivery' -Path '/watches' -Assert {
+                param($j)
+                $w = @($j.watches | Where-Object { $_.app -eq 'grants' })[0]
+                if (-not $w) { return $false }
+                $w.PSObject.Properties.Name -contains 'last_delivery'
             }
         } else {
             Add-Result -Name 'job runs to completion (hackernews)' -Status 'SKIP' -Detail 'no job id to poll (enqueue failed)'
