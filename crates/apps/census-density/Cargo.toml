@@ -10,3 +10,11 @@ census-common.workspace = true
 trades-common.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# The two `census/*` products are written straight through `ctx.datasets` into a
+# namespace no app owns, so their provenance stamps and their truncation guard
+# can only be proved against a real store: `TempStore` + `TestContext` (Dead
+# engines — these paths do no fetching).
+pumper-core = { workspace = true, features = ["test-support"] }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

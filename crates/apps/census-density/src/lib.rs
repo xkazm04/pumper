@@ -484,35 +484,15 @@ impl ScrapeApp for CensusDensity {
                             })
                         })
                         .collect();
-                    // Persist the FULL ranking (not just the top 60) as a durable
-                    // dataset so the headline saturation metric is queryable by the
-                    // launch-ranking UI, triggers, and exports — and so
-                    // change-detection can see it — instead of living only in this
-                    // job's result JSON. Keyed by place under the shared census
-                    // namespace, alongside the blend.
-                    let sat_records: Vec<(String, Value)> = rows
-                        .iter()
-                        .map(|(p, e, base, per_10k)| {
-                            (
-                                p.clone(),
-                                json!({
-                                    "place": p,
-                                    "geo": geo,
-                                    "combined_establishments": e,
-                                    "base": base,
-                                    "denominator_kind": denom_kind,
-                                    "per_10k": (per_10k * 100.0).round() / 100.0,
-                                    "acs_dataset": acs_dataset,
-                                    "acs_year": acs_year,
-                                    "year": year,
-                                }),
-                            )
-                        })
-                        .collect();
-                    let sat_sum = ctx
-                        .datasets
-                        .upsert_many(MARKET_APP, SATURATION_DATASET, &sat_records)
-                        .await?;
+                    let sat = SaturationWrite {
+                        geo: &geo,
+                        denom_kind: &denom_kind,
+                        acs_dataset: &acs_dataset,
+                        acs_year: &acs_year,
+                        year: &year,
+                    };
+                    let sat_records = saturation_records(&rows, &sat);
+                    let sat_sum = sync_saturation(&ctx, &sat_records).await?;
                     json!({
                         "dataset": format!("{MARKET_APP}/{SATURATION_DATASET}"),
                         "acs_dataset": acs_dataset,
@@ -540,7 +520,10 @@ impl ScrapeApp for CensusDensity {
             Err(e) => json!({ "skipped": format!("{e}") }),
         };
 
-        Ok(json!({
+        // `with_product_index` is what puts the two `census/*` products in the
+        // worker's index + hook scope — without it no watch, trigger or saved
+        // search on app `census` can fire, and neither product is searchable.
+        Ok(census_common::with_product_index(json!({
             "source": format!("census/cbp/{year}"),
             "geo": geo,
             "year": year,
@@ -553,7 +536,7 @@ impl ScrapeApp for CensusDensity {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
-        }))
+        })))
     }
 }
 
@@ -595,22 +578,107 @@ impl ScrapeApp for CensusDensity {
 //    sector-level signal can't silently read as state- or trade-level.
 // ---------------------------------------------------------------------------
 
-/// Virtual app namespace holding the cross-app blended dataset.
-pub const MARKET_APP: &str = "census";
-pub const MARKET_BLEND_DATASET: &str = "market_blend";
-/// Durable per-place saturation (establishments per 10k of an ACS base) — the
-/// app's headline metric, previously discarded into one job's result JSON.
-pub const SATURATION_DATASET: &str = "saturation";
+/// The virtual namespace and its two product datasets — defined in
+/// `census-common` (every census app needs them to declare `index_datasets`)
+/// and re-exported here, where the blend that writes them lives.
+pub use census_common::{MARKET_APP, MARKET_BLEND_DATASET, SATURATION_DATASET};
 
 /// Well over the worst case (4 trades × 52 states employer-side; NES is
 /// smaller), while still bounding a runaway county-mode dataset read.
 const BLEND_READ_LIMIT: i64 = 50_000;
+
+/// Whether a dataset read came back **at** its cap — i.e. it is a WINDOW over
+/// the dataset, not the dataset.
+///
+/// The blend joins five reads, each capped at [`BLEND_READ_LIMIT`]. A read that
+/// returns exactly the cap has almost certainly left rows behind, and blending
+/// it produces cells that look complete while missing whole states or trades:
+/// an `employer_only` marker that means "the solo read was truncated", not "no
+/// solo operators exist". `>=` rather than `==` because a cap can only be
+/// tightened, never exceeded — an off-by-one must fail safe (cordis's
+/// `aggregate_truncated` precedent).
+fn read_hit_cap(rows_read: usize, limit: i64) -> bool {
+    rows_read as i64 >= limit
+}
+
+/// The per-input read cap for this run: [`BLEND_READ_LIMIT`], or the
+/// `blend_read_limit` param when an operator lowers it (a diagnostic knob —
+/// lowering it does not make the blend cheaper to trust, it makes the
+/// truncation report fire, which is the point). Clamped to at least 1: a cap of
+/// 0 would read nothing and call it a complete corpus.
+fn blend_read_limit(ctx: &AppContext) -> i64 {
+    ctx.params
+        .get("blend_read_limit")
+        .and_then(Value::as_i64)
+        .map(|n| n.max(1))
+        .unwrap_or(BLEND_READ_LIMIT)
+}
+
+/// The run-level facts every saturation record carries: which geography and ACS
+/// base the ranking was computed against.
+pub struct SaturationWrite<'a> {
+    pub geo: &'a str,
+    pub denom_kind: &'a str,
+    pub acs_dataset: &'a str,
+    pub acs_year: &'a str,
+    pub year: &'a str,
+}
+
+/// The FULL saturation ranking as dataset records — not just the top 60 the
+/// result JSON shows, so the headline metric is queryable by the launch-ranking
+/// UI, triggers and exports, and change-detection can see it move.
+///
+/// `rows` are `(place, combined establishments, base, per-10k)` as ranked.
+pub fn saturation_records(
+    rows: &[(String, i64, i64, f64)],
+    w: &SaturationWrite<'_>,
+) -> Vec<(String, Value)> {
+    rows.iter()
+        .map(|(p, e, base, per_10k)| {
+            (
+                p.clone(),
+                json!({
+                    "place": p,
+                    "geo": w.geo,
+                    "combined_establishments": e,
+                    "base": base,
+                    "denominator_kind": w.denom_kind,
+                    "per_10k": (per_10k * 100.0).round() / 100.0,
+                    "acs_dataset": w.acs_dataset,
+                    "acs_year": w.acs_year,
+                    "year": w.year,
+                }),
+            )
+        })
+        .collect()
+}
+
+/// Persists the saturation ranking into the virtual `census` namespace with a
+/// real provenance stamp (the namespace bypasses `AppContext`'s automatic one).
+pub async fn sync_saturation(
+    ctx: &AppContext,
+    records: &[(String, Value)],
+) -> Result<pumper_core::UpsertSummary> {
+    let prov = census_common::derived_provenance(ctx, SATURATION_DATASET, &SATURATION_INPUTS);
+    ctx.datasets
+        .upsert_many_stamped(MARKET_APP, SATURATION_DATASET, records, None, Some(&prov))
+        .await
+}
+
+/// What a saturation row is derived from: this run's own CBP establishment
+/// counts divided by an ACS base fetched in the same run.
+const SATURATION_INPUTS: [&str; 2] = ["census-density/establishments", "census-acs/denominator"];
 
 /// Reads both apps' live records, blends them, and upserts
 /// `census/market_blend`. Returns a compact summary for the job result. If
 /// either side has no data yet (the other app may never have run), reports
 /// `blended: 0` with a note instead of writing half-truths.
 pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
+    let limit = blend_read_limit(ctx);
+    // Truncation is measured on the RAW read (the cap is a SQL `LIMIT`), before
+    // tombstones are filtered out in Rust — filtering first would hide a
+    // capped read behind a smaller live count.
+    let mut truncated: Vec<&str> = Vec::new();
     let live = |recs: Vec<pumper_core::Record>| -> Vec<Value> {
         recs.into_iter()
             .filter(|r| r.removed_at.is_none())
@@ -624,25 +692,31 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
     // deserialization (~98% wasted on a nationwide county run), and the
     // `ORDER BY updated_at DESC LIMIT 50000` meant a large dataset could silently
     // return a recency window instead of the state rows the blend needs.
-    let employers = live(
-        ctx.datasets
-            .list_filtered(
-                "census-density",
-                "establishments",
-                &[pumper_core::datasets::JsonFilter::Eq {
-                    path: "$.geo".into(),
-                    value: "state".into(),
-                }],
-                None,
-                BLEND_READ_LIMIT,
-            )
-            .await?,
-    );
-    let solos = live(
-        ctx.datasets
-            .list("census-nonemp", "nonemployers", BLEND_READ_LIMIT)
-            .await?,
-    );
+    let employers_raw = ctx
+        .datasets
+        .list_filtered(
+            "census-density",
+            "establishments",
+            &[pumper_core::datasets::JsonFilter::Eq {
+                path: "$.geo".into(),
+                value: "state".into(),
+            }],
+            None,
+            limit,
+        )
+        .await?;
+    if read_hit_cap(employers_raw.len(), limit) {
+        truncated.push("census-density/establishments");
+    }
+    let employers = live(employers_raw);
+    let solos_raw = ctx
+        .datasets
+        .list("census-nonemp", "nonemployers", limit)
+        .await?;
+    if read_hit_cap(solos_raw.len(), limit) {
+        truncated.push("census-nonemp/nonemployers");
+    }
+    let solos = live(solos_raw);
     if employers.is_empty() || solos.is_empty() {
         let missing = if employers.is_empty() {
             "census-density"
@@ -659,11 +733,14 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
     // dataset — the blend itself does no ACS fetch (census-nonemp also calls this
     // path), so the denominator join reads the base census-density stored. Empty
     // when saturation hasn't run yet → cells emit null base (graceful).
-    let bases = live(
-        ctx.datasets
-            .list(MARKET_APP, SATURATION_DATASET, BLEND_READ_LIMIT)
-            .await?,
-    );
+    let bases_raw = ctx
+        .datasets
+        .list(MARKET_APP, SATURATION_DATASET, limit)
+        .await?;
+    if read_hit_cap(bases_raw.len(), limit) {
+        truncated.push("census/saturation");
+    }
+    let bases = live(bases_raw);
     let base_by_place: BTreeMap<String, (i64, String)> = bases
         .iter()
         .filter_map(|r| {
@@ -682,16 +759,19 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
     // crate dependency — census-nesd/census-bfs depend on this crate for the
     // re-blend hook, so a reverse edge would cycle). Empty when those apps
     // haven't run → the blend emits Null fields (graceful).
-    let owner_age = live(
-        ctx.datasets
-            .list("census-nesd", "owner_age", BLEND_READ_LIMIT)
-            .await?,
-    );
-    let formation_velocity = live(
-        ctx.datasets
-            .list("census-bfs", "formation_velocity", BLEND_READ_LIMIT)
-            .await?,
-    );
+    let owner_age_raw = ctx.datasets.list("census-nesd", "owner_age", limit).await?;
+    if read_hit_cap(owner_age_raw.len(), limit) {
+        truncated.push("census-nesd/owner_age");
+    }
+    let owner_age = live(owner_age_raw);
+    let formation_velocity_raw = ctx
+        .datasets
+        .list("census-bfs", "formation_velocity", limit)
+        .await?;
+    if read_hit_cap(formation_velocity_raw.len(), limit) {
+        truncated.push("census-bfs/formation_velocity");
+    }
+    let formation_velocity = live(formation_velocity_raw);
 
     let items = blend_market(
         &employers,
@@ -711,11 +791,15 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
         .iter()
         .filter(|(_, v)| !v["formation"].is_null())
         .count();
+    // Stamped, not anonymous: these rows land in a namespace no app owns, so
+    // `ctx.datasets` is called directly and the context's automatic provenance
+    // never runs — see `census_common::derived_provenance`.
+    let prov = census_common::derived_provenance(ctx, MARKET_BLEND_DATASET, &BLEND_INPUTS);
     let summary = ctx
         .datasets
-        .upsert_many(MARKET_APP, MARKET_BLEND_DATASET, &items)
+        .upsert_many_stamped(MARKET_APP, MARKET_BLEND_DATASET, &items, None, Some(&prov))
         .await?;
-    Ok(json!({
+    let mut out = json!({
         "dataset": format!("{MARKET_APP}/{MARKET_BLEND_DATASET}"),
         "blended": items.len(),
         "matched_both": both,
@@ -723,11 +807,37 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
         "solo_only": solo_only,
         "with_succession": with_succession,
         "with_formation": with_formation,
+        // A blend over a capped read is a blend over a WINDOW: the coverage
+        // markers and totals below describe what was read, not what exists.
+        "inputs_truncated": truncated,
+        "blend_complete": truncated.is_empty(),
         "new": summary.new.len(),
         "changed": summary.changed.len(),
         "unchanged": summary.unchanged,
-    }))
+    });
+    if let (false, Value::Object(map)) = (truncated.is_empty(), &mut out) {
+        map.insert(
+            "warnings".into(),
+            json!([format!(
+                "blend inputs hit the {limit}-row read cap ({}) — the blended cells are computed \
+                 over a WINDOW of those datasets, so coverage markers, totals and per-10k figures \
+                 are PARTIAL for this run",
+                truncated.join(", ")
+            )]),
+        );
+    }
+    Ok(out)
 }
+
+/// The datasets `sync_market_blend` derives from, in read order — the `inputs`
+/// half of every blend row's provenance stamp.
+const BLEND_INPUTS: [&str; 5] = [
+    "census-density/establishments",
+    "census-nonemp/nonemployers",
+    "census/saturation",
+    "census-nesd/owner_age",
+    "census-bfs/formation_velocity",
+];
 
 /// Pure blend: employer state rows (6-digit NAICS, from `establishments`) +
 /// solo state rows (4-digit NAICS, from `nonemployers`) → one record per
@@ -1092,6 +1202,67 @@ mod tests {
         }
     }
 
+    /// Wiring guard: `run()` must return its result through
+    /// `census_common::with_product_index`. Without that declaration the two
+    /// `census/*` products are invisible — no per-record search doc, and (worker
+    /// `run_indexed_apps`) no watch, trigger or saved search scoped to app
+    /// `census` can EVER fire for this run.
+    ///
+    /// The needle is split so this assertion cannot match itself.
+    #[test]
+    fn run_result_declares_the_census_product_datasets() {
+        let needle = concat!("census_common::with_product_index", "(json!(");
+        assert_eq!(
+            include_str!("lib.rs").matches(needle).count(),
+            1,
+            "census-density's run() must wrap its result exactly once with {needle}"
+        );
+        let empty = json!({});
+        assert_eq!(
+            census_common::with_product_index(empty)["index_datasets"],
+            json!([
+                { "app": "census", "dataset": "market_blend" },
+                { "app": "census", "dataset": "saturation" },
+            ])
+        );
+    }
+
+    /// A read that comes back AT the cap is a window, not the dataset — the
+    /// anti-pattern is blending it as if it were complete (`>=`, never `==`, so
+    /// an over-fetch fails safe too).
+    #[test]
+    fn a_capped_read_is_truncated_not_a_complete_corpus() {
+        assert!(!read_hit_cap(0, 10));
+        assert!(!read_hit_cap(9, 10));
+        assert!(read_hit_cap(10, 10));
+        assert!(read_hit_cap(11, 10));
+        assert!(!read_hit_cap(49_999, BLEND_READ_LIMIT));
+        assert!(read_hit_cap(50_000, BLEND_READ_LIMIT));
+    }
+
+    #[test]
+    fn saturation_records_carry_the_run_grain_and_rounded_ratio() {
+        let rows = vec![("CA".to_string(), 400i64, 10_000i64, 400.004_f64)];
+        let recs = saturation_records(
+            &rows,
+            &SaturationWrite {
+                geo: "state",
+                denom_kind: "households",
+                acs_dataset: "acs/acs5",
+                acs_year: "2022",
+                year: "2022",
+            },
+        );
+        assert_eq!(recs.len(), 1);
+        let (key, v) = &recs[0];
+        assert_eq!(key, "CA");
+        assert_eq!(v["combined_establishments"], 400);
+        assert_eq!(v["base"], 10_000);
+        assert_eq!(v["denominator_kind"], "households");
+        assert_eq!(v["per_10k"], json!(400.0));
+        assert_eq!(v["acs_year"], "2022");
+    }
+
     fn emp(naics: &str, geo: &str, place: &str, st: &str, estab: i64) -> Value {
         json!({
             "naics": naics, "geo": geo, "place": place, "state_fips": st,
@@ -1239,6 +1410,137 @@ mod tests {
         let items = blend_market(&employers, &solos, &BTreeMap::new(), &ages, &[]);
         assert_eq!(items[0].1["pct_owners_55plus"], json!(0.5));
         assert!(items[0].1["succession_receipts"].is_null());
+    }
+
+    // ── Store-backed: the virtual `census` namespace bypasses AppContext's own
+    // stamping, so these two write paths are the ones that used to be anonymous.
+    // Dead engines throughout — neither path fetches.
+
+    async fn seeded_ctx(tag: &str) -> (pumper_core::testing::TempStore, AppContext) {
+        seeded_ctx_with(tag, json!({})).await
+    }
+
+    async fn seeded_ctx_with(
+        tag: &str,
+        params: Value,
+    ) -> (pumper_core::testing::TempStore, AppContext) {
+        let store = pumper_core::testing::TempStore::new(tag).await;
+        let ctx = pumper_core::testing::TestContext::new(&store.storage, "census-density")
+            .params(params)
+            .build();
+        ctx.datasets
+            .upsert_many(
+                "census-density",
+                "establishments",
+                &[(
+                    "238220:06".to_string(),
+                    emp("238220", "state", "CA", "06", 100),
+                )],
+            )
+            .await
+            .expect("seed employers");
+        ctx.datasets
+            .upsert_many(
+                "census-nonemp",
+                "nonemployers",
+                &[("2382:06".to_string(), solo("2382", "CA", "06", 300))],
+            )
+            .await
+            .expect("seed solos");
+        (store, ctx)
+    }
+
+    /// The anti-pattern: a derived product whose every revision reads
+    /// `Provenance::default()` — no producing job, no inputs, no as-of — so a
+    /// `/provenance/census/market_blend/{key}` lookup answers "unknown" for a
+    /// number the launch ranking is built on.
+    #[tokio::test]
+    async fn blended_revisions_carry_job_inputs_and_as_of_not_default_provenance() {
+        let (_store, ctx) = seeded_ctx("census-blend-prov").await;
+        let out = sync_market_blend(&ctx).await.expect("blend");
+        assert_eq!(out["blended"], 1);
+
+        let revs = ctx
+            .datasets
+            .history(MARKET_APP, MARKET_BLEND_DATASET, "2382:06", 10)
+            .await
+            .expect("history");
+        let p = &revs.first().expect("one revision").provenance;
+        assert!(!p.is_empty(), "blend revisions must not be anonymous");
+        assert_eq!(p.job_id.as_deref(), Some(&*ctx.job_id.to_string()));
+        let url = p.source_url.as_deref().expect("derived source_url");
+        assert!(url.starts_with("derived://census/market_blend?"), "{url}");
+        for input in BLEND_INPUTS {
+            assert!(url.contains(input), "{url} must name input {input}");
+        }
+        assert!(url.contains("&as_of=20"), "{url} must carry an as-of");
+        // A derived row has no archived body and no RuleSet — it must not claim
+        // to be replayable.
+        assert!(!p.replayable());
+    }
+
+    #[tokio::test]
+    async fn saturation_revisions_carry_the_same_derived_stamp() {
+        let store = pumper_core::testing::TempStore::new("census-sat-prov").await;
+        let ctx = pumper_core::testing::TestContext::new(&store.storage, "census-density").build();
+        let recs = saturation_records(
+            &[("CA".to_string(), 400, 10_000, 400.0)],
+            &SaturationWrite {
+                geo: "state",
+                denom_kind: "households",
+                acs_dataset: "acs/acs5",
+                acs_year: "2022",
+                year: "2022",
+            },
+        );
+        let sum = sync_saturation(&ctx, &recs).await.expect("saturation");
+        assert_eq!(sum.new.len(), 1);
+        let revs = ctx
+            .datasets
+            .history(MARKET_APP, SATURATION_DATASET, "CA", 10)
+            .await
+            .expect("history");
+        let p = &revs.first().expect("one revision").provenance;
+        assert_eq!(p.job_id.as_deref(), Some(&*ctx.job_id.to_string()));
+        assert!(p
+            .source_url
+            .as_deref()
+            .expect("derived source_url")
+            .starts_with("derived://census/saturation?"));
+    }
+
+    /// The anti-pattern: an input read that came back AT the cap is blended as
+    /// if it were the whole corpus, so `employer_only` silently means "the solo
+    /// read was truncated" and every total is partial with nothing saying so.
+    #[tokio::test]
+    async fn a_truncated_input_read_flags_the_blend_instead_of_blending_silently() {
+        let (_store, ctx) = seeded_ctx("census-blend-trunc").await;
+        let complete = sync_market_blend(&ctx).await.expect("blend");
+        assert_eq!(complete["blend_complete"], true);
+        assert_eq!(complete["inputs_truncated"], json!([]));
+        assert!(complete.get("warnings").is_none());
+
+        // Exactly at the cap (one seeded row per side, cap 1) — the boundary the
+        // silent version got wrong: a full page is a WINDOW, not a corpus.
+        let (_s2, capped) =
+            seeded_ctx_with("census-blend-trunc-cap", json!({ "blend_read_limit": 1 })).await;
+        let out = sync_market_blend(&capped).await.expect("blend");
+        assert_eq!(out["blend_complete"], false);
+        assert_eq!(
+            out["inputs_truncated"],
+            json!([
+                "census-density/establishments",
+                "census-nonemp/nonemployers"
+            ]),
+            "both at-cap reads must be named; the empty ones must not be"
+        );
+        let warning = out["warnings"][0].as_str().expect("a warning");
+        assert!(
+            warning.contains("read cap") && warning.contains("PARTIAL"),
+            "{warning}"
+        );
+        // The blend still ran — a truncated read is reported, not fatal.
+        assert_eq!(out["blended"], 1);
     }
 
     #[test]

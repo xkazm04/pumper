@@ -314,7 +314,10 @@ impl ScrapeApp for CensusBfs {
             Err(e) => json!({ "skipped": format!("{e}") }),
         };
 
-        Ok(json!({
+        // `with_product_index` puts `census/market_blend` + `census/saturation`
+        // in the worker's index + hook scope for this run — see
+        // `census_common::product_index_datasets`.
+        Ok(census_common::with_product_index(json!({
             "source": "census/eits-bfs",
             "from_year": from_year,
             "sectors": sector_summaries,
@@ -331,7 +334,7 @@ impl ScrapeApp for CensusBfs {
                 "changed": velocity.changed.len(),
                 "unchanged": velocity.unchanged,
             },
-        }))
+        })))
     }
 }
 
@@ -444,6 +447,31 @@ mod tests {
                 assert!(props.contains_key(key), "undeclared param '{key}'");
             }
         }
+    }
+
+    /// Wiring guard: `run()` must return its result through
+    /// `census_common::with_product_index`. Without that declaration the two
+    /// `census/*` products this weekly run refreshes are invisible — no
+    /// per-record search doc, and (worker `run_indexed_apps`) no watch, trigger
+    /// or saved search scoped to app `census` can EVER fire for this run.
+    ///
+    /// The needle is split so this assertion cannot match itself.
+    #[test]
+    fn run_result_declares_the_census_product_datasets() {
+        let needle = concat!("census_common::with_product_index", "(json!(");
+        assert_eq!(
+            include_str!("lib.rs").matches(needle).count(),
+            1,
+            "census-bfs's run() must wrap its result exactly once with {needle}"
+        );
+        let empty = json!({});
+        assert_eq!(
+            census_common::with_product_index(empty)["index_datasets"],
+            json!([
+                { "app": "census", "dataset": "market_blend" },
+                { "app": "census", "dataset": "saturation" },
+            ])
+        );
     }
 
     fn series(spec: &[(&str, f64)]) -> Vec<(String, f64)> {

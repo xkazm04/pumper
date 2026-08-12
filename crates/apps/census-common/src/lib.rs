@@ -6,8 +6,90 @@
 //! One definition each, used by both, so a fix can't land in only half the fleet.
 
 use pumper_core::{AppContext, Error, Provenance, Result, UpsertSummary};
-use serde_json::Value;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+
+// ---------------------------------------------------------------------------
+// The `census` product namespace — a VIRTUAL app (the `grants/unified` pattern).
+//
+// All four census apps re-derive these two datasets after their own upserts, so
+// they belong to no single app's namespace. The names live here rather than in
+// one of the apps because every app needs them to declare `index_datasets`.
+// ---------------------------------------------------------------------------
+
+/// Virtual app namespace holding the cross-app census products.
+pub const MARKET_APP: &str = "census";
+/// Blended employer + solo market view, keyed `{naics4}:{state_fips}`.
+pub const MARKET_BLEND_DATASET: &str = "market_blend";
+/// Per-place saturation (establishments per 10k of an ACS base).
+pub const SATURATION_DATASET: &str = "saturation";
+
+/// RFC-3339 UTC micros for *now* — the `as_of` a derived write is stamped with.
+///
+/// Deliberately a **provenance** value, never a record field: provenance lives
+/// on the revision, outside the change-detection hash, so an as-of that moves
+/// every run cannot mark every blended row `changed` (the churn trap the
+/// `cordis/topic_stats` rollup documents).
+pub fn as_of_now() -> String {
+    pumper_core::datasets::ts(chrono::Utc::now())
+}
+
+/// The `index_datasets` specs a census run declares: the two PRODUCT datasets
+/// under the virtual [`MARKET_APP`] namespace.
+///
+/// Two things ride on this, and neither works without it (worker.rs
+/// `dataset_search_docs` / `run_indexed_apps`):
+///  - per-record full-text search docs for the blend and the saturation
+///    ranking, instead of one opaque `_job` snapshot per run;
+///  - the `census` namespace entering the run's `indexed_apps`, which is what
+///    lets a watch, trigger or saved search scoped to app `census` fire at all.
+///
+/// Both datasets are declared by every census app because every census app
+/// re-derives the blend (and the blend reads saturation), so whichever ran last
+/// is the one that must publish. A spec naming a dataset this particular run did
+/// not touch costs one empty `changes_since` and yields no documents — the
+/// honest no-op, not a fabricated one.
+pub fn product_index_datasets() -> Value {
+    json!([
+        { "app": MARKET_APP, "dataset": MARKET_BLEND_DATASET },
+        { "app": MARKET_APP, "dataset": SATURATION_DATASET },
+    ])
+}
+
+/// Adds [`product_index_datasets`] to a census run result. A non-object result
+/// passes through untouched (there is nowhere honest to put the key).
+pub fn with_product_index(mut result: Value) -> Value {
+    if let Value::Object(map) = &mut result {
+        map.insert("index_datasets".into(), product_index_datasets());
+    }
+    result
+}
+
+/// Provenance for a write into the virtual [`MARKET_APP`] namespace.
+///
+/// These writes go straight through `ctx.datasets` (the namespace belongs to no
+/// app), which bypasses `AppContext`'s automatic stamping — so before this every
+/// blend and saturation revision carried `Provenance::default()`, i.e. nothing
+/// at all. Three facts ARE known and are recorded: the producing job, the input
+/// datasets the value was derived from, and when the derivation ran.
+///
+/// `artifact_sha`/`rules_hash` stay `None` on purpose: a derived row has no
+/// archived body of its own and no RuleSet, so it is not replayable and must not
+/// claim to be (`Provenance::replayable` stays false, and
+/// `POST /provenance/.../rederive` keeps refusing).
+pub fn derived_provenance(ctx: &AppContext, dataset: &str, inputs: &[&str]) -> Provenance {
+    Provenance {
+        job_id: Some(ctx.job_id.to_string()),
+        // `derived://` — not an http(s) URL, because nothing was fetched to
+        // produce this row. It names the join's inputs and when it ran.
+        source_url: Some(format!(
+            "derived://{MARKET_APP}/{dataset}?inputs={}&as_of={}",
+            inputs.join(","),
+            as_of_now()
+        )),
+        ..Provenance::default()
+    }
+}
 
 /// Parses a Census numeric cell.
 ///
@@ -229,9 +311,40 @@ pub fn bfs_sector_category(naics: &str) -> Option<String> {
 mod tests {
     use super::{
         artifact_sha, bfs_sector_category, census_num, http_provenance, is_55_plus_age_band,
-        is_reported_age_band, merge_summary, owner_age_share_55plus, redact_key, state_abbr,
+        is_reported_age_band, merge_summary, owner_age_share_55plus, product_index_datasets,
+        redact_key, state_abbr, with_product_index, MARKET_APP, MARKET_BLEND_DATASET,
+        SATURATION_DATASET,
     };
     use pumper_core::UpsertSummary;
+    use serde_json::json;
+
+    /// The two product datasets are what a watch/trigger/saved search on app
+    /// `census` can ever see (worker `run_indexed_apps`). Dropping either from
+    /// the spec list silently un-hooks that dataset — pinned here.
+    #[test]
+    fn product_specs_name_both_census_products_under_the_virtual_app() {
+        assert_eq!(
+            product_index_datasets(),
+            json!([
+                { "app": "census", "dataset": "market_blend" },
+                { "app": "census", "dataset": "saturation" },
+            ])
+        );
+        assert_eq!(
+            (MARKET_APP, MARKET_BLEND_DATASET, SATURATION_DATASET),
+            ("census", "market_blend", "saturation")
+        );
+    }
+
+    #[test]
+    fn with_product_index_adds_the_specs_and_keeps_the_result() {
+        let out = with_product_index(json!({ "source": "census/cbp/2022", "records": 3 }));
+        assert_eq!(out["source"], "census/cbp/2022");
+        assert_eq!(out["records"], 3);
+        assert_eq!(out["index_datasets"], product_index_datasets());
+        // A non-object result has nowhere honest to carry specs.
+        assert_eq!(with_product_index(json!([1, 2])), json!([1, 2]));
+    }
 
     /// The credential must never reach a provenance stamp — `source_url` is
     /// readable by every dataset consumer. Gutting `redact_key` to identity

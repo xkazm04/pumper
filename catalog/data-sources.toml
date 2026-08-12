@@ -492,6 +492,27 @@ notes = "No public read API; JS SPA; LMC ToS is the binding constraint (robots a
 # The annual census-density/census-nonemp stock apps predate the catalog and are
 # CATALOG_EXEMPT in the server's coverage test; these two are ON the scheduler,
 # so they are cataloged here — the drift-gate cross-checks cron vs schedule().
+#
+# The two PRODUCT datasets — `census/market_blend` and `census/saturation`, the
+# cross-app blend all four census apps re-derive — have NO row here, and cannot
+# have an honest one today (verified 2026-08-12):
+#   * the coverage test (crates/server/src/routes/mod.rs,
+#     `live_catalog_entries_map_to_registered_apps_with_matching_cron`) panics
+#     unless a live row's `app` is a REGISTERED app, and `census` is a virtual
+#     namespace no app is registered under;
+#   * both consumers of a row key on the pair the data actually lands under:
+#     `enforce_contracts` (worker.rs) reads the pair off each revision, i.e.
+#     ("census", …), and /catalog/health reads `datasets.list(s.app, s.dataset)`.
+# So the only row shape that would function is exactly the one the test refuses.
+# Filing them under a producing app instead (app = "census-density", dataset =
+# "market_blend") would compile and pass, and would be a lie: that pair is never
+# written, so the contract would never evaluate and /catalog/health would report
+# the source permanently stale. `cordis-topic-stats` is NOT a precedent for this
+# — cordis writes `topic_stats` under its own app namespace. The one existing
+# instance of the misfiled shape is `state-licensing` (row says
+# state-licensing/compliance; the app writes trades/compliance).
+# The fix belongs in the server seam (teach the coverage test that a row may
+# name a virtual namespace fed by registered apps), not in this file.
 
 [[source]]
 id = "census-bfs"

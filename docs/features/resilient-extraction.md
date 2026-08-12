@@ -80,9 +80,22 @@ an accept path, and no human reviews anything.
    signals (per-field sketches) need the app to report a `DocReport`, which today
    only `extractor`/`plugin` do. **Automated repair is restricted to sources
    backed by a declarative `RuleSet`.** A hardcoded-Rust app (grants-gov,
-   eu-sedia, the census apps) can be detected, quarantined and alerted on; it
-   cannot be repaired, because repairing it means editing Rust, and this system
-   does not get to edit and rebuild itself unattended. Stated as a non-goal in §11.
+   eu-sedia, the census apps) cannot be repaired, because repairing it means
+   editing Rust, and this system does not get to edit and rebuild itself
+   unattended. Stated as a non-goal in §11.
+   **Correction (2026-08-12): "detection is universal" describes the mechanism,
+   not the fleet.** A verdict exists only for a pair some app called
+   `ctx.observe_extraction` for — that method is the sole caller of
+   `Resilience::observe`, and today only `extractor`/`plugin` (via `DocReport`)
+   and `grants-common` reach it. **No census app calls it**, so no `census-*`
+   pair is judged, quarantined, or alerted on: `enforced_state` answers
+   `Healthy` for every one of them, exactly as it does for a virtual pair like
+   `("grants","unified")` that no app can judge. What IS true of the census
+   fleet today: suppression and truncation honesty is enforced *inside the apps*
+   (suppressed cells stay Null, a capped read flags the run) and their declared
+   catalog contracts — `census-bfs/formations`, `census-nesd/owner_age` — are
+   evaluated at publish time by `enforce_contracts`, which is a different gate
+   with a different ladder. The two `census/*` product datasets have neither.
 3. **No human is in any loop.** Every "who authorizes this" answer below is a
    deterministic policy in code. Where a design would normally say "queue for
    review", this one says "stay quarantined and keep alerting" — a stuck source is
