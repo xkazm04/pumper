@@ -3,20 +3,72 @@ type: perfect/home
 repo: pumper
 updated: 2026-08-12
 pool: 6
-pool_target: per-dispatch (r15 cap 6 — gated, building)
-shipped_total: 122
-coverage: "26/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; us-business-census + czech-labor-market GATED r15 (wave in flight); web-crawler banked slate-grade brief fronts r16; 20 never proposed"
-cursor: "r15 BUILD in flight (perfect/2026-08-12-r15, Lot C census 1-3 + Lot M mpsv 4-6); r16 PROPOSE: web-crawler first (banked slate-grade r15 prefetch brief — re-verify seeds; gaps 2+4 are CORE-side → pair with crawler-core, lot-split on the core/app boundary), then crawler-core, engine-contracts (opp 5); never-proposed before re-mining"
-last_session: "[[sessions/2026-08-12-7]]"
+pool_target: per-dispatch (r16 cap 6 — gated, building)
+shipped_total: 128
+coverage: "27/46 map contexts covered — RULE (recomputable, stated so no round has to guess again): a context is COVERED when it has a proposal pass recorded ON THE 46-MAP, i.e. `last_proposed != never`, OR an explicit nothing-clears-the-bar verdict in its note. r16 recount found the previously-carried 26 was ONE over that rule (26 of the 46 notes could not be made to yield it; archive-engine is the only nothing-clears entry). Entering r16 the honest figure was 25; web-crawler + crawler-core GATED r16 take it to 27. 19 never proposed. Inherited pre-46-map history (browser-engine, http-engine, crawler-core-as-broad-crawler, …) deliberately does NOT count as covered."
+cursor: "r16 BUILD in flight (perfect/2026-08-12-r16, Lot CORE crawl 1-3 + Lot APP crawl 4-6); r17 PROPOSE: engine-contracts (opp 5) + one of remote-engine / maintenance-tooling / data-pipeline-catalog / hackernews-example / wasm-plugin-examples (all five hold r11 banked scout briefs — re-verify seeds, the decay rule has paid in r14, r15 AND r16). Do NOT re-mine web-crawler/crawler-core before r18 (cooldown) — but their two banked anchors are the strongest queued work in the vault: dataset-storage's retention-pin-is-dead-code, and crawler-core's MAX_FRONTIER lifetime cap."
+last_session: "[[sessions/2026-08-12-8]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **6** · phase: **round 15 BUILD** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round).
+**State**: pool **6** · phase: **round 16 BUILD** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round).
 
-### Round-15 pool — 6 GATED (2026-08-12, gate: director-self-gated, SWEEP round)
+### Round-16 pool — 6 GATED (2026-08-12, gate: director-self-gated, SWEEP round)
+Two never-proposed contexts swept together on the core/app boundary the r15 prefetch brief
+predicted. Both scouts read their files end to end; the banked web-crawler brief was
+re-verified claim by claim (**6/6 CONFIRMED, four SHARPER** — the decay rule paid a third
+consecutive round, this time by making every claim bigger rather than by refuting one).
+
+**All six are robustness/optimization, and that is a recorded judgment, not a lapse.** The
+slate normally spreads across five lenses; here no feature- or UX-grade direction cleared the
+bar, because the two datasets a feature would build on (`edges`, `web-reliability/*`) have
+**zero readers workspace-wide** — building on them is the same zero-consumer product invention
+the r15 gate rejected. Said plainly rather than padding the slate.
+
+crawler-core, 3 accepted (Lot CORE — `crates/core/src/crawl.rs` only):
+1. [[crawl-resume-loses-nothing]] — robustness · M (three permanent-loss windows: pages
+   buffered-but-checkpointed then unreachable because `seen` + the dup index already claim
+   them; in-flight URLs popped and never returned at the `max_pages` break; checkpoints that
+   only fire on the kept-page path, so a mostly-304 revisit sweep gets ZERO intermediate saves.
+   The resume test that exists runs concurrency=1 with NO sink — structurally unable to catch
+   any of it, and replacing that test shape IS the direction)
+2. [[crawl-revisit-dedup-freeze]] — robustness · M (cross-page dedup applied in revisit mode
+   permanently freezes templated pages: validators discarded, cadence never advances, record
+   never updates, re-downloaded and re-dropped every run. Default `dedup_distance: 3` in all
+   modes; `dedup_distance` is 0 in every end-to-end test, which is why it shipped)
+3. [[crawl-politeness-truth]] — robustness · M (robots.txt fetched over hardcoded `https`, so
+   an http-only origin fails open and the run reports `respect_robots: true`,
+   `skipped_robots: 0` while having taken every Disallow path; per-host budgets not persisted,
+   so durable-execution retries multiply a politeness cap by the retry count)
+
+web-crawler, 3 accepted (Lot APP — `crates/apps/crawl/src/**` + `tests/` + crawling.md):
+4. [[crawl-truncation-visible]] — robustness · M (`frontier_dropped` + `skipped_host_budget`
+   computed and documented in core as honesty fields, emitted by nobody — `frontier_dropped`
+   has no reader in the entire workspace — while `crawling.md:60` lists one as returned;
+   plus `edges_written` counting no-op rows as writes, and an `output_shape` manifest four
+   milestones out of date. First `run()`-level test in the app)
+5. [[crawl-reliability-survives-interruption]] — robustness · M (an interrupted crawl
+   contributes zero reliability observations, zero cost-ledger events and zero tier-router
+   learning — and the long crawls whose telemetry is worth most are the ones most likely to be
+   interrupted; plus robots probes metered as page fetches, so every crawl fabricates a "gone
+   page" for every host without a robots.txt)
+6. [[crawl-memory-bounded]] — optimization · M (`EdgeGraph`'s two maps grow unbounded for the
+   whole run holding full URL strings, beside a frontier deliberately capped at 100k, while
+   `crawling.md:18` promises only the seen-set and 8-byte fingerprints grow)
+
+### Wave plan (round 16) — ONE branch `perfect/2026-08-12-r16`, main checkout, 2 CONCURRENT lots
+The cleanest partition of the campaign so far: **one lot, one file**. Lot CORE writes
+`crates/core/src/crawl.rs` and nothing else; Lot APP writes `crates/apps/crawl/src/{lib,
+link_graph,reliability}.rs`, a new `crates/apps/crawl/tests/`, and `docs/features/crawling.md`.
+Zero Class-B overlap — no shared registry, no shared catalog row, no shared doc.
+The one direction that would have straddled the boundary (`stopped_reason`) was
+**deliberately not slated** for exactly that reason. Class C (Director-only): everything else.
+Rust-touching lots = 2 ✓.
+
+### Round-15 pool — 6 GATED → ALL 6 SHIPPED + 1 Director fix (2026-08-12, landed `e131bae`)
 us-business-census, 3 accepted (REJECTED-deferred banked: observe-extraction
 adoption → fleet-wide sweep on source-resilience; census primary-dataset catalog
 contracts → after the virtual-app pattern proves twice; REJECTED: re-blend
