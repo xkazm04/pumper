@@ -2,19 +2,53 @@
 type: perfect/home
 repo: pumper
 updated: 2026-08-12
-pool: 0
-pool_target: per-dispatch (r12 cap was 6)
+pool: 6
+pool_target: per-dispatch (r13 cap 6)
 shipped_total: 110
-coverage: "20/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; +14 more inherit old-map passes via aliases, 26 never proposed"
-cursor: "round 13: never-proposed first — top of queue at opp 5: claude-engine, eu-grants, us-business-census, czech-labor-market, cron-scheduler, wasm-plugin-host, web-crawler, crawler-core, engine-contracts; banked CONFIRMED anchor on maintenance-tooling"
-last_session: "[[sessions/2026-08-12-2]]"
+coverage: "20/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; r13 wave in flight will add claude-engine + cron-scheduler; wasm-plugin-host banked slate-grade; 24 others never proposed"
+cursor: "round 13 BUILD in flight: 2 lots (claude-engine ×3, cron-scheduler ×3) on perfect/2026-08-12-r13; next propose tier: wasm-plugin-host (banked slate) then eu-grants, us-business-census, czech-labor-market, web-crawler, crawler-core, engine-contracts (opp 5)"
+last_session: "[[sessions/2026-08-12-3]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **0** · phase: **round 12 WRAPPED — all 6 shipped + 3 Director commits**. Next: round-13 propose from the never-proposed queue (26 remain).
+**State**: pool **6** · phase: **round 13 BUILD in flight** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round).
+
+### Round-13 pool — 6 accepted (2026-08-12, gate: director-self-gated)
+claude-engine, 3/5 (REJECTED: concurrency-cap — no volume consumer, r9 precedent;
+REJECTED-deferred: token-telemetry — banked with truncation-honesty + compose-role
+refresh as the context's anchors):
+1. [[claude-kill-tree]] — robustness · M (Windows cmd /C shim orphans the real CLI on
+   timeout; kill_on_drop reaps cmd.exe only; orphan spends with no ceiling)
+2. [[claude-cost-honesty]] — robustness · M (cost discarded on every failure path —
+   is_error/non-zero-exit/timeout; chokepoint meters Ok only; bughunt 2026-07-14 still
+   live; non-string schema result → uncacheable, re-pays forever)
+3. [[claude-subprocess-hygiene]] — robustness · M (cmd.exe arg mangling for schemas;
+   model free-string + typo'd-role silent fallthrough; repo CWD/CLAUDE.md/Stop-hook
+   loaded into every research call)
+
+cron-scheduler, 3/5 (REJECTED-deferred: tick-serialization — fix lives in
+webhook-delivery's write set, banked there; REJECTED: tick-telemetry — thin value,
+doc-truth rides tick-isolation):
+4. [[sched-tick-isolation]] — robustness · M (one bad schedule starves the rest via `?`;
+   unjoined task + inline sync-mutex unwraps = silent total-scheduler death; no
+   shutdown checks mid-tick; zero tick-loop coverage — SchedulerLoop harness)
+5. [[sched-misfire-honesty]] — robustness · M (G4 CONFIRMED: skip batch-drops on-time
+   firings sharing a tick with missed ones; grace vs observed tick; skip-branch gate
+   parity; fire-time enabled re-check)
+6. [[schedule-budget-door]] — feature · M (schedules are the last work-creator without
+   the r12 budget contract; migration 0040 + door + fire-path plumb)
+
+### Wave plan (round 13) — ONE branch `perfect/2026-08-12-r13`, main checkout, 2 CONCURRENT lots
+Write sets disjoint: **Lot C** (opus) = 1,2,3 → crates/engine-claude/* (lib, Cargo.toml,
+new tests/), core/src/{error,app,fetcher}.rs, core/tests (chokepoint/meter),
+docs/features/{fetching,apps}.md, ONBOARDING.md §engines · **Lot S** (opus) = 4,5,6 →
+server/src/{scheduler,main,worker,datahub,harness}.rs, server/routes/schedules.rs,
+core/src/storage.rs, core/migrations/0040, core/tests/migrations.rs, server/e2e/*,
+docs/features/{runtime,http-api}.md. No shared Class B beyond e2e/mod.rs (S only) —
+truly disjoint. runtime.md belongs to Lot S; Lot C reports any need there.
 
 ### Round-12 pool — ALL 6 SHIPPED (2026-08-12, gate: director-self-gated, SWEEP round)
 declarative-extractor, 3/5 (REJECTED: versions-nplus1 — banked; REJECTED-deferred:
@@ -220,14 +254,16 @@ app-runtime r9 · tiered-fetcher r9 · browser-transact r10 · api-surface r10 �
 **extraction-core r11 (3 shipped)** · **automation-api r11 (3 shipped)** ·
 **archive-engine r11 (nothing-clears-the-bar verdict recorded)**.
 
-**Never-proposed queue (28, opportunity-ranked)**:
+**Never-proposed queue (24 after r13's two proposals, opportunity-ranked)**:
 | Opp | Contexts |
 |---:|---|
-| 6 | declarative-extractor (banked slate-grade brief) · job-search-api (banked slate-grade brief) |
-| 5 | claude-engine · eu-grants · us-business-census · czech-labor-market · cron-scheduler · wasm-plugin-host · web-crawler · crawler-core · engine-contracts |
+| 6 | wasm-plugin-host (banked slate-grade brief, r13 scout — front of r14) |
+| 5 | eu-grants · us-business-census · czech-labor-market · web-crawler · crawler-core · engine-contracts |
 | 4 | vcr-testing · http-engine · browser-engine · remote-engine (banked anchor) · us-federal-grants · us-state-grants · czech-procurement · trades-operator-economics · trades-pricing · agentic-research · connector-api-watch · page-monitor · maintenance-tooling (banked CONFIRMED anchor) · plugin-runner |
 | 3 | wasm-plugin-examples (banked anchor) · data-pipeline-catalog (banked anchor) |
 | 2 | hackernews-example (banked anchor) |
+
+(r13 in flight: claude-engine + cron-scheduler left this queue 2026-08-12.)
 
 ## Queue — round 4 (re-scored 2026-08-03 over the 46-context map)
 

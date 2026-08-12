@@ -74,3 +74,12 @@ PARKED decision — do not re-propose).
   4 /metrics series, ?status 400-validation, events-webhooks.md rewritten (the
   "failed is the DLQ" doc bug dead), retention keys shipped in config.toml,
   smoke 15→17 checks.
+
+## Banked (r13, 2026-08-12, from the cron-scheduler scout)
+G2 tick-serialization anchor: the scheduler tick runs `webhook::drain_due` INLINE
+(scheduler.rs:69-71); when the FanoutPool saturates (DELIVERY_MAX_QUEUED=1024),
+run_tagged falls to its inline path (fanout.rs:126-136) and a drain batch of 20 ×
+3 attempts × 15s client timeout + backoff sleeps can park the scheduler tick for
+minutes — every cron firing late. The fix (drain spawned/bounded like refresher &
+datahub, or pool-aware) lives in webhook.rs/fanout.rs = THIS context's write set;
+rejected-deferred from cron-scheduler r13 to respect the partition.
