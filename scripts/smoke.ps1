@@ -661,7 +661,9 @@ try {
                 $resp = Invoke-WebRequest -Method Post -Uri "$baseUrl/triggers" `
                     -Body (@{
                         source_kind  = 'job'; source_app = 'hackernews'; target_app = 'hackernews'
-                        plugin_hooks = @{ predicate = @{ plugin = 'not-a-real-plugin' } }
+                        # NB: the API field is `plugins` (docs/features/trigger-plugins.md);
+                        # `plugin_hooks` is the storage column and the door ignores it.
+                        plugins      = @{ predicate = @{ plugin = 'not-a-real-plugin' } }
                     } | ConvertTo-Json -Depth 5) `
                     -ContentType 'application/json' -UseBasicParsing -TimeoutSec 10
                 $trig = $resp.Content | ConvertFrom-Json
