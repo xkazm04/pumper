@@ -143,9 +143,15 @@ impl ScrapeApp for CensusDensity {
             output_shape: Some(
                 "{source, geo, year, trades: [{naics, label, places_reported, \
                  total_establishments, total_employees, national_avg_wage, \
-                 national_avg_establishment_size, top}], top_places_overall, \
-                 top_places_by_saturation, normalization, market_blend, records, new, \
-                 changed, unchanged} — suppressed cells are absent (Null), never zeroed",
+                 national_avg_establishment_size, suppressed: {places_dropped, \
+                 employees_cells, payroll_cells}, top} | {naics, label, note}], \
+                 top_places_overall, top_places_by_saturation, normalization: \
+                 {places_matched, places_excluded_no_denominator_row, \
+                 places_excluded_base_not_positive, ...}, market_blend, \
+                 suppression, empty_answers, index_datasets, records, new, changed, \
+                 unchanged} — suppressed cells are absent (Null), never zeroed, and \
+                 are counted; a trade the API publishes nothing for (HTTP 204) yields \
+                 a `note` entry, not a failed run",
             ),
             cost_class: CostClass::Free,
         }
@@ -257,6 +263,9 @@ impl ScrapeApp for CensusDensity {
         let mut trade_summaries: Vec<Value> = Vec::new();
         // place label -> combined establishments across all trades (overall ranking).
         let mut overall: BTreeMap<String, i64> = BTreeMap::new();
+        // Run-level suppression telemetry: what the API declined to tell us.
+        let mut empty_answers = 0usize;
+        let mut suppression = Suppression::default();
 
         for (naics, label) in &trades {
             let url = build_url(&year, &geo, &states, naics, &naics_var, &api_key);
@@ -265,6 +274,19 @@ impl ScrapeApp for CensusDensity {
                 .http
                 .fetch(HttpRequest::get(url.clone()))
                 .await?;
+            // An empty answer (204, or a 200 with no body) is Census saying
+            // "nothing published at this grain" for THIS trade — a note, never
+            // the end of the run. Checked before `is_success`, which counts 204
+            // as success and used to drop it into the "not JSON" error below.
+            if census_common::is_empty_answer(resp.status, &resp.body) {
+                trade_summaries.push(json!({
+                    "naics": naics, "label": label,
+                    "note": "no data — CBP figures suppressed or not published at this \
+                             geography/NAICS grain",
+                }));
+                empty_answers += 1;
+                continue;
+            }
             if !resp.is_success() {
                 return Err(Error::App(format!(
                     "Census CBP {year} NAICS {naics}: HTTP {} (body starts: {})",
@@ -315,83 +337,26 @@ impl ScrapeApp for CensusDensity {
                     )))
                 }
             };
-            let i_state = idx("state");
-            let i_emp = idx("EMP");
-            let i_pay = idx("PAYANN");
+            let cols = CbpCols {
+                estab: i_estab,
+                geo: i_geo,
+                state: idx("state"),
+                emp: idx("EMP"),
+                pay: idx("PAYANN"),
+            };
 
-            let mut trade_records: Vec<(String, Value)> = Vec::new();
-            let mut places_reported: u32 = 0;
-            let mut total_estab: i64 = 0;
-            let mut total_emp: i64 = 0;
-            let mut total_pay: i64 = 0;
-            let mut ranked: Vec<(String, i64)> = Vec::new();
-
-            for row in rows.iter().skip(1) {
-                let geo_code = row.get(i_geo).cloned().unwrap_or_default();
-                let Some(estab) = census_common::census_num(row.get(i_estab)) else {
-                    // Suppressed/jammed primary cell: not a genuinely reported
-                    // place — skip rather than fabricate a 0-establishment row.
-                    continue;
-                };
-                // Keep the Option so a *suppressed* cell (None) can be told apart
-                // from a genuine 0 — a suppressed input must yield a Null derived
-                // ratio, never a fabricated $0 wage.
-                let emp_opt = i_emp.and_then(|i| census_common::census_num(row.get(i)));
-                let pay_opt = i_pay.and_then(|i| census_common::census_num(row.get(i)));
-                let emp = emp_opt.unwrap_or(0);
-                let pay = pay_opt.unwrap_or(0);
-                // PAYANN is in $1,000s (mirrors the solo side's receipts convention).
-                let avg_annual_wage = match (pay_opt, emp_opt) {
-                    (Some(p), Some(e)) if e > 0 => Value::from((p as f64 * 1000.0) / e as f64),
-                    _ => Value::Null,
-                };
-                let avg_establishment_size = match (emp_opt, estab) {
-                    (Some(e), s) if s > 0 => Value::from(e as f64 / s as f64),
-                    _ => Value::Null,
-                };
-
-                let (st_fips, county_fips) = if geo == "county" {
-                    let st = i_state
-                        .and_then(|i| row.get(i))
-                        .cloned()
-                        .unwrap_or_default();
-                    (st, Some(geo_code.clone()))
-                } else {
-                    (geo_code.clone(), None)
-                };
-                let place = match &county_fips {
-                    Some(c) => format!("{}·{}", census_common::state_abbr(&st_fips), c),
-                    None => census_common::state_abbr(&st_fips).to_string(),
-                };
-                let key = match &county_fips {
-                    Some(c) => format!("{naics}:{st_fips}{c}"),
-                    None => format!("{naics}:{st_fips}"),
-                };
-
-                places_reported += 1;
-                total_estab += estab;
-                total_emp += emp;
-                total_pay += pay;
-                ranked.push((place.clone(), estab));
+            let CbpRollup {
+                records: trade_records,
+                mut ranked,
+                places_reported,
+                total_estab,
+                total_emp,
+                total_pay,
+                suppressed,
+            } = map_cbp_rows(&rows, &cols, naics, label, &geo, &year);
+            suppression.merge(&suppressed);
+            for (place, estab) in &ranked {
                 *overall.entry(place.clone()).or_insert(0) += estab;
-
-                trade_records.push((
-                    key,
-                    json!({
-                        "naics": naics,
-                        "trade": label,
-                        "geo": geo,
-                        "place": place,
-                        "state_fips": st_fips,
-                        "county_fips": county_fips,
-                        "establishments": estab,
-                        "employees": emp,
-                        "annual_payroll_thousands": pay,
-                        "avg_annual_wage": avg_annual_wage,
-                        "avg_establishment_size": avg_establishment_size,
-                        "year": year,
-                    }),
-                ));
             }
 
             ranked.sort_by_key(|(_, e)| std::cmp::Reverse(*e));
@@ -422,6 +387,7 @@ impl ScrapeApp for CensusDensity {
                 "total_employees": total_emp,
                 "national_avg_wage": national_avg_wage,
                 "national_avg_establishment_size": national_avg_establishment_size,
+                "suppressed": suppressed.as_json(),
                 "top": top,
             }));
 
@@ -454,22 +420,11 @@ impl ScrapeApp for CensusDensity {
         let normalization: Value = if normalize {
             match fetch_denominator(&ctx, &acs_dataset, &acs_year, &geo, &states, &api_key).await {
                 Ok(denom) => {
-                    let mut rows: Vec<(String, i64, i64, f64)> = overall
-                        .iter()
-                        .filter_map(|(place, estab)| {
-                            let d = denom.get(place)?;
-                            let base = match denom_kind.as_str() {
-                                "population" => d.population,
-                                "owner_occupied" => d.owner_occupied,
-                                _ => d.households,
-                            };
-                            if base <= 0 {
-                                return None;
-                            }
-                            let per_10k = (*estab as f64) / (base as f64) * 10_000.0;
-                            Some((place.clone(), *estab, base, per_10k))
-                        })
-                        .collect();
+                    let Normalized {
+                        mut rows,
+                        no_denominator_row,
+                        base_not_positive,
+                    } = normalize_places(&overall, &denom, &denom_kind);
                     rows.sort_by(|a, b| b.3.total_cmp(&a.3));
                     let matched = rows.len();
                     saturation = rows
@@ -499,6 +454,11 @@ impl ScrapeApp for CensusDensity {
                         "acs_year": acs_year,
                         "denominator": denom_kind,
                         "places_matched": matched,
+                        // Places that HAVE establishment counts but no saturation
+                        // figure, split by why. Both used to vanish silently, so
+                        // a ranking over 12 of 52 states looked like the ranking.
+                        "places_excluded_no_denominator_row": no_denominator_row,
+                        "places_excluded_base_not_positive": base_not_positive,
                         "persisted": sat_records.len(),
                         "new": sat_sum.new.len(),
                         "changed": sat_sum.changed.len(),
@@ -531,6 +491,10 @@ impl ScrapeApp for CensusDensity {
             "top_places_overall": top_overall,
             "top_places_by_saturation": saturation,
             "normalization": normalization,
+            // What the API declined to tell us this run, so a shrinking corpus
+            // reads as suppression rather than as a market that vanished.
+            "suppression": suppression.as_json(),
+            "empty_answers": empty_answers,
             "market_blend": market_blend,
             "records": record_count,
             "new": summary.new.len(),
@@ -612,6 +576,210 @@ fn blend_read_limit(ctx: &AppContext) -> i64 {
         .and_then(Value::as_i64)
         .map(|n| n.max(1))
         .unwrap_or(BLEND_READ_LIMIT)
+}
+
+/// Pre-resolved CBP column indices (matched by NAME — the geography column
+/// trails the requested `get=` vars, so position is never assumed).
+pub struct CbpCols {
+    pub estab: usize,
+    pub geo: usize,
+    pub state: Option<usize>,
+    pub emp: Option<usize>,
+    pub pay: Option<usize>,
+}
+
+/// What one request's payload declined to tell us. Counted rather than
+/// discarded: "312 places reported" means something different when 40 more were
+/// dropped for a suppressed ESTAB cell, and before this the difference was
+/// invisible in every surface.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Suppression {
+    /// Rows dropped entirely — the primary cell (ESTAB) was suppressed, so the
+    /// place is not a reported place at all.
+    pub places_dropped: usize,
+    /// Reported rows whose EMP cell was suppressed (the row is kept; the
+    /// derived ratios are Null).
+    pub employees: usize,
+    /// Reported rows whose PAYANN cell was suppressed.
+    pub payroll: usize,
+}
+
+impl Suppression {
+    pub fn merge(&mut self, other: &Suppression) {
+        self.places_dropped += other.places_dropped;
+        self.employees += other.employees;
+        self.payroll += other.payroll;
+    }
+
+    pub fn as_json(&self) -> Value {
+        json!({
+            "places_dropped": self.places_dropped,
+            "employees_cells": self.employees,
+            "payroll_cells": self.payroll,
+        })
+    }
+}
+
+/// One request's parsed rollup: the dataset records, the ranking rows, the
+/// totals the trade summary is built from, and what was suppressed.
+pub struct CbpRollup {
+    pub records: Vec<(String, Value)>,
+    /// (place label, establishments) — also the per-place contribution to the
+    /// overall cross-trade ranking.
+    pub ranked: Vec<(String, i64)>,
+    pub places_reported: u32,
+    pub total_estab: i64,
+    pub total_emp: i64,
+    pub total_pay: i64,
+    pub suppressed: Suppression,
+}
+
+/// Map the CBP array-of-arrays payload (row 0 = header, addressed by the
+/// pre-resolved indices) into per-place records for one trade NAICS.
+///
+/// Suppression rules, all of them counted: a suppressed **ESTAB** drops the row
+/// (it is not a reported place, and a 0-establishment row would be a
+/// fabrication); a suppressed **EMP**/**PAYANN** keeps the row but leaves the
+/// derived ratio `Null` — never a fabricated $0 wage.
+pub fn map_cbp_rows(
+    rows: &[Vec<String>],
+    cols: &CbpCols,
+    naics: &str,
+    label: &str,
+    geo: &str,
+    year: &str,
+) -> CbpRollup {
+    let mut out = CbpRollup {
+        records: Vec::new(),
+        ranked: Vec::new(),
+        places_reported: 0,
+        total_estab: 0,
+        total_emp: 0,
+        total_pay: 0,
+        suppressed: Suppression::default(),
+    };
+
+    for row in rows.iter().skip(1) {
+        let geo_code = row.get(cols.geo).cloned().unwrap_or_default();
+        let Some(estab) = census_common::census_num(row.get(cols.estab)) else {
+            // Suppressed/jammed primary cell: not a genuinely reported place —
+            // skip rather than fabricate a 0-establishment row, and COUNT it.
+            out.suppressed.places_dropped += 1;
+            continue;
+        };
+        // Keep the Option so a *suppressed* cell (None) can be told apart from a
+        // genuine 0 — a suppressed input must yield a Null derived ratio.
+        let emp_opt = cols.emp.and_then(|i| census_common::census_num(row.get(i)));
+        let pay_opt = cols.pay.and_then(|i| census_common::census_num(row.get(i)));
+        if cols.emp.is_some() && emp_opt.is_none() {
+            out.suppressed.employees += 1;
+        }
+        if cols.pay.is_some() && pay_opt.is_none() {
+            out.suppressed.payroll += 1;
+        }
+        let emp = emp_opt.unwrap_or(0);
+        let pay = pay_opt.unwrap_or(0);
+        // PAYANN is in $1,000s (mirrors the solo side's receipts convention).
+        let avg_annual_wage = match (pay_opt, emp_opt) {
+            (Some(p), Some(e)) if e > 0 => Value::from((p as f64 * 1000.0) / e as f64),
+            _ => Value::Null,
+        };
+        let avg_establishment_size = match (emp_opt, estab) {
+            (Some(e), s) if s > 0 => Value::from(e as f64 / s as f64),
+            _ => Value::Null,
+        };
+
+        let (st_fips, county_fips) = if geo == "county" {
+            let st = cols
+                .state
+                .and_then(|i| row.get(i))
+                .cloned()
+                .unwrap_or_default();
+            (st, Some(geo_code.clone()))
+        } else {
+            (geo_code.clone(), None)
+        };
+        let place = place_of(&st_fips, county_fips.as_deref());
+        let key = match &county_fips {
+            Some(c) => format!("{naics}:{st_fips}{c}"),
+            None => format!("{naics}:{st_fips}"),
+        };
+
+        out.places_reported += 1;
+        out.total_estab += estab;
+        out.total_emp += emp;
+        out.total_pay += pay;
+        out.ranked.push((place.clone(), estab));
+
+        out.records.push((
+            key,
+            json!({
+                "naics": naics,
+                "trade": label,
+                "geo": geo,
+                "place": place,
+                "state_fips": st_fips,
+                "county_fips": county_fips,
+                "establishments": estab,
+                "employees": emp,
+                "annual_payroll_thousands": pay,
+                "avg_annual_wage": avg_annual_wage,
+                "avg_establishment_size": avg_establishment_size,
+                "year": year,
+            }),
+        ));
+    }
+
+    out
+}
+
+/// The saturation ranking plus the places that could NOT be ranked, by reason.
+pub struct Normalized {
+    /// (place, combined establishments, base, per-10k).
+    pub rows: Vec<(String, i64, i64, f64)>,
+    /// Places with establishments but no ACS row at all (a geography the
+    /// denominator query didn't cover).
+    pub no_denominator_row: usize,
+    /// Places whose chosen base is 0 or negative (an ACS jam value, or a
+    /// genuinely empty base) — dividing would fabricate an infinity.
+    pub base_not_positive: usize,
+}
+
+/// Join establishment counts to an ACS base and rank by establishments per 10k.
+///
+/// Extracted from the `filter_map` that used to do this inline, because a
+/// `return None` there was a **silent drop**: a place with no ACS row and a
+/// place whose base is 0 both simply disappeared from the ranking, so
+/// `places_matched` was the only number reported and there was nothing to
+/// compare it against.
+pub fn normalize_places(
+    overall: &BTreeMap<String, i64>,
+    denom: &BTreeMap<String, Denom>,
+    denom_kind: &str,
+) -> Normalized {
+    let mut out = Normalized {
+        rows: Vec::new(),
+        no_denominator_row: 0,
+        base_not_positive: 0,
+    };
+    for (place, estab) in overall {
+        let Some(d) = denom.get(place) else {
+            out.no_denominator_row += 1;
+            continue;
+        };
+        let base = match denom_kind {
+            "population" => d.population,
+            "owner_occupied" => d.owner_occupied,
+            _ => d.households,
+        };
+        if base <= 0 {
+            out.base_not_positive += 1;
+            continue;
+        }
+        let per_10k = (*estab as f64) / (base as f64) * 10_000.0;
+        out.rows.push((place.clone(), *estab, base, per_10k));
+    }
+    out
 }
 
 /// The run-level facts every saturation record carries: which geography and ACS
@@ -967,7 +1135,15 @@ pub fn blend_market(
             // the state's ACS base — the number the launch ranking actually wants,
             // and which didn't exist on the blend before. Null when no base is
             // known for the place (saturation hasn't run) — never fabricated.
-            let (base, denom_kind, total_market_per_10k) =
+            //
+            // COVERAGE CAVEAT, machine-readable: the numerator is whatever the
+            // cell actually has. On an `employer_only` cell it counts employer
+            // firms alone and on a `solo_only` cell solo operators alone, so
+            // comparing two places' per-10k figures without reading the basis
+            // compares a total market against half of one. The value and the
+            // basis are emitted together — a consumer that reads one sees the
+            // other.
+            let (base, denom_kind, total_market_per_10k, per_10k_basis) =
                 match c.state.as_deref().and_then(|st| base_by_place.get(st)) {
                     Some((b, kind)) if *b > 0 => (
                         Value::from(*b),
@@ -975,8 +1151,9 @@ pub fn blend_market(
                         Value::from(
                             ((total as f64 / *b as f64) * 10_000.0 * 100.0).round() / 100.0,
                         ),
+                        Value::from(per_10k_basis(coverage)),
                     ),
-                    _ => (Value::Null, Value::Null, Value::Null),
+                    _ => (Value::Null, Value::Null, Value::Null, Value::Null),
                 };
             // SUCCESSION: 55+ owner share across reported NES-D bands of the
             // naics4's 2-digit SECTOR (NES-D's per-state grain — 2382 joins
@@ -1042,6 +1219,7 @@ pub fn blend_market(
                 "base": base,
                 "denominator_kind": denom_kind,
                 "total_market_per_10k": total_market_per_10k,
+                "total_market_per_10k_basis": per_10k_basis,
                 "pct_owners_55plus": pct_owners_55plus,
                 "succession_grain": succession_grain,
                 "owner_age_year": owner_age_year,
@@ -1052,6 +1230,22 @@ pub fn blend_market(
             (format!("{naics4}:{st_fips}"), value)
         })
         .collect()
+}
+
+/// What a cell's `total_market_per_10k` actually counted, from its coverage.
+///
+/// The ratio is `total / base`, and `total` is only a TOTAL market on a `both`
+/// cell. On the one-sided cells it is half a market over a whole population —
+/// a number that reads as "this state is empty" when it means "the other half
+/// of the data hasn't been ingested for this trade". Naming the basis on the
+/// record is what stops the two from being compared as if they were the same
+/// measure.
+fn per_10k_basis(coverage: &str) -> &'static str {
+    match coverage {
+        "both" => "employer+solo",
+        "employer_only" => "employer_only — solo operators NOT counted",
+        _ => "solo_only — employer establishments NOT counted",
+    }
 }
 
 /// Build a CBP API query. State mode returns all states (or a FIPS subset); county
@@ -1091,10 +1285,10 @@ fn place_of(st_fips: &str, county_fips: Option<&str>) -> String {
 }
 
 /// ACS population/household base for saturation. Jam values (negatives) → 0.
-struct Denom {
-    population: i64,
-    households: i64,
-    owner_occupied: i64,
+pub struct Denom {
+    pub population: i64,
+    pub households: i64,
+    pub owner_occupied: i64,
 }
 
 /// Fetch the ACS denominator (total population, households, owner-occupied units)
@@ -1238,6 +1432,165 @@ mod tests {
         assert!(read_hit_cap(11, 10));
         assert!(!read_hit_cap(49_999, BLEND_READ_LIMIT));
         assert!(read_hit_cap(50_000, BLEND_READ_LIMIT));
+    }
+
+    // CBP payload shaped like the real one: header then data rows.
+    fn cbp_rows(data: &[[&str; 4]]) -> Vec<Vec<String>> {
+        let mut rows = vec![["ESTAB", "EMP", "PAYANN", "state"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>()];
+        rows.extend(
+            data.iter()
+                .map(|r| r.iter().map(|c| c.to_string()).collect::<Vec<_>>()),
+        );
+        rows
+    }
+
+    fn cbp_rollup(data: &[[&str; 4]]) -> CbpRollup {
+        map_cbp_rows(
+            &cbp_rows(data),
+            &CbpCols {
+                estab: 0,
+                geo: 3,
+                state: Some(3),
+                emp: Some(1),
+                pay: Some(2),
+            },
+            "238220",
+            "Plumbing",
+            "state",
+            "2022",
+        )
+    }
+
+    /// The anti-pattern: suppression counted as data. A withheld ESTAB drops the
+    /// place (it is not a reported place); a withheld EMP/PAYANN keeps the place
+    /// but must leave the derived ratio Null rather than fabricate a $0 wage.
+    /// Both are COUNTED — "312 places reported" means something different when
+    /// 40 more were dropped, and that difference used to be invisible.
+    #[test]
+    fn suppressed_cbp_cells_are_counted_not_absorbed_as_zeros() {
+        let r = cbp_rollup(&[
+            ["100", "500", "30000", "06"],
+            // ESTAB withheld → the whole place is dropped.
+            ["-666666666", "500", "30000", "48"],
+            // EMP withheld → place kept, both employee-derived ratios Null.
+            ["50", "D", "9000", "12"],
+        ]);
+        assert_eq!(r.records.len(), 2);
+        assert_eq!(r.places_reported, 2);
+        assert_eq!(r.suppressed.places_dropped, 1);
+        assert_eq!(r.suppressed.employees, 1);
+        assert_eq!(r.suppressed.payroll, 0);
+        assert_eq!(r.total_estab, 150, "the dropped place adds nothing");
+
+        let ca = &r.records[0].1;
+        assert_eq!(ca["establishments"], 100);
+        assert_eq!(ca["avg_annual_wage"], json!(60_000.0)); // 30000k/500
+        let fl = &r.records[1].1;
+        assert_eq!(fl["avg_annual_wage"], Value::Null);
+        assert_eq!(fl["avg_establishment_size"], Value::Null);
+
+        // A REPORTED zero is still a measured zero, never suppression.
+        let z = cbp_rollup(&[["0", "0", "0", "02"]]);
+        assert_eq!(z.records.len(), 1);
+        assert_eq!(z.records[0].1["establishments"], 0);
+        assert_eq!(z.suppressed, Suppression::default());
+    }
+
+    /// The anti-pattern: a place silently vanishing from the saturation ranking.
+    /// A place with no ACS row and a place whose base is 0 both used to `return
+    /// None` inside a `filter_map`, so `places_matched` was the only number
+    /// anyone saw and there was nothing to compare it against.
+    #[test]
+    fn places_that_cannot_be_normalized_are_counted_by_reason() {
+        let overall = BTreeMap::from([
+            ("CA".to_string(), 400i64),
+            ("TX".to_string(), 200),
+            ("AK".to_string(), 5),
+        ]);
+        let denom = BTreeMap::from([
+            (
+                "CA".to_string(),
+                Denom {
+                    population: 40_000,
+                    households: 10_000,
+                    owner_occupied: 6_000,
+                },
+            ),
+            // TX has an ACS row whose household base is a jam value → 0.
+            (
+                "TX".to_string(),
+                Denom {
+                    population: 30_000,
+                    households: 0,
+                    owner_occupied: 5_000,
+                },
+            ),
+            // AK: no row at all.
+        ]);
+        let n = normalize_places(&overall, &denom, "households");
+        assert_eq!(n.rows.len(), 1);
+        assert_eq!(n.rows[0].0, "CA");
+        assert_eq!(n.base_not_positive, 1);
+        assert_eq!(n.no_denominator_row, 1);
+        // Switching the denominator moves TX back in — the exclusion is about
+        // the chosen base, not the place.
+        let pop = normalize_places(&overall, &denom, "population");
+        assert_eq!(pop.rows.len(), 2);
+        assert_eq!(pop.base_not_positive, 0);
+    }
+
+    /// The anti-pattern: comparing a one-sided cell's per-10k with a complete
+    /// cell's as if they measured the same thing. The value now travels with a
+    /// machine-readable basis saying what entered the numerator.
+    #[test]
+    fn per_10k_carries_the_coverage_it_was_computed_over() {
+        let bases = BTreeMap::from([
+            ("CA".to_string(), (10_000i64, "households".to_string())),
+            ("TX".to_string(), (10_000i64, "households".to_string())),
+        ]);
+        // A `both` cell: employer + solo over the base.
+        let both = blend_market(
+            &[emp("238220", "state", "CA", "06", 100)],
+            &[solo("2382", "CA", "06", 300)],
+            &bases,
+            &[],
+            &[],
+        );
+        assert_eq!(both[0].1["total_market_per_10k"], json!(400.0));
+        assert_eq!(both[0].1["total_market_per_10k_basis"], "employer+solo");
+
+        // An `employer_only` cell over the SAME base: the number is half a
+        // market, and must say so rather than read as a thin state.
+        let one_sided = blend_market(
+            &[emp("561730", "state", "TX", "48", 80)],
+            &[solo("2382", "CA", "06", 1)],
+            &bases,
+            &[],
+            &[],
+        );
+        let tx = one_sided
+            .iter()
+            .find(|(k, _)| k == "5617:48")
+            .expect("TX cell");
+        assert_eq!(tx.1["coverage"], "employer_only");
+        assert_eq!(tx.1["total_market_per_10k"], json!(80.0));
+        assert_eq!(
+            tx.1["total_market_per_10k_basis"],
+            "employer_only — solo operators NOT counted"
+        );
+        // No base → no ratio AND no basis label (nothing to qualify).
+        let none = blend_market(
+            &[emp("238220", "state", "CA", "06", 100)],
+            &[solo("2382", "CA", "06", 300)],
+            &BTreeMap::new(),
+            &[],
+            &[],
+        );
+        assert!(none[0].1["total_market_per_10k"].is_null());
+        assert!(none[0].1["total_market_per_10k_basis"].is_null());
     }
 
     #[test]

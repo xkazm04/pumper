@@ -119,9 +119,12 @@ impl ScrapeApp for CensusNonemp {
             output_shape: Some(
                 "{source, year, trades: [{naics, label, states_reported, total_nonemployers, \
                  total_receipts_thousands, national_avg_receipts_per_operator, \
+                 states_with_receipts, suppressed: {places_dropped, receipts_cells}, \
                  top_states_by_density, top_states_by_avg_receipts} | {naics, label, note}], \
-                 market_blend, records, new, changed, unchanged} — a fully suppressed NAICS \
-                 yields a `note` entry, not a failure",
+                 market_blend, suppression, empty_answers, index_datasets, records, new, \
+                 changed, unchanged} — a fully suppressed NAICS yields a `note` entry, not a \
+                 failure; a suppressed NRCPTOT cell yields Null receipts (never $0), so the \
+                 receipts totals cover `states_with_receipts` only",
             ),
             cost_class: CostClass::Free,
         }
@@ -198,6 +201,10 @@ impl ScrapeApp for CensusNonemp {
         let mut summary = UpsertSummary::default();
         let mut record_count = 0usize;
         let mut trade_summaries: Vec<Value> = Vec::new();
+        // Run-level suppression telemetry: what the API declined to tell us.
+        let mut run_suppressed_places = 0usize;
+        let mut run_suppressed_receipts = 0usize;
+        let mut empty_answers = 0usize;
 
         for (naics, label) in &trades {
             let url = format!(
@@ -208,13 +215,16 @@ impl ScrapeApp for CensusNonemp {
                 .http
                 .fetch(HttpRequest::get(url.clone()))
                 .await?;
-            // 204 No Content (fully suppressed) or a non-JSON body → record a note,
-            // don't fail the whole run.
-            if resp.status == 204 || resp.body.trim().is_empty() {
+            // An empty answer (204, or a 200 with no body) is Census saying
+            // "nothing published at this grain" for THIS trade → note it, don't
+            // fail the whole run. Shared with the three sibling apps so the
+            // guard cannot drift out of one of them again.
+            if census_common::is_empty_answer(resp.status, &resp.body) {
                 trade_summaries.push(json!({
                     "naics": naics, "label": label,
                     "note": "no data — nonemployer figures suppressed at this level",
                 }));
+                empty_answers += 1;
                 continue;
             }
             if !resp.is_success() {
@@ -270,7 +280,11 @@ impl ScrapeApp for CensusNonemp {
                 ranked,
                 total_estab,
                 total_rcpt,
+                suppressed_places,
+                suppressed_receipts,
             } = map_trade_rows(&rows, i_estab, i_rcpt, i_state, naics, label, &year);
+            run_suppressed_places += suppressed_places;
+            run_suppressed_receipts += suppressed_receipts;
             record_count += records.len();
             // Stamp THIS request's key-redacted URL + the sha of the artifact it
             // was archived as onto every row it produced.
@@ -286,12 +300,26 @@ impl ScrapeApp for CensusNonemp {
 
             let mut by_density = ranked.clone();
             by_density.sort_by_key(|(_, estab, _)| std::cmp::Reverse(*estab));
-            let mut by_avg = ranked.clone();
+            // Only states that REPORTED receipts can be ranked by them: a
+            // suppressed state used to enter this ranking at $0 and sit at the
+            // bottom as if it were the country's poorest trade market.
+            let mut by_avg: Vec<(String, i64, i64)> = ranked
+                .iter()
+                .filter_map(|(s, e, avg)| avg.map(|a| (s.clone(), *e, a)))
+                .collect();
             by_avg.sort_by_key(|(_, _, avg)| std::cmp::Reverse(*avg));
-            let national_avg = if total_estab > 0 {
-                (total_rcpt * 1000) / total_estab
+            // The denominator is the operator count of the states that reported
+            // receipts — mixing in suppressed states' operators would divide
+            // real money by more operators than earned it.
+            let estab_with_receipts: i64 = ranked
+                .iter()
+                .filter(|(_, _, avg)| avg.is_some())
+                .map(|(_, e, _)| *e)
+                .sum();
+            let national_avg = if estab_with_receipts > 0 {
+                Value::from((total_rcpt * 1000) / estab_with_receipts)
             } else {
-                0
+                Value::Null
             };
 
             trade_summaries.push(json!({
@@ -301,6 +329,13 @@ impl ScrapeApp for CensusNonemp {
                 "total_nonemployers": total_estab,
                 "total_receipts_thousands": total_rcpt,
                 "national_avg_receipts_per_operator": national_avg,
+                // The receipts figures above cover only these states — the rest
+                // are disclosure-suppressed, not zero.
+                "states_with_receipts": by_avg.len(),
+                "suppressed": {
+                    "places_dropped": suppressed_places,
+                    "receipts_cells": suppressed_receipts,
+                },
                 "top_states_by_density": by_density.iter().take(5)
                     .map(|(s, e, _)| json!({ "state": s, "nonemployers": e })).collect::<Vec<_>>(),
                 "top_states_by_avg_receipts": by_avg.iter().take(5)
@@ -327,6 +362,13 @@ impl ScrapeApp for CensusNonemp {
             "year": year,
             "trades": trade_summaries,
             "market_blend": market_blend,
+            // What the API declined to tell us this run, so a shrinking corpus
+            // reads as suppression rather than as a market that vanished.
+            "suppression": {
+                "places_dropped": run_suppressed_places,
+                "receipts_cells": run_suppressed_receipts,
+            },
+            "empty_answers": empty_answers,
             "records": record_count,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
@@ -340,10 +382,20 @@ impl ScrapeApp for CensusNonemp {
 /// summary is built from.
 struct TradeRollup {
     records: Vec<(String, Value)>,
-    /// (state label, nonemployers, avg receipts $/operator)
-    ranked: Vec<(String, i64, i64)>,
+    /// (state label, nonemployers, avg receipts $/operator) — states whose
+    /// receipts are suppressed carry `None` for the average and are ranked
+    /// nowhere, rather than ranked last at $0.
+    ranked: Vec<(String, i64, Option<i64>)>,
     total_estab: i64,
+    /// Sum of the receipts that were actually REPORTED. Suppressed cells add
+    /// nothing (they used to add a fabricated 0), so this is a total over
+    /// `states_with_receipts`, not over `states_reported`.
     total_rcpt: i64,
+    /// Rows dropped entirely — the primary NESTAB cell was suppressed.
+    suppressed_places: usize,
+    /// Reported rows whose NRCPTOT cell was suppressed: the operator count is
+    /// real, the money is unknown.
+    suppressed_receipts: usize,
 }
 
 /// Map the Census array-of-arrays payload (row 0 = header, addressed by the
@@ -358,23 +410,37 @@ fn map_trade_rows(
     year: &str,
 ) -> TradeRollup {
     let mut records: Vec<(String, Value)> = Vec::new();
-    let mut ranked: Vec<(String, i64, i64)> = Vec::new();
+    let mut ranked: Vec<(String, i64, Option<i64>)> = Vec::new();
     let mut total_estab: i64 = 0;
     let mut total_rcpt: i64 = 0;
+    let mut suppressed_places = 0usize;
+    let mut suppressed_receipts = 0usize;
 
     for row in rows.iter().skip(1) {
         let Some(estab) = census_common::census_num(row.get(i_estab)) else {
             // Suppressed/jammed primary cell → not a reported operator place.
+            suppressed_places += 1;
             continue;
         };
-        // NRCPTOT is in $1,000s.
-        let rcpt = census_common::census_num(row.get(i_rcpt)).unwrap_or(0);
+        // NRCPTOT is in $1,000s. Kept as an Option all the way to the record: a
+        // suppressed receipts cell is NOT $0 of business. Defaulting it to 0
+        // used to travel the whole pipeline — into `total_receipts_thousands`,
+        // into the national average, into the blend's `solo_receipts_thousands`
+        // and out the far end as a $0 succession-wave receipt for a state that
+        // simply wasn't allowed to report.
+        let rcpt = census_common::census_num(row.get(i_rcpt));
+        if rcpt.is_none() {
+            suppressed_receipts += 1;
+        }
         let st_fips = row.get(i_state).cloned().unwrap_or_default();
         let state = census_common::state_abbr(&st_fips).to_string();
-        let avg = if estab > 0 { (rcpt * 1000) / estab } else { 0 };
+        let avg = match rcpt {
+            Some(r) if estab > 0 => Some((r * 1000) / estab),
+            _ => None,
+        };
 
         total_estab += estab;
-        total_rcpt += rcpt;
+        total_rcpt += rcpt.unwrap_or(0);
         ranked.push((state.clone(), estab, avg));
 
         records.push((
@@ -385,8 +451,11 @@ fn map_trade_rows(
                 "state": state,
                 "state_fips": st_fips,
                 "nonemployers": estab,
-                "receipts_thousands": rcpt,
-                "avg_receipts_per_operator": avg,
+                // Null, not absent: the column stays in every CSV export and
+                // every consumer sees an explicit "suppressed" rather than a
+                // field that silently came and went between vintages.
+                "receipts_thousands": rcpt.map(Value::from).unwrap_or(Value::Null),
+                "avg_receipts_per_operator": avg.map(Value::from).unwrap_or(Value::Null),
                 "year": year,
             }),
         ));
@@ -397,6 +466,8 @@ fn map_trade_rows(
         ranked,
         total_estab,
         total_rcpt,
+        suppressed_places,
+        suppressed_receipts,
     }
 }
 
@@ -495,20 +566,95 @@ mod tests {
         assert_eq!(r.total_estab, 100);
         assert_eq!(r.total_rcpt, 5000);
         assert_eq!(r.ranked.len(), 1);
+        assert_eq!(r.suppressed_places, 1, "the drop is counted, not absorbed");
     }
 
+    /// The anti-pattern this now defends against (was FLAGGED here, unfixed,
+    /// until 2026-08-12): a suppressed NRCPTOT cell recorded as `$0` receipts,
+    /// indistinguishable from a genuine zero. That fabricated zero travelled the
+    /// whole pipeline — into the state's `avg_receipts_per_operator`, into the
+    /// national average, into the blend's `solo_receipts_thousands` and out the
+    /// far end as a **$0 succession-wave receipt** for a state that was simply
+    /// not allowed to report its money.
     #[test]
-    fn suppressed_receipts_currently_sum_as_zero_not_null() {
-        // CURRENT behavior (unwrap_or(0)): a suppressed NRCPTOT cell keeps the
-        // row but records $0 receipts, indistinguishable from a genuine zero —
-        // it also drags avg and the national average down. Flagged, not fixed:
-        // behavior changes are out of scope for this test pass.
+    fn suppressed_receipts_are_null_not_a_fabricated_zero() {
         let r = rollup(&[["California", "100", "-666666666", "06"]]);
+        // The row is KEPT — the operator count is real data.
         assert_eq!(r.records.len(), 1);
+        let v = &r.records[0].1;
+        assert_eq!(v["nonemployers"], 100);
+        // The money is unknown, and says so.
+        assert_eq!(v["receipts_thousands"], Value::Null);
+        assert_eq!(v["avg_receipts_per_operator"], Value::Null);
+        // Nothing was added to the reported-receipts total, and the withholding
+        // is counted rather than absorbed.
+        assert_eq!(r.total_rcpt, 0);
+        assert_eq!(r.suppressed_receipts, 1);
+        assert_eq!(r.suppressed_places, 0);
+        // The state is ranked by density but not by receipts it never reported.
+        assert_eq!(r.ranked, vec![("CA".to_string(), 100, None)]);
+    }
+
+    /// The other half of the honesty: `census_num` distinguishes a REPORTED
+    /// zero from a suppressed cell, and a reported zero must survive as a
+    /// measured 0 — the fix above must not turn genuine zeros into Nulls.
+    #[test]
+    fn a_reported_zero_stays_a_measured_zero() {
+        let r = rollup(&[["Wyoming", "10", "0", "56"]]);
         let v = &r.records[0].1;
         assert_eq!(v["receipts_thousands"], 0);
         assert_eq!(v["avg_receipts_per_operator"], 0);
-        assert_eq!(r.total_rcpt, 0);
+        assert_eq!(r.suppressed_receipts, 0);
+        assert_eq!(r.ranked, vec![("WY".to_string(), 10, Some(0))]);
+        // And a reported zero establishment count is a real 0-operator state,
+        // not a dropped row.
+        let z = rollup(&[["Wyoming", "0", "0", "56"]]);
+        assert_eq!(z.records.len(), 1);
+        assert_eq!(z.records[0].1["nonemployers"], 0);
+        // 0 operators → no per-operator average to compute (not a divide-by-0).
+        assert_eq!(z.records[0].1["avg_receipts_per_operator"], Value::Null);
+        assert_eq!(z.suppressed_places, 0);
+    }
+
+    /// End-to-end suppression honesty across the app boundary: a suppressed
+    /// NRCPTOT must reach `census/market_blend` as an ABSENT succession figure,
+    /// not as `$0`. This is the far end of the chain the flipped test above
+    /// starts — the blend reads `receipts_thousands` off the stored record.
+    #[test]
+    fn a_suppressed_receipts_cell_yields_no_succession_dollars_in_the_blend() {
+        let solo_record = |data: &[[&str; 4]]| rollup(data).records[0].1.clone();
+        let suppressed = solo_record(&[["California", "100", "-666666666", "06"]]);
+        let reported = solo_record(&[["California", "100", "500", "06"]]);
+        let employers = vec![serde_json::json!({
+            "naics": "238220", "geo": "state", "place": "CA", "state_fips": "06",
+            "establishments": 10, "year": "2022",
+        })];
+        let bands = vec![
+            serde_json::json!({"sector":"23","state_fips":"06","age_band":"55 to 64","owners":40,"year":"2021"}),
+            serde_json::json!({"sector":"23","state_fips":"06","age_band":"25 to 54","owners":60,"year":"2021"}),
+        ];
+        let blend = |solo: Value| {
+            app_census_density::blend_market(
+                &employers,
+                &[solo],
+                &std::collections::BTreeMap::new(),
+                &bands,
+                &[],
+            )[0]
+            .1
+            .clone()
+        };
+        // Reported receipts → a real dollar figure (40% of $500k).
+        let ok = blend(reported);
+        assert_eq!(ok["succession_receipts"], 200_000);
+        // Suppressed receipts → the share is still known, the dollars are NOT.
+        let sup = blend(suppressed);
+        assert_eq!(sup["pct_owners_55plus"], serde_json::json!(0.4));
+        assert_eq!(
+            sup["succession_receipts"],
+            Value::Null,
+            "a withheld receipts cell must not become a $0 succession wave"
+        );
     }
 
     #[test]

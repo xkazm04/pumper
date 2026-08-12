@@ -102,6 +102,25 @@ pub fn census_num(cell: Option<&String>) -> Option<i64> {
         .filter(|v| *v >= 0)
 }
 
+/// Whether a Census response is an **empty answer** — the API's way of saying
+/// "nothing is published at this grain", not a failure.
+///
+/// Census returns `204 No Content` (sometimes a `200` with an empty body) for a
+/// NAICS × geography whose cells are fully disclosure-suppressed or simply not
+/// published: NES at 6-digit × state, NES-D at 3/4-digit, a sector with no
+/// series. That is a **contract-valid** answer about ONE request, and the run's
+/// other requests are unaffected.
+///
+/// It has to be checked BEFORE the JSON-shape guard, because `204` is inside
+/// `HttpResponse::is_success`'s 200..300: a bare 204 falls through to
+/// "response was not JSON" and takes the whole multi-trade run down with it —
+/// which is exactly what census-density did while its three siblings
+/// skipped-and-noted (bughunt 2026-07-14 #3). One definition, used by all four,
+/// so the guard cannot land in only part of the fleet again.
+pub fn is_empty_answer(status: u16, body: &str) -> bool {
+    status == 204 || body.trim().is_empty()
+}
+
 /// Resolves the free Census API key: `params.api_key`, else env
 /// `CENSUS_API_KEY`. `app` names the caller in the error so the operator knows
 /// which app is asking.
@@ -311,12 +330,58 @@ pub fn bfs_sector_category(naics: &str) -> Option<String> {
 mod tests {
     use super::{
         artifact_sha, bfs_sector_category, census_num, http_provenance, is_55_plus_age_band,
-        is_reported_age_band, merge_summary, owner_age_share_55plus, product_index_datasets,
-        redact_key, state_abbr, with_product_index, MARKET_APP, MARKET_BLEND_DATASET,
-        SATURATION_DATASET,
+        is_empty_answer, is_reported_age_band, merge_summary, owner_age_share_55plus,
+        product_index_datasets, redact_key, state_abbr, with_product_index, MARKET_APP,
+        MARKET_BLEND_DATASET, SATURATION_DATASET,
     };
     use pumper_core::UpsertSummary;
     use serde_json::json;
+
+    /// The anti-pattern: a bare `204 No Content` — a contract-VALID "nothing
+    /// published at this grain" — read as a broken payload, because 204 is
+    /// inside `is_success` and falls through to the JSON-shape guard. That
+    /// aborted a whole multi-trade census-density run on one suppressed cell.
+    #[test]
+    fn a_bare_204_is_an_empty_answer_not_a_json_parse_failure() {
+        assert!(is_empty_answer(204, ""));
+        assert!(is_empty_answer(204, "[[\"NAME\"]]"), "204 wins on its own");
+        // A 200 with nothing in it is the same answer by another route.
+        assert!(is_empty_answer(200, ""));
+        assert!(is_empty_answer(200, "   \n "));
+        // Real payloads — and real failures — are NOT empty answers: an HTML
+        // missing-key page must still reach the loud "not JSON" error.
+        assert!(!is_empty_answer(200, "[[\"NAME\",\"ESTAB\"]]"));
+        assert!(!is_empty_answer(200, "<html>missing key</html>"));
+        assert!(!is_empty_answer(400, "unknown predicate variable"));
+    }
+
+    /// All four census apps must route their empty-answer check through
+    /// `is_empty_answer` — the convention that a suppressed cell skips ONE
+    /// request instead of failing the run, enforced as an inventory rather than
+    /// as a sentence in a doc (the fleet already drifted here once).
+    #[test]
+    fn every_census_app_uses_the_shared_empty_answer_guard() {
+        let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("crates/apps");
+        let missing: Vec<&str> = [
+            "census-density",
+            "census-nonemp",
+            "census-nesd",
+            "census-bfs",
+        ]
+        .into_iter()
+        .filter(|app| {
+            let src = std::fs::read_to_string(root.join(app).join("src/lib.rs"))
+                .unwrap_or_else(|e| panic!("read {app}/src/lib.rs: {e}"));
+            !src.contains("census_common::is_empty_answer(")
+        })
+        .collect();
+        assert!(
+            missing.is_empty(),
+            "these census apps hand-roll their empty-answer check (or dropped it): {missing:?}"
+        );
+    }
 
     /// The two product datasets are what a watch/trigger/saved search on app
     /// `census` can ever see (worker `run_indexed_apps`). Dropping either from

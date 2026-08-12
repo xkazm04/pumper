@@ -154,10 +154,12 @@ impl ScrapeApp for CensusNesd {
             ],
             output_shape: Some(
                 "{source, year, grain: \"naics_sector\", sectors: [{sector, label, \
-                 states_reported, age_band_records, top_states_by_pct_owners_55plus} | \
-                 {sector, label, note}], sectors_not_published, market_blend, records, new, \
-                 changed, unchanged} — a sector with no published per-state data (HTTP 204) \
-                 is counted in sectors_not_published, never an error",
+                 states_reported, age_band_records, suppressed: {owner_cells}, \
+                 top_states_by_pct_owners_55plus} | {sector, label, note}], \
+                 sectors_not_published, suppression, market_blend, index_datasets, records, \
+                 new, changed, unchanged} — a sector with no published per-state data \
+                 (HTTP 204) is counted in sectors_not_published, never an error; withheld \
+                 owner cells are dropped (never 0 owners) and counted in `suppression`",
             ),
             cost_class: CostClass::Free,
         }
@@ -243,6 +245,8 @@ impl ScrapeApp for CensusNesd {
         let mut record_count = 0usize;
         let mut sector_summaries: Vec<Value> = Vec::new();
         let mut not_published: usize = 0;
+        // Run-level suppression telemetry: what the API declined to tell us.
+        let mut run_suppressed_owner_cells = 0usize;
 
         for (naics, label) in &sectors {
             let url = format!(
@@ -262,7 +266,9 @@ impl ScrapeApp for CensusNesd {
             // HTTP 204 No Content is contract-VALID: NES-D per-state data only
             // exists at 2-digit sector grain, so a finer (or unpublished) code
             // is simply "not published at this grain" — a stat, never an error.
-            if resp.status == 204 || resp.body.trim().is_empty() {
+            // Shared with the three sibling apps (`is_empty_answer`) so the
+            // guard cannot drift out of one of them again.
+            if census_common::is_empty_answer(resp.status, &resp.body) {
                 not_published += 1;
                 sector_summaries.push(json!({
                     "sector": naics, "label": label,
@@ -371,11 +377,15 @@ impl ScrapeApp for CensusNesd {
                 "label": label,
                 "states_reported": rollup.bands_by_state.len(),
                 "age_band_records": rollup.records.len(),
+                // Age bands the API withheld — the share below is computed over
+                // the bands that WERE reported, not over the whole sector.
+                "suppressed": { "owner_cells": rollup.suppressed_owner_cells },
                 "top_states_by_pct_owners_55plus": by_share.iter().take(5)
                     .map(|(s, share)| json!({ "state": s, "pct_owners_55plus": share }))
                     .collect::<Vec<_>>(),
             }));
             record_count += rollup.records.len();
+            run_suppressed_owner_cells += rollup.suppressed_owner_cells;
             census_common::merge_summary(
                 &mut summary,
                 ctx.upsert_many_with_provenance(
@@ -404,6 +414,7 @@ impl ScrapeApp for CensusNesd {
             "grain": "naics_sector",
             "sectors": sector_summaries,
             "sectors_not_published": not_published,
+            "suppression": { "owner_cells": run_suppressed_owner_cells },
             "market_blend": market_blend,
             "records": record_count,
             "new": summary.new.len(),
@@ -434,6 +445,11 @@ struct AgeRollup {
     /// state abbr → (band label, owners) for reported bands.
     bands_by_state: BTreeMap<String, Vec<(String, i64)>>,
     questions_seen: BTreeSet<String>,
+    /// Age-question rows of the all-demographics slice whose OWNNOPD cell was
+    /// suppressed: the band exists, the owner count is withheld. Dropped (never
+    /// stored as 0 owners) — and counted, because a share computed over five
+    /// bands means something different when three more were withheld.
+    suppressed_owner_cells: usize,
 }
 
 /// Map the NES-D array-of-arrays payload into per-state × age-band records for
@@ -451,6 +467,7 @@ fn map_age_rows(
     let mut records: Vec<(String, Value)> = Vec::new();
     let mut bands_by_state: BTreeMap<String, Vec<(String, i64)>> = BTreeMap::new();
     let mut questions_seen: BTreeSet<String> = BTreeSet::new();
+    let mut suppressed_owner_cells = 0usize;
     let want_q = age_question.to_uppercase();
 
     for row in rows.iter().skip(1) {
@@ -482,6 +499,7 @@ fn map_age_rows(
         // Suppressed owner counts (negative sentinels / blanks / "D") are
         // dropped, never stored as zero owners.
         let Some(owners) = census_common::census_num(row.get(cols.owners)) else {
+            suppressed_owner_cells += 1;
             continue;
         };
         let band_code = row.get(cols.band_code).cloned().unwrap_or_default();
@@ -525,6 +543,7 @@ fn map_age_rows(
         records,
         bands_by_state,
         questions_seen,
+        suppressed_owner_cells,
     }
 }
 

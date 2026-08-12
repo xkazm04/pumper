@@ -128,10 +128,12 @@ impl ScrapeApp for CensusBfs {
             ],
             output_shape: Some(
                 "{source, from_year, sectors: [{sector, label, monthly_cells, \
-                 velocity_records}], market_blend, formations: {records, new, changed, \
-                 unchanged}, formation_velocity: {records, new, changed, unchanged}} — \
-                 every record is US-national NAICS-sector grain \
-                 (grain=naics_sector_national); t12m fields stay Null until 12 months exist",
+                 velocity_records}], empty_series, market_blend, index_datasets, \
+                 formations: {records, new, changed, unchanged}, formation_velocity: \
+                 {records, new, changed, unchanged}} — every record is US-national \
+                 NAICS-sector grain (grain=naics_sector_national); t12m fields stay Null \
+                 until 12 months exist; `empty_series` names the sector/measure requests \
+                 the API served nothing for",
             ),
             cost_class: CostClass::Free,
         }
@@ -169,6 +171,8 @@ impl ScrapeApp for CensusBfs {
         let mut formation_records: Vec<(String, Value)> = Vec::new();
         let mut velocity_records: Vec<(String, Value)> = Vec::new();
         let mut sector_summaries: Vec<Value> = Vec::new();
+        // `{sector}/{data_type_code}` pairs the API served nothing for.
+        let mut empty_series: Vec<String> = Vec::new();
 
         for (sector, label) in &sectors {
             // period → (applications, high-propensity). National series — the
@@ -182,8 +186,12 @@ impl ScrapeApp for CensusBfs {
                     "https://api.census.gov/data/timeseries/eits/bfs?get=cell_value,data_type_code,category_code,seasonally_adj&for=us:*&time=from+{from_year}&category_code={sector}&data_type_code={dt_code}&seasonally_adj=no&time_slot_id=0&key={api_key}"
                 );
                 let resp = ctx.engines.http.fetch(HttpRequest::get(url)).await?;
-                // An empty series for one sector/measure is a note, not a failure.
-                if resp.status == 204 || resp.body.trim().is_empty() {
+                // An empty series for one sector/measure is a note, not a
+                // failure — and now a COUNTED one: a silently skipped measure
+                // used to look identical to a measure that returned zeros.
+                // Shared with the three sibling apps (`is_empty_answer`).
+                if census_common::is_empty_answer(resp.status, &resp.body) {
+                    empty_series.push(format!("{sector}/{dt_code}"));
                     continue;
                 }
                 if !resp.is_success() {
@@ -321,6 +329,9 @@ impl ScrapeApp for CensusBfs {
             "source": "census/eits-bfs",
             "from_year": from_year,
             "sectors": sector_summaries,
+            // Sector × measure requests the API served nothing for — an empty
+            // answer is a fact about the release, not an absence of formations.
+            "empty_series": empty_series,
             "market_blend": market_blend,
             "formations": {
                 "records": formation_records.len(),
