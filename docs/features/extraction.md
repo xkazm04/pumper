@@ -33,12 +33,26 @@ Status reflects the **rule match, before transforms** — it answers "did the se
 - `coercion_failed` — the selector matched and the transform chain reduced it to nothing. This is the wrong-element signature: `to_number` on `"Add to cart"` yields null while the field still reports `matched`, so a coercion-failure rate that rises while the match rate stays flat has almost no explanation other than a rebound selector.
 - `no_transforms` — nothing to coerce.
 
+### Inside a listing: per-inner-field counts
+
+An `each` rule reports **one** status for the whole array, and that status is `matched` as long as the container matched — the array is full of objects, they just all carry `price: null`. A listing whose inner `price` selector dies is therefore invisible at the document scope. `report.each` is the missing signal: **per inner field, aggregated across the listing's items**.
+
+Keys are the dotted path from the top-level field: `products.price`, and `products.variants.sku` for a nested `each`. Each value is `{items, matched, empty, container_empty, error}` — **counts, never per-item lists**, so a report over a 5000-row listing is exactly the size of one over a 5-row listing (one entry per inner field of the rule set, whatever the document does).
+
+- `items` is the denominator: how many listing items the inner rule was attempted on. A container that matched but held nothing gives every inner field an honest `items: 0` row — present (so the field is discoverable) and *not* a failure.
+- A **hit** is `matched + container_empty`, exactly mirroring `container_empty` not being a miss at the document scope; a **miss** is `empty + error`, exactly mirroring `FieldStatus::is_miss`.
+- **Dead vs sparse**: `items > 0 && hits == 0` means the selector bound on *no* item — listing rot. Anything in between is a sparse field (some cards carry a badge, some don't). Collapsing the two is the failure the array-level `matched` forces.
+
+The listing's own `report.fields` entry is unchanged (still `matched`/`empty`/`container_empty`), and `report.each` is omitted entirely from the JSON for rule sets with no `each` rule — this is additive on the existing report shape.
+
 API (`extract.rs`):
 
 - `extract_one_with_report(rules, doc) -> (Value, DocReport)`
 - `extract_batch_with_report(rules, docs) -> Vec<(Value, DocReport)>`
 
-`DocReport` is `{fields: {field -> {status, detail?}}, coercion: {field -> status}}` (`FieldStatus` is a `status`-tagged enum; `coercion` is omitted when empty). Both are serde-stable for downstream serialization. **Wire note**: `DocReport` was a serde-*transparent* field map before the coercion status existed, so a reader of `POST /extract/preview` now finds the statuses one level down under `report.fields`.
+`DocReport` is `{fields: {field -> {status, detail?}}, coercion: {field -> status}, each: {dotted.path -> {items, matched, empty, container_empty, error}}}` (`FieldStatus` is a `status`-tagged enum; `coercion` and `each` are omitted when empty). All are serde-stable for downstream serialization. **Wire note**: `DocReport` was a serde-*transparent* field map before the coercion status existed, so a reader of `POST /extract/preview` now finds the statuses one level down under `report.fields`.
+
+**Who reads `each` today**: the `extractor` app's `worst_fields` roll-up and the replay-CI `inner_fields` rows (both below). The resilience per-field sketches, the `provisioner` accept gate and the DataHub/reliability *scoring* still key off `report.fields` only, so listing rot shows up in a run's result and in the host reliability record's echoed `worst_fields` — but does not yet move a health score or a provisioning verdict.
 
 ### Input modes
 
@@ -54,8 +68,18 @@ Both modes share the extraction + quality-report path and report aggregate quali
 
 - urls mode: `requested`, `fetched`, `skipped`, `failed` (skipped URLs).
 - source mode: `source {app, dataset}`, `requested`, `loaded`, `missing`, `missing_keys` (`[{key, reason}]`).
-- both: `new` / `changed` / `unchanged` (upsert outcome), `fields_matched` / `fields_total` (matched extractions over total attempted), and `worst_fields` — fields that missed at least once, worst first: `{field, misses, errors, miss_rate}` (a miss is an `empty` or `error` status — never `container_empty`; `miss_rate` is misses ÷ docs). Records are tagged `_url` = source URL / record key.
+- both: `new` / `changed` / `unchanged` (upsert outcome), `fields_matched` / `fields_total` (matched extractions over total attempted), and `worst_fields` — fields that missed at least once, worst first. Two row scopes:
+  - **document scope** (top-level fields): `{field, misses, errors, miss_rate}` — a miss is an `empty` or `error` status, never `container_empty`; `miss_rate` is misses ÷ docs.
+  - **item scope** (inner fields of an `each` listing, keyed `products.price`): the same four keys plus `{scope: "item", items, hits, dead}`. Here `miss_rate` is misses ÷ listing **items**, which is why `scope` is on the row; `dead: true` means the selector bound on no item at all (listing rot) as opposed to a sparse field.
+
+  `fields_matched`/`fields_total` stay document-scoped on purpose: they are the run's rule-level match rate, and folding item counts in would let one wide listing outvote every other field in the rule set. Records are tagged `_url` = source URL / record key.
 - both: `health` — the extraction-health verdict for this run (`{verdict, diagnosis, score, state, previous_state, statistical_coverage, reasons, drift}`), or `null` when detection is off. urls mode also reports `fetch_ok_rate`. See [resilient-extraction.md](resilient-extraction.md).
+
+### Replay-CI (`replay` param)
+
+`{"replay": {"rules": …, "baseline_rules"?: …, "against": {app, dataset, url_pattern?, versions, max_pages}, "bisect_field"?: …}}` runs a **candidate** rule set over stored bodies and diffs it against a baseline — strictly read-only (job result + a `replay-report.json` artifact, never a dataset record). The report carries `fields` (per top-level field: `match_rate`, `baseline_match_rate`, `delta`, and bounded `added`/`lost`/`changed` value samples), `regressions`/`regressed_urls` per URL, and `bisect` (the adjacent observation pair where a field's match flipped).
+
+`inner_fields` is the item-scoped companion, one row per inner field of an `each` listing: `{field: "products.price", scope: "item", items, match_rate, dead, baseline_items?, baseline_match_rate?, delta?}`, worst regression first. Without it a rule edit that kills an inner selector diffs to `delta: 0.0` — both sides still report one `matched` for the whole array. These rows carry **no value samples**: the values live inside the array items and the report aggregates counts rather than echoing per-item values (that bound is what keeps a wide listing's report small). A field that needs value-level diffing is diffed by lifting it out of the listing.
 
 **Artifact retention**: source mode depends on the origin job's bodies still being on disk. Crawl bodies live in per-job dirs (`data/artifacts/<app>/<job_id>/`). Retention is **off by default** (`[storage] artifact_retention_days = 0`) — bodies persist indefinitely unless an operator opts in. When it is on, the janitor reclaims bodies older than the window *except* any body a **replayable** revision points at (`artifact_sha` + `rules_hash` both stamped), which is pinned regardless of age, and except VCR cassettes unless `artifact_retention_include_cassettes` is set. A body reclaimed (or manually deleted) surfaces its key in `missing_keys` on the next extract — never as a silent null. `GET /retention/preview` reports reclaimable bytes per app without deleting anything. See [datasets.md § Retention](datasets.md).
 

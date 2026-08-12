@@ -184,11 +184,49 @@ fn parse_concurrency(params: &Value) -> usize {
         .unwrap_or(DEFAULT_FETCH_CONCURRENCY)
 }
 
+/// Running totals for one INNER field of an `each` listing, pooled across every
+/// document of the run. The denominator is listing ITEMS, not documents — a
+/// listing's inner selector is attempted once per card, not once per page.
+#[derive(Default)]
+struct InnerRollup {
+    items: u64,
+    hits: u64,
+    misses: u64,
+    errors: u64,
+}
+
+impl InnerRollup {
+    fn add(&mut self, s: &pumper_core::extract::InnerFieldStats) {
+        self.items += s.items as u64;
+        self.hits += s.hits() as u64;
+        self.misses += s.misses() as u64;
+        self.errors += s.error as u64;
+    }
+}
+
+/// Whether an inner listing field is WHOLLY dead across the run — the selector
+/// bound on none of the items it was attempted on — as opposed to sparse (some
+/// items carry it, some legitimately do not). This is the distinction the
+/// listing's single array-level `Matched` erases, and the one an operator needs
+/// to tell "the site dropped a class" from "not every card has a badge".
+fn inner_field_dead(items: u64, hits: u64) -> bool {
+    items > 0 && hits == 0
+}
+
 /// Aggregate the per-document reports into a quality signal for the job result:
 /// how many field extractions matched out of the total attempted, plus the
 /// fields with the highest miss rate (an empty or errored extraction is a miss).
 /// Returns `(matched, total, worst_fields)`; `worst_fields` lists only fields
 /// that missed at least once, worst first.
+///
+/// `worst_fields` rows come in two scopes. Top-level fields keep their original
+/// shape exactly (`{field, misses, errors, miss_rate}`, `miss_rate` per
+/// DOCUMENT). Inner fields of an `each` listing — keyed by their dotted path,
+/// e.g. `products.price` — add `{scope: "item", items, hits, dead}` and their
+/// `miss_rate` is per listing ITEM, which is why the scope tag is not optional.
+/// `matched`/`total` deliberately stay document-scoped: they are the run's
+/// rule-level match rate and folding item counts into them would make one wide
+/// listing outvote every other field in the rule set.
 fn summarize_reports<'a>(
     reports: impl IntoIterator<Item = &'a DocReport>,
 ) -> (u64, u64, Vec<Value>) {
@@ -197,6 +235,9 @@ fn summarize_reports<'a>(
     let mut doc_count: u64 = 0;
     // field -> (misses, errors)
     let mut misses: std::collections::BTreeMap<&str, (u64, u64)> =
+        std::collections::BTreeMap::new();
+    // dotted inner path -> pooled item counts
+    let mut inner: std::collections::BTreeMap<&str, InnerRollup> =
         std::collections::BTreeMap::new();
     for report in reports {
         doc_count += 1;
@@ -214,6 +255,9 @@ fn summarize_reports<'a>(
                 }
             }
         }
+        for (path, stats) in &report.each {
+            inner.entry(path.as_str()).or_default().add(stats);
+        }
     }
     let docs = doc_count.max(1) as f64;
     let mut worst: Vec<Value> = misses
@@ -228,6 +272,28 @@ fn summarize_reports<'a>(
             })
         })
         .collect();
+    worst.extend(inner.into_iter().filter(|(_, r)| r.misses > 0).map(
+        |(
+            field,
+            InnerRollup {
+                items,
+                hits,
+                misses: m,
+                errors,
+            },
+        )| {
+            json!({
+                "field": field,
+                "misses": m,
+                "errors": errors,
+                "miss_rate": ((m as f64 / items.max(1) as f64) * 1000.0).round() / 1000.0,
+                "scope": "item",
+                "items": items,
+                "hits": hits,
+                "dead": inner_field_dead(items, hits),
+            })
+        },
+    ));
     // Highest miss count first; ties broken by field name for stable output.
     worst.sort_by(|a, b| {
         b["misses"]
@@ -1602,6 +1668,99 @@ mod tests {
         assert_eq!(worst[1]["misses"], 1);
         assert_eq!(worst[1]["errors"], 1);
         assert_eq!(worst[1]["miss_rate"], 0.5);
+    }
+
+    #[test]
+    fn worst_fields_surfaces_a_dead_inner_field_not_just_a_matched_listing() {
+        // THE REFUTED BEHAVIOR: the listing rule reports one status for the
+        // whole array, so a `price` selector that died on every card left
+        // `worst_fields` EMPTY — the run looked perfect. It is not.
+        use pumper_core::extract::InnerFieldStats;
+        let each = |pairs: &[(&str, InnerFieldStats)]| DocReport {
+            fields: [("products".to_string(), FieldStatus::Matched)]
+                .into_iter()
+                .collect(),
+            each: pairs.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            ..DocReport::default()
+        };
+        let dead = InnerFieldStats {
+            items: 3,
+            matched: 0,
+            empty: 3,
+            ..InnerFieldStats::default()
+        };
+        let sparse = InnerFieldStats {
+            items: 3,
+            matched: 1,
+            empty: 2,
+            ..InnerFieldStats::default()
+        };
+        let fine = InnerFieldStats {
+            items: 3,
+            matched: 3,
+            ..InnerFieldStats::default()
+        };
+        let reports = [each(&[
+            ("products.price", dead),
+            ("products.badge", sparse),
+            ("products.name", fine),
+        ])];
+        let (matched, total, worst) = summarize_reports(reports.iter());
+        // Document-scoped totals are untouched: one field, one document, matched.
+        assert_eq!((matched, total), (1, 1));
+        // ...but the dead inner field is now the run's worst row.
+        assert_eq!(worst.len(), 2, "{worst:?}");
+        assert_eq!(worst[0]["field"], "products.price");
+        assert_eq!(worst[0]["scope"], "item");
+        assert_eq!(worst[0]["items"], 3);
+        assert_eq!(worst[0]["misses"], 3);
+        assert_eq!(worst[0]["miss_rate"], 1.0);
+        assert_eq!(worst[0]["dead"], true);
+        // A sparse field is reported but NOT flagged dead — the whole point.
+        assert_eq!(worst[1]["field"], "products.badge");
+        assert_eq!(worst[1]["dead"], false);
+        assert_eq!(worst[1]["misses"], 2);
+        // A healthy inner field never enters worst_fields at all.
+        assert!(worst.iter().all(|w| w["field"] != "products.name"));
+    }
+
+    #[test]
+    fn inner_container_empty_is_a_hit_not_a_miss_like_the_document_scope() {
+        // The `ContainerEmpty` convention is implemented once per scope:
+        // `summarize_reports` for documents, `InnerFieldStats::hits` for items.
+        // Pin them together so neither can silently start counting a quiet
+        // sub-listing as a broken selector.
+        use pumper_core::extract::InnerFieldStats;
+        let doc_scope = [report(&[("jobs", FieldStatus::ContainerEmpty)])];
+        let (matched, total, worst) = summarize_reports(doc_scope.iter());
+        assert_eq!((matched, total), (1, 1));
+        assert!(
+            worst.is_empty(),
+            "document scope: quiet listing is not a miss"
+        );
+
+        let quiet_nested = InnerFieldStats {
+            items: 2,
+            container_empty: 2,
+            ..InnerFieldStats::default()
+        };
+        assert_eq!(quiet_nested.hits(), 2);
+        assert_eq!(quiet_nested.misses(), 0);
+        assert!(!quiet_nested.is_dead());
+        let item_scope = [DocReport {
+            fields: [("products".to_string(), FieldStatus::Matched)]
+                .into_iter()
+                .collect(),
+            each: [("products.variants".to_string(), quiet_nested)]
+                .into_iter()
+                .collect(),
+            ..DocReport::default()
+        }];
+        let (_, _, worst) = summarize_reports(item_scope.iter());
+        assert!(
+            worst.is_empty(),
+            "item scope: quiet sub-listing is not a miss"
+        );
     }
 
     #[test]

@@ -132,11 +132,100 @@ impl DocKey {
 
 /// The match convention shared with `summarize_reports`: a container that
 /// matched but held no items is still a working selector, not a miss.
+///
+/// The item-scoped twin of this rule (inside an `each` listing) is
+/// [`pumper_core::extract::InnerFieldStats::hits`] — ONE implementation in core
+/// that both this module and `summarize_reports` call, so the two scopes cannot
+/// disagree about what counts as a working selector.
 fn is_match(status: Option<&FieldStatus>) -> bool {
     matches!(
         status,
         Some(FieldStatus::Matched) | Some(FieldStatus::ContainerEmpty)
     )
+}
+
+/// Per-inner-field diff accumulator, item-scoped (a listing's inner selector is
+/// attempted once per card, not once per page).
+#[derive(Default)]
+struct InnerDiff {
+    cand_items: u64,
+    cand_hits: u64,
+    base_items: u64,
+    base_hits: u64,
+}
+
+/// Diffs the per-inner-field reports of `each` listings — the layer the
+/// document-level rows cannot see, because a listing whose `price` selector
+/// died still reports one `Matched` for the whole array.
+///
+/// Rows are item-scoped rates only, with no `added`/`lost`/`changed` value
+/// samples: the values live INSIDE the array items and the report deliberately
+/// aggregates counts rather than echoing per-item values (that bound is what
+/// keeps a 5000-row listing's report the size of a 5-row one). A field that
+/// needs value-level diffing is diffed by lifting it out of the listing.
+pub(crate) fn diff_inner_fields(
+    cand: &[(Value, DocReport)],
+    base: Option<&[(Value, DocReport)]>,
+) -> Vec<Value> {
+    let mut diffs: BTreeMap<&str, InnerDiff> = BTreeMap::new();
+    for (_, r) in cand {
+        for (path, s) in &r.each {
+            let d = diffs.entry(path.as_str()).or_default();
+            d.cand_items += s.items as u64;
+            d.cand_hits += s.hits() as u64;
+        }
+    }
+    for (_, r) in base.unwrap_or(&[]) {
+        for (path, s) in &r.each {
+            let d = diffs.entry(path.as_str()).or_default();
+            d.base_items += s.items as u64;
+            d.base_hits += s.hits() as u64;
+        }
+    }
+    let rate = |hits: u64, items: u64| {
+        if items == 0 {
+            0.0
+        } else {
+            ((hits as f64 / items as f64) * 1000.0).round() / 1000.0
+        }
+    };
+    let mut rows: Vec<Value> = diffs
+        .into_iter()
+        .map(|(field, d)| {
+            let mut row = json!({
+                "field": field,
+                "scope": "item",
+                "items": d.cand_items,
+                "match_rate": rate(d.cand_hits, d.cand_items),
+                // The listing-rot verdict: the selector bound on NO item it was
+                // attempted on (distinct from a sparse field, and from a listing
+                // that simply had no items).
+                "dead": d.cand_items > 0 && d.cand_hits == 0,
+            });
+            if base.is_some() {
+                row["baseline_items"] = json!(d.base_items);
+                row["baseline_match_rate"] = json!(rate(d.base_hits, d.base_items));
+                row["delta"] =
+                    json!(rate(d.cand_hits, d.cand_items) - rate(d.base_hits, d.base_items));
+            }
+            row
+        })
+        .collect();
+    // Worst regression first (or lowest match rate for a candidate-only run),
+    // ties broken by name — the same ordering as the document-level rows.
+    rows.sort_by(|a, b| {
+        let key = |v: &Value| {
+            v.get("delta")
+                .or_else(|| v.get("match_rate"))
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0)
+        };
+        key(a)
+            .partial_cmp(&key(b))
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| a["field"].as_str().cmp(&b["field"].as_str()))
+    });
+    rows
 }
 
 /// Per-field diff accumulator (counts full, samples bounded).
@@ -422,6 +511,7 @@ pub(crate) async fn run_replay(ctx: &AppContext, replay: &Map<String, Value>) ->
     .map_err(|e| Error::App(format!("replay extract task failed: {e}")))?;
 
     let diff = diff_fields(&keys, &cand_reports, base_reports.as_deref());
+    let inner_fields = diff_inner_fields(&cand_reports, base_reports.as_deref());
     let bisect = p
         .bisect_field
         .as_deref()
@@ -445,6 +535,7 @@ pub(crate) async fn run_replay(ctx: &AppContext, replay: &Map<String, Value>) ->
         "missing_keys": missing,
         "baseline": base_reports.is_some(),
         "fields": diff.fields,
+        "inner_fields": inner_fields,
         "regressed_urls": diff.regressed_urls,
         "regressions": diff.regressions,
         "bisect": bisect,
@@ -598,6 +689,74 @@ mod tests {
         assert_eq!(out.regressions[0]["changed"][0], "price");
         assert_eq!(out.regressions[1]["url"], "http://b");
         assert_eq!(out.regressions[1]["lost"][0], "price");
+    }
+
+    #[test]
+    fn inner_listing_rot_is_a_replay_regression_not_an_invisible_one() {
+        // THE REFUTED BEHAVIOR: both rule sets report one `Matched` for the
+        // whole listing, so the document-level diff shows delta 0.0 — a rule
+        // edit that killed the inner `price` selector shipped clean. The
+        // item-scoped rows are what catch it.
+        use pumper_core::extract::InnerFieldStats;
+        let listing = |price: InnerFieldStats| {
+            let mut rep = DocReport {
+                fields: [("products".to_string(), FieldStatus::Matched)]
+                    .into_iter()
+                    .collect(),
+                ..DocReport::default()
+            };
+            rep.each.insert("products.price".into(), price);
+            rep.each.insert(
+                "products.name".into(),
+                InnerFieldStats {
+                    items: 4,
+                    matched: 4,
+                    ..InnerFieldStats::default()
+                },
+            );
+            (json!({"products": []}), rep)
+        };
+        let base = [listing(InnerFieldStats {
+            items: 4,
+            matched: 4,
+            ..InnerFieldStats::default()
+        })];
+        let cand = [listing(InnerFieldStats {
+            items: 4,
+            matched: 0,
+            empty: 4,
+            ..InnerFieldStats::default()
+        })];
+
+        // Document scope sees nothing: the listing still matched on both sides.
+        let keys = [doc("http://a", None)];
+        let flat = diff_fields(&keys, &cand, Some(&base));
+        assert_eq!(flat.fields[0]["field"], "products");
+        assert_eq!(flat.fields[0]["delta"], 0.0);
+        assert_eq!(flat.regressed_urls, 0);
+
+        // Item scope names the dead field, worst first.
+        let inner = diff_inner_fields(&cand, Some(&base));
+        assert_eq!(inner.len(), 2, "{inner:?}");
+        assert_eq!(inner[0]["field"], "products.price");
+        assert_eq!(inner[0]["scope"], "item");
+        assert_eq!(inner[0]["items"], 4);
+        assert_eq!(inner[0]["match_rate"], 0.0);
+        assert_eq!(inner[0]["baseline_match_rate"], 1.0);
+        assert_eq!(inner[0]["delta"], -1.0);
+        assert_eq!(inner[0]["dead"], true);
+        assert_eq!(inner[1]["field"], "products.name");
+        assert_eq!(inner[1]["delta"], 0.0);
+        assert_eq!(inner[1]["dead"], false);
+
+        // Candidate-only replay: rates and the dead flag, no deltas.
+        let solo = diff_inner_fields(&cand, None);
+        assert_eq!(solo[0]["field"], "products.price");
+        assert_eq!(solo[0]["match_rate"], 0.0);
+        assert!(solo[0].get("delta").is_none());
+        // A rule set with no `each` rule contributes no item-scoped rows.
+        let plain = [report(&[("t", FieldStatus::Matched)], json!({"t": "x"}))];
+        assert!(diff_inner_fields(&plain, None).is_empty());
     }
 
     #[test]

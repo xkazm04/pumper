@@ -550,10 +550,76 @@ pub enum CoercionStatus {
     NoTransforms,
 }
 
+/// One inner field's outcome inside an [`Rule::Each`] listing, aggregated over
+/// the listing's items.
+///
+/// A listing rule reports ONE [`FieldStatus`] for the whole array, so a card
+/// whose `price` selector quietly stopped matching leaves the rule `Matched` —
+/// the array is still full of objects, they just all carry `price: null`. These
+/// counts are what make that visible: they are per inner field and per document,
+/// aggregated ACROSS items (counts, never per-item lists), so the report stays
+/// O(rule fields) on a listing of any width.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InnerFieldStats {
+    /// Items the inner rule ran over — the denominator for every rate here.
+    pub items: u32,
+    pub matched: u32,
+    pub empty: u32,
+    /// Items where a NESTED `each` matched its container but held no items —
+    /// a working selector over a quiet sub-listing, counted as a hit for the
+    /// same reason [`FieldStatus::is_miss`] excludes `ContainerEmpty`.
+    pub container_empty: u32,
+    pub error: u32,
+}
+
+impl InnerFieldStats {
+    /// Items where the inner rule found nothing. Mirrors
+    /// [`FieldStatus::is_miss`] exactly, so an inner miss and a top-level miss
+    /// are the same judgement applied at two scopes.
+    pub fn misses(&self) -> u32 {
+        self.empty + self.error
+    }
+
+    /// Items where the inner selector still bound (matched, or a nested
+    /// container that matched but was quiet).
+    pub fn hits(&self) -> u32 {
+        self.matched + self.container_empty
+    }
+
+    /// The listing had items and the inner selector bound on NONE of them —
+    /// listing rot, as opposed to a sparse field only some items carry.
+    /// This is the distinction a single array-level `Matched` erases.
+    pub fn is_dead(&self) -> bool {
+        self.items > 0 && self.hits() == 0
+    }
+
+    /// Fraction of items where the inner rule found nothing (`0.0` for an
+    /// empty listing — no items, no claim).
+    pub fn miss_rate(&self) -> f64 {
+        if self.items == 0 {
+            0.0
+        } else {
+            self.misses() as f64 / self.items as f64
+        }
+    }
+
+    /// Folds one item's outcome for this inner field.
+    fn push(&mut self, status: &FieldStatus) {
+        self.items += 1;
+        match status {
+            FieldStatus::Matched => self.matched += 1,
+            FieldStatus::Empty => self.empty += 1,
+            FieldStatus::ContainerEmpty => self.container_empty += 1,
+            FieldStatus::Error { .. } => self.error += 1,
+        }
+    }
+}
+
 /// Per-document extraction report — the quality companion to an extracted
 /// record. `fields` reflects the rule match (before transforms), so it answers
 /// "did the selector find anything?"; `coercion` answers "and was it the right
-/// kind of thing?" for the fields that have a transform chain.
+/// kind of thing?" for the fields that have a transform chain; `each` answers
+/// "and inside the listing, did every inner selector still bind?".
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct DocReport {
     pub fields: BTreeMap<String, FieldStatus>,
@@ -562,6 +628,14 @@ pub struct DocReport {
     /// transforms), so absence means "unknown", never "fine".
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub coercion: BTreeMap<String, CoercionStatus>,
+    /// Per-inner-field outcomes inside [`Rule::Each`] listings, keyed by the
+    /// dotted path from the top-level field (`products.price`, and
+    /// `products.variants.sku` for a nested `each`). ADDITIVE: `fields` still
+    /// carries the listing's own single status, unchanged. Empty on rule sets
+    /// with no `each` rule and on reports built before this existed, so absence
+    /// means "unknown", never "fine".
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub each: BTreeMap<String, InnerFieldStats>,
 }
 
 /// Extracts one document into a JSON object. HTML is parsed at most once (only
@@ -661,8 +735,19 @@ pub(crate) fn extract_one_parsed(
                 fields,
                 container,
             } => {
-                let (items, container_matched) =
-                    each_extract(html.unwrap(), selector, fields, container.as_ref());
+                // The listing's inner outcomes are accumulated only when a
+                // report was asked for — no report, no per-item bookkeeping.
+                let mut acc = want_report.then(EachAcc::default);
+                let (items, container_matched) = each_extract(
+                    html.unwrap(),
+                    selector,
+                    fields,
+                    container.as_ref(),
+                    &mut acc,
+                );
+                if let Some(acc) = acc {
+                    acc.flatten_into(name, fields, &mut report.each);
+                }
                 (Value::Array(items), true, "", container_matched)
             }
         };
@@ -692,22 +777,79 @@ pub(crate) fn extract_one_parsed(
     (Value::Object(obj), report)
 }
 
+/// Accumulates one `each` rule's per-inner-field outcomes across its items
+/// WITHOUT allocating per item: slots are positional (parallel to the compiled
+/// inner field list) and the dotted report paths are built once, at
+/// [`EachAcc::flatten_into`] time. That is what keeps a report over a 5000-row
+/// listing the same size as a report over a 5-row one.
+#[derive(Default)]
+struct EachAcc {
+    slots: Vec<InnerSlot>,
+}
+
+#[derive(Default)]
+struct InnerSlot {
+    stats: InnerFieldStats,
+    /// Present only when the inner rule is itself an `each`.
+    nested: Option<EachAcc>,
+}
+
+impl EachAcc {
+    /// Grows the slot vector to cover every inner field. Called once per item
+    /// (cheap after the first) so an accumulator built for an empty listing
+    /// still knows the shape it was measuring.
+    fn fit(&mut self, n: usize) {
+        if self.slots.len() < n {
+            self.slots.resize_with(n, InnerSlot::default);
+        }
+    }
+
+    /// Writes the accumulated counts into `out`, keyed `{prefix}.{field}`, and
+    /// recurses into nested `each` rules. Iterates the RULE's fields rather
+    /// than the filled slots, so an inner field of an empty listing still gets
+    /// an honest `items: 0` row instead of vanishing from the report.
+    fn flatten_into(
+        mut self,
+        prefix: &str,
+        fields: &[(String, CompiledRule, Vec<CompiledTransform>)],
+        out: &mut BTreeMap<String, InnerFieldStats>,
+    ) {
+        self.fit(fields.len());
+        for (slot, (name, rule, _)) in self.slots.into_iter().zip(fields) {
+            let path = format!("{prefix}.{name}");
+            if let CompiledRule::Each {
+                fields: inner_fields,
+                ..
+            } = rule
+            {
+                slot.nested
+                    .unwrap_or_default()
+                    .flatten_into(&path, inner_fields, out);
+            }
+            out.insert(path, slot.stats);
+        }
+    }
+}
+
 /// Runs an `each` rule, returning `(items, container_matched)`. With no
 /// `container` the items are selected document-wide and `container_matched` is
 /// false (an empty result is just `Empty`, as before). With one, items are
 /// selected *inside* every matching container, and `container_matched` reports
 /// whether the listing element was found at all — the split that separates a
 /// quiet listing from a broken one.
+///
+/// `acc`, when `Some`, collects each item's per-inner-field outcome.
 fn each_extract(
     html: &Html,
     selector: &Selector,
     fields: &[(String, CompiledRule, Vec<CompiledTransform>)],
     container: Option<&Selector>,
+    acc: &mut Option<EachAcc>,
 ) -> (Vec<Value>, bool) {
     match container {
         None => (
             html.select(selector)
-                .map(|el| extract_scoped(el, fields))
+                .map(|el| extract_scoped(el, fields, acc))
                 .collect(),
             false,
         ),
@@ -716,7 +858,43 @@ fn each_extract(
             let mut found = false;
             for root in html.select(container) {
                 found = true;
-                items.extend(root.select(selector).map(|el| extract_scoped(el, fields)));
+                items.extend(
+                    root.select(selector)
+                        .map(|el| extract_scoped(el, fields, acc)),
+                );
+            }
+            (items, found)
+        }
+    }
+}
+
+/// [`each_extract`] for a nested `each`: the same container split, resolved
+/// inside one item element instead of the whole document, so a card's own
+/// sub-listing reports exactly like the top level does.
+fn each_scoped(
+    root: ElementRef,
+    selector: &Selector,
+    fields: &[(String, CompiledRule, Vec<CompiledTransform>)],
+    container: Option<&Selector>,
+    acc: &mut Option<EachAcc>,
+) -> (Vec<Value>, bool) {
+    match container {
+        None => (
+            root.select(selector)
+                .map(|el| extract_scoped(el, fields, acc))
+                .collect(),
+            false,
+        ),
+        Some(container) => {
+            let mut items = Vec::new();
+            let mut found = false;
+            for inner in root.select(container) {
+                found = true;
+                items.extend(
+                    inner
+                        .select(selector)
+                        .map(|el| extract_scoped(el, fields, acc)),
+                );
             }
             (items, found)
         }
@@ -824,49 +1002,83 @@ fn css_extract(
 /// `root`, regex runs over the element's own HTML, and a nested `each` recurses
 /// into `root`'s subtree — so every item's fields stay bound together and a
 /// missing field is a `null` on its own item, never a mis-zipped parallel array.
+///
+/// `acc`, when `Some`, records each inner field's [`FieldStatus`] for this item
+/// — the same pre-transform classification the top level uses, folded into
+/// per-field counts so listing rot is visible without echoing every item.
 fn extract_scoped(
     root: ElementRef,
     fields: &[(String, CompiledRule, Vec<CompiledTransform>)],
+    acc: &mut Option<EachAcc>,
 ) -> Value {
+    if let Some(a) = acc.as_mut() {
+        a.fit(fields.len());
+    }
     let mut obj = Map::with_capacity(fields.len());
-    for (name, rule, transforms) in fields {
-        let mut value = match rule {
+    for (i, (name, rule, transforms)) in fields.iter().enumerate() {
+        // Same tuple shape as the document-level loop: (raw value, whether the
+        // rule could run, error detail, whether a nested container matched).
+        let (mut value, ran, detail, container_matched): (Value, bool, &str, bool) = match rule {
             CompiledRule::Css {
                 selector,
                 attr,
                 all,
                 html: as_html,
-            } => collect_css(root.select(selector), attr.as_deref(), *all, *as_html),
-            CompiledRule::Regex { re, group } => re
-                .captures(&root.html())
-                .and_then(|c| c.get(*group))
-                .map(|m| Value::String(m.as_str().to_string()))
-                .unwrap_or(Value::Null),
-            CompiledRule::Const { value } => value.clone(),
+            } => (
+                collect_css(root.select(selector), attr.as_deref(), *all, *as_html),
+                true,
+                "",
+                false,
+            ),
+            CompiledRule::Regex { re, group } => (
+                re.captures(&root.html())
+                    .and_then(|c| c.get(*group))
+                    .map(|m| Value::String(m.as_str().to_string()))
+                    .unwrap_or(Value::Null),
+                true,
+                "",
+                false,
+            ),
+            CompiledRule::Const { value } => (value.clone(), true, "", false),
             // A nested `each`'s container (when set) is resolved inside this item,
             // so a card's own sub-listing splits the same way the top level does.
             CompiledRule::Each {
                 selector,
-                fields,
+                fields: inner_fields,
                 container,
-            } => Value::Array(match container {
-                None => root
-                    .select(selector)
-                    .map(|el| extract_scoped(el, fields))
-                    .collect(),
-                Some(container) => root
-                    .select(container)
-                    .flat_map(|inner| {
-                        inner
-                            .select(selector)
-                            .map(|el| extract_scoped(el, fields))
-                            .collect::<Vec<_>>()
-                    })
-                    .collect(),
-            }),
-            // json/xpath are rejected at compile inside a container.
-            CompiledRule::Json { .. } | CompiledRule::Xpath { .. } => Value::Null,
+            } => {
+                let (items, matched) = match acc.as_mut() {
+                    Some(a) => {
+                        let nested = &mut a.slots[i].nested;
+                        if nested.is_none() {
+                            *nested = Some(EachAcc::default());
+                        }
+                        each_scoped(root, selector, inner_fields, container.as_ref(), nested)
+                    }
+                    None => {
+                        each_scoped(root, selector, inner_fields, container.as_ref(), &mut None)
+                    }
+                };
+                (Value::Array(items), true, "", matched)
+            }
+            // json/xpath are rejected at compile inside a container, so this arm
+            // is unreachable — and if it ever became reachable it is a rule that
+            // could not run, never a document that had nothing.
+            CompiledRule::Json { .. } | CompiledRule::Xpath { .. } => (
+                Value::Null,
+                false,
+                "'json'/'xpath' rules cannot run inside an 'each' container",
+                false,
+            ),
         };
+        if let Some(a) = acc.as_mut() {
+            a.slots[i].stats.push(&FieldStatus::classify(
+                ran,
+                &value,
+                detail,
+                container_matched,
+            ));
+        }
         for t in transforms {
             value = t.apply(value);
         }
@@ -1206,6 +1418,179 @@ mod tests {
         }))
         .unwrap();
         assert!(ok.compile().is_ok());
+    }
+
+    #[test]
+    fn listing_rot_not_invisible() {
+        // THE REFUTED BEHAVIOR: before per-inner-field reports, a listing whose
+        // `price` selector had died still reported exactly one status for the
+        // whole array — `FieldStatus::Matched`, because the array was full of
+        // objects — and `report.fields` carried NO signal at all that every
+        // single card's price was now null. `report.each` is that signal.
+        use super::{extract_one_with_report, FieldStatus};
+        let rules = ruleset(json!({
+            "products": {
+                "type": "each",
+                "selector": ".card",
+                "fields": {
+                    "name":  {"type": "css", "selector": "h3"},
+                    "price": {"type": "css", "selector": ".price"},
+                    "badge": {"type": "css", "selector": ".badge"}
+                }
+            }
+        }));
+        // 3 cards: name always there, price NOWHERE (the site dropped the
+        // class), badge on exactly one card (legitimately sparse).
+        let healthy = r#"
+            <div class="card"><h3>A</h3><span class="price">$10</span></div>
+            <div class="card"><h3>B</h3><span class="price">$20</span></div>
+            <div class="card"><h3>C</h3><span class="price">$30</span></div>
+        "#;
+        let rotted = r#"
+            <div class="card"><h3>A</h3><span class="amount">$10</span><i class="badge">new</i></div>
+            <div class="card"><h3>B</h3><span class="amount">$20</span></div>
+            <div class="card"><h3>C</h3><span class="amount">$30</span></div>
+        "#;
+
+        let (_, before) = extract_one_with_report(&rules, healthy);
+        assert_eq!(before.fields["products"], FieldStatus::Matched);
+        assert_eq!(before.each["products.price"].items, 3);
+        assert_eq!(before.each["products.price"].matched, 3);
+        assert!(!before.each["products.price"].is_dead());
+
+        let (values, after) = extract_one_with_report(&rules, rotted);
+        // The listing rule itself STILL says Matched — that part is unchanged,
+        // and it is exactly why the old report could not see the rot.
+        assert_eq!(after.fields["products"], FieldStatus::Matched);
+        assert!(!after.fields["products"].is_miss());
+        assert_eq!(values["products"][0]["price"], json!(null));
+
+        // ...but the inner report now shows it, and separates dead from sparse.
+        let price = after.each["products.price"];
+        assert_eq!((price.items, price.matched, price.empty), (3, 0, 3));
+        assert_eq!(price.misses(), 3);
+        assert_eq!(price.miss_rate(), 1.0);
+        assert!(
+            price.is_dead(),
+            "a wholly-dead inner field must read as dead"
+        );
+
+        let badge = after.each["products.badge"];
+        assert_eq!((badge.items, badge.matched, badge.misses()), (3, 1, 2));
+        assert!(
+            !badge.is_dead(),
+            "a sparse field must NOT be confused with a dead one"
+        );
+
+        let name = after.each["products.name"];
+        assert_eq!((name.items, name.matched, name.misses()), (3, 3, 0));
+
+        // serde: the additive map rides the same report the preview endpoint
+        // and the health detector already serialize.
+        let wire = serde_json::to_value(&after).unwrap();
+        assert_eq!(wire["each"]["products.price"]["items"], json!(3));
+        assert_eq!(wire["each"]["products.price"]["empty"], json!(3));
+        // Rule sets with no `each` rule carry no `each` key at all (skip_if_empty),
+        // so an old consumer sees byte-identical JSON.
+        let plain = ruleset(json!({"t": {"type": "css", "selector": "h1"}}));
+        let (_, r) = extract_one_with_report(&plain, "<h1>x</h1>");
+        assert!(r.each.is_empty());
+        assert!(serde_json::to_value(&r).unwrap().get("each").is_none());
+    }
+
+    #[test]
+    fn inner_reports_are_bounded_by_rule_width_not_listing_width() {
+        // 5000 cards, 2 inner fields → 2 report entries. Counts, never lists.
+        use super::extract_one_with_report;
+        let rules = ruleset(json!({
+            "rows": {"type": "each", "selector": ".r", "fields": {
+                "a": {"type": "css", "selector": ".a"},
+                "b": {"type": "css", "selector": ".b"}
+            }}
+        }));
+        let doc: String = (0..5000)
+            .map(|i| format!("<div class=\"r\"><span class=\"a\">{i}</span></div>"))
+            .collect();
+        let (_, report) = extract_one_with_report(&rules, &doc);
+        assert_eq!(report.each.len(), 2);
+        assert_eq!(report.each["rows.a"].items, 5000);
+        assert_eq!(report.each["rows.a"].matched, 5000);
+        assert!(report.each["rows.b"].is_dead());
+    }
+
+    #[test]
+    fn nested_each_inner_fields_report_under_a_dotted_path() {
+        use super::extract_one_with_report;
+        let rules = ruleset(json!({
+            "products": {"type": "each", "selector": ".card", "fields": {
+                "name": {"type": "css", "selector": "h3"},
+                "variants": {"type": "each", "selector": ".v", "container": ".variants",
+                             "fields": {"sku": {"type": "css", "selector": ".sku"},
+                                        "size": {"type": "css", "selector": ".size"}}}
+            }}
+        }));
+        let doc = r#"
+            <div class="card"><h3>A</h3><div class="variants">
+              <div class="v"><span class="sku">a-1</span></div>
+              <div class="v"><span class="sku">a-2</span></div>
+            </div></div>
+            <div class="card"><h3>B</h3><div class="variants"></div></div>
+        "#;
+        let (_, report) = extract_one_with_report(&rules, doc);
+        // Two cards; the second's variants container matched but was quiet, so
+        // the nested `each` field is a hit on that item, not a miss.
+        let variants = report.each["products.variants"];
+        assert_eq!((variants.items, variants.matched), (2, 1));
+        assert_eq!(variants.container_empty, 1);
+        assert_eq!(variants.misses(), 0);
+        assert!(!variants.is_dead());
+        // The nested inner fields report under the dotted path, over the ITEMS
+        // of the nested listing (2 variants total, both on card A).
+        let sku = report.each["products.variants.sku"];
+        assert_eq!((sku.items, sku.matched), (2, 2));
+        let size = report.each["products.variants.size"];
+        assert_eq!((size.items, size.matched, size.empty), (2, 0, 2));
+        assert!(size.is_dead());
+    }
+
+    #[test]
+    fn empty_listing_reports_zero_items_not_a_dead_field() {
+        // A container that matched but held nothing: every inner field is an
+        // honest `items: 0` row — present in the report (so it is discoverable)
+        // and NOT dead (there was nothing to extract from).
+        use super::{extract_one_with_report, FieldStatus};
+        let rules = ruleset(json!({
+            "jobs": {"type": "each", "selector": ".job", "container": "#listing",
+                     "fields": {"title": {"type": "css", "selector": "h3"}}}
+        }));
+        let (_, r) = extract_one_with_report(&rules, r#"<div id="listing"><p>none</p></div>"#);
+        assert_eq!(r.fields["jobs"], FieldStatus::ContainerEmpty);
+        let title = r.each["jobs.title"];
+        assert_eq!((title.items, title.matched, title.misses()), (0, 0, 0));
+        assert!(!title.is_dead());
+        assert_eq!(title.miss_rate(), 0.0);
+    }
+
+    #[test]
+    fn inner_stats_count_a_hit_exactly_like_field_status_is_miss() {
+        // The two miss conventions must not drift: `InnerFieldStats::misses`
+        // counts precisely the statuses `FieldStatus::is_miss` returns true for.
+        use super::{FieldStatus, InnerFieldStats};
+        for status in [
+            FieldStatus::Matched,
+            FieldStatus::Empty,
+            FieldStatus::ContainerEmpty,
+            FieldStatus::Error { detail: "x".into() },
+        ] {
+            let mut s = InnerFieldStats::default();
+            s.push(&status);
+            assert_eq!(
+                s.misses() == 1,
+                status.is_miss(),
+                "miss convention diverged for {status:?}"
+            );
+            assert_eq!(s.hits() + s.misses(), s.items);
+        }
     }
 
     #[test]
