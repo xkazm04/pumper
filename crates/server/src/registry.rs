@@ -63,7 +63,8 @@ pub(crate) struct VirtualNamespace {
     /// The `app` value revisions land under, and that a watch must name.
     pub name: &'static str,
     /// The registered apps that publish into it. Pinned by test: an entry whose
-    /// publishers are no longer registered is stale.
+    /// publishers are no longer registered — or that never wrote into the
+    /// namespace at all — is stale.
     pub publishers: &'static [&'static str],
     /// Why it exists, quoted at operators in the refusal message.
     pub note: &'static str,
@@ -79,7 +80,12 @@ pub(crate) const VIRTUAL_NAMESPACES: &[VirtualNamespace] = &[VirtualNamespace {
     // grant source apps, not on `grants-common`; `virtual_namespace_publishers_are_registered`
     // pins the entry against the registry instead.
     name: "grants",
-    publishers: &["grants-gov", "ca-grants", "eu-sedia", "cordis"],
+    // `cordis` is deliberately NOT here. It is an EU-funding app, but it writes
+    // only its own `cordis/projects` + `cordis/topic_stats` and never calls
+    // `grants_common::finalize_unified` — so `publishes_into("cordis")` used to
+    // redirect an operator who watched `cordis` to a namespace that will never
+    // carry one of its revisions.
+    publishers: &["grants-gov", "ca-grants", "eu-sedia"],
     note: "the cross-source unified grants namespace every grant source publishes into",
 }];
 
@@ -273,6 +279,41 @@ mod virtual_namespace_tests {
         }
     }
 
+    /// Registration is not publication. The previous check only asked whether a
+    /// declared publisher **exists**, which is why `cordis` — a registered EU
+    /// funding app that writes only its own two datasets and never calls
+    /// `finalize_unified` — sat in the `grants` publisher list vouching for
+    /// records it will never write, and `publishes_into("cordis")` redirected
+    /// operators to a namespace none of its revisions ever reach.
+    ///
+    /// The pin available from this crate is the app's own manifest: a
+    /// cross-source publisher describes the shared layer's result block in its
+    /// declared `output_shape`. (The converse is deliberately NOT asserted — a
+    /// `unified` block is a shared idiom, and the trades apps have their own —
+    /// and it does not need to be: this list is only a bootstrap seed, and the
+    /// running authority for "what can be watched" is the store, which knows
+    /// every namespace that actually holds a record.)
+    #[test]
+    fn a_namespace_never_names_a_publisher_that_writes_nothing_into_it() {
+        let apps = apps();
+        for ns in VIRTUAL_NAMESPACES {
+            for publisher in ns.publishers {
+                let app = apps
+                    .iter()
+                    .find(|a| a.name() == *publisher)
+                    .expect("checked registered above");
+                let shape = app.manifest().output_shape.unwrap_or("");
+                assert!(
+                    shape.contains("unified"),
+                    "virtual namespace '{}' claims publisher '{publisher}', whose manifest \
+                     describes no cross-source unified block — either it never publishes \
+                     there (drop it from the seed) or its manifest is stale",
+                    ns.name
+                );
+            }
+        }
+    }
+
     /// A namespace that is also a registered app is not virtual; leaving it in
     /// the seed would mean two answers to "what is this name" and a refusal
     /// message that names the wrong one.
@@ -297,8 +338,11 @@ mod virtual_namespace_tests {
             assert_eq!(ns.name, "grants");
             assert!(!ns.note.is_empty(), "the redirect has to explain itself");
         }
-        // An app that publishes only under its own name has no redirect to give.
+        // An app that publishes only under its own name has no redirect to give
+        // — including `cordis`, whose records land in `cordis/*` and nowhere
+        // else, so a redirect would have sent an operator to the wrong place.
         assert!(publishes_into("hackernews").is_none());
+        assert!(publishes_into("cordis").is_none());
     }
 }
 

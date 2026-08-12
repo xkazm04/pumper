@@ -19,14 +19,18 @@
 //! joined from the `cordis` app's `topic_stats` dataset — funded-outcome priors
 //! (project count, EU contribution, top participant orgs) for the topic's
 //! predecessor family, keyed by [`topic_lineage`]. Topics whose family has no
-//! stats get no block. Queryable via `?filter=history.stats.project_count:gte:1`.
+//! stats — or whose family has been **tombstoned** because it left the CORDIS
+//! corpus — get no block. The block carries `as_of` (when cordis last confirmed
+//! those numbers) and, inside `stats`, cordis's own `coverage`: the walk takes
+//! ~46 weeks, so these are partial-corpus priors for most of a year and must
+//! say so. Queryable via `?filter=history.stats.project_count:gte:1`.
 
 use std::collections::HashMap;
 
 use async_trait::async_trait;
 use pumper_core::{
     html_to_markdown, AppContext, AppManifest, CostClass, Error, HttpMethod, HttpRequest,
-    ManifestExample, Provenance, Result, ScrapeApp,
+    ManifestExample, Provenance, Record, Result, ScrapeApp,
 };
 use serde_json::{json, Value};
 
@@ -120,7 +124,10 @@ impl ScrapeApp for EuSedia {
                  source gets there first, so a run that did not own it reports \
                  `crossSourceDups`/`recurrenceLinks` as null (not 0) — normalized topics in \
                  the `opportunities` dataset (keyed by topic identifier), Horizon topics \
-                 carrying a `history` block joined from cordis/topic_stats",
+                 carrying a `history` block joined from cordis/topic_stats \
+                 (`{family, source, as_of, stats}`, where `stats.coverage` says how much of \
+                 the ~23k-project CORDIS corpus those priors rest on; a tombstoned family \
+                 yields no block)",
             ),
             cost_class: CostClass::Free,
         }
@@ -235,23 +242,20 @@ impl ScrapeApp for EuSedia {
             let Some(family) = topic_lineage(key) else {
                 continue;
             };
-            let stats = match family_stats.get(&family) {
+            let block = match family_stats.get(&family) {
                 Some(cached) => cached.clone(),
                 None => {
                     let fetched = ctx
                         .datasets
                         .get("cordis", "topic_stats", &family)
                         .await?
-                        .map(|r| r.data);
+                        .and_then(|rec| history_block(&family, rec));
                     family_stats.insert(family.clone(), fetched.clone());
                     fetched
                 }
             };
-            if let (Some(stats), Value::Object(map)) = (stats, &mut *record) {
-                map.insert(
-                    "history".into(),
-                    json!({ "family": family, "source": "cordis", "stats": stats }),
-                );
+            if let (Some(block), Value::Object(map)) = (block, &mut *record) {
+                map.insert(HISTORY_FIELD.into(), block);
                 history_joined += 1;
             }
         }
@@ -315,6 +319,39 @@ impl ScrapeApp for EuSedia {
         }
         Ok(out)
     }
+}
+
+/// The record field the CORDIS win-intelligence join writes into. Named once
+/// because two things have to agree about it: the join below, and the
+/// derived-path declaration at the upsert.
+const HISTORY_FIELD: &str = "history";
+
+/// The `history` block for one open topic, or `None` when there is nothing
+/// honest to attach.
+///
+/// A **tombstoned** stats record yields `None`. cordis's rollup is a complete
+/// recompute, so a family whose projects left the corpus is tombstoned — and
+/// `Datasets::get` returns tombstoned rows (only the filtered/list reads exclude
+/// them). Joining one anyway is exactly how a ghost family outlives the corpus
+/// it was computed from and keeps being served as a funded-outcome prior.
+///
+/// `as_of` comes off the record **envelope**, not out of the stats value: the
+/// store refreshes `last_seen` on every rollup, unchanged families included, so
+/// it is the honest "cordis last confirmed these numbers at" — and it costs no
+/// weekly content churn on every family the way a stamped field would.
+fn history_block(family: &str, rec: Record) -> Option<Value> {
+    if rec.removed_at.is_some() {
+        return None;
+    }
+    Some(json!({
+        "family": family,
+        "source": "cordis",
+        "as_of": rec.last_seen.to_rfc3339(),
+        // Carries cordis's own `coverage` block: how much of the ~23k-project
+        // corpus these numbers rest on. A partial-walk prior must not read like
+        // a complete one.
+        "stats": rec.data,
+    }))
 }
 
 /// Horizon topic-family key: the identifier with its call-year segment removed,
@@ -635,5 +672,114 @@ mod tests {
         let (_, rec) = normalize(&hit);
         assert!(rec["description_text"].is_null());
         assert!(rec["descriptionByte"].is_null());
+    }
+}
+
+/// The CORDIS win-intelligence join, end to end against a real store — because
+/// what it must NOT join (a tombstoned family) is a property of the store, not
+/// of any pure function.
+#[cfg(test)]
+mod history_join_tests {
+    use super::*;
+    use pumper_core::testing::{engines_with, Dead, TempStore, TestContext};
+    use pumper_core::HttpResponse;
+    use std::sync::Arc;
+
+    /// Two open Horizon topics, one per family — a SEDIA response with nothing
+    /// interesting in it except the two identifiers the join keys on.
+    struct ScriptedSedia;
+
+    #[async_trait]
+    impl pumper_core::HttpClient for ScriptedSedia {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            let hit = |id: &str| {
+                json!({
+                    "reference": id, "url": "https://ec.europa.eu/x", "summary": "s",
+                    "metadata": {
+                        "identifier": [id], "title": ["T"], "status": ["31094502"],
+                    }
+                })
+            };
+            let body = json!({
+                "totalResults": 2,
+                "results": [
+                    hit("HORIZON-CL4-2026-DATA-01"),
+                    hit("HORIZON-CL4-2026-GHOST-01"),
+                ]
+            });
+            Ok(HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: body.to_string(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    /// A family that left the CORDIS corpus is tombstoned by the rollup — and
+    /// `Datasets::get` still returns tombstoned rows, so the join used to keep
+    /// serving its stats as a live funded-outcome prior forever.
+    #[tokio::test]
+    async fn a_tombstoned_family_yields_no_history_block() {
+        let store = TempStore::new("eu-sedia-history").await;
+        let ds = store.datasets();
+        let stats = |family: &str| {
+            json!({
+                "family": family, "project_count": 3, "contribution_known": 3,
+                "total_ec_contribution": 6_300_000.0, "mean_ec_contribution": 2_100_000.0,
+                "top_participants": [], "coverage": {
+                    "corpus_aggregated": 1_200, "corpus_total": 23_361, "corpus_swept": false
+                }
+            })
+        };
+        for family in ["HORIZON-CL4-DATA-01", "HORIZON-CL4-GHOST-01"] {
+            ds.upsert("cordis", "topic_stats", family, &stats(family))
+                .await
+                .unwrap();
+        }
+        ds.tombstone_keys(
+            "cordis",
+            "topic_stats",
+            &["HORIZON-CL4-GHOST-01".to_string()],
+        )
+        .await
+        .unwrap();
+
+        let engines = engines_with(Arc::new(ScriptedSedia), Arc::new(Dead), Arc::new(Dead));
+        let ctx = TestContext::new(&store.storage, "eu-sedia")
+            .params(json!({ "pageSize": 100, "maxPages": 1 }))
+            .engines(engines)
+            .build();
+        let out = EuSedia.run(ctx).await.expect("run");
+        assert_eq!(out["fetched"], 2);
+        assert_eq!(out["historyJoined"], 1, "the ghost must not be joined");
+
+        let live = ds
+            .get("eu-sedia", "opportunities", "HORIZON-CL4-2026-DATA-01")
+            .await
+            .unwrap()
+            .unwrap();
+        let history = &live.data["history"];
+        assert_eq!(history["family"], "HORIZON-CL4-DATA-01");
+        assert_eq!(history["source"], "cordis");
+        // Partial-corpus context rides through to the consumer.
+        assert_eq!(history["stats"]["coverage"]["corpus_aggregated"], 1_200);
+        assert_eq!(history["stats"]["coverage"]["corpus_swept"], false);
+        assert!(
+            history["as_of"].as_str().is_some_and(|s| s.contains('T')),
+            "the block must say when cordis last confirmed these numbers: {history}"
+        );
+
+        let ghost = ds
+            .get("eu-sedia", "opportunities", "HORIZON-CL4-2026-GHOST-01")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            ghost.data.get("history").is_none(),
+            "a removed family must leave no history behind: {}",
+            ghost.data
+        );
     }
 }

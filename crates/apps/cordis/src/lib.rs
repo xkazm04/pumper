@@ -403,18 +403,48 @@ impl ScrapeApp for Cordis {
 
         // Re-aggregate topic families over the WHOLE stored corpus (not just
         // this run's window) so stats stay consistent while the cursor sweeps.
-        // Change detection makes untouched families free.
+        // Change detection makes untouched families free. Tombstoned rows are
+        // excluded — `list` returns them, and a removed project must not keep
+        // counting toward a family's funded-outcome numbers.
         let corpus = ctx
             .datasets
-            .list(&ctx.app, "projects", AGGREGATE_LIMIT)
+            .list_filtered(&ctx.app, "projects", &[], None, AGGREGATE_LIMIT)
             .await?;
         let corpus_values: Vec<&Value> = corpus.iter().map(|r| &r.data).collect();
-        let stats = aggregate_topic_stats(&corpus_values);
+        let coverage = Coverage {
+            aggregated: corpus.len(),
+            listing_total: Some(total),
+            swept: end == SweepEnd::Complete,
+        };
+        let stats = aggregate_topic_stats(&corpus_values, coverage);
         let families = stats.len();
+        let mut warnings: Vec<String> = Vec::new();
         // A rollup over thousands of stored projects from as many URLs: only job
-        // lineage is knowable, so `upsert_many`'s automatic job_id stamp is the
-        // whole honest provenance here. Naming one source_url would be a lie.
-        let stats_summary = ctx.upsert_many("topic_stats", &stats).await?;
+        // lineage is knowable, so the automatic job_id stamp is the whole honest
+        // provenance here. Naming one source_url would be a lie.
+        //
+        // The rollup is a COMPLETE recompute over the stored corpus, so the batch
+        // IS this dataset's whole current state and a family that left the corpus
+        // has to disappear — `sync_many`, not `upsert_many` (which left the ghost
+        // row behind forever, and eu-sedia kept joining it onto open topics).
+        // The one precondition: the corpus read must not itself have been
+        // truncated. A read that came back at the cap is a WINDOW, and syncing a
+        // window would tombstone every family whose projects fell outside it — so
+        // the cap doubles as the switch that turns removal detection off, and it
+        // is never silent.
+        let complete_read = rollup_is_complete(corpus.len(), AGGREGATE_LIMIT);
+        let stats_summary = if complete_read {
+            ctx.sync_many("topic_stats", &stats).await?
+        } else {
+            warnings.push(format!(
+                "topic_stats rollup aggregated only the newest {} stored projects \
+                 (AGGREGATE_LIMIT = {AGGREGATE_LIMIT}): the family stats are PARTIAL, and \
+                 removal detection is switched off for this run so families outside the \
+                 window are not tombstoned",
+                corpus.len()
+            ));
+            ctx.upsert_many("topic_stats", &stats).await?
+        };
 
         // Persist the resume cursor. It wraps to the top of the corpus ONLY on a
         // proven-complete walk; every other ending keeps the place this run
@@ -448,6 +478,8 @@ impl ScrapeApp for Cordis {
             "families": families,
             "stats_new": stats_summary.new.len(),
             "stats_changed": stats_summary.changed.len(),
+            "stats_removed": stats_summary.removed.len(),
+            "aggregate_truncated": !complete_read,
             "cursor_next_page": next_offset / page_size + 1,
             "cursor_next_offset": next_offset,
             "sweep": end.as_str(),
@@ -455,15 +487,17 @@ impl ScrapeApp for Cordis {
         });
         if end == SweepEnd::ShortPage {
             // Loud, because the silent version of this cost ~46 weeks of walk.
-            let msg = format!(
+            warnings.push(format!(
                 "listing page {page} returned {} of {page_size} results while the API reports \
                  {total} total — treated as a TRUNCATED page, not the end of the corpus: the \
                  resume cursor keeps its place ({}) and `corpus_swept` is false",
                 consumed.min(page_size),
                 start_offset + consumed
-            );
+            ));
+        }
+        if !warnings.is_empty() {
             if let Value::Object(map) = &mut out {
-                map.insert("warnings".into(), json!([msg]));
+                map.insert("warnings".into(), json!(warnings));
             }
         }
         Ok(out)
@@ -827,6 +861,54 @@ fn start_year(s: &str) -> Option<u64> {
     (1980..=2100).contains(&y).then_some(y)
 }
 
+/// What a `topic_stats` rollup's numbers actually rest on.
+///
+/// The walk takes ~46 weeks, so for most of a year these are **partial-corpus**
+/// aggregates — and eu-sedia embeds them verbatim into every open Horizon topic
+/// as a funded-outcome prior. Without this block a reader cannot tell "3
+/// projects funded, out of the 3 that exist in this family" from "3 so far, out
+/// of a corpus we have walked 5% of", and the second presented as the first is
+/// the difference between a prior and a lie.
+#[derive(Debug, Clone, Copy)]
+struct Coverage {
+    /// Stored project records this rollup aggregated.
+    aggregated: usize,
+    /// The listing's own reported corpus size, when stage 1 knows it. `None`
+    /// writes `Null` — never a fabricated 0.
+    listing_total: Option<u64>,
+    /// Whether the walk has provably covered the whole corpus ([`SweepEnd`]).
+    swept: bool,
+}
+
+impl Coverage {
+    /// The `coverage` block every stats record carries.
+    ///
+    /// Deliberately carries **no timestamp**. The store already stamps
+    /// `last_seen` on every rollup — including one that changed nothing — so a
+    /// stamped `as_of` would buy nothing except a content change on every
+    /// family every week, which eu-sedia would then propagate onto every joined
+    /// Horizon topic. The as-of is read off the record envelope instead
+    /// (eu-sedia surfaces it as `history.as_of`).
+    fn block(self) -> Value {
+        json!({
+            "corpus_aggregated": self.aggregated,
+            "corpus_total": self.listing_total,
+            "corpus_swept": self.swept,
+        })
+    }
+}
+
+/// Whether the rollup's batch may be treated as the COMPLETE current state of
+/// `topic_stats` — the precondition for removal detection.
+///
+/// The corpus read is capped at [`AGGREGATE_LIMIT`]. A read that came back AT
+/// the cap is a window over the corpus, not the corpus: syncing it would
+/// tombstone every family whose projects fell outside the window. So the cap is
+/// also the switch that turns removals off — and the caller reports it.
+fn rollup_is_complete(corpus_rows: usize, limit: i64) -> bool {
+    (corpus_rows as i64) < limit
+}
+
 /// Per-topic-family win stats over the project corpus. Only projects whose
 /// `topic` (sub-call, falling back to master-call identifier) yields a Horizon
 /// lineage family participate (non-Horizon topics have no family — see
@@ -836,7 +918,10 @@ fn start_year(s: &str) -> Option<u64> {
 /// numbers actually rest on. Participant leaderboard counts each org (any
 /// role, coordinator included) once per project, bounded to the top 10
 /// (count-desc, then name for determinism).
-fn aggregate_topic_stats(projects: &[&Value]) -> Vec<(String, Value)> {
+///
+/// Every record carries the [`Coverage`] block: these numbers are a claim about
+/// whatever share of the corpus has been walked so far, and they must say so.
+fn aggregate_topic_stats(projects: &[&Value], coverage: Coverage) -> Vec<(String, Value)> {
     struct Family {
         count: u64,
         known: Vec<f64>,
@@ -914,6 +999,7 @@ fn aggregate_topic_stats(projects: &[&Value]) -> Vec<(String, Value)> {
                 "top_participants": top,
                 "first_start_year": f.years.iter().min(),
                 "last_start_year": f.years.iter().max(),
+                "coverage": coverage.block(),
             });
             (family, stats)
         })
@@ -1297,6 +1383,16 @@ mod tests {
         })
     }
 
+    /// A mid-walk rollup: `n` projects aggregated out of a ~23k corpus that has
+    /// NOT been swept — the state cordis is in for ~46 weeks of every year.
+    fn cov(n: usize) -> Coverage {
+        Coverage {
+            aggregated: n,
+            listing_total: Some(23_361),
+            swept: false,
+        }
+    }
+
     #[test]
     fn aggregate_groups_years_into_one_family_and_averages_known_only() {
         let a = proj(
@@ -1314,7 +1410,7 @@ mod tests {
         let c = proj("HORIZON-CL4-2024-DATA-01", None, "VTT", &[]);
         let d = proj("ERASMUS-EDU-2024-X", Some(1.0), "NOPE", &[]); // no family
         let refs: Vec<&Value> = vec![&a, &b, &c, &d];
-        let stats = aggregate_topic_stats(&refs);
+        let stats = aggregate_topic_stats(&refs, cov(refs.len()));
         assert_eq!(stats.len(), 1);
         let (family, s) = &stats[0];
         assert_eq!(family, "HORIZON-CL4-DATA-01");
@@ -1334,7 +1430,7 @@ mod tests {
     fn aggregate_with_no_known_contributions_reports_null_not_zero() {
         let a = proj("HORIZON-EIC-2025-PATHFINDEROPEN-01", None, "ETH", &[]);
         let refs: Vec<&Value> = vec![&a];
-        let stats = aggregate_topic_stats(&refs);
+        let stats = aggregate_topic_stats(&refs, cov(refs.len()));
         let s = &stats[0].1;
         assert_eq!(s["project_count"], 1);
         assert!(s["total_ec_contribution"].is_null());
@@ -1348,7 +1444,7 @@ mod tests {
         let a = proj("HORIZON-CL5-2024-D3-01", Some(1.0), "ZZZ-COORD", &org_refs);
         let b = proj("HORIZON-CL5-2022-D3-01", Some(1.0), "ORG-03", &[]);
         let refs: Vec<&Value> = vec![&a, &b];
-        let stats = aggregate_topic_stats(&refs);
+        let stats = aggregate_topic_stats(&refs, cov(refs.len()));
         let top = stats[0].1["top_participants"].as_array().unwrap();
         assert_eq!(top.len(), 10, "leaderboard must stay bounded");
         // ORG-03 appears in both projects → count 2, ranked first.
@@ -1356,6 +1452,64 @@ mod tests {
         assert_eq!(top[0]["projects"], 2);
         // Ties broken by name for determinism.
         assert_eq!(top[1]["org"], "ORG-00");
+    }
+
+    // ── Rollup honesty: what the numbers rest on ──
+
+    /// The anti-pattern: "3 projects funded, mean €2.1M" published with no way
+    /// to tell whether that is the whole family or the 5% of the corpus walked
+    /// so far — and eu-sedia embedding exactly that into every Horizon topic.
+    #[test]
+    fn partial_corpus_stats_say_so_instead_of_reading_as_the_whole_truth() {
+        let a = proj("HORIZON-CL4-2022-DATA-01", Some(2_100_000.0), "FHG", &[]);
+        let refs: Vec<&Value> = vec![&a];
+        let mid_walk = aggregate_topic_stats(&refs, cov(1_200));
+        let c = &mid_walk[0].1["coverage"];
+        assert_eq!(c["corpus_aggregated"], 1_200);
+        assert_eq!(c["corpus_total"], 23_361);
+        assert_eq!(c["corpus_swept"], false, "3 of ~23k walked, and it says so");
+
+        // …and the same family after a proven-complete sweep is a different
+        // claim entirely, even with identical numbers.
+        let swept = aggregate_topic_stats(
+            &refs,
+            Coverage {
+                aggregated: 23_361,
+                listing_total: Some(23_361),
+                swept: true,
+            },
+        );
+        assert_eq!(swept[0].1["coverage"]["corpus_swept"], true);
+        assert_eq!(swept[0].1["project_count"], mid_walk[0].1["project_count"]);
+        assert_ne!(swept[0].1["coverage"], mid_walk[0].1["coverage"]);
+    }
+
+    #[test]
+    fn an_unknown_listing_total_is_null_not_a_fabricated_zero() {
+        let a = proj("HORIZON-CL4-2022-DATA-01", Some(1.0), "FHG", &[]);
+        let refs: Vec<&Value> = vec![&a];
+        let stats = aggregate_topic_stats(
+            &refs,
+            Coverage {
+                aggregated: 1,
+                listing_total: None,
+                swept: false,
+            },
+        );
+        assert!(stats[0].1["coverage"]["corpus_total"].is_null());
+    }
+
+    /// The tripwire on [`AGGREGATE_LIMIT`]. A corpus read that came back AT the
+    /// cap is a window, and the anti-pattern is syncing a window as if it were
+    /// the whole dataset — which tombstones every family outside it.
+    #[test]
+    fn a_truncated_corpus_read_is_not_a_complete_state_to_sync_from() {
+        assert!(rollup_is_complete(199_999, AGGREGATE_LIMIT));
+        assert!(!rollup_is_complete(200_000, AGGREGATE_LIMIT));
+        assert!(!rollup_is_complete(200_001, AGGREGATE_LIMIT));
+        // An empty corpus is a complete (if uninteresting) state — and
+        // `detect_removed` refuses an empty batch anyway.
+        assert!(rollup_is_complete(0, AGGREGATE_LIMIT));
     }
 
     #[test]
@@ -1369,7 +1523,7 @@ mod tests {
             "start_year": 2022,
         });
         let refs: Vec<&Value> = vec![&legacy];
-        let stats = aggregate_topic_stats(&refs);
+        let stats = aggregate_topic_stats(&refs, cov(refs.len()));
         let top = stats[0].1["top_participants"].as_array().unwrap();
         assert_eq!(top.len(), 2);
     }
@@ -1395,16 +1549,29 @@ mod walk_tests {
         total_override: Option<u64>,
         /// (1-based page, hits it returns) — a truncated page mid-corpus.
         short_page: Option<(u64, usize)>,
+        /// How many distinct topic families the detail responses spread over.
+        families: usize,
     }
 
     impl ScriptedCordis {
         fn of(n: usize) -> Self {
             Self {
-                corpus: (0..n).map(|i| format!("{:06}", 100_000 + i)).collect(),
+                corpus: (0..n).map(id_at).collect(),
                 total_override: None,
                 short_page: None,
+                families: 1,
             }
         }
+    }
+
+    /// The listing id at corpus position `i`.
+    fn id_at(i: usize) -> String {
+        format!("{:06}", 100_000 + i)
+    }
+
+    /// The family key the scripted detail for `id` rolls up into.
+    fn family_at(i: usize, families: usize) -> String {
+        format!("HORIZON-CL4-DATA-{:02}", i % families + 1)
     }
 
     #[async_trait]
@@ -1436,13 +1603,17 @@ mod walk_tests {
                 } })
             } else {
                 let id = parsed.path().rsplit('/').next().unwrap().to_string();
+                let idx: usize = id.parse::<usize>().unwrap() - 100_000;
+                // Same lineage family as `family_at`, with a call year the
+                // lineage grammar strips.
+                let topic = format!("HORIZON-CL4-2022-DATA-{:02}", idx % self.families + 1);
                 json!({
                     "rcn": id, "id": id, "acronym": "ACR", "title": "T",
                     "ecMaxContribution": "1000000", "totalCost": "2000000",
                     "startDate": "2022-06-01", "status": "SIGNED",
                     "relations": { "associations": {
                         "1": { "attributes": { "type": "relatedSubCall" },
-                               "identifier": "HORIZON-CL4-2022-DATA-01" },
+                               "identifier": topic },
                         "2": { "legalName": "ORG",
                                "attributes": { "type": "coordinator",
                                                "ecContribution": "500000", "order": 1 } }
@@ -1545,9 +1716,8 @@ mod walk_tests {
 
         // Now the drifted query: syntactically fine, semantically empty.
         let drifted = ScriptedCordis {
-            corpus: Vec::new(),
             total_override: Some(0),
-            short_page: None,
+            ..ScriptedCordis::of(0)
         };
         let err = run(&store, drifted, params)
             .await
@@ -1559,6 +1729,75 @@ mod walk_tests {
         assert_eq!(
             state.data["next_offset"], 50,
             "a drifted listing must not move — let alone wrap — the cursor"
+        );
+    }
+
+    /// The ghost: the rollup is a complete recompute, but it used to be written
+    /// with `upsert_many` — so a family whose projects left the corpus kept its
+    /// stale row forever, and eu-sedia kept joining that row onto open topics as
+    /// a funded-outcome prior. It has to disappear.
+    #[tokio::test]
+    async fn a_family_that_leaves_the_corpus_is_tombstoned_not_left_as_a_ghost() {
+        let store = TempStore::new("cordis-ghost").await;
+        let ds = store.datasets();
+        let params = json!({ "pageSize": 10, "maxProjects": 100 });
+
+        let first = run(
+            &store,
+            ScriptedCordis {
+                families: 2,
+                ..ScriptedCordis::of(10)
+            },
+            params.clone(),
+        )
+        .await
+        .expect("run 1");
+        assert_eq!(first["families"], 2);
+        assert_eq!(first["stats_new"], 2);
+        assert_eq!(first["stats_removed"], 0);
+        assert_eq!(first["aggregate_truncated"], false);
+        // The partial-walk coverage rode along into the stored stats.
+        let ghost_key = family_at(1, 2);
+        let ghost = ds
+            .get("cordis", "topic_stats", &ghost_key)
+            .await
+            .unwrap()
+            .expect("family 02 exists");
+        assert_eq!(ghost.data["coverage"]["corpus_aggregated"], 10);
+        assert_eq!(ghost.data["coverage"]["corpus_swept"], true);
+        assert!(ghost.removed_at.is_none());
+
+        // Family 02's projects leave the corpus (a purge, a delisting, a
+        // re-scoped query) and the listing no longer offers them.
+        for i in (1..10).step_by(2) {
+            assert!(ds
+                .delete_record("cordis", "projects", &id_at(i))
+                .await
+                .unwrap());
+        }
+        let survivors: Vec<String> = (0..10).step_by(2).map(id_at).collect();
+        let second = run(
+            &store,
+            ScriptedCordis {
+                corpus: survivors,
+                families: 2,
+                ..ScriptedCordis::of(0)
+            },
+            params,
+        )
+        .await
+        .expect("run 2");
+
+        assert_eq!(second["families"], 1, "only family 01 is left");
+        assert_eq!(second["stats_removed"], 1, "the ghost has to die");
+        let dead = ds
+            .get("cordis", "topic_stats", &ghost_key)
+            .await
+            .unwrap()
+            .expect("the row is tombstoned, not deleted");
+        assert!(
+            dead.removed_at.is_some(),
+            "a family that left the corpus must not keep serving stale stats"
         );
     }
 

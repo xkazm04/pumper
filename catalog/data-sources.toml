@@ -642,6 +642,46 @@ participants = "array"
 ec_contribution = { min = 0.0, max = 2000000000.0 }
 total_cost = { min = 0.0, max = 2000000000.0 }
 
+# The SECOND data product of the same app (the reconciler keys schedules per
+# APP, so this row adds no second schedule — it exists to give `topic_stats` its
+# own declared contract and its own freshness row on /sources). It is a rollup,
+# not a fetch: no URL of its own beyond the corpus it aggregates.
+[[source]]
+id = "cordis-topic-stats"
+app = "cordis"
+market = "eu"
+name = "CORDIS topic-family win statistics (rollup of cordis/projects)"
+url = "https://cordis.europa.eu/project/id/{id}?format=json"
+category = "awarded-history"
+engine = "http"
+access = "key-free"
+cadence = "weekly"
+cron = "0 0 7 * * 1"
+status = "live"
+confidence = 3
+dataset = "topic_stats"
+notes = "Per-topic-lineage-family funded-outcome rollup recomputed over the WHOLE stored cordis/projects corpus on every run, and joined by eu-sedia onto open Horizon topics as a `history` block. Written with sync_many since 2026-08-12: the batch is a complete recompute, so a family whose projects left the corpus is TOMBSTONED instead of lingering as a ghost row eu-sedia kept serving. Every record carries a `coverage` block ({corpus_aggregated, corpus_total, corpus_swept}) because the walk takes ~46 weeks — these are partial-corpus priors for most of a year and must say so. If the corpus read ever comes back at AGGREGATE_LIMIT (200k, ~8.7x the corpus) the rollup is partial and removal detection is switched off for that run, reported as aggregate_truncated + a warning."
+
+# Removals are now legitimate here (a family can genuinely leave the corpus),
+# which is exactly why max_row_delta_pct is declared: it is the mass-tombstone
+# tripwire on the new sync path. `coverage` is required because a stats record
+# without it is a partial-corpus number presented as the whole truth.
+[source.contract]
+required_fields = ["family", "project_count", "coverage"]
+max_row_delta_pct = 10.0
+max_staleness_hours = 192
+
+[source.contract.types]
+family = "string"
+project_count = "number"
+coverage = "object"
+top_participants = "array"
+
+[source.contract.ranges]
+project_count = { min = 0.0, max = 100000.0 }
+mean_ec_contribution = { min = 0.0, max = 2000000000.0 }
+total_ec_contribution = { min = 0.0, max = 2000000000000.0 }
+
 # ── Personas connector API-doc monitoring (feeds curated marketplace events) ──
 
 [[source]]
