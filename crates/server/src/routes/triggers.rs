@@ -24,32 +24,65 @@ pub(crate) struct TriggersQuery {
     cursor: Option<String>,
 }
 
+/// The values `GET /triggers?app=` may take.
+///
+/// Wider than the watch namespace set on purpose, and the widening is the whole
+/// reason this is a separate function: the filter binds against
+/// `triggers.source_app`, and a `source_kind = "external"` trigger's source is
+/// an **ingress source id** (or `*`), not an app at all. Validating trigger
+/// filters against the watch set alone would 400 a filter that returns rows.
+///
+/// Stored `source_app` values are unioned in for the same reason
+/// `watch_filter_values` unions stored watch apps: whatever exists must stay
+/// filterable.
+async fn trigger_filter_values(
+    state: &AppState,
+) -> Result<std::collections::BTreeSet<String>, ApiError> {
+    let index = super::watches::namespace_index(state).await?;
+    let mut values = super::watches::watch_filter_values(state, &index).await?;
+    values.extend(state.storage.trigger_source_apps().await?);
+    values.extend(
+        state
+            .storage
+            .list_ingress_sources()
+            .await?
+            .into_iter()
+            .map(|s| s.id),
+    );
+    // `*` is the wildcard an external trigger stores for "any ingress source".
+    values.insert(pumper_core::storage::TRIGGER_SET_ID.to_string());
+    Ok(values)
+}
+
 #[utoipa::path(
     get,
     path = "/triggers",
     tag = "triggers",
     params(TriggersQuery),
-    responses((status = 200, description = "Dual-mode: `{triggers: [Trigger]}`, or `{items, next_cursor}` when `cursor` is present."))
+    responses(
+        (status = 200, description = "Dual-mode: `{triggers: [Trigger]}`, or `{items, next_cursor}` when `cursor` is present. `app` filters on `source_app`."),
+        (status = 400, description = "Unknown `app`: no trigger source can carry that value (the message lists the accepted ones — registered apps, virtual namespaces, ingress source ids, and `*`)", body = Object),
+    )
 )]
 pub(crate) async fn list_triggers(
     State(state): State<AppState>,
     Query(query): Query<TriggersQuery>,
 ) -> Result<Json<Value>, ApiError> {
     let limit = query.limit.clamp(1, 500);
+    // Same rule as `?status=` two screens down: an unmatchable filter is a
+    // caller mistake, and answering `200 []` reads as "you have no triggers on
+    // that source" — the opposite of the truth.
+    let values = trigger_filter_values(&state).await?;
+    let app = super::watches::validate_app_filter(query.app.as_deref(), &values)
+        .map_err(|msg| ApiError(StatusCode::BAD_REQUEST, msg))?;
     let Some(cursor) = &query.cursor else {
         // Legacy bare-array mode is still capped: an uncursored list must not
         // stream an entire table.
-        let triggers = state
-            .storage
-            .list_triggers_page(query.app.as_deref(), None, limit)
-            .await?;
+        let triggers = state.storage.list_triggers_page(app, None, limit).await?;
         return Ok(Json(json!({ "triggers": triggers })));
     };
     let after = parse_cursor(cursor);
-    let items = state
-        .storage
-        .list_triggers_page(query.app.as_deref(), after, limit)
-        .await?;
+    let items = state.storage.list_triggers_page(app, after, limit).await?;
     let next_cursor = keyset_cursor(&items, limit, |t| {
         format!("{}|{}", pumper_core::datasets::ts(t.created_at), t.id)
     });

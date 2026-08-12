@@ -891,6 +891,32 @@ impl Storage {
         rows.into_iter().map(Watch::try_from).collect()
     }
 
+    /// Distinct `app` values that watches are actually stored under.
+    ///
+    /// Feeds the `?app=` filter validator: a value that some existing row
+    /// carries must never be refused, however the creation gate has tightened
+    /// since. Without this, hardening the gate would turn a working filter over
+    /// legacy rows into a 400.
+    pub async fn watch_apps(&self) -> Result<Vec<String>> {
+        let apps: Vec<String> = sqlx::query_scalar("SELECT DISTINCT app FROM watches ORDER BY app")
+            .fetch_all(&self.pool)
+            .await?;
+        Ok(apps)
+    }
+
+    /// Distinct `source_app` values that triggers are actually stored under —
+    /// the `GET /triggers?app=` counterpart of [`Storage::watch_apps`]. Trigger
+    /// sources are deliberately wider than watch namespaces (an `external`
+    /// trigger's `source_app` is an ingress source id, or `*`), so the filter's
+    /// accepted set has to include whatever was stored.
+    pub async fn trigger_source_apps(&self) -> Result<Vec<String>> {
+        let apps: Vec<String> =
+            sqlx::query_scalar("SELECT DISTINCT source_app FROM triggers ORDER BY source_app")
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(apps)
+    }
+
     pub async fn set_watch_enabled(&self, id: &str, enabled: bool) -> Result<bool> {
         let result = sqlx::query("UPDATE watches SET enabled = ?2 WHERE id = ?1")
             .bind(id)
@@ -1634,6 +1660,67 @@ impl Storage {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter().map(Delivery::try_from).collect()
+    }
+
+    /// Keyset page of the deliveries belonging to ONE source row — a watch, a
+    /// job callback, a saved search — ordered (created_at DESC, id DESC) and
+    /// optionally filtered by status. Bodies excluded, same as
+    /// [`Storage::list_deliveries`].
+    ///
+    /// `webhook_deliveries` has carried `(kind, ref_id)` since it was created,
+    /// but nothing ever queried on it: `status` was the only filter, so "did
+    /// watch X ever deliver?" had no answer over the API — you could see that
+    /// *some* delivery was dead without being able to tell which subscription
+    /// had gone quiet. See [`DELIVERY_KIND_WATCH`] for the watch value.
+    pub async fn list_deliveries_for_ref_page(
+        &self,
+        kind: &str,
+        ref_id: &str,
+        status: Option<&str>,
+        after: Option<(String, String)>,
+        limit: i64,
+    ) -> Result<Vec<Delivery>> {
+        let (after_ts, after_id) = split_after(after);
+        let rows: Vec<DeliveryRow> = sqlx::query_as(
+            "SELECT id, kind, ref_id, url, event, '' AS body, status, attempts, last_error, \
+             created_at, updated_at FROM webhook_deliveries \
+             WHERE kind = ?1 AND ref_id = ?2 AND (?3 IS NULL OR status = ?3) \
+             AND (?4 IS NULL OR created_at < ?4 OR (created_at = ?4 AND id < ?5)) \
+             ORDER BY created_at DESC, id DESC LIMIT ?6",
+        )
+        .bind(kind)
+        .bind(ref_id)
+        .bind(status)
+        .bind(after_ts)
+        .bind(after_id)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Delivery::try_from).collect()
+    }
+
+    /// The most recent delivery attempted for one source row: `(id, status,
+    /// updated_at)`, or `None` if it has never delivered.
+    ///
+    /// Backs the `last_delivery` enrichment on `GET /watches`, whose whole point
+    /// is that `None` (never fired — possibly a watch that structurally cannot)
+    /// is a different answer from `Some(("…", "dead", …))` (fires, nobody is
+    /// receiving), and the listing used to render both as the same enabled row.
+    pub async fn latest_delivery_for_ref(
+        &self,
+        kind: &str,
+        ref_id: &str,
+    ) -> Result<Option<(String, String, DateTime<Utc>)>> {
+        let row: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT id, status, updated_at FROM webhook_deliveries \
+             WHERE kind = ?1 AND ref_id = ?2 ORDER BY created_at DESC, id DESC LIMIT 1",
+        )
+        .bind(kind)
+        .bind(ref_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        row.map(|(id, status, at)| Ok((id, status, parse_ts(&at)?)))
+            .transpose()
     }
 
     /// Keyset page of deliveries ordered (created_at DESC, id DESC), optionally
@@ -2670,6 +2757,16 @@ pub struct TriggerRun {
     pub detail: Option<String>,
     pub created_at: DateTime<Utc>,
 }
+
+/// `webhook_deliveries.kind` for a delivery a **dataset watch** produced; the
+/// row's `ref_id` is then the watch id.
+///
+/// The value the server's `webhook::dispatch_change` stamps. Named here because
+/// the watch→delivery queries ([`Storage::list_deliveries_for_ref_page`],
+/// [`Storage::latest_delivery_for_ref`]) have to agree with the dispatcher for
+/// `GET /watches/{id}/deliveries` to answer anything at all — an e2e drives a
+/// real dispatch through both ends rather than trusting the string twice.
+pub const DELIVERY_KIND_WATCH: &str = "change";
 
 /// The `trigger_id` a decision carries when it is about the evaluation SET, not
 /// about one trigger — the only such case is the set failing to load, which

@@ -27,13 +27,31 @@ Kinds (the `kind` column on a delivery row, and where its signing secret comes f
 | `failure` | `job.failed` | job id | `[webhooks] failure_secret` (config, not a row) |
 
 - **`job.terminal`** — job set `callback_url` (+ optional `callback_secret`) at enqueue; the finished job JSON is delivered on terminal state.
-- **`dataset.changed`** — dataset **watches** (`watches` table): standing subscriptions `{app, dataset|'*', url, secret?, sink}`. After a successful run, revisions are grouped by dataset and each covering watch receives `{event, watch_id, job_id, app, dataset, count, changes[]}` (field-level diffs included). CRUD: `GET/POST /watches`, `DELETE /watches/{id}`, `POST /watches/{id}/enabled`. See [Sinks](#sinks) for the non-HTTP delivery targets.
+- **`dataset.changed`** — dataset **watches** (`watches` table): standing subscriptions `{app, dataset|'*', url, secret?, sink}`. After a successful run, revisions are grouped by dataset and each covering watch receives `{event, watch_id, job_id, app, dataset, count, changes[]}` (field-level diffs included). CRUD: `GET/POST /watches`, `DELETE /watches/{id}`, `POST /watches/{id}/enabled`, plus the per-watch delivery log `GET /watches/{id}/deliveries`. See [Watchable namespaces](#watch-namespaces) for what `app` may be, and [Sinks](#sinks) for the non-HTTP delivery targets.
 - **`search.matched`** — saved-search alerts (see [search.md](search.md)).
 - **`job.failed`** — global permanent-failure firehose. When `[webhooks] failure_url` is configured, every job that fails **permanently** (attempts exhausted — app error, timeout, or a reaped stale lease) POSTs `{event, job_id, app, error, attempts, schedule_id}` there, HMAC-signed with `[webhooks] failure_secret` if set. This is distinct from `job.terminal`: a job's own `callback_url` already receives the full terminal JSON on failure, so `job.failed` is the cross-app subscription for "any job failed" (which has no natural per-resource key), not a per-job duplicate. Retryable requeues do **not** fire it — permanent failures only.
 
 Every kind above resolves its secret again on **every** retry and replay, from the source row (or config for `failure`), so a rotated secret takes effect on the next send. A source that was deleted resolves to "no secret" and the delivery is re-sent unsigned — exactly as it was first sent.
 
 **A degrading source never pushes.** Before `dataset.changed` watches (and dataset triggers) are evaluated, the run's revision batch is filtered per **dataset** by extraction health: a dataset whose source state suppresses outbound pushes is dropped from the batch, so no watch and no trigger ever sees it. The filter runs *before* the hooks on purpose — a delivered webhook cannot be recalled, so the ordering is the enforcement. It is per-dataset rather than per-job, so a break in one of an app's datasets doesn't silence the others. **No-op unless `[resilience] enforce` is on** (default off — see [resilient-extraction.md](resilient-extraction.md)). Suppression is a silent drop plus a warn log, not a delivery-log row; the DLQ below is only about deliveries that were attempted.
+
+<a id="watch-namespaces"></a>
+## Watchable namespaces, and proving a watch is alive
+
+A watch's `app` is the **namespace the records land under**, which is not always the app that produced them. The fan-out matches watches against the entry app of the run's change batch, and that batch spans every namespace the run declares in its result's `index_datasets` — so a `ca-grants` run publishes its unified records as app `grants`, and `grants` is the namespace to watch.
+
+`POST /watches` gates `app` on the set of namespaces the fan-out can actually deliver under: every registered app, the declared virtual namespaces (`registry::VIRTUAL_NAMESPACES` — today just `grants`), every namespace that already holds records (this is what covers caller-named `app-peer` mirror namespaces), and every saved search's materialize target. Two refusals:
+
+- **`404`** — the namespace is none of those. When the name is a source app that publishes elsewhere, the message says where (`records for 'ca-grants' land under app 'grants'`).
+- **`400`** — the namespace is real but the named `dataset` demonstrably belongs to another one, e.g. `{app: "ca-grants", dataset: "unified"}`. A dataset nothing has written yet is accepted: a brand-new app's first dataset is indistinguishable from a typo until it runs.
+
+> Before this, `POST /watches {app: "grants"}` answered **404** (the one namespace worth watching was the one you could not watch) while `{app: "ca-grants", dataset: "unified"}` was **accepted** and sat enabled forever without ever firing.
+
+`?app=` on `GET /watches` and `GET /triggers` is validated against the same set (plus, for triggers, ingress source ids and `*`, since an `external` trigger's `source_app` is an ingress source; plus, for both, the values already stored, so tightening the create gate can never 400 a filter that returns rows). An unmatchable value is a **400** naming the accepted ones, not a `200` with an empty list — the same rule `?status=` follows, for the same reason.
+
+**Is this watch alive?** `GET /watches` enriches each row with `last_delivery` — `{id, status, at}`, or an explicit `null` when it has never delivered — so a watch that has never fired is distinguishable from one firing into a dead receiver. `GET /watches/{id}/deliveries?status=&limit=&cursor=` is that watch's own delivery log (same four-state `status` vocabulary and validator as `GET /webhooks/deliveries`; bodies excluded — fetch one from `GET /webhooks/deliveries/{id}`). An unknown watch id is a **404**, not `{count: 0}`.
+
+**Known gap:** "already holds records" proves records exist, not that the fan-out carries them. A namespace whose producers never declare `index_datasets` — today `trades`, written by the trades apps through `trades_common::unified` — is accepted and its watch will not fire. `last_delivery: null` is what surfaces that.
 
 <a id="sinks"></a>
 ## Sinks — where a `dataset.changed` event is delivered

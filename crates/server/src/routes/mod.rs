@@ -210,6 +210,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_watches, create_watch))
         .routes(routes!(delete_watch))
         .routes(routes!(set_watch_enabled))
+        .routes(routes!(watch_deliveries))
         .routes(routes!(list_triggers, create_trigger))
         .routes(routes!(delete_trigger))
         .routes(routes!(set_trigger_enabled))
@@ -529,6 +530,7 @@ mod api_spec_tests {
         "POST /watches",
         "DELETE /watches/{id}",
         "POST /watches/{id}/enabled",
+        "GET /watches/{id}/deliveries",
         "GET /triggers",
         "POST /triggers",
         "DELETE /triggers/{id}",

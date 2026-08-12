@@ -40,6 +40,57 @@ pub fn apps() -> Vec<Arc<dyn ScrapeApp>> {
     ]
 }
 
+// ---- Virtual namespaces ------------------------------------------------------
+//
+// Not every app namespace the change fan-out delivers under is a registered
+// app. `worker::run_indexed_apps` widens each run to the job's own app PLUS the
+// namespaces its result names in `index_datasets`, and the watch fan-out
+// (`worker::notify_watches`) then matches watches against those namespaces — so
+// `grants` is where every grant revision lands, and `POST /watches
+// {app: "grants"}` used to 404 because `grants` is not in `apps()` above.
+//
+// Those namespaces are declared in a RESULT, at runtime, so they are not
+// statically enumerable: `app-peer` writes under whatever `params.namespace`
+// says (default `peer_<remote_app>`), which no compile-time list can predict.
+// The running authority is therefore the store — a namespace that already holds
+// records is one the fan-out demonstrably delivered under — and the list below
+// is only the BOOTSTRAP SEED for namespaces that are structurally certain but
+// may not have been written to yet on a fresh install. See
+// `routes::watches::namespace_index`, which unions the three sources.
+
+/// One virtual namespace that exists before any run has written to it.
+pub(crate) struct VirtualNamespace {
+    /// The `app` value revisions land under, and that a watch must name.
+    pub name: &'static str,
+    /// The registered apps that publish into it. Pinned by test: an entry whose
+    /// publishers are no longer registered is stale.
+    pub publishers: &'static [&'static str],
+    /// Why it exists, quoted at operators in the refusal message.
+    pub note: &'static str,
+}
+
+/// Virtual namespaces this build can deliver under before their first run.
+///
+/// Deliberately tiny, and deliberately not the only source: keep it to
+/// namespaces a caller would reasonably watch on a fresh install. Anything else
+/// becomes watchable the moment it holds a record.
+pub(crate) const VIRTUAL_NAMESPACES: &[VirtualNamespace] = &[VirtualNamespace {
+    // `grants_common::UNIFIED_APP`. Not imported: `pumper-server` depends on the
+    // grant source apps, not on `grants-common`; `virtual_namespace_publishers_are_registered`
+    // pins the entry against the registry instead.
+    name: "grants",
+    publishers: &["grants-gov", "ca-grants", "eu-sedia", "cordis"],
+    note: "the cross-source unified grants namespace every grant source publishes into",
+}];
+
+/// The virtual namespace a registered app publishes into, if any — the hint
+/// behind "you watched the source app, but the records land somewhere else".
+pub(crate) fn publishes_into(app: &str) -> Option<&'static VirtualNamespace> {
+    VIRTUAL_NAMESPACES
+        .iter()
+        .find(|ns| ns.publishers.contains(&app))
+}
+
 /// One app rendered as an MCP-compatible tool definition: `name`,
 /// `description`, and `inputSchema` are the MCP tool-definition contract
 /// (an app with no declared schema gets the permissive `{"type":"object"}`);
@@ -186,6 +237,68 @@ mod dynamic_tests {
             .contains("no description"));
         assert_eq!(bare["has_params_schema"], false);
         assert!(bare["params_schema"].is_null());
+    }
+}
+
+#[cfg(test)]
+mod virtual_namespace_tests {
+    use super::{apps, publishes_into, VIRTUAL_NAMESPACES};
+    use std::collections::BTreeSet;
+
+    fn registered() -> BTreeSet<&'static str> {
+        apps().iter().map(|a| a.name()).collect()
+    }
+
+    /// The drift this pins: a seed entry survives a rename or a removal of the
+    /// apps that feed it and quietly starts vouching for a namespace nothing
+    /// writes to — which is how a hand-kept list becomes a lie.
+    #[test]
+    fn virtual_namespace_publishers_are_registered() {
+        let registered = registered();
+        for ns in VIRTUAL_NAMESPACES {
+            assert!(
+                !ns.publishers.is_empty(),
+                "virtual namespace '{}' names no publisher, so nothing can ever \
+                 deliver under it",
+                ns.name
+            );
+            for publisher in ns.publishers {
+                assert!(
+                    registered.contains(publisher),
+                    "virtual namespace '{}' claims publisher '{publisher}', which is not \
+                     a registered app — the entry is stale",
+                    ns.name
+                );
+            }
+        }
+    }
+
+    /// A namespace that is also a registered app is not virtual; leaving it in
+    /// the seed would mean two answers to "what is this name" and a refusal
+    /// message that names the wrong one.
+    #[test]
+    fn a_virtual_namespace_is_not_also_a_registered_app() {
+        let registered = registered();
+        for ns in VIRTUAL_NAMESPACES {
+            assert!(
+                !registered.contains(ns.name),
+                "'{}' is a registered app, so it is not a virtual namespace",
+                ns.name
+            );
+        }
+    }
+
+    /// The ca-grants/unified trap, at the level of the hint that closes it: a
+    /// grant source app has to be able to say where its unified records go.
+    #[test]
+    fn a_grant_source_names_the_namespace_its_records_land_under() {
+        for source in ["ca-grants", "grants-gov"] {
+            let ns = publishes_into(source).expect("a grant source redirects");
+            assert_eq!(ns.name, "grants");
+            assert!(!ns.note.is_empty(), "the redirect has to explain itself");
+        }
+        // An app that publishes only under its own name has no redirect to give.
+        assert!(publishes_into("hackernews").is_none());
     }
 }
 
