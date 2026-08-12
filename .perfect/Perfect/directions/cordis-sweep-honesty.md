@@ -3,12 +3,12 @@ slug: cordis-sweep-honesty
 type: perfect/direction
 context: "[[eu-grants]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 7f525e4
 ---
 
 ## What & why
@@ -53,4 +53,15 @@ an entire corpus cycle because the cursor advances past ids that were never fetc
   raw GETs (fetch-discipline is inventoried; out of scope here).
 
 ## Build record
-(pending)
+Shipped 7f525e4 (Lot E, opus). SweepEnd{Complete|Capped|ShortPage} + extracted
+predicates (reached_listing_end / walk_end / empty_first_page_is_drift /
+empty_listing_is_drift / cursor_offset / cursor_record); only page arithmetic
+against the listing's own total wraps the cursor. Cursor became an absolute
+OFFSET (survives pageSize changes; legacy page-only rows converted, nonsense →
+top, never a panic); the 450/100 tail is revisited (e2e proves the literal
+case). total:0-over-stored-corpus fails loudly via count_filtered gated to the
+suspicious case; stage-2 checkpoint v2 keyed on offset (v1 discarded, bounded
+cost). Builder refutations: the old first-page drift guard's start_page==1 gate
+exempted EVERY scheduled run after the first (generalized to arithmetic); the
+short-page clause fired alone only in the pathological case. 12 new tests incl.
+4 e2e walks against a scripted CORDIS + real temp store. Review: KEEP.

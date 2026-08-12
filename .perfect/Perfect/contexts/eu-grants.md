@@ -67,3 +67,15 @@ the load-bearing joined output); max_row_delta_pct=10 questionable mid-walk.
 
 ## Shipped
 - (inherited, pre-46-map)
+- r14 (2026-08-12): [[cordis-sweep-honesty]] → 7f525e4 (only page arithmetic
+  proves the corpus end; offset cursor — the 450/100 tail revisited; total:0
+  drift loud with cursor untouched; checkpoint v2). [[topic-stats-honesty]] →
+  a60b996 (coverage block on every stats record; sync_many with the window
+  tripwire; ghosts die end-to-end incl. the eu-sedia join; cordis out of the
+  grants publisher seed; topic_stats catalog contract). [[derived-change-honesty]]
+  → 45dd84b (core DerivedPaths seam — derived paths out of the change hash,
+  revisions keep the full value, refresh writes keep reads fresh; eu-sedia
+  adopts for history: weekly cordis churn no longer fires watches/webhooks/
+  revisions on every joined topic; cordis finally in the feature docs).
+  One-time deploy note: first eu-sedia run reports changed≈historyJoined once
+  (documented transition), then settles.

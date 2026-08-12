@@ -70,3 +70,17 @@ docs tabulate fail-open accurately but never state the ledger blindness.
 
 ## Shipped
 - (via trigger-pipeline r6 — 8adfc91)
+- r14 (2026-08-12): [[wasm-sandbox-admission]] → 068e11c (permit travels with the
+  blocking work — cancelled callers can't over-admit stores; poisoned-lock
+  recovery at all 5 sites; Error::Plugin + PluginFailure×6 kills observatory
+  string-matching; probe budgets from config). [[wasm-ledger-honesty]] → 10fa27d
+  (every hook failure class a distinct allowlisted ledger outcome; predicate_veto
+  means only pass=false; has()/list() answer executability; dry-run names
+  unusable plugins + incidents; plugin_missing once-per-deployment, re-armed on
+  reload). [[wasm-fuel-telemetry]] → f2884e0 (fuel-used + memory high-water per
+  call via run_metered; GET /plugins telemetry with budgets; observatory fuel
+  cost signal; extraction.md:180 known gap closed). + Director 44f7e33 (dynamic
+  discovery probes on the live budget; smoke 32→34).
+  Remaining known honest gaps: trapped call's partial burn not carried;
+  shipped-plugin #[ignore] e2e still need `just plugins-install`; busyloop.wasm
+  still sits in data/plugins (less hazardous now — cancelled callers hold slots).

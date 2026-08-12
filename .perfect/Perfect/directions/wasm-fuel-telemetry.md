@@ -3,12 +3,12 @@ slug: wasm-fuel-telemetry
 type: perfect/direction
 context: "[[wasm-plugin-host]]"
 lens: feature
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: f2884e0
 ---
 
 ## What & why
@@ -50,4 +50,14 @@ guesswork into a read.
 - Non-goal: cost accounting in job receipts (fuel is not money; CostClass unchanged).
 
 ## Build record
-(pending)
+Shipped f2884e0 (Lot W, opus). PluginRunStats all-Option (unmetered ≠ measured
+zero — pinned by test); run_metered with default impl (stubs implement nothing);
+wasm host routes run() THROUGH run_metered (single execution path). measure() is
+exact by construction (fuel = budget − get_fuel; memory only grows in a fresh
+store). Cost on the JOB RESULT deliberately not on records — per-record fuel
+would churn change detection (the same disease derived-change-honesty cures).
+GET /plugins telemetry carries budgets alongside usage; calls:0 for never-run
+(distinct from absent); cleared on reload (new binary, old history would be
+fiction). Observatory cost_signal=fuel with labelled elapsed_ms fallback.
+extraction.md:180 known-gap replaced with the contract + the honest bound (a
+trapped call's partial burn is not carried). Review: KEEP.

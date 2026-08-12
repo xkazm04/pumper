@@ -3,12 +3,12 @@ slug: wasm-sandbox-admission
 type: perfect/direction
 context: "[[wasm-plugin-host]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 068e11c
 ---
 
 ## What & why
@@ -61,4 +61,14 @@ substring — rewording a message silently reclassifies rows with zero test fail
 - Non-goal: fuel/memory telemetry (that is [[wasm-fuel-telemetry]]).
 
 ## Build record
-(pending)
+Shipped 068e11c (Lot W, opus). Permit travels in the spawn_blocking closure via
+extracted run_admitted; cancellation test is sleep-free (oneshot+mpsc) and paired
+with a companion test pinning the OLD shape's leak so the assertion isn't a
+tautology. Advisory recovery local to engine-wasm (read_modules/write_modules) —
+builder REFUTED the hoist option: lock_advisory is Mutex-only AND private
+(routes/mod.rs declares `mod error;`), unreachable regardless. Error::Plugin
+{plugin, kind: PluginFailure×6, message} + client_facing → 500-not-502 (in-process
+sandbox is not an upstream; leak-checked). Observatory classifies on the type,
+two-direction test (reworded trap stays trap; lookalike prose doesn't classify).
+ProbeBudget::from_config; DescribeMiss{NoExport(debug)|Broken(warn)} levelled by
+defect not caller. Review: KEEP, no deviations. Gate: workspace green on tip.

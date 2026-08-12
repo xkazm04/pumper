@@ -3,12 +3,12 @@ slug: topic-stats-honesty
 type: perfect/direction
 context: "[[eu-grants]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: a60b996
 ---
 
 ## What & why
@@ -54,4 +54,15 @@ eu-sedia keeps joining it), and the 200k aggregation limit truncates silently.
 - Non-goal: making cordis a grants/unified producer — out of scope, different design.
 
 ## Build record
-(pending)
+Shipped a60b996 (Lot E, opus). Coverage{corpus_aggregated, corpus_total
+(Null-not-0), corpus_swept} on every stats record; rollup → sync_many gated on
+rollup_is_complete (an at-cap read is a WINDOW: removals off + aggregate_truncated
++ warning — the tripwire that stops a window from tombstoning the world);
+list_filtered excludes tombstoned projects. eu-sedia history_block refuses
+tombstoned families (builder refutation: sync_many alone insufficient —
+Datasets::get returns tombstoned rows) and carries as_of. ACCEPTED DEVIATION: no
+stamped as_of field — envelope last_seen surfaced as history.as_of (a stamped
+field would churn every family weekly, the disease D3 kills). Riders: cordis
+dropped from grants publishers + manifest-describes-unified pin;
+cordis-topic-stats catalog contract row (per-(app,dataset) keying verified, no
+second schedule). Ghost e2e proves the family dies end-to-end. Review: KEEP.

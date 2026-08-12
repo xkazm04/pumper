@@ -3,12 +3,12 @@ slug: wasm-ledger-honesty
 type: perfect/direction
 context: "[[wasm-plugin-host]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 10fa27d
 ---
 
 ## What & why
@@ -65,4 +65,17 @@ every hook failure class truthful in the ledger, in `has()`, and in dry-run.
   plugin-runner's anchor, banked there.
 
 ## Build record
-(pending)
+Shipped 10fa27d (Lot W, opus). HookVerdict{obj, incidents} — apply_plugin_hooks
+stays pure, callers record; 4 new outcomes (hook_trap/hook_malformed/
+hook_not_executable/hook_host_error) classified from the typed PluginFailure.
+ACCEPTED DEVIATION (better than both offered options): error-under-skip keeps its
+OWN failure outcome with the consequence in detail and emits NO predicate_veto —
+conflation structurally impossible, veto means exactly one thing. executable flag:
+load stays permissive, has()/list() answer executability, manifests carry the
+flag. Dry-run reports hooks.{unusable_plugins, incidents} both on stop and fire.
+plugin_missing/hook_not_executable deduped once per (trigger,plugin,outcome),
+re-armed by POST /plugins/reload (known-gap row amplification closed). Builder
+refutations: report_missing_plugins row moved to the incident path (double-record
+avoided); no allowlist test EXISTED — wrote the EXPECTED-diff one. e2e layered on
+the existing harness (+5 tests incl. once-not-per-event). First-run test failure
+fixed in code not assertion (detail-wording parity). Review: KEEP.

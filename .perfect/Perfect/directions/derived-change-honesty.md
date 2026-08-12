@@ -3,12 +3,12 @@ slug: derived-change-honesty
 type: perfect/direction
 context: "[[eu-grants]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 45dd84b
 ---
 
 ## What & why
@@ -59,4 +59,15 @@ value) — adopted by eu-sedia for the history block. The seam is a platform pri
   joins; any change to revision storage shape.
 
 ## Build record
-(pending)
+Shipped 45dd84b (Lot E, opus). DerivedPaths opt-in per write, NONE default;
+hash_input returns Cow::Borrowed when nothing declared/matched — the no-op case
+is provably byte-identical, and the 4-entry-point hash-identity test asserts it
+against raw SQL. refresh write: derived-only movement rewrites the body (reads
+never stale), appends NO revision, verdict Unchanged — only reachable with
+declared paths. SimHash deliberately full-value (/duplicates compares stored
+records); derived-spec recompute passes NONE with reasoning. Transition pinned:
+exactly one changed run then settles. eu-sedia adopts for history via shared
+HISTORY_FIELD const (test pins join+declaration agree); e2e proves weekly cordis
+churn → changed:0, no second revision, fresh read. Docs: datasets.md seam table;
+apps.md gains cordis + the join; datahub.md fake-"calls" example fixed. Declared
+exceptions accepted: core/lib.rs barrel export, Cargo.lock. Review: KEEP.
