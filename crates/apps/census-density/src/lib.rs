@@ -360,8 +360,9 @@ impl ScrapeApp for CensusDensity {
                 places_reported,
                 total_estab,
                 total_emp,
-                total_pay,
+                total_pay: _,
                 suppressed,
+                paired,
             } = map_cbp_rows(&rows, &cols, naics, label, &geo, &year);
             suppression.merge(&suppressed);
             for (place, estab) in &ranked {
@@ -374,20 +375,11 @@ impl ScrapeApp for CensusDensity {
                 .take(5)
                 .map(|(p, e)| json!({ "place": p, "establishments": e }))
                 .collect();
-            // National employer-side benchmarks: sum(pay)/sum(emp) and
-            // sum(emp)/sum(estab) across reported places (the solo side reports the
-            // analogous national receipts-per-operator). Suppressed cells contribute
-            // 0 to the sums, same as the raw totals, so the ratio is over reported places.
-            let national_avg_wage = if total_emp > 0 {
-                Value::from((total_pay as f64 * 1000.0) / total_emp as f64)
-            } else {
-                Value::Null
-            };
-            let national_avg_establishment_size = if total_estab > 0 {
-                Value::from(total_emp as f64 / total_estab as f64)
-            } else {
-                Value::Null
-            };
+            // National employer-side benchmarks, each over the places that
+            // reported BOTH halves of its own ratio — see [`PairedTotals`]. The
+            // raw totals below are sums over whatever WAS reported and are not
+            // interchangeable with these denominators.
+            let (national_avg_wage, national_avg_establishment_size) = national_benchmarks(&paired);
             trade_summaries.push(json!({
                 "naics": naics,
                 "label": label,
@@ -645,6 +637,50 @@ pub struct CbpRollup {
     pub total_emp: i64,
     pub total_pay: i64,
     pub suppressed: Suppression,
+    pub paired: PairedTotals,
+}
+
+/// The sums the two national benchmarks are computed over.
+///
+/// Both benchmarks are RATIOS, and a ratio is only a benchmark when its
+/// numerator and denominator describe the **same places**. Suppression is
+/// per-cell, so they do not: a state that reports `EMP` but has `PAYANN`
+/// withheld used to add its employees to the denominator of
+/// `national_avg_wage` while adding nothing to the numerator, pushing the
+/// national wage down by however much of the country was suppressed that
+/// vintage — a number that moves with Census's disclosure rules rather than
+/// with the labour market. The mirror case (payroll reported, employees
+/// withheld) pushed it up.
+///
+/// So each ratio carries its own pair of sums, accumulated only from the places
+/// that reported everything that ratio needs.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct PairedTotals {
+    /// Employees of places that reported BOTH `EMP` and `PAYANN`.
+    pub wage_emp: i64,
+    /// Annual payroll ($1,000s) of those same places.
+    pub wage_pay: i64,
+    /// Employees of places that reported `EMP`.
+    pub size_emp: i64,
+    /// Establishments of those same places.
+    pub size_estab: i64,
+}
+
+/// The two national employer-side benchmarks — `(avg annual wage, avg
+/// establishment size)` — each over its own reported-both subset, `Null` when
+/// nothing in the payload supports it.
+pub fn national_benchmarks(p: &PairedTotals) -> (Value, Value) {
+    let wage = if p.wage_emp > 0 {
+        Value::from((p.wage_pay as f64 * 1000.0) / p.wage_emp as f64)
+    } else {
+        Value::Null
+    };
+    let size = if p.size_estab > 0 {
+        Value::from(p.size_emp as f64 / p.size_estab as f64)
+    } else {
+        Value::Null
+    };
+    (wage, size)
 }
 
 /// Map the CBP array-of-arrays payload (row 0 = header, addressed by the
@@ -670,6 +706,7 @@ pub fn map_cbp_rows(
         total_emp: 0,
         total_pay: 0,
         suppressed: Suppression::default(),
+        paired: PairedTotals::default(),
     };
 
     for row in rows.iter().skip(1) {
@@ -690,8 +727,6 @@ pub fn map_cbp_rows(
         if cols.pay.is_some() && pay_opt.is_none() {
             out.suppressed.payroll += 1;
         }
-        let emp = emp_opt.unwrap_or(0);
-        let pay = pay_opt.unwrap_or(0);
         // PAYANN is in $1,000s (mirrors the solo side's receipts convention).
         let avg_annual_wage = match (pay_opt, emp_opt) {
             (Some(p), Some(e)) if e > 0 => Value::from((p as f64 * 1000.0) / e as f64),
@@ -720,8 +755,18 @@ pub fn map_cbp_rows(
 
         out.places_reported += 1;
         out.total_estab += estab;
-        out.total_emp += emp;
-        out.total_pay += pay;
+        out.total_emp += emp_opt.unwrap_or(0);
+        out.total_pay += pay_opt.unwrap_or(0);
+        // The two national benchmarks are ratios, so each needs BOTH of its
+        // halves from the SAME set of places — see [`PairedTotals`].
+        if let Some(e) = emp_opt {
+            out.paired.size_emp += e;
+            out.paired.size_estab += estab;
+            if let Some(p) = pay_opt {
+                out.paired.wage_emp += e;
+                out.paired.wage_pay += p;
+            }
+        }
         out.ranked.push((place.clone(), estab));
 
         out.records.push((
@@ -734,8 +779,12 @@ pub fn map_cbp_rows(
                 "state_fips": st_fips,
                 "county_fips": county_fips,
                 "establishments": estab,
-                "employees": emp,
-                "annual_payroll_thousands": pay,
+                // Null, not 0: a withheld EMP/PAYANN cell is unknown, and a
+                // fabricated zero here is the same lie the solo side's
+                // `receipts_thousands` used to tell (it read as a state whose
+                // plumbers employ nobody and pay nothing).
+                "employees": emp_opt.map(Value::from).unwrap_or(Value::Null),
+                "annual_payroll_thousands": pay_opt.map(Value::from).unwrap_or(Value::Null),
                 "avg_annual_wage": avg_annual_wage,
                 "avg_establishment_size": avg_establishment_size,
                 "year": year,
@@ -1628,6 +1677,51 @@ mod tests {
         assert_eq!(z.records.len(), 1);
         assert_eq!(z.records[0].1["establishments"], 0);
         assert_eq!(z.suppressed, Suppression::default());
+    }
+
+    /// The anti-pattern: a national ratio whose numerator and denominator come
+    /// from different sets of places. Suppression is per-CELL, so a state that
+    /// reported `EMP` with `PAYANN` withheld used to add its employees to the
+    /// denominator of `national_avg_wage` and nothing to the numerator — the
+    /// published national wage then moved with Census's disclosure rules rather
+    /// than with the labour market. It is the employer-side twin of the
+    /// `receipts_thousands` fabrication.
+    #[test]
+    fn national_benchmarks_divide_only_by_the_places_that_reported_both_halves() {
+        // CA reports everything; TX reports employees but its payroll is
+        // withheld; FL's employee count is withheld.
+        let r = cbp_rollup(&[
+            ["100", "1000", "50000", "06"],
+            ["50", "500", "-666666666", "48"],
+            ["25", "D", "9000", "12"],
+        ]);
+        assert_eq!(r.suppressed.payroll, 1);
+        assert_eq!(r.suppressed.employees, 1);
+
+        // Wage: only CA reported both → $50,000k over 1,000 employees.
+        // The buggy pairing divided 50,000k by CA+TX's 1,500 employees ($33.3k)
+        // — a third lower, purely because Texas was not allowed to answer.
+        let (wage, size) = national_benchmarks(&r.paired);
+        assert_eq!(wage, json!(50_000.0));
+        // Establishment size: CA + TX reported employees (FL did not), so the
+        // denominator is their 150 establishments, not all 175.
+        assert_eq!(size, json!(10.0));
+
+        // The raw totals stay sums-over-reported and are NOT the ratio's halves.
+        assert_eq!(r.total_emp, 1500);
+        assert_eq!(r.total_estab, 175);
+
+        // A withheld cell is Null on the record too — never a fabricated 0.
+        let tx = &r.records[1].1;
+        assert_eq!(tx["employees"], 500);
+        assert_eq!(tx["annual_payroll_thousands"], Value::Null);
+        let fl = &r.records[2].1;
+        assert_eq!(fl["employees"], Value::Null);
+        assert_eq!(fl["annual_payroll_thousands"], 9000);
+
+        // Nothing reported → no benchmark, rather than a 0 or a divide-by-zero.
+        let none = national_benchmarks(&PairedTotals::default());
+        assert_eq!(none, (Value::Null, Value::Null));
     }
 
     /// The anti-pattern: a place silently vanishing from the saturation ranking.
