@@ -1,0 +1,26 @@
+-- Misfire skips stop borrowing `last_run`.
+--
+-- Under `misfire_policy = 'skip'` the scheduler advanced past the missed
+-- firings by stamping `last_run = now` — the same column a real firing writes.
+-- One row then answered two contradictory things at once: `last_run` said "this
+-- ran a minute ago" while `last_job_id` was null, because no job was ever
+-- enqueued. The count of firings the policy ate existed only in a log line.
+--
+-- Split the two facts. `last_run` now means exactly "the last time a job was
+-- enqueued"; the skip path writes here instead:
+--
+--   last_skipped_at  when the scheduler last advanced past missed firings
+--                    WITHOUT enqueuing. NULL = never skipped.
+--   skipped_count    cumulative firings eaten by the skip policy across the
+--                    schedule's life (not a per-tick value) — the number that
+--                    tells an operator their `skip` schedule is quietly doing
+--                    nothing.
+--
+-- The cron reference is now MAX(last_run, last_skipped_at) (see
+-- `scheduler::schedule_reference`), which is what keeps `skip` from re-scanning
+-- the same backlog every tick and keeps `project_next_run` agreeing with the
+-- reconcile loop. Existing rows default to "never skipped", which is the
+-- correct reading of history: before this migration every advance was a firing
+-- as far as the table could tell.
+ALTER TABLE schedules ADD COLUMN last_skipped_at TEXT;
+ALTER TABLE schedules ADD COLUMN skipped_count INTEGER NOT NULL DEFAULT 0;

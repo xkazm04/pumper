@@ -114,8 +114,9 @@ pub(crate) async fn reconcile(
             }
         };
         let tz = parse_tz(schedule.timezone.as_deref());
-        // Next firing after the last run (or after creation for a fresh schedule).
-        let reference = schedule.last_run.unwrap_or(schedule.created_at);
+        // Next firing after this schedule's cron reference (see the shared
+        // `schedule_reference`, which `project_next_run` uses too).
+        let reference = schedule_reference(&schedule);
         let misfire_skip = schedule.misfire_policy == "skip";
 
         match decide(cron, tz, reference, now, misfire_skip, grace) {
@@ -125,7 +126,13 @@ pub(crate) async fn reconcile(
                     id = %schedule.id, app = %schedule.app, missed,
                     "misfire policy 'skip': advancing past missed firings without enqueuing"
                 );
-                state.storage.touch_schedule(&schedule.id, now).await?;
+                // NOT `touch_schedule`: nothing ran, so `last_run` must not move.
+                // The advance is recorded as a skip (with its eaten-firing count),
+                // which `schedule_reference` then honours — see migration 0039.
+                state
+                    .storage
+                    .record_schedule_skip(&schedule.id, now, missed)
+                    .await?;
             }
             Action::Fire { collapsed } => {
                 if !state.registry.contains_key(&schedule.app) {
@@ -135,7 +142,9 @@ pub(crate) async fn reconcile(
                 // Overlap guard: don't stack a second run while the previous one
                 // is still queued/running. last_run is NOT touched, so the missed
                 // firing stays due and fires on the first tick after it finishes.
-                if state.storage.schedule_has_active_job(&schedule.id).await? {
+                // The SAME read + predicate `GET /schedules` reports as
+                // `health: "overlapping"` — see `latest_run`.
+                if latest_run(state, &schedule.id).await?.holds_slot {
                     info!(id = %schedule.id, app = %schedule.app, "previous scheduled run still active; skipping tick");
                     continue;
                 }
@@ -337,18 +346,90 @@ fn parse_tz(name: Option<&str>) -> Tz {
     name.and_then(|n| n.parse().ok()).unwrap_or(Tz::UTC)
 }
 
+/// The instant a schedule's cron is projected forward from: the most recent
+/// point the scheduler has already accounted for.
+///
+/// That is the LATER of "when a job was last enqueued" (`last_run`) and "when
+/// the `skip` misfire policy last advanced past missed firings"
+/// (`last_skipped_at`), falling back to `created_at` for a schedule that has
+/// done neither.
+///
+/// Both facts have to count. `last_run` alone would make a `skip` schedule
+/// re-scan the same backlog on every tick forever (it advanced past those
+/// firings precisely so it would not); `last_skipped_at` alone would forget
+/// real runs. Before migration 0039 the skip path borrowed `last_run` to get
+/// this effect, which is what made a row report a run that never happened.
+///
+/// Extracted so the reconcile loop and [`project_next_run`] cannot drift: the
+/// projected `next_run` on `GET /schedules` is computed from the same reference
+/// the next tick will use.
+pub fn schedule_reference(schedule: &Schedule) -> DateTime<Utc> {
+    [schedule.last_run, schedule.last_skipped_at]
+        .into_iter()
+        .flatten()
+        .max()
+        .unwrap_or(schedule.created_at)
+}
+
 /// Projects a schedule's next firing (read-only, for the observability API),
 /// using the exact reference rule the reconcile loop does: the first cron time
-/// strictly after `last_run` (or `created_at` for a never-run schedule),
-/// evaluated in the schedule's timezone. `None` if the cron is unparseable or has
-/// no future firing — so the API can never disagree with the scheduler.
+/// strictly after [`schedule_reference`], evaluated in the schedule's timezone.
+/// `None` if the cron is unparseable or has no future firing — so the API can
+/// never disagree with the scheduler.
 pub fn project_next_run(schedule: &Schedule) -> Option<DateTime<Utc>> {
     let cron = CronSchedule::from_str(&schedule.cron).ok()?;
     let tz = parse_tz(schedule.timezone.as_deref());
-    let reference = schedule.last_run.unwrap_or(schedule.created_at);
+    let reference = schedule_reference(schedule);
     cron.after(&reference.with_timezone(&tz))
         .next()
         .map(|t| t.with_timezone(&Utc))
+}
+
+/// A schedule's most recent firing, read once and interpreted once.
+///
+/// The scheduler's overlap guard and the `GET /schedules` health derivation both
+/// go through [`latest_run`] to build this, so there is no second place where
+/// "is a run of this schedule still outstanding?" can be answered differently.
+pub(crate) struct LatestRun {
+    /// The most recent job this schedule enqueued, if any.
+    pub job_id: Option<String>,
+    /// That job's status.
+    pub status: Option<String>,
+    /// Whether that run still holds the schedule's firing slot — see
+    /// [`run_holds_slot`].
+    pub holds_slot: bool,
+}
+
+/// Whether a schedule's most recent run still holds its firing slot.
+///
+/// The anti-pattern this replaces: the guard was existential over ALL of the
+/// schedule's jobs (`status IN ('queued','running')`) while health read only the
+/// newest one. `POST /jobs/retry` on an OLD failed job of a schedule re-queues
+/// it without touching `created_at`, and nothing ever clears `schedule_id` — so
+/// the existential guard stayed true forever, the schedule silently stopped
+/// firing, and `GET /schedules` answered `ok`. `POST /jobs/retry {app}` could
+/// wedge every schedule of an app in one call.
+///
+/// Keying on the NEWEST firing keeps the guarantee the guard exists for — while
+/// a scheduled run is queued/running it *is* the newest job, because the guard
+/// itself prevented anything newer — and drops the wedge, since a retried older
+/// job is by definition not the newest.
+pub(crate) fn run_holds_slot(status: Option<&str>) -> bool {
+    matches!(status, Some("queued") | Some("running"))
+}
+
+/// Reads a schedule's most recent firing and applies [`run_holds_slot`] to it.
+pub(crate) async fn latest_run(state: &AppState, schedule_id: &str) -> anyhow::Result<LatestRun> {
+    let latest = state.storage.latest_job_for_schedule(schedule_id).await?;
+    let (job_id, status) = match latest {
+        Some((id, status)) => (Some(id), Some(status)),
+        None => (None, None),
+    };
+    Ok(LatestRun {
+        holds_slot: run_holds_slot(status.as_deref()),
+        job_id,
+        status,
+    })
 }
 
 /// Decides a schedule's action this tick — pure (no I/O), so it is unit-testable
@@ -498,6 +579,8 @@ mod tests {
             max_attempts: None,
             managed_by: None,
             last_run,
+            last_skipped_at: None,
+            skipped_count: 0,
             created_at: Utc.with_ymd_and_hms(2026, 7, 13, 9, 15, 0).unwrap(),
         }
     }
@@ -525,6 +608,121 @@ mod tests {
     #[test]
     fn project_next_run_none_on_bad_cron() {
         assert_eq!(project_next_run(&schedule("not a cron", None, None)), None);
+    }
+
+    /// `misfire_policy = "skip"` advances past missed firings; the reference has
+    /// to move with it or the schedule re-scans the same backlog every tick
+    /// forever. That advance used to be written to `last_run` — this pins that
+    /// moving it to `last_skipped_at` did NOT break the projection.
+    #[test]
+    fn project_next_run_follows_a_skip_not_only_a_run() {
+        let mut skipped = schedule(HOURLY, None, None);
+        skipped.last_skipped_at = Some(Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap());
+        assert_eq!(
+            project_next_run(&skipped),
+            Some(Utc.with_ymd_and_hms(2026, 7, 13, 13, 0, 0).unwrap()),
+            "a skip advanced the schedule past 12:00, so the next firing is 13:00 — \
+             not the 10:00 that projecting from created_at would give"
+        );
+    }
+
+    /// The reference is the LATER of the two facts, whichever way round they
+    /// happened — a schedule that ran at 12:00 and skipped at 09:00 is not
+    /// dragged backwards, and vice versa.
+    #[test]
+    fn schedule_reference_takes_the_later_fact_not_a_fixed_column() {
+        let created = Utc.with_ymd_and_hms(2026, 7, 13, 9, 15, 0).unwrap();
+        let early = Utc.with_ymd_and_hms(2026, 7, 13, 10, 0, 0).unwrap();
+        let late = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 0).unwrap();
+
+        let mut s = schedule(HOURLY, None, None);
+        assert_eq!(schedule_reference(&s), created, "neither fact yet");
+
+        s.last_run = Some(late);
+        s.last_skipped_at = Some(early);
+        assert_eq!(schedule_reference(&s), late, "a real run is newer");
+
+        s.last_run = Some(early);
+        s.last_skipped_at = Some(late);
+        assert_eq!(
+            schedule_reference(&s),
+            late,
+            "a skip after the last run still moves the reference — otherwise the \
+             skipped backlog is re-scanned on every tick, forever"
+        );
+    }
+
+    /// The wedge, at predicate level: the guard used to be existential over ALL
+    /// of a schedule's jobs, so ONE manually retried old job held the schedule's
+    /// firing slot forever while `GET /schedules` read the newest job and said
+    /// `ok`. One predicate over the newest run cannot produce that split.
+    #[test]
+    fn a_retried_older_job_does_not_hold_the_slot_only_the_newest_run_does() {
+        // Newest run still going: the slot IS held — the guarantee the guard
+        // exists for ("don't stack a second run on top of mine").
+        assert!(run_holds_slot(Some("queued")));
+        assert!(run_holds_slot(Some("running")));
+        // Newest run finished: the slot is free, whatever any OLDER job of the
+        // same schedule was manually retried into.
+        for terminal in ["succeeded", "failed", "cancelled"] {
+            assert!(
+                !run_holds_slot(Some(terminal)),
+                "a schedule whose newest run is '{terminal}' must fire again"
+            );
+        }
+        // Never fired at all: nothing to overlap with.
+        assert!(!run_holds_slot(None));
+    }
+
+    /// The EXPECTED-diff guard for "one predicate, two readers": the overlap
+    /// question may be answered in exactly these places, and the health
+    /// derivation must reach it through the shared read rather than
+    /// re-deriving `queued`/`running` for itself. A second hand-rolled status
+    /// match anywhere in the schedules surface is how the two drifted apart in
+    /// the first place.
+    #[test]
+    fn health_and_guard_share_one_predicate() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let scheduler = std::fs::read_to_string(src.join("scheduler.rs")).expect("scheduler.rs");
+        let route =
+            std::fs::read_to_string(src.join("routes/schedules.rs")).expect("routes/schedules.rs");
+
+        // Both readers go through the one read+interpret helper.
+        assert!(
+            scheduler.contains("latest_run(state, &schedule.id).await?.holds_slot"),
+            "the scheduler's overlap guard must consult `latest_run`"
+        );
+        assert!(
+            route.contains("crate::scheduler::latest_run("),
+            "the health derivation must consult `latest_run`, not its own query"
+        );
+
+        // And only `run_holds_slot` itself decides what an active status is.
+        let matches_active = |body: &str| {
+            body.contains(r#"Some("queued") | Some("running")"#)
+                || body.contains(r#"Some("running") | Some("queued")"#)
+        };
+        assert!(
+            !matches_active(&route),
+            "routes/schedules.rs re-derives the active-status set — the exact \
+             divergence `run_holds_slot` exists to prevent"
+        );
+        let outside_predicate = scheduler
+            .split("pub(crate) fn run_holds_slot")
+            .next()
+            .expect("split yields the text before the predicate");
+        assert!(
+            !matches_active(outside_predicate),
+            "scheduler.rs answers the overlap question somewhere other than \
+             `run_holds_slot`"
+        );
+
+        // The divergent existential twin must stay gone.
+        assert!(
+            !scheduler.contains("schedule_has_active_job"),
+            "the existential overlap query is back; it is what wedged schedules \
+             on `POST /jobs/retry`"
+        );
     }
 
     #[test]

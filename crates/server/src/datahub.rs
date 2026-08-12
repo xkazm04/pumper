@@ -2266,6 +2266,8 @@ mod tests {
             max_attempts: None,
             managed_by: managed_by.map(str::to_string),
             last_run: None,
+            last_skipped_at: None,
+            skipped_count: 0,
             created_at: chrono::Utc::now(),
         }
     }

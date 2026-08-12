@@ -90,14 +90,28 @@ pub struct Schedule {
     /// the catalog reconciler never touches these); `Some("catalog")` = driven by
     /// `catalog/data-sources.toml` via the reconciler.
     pub managed_by: Option<String>,
+    /// When this schedule last **enqueued a job**. `None` = it never has.
+    ///
+    /// Narrower than it used to be: under `misfire_policy = "skip"` the
+    /// scheduler used to stamp this column when advancing past missed firings,
+    /// so a schedule that had never run once still reported a recent `last_run`
+    /// next to a null `last_job_id`. Skips now land in
+    /// [`Schedule::last_skipped_at`] instead (migration 0039).
     pub last_run: Option<DateTime<Utc>>,
+    /// When the `skip` misfire policy last advanced past missed firings WITHOUT
+    /// enqueuing anything. `None` = never skipped.
+    pub last_skipped_at: Option<DateTime<Utc>>,
+    /// Cumulative firings the `skip` policy has eaten over this schedule's life
+    /// — the number that makes "my skip schedule quietly does nothing" visible
+    /// on `GET /schedules` instead of only in a log line.
+    pub skipped_count: i64,
     pub created_at: DateTime<Utc>,
 }
 
 /// Column list shared by every `schedules` SELECT (kept in sync with `ScheduleRow`).
 const SCHEDULE_COLUMNS: &str =
     "id, app, cron, params, enabled, priority, timezone, misfire_policy, max_attempts, \
-     managed_by, last_run, created_at";
+     managed_by, last_run, last_skipped_at, skipped_count, created_at";
 
 /// Create-time fields for a schedule (borrowed; storage assigns id/enabled/time).
 #[derive(Debug, Clone)]
@@ -535,21 +549,24 @@ impl Storage {
         Ok(row)
     }
 
-    /// True when a schedule already has a job queued or running — the overlap
-    /// guard the scheduler consults before firing.
-    pub async fn schedule_has_active_job(&self, schedule_id: &str) -> Result<bool> {
-        let found: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM jobs WHERE schedule_id = ?1 AND status IN ('queued', 'running') LIMIT 1",
-        )
-        .bind(schedule_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(found.is_some())
-    }
-
     /// The most recent job this schedule enqueued: `(job_id, status)`, or `None`
-    /// if it has never fired. Backs the schedule-observability API (`last_job_id`
-    /// / `last_status`); uses the same `schedule_id` index as the overlap guard.
+    /// if it has never fired.
+    ///
+    /// The single read behind BOTH the scheduler's overlap guard and the
+    /// `GET /schedules` health derivation (`scheduler::latest_run`, whose
+    /// `run_holds_slot` predicate is the one interpretation of this status).
+    ///
+    /// **This used to have an existential twin** — `schedule_has_active_job`,
+    /// `WHERE schedule_id = ? AND status IN ('queued','running')` over ALL of
+    /// the schedule's jobs — that only the scheduler consulted, while health
+    /// read only the newest row. The two disagreed exactly when it mattered:
+    /// `POST /jobs/retry` on an OLD job of the schedule re-queued a row that
+    /// satisfied the existential guard forever (retry does not touch
+    /// `created_at`, and nothing clears `schedule_id`), so the schedule stopped
+    /// firing while the API kept answering `health: "ok"`. Bulk retry by app
+    /// wedged every schedule of that app at once. Keying both on the newest
+    /// firing keeps "don't stack a run while mine is still going" and drops the
+    /// wedge, because a retried older job is by definition not the newest.
     pub async fn latest_job_for_schedule(
         &self,
         schedule_id: &str,
@@ -736,12 +753,44 @@ impl Storage {
         Ok(result.rows_affected() > 0)
     }
 
+    /// Records that this schedule **enqueued a job** at `when`. Called only from
+    /// the fire path, after the enqueue succeeded — `last_run` is the answer to
+    /// "when did this last actually run", so nothing that did not run may write
+    /// it (see [`Storage::record_schedule_skip`]).
     pub async fn touch_schedule(&self, id: &str, when: DateTime<Utc>) -> Result<()> {
         sqlx::query("UPDATE schedules SET last_run = ?2 WHERE id = ?1")
             .bind(id)
             .bind(ts(when))
             .execute(&self.pool)
             .await?;
+        Ok(())
+    }
+
+    /// Records a `misfire_policy = "skip"` advance: `missed` firings passed over
+    /// without enqueuing anything.
+    ///
+    /// Stamps `last_skipped_at` and accumulates `skipped_count`, and deliberately
+    /// does NOT touch `last_run`. The skip still has to move the schedule's cron
+    /// reference forward or the same backlog is re-scanned every tick forever —
+    /// that is why `scheduler::schedule_reference` reads
+    /// `MAX(last_run, last_skipped_at)` rather than `last_run` alone. Before
+    /// migration 0039 the skip borrowed `last_run` for that job, which is what
+    /// made one row claim a run that never happened.
+    pub async fn record_schedule_skip(
+        &self,
+        id: &str,
+        when: DateTime<Utc>,
+        missed: usize,
+    ) -> Result<()> {
+        sqlx::query(
+            "UPDATE schedules SET last_skipped_at = ?2, skipped_count = skipped_count + ?3 \
+             WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(ts(when))
+        .bind(missed as i64)
+        .execute(&self.pool)
+        .await?;
         Ok(())
     }
 
@@ -3009,6 +3058,8 @@ struct ScheduleRow {
     max_attempts: Option<i64>,
     managed_by: Option<String>,
     last_run: Option<String>,
+    last_skipped_at: Option<String>,
+    skipped_count: i64,
     created_at: String,
 }
 
@@ -3028,6 +3079,8 @@ impl TryFrom<ScheduleRow> for Schedule {
             max_attempts: r.max_attempts,
             managed_by: r.managed_by,
             last_run: r.last_run.as_deref().map(parse_ts).transpose()?,
+            last_skipped_at: r.last_skipped_at.as_deref().map(parse_ts).transpose()?,
+            skipped_count: r.skipped_count,
             created_at: parse_ts(&r.created_at)?,
         })
     }

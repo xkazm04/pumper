@@ -27,7 +27,7 @@ pub(crate) struct SchedulesQuery {
     path = "/schedules",
     tag = "schedules",
     params(SchedulesQuery),
-    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `overlapping`) — so a silently-wedged schedule is visible over the API."))
+    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `overlapping`) — so a silently-wedged schedule is visible over the API. `last_run` means *a job was enqueued* and is null until one was; firings eaten by `misfire_policy = \"skip\"` are reported separately as `last_skipped_at` + `skipped_count` (cumulative), so the two can no longer contradict each other."))
 )]
 pub(crate) async fn list_schedules(
     State(state): State<AppState>,
@@ -55,8 +55,14 @@ pub(crate) async fn list_schedules(
 /// Enriches each schedule with the observability fields the raw row can't carry:
 /// the computed `next_run`, its most recent job (`last_job_id` / `last_status`),
 /// and a `health` reason so "why isn't this firing?" is answerable over the API
-/// instead of only in server logs. `health` is derived from the same conditions
-/// the scheduler checks, so the API and the reconcile loop can't disagree.
+/// instead of only in server logs.
+///
+/// `health` is derived from the same conditions the scheduler checks — and for
+/// the overlap condition from the same read and the same predicate
+/// (`scheduler::latest_run` → `run_holds_slot`), not a second interpretation of
+/// a second query. The previous arrangement had exactly that second
+/// interpretation, and it reported `ok` for schedules the scheduler had already
+/// stopped firing (see `run_holds_slot`).
 async fn enrich_schedules(
     state: &AppState,
     schedules: Vec<Schedule>,
@@ -64,14 +70,17 @@ async fn enrich_schedules(
     let mut out = Vec::with_capacity(schedules.len());
     for schedule in schedules {
         let next_run = crate::scheduler::project_next_run(&schedule);
-        let last = state.storage.latest_job_for_schedule(&schedule.id).await?;
-        let (last_job_id, last_status) = match &last {
-            Some((id, status)) => (Some(id.clone()), Some(status.clone())),
-            None => (None, None),
-        };
+        let last = crate::scheduler::latest_run(state, &schedule.id)
+            .await
+            .map_err(|e| {
+                ApiError(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to read the schedule's latest run: {e}"),
+                )
+            })?;
+        let (last_job_id, last_status) = (last.job_id, last.status);
         // Precedence mirrors the scheduler's own short-circuits: a disabled or
         // mis-configured schedule never reaches the overlap check.
-        let last_active = matches!(last_status.as_deref(), Some("queued") | Some("running"));
         let health = if !schedule.enabled {
             "disabled"
         } else if next_run.is_none() {
@@ -93,7 +102,7 @@ async fn enrich_schedules(
             // in the same instant the scheduler starts firing it again — a
             // stored flag would have to be un-set by somebody.
             "invalid_params"
-        } else if last_active {
+        } else if last.holds_slot {
             "overlapping"
         } else {
             "ok"
