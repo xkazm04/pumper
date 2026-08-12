@@ -48,16 +48,27 @@ const EXPECTED_RAW_ENGINE_CALLS: &[(&str, usize)] = &[
     // per-request knob the tiered `FetchRequest` deliberately does not carry:
     // ETag revalidation, `max_body_bytes`, a per-request timeout, a POST body,
     // or a bytes (non-UTF-8) response.
+    // CKAN datastore API: POST with a JSON body.
+    ("crates/apps/ca-grants/src/lib.rs::ctx.engines.http", 1),
     ("crates/apps/census-bfs/src/lib.rs::ctx.engines.http", 1),
-    ("crates/apps/census-density/src/lib.rs::ctx.engines.http", 1),
+    ("crates/apps/census-density/src/lib.rs::ctx.engines.http", 2),
+    ("crates/apps/census-nesd/src/lib.rs::ctx.engines.http", 1),
+    ("crates/apps/census-nonemp/src/lib.rs::ctx.engines.http", 1),
     // Release ZIP via `fetch_bytes` + `max_body_bytes` — binary, not text.
     (
         "crates/apps/cms-fee-schedule/src/lib.rs::ctx.engines.http",
-        1,
+        2,
     ),
     ("crates/apps/cordis/src/lib.rs::ctx.engines.http", 2),
+    // SEDIA search API: POST with a JSON body.
+    ("crates/apps/eu-sedia/src/lib.rs::ctx.engines.http", 1),
     // POST `search2` with a JSON body — the tiered fetcher only issues GETs.
-    ("crates/apps/grants-gov/src/lib.rs::ctx.engines.http", 1),
+    ("crates/apps/grants-gov/src/lib.rs::ctx.engines.http", 2),
+    // The README walkthrough template. This one is a rendered PAGE, not an API
+    // — it predates the chokepoint and arguably SHOULD be `ctx.fetch`; the
+    // migration (with provenance stamping) is banked in the vault
+    // (hackernews-teaches-current-idioms, r11). Reviewed, not endorsed.
+    ("crates/apps/hackernews/src/lib.rs::ctx.engines.http", 1),
     ("crates/apps/mpsv-ispv/src/lib.rs::ctx.engines.http", 1),
     // ~188 MB bulk feed: `no_cache` + a per-request 300s timeout, plus an ARES
     // company lookup. Both are APIs.
@@ -89,6 +100,12 @@ const EXPECTED_RAW_ENGINE_CALLS: &[(&str, usize)] = &[
     // ── Jobless server-side callers: no AppContext exists ────────────────────
     // Materialized-view refresher: a background server task, not a job run.
     ("crates/server/src/refresher.rs::state.engines.http", 1),
+    // Provisioner proposal validation: a synchronous route-driven sample fetch
+    // with no job attached — same class as the `/extract/preview` entry below.
+    (
+        "crates/server/src/routes/provisioner.rs::state.engines.fetch",
+        1,
+    ),
     // `/remote/*` proxy: forwards a caller's request to a peer node.
     ("crates/server/src/routes/remote.rs::state.engines.http", 1),
     // `POST /extract/preview`: a synchronous, jobless rules try-out. There is
@@ -160,6 +177,20 @@ fn raw_engine_exprs(line: &str) -> Vec<String> {
 /// the line scanner about string literals.
 const SELF_PATH: &str = "crates/core/tests/fetch_chokepoint.rs";
 
+/// One source file as the scanner must see it: comment/doc lines dropped, the
+/// rest joined with no separator. rustfmt wraps long method chains
+/// (`ctx\n.engines\n.http\n.fetch(...)`), and a per-line scan reads the wrapped
+/// form as no call site at all — nine real sites across six files were
+/// invisible to this guard until the scan joined lines (found 2026-08-12).
+/// Joining cannot invent a site: a statement can't end in an identifier while
+/// the next begins with `.` unless they are one chain.
+fn scannable_source(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("//") && !l.starts_with('*'))
+        .collect()
+}
+
 /// Scans the workspace for raw-engine call sites, as
 /// `<repo-relative path>::<expr>` → occurrences.
 fn raw_engine_calls() -> BTreeMap<String, usize> {
@@ -180,10 +211,8 @@ fn raw_engine_calls() -> BTreeMap<String, usize> {
         if rel == SELF_PATH {
             continue;
         }
-        for line in text.lines() {
-            for expr in raw_engine_exprs(line) {
-                *found.entry(format!("{rel}::{expr}")).or_default() += 1;
-            }
+        for expr in raw_engine_exprs(&scannable_source(&text)) {
+            *found.entry(format!("{rel}::{expr}")).or_default() += 1;
         }
     }
     found
@@ -261,4 +290,19 @@ fn comment_mentions_are_not_call_sites() {
             "state.engines.browser".to_string()
         ]
     );
+}
+
+/// The anti-pattern this scanner shipped with: rustfmt wraps a long chain onto
+/// four lines and the per-line scan saw nothing. The joined view must see one
+/// call site, and comment lines must still drop out before the join (a doc
+/// line gluing onto code must not manufacture a receiver).
+#[test]
+fn rustfmt_wrapped_chains_are_still_call_sites() {
+    let wrapped = "        let response = ctx\n            .engines\n            .http\n            .fetch(HttpRequest::get(url))\n            .await?;\n";
+    assert_eq!(
+        raw_engine_exprs(&scannable_source(wrapped)),
+        vec!["ctx.engines.http".to_string()]
+    );
+    let commented = "// wrapped in prose: ctx\n// .engines.http is documented here\nlet x = 1;\n";
+    assert!(raw_engine_exprs(&scannable_source(commented)).is_empty());
 }
