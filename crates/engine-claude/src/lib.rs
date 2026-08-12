@@ -10,9 +10,9 @@ use async_trait::async_trait;
 use pumper_core::config::ClaudeConfig;
 use pumper_core::{Error, ResearchOutput, ResearchRequest, Researcher, Result};
 use serde_json::Value;
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
-use tracing::{debug, info};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, Command};
+use tracing::{debug, info, warn};
 
 pub struct ClaudeEngine {
     cfg: ClaudeConfig,
@@ -117,36 +117,117 @@ impl Researcher for ClaudeEngine {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
+            // Backstop only. It kills the DIRECT child, which on the Windows
+            // shim path is `cmd.exe` and not the process that spends money —
+            // see `kill_process_tree`.
             .kill_on_drop(true);
 
         debug!(timeout_secs = timeout.as_secs(), "spawning claude cli");
         let mut child = cmd
             .spawn()
             .map_err(|e| Error::Claude(format!("failed to spawn '{}': {e}", self.cfg.binary)))?;
+        // Captured BEFORE anything can reap the process: `Child::id` returns
+        // `None` once the child has been waited on, and the tree kill needs the
+        // shim's pid. The live `Child` handle is also what keeps Windows from
+        // recycling that pid — killing a *recycled* pid's tree would be far
+        // worse than the leak this fixes — so the kill must run while the handle
+        // is still held.
+        let pid = child.id();
 
         let mut stdin = child
             .stdin
             .take()
             .ok_or_else(|| Error::Claude("no stdin handle".into()))?;
+        let mut stdout_pipe = child
+            .stdout
+            .take()
+            .ok_or_else(|| Error::Claude("no stdout handle".into()))?;
+        let mut stderr_pipe = child
+            .stderr
+            .take()
+            .ok_or_else(|| Error::Claude("no stderr handle".into()))?;
+
         let prompt = req.prompt.clone();
         let writer = tokio::spawn(async move {
             let _ = stdin.write_all(prompt.as_bytes()).await;
             let _ = stdin.shutdown().await;
         });
+        // Drained concurrently with the wait, because a child that fills its
+        // stdout pipe blocks forever if nobody reads it. `wait_with_output` used
+        // to do this for us — but it CONSUMES the child, which left
+        // `kill_on_drop` as the only possible cleanup. Reading the pipes by hand
+        // is the price of keeping `child` borrowable, and a borrowable child is
+        // what makes an explicit process-tree kill possible at all.
+        let stdout_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stdout_pipe.read_to_end(&mut buf).await;
+            buf
+        });
+        let stderr_task = tokio::spawn(async move {
+            let mut buf = Vec::new();
+            let _ = stderr_pipe.read_to_end(&mut buf).await;
+            buf
+        });
+        let side = [
+            writer.abort_handle(),
+            stdout_task.abort_handle(),
+            stderr_task.abort_handle(),
+        ];
 
-        // On timeout the future is dropped and kill_on_drop reaps the child.
-        let output = tokio::time::timeout(timeout, child.wait_with_output())
-            .await
-            .map_err(|_| Error::Claude(format!("timed out after {}s", timeout.as_secs())))?
-            .map_err(|e| Error::Claude(format!("cli failed: {e}")))?;
+        // ONE deadline governs the whole run — the wait AND the drain — so an
+        // orphan holding the stdout pipe open cannot park this call past the
+        // caller's timeout after the CLI itself is gone.
+        let deadline = tokio::time::Instant::now() + timeout;
+        let status = match tokio::time::timeout_at(deadline, child.wait()).await {
+            Ok(Ok(status)) => status,
+            Ok(Err(e)) => {
+                return Err(abandon_run(&mut child, pid, &side, format!("cli failed: {e}")).await)
+            }
+            Err(_) => {
+                return Err(abandon_run(
+                    &mut child,
+                    pid,
+                    &side,
+                    format!(
+                        "timed out after {}s waiting for the cli to exit",
+                        timeout.as_secs()
+                    ),
+                )
+                .await)
+            }
+        };
+        // The child is gone, so the writer's pipe is closed and the task is
+        // finished or about to be — this cannot hang.
         let _ = writer.await;
+        let stdout_bytes = match tokio::time::timeout_at(deadline, stdout_task).await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) => return Err(Error::Claude(format!("stdout reader failed: {e}"))),
+            Err(_) => {
+                return Err(abandon_run(
+                    &mut child,
+                    pid,
+                    &side,
+                    format!(
+                        "timed out after {}s draining cli stdout — a spawned process is still \
+                         holding the pipe open",
+                        timeout.as_secs()
+                    ),
+                )
+                .await)
+            }
+        };
+        // stderr only decorates an error message; never fail the run over it.
+        let stderr_bytes = match tokio::time::timeout_at(deadline, stderr_task).await {
+            Ok(Ok(buf)) => buf,
+            _ => Vec::new(),
+        };
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        if !status.success() {
+            let stderr = String::from_utf8_lossy(&stderr_bytes);
             return Err(Error::Claude(format!(
                 "exited with {}: {}",
-                output.status,
+                status,
                 truncate(&stderr, 2000)
             )));
         }
@@ -186,6 +267,97 @@ impl Researcher for ClaudeEngine {
             num_turns: envelope["num_turns"].as_u64(),
             session_id: envelope["session_id"].as_str().map(String::from),
         })
+    }
+}
+
+/// Ends a run that will not be waited on: aborts the side tasks, kills the whole
+/// process tree, and mints the error that says so.
+///
+/// The stdin writer is aborted rather than left behind: it is parked on
+/// `write_all` into a pipe nobody will ever read again, and dropping the future
+/// (the old behaviour) never even reached the `writer.await` below it — `?`
+/// returned first, so the task leaked for the life of the process.
+async fn abandon_run(
+    child: &mut Child,
+    pid: Option<u32>,
+    side: &[tokio::task::AbortHandle],
+    why: String,
+) -> Error {
+    for task in side {
+        task.abort();
+    }
+    let outcome = kill_process_tree(child, pid).await;
+    Error::Claude(format!("{why}; {outcome}"))
+}
+
+/// Kills the child **and everything it spawned**, returning what was done for
+/// the error message (an operator has to be able to tell a killed tree from the
+/// orphan-and-hope behaviour this replaces).
+///
+/// On the Windows shim path the direct child is `cmd.exe`, and the process that
+/// holds the API key and burns money is its `claude`/node grandchild.
+/// `TerminateProcess` — which is all `Child::kill` and `kill_on_drop` do — kills
+/// only the shim: the grandchild is re-parented, keeps running its whole agentic
+/// loop, keeps spending, and has nobody left to reap it. `taskkill /T` walks the
+/// live parent/child snapshot and kills the tree from the root down, which is
+/// exactly the shape this engine creates (shim → cli → tool subprocesses, all
+/// alive and still linked at kill time).
+///
+/// **Why not a Job Object.** `CreateJobObject` +
+/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` is stronger — it survives re-parenting
+/// and needs no snapshot walk — but it costs a native `windows` dependency and
+/// unsafe handle plumbing in an engine whose entire job is spawning ONE
+/// cooperative CLI that does not try to escape. `taskkill` covers every tree
+/// this engine creates, at zero dependency cost.
+///
+/// On POSIX there is no shim: the child IS the CLI, so killing it stops the
+/// spend at the source, and `Child::kill` is the whole mechanism.
+async fn kill_process_tree(child: &mut Child, pid: Option<u32>) -> String {
+    let mut outcome = "direct child killed".to_string();
+    if let Some((program, args)) = pid.and_then(tree_kill_argv) {
+        let killed = Command::new(program)
+            .args(&args)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .status()
+            .await;
+        outcome = match killed {
+            Ok(status) if status.success() => "process tree killed".to_string(),
+            // Exit 128 = "no such process": it had already exited on its own.
+            Ok(status) => format!("process tree kill reported {status}"),
+            Err(e) => {
+                warn!(?pid, "process tree kill failed: {e}");
+                format!("process tree kill FAILED ({e}) — a spawned process may still be running")
+            }
+        };
+    }
+    let _ = child.start_kill();
+    // Reap, so the child is not left a zombie. Bounded: a kill that somehow did
+    // not land must not hang the caller past its own deadline.
+    let _ = tokio::time::timeout(Duration::from_secs(5), child.wait()).await;
+    outcome
+}
+
+/// The command that kills the whole process tree rooted at `pid`, or `None`
+/// where killing the direct child already IS the whole tree (POSIX: no shim).
+///
+/// Extracted as a pure function so the flags are asserted in a test instead of
+/// being reviewed once — dropping `/T` here silently restores the orphan bug,
+/// and nothing else in the system would notice.
+fn tree_kill_argv(pid: u32) -> Option<(&'static str, Vec<String>)> {
+    #[cfg(windows)]
+    {
+        Some((
+            "taskkill",
+            vec!["/PID".into(), pid.to_string(), "/T".into(), "/F".into()],
+        ))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = pid;
+        None
     }
 }
 
@@ -241,8 +413,36 @@ fn truncate(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::parse_loose_json;
+    use super::{parse_loose_json, tree_kill_argv};
     use serde_json::json;
+
+    /// The anti-pattern: killing the `cmd.exe` shim and calling it done. The
+    /// grandchild behind the shim is the process holding the API key, and it
+    /// keeps running its agentic loop — and keeps spending — unless the kill
+    /// walks the tree. `/T` is that walk; `/F` is what makes it unconditional.
+    #[cfg(windows)]
+    #[test]
+    fn tree_kill_targets_the_tree_not_only_the_shim() {
+        let (program, args) = tree_kill_argv(4242).expect("windows kills the tree explicitly");
+        assert_eq!(program, "taskkill");
+        assert!(args.contains(&"/T".to_string()), "no tree walk: {args:?}");
+        assert!(args.contains(&"/F".to_string()), "not forced: {args:?}");
+        let pid_at = args.iter().position(|a| a == "/PID").expect("/PID flag");
+        assert_eq!(
+            args.get(pid_at + 1).map(String::as_str),
+            Some("4242"),
+            "the pid must follow /PID: {args:?}"
+        );
+    }
+
+    /// POSIX spawns the CLI directly — no shim, so the direct child IS the
+    /// process that spends money and `Child::kill` stops it at the source.
+    /// Asserting `None` keeps that reasoning explicit rather than accidental.
+    #[cfg(not(windows))]
+    #[test]
+    fn posix_needs_no_tree_walk_because_there_is_no_shim() {
+        assert!(tree_kill_argv(4242).is_none());
+    }
 
     #[test]
     fn raw_json() {

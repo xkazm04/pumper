@@ -9,3 +9,8 @@ tokio.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+
+[dev-dependencies]
+# The fake-CLI harness (crates/engine-claude/tests/): temp-dir scripts that play
+# the part of `claude` so `research()` is testable without an API key or spend.
+tempfile = "3"
