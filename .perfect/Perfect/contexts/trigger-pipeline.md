@@ -48,6 +48,16 @@ Test coverage: pure half thorough (decide/filters/hooks via StubPlugins); e2e on
 dataset-fanout kind (`e2e/worker_fanout.rs`). Untested: multi-dataset enqueue, terminal e2e,
 ingress handler gates, real-WASM-host hooks, dedup-race branch.
 
+## Banked anchors
+- 2026-08-12 (r14 landing, Director-observed): **the trigger door is unknown-body-field
+  tolerant** — POST /triggers with a typo'd `plugins` key (e.g. `plugin_hooks`, the
+  storage column name) answers 201 and creates an UNGATED trigger; the exact
+  mis-deployment class the dry-run's `unusable_plugins` surface exists to catch, one
+  level earlier. Candidate direction: unknown-body-field policy at the work-creator
+  doors (triggers/schedules/jobs/watches), probably serde deny_unknown_fields or a
+  shared 400-on-unknown-keys helper + inventory test. Found when r14's smoke check
+  tripped over it (1a8b955).
+
 ## Direction history
 - 2026-08-04 (round 6): presented 6 (5 context + 1 banked cross-context seed), **accepted
   6/6 clean sweep** — per-dataset-trigger-hops (robustness, confirmed bug), trigger-decision-

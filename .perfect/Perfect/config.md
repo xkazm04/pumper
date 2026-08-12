@@ -53,6 +53,24 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   resource-destructive actions even when they are obviously regenerable.
 
 ## Skill improvement log
+- 2026-08-12 (round 14): **A session note that records reviews AS THEY HAPPEN makes a
+  death between review and gates nearly free.** The continuation found all 7 commits
+  landed, both lots' KEEP verdicts written with file-level specifics, and an executable
+  "if resuming" block — total recovery cost was one spot-verify pass (grep the recorded
+  claims against the code) plus the gates. Keep writing reviews into the session note
+  incrementally, not at wrap.
+- 2026-08-12 (round 14): **A smoke check written from memory of the data model used the
+  storage column name (`plugin_hooks`) where the API takes `plugins` — and the door's
+  unknown-field tolerance turned that typo into a false FAIL that looked like a product
+  bug.** Two lessons: (a) when writing a NEW check against an API, copy the field names
+  from the route's request struct or the feature doc, never from the model/migration;
+  (b) the door silently 201-ing a typo'd gate config is itself a finding — banked on
+  trigger-pipeline as a candidate direction (unknown-body-field policy at the doors).
+- 2026-08-12 (round 14): **The uncommitted-vault-death window is real: ~176 lines of
+  review-state sat dirty in the working tree when the session died.** The continuation's
+  first act was committing them before touching anything else. Consider committing vault
+  review-state per-lot (not per-session) in future rounds — the vault is in-repo here, so
+  a commit is cheap insurance.
 - 2026-08-12 (round 13): **Builder death is the norm, and the recovery protocol has
   converged to near-zero cost.** Three of the last five rounds died mid-build; r13
   died TWICE (original + first continuation) and still shipped 6/6 with zero work
