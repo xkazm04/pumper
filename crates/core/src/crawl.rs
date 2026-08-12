@@ -1032,14 +1032,17 @@ pub async fn crawl(
             }
         };
         stats.crawled += 1;
-        // A known page fetched with a conditional GET that came back 200 (or a
-        // discovered link is absent from `conditional`): count the revisit.
-        if cfg.revisit && conditional.contains_key(&fetched.url) {
+        // A known page fetched with a conditional GET that came back 200 (a
+        // discovered link is absent from `conditional`): count the revisit. The
+        // same flag decides whether the cross-page dedup gate applies at all.
+        let known_page = cfg.revisit && conditional.contains_key(&fetched.url);
+        if known_page {
             stats.revisited += 1;
         }
 
         let hash = simhash(&fetched.body);
-        let duplicate = cfg.dedup_distance > 0 && dedup_index.is_near_dup(hash);
+        let duplicate =
+            dedup_applies(cfg.dedup_distance, known_page) && dedup_index.is_near_dup(hash);
 
         if duplicate {
             stats.skipped_duplicates += 1;
@@ -1252,6 +1255,32 @@ impl Checkpoint {
             _ => CheckpointLoad::Incompatible,
         }
     }
+}
+
+/// Whether the cross-page near-duplicate gate applies to this fetch.
+///
+/// Cross-page dedup answers *"is this the same content we already kept under a
+/// different URL?"* — the right question for a FRESH crawl, where twenty URLs of
+/// one templated page are twenty copies of one document. A revisit asks the
+/// opposite question: a sentinel recrawl re-checks each KNOWN page against **its
+/// own history**, not against its siblings. Two product pages that share a
+/// template are not duplicates of one another for monitoring purposes.
+///
+/// Anti-pattern this defends — *the frozen revisit record*. The gate used to be
+/// unconditional, and the app ships `dedup_distance: 3` in every mode, so this
+/// was the default behavior rather than an edge case. A known page whose body
+/// landed within 3 bits of a sibling already fetched this run bumped
+/// `revisited`, then returned without ever touching the sink: its fresh
+/// `etag`/`last_modified` were discarded, its [`RevisitCadence`] never advanced,
+/// and its stored record froze — stale validators and all. The next run sent the
+/// same stale validator, got another full `200`, and was dropped again. Forever,
+/// over exactly the paginated/templated population a revisit sweep exists for,
+/// while `skipped_duplicates` climbed and the run reported success.
+///
+/// A URL *discovered* during a revisit (`discover`) is not a known page, so it
+/// keeps the fresh-crawl gate.
+fn dedup_applies(dedup_distance: u32, known_page: bool) -> bool {
+    dedup_distance > 0 && !known_page
 }
 
 /// The queue a checkpoint must persist: everything still in the frontier PLUS
@@ -2791,6 +2820,120 @@ mod tests {
             stats.kept,
             "and every kept page ends up in the sink exactly once"
         );
+    }
+
+    #[test]
+    fn dedup_gate_is_skipped_for_known_pages_not_for_new_ones() {
+        // Fresh crawl: the gate is the whole point of `dedup_distance`.
+        assert!(dedup_applies(3, false));
+        // Revisit of a KNOWN page: never gated against a sibling's body.
+        assert!(!dedup_applies(3, true));
+        // `dedup_distance: 0` still disables it everywhere.
+        assert!(!dedup_applies(0, false));
+        assert!(!dedup_applies(0, true));
+    }
+
+    /// Two URLs serving byte-identical bodies (SimHash distance 0, so the near-dup
+    /// verdict is deterministic at any `dedup_distance > 0`), plus their fresh
+    /// `ETag`s.
+    fn twin_pages() -> MockHttp {
+        let twin = "<html><head><title>Product</title></head><body>\
+            <p>the same templated body served at two different urls</p></body></html>";
+        let mut pages = HashMap::new();
+        let mut resp_etags = HashMap::new();
+        for path in ["one", "two"] {
+            pages.insert(format!("https://ex.com/{path}"), (200, twin.to_string()));
+            resp_etags.insert(format!("https://ex.com/{path}"), format!("fresh-{path}"));
+        }
+        MockHttp {
+            pages,
+            resp_etags,
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn a_revisited_page_is_not_dropped_as_a_near_dup_of_its_sibling() {
+        // Both known pages share a template. Under the old unconditional gate the
+        // second one counted as `revisited`, then returned before the sink: fresh
+        // validators discarded, cadence frozen, record never updated — so the next
+        // run re-downloaded it and dropped it again, forever.
+        let http = Arc::new(twin_pages());
+        let source = Box::new(SeedSource(vec![
+            RevisitSeed::bare("https://ex.com/one", Some("stale-one".into()), None),
+            RevisitSeed::bare("https://ex.com/two", Some("stale-two".into()), None),
+        ]));
+        let harness = CrawlHarness::new();
+        let mut cfg = test_cfg(&[]);
+        cfg.revisit = true;
+        cfg.dedup_distance = 3; // the app's default, in every mode
+
+        let stats = crawl(
+            http,
+            cfg,
+            None,
+            Some(harness.sink()),
+            Some(source),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stats.revisited, 2);
+        assert_eq!(
+            stats.skipped_duplicates, 0,
+            "a known page is never a duplicate OF ANOTHER PAGE"
+        );
+        assert_eq!(stats.kept, 2, "both records are refreshed");
+
+        let records = harness.records.lock().unwrap();
+        for path in ["one", "two"] {
+            let url = format!("https://ex.com/{path}");
+            let rec = records
+                .iter()
+                .find(|r| r.url == url)
+                .unwrap_or_else(|| panic!("{url} reached the sink"));
+            assert_eq!(
+                rec.etag.as_deref(),
+                Some(format!("fresh-{path}").as_str()),
+                "the fresh validator is stored, so the next run can revalidate"
+            );
+            let cadence = rec.cadence.as_ref().expect("cadence advanced");
+            assert_eq!(cadence.checks, 1, "the check was observed");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_fresh_crawl_still_drops_near_duplicate_new_pages() {
+        // The guard for the fix above: removing the gate outright (rather than
+        // scoping it to non-known pages) would keep all three pages here.
+        let mut mock = twin_pages();
+        mock.pages.insert(
+            "https://ex.com/".to_string(),
+            (
+                200,
+                "<html><head><title>Index</title></head><body><h1>Catalogue index</h1>\
+                 <a href=\"/one\">one</a><a href=\"/two\">two</a></body></html>"
+                    .to_string(),
+            ),
+        );
+        let http = Arc::new(mock);
+        let harness = CrawlHarness::new();
+        let mut cfg = test_cfg(&["https://ex.com/"]);
+        cfg.dedup_distance = 3;
+
+        let stats = crawl(http, cfg, None, Some(harness.sink()), None, None, None)
+            .await
+            .unwrap();
+
+        assert_eq!(stats.crawled, 3, "all three pages were fetched");
+        assert_eq!(
+            stats.skipped_duplicates, 1,
+            "the second copy of the templated body is still suppressed"
+        );
+        assert_eq!(stats.kept, 2, "index + one copy");
+        assert_eq!(harness.records.lock().unwrap().len(), 2);
     }
 
     #[test]
