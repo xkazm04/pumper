@@ -50,19 +50,29 @@ pub(crate) enum Outcome {
     SchemaInvalid,
 }
 
-/// Classify one replay result. Error-message matching is pinned to the host's
-/// own wording (engine-wasm wraps traps as "plugin trapped (fuel/memory/panic)"
-/// and task aborts as "panicked"); anything else a run can fail with is a
-/// contract violation, not a sandbox stop.
-pub(crate) fn classify_outcome(res: &std::result::Result<Value, String>) -> Outcome {
+/// Classify one replay result.
+///
+/// The anti-pattern this replaces: classification used to match SUBSTRINGS of
+/// the host's own error prose (`"trapped"`, `"panicked"`). Rewording one
+/// `format!` in engine-wasm silently reclassified every row this app writes —
+/// and drift scores are computed against those rows — with no test anywhere
+/// failing. The host now carries a typed [`PluginFailure`], so the class is
+/// read from the type and the message is free to say whatever is useful.
+///
+/// [`PluginFailure`]: pumper_core::error::PluginFailure
+pub(crate) fn classify_outcome(res: &std::result::Result<Value, Error>) -> Outcome {
+    use pumper_core::error::PluginFailure;
     match res {
-        Err(msg) => {
-            if msg.contains("trapped") || msg.contains("panicked") {
-                Outcome::Trap
-            } else {
-                Outcome::SchemaInvalid
-            }
-        }
+        // `Trap` is the only class that means "the sandbox stopped it" — fuel
+        // exhaustion, the memory cap and an explicit trap all arrive that way.
+        // Every other class (a module that never exported the ABI, output that
+        // is not the contract, an unknown name, a host fault) is a contract
+        // violation from this report's point of view: the plugin produced no
+        // usable answer for a reason that is not resource pressure.
+        Err(e) => match e.plugin_failure() {
+            Some(PluginFailure::Trap) => Outcome::Trap,
+            _ => Outcome::SchemaInvalid,
+        },
         Ok(v) => {
             if is_empty_output(v) {
                 Outcome::Empty
@@ -376,13 +386,10 @@ pub(crate) async fn run_observatory(ctx: &AppContext) -> Result<Value> {
             let mut elapsed_total_ms = 0.0f64;
             for body in &bodies {
                 let start = std::time::Instant::now();
-                let res: std::result::Result<Value, String> = if body.is_empty() {
+                let res: std::result::Result<Value, Error> = if body.is_empty() {
                     Ok(Value::Null)
                 } else {
-                    ctx.plugins
-                        .run(plugin, body, &Value::Null)
-                        .await
-                        .map_err(|e| e.to_string())
+                    ctx.plugins.run(plugin, body, &Value::Null).await
                 };
                 elapsed_total_ms += start.elapsed().as_secs_f64() * 1000.0;
                 let outcome = classify_outcome(&res);
@@ -499,24 +506,74 @@ mod tests {
 
     // --- outcome classification -------------------------------------------
 
+    use pumper_core::error::PluginFailure;
+
+    fn failed(kind: PluginFailure, message: &str) -> std::result::Result<Value, Error> {
+        Err(Error::plugin(kind, "title", message))
+    }
+
     #[test]
     fn classify_traps_on_sandbox_stops() {
-        let trap: std::result::Result<Value, String> =
-            Err("plugin trapped (fuel/memory/panic): all fuel consumed".into());
-        assert_eq!(classify_outcome(&trap), Outcome::Trap);
-        let panic: std::result::Result<Value, String> =
-            Err("plugin task panicked: JoinError".into());
-        assert_eq!(classify_outcome(&panic), Outcome::Trap);
+        assert_eq!(
+            classify_outcome(&failed(PluginFailure::Trap, "all fuel consumed")),
+            Outcome::Trap
+        );
     }
 
     #[test]
     fn classify_schema_invalid_on_contract_violations() {
-        let bad_json: std::result::Result<Value, String> =
-            Err("plugin returned invalid JSON: expected value".into());
-        assert_eq!(classify_outcome(&bad_json), Outcome::SchemaInvalid);
-        let oob: std::result::Result<Value, String> =
-            Err("plugin output range out of bounds: ptr=9 len=9 mem=1".into());
-        assert_eq!(classify_outcome(&oob), Outcome::SchemaInvalid);
+        assert_eq!(
+            classify_outcome(&failed(
+                PluginFailure::MalformedOutput,
+                "returned invalid JSON: expected value"
+            )),
+            Outcome::SchemaInvalid
+        );
+        assert_eq!(
+            classify_outcome(&failed(
+                PluginFailure::MalformedOutput,
+                "output range out of bounds: ptr=9 len=9 mem=1"
+            )),
+            Outcome::SchemaInvalid
+        );
+        // A module that never exported the ABI produced no answer either, and
+        // it is not resource pressure — so it is not a trap.
+        assert_eq!(
+            classify_outcome(&failed(PluginFailure::MissingExport, "exports no 'memory'")),
+            Outcome::SchemaInvalid
+        );
+    }
+
+    /// THE anti-pattern: classification used to read substrings of the host's
+    /// prose, so rewording one `format!` in engine-wasm reclassified stored
+    /// rows — and drift is computed against those rows — with nothing failing.
+    /// The class must be immune to the message, in both directions.
+    #[test]
+    fn classification_survives_rewording_and_is_not_fooled_by_lookalike_prose() {
+        // A trap stays a trap however it is phrased — including phrasings that
+        // contain none of the old marker words.
+        for message in ["fuel budget exhausted", "the sandbox stopped it", ""] {
+            assert_eq!(
+                classify_outcome(&failed(PluginFailure::Trap, message)),
+                Outcome::Trap,
+                "reworded trap misclassified: {message:?}"
+            );
+        }
+        // …and prose that merely LOOKS like a trap is not one. Under the old
+        // substring rule both of these counted as sandbox stops.
+        assert_eq!(
+            classify_outcome(&failed(
+                PluginFailure::MalformedOutput,
+                "the plugin trapped the value in a string it then panicked on"
+            )),
+            Outcome::SchemaInvalid
+        );
+        // An error from outside the plugin host carries no class at all and
+        // must not be promoted into the trap bucket.
+        assert_eq!(
+            classify_outcome(&Err(Error::App("plugin trapped, allegedly".into()))),
+            Outcome::SchemaInvalid
+        );
     }
 
     #[test]
@@ -529,10 +586,18 @@ mod tests {
             json!({ "title": null, "tags": [] }),
             json!({ "error": "no <title> found" }),
         ] {
-            assert_eq!(classify_outcome(&Ok(v.clone())), Outcome::Empty, "{v}");
+            assert_eq!(
+                classify_outcome(&Ok::<Value, Error>(v.clone())),
+                Outcome::Empty,
+                "{v}"
+            );
         }
         for v in [json!({ "title": "x" }), json!([1]), json!(42)] {
-            assert_eq!(classify_outcome(&Ok(v.clone())), Outcome::Ok, "{v}");
+            assert_eq!(
+                classify_outcome(&Ok::<Value, Error>(v.clone())),
+                Outcome::Ok,
+                "{v}"
+            );
         }
     }
 

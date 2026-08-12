@@ -89,6 +89,67 @@ impl ClaudeFailure {
     }
 }
 
+/// How a sandboxed WASM plugin call failed.
+///
+/// Typed rather than stringly for the same reason [`ClaudeFailure`] is: the
+/// consumers of a plugin failure **classify** it — the observatory buckets
+/// replays into ok/trap/empty/schema_invalid, the trigger ledger records a
+/// distinct outcome per class — and they used to do it by matching substrings
+/// of the host's own `format!` messages. Rewording one message silently
+/// reclassified every row it produced, with no test anywhere failing.
+///
+/// The classes are drawn along the lines an OPERATOR can act on, not along the
+/// wasmtime API's seams: "the sandbox stopped it" is one fact whether the stop
+/// was a trap, fuel exhaustion or the memory cap (all three arrive as traps and
+/// all three mean *this plugin is too expensive or broken*), while "the module
+/// isn't there" and "the module is there but doesn't export the ABI" are
+/// genuinely different deployment mistakes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PluginFailure {
+    /// No module of that name is loaded — never installed, or the name is a
+    /// typo. Usually means `just plugins-install` never ran.
+    Unknown,
+    /// The plugin subsystem is switched off (`[plugins] enabled = false`), so
+    /// *no* name would resolve. Distinct from [`Unknown`](Self::Unknown)
+    /// because the fix is a config change, not a build step — and because a
+    /// disabled host reports every configured hook missing at once, which a
+    /// caller may want to dedupe rather than amplify.
+    Disabled,
+    /// The module loaded but does not export the ABI the call needs (`memory`,
+    /// `alloc`, or neither `extract_v2` nor `extract`). A describe-only
+    /// dynamic-app module hits this: it is a legitimate module, just not an
+    /// executable extraction/hook plugin.
+    MissingExport,
+    /// The sandbox stopped it mid-run: an explicit trap (`unreachable`, a guest
+    /// panic), CPU fuel exhaustion, or the linear-memory cap. The limits held —
+    /// this is the sandbox working, not the host failing.
+    Trap,
+    /// It ran to completion and returned, but what it returned is not the
+    /// contract: a packed pointer/length outside its own memory, unreadable
+    /// bytes, or output that is not UTF-8 JSON.
+    MalformedOutput,
+    /// The **host** failed around the call — store setup, the blocking task
+    /// panicking, the admission gate closing. Not the plugin's fault, and the
+    /// one class that means "file a bug against pumper".
+    Host,
+}
+
+impl PluginFailure {
+    /// Stable snake_case token for logs, ledger `detail` values and dataset
+    /// rows. These strings ARE a contract (the trigger ledger's outcome
+    /// vocabulary is built from them); the human message is not.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PluginFailure::Unknown => "unknown_plugin",
+            PluginFailure::Disabled => "plugins_disabled",
+            PluginFailure::MissingExport => "missing_export",
+            PluginFailure::Trap => "trap",
+            PluginFailure::MalformedOutput => "malformed_output",
+            PluginFailure::Host => "host_error",
+        }
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("http engine: {0}")]
@@ -121,6 +182,18 @@ pub enum Error {
     Config(String),
     #[error("app: {0}")]
     App(String),
+    /// A sandboxed WASM plugin call failed. The struct variant exists to carry
+    /// [`PluginFailure`]: the classification is what every consumer actually
+    /// wants, and a `String`-only variant forced them to re-derive it by
+    /// matching substrings of the message. Build it with [`Error::plugin`].
+    #[error("plugin '{plugin}' ({}): {message}", kind.as_str())]
+    Plugin {
+        /// The module the call named. Present even for
+        /// [`PluginFailure::Unknown`] — that IS the actionable fact.
+        plugin: String,
+        kind: PluginFailure,
+        message: String,
+    },
     /// A metered seam refused to start further paid work because the job's
     /// `budget_usd` ceiling is already reached.
     ///
@@ -174,6 +247,29 @@ impl Error {
         }
     }
 
+    /// A sandboxed-plugin failure of a known class, naming the module.
+    pub fn plugin(
+        kind: PluginFailure,
+        plugin: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        Error::Plugin {
+            plugin: plugin.into(),
+            kind,
+            message: message.into(),
+        }
+    }
+
+    /// How a plugin call failed, if this failure came from one. Consumers
+    /// classify on THIS rather than on the message — that is the whole point of
+    /// the typed variant.
+    pub fn plugin_failure(&self) -> Option<PluginFailure> {
+        match self {
+            Error::Plugin { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
+
     /// What this failure reports about money already spent, if it is the kind of
     /// failure that can. Metered seams consult it *before* propagating, so the
     /// ledger sees the spend of a call that failed.
@@ -221,7 +317,101 @@ pub type Result<T> = std::result::Result<T, Error>;
 
 #[cfg(test)]
 mod tests {
-    use super::{ClaudeFailure, ClaudeSpend, Error};
+    use super::{ClaudeFailure, ClaudeSpend, Error, PluginFailure};
+
+    /// The anti-pattern this variant replaces: every sandbox failure was an
+    /// `Error::App(format!(...))`, so the observatory and the trigger ledger
+    /// classified rows by matching substrings of the host's prose. Rewording a
+    /// message reclassified data, and no test anywhere failed.
+    ///
+    /// The class must therefore survive **any** message.
+    #[test]
+    fn a_plugin_failure_classifies_by_kind_not_by_message_wording() {
+        for message in [
+            "plugin trapped (fuel/memory/panic): all fuel consumed",
+            "wholly reworded prose that mentions nothing recognisable",
+            "",
+        ] {
+            let err = Error::plugin(PluginFailure::Trap, "delta-slim", message);
+            assert_eq!(
+                err.plugin_failure(),
+                Some(PluginFailure::Trap),
+                "the class is a field, not a substring of {message:?}"
+            );
+        }
+    }
+
+    /// Each class is a different operator action — a missing build step, a
+    /// config flag, a plugin that never exported the ABI, an over-budget
+    /// module, a contract violation, a host bug. Collapsing any two of them
+    /// loses the action.
+    #[test]
+    fn plugin_failure_classes_are_distinct_and_named() {
+        let all = [
+            PluginFailure::Unknown,
+            PluginFailure::Disabled,
+            PluginFailure::MissingExport,
+            PluginFailure::Trap,
+            PluginFailure::MalformedOutput,
+            PluginFailure::Host,
+        ];
+        let mut tokens: Vec<&str> = all.iter().map(|k| k.as_str()).collect();
+        tokens.sort_unstable();
+        let unique = {
+            let mut t = tokens.clone();
+            t.dedup();
+            t
+        };
+        assert_eq!(tokens, unique, "two classes share a token: {tokens:?}");
+        for kind in all {
+            assert!(
+                !kind.as_str().is_empty() && kind.as_str().is_ascii(),
+                "{kind:?} needs a stable snake_case token"
+            );
+        }
+    }
+
+    /// The module name is the actionable half of the failure, so it travels in
+    /// a field (and still reaches the human message).
+    #[test]
+    fn a_plugin_failure_names_the_module_it_came_from() {
+        let err = Error::plugin(PluginFailure::Unknown, "trigger-gate", "not loaded");
+        let Error::Plugin { plugin, kind, .. } = &err else {
+            panic!("wrong variant");
+        };
+        assert_eq!(plugin, "trigger-gate");
+        assert_eq!(*kind, PluginFailure::Unknown);
+        let shown = err.to_string();
+        assert!(shown.contains("trigger-gate"), "{shown}");
+        assert!(shown.contains("unknown_plugin"), "{shown}");
+    }
+
+    /// The mirror risk: anything that is not a plugin call must not answer this
+    /// question, or a caller's `match` on the class silently swallows unrelated
+    /// failures into a plugin bucket.
+    #[test]
+    fn non_plugin_failures_report_no_plugin_class() {
+        assert!(Error::App("plugin trapped, allegedly".into())
+            .plugin_failure()
+            .is_none());
+        assert!(Error::Http("connection reset".into())
+            .plugin_failure()
+            .is_none());
+    }
+
+    /// A plugin trap is the sandbox WORKING. Retrying it may well succeed
+    /// (a different document, a raised fuel budget), so it must not join the
+    /// terminal set and take a job's retries away.
+    #[test]
+    fn a_plugin_failure_is_not_terminal_for_the_job() {
+        for kind in [
+            PluginFailure::Trap,
+            PluginFailure::Unknown,
+            PluginFailure::MalformedOutput,
+        ] {
+            assert!(!Error::plugin(kind, "p", "x").is_terminal_for_job());
+        }
+    }
 
     /// The anti-pattern this variant was reshaped for: a run that burns to its
     /// budget and *then* fails reported `$0`, because the cost lived in the same

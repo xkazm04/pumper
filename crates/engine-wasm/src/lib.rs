@@ -28,10 +28,11 @@
 
 use std::collections::HashMap;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 
 use async_trait::async_trait;
 use pumper_core::config::PluginConfig;
+use pumper_core::error::PluginFailure;
 use pumper_core::{Error, Plugins, Result};
 use serde_json::Value;
 use tokio::sync::Semaphore;
@@ -40,16 +41,22 @@ use wasmtime::{
     StoreLimits, StoreLimitsBuilder, TypedFunc,
 };
 
+/// The loaded-module index, swapped wholesale by [`Plugins::reload`].
+type ModuleMap = HashMap<String, LoadedPlugin>;
+
 pub struct WasmPluginHost {
     engine: Engine,
     dir: std::path::PathBuf,
     fuel: u64,
     max_memory: usize,
+    /// Budget for the load-time `describe()` probe, derived from the same
+    /// `[plugins]` config as a real call.
+    probe: ProbeBudget,
     /// Global admission gate: caps concurrent `execute` calls so aggregate wasm
     /// memory (`max_memory × permits`) and blocking-pool usage stay bounded no
     /// matter how wide the caller's fan-out is.
     sem: Arc<Semaphore>,
-    modules: RwLock<HashMap<String, LoadedPlugin>>,
+    modules: RwLock<ModuleMap>,
 }
 
 /// A compiled, **pre-instantiated** plugin plus its self-describing manifest
@@ -79,13 +86,40 @@ fn resolve_max_concurrent(configured: usize) -> usize {
         .unwrap_or(4)
 }
 
+/// The fuel + memory budget one `describe()` manifest probe runs under.
+///
+/// This used to be two constants nailed into the source — 10M fuel and a bare
+/// `16 * 1024 * 1024` — that no configuration could reach. Raising `[plugins]
+/// fuel` for a plugin whose `describe()` legitimately needed more did nothing
+/// (its manifest silently stayed absent), and the probe's 16 MiB quietly
+/// contradicted a configured `max_memory_mb` of 64. A manifest read IS a plugin
+/// call, so it runs under the plugin call's own configured limits.
+#[derive(Debug, Clone, Copy)]
+struct ProbeBudget {
+    fuel: u64,
+    max_memory: usize,
+}
+
+impl ProbeBudget {
+    fn from_config(cfg: &PluginConfig) -> Self {
+        Self {
+            fuel: cfg.fuel,
+            max_memory: cfg.max_memory_mb.saturating_mul(1024 * 1024),
+        }
+    }
+}
+
 impl WasmPluginHost {
     pub fn new(cfg: &PluginConfig) -> Result<Self> {
         let mut config = Config::new();
         config.consume_fuel(true); // enables the per-call instruction budget
+
+        // Deliberately NOT an `Error::Plugin`: no plugin is involved yet. This is
+        // the wasmtime engine itself refusing to exist, which is a startup fault.
         let engine = Engine::new(&config).map_err(|e| Error::App(format!("wasm engine: {e}")))?;
         std::fs::create_dir_all(&cfg.dir)?;
-        let modules = load_dir(&engine, &cfg.dir);
+        let probe = ProbeBudget::from_config(cfg);
+        let modules = load_dir(&engine, &cfg.dir, probe);
         let max_concurrent = resolve_max_concurrent(cfg.max_concurrent);
         tracing::info!(
             count = modules.len(),
@@ -98,46 +132,136 @@ impl WasmPluginHost {
             dir: cfg.dir.clone(),
             fuel: cfg.fuel,
             max_memory: cfg.max_memory_mb.saturating_mul(1024 * 1024),
+            probe,
             sem: Arc::new(Semaphore::new(max_concurrent)),
             modules: RwLock::new(modules),
         })
     }
+
+    /// Reads the module index, **recovering** from a poisoned lock rather than
+    /// propagating it.
+    ///
+    /// The anti-pattern this replaces: five bare `.read()/.write().unwrap()`s.
+    /// A `std::sync::RwLock` is poisoned *permanently* by one panic under its
+    /// write guard, so a single unlucky reload turned every plugin call, every
+    /// `GET /plugins`, every `has()` on the trigger hot path and every
+    /// subsequent reload into a panic — for the rest of the process's life.
+    ///
+    /// Poisoning is a warning about the DATA, and this data cannot be left
+    /// half-written: the only writer replaces the whole map in one move
+    /// (`*guard = modules`), after `load_dir` has already finished building it
+    /// off-lock. A recovered reader therefore sees either the complete old map
+    /// or the complete new one — never a torn one. (Same reasoning as the
+    /// server's `lock_advisory` carve-out; that helper is `Mutex`-only and
+    /// private to the server crate, so the recovery lives here.)
+    fn read_modules(&self) -> RwLockReadGuard<'_, ModuleMap> {
+        match self.modules.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn_poisoned();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    /// Write half of [`read_modules`] — same carve-out, same reasoning.
+    fn write_modules(&self) -> RwLockWriteGuard<'_, ModuleMap> {
+        match self.modules.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn_poisoned();
+                poisoned.into_inner()
+            }
+        }
+    }
+}
+
+fn warn_poisoned() {
+    tracing::warn!(
+        "recovering a poisoned wasm plugin index lock — some earlier task panicked while \
+         holding it. The index is replaced wholesale, never edited in place, so what is \
+         reused here is a structurally complete map; the panic itself was reported where \
+         it happened"
+    );
+}
+
+/// Runs `work` on the blocking pool under an admission permit that travels
+/// **with the work**, not with the caller.
+///
+/// The anti-pattern this replaces, and the reason the gate was a lie: the
+/// permit was an `OwnedSemaphorePermit` bound in the async fn's own frame while
+/// the wasm ran inside `spawn_blocking`. `spawn_blocking` is uncancellable — the
+/// thread runs to completion no matter what — but dropping the *future* (a
+/// worker timeout, a `select!` branch losing a race, a disconnected client)
+/// drops that frame, releasing the permit while the orphaned thread is still
+/// burning its fuel budget inside a live `Store`. A caller that cancels N times
+/// therefore admits N+1 concurrent stores, so live wasm memory could exceed the
+/// `max_concurrent × max_memory` bound this gate exists to enforce, precisely
+/// under the load that produces timeouts.
+async fn run_admitted<T: Send + 'static>(
+    sem: Arc<Semaphore>,
+    plugin: &str,
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T> {
+    // Acquired BEFORE spawn_blocking so excess callers wait here rather than
+    // piling onto the blocking pool. The semaphore is never closed, so the only
+    // error is impossible — map it defensively.
+    let permit = sem.acquire_owned().await.map_err(|e| {
+        Error::plugin(
+            PluginFailure::Host,
+            plugin,
+            format!("plugin admission gate closed: {e}"),
+        )
+    })?;
+    tokio::task::spawn_blocking(move || {
+        // The permit lives HERE, in the blocking closure's frame, so the slot is
+        // returned when the work actually stops — never when the caller merely
+        // stops waiting for it.
+        let _permit = permit;
+        work()
+    })
+    .await
+    .map_err(|e| {
+        Error::plugin(
+            PluginFailure::Host,
+            plugin,
+            format!("blocking plugin task panicked: {e}"),
+        )
+    })
 }
 
 #[async_trait]
 impl Plugins for WasmPluginHost {
     async fn run(&self, name: &str, input: &str, params: &Value) -> Result<Value> {
         let pre = self
-            .modules
-            .read()
-            .unwrap()
+            .read_modules()
             .get(name)
             .map(|p| p.pre.clone())
-            .ok_or_else(|| Error::App(format!("unknown plugin '{name}'")))?;
+            .ok_or_else(|| {
+                Error::plugin(
+                    PluginFailure::Unknown,
+                    name,
+                    "no module of that name is loaded — build and install it \
+                     (`just plugins-install`), then POST /plugins/reload",
+                )
+            })?;
         let engine = self.engine.clone();
+        let plugin = name.to_string();
         let input = input.to_string();
         let params = params.clone();
         let (fuel, max_memory) = (self.fuel, self.max_memory);
-        // Global admission: hold a permit for the whole execution so a wide
-        // fan-out (e.g. a 200-URL plugin job) can't spin up 200 stores at once.
-        // Acquired BEFORE spawn_blocking so excess callers wait here rather than
-        // piling onto the blocking pool. The semaphore is never closed, so the
-        // only error is impossible — map it defensively.
-        let _permit = self
-            .sem
-            .clone()
-            .acquire_owned()
-            .await
-            .map_err(|e| Error::App(format!("plugin semaphore closed: {e}")))?;
-        // Wasm execution is synchronous and CPU-bound — run it off the async
-        // runtime so a busy plugin never stalls a tokio worker.
-        tokio::task::spawn_blocking(move || execute(engine, pre, input, params, fuel, max_memory))
-            .await
-            .map_err(|e| Error::App(format!("plugin task panicked: {e}")))?
+        // Global admission: a wide fan-out (e.g. a 200-URL plugin job) can't
+        // spin up 200 stores at once. Wasm execution is synchronous and
+        // CPU-bound, so it runs off the async runtime — and the permit rides
+        // along with it (see `run_admitted`).
+        run_admitted(self.sem.clone(), name, move || {
+            execute(engine, pre, &plugin, input, params, fuel, max_memory)
+        })
+        .await?
     }
 
     fn list(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.modules.read().unwrap().keys().cloned().collect();
+        let mut names: Vec<String> = self.read_modules().keys().cloned().collect();
         names.sort();
         names
     }
@@ -145,11 +269,11 @@ impl Plugins for WasmPluginHost {
     /// Map lookup rather than the trait's default list-and-scan: trigger hooks
     /// ask this per event, per hook.
     fn has(&self, name: &str) -> bool {
-        self.modules.read().unwrap().contains_key(name)
+        self.read_modules().contains_key(name)
     }
 
     fn manifests(&self) -> Vec<Value> {
-        let modules = self.modules.read().unwrap();
+        let modules = self.read_modules();
         let mut entries: Vec<(&String, &LoadedPlugin)> = modules.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         entries
@@ -171,23 +295,24 @@ impl Plugins for WasmPluginHost {
         // off the async runtime — as `run` already does for the same reason — so a
         // dir of 10-20 modules (~0.2-2s of compile) doesn't park a tokio worker and
         // stall unrelated in-flight requests. Only the brief lock swap stays inline.
-        let (engine, dir) = (self.engine.clone(), self.dir.clone());
-        let modules = tokio::task::spawn_blocking(move || load_dir(&engine, &dir))
+        let (engine, dir, probe) = (self.engine.clone(), self.dir.clone(), self.probe);
+        let modules = tokio::task::spawn_blocking(move || load_dir(&engine, &dir, probe))
             .await
-            .map_err(|e| Error::App(format!("plugin reload task panicked: {e}")))?;
+            .map_err(|e| {
+                Error::plugin(
+                    PluginFailure::Host,
+                    "<reload>",
+                    format!("plugin reload task panicked: {e}"),
+                )
+            })?;
         let count = modules.len();
-        *self.modules.write().unwrap() = modules;
+        *self.write_modules() = modules;
         tracing::info!(count, "reloaded wasm plugins");
         Ok(count)
     }
 }
 
-/// Fuel budget for the one-shot `describe()` probe at load time — generous for
-/// returning a small static manifest, but bounded so a hostile module can't spin
-/// the loader.
-const DESCRIBE_FUEL: u64 = 10_000_000;
-
-fn load_dir(engine: &Engine, dir: &Path) -> HashMap<String, LoadedPlugin> {
+fn load_dir(engine: &Engine, dir: &Path, probe: ProbeBudget) -> ModuleMap {
     let mut map = HashMap::new();
     let Ok(entries) = std::fs::read_dir(dir) else {
         return map;
@@ -208,11 +333,18 @@ fn load_dir(engine: &Engine, dir: &Path) -> HashMap<String, LoadedPlugin> {
                 continue;
             }
         };
-        match pre_instantiate(engine, &module) {
+        match pre_instantiate(engine, &name, &module) {
             Ok(pre) => {
                 // Read the optional self-describing manifest once, best-effort —
-                // a missing/failed `describe` degrades to name-only metadata.
-                let manifest = describe_manifest(engine, &pre);
+                // a missing/failed `describe` degrades to name-only metadata,
+                // but it is REPORTED (it used to vanish into `.ok()?`).
+                let manifest = match describe_manifest(engine, &pre, &name, probe) {
+                    Ok(manifest) => Some(manifest),
+                    Err(miss) => {
+                        log_describe_miss(&path, &miss);
+                        None
+                    }
+                };
                 map.insert(name, LoadedPlugin { pre, manifest });
             }
             Err(err) => {
@@ -229,11 +361,19 @@ fn load_dir(engine: &Engine, dir: &Path) -> HashMap<String, LoadedPlugin> {
 /// Plugins declare no imports, so this cannot fail for a well-formed module —
 /// but a module that *does* import something now fails at LOAD time with a
 /// clear message instead of failing identically on every call forever.
-fn pre_instantiate(engine: &Engine, module: &Module) -> Result<InstancePre<StoreLimits>> {
+fn pre_instantiate(
+    engine: &Engine,
+    plugin: &str,
+    module: &Module,
+) -> Result<InstancePre<StoreLimits>> {
     let linker: Linker<StoreLimits> = Linker::new(engine);
-    linker
-        .instantiate_pre(module)
-        .map_err(|e| Error::App(format!("pre-instantiate: {e}")))
+    linker.instantiate_pre(module).map_err(|e| {
+        Error::plugin(
+            PluginFailure::MissingExport,
+            plugin,
+            format!("module declares imports the sandbox grants nothing for: {e}"),
+        )
+    })
 }
 
 /// Builds a fuel-and-memory-limited store and instantiates `pre` in it.
@@ -244,6 +384,7 @@ fn pre_instantiate(engine: &Engine, module: &Module) -> Result<InstancePre<Store
 fn instantiate(
     engine: &Engine,
     pre: &InstancePre<StoreLimits>,
+    plugin: &str,
     fuel: u64,
     max_memory: usize,
 ) -> Result<(Store<StoreLimits>, Instance)> {
@@ -260,12 +401,26 @@ fn instantiate(
         .build();
     let mut store = Store::new(engine, limits);
     store.limiter(|l| l as &mut dyn ResourceLimiter);
-    store
-        .set_fuel(fuel)
-        .map_err(|e| Error::App(format!("set fuel: {e}")))?;
-    let instance = pre
-        .instantiate(&mut store)
-        .map_err(|e| Error::App(format!("instantiate: {e}")))?;
+    // Fuel metering is enabled on the Engine, so this only fails if the host
+    // built the engine wrong — our bug, not the plugin's.
+    store.set_fuel(fuel).map_err(|e| {
+        Error::plugin(
+            PluginFailure::Host,
+            plugin,
+            format!("could not set the fuel budget: {e}"),
+        )
+    })?;
+    // Classed as a sandbox stop rather than a host error: with imports already
+    // resolved at load time, what fails here is the store's resource limiter
+    // refusing the module's declared memory/tables — i.e. the caps doing their
+    // job, which is what the operator needs to read out of the failure.
+    let instance = pre.instantiate(&mut store).map_err(|e| {
+        Error::plugin(
+            PluginFailure::Trap,
+            plugin,
+            format!("instantiation refused (memory/table limits): {e}"),
+        )
+    })?;
     Ok((store, instance))
 }
 
@@ -273,7 +428,12 @@ fn instantiate(
 /// returning the output bytes. Guards the guest-controlled `out_len` against the
 /// module's own linear-memory size BEFORE allocating, so a crafted return can't
 /// drive a giant host-side allocation and abort the process.
-fn read_packed(store: &mut Store<StoreLimits>, memory: &Memory, packed: u64) -> Result<Vec<u8>> {
+fn read_packed(
+    store: &mut Store<StoreLimits>,
+    memory: &Memory,
+    plugin: &str,
+    packed: u64,
+) -> Result<Vec<u8>> {
     let out_ptr = (packed >> 32) as usize;
     let out_len = (packed & 0xffff_ffff) as usize;
     let mem_size = memory.data_size(&*store);
@@ -281,28 +441,82 @@ fn read_packed(store: &mut Store<StoreLimits>, memory: &Memory, packed: u64) -> 
         .checked_add(out_len)
         .is_none_or(|end| end > mem_size)
     {
-        return Err(Error::App(format!(
-            "plugin output range out of bounds: ptr={out_ptr} len={out_len} mem={mem_size}"
-        )));
+        return Err(Error::plugin(
+            PluginFailure::MalformedOutput,
+            plugin,
+            format!("output range out of bounds: ptr={out_ptr} len={out_len} mem={mem_size}"),
+        ));
     }
     let mut out = vec![0u8; out_len];
-    memory
-        .read(&*store, out_ptr, &mut out)
-        .map_err(|e| Error::App(format!("read output: {e}")))?;
+    memory.read(&*store, out_ptr, &mut out).map_err(|e| {
+        Error::plugin(
+            PluginFailure::MalformedOutput,
+            plugin,
+            format!("output bytes unreadable: {e}"),
+        )
+    })?;
     Ok(out)
 }
 
-/// Best-effort read of a plugin's `describe() -> u64` manifest at load time.
-/// Any miss (no export, trap, non-JSON) → `None`, degrading to name-only.
-fn describe_manifest(engine: &Engine, pre: &InstancePre<StoreLimits>) -> Option<Value> {
-    let (mut store, instance) = instantiate(engine, pre, DESCRIBE_FUEL, 16 * 1024 * 1024).ok()?;
-    let memory = instance.get_memory(&mut store, "memory")?;
-    let describe = instance
-        .get_typed_func::<(), u64>(&mut store, "describe")
-        .ok()?;
-    let packed = describe.call(&mut store, ()).ok()?;
-    let bytes = read_packed(&mut store, &memory, packed).ok()?;
-    serde_json::from_slice(&bytes).ok()
+/// Why a `describe()` probe produced no manifest.
+///
+/// Two cases, deliberately kept apart, because they mean opposite things about
+/// the module: not having a `describe` export at all is the LEGAL legacy
+/// extraction-plugin shape, while having one that fails is a defect.
+enum DescribeMiss {
+    /// No `describe` export (or no `memory` to read a manifest out of).
+    NoExport,
+    /// It exports `describe` and the probe still failed: a trap, fuel
+    /// exhaustion, an out-of-range return, non-JSON bytes.
+    Broken(String),
+}
+
+/// The single place a failed `describe()` probe is reported, so the plugin-load
+/// path and dynamic-app discovery say the same thing about the same module.
+///
+/// The anti-pattern this replaces: the load path swallowed every miss through
+/// `.ok()?` while discovery `warn!`ed about all of them — so a genuinely broken
+/// manifest was *silent* when the module was loaded as a plugin, and an
+/// ordinary describe-less extraction plugin was *noisy* when the same directory
+/// was scanned for dynamic apps. The level now follows the DEFECT, not the
+/// caller.
+fn log_describe_miss(path: &Path, miss: &DescribeMiss) {
+    match miss {
+        DescribeMiss::NoExport => tracing::debug!(
+            path = %path.display(),
+            "no describe() manifest — metadata degrades to name-only"
+        ),
+        DescribeMiss::Broken(why) => tracing::warn!(
+            path = %path.display(),
+            "describe() is exported but failed, so this module has no manifest: {why}"
+        ),
+    }
+}
+
+/// Best-effort read of a plugin's `describe() -> u64` manifest, under the
+/// configured probe budget. The reason for a miss is returned rather than
+/// dropped, so every caller can report it (see [`log_describe_miss`]).
+fn describe_manifest(
+    engine: &Engine,
+    pre: &InstancePre<StoreLimits>,
+    plugin: &str,
+    budget: ProbeBudget,
+) -> std::result::Result<Value, DescribeMiss> {
+    let (mut store, instance) = instantiate(engine, pre, plugin, budget.fuel, budget.max_memory)
+        .map_err(|e| DescribeMiss::Broken(e.to_string()))?;
+    let Some(memory) = instance.get_memory(&mut store, "memory") else {
+        return Err(DescribeMiss::NoExport);
+    };
+    let Ok(describe) = instance.get_typed_func::<(), u64>(&mut store, "describe") else {
+        return Err(DescribeMiss::NoExport);
+    };
+    let packed = describe
+        .call(&mut store, ())
+        .map_err(|e| DescribeMiss::Broken(format!("describe() trapped: {e}")))?;
+    let bytes = read_packed(&mut store, &memory, plugin, packed)
+        .map_err(|e| DescribeMiss::Broken(e.to_string()))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|e| DescribeMiss::Broken(format!("describe() output is not JSON: {e}")))
 }
 
 // ---- Dynamic-app discovery (M28 v1 slice: discovery + manifest ONLY) --------
@@ -328,7 +542,18 @@ pub struct DynamicAppManifest {
 /// (unlike an extraction plugin) must self-describe to be listable at all. A
 /// missing/unreadable dir is simply empty. Each probe runs in a fresh
 /// fuel-and-memory-limited store, so a hostile module can't spin discovery.
+///
+/// Probes run under the DEFAULT `[plugins]` budget. Callers holding the live
+/// config should use [`discover_dynamic_apps_with`] so a deployment that raised
+/// `fuel`/`max_memory_mb` gets the budget it asked for here too.
 pub fn discover_dynamic_apps(dir: &Path) -> Vec<DynamicAppManifest> {
+    discover_dynamic_apps_with(dir, &PluginConfig::default())
+}
+
+/// [`discover_dynamic_apps`] with the probe budget taken from `cfg` — the same
+/// `fuel` / `max_memory_mb` a real plugin call runs under.
+pub fn discover_dynamic_apps_with(dir: &Path, cfg: &PluginConfig) -> Vec<DynamicAppManifest> {
+    let budget = ProbeBudget::from_config(cfg);
     let mut config = Config::new();
     config.consume_fuel(true);
     let engine = match Engine::new(&config) {
@@ -357,75 +582,110 @@ pub fn discover_dynamic_apps(dir: &Path) -> Vec<DynamicAppManifest> {
                 continue;
             }
         };
-        let pre = match pre_instantiate(&engine, &module) {
+        let pre = match pre_instantiate(&engine, &name, &module) {
             Ok(pre) => pre,
             Err(err) => {
                 tracing::warn!(path = %path.display(), "dynamic app failed to link: {err}");
                 continue;
             }
         };
-        match describe_manifest(&engine, &pre) {
-            Some(manifest @ Value::Object(_)) => apps.push(DynamicAppManifest { name, manifest }),
-            _ => tracing::warn!(
-                path = %path.display(),
-                "skipping dynamic app: no working describe() returning a JSON object manifest"
+        match describe_manifest(&engine, &pre, &name, budget) {
+            Ok(manifest @ Value::Object(_)) => apps.push(DynamicAppManifest { name, manifest }),
+            // A manifest that parsed but is not an object is as unusable as a
+            // missing one for a dynamic app, and is a defect either way.
+            Ok(other) => log_describe_miss(
+                &path,
+                &DescribeMiss::Broken(format!(
+                    "describe() returned {other}, not a JSON object manifest"
+                )),
             ),
+            Err(miss) => log_describe_miss(&path, &miss),
         }
     }
     apps.sort_by(|a, b| a.name.cmp(&b.name));
     apps
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute(
     engine: Engine,
     pre: InstancePre<StoreLimits>,
+    plugin: &str,
     input: String,
     params: Value,
     fuel: u64,
     max_memory: usize,
 ) -> Result<Value> {
-    let (mut store, instance) = instantiate(&engine, &pre, fuel, max_memory)?;
-    let memory = instance
-        .get_memory(&mut store, "memory")
-        .ok_or_else(|| Error::App("plugin exports no 'memory'".into()))?;
+    let (mut store, instance) = instantiate(&engine, &pre, plugin, fuel, max_memory)?;
+    let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
+        Error::plugin(PluginFailure::MissingExport, plugin, "exports no 'memory'")
+    })?;
     let alloc = instance
         .get_typed_func::<u32, u32>(&mut store, "alloc")
-        .map_err(|e| Error::App(format!("plugin missing alloc(u32)->u32: {e}")))?;
+        .map_err(|e| {
+            Error::plugin(
+                PluginFailure::MissingExport,
+                plugin,
+                format!("missing alloc(u32)->u32: {e}"),
+            )
+        })?;
 
     // Prefer the params-aware `extract_v2` ABI (input is a `{doc, params}`
     // envelope); fall back to the legacy `extract` (raw document, params ignored)
     // so plugins built before the envelope keep working unchanged.
-    let (func, input_bytes): (TypedFunc<(u32, u32), u64>, Vec<u8>) = match instance
-        .get_typed_func::<(u32, u32), u64>(&mut store, "extract_v2")
-    {
-        Ok(f) => {
-            let envelope = serde_json::json!({ "doc": input, "params": params }).to_string();
-            (f, envelope.into_bytes())
-        }
-        Err(_) => {
-            let f = instance
-                .get_typed_func::<(u32, u32), u64>(&mut store, "extract")
-                .map_err(|e| Error::App(format!("plugin missing extract(u32,u32)->u64: {e}")))?;
-            (f, input.into_bytes())
-        }
-    };
+    let (func, input_bytes): (TypedFunc<(u32, u32), u64>, Vec<u8>) =
+        match instance.get_typed_func::<(u32, u32), u64>(&mut store, "extract_v2") {
+            Ok(f) => {
+                let envelope = serde_json::json!({ "doc": input, "params": params }).to_string();
+                (f, envelope.into_bytes())
+            }
+            Err(_) => {
+                let f = instance
+                    .get_typed_func::<(u32, u32), u64>(&mut store, "extract")
+                    .map_err(|e| {
+                        Error::plugin(
+                            PluginFailure::MissingExport,
+                            plugin,
+                            format!("exports neither extract_v2 nor extract(u32,u32)->u64: {e}"),
+                        )
+                    })?;
+                (f, input.into_bytes())
+            }
+        };
 
     let len = input_bytes.len() as u32;
     let in_ptr = alloc
         .call(&mut store, len)
-        .map_err(|e| Error::App(format!("plugin alloc trapped: {e}")))?;
+        .map_err(|e| Error::plugin(PluginFailure::Trap, plugin, format!("alloc trapped: {e}")))?;
+    // The guest handed back a pointer we cannot write `len` bytes to — its own
+    // ABI contract, broken on the input side.
     memory
         .write(&mut store, in_ptr as usize, &input_bytes)
-        .map_err(|e| Error::App(format!("write input: {e}")))?;
+        .map_err(|e| {
+            Error::plugin(
+                PluginFailure::MalformedOutput,
+                plugin,
+                format!("alloc({len}) returned an unwritable pointer {in_ptr}: {e}"),
+            )
+        })?;
 
     // On fuel exhaustion / OOM this returns a trap — the sandbox holds.
-    let packed = func
-        .call(&mut store, (in_ptr, len))
-        .map_err(|e| Error::App(format!("plugin trapped (fuel/memory/panic): {e}")))?;
+    let packed = func.call(&mut store, (in_ptr, len)).map_err(|e| {
+        Error::plugin(
+            PluginFailure::Trap,
+            plugin,
+            format!("trapped (fuel/memory/panic): {e}"),
+        )
+    })?;
 
-    let out = read_packed(&mut store, &memory, packed)?;
-    serde_json::from_slice(&out)
-        .map_err(|e| Error::App(format!("plugin returned invalid JSON: {e}")))
+    let out = read_packed(&mut store, &memory, plugin, packed)?;
+    serde_json::from_slice(&out).map_err(|e| {
+        Error::plugin(
+            PluginFailure::MalformedOutput,
+            plugin,
+            format!("returned invalid JSON: {e}"),
+        )
+    })
 }
 
 #[cfg(test)]
@@ -556,7 +816,7 @@ mod tests {
         let relink = started.elapsed();
 
         // AFTER: link once at load, then a fresh Store + InstancePre::instantiate.
-        let pre = pre_instantiate(&engine, &module).expect("pre");
+        let pre = pre_instantiate(&engine, "fixture", &module).expect("pre");
         let started = std::time::Instant::now();
         for _ in 0..N {
             let mut store = Store::new(&engine, limits());
@@ -586,5 +846,219 @@ mod tests {
         // 0 → one-per-core, always at least 1 (never an empty semaphore that
         // would deadlock every plugin run).
         assert!(resolve_max_concurrent(0) >= 1);
+    }
+
+    /// Blocks until told to stop, announcing when it started — a stand-in for
+    /// wasm burning through a fuel budget on an uncancellable thread.
+    fn blocking_work() -> (
+        impl FnOnce() + Send + 'static,
+        tokio::sync::oneshot::Receiver<()>,
+        std::sync::mpsc::Sender<()>,
+    ) {
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let work = move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        };
+        (work, started_rx, release_tx)
+    }
+
+    /// THE admission bug: the permit used to live in the async fn's frame while
+    /// the work ran on an uncancellable `spawn_blocking` thread. A caller that
+    /// stops waiting (worker timeout, lost `select!` race, dropped request)
+    /// dropped that frame and returned the slot — while the orphaned thread was
+    /// still holding a live `Store` with up to `max_memory` of wasm memory. The
+    /// gate's whole promise, `max_concurrent × max_memory`, was therefore void
+    /// exactly under the load that produces cancellations.
+    ///
+    /// Semaphore-saturation shaped, no sleeps: cancel a call, then try to admit
+    /// another one while the first is provably still running.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_cancelled_caller_cannot_admit_a_second_store_while_the_first_still_runs() {
+        let sem = Arc::new(Semaphore::new(1));
+        let (work, started, release) = blocking_work();
+        let mut call = Box::pin(run_admitted(sem.clone(), "burner", work));
+
+        // Drive the call far enough that the blocking work has genuinely begun,
+        // then abandon it — the caller's cancellation.
+        tokio::select! {
+            _ = &mut call => panic!("the work cannot complete: it is blocked on release"),
+            started = started => started.expect("the blocking work started"),
+        }
+        drop(call);
+
+        assert!(
+            sem.try_acquire().is_err(),
+            "the caller went away but its store is STILL live on an uncancellable thread — \
+             admitting another call here is exactly how max_concurrent × max_memory is exceeded"
+        );
+
+        // The slot comes back when the WORK stops, not when the caller does.
+        release
+            .send(())
+            .expect("the orphaned thread is still there");
+        let permit = tokio::time::timeout(std::time::Duration::from_secs(5), sem.acquire())
+            .await
+            .expect("the permit must be released once the work actually finishes")
+            .expect("the gate is never closed");
+        drop(permit);
+    }
+
+    /// The shape that was replaced, pinned so nobody reintroduces it: holding
+    /// the permit in the ASYNC frame frees the slot on cancellation alone. This
+    /// asserts the BUG, on a hand-rolled copy of the old code, so the assertion
+    /// above is a real difference rather than a tautology.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn holding_the_permit_in_the_async_frame_is_what_broke_the_bound() {
+        let sem = Arc::new(Semaphore::new(1));
+        let (work, started, release) = blocking_work();
+        let gate = sem.clone();
+        let mut call = Box::pin(async move {
+            // The old shape: permit bound here, work moved elsewhere.
+            let _permit = gate.acquire_owned().await.expect("gate open");
+            let _ = tokio::task::spawn_blocking(work).await;
+        });
+        tokio::select! {
+            _ = &mut call => panic!("the work cannot complete: it is blocked on release"),
+            started = started => started.expect("the blocking work started"),
+        }
+        drop(call);
+        assert!(
+            sem.try_acquire().is_ok(),
+            "this is the anti-pattern: the slot is free while the thread it accounted for runs"
+        );
+        release.send(()).ok();
+    }
+
+    /// The permanent-500 shape, at the plugin host: one panic under the write
+    /// guard poisons a `std::sync::RwLock` forever, and five bare `.unwrap()`s
+    /// meant every later call, listing, `has()` and reload panicked for the rest
+    /// of the process's life. The index is replaced wholesale, so recovery hands
+    /// back a structurally complete map.
+    #[test]
+    fn a_poisoned_module_index_degrades_instead_of_killing_every_plugin_call() {
+        let dir = fresh_host_dir("poison");
+        std::fs::write(dir.join("here.wasm"), FIXTURE_WAT).expect("write fixture");
+        let host = WasmPluginHost::new(&PluginConfig {
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .expect("host");
+        assert_eq!(host.list(), vec!["here".to_string()]);
+
+        // A holder dies mid-write, exactly as a panicking reload would.
+        let caught = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = host.modules.write().expect("not poisoned yet");
+            panic!("holder died");
+        }));
+        assert!(caught.is_err(), "the holder really did unwind");
+        assert!(
+            host.modules.is_poisoned(),
+            "and the lock really is poisoned"
+        );
+        assert!(
+            host.modules.read().is_err(),
+            "so a bare `.read().unwrap()` here would panic — the permanent-failure generator"
+        );
+
+        // Every reader still answers, with the data intact.
+        for _ in 0..3 {
+            assert_eq!(host.list(), vec!["here".to_string()]);
+            assert!(host.has("here"));
+            assert!(!host.has("gone"));
+            assert_eq!(host.manifests().len(), 1);
+        }
+        // …and the writer can still swap the index.
+        *host.write_modules() = ModuleMap::new();
+        assert!(host.list().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The probe budget used to be two constants (`10_000_000` fuel, a bare
+    /// 16 MiB) that no config could reach: a deployment that raised `[plugins]
+    /// fuel` for a describe-heavy plugin got nothing, and the 16 MiB silently
+    /// contradicted a configured 64 MiB cap.
+    #[test]
+    fn describe_probe_budget_follows_config_not_a_hidden_constant() {
+        let budget = ProbeBudget::from_config(&PluginConfig {
+            fuel: 7_777,
+            max_memory_mb: 3,
+            ..Default::default()
+        });
+        assert_eq!(budget.fuel, 7_777);
+        assert_eq!(budget.max_memory, 3 * 1024 * 1024);
+        assert_ne!(budget.fuel, 10_000_000, "the old hardcoded probe fuel");
+        assert_ne!(budget.max_memory, 16 * 1024 * 1024, "the old hardcoded cap");
+        // A default host derives the same budget a real call runs under.
+        let cfg = PluginConfig::default();
+        let budget = ProbeBudget::from_config(&cfg);
+        assert_eq!(budget.fuel, cfg.fuel);
+        assert_eq!(budget.max_memory, cfg.max_memory_mb * 1024 * 1024);
+    }
+
+    /// Every failure the CALL path can produce is classified, so consumers
+    /// (observatory buckets, the trigger ledger) never have to read the prose.
+    #[tokio::test]
+    async fn call_failures_carry_a_typed_class_not_just_a_message() {
+        let dir = fresh_host_dir("classes");
+        // Legal module, but not an executable plugin: no alloc, no extract.
+        std::fs::write(
+            dir.join("describe_only.wasm"),
+            "(module (memory (export \"memory\") 1))",
+        )
+        .expect("write fixture");
+        // Returns bytes that are not JSON.
+        std::fs::write(
+            dir.join("garbage.wasm"),
+            "(module (memory (export \"memory\") 1) (data (i32.const 16) \"not json\") \
+             (func (export \"alloc\") (param i32) (result i32) (i32.const 4096)) \
+             (func (export \"extract_v2\") (param i32 i32) (result i64) \
+               (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 8))))",
+        )
+        .expect("write fixture");
+        // Traps immediately.
+        std::fs::write(
+            dir.join("boom.wasm"),
+            "(module (memory (export \"memory\") 1) \
+             (func (export \"alloc\") (param i32) (result i32) (i32.const 4096)) \
+             (func (export \"extract_v2\") (param i32 i32) (result i64) (unreachable)))",
+        )
+        .expect("write fixture");
+        let host = WasmPluginHost::new(&PluginConfig {
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .expect("host");
+
+        for (name, expected) in [
+            ("nowhere", PluginFailure::Unknown),
+            ("describe_only", PluginFailure::MissingExport),
+            ("boom", PluginFailure::Trap),
+            ("garbage", PluginFailure::MalformedOutput),
+        ] {
+            let err = host
+                .run(name, "<doc/>", &Value::Null)
+                .await
+                .expect_err("must fail");
+            assert_eq!(
+                err.plugin_failure(),
+                Some(expected),
+                "{name} misclassified: {err}"
+            );
+            assert!(
+                err.to_string().contains(name),
+                "the failure must name the module: {err}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn fresh_host_dir(tag: &str) -> std::path::PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("pumper-wasm-host-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("fixture dir");
+        dir
     }
 }

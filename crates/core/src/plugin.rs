@@ -12,6 +12,7 @@
 use async_trait::async_trait;
 use serde_json::Value;
 
+use crate::error::PluginFailure;
 use crate::{Error, Result};
 
 #[async_trait]
@@ -60,9 +61,15 @@ pub struct NoPlugins;
 #[async_trait]
 impl Plugins for NoPlugins {
     async fn run(&self, name: &str, _input: &str, _params: &Value) -> Result<Value> {
-        Err(Error::App(format!(
-            "plugins are disabled; cannot run '{name}'"
-        )))
+        // `Disabled`, not `Unknown`: the name is irrelevant here — NO name would
+        // resolve — and the fix is `[plugins] enabled = true`, not a build step.
+        // Callers that report missing hooks use the distinction to avoid telling
+        // an operator to rebuild a plugin they deliberately switched off.
+        Err(Error::plugin(
+            PluginFailure::Disabled,
+            name,
+            "the plugin subsystem is disabled ([plugins] enabled = false)",
+        ))
     }
     fn list(&self) -> Vec<String> {
         Vec::new()

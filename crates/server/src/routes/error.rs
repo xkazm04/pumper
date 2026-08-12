@@ -110,6 +110,15 @@ pub(crate) fn client_facing(e: &pumper_core::Error) -> (StatusCode, String) {
         E::Http(_) | E::Browser(_) | E::Claude { .. } => {
             (StatusCode::BAD_GATEWAY, UPSTREAM_MESSAGE.into())
         }
+        // Deliberately NOT a 502: a WASM plugin runs *inside this process*, so
+        // blaming an upstream would be a lie, and the operator debugging it is
+        // the one running this server. Deliberately not split by
+        // `PluginFailure` either — no route takes a plugin name, so every one of
+        // these that can reach an HTTP boundary today comes from
+        // `POST /plugins/reload` and is a host fault. The class is not lost: it
+        // travels on the error to the surfaces that can act on it (the trigger
+        // decision ledger, the observatory's outcome buckets, the job result).
+        E::Plugin { .. } => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_MESSAGE.into()),
         // Genuinely unexpected here. Listed one by one rather than caught by a
         // wildcard so a new core variant has to be given a home on purpose.
         E::Storage(_)
@@ -654,6 +663,38 @@ mod contract_tests {
                     offenders.push(format!("{} contains `{bad}`", path.display()));
                 }
             }
+        }
+    }
+
+    /// A sandboxed plugin failing is THIS process failing, so it is a 500 —
+    /// 502 would blame an upstream that does not exist. The body stays generic,
+    /// which also means a wasmtime trap dump (offsets, symbol names, the module
+    /// path) never reaches an unauthenticated caller.
+    #[test]
+    fn plugin_failures_are_500_and_leak_no_sandbox_detail() {
+        use pumper_core::error::PluginFailure;
+        for kind in [
+            PluginFailure::Unknown,
+            PluginFailure::Disabled,
+            PluginFailure::MissingExport,
+            PluginFailure::Trap,
+            PluginFailure::MalformedOutput,
+            PluginFailure::Host,
+        ] {
+            let e = pumper_core::Error::plugin(
+                kind,
+                "delta-slim",
+                "wasm trap at /srv/pumper/data/plugins/delta-slim.wasm:0x1f4",
+            );
+            let (status, msg) = client_facing(&e);
+            assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{kind:?}");
+            assert_ne!(
+                status,
+                StatusCode::BAD_GATEWAY,
+                "{kind:?}: an in-process sandbox is not an upstream"
+            );
+            assert_eq!(msg, INTERNAL_MESSAGE);
+            assert!(!msg.contains("/srv/"), "trap detail leaked: {msg:?}");
         }
     }
 

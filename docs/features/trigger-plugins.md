@@ -124,6 +124,18 @@ call gets its own wasmtime `Store`, so no state survives between invocations;
 only the module's linking is shared (pre-instantiated once at load). Plugins
 declare no imports, so they have no filesystem or network access.
 
+The admission permit belongs to the running work, not to the caller waiting on
+it. Wasm executes on an uncancellable blocking thread, so abandoning the call (a
+worker timeout, a lost `select!` race) does **not** free the slot — it is
+released when the store is actually torn down. `max_concurrent × max_memory_mb`
+therefore stays a real ceiling under cancellation.
+
+Failures are reported with a typed class rather than a formatted string —
+`trap`, `malformed_output`, `missing_export`, `unknown_plugin`,
+`plugins_disabled`, `host_error` — so the ledger and the observatory classify on
+the type and a reworded message cannot silently reclassify stored rows. See
+[extraction.md](extraction.md) for the shared sandbox contract.
+
 ## Known gaps
 
 - Hooks cannot be edited on an existing trigger (delete + create).
