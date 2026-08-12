@@ -8,6 +8,7 @@
 //! stack can't match in-process: the GIL serializes CPU-bound parsing, and
 //! scaling out means `multiprocessing` with pickle overhead across processes.
 
+use std::borrow::Cow;
 use std::collections::BTreeMap;
 
 use rayon::prelude::*;
@@ -116,7 +117,8 @@ pub enum Transform {
     },
     /// HTML fragment → clean Markdown (pair with a `css` rule's `html: true`).
     ToMarkdown,
-    /// Replace a null result with this value.
+    /// Replace a **blank** result (`null`, a whitespace-only string, or an empty
+    /// array — the same predicate [`FieldStatus`] calls empty) with this value.
     Default {
         value: Value,
     },
@@ -305,9 +307,15 @@ impl CompiledTransform {
     }
 
     /// Applies to one value; arrays are mapped element-wise (except `default`).
+    ///
+    /// `default` fires on [`is_blank`] — the SAME predicate that decides
+    /// [`FieldStatus::Empty`] — so the two cannot disagree. It used to fire only
+    /// on `Value::Null`, which left a matched-but-empty `""` (or an empty array)
+    /// reported as `empty` while the declared default never applied: the status
+    /// system said "this field produced nothing" and the value said `""`.
     fn apply(&self, value: Value) -> Value {
         match (self, value) {
-            (Self::Default { value: d }, Value::Null) => d.clone(),
+            (Self::Default { value: d }, v) if is_blank(&v) => d.clone(),
             (Self::Default { .. }, v) => v,
             (t, Value::Array(items)) => {
                 Value::Array(items.into_iter().map(|v| t.apply_scalar(v)).collect())
@@ -376,12 +384,39 @@ fn coerce_number(value: Value, int: bool) -> Value {
         _ => None,
     };
     match num {
-        Some(n) if int => Value::from(n.trunc() as i64),
-        Some(n) => serde_json::Number::from_f64(n)
-            .map(Value::Number)
-            .unwrap_or(Value::Null),
+        Some(n) => number_value(n, int),
         None => Value::Null,
     }
+}
+
+/// 2^63 — the exclusive upper bound of `i64` as an `f64`. `-2^63` is exactly
+/// `i64::MIN`, so it is the *inclusive* lower bound.
+const I64_LIMIT: f64 = 9_223_372_036_854_775_808.0;
+
+/// One parsed number as JSON, or `Null` when it cannot be represented — the
+/// single place `to_number` and `to_int` decide that, so they cannot disagree.
+///
+/// They used to: a 400-digit price string parses to `f64::INFINITY`, and
+/// `to_number` correctly refused it (`serde_json::Number::from_f64` rejects
+/// non-finite) while `to_int`'s `as i64` cast *saturated* it to
+/// `9223372036854775807` — a fabricated number, indistinguishable from a real
+/// one, in a field whose whole point is to be trustworthy. A value f64 cannot
+/// hold, or one outside `i64` when an integer was asked for, is null at BOTH
+/// precisions: the honest answer is "not a number", never a clamped stand-in.
+fn number_value(n: f64, int: bool) -> Value {
+    if !n.is_finite() {
+        return Value::Null;
+    }
+    if int {
+        let t = n.trunc();
+        if !(-I64_LIMIT..I64_LIMIT).contains(&t) {
+            return Value::Null;
+        }
+        return Value::from(t as i64);
+    }
+    serde_json::Number::from_f64(n)
+        .map(Value::Number)
+        .unwrap_or(Value::Null)
 }
 
 /// Parses the FIRST valid decimal number found in a string, tolerating leading
@@ -689,69 +724,86 @@ pub(crate) fn extract_one_parsed(
     let mut report = DocReport::default();
     for (name, rule, transforms) in &rules.fields {
         // (raw value, whether the rule's required parse was available, error
-        // detail, whether an `each` container selector matched)
-        let (mut value, ran, detail, container_matched): (Value, bool, &str, bool) = match rule {
-            CompiledRule::Css {
-                selector,
-                attr,
-                all,
-                html: as_html,
-            } => (
-                css_extract(html.unwrap(), selector, attr.as_deref(), *all, *as_html),
-                true,
-                "",
-                false,
-            ),
-            CompiledRule::Regex { re, group } => (
-                re.captures(doc)
-                    .and_then(|c| c.get(*group))
-                    .map(|m| Value::String(m.as_str().to_string()))
-                    .unwrap_or(Value::Null),
-                true,
-                "",
-                false,
-            ),
-            CompiledRule::Json { pointer } => match json.as_ref() {
-                Some(j) => (
-                    j.pointer(pointer).cloned().unwrap_or(Value::Null),
+        // detail, whether an `each` container selector matched). `detail` is a
+        // `Cow` so a *runtime* failure (an xpath that parsed but could not
+        // evaluate) can name itself without every healthy field paying for an
+        // allocation.
+        let (mut value, ran, detail, container_matched): (Value, bool, Cow<'static, str>, bool) =
+            match rule {
+                CompiledRule::Css {
+                    selector,
+                    attr,
+                    all,
+                    html: as_html,
+                } => (
+                    css_extract(html.unwrap(), selector, attr.as_deref(), *all, *as_html),
                     true,
-                    "",
+                    Cow::Borrowed(""),
                     false,
                 ),
-                None => (Value::Null, false, "body did not parse as JSON", false),
-            },
-            CompiledRule::Xpath { xpath, all } => match xpath_tree.as_ref() {
-                Some(tree) => (xpath_extract(tree, xpath, *all), true, "", false),
-                None => (
-                    Value::Null,
-                    false,
-                    "document did not parse as HTML for xpath",
+                CompiledRule::Regex { re, group } => (
+                    re.captures(doc)
+                        .and_then(|c| c.get(*group))
+                        .map(|m| Value::String(m.as_str().to_string()))
+                        .unwrap_or(Value::Null),
+                    true,
+                    Cow::Borrowed(""),
                     false,
                 ),
-            },
-            CompiledRule::Const { value } => (value.clone(), true, "", false),
-            CompiledRule::Each {
-                selector,
-                fields,
-                container,
-            } => {
-                // The listing's inner outcomes are accumulated only when a
-                // report was asked for — no report, no per-item bookkeeping.
-                let mut acc = want_report.then(EachAcc::default);
-                let (items, container_matched) = each_extract(
-                    html.unwrap(),
+                CompiledRule::Json { pointer } => match json.as_ref() {
+                    Some(j) => (
+                        j.pointer(pointer).cloned().unwrap_or(Value::Null),
+                        true,
+                        Cow::Borrowed(""),
+                        false,
+                    ),
+                    None => (
+                        Value::Null,
+                        false,
+                        Cow::Borrowed("body did not parse as JSON"),
+                        false,
+                    ),
+                },
+                CompiledRule::Xpath { xpath, all } => match xpath_tree.as_ref() {
+                    Some(tree) => match xpath_extract(tree, xpath, *all) {
+                        Ok(v) => (v, true, Cow::Borrowed(""), false),
+                        Err(detail) => (Value::Null, false, Cow::Owned(detail), false),
+                    },
+                    None => (
+                        Value::Null,
+                        false,
+                        Cow::Borrowed("document did not parse as HTML for xpath"),
+                        false,
+                    ),
+                },
+                CompiledRule::Const { value } => (value.clone(), true, Cow::Borrowed(""), false),
+                CompiledRule::Each {
                     selector,
                     fields,
-                    container.as_ref(),
-                    &mut acc,
-                );
-                if let Some(acc) = acc {
-                    acc.flatten_into(name, fields, &mut report.each);
+                    container,
+                } => {
+                    // The listing's inner outcomes are accumulated only when a
+                    // report was asked for — no report, no per-item bookkeeping.
+                    let mut acc = want_report.then(EachAcc::default);
+                    let (items, container_matched) = each_extract(
+                        html.unwrap(),
+                        selector,
+                        fields,
+                        container.as_ref(),
+                        &mut acc,
+                    );
+                    if let Some(acc) = acc {
+                        acc.flatten_into(name, fields, &mut report.each);
+                    }
+                    (
+                        Value::Array(items),
+                        true,
+                        Cow::Borrowed(""),
+                        container_matched,
+                    )
                 }
-                (Value::Array(items), true, "", container_matched)
-            }
-        };
-        let status = FieldStatus::classify(ran, &value, detail, container_matched);
+            };
+        let status = FieldStatus::classify(ran, &value, &detail, container_matched);
         let matched = matches!(status, FieldStatus::Matched);
         if want_report {
             report.fields.insert(name.clone(), status);
@@ -917,24 +969,34 @@ pub fn extract_batch_with_report(
         .collect()
 }
 
+/// Runs one compiled XPath, or reports WHY it could not run.
+///
+/// An expression that parses but fails at evaluation (an undefined variable, an
+/// unsupported function call, a type error mid-expression) used to return
+/// `Value::Null` — which [`FieldStatus::classify`] then read as `Empty`, i.e.
+/// "the site had nothing here". That is the one classification a broken rule
+/// must never be able to claim: `Empty` is a fact about the *document*, and a
+/// rule that never evaluated learned no facts about the document at all. The
+/// error string travels to [`FieldStatus::Error`] instead.
 fn xpath_extract(
     tree: &skyscraper::xpath::XpathItemTree,
     xpath: &skyscraper::xpath::Xpath,
     all: bool,
-) -> Value {
-    let Ok(items) = xpath.apply(tree) else {
-        return Value::Null;
-    };
+) -> std::result::Result<Value, String> {
+    let items = xpath
+        .apply(tree)
+        .map_err(|e| format!("xpath failed to evaluate: {e}"))?;
     let mut values = items.iter().map(|item| xpath_item_value(item, tree));
-    if all {
+    Ok(if all {
         Value::Array(values.collect())
     } else {
         values.next().unwrap_or(Value::Null)
-    }
+    })
 }
 
 /// One XPath result as JSON: attribute nodes yield their value, text nodes
-/// their content, elements their recursive text; atomics render as strings.
+/// their content, elements their recursive text; atomic values keep their own
+/// JSON type ([`xpath_atomic_value`]).
 fn xpath_item_value(
     item: &skyscraper::xpath::grammar::data_model::XpathItem,
     tree: &skyscraper::xpath::XpathItemTree,
@@ -947,7 +1009,33 @@ fn xpath_item_value(
             XpathItemTreeNode::TextNode(t) => Value::String(t.content.trim().to_string()),
             n => Value::String(n.text_content(tree).trim().to_string()),
         },
-        other => Value::String(format!("{other:?}")),
+        XpathItem::AnyAtomicType(atomic) => xpath_atomic_value(atomic),
+        // A function item is a callable, not data: there is no honest JSON for
+        // it, and its Debug rendering is engine internals, not an extraction.
+        XpathItem::Function(_) => Value::Null,
+    }
+}
+
+/// One XPath **atomic** result as JSON, by type.
+///
+/// `count(//li)`, `string(//h1)` and `not(//x)` are the XPath expressions CSS
+/// cannot express, and they are exactly the ones that do not return nodes.
+/// Every non-node result used to be rendered with `format!("{other:?}")` — so
+/// `count(//li)` stored the string `"AnyAtomicType(Integer(3))"`, a Rust Debug
+/// dump written into the dataset as if it were extracted data, `matched` in the
+/// report and all. Numbers become JSON numbers, booleans booleans, strings
+/// strings; a non-finite double is null rather than a fabricated value
+/// ([`number_value`], the same rule `to_number` follows).
+fn xpath_atomic_value(atomic: &skyscraper::xpath::grammar::data_model::AnyAtomicType) -> Value {
+    use skyscraper::xpath::grammar::data_model::AnyAtomicType;
+    match atomic {
+        AnyAtomicType::Boolean(b) => Value::Bool(*b),
+        AnyAtomicType::Integer(i) => Value::from(*i),
+        AnyAtomicType::Float(f) => number_value(f64::from(f.0), false),
+        AnyAtomicType::Double(d) => number_value(d.0, false),
+        AnyAtomicType::String(s) => Value::String(s.clone()),
+        // A QName is a *name*; its lexical form (`prefix:local`) is the value.
+        q @ AnyAtomicType::QName { .. } => Value::String(q.to_string()),
     }
 }
 
@@ -1591,6 +1679,205 @@ mod tests {
             );
             assert_eq!(s.hits() + s.misses(), s.items);
         }
+    }
+
+    #[test]
+    fn xpath_atomics_are_typed_values_not_debug_strings() {
+        // THE REFUTED BEHAVIOR: every non-node XPath result went through
+        // `format!("{other:?}")`, so `count(//li)` stored the Rust Debug dump
+        // `"AnyAtomicType(Integer(3))"` — engine internals written into the
+        // dataset as if they were extracted data, and `matched` in the report.
+        let rules = ruleset(json!({
+            "n":     {"type": "xpath", "xpath": "count(//li)"},
+            "title": {"type": "xpath", "xpath": "string(//h1)"},
+            "none":  {"type": "xpath", "xpath": "not(//article)"},
+            "num":   {"type": "xpath", "xpath": "number('3.5')"}
+        }));
+        let doc = "<html><body><h1>Hi</h1><ul><li>a</li><li>b</li><li>c</li></ul></body></html>"
+            .to_string();
+        let out = &extract_batch(&rules, std::slice::from_ref(&doc))[0];
+        assert_eq!(out["n"], json!(3), "count() must be a JSON number");
+        assert!(out["n"].is_number());
+        assert_eq!(out["title"], json!("Hi"), "string() must be a JSON string");
+        assert_eq!(out["none"], json!(true), "not() must be a JSON boolean");
+        assert!(out["none"].is_boolean());
+        assert_eq!(out["num"], json!(3.5));
+        // No value anywhere carries the Debug shape of the engine's own enums.
+        let wire = serde_json::to_string(out).unwrap();
+        assert!(!wire.contains("AnyAtomicType"), "{wire}");
+        assert!(!wire.contains("Integer("), "{wire}");
+    }
+
+    #[test]
+    fn xpath_error_not_empty() {
+        // An expression that PARSES but cannot evaluate (an unsupported
+        // function, an undefined variable) used to return Null, which
+        // classified as `Empty` — "the site had nothing here". That is a claim
+        // about the document, and a rule that never evaluated learned nothing
+        // about the document.
+        use super::{extract_one_with_report, FieldStatus};
+        let rules = ruleset(json!({
+            "broken": {"type": "xpath", "xpath": "unknown-fn()"},
+            "unbound": {"type": "xpath", "xpath": "//div[$missing]"},
+            "fine":   {"type": "xpath", "xpath": "//h1"},
+            "absent": {"type": "xpath", "xpath": "//article"}
+        }));
+        let (values, report) =
+            extract_one_with_report(&rules, "<html><body><div><h1>Hi</h1></div></body></html>");
+        let FieldStatus::Error { detail } = &report.fields["broken"] else {
+            panic!(
+                "a runtime xpath failure must be Error, got {:?}",
+                report.fields["broken"]
+            );
+        };
+        assert!(detail.contains("xpath"), "{detail}");
+        assert!(report.fields["broken"].is_miss());
+        assert!(matches!(
+            report.fields["unbound"],
+            FieldStatus::Error { .. }
+        ));
+        assert_eq!(values["broken"], json!(null));
+        // A working rule is unaffected, and a rule that ran and found nothing
+        // is STILL `Empty` — the honest miss keeps its own name.
+        assert_eq!(report.fields["fine"], FieldStatus::Matched);
+        assert_eq!(report.fields["absent"], FieldStatus::Empty);
+    }
+
+    #[test]
+    fn default_fires_on_blank_not_just_null() {
+        // `default` fired only on `Value::Null`, while the status system calls
+        // null / whitespace-only string / empty array all "blank". A selector
+        // that matched an empty <span> therefore reported `empty` AND kept the
+        // `""` — the declared default silently never applied.
+        use super::{extract_one_with_report, FieldStatus};
+        let rules = ruleset(json!({
+            "absent": {"type": "css", "selector": ".nope",
+                       "transforms": [{"op": "default", "value": "n/a"}]},
+            "blank":  {"type": "css", "selector": ".blank",
+                       "transforms": [{"op": "default", "value": "n/a"}]},
+            "spaces": {"type": "const", "value": "   ",
+                       "transforms": [{"op": "default", "value": "n/a"}]},
+            "list":   {"type": "css", "selector": ".none", "all": true,
+                       "transforms": [{"op": "default", "value": []}]},
+            "kept":   {"type": "css", "selector": "h1",
+                       "transforms": [{"op": "default", "value": "n/a"}]},
+            "zero":   {"type": "const", "value": 0,
+                       "transforms": [{"op": "default", "value": "n/a"}]},
+            "false":  {"type": "const", "value": false,
+                       "transforms": [{"op": "default", "value": "n/a"}]}
+        }));
+        let doc = r#"<h1>Hi</h1><span class="blank">   </span>"#;
+        let (values, report) = extract_one_with_report(&rules, doc);
+        // The existing null case is preserved exactly (it is a subset of blank).
+        assert_eq!(values["absent"], json!("n/a"));
+        // ...and the cases the status system already called empty now agree.
+        assert_eq!(report.fields["blank"], FieldStatus::Empty);
+        assert_eq!(values["blank"], json!("n/a"));
+        assert_eq!(values["spaces"], json!("n/a"));
+        assert_eq!(values["list"], json!([]));
+        // A real value is never replaced — including falsey ones, which are
+        // data, not absence.
+        assert_eq!(values["kept"], json!("Hi"));
+        assert_eq!(values["zero"], json!(0));
+        assert_eq!(values["false"], json!(false));
+    }
+
+    #[test]
+    fn default_agrees_with_the_status_predicate_on_every_shape() {
+        // The structural guard: `default` fires on EXACTLY the values the
+        // report calls blank. One predicate, two consumers — they cannot drift.
+        use super::{is_blank, CompiledTransform};
+        let d = CompiledTransform::Default {
+            value: json!("FILLED"),
+        };
+        for v in [
+            json!(null),
+            json!(""),
+            json!("   "),
+            json!([]),
+            json!("x"),
+            json!(0),
+            json!(false),
+            json!(["a"]),
+            json!({}),
+        ] {
+            let blank = is_blank(&v);
+            let filled = d.apply(v.clone()) == json!("FILLED");
+            assert_eq!(blank, filled, "default/is_blank diverged on {v}");
+        }
+    }
+
+    #[test]
+    fn to_int_overflow_is_null_not_a_saturated_number() {
+        // A 400-digit string parses to f64::INFINITY. `to_number` refused it
+        // (null), while `to_int`'s `as i64` cast SATURATED it to
+        // 9223372036854775807 — a fabricated number indistinguishable from a
+        // real one. The two now give the same answer.
+        let huge = format!("1{}", "0".repeat(400));
+        let pair = |input: &str| {
+            let rules = ruleset(json!({
+                "i": {"type": "const", "value": input, "transforms": [{"op": "to_int"}]},
+                "f": {"type": "const", "value": input, "transforms": [{"op": "to_number"}]}
+            }));
+            let out = extract_batch(&rules, std::slice::from_ref(&String::new()))[0].clone();
+            (out["i"].clone(), out["f"].clone())
+        };
+
+        // NON-FINITE: the two agree, and the answer is null at both precisions.
+        for input in [huge.as_str(), &format!("-{huge}")] {
+            let (i, f) = pair(input);
+            assert_eq!(i, json!(null), "to_int({input:?}) must not saturate");
+            assert_eq!(f, json!(null), "to_number({input:?})");
+        }
+
+        // FINITE but outside i64: they legitimately differ, because an f64
+        // holds 1e20 exactly and an i64 cannot hold it at all — so `to_int`
+        // says null (it has no integer to give) rather than clamping to
+        // i64::MAX, and `to_number` keeps the double it really parsed.
+        for input in ["99999999999999999999", "-99999999999999999999"] {
+            let (i, f) = pair(input);
+            assert_eq!(i, json!(null), "to_int({input:?}) must not saturate");
+            assert!(f.is_number(), "to_number({input:?}) = {f}");
+        }
+
+        // Ordinary values are untouched by the guard.
+        assert_eq!(pair("42"), (json!(42), json!(42.0)));
+        assert_eq!(pair("-5.9"), (json!(-5), json!(-5.9)));
+        // No exponent parsing: the first number in "1e999" is 1, not infinity.
+        assert_eq!(pair("1e999"), (json!(1), json!(1.0)));
+    }
+
+    #[test]
+    fn uppercase_and_regex_replace_map_strings_and_pass_others_through() {
+        // Both transforms shipped with zero coverage: the only two in the
+        // catalogue nothing pinned.
+        let rules = ruleset(json!({
+            "up":    {"type": "css", "selector": "h1", "transforms": [{"op": "uppercase"}]},
+            "each":  {"type": "css", "selector": "li", "all": true,
+                      "transforms": [{"op": "uppercase"}]},
+            "slug":  {"type": "css", "selector": ".t",
+                      "transforms": [{"op": "regex_replace",
+                                      "pattern": "\\s+", "replacement": "-"},
+                                     {"op": "lowercase"}]},
+            "caps":  {"type": "css", "selector": ".d",
+                      "transforms": [{"op": "regex_replace",
+                                      "pattern": "(\\d{4})-(\\d{2})",
+                                      "replacement": "$2/$1"}]},
+            "num":   {"type": "const", "value": 7, "transforms": [{"op": "uppercase"}]},
+            "miss":  {"type": "css", "selector": ".nope",
+                      "transforms": [{"op": "regex_replace", "pattern": "a", "replacement": "b"}]}
+        }));
+        let doc = r#"<h1>hi there</h1><ul><li>a</li><li>b</li></ul>
+                     <span class="t">Rust  Is Fast</span><span class="d">2026-07</span>"#
+            .to_string();
+        let out = &extract_batch(&rules, std::slice::from_ref(&doc))[0];
+        assert_eq!(out["up"], json!("HI THERE"));
+        assert_eq!(out["each"], json!(["A", "B"]), "element-wise over arrays");
+        assert_eq!(out["slug"], json!("rust-is-fast"));
+        assert_eq!(out["caps"], json!("07/2026"), "$N capture references");
+        // Non-strings pass through untouched; a miss stays a miss.
+        assert_eq!(out["num"], json!(7));
+        assert_eq!(out["miss"], json!(null));
     }
 
     #[test]
