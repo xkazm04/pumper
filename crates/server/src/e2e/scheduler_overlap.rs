@@ -29,6 +29,7 @@ async fn overlap_guard_holds_a_due_firing_and_releases_it_after_completion() {
             timezone: None,
             misfire_policy: "fire_once",
             max_attempts: Some(1),
+            budget_usd: None,
         })
         .await
         .expect("create schedule");

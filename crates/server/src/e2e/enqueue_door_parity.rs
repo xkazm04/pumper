@@ -191,6 +191,7 @@ async fn legacy_invalid_schedule_is_skipped_visibly_not_enqueued_or_silently_ok(
             timezone: None,
             misfire_policy: "fire_once",
             max_attempts: Some(1),
+            budget_usd: None,
         })
         .await
         .expect("storage takes the row the API would refuse");

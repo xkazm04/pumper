@@ -203,6 +203,7 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(list_schedules, create_schedule))
         .routes(routes!(delete_schedule))
         .routes(routes!(set_schedule_enabled))
+        .routes(routes!(set_schedule_budget))
         .routes(routes!(list_records, delete_dataset_route))
         .routes(routes!(delete_record_route))
         .routes(routes!(export_records))
@@ -519,6 +520,7 @@ mod api_spec_tests {
         "POST /schedules",
         "DELETE /schedules/{id}",
         "POST /schedules/{id}/enabled",
+        "POST /schedules/{id}/budget",
         "GET /datasets/{app}/{dataset}",
         "GET /datasets/{app}/{dataset}/export",
         "GET /datasets/{app}/{dataset}/duplicates",

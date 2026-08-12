@@ -89,6 +89,7 @@ async fn due_schedule(state: &AppState, misfire_policy: &str) -> String {
             timezone: None,
             misfire_policy,
             max_attempts: Some(1),
+            budget_usd: None,
         })
         .await
         .expect("create schedule");
@@ -118,6 +119,7 @@ async fn hourly_schedule(
             timezone: None,
             misfire_policy,
             max_attempts: Some(1),
+            budget_usd: None,
         })
         .await
         .expect("create schedule");

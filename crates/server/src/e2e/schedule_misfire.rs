@@ -47,6 +47,7 @@ async fn hourly(
             timezone: None,
             misfire_policy: policy,
             max_attempts: Some(1),
+            budget_usd: None,
         })
         .await
         .expect("create schedule");

@@ -385,7 +385,8 @@ pub(crate) async fn reconcile_one(
 
     // Fire-time re-check against the LIVE row rather than the pass's snapshot —
     // see `still_firable`.
-    if !still_firable(state.storage.get_schedule(&schedule.id).await?.as_ref()) {
+    let fresh = state.storage.get_schedule(&schedule.id).await?;
+    if !still_firable(fresh.as_ref()) {
         info!(
             id = %schedule.id, app = %schedule.app,
             "schedule was disabled or removed after this pass read it; not enqueuing"
@@ -401,6 +402,11 @@ pub(crate) async fn reconcile_one(
         max_attempts,
         priority: schedule.priority,
         schedule_id: Some(schedule.id.clone()),
+        // The schedule's own ceiling, off the live row — see `firing_budget`.
+        // This field is why the fire path may not build its options from
+        // `Default`: `budget_usd: None` is "no ceiling", so every scheduled run
+        // of a Claude-tier app used to be unlimited.
+        budget_usd: firing_budget(fresh.as_ref(), schedule),
         ..Default::default()
     };
     let job = state.storage.enqueue(&schedule.app, opts).await?;
@@ -441,6 +447,26 @@ pub(crate) async fn reconcile_one(
 /// (`None`) is refused for the same reason.
 pub(crate) fn still_firable(fresh: Option<&Schedule>) -> bool {
     matches!(fresh, Some(s) if s.enabled)
+}
+
+/// The spend ceiling one firing must carry (migration 0040). `None` = no ceiling.
+///
+/// The anti-pattern this replaces: `EnqueueOptions { ..Default::default() }` on
+/// the fire path, which handed every scheduled run `budget_usd: None`. Schedules
+/// were then the last work-creator without a ceiling — an unattended, recurring,
+/// paid standing order was the one work shape that could spend without limit,
+/// while the same app enqueued at the jobs door honoured its cap.
+///
+/// The value is read off the row the fire step re-read for [`still_firable`],
+/// not off the pass snapshot, because a ceiling is a money decision the operator
+/// made *before* this enqueue: `POST /schedules/{id}/budget` landing while the
+/// pass walks the table must bind this firing, not merely the next one. The
+/// asymmetry with `params`/`priority` (which stay on the snapshot, where they
+/// were validated) is deliberate — neither of those is a spend, and re-reading
+/// costs nothing here since the row is already in hand. `fresh = None` cannot
+/// fire at all, so the snapshot only backstops the signature.
+pub(crate) fn firing_budget(fresh: Option<&Schedule>, snapshot: &Schedule) -> Option<f64> {
+    fresh.map_or(snapshot.budget_usd, |live| live.budget_usd)
 }
 
 // ---- Catalog reconcile (M19) ----------------------------------------------
@@ -924,6 +950,7 @@ mod tests {
             timezone: tz.map(String::from),
             misfire_policy: "fire_once".into(),
             max_attempts: None,
+            budget_usd: None,
             managed_by: None,
             last_run,
             last_skipped_at: None,
@@ -1300,6 +1327,33 @@ mod tests {
         assert!(!still_firable(Some(&live)));
         // Deleted between the snapshot and the enqueue: same answer.
         assert!(!still_firable(None));
+    }
+
+    /// The money half of the same re-read. A ceiling set on a schedule while the
+    /// pass is walking the table is an instruction about *this* firing — the
+    /// operator placed it before the enqueue happened — so replaying the
+    /// snapshot's ceiling would let exactly one more unbounded run out of the
+    /// door after the call that was meant to stop it.
+    #[test]
+    fn the_firing_budget_is_the_live_rows_not_the_pass_snapshots() {
+        let snapshot = schedule(HOURLY, None, None);
+        assert_eq!(
+            firing_budget(Some(&snapshot), &snapshot),
+            None,
+            "no ceiling anywhere stays no ceiling — this feature invents none"
+        );
+
+        // Set mid-pass: the firing this step is about must already honour it.
+        let mut live = snapshot.clone();
+        live.budget_usd = Some(2.0);
+        assert_eq!(firing_budget(Some(&live), &snapshot), Some(2.0));
+
+        // ...and cleared mid-pass, the other direction: the operator lifted the
+        // ceiling, so the stale one must not keep capping the run.
+        let mut capped = snapshot.clone();
+        capped.budget_usd = Some(2.0);
+        live.budget_usd = None;
+        assert_eq!(firing_budget(Some(&live), &capped), None);
     }
 
     #[test]

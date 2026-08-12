@@ -144,6 +144,22 @@ async fn replay_keeps_columns_added_by_later_migrations() {
         );
     }
 
+    let schedules = column_names(&pool, "schedules").await;
+    for col in [
+        "timezone",        // 0018 cron maturity
+        "misfire_policy",  // 0018 cron maturity
+        "max_attempts",    // 0018 cron maturity
+        "managed_by",      // 0023 catalog reconcile fence
+        "last_skipped_at", // 0039 schedule skips
+        "skipped_count",   // 0039 schedule skips
+        "budget_usd",      // 0040 schedule budget
+    ] {
+        assert!(
+            schedules.contains(col),
+            "schedules lost column `{col}`: {schedules:?}"
+        );
+    }
+
     let triggers = column_names(&pool, "triggers").await;
     for col in [
         "filters",      // 0021 external triggers

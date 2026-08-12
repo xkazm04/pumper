@@ -391,6 +391,7 @@ async fn seed_schedules(state: &AppState) -> (String, String) {
             timezone: None,
             misfire_policy: "fire_once",
             max_attempts: None,
+            budget_usd: None,
         })
         .await
         .expect("hand-made schedule");
