@@ -51,6 +51,14 @@
 //! to derive org type. The ~188 MB full-file fetch sets a per-request
 //! `HttpRequest.timeout_secs` (the client-global `[http] timeout_secs` stays at
 //! its 30s default for the rest of the fleet).
+//!
+//! DRIFT IS LOUD. A document with no `polozky` array fails the run naming the
+//! drift ([`feed_postings`]) instead of aggregating zero postings into a clean
+//! `feedRecords: 0` success, and the DEFAULT feed at full width carrying fewer
+//! than [`MIN_PLAUSIBLE_POSTINGS`] postings fails before any aggregation
+//! ([`implausibly_small_feed`]) so a collapsed feed cannot overwrite every
+//! national cell with near-empty ones. Both paths write nothing, and since
+//! every dataset here is upsert-only, yesterday's values stay in place.
 
 #![allow(non_snake_case)]
 
@@ -72,6 +80,14 @@ const FULL_URL: &str = "https://data.mpsv.cz/od/soubory/volna-mista/volna-mista.
 /// Salary sanity band (CZK monthly) — drops hourly-mislabeled rows and errors.
 const SALARY_MIN: f64 = 5_000.0;
 const SALARY_MAX: f64 = 2_000_000.0;
+/// Floor on the posting count that may recompute NATIONAL aggregates.
+///
+/// "Volná místa za celou ČR" is the whole country's live vacancy register —
+/// ~300k postings, replaced daily. 1 000 is 0.3% of that: no holiday, no
+/// seasonal trough and no real labour-market event produces it, only a
+/// truncated download or a partial publication. Applies to the default feed at
+/// full width only — see [`implausibly_small_feed`].
+const MIN_PLAUSIBLE_POSTINGS: usize = 1_000;
 
 /// Official ISPV salary statistics — read cross-app from the store.
 const ISPV_APP: &str = "mpsv-ispv";
@@ -359,7 +375,26 @@ impl ScrapeApp for MpsvVpm {
         })?;
         drop(resp); // free the ~188 MB source string before aggregating
 
-        let total = feed.polozky.len();
+        // Schema drift and an empty publication are DIFFERENT claims, and
+        // `#[serde(default)]` used to erase the difference into a clean
+        // `feedRecords: 0` success (see `feed_postings`).
+        let postings = feed_postings(feed).map_err(|why| {
+            Error::App(format!("mpsv-vpm: source contract drift at {url}: {why}"))
+        })?;
+
+        let total = postings.len();
+        // The size floor: only the DEFAULT national feed at full width is judged
+        // (see `implausibly_small_feed`). Checked before ANY aggregation, so a
+        // collapsed feed republishes nothing at all.
+        if implausibly_small_feed(total, url == FULL_URL, max_records) {
+            return Err(Error::App(format!(
+                "mpsv-vpm: the national vacancy register carried only {total} postings (floor \
+                 {MIN_PLAUSIBLE_POSTINGS}, normal ~300k) — refusing to recompute national \
+                 aggregates from a collapsed feed. Nothing was written, so `role_region_agg`, \
+                 `region_agg` and the `cz-labour` products keep yesterday's values instead of \
+                 being overwritten with near-empty cells."
+            )));
+        }
         let considered = if max_records == 0 {
             total
         } else {
@@ -368,8 +403,7 @@ impl ScrapeApp for MpsvVpm {
 
         // Reference "today" = the most recent change date in the feed (≈ its
         // publish date); posting age and the recency cutoff are measured from it.
-        let ref_date: Option<NaiveDate> = feed
-            .polozky
+        let ref_date: Option<NaiveDate> = postings
             .iter()
             .take(considered)
             .filter_map(|p| p.changed_date())
@@ -408,7 +442,7 @@ impl ScrapeApp for MpsvVpm {
         // gather a few extra candidates per group, then keep only the richest N
         let gather_cap = samples_per_group.saturating_mul(6).max(samples_per_group);
 
-        for p in feed.polozky.iter().take(considered) {
+        for p in postings.iter().take(considered) {
             // Survival ledger: track every classifiable posting with a stable id.
             if let (Some(pid), Some(cz)) = (p.portalId, p.czisco()) {
                 ledger_today.insert(
@@ -441,13 +475,23 @@ impl ScrapeApp for MpsvVpm {
                 posted_ages.push((rd - pd).num_days().max(0));
             }
 
-            let czisco = match p.czisco() {
-                Some(c) => c,
-                None => continue, // unclassifiable postings can't feed the products
-            };
             let org = p.org_type();
             let kraj = p.kraj();
             let salary = p.monthly_salary_point();
+
+            // Region roll-ups FIRST — they key on (kraj, orgType) only and need
+            // no occupation code, so they must not sit behind the CZ-ISCO gate
+            // below. They used to, which silently excluded every unclassified
+            // posting from the dataset documented as "the true regional salary
+            // distribution" (bughunt 2026-07-14 #2).
+            for key in region_rollup_keys(kraj.as_deref(), &org) {
+                regions.entry(key).or_default().add(salary);
+            }
+
+            let czisco = match p.czisco() {
+                Some(c) => c,
+                None => continue, // unclassifiable postings can't feed the OCCUPATION products
+            };
 
             // regional cell (when kraj known) + national ALL cell
             if let Some(k) = &kraj {
@@ -458,27 +502,6 @@ impl ScrapeApp for MpsvVpm {
             }
             cells
                 .entry((czisco.clone(), "ALL".to_string(), org.clone()))
-                .or_default()
-                .add(salary);
-
-            // region rollups (all occupations): per (kraj, orgType), per (kraj, all),
-            // and national (ALL, orgType) + (ALL, all).
-            if let Some(k) = &kraj {
-                regions
-                    .entry((k.clone(), org.clone()))
-                    .or_default()
-                    .add(salary);
-                regions
-                    .entry((k.clone(), "all".to_string()))
-                    .or_default()
-                    .add(salary);
-            }
-            regions
-                .entry(("ALL".to_string(), org.clone()))
-                .or_default()
-                .add(salary);
-            regions
-                .entry(("ALL".to_string(), "all".to_string()))
                 .or_default()
                 .add(salary);
 
@@ -525,7 +548,7 @@ impl ScrapeApp for MpsvVpm {
         // HTTP fetches taking minutes; without this the whole corpus stays resident
         // across those network waits while other apps run concurrently. (Mirrors the
         // existing `drop(resp)` — extended to the larger, longer-lived parsed side.)
-        drop(feed);
+        drop(postings);
 
         // aggregate cells that clear the min-count threshold (statistically usable)
         let mut agg_items: Vec<(String, Value)> = Vec::new();
@@ -1170,6 +1193,64 @@ impl ScrapeApp for MpsvVpm {
             .await?;
         Ok(out)
     }
+}
+
+/// The postings behind a parsed feed, or the reason the document is SCHEMA
+/// DRIFT and must not be reported as a clean `feedRecords: 0` success.
+///
+/// `Feed::polozky` used to be `#[serde(default)]`, which erased the whole
+/// distinction: a renamed key, a re-wrapped envelope and an error document that
+/// happens to be valid JSON all deserialized to an empty `Vec`, aggregated to
+/// nothing, wrote nothing, and reported success. On a ~300k-posting national
+/// feed that is doubly invisible — `upsert_many` is a partial upsert, so no row
+/// is tombstoned either and there is no data-loss alarm to notice. The only
+/// observable was a `0` in a field nobody alerts on.
+///
+/// A present-but-EMPTY `polozky: []` is a different claim ("the register is
+/// empty today") and is judged by [`implausibly_small_feed`], not here.
+fn feed_postings(feed: Feed) -> std::result::Result<Vec<Posting>, &'static str> {
+    feed.polozky.ok_or(
+        "the document carries no `polozky` array — the source contract changed \
+         (renamed/re-wrapped key, or an error envelope that parsed as JSON). This is NOT an \
+         empty feed, and nothing was aggregated or written",
+    )
+}
+
+/// Whether this run may publish national aggregates from a feed of `total`
+/// postings.
+///
+/// The register carries ~300k live postings every day; [`MIN_PLAUSIBLE_POSTINGS`]
+/// is 0.3% of that, so only a truncated download or a partial publication can
+/// reach it. Deliberately scoped to the DEFAULT feed at full width:
+///
+/// * a `url` override points at a trimmed mirror **on purpose** — the manifest's
+///   own smoke example does exactly that;
+/// * `maxRecords` truncates **on purpose**.
+///
+/// A floor that judged those would refuse the runs it exists to allow. This is
+/// a per-feed floor, not a global one, for the same reason mpsv-ispv's floor is
+/// 50 and not 1000: the number is a property of the source, not of the fleet.
+fn implausibly_small_feed(total: usize, is_default_feed: bool, max_records: usize) -> bool {
+    is_default_feed && max_records == 0 && total < MIN_PLAUSIBLE_POSTINGS
+}
+
+/// The region roll-up cells one posting contributes to: its own kraj (per org
+/// type and pooled `all`), plus the national `ALL` pair.
+///
+/// Extracted so it can be called ABOVE the CZ-ISCO gate in the aggregation loop.
+/// None of these keys uses the occupation code, yet the roll-up used to sit
+/// after `czisco`'s early `continue` — so every posting the feed leaves
+/// unclassified was silently missing from `region_agg`, the dataset whose whole
+/// claim is being "the true regional salary distribution".
+fn region_rollup_keys(kraj: Option<&str>, org: &str) -> Vec<(String, String)> {
+    let mut keys = Vec::with_capacity(4);
+    if let Some(k) = kraj {
+        keys.push((k.to_string(), org.to_string()));
+        keys.push((k.to_string(), "all".to_string()));
+    }
+    keys.push(("ALL".to_string(), org.to_string()));
+    keys.push(("ALL".to_string(), "all".to_string()));
+    keys
 }
 
 /// Numeric CZ-ISCO unit group: `"CzIsco/93291"` → `"9329"` (first 4 digits of the
@@ -2052,8 +2133,9 @@ fn aggregate_lifecycle(
 
 #[derive(Deserialize)]
 struct Feed {
-    #[serde(default)]
-    polozky: Vec<Posting>,
+    /// `Option`, deliberately NOT `#[serde(default)]`: absence has to survive
+    /// deserialization for [`feed_postings`] to tell drift from an empty feed.
+    polozky: Option<Vec<Posting>>,
 }
 
 #[derive(Deserialize)]
@@ -2375,6 +2457,8 @@ struct Sample {
 mod tests {
     use super::*;
 
+    use pumper_core::testing::{engines_with, Dead, TempStore, TestContext};
+
     /// The manifest must describe the params the code actually reads. The server
     /// registry test validates examples against the schema; this one catches the
     /// drift that a validator cannot see — an example or a scheduled default
@@ -2508,6 +2592,222 @@ mod tests {
         assert_eq!(hourly.monthly_salary_point(), None);
         let empty: Posting = serde_json::from_value(json!({})).unwrap();
         assert_eq!(empty.monthly_salary_point(), None);
+    }
+
+    // ── feed-drift honesty ──────────────────────────────────────────────────
+
+    /// The anti-pattern: `#[serde(default)]` on `polozky` made a renamed key,
+    /// a re-wrapped envelope and an error document indistinguishable from an
+    /// empty feed — all four aggregated to nothing and reported success.
+    #[test]
+    fn missing_polozky_is_drift_not_an_empty_feed() {
+        let drift = |body: Value| {
+            let feed: Feed = serde_json::from_value(body).expect("parses as Feed");
+            feed_postings(feed)
+        };
+        // Renamed key.
+        assert!(drift(json!({ "items": [] })).is_err());
+        // Re-wrapped envelope.
+        assert!(drift(json!({ "data": { "polozky": [] } })).is_err());
+        // An error document that happens to be valid JSON.
+        assert!(drift(json!({ "error": "service unavailable" })).is_err());
+        // The honest empty feed is NOT drift — the size floor judges it instead.
+        assert_eq!(drift(json!({ "polozky": [] })).expect("ok").len(), 0);
+        // And a real feed passes through untouched.
+        let ok = drift(json!({ "polozky": [{ "mesicniMzdaOd": 40000.0 }] })).expect("ok");
+        assert_eq!(ok.len(), 1);
+    }
+
+    #[test]
+    fn size_floor_judges_the_national_feed_only_never_a_mirror_or_a_capped_run() {
+        // The collapse the floor exists for: default feed, full width.
+        assert!(implausibly_small_feed(0, true, 0));
+        assert!(implausibly_small_feed(MIN_PLAUSIBLE_POSTINGS - 1, true, 0));
+        assert!(!implausibly_small_feed(MIN_PLAUSIBLE_POSTINGS, true, 0));
+        assert!(!implausibly_small_feed(300_000, true, 0));
+        // A `url` override is a deliberately trimmed mirror — the manifest's own
+        // smoke example. Refusing it would break the runs the floor exists to allow.
+        assert!(!implausibly_small_feed(20, false, 0));
+        // `maxRecords` truncates on purpose.
+        assert!(!implausibly_small_feed(20, true, 20_000));
+    }
+
+    /// Bughunt 2026-07-14 #2: the region roll-up sat behind the CZ-ISCO early
+    /// `continue`, so `region_agg` — "the true regional salary distribution" —
+    /// silently omitted every posting the feed leaves unclassified.
+    #[test]
+    fn region_rollup_keys_need_no_occupation_code_and_cover_kraj_and_national() {
+        let keys = region_rollup_keys(Some("Kraj/108"), "private");
+        assert_eq!(
+            keys,
+            vec![
+                ("Kraj/108".to_string(), "private".to_string()),
+                ("Kraj/108".to_string(), "all".to_string()),
+                ("ALL".to_string(), "private".to_string()),
+                ("ALL".to_string(), "all".to_string()),
+            ]
+        );
+        // A posting with no kraj still counts nationally — it just has no region.
+        assert_eq!(
+            region_rollup_keys(None, "public"),
+            vec![
+                ("ALL".to_string(), "public".to_string()),
+                ("ALL".to_string(), "all".to_string()),
+            ]
+        );
+    }
+
+    // ── run() end-to-end over a stubbed HTTP engine ─────────────────────────
+
+    /// One scripted HTTP response for every request. `aresMaxLookups: 0` in the
+    /// test params keeps the ARES leg out, so the feed fetch is the only call.
+    struct StubHttp {
+        body: String,
+    }
+
+    #[async_trait]
+    impl pumper_core::HttpClient for StubHttp {
+        async fn fetch(&self, _: HttpRequest) -> Result<pumper_core::HttpResponse> {
+            Ok(pumper_core::HttpResponse {
+                status: 200,
+                headers: Default::default(),
+                body: self.body.clone(),
+                final_url: FULL_URL.to_string(),
+                cache_hit: false,
+            })
+        }
+    }
+
+    fn vpm_ctx(store: &TempStore, body: String, params: Value) -> AppContext {
+        let http = std::sync::Arc::new(StubHttp { body });
+        TestContext::new(&store.storage, "mpsv-vpm")
+            .params(params)
+            .engines(engines_with(
+                http,
+                std::sync::Arc::new(Dead),
+                std::sync::Arc::new(Dead),
+            ))
+            .build()
+    }
+
+    /// One posting, with an optional occupation code — the fixture the region
+    /// bias turns on.
+    fn posting(id: i64, czisco: Option<&str>, kraj: &str, salary: f64) -> Value {
+        let mut p = json!({
+            "portalId": id,
+            "datumVlozeni": "2026-08-01T00:00:00Z",
+            "datumZmeny": "2026-08-10T00:00:00Z",
+            "mesicniMzdaOd": salary,
+            "mesicniMzdaDo": salary,
+            "pozadovanaProfese": { "cs": "Pracovník" },
+            "zamestnavatel": { "ico": "27074358", "nazev": "Alza.cz a.s." },
+            "mistoVykonuPrace": { "pracoviste": [{ "adresa": { "kraj": { "id": kraj } } }] },
+        });
+        if let Some(cz) = czisco {
+            p["profeseCzIsco"] = json!({ "id": cz });
+        }
+        p
+    }
+
+    /// The bughunt bug, proven at run level: with three unclassified postings in
+    /// the same kraj as three classified ones, `region_agg` must count SIX.
+    #[tokio::test]
+    async fn run_region_agg_counts_unclassified_postings_not_only_czisco_ones() {
+        let store = TempStore::new("mpsv-vpm-region").await;
+        let mut rows: Vec<Value> = (0..3)
+            .map(|i| posting(i, Some("CzIsco/52231"), "Kraj/108", 40_000.0))
+            .collect();
+        rows.extend((10..13).map(|i| posting(i, None, "Kraj/108", 60_000.0)));
+        let body = json!({ "polozky": rows }).to_string();
+        // `url` override keeps the national size floor out of the way.
+        let params = json!({
+            "url": "https://example.test/mirror.json",
+            "minCount": 1,
+            "aresMaxLookups": 0,
+        });
+        let out = MpsvVpm
+            .run(vpm_ctx(&store, body, params))
+            .await
+            .expect("run");
+        assert_eq!(out["feedRecords"], 6);
+        let regions = store
+            .datasets()
+            .list("mpsv-vpm", "region_agg", 100)
+            .await
+            .expect("read back");
+        let kraj_all = regions
+            .iter()
+            .find(|r| r.key == "Kraj/108|all")
+            .expect("the kraj's pooled cell");
+        assert_eq!(
+            kraj_all.data["count"], 6,
+            "unclassified postings belong in the REGIONAL distribution — they \
+             only lack an occupation, not a region"
+        );
+        // Their salaries too: median of [40k,40k,40k,60k,60k,60k] is 40k at
+        // nearest rank, and the max proves the 60k rows are in the pool.
+        assert_eq!(kraj_all.data["salaryCount"], 6);
+        assert_eq!(kraj_all.data["salaryMax"], 60_000);
+        // The occupation-keyed table is unchanged: only the 3 classified rows.
+        let cells = store
+            .datasets()
+            .list("mpsv-vpm", "role_region_agg", 100)
+            .await
+            .expect("read back");
+        assert_eq!(
+            cells
+                .iter()
+                .find(|r| r.key == "CzIsco/52231|Kraj/108|private")
+                .expect("occupation cell")
+                .data["count"],
+            3
+        );
+    }
+
+    #[tokio::test]
+    async fn run_fails_on_drift_instead_of_reporting_a_clean_zero_record_success() {
+        let store = TempStore::new("mpsv-vpm-drift").await;
+        let body = json!({ "polozkyVolnychMist": [] }).to_string();
+        let err = MpsvVpm
+            .run(vpm_ctx(
+                &store,
+                body,
+                json!({ "url": "https://example.test/mirror.json" }),
+            ))
+            .await
+            .expect_err("drift must fail the run");
+        assert!(err.to_string().contains("source contract drift"), "{err}");
+        assert!(store
+            .datasets()
+            .list("mpsv-vpm", "region_agg", 10)
+            .await
+            .expect("read back")
+            .is_empty());
+    }
+
+    /// The near-empty national feed: the key is present, so the drift check
+    /// passes and only the floor stands between a collapsed download and every
+    /// national cell being recomputed from nothing.
+    #[tokio::test]
+    async fn run_refuses_a_collapsed_national_feed_before_touching_any_aggregate() {
+        let store = TempStore::new("mpsv-vpm-floor").await;
+        let rows: Vec<Value> = (0..5)
+            .map(|i| posting(i, Some("CzIsco/52231"), "Kraj/108", 40_000.0))
+            .collect();
+        let body = json!({ "polozky": rows }).to_string();
+        // No `url` param → the DEFAULT national feed, at full width.
+        let err = MpsvVpm
+            .run(vpm_ctx(&store, body, json!({ "aresMaxLookups": 0 })))
+            .await
+            .expect_err("a collapsed national feed must fail the run");
+        let msg = err.to_string();
+        assert!(msg.contains("collapsed feed"), "{msg}");
+        assert!(store
+            .datasets()
+            .list("mpsv-vpm", "region_agg", 10)
+            .await
+            .expect("read back")
+            .is_empty());
     }
 
     #[test]

@@ -7,3 +7,10 @@ edition.workspace = true
 pumper-core.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+# `run()` end-to-end over a stubbed HTTP engine: TempStore + TestContext +
+# `engines_with` come from core's shared harness, so there is no parallel
+# fixture to keep in sync.
+tokio.workspace = true
+pumper-core = { workspace = true, features = ["test-support"] }
