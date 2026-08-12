@@ -53,6 +53,32 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   resource-destructive actions even when they are obviously regenerable.
 
 ## Skill improvement log
+- 2026-08-12 (round 13): **Builder death is the norm, and the recovery protocol has
+  converged to near-zero cost.** Three of the last five rounds died mid-build; r13
+  died TWICE (original + first continuation) and still shipped 6/6 with zero work
+  lost. What made it cheap, in order of load-bearing-ness: (1) builders commit per
+  direction the moment it verifies, (2) the session note's `next:` pointer names the
+  exact remaining work, (3) the active-runs entry names the branch and the in-flight
+  lots. A continuation session needs only those three to resume losslessly. Keep all
+  three as non-negotiable steps.
+- 2026-08-12 (round 13): **A dead sibling session's dirty file in your own wave's
+  checkout is wave work, not foreign work.** The r13 smoke extension sat uncommitted
+  in the tree across two session deaths; the parallel-safety rule ("leave dirty files
+  you did not create alone") correctly protects OTHER sessions' work, but a file that
+  is unambiguously this wave's planned output (named in the dead session's `next:`)
+  should be reviewed like a builder diff and landed, not orphaned.
+- 2026-08-12 (round 13): **Don't pipe a gate through `tail` — you keep the exit code
+  and lose the evidence.** `just ci | tail -60` proved green but destroyed the test
+  totals, costing a full re-run to recover the ledger number. Capture gate output to
+  a file (`> log 2>&1`), then read the file; the round-6 exit-code rule and this are
+  the two halves of the same discipline.
+- 2026-08-12 (round 13): **An acceptance criterion can be wrong in the particulars and
+  right in the principle — judge deviations against the principle.** The criteria
+  said refuse `"` at the cmd.exe shim; the builder MEASURED cmd's actual re-parse and
+  proved refusing quotes would break every schema-using app while a lone quote
+  mangles nothing. The criterion's own words ("per actual cmd re-parsing rules")
+  licensed the deviation. Review verdict: the measurement wins; record the deviation
+  in the build record rather than forcing criteria-compliance.
 - 2026-08-12 (round 12): **The report-don't-touch seam for out-of-set changes worked
   end-to-end for the first time at full depth**: Lot X predicted the worker.rs
   double-index its own change would create, specified the exact guard + the fallback

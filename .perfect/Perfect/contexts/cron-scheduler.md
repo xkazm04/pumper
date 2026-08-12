@@ -69,5 +69,17 @@ Direction-grade gaps (scout, verified against source):
     once G2 is fixed. Banked as a seed, not an anchor.
 
 ## Shipped
-- (r13 wave in flight)
+- 2026-08-12 (r13): [[sched-tick-isolation]] → `4788dbb` — one bad schedule cannot
+  starve the rest (`reconcile_one` + `PassTally::absorb`); panics contained at two
+  levels; both inline sync-mutex sites poison-tolerant; shutdown checked between
+  schedules; main joins the task; `SchedulerLoop` harness = first tick-loop coverage.
+- 2026-08-12 (r13): [[sched-misfire-honesty]] → `edf3041` — per-firing misfire
+  classification (`SkipThenFire`): skip eats only what a previous pass genuinely
+  missed; slow ticks stop manufacturing misfires; skip-branch gate parity;
+  fire-time enabled re-check.
+- 2026-08-12 (r13): [[schedule-budget-door]] → `85348d2` + `1f05e09` — schedules
+  were the last work-creator without the r12 budget contract; migration 0040,
+  ceiling on both schedule doors via the shared validator, fire path reads the
+  LIVE row so a mid-pass ceiling binds that firing; catalog reconcile cannot wipe
+  one; `POST /schedules/{id}/budget` is the late door for code-seeded/managed rows.
 - (inherited — see [[job-worker-cron-scheduler]])

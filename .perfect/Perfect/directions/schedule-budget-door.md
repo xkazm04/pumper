@@ -3,12 +3,12 @@ slug: schedule-budget-door
 type: perfect/direction
 context: "[[cron-scheduler]]"
 lens: feature
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 85348d2 + 1f05e09
 ---
 
 ## What & why
@@ -66,4 +66,23 @@ jobs, then scheduled them nightly — and the scheduled ones ran unlimited."
   run the route-inventory and openapi tests.
 
 ## Build record
-(pending)
+Two-session build. The original Lot S builder died with the first half done —
+session -4 snapshotted it as `85348d2` (migration 0040, storage column +
+`set_schedule_budget`, both route doors through the shared
+`routes::jobs::validate_budget_usd`). Continuation builder (opus, Lot S2) completed
+it as `1f05e09`. Review verdict KEEP (session -5, diff read in full): the fire path
+plumbs the ceiling via extracted `firing_budget`, read off the LIVE row the step
+already re-reads for `still_firable` — a ceiling set while the pass walks the table
+binds THAT firing (the money-vs-params asymmetry is argued in the doc comment);
+`POST /schedules/{id}/budget` registered + in the EXPECTED route inventory;
+migration replay test pins schedules cols 0018/0023/0039/0040; five e2e tests incl.
+mid-pass bind and catalog-reconcile clobber-proof (create re-apply, cron update,
+disable/enable), 3/5 fail with the fire-path line removed (builder-verified). NULL
+stays no-ceiling — no default invented. The r12 extinction scan sweeps all of
+server/src so the new doors are inside its coverage. **Deviation noted:**
+budget-exhaustion parity with the jobs door is covered transitively (the enqueued
+job is byte-identical; the exhaustion machinery is job-side and r9-tested) rather
+than re-driven e2e — accepted. Docs: runtime.md spend-ceiling section, http-api.md
+schedules row, "every work-creating door now has the same floor". Smoke extended
+with 3 live checks (422 floor, 404 late door, round-trip) — Director commit.
+Wave gate: `just ci` exit 0 (session -5).

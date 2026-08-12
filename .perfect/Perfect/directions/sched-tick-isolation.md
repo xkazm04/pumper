@@ -3,12 +3,12 @@ slug: sched-tick-isolation
 type: perfect/direction
 context: "[[cron-scheduler]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 4788dbb
 ---
 
 ## What & why
@@ -73,4 +73,12 @@ why."
   picks with reasoning).
 
 ## Build record
-(pending)
+Builder (opus, Lot S, original r13 session) shipped `4788dbb`. Review verdict KEEP
+(session -4, diff read in full): `reconcile_one` + `PassTally::absorb` — a
+per-schedule error CANNOT propagate by signature; two-level panic containment with
+argued `AssertUnwindSafe`; `lock_advisory` at both inline sync-mutex sites
+(datahub.rs, worker.rs); shutdown checked between schedules; main joins the task
+bounded by `SCHEDULER_SHUTDOWN_GRACE`. `SchedulerLoop` harness = first-ever coverage
+of the real tick loop (fires a due schedule, survives an injected per-schedule
+failure, exits on the token). runtime.md now tells the truth about the tick's four
+piggybacked jobs + boot catalog reconcile. Wave gate: `just ci` exit 0 (session -5).

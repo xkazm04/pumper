@@ -2,21 +2,21 @@
 type: perfect/home
 repo: pumper
 updated: 2026-08-12
-pool: 6
+pool: 0
 pool_target: per-dispatch (r13 cap 6)
-shipped_total: 110
-coverage: "20/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; r13 wave in flight will add claude-engine + cron-scheduler; wasm-plugin-host banked slate-grade; 24 others never proposed"
-cursor: "round 13 BUILD in flight: 2 lots (claude-engine ×3, cron-scheduler ×3) on perfect/2026-08-12-r13; next propose tier: wasm-plugin-host (banked slate) then eu-grants, us-business-census, czech-labor-market, web-crawler, crawler-core, engine-contracts (opp 5)"
-last_session: "[[sessions/2026-08-12-3]]"
+shipped_total: 116
+coverage: "22/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; wasm-plugin-host banked slate-grade fronts r14; 24 others never proposed"
+cursor: "round 14 PROPOSE: wasm-plugin-host first (banked slate-grade brief from the r13 scout — re-verify seeds), then eu-grants, us-business-census, czech-labor-market, web-crawler, crawler-core, engine-contracts (opp 5); never-proposed before re-mining"
+last_session: "[[sessions/2026-08-12-5]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **6** · phase: **round 13 BUILD in flight** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round).
+**State**: pool **0** · phase: **round 13 SHIPPED — round 14 propose next** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round).
 
-### Round-13 pool — 6 accepted (2026-08-12, gate: director-self-gated)
+### Round-13 pool — ALL 6 SHIPPED (2026-08-12, gate: director-self-gated, SWEEP round; original session died mid-build, TWO continuation sessions recovered + landed)
 claude-engine, 3/5 (REJECTED: concurrency-cap — no volume consumer, r9 precedent;
 REJECTED-deferred: token-telemetry — banked with truncation-honesty + compose-role
 refresh as the context's anchors):
@@ -247,12 +247,15 @@ old-map notes got `superseded_by:` aliases (broad-crawler, declarative-extractio
 fetch-engines, http-api-routes, job-worker-cron-scheduler, tiered-fetcher-politeness,
 us-grant-opportunities, us-trades-wages-tax-valuation) — history preserved, none retired.
 
-**Covered (18)**: dataset-storage r4 · job-worker r4 · source-resilience r5 ·
+**Covered (22)**: dataset-storage r4 · job-worker r4 · source-resilience r5 ·
 grants-unified-layer r5 · trigger-pipeline r6 · dataset-api r6 · source-provisioner r7 ·
 search-engine r7 · datahub-bridge r7 · webhook-delivery r8 · dataset-peering r8 ·
 app-runtime r9 · tiered-fetcher r9 · browser-transact r10 · api-surface r10 ·
-**extraction-core r11 (3 shipped)** · **automation-api r11 (3 shipped)** ·
-**archive-engine r11 (nothing-clears-the-bar verdict recorded)**.
+extraction-core r11 (3 shipped) · automation-api r11 (3 shipped) ·
+archive-engine r11 (nothing-clears-the-bar verdict recorded) ·
+declarative-extractor r12 (3 shipped) · job-search-api r12 (3 shipped) ·
+**claude-engine r13 (3 shipped)** · **cron-scheduler r13 (3 shipped)**.
+(The r12 wrap updated the frontmatter count but not this list — drift fixed 2026-08-12-5.)
 
 **Never-proposed queue (24 after r13's two proposals, opportunity-ranked)**:
 | Opp | Contexts |
@@ -412,6 +415,7 @@ spend — was killed at the challenge gate, `worker.rs:528-545` already keeps th
 
 ## Shipped ledger
 
+- 2026-08-12 · **Round 13 (6/6 + 1 Director commit, AUTONOMOUS director-self-gated, SWEEP round; original session died mid-build, two continuation sessions recovered + landed — zero work lost)** — claude-engine 3/5, cron-scheduler 3/5; 4 rejected (2 outright: concurrency-cap no-volume-consumer, tick-telemetry thin-value; 2 rejected-deferred banked: token-telemetry as the context anchor, tick-serialization on webhook-delivery's note where its write set lives). Master `59ab59a` → `a53e3ea` (ff; fifth concurrent two-lot wave, zero collisions). claude-engine: 1dcbbeb (a timeout kills the WHOLE process tree — taskkill /T on the shim pid; the orphan-spend class dead; first-ever tests of research() via the new fake-CLI harness), c7f5c37 (a failed call still reports what it spent — ClaudeSpend in Error::Claude, ledger_event pure decision, meter-before-propagate at both seams, cost_unreported on unpriced success, envelope_text kills the uncacheable empty-text class; original builder died with this COMPLETE, landed from its tree), b0d363c (check_shim_argv refuses measured cmd.exe hostiles + 8000-char line budget; system prompts travel by file not argv; unknown role/garbage model refused pre-spawn; subprocess runs in <storage root>/claude-cwd — the 35k-token repo-context leak closed). cron-scheduler: 4788dbb (tick isolated/contained/joined — reconcile_one + PassTally, two-level panic containment, lock_advisory at both inline mutex sites, SchedulerLoop harness = first tick-loop coverage), edf3041 (misfire skip eats only what was genuinely missed — per-firing SkipThenFire, misfire_cutoff = previous pass's timestamp, skip-branch gate parity, fire-time re-check), 85348d2+1f05e09 (a standing cron order can carry a spend ceiling — migration 0040, both doors through the shared validator, firing_budget off the LIVE row so a mid-pass ceiling binds that firing, catalog reconcile cannot wipe one; the last work-creator now under the r12 budget contract). Director: a53e3ea (smoke 29→32: budget floor 422, late door 404, ceiling round-trip). **Final gate: 1486/0 full workspace (`just ci` exit 0) + live smoke 32/32 on the wave tip (= merged master content, ff).** Coverage 20→22/46. Cumulative: 116/116.
 - 2026-08-12 · **Round 12 (6/6 + 3 Director commits, AUTONOMOUS director-self-gated, SWEEP round)** — declarative-extractor 3/5, job-search-api 3/5; 4 rejected (2 banked, host-weather-import-atomicity CONFIRMED-banked as next anchor, recipes-surface rejected as dead-surface polish). Master `3385b8b` → wave tip (ff; fourth concurrent two-lot wave, zero collisions, both builders survived to final report — first deathless round since r7). extractor: aac6dd5 (one mode per job — oneOf at the door + resolve_run_mode in the app; the schema's anyOf admitted exactly the illegal combinations; concurrency clamped to the declared 64), 4c9092a (five result lies closed: EXPECTED-diff-pinned output_shape, sweep truncation + source.limit, backfill health/worst_fields via poolable QualityRollup, registration failure surfaces, actual write target named @q included), 742cd44 (records echo bounded 100/1000/0 + index_datasets on all write modes gated producer-side + clone gone). jobs/search: acba9f4 (budget_usd 0/neg/NaN/∞ refused, not silently unlimited), e638efc (control events carry the real app via RETURNING; user cancel outranks the drain via claim-under-mutex-before-fire; refuted "/events has an app filter"), 63db76f (index-state block on every search answer via shared run_search; 3 degraded states; MCP parity). Director: e9c3c32 (search_docs echo-indexing delegated when index_datasets present — double-index closed), 6f6efdb (trigger door budget floor — the audit found the same filter stored+replayed per hop; extinction scan), 0790fdd (smoke 25→29). **Final gate: 1419/0 full workspace + live smoke 29/29 on the wave tip (= merged master content, ff).** Coverage 18→20/46. Cumulative: 110/110.
 - 2026-08-12 · **Round 11 (6/6 + 3 Director commits, AUTONOMOUS director-self-gated, SWEEP round, resumed)** — extraction-core 3/5, automation-api 3/5; 5 rejected-deferred (all banked), archive-engine covered with a nothing-clears verdict. Original session died mid-build with ~1,280 uncommitted lines; continuation snapshotted both lots' dirty trees, reviewed and landed the completed first directions, then two fresh opus continuation builders finished the rest — zero work lost. Master `d275fde` → `3216ec7` (ff; third concurrent two-lot wave, zero collisions). extraction: 1b6aebc (per-inner-field listing reports — rot vs sparse distinguishable, worst_fields + replay wired), 26fb0cc (four extraction lies closed: XPath Debug garbage, Err→Empty, default-on-blank via shared is_blank, to_int saturation), ee5d8e4 (url_absolute per-call base seam, every URL-bearing mode + preview + induce; base_url_missing honesty; FetchOutcome-drops-final_url found + banked). automation: 6c3f91a (one params door behind all six work-creators, inventory-enforced; replace→merge resolved; bad_params ledger outcome), 85bb5f9+fb78574 (existential guard twin deleted — retry-wedge dead; migration 0039 skip recording; schedule_reference shared by reconcile + projection; builder self-caught a red-guard ship via full-failure rescan), 5ee2462 (NamespaceIndex registry+seed+store+saved-search; virtual namespaces watchable; separate trigger filter set — ingress ids aren't apps; watch→deliveries route; explicit-null last_delivery; trades gap banked). Director: 1c43ca7 (chokepoint guard sees through rustfmt wrapping — 9 invisible raw-engine sites reviewed into EXPECTED), 84e4ac3+3216ec7 (smoke 21→25: schedules 422 door, grants watchable, bogus-filter 400, last_delivery). **Final gate: 1372/0 full workspace + live smoke 25/25 on the wave tip (= merged master content, ff).** Coverage 15→18/46. Cumulative: 104/104.
 - 2026-08-11 · **Round 10 (6/6 + 2 Director commits, AUTONOMOUS director-self-gated, resumed)** — browser-transact 3/5, api-surface 3/5; 2 rejected outright, 3 rejected-deferred (banked). Session died post-gate pre-build; continuation session re-verified the evidence anchors and ran the recorded wave plan unchanged. Master `95713f0` → `c630a3f` (ff; second concurrent two-lot wave, disjoint write sets, zero collisions). transact: 428d2e9 (evidence bundle distinguishes a total miss from a clean run — per-step outcomes, successes-only count, submit-target probe, profile + DOM truncate-don't-destroy), f0ddec5 (secrets masked in-page + decode-side re-enforcement; end-to-end no-sentinel proof), 8e17ca7 (Error::Transact terminal; door tightened schema+app-side — builder discovered trigger enqueues bypass the validator entirely; missing profile refuses pre-Chrome). api: c9c2c68 (shutdown terminates bounded with the politeness snapshot flushed post-drain; all 3 SSE surfaces end on the token), 0cfc366 (error-code map complete + inventory-enforced; client_facing exhaustive table; 500 bodies redacted+logged; RowNotFound reasoned-stays-500), 4855fcd (CatchPanicLayer in the driven stack; lock_advisory ×5 + no-lock-unwrap sweep; preview clamp). Director: 684d2c7 (core prelude), c630a3f (smoke +4 checks). **Final gate: 1314/0 full workspace + live smoke 21/21 on the merged master's own binary.** Cumulative: 98/98.

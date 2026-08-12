@@ -3,12 +3,12 @@ slug: claude-kill-tree
 type: perfect/direction
 context: "[[claude-engine]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 1dcbbeb
 ---
 
 ## What & why
@@ -64,4 +64,11 @@ for the full run — and nothing anywhere shows that."
 - Risk: test flakiness on process polling — use bounded retry loops, not fixed sleeps.
 
 ## Build record
-(pending)
+Builder (opus, Lot C, original r13 session) shipped `1dcbbeb`. Review verdict KEEP
+(session -4, diff read in full): `taskkill /PID <pid> /T /F` while the Child handle
+pins the pid; the Job-Object tradeoff is reasoned at the site; `tree_kill_argv` is
+pure and mutation-probed; ONE deadline governs wait AND drain; the stdin-writer task
+is no longer leaked on the timeout path. The fake-CLI harness born here is the first
+test of `research()` in the crate's history (grandchild-orphan kill proven by pid
+poll; non-zero exit, malformed stdout, happy path covered). Wave gate: `just ci`
+exit 0 on the wave tip (session -5).

@@ -3,12 +3,12 @@ slug: sched-misfire-honesty
 type: perfect/direction
 context: "[[cron-scheduler]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: edf3041
 ---
 
 ## What & why
@@ -73,4 +73,14 @@ the scheduler was healthy the whole time."
   with reasoning if touched).
 
 ## Build record
-(pending)
+Builder (opus, Lot S, original r13 session) shipped `edf3041`. Review verdict KEEP
+(session -4, diff read in full): per-firing classification (`SkipThenFire` action) —
+an on-time firing sharing a tick with missed ones now fires while skip advances past
+only the genuinely-missed; `misfire_cutoff` = the PREVIOUS pass's timestamp (grace
+survives only as the boot floor), so a slow tick can no longer manufacture misfires;
+gate parity on the skip branch (unregistered app / invalid params record no skip
+advance); `still_firable` fire-time re-check closes the disable race. The
+`SkippedAndFired` failure ordering was checked at review: enqueue → touch →
+record-skip means a failed skip-record under-counts `skipped_count` but cannot
+re-eat or double-fire. runtime.md misfire prose now true. Wave gate: `just ci`
+exit 0 (session -5).

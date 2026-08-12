@@ -3,12 +3,12 @@ slug: claude-subprocess-hygiene
 type: perfect/direction
 context: "[[claude-engine]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: b0d363c
 ---
 
 ## What & why
@@ -74,4 +74,22 @@ conventions."
   speculatively).
 
 ## Build record
-(pending)
+Continuation builder (opus, Lot C2, session -4 brief) shipped `b0d363c`. Review
+verdict KEEP (session -5, diff read in full): `check_shim_argv` refuses the MEASURED
+cmd.exe hostiles (`% & | < > ^` + NL/CR — each behavior probed through a real
+`cmd /C` round-trip, not taken from a table) and budgets the rendered line at 8000
+chars (measured cliff: 8008 through, 8108 refused), naming the offending flag; the
+binary path itself is vetted too. **Accepted deviation from the criteria:** `"` is
+deliberately NOT refused — measurement showed a real JSON schema round-trips
+byte-exact and refusing quotes would break all six schema-using apps; the criterion
+said "per actual cmd re-parsing rules" and this IS the actual rule. System prompts
+left argv entirely (`--append-system-prompt-file`, verified live in `claude --help`
+by builder AND Director; Drop-cleaned scratch file, pid+counter named). Unknown
+`role` → error naming configured roles; `model` gated by `[A-Za-z0-9._:-]{1,128}`;
+both pre-spawn (Spawn class — nothing ran, no ledger row). CWD isolation:
+`isolation_dir` is `serde(skip)`, DERIVED as `<storage root>/claude-cwd` in
+state.rs, with a test pinning that it is not a config key; docs state the honest
+limits (CLAUDE.md discovery walks upward; `[claude] bare` is the complete lever).
+`resolve()` precedence tested per field. Fake-CLI harness extended — argv recorded
+two ways (`%~1` splits on commas, `%*` is byte-exact) because neither alone is
+honest on Windows. Wave gate: `just ci` exit 0 on the wave tip (session -5).

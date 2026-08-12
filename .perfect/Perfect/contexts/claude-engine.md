@@ -57,4 +57,14 @@ total_cost_usd on success only. CONFIRMED-class gaps, Director-verified in sourc
     candidate with doc note).
 
 ## Shipped
-- (r13 wave in flight)
+- 2026-08-12 (r13): [[claude-kill-tree]] → `1dcbbeb` — a timeout/cancel kills the
+  whole process tree (taskkill /T on the shim pid), the orphan-spend class is dead;
+  first-ever tests of `research()` via the fake-CLI harness.
+- 2026-08-12 (r13): [[claude-cost-honesty]] → `c7f5c37` — every failure path that
+  can know its cost reports it structurally (`ClaudeSpend` in `Error::Claude`);
+  chokepoint meters before propagating; timeouts write an unmetered-marker $0 row;
+  non-string schema results are cacheable via `envelope_text`.
+- 2026-08-12 (r13): [[claude-subprocess-hygiene]] → `b0d363c` — `check_shim_argv`
+  refuses measured cmd.exe hostiles + 8000-char line budget; system prompts travel
+  by file, not argv; unknown role/garbage model refused pre-spawn; subprocess runs
+  in `<storage root>/claude-cwd`, ending the 35k-token repo-context leak.

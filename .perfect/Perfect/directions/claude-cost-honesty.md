@@ -3,12 +3,12 @@ slug: claude-cost-honesty
 type: perfect/direction
 context: "[[claude-engine]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: c7f5c37
 ---
 
 ## What & why
@@ -75,4 +75,13 @@ says $9 — and my scheduled job re-paid for the same answer every night."
   lot, sequential — kill-tree first, then this).
 
 ## Build record
-(pending)
+Original Lot C builder died pre-commit with the direction COMPLETE (all 6 criteria,
+tests at 3 layers). Session -4 snapshotted the dirty tree via `git commit --only`
+and landed it as `c7f5c37` after one Director fix: the catalog.rs test initializer
+was missing the new `budget_usd` field — a Lot S ripple that `cargo check` misses
+because it skips test cfg. Review verdict KEEP: `Error::Claude` struct variant with
+`ClaudeSpend`; `ledger_event` is a pure decision (reported / timeout / spawn /
+unreadable all distinct); both metered seams meter-before-propagate; tier-3 rides
+`ladder_exhausted`; `cost_unreported` on unpriced success; `envelope_text` kills the
+empty-text uncacheable class. Checked: cost travels in a FIELD, not the message.
+Wave gate: `just ci` exit 0 on the wave tip (session -5).
