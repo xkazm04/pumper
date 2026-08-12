@@ -116,6 +116,96 @@ pub(crate) fn build_search_request(
     })
 }
 
+/// Why an answer from this index cannot be taken at face value, or `None` when
+/// it can.
+///
+/// The trap this closes: a **disabled** or **wiped** index answers
+/// `200 {total: 0, hits: []}` — byte-identical to a genuine miss. A schema-drift
+/// rebuild empties the index (see `docs/features/search.md` § "Opening the
+/// index"), the delta-driven refill only rolls forward, and queries keep
+/// returning `200`, so the surface *looks* healthy. The signal existed only on
+/// `GET /search/status`; nothing made a **query** carry it, and a human or an
+/// MCP agent searching a wiped index concludes the data does not exist.
+///
+/// `doc_count: None` means the count could not be read — reported as its own
+/// degraded state rather than folded into `0`, which would slander a healthy
+/// index (and is the same "never report an unmeasured value as zero" rule the
+/// stage timings and `SearchIndexStats` follow).
+pub(crate) fn index_degraded_reason(enabled: bool, doc_count: Option<u64>) -> Option<&'static str> {
+    match (enabled, doc_count) {
+        (false, _) => Some(
+            "search is disabled ([search] enabled = false): nothing is indexed, so an empty page \
+             here means 'not searchable on this deployment', not 'no matches'",
+        ),
+        (true, Some(0)) => Some(
+            "the index holds 0 documents — wiped by schema drift, quarantined as corrupt, or \
+             never populated. An empty page is NOT evidence the records are missing; rebuild it \
+             with the server stopped: `cargo run -p pumper-server --bin search-backfill -- --all` \
+             (or `-- --app <app>` for one namespace)",
+        ),
+        (true, None) => Some(
+            "the index document count could not be read, so an empty page cannot be told apart \
+             from a wiped index — check GET /search/status",
+        ),
+        (true, Some(_)) => None,
+    }
+}
+
+/// The `index` block every search response carries: the state the answer was
+/// computed against, so `total: 0` is never ambiguous.
+fn index_block(enabled: bool, doc_count: Option<u64>) -> Value {
+    let reason = index_degraded_reason(enabled, doc_count);
+    json!({
+        "enabled": enabled,
+        "doc_count": doc_count,
+        "degraded": reason.is_some(),
+        "reason": reason,
+    })
+}
+
+/// Runs a validated request and renders the body **both** search surfaces
+/// return — `GET /search` and the MCP `search` tool.
+///
+/// One construction, deliberately: [`build_search_request`] already stops the
+/// two surfaces speaking different query grammars, and this stops them
+/// answering in different shapes. Without it the index-state block would exist
+/// on one surface and not the other — which is precisely how the MCP tool ended
+/// up with a strict subset of the query params before the shared builder landed.
+///
+/// `facets` are rendered only when the request asked for them, preserving the
+/// tool's documented "same surface, minus facets".
+pub(crate) async fn run_search(
+    state: &AppState,
+    req: pumper_core::SearchRequest,
+) -> pumper_core::Result<Value> {
+    let (q, wants_facets) = (req.q.clone(), req.facets);
+    let results = state.search.query(req).await?;
+    // Unconditional, because it is cheap by construction: Tantivy's `doc_count`
+    // is `reader.searcher().num_docs()` — a sum over segment metadata the reader
+    // already holds, no I/O and no second query (`query()` acquires the same
+    // searcher). So a healthy response carries its corpus size too, rather than
+    // the block appearing only on the empty page that needed explaining.
+    let doc_count = match state.search.doc_count().await {
+        Ok(n) => Some(n),
+        Err(e) => {
+            tracing::warn!("search index doc_count unreadable: {e}");
+            None
+        }
+    };
+    let mut body = json!({
+        "query": q,
+        // The real match count (was hits.len(), i.e. the page size).
+        "total": results.total,
+        "count": results.hits.len(),
+        "hits": results.hits,
+        "index": index_block(state.config.search.enabled, doc_count),
+    });
+    if wants_facets {
+        body["facets"] = json!(results.facets);
+    }
+    Ok(body)
+}
+
 /// Full-text search across everything indexed from job results (BM25 ranked),
 /// with highlighted snippets and app/dataset facets over the matching set.
 #[utoipa::path(
@@ -124,7 +214,7 @@ pub(crate) fn build_search_request(
     tag = "search",
     params(SearchQuery),
     responses(
-        (status = 200, description = "`{query, total, count, hits, facets}` — BM25 ranked (or `sort=newest`), highlighted snippets. `total` is the full match count; `count` is the returned page size. `offset` pages (offset=limit → page 2, clamped to 10000); `sort=newest` orders by index time; `since=<unix-secs>` filters to recent docs. Entity filters (index-time regex extraction; docs without an extracted value never match): `amount_gte`/`amount_lte` in whole US dollars, `date_before`/`date_after` on the extracted deadline (unix seconds). The MCP `search` tool takes these same params through the same parser, and returns everything but `facets`."),
+        (status = 200, description = "`{query, total, count, hits, facets, index}` — BM25 ranked (or `sort=newest`), highlighted snippets. `total` is the full match count; `count` is the returned page size. `offset` pages (offset=limit → page 2, clamped to 10000); `sort=newest` orders by index time; `since=<unix-secs>` filters to recent docs. Entity filters (index-time regex extraction; docs without an extracted value never match): `amount_gte`/`amount_lte` in whole US dollars, `date_before`/`date_after` on the extracted deadline (unix seconds). The MCP `search` tool takes these same params through the same parser, and returns everything but `facets`. `index` is the state the answer was computed against — `{enabled, doc_count, degraded, reason}`; `degraded: true` (disabled index, or an enabled one holding 0 documents) means an empty page is NOT evidence the records are missing, and `reason` names the recovery."),
         (status = 400, description = "Empty query, or a `sort` other than `score`/`newest`", body = Object),
     )
 )]
@@ -132,7 +222,6 @@ pub(crate) async fn search(
     State(state): State<AppState>,
     Query(query): Query<SearchQuery>,
 ) -> Result<Json<Value>, ApiError> {
-    let q = query.q.clone();
     // Same builder the MCP `search` tool calls — one grammar, one set of clamps.
     let req = build_search_request(SearchInput {
         q: query.q,
@@ -151,15 +240,9 @@ pub(crate) async fn search(
         facets: true,
     })
     .map_err(|e| ApiError(StatusCode::BAD_REQUEST, e))?;
-    let results = state.search.query(req).await?;
-    Ok(Json(json!({
-        "query": q,
-        // The real match count (was hits.len(), i.e. the page size).
-        "total": results.total,
-        "count": results.hits.len(),
-        "hits": results.hits,
-        "facets": results.facets,
-    })))
+    // Same renderer the MCP `search` tool calls — one body shape, one index-state
+    // block, so neither surface can go silently-empty while the other tells.
+    Ok(Json(run_search(&state, req).await?))
 }
 
 #[utoipa::path(
@@ -424,8 +507,30 @@ pub(crate) async fn delete_search_dataset(
 
 #[cfg(test)]
 mod tests {
-    use super::{build_search_request, SearchInput, SEARCH_MAX_OFFSET};
+    use super::{build_search_request, index_degraded_reason, SearchInput, SEARCH_MAX_OFFSET};
     use pumper_core::SearchSort;
+
+    /// The anti-pattern: a wiped index answering `200 {total: 0, hits: []}` —
+    /// indistinguishable from "no matches" — so the caller concludes the data
+    /// does not exist and never learns the corpus needs a backfill.
+    #[test]
+    fn wiped_index_says_so_not_silent_empty() {
+        let wiped = index_degraded_reason(true, Some(0)).expect("an empty enabled index degrades");
+        assert!(
+            wiped.contains("search-backfill"),
+            "the reason must name the recovery, not just the symptom: {wiped}"
+        );
+        // Disabled is a DIFFERENT degradation with a different fix — a caller
+        // must be able to tell "nothing indexed here" from "index emptied".
+        let off = index_degraded_reason(false, Some(0)).expect("a disabled index degrades");
+        assert!(off.contains("disabled") && off != wiped, "{off}");
+        // Unreadable telemetry is its own honest state, never folded into 0 —
+        // that would slander a healthy index.
+        assert!(index_degraded_reason(true, None).is_some());
+        // A populated, enabled index is not degraded, whatever this query matched.
+        assert_eq!(index_degraded_reason(true, Some(1)), None);
+        assert_eq!(index_degraded_reason(true, Some(50_000)), None);
+    }
 
     fn input(q: &str) -> SearchInput {
         SearchInput {

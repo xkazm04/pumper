@@ -35,7 +35,10 @@ pub(crate) use retention::artifact_retention_plan;
 // The search query surface's parsing/clamping, re-exported for the MCP `search`
 // tool (`crate::mcp`) so the agent-facing tool and `GET /search` share one
 // grammar — same defaults, same clamps, same `sort` vocabulary.
-pub(crate) use search::{build_search_request, SearchInput, SEARCH_MAX_OFFSET};
+// `run_search` extends that sharing to the ANSWER: one body shape (including
+// the `index` degraded-state block), so neither surface can go silently-empty
+// on a wiped index while the other tells the truth.
+pub(crate) use search::{build_search_request, run_search, SearchInput, SEARCH_MAX_OFFSET};
 
 mod datasets;
 mod derived;

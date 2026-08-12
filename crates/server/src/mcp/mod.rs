@@ -178,7 +178,10 @@ fn server_tools(state: &AppState) -> Vec<Value> {
                 offset, order by relevance or index time, and filter on the entity fields \
                 extracted at index time (money amount, deadline date). Same query surface \
                 as GET /search; app/dataset facets are the one thing this tool does not \
-                return.",
+                return. Every result carries an `index` block ({enabled, doc_count, degraded, \
+                reason}) — when `degraded` is true the index is disabled or empty, so an empty \
+                `hits` list is NOT evidence the records do not exist; read `reason` before \
+                concluding anything from zero hits.",
             "inputSchema": {
                 "type": "object",
                 "required": ["q"],
@@ -416,11 +419,16 @@ async fn tool_query_dataset(state: &AppState, args: &Value) -> Result<Value, Str
 /// subset (q/limit/app/dataset), so an agent could not page, sort, or filter
 /// what the REST surface has filtered on since M14. Facets stay off: this tool
 /// returns hits only, and computing them costs a ≥1000-doc sample.
+///
+/// The body itself is rendered by [`crate::routes::run_search`], the same
+/// renderer `GET /search` uses — so the `index` degraded-state block reaches
+/// the agent too. An agent is the caller most likely to be fooled by a wiped
+/// index: it reads `total: 0` and reports back that the data does not exist.
 async fn tool_search(state: &AppState, args: &Value) -> Result<Value, String> {
     let q = require_str(args, "q")?.to_string();
     let str_arg = |key: &str| args.get(key).and_then(Value::as_str).map(String::from);
     let req = crate::routes::build_search_request(crate::routes::SearchInput {
-        q: q.clone(),
+        q,
         // The tool schema's own cap; `build_search_request` clamps again.
         limit: args
             .get("limit")
@@ -441,13 +449,13 @@ async fn tool_search(state: &AppState, args: &Value) -> Result<Value, String> {
         date_before: args.get("date_before").and_then(Value::as_i64),
         facets: false,
     })?;
-    let results = state.search.query(req).await.map_err(|e| e.to_string())?;
-    Ok(json!({
-        "query": q,
-        "total": results.total,
-        "count": results.hits.len(),
-        "hits": results.hits,
-    }))
+    // Same renderer `GET /search` uses (`facets: false` is what keeps this
+    // result facet-free), so the agent gets the `index` degraded-state block
+    // too: an empty page from a wiped index must not read to an agent as
+    // "this data does not exist".
+    crate::routes::run_search(state, req)
+        .await
+        .map_err(|e| e.to_string())
 }
 
 /// The budget rail: whatever the agent asks for, the job's spend ceiling is

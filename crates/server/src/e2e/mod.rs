@@ -34,6 +34,7 @@ mod request_panics;
 mod router;
 mod schedule_truth;
 mod scheduler_overlap;
+mod search_degraded;
 mod shutdown_bounds;
 mod shutdown_drain;
 mod sink_delivery;
