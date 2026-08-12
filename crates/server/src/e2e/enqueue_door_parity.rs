@@ -154,7 +154,7 @@ async fn scheduled_run_merges_over_defaults_not_replaces_them() {
     let id = created["id"].as_str().expect("schedule id").to_string();
     backdate(&state, &id).await;
 
-    scheduler::reconcile(&state, &mut HashMap::new(), Utc::now())
+    scheduler::reconcile(&state, &mut HashMap::new(), None, Utc::now())
         .await
         .unwrap();
 
@@ -196,7 +196,7 @@ async fn legacy_invalid_schedule_is_skipped_visibly_not_enqueued_or_silently_ok(
         .expect("storage takes the row the API would refuse");
     backdate(&state, &schedule.id).await;
 
-    scheduler::reconcile(&state, &mut HashMap::new(), Utc::now())
+    scheduler::reconcile(&state, &mut HashMap::new(), None, Utc::now())
         .await
         .unwrap();
     assert_eq!(

@@ -33,6 +33,7 @@ mod peer_mirror;
 mod provisioner_lifecycle;
 mod request_panics;
 mod router;
+mod schedule_misfire;
 mod schedule_truth;
 mod scheduler_overlap;
 mod scheduler_tick;

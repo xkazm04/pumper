@@ -54,6 +54,10 @@ pub async fn run(state: AppState) {
     // re-parse every schedule's cron on every tick (an edited cron is a new key and
     // re-parses). Lives here so it outlives a single reconcile.
     let mut cron_cache: HashMap<String, CronSchedule> = HashMap::new();
+    // When the previous reconcile pass ran. This is what lets "missed" mean "a
+    // pass already had its chance at this firing" rather than "older than a
+    // constant derived from the configured tick" — see [`misfire_cutoff`].
+    let mut last_pass: Option<DateTime<Utc>> = None;
     loop {
         if state.shutdown.is_cancelled() {
             break;
@@ -72,18 +76,24 @@ pub async fn run(state: AppState) {
         // silently change scheduling behaviour. Catching around the tick body
         // keeps every cross-tick fact and costs one `AssertUnwindSafe`.
         //
-        // `AssertUnwindSafe` over the future: the only state that outlives a
-        // tick is `cron_cache`, a pure memo of parsed cron expressions mutated
-        // by one non-async `entry().or_insert()` that no unwind can interleave.
-        // Everything else is read fresh from `state` on the next tick.
+        // `AssertUnwindSafe` over the future: the state that outlives a tick is
+        // `cron_cache` (a pure memo of parsed cron expressions mutated by one
+        // non-async `entry().or_insert()` that no unwind can interleave) and
+        // `last_pass` (advanced out here, never inside the tick). Everything
+        // else is read fresh from `state` on the next tick.
         let ticked = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(tick_once(
             &state,
             &mut cron_cache,
+            last_pass,
             now,
         )))
         .await;
-        if let Err(payload) = ticked {
-            error!(
+        match ticked {
+            // Only a pass that actually completed counts as "a pass had its
+            // chance at this firing".
+            Ok(true) => last_pass = Some(now),
+            Ok(false) => {}
+            Err(payload) => error!(
                 "scheduler tick PANICKED and was contained; the loop continues (cron, the \
                  stuck-job reaper, the webhook dead-letter drain, the cache refresher and the \
                  DataHub governance poll all ride this tick): {}",
@@ -91,7 +101,7 @@ pub async fn run(state: AppState) {
                     &*payload,
                     crate::worker::take_panic_location().as_deref()
                 )
-            );
+            ),
         }
         // Stop enqueuing new scheduled work as soon as shutdown is signalled.
         tokio::select! {
@@ -104,19 +114,28 @@ pub async fn run(state: AppState) {
 
 /// One tick: the cron reconcile plus the four periodic jobs that ride this loop
 /// rather than owning a timer of their own.
+///
+/// Returns whether the reconcile *pass* completed — the only thing that may
+/// advance `last_pass`. A pass that failed at `list_schedules` never looked at a
+/// single schedule and so gave no firing its chance.
 async fn tick_once(
     state: &AppState,
     cron_cache: &mut HashMap<String, CronSchedule>,
+    last_pass: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
-) {
-    match reconcile(state, cron_cache, now).await {
+) -> bool {
+    let completed = match reconcile(state, cron_cache, last_pass, now).await {
         Ok(tally) => {
             if tally.acted() {
                 info!(?tally, "scheduler pass");
             }
+            true
         }
-        Err(e) => error!("scheduler reconcile failed: {e}"),
-    }
+        Err(e) => {
+            error!("scheduler reconcile failed: {e}");
+            false
+        }
+    };
     // Piggyback the scheduler tick to run the stuck-job reaper: re-queue
     // running jobs whose heartbeat lease has gone stale (a hung task on a
     // live server). Cheap — one indexed scan of `running` jobs. The hourly
@@ -137,6 +156,7 @@ async fn tick_once(
     // interval-gated and spawned — deprecations/tags/assertions in DataHub
     // become schedule disables, Claude-tier pauses, and immediate syncs.
     crate::datahub::govern_tick(state);
+    completed
 }
 
 /// What one schedule's step did this pass.
@@ -148,10 +168,14 @@ pub(crate) enum StepOutcome {
     Fired,
     /// `misfire_policy = "skip"` advanced past missed firings; nothing ran.
     Skipped,
+    /// Both, in one tick: the genuinely-missed firings were advanced past AND
+    /// the on-time firing that shared the tick was enqueued.
+    SkippedAndFired,
     /// The overlap guard held the firing (a previous run still owns the slot).
     Held,
     /// A door gate refused the row (unparseable cron, unregistered app, invalid
-    /// params). Nothing is recorded, so fixing the row makes the firing happen.
+    /// params, or a row disabled/removed since the pass read it). Nothing is
+    /// recorded, so fixing the row makes the firing happen.
     Refused,
 }
 
@@ -187,6 +211,10 @@ impl PassTally {
             Ok(StepOutcome::Idle) => {}
             Ok(StepOutcome::Fired) => self.fired += 1,
             Ok(StepOutcome::Skipped) => self.skipped += 1,
+            Ok(StepOutcome::SkippedAndFired) => {
+                self.skipped += 1;
+                self.fired += 1;
+            }
             Ok(StepOutcome::Held) => self.held += 1,
             Ok(StepOutcome::Refused) => self.refused += 1,
             Err(e) => {
@@ -207,15 +235,19 @@ impl PassTally {
 
 /// `now` is a parameter (the same rule `decide` follows) so a test can drive a
 /// reconcile pass deterministically without waiting for wall-clock time.
+/// `last_pass` is when the previous pass ran (`None` = first pass since boot) —
+/// see [`misfire_cutoff`].
 pub(crate) async fn reconcile(
     state: &AppState,
     cron_cache: &mut HashMap<String, CronSchedule>,
+    last_pass: Option<DateTime<Utc>>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<PassTally> {
-    // A firing more than two ticks late was missed while the scheduler was down
-    // (a healthy tick catches a due firing within one interval). This is the
-    // grace window that separates an on-time run from a backlog misfire.
+    // Floor for the first pass after boot, when there is no previous pass to
+    // measure against: a firing more than two configured ticks late was missed
+    // while the scheduler was down.
     let grace = chrono::Duration::seconds(state.config.worker.schedule_tick_secs.max(1) as i64 * 2);
+    let cutoff = misfire_cutoff(last_pass, now, grace);
     let mut tally = PassTally::default();
     for schedule in state.storage.list_schedules().await? {
         if !schedule.enabled {
@@ -249,7 +281,7 @@ pub(crate) async fn reconcile(
         // `default_params()` unwinds is reached INLINE from here (through
         // `validate_schedule_params`), and one such app must not cost every
         // other schedule its pass.
-        let step = reconcile_one(state, &schedule, cron, grace, now);
+        let step = reconcile_one(state, &schedule, cron, cutoff, now);
         let outcome =
             match futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(step)).await {
                 Ok(outcome) => outcome,
@@ -275,7 +307,7 @@ pub(crate) async fn reconcile_one(
     state: &AppState,
     schedule: &Schedule,
     cron: &CronSchedule,
-    grace: chrono::Duration,
+    cutoff: DateTime<Utc>,
     now: DateTime<Utc>,
 ) -> anyhow::Result<StepOutcome> {
     let tz = parse_tz(schedule.timezone.as_deref());
@@ -284,56 +316,82 @@ pub(crate) async fn reconcile_one(
     let reference = schedule_reference(schedule);
     let misfire_skip = schedule.misfire_policy == "skip";
 
-    let collapsed = match decide(cron, tz, reference, now, misfire_skip, grace) {
+    let (missed, collapsed, fires) = match decide(cron, tz, reference, now, misfire_skip, cutoff) {
         Action::Idle => return Ok(StepOutcome::Idle),
-        Action::Fire { collapsed } => collapsed,
-        Action::Skip { missed } => {
-            info!(
-                id = %schedule.id, app = %schedule.app, missed,
-                "misfire policy 'skip': advancing past missed firings without enqueuing"
-            );
-            // NOT `touch_schedule`: nothing ran, so `last_run` must not move.
-            // The advance is recorded as a skip (with its eaten-firing count),
-            // which `schedule_reference` then honours — see migration 0039.
-            state
-                .storage
-                .record_schedule_skip(&schedule.id, now, missed)
-                .await?;
-            return Ok(StepOutcome::Skipped);
-        }
+        Action::Fire { collapsed } => (0, collapsed, true),
+        Action::Skip { missed } => (missed, 0, false),
+        Action::SkipThenFire { missed } => (missed, 0, true),
     };
 
+    // ---- Door gates ---------------------------------------------------------
+    // These apply to EVERY acting branch, `skip` included. A `skip` schedule on
+    // an unregistered app used to accrue `skipped_count` forever while
+    // `GET /schedules` reported `health: "unregistered_app"` — the row "ate"
+    // firings that could never have run in the first place, and the count of
+    // eaten firings said work had been dropped when none was ever runnable.
+    // Refusing without recording keeps ONE contract for both policies: fixing
+    // the row makes it fire, because nothing advanced while it was broken.
     if !state.registry.contains_key(&schedule.app) {
-        warn!(app = %schedule.app, "schedule references unregistered app; skipping");
+        warn!(
+            id = %schedule.id, app = %schedule.app,
+            "schedule references unregistered app; neither firing nor recording a skip advance"
+        );
         return Ok(StepOutcome::Refused);
     }
-    // Overlap guard: don't stack a second run while the previous one
-    // is still queued/running. last_run is NOT touched, so the missed
-    // firing stays due and fires on the first tick after it finishes.
-    // The SAME read + predicate `GET /schedules` reports as
-    // `health: "overlapping"` — see `latest_run`.
-    if latest_run(state, &schedule.id).await?.holds_slot {
-        info!(id = %schedule.id, app = %schedule.app, "previous scheduled run still active; skipping tick");
-        return Ok(StepOutcome::Held);
-    }
-
     // Door parity: a schedule whose effective params fail the app's declared
-    // schema is SKIPPED, not enqueued — the same 422 the HTTP door answers,
-    // moved to the only place a legacy row can still be caught. `last_run` is
-    // deliberately NOT touched (as with an unregistered app), so fixing the row
-    // makes the schedule fire again instead of having silently eaten firings.
+    // schema is REFUSED, not enqueued — the same 422 the HTTP door answers,
+    // moved to the only place a legacy row can still be caught. Neither
+    // `last_run` nor `last_skipped_at` is touched, so fixing the row makes the
+    // schedule fire again instead of having silently eaten firings.
     // Visible on `GET /schedules` as `health: "invalid_params"`.
     let params = match validate_schedule_params(&state.registry, &schedule.app, &schedule.params) {
         Ok(params) => params,
         Err(msg) => {
             warn!(
                 id = %schedule.id, app = %schedule.app,
-                "schedule params fail the app's declared schema; not enqueuing \
-                 (GET /schedules shows health=invalid_params): {msg}"
+                "schedule params fail the app's declared schema; neither firing nor recording a \
+                 skip advance (GET /schedules shows health=invalid_params): {msg}"
             );
             return Ok(StepOutcome::Refused);
         }
     };
+
+    if !fires {
+        info!(
+            id = %schedule.id, app = %schedule.app, missed,
+            "misfire policy 'skip': advancing past missed firings without enqueuing"
+        );
+        // NOT `touch_schedule`: nothing ran, so `last_run` must not move.
+        // The advance is recorded as a skip (with its eaten-firing count),
+        // which `schedule_reference` then honours — see migration 0039.
+        state
+            .storage
+            .record_schedule_skip(&schedule.id, now, missed)
+            .await?;
+        return Ok(StepOutcome::Skipped);
+    }
+
+    // Overlap guard: don't stack a second run while the previous one
+    // is still queued/running. last_run is NOT touched, so the missed
+    // firing stays due and fires on the first tick after it finishes.
+    // The SAME read + predicate `GET /schedules` reports as
+    // `health: "overlapping"` — see `latest_run`. Nothing is recorded here, the
+    // skip advance included: recording it would move the reference past the very
+    // firing the guard just promised to keep due.
+    if latest_run(state, &schedule.id).await?.holds_slot {
+        info!(id = %schedule.id, app = %schedule.app, "previous scheduled run still active; skipping tick");
+        return Ok(StepOutcome::Held);
+    }
+
+    // Fire-time re-check against the LIVE row rather than the pass's snapshot —
+    // see `still_firable`.
+    if !still_firable(state.storage.get_schedule(&schedule.id).await?.as_ref()) {
+        info!(
+            id = %schedule.id, app = %schedule.app,
+            "schedule was disabled or removed after this pass read it; not enqueuing"
+        );
+        return Ok(StepOutcome::Refused);
+    }
 
     let max_attempts = schedule
         .max_attempts
@@ -353,7 +411,36 @@ pub(crate) async fn reconcile_one(
     }
     state.storage.touch_schedule(&schedule.id, now).await?;
     state.notify.notify_one();
-    Ok(StepOutcome::Fired)
+    if missed == 0 {
+        return Ok(StepOutcome::Fired);
+    }
+    // Skip-then-fire: the enqueue happens FIRST on purpose. `record_schedule_skip`
+    // stamps `last_skipped_at = now`, which advances the cron reference past
+    // every pending firing — the on-time one included. Recording it ahead of a
+    // failed enqueue would eat the very run this branch exists to preserve.
+    info!(
+        id = %schedule.id, app = %schedule.app, missed,
+        "misfire policy 'skip': advanced past missed firings AND ran the on-time firing that \
+         shared this tick"
+    );
+    state
+        .storage
+        .record_schedule_skip(&schedule.id, now, missed)
+        .await?;
+    Ok(StepOutcome::SkippedAndFired)
+}
+
+/// Whether a schedule the pass read earlier may still be fired *now*.
+///
+/// The anti-pattern this replaces: enqueuing from a snapshot. `list_schedules`
+/// reads the whole table at the top of a pass; by the time an
+/// alphabetically-later row is reached, `POST /schedules/{id}/enabled {false}`,
+/// a catalog reconcile, or a DataHub governance disable may already have turned
+/// it off — and the tick would still enqueue a paid run from the stale row and
+/// stamp `last_run` on a schedule the operator had just stopped. A deleted row
+/// (`None`) is refused for the same reason.
+pub(crate) fn still_firable(fresh: Option<&Schedule>) -> bool {
+    matches!(fresh, Some(s) if s.enabled)
 }
 
 // ---- Catalog reconcile (M19) ----------------------------------------------
@@ -495,6 +582,16 @@ enum Action {
     Fire { collapsed: usize },
     /// `misfire_policy = skip`: advance past `missed` firings without enqueuing.
     Skip { missed: usize },
+    /// `misfire_policy = skip`, and the pending firings are of BOTH kinds:
+    /// advance past `missed` genuinely-missed ones **and** enqueue the on-time
+    /// firing that shares this tick.
+    ///
+    /// This variant is why classification is per firing rather than per batch.
+    /// `skip` used to classify the whole pending batch from its OLDEST member,
+    /// so an hourly schedule that missed 11:00 while the process was down and
+    /// came back at 12:00:05 produced `Skip { missed: 2 }` — and the
+    /// legitimately-due 12:00 run was dropped along with the one really missed.
+    SkipThenFire { missed: usize },
 }
 
 /// Parses an IANA timezone name; unknown/absent names fall back to UTC. The API
@@ -589,66 +686,142 @@ pub(crate) async fn latest_run(state: &AppState, schedule_id: &str) -> anyhow::R
     })
 }
 
+/// The instant that separates a **missed** firing from an **on-time** one.
+///
+/// "Missed" has to mean *a previous pass already had the chance to fire this and
+/// didn't*, not *older than a constant*. Deriving the line from the CONFIGURED
+/// tick (`grace = schedule_tick_secs × 2`) made it a statement about the config
+/// rather than about what actually happened: any tick that ran long — and the
+/// webhook dead-letter drain runs in-line on this loop, by design — reclassified
+/// a firing the process was up for as a misfire, and under
+/// `misfire_policy = "skip"` that ate a real, on-time run.
+///
+/// So when there IS a previous pass, its timestamp is the line exactly: a firing
+/// after it has been seen by no pass and is on-time *by construction*, however
+/// long the tick took. The configured grace survives as the floor for the first
+/// pass after boot, where there is no previous pass and a genuine downtime
+/// backlog is precisely what we expect to find.
+pub(crate) fn misfire_cutoff(
+    last_pass: Option<DateTime<Utc>>,
+    now: DateTime<Utc>,
+    grace: chrono::Duration,
+) -> DateTime<Utc> {
+    last_pass.unwrap_or(now - grace)
+}
+
+/// Pending firings beyond the first that this one run folds up — diagnostic only.
+fn collapse_count(cron: &CronSchedule, reference: &DateTime<Tz>, now: &DateTime<Tz>) -> usize {
+    // Fire enqueues ONE run no matter how many firings are pending, and the
+    // overlap guard can keep this schedule "due" for many ticks — so bound the
+    // enumeration to a small cap instead of re-walking the whole growing
+    // backlog every tick. Exact for realistic backlogs, saturating at the cap.
+    let mut collapsed = 0usize;
+    for fire in cron.after(reference).skip(1) {
+        if fire > *now {
+            break;
+        }
+        collapsed += 1;
+        if collapsed >= COLLAPSE_LOG_CAP {
+            break;
+        }
+    }
+    collapsed
+}
+
+/// Pending firings a previous pass already had its chance at (`fire <= cutoff`).
+///
+/// Bounded by `now` as well, so a cutoff in the future can never count a firing
+/// that has not happened yet as missed.
+fn missed_count(
+    cron: &CronSchedule,
+    reference: &DateTime<Tz>,
+    cutoff: &DateTime<Tz>,
+    now: &DateTime<Tz>,
+) -> usize {
+    let bound = std::cmp::min(cutoff, now);
+    // Skip advances past ALL missed firings, so it needs the exact count — but
+    // this happens once (the pass then advances the reference), not every tick.
+    let mut missed = 0usize;
+    for fire in cron.after(reference) {
+        if fire > *bound {
+            break;
+        }
+        missed += 1;
+        if missed >= MAX_MISFIRE_SCAN {
+            break;
+        }
+    }
+    missed
+}
+
+/// Whether a firing **no pass has seen yet** is due in this tick.
+///
+/// O(1): one iterator step from the later of the schedule's own reference and
+/// the cutoff. That matters because [`MAX_MISFIRE_SCAN`] bounds the missed
+/// count — walking for the on-time firing instead would let a pathological
+/// backlog hide it behind the cap, and the skip advance (which stamps
+/// `last_skipped_at = now`) would then eat it.
+fn has_due_on_time_firing(
+    cron: &CronSchedule,
+    reference: &DateTime<Tz>,
+    cutoff: &DateTime<Tz>,
+    now: &DateTime<Tz>,
+) -> bool {
+    let from = std::cmp::max(reference, cutoff);
+    cron.after(from).next().is_some_and(|fire| fire <= *now)
+}
+
 /// Decides a schedule's action this tick — pure (no I/O), so it is unit-testable
 /// against simulated downtime and DST boundaries.
 ///
 /// The cron is evaluated in `tz` (a firing at a nonexistent local wall-clock time
-/// — e.g. inside a spring-forward gap — is skipped by the cron iterator). `grace`
-/// is how late the oldest pending firing may be and still count as on-time; older
-/// than that means it was missed while the scheduler was down (a misfire).
+/// — e.g. inside a spring-forward gap — is skipped by the cron iterator).
+/// `cutoff` ([`misfire_cutoff`]) is the line between missed and on-time: a
+/// pending firing at or before it was already a previous pass's to run.
+///
+/// Under `misfire_policy = "skip"` the classification is **per firing**, not per
+/// batch: the missed ones are advanced past and an on-time firing sharing the
+/// same tick still runs ([`Action::SkipThenFire`]). `fire_once` is unchanged —
+/// it collapses the whole pending backlog into one run by definition, so it has
+/// nothing to classify.
 fn decide(
     cron: &CronSchedule,
     tz: Tz,
     reference: DateTime<Utc>,
     now: DateTime<Utc>,
     misfire_skip: bool,
-    grace: chrono::Duration,
+    cutoff: DateTime<Utc>,
 ) -> Action {
     let reference_tz = reference.with_timezone(&tz);
     let now_tz = now.with_timezone(&tz);
 
-    let mut iter = cron.after(&reference_tz);
-    // The earliest pending firing is one iterator step: firings come out
-    // increasing, so if the first is still in the future nothing is due. This
-    // avoids enumerating the whole backlog just to find the oldest one.
-    let earliest = match iter.next() {
-        Some(fire) if fire <= now_tz => fire,
+    // Anything pending at all? One iterator step: firings come out increasing,
+    // so if the first is still in the future nothing is due. This avoids
+    // enumerating a backlog just to find that out.
+    match cron.after(&reference_tz).next() {
+        Some(fire) if fire <= now_tz => {}
         _ => return Action::Idle,
-    };
+    }
 
-    // Misfire = the oldest pending firing is more than `grace` behind now.
-    let missed = now_tz.signed_duration_since(earliest) > grace;
-    if missed && misfire_skip {
-        // Skip advances past ALL missed firings, so it needs the exact count — but
-        // this happens once (the tick then touches last_run), not every tick.
-        let mut missed = 1usize;
-        for fire in iter {
-            if fire > now_tz {
-                break;
-            }
-            missed += 1;
-            if missed >= MAX_MISFIRE_SCAN {
-                break;
-            }
-        }
-        Action::Skip { missed }
+    if !misfire_skip {
+        return Action::Fire {
+            collapsed: collapse_count(cron, &reference_tz, &now_tz),
+        };
+    }
+
+    let cutoff_tz = cutoff.with_timezone(&tz);
+    let missed = missed_count(cron, &reference_tz, &cutoff_tz, &now_tz);
+    if missed == 0 {
+        // Everything pending is on-time. `skip` skips *missed* firings, and
+        // there are none — so this is an ordinary run.
+        return Action::Fire {
+            collapsed: collapse_count(cron, &reference_tz, &now_tz),
+        };
+    }
+    if has_due_on_time_firing(cron, &reference_tz, &cutoff_tz, &now_tz) {
+        Action::SkipThenFire { missed }
     } else {
-        // Fire enqueues ONE run no matter how many firings are pending, and the
-        // overlap guard can keep this schedule "due" for many ticks — so bound the
-        // enumeration to a small cap instead of re-walking the whole growing
-        // backlog every tick. `collapsed` is a diagnostic log field: exact for
-        // realistic backlogs, saturating at the cap for pathological ones.
-        let mut collapsed = 0usize;
-        for fire in iter {
-            if fire > now_tz {
-                break;
-            }
-            collapsed += 1;
-            if collapsed >= COLLAPSE_LOG_CAP {
-                break;
-            }
-        }
-        Action::Fire { collapsed }
+        Action::Skip { missed }
     }
 }
 
@@ -710,7 +883,17 @@ mod tests {
 
     /// Top of every hour.
     const HOURLY: &str = "0 0 * * * *";
+    /// Every quarter hour — the cadence at which a slow tick and the configured
+    /// grace window can actually disagree.
+    const QUARTER_HOURLY: &str = "0 0,15,30,45 * * * *";
     const GRACE: chrono::Duration = chrono::Duration::seconds(30);
+
+    /// The cutoff a FIRST pass after boot computes (no previous pass, so the
+    /// configured grace is the floor). Spelled through the shipped
+    /// [`misfire_cutoff`] so these cases stay tied to the real rule.
+    fn boot_cutoff(now: DateTime<Utc>, grace: chrono::Duration) -> DateTime<Utc> {
+        misfire_cutoff(None, now, grace)
+    }
 
     #[test]
     fn idle_when_next_firing_is_in_the_future() {
@@ -718,7 +901,14 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 30).unwrap();
         // Next hourly firing after 12:00 is 13:00 — not yet due.
         assert_eq!(
-            decide(&cron(HOURLY), Tz::UTC, reference, now, false, GRACE),
+            decide(
+                &cron(HOURLY),
+                Tz::UTC,
+                reference,
+                now,
+                false,
+                boot_cutoff(now, GRACE)
+            ),
             Action::Idle
         );
     }
@@ -978,15 +1168,83 @@ mod tests {
         // Firing at 12:00:00 detected 30s later — within grace, so on-time.
         let reference = Utc.with_ymd_and_hms(2026, 7, 13, 11, 30, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 30).unwrap();
-        let grace = chrono::Duration::seconds(60);
+        let cutoff = boot_cutoff(now, chrono::Duration::seconds(60));
         assert_eq!(
-            decide(&cron(HOURLY), Tz::UTC, reference, now, false, grace),
+            decide(&cron(HOURLY), Tz::UTC, reference, now, false, cutoff),
             Action::Fire { collapsed: 0 }
         );
         // skip only skips *missed* firings; an on-time one still runs.
         assert_eq!(
-            decide(&cron(HOURLY), Tz::UTC, reference, now, true, grace),
+            decide(&cron(HOURLY), Tz::UTC, reference, now, true, cutoff),
             Action::Fire { collapsed: 0 }
+        );
+    }
+
+    /// The load-bearing invariant, in the case that used to break it: an on-time
+    /// firing shares a tick with an older one that really was missed.
+    ///
+    /// Hourly schedule, last run 10:00, the process was down across 11:00 and is
+    /// back at 12:00:05. Classifying the batch by its OLDEST member called BOTH
+    /// pending firings misfires (`Skip { missed: 2 }`), so `skip` silently
+    /// dropped the 12:00 run the process was up and due for — the policy is
+    /// "don't catch up", not "don't run".
+    #[test]
+    fn a_shared_tick_skips_the_missed_firing_and_still_runs_the_on_time_one() {
+        let reference = Utc.with_ymd_and_hms(2026, 7, 13, 10, 0, 0).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 5).unwrap();
+        let cutoff = boot_cutoff(now, chrono::Duration::seconds(60));
+        assert_eq!(
+            decide(&cron(HOURLY), Tz::UTC, reference, now, true, cutoff),
+            Action::SkipThenFire { missed: 1 },
+            "11:00 was missed and is advanced past; the due 12:00 firing still runs"
+        );
+        // `fire_once` is untouched: it collapses the whole backlog into one run.
+        assert_eq!(
+            decide(&cron(HOURLY), Tz::UTC, reference, now, false, cutoff),
+            Action::Fire { collapsed: 1 }
+        );
+    }
+
+    /// A tick that ran long must not manufacture misfires. The webhook
+    /// dead-letter drain runs in-line on this loop, so a tick's duration is not
+    /// a property the config describes — and while grace was `tick × 2`, a
+    /// 20-minute tick turned a firing the process was up for into an eaten one.
+    #[test]
+    fn a_slow_tick_does_not_manufacture_a_misfire() {
+        // Quarter-hourly, fired at 11:00. The previous pass ran at 11:00:02;
+        // this one at 11:20 because the tick took twenty minutes. 11:15 is
+        // pending, and NO pass has ever seen it.
+        let reference = Utc.with_ymd_and_hms(2026, 7, 13, 11, 0, 0).unwrap();
+        let last_pass = Utc.with_ymd_and_hms(2026, 7, 13, 11, 0, 2).unwrap();
+        let now = Utc.with_ymd_and_hms(2026, 7, 13, 11, 20, 0).unwrap();
+        let grace = chrono::Duration::seconds(60); // schedule_tick_secs = 30
+
+        assert_eq!(
+            decide(
+                &cron(QUARTER_HOURLY),
+                Tz::UTC,
+                reference,
+                now,
+                true,
+                misfire_cutoff(Some(last_pass), now, grace)
+            ),
+            Action::Fire { collapsed: 0 },
+            "a firing due since the last pass is on-time by construction"
+        );
+        // The same instant under the OLD rule (grace floor only, i.e. what every
+        // tick used to compute): 11:15 is more than 60s behind 11:20, so `skip`
+        // ate a run the process was up for the whole time.
+        assert_eq!(
+            decide(
+                &cron(QUARTER_HOURLY),
+                Tz::UTC,
+                reference,
+                now,
+                true,
+                boot_cutoff(now, grace)
+            ),
+            Action::Skip { missed: 1 },
+            "this is the behaviour threading the previous pass through fixes"
         );
     }
 
@@ -996,19 +1254,52 @@ mod tests {
         let reference = Utc.with_ymd_and_hms(2026, 7, 13, 8, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 30).unwrap();
         assert_eq!(
-            decide(&cron(HOURLY), Tz::UTC, reference, now, false, GRACE),
+            decide(
+                &cron(HOURLY),
+                Tz::UTC,
+                reference,
+                now,
+                false,
+                boot_cutoff(now, GRACE)
+            ),
             Action::Fire { collapsed: 3 }
         );
     }
 
+    /// A genuine downtime backlog with nothing on-time in it still skips whole —
+    /// the r11 behaviour the skip advance and `schedule_reference` are pinned to.
+    /// The 12:00 firing IS the oldest-within-grace one here, so it counts as
+    /// missed and the backlog is 4, exactly as before.
     #[test]
     fn skip_advances_past_a_downtime_backlog_without_running() {
         let reference = Utc.with_ymd_and_hms(2026, 7, 13, 8, 0, 0).unwrap();
         let now = Utc.with_ymd_and_hms(2026, 7, 13, 12, 0, 30).unwrap();
         assert_eq!(
-            decide(&cron(HOURLY), Tz::UTC, reference, now, true, GRACE),
+            decide(
+                &cron(HOURLY),
+                Tz::UTC,
+                reference,
+                now,
+                true,
+                boot_cutoff(now, GRACE)
+            ),
             Action::Skip { missed: 4 }
         );
+    }
+
+    /// The fire-time re-check, at predicate level. The pass works from a
+    /// snapshot taken by one `list_schedules`, and a disable can land between
+    /// that read and this row's enqueue — from the API, a catalog reconcile or a
+    /// DataHub governance action. Firing anyway spends money on a schedule the
+    /// operator has already stopped, and stamps `last_run` to prove it ran.
+    #[test]
+    fn a_disabled_row_is_not_fired_from_a_stale_snapshot() {
+        let mut live = schedule(HOURLY, None, None);
+        assert!(still_firable(Some(&live)), "an enabled row still fires");
+        live.enabled = false;
+        assert!(!still_firable(Some(&live)));
+        // Deleted between the snapshot and the enqueue: same answer.
+        assert!(!still_firable(None));
     }
 
     #[test]

@@ -42,7 +42,7 @@ async fn overlap_guard_holds_a_due_firing_and_releases_it_after_completion() {
     let mut cron_cache = HashMap::new();
 
     // First reconcile: due → exactly one job enqueued, last_run advanced.
-    scheduler::reconcile(&state, &mut cron_cache, Utc::now())
+    scheduler::reconcile(&state, &mut cron_cache, None, Utc::now())
         .await
         .unwrap();
     let count = jobs_for(&state, "fake").await;
@@ -52,7 +52,7 @@ async fn overlap_guard_holds_a_due_firing_and_releases_it_after_completion() {
     // Second reconcile a minute later, previous job still queued (active):
     // the guard holds the firing AND leaves last_run untouched.
     let later = Utc::now() + chrono::Duration::minutes(2);
-    scheduler::reconcile(&state, &mut cron_cache, later)
+    scheduler::reconcile(&state, &mut cron_cache, None, later)
         .await
         .unwrap();
     assert_eq!(
@@ -94,7 +94,7 @@ async fn overlap_guard_holds_a_due_firing_and_releases_it_after_completion() {
         JobStatus::Succeeded
     );
 
-    scheduler::reconcile(&state, &mut cron_cache, later)
+    scheduler::reconcile(&state, &mut cron_cache, None, later)
         .await
         .unwrap();
     assert_eq!(

@@ -101,6 +101,35 @@ async fn due_schedule(state: &AppState, misfire_policy: &str) -> String {
     schedule.id
 }
 
+/// An hourly schedule for `fake` with an explicit `created_at`, so a test can
+/// place both the backlog and the observation instant deterministically.
+async fn hourly_schedule(
+    state: &AppState,
+    misfire_policy: &str,
+    created_at: chrono::DateTime<Utc>,
+) -> String {
+    let schedule = state
+        .storage
+        .create_schedule(NewSchedule {
+            app: "fake",
+            cron: "0 0 * * * *",
+            params: json!({}),
+            priority: 0,
+            timezone: None,
+            misfire_policy,
+            max_attempts: Some(1),
+        })
+        .await
+        .expect("create schedule");
+    sqlx::query("UPDATE schedules SET created_at = ?1 WHERE id = ?2")
+        .bind(created_at.to_rfc3339())
+        .bind(&schedule.id)
+        .execute(&state.storage.pool())
+        .await
+        .unwrap();
+    schedule.id
+}
+
 async fn jobs_for_schedule(state: &AppState, id: &str) -> i64 {
     sqlx::query_scalar("SELECT COUNT(*) FROM jobs WHERE schedule_id = ?1")
         .bind(id)
@@ -150,7 +179,7 @@ async fn a_retried_older_job_does_not_wedge_the_schedule_forever() {
     let mut cron_cache = HashMap::new();
 
     // Firing A: fails permanently (max_attempts = 1).
-    scheduler::reconcile(&state, &mut cron_cache, Utc::now())
+    scheduler::reconcile(&state, &mut cron_cache, None, Utc::now())
         .await
         .unwrap();
     let job_a = run_queued_job(&state, false).await;
@@ -161,7 +190,7 @@ async fn a_retried_older_job_does_not_wedge_the_schedule_forever() {
 
     // Firing B, two minutes later: succeeds.
     let t2 = Utc::now() + Duration::minutes(2);
-    scheduler::reconcile(&state, &mut cron_cache, t2)
+    scheduler::reconcile(&state, &mut cron_cache, None, t2)
         .await
         .unwrap();
     assert_eq!(jobs_for_schedule(&state, &id).await, 2, "B fired");
@@ -193,7 +222,7 @@ async fn a_retried_older_job_does_not_wedge_the_schedule_forever() {
 
     // ...and the scheduler must agree with it. This is the wedge.
     let t3 = Utc::now() + Duration::minutes(4);
-    scheduler::reconcile(&state, &mut cron_cache, t3)
+    scheduler::reconcile(&state, &mut cron_cache, None, t3)
         .await
         .unwrap();
     assert_eq!(
@@ -214,7 +243,7 @@ async fn a_live_run_still_holds_the_slot_and_reports_overlapping() {
     let id = due_schedule(&state, "fire_once").await;
     let mut cron_cache = HashMap::new();
 
-    scheduler::reconcile(&state, &mut cron_cache, Utc::now())
+    scheduler::reconcile(&state, &mut cron_cache, None, Utc::now())
         .await
         .unwrap();
     assert_eq!(jobs_for_schedule(&state, &id).await, 1);
@@ -226,7 +255,7 @@ async fn a_live_run_still_holds_the_slot_and_reports_overlapping() {
     assert_eq!(row["health"], "overlapping", "{row}");
 
     let t2 = Utc::now() + Duration::minutes(2);
-    scheduler::reconcile(&state, &mut cron_cache, t2)
+    scheduler::reconcile(&state, &mut cron_cache, None, t2)
         .await
         .unwrap();
     assert_eq!(
@@ -243,7 +272,7 @@ async fn a_live_run_still_holds_the_slot_and_reports_overlapping() {
     // Finishing it releases the held firing on the next tick.
     run_queued_job(&state, true).await;
     assert_eq!(only_schedule(&router).await["health"], "ok");
-    scheduler::reconcile(&state, &mut cron_cache, t2)
+    scheduler::reconcile(&state, &mut cron_cache, None, t2)
         .await
         .unwrap();
     assert_eq!(jobs_for_schedule(&state, &id).await, 2);
@@ -255,21 +284,30 @@ async fn a_live_run_still_holds_the_slot_and_reports_overlapping() {
 /// was down. It used to record that advance in `last_run` — so the row claimed a
 /// run that never happened, next to a null `last_job_id`, and the number of
 /// eaten firings existed only in the logs.
+///
+/// Driven on an HOURLY cron at a fixed half-past instant so every pending firing
+/// is genuinely missed and nothing is on-time. That matters since misfire
+/// classification became per-firing: on an every-minute cron at wall-clock
+/// `now`, the top-of-this-minute firing is on-time and `skip` correctly runs it
+/// (covered in `schedule_misfire.rs`), which would make this case's outcome
+/// depend on which second the suite happened to reach it.
 #[tokio::test]
 async fn a_misfire_skip_is_recorded_as_a_skip_not_as_a_run() {
     let (state, _store) = test_state(vec![Arc::new(FakeApp)]).await;
     let router = routes::router(state.clone());
-    let id = due_schedule(&state, "skip").await;
+    // 07:30 → firings at 08,09,10,11,12; observed at 12:30, all ≥30 min old.
+    let skip_now = chrono::TimeZone::with_ymd_and_hms(&Utc, 2026, 7, 13, 12, 30, 0).unwrap();
+    let id = hourly_schedule(&state, "skip", skip_now - Duration::hours(5)).await;
 
-    // Five minutes of every-minute firings missed while "down".
-    scheduler::reconcile(&state, &mut HashMap::new(), Utc::now())
+    // Five hours of hourly firings missed while "down".
+    scheduler::reconcile(&state, &mut HashMap::new(), None, skip_now)
         .await
         .unwrap();
 
     assert_eq!(
         jobs_for_schedule(&state, &id).await,
         0,
-        "the whole point of `skip` is that nothing runs"
+        "no firing here is on-time, so the whole point of `skip` is that nothing runs"
     );
     let row = only_schedule(&router).await;
     assert!(
@@ -285,10 +323,10 @@ async fn a_misfire_skip_is_recorded_as_a_skip_not_as_a_run() {
         "the advance is recorded where it belongs: {row}"
     );
     let skipped = row["skipped_count"].as_i64().expect("skipped_count");
-    assert!(
-        skipped >= 4,
+    assert_eq!(
+        skipped, 5,
         "the eaten firings are counted on the row, not only in a log line \
-         (five minutes of an every-minute cron): {row}"
+         (five hours of an hourly cron): {row}"
     );
 
     // And the projection followed the skip: the schedule is not stuck re-scanning
@@ -296,13 +334,13 @@ async fn a_misfire_skip_is_recorded_as_a_skip_not_as_a_run() {
     let next_run = row["next_run"].as_str().expect("next_run");
     let next: chrono::DateTime<Utc> = next_run.parse().expect("rfc3339 next_run");
     assert!(
-        next > Utc::now() - Duration::seconds(90),
+        next > skip_now,
         "a skip must move the cron reference forward, or every tick re-scans the \
          same backlog forever: {row}"
     );
 
     // A second tick right after eats nothing more.
-    scheduler::reconcile(&state, &mut HashMap::new(), Utc::now())
+    scheduler::reconcile(&state, &mut HashMap::new(), None, skip_now)
         .await
         .unwrap();
     assert_eq!(
@@ -324,7 +362,8 @@ async fn a_misfire_skip_is_recorded_as_a_skip_not_as_a_run() {
     scheduler::reconcile(
         &state,
         &mut HashMap::new(),
-        Utc::now() + Duration::minutes(2),
+        None,
+        skip_now + Duration::minutes(90),
     )
     .await
     .unwrap();
@@ -381,7 +420,7 @@ async fn disabled_and_invalid_cron_are_named_not_reported_as_ok() {
     assert!(row["next_run"].is_null(), "{row}");
 
     // The scheduler agrees: nothing fires.
-    scheduler::reconcile(&state, &mut HashMap::new(), Utc::now())
+    scheduler::reconcile(&state, &mut HashMap::new(), None, Utc::now())
         .await
         .unwrap();
     assert_eq!(jobs_for_schedule(&state, &id).await, 0);

@@ -148,7 +148,7 @@ async fn a_cancelled_token_stops_the_pass_before_it_enqueues() {
 
     state.shutdown.cancel();
     let mut cron_cache = std::collections::HashMap::new();
-    let tally = crate::scheduler::reconcile(&state, &mut cron_cache, Utc::now())
+    let tally = crate::scheduler::reconcile(&state, &mut cron_cache, None, Utc::now())
         .await
         .expect("pass reads the table");
 
