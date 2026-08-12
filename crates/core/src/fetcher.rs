@@ -607,6 +607,7 @@ impl Fetcher {
         }
 
         // --- Claude research tier ---
+        let mut claude_spend = None;
         if req.strategy == FetchStrategy::AutoWithResearch {
             let prompt = req.research_prompt.clone().unwrap_or_else(|| {
                 format!(
@@ -646,23 +647,29 @@ impl Fetcher {
                         cost_usd: out.cost_usd,
                     });
                 }
-                Err(e) => trace_tier_error(
-                    &mut escalations,
-                    &mut trace,
-                    FetchTier::Claude,
-                    "claude",
-                    &e,
-                    started,
-                ),
+                Err(e) => {
+                    // The paid tier can fail *after* spending. That money is
+                    // real and has to reach the job's ledger, and this error is
+                    // the only channel out — see `ladder_exhausted`.
+                    claude_spend = e.claude_spend();
+                    trace_tier_error(
+                        &mut escalations,
+                        &mut trace,
+                        FetchTier::Claude,
+                        "claude",
+                        &e,
+                        started,
+                    );
+                }
             }
         }
 
-        Err(Error::App(format!(
-            "all fetch tiers exhausted for {} (attempted: {}): {}",
-            req.url,
-            attempted_tiers(&trace),
-            escalations.join("; ")
-        )))
+        Err(ladder_exhausted(
+            &req.url,
+            &trace,
+            &escalations,
+            claude_spend,
+        ))
     }
 
     /// One attempt at the HTTP tier, at either of its two positions in the
@@ -936,6 +943,35 @@ fn trace_tier_error(
 
 fn elapsed_ms(started: Instant) -> u64 {
     started.elapsed().as_millis().min(u64::MAX as u128) as u64
+}
+
+/// The error that ends the ladder when every tier has been tried: the exhaustion
+/// message carrying the whole trail.
+///
+/// **Why the variant depends on `claude_spend`.** The paid tier can spend money
+/// and *then* fail, and the fetcher has no cost ledger to write that to — the
+/// error is its only channel to [`crate::app::AppContext::fetch`], which does.
+/// So when (and only when) the Claude tier reports something the ledger must
+/// record, the same message is minted as the cost-carrying `Error::Claude`;
+/// otherwise it stays `Error::App`, which is what the ladder has always
+/// returned. **The text is identical either way** — the trail is the payload for
+/// humans, the variant is the payload for the ledger.
+fn ladder_exhausted(
+    url: &str,
+    trace: &[TierTrace],
+    escalations: &[String],
+    claude_spend: Option<crate::error::ClaudeSpend>,
+) -> Error {
+    let message = format!(
+        "all fetch tiers exhausted for {} (attempted: {}): {}",
+        url,
+        attempted_tiers(trace),
+        escalations.join("; ")
+    );
+    match claude_spend.filter(|s| s.ledger_event().is_some()) {
+        Some(spend) => Error::Claude { message, spend },
+        None => Error::App(message),
+    }
 }
 
 /// Whether the ladder attempts the http tier at its normal cheap-first slot.
@@ -1713,7 +1749,10 @@ mod tests {
         #[async_trait]
         impl Researcher for FailingResearcher {
             async fn research(&self, _req: ResearchRequest) -> Result<ResearchOutput> {
-                Err(Error::Claude("claude binary not found on PATH".into()))
+                Err(Error::claude(
+                    crate::error::ClaudeFailure::Spawn,
+                    "claude binary not found on PATH",
+                ))
             }
         }
         // The host is unreachable outright, so the browser fallback's http

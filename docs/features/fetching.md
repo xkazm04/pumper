@@ -125,6 +125,20 @@ A tier no longer passes purely on char count. On escalating strategies (`auto`, 
 
 One deadline (`[claude] timeout_secs`, default 600; per-request `timeout_secs` overrides) covers both waiting for exit and draining stdout, so a leaked process holding the output pipe open cannot park a call past its own timeout.
 
+**A failed call still spent money, and the ledger says so.** The CLI reports `total_cost_usd` in the *same* envelope it reports a failure in, so the runs that cost the most were exactly the ones whose spend used to vanish. Every failure now carries a structured spend out of the engine, and the metered seams (`ctx.research`, `ctx.fetch`) write it to `cost_events` **before** propagating the error — which is what lets the per-job `budget_usd` clamp see money burned by a run that then failed. The `detail` column distinguishes the cases:
+
+| `detail` | when | `cost_usd` |
+| --- | --- | --- |
+| `failed_spend (is_error)` | `is_error` envelope that reported a cost | what the CLI reported |
+| `failed_spend (nonzero_exit)` | non-zero exit whose stdout still held an envelope | what the CLI reported |
+| `failed_spend_unreported (<class>)` | the run happened but its cost is unreadable | `0` — unknown, not free |
+| `unmetered_timeout` | killed by the deadline; no envelope exists | `0` — a paid call vanished |
+| `cost_unreported` | a **successful** envelope with no `total_cost_usd` | `0` — unknown, not free |
+
+A failure that never started a process (a bad `binary`) writes no row at all — inventing one would be its own lie. Tier-3 has different plumbing (the fetcher drives the researcher itself and `ctx.fetch` meters the *outcome*, which does not exist when the ladder fails), so the paid tier's spend rides out on the `all fetch tiers exhausted …` error and is metered from there; the message is identical either way.
+
+**Structured answers are cacheable.** Under `--json-schema` the CLI may return `result` as an object rather than a string. That used to become empty `text`, which the research cache refuses to store — so the call re-paid the model on every repeat, silently. A non-string `result` now falls back to the validated `structured_output` (then the raw value), serialized.
+
 ## Politeness governor (adaptive)
 
 Per-host token bucket: configured spacing (`[governor] default_rps`, `per_domain`, jitter) **plus a learned penalty**: a 429/503 doubles the host's extra spacing and pushes the host's next slot out; only a genuinely healthy **2xx** response halves it (a 4xx like 404/403 is not health and no longer rewards faster spacing; other 5xx stay neutral). Penalty bounds are configurable — `[governor] penalty_base_secs` (default 1), `penalty_cap_secs` (300), `penalty_floor_ms` (100, below which a decaying penalty is dropped). Both `Retry-After` forms are honored: delta-seconds and an HTTP-date (converted to a delay from now); a larger `Retry-After` wins over doubling. State is held in one sharded map keyed by host, so distinct hosts never contend; idle hosts are evicted once the map outgrows its cap. Learned penalties are **persisted** (see host profiles below) so they survive a restart.

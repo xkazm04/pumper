@@ -114,8 +114,20 @@ impl Researcher for Dead {
 /// a test can assert on the budget clamp, turn caps and call count.
 #[derive(Default)]
 pub struct ScriptedResearcher {
-    script: Vec<(String, ResearchOutput)>,
+    script: Vec<(String, ScriptedReply)>,
     calls: std::sync::Mutex<Vec<ResearchRequest>>,
+}
+
+/// What a scripted prompt replays: an answer, or a failure that may carry the
+/// money the CLI reported spending on its way out (`Error` is not `Clone`, so
+/// the failure is stored as its parts and minted per call).
+#[derive(Clone)]
+enum ScriptedReply {
+    Answer(Box<ResearchOutput>),
+    Failure {
+        message: String,
+        spend: crate::error::ClaudeSpend,
+    },
 }
 
 impl ScriptedResearcher {
@@ -127,7 +139,29 @@ impl ScriptedResearcher {
     /// An empty `key` matches every prompt.
     #[must_use]
     pub fn on(mut self, key: impl Into<String>, out: ResearchOutput) -> Self {
-        self.script.push((key.into(), out));
+        self.script
+            .push((key.into(), ScriptedReply::Answer(Box::new(out))));
+        self
+    }
+
+    /// Fails any prompt containing `key` with a Claude-engine error carrying
+    /// `spend` — the failed-spend path, where the CLI reports money it already
+    /// burned in the very envelope that reports the failure. An empty `key`
+    /// fails every prompt.
+    #[must_use]
+    pub fn on_failure(
+        mut self,
+        key: impl Into<String>,
+        message: impl Into<String>,
+        spend: crate::error::ClaudeSpend,
+    ) -> Self {
+        self.script.push((
+            key.into(),
+            ScriptedReply::Failure {
+                message: message.into(),
+                spend,
+            },
+        ));
         self
     }
 
@@ -154,19 +188,23 @@ impl Researcher for ScriptedResearcher {
             .script
             .iter()
             .find(|(key, _)| key.is_empty() || req.prompt.contains(key.as_str()))
-            .map(|(_, out)| out.clone());
+            .map(|(_, reply)| reply.clone());
         self.calls
             .lock()
             .expect("scripted researcher lock")
             .push(req.clone());
-        hit.ok_or_else(|| {
-            crate::Error::App(format!(
+        match hit {
+            Some(ScriptedReply::Answer(out)) => Ok(*out),
+            Some(ScriptedReply::Failure { message, spend }) => {
+                Err(crate::Error::Claude { message, spend })
+            }
+            None => Err(crate::Error::App(format!(
                 "no recorded transcript matches this prompt — the request changed. \
                  Scripted keys: {:?}. Prompt began: {:?}",
                 self.script.iter().map(|(k, _)| k).collect::<Vec<_>>(),
                 req.prompt.chars().take(200).collect::<String>(),
-            ))
-        })
+            ))),
+        }
     }
 }
 

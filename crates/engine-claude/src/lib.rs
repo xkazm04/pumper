@@ -8,6 +8,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use pumper_core::config::ClaudeConfig;
+use pumper_core::error::ClaudeFailure;
 use pumper_core::{Error, ResearchOutput, ResearchRequest, Researcher, Result};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -123,9 +124,12 @@ impl Researcher for ClaudeEngine {
             .kill_on_drop(true);
 
         debug!(timeout_secs = timeout.as_secs(), "spawning claude cli");
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| Error::Claude(format!("failed to spawn '{}': {e}", self.cfg.binary)))?;
+        let mut child = cmd.spawn().map_err(|e| {
+            Error::claude(
+                ClaudeFailure::Spawn,
+                format!("failed to spawn '{}': {e}", self.cfg.binary),
+            )
+        })?;
         // Captured BEFORE anything can reap the process: `Child::id` returns
         // `None` once the child has been waited on, and the tree kill needs the
         // shim's pid. The live `Child` handle is also what keeps Windows from
@@ -137,15 +141,15 @@ impl Researcher for ClaudeEngine {
         let mut stdin = child
             .stdin
             .take()
-            .ok_or_else(|| Error::Claude("no stdin handle".into()))?;
+            .ok_or_else(|| Error::claude(ClaudeFailure::Spawn, "no stdin handle"))?;
         let mut stdout_pipe = child
             .stdout
             .take()
-            .ok_or_else(|| Error::Claude("no stdout handle".into()))?;
+            .ok_or_else(|| Error::claude(ClaudeFailure::Spawn, "no stdout handle"))?;
         let mut stderr_pipe = child
             .stderr
             .take()
-            .ok_or_else(|| Error::Claude("no stderr handle".into()))?;
+            .ok_or_else(|| Error::claude(ClaudeFailure::Spawn, "no stderr handle"))?;
 
         let prompt = req.prompt.clone();
         let writer = tokio::spawn(async move {
@@ -201,7 +205,12 @@ impl Researcher for ClaudeEngine {
         let _ = writer.await;
         let stdout_bytes = match tokio::time::timeout_at(deadline, stdout_task).await {
             Ok(Ok(buf)) => buf,
-            Ok(Err(e)) => return Err(Error::Claude(format!("stdout reader failed: {e}"))),
+            Ok(Err(e)) => {
+                return Err(Error::claude(
+                    ClaudeFailure::Unparseable,
+                    format!("stdout reader failed: {e}"),
+                ))
+            }
             Err(_) => {
                 return Err(abandon_run(
                     &mut child,
@@ -223,29 +232,41 @@ impl Researcher for ClaudeEngine {
         };
 
         let stdout = String::from_utf8_lossy(&stdout_bytes);
+        // A non-zero exit does NOT mean stdout is worthless: the CLI routinely
+        // prints a complete envelope — cost and all — and then exits non-zero.
+        // Discarding stdout here threw that spend away.
+        let parsed = serde_json::from_str::<Value>(stdout.trim());
+        let reported_cost = parsed
+            .as_ref()
+            .ok()
+            .and_then(|e| e["total_cost_usd"].as_f64());
         if !status.success() {
             let stderr = String::from_utf8_lossy(&stderr_bytes);
-            return Err(Error::Claude(format!(
-                "exited with {}: {}",
-                status,
-                truncate(&stderr, 2000)
-            )));
+            return Err(Error::claude_spent(
+                ClaudeFailure::NonZeroExit,
+                reported_cost,
+                format!("exited with {}: {}", status, truncate(&stderr, 2000)),
+            ));
         }
 
-        let envelope: Value = serde_json::from_str(stdout.trim()).map_err(|e| {
-            Error::Claude(format!(
-                "unparseable cli output: {e}: {}",
-                truncate(&stdout, 500)
-            ))
+        let envelope = parsed.map_err(|e| {
+            Error::claude(
+                ClaudeFailure::Unparseable,
+                format!("unparseable cli output: {e}: {}", truncate(&stdout, 500)),
+            )
         })?;
         if envelope["is_error"].as_bool() == Some(true) {
-            return Err(Error::Claude(format!(
-                "cli reported error: {}",
-                envelope["result"]
-            )));
+            // The most expensive failure shape there is: the run *happened*, so
+            // the envelope's cost is money already spent. It rides out on the
+            // error and the chokepoint meters it.
+            return Err(Error::claude_spent(
+                ClaudeFailure::CliError,
+                reported_cost,
+                format!("cli reported error: {}", envelope["result"]),
+            ));
         }
 
-        let text = envelope["result"].as_str().unwrap_or_default().to_string();
+        let text = envelope_text(&envelope);
         // Prefer the CLI's validated structured output when a schema was set;
         // otherwise best-effort parse JSON out of the free-form result.
         let json = match envelope.get("structured_output") {
@@ -287,7 +308,10 @@ async fn abandon_run(
         task.abort();
     }
     let outcome = kill_process_tree(child, pid).await;
-    Error::Claude(format!("{why}; {outcome}"))
+    // Unreported by construction: a killed run produces no envelope, so what it
+    // spent is unknowable here. The chokepoint still records THAT it happened
+    // (`unmetered_timeout`) rather than leaving the ledger silent.
+    Error::claude(ClaudeFailure::Timeout, format!("{why}; {outcome}"))
 }
 
 /// Kills the child **and everything it spawned**, returning what was done for
@@ -368,6 +392,28 @@ struct Resolved {
     max_budget_usd: Option<f64>,
 }
 
+/// The answer text for an envelope whose `result` is **not necessarily a
+/// string**.
+///
+/// Under `--json-schema` the CLI may return `result` as an object/array. The old
+/// `as_str().unwrap_or_default()` turned exactly those answers into `""` — and
+/// an empty text is what the research cache refuses to store, so every repeat of
+/// a schema-constrained call re-paid the model and nothing anywhere said why.
+/// A non-string result falls back to the validated `structured_output`, then to
+/// the raw `result` value, serialized.
+fn envelope_text(envelope: &Value) -> String {
+    if let Some(text) = envelope["result"].as_str() {
+        return text.to_string();
+    }
+    let fallback = match envelope.get("structured_output") {
+        Some(value) if !value.is_null() => Some(value),
+        _ => envelope.get("result").filter(|v| !v.is_null()),
+    };
+    fallback
+        .and_then(|v| serde_json::to_string(v).ok())
+        .unwrap_or_default()
+}
+
 /// Accepts raw JSON, JSON in markdown fences, or a JSON object/array embedded
 /// in surrounding prose — agents love to add a lead-in sentence.
 fn parse_loose_json(text: &str) -> Option<Value> {
@@ -413,8 +459,49 @@ fn truncate(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_loose_json, tree_kill_argv};
+    use super::{envelope_text, parse_loose_json, tree_kill_argv};
     use serde_json::json;
+
+    /// The ordinary shape: a string result travels verbatim.
+    #[test]
+    fn string_result_is_the_text() {
+        assert_eq!(
+            envelope_text(&json!({"result": "plain prose"})),
+            "plain prose"
+        );
+    }
+
+    /// THE anti-pattern: `result.as_str().unwrap_or_default()` on a
+    /// schema-constrained object produced `""` — which the research cache
+    /// refuses to store, so the call re-paid the model on every repeat with no
+    /// signal anywhere.
+    #[test]
+    fn schema_result_is_not_silently_empty_and_uncacheable() {
+        let text = envelope_text(&json!({
+            "result": {"state": "CA", "rate": 13.3},
+            "structured_output": {"state": "CA", "rate": 13.3},
+        }));
+        assert!(!text.is_empty(), "an object result became empty text");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&text).unwrap(),
+            json!({"state": "CA", "rate": 13.3})
+        );
+    }
+
+    /// Same failure without a `structured_output` to fall back on: the raw
+    /// result value is still an answer, and still better than `""`.
+    #[test]
+    fn non_string_result_without_structured_output_still_has_text() {
+        let text = envelope_text(&json!({"result": [1, 2, 3]}));
+        assert_eq!(text, "[1,2,3]");
+    }
+
+    /// The honest empty case stays empty — no answer is not an answer.
+    #[test]
+    fn a_missing_result_is_still_empty() {
+        assert_eq!(envelope_text(&json!({"num_turns": 3})), "");
+        assert_eq!(envelope_text(&json!({"result": null})), "");
+    }
 
     /// The anti-pattern: killing the `cmd.exe` shim and calling it done. The
     /// grandchild behind the shim is the process holding the API key, and it

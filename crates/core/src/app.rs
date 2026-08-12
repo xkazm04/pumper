@@ -235,6 +235,19 @@ impl AppContext {
         }
     }
 
+    /// Records what a **failed** metered call already spent, before the error
+    /// propagates. A no-op for failures that cannot have spent anything (see
+    /// [`ClaudeSpend::ledger_event`]), so this never fabricates ledger rows.
+    ///
+    /// Both metered seams call it: `research` (the chokepoint) and `fetch`
+    /// (whose tier-3 spend rides out on the ladder's exhaustion error).
+    async fn meter_failed_spend(&self, e: &Error, url: Option<&str>) {
+        let Some((cost, detail)) = e.claude_spend().and_then(|s| s.ledger_event()) else {
+            return;
+        };
+        self.meter("claude", url, cost, Some(&detail)).await;
+    }
+
     /// Teaches the learned tier router about one fetch outcome for `host`: an
     /// HTTP win resets the host, an HTTP loss (thin/blocked/error) adds a strike,
     /// and hosts that persistently lose start straight at the browser tier.
@@ -331,7 +344,16 @@ impl AppContext {
             }
         }
         let url = req.url.clone();
-        let mut outcome = self.engines.fetch.fetch(req).await?;
+        let mut outcome = match self.engines.fetch.fetch(req).await {
+            Ok(outcome) => outcome,
+            // The ladder's paid tier can spend and *then* have the whole ladder
+            // run out of tiers; the exhaustion error carries that spend out
+            // (the fetcher has no ledger of its own to write it to).
+            Err(e) => {
+                self.meter_failed_spend(&e, Some(&url)).await;
+                return Err(e);
+            }
+        };
         // Router-level skips are recorded as structured `skipped_by_router`
         // trace entries and kept as human trail lines alongside.
         if let Some(note) = tier_note {
@@ -433,9 +455,20 @@ impl AppContext {
         if let Some(remaining) = self.require_budget().await? {
             req.max_budget_usd = Some(Self::clamp_to_headroom(req.max_budget_usd, remaining));
         }
-        let out = self.engines.researcher().research(req.clone()).await?;
-        self.meter("claude", None, out.cost_usd.unwrap_or(0.0), None)
-            .await;
+        let out = match self.engines.researcher().research(req.clone()).await {
+            Ok(out) => out,
+            // **A failed call still spent money.** The CLI reports
+            // `total_cost_usd` in the same envelope it reports `is_error` in, so
+            // the expensive failures are exactly the ones whose spend used to
+            // vanish here — leaving the budget ceiling unenforceable for them.
+            // Meter first, then propagate unchanged.
+            Err(e) => {
+                self.meter_failed_spend(&e, None).await;
+                return Err(e);
+            }
+        };
+        let (cost, detail) = success_spend_event(out.cost_usd);
+        self.meter("claude", None, cost, detail).await;
         if let Some(key) = &key {
             if let Err(e) = self.research_cache.put(key, &out).await {
                 tracing::warn!(job = %self.job_id, "research cache write failed: {e}");
@@ -698,6 +731,21 @@ fn budget_is_exhausted(remaining: Option<f64>) -> bool {
     matches!(remaining, Some(r) if r <= 0.0)
 }
 
+/// The cost event a **successful** research answer must leave, as
+/// `(cost_usd, detail)`.
+///
+/// An envelope with no `total_cost_usd` is not a free call — it is a call whose
+/// price we could not read (an older CLI, a changed envelope shape). Recording
+/// it as a bare `$0` makes it indistinguishable from a genuinely free cache hit,
+/// and silently under-counts the job's spend against its ceiling; the
+/// `cost_unreported` detail keeps the gap visible in the ledger.
+fn success_spend_event(cost_usd: Option<f64>) -> (f64, Option<&'static str>) {
+    match cost_usd {
+        Some(cost) => (cost, None),
+        None => (0.0, Some("cost_unreported")),
+    }
+}
+
 /// The refusal a metered seam raises once the ceiling is reached. Built here so
 /// the message and the [`Error::BudgetExhausted`] classification are minted in
 /// ONE place — a hand-rolled `Error::App("...budget...")` elsewhere would read
@@ -866,7 +914,24 @@ pub trait ScrapeApp: Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use super::{budget_exhausted_error, budget_is_exhausted, safe_path_segment};
+    use super::{
+        budget_exhausted_error, budget_is_exhausted, safe_path_segment, success_spend_event,
+    };
+
+    /// A priced answer meters its price with no editorial detail — the ordinary
+    /// case, and the one the budget clamp reads.
+    #[test]
+    fn a_priced_answer_meters_its_price() {
+        assert_eq!(success_spend_event(Some(0.37)), (0.37, None));
+    }
+
+    /// The anti-pattern: an envelope with no `total_cost_usd` metered as a bare
+    /// `$0`, which reads exactly like a free cache hit and quietly under-counts
+    /// the job's spend. It must be labelled.
+    #[test]
+    fn an_unpriced_answer_is_not_indistinguishable_from_a_free_one() {
+        assert_eq!(success_spend_event(None), (0.0, Some("cost_unreported")));
+    }
 
     /// The boundary both metered seams share. `None` = unlimited, and the
     /// anti-pattern is treating it as `0.0`: that would refuse every job

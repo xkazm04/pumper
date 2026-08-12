@@ -107,7 +107,7 @@ pub(crate) fn client_facing(e: &pumper_core::Error) -> (StatusCode, String) {
         // between stored state and what was asked of it, not a missing route.
         E::ReplayMiss(_) => (StatusCode::CONFLICT, REPLAY_MISS_MESSAGE.into()),
         // Somebody else's failure, reported as such rather than as ours.
-        E::Http(_) | E::Browser(_) | E::Claude(_) => {
+        E::Http(_) | E::Browser(_) | E::Claude { .. } => {
             (StatusCode::BAD_GATEWAY, UPSTREAM_MESSAGE.into())
         }
         // Genuinely unexpected here. Listed one by one rather than caught by a
@@ -477,7 +477,10 @@ mod contract_tests {
         for e in [
             pumper_core::Error::Http("connect https://slow.example/a?k=v: timed out".into()),
             pumper_core::Error::Browser("chrome crashed rendering https://x.example".into()),
-            pumper_core::Error::Claude("cli exited 1".into()),
+            pumper_core::Error::claude(
+                pumper_core::error::ClaudeFailure::NonZeroExit,
+                "cli exited 1",
+            ),
         ] {
             let err = ApiError::from(e);
             assert_eq!(err.0, StatusCode::BAD_GATEWAY);

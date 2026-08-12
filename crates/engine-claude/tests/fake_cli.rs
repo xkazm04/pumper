@@ -59,6 +59,12 @@ impl FakeCli {
 
     /// A fake CLI that prints `envelope` on stdout and exits 0.
     fn printing(tag: &str, envelope: &serde_json::Value) -> Self {
+        Self::printing_then_exit(tag, envelope, 0)
+    }
+
+    /// A fake CLI that prints `envelope` on stdout and then exits `code` — the
+    /// real CLI's "complete envelope, non-zero exit" shape.
+    fn printing_then_exit(tag: &str, envelope: &serde_json::Value, code: i32) -> Self {
         let dir = Self::temp_dir(tag);
         let payload = dir.path().join("envelope.json");
         std::fs::write(
@@ -69,9 +75,9 @@ impl FakeCli {
         // `type`/`cat` of a file keeps the JSON out of the script's own quoting
         // rules — the point is to test the engine, not batch escaping.
         let body = if cfg!(windows) {
-            format!("type \"{}\"", payload.display())
+            format!("type \"{}\"\r\nexit /b {code}", payload.display())
         } else {
-            format!("cat \"{}\"", payload.display())
+            format!("cat \"{}\"\nexit {code}", payload.display())
         };
         Self::in_dir(dir, &body)
     }
@@ -153,6 +159,122 @@ async fn malformed_stdout_names_itself_instead_of_looking_like_an_empty_answer()
     assert!(
         msg.contains("not json"),
         "the raw output is not shown: {msg}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Cost honesty: money the CLI reports on a failure path is real money
+// ---------------------------------------------------------------------------
+
+/// THE anti-pattern: the `is_error` envelope carries `total_cost_usd` in the
+/// very same object the engine threw away, so the runs that spent the most were
+/// the ones the ledger never heard about.
+#[tokio::test]
+async fn an_is_error_envelope_carries_its_cost_out_of_the_failure() {
+    let cli = FakeCli::printing(
+        "is-error",
+        &serde_json::json!({
+            "is_error": true,
+            "result": "hit the model's own budget ceiling",
+            "total_cost_usd": 0.87,
+        }),
+    );
+
+    let err = cli
+        .engine(30)
+        .research(ResearchRequest::new("an expensive question"))
+        .await
+        .expect_err("an is_error envelope is a failure");
+    let spend = err.claude_spend().expect("a claude failure carries spend");
+    assert_eq!(
+        spend.cost_usd,
+        Some(0.87),
+        "the money the CLI reported burning was discarded with the envelope"
+    );
+    assert_eq!(spend.class, pumper_core::error::ClaudeFailure::CliError);
+}
+
+/// A non-zero exit does not mean stdout was worthless: the CLI routinely prints
+/// a complete envelope and *then* exits non-zero. Discarding stdout discarded
+/// the cost with it.
+#[tokio::test]
+async fn a_non_zero_exit_keeps_the_cost_its_envelope_reported() {
+    let cli = FakeCli::printing_then_exit(
+        "exit-with-envelope",
+        &serde_json::json!({
+            "is_error": true,
+            "result": "crashed after spending",
+            "total_cost_usd": 0.31,
+        }),
+        7,
+    );
+
+    let err = cli
+        .engine(30)
+        .research(ResearchRequest::new("a question"))
+        .await
+        .expect_err("a non-zero exit is a failure");
+    let spend = err.claude_spend().expect("a claude failure carries spend");
+    assert_eq!(
+        spend.cost_usd,
+        Some(0.31),
+        "stdout was discarded on the non-zero-exit path, and the cost with it"
+    );
+    assert_eq!(spend.class, pumper_core::error::ClaudeFailure::NonZeroExit);
+}
+
+/// The whole failure surface must be able to answer "how much did that cost?" —
+/// including with "nothing was reported", which is a different answer from `$0`.
+#[tokio::test]
+async fn a_failure_without_an_envelope_reports_unknown_spend_not_zero() {
+    let cli = FakeCli::new("no-envelope", "echo not json at all");
+
+    let err = cli
+        .engine(30)
+        .research(ResearchRequest::new("a question"))
+        .await
+        .expect_err("garbage on stdout is a failure");
+    let spend = err.claude_spend().expect("a claude failure carries spend");
+    assert_eq!(
+        spend.cost_usd, None,
+        "an unreadable envelope reports an UNKNOWN spend, never a metered $0"
+    );
+    assert_eq!(spend.class, pumper_core::error::ClaudeFailure::Unparseable);
+}
+
+/// THE anti-pattern for schema-constrained calls: `result.as_str()` on an
+/// object yields `""`, and the research cache refuses to store an empty answer —
+/// so the call re-paid the model on every repeat, with nothing anywhere saying
+/// why. A non-string result must still produce cacheable text.
+#[tokio::test]
+async fn schema_result_is_not_silently_empty_and_uncacheable() {
+    let cli = FakeCli::printing(
+        "schema",
+        &serde_json::json!({
+            "is_error": false,
+            "result": {"state": "CA", "rate": 13.3},
+            "structured_output": {"state": "CA", "rate": 13.3},
+            "total_cost_usd": 0.05,
+        }),
+    );
+
+    let mut req = ResearchRequest::new("top marginal rate?");
+    req.json_schema = Some(serde_json::json!({"type": "object"}));
+    let out = cli
+        .engine(30)
+        .research(req)
+        .await
+        .expect("a valid envelope");
+
+    assert!(
+        !out.text.is_empty(),
+        "a schema-constrained answer came back as empty text — the research \
+         cache refuses to store that, so the call re-pays the model forever"
+    );
+    assert_eq!(
+        out.json,
+        Some(serde_json::json!({"state": "CA", "rate": 13.3})),
+        "the validated structured output is still the parsed answer"
     );
 }
 

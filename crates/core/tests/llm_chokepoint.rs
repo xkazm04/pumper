@@ -21,6 +21,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use pumper_core::error::{ClaudeFailure, ClaudeSpend};
+use pumper_core::fetcher::{FetchRequest, FetchStrategy};
 use pumper_core::testing::TestContext;
 use pumper_core::testing::{engines_with, research_output, Dead, ScriptedResearcher, TempStore};
 use pumper_core::ResearchRequest;
@@ -67,7 +69,15 @@ fn rust_sources(dir: &Path, out: &mut Vec<PathBuf>) {
         let path = entry.path();
         if path.is_dir() {
             // `target/` holds generated + vendored code, not our call sites.
-            if path.file_name().is_some_and(|n| n == "target") {
+            // `tests/` holds integration tests, which Cargo never links into a
+            // shipped library: an *engine's own* tests must drive that engine
+            // directly (that is what they test), and they cannot lose metering
+            // because there is no job and no ledger behind them. Test modules
+            // inside `src/` are still scanned — those live in shipped files.
+            if path
+                .file_name()
+                .is_some_and(|n| n == "target" || n == "tests")
+            {
                 continue;
             }
             rust_sources(&path, out);
@@ -296,5 +306,187 @@ async fn every_model_call_is_metered_not_invisible_to_the_ledger() {
     assert!(
         (total - 0.37).abs() < 1e-9,
         "model spend {total} never reached the cost ledger"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Failed calls spend money too
+// ---------------------------------------------------------------------------
+
+/// A dead HTTP engine — every tier below Claude has to genuinely fail for the
+/// ladder to exhaust, and `Dead` panics instead of erroring.
+struct DownHttp;
+
+#[async_trait::async_trait]
+impl pumper_core::HttpClient for DownHttp {
+    async fn fetch(
+        &self,
+        _req: pumper_core::HttpRequest,
+    ) -> pumper_core::Result<pumper_core::HttpResponse> {
+        Err(pumper_core::Error::Http("dns error: no such host".into()))
+    }
+}
+
+struct DownBrowser;
+
+#[async_trait::async_trait]
+impl pumper_core::Browser for DownBrowser {
+    async fn render(
+        &self,
+        _req: pumper_core::RenderRequest,
+    ) -> pumper_core::Result<pumper_core::RenderedPage> {
+        Err(pumper_core::Error::Browser("chrome is not running".into()))
+    }
+}
+
+/// THE anti-pattern: a run that burns to its ceiling and *then* errors recorded
+/// `$0`. The CLI reports `total_cost_usd` in the same envelope it reports
+/// `is_error` in, so the failures that cost the most were exactly the ones whose
+/// spend vanished — which makes the budget ceiling unenforceable for them, since
+/// the next call re-reads a ledger that says nothing was ever spent.
+#[tokio::test]
+async fn a_failed_call_still_meters_what_it_spent() {
+    let store = TempStore::new("chokepoint-failed-spend").await;
+    let engine = Arc::new(ScriptedResearcher::new().on_failure(
+        "",
+        "cli reported error: budget exceeded mid-run",
+        ClaudeSpend::reported(ClaudeFailure::CliError, 0.55),
+    ));
+    let ctx = TestContext::new(&store.storage, "chokepoint")
+        .engines(engines_with(Arc::new(Dead), Arc::new(Dead), engine.clone()))
+        .budget_usd(1.00)
+        .build();
+
+    ctx.research(ResearchRequest::new("an expensive question"))
+        .await
+        .expect_err("the engine failed");
+
+    let events = ctx.costs.job_events(ctx.job_id).await.unwrap();
+    let total = ctx.costs.job_total(ctx.job_id).await.unwrap();
+    assert_eq!(events.len(), 1, "the failed spend left no ledger row");
+    assert!(
+        (total - 0.55).abs() < 1e-9,
+        "the ${total} recorded is not the $0.55 the failing run reported spending"
+    );
+    assert_eq!(
+        events[0].detail.as_deref(),
+        Some("failed_spend (is_error)"),
+        "the row must name the failure class, or a failed spend is \
+         indistinguishable from a successful one"
+    );
+
+    // And the whole point: the clamp now sees that money.
+    let left = ctx.remaining_budget_usd().await.unwrap().unwrap();
+    assert!(
+        (left - 0.45).abs() < 1e-9,
+        "the failed spend did not move the job's remaining headroom: {left}"
+    );
+}
+
+/// A killed run cannot report its spend — but the ledger must say that a paid
+/// call vanished unmetered, rather than say nothing and read as "no call".
+#[tokio::test]
+async fn a_timeout_is_recorded_as_unmetered_not_as_nothing() {
+    let store = TempStore::new("chokepoint-timeout").await;
+    let engine = Arc::new(ScriptedResearcher::new().on_failure(
+        "",
+        "timed out after 600s; process tree killed",
+        ClaudeSpend::unreported(ClaudeFailure::Timeout),
+    ));
+    let ctx = TestContext::new(&store.storage, "chokepoint")
+        .engines(engines_with(Arc::new(Dead), Arc::new(Dead), engine.clone()))
+        .build();
+
+    ctx.research(ResearchRequest::new("a question that hangs"))
+        .await
+        .expect_err("the engine timed out");
+
+    let events = ctx.costs.job_events(ctx.job_id).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].detail.as_deref(), Some("unmetered_timeout"));
+    assert_eq!(events[0].cost_usd, 0.0, "a timeout reports no amount");
+}
+
+/// The mirror risk: inventing rows. A call that never started a process spent
+/// nothing, and a `$0` row claiming otherwise is its own kind of lie.
+#[tokio::test]
+async fn a_call_that_never_ran_writes_no_cost_row() {
+    let store = TempStore::new("chokepoint-spawn-fail").await;
+    let engine = Arc::new(ScriptedResearcher::new().on_failure(
+        "",
+        "failed to spawn 'claude': not found",
+        ClaudeSpend::unreported(ClaudeFailure::Spawn),
+    ));
+    let ctx = TestContext::new(&store.storage, "chokepoint")
+        .engines(engines_with(Arc::new(Dead), Arc::new(Dead), engine.clone()))
+        .build();
+
+    ctx.research(ResearchRequest::new("anything"))
+        .await
+        .expect_err("the engine could not start");
+
+    assert!(
+        ctx.costs.job_events(ctx.job_id).await.unwrap().is_empty(),
+        "a call that never ran must not fabricate a cost event"
+    );
+}
+
+/// An envelope with no `total_cost_usd` is not a free call — it is a call whose
+/// price we could not read. Metering it as a bare `$0` makes it identical to a
+/// cache hit in the ledger.
+#[tokio::test]
+async fn an_unpriced_answer_is_labelled_not_silently_free() {
+    let store = TempStore::new("chokepoint-unpriced").await;
+    let mut out = research_output("answer");
+    out.cost_usd = None;
+    let engine = Arc::new(ScriptedResearcher::new().on("", out));
+    let ctx = TestContext::new(&store.storage, "chokepoint")
+        .engines(engines_with(Arc::new(Dead), Arc::new(Dead), engine.clone()))
+        .build();
+
+    ctx.research(ResearchRequest::new("what changed?"))
+        .await
+        .unwrap();
+
+    let events = ctx.costs.job_events(ctx.job_id).await.unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].detail.as_deref(), Some("cost_unreported"));
+}
+
+/// The tier-3 path has different plumbing: the fetcher drives the researcher
+/// itself and `AppContext::fetch` meters the *outcome*, which does not exist
+/// when the ladder fails. The paid tier's spend therefore has to ride out on the
+/// exhaustion error — and land in the ledger anyway.
+#[tokio::test]
+async fn tier3_spend_survives_an_exhausted_ladder() {
+    let store = TempStore::new("chokepoint-tier3").await;
+    let engine = Arc::new(ScriptedResearcher::new().on_failure(
+        "",
+        "cli reported error: could not reach the page",
+        ClaudeSpend::reported(ClaudeFailure::CliError, 0.12),
+    ));
+    // The cheap tiers are down, so the ladder genuinely runs out of tiers after
+    // the paid one — the shape where the spend used to disappear.
+    let ctx = TestContext::new(&store.storage, "chokepoint")
+        .engines(engines_with(
+            Arc::new(DownHttp),
+            Arc::new(DownBrowser),
+            engine.clone(),
+        ))
+        .build();
+
+    let mut req = FetchRequest::new("https://example.test/page");
+    req.strategy = FetchStrategy::AutoWithResearch;
+    req.skip_http = true;
+    let err = ctx.fetch(req).await.expect_err("every tier failed");
+    assert!(
+        err.to_string().contains("all fetch tiers exhausted"),
+        "the exhaustion trail must survive the cost plumbing: {err}"
+    );
+
+    let total = ctx.costs.job_total(ctx.job_id).await.unwrap();
+    assert!(
+        (total - 0.12).abs() < 1e-9,
+        "the tier-3 spend of $0.12 never reached the ledger (recorded ${total})"
     );
 }

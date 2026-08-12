@@ -3719,6 +3719,7 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
