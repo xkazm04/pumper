@@ -118,6 +118,23 @@ pub struct AppState {
     /// In-memory only — a verdict is per-run telemetry, re-established by the
     /// next run; std Mutex, only quick insert/clone, no await held.
     pub contract_verdicts: Arc<std::sync::Mutex<HashMap<String, serde_json::Value>>>,
+    /// `<trigger_id>|<plugin>` pairs already reported as an unusable hook plugin
+    /// in the decision ledger, so the report is **once per state change** rather
+    /// than once per event.
+    ///
+    /// The bug this bounds: "this hook names a plugin the host cannot run" is a
+    /// fact about CONFIGURATION, not about the event being evaluated — but it
+    /// was recorded per hook per event, forever. A busy edge with one typo (or a
+    /// deployment with `[plugins] enabled = false`, which makes *every*
+    /// configured hook unusable at once) buried its own ledger under identical
+    /// rows, drowning the per-event decisions the ledger exists for.
+    ///
+    /// Cleared by `POST /plugins/reload`: reloading is the only thing that can
+    /// change the answer, so it is exactly the state change that re-arms the
+    /// report. `tokio::sync::Mutex` because the recording path is async and this
+    /// set must never be poisonable — a lost bound would be a silent regression
+    /// to the amplified shape.
+    pub plugin_missing_reported: Arc<tokio::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
 /// The externally-supplied inputs of an [`AppState`]: the pieces `init` builds
@@ -215,6 +232,9 @@ impl AppState {
             datahub_last: Arc::new(std::sync::Mutex::new(Default::default())),
             datahub_govern: Default::default(),
             contract_verdicts: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            plugin_missing_reported: Arc::new(tokio::sync::Mutex::new(
+                std::collections::HashSet::new(),
+            )),
         })
     }
 

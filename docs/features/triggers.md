@@ -33,6 +33,8 @@ Handlers live in `crates/server/src/routes/triggers.rs`; the fire/decide logic i
 
 `GET/POST /triggers` (kind-aware validation), `DELETE /triggers/{id}`, `POST /triggers/{id}/enabled`, `POST /triggers/{id}/test` (dry-run against the most recent source job → `would_fire` + resolved params + reason; `?fire=true` enqueues for real, idempotency-bypassed), `GET /triggers/{id}/runs` (lineage **and** the decision ledger — below).
 
+The dry-run also returns `hooks: {unusable_plugins, incidents}` whenever the trigger has plugin hooks. `unusable_plugins` names configured hook plugins this host cannot execute — non-empty means the hop is **ungated** however `would_fire` reads, which is precisely the state a dry-run is meant to expose. `incidents` carries each hook's ledger `outcome` + `detail`, in the same vocabulary the decision ledger uses, so a hook that trapped is reported as a trap instead of as a fabricated `pass=false`.
+
 ## The decision ledger (`trigger_runs` table)
 
 Every evaluation of a trigger against one source event is recorded, fires and **skips** alike — the negatives were previously log-only or entirely silent, so "why did my pipeline not fire?" was unanswerable from the API.
@@ -49,8 +51,12 @@ Every evaluation of a trigger against one source event is recorded, fires and **
 | `status_mismatch` | The source job's terminal status did not pass `on_status` |
 | `filter_miss` | The inbound payload did not satisfy the trigger's JSON-path filters |
 | `bad_filters` | The trigger's stored filter specs no longer parse |
-| `predicate_veto` | A predicate plugin returned `pass=false` (or failed with `on_error = "skip"`) |
-| `plugin_missing` | A **configured** hook names a plugin the host has not loaded, so the hook did nothing — the predicate did not gate, the transform did not shape (`detail` = the plugin name). The hop still fired: fail-open is the contract. Usually means `just plugins-install` was never run — see [trigger-plugins.md](trigger-plugins.md) |
+| `predicate_veto` | A predicate plugin **ran and answered** `pass=false`. Exactly that — a predicate that crashed records its own failure outcome below, even under `on_error = "skip"`, so counting vetoes counts gate decisions and nothing else |
+| `plugin_missing` | A **configured** hook names a plugin the host cannot execute (not installed, or `[plugins] enabled = false`), so the hook did nothing — the predicate did not gate, the transform did not shape. The hop still fired: fail-open is the contract. Usually means `just plugins-install` was never run — see [trigger-plugins.md](trigger-plugins.md). Recorded **once per (trigger, plugin)**, re-armed by `POST /plugins/reload` |
+| `hook_trap` | The sandbox stopped a hook plugin: an explicit trap, CPU fuel exhaustion, or the memory cap. `detail` names the slot, the plugin, and whether the hop went on to fire (`on_error=fire`) or was stopped (`on_error=skip`) |
+| `hook_malformed` | A hook plugin ran and returned, but not the contract: output that is not JSON, a predicate verdict without a `pass` bool, or a transform whose output is not an object |
+| `hook_not_executable` | The named module IS loaded but exports no usable `extract`/`extract_v2` ABI, so it can never gate or shape anything. Bounded like `plugin_missing` |
+| `hook_host_error` | The plugin **host** failed around the call (its blocking task panicked, the admission gate closed). Not the plugin's fault — this one means file a bug |
 | `cycle` / `depth` | Provenance guards (`chain`, `[triggers] max_depth`) |
 | `target_unregistered` | `target_app` is not a registered app (`detail` = the app) |
 | `bad_params` | The resolved hop params (the trigger's `params` template with the `_trigger` envelope merged over it) fail the **target** app's declared `params_schema`, so the hop was not enqueued. `detail` is the same pointer-path message `POST /apps/{name}/jobs` answers with. Fix the template — a hop that cannot pass the enqueue door was only ever going to fail on the target app |

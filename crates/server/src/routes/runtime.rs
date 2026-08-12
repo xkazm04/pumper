@@ -330,14 +330,21 @@ pub(crate) async fn list_plugins(
 }
 
 /// Hot-swap: rescan the plugin directory and reload every `.wasm` module.
+///
+/// Also re-arms the trigger ledger's "this hook names a plugin I cannot run"
+/// report. That row is written once per (trigger, plugin) rather than once per
+/// event — it describes the deployment, not the event — and a reload is the only
+/// thing that can change the answer, so it is exactly where the suppression
+/// must be dropped.
 #[utoipa::path(
     post,
     path = "/plugins/reload",
     tag = "plugins",
-    responses((status = 200, description = "`{loaded: <count>}`"))
+    responses((status = 200, description = "`{loaded: <count>}` — also re-arms the once-per-deployment `plugin_missing`/`hook_not_executable` trigger-ledger reports"))
 )]
 pub(crate) async fn reload_plugins(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let loaded = state.plugins.reload().await?;
+    state.plugin_missing_reported.lock().await.clear();
     Ok(Json(json!({ "loaded": loaded })))
 }
 

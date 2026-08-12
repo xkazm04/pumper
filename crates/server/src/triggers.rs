@@ -211,15 +211,22 @@ pub fn restamp_provenance(original: &Value, transformed: Value) -> Value {
     Value::Object(out)
 }
 
-/// Names a trigger's CONFIGURED hooks point at that the plugin host has not
-/// loaded, in hook order (predicate, then transform). Empty when the trigger
-/// has no hooks, or when every named module is present.
+/// Names the plugins a trigger's CONFIGURED hooks point at that the host cannot
+/// **execute**, in hook order (predicate, then transform). Empty when the
+/// trigger has no hooks, or when every named module is usable.
+///
+/// "Cannot execute" is [`Plugins::has`], which answers for executability rather
+/// than mere presence: a module that loaded but exports no `extract`/
+/// `extract_v2` ABI (a describe-only dynamic-app module, say) is as useless to a
+/// hook as one that was never installed, and used to answer `has() == true`.
 ///
 /// The anti-pattern this exists to expose: a configured predicate whose module
 /// was never built into `data/plugins/` takes the same fail-open path as a
 /// predicate that passed, so a gate nobody deployed is indistinguishable from
 /// a gate that said yes. The hop still fires — fail-open is the contract — but
 /// the caller can now say so at error level and in the decision ledger.
+///
+/// [`Plugins::has`]: pumper_core::Plugins::has
 pub fn missing_hook_plugins(plugins: &dyn pumper_core::Plugins, trigger: &Trigger) -> Vec<String> {
     let Some(hooks) = &trigger.plugin_hooks else {
         return Vec::new();
@@ -232,50 +239,178 @@ pub fn missing_hook_plugins(plugins: &dyn pumper_core::Plugins, trigger: &Trigge
         .collect()
 }
 
+/// Which hook slot something happened in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HookSlot {
+    Predicate,
+    Transform,
+}
+
+impl HookSlot {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            HookSlot::Predicate => "predicate",
+            HookSlot::Transform => "transform",
+        }
+    }
+}
+
+/// One ledger-worthy thing that happened while running a trigger's hooks.
+///
+/// [`apply_plugin_hooks`] is deliberately **pure**: it has no storage handle,
+/// takes no `AppState`, and stays unit-testable against a stub host. It
+/// therefore cannot write rows — it returns them, and the caller (which owns the
+/// ledger context) records them. That is the same extracted-function shape the
+/// rest of this module uses, and it is why every hook failure class could be
+/// made visible without threading a database through a decision function.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HookIncident {
+    pub slot: HookSlot,
+    pub plugin: String,
+    /// An allowlisted `trigger_runs.outcome` (see
+    /// [`pumper_core::storage::TRIGGER_OUTCOMES`]).
+    pub outcome: &'static str,
+    /// The row's `detail`: names the slot, the plugin and what happened.
+    pub detail: String,
+}
+
+/// What a trigger's plugin hooks decided, plus the rows the caller must record.
+#[derive(Debug, Clone, PartialEq)]
+pub struct HookVerdict {
+    /// The (possibly transformed) `_trigger` object, or `None` when the hop was
+    /// stopped (a predicate veto, or a predicate failure under `on_error: skip`).
+    pub obj: Option<Value>,
+    /// Every ledger-worthy incident, in hook order.
+    pub incidents: Vec<HookIncident>,
+}
+
+impl HookVerdict {
+    /// No hooks, or hooks that all did their job silently.
+    fn clean(obj: Value) -> Self {
+        Self {
+            obj: Some(obj),
+            incidents: Vec::new(),
+        }
+    }
+
+    /// The reason the hop was stopped, for a dry-run to echo — the detail of the
+    /// last incident, which is always the stopping one on a `None` verdict.
+    pub fn stop_reason(&self) -> Option<&str> {
+        self.obj
+            .is_none()
+            .then(|| self.incidents.last().map(|i| i.detail.as_str()))
+            .flatten()
+    }
+}
+
+/// The ledger outcome a failed plugin call deserves, read from the host's TYPED
+/// failure class rather than from its message.
+///
+/// The anti-pattern this closes: all four of these classes used to end in the
+/// same place — a `warn!` and nothing else — so "my trigger fired without being
+/// gated" was unanswerable from the ledger that exists to answer exactly that.
+/// Worse, under `on_error: skip` a crashed predicate was recorded as
+/// `predicate_veto`, i.e. as a healthy gate decision for a sandbox that
+/// crashed.
+pub fn hook_failure_outcome(e: &pumper_core::Error) -> &'static str {
+    use pumper_core::error::PluginFailure as F;
+    match e.plugin_failure() {
+        // The sandbox stopped it: explicit trap, fuel exhaustion, memory cap.
+        Some(F::Trap) => "hook_trap",
+        // It returned, but not the contract.
+        Some(F::MalformedOutput) => "hook_malformed",
+        // Loaded, but it is not an executable plugin (no extract ABI).
+        Some(F::MissingExport) => "hook_not_executable",
+        // Not loaded at all, or the whole subsystem is off — both mean the hook
+        // did nothing and the hop was never gated.
+        Some(F::Unknown) | Some(F::Disabled) => "plugin_missing",
+        // The host broke around the call, or an error arrived from somewhere
+        // that is not the plugin host at all. Either way it is our bug, not the
+        // plugin's, and it must not read as one of the classes above.
+        Some(F::Host) | None => "hook_host_error",
+    }
+}
+
 /// Runs a trigger's plugin hooks over the built `_trigger` object.
-/// `None` = the predicate said skip; `Some(obj)` = the (possibly transformed)
-/// object to merge into target params. Every failure path is fail-open with a
-/// loud log: predicate errors fall back to the hook's `on_error` default
-/// (fire), transform errors keep the untransformed object.
+///
+/// Fail-open is unchanged: a predicate that traps, burns its fuel, is missing,
+/// or answers nonsense still lets the hop fire unless `on_error: "skip"` says
+/// otherwise, and a failing transform keeps the original envelope. What changed
+/// is that every one of those paths now leaves a truthful [`HookIncident`] for
+/// the caller to record, instead of only a `warn!` line.
 pub async fn apply_plugin_hooks(
     plugins: &dyn pumper_core::Plugins,
     trigger: &Trigger,
     obj: Value,
-) -> Option<Value> {
+) -> HookVerdict {
     let Some(hooks) = &trigger.plugin_hooks else {
-        return Some(obj);
+        return HookVerdict::clean(obj);
     };
+    let mut incidents: Vec<HookIncident> = Vec::new();
+
     if let Some(hook) = &hooks.predicate {
         let input = obj.to_string();
-        match plugins.run(&hook.plugin, &input, &hook.params).await {
+        // How a FAILED predicate resolves. Errors and malformed verdicts share
+        // this: both mean "the gate did not answer", and `on_error` is the one
+        // knob that decides what an unanswered gate means.
+        let fire = predicate_fail_default(hook.on_error.as_deref());
+        let outcome_and_detail = match plugins.run(&hook.plugin, &input, &hook.params).await {
             Ok(out) => match predicate_verdict(&out) {
-                Some(true) => {}
+                Some(true) => None,
                 Some(false) => {
                     info!(trigger = %trigger.id, plugin = %hook.plugin,
                           "trigger skipped: predicate plugin returned pass=false");
-                    return None;
+                    incidents.push(HookIncident {
+                        slot: HookSlot::Predicate,
+                        plugin: hook.plugin.clone(),
+                        outcome: "predicate_veto",
+                        detail: format!("predicate plugin '{}' returned pass=false", hook.plugin),
+                    });
+                    return HookVerdict {
+                        obj: None,
+                        incidents,
+                    };
                 }
-                None => {
-                    let fire = predicate_fail_default(hook.on_error.as_deref());
-                    warn!(trigger = %trigger.id, plugin = %hook.plugin,
-                          fallback = if fire { "fire" } else { "skip" },
-                          "predicate plugin returned a malformed verdict (want {{\"pass\": bool}}): {out}");
-                    if !fire {
-                        return None;
-                    }
-                }
+                None => Some((
+                    "hook_malformed",
+                    format!(
+                        "predicate plugin '{}' returned a malformed verdict \
+                         (want {{\"pass\": bool}}): {out}",
+                        hook.plugin
+                    ),
+                )),
             },
-            Err(e) => {
-                let fire = predicate_fail_default(hook.on_error.as_deref());
-                warn!(trigger = %trigger.id, plugin = %hook.plugin,
-                      fallback = if fire { "fire" } else { "skip" },
-                      "predicate plugin failed (trap/fuel/missing): {e}");
-                if !fire {
-                    return None;
-                }
+            Err(e) => Some((hook_failure_outcome(&e), format!("{e}"))),
+        };
+        if let Some((outcome, why)) = outcome_and_detail {
+            warn!(trigger = %trigger.id, plugin = %hook.plugin, %outcome,
+                  fallback = if fire { "fire" } else { "skip" },
+                  "predicate hook did not answer: {why}");
+            // The stopped case keeps the FAILURE's own outcome rather than
+            // borrowing `predicate_veto`. A sandbox that crashed and a gate that
+            // said no are different facts, and an operator counting vetoes must
+            // not be shown a crash as a healthy decision. The consequence lives
+            // in `detail`, so one row carries both halves.
+            let detail = if fire {
+                format!("{why} — on_error=fire, hop NOT gated")
+            } else {
+                format!("{why} — on_error=skip, hop stopped")
+            };
+            incidents.push(HookIncident {
+                slot: HookSlot::Predicate,
+                plugin: hook.plugin.clone(),
+                outcome,
+                detail,
+            });
+            if !fire {
+                return HookVerdict {
+                    obj: None,
+                    incidents,
+                };
             }
         }
     }
+
     let obj = if let Some(hook) = &hooks.transform {
         let input = obj.to_string();
         match plugins.run(&hook.plugin, &input, &hook.params).await {
@@ -283,18 +418,42 @@ pub async fn apply_plugin_hooks(
             Ok(other) => {
                 warn!(trigger = %trigger.id, plugin = %hook.plugin,
                       "transform plugin returned non-object output; keeping the original envelope: {other}");
+                incidents.push(HookIncident {
+                    slot: HookSlot::Transform,
+                    plugin: hook.plugin.clone(),
+                    outcome: "hook_malformed",
+                    // Same consequence phrasing as the transform error path
+                    // below: both keep the original envelope, and a ledger that
+                    // words one failure differently from another is a ledger an
+                    // operator has to read twice.
+                    detail: format!(
+                        "transform plugin '{}' returned non-object output: {other} \
+                         — original envelope kept, hop NOT shaped",
+                        hook.plugin
+                    ),
+                });
                 obj
             }
             Err(e) => {
-                warn!(trigger = %trigger.id, plugin = %hook.plugin,
-                      "transform plugin failed (trap/fuel/missing); keeping the original envelope: {e}");
+                let outcome = hook_failure_outcome(&e);
+                warn!(trigger = %trigger.id, plugin = %hook.plugin, %outcome,
+                      "transform hook failed; keeping the original envelope: {e}");
+                incidents.push(HookIncident {
+                    slot: HookSlot::Transform,
+                    plugin: hook.plugin.clone(),
+                    outcome,
+                    detail: format!("{e} — original envelope kept, hop NOT shaped"),
+                });
                 obj
             }
         }
     } else {
         obj
     };
-    Some(obj)
+    HookVerdict {
+        obj: Some(obj),
+        incidents,
+    }
 }
 
 /// At-most-once-per-source-run dedup key (existing partial unique index).
@@ -638,24 +797,73 @@ impl Ctx<'_> {
     }
 }
 
-/// Reports every configured hook of `trigger` whose plugin is not loaded: one
-/// error-level log and one `plugin_missing` ledger row per missing module.
+/// Logs, at error level, every configured hook of `trigger` whose plugin the
+/// host cannot execute.
 ///
 /// Deliberately NOT a gate. The hop proceeds into the fail-open path exactly
 /// as before — a mis-deployed plugin must not wedge a pipeline edge — but the
 /// silence is what made this bug survivable, and the silence is what ends.
-async fn report_missing_plugins(state: &AppState, trigger: &Trigger, ctx: &Ctx<'_>) {
+///
+/// The matching LEDGER row is not written here: it comes from the hook's own
+/// [`HookIncident`] (the call fails with `unknown_plugin` /
+/// `missing_export`, which [`hook_failure_outcome`] classifies), so a missing
+/// plugin produces exactly one row, from the same place every other hook
+/// failure does. This function is the loud log that names the fix.
+fn report_missing_plugins(state: &AppState, trigger: &Trigger) {
     for plugin in missing_hook_plugins(state.plugins.as_ref(), trigger) {
         error!(trigger = %trigger.id, plugin = %plugin,
-               "trigger hook names a plugin that is not loaded: the hook did NOTHING \
-                (predicate did not gate / transform did not shape) and the hop takes the \
+               "trigger hook names a plugin this host cannot execute (not installed, or \
+                installed without the extract ABI): the hook does NOTHING — the predicate \
+                does not gate, the transform does not shape — and the hop takes the \
                 fail-open path. Build and install it with `just plugins-install`, then \
                 POST /plugins/reload");
+    }
+}
+
+/// Outcomes that describe the DEPLOYMENT rather than the event being evaluated.
+///
+/// A typo'd plugin name is not news on the ten-thousandth event; it is the same
+/// fact it was on the first. Recording it per event buried the per-event
+/// decisions the ledger exists for under identical rows — the known gap
+/// `docs/features/trigger-plugins.md` used to carry.
+fn is_static_hook_fact(outcome: &str) -> bool {
+    matches!(outcome, "plugin_missing" | "hook_not_executable")
+}
+
+/// Records the ledger rows one hook evaluation produced.
+///
+/// Everything is written, EXCEPT [`is_static_hook_fact`] outcomes: those are
+/// written once per `(trigger, plugin, outcome)` and then suppressed until
+/// `POST /plugins/reload` clears the set — reloading being the only thing that
+/// can change the answer, and therefore exactly the state change that re-arms
+/// the report.
+async fn record_hook_incidents(
+    state: &AppState,
+    trigger: &Trigger,
+    ctx: &Ctx<'_>,
+    incidents: &[HookIncident],
+) {
+    for inc in incidents {
+        if is_static_hook_fact(inc.outcome) {
+            let key = format!("{}|{}|{}", trigger.id, inc.plugin, inc.outcome);
+            // Guard dropped before the await: the set is a fast membership
+            // check, never held across IO.
+            let first_sighting = {
+                let mut seen = state.plugin_missing_reported.lock().await;
+                seen.insert(key)
+            };
+            if !first_sighting {
+                debug!(trigger = %trigger.id, plugin = %inc.plugin, outcome = %inc.outcome,
+                       "hook deployment fault already in the ledger for this trigger; \
+                        not writing an identical row per event (POST /plugins/reload re-arms it)");
+                continue;
+            }
+        }
         record(
             state,
             NewTriggerRun {
-                detail: Some(&plugin),
-                ..ctx.row(&trigger.id, "plugin_missing")
+                detail: Some(&inc.detail),
+                ..ctx.row(&trigger.id, inc.outcome)
             },
         )
         .await;
@@ -915,9 +1123,10 @@ pub async fn fire_external_triggers(
             &chain,
         );
         // Plugin predicate/transform hooks (fail-open, see `apply_plugin_hooks`).
-        report_missing_plugins(state, trigger, &ctx).await;
-        let Some(obj) = apply_plugin_hooks(state.plugins.as_ref(), trigger, obj).await else {
-            record(state, ctx.row(&trigger.id, "predicate_veto")).await;
+        report_missing_plugins(state, trigger);
+        let verdict = apply_plugin_hooks(state.plugins.as_ref(), trigger, obj).await;
+        record_hook_incidents(state, trigger, &ctx, &verdict.incidents).await;
+        let Some(obj) = verdict.obj else {
             continue;
         };
         if !state.registry.contains_key(&trigger.target_app) {
@@ -1044,10 +1253,13 @@ async fn enqueue_hop(
 ) -> usize {
     // Plugin hooks first: a predicate may veto the hop, a transform may shape
     // the `_trigger` envelope. Both fail open (see `apply_plugin_hooks`), and a
-    // hook whose plugin was never deployed says so loudly first.
-    report_missing_plugins(state, trigger, ctx).await;
-    let Some(obj) = apply_plugin_hooks(state.plugins.as_ref(), trigger, obj).await else {
-        record(state, ctx.row(&trigger.id, "predicate_veto")).await;
+    // hook whose plugin was never deployed says so loudly first. Every hook
+    // incident — veto, trap, malformed output, missing module — lands in the
+    // ledger before the hop's own decision does.
+    report_missing_plugins(state, trigger);
+    let verdict = apply_plugin_hooks(state.plugins.as_ref(), trigger, obj).await;
+    record_hook_incidents(state, trigger, ctx, &verdict.incidents).await;
+    let Some(obj) = verdict.obj else {
         return 0;
     };
     if !state.registry.contains_key(&trigger.target_app) {
@@ -1465,18 +1677,23 @@ mod tests {
 
     // ── plugin hooks (M15) ───────────────────────────────────────────────────
 
+    use pumper_core::error::PluginFailure;
     use pumper_core::{PluginHook, TriggerPluginHooks};
 
     /// Canned in-memory host standing in for the WASM runtime — the same
     /// stubbing move the plugin app tests use when the .wasm artifact is
     /// absent. Records the envelope each plugin received.
+    ///
+    /// Failures are declared as a [`PluginFailure`] rather than as a message,
+    /// because the class is what the ledger now reads: a stub that could only
+    /// produce prose could not exercise the classification at all.
     struct StubPlugins {
-        outputs: std::collections::HashMap<String, std::result::Result<Value, String>>,
+        outputs: std::collections::HashMap<String, std::result::Result<Value, PluginFailure>>,
         calls: std::sync::Mutex<Vec<(String, String, Value)>>,
     }
 
     impl StubPlugins {
-        fn new(outputs: Vec<(&str, std::result::Result<Value, String>)>) -> Self {
+        fn new(outputs: Vec<(&str, std::result::Result<Value, PluginFailure>)>) -> Self {
             Self {
                 outputs: outputs
                     .into_iter()
@@ -1496,8 +1713,12 @@ mod tests {
                 .push((name.to_string(), input.to_string(), params.clone()));
             match self.outputs.get(name) {
                 Some(Ok(v)) => Ok(v.clone()),
-                Some(Err(e)) => Err(pumper_core::Error::App(e.clone())),
-                None => Err(pumper_core::Error::App(format!("unknown plugin '{name}'"))),
+                Some(Err(kind)) => Err(pumper_core::Error::plugin(*kind, name, "stub failure")),
+                None => Err(pumper_core::Error::plugin(
+                    PluginFailure::Unknown,
+                    name,
+                    "not loaded",
+                )),
             }
         }
         fn list(&self) -> Vec<String> {
@@ -1593,6 +1814,16 @@ mod tests {
         assert_eq!(restamp_provenance(&original, json!([1, 2])), original);
     }
 
+    /// The object half of a verdict — what `apply_plugin_hooks` used to return
+    /// before it also had to report WHY. The incident half has its own tests.
+    async fn hook_obj(
+        plugins: &dyn pumper_core::Plugins,
+        trigger: &pumper_core::Trigger,
+        obj: Value,
+    ) -> Option<Value> {
+        apply_plugin_hooks(plugins, trigger, obj).await.obj
+    }
+
     #[tokio::test]
     async fn hooks_absent_is_a_passthrough() {
         let plugins = StubPlugins::new(vec![]);
@@ -1601,8 +1832,12 @@ mod tests {
             transform: None,
         });
         trigger.plugin_hooks = None;
-        let out = apply_plugin_hooks(&plugins, &trigger, delta()).await;
-        assert_eq!(out, Some(delta()));
+        let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
+        assert_eq!(verdict.obj, Some(delta()));
+        assert!(
+            verdict.incidents.is_empty(),
+            "a trigger with no hooks has nothing to report"
+        );
         assert!(plugins.calls.lock().unwrap().is_empty(), "no plugin runs");
     }
 
@@ -1613,7 +1848,7 @@ mod tests {
             predicate: Some(hook("gate", json!({ "min_count": 5 }), None)),
             transform: None,
         });
-        assert_eq!(apply_plugin_hooks(&plugins, &trigger, delta()).await, None);
+        assert_eq!(hook_obj(&plugins, &trigger, delta()).await, None);
         // The plugin saw the delta envelope as input and its own params.
         let calls = plugins.calls.lock().unwrap();
         assert_eq!(calls[0].0, "gate");
@@ -1625,43 +1860,31 @@ mod tests {
         drop(calls);
 
         let plugins = StubPlugins::new(vec![("gate", Ok(json!({ "pass": true })))]);
-        assert_eq!(
-            apply_plugin_hooks(&plugins, &trigger, delta()).await,
-            Some(delta())
-        );
+        assert_eq!(hook_obj(&plugins, &trigger, delta()).await, Some(delta()));
     }
 
     #[tokio::test]
     async fn predicate_failure_is_fail_open_by_default_and_skip_when_configured() {
         // Trap/error → default fail-open: the hop still fires, envelope intact.
-        let plugins = StubPlugins::new(vec![("gate", Err("fuel exhausted".into()))]);
+        let plugins = StubPlugins::new(vec![("gate", Err(PluginFailure::Trap))]);
         let trigger = trigger_with_hooks(TriggerPluginHooks {
             predicate: Some(hook("gate", json!({}), None)),
             transform: None,
         });
-        assert_eq!(
-            apply_plugin_hooks(&plugins, &trigger, delta()).await,
-            Some(delta())
-        );
+        assert_eq!(hook_obj(&plugins, &trigger, delta()).await, Some(delta()));
         // Unknown plugin (not loaded) is the same failure class.
         let plugins = StubPlugins::new(vec![]);
-        assert_eq!(
-            apply_plugin_hooks(&plugins, &trigger, delta()).await,
-            Some(delta())
-        );
+        assert_eq!(hook_obj(&plugins, &trigger, delta()).await, Some(delta()));
         // Malformed verdict → same fail-open path.
         let plugins = StubPlugins::new(vec![("gate", Ok(json!({ "verdict": "yes" })))]);
-        assert_eq!(
-            apply_plugin_hooks(&plugins, &trigger, delta()).await,
-            Some(delta())
-        );
+        assert_eq!(hook_obj(&plugins, &trigger, delta()).await, Some(delta()));
         // on_error: "skip" flips the default.
-        let plugins = StubPlugins::new(vec![("gate", Err("trap".into()))]);
+        let plugins = StubPlugins::new(vec![("gate", Err(PluginFailure::Trap))]);
         let trigger = trigger_with_hooks(TriggerPluginHooks {
             predicate: Some(hook("gate", json!({}), Some("skip"))),
             transform: None,
         });
-        assert_eq!(apply_plugin_hooks(&plugins, &trigger, delta()).await, None);
+        assert_eq!(hook_obj(&plugins, &trigger, delta()).await, None);
     }
 
     #[tokio::test]
@@ -1674,7 +1897,7 @@ mod tests {
             predicate: None,
             transform: Some(hook("slim", json!({}), None)),
         });
-        let out = apply_plugin_hooks(&plugins, &trigger, delta())
+        let out = hook_obj(&plugins, &trigger, delta())
             .await
             .expect("transform never skips");
         assert_eq!(out["summary"], "3 fresh in d");
@@ -1682,16 +1905,10 @@ mod tests {
         assert_eq!(out["trigger_id"], "T1");
 
         // Error / non-object output → the untransformed envelope, loudly.
-        let plugins = StubPlugins::new(vec![("slim", Err("trap".into()))]);
-        assert_eq!(
-            apply_plugin_hooks(&plugins, &trigger, delta()).await,
-            Some(delta())
-        );
+        let plugins = StubPlugins::new(vec![("slim", Err(PluginFailure::Trap))]);
+        assert_eq!(hook_obj(&plugins, &trigger, delta()).await, Some(delta()));
         let plugins = StubPlugins::new(vec![("slim", Ok(json!([1, 2, 3])))]);
-        assert_eq!(
-            apply_plugin_hooks(&plugins, &trigger, delta()).await,
-            Some(delta())
-        );
+        assert_eq!(hook_obj(&plugins, &trigger, delta()).await, Some(delta()));
     }
 
     #[tokio::test]
@@ -1704,9 +1921,208 @@ mod tests {
             predicate: Some(hook("gate", json!({}), None)),
             transform: Some(hook("slim", json!({}), None)),
         });
-        assert_eq!(apply_plugin_hooks(&plugins, &trigger, delta()).await, None);
+        assert_eq!(hook_obj(&plugins, &trigger, delta()).await, None);
         let calls = plugins.calls.lock().unwrap();
         assert_eq!(calls.len(), 1, "veto must short-circuit the transform");
         assert_eq!(calls[0].0, "gate");
+    }
+
+    // ── hook incidents: what the ledger is told ─────────────────────────────
+
+    /// THE conflation this closes: a predicate that CRASHED under
+    /// `on_error: skip` was recorded as `predicate_veto` — the same word a
+    /// healthy gate saying "no" uses. An operator reading the ledger saw a
+    /// clean gate decision for a sandbox that had blown up.
+    #[tokio::test]
+    async fn a_crashed_predicate_is_not_recorded_as_a_veto() {
+        let plugins = StubPlugins::new(vec![("gate", Err(PluginFailure::Trap))]);
+        let trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: Some(hook("gate", json!({}), Some("skip"))),
+            transform: None,
+        });
+        let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
+        assert_eq!(verdict.obj, None, "on_error=skip still stops the hop");
+        assert_eq!(verdict.incidents.len(), 1);
+        let inc = &verdict.incidents[0];
+        assert_eq!(inc.outcome, "hook_trap");
+        assert_ne!(
+            inc.outcome, "predicate_veto",
+            "a crashed sandbox must never read as a gate decision"
+        );
+        assert_eq!(inc.slot, HookSlot::Predicate);
+        assert_eq!(inc.plugin, "gate");
+        assert!(
+            inc.detail.contains("on_error=skip") && inc.detail.contains("stopped"),
+            "the row must say the hop was stopped: {}",
+            inc.detail
+        );
+        assert_eq!(
+            verdict.stop_reason(),
+            Some(inc.detail.as_str()),
+            "a dry-run echoes the real reason, not a fabricated one"
+        );
+
+        // …and the genuine article still uses the word it earned.
+        let plugins = StubPlugins::new(vec![("gate", Ok(json!({ "pass": false })))]);
+        let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
+        assert_eq!(verdict.obj, None);
+        assert_eq!(verdict.incidents[0].outcome, "predicate_veto");
+        assert!(verdict.incidents[0].detail.contains("pass=false"));
+    }
+
+    /// The four sandbox failure classes the ledger could not represent at all:
+    /// a hop fired ungated and the only trace was a `warn!`. Each now leaves a
+    /// distinct, truthful row — and the hop still fires, because fail-open is
+    /// the contract and this is honesty, not a behaviour change.
+    #[tokio::test]
+    async fn every_hook_failure_class_leaves_its_own_row_and_still_fires() {
+        for (kind, expected) in [
+            (PluginFailure::Trap, "hook_trap"),
+            (PluginFailure::MalformedOutput, "hook_malformed"),
+            (PluginFailure::MissingExport, "hook_not_executable"),
+            (PluginFailure::Unknown, "plugin_missing"),
+            (PluginFailure::Disabled, "plugin_missing"),
+            (PluginFailure::Host, "hook_host_error"),
+        ] {
+            let plugins = StubPlugins::new(vec![("gate", Err(kind))]);
+            let trigger = trigger_with_hooks(TriggerPluginHooks {
+                predicate: Some(hook("gate", json!({}), None)),
+                transform: None,
+            });
+            let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
+            assert_eq!(
+                verdict.obj,
+                Some(delta()),
+                "{kind:?} must still fail OPEN — this change is honesty, not a gate"
+            );
+            assert_eq!(verdict.incidents.len(), 1, "{kind:?}");
+            assert_eq!(verdict.incidents[0].outcome, expected, "{kind:?}");
+            assert!(
+                verdict.incidents[0].detail.contains("NOT gated"),
+                "{kind:?}: the row must say the hop was not gated: {}",
+                verdict.incidents[0].detail
+            );
+        }
+    }
+
+    /// A predicate that answers something other than `{"pass": bool}` is a
+    /// contract violation, not a trap — and a transform that answers a
+    /// non-object is the same violation in the other slot.
+    #[tokio::test]
+    async fn malformed_hook_output_is_recorded_as_malformed_in_either_slot() {
+        let plugins = StubPlugins::new(vec![("gate", Ok(json!({ "verdict": "yes" })))]);
+        let trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: Some(hook("gate", json!({}), None)),
+            transform: None,
+        });
+        let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
+        assert_eq!(verdict.obj, Some(delta()));
+        assert_eq!(verdict.incidents[0].outcome, "hook_malformed");
+        assert_eq!(verdict.incidents[0].slot, HookSlot::Predicate);
+
+        let plugins = StubPlugins::new(vec![("slim", Ok(json!([1, 2, 3])))]);
+        let trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: None,
+            transform: Some(hook("slim", json!({}), None)),
+        });
+        let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
+        assert_eq!(verdict.obj, Some(delta()), "the original envelope survives");
+        assert_eq!(verdict.incidents[0].outcome, "hook_malformed");
+        assert_eq!(verdict.incidents[0].slot, HookSlot::Transform);
+        assert!(verdict.incidents[0].detail.contains("NOT shaped"));
+    }
+
+    /// A hop that sails through both hooks says nothing — the rows have to mean
+    /// something, and a per-event row for a healthy edge is the amplification
+    /// this whole direction is about avoiding.
+    #[tokio::test]
+    async fn healthy_hooks_report_no_incidents() {
+        let plugins = StubPlugins::new(vec![
+            ("gate", Ok(json!({ "pass": true }))),
+            ("slim", Ok(json!({ "summary": "ok" }))),
+        ]);
+        let trigger = trigger_with_hooks(TriggerPluginHooks {
+            predicate: Some(hook("gate", json!({}), None)),
+            transform: Some(hook("slim", json!({}), None)),
+        });
+        let verdict = apply_plugin_hooks(&plugins, &trigger, delta()).await;
+        assert!(verdict.obj.is_some());
+        assert!(verdict.incidents.is_empty());
+        assert_eq!(verdict.stop_reason(), None);
+    }
+
+    /// The convention, enforced as an inventory rather than as a sentence: every
+    /// outcome this module can hand the ledger is in
+    /// [`pumper_core::storage::TRIGGER_OUTCOMES`], and every `hook_*` word in
+    /// that vocabulary is one something here actually produces. A row whose
+    /// outcome is not in the allowlist is a value `GET /triggers/{id}/runs`
+    /// documents as impossible; a listed word nothing produces is dead API.
+    #[test]
+    fn hook_outcomes_and_the_storage_allowlist_agree_in_both_directions() {
+        use pumper_core::storage::TRIGGER_OUTCOMES;
+        use std::collections::BTreeSet;
+
+        let mut produced: BTreeSet<&str> = BTreeSet::new();
+        for kind in [
+            PluginFailure::Unknown,
+            PluginFailure::Disabled,
+            PluginFailure::MissingExport,
+            PluginFailure::Trap,
+            PluginFailure::MalformedOutput,
+            PluginFailure::Host,
+        ] {
+            produced.insert(hook_failure_outcome(&pumper_core::Error::plugin(
+                kind, "p", "x",
+            )));
+        }
+        // The two this module names directly rather than deriving from a class.
+        produced.insert("predicate_veto");
+        produced.insert("hook_malformed");
+        // An error that never came from the plugin host at all still lands
+        // somewhere allowlisted rather than inventing a word.
+        produced.insert(hook_failure_outcome(&pumper_core::Error::App("x".into())));
+
+        for outcome in &produced {
+            assert!(
+                TRIGGER_OUTCOMES.contains(outcome),
+                "'{outcome}' is recorded but not in TRIGGER_OUTCOMES — add it there \
+                 (with a comment saying what it means) or stop producing it"
+            );
+        }
+        let listed: BTreeSet<&str> = TRIGGER_OUTCOMES
+            .iter()
+            .copied()
+            .filter(|o| o.starts_with("hook_"))
+            .collect();
+        let produced_hook: BTreeSet<&str> = produced
+            .iter()
+            .copied()
+            .filter(|o| o.starts_with("hook_"))
+            .collect();
+        assert_eq!(
+            listed, produced_hook,
+            "the hook_* vocabulary drifted: TRIGGER_OUTCOMES and this module disagree"
+        );
+    }
+
+    /// Which outcomes are bounded, pinned: exactly the ones that describe the
+    /// DEPLOYMENT. A per-event failure (a trap on this particular delta) is news
+    /// every time and must never be suppressed.
+    #[test]
+    fn only_deployment_facts_are_deduped_not_per_event_failures() {
+        assert!(is_static_hook_fact("plugin_missing"));
+        assert!(is_static_hook_fact("hook_not_executable"));
+        for per_event in [
+            "hook_trap",
+            "hook_malformed",
+            "hook_host_error",
+            "predicate_veto",
+            "fired",
+        ] {
+            assert!(
+                !is_static_hook_fact(per_event),
+                "'{per_event}' varies per event — suppressing it would hide real failures"
+            );
+        }
     }
 }

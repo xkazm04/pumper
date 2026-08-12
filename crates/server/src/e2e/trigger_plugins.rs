@@ -28,6 +28,13 @@ use super::harness::{test_state_with_plugins, FakeApp};
 use crate::state::AppState;
 use crate::triggers::{apply_plugin_hooks, fire_terminal_triggers, missing_hook_plugins};
 
+/// The object half of a hook verdict — the fail-open behaviour these tests were
+/// written against. The incident half (what the ledger is told) is asserted by
+/// the ledger tests further down, against the same real host.
+async fn hook_obj(plugins: &dyn Plugins, trigger: &Trigger, obj: Value) -> Option<Value> {
+    apply_plugin_hooks(plugins, trigger, obj).await.obj
+}
+
 // ── wat fixtures ─────────────────────────────────────────────────────────────
 
 /// A module in the plugin ABI shape whose `extract_v2` always returns `out`.
@@ -159,13 +166,13 @@ async fn a_real_wasm_predicate_vetoes_the_hop_and_a_passing_one_does_not() {
     );
     let vetoed = trigger(Some(predicate_only("veto", json!({}))));
     assert_eq!(
-        apply_plugin_hooks(plugins.as_ref(), &vetoed, delta()).await,
+        hook_obj(plugins.as_ref(), &vetoed, delta()).await,
         None,
         "a real module returning pass=false must stop the hop"
     );
     let allowed = trigger(Some(predicate_only("allow", json!({}))));
     assert_eq!(
-        apply_plugin_hooks(plugins.as_ref(), &allowed, delta()).await,
+        hook_obj(plugins.as_ref(), &allowed, delta()).await,
         Some(delta()),
         "pass=true leaves the envelope untouched"
     );
@@ -181,7 +188,7 @@ async fn a_real_wasm_transform_reshapes_but_cannot_forge_provenance() {
         &[("shape", &returning_wat(forging))],
     );
     let t = trigger(Some(transform_only("shape", json!({}))));
-    let out = apply_plugin_hooks(plugins.as_ref(), &t, delta())
+    let out = hook_obj(plugins.as_ref(), &t, delta())
         .await
         .expect("a transform never skips");
     // The plugin's shaping survives…
@@ -216,29 +223,23 @@ async fn every_sandbox_failure_mode_fails_open_not_closed() {
     // 1. Fuel exhaustion in a predicate → the hop still fires.
     let t = trigger(Some(predicate_only("burn", json!({}))));
     assert_eq!(
-        apply_plugin_hooks(plugins.as_ref(), &t, delta()).await,
+        hook_obj(plugins.as_ref(), &t, delta()).await,
         Some(delta()),
         "a predicate that burns its fuel budget must not wedge the edge"
     );
     // 2. An outright trap → same.
     let t = trigger(Some(predicate_only("boom", json!({}))));
-    assert_eq!(
-        apply_plugin_hooks(plugins.as_ref(), &t, delta()).await,
-        Some(delta())
-    );
+    assert_eq!(hook_obj(plugins.as_ref(), &t, delta()).await, Some(delta()));
     // 3. Non-JSON output → same, and specifically NOT a malformed envelope
     //    leaking into target params.
     let t = trigger(Some(predicate_only("garbage", json!({}))));
-    assert_eq!(
-        apply_plugin_hooks(plugins.as_ref(), &t, delta()).await,
-        Some(delta())
-    );
+    assert_eq!(hook_obj(plugins.as_ref(), &t, delta()).await, Some(delta()));
 
     // The transform half of each: the ORIGINAL envelope survives intact.
     for plugin in ["burn", "boom", "garbage"] {
         let t = trigger(Some(transform_only(plugin, json!({}))));
         assert_eq!(
-            apply_plugin_hooks(plugins.as_ref(), &t, delta()).await,
+            hook_obj(plugins.as_ref(), &t, delta()).await,
             Some(delta()),
             "a failing {plugin} transform must keep the untransformed envelope"
         );
@@ -250,7 +251,7 @@ async fn every_sandbox_failure_mode_fails_open_not_closed() {
         h.on_error = Some("skip".into());
     }
     assert_eq!(
-        apply_plugin_hooks(plugins.as_ref(), &t, delta()).await,
+        hook_obj(plugins.as_ref(), &t, delta()).await,
         None,
         "on_error=skip is the opt-in to failing closed"
     );
@@ -335,10 +336,247 @@ async fn a_configured_hook_with_no_loaded_plugin_is_recorded_not_only_silently_p
         .iter()
         .find(|d| d.outcome == "plugin_missing")
         .expect("a plugin_missing row");
-    assert_eq!(missing.detail.as_deref(), Some("never-built"));
+    let detail = missing.detail.as_deref().unwrap_or_default();
+    assert!(detail.contains("never-built"), "names the plugin: {detail}");
+    assert!(
+        detail.contains("NOT gated"),
+        "and says what that cost: {detail}"
+    );
     assert!(
         decisions.iter().any(|d| d.outcome == "fired"),
         "the hop is recorded as fired too — the row is a note, not a veto"
+    );
+}
+
+// ── the sandbox failure classes, in the ledger ───────────────────────────────
+
+/// Creates a job-kind trigger on `fake` with the given hooks and returns it.
+async fn hooked_trigger(state: &AppState, hooks: TriggerPluginHooks) -> Trigger {
+    state
+        .storage
+        .create_trigger(&NewTrigger {
+            name: Some("gated"),
+            source_kind: "job",
+            source_app: "fake",
+            source_dataset: None,
+            on_change: None,
+            on_status: Some("succeeded"),
+            target_app: "fake",
+            params: &json!({}),
+            budget_usd: None,
+            priority: 0,
+            max_attempts: 1,
+            filters: None,
+            plugin_hooks: Some(&hooks),
+        })
+        .await
+        .expect("create trigger")
+}
+
+async fn outcomes_of(state: &AppState, trigger_id: &str) -> Vec<String> {
+    state
+        .storage
+        .list_trigger_runs_page(trigger_id, None, 50)
+        .await
+        .expect("decisions")
+        .into_iter()
+        .map(|d| d.outcome)
+        .collect()
+}
+
+/// The question the decision ledger exists to answer — "why didn't my trigger
+/// gate?" — was unanswerable for every sandbox failure: a real module that
+/// trapped let the hop fire with nothing but a `warn!` behind it. Through the
+/// REAL host, with a real trap.
+#[tokio::test]
+async fn a_real_trap_leaves_a_hook_trap_row_while_the_hop_still_fires() {
+    let plugins = wat_host("ledger-trap", 200_000_000, &[("boom", TRAP_WAT)]);
+    let (state, _store) = test_state_with_plugins(vec![Arc::new(FakeApp)], plugins).await;
+    let t = hooked_trigger(&state, predicate_only("boom", json!({}))).await;
+
+    let job = succeeded_source(&state).await;
+    fire_terminal_triggers(&state, &job).await;
+
+    let decisions = state
+        .storage
+        .list_trigger_runs_page(&t.id, None, 50)
+        .await
+        .unwrap();
+    let trap = decisions
+        .iter()
+        .find(|d| d.outcome == "hook_trap")
+        .expect("the trap is in the ledger");
+    let detail = trap.detail.as_deref().unwrap_or_default();
+    assert!(detail.contains("boom"), "names the plugin: {detail}");
+    assert!(
+        detail.contains("NOT gated"),
+        "and says the hop went through ungated: {detail}"
+    );
+    assert!(
+        !decisions.iter().any(|d| d.outcome == "predicate_veto"),
+        "a crashed sandbox must not be recorded as a gate decision"
+    );
+    assert!(
+        decisions.iter().any(|d| d.outcome == "fired"),
+        "fail-open is unchanged — the hop still fires"
+    );
+}
+
+/// The other half: `on_error: skip` stops the hop, and the row still says
+/// `hook_trap` rather than borrowing `predicate_veto`. This is the exact
+/// conflation an operator could not see through — a crashed sandbox rendered as
+/// a healthy "the gate said no".
+#[tokio::test]
+async fn a_fuel_burn_under_on_error_skip_stops_the_hop_without_faking_a_veto() {
+    // Small budget so the spinning module exhausts it fast.
+    let plugins = wat_host("ledger-fuel", 200_000, &[("burn", BURN_WAT)]);
+    let (state, _store) = test_state_with_plugins(vec![Arc::new(FakeApp)], plugins).await;
+    let mut hooks = predicate_only("burn", json!({}));
+    if let Some(p) = hooks.predicate.as_mut() {
+        p.on_error = Some("skip".into());
+    }
+    let t = hooked_trigger(&state, hooks).await;
+
+    let job = succeeded_source(&state).await;
+    fire_terminal_triggers(&state, &job).await;
+
+    assert!(
+        state
+            .storage
+            .jobs_by_trigger(&t.id, 10)
+            .await
+            .unwrap()
+            .is_empty(),
+        "on_error=skip really did stop the hop"
+    );
+    let decisions = state
+        .storage
+        .list_trigger_runs_page(&t.id, None, 50)
+        .await
+        .unwrap();
+    let trap = decisions
+        .iter()
+        .find(|d| d.outcome == "hook_trap")
+        .expect("the fuel exhaustion is in the ledger");
+    assert!(trap
+        .detail
+        .as_deref()
+        .unwrap_or_default()
+        .contains("on_error=skip"));
+    assert!(
+        !decisions.iter().any(|d| d.outcome == "predicate_veto"),
+        "THE bug: a crashed predicate under on_error=skip used to be indistinguishable \
+         from a predicate that answered pass=false"
+    );
+}
+
+/// A transform that answers bytes which are not JSON: the envelope survives
+/// untransformed (fail-open), and the ledger says the shaping never happened.
+#[tokio::test]
+async fn non_json_transform_output_is_recorded_as_malformed() {
+    let plugins = wat_host(
+        "ledger-garbage",
+        200_000_000,
+        &[("garbage", &returning_wat("this is not json"))],
+    );
+    let (state, _store) = test_state_with_plugins(vec![Arc::new(FakeApp)], plugins).await;
+    let t = hooked_trigger(&state, transform_only("garbage", json!({}))).await;
+
+    let job = succeeded_source(&state).await;
+    fire_terminal_triggers(&state, &job).await;
+
+    let outcomes = outcomes_of(&state, &t.id).await;
+    assert!(
+        outcomes.iter().any(|o| o == "hook_malformed"),
+        "expected a hook_malformed row, got {outcomes:?}"
+    );
+    assert!(outcomes.iter().any(|o| o == "fired"));
+}
+
+/// The repo's own fixture shape proved `has()` lied: a module with a `memory`
+/// and nothing else compiled, loaded, and answered `has() == true` — so a hook
+/// pointed at it looked deployed and silently did nothing. Loading stays
+/// permissive (dynamic-app discovery depends on describe-only modules being
+/// loadable); what changed is that it is no longer reported as USABLE.
+#[tokio::test]
+async fn a_module_without_the_extract_abi_is_not_a_usable_hook_plugin() {
+    let plugins = wat_host(
+        "no-abi",
+        200_000_000,
+        &[
+            ("describe_only", "(module (memory (export \"memory\") 1))"),
+            ("real", &returning_wat(r#"{"pass":true}"#)),
+        ],
+    );
+    // Still loaded and still listed for discovery, flagged for what it is…
+    let manifests = plugins.manifests();
+    let entry = manifests
+        .iter()
+        .find(|m| m["name"] == json!("describe_only"))
+        .expect("a describe-only module is still listed");
+    assert_eq!(entry["executable"], json!(false));
+    let real = manifests
+        .iter()
+        .find(|m| m["name"] == json!("real"))
+        .expect("the real plugin is listed");
+    assert_eq!(real["executable"], json!(true));
+    // …but it is not offered as something a caller can run.
+    assert!(!plugins.has("describe_only"), "has() answers executability");
+    assert!(plugins.has("real"));
+    assert_eq!(plugins.list(), vec!["real".to_string()]);
+
+    // And a hook pointed at it is reported, not silently believed.
+    let t = trigger(Some(predicate_only("describe_only", json!({}))));
+    assert_eq!(
+        missing_hook_plugins(plugins.as_ref(), &t),
+        vec!["describe_only"],
+        "the dry-run and the fire path must see the same truth"
+    );
+    let verdict = apply_plugin_hooks(plugins.as_ref(), &t, delta()).await;
+    assert_eq!(verdict.obj, Some(delta()), "fail-open holds");
+    assert_eq!(verdict.incidents[0].outcome, "hook_not_executable");
+}
+
+/// The known gap this closes: `plugin_missing` was written per hook PER EVENT,
+/// forever. A busy edge with one typo buried its own ledger under identical
+/// rows. It is a fact about the deployment, so it is recorded once — and
+/// re-armed by the only thing that can change the answer.
+#[tokio::test]
+async fn a_missing_plugin_is_recorded_once_not_once_per_event() {
+    let plugins = wat_host("dedup", 200_000_000, &[]);
+    let (state, _store) = test_state_with_plugins(vec![Arc::new(FakeApp)], plugins).await;
+    let t = hooked_trigger(&state, predicate_only("never-built", json!({}))).await;
+
+    for _ in 0..3 {
+        let job = succeeded_source(&state).await;
+        fire_terminal_triggers(&state, &job).await;
+    }
+    let outcomes = outcomes_of(&state, &t.id).await;
+    assert_eq!(
+        outcomes.iter().filter(|o| *o == "plugin_missing").count(),
+        1,
+        "three events, one deployment fault, one row — got {outcomes:?}"
+    );
+    assert_eq!(
+        outcomes.iter().filter(|o| *o == "fired").count(),
+        3,
+        "the per-event decisions are all still there — only the repeated \
+         deployment fact is bounded"
+    );
+
+    // A reload is the state change that could make the answer different, so it
+    // re-arms the report (POST /plugins/reload clears the same set).
+    state.plugin_missing_reported.lock().await.clear();
+    let job = succeeded_source(&state).await;
+    fire_terminal_triggers(&state, &job).await;
+    assert_eq!(
+        outcomes_of(&state, &t.id)
+            .await
+            .iter()
+            .filter(|o| *o == "plugin_missing")
+            .count(),
+        2,
+        "after a reload the fault is reported again"
     );
 }
 
@@ -417,36 +655,24 @@ async fn shipped_trigger_gate_gates_on_min_count_and_dataset() {
         "trigger-gate",
         json!({"min_count": 2}),
     )));
-    assert_eq!(
-        apply_plugin_hooks(plugins.as_ref(), &t, delta()).await,
-        Some(delta())
-    );
+    assert_eq!(hook_obj(plugins.as_ref(), &t, delta()).await, Some(delta()));
     // …and does not clear min_count=10 → vetoed.
     let t = trigger(Some(predicate_only(
         "trigger-gate",
         json!({"min_count": 10}),
     )));
-    assert_eq!(
-        apply_plugin_hooks(plugins.as_ref(), &t, delta()).await,
-        None
-    );
+    assert_eq!(hook_obj(plugins.as_ref(), &t, delta()).await, None);
     // The dataset knob: the delta is `grants`.
     let t = trigger(Some(predicate_only(
         "trigger-gate",
         json!({"dataset": "grants"}),
     )));
-    assert_eq!(
-        apply_plugin_hooks(plugins.as_ref(), &t, delta()).await,
-        Some(delta())
-    );
+    assert_eq!(hook_obj(plugins.as_ref(), &t, delta()).await, Some(delta()));
     let t = trigger(Some(predicate_only(
         "trigger-gate",
         json!({"dataset": "orgs"}),
     )));
-    assert_eq!(
-        apply_plugin_hooks(plugins.as_ref(), &t, delta()).await,
-        None
-    );
+    assert_eq!(hook_obj(plugins.as_ref(), &t, delta()).await, None);
 }
 
 #[tokio::test]
@@ -461,7 +687,7 @@ async fn shipped_delta_slim_slims_the_envelope_without_losing_lineage() {
         "delta-slim",
         json!({ "keep": ["dataset", "count"] }),
     )));
-    let out = apply_plugin_hooks(plugins.as_ref(), &t, delta())
+    let out = hook_obj(plugins.as_ref(), &t, delta())
         .await
         .expect("transform never skips");
     assert_eq!(out["dataset"], "grants");
@@ -474,7 +700,7 @@ async fn shipped_delta_slim_slims_the_envelope_without_losing_lineage() {
 
     // `max_keys` mode: the key list is capped, nothing else is dropped.
     let t = trigger(Some(transform_only("delta-slim", json!({ "max_keys": 1 }))));
-    let out = apply_plugin_hooks(plugins.as_ref(), &t, delta())
+    let out = hook_obj(plugins.as_ref(), &t, delta())
         .await
         .expect("transform never skips");
     assert_eq!(out["keys"], json!(["k1"]));

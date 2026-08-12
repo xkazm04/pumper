@@ -332,7 +332,7 @@ pub(crate) struct TestTriggerQuery {
     tag = "triggers",
     params(("id" = String, Path, description = "Trigger id"), TestTriggerQuery),
     responses(
-        (status = 200, description = "Dry-run decision `{would_fire, ...}` or, with `?fire=true`, `{fired, job}`"),
+        (status = 200, description = "Dry-run decision `{would_fire, ..., hooks: {unusable_plugins, incidents}}` or, with `?fire=true`, `{fired, job}`. `hooks.unusable_plugins` names configured hook plugins this host cannot execute (the hop is then UNGATED even when `would_fire` is true); `hooks.incidents` carries each hook's ledger outcome + detail."),
         (status = 404, description = "Trigger not found", body = Object),
         (status = 422, description = "`?fire=true` only: the resolved params fail the target app's declared JSON Schema (the live fire path records this as a `bad_params` decision instead)", body = Object),
     )
@@ -421,10 +421,42 @@ pub(crate) async fn test_trigger(
     };
     // Run the plugin hooks the live fire path would, so the dry-run decision
     // and the previewed params are honest about predicate/transform effects.
-    let Some(obj) =
-        crate::triggers::apply_plugin_hooks(state.plugins.as_ref(), &trigger, obj).await
-    else {
-        return Ok(Json(no_fire("predicate plugin returned pass=false")));
+    //
+    // Two lies this closes. (1) The dry-run never asked `missing_hook_plugins`,
+    // so a trigger gated by a plugin nobody installed answered a clean
+    // `would_fire: true` — the exact state the operator is dry-running to
+    // discover. (2) Any `None` verdict was reported as "predicate plugin
+    // returned pass=false", which fabricated a healthy gate decision for a
+    // sandbox that had crashed under `on_error: skip`. Both now report what
+    // actually happened, from the same helpers the live path uses.
+    let unusable = crate::triggers::missing_hook_plugins(state.plugins.as_ref(), &trigger);
+    let verdict = crate::triggers::apply_plugin_hooks(state.plugins.as_ref(), &trigger, obj).await;
+    let hooks = json!({
+        // Configured hook plugins this host cannot execute (not installed, or
+        // installed without the extract ABI). Non-empty means the hop is
+        // UNGATED, however `would_fire` reads.
+        "unusable_plugins": unusable,
+        // Every ledger-worthy thing the hooks did, in the same vocabulary the
+        // decision ledger records (`GET /triggers/{id}/runs`).
+        "incidents": verdict
+            .incidents
+            .iter()
+            .map(|i| json!({
+                "slot": i.slot.as_str(),
+                "plugin": i.plugin,
+                "outcome": i.outcome,
+                "detail": i.detail,
+            }))
+            .collect::<Vec<_>>(),
+    });
+    let Some(obj) = verdict.obj else {
+        return Ok(Json(json!({
+            "would_fire": false,
+            "reason": verdict
+                .stop_reason()
+                .unwrap_or("a plugin hook stopped the hop"),
+            "hooks": hooks,
+        })));
     };
     let resolved_params = crate::triggers::merged_params(&trigger.params, obj);
 
@@ -434,6 +466,7 @@ pub(crate) async fn test_trigger(
             "target_app": trigger.target_app,
             "source_job_id": source.id,
             "resolved_params": resolved_params,
+            "hooks": hooks,
         })));
     }
     // Real fire: the same params door the live fire path applies, so `?fire=true`
@@ -473,7 +506,8 @@ pub(crate) struct RunsQuery {
 /// evaluation of this trigger against one source event, INCLUDING the negatives
 /// (`no_change_match`, `status_mismatch`, `filter_miss`, `dedup`, `cycle`,
 /// `depth`, `target_unregistered`, `bad_params`, `predicate_veto`,
-/// `plugin_missing`, `bad_filters`, `eval_set_error`, `enqueue_failed`), which
+/// `plugin_missing`, `hook_trap`, `hook_malformed`, `hook_not_executable`,
+/// `hook_host_error`, `bad_filters`, `eval_set_error`, `enqueue_failed`), which
 /// are otherwise invisible. The vocabulary is `pumper_core::TRIGGER_OUTCOMES`.
 /// Decisions page with `cursor`.
 #[utoipa::path(

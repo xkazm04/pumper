@@ -91,28 +91,46 @@ discard.
 
 ## Failure semantics — fail-open, always
 
-A broken plugin must never wedge a pipeline edge. Every failure path proceeds:
+A broken plugin must never wedge a pipeline edge. Every failure path proceeds —
+**and every one of them is now recorded**, with its own outcome, in the decision
+ledger (`GET /triggers/{id}/runs` → `decisions`). Before this, all of them were a
+`warn!` and nothing else: "why did my trigger fire without being gated?" was
+unanswerable from the very API that exists to answer it.
 
-| Situation | Predicate | Transform |
-|---|---|---|
-| Trap (`unreachable`, panic) | hop fires (`on_error` may flip it to skip) | original envelope kept |
-| CPU fuel exhausted (`[plugins] fuel`) | hop fires | original envelope kept |
-| Memory cap hit (`[plugins] max_memory_mb`) | hop fires | original envelope kept |
-| Output is not valid JSON | hop fires | original envelope kept |
-| Output violates the contract (no `pass` bool / not an object) | hop fires | original envelope kept |
-| The named plugin is not loaded | hop fires, **ungated** | original envelope kept |
-| Plugins disabled (`[plugins] enabled = false`) | hop fires, ungated | original envelope kept |
+| Situation | Predicate | Transform | Ledger outcome |
+|---|---|---|---|
+| Trap (`unreachable`, panic) | hop fires (`on_error` may flip it to skip) | original envelope kept | `hook_trap` |
+| CPU fuel exhausted (`[plugins] fuel`) | hop fires | original envelope kept | `hook_trap` |
+| Memory cap hit (`[plugins] max_memory_mb`) | hop fires | original envelope kept | `hook_trap` |
+| Output is not valid JSON | hop fires | original envelope kept | `hook_malformed` |
+| Output violates the contract (no `pass` bool / not an object) | hop fires | original envelope kept | `hook_malformed` |
+| The named plugin is not loaded | hop fires, **ungated** | original envelope kept | `plugin_missing` |
+| Plugins disabled (`[plugins] enabled = false`) | hop fires, ungated | original envelope kept | `plugin_missing` |
+| The module is loaded but exports no `extract`/`extract_v2` ABI | hop fires, **ungated** | original envelope kept | `hook_not_executable` |
+| The host itself broke around the call | hop fires | original envelope kept | `hook_host_error` |
+| Predicate ran and answered `pass=false` | hop skipped | not reached | `predicate_veto` |
+
+`detail` on every failure row names the slot, the plugin and the consequence
+(`… — on_error=fire, hop NOT gated` / `… — on_error=skip, hop stopped` /
+`… — original envelope kept, hop NOT shaped`).
 
 `on_error: "skip"` on the predicate is the explicit opt-in to failing **closed**
-instead — it converts every predicate failure above into a skipped hop, recorded
-as `predicate_veto`.
+instead — it converts every predicate failure above into a skipped hop. The row
+keeps the *failure's* own outcome rather than borrowing `predicate_veto`: a
+sandbox that crashed and a gate that said no are different facts, and an operator
+counting vetoes must not be shown a crash as a healthy decision. `predicate_veto`
+now means exactly one thing — a predicate that **ran and answered** `pass=false`.
 
-The last two rows are the dangerous ones, because "the gate passed" and "there
-was no gate" produce the same job. So a **configured** hook whose plugin is not
-loaded is recorded, per evaluation, as a `plugin_missing` row in the decision
-ledger (`GET /triggers/{id}/runs` → `decisions`, `detail` = the plugin name)
-alongside an error-level log. The hop still fires; the row is a note, not a
-veto.
+The un-gated rows are the dangerous ones, because "the gate passed" and "there
+was no gate" produce the same job. Those are also facts about the DEPLOYMENT
+rather than about the event, so they are recorded **once per (trigger, plugin)**
+and then suppressed — `POST /plugins/reload` (the only thing that can change the
+answer) re-arms them. The error-level log fires on every evaluation regardless.
+
+`GET /plugins` marks each entry `executable: true|false`, and `has()`/`list()`
+answer for executability, so a module without the extract ABI is never offered as
+a usable hook plugin. Loading stays permissive — describe-only modules must keep
+loading for dynamic-app discovery.
 
 ## Sandbox limits
 
@@ -140,9 +158,14 @@ the type and a reworded message cannot silently reclassify stored rows. See
 
 - Hooks cannot be edited on an existing trigger (delete + create).
 - No dry-run for a hook on its own; `POST /triggers/{id}/test` runs the hooks as
-  part of a whole-trigger dry run, and external triggers cannot be dry-run at
-  all.
-- `plugin_missing` is recorded per evaluation, so a busy edge with a mis-typed
-  plugin name writes one row per event until it is fixed.
+  part of a whole-trigger dry run (reporting `hooks.unusable_plugins` and
+  `hooks.incidents`), and external triggers cannot be dry-run at all.
+- The once-per-(trigger, plugin) bound on `plugin_missing` /
+  `hook_not_executable` is **per process**: it is re-armed by a reload or a
+  restart, not by a timer, so a long-lived server records the fault once and
+  the ledger will not repeat it until something changes.
+- `executable` is decided from export **names**, not signatures. A module
+  exporting an `alloc` of the wrong type still lists as executable and fails per
+  call with `hook_not_executable` instead.
 - The concurrency gate is shared with extraction plugins and cannot be split.
 - Only `predicate` and `transform` slots exist; there is no post-enqueue hook.

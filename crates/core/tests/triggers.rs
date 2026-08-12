@@ -258,6 +258,86 @@ async fn trigger_decision_ledger_records_skips_not_only_fires() {
     assert_eq!(storage.prune_trigger_runs(1).await.unwrap(), 0);
 }
 
+/// The sandbox failure classes the ledger could not previously REPRESENT: a
+/// hook that trapped, burned its fuel, answered garbage, or named a module with
+/// no runnable ABI all fired the hop with nothing but a `warn!` behind them.
+/// Each is now its own word, and each round-trips with its detail intact — a
+/// vocabulary the API documents is only real if the store actually holds it.
+#[tokio::test]
+async fn the_ledger_holds_every_hook_failure_class_distinctly() {
+    use pumper_core::storage::{NewTriggerRun, TRIGGER_OUTCOMES};
+    let store = pumper_core::testing::TempStore::new("trigger-hook-outcomes").await;
+    let storage = &store.storage;
+
+    // The four hook failure classes, plus the veto they must never be confused
+    // with. `plugin_missing` predates this set and is covered above.
+    let classes = [
+        (
+            "hook_trap",
+            "predicate plugin 'gate' trapped — on_error=skip, hop stopped",
+        ),
+        (
+            "hook_malformed",
+            "transform plugin 'slim' returned non-object output",
+        ),
+        (
+            "hook_not_executable",
+            "predicate plugin 'stub' exports no extract ABI",
+        ),
+        (
+            "hook_host_error",
+            "the plugin host's blocking task panicked",
+        ),
+        (
+            "predicate_veto",
+            "predicate plugin 'gate' returned pass=false",
+        ),
+    ];
+    for (outcome, detail) in classes {
+        assert!(
+            TRIGGER_OUTCOMES.contains(&outcome),
+            "'{outcome}' must be in the documented vocabulary before anything writes it"
+        );
+        storage
+            .record_trigger_run(&NewTriggerRun {
+                trigger_id: "T9",
+                outcome,
+                source_kind: "job",
+                source_job_id: Some("J9"),
+                detail: Some(detail),
+                ..Default::default()
+            })
+            .await
+            .expect("record hook decision");
+    }
+
+    let page = storage
+        .list_trigger_runs_page("T9", None, 50)
+        .await
+        .unwrap();
+    assert_eq!(page.len(), classes.len());
+    for (outcome, detail) in classes {
+        let row = page
+            .iter()
+            .find(|r| r.outcome == outcome)
+            .unwrap_or_else(|| panic!("no '{outcome}' row"));
+        assert_eq!(
+            row.detail.as_deref(),
+            Some(detail),
+            "'{outcome}' lost the detail that names the plugin and the consequence"
+        );
+    }
+    // The distinctness that matters: a crashed sandbox and a gate that said no
+    // are separate rows, not one word doing both jobs.
+    assert_eq!(
+        page.iter()
+            .filter(|r| r.outcome == "predicate_veto")
+            .count(),
+        1,
+        "only the genuine pass=false answer may claim the veto word"
+    );
+}
+
 /// M15: plugin_hooks JSON column round-trips through create/get, and an
 /// all-empty hooks object stores as NULL (no hooks).
 #[tokio::test]

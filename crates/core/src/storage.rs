@@ -2839,15 +2839,40 @@ pub const TRIGGER_OUTCOMES: &[&str] = &[
     "filter_miss",
     // The trigger's stored filter specs no longer parse.
     "bad_filters",
-    // A predicate plugin returned `pass=false` (or failed with `on_error=skip`).
+    // A predicate plugin RAN and answered `pass=false`. Exactly that, and
+    // nothing else: a predicate that crashed, burned its fuel or answered
+    // nonsense records its own failure outcome below, even when `on_error=skip`
+    // turns that failure into a stopped hop. The two used to share this word,
+    // so an operator counting vetoes was shown crashed sandboxes as healthy
+    // gate decisions.
     "predicate_veto",
-    // A CONFIGURED plugin hook names a module the host has not loaded, so the
-    // hook did nothing: the predicate did not gate and the transform did not
-    // shape. The hop itself still took the fail-open path — this row exists
-    // because "the gate passed" and "there was no gate" are otherwise
-    // indistinguishable. Usually means the build/install step never ran
-    // (`just plugins-install`). `detail` is the missing plugin name.
+    // A CONFIGURED plugin hook names a module the host cannot execute — not
+    // installed, or the whole subsystem is off — so the hook did nothing: the
+    // predicate did not gate and the transform did not shape. The hop itself
+    // still took the fail-open path; this row exists because "the gate passed"
+    // and "there was no gate" are otherwise indistinguishable. Usually means the
+    // build/install step never ran (`just plugins-install`). Recorded once per
+    // (trigger, plugin) until `POST /plugins/reload`, because it is a fact about
+    // the deployment rather than about the event.
     "plugin_missing",
+    // A hook plugin was stopped by the sandbox: an explicit trap, CPU fuel
+    // exhaustion, or the memory cap. `detail` names the slot, the plugin, and
+    // whether the hop went on to fire (`on_error=fire`) or was stopped
+    // (`on_error=skip`).
+    "hook_trap",
+    // A hook plugin ran and returned, but not the contract: output that is not
+    // JSON, a predicate verdict without a `pass` bool, or a transform whose
+    // output is not an object. Same `detail` shape as `hook_trap`.
+    "hook_malformed",
+    // The named module IS loaded but exports no usable `extract`/`extract_v2`
+    // ABI, so it can never gate or shape anything — a describe-only module
+    // wired into a hook slot by mistake. Recorded once per (trigger, plugin)
+    // until `POST /plugins/reload`, for the same reason as `plugin_missing`.
+    "hook_not_executable",
+    // The plugin HOST failed around the call (its blocking task panicked, the
+    // admission gate closed), or an error reached the hook path from outside the
+    // host entirely. Not the plugin's fault — this one means file a bug.
+    "hook_host_error",
     // The trigger already appears in the source's provenance chain.
     "cycle",
     // `[triggers] max_depth` reached.

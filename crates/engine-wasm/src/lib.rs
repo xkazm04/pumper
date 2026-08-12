@@ -73,6 +73,30 @@ pub struct WasmPluginHost {
 struct LoadedPlugin {
     pre: InstancePre<StoreLimits>,
     manifest: Option<Value>,
+    /// Whether this module exports the ABI a [`Plugins::run`] call needs.
+    ///
+    /// Loading stays permissive on purpose — a `.wasm` in the plugin dir that
+    /// only exports `describe()` is a legitimate module (that is exactly the
+    /// dynamic-app shape) and must keep appearing in `GET /plugins`. But it can
+    /// never gate or shape anything, and reporting it as a usable plugin was a
+    /// lie the repo's own `extract_only.wasm` fixture proved: `has()` said
+    /// `true` for a module with no `alloc` and no `extract`, so a trigger hook
+    /// pointed at it looked deployed and silently did nothing.
+    executable: bool,
+}
+
+/// Whether `module` exports the ABI [`Plugins::run`] needs: a `memory`, an
+/// `alloc`, and at least one of `extract_v2` / `extract`.
+///
+/// Names only — the exact signatures are re-checked per call, where a
+/// wrong-typed export surfaces as a `missing_export` failure. This is the cheap
+/// load-time answer to "could this ever run at all", which is the question
+/// `has()` and `list()` are asked.
+fn exports_extract_abi(module: &Module) -> bool {
+    let names: std::collections::HashSet<&str> = module.exports().map(|e| e.name()).collect();
+    names.contains("memory")
+        && names.contains("alloc")
+        && (names.contains("extract_v2") || names.contains("extract"))
 }
 
 /// Resolve the concurrency cap: `0` means "one per core" via
@@ -260,32 +284,52 @@ impl Plugins for WasmPluginHost {
         .await?
     }
 
+    /// The plugins a caller can actually RUN — `executable` only.
+    ///
+    /// A describe-only module stays loaded and stays visible in
+    /// [`manifests`](Plugins::manifests) (that is the dynamic-app discovery
+    /// shape), but handing its name back here would mean the observatory
+    /// replaying a module that cannot execute and a UI offering it for a hook.
     fn list(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.read_modules().keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .read_modules()
+            .iter()
+            .filter(|(_, p)| p.executable)
+            .map(|(name, _)| name.clone())
+            .collect();
         names.sort();
         names
     }
 
     /// Map lookup rather than the trait's default list-and-scan: trigger hooks
     /// ask this per event, per hook.
+    ///
+    /// Answers **executability**, not mere presence. The trait documents this as
+    /// "would `run` find a module at all", and a module without the extract ABI
+    /// is one `run` can never serve — reporting it as present made a hook
+    /// pointed at it look deployed while it silently did nothing.
     fn has(&self, name: &str) -> bool {
-        self.read_modules().contains_key(name)
+        self.read_modules().get(name).is_some_and(|p| p.executable)
     }
 
+    /// Every loaded module, executable or not, each with an explicit
+    /// `executable` flag — `GET /plugins` is the discovery surface, so hiding a
+    /// module here would hide the very mistake an operator needs to see.
     fn manifests(&self) -> Vec<Value> {
         let modules = self.read_modules();
         let mut entries: Vec<(&String, &LoadedPlugin)> = modules.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
         entries
             .into_iter()
-            .map(|(name, p)| match &p.manifest {
-                // A plugin's own describe() output, with its name authoritative.
-                Some(Value::Object(m)) => {
-                    let mut m = m.clone();
-                    m.insert("name".into(), Value::String(name.clone()));
-                    Value::Object(m)
-                }
-                _ => serde_json::json!({ "name": name }),
+            .map(|(name, p)| {
+                let mut m = match &p.manifest {
+                    // A plugin's own describe() output, with its name authoritative.
+                    Some(Value::Object(m)) => m.clone(),
+                    _ => serde_json::Map::new(),
+                };
+                m.insert("name".into(), Value::String(name.clone()));
+                m.insert("executable".into(), Value::Bool(p.executable));
+                Value::Object(m)
             })
             .collect()
     }
@@ -333,6 +377,7 @@ fn load_dir(engine: &Engine, dir: &Path, probe: ProbeBudget) -> ModuleMap {
                 continue;
             }
         };
+        let executable = exports_extract_abi(&module);
         match pre_instantiate(engine, &name, &module) {
             Ok(pre) => {
                 // Read the optional self-describing manifest once, best-effort —
@@ -345,7 +390,22 @@ fn load_dir(engine: &Engine, dir: &Path, probe: ProbeBudget) -> ModuleMap {
                         None
                     }
                 };
-                map.insert(name, LoadedPlugin { pre, manifest });
+                if !executable {
+                    tracing::info!(
+                        path = %path.display(),
+                        "loaded a module with no extract ABI: it is listed (with \
+                         executable: false) but can never serve a run() call or a \
+                         trigger hook"
+                    );
+                }
+                map.insert(
+                    name,
+                    LoadedPlugin {
+                        pre,
+                        manifest,
+                        executable,
+                    },
+                );
             }
             Err(err) => {
                 tracing::warn!(path = %path.display(), "failed to link plugin: {err}")
