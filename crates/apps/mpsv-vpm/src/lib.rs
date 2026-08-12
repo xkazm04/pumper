@@ -143,6 +143,65 @@ const NOWCAST_RATIO_MAX: f64 = 4.0;
 /// event that could have corrected it.
 const NOWCAST_ANCHOR_STALE_DAYS: i64 = 400;
 
+/// The virtual shared namespace this app publishes its cross-source labour
+/// products into — and therefore the namespace an operator must NAME to watch
+/// them (`POST /watches {app: "cz-labour"}`), since the change fan-out matches
+/// watches against the entry app of the revision, not the job's app.
+pub const CZ_LABOUR_NAMESPACE: &str = GAP_APP;
+
+/// The `(app, dataset)` pairs this app offers to the full-text search index,
+/// declared in the run result as `index_datasets`.
+///
+/// Two things hang off this list, and the second is the reason the `cz-labour`
+/// entries matter more than search does. `worker::dataset_search_docs` indexes
+/// each named dataset's changed records as individual documents (cost
+/// O(changes), not O(corpus)); and `worker::run_indexed_apps` — which is what
+/// scopes `load_run_changes` — widens the run's hook batch to every namespace
+/// named here. Without a `cz-labour` entry the trio's revisions are invisible to
+/// `notify_watches`, `fire_dataset_triggers` and `enforce_contracts` alike: a
+/// run writes them and the fan-out never sees them.
+///
+/// **What is in, and why the other eight are out.** The bar is value per
+/// indexed document, since every changed row costs one document every day:
+///
+/// * `cz-labour/salary_gap`, `cz-labour/salary_nowcast`,
+///   `cz-labour/vacancy_lifecycle` — the cross-source products, ~hundreds of
+///   rows each, and exactly what an operator wants alerting on ("tell me when
+///   the projected median for my role moves").
+/// * `region_agg` — 14 kraje × a handful of org types ≈ 60 rows: the regional
+///   headline, at negligible cost.
+/// * `role_region_agg` is OUT: occupation × kraj × org type is the
+///   highest-cardinality table here (tens of thousands of cells, nearly all of
+///   which change daily), and it is already addressable by key.
+/// * `skill_demand`, `education_agg` are OUT: same daily-churn cross product,
+///   and their identity is an opaque codebook URI (`Dovednost/…`) — there is no
+///   searchable TEXT in them, only codes a query would have to already know.
+/// * `role_trends` is OUT: derived counts recomputed daily from
+///   `role_region_agg`'s history — indexing it indexes the same churn twice.
+/// * `vacancy_samples` and `employers` are OUT together, and deliberately as a
+///   pair: the samples are a reservoir that re-rolls every run (no stable
+///   document identity), and `employers` exists to enrich exactly those samples
+///   — an employer hit whose postings are not indexed leads nowhere.
+/// * `freshness` and `vacancy_ledger` are OUT: one row each, and both are
+///   operational state, not a labour-market product.
+pub const INDEXED_DATASETS: &[(&str, &str)] = &[
+    (GAP_APP, GAP_DATASET),
+    (GAP_APP, NOWCAST_DATASET),
+    (GAP_APP, LIFECYCLE_DATASET),
+    ("mpsv-vpm", "region_agg"),
+];
+
+/// [`INDEXED_DATASETS`] rendered as the result's `index_datasets` value — the
+/// exact shape `worker::index_dataset_specs` parses.
+pub fn index_datasets_spec() -> Value {
+    Value::Array(
+        INDEXED_DATASETS
+            .iter()
+            .map(|(app, dataset)| json!({ "app": app, "dataset": dataset }))
+            .collect(),
+    )
+}
+
 /// ARES business register — key-free JSON REST lookup of one economic subject
 /// by IČO. Enriches the employers behind this run's vacancy samples.
 const ARES_URL: &str = "https://ares.gov.cz/ekonomicke-subjekty-v-be/rest/ekonomicke-subjekty";
@@ -1188,11 +1247,93 @@ impl ScrapeApp for MpsvVpm {
             "employers": employer_summary,
             "vacancyLedger": vacancy_ledger,
             "freshness": freshness,
+            // Per-record search docs AND — the load-bearing half — the
+            // namespaces the run's hook batch spans. Without the `cz-labour`
+            // entries `worker::load_run_changes` never loads the trio's
+            // revisions, so no watch or dataset trigger on the shared labour
+            // namespace can fire. See `INDEXED_DATASETS`.
+            "index_datasets": index_datasets_spec(),
         });
         ctx.save_artifact("summary.json", &serde_json::to_vec_pretty(&out)?)
             .await?;
         Ok(out)
     }
+}
+
+// ── search-document titles ──────────────────────────────────────────────────
+//
+// `SearchDoc::from_dataset_record` builds a document's TITLE from the record's
+// own `title`/`name`/`headline`/`full_name` field and its BODY from the raw
+// JSON. These aggregate rows carry none of those, so every hit would have
+// rendered as an untitled JSON dump — the record's `title` is the only line the
+// producer controls, so it carries the identity AND the number a reader came
+// looking for. Kept ASCII-digit (`45000 CZK`, not `45 000`) so the number is one
+// searchable token.
+
+/// Region label for a title: `ALL` is the national roll-up, not a kraj id.
+fn kraj_label(kraj: &str) -> String {
+    if kraj == "ALL" {
+        "Czechia (all regions)".to_string()
+    } else {
+        format!("kraj {kraj}")
+    }
+}
+
+/// Org-type label for a title: `all` is the pooled cell, not an org type.
+fn org_label(org: &str) -> String {
+    if org == "all" {
+        "all employers".to_string()
+    } else {
+        format!("{org} employers")
+    }
+}
+
+fn gap_title(group: &str, sfera: &str, posted: i64, official: i64, gap_pct: f64) -> String {
+    format!(
+        "CZ-ISCO {group} {sfera} — posted median {posted} CZK vs official {official} CZK \
+         ({gap_pct:+.1}%)"
+    )
+}
+
+fn nowcast_title(
+    group: &str,
+    sfera: &str,
+    posted: i64,
+    nowcast: Option<i64>,
+    withheld: Option<&str>,
+    confidence: &str,
+) -> String {
+    match (nowcast, withheld) {
+        (Some(n), _) => format!(
+            "CZ-ISCO {group} {sfera} — nowcast official-grade median {n} CZK \
+             (posted {posted} CZK, {confidence} confidence)"
+        ),
+        // The withheld row is a first-class hit: an operator searching the cell
+        // must find the retraction, not nothing.
+        (None, reason) => format!(
+            "CZ-ISCO {group} {sfera} — nowcast withheld ({}) — posted median {posted} CZK",
+            reason.unwrap_or("unknown")
+        ),
+    }
+}
+
+fn lifecycle_title(group: &str, kraj: &str, median_days: i64, closures: usize) -> String {
+    format!(
+        "CZ-ISCO {group} {} — median {median_days} days to close, {closures} closures",
+        kraj_label(kraj)
+    )
+}
+
+fn region_title(kraj: &str, org: &str, count: usize, median: Option<i64>) -> String {
+    let salary = match median {
+        Some(m) => format!("median salary {m} CZK"),
+        None => "no posted salaries".to_string(),
+    };
+    format!(
+        "{}, {} — {count} postings, {salary}",
+        kraj_label(kraj),
+        org_label(org)
+    )
 }
 
 /// The postings behind a parsed feed, or the reason the document is SCHEMA
@@ -1255,6 +1396,19 @@ fn region_rollup_keys(kraj: Option<&str>, org: &str) -> Vec<(String, String)> {
 
 /// Numeric CZ-ISCO unit group: `"CzIsco/93291"` → `"9329"` (first 4 digits of the
 /// bare code). Buckets JD samples at the ISCO unit-group level.
+///
+/// JOIN HAZARD — this app publishes TWO occupation grains, on purpose:
+/// * `role_region_agg` / `vacancy_samples` key on the RAW code the feed
+///   publishes (`CzIsco/93291`, a 5-digit sub-group);
+/// * `skill_demand`, `education_agg` and all three `cz-labour/*` products key on
+///   this 4-digit unit group, because that is the finest level ISPV publishes
+///   and therefore the only level a posted-vs-official join can honestly happen
+///   at (medians cannot be recombined from finer cells).
+///
+/// So `role_region_agg.czIsco` does NOT join to `salary_gap.czIscoGroup` /
+/// `salary_nowcast.isco4` / `vacancy_lifecycle.czIscoGroup` without passing
+/// through this function first. Documented for consumers in
+/// `docs/features/apps.md`.
 fn unit_group(czisco: &str) -> String {
     let code = czisco.rsplit('/').next().unwrap_or(czisco);
     let digits: String = code
@@ -1359,6 +1513,15 @@ fn compute_salary_gaps(
         items.push((
             format!("{group}|{sfera}"),
             json!({
+                // The full-text index reads `title` off the record — see the
+                // search-document titles section.
+                "title": gap_title(
+                    group,
+                    sfera,
+                    posted_median,
+                    official_median.round() as i64,
+                    gap_pct,
+                ),
                 "czIscoGroup": group,
                 "sfera": sfera,
                 "postedMedian": posted_median,
@@ -1573,13 +1736,24 @@ fn compute_salary_nowcast(
                 degrade_for_stale_anchor(nowcast_confidence(ratios.len(), spread), staleness_days)
             }
         };
+        let nowcast_median = withheld.is_none().then(|| projected.round() as i64);
         items.push((
             key,
             json!({
+                // The full-text index reads `title` off the record — see the
+                // search-document titles section.
+                "title": nowcast_title(
+                    group,
+                    sfera,
+                    posted_median,
+                    nowcast_median,
+                    withheld,
+                    confidence,
+                ),
                 "isco4": group,
                 "sfera": sfera,
                 "posted_median": posted_median,
-                "nowcast_median": withheld.is_none().then(|| projected.round() as i64),
+                "nowcast_median": nowcast_median,
                 // Null when there is no number, naming which guard refused it.
                 "withheld": withheld,
                 "ratio_used": ratio_used
@@ -2107,6 +2281,9 @@ fn aggregate_lifecycle(
         items.push((
             format!("{ug}|{kraj}"),
             json!({
+                // The full-text index reads `title` off the record — see the
+                // search-document titles section.
+                "title": lifecycle_title(&ug, &kraj, pct(0.5), n),
                 "czIscoGroup": ug,
                 "krajId": kraj,
                 // Time from first observation to disappearance from the feed.
@@ -2433,6 +2610,9 @@ impl Cell {
     fn to_region_value(&self, kraj: &str, org: &str) -> Value {
         let (s, pct) = self.stats();
         json!({
+            // The full-text index reads `title` off the record — see the
+            // search-document titles section.
+            "title": region_title(kraj, org, self.count, pct(0.5)),
             "krajId": kraj,
             "orgType": org,
             "count": self.count,
@@ -2594,6 +2774,153 @@ mod tests {
         assert_eq!(empty.monthly_salary_point(), None);
     }
 
+    // ── discovery: index_datasets + search-doc titles ───────────────────────
+
+    /// The load-bearing half of `index_datasets` is NOT search — it is
+    /// `worker::run_indexed_apps`, which scopes `load_run_changes`. Drop the
+    /// `cz-labour` entries and the trio's revisions never enter the run's hook
+    /// batch, so no watch and no dataset trigger on the shared labour namespace
+    /// can ever fire.
+    #[test]
+    fn index_datasets_names_the_cz_labour_namespace_or_no_watch_can_ever_fire() {
+        let spec = index_datasets_spec();
+        let entries = spec.as_array().expect("array of specs");
+        assert_eq!(entries.len(), INDEXED_DATASETS.len());
+        let named: Vec<(&str, &str)> = entries
+            .iter()
+            .map(|e| {
+                (
+                    e["app"].as_str().expect("app"),
+                    e["dataset"].as_str().expect("dataset"),
+                )
+            })
+            .collect();
+        for dataset in [GAP_DATASET, NOWCAST_DATASET, LIFECYCLE_DATASET] {
+            assert!(
+                named.contains(&(CZ_LABOUR_NAMESPACE, dataset)),
+                "{CZ_LABOUR_NAMESPACE}/{dataset} must be declared: {named:?}"
+            );
+        }
+        assert_eq!(CZ_LABOUR_NAMESPACE, "cz-labour");
+    }
+
+    /// Inventory, EXPECTED-diff style: the include/exclude judgment is a
+    /// decision, so adding a dataset to the index has to be a deliberate edit
+    /// here — not something that happens because a new dataset was written.
+    #[test]
+    fn indexed_datasets_exclude_the_high_cardinality_and_identity_less_tables() {
+        const EXPECTED: &[(&str, &str)] = &[
+            ("cz-labour", "salary_gap"),
+            ("cz-labour", "salary_nowcast"),
+            ("cz-labour", "vacancy_lifecycle"),
+            ("mpsv-vpm", "region_agg"),
+        ];
+        assert_eq!(
+            INDEXED_DATASETS, EXPECTED,
+            "the indexed set is a judgment call (see INDEXED_DATASETS' doc): \
+             every changed row costs one search document EVERY DAY"
+        );
+        // The eight deliberately left out, each for a reason recorded on
+        // `INDEXED_DATASETS`. Named here so a future addition trips this test
+        // rather than sliding in.
+        for excluded in [
+            "role_region_agg",
+            "vacancy_samples",
+            "skill_demand",
+            "education_agg",
+            "role_trends",
+            "employers",
+            "freshness",
+            "vacancy_ledger",
+        ] {
+            assert!(
+                !INDEXED_DATASETS.iter().any(|(_, d)| *d == excluded),
+                "'{excluded}' is excluded on purpose — justify it in \
+                 INDEXED_DATASETS' doc before adding it"
+            );
+        }
+    }
+
+    /// A search hit's title is the only line this app controls (the body is the
+    /// raw JSON dump the index builds itself), so it has to read as a sentence
+    /// carrying the role, the region and the number.
+    #[test]
+    fn search_titles_read_as_sentences_not_as_a_raw_json_dump() {
+        assert_eq!(
+            gap_title("5223", "MZDOVA", 50_000, 40_000, 25.0),
+            "CZ-ISCO 5223 MZDOVA — posted median 50000 CZK vs official 40000 CZK (+25.0%)"
+        );
+        // A negative gap keeps its sign — "posted below official" is the whole
+        // point of the row.
+        assert!(gap_title("5223", "PLATOVA", 30_000, 40_000, -25.0).contains("(-25.0%)"));
+
+        assert_eq!(
+            nowcast_title("5223", "MZDOVA", 50_000, Some(40_000), None, "med"),
+            "CZ-ISCO 5223 MZDOVA — nowcast official-grade median 40000 CZK \
+             (posted 50000 CZK, med confidence)"
+        );
+        // A withheld row is a first-class hit: searching the cell must surface
+        // the retraction, not silence.
+        assert_eq!(
+            nowcast_title(
+                "5223",
+                "MZDOVA",
+                50_000,
+                None,
+                Some("thin_evidence"),
+                "none"
+            ),
+            "CZ-ISCO 5223 MZDOVA — nowcast withheld (thin_evidence) — posted median 50000 CZK"
+        );
+
+        assert_eq!(
+            lifecycle_title("5223", "Kraj/108", 14, 30),
+            "CZ-ISCO 5223 kraj Kraj/108 — median 14 days to close, 30 closures"
+        );
+        // The `ALL` roll-up is national, not a kraj called "ALL".
+        assert!(lifecycle_title("5223", "ALL", 21, 900).contains("Czechia (all regions)"));
+
+        assert_eq!(
+            region_title("Kraj/108", "private", 1_234, Some(45_000)),
+            "kraj Kraj/108, private employers — 1234 postings, median salary 45000 CZK"
+        );
+        assert_eq!(
+            region_title("ALL", "all", 300_000, None),
+            "Czechia (all regions), all employers — 300000 postings, no posted salaries"
+        );
+    }
+
+    #[test]
+    fn indexed_rows_carry_the_title_the_search_doc_builder_reads() {
+        // gap
+        let posted = posted_map(vec![(
+            ("5223", "MZDOVA"),
+            cell(&[40_000.0, 50_000.0, 60_000.0]),
+        )]);
+        let mut official = HashMap::new();
+        official.insert(("5223".to_string(), "MZDOVA".to_string()), (40_000.0, None));
+        let gaps = compute_salary_gaps(&posted, &official, 1);
+        assert_eq!(
+            gaps[0].1["title"],
+            "CZ-ISCO 5223 MZDOVA — posted median 50000 CZK vs official 40000 CZK (+25.0%)"
+        );
+        // nowcast
+        let ratios = ratios_map(&[("5223|MZDOVA", &[1.25, 1.25, 1.25])]);
+        let anchors = anchor_map(&[(("5223", "MZDOVA"), (2026, 7, 1))]);
+        let today = NaiveDate::from_ymd_opt(2026, 7, 31).unwrap();
+        let nowcasts = compute_salary_nowcast(&posted, &ratios, &anchors, today, 1);
+        assert!(nowcasts[0].1["title"]
+            .as_str()
+            .expect("title")
+            .contains("nowcast official-grade median 40000 CZK"));
+        // region_agg
+        let region = cell(&[40_000.0, 50_000.0]).to_region_value("Kraj/108", "private");
+        assert!(region["title"]
+            .as_str()
+            .expect("title")
+            .starts_with("kraj Kraj/108, private employers — 2 postings"));
+    }
+
     // ── feed-drift honesty ──────────────────────────────────────────────────
 
     /// The anti-pattern: `#[serde(default)]` on `polozky` made a renamed key,
@@ -2730,6 +3057,8 @@ mod tests {
             .await
             .expect("run");
         assert_eq!(out["feedRecords"], 6);
+        // The declaration the fan-out reads travels on every successful run.
+        assert_eq!(out["index_datasets"], index_datasets_spec());
         let regions = store
             .datasets()
             .list("mpsv-vpm", "region_agg", 100)

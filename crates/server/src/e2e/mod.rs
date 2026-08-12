@@ -28,6 +28,7 @@ mod job_control_honesty;
 mod job_receipt;
 mod mcp;
 mod mcp_live;
+mod mpsv;
 mod panic_containment;
 mod peer_mirror;
 mod provisioner_lifecycle;

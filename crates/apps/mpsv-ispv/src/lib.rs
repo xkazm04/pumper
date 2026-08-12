@@ -155,6 +155,18 @@ impl ScrapeApp for MpsvIspv {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            // Per-record search docs for the official wage anchor: one document
+            // per `czIsco|sfera`, so a saved search or a watch can fire on a
+            // published revision instead of the quarterly refresh being
+            // discoverable only through the job result. The dataset is small
+            // (~hundreds of rows, quarterly), so this is the cheapest indexable
+            // corpus in the fleet.
+            //
+            // No `title` is added to the records: `wages` rows are stored
+            // VERBATIM as the source published them (that is the app's
+            // contract), so the search doc's title is empty and hits are found
+            // through the body — the CZ-ISCO code, the sphere, and the figures.
+            "index_datasets": [{ "app": "mpsv-ispv", "dataset": "wages" }],
         }))
     }
 }
@@ -393,6 +405,13 @@ mod tests {
         assert_eq!(out["rows"], 60);
         assert_eq!(out["stored"], 60);
         assert_eq!(out["new"], 60);
+        // Discovery: the official anchor is offered to the full-text index, one
+        // document per `czIsco|sfera`, so a saved search or watch can fire on a
+        // published revision.
+        assert_eq!(
+            out["index_datasets"],
+            json!([{ "app": "mpsv-ispv", "dataset": "wages" }])
+        );
         let stored = store
             .datasets()
             .list("mpsv-ispv", "wages", 1_000)
