@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -1233,6 +1233,32 @@ pub struct ClaudeConfig {
     /// TTL for cached research outputs (identical prompts served from disk
     /// instead of re-spending). 0 disables the research cache.
     pub research_cache_ttl_secs: u64,
+    /// Working directory handed to the CLI subprocess, and the scratch root for
+    /// the files the engine hands it (`--append-system-prompt-file`).
+    ///
+    /// Derived, never configured: the server sets it to `<storage root>/claude-cwd`
+    /// (the parent of `[storage] database_path`), which is why it is `serde(skip)`
+    /// — a second key here could only disagree with the storage layout. `None`
+    /// inherits the server's own CWD, which is the historical behaviour and what
+    /// the engine's own tests construct.
+    #[serde(skip)]
+    pub isolation_dir: Option<PathBuf>,
+}
+
+impl ClaudeConfig {
+    /// Where the CLI subprocess should run, derived from the storage root (the
+    /// parent of `[storage] database_path`) rather than from a key of its own.
+    ///
+    /// A relative `database_path` with no parent (`"pumper.db"`) yields a
+    /// relative `claude-cwd` beside it — still a dedicated directory, which is
+    /// the whole point, and still not the server's own CWD.
+    pub fn workdir_for(database_path: &Path) -> PathBuf {
+        database_path
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .unwrap_or(Path::new("."))
+            .join("claude-cwd")
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -1273,6 +1299,7 @@ impl Default for ClaudeConfig {
             allowed_tools: vec!["WebSearch".into(), "WebFetch".into()],
             roles,
             research_cache_ttl_secs: 24 * 3600,
+            isolation_dir: None,
         }
     }
 }
@@ -1453,6 +1480,39 @@ mod tests {
         Config::default()
             .validate()
             .expect("shipped defaults must satisfy their own invariants");
+    }
+
+    /// The claude subprocess must never be handed the server's own CWD: that is
+    /// how a dev server leaked this repo's CLAUDE.md, skills and hooks into every
+    /// research call. The dir is derived from the storage root, never inherited.
+    #[test]
+    fn the_claude_workdir_is_derived_from_storage_not_inherited() {
+        assert_eq!(
+            ClaudeConfig::workdir_for(Path::new("data/pumper.db")),
+            PathBuf::from("data").join("claude-cwd")
+        );
+        assert_eq!(
+            ClaudeConfig::workdir_for(Path::new("/srv/pumper/state/pumper.db")),
+            PathBuf::from("/srv/pumper/state").join("claude-cwd")
+        );
+        // A bare filename has no parent — "" would silently mean the CWD, which
+        // is exactly the value this function exists to avoid.
+        assert_eq!(
+            ClaudeConfig::workdir_for(Path::new("pumper.db")),
+            PathBuf::from(".").join("claude-cwd")
+        );
+    }
+
+    /// Derived, not configured: a `[claude] isolation_dir` key in a config file
+    /// must not exist, or it could disagree with the storage layout.
+    #[test]
+    fn the_claude_workdir_is_not_a_config_key() {
+        let cfg: ClaudeConfig =
+            toml::from_str(r#"isolation_dir = "C:/somewhere-else""#).expect("unknown keys ignored");
+        assert!(
+            cfg.isolation_dir.is_none(),
+            "isolation_dir became a config key — it is derived from [storage]"
+        );
     }
 
     #[test]

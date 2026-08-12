@@ -139,6 +139,40 @@ A failure that never started a process (a bad `binary`) writes no row at all —
 
 **Structured answers are cacheable.** Under `--json-schema` the CLI may return `result` as an object rather than a string. That used to become empty `text`, which the research cache refuses to store — so the call re-paid the model on every repeat, silently. A non-string `result` now falls back to the validated `structured_output` (then the raw value), serialized.
 
+#### What may cross the cmd.exe shim
+
+Only the Windows shim path re-parses (`[claude] binary` pointing at a real `.exe`, and every POSIX spawn, deliver argv byte-exact and are not restricted). On that path cmd.exe parses the command line a second time, and the following were **measured** through a real round-trip rather than assumed:
+
+| in the value | what cmd.exe does |
+| --- | --- |
+| `&` | truncates the value and runs the remainder as a **second command** |
+| `\|`, `>` | hijacks the invocation into a pipe/redirect — the CLI never runs |
+| `^` | **silently eaten** (`a ^ b` arrives as `a  b`) |
+| `%` | expands: `%TEMP%` arrived as a path, `%PATH%` inlined the whole variable into the value |
+| `<` | survives or breaks depending on cmd's quote state at that point |
+| newline / CR | truncates the value / dropped silently |
+| `"` `{}` `[]` `\` `,` `:` `;` `!` `()` non-ASCII | **survive byte-exact** — a real JSON schema round-trips intact |
+
+Values holding a character from the first six rows are now **refused before anything spawns**, with an error naming the offending flag — never sanitised, because a silently-altered schema still costs a full run and constrains the answer to something the app never asked for. The whole rendered command line is also budgeted at 8000 characters (cmd.exe's own ceiling is 8191, where it truncates); an oversized `json_schema` is refused rather than cut in half. A refusal is classed `Spawn`: nothing ran, so nothing was spent and no ledger row is written.
+
+`append_system_prompt` is exempt because it no longer travels on the command line at all — the engine writes it to a scratch file and passes `--append-system-prompt-file`, so operator prose is free to contain `R&D`, `100%` or `>`. The file is written under the working directory below and deleted when the run ends.
+
+#### Roles and models are validated at the engine door
+
+- An **unknown `role`** is now an error naming the roles that *are* configured, instead of resolving to `None` and falling through to the config defaults. A typo'd `role` in a `POST /jobs` body used to succeed while quietly buying a different model at a different effort. A request with **no** `role` is unaffected and still takes the config defaults. Note that `[claude.roles]` in a config file *replaces* the default map rather than merging with it — if you define your own roles, keep the names your apps pass (the shipped apps all send `research` or `compose`).
+- **`model`** is a free string from the job body all the way to `--model`, so it must match `[A-Za-z0-9._:-]{1,128}` (a conservative pattern, deliberately not a catalogue of known ids — new models ship too often). Anything else is refused before spawning.
+
+#### The subprocess gets its own working directory
+
+The CLI used to inherit the server's CWD. When the server was started from a directory that is itself a Claude Code project — which in development is the norm — every research call discovered that project's `CLAUDE.md`, skills and hooks and paid for them: measured in this repo, **35k cached input tokens** loaded for a one-word prompt, plus the repo's `Stop` hook firing on each call, on questions that had nothing to do with the repo.
+
+The subprocess now runs in `<storage root>/claude-cwd` (the parent of `[storage] database_path`, created on demand), which is also where the system-prompt scratch file goes. This is **derived, not configurable** — a key of its own could only disagree with the storage layout.
+
+Two honest limits:
+
+- `CLAUDE.md` discovery walks *upward*. If your storage root sits inside a Claude Code project (the default `data/pumper.db` does, when you run from a checkout), the parent project is still found. The escape hatch is the existing `[storage] database_path`: point it somewhere outside any such project and the context is genuinely empty. There is no new config key for this.
+- `[claude] bare` (default `false`, unchanged) remains the complete lever: it skips hooks, plugin sync, auto-memory and `CLAUDE.md` auto-discovery outright, regardless of where the process runs. Set it when you want the subprocess to carry nothing but your prompt.
+
 ## Politeness governor (adaptive)
 
 Per-host token bucket: configured spacing (`[governor] default_rps`, `per_domain`, jitter) **plus a learned penalty**: a 429/503 doubles the host's extra spacing and pushes the host's next slot out; only a genuinely healthy **2xx** response halves it (a 4xx like 404/403 is not health and no longer rewards faster spacing; other 5xx stay neutral). Penalty bounds are configurable — `[governor] penalty_base_secs` (default 1), `penalty_cap_secs` (300), `penalty_floor_ms` (100, below which a decaying penalty is dropped). Both `Retry-After` forms are honored: delta-seconds and an HTTP-date (converted to a delay from now); a larger `Retry-After` wins over doubling. State is held in one sharded map keyed by host, so distinct hosts never contend; idle hosts are evicted once the map outgrows its cap. Learned penalties are **persisted** (see host profiles below) so they survive a restart.

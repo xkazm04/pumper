@@ -82,6 +82,92 @@ impl FakeCli {
         Self::in_dir(dir, &body)
     }
 
+    /// A fake CLI that records what it was actually handed — its working
+    /// directory in `cwd.txt`, plus argv two ways — beside the envelope it then
+    /// prints. This is the only way to assert what crossed the `cmd.exe` shim,
+    /// which is where the mangling lives.
+    ///
+    /// **Two recordings, because on Windows neither alone is honest.**
+    /// `argv.txt` holds batch's own tokens (`%~1`), which are convenient for
+    /// "was this flag passed" but are *not* what the real CLI sees: batch splits
+    /// tokens on commas, so a JSON schema arrives in `argv.txt` in pieces even
+    /// when it crossed the shim perfectly. `cmdline.txt` holds the raw remainder
+    /// (`%*`) — byte-for-byte what the npm shim forwards to `node`, which then
+    /// applies MSVCRT parsing — so it is the fidelity oracle. Assert *content*
+    /// against `cmdline.txt` and *presence* against `argv.txt`.
+    fn recording(tag: &str, envelope: &serde_json::Value) -> Self {
+        let dir = Self::temp_dir(tag);
+        let payload = dir.path().join("envelope.json");
+        std::fs::write(
+            &payload,
+            serde_json::to_vec_pretty(envelope).expect("envelope"),
+        )
+        .expect("write envelope");
+        let argv = dir.path().join("argv.txt");
+        let cmdline = dir.path().join("cmdline.txt");
+        let cwd = dir.path().join("cwd.txt");
+        // Redirections lead each line: `echo %*>"f"` would read as a *stderr*
+        // redirect whenever the value happens to end in a digit.
+        let body = if cfg!(windows) {
+            format!(
+                "> \"{cwd}\" cd\n\
+                 > \"{cmdline}\" echo %*\n\
+                 break > \"{argv}\"\n\
+                 :next\n\
+                 if \"%~1\"==\"\" goto done\n\
+                 >> \"{argv}\" echo %~1\n\
+                 shift\n\
+                 goto next\n\
+                 :done\n\
+                 type \"{payload}\"",
+                cwd = cwd.display(),
+                cmdline = cmdline.display(),
+                argv = argv.display(),
+                payload = payload.display()
+            )
+        } else {
+            format!(
+                "pwd > \"{cwd}\"\n\
+                 printf '%s\\n' \"$*\" > \"{cmdline}\"\n\
+                 : > \"{argv}\"\n\
+                 for a in \"$@\"; do printf '%s\\n' \"$a\" >> \"{argv}\"; done\n\
+                 cat \"{payload}\"",
+                cwd = cwd.display(),
+                cmdline = cmdline.display(),
+                argv = argv.display(),
+                payload = payload.display()
+            )
+        };
+        Self::in_dir(dir, &body)
+    }
+
+    /// Absolute path of a file the recording fake wrote beside itself.
+    fn artifact(&self, name: &str) -> PathBuf {
+        self.binary.parent().expect("script dir").join(name)
+    }
+
+    /// The argv the fake CLI actually received, one value per line.
+    fn recorded_argv(&self) -> Vec<String> {
+        let raw = std::fs::read_to_string(self.artifact("argv.txt"))
+            .expect("the fake cli did not record its argv — did it run at all?");
+        raw.lines().map(|l| l.trim_end().to_string()).collect()
+    }
+
+    /// The raw command tail the CLI was handed, with the shim's `\"` escaping
+    /// undone — i.e. the string an MSVCRT argv parser reconstructs. On POSIX
+    /// there is no escaping and the unescape is a no-op.
+    fn recorded_command_line(&self) -> String {
+        std::fs::read_to_string(self.artifact("cmdline.txt"))
+            .expect("the fake cli did not record its command line — did it run at all?")
+            .trim()
+            .replace("\\\"", "\"")
+    }
+
+    fn recorded_cwd(&self) -> PathBuf {
+        let raw = std::fs::read_to_string(self.artifact("cwd.txt")).expect("cwd.txt");
+        PathBuf::from(raw.trim())
+    }
+
     fn config(&self, timeout_secs: u64) -> ClaudeConfig {
         ClaudeConfig {
             binary: self.binary.to_string_lossy().into_owned(),
@@ -93,6 +179,11 @@ impl FakeCli {
     fn engine(&self, timeout_secs: u64) -> ClaudeEngine {
         ClaudeEngine::new(&self.config(timeout_secs))
     }
+}
+
+/// An envelope the engine accepts, for tests whose subject is the *input* side.
+fn ok_envelope() -> serde_json::Value {
+    serde_json::json!({"is_error": false, "result": "ok", "total_cost_usd": 0.01})
 }
 
 #[tokio::test]
@@ -275,6 +366,281 @@ async fn schema_result_is_not_silently_empty_and_uncacheable() {
         out.json,
         Some(serde_json::json!({"state": "CA", "rate": 13.3})),
         "the validated structured output is still the parsed answer"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Subprocess hygiene: what the engine hands the CLI
+// ---------------------------------------------------------------------------
+
+/// THE anti-pattern: free-form prose went out as `--append-system-prompt <text>`,
+/// straight into cmd.exe's re-parse. "R&D" truncated the value and ran the rest
+/// as a command; "100% of" expanded an environment variable into it. The text now
+/// travels by file, so no amount of prose can reach the command line.
+#[tokio::test]
+async fn the_system_prompt_travels_by_file_not_argv() {
+    let cli = FakeCli::recording("sysprompt", &ok_envelope());
+    let hostile = "Cite R&D spend >50% of revenue | flag ^outliers^";
+
+    let mut req = ResearchRequest::new("q");
+    req.append_system_prompt = Some(hostile.to_string());
+    cli.engine(30)
+        .research(req)
+        .await
+        .expect("prose full of shell metacharacters must not fail the run");
+
+    let argv = cli.recorded_argv();
+    assert!(
+        !argv.iter().any(|a| a == "--append-system-prompt"),
+        "the prose is back on the command line: {argv:?}"
+    );
+    let at = argv
+        .iter()
+        .position(|a| a == "--append-system-prompt-file")
+        .expect("the system prompt must be passed by file");
+    let path = argv.get(at + 1).expect("a path follows the flag");
+    assert!(
+        !cli.recorded_command_line().contains("R&D"),
+        "the prose itself reached the command line: {}",
+        cli.recorded_command_line()
+    );
+    // The engine deletes the file when the run ends, so the assertion that it
+    // carried the *exact* text is on the path it handed over.
+    assert!(
+        path.ends_with(".txt") && path.contains("sysprompt"),
+        "not a scratch file path: {path}"
+    );
+}
+
+/// The scratch file is not litter: it holds an operator's prompt text, and one
+/// per research call would accumulate forever under the storage root.
+#[tokio::test]
+async fn the_system_prompt_file_is_deleted_after_the_run() {
+    let workdir = tempfile::Builder::new()
+        .prefix("pumper-claude-cwd-")
+        .tempdir()
+        .expect("temp dir");
+    let cli = FakeCli::recording("sysprompt-cleanup", &ok_envelope());
+    let cfg = ClaudeConfig {
+        isolation_dir: Some(workdir.path().to_path_buf()),
+        ..cli.config(30)
+    };
+
+    let mut req = ResearchRequest::new("q");
+    req.append_system_prompt = Some("some instructions".into());
+    ClaudeEngine::new(&cfg).research(req).await.expect("a run");
+
+    let leftovers: Vec<_> = std::fs::read_dir(workdir.path())
+        .expect("read workdir")
+        .filter_map(|e| e.ok())
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with("pumper-sysprompt-"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "the system-prompt file outlived its run: {leftovers:?}"
+    );
+}
+
+/// THE anti-pattern: the subprocess inherited the server's CWD, so in dev every
+/// scraping research call discovered *this repo's* CLAUDE.md, skills and Stop
+/// hooks — paid context that has nothing to do with the job. An explicit,
+/// dedicated working directory is what stops that discovery starting here.
+#[tokio::test]
+async fn the_subprocess_runs_in_its_own_dir_not_the_servers_cwd() {
+    let workdir = tempfile::Builder::new()
+        .prefix("pumper-claude-cwd-")
+        .tempdir()
+        .expect("temp dir");
+    // A dir the engine must create itself — the storage root exists long before
+    // anything asks Claude a question.
+    let nested = workdir.path().join("claude-cwd");
+    let cli = FakeCli::recording("cwd", &ok_envelope());
+    let cfg = ClaudeConfig {
+        isolation_dir: Some(nested.clone()),
+        ..cli.config(30)
+    };
+
+    ClaudeEngine::new(&cfg)
+        .research(ResearchRequest::new("q"))
+        .await
+        .expect("a run");
+
+    assert!(nested.is_dir(), "the working dir was not created");
+    let seen = cli.recorded_cwd();
+    assert_eq!(
+        seen.canonicalize().expect("canonicalize seen"),
+        nested.canonicalize().expect("canonicalize expected"),
+        "the subprocess did not run in its isolation dir"
+    );
+    assert_ne!(
+        seen.canonicalize().ok(),
+        std::env::current_dir()
+            .ok()
+            .and_then(|d| d.canonicalize().ok()),
+        "the subprocess inherited the server's CWD"
+    );
+}
+
+/// Unset isolation dir = today's behaviour, which is what every other test in
+/// this file (and every ClaudeConfig built by hand) relies on.
+#[tokio::test]
+async fn no_isolation_dir_keeps_the_inherited_cwd() {
+    let cli = FakeCli::recording("cwd-inherited", &ok_envelope());
+    cli.engine(30)
+        .research(ResearchRequest::new("q"))
+        .await
+        .expect("a run");
+
+    assert_eq!(
+        cli.recorded_cwd().canonicalize().ok(),
+        std::env::current_dir()
+            .ok()
+            .and_then(|d| d.canonicalize().ok()),
+        "an unset isolation dir must not move the subprocess"
+    );
+}
+
+/// A schema cmd.exe would corrupt must be refused *before* anything spawns — a
+/// mangled schema still costs a full run, and the answer would be validated
+/// against a schema the app never wrote.
+#[cfg(windows)]
+#[tokio::test]
+async fn a_hostile_schema_is_refused_before_the_cli_runs() {
+    let cli = FakeCli::recording("hostile-schema", &ok_envelope());
+
+    let mut req = ResearchRequest::new("q");
+    req.json_schema = Some(serde_json::json!({
+        "type": "object",
+        "description": "R&D > 50% of revenue",
+    }));
+    let err = cli
+        .engine(30)
+        .research(req)
+        .await
+        .expect_err("a schema cmd.exe would mangle must be refused");
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("--json-schema"),
+        "the flag is not named: {msg}"
+    );
+    assert!(
+        !cli.artifact("argv.txt").exists(),
+        "the CLI ran anyway — a refusal that still spawns still spends"
+    );
+    assert_eq!(
+        err.claude_spend().expect("a claude failure").class,
+        pumper_core::error::ClaudeFailure::Spawn,
+        "nothing ran, so the ledger must record no spend at all"
+    );
+}
+
+/// An ordinary schema must still reach the CLI intact: the guard's failure mode
+/// with the highest blast radius is refusing the six apps that send one.
+#[tokio::test]
+async fn an_ordinary_schema_still_reaches_the_cli() {
+    let cli = FakeCli::recording("ok-schema", &ok_envelope());
+
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"state": {"type": "string"}},
+        "required": ["state"],
+    });
+    let mut req = ResearchRequest::new("q");
+    req.json_schema = Some(schema.clone());
+    cli.engine(30).research(req).await.expect("a valid schema");
+
+    assert!(
+        cli.recorded_argv().iter().any(|a| a == "--json-schema"),
+        "the schema flag never reached the CLI"
+    );
+    // Content fidelity is asserted against the raw tail, not batch's tokens —
+    // see `FakeCli::recording`. The schema must arrive character-for-character:
+    // a schema that survives "mostly" still constrains the answer to something
+    // the app did not ask for.
+    assert!(
+        cli.recorded_command_line().contains(&schema.to_string()),
+        "the schema was mangled crossing the shim: {}",
+        cli.recorded_command_line()
+    );
+}
+
+/// THE anti-pattern: a typo'd role resolved to `None` and fell through to the
+/// config defaults, so the job succeeded having bought a different model at a
+/// different effort than the caller asked for.
+#[tokio::test]
+async fn an_unknown_role_is_an_error_not_a_silent_default() {
+    let cli = FakeCli::recording("bad-role", &ok_envelope());
+
+    let err = cli
+        .engine(30)
+        .research(ResearchRequest::new("q").with_role("reserch"))
+        .await
+        .expect_err("an unconfigured role must not resolve to the defaults");
+
+    let msg = err.to_string();
+    assert!(msg.contains("reserch"), "the typo is not echoed: {msg}");
+    assert!(
+        msg.contains("research") && msg.contains("compose"),
+        "the message must name the configured roles: {msg}"
+    );
+    assert!(
+        !cli.artifact("argv.txt").exists(),
+        "the CLI ran with the wrong preset anyway"
+    );
+}
+
+/// The compatibility half of the same door: a request with no role at all is the
+/// common case and keeps working, on the config defaults.
+#[tokio::test]
+async fn a_request_with_no_role_still_runs() {
+    let cli = FakeCli::recording("no-role", &ok_envelope());
+    let out = cli
+        .engine(30)
+        .research(ResearchRequest::new("q"))
+        .await
+        .expect("a request without a role is valid");
+    assert_eq!(out.text, "ok");
+}
+
+/// A configured role resolves and reaches the CLI as the model it names.
+#[tokio::test]
+async fn a_configured_role_reaches_the_cli_as_its_model() {
+    let cli = FakeCli::recording("good-role", &ok_envelope());
+    cli.engine(30)
+        .research(ResearchRequest::new("q").with_role("compose"))
+        .await
+        .expect("a configured role resolves");
+
+    let argv = cli.recorded_argv();
+    let at = argv.iter().position(|a| a == "--model").expect("--model");
+    assert_eq!(
+        argv.get(at + 1).map(String::as_str),
+        Some("claude-opus-4-8"),
+        "the compose role's model did not reach the CLI: {argv:?}"
+    );
+}
+
+/// `model` is a free string from the `POST /jobs` body all the way to `--model`.
+/// A garbage value must be refused at the door, not become a subprocess parse
+/// error (or worse) after a process has already started.
+#[tokio::test]
+async fn a_garbage_model_is_refused_before_spawning() {
+    let cli = FakeCli::recording("bad-model", &ok_envelope());
+
+    let mut req = ResearchRequest::new("q");
+    req.model = Some("opus --dangerously-skip-permissions".into());
+    let err = cli
+        .engine(30)
+        .research(req)
+        .await
+        .expect_err("a free-string model must be validated at the engine door");
+
+    assert!(err.to_string().contains("refusing model"), "{err}");
+    assert!(
+        !cli.artifact("argv.txt").exists(),
+        "the CLI was spawned with an unvalidated model"
     );
 }
 

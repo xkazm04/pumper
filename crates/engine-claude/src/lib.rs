@@ -3,7 +3,10 @@
 //! stdin, which sidesteps Windows command-line length limits and cmd.exe
 //! quoting entirely.
 
+use std::fmt;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -26,14 +29,40 @@ impl ClaudeEngine {
 
     /// Resolves model/effort/budget from the request's explicit fields, then
     /// its role preset, then the config defaults (in that precedence).
-    fn resolve(&self, req: &ResearchRequest) -> Resolved {
-        let role = req.role.as_deref().and_then(|r| self.cfg.roles.get(r));
-        Resolved {
-            model: req
-                .model
-                .clone()
-                .or_else(|| role.and_then(|r| r.model.clone()))
-                .or_else(|| self.cfg.model.clone()),
+    ///
+    /// Fails on a role nobody configured. That used to resolve to `None` and
+    /// fall straight through to the config defaults, so a typo'd `role` in a
+    /// `POST /jobs` body silently bought a *different model at a different
+    /// effort* than the caller asked for — the job succeeded, the bill was
+    /// wrong, and nothing anywhere said so.
+    fn resolve(&self, req: &ResearchRequest) -> Result<Resolved> {
+        let role = match req.role.as_deref() {
+            None => None,
+            Some(name) => Some(self.cfg.roles.get(name).ok_or_else(|| {
+                Error::claude(
+                    ClaudeFailure::Spawn,
+                    unknown_role_message(name, self.cfg.roles.keys().map(String::as_str)),
+                )
+            })?),
+        };
+        let model = req
+            .model
+            .clone()
+            .or_else(|| role.and_then(|r| r.model.clone()))
+            .or_else(|| self.cfg.model.clone());
+        if let Some(model) = model.as_deref().filter(|m| !is_plain_model_id(m)) {
+            return Err(Error::claude(
+                ClaudeFailure::Spawn,
+                format!(
+                    "refusing model {model:?}: a model id may only contain letters, digits, \
+                     '.', '_', ':' and '-' (at most {MAX_MODEL_ID_CHARS} of them). It reaches \
+                     the CLI as `--model <value>`, so anything else is a subprocess parse \
+                     error at best"
+                ),
+            ));
+        }
+        Ok(Resolved {
+            model,
             effort: req
                 .effort
                 .clone()
@@ -43,10 +72,31 @@ impl ClaudeEngine {
                 .max_budget_usd
                 .or_else(|| role.and_then(|r| r.max_budget_usd))
                 .or(self.cfg.max_budget_usd),
-        }
+        })
     }
 
-    fn command(&self, req: &ResearchRequest, resolved: &Resolved) -> Command {
+    /// The directory the subprocess runs in, and the scratch root for files the
+    /// engine hands it. Created on demand; `None` keeps the server's own CWD.
+    fn workdir(&self) -> Result<Option<PathBuf>> {
+        let Some(dir) = self.cfg.isolation_dir.as_ref() else {
+            return Ok(None);
+        };
+        std::fs::create_dir_all(dir).map_err(|e| {
+            Error::claude(
+                ClaudeFailure::Spawn,
+                format!(
+                    "could not create the claude working dir {}: {e}",
+                    dir.display()
+                ),
+            )
+        })?;
+        Ok(Some(dir.clone()))
+    }
+
+    fn command(&self, req: &ResearchRequest, resolved: &Resolved) -> Result<Launch> {
+        let workdir = self.workdir()?;
+        let scratch_root = workdir.clone().unwrap_or_else(std::env::temp_dir);
+        let mut scratch: Vec<ScratchFile> = Vec::new();
         let mut args: Vec<String> = vec!["-p".into(), "--output-format".into(), "json".into()];
         if let Some(model) = &resolved.model {
             args.push("--model".into());
@@ -82,17 +132,26 @@ impl ClaudeEngine {
             args.push("--json-schema".into());
             args.push(schema.to_string());
         }
-        // Caveat: these travel as cmd.exe arguments on Windows; exotic shell
-        // metacharacters may be mangled. Prefer folding instructions into the
-        // prompt itself, which goes over stdin.
+        // Free-form operator prose is the single most cmd.exe-hostile thing the
+        // engine handles ("R&D", "100% of", "cost > value" all mangle or inject),
+        // so it does not travel on argv at all: `--append-system-prompt-file`
+        // takes a path, and the CLI reads the text itself. Only the path is left
+        // for the guard below to vet.
         if let Some(system) = &req.append_system_prompt {
-            args.push("--append-system-prompt".into());
-            args.push(system.clone());
+            let file = ScratchFile::write(&scratch_root, "sysprompt", system)?;
+            args.push("--append-system-prompt-file".into());
+            args.push(file.path().to_string_lossy().into_owned());
+            scratch.push(file);
         }
 
         // npm installs `claude` as .ps1/.cmd shims, which CreateProcess cannot
         // spawn directly — route through cmd.exe unless pointed at a real .exe.
-        let mut cmd = if cfg!(windows) && !self.cfg.binary.to_lowercase().ends_with(".exe") {
+        let via_shim = cfg!(windows) && !self.cfg.binary.to_lowercase().ends_with(".exe");
+        let mut cmd = if via_shim {
+            // Only this path re-parses. Vetting argv unconditionally would refuse
+            // schemas that a direct `execve`/`CreateProcess` delivers byte-exact.
+            check_shim_argv(&self.cfg.binary, &args)
+                .map_err(|refusal| Error::claude(ClaudeFailure::Spawn, refusal.to_string()))?;
             let mut c = Command::new("cmd");
             c.arg("/C").arg(&self.cfg.binary);
             c
@@ -100,7 +159,51 @@ impl ClaudeEngine {
             Command::new(&self.cfg.binary)
         };
         cmd.args(&args);
-        cmd
+        if let Some(dir) = &workdir {
+            cmd.current_dir(dir);
+        }
+        Ok(Launch { cmd, scratch })
+    }
+}
+
+/// A command plus the scratch files that must outlive the process reading them.
+struct Launch {
+    cmd: Command,
+    scratch: Vec<ScratchFile>,
+}
+
+/// A file handed to the subprocess by path, removed when the run ends —
+/// including on every early-return path, which is the point of the `Drop`.
+struct ScratchFile(PathBuf);
+
+impl ScratchFile {
+    fn write(dir: &Path, kind: &str, body: &str) -> Result<Self> {
+        // pid + counter: two concurrent research jobs in one process must not
+        // hand the CLI the same path, and a stale file from a previous run of a
+        // recycled pid must not be readable as this run's prompt.
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let path = dir.join(format!(
+            "pumper-{kind}-{}-{}.txt",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::write(&path, body).map_err(|e| {
+            Error::claude(
+                ClaudeFailure::Spawn,
+                format!("could not write {kind} file {}: {e}", path.display()),
+            )
+        })?;
+        Ok(Self(path))
+    }
+
+    fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
+impl Drop for ScratchFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -108,13 +211,18 @@ impl ClaudeEngine {
 impl Researcher for ClaudeEngine {
     async fn research(&self, req: ResearchRequest) -> Result<ResearchOutput> {
         let timeout = Duration::from_secs(req.timeout_secs.unwrap_or(self.cfg.timeout_secs));
-        let resolved = self.resolve(&req);
+        let resolved = self.resolve(&req)?;
         debug!(
             model = resolved.model.as_deref().unwrap_or("<default>"),
             effort = resolved.effort.as_deref().unwrap_or("<default>"),
             "resolved claude run"
         );
-        let mut cmd = self.command(&req, &resolved);
+        // Held for the whole call: the CLI reads the system-prompt file at
+        // startup, and dropping this is what deletes it afterwards.
+        let Launch {
+            mut cmd,
+            scratch: _scratch,
+        } = self.command(&req, &resolved)?;
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -385,7 +493,146 @@ fn tree_kill_argv(pid: u32) -> Option<(&'static str, Vec<String>)> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// What may cross the cmd.exe shim
+// ---------------------------------------------------------------------------
+
+/// Characters cmd.exe re-interprets when it re-parses the line on the shim path.
+///
+/// **Measured** (Windows 11, `cmd /C <shim>` with argv echoed back by node), not
+/// taken from a table — the results differ from the obvious guess in both
+/// directions:
+///
+/// - `&` truncates the value and runs the remainder as a *second command*.
+/// - `|`, `>` hijack the invocation into a pipe/redirect; the CLI never runs.
+/// - `^` is cmd's escape character and is **silently eaten** (`a ^ b` arrives as
+///   `a  b`) — the worst shape here: no error, a corrupted schema, money spent.
+/// - `%` expands: `%TEMP%` arrived as `C:\Users\…\Temp`, and `%PATH%` inlined the
+///   entire PATH into the argument. Mangling *and* an environment leak into a
+///   value that reaches the model.
+/// - `<` survived one probe and broke another (it depends on cmd's quote state at
+///   that point, which `\"`-escaped JSON desynchronises) — unreliable is refused.
+/// - A newline truncates the value; a carriage return is dropped silently.
+///
+/// Deliberately **absent: the double quote**. Refusing `"` was the tempting rule
+/// and it would have broken every schema-using app: a real JSON schema — quotes,
+/// braces, brackets, colons, commas, backslashes, non-ASCII — round-trips
+/// byte-exact through the shim, and six production apps depend on that. A lone
+/// `"` cannot mangle anything by itself; it only desynchronises quote state,
+/// which matters solely for the characters already refused above.
+const CMD_HOSTILE: &[char] = &['%', '&', '|', '<', '>', '^', '\n', '\r'];
+
+/// Budget for the whole rendered `cmd /C …` line.
+///
+/// Measured cliff: a line built from an 8008-character value went through, 8108
+/// failed with "The command line is too long" — consistent with cmd.exe's
+/// documented 8191 ceiling. The budget keeps ~190 characters of headroom for
+/// quoting the probe could not exercise.
+const MAX_SHIM_COMMAND_LINE: usize = 8000;
+
+/// Longest model id accepted. Real ids are ~20 characters; this only has to be
+/// short enough that a runaway string is refused before it reaches argv.
+const MAX_MODEL_ID_CHARS: usize = 128;
+
+/// Why an argument cannot cross the shim. Typed so the refusal names the flag —
+/// "argument rejected" would leave an operator guessing which of nine it was.
+#[derive(Debug, PartialEq, Eq)]
+enum ShimRefusal {
+    Metacharacter { flag: String, ch: char },
+    TooLong { flag: String, width: usize },
+}
+
+impl fmt::Display for ShimRefusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Metacharacter { flag, ch } => write!(
+                f,
+                "refusing to run: the value for `{flag}` contains {ch:?}, which cmd.exe \
+                 re-interprets when it re-parses the command line for the `claude` shim \
+                 (it would be mangled, or run as a separate command). Fold the text into \
+                 the prompt, which is piped over stdin, or point `[claude] binary` at a \
+                 real .exe to bypass the shim"
+            ),
+            Self::TooLong { flag, width } => write!(
+                f,
+                "refusing to run: the command line reaches {width} characters by `{flag}`, \
+                 over the {MAX_SHIM_COMMAND_LINE}-character budget for the cmd.exe shim \
+                 (cmd.exe truncates at 8191). Shrink the schema, or point `[claude] binary` \
+                 at a real .exe to bypass the shim"
+            ),
+        }
+    }
+}
+
+/// Conservative rendered width of one argv value once Rust has quoted it for
+/// `CreateProcess`, plus the separating space. Over-estimating is the safe
+/// direction: a refusal is loud, a truncated command line is not.
+fn shim_arg_width(value: &str) -> usize {
+    let escaped = value.chars().filter(|c| matches!(c, '"' | '\\')).count();
+    value.chars().count() + escaped + 3
+}
+
+/// The offending character, if this value cannot survive cmd.exe's re-parse.
+fn cmd_hostile_char(value: &str) -> Option<char> {
+    value.chars().find(|c| CMD_HOSTILE.contains(c))
+}
+
+/// Vets everything destined for the shim, naming the flag that owns the offending
+/// value. **Refuses; never sanitises.** Stripping or escaping would hand the model
+/// a schema that is not the one the app wrote, and a wrong answer that looks right
+/// is worse than a failed job.
+fn check_shim_argv(binary: &str, args: &[String]) -> std::result::Result<(), ShimRefusal> {
+    // `cmd /C ` plus the shim path are on the line too, and a binary path is as
+    // capable of holding a `&` as any other value.
+    let mut flag = "[claude] binary".to_string();
+    let mut width = "cmd /C ".len() + shim_arg_width(binary);
+    if let Some(ch) = cmd_hostile_char(binary) {
+        return Err(ShimRefusal::Metacharacter { flag, ch });
+    }
+    for arg in args {
+        // Values follow their flag, so the most recent flag names the offender.
+        if arg.starts_with('-') {
+            flag = arg.clone();
+        }
+        if let Some(ch) = cmd_hostile_char(arg) {
+            return Err(ShimRefusal::Metacharacter { flag, ch });
+        }
+        width += shim_arg_width(arg);
+        if width > MAX_SHIM_COMMAND_LINE {
+            return Err(ShimRefusal::TooLong { flag, width });
+        }
+    }
+    Ok(())
+}
+
+/// Whether a model id is plain enough to hand to `--model` unquoted-in-spirit.
+/// A pattern check, deliberately **not** a catalogue of known ids: new models
+/// ship constantly and an allowlist would reject them for a week each time.
+fn is_plain_model_id(model: &str) -> bool {
+    !model.is_empty()
+        && model.chars().count() <= MAX_MODEL_ID_CHARS
+        && model
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | ':' | '-'))
+}
+
+/// Names what the operator could have meant. A bare "unknown role" is useless
+/// when the roles live in a config file the caller may never have read.
+fn unknown_role_message<'a>(name: &str, known: impl Iterator<Item = &'a str>) -> String {
+    let mut names: Vec<&str> = known.collect();
+    names.sort_unstable();
+    if names.is_empty() {
+        format!("unknown claude role {name:?}: no roles are configured under [claude.roles]")
+    } else {
+        format!(
+            "unknown claude role {name:?}; configured roles are: {}",
+            names.join(", ")
+        )
+    }
+}
+
 /// Effective model/effort/budget after merging request, role, and config.
+#[derive(Debug)]
 struct Resolved {
     model: Option<String>,
     effort: Option<String>,
@@ -459,8 +706,215 @@ fn truncate(s: &str, max_chars: usize) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{envelope_text, parse_loose_json, tree_kill_argv};
+    use super::{
+        check_shim_argv, envelope_text, is_plain_model_id, parse_loose_json, tree_kill_argv,
+        unknown_role_message, ClaudeEngine, ShimRefusal, MAX_SHIM_COMMAND_LINE,
+    };
+    use pumper_core::config::{ClaudeConfig, ClaudeRole};
+    use pumper_core::ResearchRequest;
     use serde_json::json;
+
+    fn argv(pairs: &[&str]) -> Vec<String> {
+        pairs.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// THE anti-pattern this guard exists for: cmd.exe re-parses the shim line,
+    /// so these characters do not arrive as written. Each was *measured* through
+    /// a real `cmd /C` round-trip — `&` splits the value and runs the tail as a
+    /// command, `^` is eaten in silence, `%TEMP%` expands to a path. Mangling is
+    /// worse than failing, because a corrupted schema still costs a full run.
+    #[test]
+    fn cmd_args_refused_not_mangled() {
+        for ch in ['%', '&', '|', '<', '>', '^', '\n', '\r'] {
+            let schema = format!("{{\"d\":\"a{ch}b\"}}");
+            let err = check_shim_argv("claude", &argv(&["--json-schema", &schema]))
+                .expect_err("this character does not survive cmd.exe and must be refused");
+            assert_eq!(
+                err,
+                ShimRefusal::Metacharacter {
+                    flag: "--json-schema".into(),
+                    ch
+                },
+                "the refusal must name the offending flag and character"
+            );
+            assert!(
+                err.to_string().contains("--json-schema"),
+                "an operator cannot act on a refusal that hides the flag: {err}"
+            );
+        }
+    }
+
+    /// The over-refusal that would have been worse than the bug: a real JSON
+    /// schema is *made of* double quotes, and six production apps send one on
+    /// every call. Measured byte-exact through `cmd /C`, so it must pass.
+    #[test]
+    fn a_real_schema_still_crosses_the_shim() {
+        let schema = r#"{"type":"object","properties":{"state":{"type":"string"},"rate":{"type":"number"}},"required":["state","rate"],"note":"C:\\x — café (a=b; y!)"}"#;
+        assert!(
+            check_shim_argv("claude", &argv(&["--json-schema", schema])).is_ok(),
+            "refusing quotes/braces/backslashes would break every schema-using app"
+        );
+    }
+
+    /// A binary path is an argv value like any other — and it is the one value an
+    /// operator sets by hand in config.
+    #[test]
+    fn a_hostile_binary_path_is_refused_too() {
+        let err = check_shim_argv(r"C:\tools\claude&calc\claude.cmd", &argv(&["-p"]))
+            .expect_err("a binary path holding '&' runs a second command");
+        assert!(err.to_string().contains("[claude] binary"), "{err}");
+    }
+
+    /// Over the ceiling cmd.exe silently truncates at, so the CLI would receive
+    /// half a schema. Refusing names a number an operator can act on.
+    #[test]
+    fn an_oversized_command_line_is_refused_not_truncated() {
+        let huge = "a".repeat(MAX_SHIM_COMMAND_LINE + 10);
+        let err = check_shim_argv("claude", &argv(&["--json-schema", &huge]))
+            .expect_err("cmd.exe cannot carry a line this long");
+        assert!(
+            matches!(err, ShimRefusal::TooLong { .. }),
+            "wrong refusal: {err:?}"
+        );
+        assert!(err.to_string().contains("--json-schema"), "{err}");
+    }
+
+    /// The budget is a *line* budget, not a per-argument one: many medium
+    /// arguments overflow cmd.exe exactly as one huge argument does.
+    #[test]
+    fn the_budget_counts_the_whole_line_not_one_arg() {
+        let chunk = "b".repeat(1000);
+        let mut args = Vec::new();
+        for _ in 0..9 {
+            args.push("--append".to_string());
+            args.push(chunk.clone());
+        }
+        assert!(
+            check_shim_argv("claude", &args).is_err(),
+            "nine 1000-char values fit under no 8000-character line"
+        );
+    }
+
+    #[test]
+    fn garbage_model_is_refused_not_handed_to_the_subprocess() {
+        assert!(is_plain_model_id("claude-sonnet-5"));
+        assert!(is_plain_model_id("us.anthropic.claude-opus-4-8:0"));
+        assert!(!is_plain_model_id(""), "an empty --model value is garbage");
+        assert!(
+            !is_plain_model_id("sonnet 5"),
+            "a space splits the argument"
+        );
+        assert!(!is_plain_model_id("sonnet&calc"), "shell metacharacter");
+        assert!(!is_plain_model_id("--dangerously-skip-permissions x"));
+        assert!(!is_plain_model_id(&"a".repeat(500)));
+    }
+
+    #[test]
+    fn unknown_role_message_names_the_known_roles() {
+        let msg = unknown_role_message("reserch", ["compose", "research"].into_iter());
+        assert!(msg.contains("reserch"), "the typo is not echoed: {msg}");
+        assert!(msg.contains("compose") && msg.contains("research"), "{msg}");
+        let empty = unknown_role_message("research", std::iter::empty());
+        assert!(empty.contains("[claude.roles]"), "{empty}");
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve() precedence — request > role > config, per field independently
+    // -----------------------------------------------------------------------
+
+    fn engine_with_roles() -> ClaudeEngine {
+        let mut cfg = ClaudeConfig {
+            model: Some("config-model".into()),
+            effort: Some("config-effort".into()),
+            max_budget_usd: Some(1.0),
+            ..ClaudeConfig::default()
+        };
+        cfg.roles.clear();
+        cfg.roles.insert(
+            "compose".into(),
+            ClaudeRole {
+                model: Some("role-model".into()),
+                effort: Some("role-effort".into()),
+                max_budget_usd: Some(2.0),
+            },
+        );
+        ClaudeEngine::new(&cfg)
+    }
+
+    #[test]
+    fn config_defaults_apply_when_nothing_overrides_them() {
+        let resolved = engine_with_roles()
+            .resolve(&ResearchRequest::new("q"))
+            .expect("a request with no role is valid");
+        assert_eq!(resolved.model.as_deref(), Some("config-model"));
+        assert_eq!(resolved.effort.as_deref(), Some("config-effort"));
+        assert_eq!(resolved.max_budget_usd, Some(1.0));
+    }
+
+    #[test]
+    fn a_role_overrides_the_config_defaults() {
+        let resolved = engine_with_roles()
+            .resolve(&ResearchRequest::new("q").with_role("compose"))
+            .expect("a configured role resolves");
+        assert_eq!(resolved.model.as_deref(), Some("role-model"));
+        assert_eq!(resolved.effort.as_deref(), Some("role-effort"));
+        assert_eq!(resolved.max_budget_usd, Some(2.0));
+    }
+
+    /// Per field *independently*: a request that sets only `model` must keep the
+    /// role's effort and budget, not reset them to the config defaults.
+    #[test]
+    fn a_request_field_overrides_only_its_own_field() {
+        let mut req = ResearchRequest::new("q").with_role("compose");
+        req.model = Some("request-model".into());
+        let resolved = engine_with_roles().resolve(&req).expect("valid");
+        assert_eq!(resolved.model.as_deref(), Some("request-model"));
+        assert_eq!(
+            resolved.effort.as_deref(),
+            Some("role-effort"),
+            "an explicit model must not discard the role's effort"
+        );
+        assert_eq!(resolved.max_budget_usd, Some(2.0));
+    }
+
+    /// A request field beats the role even when the role sets it too — and the
+    /// other two fields still come from the role.
+    #[test]
+    fn a_request_beats_the_role_on_every_field() {
+        let mut req = ResearchRequest::new("q").with_role("compose");
+        req.effort = Some("request-effort".into());
+        req.max_budget_usd = Some(3.0);
+        let resolved = engine_with_roles().resolve(&req).expect("valid");
+        assert_eq!(resolved.model.as_deref(), Some("role-model"));
+        assert_eq!(resolved.effort.as_deref(), Some("request-effort"));
+        assert_eq!(resolved.max_budget_usd, Some(3.0));
+    }
+
+    /// THE anti-pattern: an unknown role resolved to `None` and fell through to
+    /// the config defaults, so a typo bought a different model at a different
+    /// effort and the job *succeeded* with the wrong bill.
+    #[test]
+    fn an_unknown_role_is_refused_not_silently_defaulted() {
+        let err = engine_with_roles()
+            .resolve(&ResearchRequest::new("q").with_role("compoze"))
+            .expect_err("a typo'd role must not resolve to the config defaults");
+        let msg = err.to_string();
+        assert!(msg.contains("compoze"), "{msg}");
+        assert!(
+            msg.contains("compose"),
+            "the message must list what IS configured: {msg}"
+        );
+    }
+
+    #[test]
+    fn a_garbage_model_is_refused_at_the_engine_door() {
+        let mut req = ResearchRequest::new("q");
+        req.model = Some("sonnet 5; rm -rf /".into());
+        let err = engine_with_roles()
+            .resolve(&req)
+            .expect_err("a free-string model must not reach --model");
+        assert!(err.to_string().contains("refusing model"), "{err}");
+    }
 
     /// The ordinary shape: a string result travels verbatim.
     #[test]

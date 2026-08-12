@@ -354,10 +354,22 @@ let out = ctx.engines.claude.research(req).await?;
 ```
 Model + reasoning are chosen per job: pass a `role` (presets in `[claude.roles]`),
 or set `model` / `effort` (`low|medium|high|xhigh|max`) directly — request fields
-override the role, which overrides the config default. `out.json` is auto-populated
-when the reply parses as JSON (fenced and prose-embedded JSON are both extracted;
-`json_schema` uses the CLI's validated `--json-schema` output). **Instruct the
-agent to return strict JSON** for structured output.
+override the role, which overrides the config default, **per field independently**.
+`out.json` is auto-populated when the reply parses as JSON (fenced and
+prose-embedded JSON are both extracted; `json_schema` uses the CLI's validated
+`--json-schema` output). **Instruct the agent to return strict JSON** for
+structured output.
+
+The engine refuses bad input rather than passing it to the subprocess: a `role`
+no config defines is an error naming the configured roles (a *missing* role is
+fine — it takes the defaults), a `model` outside `[A-Za-z0-9._:-]{1,128}` is
+refused, and on the Windows shim path any value holding `% & | < > ^` or a
+newline is refused instead of being mangled by cmd.exe's second parse. All of
+these fail before spawning, so they cost nothing. `append_system_prompt` is
+exempt — it travels by file, not argv — so prose may contain anything. The
+subprocess runs in `<storage root>/claude-cwd`, not the server's CWD, so it does
+not inherit your checkout's `CLAUDE.md`/hooks. See
+[docs/features/fetching.md](docs/features/fetching.md#what-may-cross-the-cmdexe-shim).
 
 ### `ctx.engines.fetch` — `Fetcher::fetch(FetchRequest) -> FetchOutcome`
 ```rust

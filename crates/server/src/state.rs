@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use pumper_core::config::ClaudeConfig;
 use pumper_core::{
     Config, CostLedger, Datasets, EngineSet, Fetcher, Governor, HttpCache, HttpClient, NoPlugins,
     NoSearch, Plugins, ResearchCache, Resilience, ScrapeApp, Search, Storage, TierMemory,
@@ -236,7 +237,22 @@ impl AppState {
             profiles_dir.clone(),
         )?);
         let browser = Arc::new(BrowserEngine::new(&config.browser, profiles_dir));
-        let claude = Arc::new(ClaudeEngine::new(&config.claude));
+        // The CLI subprocess gets its own working directory under the storage
+        // root instead of inheriting the server's CWD. Left inherited, a server
+        // started from a directory that happens to be a Claude Code project
+        // loaded that project's CLAUDE.md, skills and hooks into every research
+        // call — paid context that has nothing to do with the job (measured in
+        // dev: 35k cached input tokens for a one-word prompt, plus the repo's
+        // Stop hook firing per call).
+        //
+        // Derived, not configured: it is `<storage root>/claude-cwd`, so an
+        // operator who wants total isolation moves `[storage] database_path`
+        // out of any Claude Code project rather than reaching for a second key.
+        let claude_cfg = ClaudeConfig {
+            isolation_dir: Some(ClaudeConfig::workdir_for(&config.storage.database_path)),
+            ..config.claude.clone()
+        };
+        let claude = Arc::new(ClaudeEngine::new(&claude_cfg));
         // Tier-zero archive engine (`[archive]`, default OFF). Its CDX and
         // snapshot requests run through the SAME HttpEngine, so archive.org is
         // governed/cached/capped exactly like any other host.
