@@ -117,6 +117,85 @@ pub fn host_of(url: &str) -> Option<String> {
     (!host.is_empty()).then(|| host.to_lowercase())
 }
 
+/// Whether this crawl saw the entire graph it discovered.
+///
+/// Anti-pattern this defends: core counts truncation honestly and documents both
+/// counters as existing so a capped crawl is "reported honestly rather than
+/// silently dropping discovered URLs" — and the app emitted **neither**, so a
+/// crawl that refused thousands of discovered URLs at the 100k frontier cap, or
+/// dumped a whole host's backlog at `max_pages_per_host`, returned a result
+/// byte-identical to one that covered the whole site. Emitting the two raw
+/// counters is still not legible on its own (a caller would have to know that
+/// "both zero means complete"), so the verdict is named and reported beside them.
+fn coverage_complete(frontier_dropped: usize, skipped_host_budget: usize) -> bool {
+    frontier_dropped == 0 && skipped_host_budget == 0
+}
+
+/// The `warnings` entry for a truncated crawl — the fleet's idiom for "this
+/// result describes a WINDOW, not the whole thing" (cordis `aggregate_truncated`,
+/// census `blend_complete`). `None` when nothing was cut, so a complete crawl
+/// carries no warning noise.
+fn coverage_warning(frontier_dropped: usize, skipped_host_budget: usize) -> Option<String> {
+    if coverage_complete(frontier_dropped, skipped_host_budget) {
+        return None;
+    }
+    let mut parts: Vec<String> = Vec::new();
+    if frontier_dropped > 0 {
+        parts.push(format!(
+            "{frontier_dropped} discovered URLs were refused at the frontier cap"
+        ));
+    }
+    if skipped_host_budget > 0 {
+        parts.push(format!(
+            "{skipped_host_budget} queued URLs were dropped when their host reached \
+             max_pages_per_host"
+        ));
+    }
+    Some(format!(
+        "coverage is PARTIAL: {} — this run crawled a WINDOW of the graph it discovered, so the \
+         page counts and `top_linked` describe what was reached, not what exists",
+        parts.join(" and ")
+    ))
+}
+
+/// The manifest's `output_shape`: the leading `{...}` block lists **every key
+/// `run()` always returns**, and nothing else. [`output_shape_keys`] parses that
+/// block so an inventory test can diff it against a real run in both directions.
+///
+/// Anti-pattern this defends: the previous shape advertised `pages`, `skipped`
+/// and `unchanged` (keys no run has ever emitted) and omitted every field added
+/// by the last four milestones. `output_shape` is what a consumer codes against,
+/// so drift here is a broken contract, not a stale comment.
+const OUTPUT_SHAPE: &str = "{crawled, kept, skipped_duplicates, skipped_robots, \
+     skipped_filtered, frontier_dropped, skipped_host_budget, coverage_complete, \
+     sitemap_seeded, failed, failed_by_host, skipped_botwall, robots_fetch_failures, \
+     checkpoint_errors, resumed, checkpoint_reset, hosts, frontier_remaining, pages_dataset, \
+     pages_new, pages_changed, pages_unchanged, revisit, revisited, unchanged_304, \
+     skipped_not_due, cadence_updates, changed, new, gone, versions_archived, \
+     reliability_hosts, edges_dataset, edges_written, edges_unchanged, \
+     edges_dropped_out_degree, edges_deduped, top_linked} — crawl tallies plus the `pages` \
+     dataset upsert summary. A truncated crawl (`coverage_complete: false`) additionally \
+     carries a `warnings` array naming what was cut. Bodies land in the job's artifact dir, \
+     changed revisions also as revision-suffixed copies recorded in `page_versions`, and the \
+     link graph streams into the `edges` dataset (key `{from_url}|{to_url}`).";
+
+/// The always-present result keys named by [`OUTPUT_SHAPE`] — everything inside
+/// its leading brace block. Lives beside the string it parses so the inventory
+/// test cannot drift from the format.
+pub fn output_shape_keys() -> Vec<&'static str> {
+    let Some(open) = OUTPUT_SHAPE.find('{') else {
+        return Vec::new();
+    };
+    let Some(close) = OUTPUT_SHAPE[open..].find('}').map(|i| open + i) else {
+        return Vec::new();
+    };
+    OUTPUT_SHAPE[open + 1..close]
+        .split(',')
+        .map(str::trim)
+        .filter(|k| !k.is_empty())
+        .collect()
+}
+
 /// Max existing `pages` records loaded as revisit seeds per run (bounds the
 /// dataset read and the frontier). A larger known set is revisited across runs.
 const REVISIT_SEED_LIMIT: i64 = 10_000;
@@ -136,9 +215,13 @@ struct PageCounts {
     /// Cadence-only counter merges written for `304` check markers (M07). Kept
     /// separate from `changed` — a cadence bump is bookkeeping, not content.
     cadence_updates: AtomicUsize,
-    /// Link-graph edges successfully upserted into the `edges` dataset (M08).
-    /// Counted on write success, like `versions_archived`.
+    /// Link-graph edges the store actually WROTE into the `edges` dataset (M08):
+    /// `summary.new + summary.changed`, exactly as `pages` counts its own writes.
     edges_written: AtomicUsize,
+    /// Edge rows the store found already present and identical — a no-op upsert.
+    /// Kept beside `edges_written` so the batch total stays recoverable now that
+    /// `edges_written` no longer counts no-ops as writes.
+    edges_unchanged: AtomicUsize,
 }
 
 /// Full stored `pages` record per URL, captured at revisit-seed load so the
@@ -475,10 +558,18 @@ impl PageSink for DatasetPageSink {
                 )
                 .await
             {
-                Ok(_) => {
+                Ok(summary) => {
+                    // What the STORE did, not what we handed it. Discarding the
+                    // summary and adding `edge_rows.len()` counted every no-op
+                    // upsert as a write, so a re-crawl of a stable site reported
+                    // its whole link graph as freshly written — while `pages`
+                    // two hundred lines above always used the summary.
                     self.counts
                         .edges_written
-                        .fetch_add(edge_rows.len(), Ordering::Relaxed);
+                        .fetch_add(summary.new.len() + summary.changed.len(), Ordering::Relaxed);
+                    self.counts
+                        .edges_unchanged
+                        .fetch_add(summary.unchanged, Ordering::Relaxed);
                 }
                 Err(e) => tracing::warn!(job = %self.job_id, "crawl edges upsert failed: {e}"),
             }
@@ -635,13 +726,11 @@ impl ScrapeApp for Crawl {
                     params: json!({ "mode": "revisit", "max_pages": 200 }),
                 },
             ],
-            output_shape: Some(
-                "{pages, new, changed, unchanged, skipped, hosts, versions_archived, \
-                 edges_written, edges_dropped_out_degree, top_linked} — crawl tallies plus the \
-                 `pages` dataset upsert summary; bodies land in the job's artifact dir, changed \
-                 revisions also as revision-suffixed copies recorded in `page_versions`, and the \
-                 link graph streams into the `edges` dataset (key `{from_url}|{to_url}`)",
-            ),
+            // Every key `run()` always returns, in emit order. An inventory test
+            // (`tests/result_contract.rs`) diffs this list against a real run's
+            // keys in BOTH directions — the manifest drifted through four
+            // milestones unnoticed because nothing compared the two.
+            output_shape: Some(OUTPUT_SHAPE),
             cost_class: CostClass::Free,
         }
     }
@@ -838,12 +927,23 @@ impl ScrapeApp for Crawl {
         let pages_new = counts.new.load(Ordering::Relaxed);
         let pages_changed = counts.changed.load(Ordering::Relaxed);
         let pages_unchanged = counts.unchanged.load(Ordering::Relaxed);
-        Ok(json!({
+        let mut out = json!({
             "crawled": stats.crawled,
             "kept": stats.kept,
             "skipped_duplicates": stats.skipped_duplicates,
             "skipped_robots": stats.skipped_robots,
             "skipped_filtered": stats.skipped_filtered,
+            // Honest truncation accounting: core computes both counters so a
+            // capped crawl is reported rather than silently short, and until now
+            // the app surfaced neither. `coverage_complete` is the legible
+            // verdict — a caller should not have to know that two zeros mean
+            // "this crawl saw the whole discovered graph".
+            "frontier_dropped": stats.frontier_dropped,
+            "skipped_host_budget": stats.skipped_host_budget,
+            "coverage_complete": coverage_complete(
+                stats.frontier_dropped,
+                stats.skipped_host_budget,
+            ),
             "sitemap_seeded": stats.sitemap_seeded,
             // Honest failure/bot-wall accounting (previously swallowed silently).
             "failed": stats.failed,
@@ -884,10 +984,20 @@ impl ScrapeApp for Crawl {
             // the within-run most-linked-to pages.
             "edges_dataset": link_graph::EDGES_DATASET,
             "edges_written": counts.edges_written.load(Ordering::Relaxed),
+            "edges_unchanged": counts.edges_unchanged.load(Ordering::Relaxed),
             "edges_dropped_out_degree": edge_summary.0,
             "edges_deduped": edge_summary.1,
             "top_linked": edge_summary.2,
-        }))
+        });
+        // Fleet idiom: a partial result says so in `warnings`, and a complete one
+        // stays quiet (cordis `aggregate_truncated`, census `blend_complete`).
+        if let (Some(warning), Value::Object(map)) = (
+            coverage_warning(stats.frontier_dropped, stats.skipped_host_budget),
+            &mut out,
+        ) {
+            map.insert("warnings".into(), json!([warning]));
+        }
+        Ok(out)
     }
 }
 
@@ -987,6 +1097,58 @@ mod tests {
         assert_eq!(host_of(""), None);
     }
 
+    // ── truncation honesty ──────────────────────────────────────────────────
+
+    #[test]
+    fn a_complete_crawl_is_not_warned_about() {
+        // The control arm: if a complete crawl warned, the flag would be noise
+        // on every run and nobody would read it.
+        assert!(coverage_complete(0, 0));
+        assert_eq!(coverage_warning(0, 0), None);
+    }
+
+    #[test]
+    fn a_truncated_crawl_is_not_silent() {
+        // THE REFUTED BEHAVIOR: both counters existed, both were computed, and
+        // a crawl that discarded 12,000 discovered URLs returned a result
+        // byte-identical to one that saw the whole site.
+        assert!(!coverage_complete(12_000, 0));
+        let w = coverage_warning(12_000, 0).expect("a dropped frontier is truncation");
+        assert!(w.contains("12000"), "{w}");
+        assert!(w.contains("frontier cap"), "{w}");
+        assert!(
+            !w.contains("max_pages_per_host"),
+            "no cause it didn't hit: {w}"
+        );
+    }
+
+    #[test]
+    fn a_host_budget_dump_is_not_silent() {
+        assert!(!coverage_complete(0, 340));
+        let w = coverage_warning(0, 340).expect("a dumped host backlog is truncation");
+        assert!(w.contains("340"), "{w}");
+        assert!(w.contains("max_pages_per_host"), "{w}");
+    }
+
+    #[test]
+    fn both_truncation_causes_are_named_not_just_the_first() {
+        let w = coverage_warning(7, 9).expect("truncated");
+        assert!(w.contains('7') && w.contains('9'), "{w}");
+        assert!(
+            w.contains(" and "),
+            "both causes belong in one warning: {w}"
+        );
+    }
+
+    #[test]
+    fn output_shape_key_block_parses_to_bare_keys() {
+        let keys = output_shape_keys();
+        assert!(keys.contains(&"crawled"), "{keys:?}");
+        assert!(keys.contains(&"top_linked"), "{keys:?}");
+        // The prose tail (which itself contains `{from_url}`) must not leak in.
+        assert!(!keys.iter().any(|k| k.contains(' ')), "{keys:?}");
+    }
+
     // ── provenance (M12) ────────────────────────────────────────────────────
 
     const JOB: &str = "11111111-2222-3333-4444-555555555555";
@@ -1061,6 +1223,38 @@ mod tests {
             .remove(0);
         assert_eq!(edge.provenance.job_id.as_deref(), Some(JOB));
         assert!(edge.provenance.source_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn an_unchanged_edge_upsert_is_not_counted_as_a_write() {
+        // THE REFUTED BEHAVIOR: `Ok(_) => edges_written += edge_rows.len()`.
+        // The store's own summary was thrown away, so an edge it found already
+        // present and identical — a no-op — was reported as a write.
+        let store = TempStore::new("crawl-edges-noop").await;
+        let mut first = sink_over(&store, b"<html>one</html>", "page-a.html").await;
+        first
+            .emit(vec![page("https://example.com/a", 7, "page-a.html")])
+            .await;
+        assert_eq!(first.counts.edges_written.load(Ordering::Relaxed), 1);
+        assert_eq!(first.counts.edges_unchanged.load(Ordering::Relaxed), 0);
+
+        // The same job re-offering the identical edge (a fresh within-run dedup
+        // set, so the row really is handed to the store again): nothing is
+        // written, and the result must not claim otherwise.
+        let mut again = sink_over(&store, b"<html>one</html>", "page-a.html").await;
+        again
+            .emit(vec![page("https://example.com/a", 7, "page-a.html")])
+            .await;
+        assert_eq!(
+            again.counts.edges_written.load(Ordering::Relaxed),
+            0,
+            "a no-op upsert is not a write"
+        );
+        assert_eq!(
+            again.counts.edges_unchanged.load(Ordering::Relaxed),
+            1,
+            "...but it stays visible as an unchanged row"
+        );
     }
 
     #[tokio::test]
