@@ -101,6 +101,36 @@ fn parse_archive_params(
 /// Backfill mode also pages through `page_versions` in batches of this size.
 const SOURCE_LIST_LIMIT: i64 = 10_000;
 
+/// The no-keys sweep cap actually in force: `source.limit`, clamped into
+/// `1..=`[`SOURCE_LIST_LIMIT`], defaulting to the ceiling.
+///
+/// Lowering it is the only way to exercise the truncation signal without a
+/// 10,000-record fixture, and it doubles as a bounded smoke run over a large
+/// corpus. It can only narrow the sweep — the ceiling is what keeps one job
+/// from reading an unbounded dataset into memory.
+fn parse_source_limit(source: &serde_json::Map<String, Value>) -> i64 {
+    source
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| (n.max(1) as i64).min(SOURCE_LIST_LIMIT))
+        .unwrap_or(SOURCE_LIST_LIMIT)
+}
+
+/// Whether a capped dataset sweep may have left records behind.
+///
+/// THE ANTI-PATTERN THIS CLOSES: a full page means the CAP decided where the
+/// sweep stopped, not the dataset. A 12,000-record source extracted 10,000 and
+/// reported `requested: 10000` — a number indistinguishable from a dataset that
+/// really does hold 10,000 rows, so nothing downstream could tell a complete
+/// run from a silently partial one.
+///
+/// Judged on the page the store returned, BEFORE the removed/gone filter: how
+/// many rows survived that filter says nothing about whether more rows exist
+/// past the cap.
+fn sweep_truncated(returned: usize, limit: i64) -> bool {
+    limit > 0 && returned as i64 >= limit
+}
+
 /// The crawl app's versioned archive dataset: one record per CHANGED revision of
 /// a page, keyed `{url}#{revision}`, carrying `{url, revision, artifact_path,
 /// job_id, simhash, fetched_at}` — the same artifact contract as `pages`, so
@@ -276,11 +306,15 @@ fn resolve_run_mode(params: &Value) -> std::result::Result<RunMode, String> {
 /// Running totals for one INNER field of an `each` listing, pooled across every
 /// document of the run. The denominator is listing ITEMS, not documents — a
 /// listing's inner selector is attempted once per card, not once per page.
-#[derive(Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 struct InnerRollup {
+    #[serde(default)]
     items: u64,
+    #[serde(default)]
     hits: u64,
+    #[serde(default)]
     misses: u64,
+    #[serde(default)]
     errors: u64,
 }
 
@@ -291,6 +325,138 @@ impl InnerRollup {
         self.misses += s.misses() as u64;
         self.errors += s.error as u64;
     }
+
+    fn merge(&mut self, o: &InnerRollup) {
+        self.items += o.items;
+        self.hits += o.hits;
+        self.misses += o.misses;
+        self.errors += o.errors;
+    }
+}
+
+/// One top-level field's miss tally. A named struct rather than a tuple because
+/// it is serialized into the backfill checkpoint, where `(u64, u64)` would be a
+/// positional blob nobody can read six months later.
+#[derive(Debug, Clone, Copy, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct FieldMisses {
+    #[serde(default)]
+    misses: u64,
+    #[serde(default)]
+    errors: u64,
+}
+
+/// The run's extraction-quality counters, **poolable**.
+///
+/// Rendering `worst_fields` used to happen once per `extract_and_upsert` call
+/// and be thrown away, which is why the backfill mode — the one mode that calls
+/// it repeatedly — reported `fields_matched`/`fields_total` pooled across every
+/// batch but no `worst_fields` at all: there was nothing to pool them WITH. The
+/// counters live here so a multi-batch run's breakdown is the same shape as a
+/// single-batch run's, with cumulative denominators.
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+struct QualityRollup {
+    #[serde(default)]
+    matched: u64,
+    #[serde(default)]
+    total: u64,
+    /// Documents seen — the denominator of a document-scoped `miss_rate`.
+    #[serde(default)]
+    docs: u64,
+    #[serde(default)]
+    fields: std::collections::BTreeMap<String, FieldMisses>,
+    /// Dotted inner path (`products.price`) -> pooled item counts.
+    #[serde(default)]
+    inner: std::collections::BTreeMap<String, InnerRollup>,
+}
+
+impl QualityRollup {
+    /// Folds one batch's per-document reports in.
+    fn add<'a>(&mut self, reports: impl IntoIterator<Item = &'a DocReport>) {
+        for report in reports {
+            self.docs += 1;
+            for (field, status) in &report.fields {
+                self.total += 1;
+                let entry = self.fields.entry(field.clone()).or_default();
+                match status {
+                    // A container that matched but held no items is not a miss —
+                    // the listing selector still binds, the listing is just quiet.
+                    FieldStatus::Matched | FieldStatus::ContainerEmpty => self.matched += 1,
+                    FieldStatus::Empty => entry.misses += 1,
+                    FieldStatus::Error { .. } => {
+                        entry.misses += 1;
+                        entry.errors += 1;
+                    }
+                }
+            }
+            for (path, stats) in &report.each {
+                self.inner.entry(path.clone()).or_default().add(stats);
+            }
+        }
+    }
+
+    /// Pools another batch's rollup into this one — the operation the backfill
+    /// mode needs and the reason this is a struct rather than a local tuple.
+    fn merge(&mut self, other: &QualityRollup) {
+        self.matched += other.matched;
+        self.total += other.total;
+        self.docs += other.docs;
+        for (field, m) in &other.fields {
+            let e = self.fields.entry(field.clone()).or_default();
+            e.misses += m.misses;
+            e.errors += m.errors;
+        }
+        for (path, r) in &other.inner {
+            self.inner.entry(path.clone()).or_default().merge(r);
+        }
+    }
+
+    /// The fields with the highest miss rate, worst first; only fields that
+    /// missed at least once appear.
+    ///
+    /// Rows come in two scopes. Top-level fields keep their original shape
+    /// exactly (`{field, misses, errors, miss_rate}`, `miss_rate` per DOCUMENT).
+    /// Inner fields of an `each` listing — keyed by their dotted path, e.g.
+    /// `products.price` — add `{scope: "item", items, hits, dead}` and their
+    /// `miss_rate` is per listing ITEM, which is why the scope tag is not
+    /// optional. `matched`/`total` deliberately stay document-scoped: they are
+    /// the run's rule-level match rate and folding item counts into them would
+    /// make one wide listing outvote every other field in the rule set.
+    fn worst_fields(&self) -> Vec<Value> {
+        let docs = self.docs.max(1) as f64;
+        let mut worst: Vec<Value> = self
+            .fields
+            .iter()
+            .filter(|(_, m)| m.misses > 0)
+            .map(|(field, m)| {
+                json!({
+                    "field": field,
+                    "misses": m.misses,
+                    "errors": m.errors,
+                    "miss_rate": ((m.misses as f64 / docs) * 1000.0).round() / 1000.0,
+                })
+            })
+            .collect();
+        worst.extend(self.inner.iter().filter(|(_, r)| r.misses > 0).map(|(field, r)| {
+            json!({
+                "field": field,
+                "misses": r.misses,
+                "errors": r.errors,
+                "miss_rate": ((r.misses as f64 / r.items.max(1) as f64) * 1000.0).round() / 1000.0,
+                "scope": "item",
+                "items": r.items,
+                "hits": r.hits,
+                "dead": inner_field_dead(r.items, r.hits),
+            })
+        }));
+        // Highest miss count first; ties broken by field name for stable output.
+        worst.sort_by(|a, b| {
+            b["misses"]
+                .as_u64()
+                .cmp(&a["misses"].as_u64())
+                .then_with(|| a["field"].as_str().cmp(&b["field"].as_str()))
+        });
+        worst
+    }
 }
 
 /// Whether an inner listing field is WHOLLY dead across the run — the selector
@@ -300,97 +466,6 @@ impl InnerRollup {
 /// to tell "the site dropped a class" from "not every card has a badge".
 fn inner_field_dead(items: u64, hits: u64) -> bool {
     items > 0 && hits == 0
-}
-
-/// Aggregate the per-document reports into a quality signal for the job result:
-/// how many field extractions matched out of the total attempted, plus the
-/// fields with the highest miss rate (an empty or errored extraction is a miss).
-/// Returns `(matched, total, worst_fields)`; `worst_fields` lists only fields
-/// that missed at least once, worst first.
-///
-/// `worst_fields` rows come in two scopes. Top-level fields keep their original
-/// shape exactly (`{field, misses, errors, miss_rate}`, `miss_rate` per
-/// DOCUMENT). Inner fields of an `each` listing — keyed by their dotted path,
-/// e.g. `products.price` — add `{scope: "item", items, hits, dead}` and their
-/// `miss_rate` is per listing ITEM, which is why the scope tag is not optional.
-/// `matched`/`total` deliberately stay document-scoped: they are the run's
-/// rule-level match rate and folding item counts into them would make one wide
-/// listing outvote every other field in the rule set.
-fn summarize_reports<'a>(
-    reports: impl IntoIterator<Item = &'a DocReport>,
-) -> (u64, u64, Vec<Value>) {
-    let mut matched: u64 = 0;
-    let mut total: u64 = 0;
-    let mut doc_count: u64 = 0;
-    // field -> (misses, errors)
-    let mut misses: std::collections::BTreeMap<&str, (u64, u64)> =
-        std::collections::BTreeMap::new();
-    // dotted inner path -> pooled item counts
-    let mut inner: std::collections::BTreeMap<&str, InnerRollup> =
-        std::collections::BTreeMap::new();
-    for report in reports {
-        doc_count += 1;
-        for (field, status) in &report.fields {
-            total += 1;
-            let entry = misses.entry(field.as_str()).or_default();
-            match status {
-                // A container that matched but held no items is not a miss — the
-                // listing selector still binds, the listing is just quiet.
-                FieldStatus::Matched | FieldStatus::ContainerEmpty => matched += 1,
-                FieldStatus::Empty => entry.0 += 1,
-                FieldStatus::Error { .. } => {
-                    entry.0 += 1;
-                    entry.1 += 1;
-                }
-            }
-        }
-        for (path, stats) in &report.each {
-            inner.entry(path.as_str()).or_default().add(stats);
-        }
-    }
-    let docs = doc_count.max(1) as f64;
-    let mut worst: Vec<Value> = misses
-        .into_iter()
-        .filter(|(_, (m, _))| *m > 0)
-        .map(|(field, (m, errors))| {
-            json!({
-                "field": field,
-                "misses": m,
-                "errors": errors,
-                "miss_rate": ((m as f64 / docs) * 1000.0).round() / 1000.0,
-            })
-        })
-        .collect();
-    worst.extend(inner.into_iter().filter(|(_, r)| r.misses > 0).map(
-        |(
-            field,
-            InnerRollup {
-                items,
-                hits,
-                misses: m,
-                errors,
-            },
-        )| {
-            json!({
-                "field": field,
-                "misses": m,
-                "errors": errors,
-                "miss_rate": ((m as f64 / items.max(1) as f64) * 1000.0).round() / 1000.0,
-                "scope": "item",
-                "items": items,
-                "hits": hits,
-                "dead": inner_field_dead(items, hits),
-            })
-        },
-    ));
-    // Highest miss count first; ties broken by field name for stable output.
-    worst.sort_by(|a, b| {
-        b["misses"]
-            .as_u64()
-            .cmp(&a["misses"].as_u64())
-            .then_with(|| a["field"].as_str().cmp(&b["field"].as_str()))
-    });
-    (matched, total, worst)
 }
 
 /// Runs the compiled rules over `docs` off the async runtime (rayon fan-out),
@@ -480,7 +555,9 @@ async fn extract_and_upsert(
     // re-parse them).
     let (reported, signals) = run_extraction(compiled, docs, bases, ctx.health.enabled()).await?;
     // Borrow the reports rather than deep-cloning each into a throwaway Vec.
-    let (matched, total, worst) = summarize_reports(reported.iter().map(|(_, r)| r));
+    let mut quality = QualityRollup::default();
+    quality.add(reported.iter().map(|(_, r)| r));
+    let worst = quality.worst_fields();
     let base_url_missing = docs_missing_base(reported.iter().map(|(_, r)| r));
     if base_url_missing > 0 {
         tracing::warn!(
@@ -519,18 +596,75 @@ async fn extract_and_upsert(
             (key, rec)
         })
         .collect();
+    // Where this batch is ABOUT to land, read at the same point the write path
+    // reads it (after `observe` settled the state, before the upsert). A
+    // quarantined source is diverted to the shadow `<dataset>@q` inside
+    // `upsert_many_with_provenance`, and until now no field of the result said
+    // which of the two the caller should go looking in.
+    let written = pumper_core::resilience::write_dataset(
+        dataset,
+        ctx.health.enforced_state(&ctx.app, dataset).await,
+    );
     let summary = ctx
         .upsert_many_with_provenance(dataset, &items, prov)
         .await?;
     Ok(ExtractOutcome {
         records,
-        matched,
-        total,
-        worst,
+        quality,
         base_url_missing,
         summary,
         health: verdict,
+        dataset: written,
     })
+}
+
+/// The outcome of registering this run's rule set in the content-addressed
+/// registry: the hash stamped on every revision the run writes, or the reason
+/// there is none.
+///
+/// THE ANTI-PATTERN THIS CLOSES: registration failure was a `warn!` and nothing
+/// else. The run succeeded, the records landed with a null `rules_hash`, and
+/// those revisions are permanently NON-REPLAYABLE (the artifact-pinning
+/// janitor, `replayable_revisions` and every re-derivation path key off that
+/// stamp) — with no trace in the job result, the receipt, or the webhook. The
+/// only evidence was a log line on a box nobody reads.
+#[derive(Debug, Default, PartialEq)]
+struct RulesRegistration {
+    hash: Option<String>,
+    error: Option<String>,
+}
+
+impl RulesRegistration {
+    /// Pure classification of the registry call's outcome. Best-effort stays
+    /// best-effort — provenance is additive metadata and a registry write
+    /// failure must never fail a working extraction — but the degradation is
+    /// now a FACT IN THE RESULT rather than only in a log.
+    fn from_outcome(outcome: Result<String>) -> Self {
+        match outcome {
+            Ok(hash) => Self {
+                hash: Some(hash),
+                error: None,
+            },
+            Err(e) => Self {
+                hash: None,
+                error: Some(e.to_string()),
+            },
+        }
+    }
+
+    fn hash(&self) -> Option<&str> {
+        self.hash.as_deref()
+    }
+
+    /// Stamps `rules_hash` (honest-null on failure) and, only when there is
+    /// one, `rules_registration_error` onto a write mode's result.
+    fn merge_into(&self, result: &mut Value) {
+        let Value::Object(map) = result else { return };
+        map.insert("rules_hash".into(), json!(self.hash));
+        if let Some(e) = &self.error {
+            map.insert("rules_registration_error".into(), json!(e));
+        }
+    }
 }
 
 /// Documents whose rule set asked to resolve URLs but had no document URL to
@@ -578,17 +712,20 @@ fn tag_record(
 }
 
 /// What one extraction pass produced: the records, the aggregate quality signal,
-/// the write summary, and the source-health verdict.
+/// the write summary, the source-health verdict, and where the batch landed.
 struct ExtractOutcome {
     records: Vec<Value>,
-    matched: u64,
-    total: u64,
-    worst: Vec<Value>,
+    /// This batch's quality counters — poolable, so a multi-batch mode reports
+    /// the same breakdown a single-batch mode does.
+    quality: QualityRollup,
     /// Documents extracted without a base URL by a rule set that needed one
     /// ([`docs_missing_base`]).
     base_url_missing: u64,
     summary: UpsertSummary,
     health: Option<Value>,
+    /// The dataset this batch ACTUALLY landed in: the requested name, or the
+    /// shadow `<dataset>@q` when enforcement diverted a quarantined source.
+    dataset: String,
 }
 
 /// Reports this run to the health detector and renders its verdict for the job
@@ -915,6 +1052,12 @@ impl ScrapeApp for Extractor {
                             "app": { "type": "string" },
                             "dataset": { "type": "string" },
                             "keys": { "type": "array", "items": { "type": "string" } },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 10000,
+                                "description": "Cap on the no-keys sweep of live records (default and ceiling 10000). Ignored when `keys`/`_trigger.keys` name the set. The result's `truncated` says whether the cap — rather than the dataset — decided where the sweep stopped."
+                            },
                             "as_of": {
                                 "type": "string",
                                 "description": "RFC3339 timestamp: resolve each key to the newest archived version (crawl page_versions) observed at or before this instant. Mutually exclusive with `versions`."
@@ -1027,14 +1170,39 @@ impl ScrapeApp for Extractor {
                     }),
                 },
             ],
+            // Written from the four `Ok(json!(...))` sites, key for key. The
+            // previous text promised {extracted, errors, removed?} — three keys
+            // NO mode has ever emitted — while omitting most of what every mode
+            // does emit. A manifest that describes a result nobody returns is
+            // worse than no manifest: it is a contract a consumer can code
+            // against and get null from forever.
             output_shape: Some(
-                "{extracted, errors, dataset, new, changed, unchanged, removed?} — an upsert \
-                 summary plus per-document extraction error counts. Replay mode instead \
-                 returns {fields: [per-field match-rate deltas + added/lost/changed samples], \
-                 regressions, bisect?, artifact: \"replay-report.json\"} and writes nothing. \
-                 Induce mode returns {induced, rules (candidate RuleSet), container, fields: \
-                 [per-field support stats], next, artifact: \"induced-ruleset.json\"} and \
-                 writes nothing.",
+                "Every mode returns `mode`. The three WRITE modes (mode: \"urls\" | \"source\" \
+                 | \"archive\") return {dataset (the dataset actually written — \
+                 `<name>@q` when a quarantined source was diverted), new, changed, unchanged, \
+                 fields_matched, fields_total, worst_fields[], base_url_missing, health|null, \
+                 rules_hash|null, rules_registration_error?, records[] (a BOUNDED echo — see \
+                 `records_echo`), records_total, records_truncated, index_datasets?}. Plus, per \
+                 mode: urls {requested, fetched, skipped, failed[], fetch_ok_rate}; source \
+                 {source{app,dataset}, requested, limit, truncated (the no-keys sweep hit its \
+                 cap), loaded, missing, missing_keys[]}; archive {target, from, to, \
+                 max_snapshots, snapshots_found, truncated, fetched, failed, \
+                 failed_snapshots[], fetch_ok_rate}. Backfill (mode: \"backfill\", via \
+                 source.backfill) writes per batch and returns the same pooled quality keys \
+                 minus the records echo: {resumed_from_checkpoint, source{app,dataset}, \
+                 scanned, skipped_pattern, loaded, batches, missing, missing_keys[], dataset|\
+                 null, new, changed, unchanged, fields_matched, fields_total, worst_fields[], \
+                 base_url_missing, health|null (the final batch's verdict), rules_hash|null, \
+                 index_datasets?}. Replay mode writes NOTHING and returns {mode: \"replay\", \
+                 against{}, urls_matching, truncated, docs, missing, missing_keys[], baseline, \
+                 fields[] (per-field match-rate deltas + added/lost/changed samples), \
+                 inner_fields[], regressed_urls[], regressions, bisect?, artifact: \
+                 \"replay-report.json\"}. Induce mode writes NOTHING and returns {mode: \
+                 \"induce\", source{}, url_pattern, min_support, min_instances, \
+                 pages_matching, truncated, docs, missing, missing_keys[], induced} plus, when \
+                 induced is true, {rules (candidate RuleSet), container, fields[] (per-field \
+                 support stats), candidates_considered, next, artifact: \
+                 \"induced-ruleset.json\"} — or {reason} when it is false.",
             ),
             cost_class: CostClass::Free,
         }
@@ -1076,14 +1244,13 @@ impl ScrapeApp for Extractor {
         // one place in the fleet where a real `rules_hash` exists, and it is what
         // makes a record re-derivable once the caller's live rules have moved on.
         // Best-effort: provenance is additive metadata and a registry write
-        // failure must never fail a working extraction.
-        let rules_hash = match ctx.register_rules(&rules_json).await {
-            Ok(hash) => Some(hash),
-            Err(e) => {
-                tracing::warn!("ruleset registration failed, revisions unstamped: {e}");
-                None
-            }
-        };
+        // failure must never fail a working extraction — but it IS reported
+        // (`rules_hash: null` + `rules_registration_error`), because unstamped
+        // revisions are permanently non-replayable.
+        let registration = RulesRegistration::from_outcome(ctx.register_rules(&rules_json).await);
+        if let Some(e) = &registration.error {
+            tracing::warn!("ruleset registration failed, revisions unstamped: {e}");
+        }
         let dataset = ctx
             .params
             .get("dataset")
@@ -1094,10 +1261,10 @@ impl ScrapeApp for Extractor {
         // Two input modes: fetch live `urls`, or read stored bodies from a
         // crawl→dataset `source`. Exactly one, already resolved above.
         if mode == RunMode::Source {
-            self.run_source_mode(&ctx, compiled, &dataset, rules_hash.as_deref())
+            self.run_source_mode(&ctx, compiled, &dataset, &registration)
                 .await
         } else {
-            self.run_urls_mode(&ctx, compiled, &dataset, rules_hash.as_deref())
+            self.run_urls_mode(&ctx, compiled, &dataset, &registration)
                 .await
         }
     }
@@ -1111,7 +1278,7 @@ impl Extractor {
         ctx: &AppContext,
         compiled: Arc<CompiledRuleSet>,
         dataset: &str,
-        rules_hash: Option<&str>,
+        registration: &RulesRegistration,
     ) -> Result<Value> {
         let urls: Vec<String> = ctx
             .params
@@ -1196,25 +1363,29 @@ impl Extractor {
 
         let requested = urls.len();
         let fetched = keyed.len();
-        let out = extract_and_upsert(ctx, compiled, dataset, keyed, fetch, rules_hash).await?;
+        let out =
+            extract_and_upsert(ctx, compiled, dataset, keyed, fetch, registration.hash()).await?;
 
-        Ok(json!({
+        let mut result = json!({
             "mode": "urls",
             "requested": requested,
             "fetched": fetched,
             "skipped": failed.len(),
             "failed": failed,
             "fetch_ok_rate": fetch.rate(),
+            "dataset": out.dataset,
             "new": out.summary.new.len(),
             "changed": out.summary.changed.len(),
             "unchanged": out.summary.unchanged,
-            "fields_matched": out.matched,
-            "fields_total": out.total,
-            "worst_fields": out.worst,
+            "fields_matched": out.quality.matched,
+            "fields_total": out.quality.total,
+            "worst_fields": out.quality.worst_fields(),
             "base_url_missing": out.base_url_missing,
             "health": out.health,
             "records": out.records,
-        }))
+        });
+        registration.merge_into(&mut result);
+        Ok(result)
     }
 
     /// Source mode: read stored crawl bodies from `{app, dataset, keys?}` instead
@@ -1226,7 +1397,7 @@ impl Extractor {
         ctx: &AppContext,
         compiled: Arc<CompiledRuleSet>,
         dataset: &str,
-        rules_hash: Option<&str>,
+        registration: &RulesRegistration,
     ) -> Result<Value> {
         let source = ctx
             .params
@@ -1240,7 +1411,7 @@ impl Extractor {
         // app/dataset needed.
         if let Some(archive) = source.get("archive").and_then(Value::as_object) {
             return self
-                .run_archive_backfill(ctx, compiled, dataset, archive, rules_hash)
+                .run_archive_backfill(ctx, compiled, dataset, archive, registration)
                 .await;
         }
         let src_app = source
@@ -1276,7 +1447,7 @@ impl Extractor {
             .unwrap_or(false)
         {
             return self
-                .run_backfill(ctx, compiled, dataset, &src_app, source, rules_hash)
+                .run_backfill(ctx, compiled, dataset, &src_app, source, registration)
                 .await;
         }
         let as_of = source
@@ -1293,6 +1464,8 @@ impl Extractor {
         let mut keyed: Vec<SourceDoc> = Vec::new();
         let mut missing: Vec<Value> = Vec::new();
         let requested: usize;
+        let limit = parse_source_limit(source);
+        let mut truncated = false;
 
         // Resolve the natural keys first (explicit / trigger keys, else the live
         // sweep) — every mode selects the same key set; the modes differ only in
@@ -1302,11 +1475,14 @@ impl Extractor {
             requested = keys.len();
             keys.into_iter().map(|k| (k, None)).collect()
         } else {
-            // No keys: every live (not removed, not gone) record.
-            let records: Vec<Record> = ctx
-                .datasets
-                .list(&src_app, &src_dataset, SOURCE_LIST_LIMIT)
-                .await?
+            // No keys: every live (not removed, not gone) record — up to `limit`.
+            let page = ctx.datasets.list(&src_app, &src_dataset, limit).await?;
+            // Judged on the PAGE, before the live filter: a full page means the
+            // cap decided where the sweep stopped, whatever share of it survived
+            // the filter. A 12,000-record dataset used to extract 10,000 and
+            // report `requested: 10000` as if that were the whole of it.
+            truncated = sweep_truncated(page.len(), limit);
+            let records: Vec<Record> = page
                 .into_iter()
                 .filter(|r| {
                     r.removed_at.is_none()
@@ -1319,6 +1495,15 @@ impl Extractor {
                 .map(|r| (r.key.clone(), Some(r)))
                 .collect()
         };
+        if truncated {
+            tracing::warn!(
+                src_app,
+                src_dataset,
+                limit,
+                "source sweep hit its record cap: this run covers only the most recently \
+                 updated page of the dataset"
+            );
+        }
 
         for (key, pre_fetched) in selected {
             let live = match pre_fetched {
@@ -1399,27 +1584,34 @@ impl Extractor {
             dataset,
             keyed,
             FetchHealth::default(),
-            rules_hash,
+            registration.hash(),
         )
         .await?;
 
-        Ok(json!({
+        let missing_count = missing.len();
+        missing.truncate(MISSING_ECHO_LIMIT);
+        let mut result = json!({
             "mode": "source",
             "source": {"app": src_app, "dataset": src_dataset},
             "requested": requested,
+            "limit": limit,
+            "truncated": truncated,
             "loaded": loaded,
-            "missing": missing.len(),
+            "missing": missing_count,
             "missing_keys": missing,
+            "dataset": out.dataset,
             "new": out.summary.new.len(),
             "changed": out.summary.changed.len(),
             "unchanged": out.summary.unchanged,
-            "fields_matched": out.matched,
-            "fields_total": out.total,
-            "worst_fields": out.worst,
+            "fields_matched": out.quality.matched,
+            "fields_total": out.quality.total,
+            "worst_fields": out.quality.worst_fields(),
             "base_url_missing": out.base_url_missing,
             "health": out.health,
             "records": out.records,
-        }))
+        });
+        registration.merge_into(&mut result);
+        Ok(result)
     }
 
     /// Backfill mode: fan the compiled rule set over ALL archived versions in the
@@ -1436,7 +1628,7 @@ impl Extractor {
         dataset: &str,
         src_app: &str,
         source: &serde_json::Map<String, Value>,
-        rules_hash: Option<&str>,
+        registration: &RulesRegistration,
     ) -> Result<Value> {
         let pattern = source
             .get("url_pattern")
@@ -1462,6 +1654,22 @@ impl Extractor {
         let (mut new, mut changed, mut unchanged) = (st.new, st.changed, st.unchanged);
         let (mut fields_matched, mut fields_total) = (st.fields_matched, st.fields_total);
         let mut base_url_missing = st.base_url_missing;
+        // Pooled across every batch of the (possibly resumed) scan, exactly like
+        // the two counters above — it is their miss breakdown, and reporting one
+        // cumulatively while the other covered a single batch would be worse
+        // than reporting neither.
+        let mut quality = st.quality.clone();
+        // The verdict from the LAST batch that produced one. Verdicts are not
+        // poolable — a verdict is the source's STATE, and averaging four states
+        // is not a state — so the honest single answer is where the source
+        // ended up. Every batch's verdict is recorded in the health store; only
+        // the final one is echoed here.
+        let mut health: Option<Value> = None;
+        // Every dataset this run's batches actually landed in. Normally one; a
+        // health flip mid-scan can split a backfill across `<dataset>` and the
+        // shadow `<dataset>@q`, and a result naming only one of them would send
+        // the reader to the wrong table.
+        let mut written: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         loop {
             let batch = ctx
                 .datasets
@@ -1516,15 +1724,20 @@ impl Extractor {
                     dataset,
                     keyed,
                     FetchHealth::default(),
-                    rules_hash,
+                    registration.hash(),
                 )
                 .await?;
                 new += out.summary.new.len();
                 changed += out.summary.changed.len();
                 unchanged += out.summary.unchanged;
-                fields_matched += out.matched;
-                fields_total += out.total;
+                fields_matched += out.quality.matched;
+                fields_total += out.quality.total;
                 base_url_missing += out.base_url_missing;
+                quality.merge(&out.quality);
+                if out.health.is_some() {
+                    health = out.health;
+                }
+                written.insert(out.dataset);
             }
             // Cursor + tallies AFTER the batch's writes committed, so a resume
             // never re-does a page and never double-counts one.
@@ -1541,6 +1754,7 @@ impl Extractor {
                 fields_matched,
                 fields_total,
                 base_url_missing,
+                quality: quality.clone(),
             };
             ctx.checkpoint(st.to_value()).await;
             if short {
@@ -1550,7 +1764,7 @@ impl Extractor {
         // Bound the per-key echo; the full count is still reported.
         let missing_count = missing.len();
         missing.truncate(MISSING_ECHO_LIMIT);
-        Ok(json!({
+        let mut result = json!({
             "mode": "backfill",
             "resumed_from_checkpoint": resumed,
             "source": {"app": src_app, "dataset": VERSIONS_DATASET},
@@ -1560,13 +1774,20 @@ impl Extractor {
             "batches": batches,
             "missing": missing_count,
             "missing_keys": missing,
+            // Honest-null when no batch wrote: naming a target for a write that
+            // never happened is exactly the kind of claim this direction removes.
+            "dataset": written.iter().next_back(),
             "new": new,
             "changed": changed,
             "unchanged": unchanged,
             "fields_matched": fields_matched,
             "fields_total": fields_total,
+            "worst_fields": quality.worst_fields(),
             "base_url_missing": base_url_missing,
-        }))
+            "health": health,
+        });
+        registration.merge_into(&mut result);
+        Ok(result)
     }
 
     /// Wayback historical backfill (`source.archive`): enumerate the web
@@ -1584,7 +1805,7 @@ impl Extractor {
         compiled: Arc<CompiledRuleSet>,
         dataset: &str,
         archive: &serde_json::Map<String, Value>,
-        rules_hash: Option<&str>,
+        registration: &RulesRegistration,
     ) -> Result<Value> {
         let p = parse_archive_params(archive).map_err(Error::App)?;
         let engine = ArchiveEngine::new(
@@ -1669,11 +1890,12 @@ impl Extractor {
         });
 
         let fetched = keyed.len();
-        let out = extract_and_upsert(ctx, compiled, dataset, keyed, fetch, rules_hash).await?;
+        let out =
+            extract_and_upsert(ctx, compiled, dataset, keyed, fetch, registration.hash()).await?;
 
         let failed_count = failed.len();
         failed.truncate(MISSING_ECHO_LIMIT);
-        Ok(json!({
+        let mut result = json!({
             "mode": "archive",
             "target": p.target,
             "from": p.from,
@@ -1685,16 +1907,19 @@ impl Extractor {
             "failed": failed_count,
             "failed_snapshots": failed,
             "fetch_ok_rate": fetch.rate(),
+            "dataset": out.dataset,
             "new": out.summary.new.len(),
             "changed": out.summary.changed.len(),
             "unchanged": out.summary.unchanged,
-            "fields_matched": out.matched,
-            "fields_total": out.total,
-            "worst_fields": out.worst,
+            "fields_matched": out.quality.matched,
+            "fields_total": out.quality.total,
+            "worst_fields": out.quality.worst_fields(),
             "base_url_missing": out.base_url_missing,
             "health": out.health,
             "records": out.records,
-        }))
+        });
+        registration.merge_into(&mut result);
+        Ok(result)
     }
 }
 
@@ -1739,6 +1964,15 @@ struct BackfillState {
     /// resumes at 0 rather than restarting the whole backfill.
     #[serde(default)]
     base_url_missing: u64,
+    /// The pooled miss breakdown behind `fields_matched`/`fields_total`, carried
+    /// so a resumed scan's `worst_fields` covers the same span its counters do.
+    ///
+    /// Those two counters are kept as their own fields rather than read off this
+    /// rollup: they predate it, and a checkpoint written before `quality`
+    /// existed must resume with correct totals (this field defaults to empty)
+    /// instead of silently restarting them at zero.
+    #[serde(default)]
+    quality: QualityRollup,
 }
 
 impl BackfillState {
@@ -1828,8 +2062,20 @@ mod observation_host_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::summarize_reports;
+    use super::QualityRollup;
     use pumper_core::{DocReport, FieldStatus};
+    use serde_json::Value;
+
+    /// The single-batch view of a [`QualityRollup`]: fold these reports in and
+    /// render. Production code keeps the rollup itself (backfill pools several),
+    /// but every assertion below is about one batch's summary.
+    fn summarize_reports<'a>(
+        reports: impl IntoIterator<Item = &'a DocReport>,
+    ) -> (u64, u64, Vec<Value>) {
+        let mut r = QualityRollup::default();
+        r.add(reports);
+        (r.matched, r.total, r.worst_fields())
+    }
 
     fn report(pairs: &[(&str, FieldStatus)]) -> DocReport {
         DocReport {
@@ -2099,6 +2345,161 @@ mod tests {
         assert_eq!(rec["_url"], "https://a/x");
         assert!(rec.get("_observed_at").is_none());
         assert!(rec.get("_fetched_via").is_none());
+    }
+
+    #[test]
+    fn pooled_worst_fields_match_a_single_batch_over_the_same_documents() {
+        // THE REFUTED BEHAVIOR: `worst_fields` was rendered per
+        // `extract_and_upsert` call and thrown away, so the backfill mode — the
+        // only multi-batch mode — reported pooled `fields_matched`/`fields_total`
+        // and NO breakdown at all. Pooling has to give the same answer as one
+        // big batch, or the two modes' quality reports mean different things.
+        let err = FieldStatus::Error { detail: "x".into() };
+        let a = [
+            report(&[("title", FieldStatus::Matched), ("price", err.clone())]),
+            report(&[("title", FieldStatus::Empty), ("price", FieldStatus::Empty)]),
+        ];
+        let b = [report(&[
+            ("title", FieldStatus::Matched),
+            ("price", FieldStatus::Empty),
+        ])];
+
+        let one_batch = {
+            let mut r = QualityRollup::default();
+            r.add(a.iter().chain(b.iter()));
+            r
+        };
+        let pooled = {
+            let mut first = QualityRollup::default();
+            first.add(a.iter());
+            let mut second = QualityRollup::default();
+            second.add(b.iter());
+            first.merge(&second);
+            first
+        };
+        assert_eq!(pooled, one_batch, "merge must be exactly concatenation");
+        // ...and the pooled denominators are cumulative, not per-batch: price
+        // missed on all 3 documents.
+        let worst = pooled.worst_fields();
+        assert_eq!(worst[0]["field"], "price");
+        assert_eq!(worst[0]["misses"], 3);
+        assert_eq!(worst[0]["errors"], 1);
+        assert_eq!(worst[0]["miss_rate"], 1.0);
+        assert_eq!(worst[1]["field"], "title");
+        assert_eq!(worst[1]["miss_rate"], 0.333);
+    }
+
+    #[test]
+    fn a_pooled_rollup_survives_a_checkpoint_round_trip() {
+        // The backfill carries the rollup in its resumable state; a shape that
+        // does not round-trip would silently reset the breakdown on every reap
+        // while the counters beside it kept climbing.
+        use pumper_core::extract::InnerFieldStats;
+        let mut r = QualityRollup::default();
+        r.add([&DocReport {
+            fields: [
+                ("title".to_string(), FieldStatus::Matched),
+                ("price".to_string(), FieldStatus::Empty),
+            ]
+            .into_iter()
+            .collect(),
+            each: [(
+                "products.sku".to_string(),
+                InnerFieldStats {
+                    items: 4,
+                    matched: 1,
+                    empty: 3,
+                    ..InnerFieldStats::default()
+                },
+            )]
+            .into_iter()
+            .collect(),
+            ..DocReport::default()
+        }]);
+        let round_tripped: QualityRollup =
+            serde_json::from_value(serde_json::to_value(&r).unwrap()).unwrap();
+        assert_eq!(round_tripped, r);
+        assert_eq!(round_tripped.worst_fields(), r.worst_fields());
+        // An older checkpoint that predates the field restores empty, not broken.
+        let empty: QualityRollup = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty, QualityRollup::default());
+    }
+
+    #[test]
+    fn a_full_page_is_truncated_not_a_complete_sweep() {
+        // THE REFUTED BEHAVIOR: source mode listed at most 10,000 live records
+        // and reported that count as `requested` with no signal — a 12,000-record
+        // dataset silently extracted 10,000 and looked like a clean full run.
+        use super::sweep_truncated;
+        assert!(sweep_truncated(10, 10), "a full page may hide more");
+        assert!(sweep_truncated(11, 10), "over-full is still truncated");
+        assert!(!sweep_truncated(9, 10), "a short page IS the whole dataset");
+        assert!(!sweep_truncated(0, 10), "an empty dataset is not truncated");
+    }
+
+    #[test]
+    fn sweep_truncation_is_judged_on_the_page_not_the_live_count() {
+        // The distinction that makes the flag correct: the store returns a full
+        // page, most of it removed/gone, so the LIVE count is small — but the
+        // cap still decided where the read stopped and rows past it were never
+        // seen. Judging on the filtered count would call that run complete.
+        use super::sweep_truncated;
+        let page_returned = 10; // the cap
+        let live_after_filter = 3;
+        assert!(sweep_truncated(page_returned, 10));
+        assert!(!sweep_truncated(live_after_filter, 10));
+    }
+
+    #[test]
+    fn source_limit_clamps_into_the_ceiling_and_defaults_to_it() {
+        use super::{parse_source_limit, SOURCE_LIST_LIMIT};
+        use serde_json::json;
+        let obj = |v: serde_json::Value| v.as_object().unwrap().clone();
+        assert_eq!(parse_source_limit(&obj(json!({}))), SOURCE_LIST_LIMIT);
+        assert_eq!(parse_source_limit(&obj(json!({"limit": 5}))), 5);
+        // Never zero (an idle sweep) and never above the ceiling (an unbounded read).
+        assert_eq!(parse_source_limit(&obj(json!({"limit": 0}))), 1);
+        assert_eq!(
+            parse_source_limit(&obj(json!({"limit": 999_999}))),
+            SOURCE_LIST_LIMIT
+        );
+        assert_eq!(
+            parse_source_limit(&obj(json!({"limit": "many"}))),
+            SOURCE_LIST_LIMIT
+        );
+    }
+
+    #[test]
+    fn registration_failure_surfaces_in_the_result_not_only_in_a_log() {
+        // THE REFUTED BEHAVIOR: a failed `register_rules` was a `warn!` and
+        // nothing more. The run returned 200, the records landed with a null
+        // `rules_hash`, and those revisions are permanently non-replayable —
+        // with no trace anywhere a consumer, receipt or webhook can see.
+        use super::RulesRegistration;
+        use serde_json::json;
+
+        let failed = RulesRegistration::from_outcome(Err(pumper_core::Error::App(
+            "registry write failed: database is locked".into(),
+        )));
+        assert_eq!(failed.hash(), None);
+        let mut result = json!({ "mode": "urls" });
+        failed.merge_into(&mut result);
+        assert_eq!(result["rules_hash"], Value::Null, "honest null, not absent");
+        assert!(
+            result["rules_registration_error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("database is locked"),
+            "the reason travels with the null: {result}"
+        );
+
+        // The success path stamps the hash and invents no error key.
+        let ok = RulesRegistration::from_outcome(Ok("sha256:abc".into()));
+        assert_eq!(ok.hash(), Some("sha256:abc"));
+        let mut result = json!({ "mode": "urls" });
+        ok.merge_into(&mut result);
+        assert_eq!(result["rules_hash"], "sha256:abc");
+        assert!(result.get("rules_registration_error").is_none());
     }
 
     #[test]
