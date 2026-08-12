@@ -563,6 +563,42 @@ try {
                 if (-not $w) { return $false }
                 $w.PSObject.Properties.Name -contains 'last_delivery'
             }
+
+            # Round 12: mode exclusivity, the budget floor at both doors, and
+            # the search answer's index-state block — all state-independent.
+            # A params object carrying several extractor mode roots is refused
+            # at the door (the app used to run the first match and return 200).
+            Test-DoorRefusal -Name 'POST /apps/extractor/jobs conflicting modes -> 422' `
+                -Path '/apps/extractor/jobs' `
+                -Body @{ params = @{
+                        rules  = @{ title = @{ type = 'css'; selector = 'h1' } }
+                        urls   = @('https://example.com/')
+                        replay = @{ rules = @{ title = @{ type = 'css'; selector = 'h1' } } }
+                    } } `
+                -Expect 422 -BodyLike '*"unprocessable"*'
+            # budget_usd: 0 is a refusal, not a silent "no ceiling" — at the
+            # jobs door and at the trigger door (where the dropped value would
+            # be replayed into every hop: a standing unlimited-spend generator).
+            Test-DoorRefusal -Name 'POST /apps/hackernews/jobs budget_usd:0 -> 422' `
+                -Path '/apps/hackernews/jobs' `
+                -Body @{ budget_usd = 0.0 } `
+                -Expect 422 -BodyLike '*NO spend ceiling*'
+            Test-DoorRefusal -Name 'POST /triggers budget_usd:0 -> 422' `
+                -Path '/triggers' `
+                -Body @{ source_kind = 'job'; source_app = 'hackernews'; target_app = 'hackernews'; budget_usd = 0.0 } `
+                -Expect 422 -BodyLike '*NO spend ceiling*'
+            # Every search answer names the index it came from: the additive
+            # `index` block with an explicit degraded verdict, so `total: 0`
+            # from a wiped/disabled index can never read as "no matches".
+            # Shape-only on purpose — whether THIS scratch index is populated
+            # by now is state; the honesty surface is the block itself.
+            Test-JsonEndpoint -Name 'GET /search carries the index-state block' `
+                -Path '/search?q=smoke' -Assert {
+                param($j)
+                $names = $j.index.PSObject.Properties.Name
+                ($names -contains 'enabled') -and ($names -contains 'doc_count') -and
+                ($names -contains 'degraded') -and ($names -contains 'reason')
+            }
         } else {
             Add-Result -Name 'job runs to completion (hackernews)' -Status 'SKIP' -Detail 'no job id to poll (enqueue failed)'
             Add-Result -Name 'GET /jobs/{id}/receipt' -Status 'SKIP' -Detail 'no job id to fetch a receipt for'
