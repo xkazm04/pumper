@@ -45,9 +45,18 @@
 //!
 //! Coverage: `max_projects` caps the detail fetches per run (each is a
 //! governor-paced request). A resume cursor persisted in the `state` dataset
-//! advances the page window across scheduled runs and wraps at the end, so the
+//! advances the window across scheduled runs and wraps at the end, so the
 //! ~23k-project Horizon corpus is covered over successive weekly runs without
 //! hammering the API in one go.
+//!
+//! **Sweep honesty.** The cursor is an *offset into the listing*, not a page
+//! number, and only a walk that provably reached the end wraps it. See
+//! [`SweepEnd`]: a page shorter than `pageSize` while the listing's own reported
+//! total says more remains is a truncation, not the end of the corpus — treating
+//! it as the end used to reset ~46 weeks of accumulated progress to page 1 while
+//! reporting `corpus_swept: true`. And because the cursor counts *consumed ids*,
+//! a `maxProjects` that is not a multiple of `pageSize` re-visits the truncated
+//! tail on the next run instead of stepping over it for a whole corpus cycle.
 
 use std::collections::{HashMap, HashSet};
 
@@ -124,7 +133,7 @@ impl ScrapeApp for Cordis {
                     },
                     "startPage": {
                         "type": "integer", "minimum": 1,
-                        "description": "Overrides the persisted resume cursor in cordis/state (1-based listing page)."
+                        "description": "Overrides the persisted resume cursor in cordis/state (1-based listing page; resumes at the top of that page, i.e. offset (page-1)*pageSize)."
                     }
                 },
                 "additionalProperties": true
@@ -140,11 +149,16 @@ impl ScrapeApp for Cordis {
                 },
             ],
             output_shape: Some(
-                "{source, query, totalResults, startPage, pages, ids_enumerated, \
-                 skipped_unlisted, detail_failed, skipped_unkeyed, fetched, resumed_from, new, \
-                 changed, unchanged, corpus, families, stats_new, stats_changed, \
-                 cursor_next_page, corpus_swept} — RCN-keyed projects in `projects`, \
-                 per-topic-family rollups in `topic_stats` (read by eu-sedia)",
+                "{source, query, totalResults, startPage, start_offset, skip_in_page, pages, \
+                 ids_enumerated, skipped_unlisted, detail_failed, skipped_unkeyed, fetched, \
+                 resumed_from, new, changed, unchanged, corpus, families, stats_new, \
+                 stats_changed, cursor_next_page, cursor_next_offset, sweep, corpus_swept, \
+                 warnings[]} — RCN-keyed projects in `projects`, per-topic-family rollups in \
+                 `topic_stats` (read by eu-sedia). `sweep` is `complete` (page arithmetic \
+                 proved the listing's end — only then does `corpus_swept` hold and the cursor \
+                 wrap), `capped` (stopped at maxProjects with corpus left) or `short_page` (a \
+                 truncated page while the reported total says more remains: NOT the end, so \
+                 the cursor keeps its place and a warning is reported)",
             ),
             cost_class: CostClass::Free,
         }
@@ -171,31 +185,35 @@ impl ScrapeApp for Cordis {
             .clamp(1, 5000);
 
         // Resume cursor: continue where the last run stopped so the corpus is
-        // covered over successive runs. An explicit `startPage` param overrides.
-        let cursor_start = match ctx.datasets.get(&ctx.app, "state", "cursor").await? {
-            Some(rec) => rec
-                .data
-                .get("next_page")
-                .and_then(Value::as_u64)
-                .unwrap_or(1),
-            None => 1,
+        // covered over successive runs. An explicit `startPage` param overrides
+        // (resuming at the TOP of that page — a human asking for a page means
+        // the page, not some offset inside it).
+        let stored_cursor = ctx
+            .datasets
+            .get(&ctx.app, "state", "cursor")
+            .await?
+            .map(|r| r.data);
+        let start_offset = match ctx.params.get("startPage").and_then(Value::as_u64) {
+            Some(p) => (p.max(1) - 1) * page_size,
+            None => cursor_offset(stored_cursor.as_ref(), page_size),
         };
-        let start_page = ctx
-            .params
-            .get("startPage")
-            .and_then(Value::as_u64)
-            .unwrap_or(cursor_start)
-            .max(1);
+        let start_page = start_offset / page_size + 1;
+        let skip_in_page = start_offset % page_size;
 
         // ── Stage 1: listing sweep — enumerate project ids only. ──
         let mut ids: Vec<String> = Vec::new();
         let mut unlisted: u64 = 0; // listing hits without an id
-        let mut total: u64 = 0;
+        let mut total: u64;
         let mut page = start_page;
         let mut pages_fetched: u64 = 0;
-        let mut exhausted = false;
+        // Listing positions this run consumed, counted from `start_offset`. The
+        // cursor advances by THIS, not by pages fetched: a `maxProjects` that
+        // truncates mid-page must leave the tail for the next run, not step over
+        // it (which skipped those projects for a whole ~46-week corpus cycle).
+        let mut consumed: u64 = 0;
+        let end: SweepEnd;
 
-        while (ids.len() as u64) < max_projects {
+        loop {
             let url = url::Url::parse_with_params(
                 SEARCH_URL,
                 &[
@@ -232,28 +250,70 @@ impl ScrapeApp for Cordis {
                 )
             })?;
             total = page_total;
-            if total > 0 && hits.is_empty() && pages_fetched == 0 && start_page == 1 {
+            let got = hits.len() as u64;
+            if pages_fetched == 0 && empty_first_page_is_drift(page, page_size, total, got) {
                 return Err(Error::App(format!(
-                    "cordis: API reported {total} results but page 1 parsed 0 hits — \
-                     likely an upstream schema change"
+                    "cordis: API reported {total} results but listing page {page} parsed 0 \
+                     hits — likely an upstream schema change (page1.json artifact holds the \
+                     raw body). The resume cursor is left untouched."
                 )));
             }
 
-            let got = hits.len() as u64;
-            for hit in &hits {
+            // The first page of a resumed run re-fetches the page the cursor sits
+            // inside; the ids before the cursor were already consumed last run.
+            let skip_here = if pages_fetched == 0 {
+                skip_in_page.min(got)
+            } else {
+                0
+            };
+            let mut taken: u64 = 0;
+            for hit in hits.iter().skip(skip_here as usize) {
+                if ids.len() as u64 >= max_projects {
+                    break;
+                }
+                taken += 1;
                 match scalar_string(hit.get("id")).filter(|s| !s.is_empty()) {
                     Some(id) => ids.push(id),
                     None => unlisted += 1,
                 }
             }
+            consumed += taken;
             pages_fetched += 1;
-            page += 1;
-            if got < page_size || ((page - 1) * page_size) >= total {
-                exhausted = true;
+            let leftover = got.saturating_sub(skip_here).saturating_sub(taken);
+            if let Some(reason) = walk_end(
+                page,
+                page_size,
+                total,
+                got,
+                leftover,
+                ids.len() as u64 >= max_projects,
+            ) {
+                end = reason;
                 break;
             }
+            page += 1;
         }
-        ids.truncate(max_projects as usize);
+
+        // A listing that suddenly reports nothing while a corpus is already
+        // stored is drift, not a clean sweep — and it must NOT wrap the cursor.
+        // Gated on the cheap half first so the count query only runs in the
+        // suspicious case. This is the hole the stage-2 `attempted > 0` guard
+        // structurally cannot see: a total:0 listing attempts no detail fetch.
+        if total == 0 && ids.is_empty() {
+            let stored_corpus = ctx
+                .datasets
+                .count_filtered(&ctx.app, "projects", &[])
+                .await?;
+            if empty_listing_is_drift(total, ids.len(), stored_corpus) {
+                return Err(Error::App(format!(
+                    "cordis: the search listing reported total:0 while {stored_corpus} projects \
+                     are already stored — the query grammar drifted (the older \
+                     `/project/frameworkProgramme=` grammar silently returns total:0; the \
+                     VERIFIED one is `contenttype='project' AND programme/code='HORIZON'`). \
+                     The resume cursor is left untouched."
+                )));
+            }
+        }
 
         // ── Stage 2: per-project detail fetch (the real data). ──
         //
@@ -264,7 +324,7 @@ impl ScrapeApp for Cordis {
         // so a re-claim skips them instead of re-fetching. The listing stage is
         // deliberately NOT checkpointed: it is ~5 cheap calls and re-running it
         // is what regenerates `ids` for the resume to filter.
-        let mut done: HashSet<String> = restored_done(ctx.restore(), start_page);
+        let mut done: HashSet<String> = restored_done(ctx.restore(), start_offset);
         let resumed_from = ids.iter().filter(|id| done.contains(*id)).count() as u64;
         let mut new_keys: u64 = 0;
         let mut changed_keys: u64 = 0;
@@ -326,7 +386,7 @@ impl ScrapeApp for Cordis {
                 None => skipped += 1,
             }
             done.insert(id.clone());
-            ctx.checkpoint(stage2_state(start_page, &done)).await;
+            ctx.checkpoint(stage2_state(start_offset, &done)).await;
         }
         // Drift stays loud: attempting detail fetches and normalizing NONE of
         // them is a contract break, never a clean empty sweep. Gated on what
@@ -339,7 +399,7 @@ impl ScrapeApp for Cordis {
                  — the detail contract drifted (detail1.json artifact holds a raw body)"
             )));
         }
-        ctx.checkpoint_now(stage2_state(start_page, &done)).await;
+        ctx.checkpoint_now(stage2_state(start_offset, &done)).await;
 
         // Re-aggregate topic families over the WHOLE stored corpus (not just
         // this run's window) so stats stay consistent while the cursor sweeps.
@@ -356,16 +416,24 @@ impl ScrapeApp for Cordis {
         // whole honest provenance here. Naming one source_url would be a lie.
         let stats_summary = ctx.upsert_many("topic_stats", &stats).await?;
 
-        // Persist the resume cursor: wrap to page 1 once the corpus is covered.
-        let next_page = if exhausted { 1 } else { page };
-        ctx.upsert("state", "cursor", &json!({ "next_page": next_page }))
+        // Persist the resume cursor. It wraps to the top of the corpus ONLY on a
+        // proven-complete walk; every other ending keeps the place this run
+        // reached, counted in consumed listing positions.
+        let next_offset = if end == SweepEnd::Complete {
+            0
+        } else {
+            start_offset + consumed
+        };
+        ctx.upsert("state", "cursor", &cursor_record(next_offset, page_size))
             .await?;
 
-        Ok(json!({
+        let mut out = json!({
             "source": "cordis.europa.eu (search listing + project detail)",
             "query": query,
             "totalResults": total,
             "startPage": start_page,
+            "start_offset": start_offset,
+            "skip_in_page": skip_in_page,
             "pages": pages_fetched,
             "ids_enumerated": ids.len(),
             "skipped_unlisted": unlisted,
@@ -380,40 +448,174 @@ impl ScrapeApp for Cordis {
             "families": families,
             "stats_new": stats_summary.new.len(),
             "stats_changed": stats_summary.changed.len(),
-            "cursor_next_page": next_page,
-            "corpus_swept": exhausted,
-        }))
+            "cursor_next_page": next_offset / page_size + 1,
+            "cursor_next_offset": next_offset,
+            "sweep": end.as_str(),
+            "corpus_swept": end == SweepEnd::Complete,
+        });
+        if end == SweepEnd::ShortPage {
+            // Loud, because the silent version of this cost ~46 weeks of walk.
+            let msg = format!(
+                "listing page {page} returned {} of {page_size} results while the API reports \
+                 {total} total — treated as a TRUNCATED page, not the end of the corpus: the \
+                 resume cursor keeps its place ({}) and `corpus_swept` is false",
+                consumed.min(page_size),
+                start_offset + consumed
+            );
+            if let Value::Object(map) = &mut out {
+                map.insert("warnings".into(), json!([msg]));
+            }
+        }
+        Ok(out)
+    }
+}
+
+/// How the listing walk ended — the three-way distinction the single
+/// `exhausted` flag used to collapse into one lie.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SweepEnd {
+    /// Page arithmetic against the listing's OWN reported total proves the walk
+    /// reached the end of the corpus. The only ending that wraps the resume
+    /// cursor and reports `corpus_swept: true`.
+    Complete,
+    /// Stopped at the per-run `maxProjects` cap with corpus left to walk.
+    Capped,
+    /// A page came back shorter than `pageSize` while the reported total says
+    /// more remains. A transient truncation, NOT the end of the corpus.
+    ShortPage,
+}
+
+impl SweepEnd {
+    fn as_str(self) -> &'static str {
+        match self {
+            SweepEnd::Complete => "complete",
+            SweepEnd::Capped => "capped",
+            SweepEnd::ShortPage => "short_page",
+        }
+    }
+}
+
+/// Whether page arithmetic proves the walk reached the listing's end: the
+/// 1-based `page` just fetched covers the listing's own reported `total`.
+///
+/// This — and ONLY this — is proof of the end. A short page is evidence of
+/// nothing: the same shape arrives from a rate-limited or half-broken upstream.
+fn reached_listing_end(page: u64, page_size: u64, total: u64) -> bool {
+    page.saturating_mul(page_size) >= total
+}
+
+/// How the walk ends after fetching `page`, or `None` to keep walking.
+///
+/// - `got` — hits the page returned.
+/// - `leftover` — hits on this page the per-run cap left unconsumed (>0 can only
+///   happen when the cap cut the page mid-way, which is never the corpus end).
+/// - `full` — the run has collected its `maxProjects` ids.
+fn walk_end(
+    page: u64,
+    page_size: u64,
+    total: u64,
+    got: u64,
+    leftover: u64,
+    full: bool,
+) -> Option<SweepEnd> {
+    if leftover > 0 {
+        // The cap truncated this page: whatever the arithmetic says about the
+        // corpus, THIS run did not consume the tail it is standing on.
+        Some(SweepEnd::Capped)
+    } else if reached_listing_end(page, page_size, total) {
+        Some(SweepEnd::Complete)
+    } else if full {
+        Some(SweepEnd::Capped)
+    } else if got < page_size {
+        Some(SweepEnd::ShortPage)
+    } else {
+        None
+    }
+}
+
+/// Whether the FIRST page of this run coming back empty is contract drift.
+///
+/// It is drift when the listing says there are results AND the arithmetic puts
+/// this page inside the corpus. A resume cursor that has run past a shrunken
+/// listing produces the same empty page and is NOT drift — it is the ordinary
+/// end of a sweep, which [`reached_listing_end`] then wraps.
+fn empty_first_page_is_drift(page: u64, page_size: u64, total: u64, got: u64) -> bool {
+    total > 0 && got == 0 && page.saturating_sub(1).saturating_mul(page_size) < total
+}
+
+/// Whether an empty listing result is contract drift rather than an honest
+/// empty corpus: the API reported nothing at all while projects are already
+/// stored locally. The verified-then-drifted query grammar (`total: 0` for a
+/// syntactically valid but wrong query) lands exactly here, and it used to walk
+/// straight through the stage-2 drift guard — that guard is gated on
+/// `attempted > 0`, and a listing with no ids attempts no detail fetch.
+fn empty_listing_is_drift(total: u64, enumerated: usize, stored_corpus: i64) -> bool {
+    total == 0 && enumerated == 0 && stored_corpus > 0
+}
+
+/// The persisted resume cursor. `next_offset` is the canonical field — an
+/// absolute 0-based position in the listing, so it survives a change of
+/// `pageSize`; `next_page`/`skip_in_page` are its readable projection at the
+/// current page size, and `next_page` alone is what a pre-offset reader saw.
+fn cursor_record(next_offset: u64, page_size: u64) -> Value {
+    json!({
+        "next_offset": next_offset,
+        "next_page": next_offset / page_size + 1,
+        "skip_in_page": next_offset % page_size,
+        "page_size": page_size,
+    })
+}
+
+/// Reads the stored resume cursor as a listing offset, tolerating every shape
+/// the `cordis/state` row has ever had. A legacy row carries only `next_page`,
+/// which is converted at THIS run's page size (start-from-current, the honest
+/// reading when the page size it was written at is unknown). Anything
+/// unrecognizable starts from the top — never a panic, never an error.
+fn cursor_offset(state: Option<&Value>, page_size: u64) -> u64 {
+    let Some(state) = state else { return 0 };
+    if let Some(offset) = state.get("next_offset").and_then(Value::as_u64) {
+        return offset;
+    }
+    match state.get("next_page").and_then(Value::as_u64) {
+        Some(page) => page.max(1).saturating_sub(1).saturating_mul(page_size),
+        None => 0,
     }
 }
 
 /// Checkpoint schema version — a snapshot in any other shape means "start
 /// fresh", never a failed run (the sink is advisory by contract).
-const STAGE2_STATE_VERSION: u64 = 1;
+///
+/// **v2** keys the window on the listing OFFSET rather than the page number: a
+/// v1 `start_page` is not comparable to a v2 `start_offset` (the same page
+/// number now means a different set of ids once a mid-page resume exists), so a
+/// v1 snapshot is discarded. The cost is bounded — one in-flight job re-fetches
+/// details it already wrote, which change detection reports `unchanged`.
+const STAGE2_STATE_VERSION: u64 = 2;
 
 /// The stage-2 checkpoint payload: which listing window this attempt is working
-/// (so a run that resumes under a *different* `startPage` cannot inherit a
+/// (so a run that resumes under a *different* start offset cannot inherit a
 /// stale done-set) and the project ids already written to `projects`. Ids only —
 /// never record bodies, so the snapshot stays small at 5000 projects.
-fn stage2_state(start_page: u64, done: &HashSet<String>) -> Value {
+fn stage2_state(start_offset: u64, done: &HashSet<String>) -> Value {
     let mut ids: Vec<&String> = done.iter().collect();
     ids.sort(); // a HashSet has no order; a stable snapshot diffs cleanly
     json!({
         "v": STAGE2_STATE_VERSION,
         "stage": "details",
-        "start_page": start_page,
+        "start_offset": start_offset,
         "done": ids,
     })
 }
 
 /// The already-written project ids from a prior attempt of this job, or an
 /// empty set. Tolerates any stored shape; a snapshot taken against a different
-/// `start_page` is discarded rather than misapplied to a different window.
-fn restored_done(state: Option<&Value>, start_page: u64) -> HashSet<String> {
+/// `start_offset` is discarded rather than misapplied to a different window.
+fn restored_done(state: Option<&Value>, start_offset: u64) -> HashSet<String> {
     let empty = HashSet::new();
     let Some(state) = state else { return empty };
     if state.get("v").and_then(Value::as_u64) != Some(STAGE2_STATE_VERSION)
         || state.get("stage").and_then(Value::as_str) != Some("details")
-        || state.get("start_page").and_then(Value::as_u64) != Some(start_page)
+        || state.get("start_offset").and_then(Value::as_u64) != Some(start_offset)
     {
         return empty;
     }
@@ -763,6 +965,143 @@ mod tests {
         assert!(extract_hits(&json!({ "payload": { "total": 5, "hits": [] } })).is_none());
     }
 
+    // ── Stage 1: sweep honesty (what may claim the corpus was swept) ──
+
+    /// THE anti-pattern this whole seam exists for: one page that comes back
+    /// short — rate limiting, a half-broken upstream, a partial index — used to
+    /// set `exhausted`, which both claimed `corpus_swept: true` and reset the
+    /// resume cursor to page 1, wiping up to ~46 weeks of accumulated walk.
+    #[test]
+    fn a_short_page_is_not_proof_the_corpus_was_swept() {
+        // Page 3 of 234 comes back with 40 of 100 while the API still reports
+        // 23,361 results. Nothing about the end of the corpus is proven.
+        assert_eq!(
+            walk_end(3, 100, 23_361, 40, 0, false),
+            Some(SweepEnd::ShortPage)
+        );
+        assert!(!reached_listing_end(3, 100, 23_361));
+        // An EMPTY page in the middle of the corpus is the same story.
+        assert_eq!(
+            walk_end(3, 100, 23_361, 0, 0, false),
+            Some(SweepEnd::ShortPage)
+        );
+    }
+
+    #[test]
+    fn only_page_arithmetic_proves_the_end_of_the_corpus() {
+        // The real last page: 234 * 100 = 23,400 >= 23,361. Short AND proven.
+        assert!(reached_listing_end(234, 100, 23_361));
+        assert_eq!(
+            walk_end(234, 100, 23_361, 61, 0, false),
+            Some(SweepEnd::Complete)
+        );
+        // A cursor that ran past a shrunken listing is also an honest end.
+        assert_eq!(
+            walk_end(300, 100, 23_361, 0, 0, false),
+            Some(SweepEnd::Complete)
+        );
+        // Mid-corpus with a full page: keep walking, decide nothing.
+        assert_eq!(walk_end(3, 100, 23_361, 100, 0, false), None);
+    }
+
+    #[test]
+    fn a_capped_run_does_not_claim_the_corpus_was_swept() {
+        // Cap hit mid-page: `leftover` hits are still sitting on the page we
+        // are standing on, so this can never be the end — even if the page
+        // arithmetic would otherwise say so.
+        assert_eq!(
+            walk_end(5, 100, 450, 100, 50, true),
+            Some(SweepEnd::Capped),
+            "an untaken tail must never read as a complete sweep"
+        );
+        // Cap hit exactly on a page boundary, mid-corpus.
+        assert_eq!(
+            walk_end(5, 100, 23_361, 100, 0, true),
+            Some(SweepEnd::Capped)
+        );
+        // But a page that BOTH finishes the corpus and was fully consumed is
+        // complete, cap or no cap.
+        assert_eq!(walk_end(5, 100, 450, 50, 0, true), Some(SweepEnd::Complete));
+    }
+
+    #[test]
+    fn only_a_complete_sweep_wraps_the_cursor() {
+        // The wrap rule, stated once: Complete → back to the top; everything
+        // else keeps its place. (The run body encodes this as
+        // `if end == SweepEnd::Complete { 0 } else { start_offset + consumed }`.)
+        for end in [SweepEnd::Capped, SweepEnd::ShortPage] {
+            assert_ne!(end, SweepEnd::Complete, "{} must not wrap", end.as_str());
+        }
+        assert_eq!(SweepEnd::Complete.as_str(), "complete");
+        assert_eq!(SweepEnd::Capped.as_str(), "capped");
+        assert_eq!(SweepEnd::ShortPage.as_str(), "short_page");
+    }
+
+    #[test]
+    fn an_empty_first_page_inside_the_corpus_is_drift_but_past_the_end_is_not() {
+        // Page 1 empty while 23,361 results are claimed: drift (the old guard).
+        assert!(empty_first_page_is_drift(1, 100, 23_361, 0));
+        // …and now ALSO drift when the run resumed mid-corpus, which the old
+        // `start_page == 1` gate silently exempted — i.e. every scheduled run
+        // after the first.
+        assert!(empty_first_page_is_drift(50, 100, 23_361, 0));
+        // A cursor past the end of a shrunken listing is an ordinary sweep end.
+        assert!(!empty_first_page_is_drift(300, 100, 23_361, 0));
+        // A page with hits is never this kind of drift, and neither is an
+        // honestly empty corpus.
+        assert!(!empty_first_page_is_drift(1, 100, 23_361, 100));
+        assert!(!empty_first_page_is_drift(1, 100, 0, 0));
+    }
+
+    /// The `attempted == 0` hole: the stage-2 drift guard only fires once a
+    /// detail fetch has been attempted, and a listing that returns `total: 0`
+    /// attempts none — so the documented query-grammar drift (the
+    /// `/project/frameworkProgramme=` grammar returns total:0 against a live
+    /// API) walked through every guard and reported a clean, empty, cursor-
+    /// wrapping sweep.
+    #[test]
+    fn a_zero_total_listing_against_a_stored_corpus_is_drift_not_an_empty_sweep() {
+        assert!(empty_listing_is_drift(0, 0, 8_412));
+        // A genuinely empty store is a first run, not drift.
+        assert!(!empty_listing_is_drift(0, 0, 0));
+        // A listing that DID enumerate ids is not this failure.
+        assert!(!empty_listing_is_drift(0, 12, 8_412));
+        assert!(!empty_listing_is_drift(23_361, 0, 8_412));
+    }
+
+    // ── Stage 1: the resume cursor ──
+
+    #[test]
+    fn the_cursor_counts_consumed_ids_not_pages() {
+        // maxProjects=450 at pageSize=100 truncates page 5 after 50 ids. The
+        // anti-pattern: persisting "next page = 6", which steps over the other
+        // 50 ids of page 5 for a whole corpus cycle.
+        let rec = cursor_record(450, 100);
+        assert_eq!(rec["next_offset"], 450);
+        assert_eq!(rec["next_page"], 5, "the tail's own page, not the next one");
+        assert_eq!(rec["skip_in_page"], 50, "…resuming after what was consumed");
+        // Round-trips back through the reader at the same page size.
+        assert_eq!(cursor_offset(Some(&rec), 100), 450);
+        // …and at a DIFFERENT page size, because the offset is absolute.
+        assert_eq!(cursor_offset(Some(&rec), 50), 450);
+    }
+
+    #[test]
+    fn cursor_offset_tolerates_legacy_and_unknown_state_rows() {
+        // The pre-offset row shape: page-only. Converted at this run's page
+        // size — start-from-current, never a panic.
+        assert_eq!(cursor_offset(Some(&json!({ "next_page": 7 })), 100), 600);
+        assert_eq!(cursor_offset(Some(&json!({ "next_page": 1 })), 100), 0);
+        // Nonsense values degrade to the top of the corpus.
+        assert_eq!(cursor_offset(Some(&json!({ "next_page": 0 })), 100), 0);
+        assert_eq!(cursor_offset(Some(&json!({ "next_page": "7" })), 100), 0);
+        assert_eq!(cursor_offset(Some(&json!({ "frontier": 3 })), 100), 0);
+        assert_eq!(cursor_offset(Some(&json!("nonsense")), 100), 0);
+        assert_eq!(cursor_offset(None, 100), 0);
+        // A complete sweep wraps to the very top.
+        assert_eq!(cursor_offset(Some(&cursor_record(0, 100)), 100), 0);
+    }
+
     // ── Durable execution: stage-2 resume state ──
 
     #[test]
@@ -794,13 +1133,20 @@ mod tests {
         // Foreign / versioned-out shapes start fresh instead of erroring.
         assert!(restored_done(Some(&json!({ "frontier": ["x"] })), 7).is_empty());
         assert!(restored_done(
-            Some(&json!({ "v": 99, "stage": "details", "start_page": 7, "done": ["a"] })),
+            Some(&json!({ "v": 99, "stage": "details", "start_offset": 7, "done": ["a"] })),
+            7
+        )
+        .is_empty());
+        // A pre-offset (v1) snapshot keyed on `start_page` is not comparable to
+        // an offset window — discarded, not misread as "page 7 == offset 7".
+        assert!(restored_done(
+            Some(&json!({ "v": 1, "stage": "details", "start_page": 7, "done": ["a"] })),
             7
         )
         .is_empty());
         // A well-formed snapshot with no done ids is simply an empty resume.
         assert!(restored_done(
-            Some(&json!({ "v": 1, "stage": "details", "start_page": 7 })),
+            Some(&json!({ "v": STAGE2_STATE_VERSION, "stage": "details", "start_offset": 7 })),
             7
         )
         .is_empty());
@@ -1026,5 +1372,213 @@ mod tests {
         let stats = aggregate_topic_stats(&refs);
         let top = stats[0].1["top_participants"].as_array().unwrap();
         assert_eq!(top.len(), 2);
+    }
+}
+
+/// End-to-end walk tests against a scripted CORDIS API and a real temp store —
+/// the cursor is *persisted state*, so the arithmetic has to be proven where it
+/// actually lands, not only in the predicate.
+#[cfg(test)]
+mod walk_tests {
+    use super::*;
+    use pumper_core::testing::{engines_with, Dead, TempStore, TestContext};
+    use pumper_core::{HttpResponse, ScrapeApp};
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    /// A CORDIS API with a fixed corpus of ids, plus the two failure shapes
+    /// this seam exists for: a page truncated mid-corpus, and a listing that
+    /// reports `total: 0`.
+    struct ScriptedCordis {
+        corpus: Vec<String>,
+        /// Reported as `payload.total` (defaults to the corpus size).
+        total_override: Option<u64>,
+        /// (1-based page, hits it returns) — a truncated page mid-corpus.
+        short_page: Option<(u64, usize)>,
+    }
+
+    impl ScriptedCordis {
+        fn of(n: usize) -> Self {
+            Self {
+                corpus: (0..n).map(|i| format!("{:06}", 100_000 + i)).collect(),
+                total_override: None,
+                short_page: None,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl pumper_core::HttpClient for ScriptedCordis {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            let parsed = url::Url::parse(&req.url).expect("test url parses");
+            let body = if req.url.contains("/api/search/results") {
+                let q: HashMap<_, _> = parsed.query_pairs().into_owned().collect();
+                let page: u64 = q["p"].parse().unwrap();
+                let num: usize = q["num"].parse().unwrap();
+                let from = ((page - 1) as usize).saturating_mul(num);
+                let mut window: Vec<Value> = self
+                    .corpus
+                    .iter()
+                    .skip(from)
+                    .take(num)
+                    .map(|id| json!({ "id": id, "contentType": "project" }))
+                    .collect();
+                if let Some((short, keep)) = self.short_page {
+                    if short == page {
+                        window.truncate(keep);
+                    }
+                }
+                json!({ "status": true, "payload": {
+                    "total": self.total_override.unwrap_or(self.corpus.len() as u64),
+                    "page": page,
+                    "nItems": window.len(),
+                    "results": window,
+                } })
+            } else {
+                let id = parsed.path().rsplit('/').next().unwrap().to_string();
+                json!({
+                    "rcn": id, "id": id, "acronym": "ACR", "title": "T",
+                    "ecMaxContribution": "1000000", "totalCost": "2000000",
+                    "startDate": "2022-06-01", "status": "SIGNED",
+                    "relations": { "associations": {
+                        "1": { "attributes": { "type": "relatedSubCall" },
+                               "identifier": "HORIZON-CL4-2022-DATA-01" },
+                        "2": { "legalName": "ORG",
+                               "attributes": { "type": "coordinator",
+                                               "ecContribution": "500000", "order": 1 } }
+                    } }
+                })
+            };
+            Ok(HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: body.to_string(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    async fn run(store: &TempStore, api: ScriptedCordis, params: Value) -> Result<Value> {
+        let engines = engines_with(Arc::new(api), Arc::new(Dead), Arc::new(Dead));
+        let ctx = TestContext::new(&store.storage, "cordis")
+            .params(params)
+            .engines(engines)
+            .build();
+        Cordis.run(ctx).await
+    }
+
+    /// THE tail-skip bug, end to end: `maxProjects` 450 at `pageSize` 100
+    /// truncates page 5 after 50 ids, and the old cursor persisted "next page =
+    /// 6" — stepping over the other 50 for a whole ~46-week corpus cycle.
+    #[tokio::test]
+    async fn the_truncated_tail_is_revisited_not_skipped_for_a_cycle() {
+        let store = TempStore::new("cordis-tail").await;
+        let params = json!({ "pageSize": 100, "maxProjects": 450 });
+
+        let first = run(&store, ScriptedCordis::of(500), params.clone())
+            .await
+            .expect("run 1");
+        assert_eq!(first["fetched"], 450);
+        assert_eq!(first["sweep"], "capped");
+        assert_eq!(first["corpus_swept"], false, "the cap is not the end");
+        assert_eq!(first["cursor_next_offset"], 450);
+        assert_eq!(first["cursor_next_page"], 5, "page 5, not page 6");
+
+        // Run 2 resumes INSIDE page 5 and picks up exactly the 50 skipped ids.
+        let second = run(&store, ScriptedCordis::of(500), params)
+            .await
+            .expect("run 2");
+        assert_eq!(second["start_offset"], 450);
+        assert_eq!(second["skip_in_page"], 50);
+        assert_eq!(second["ids_enumerated"], 50);
+        assert_eq!(second["new"], 50, "the skipped tail, not a re-fetch");
+        assert_eq!(second["corpus"], 500, "the whole corpus, in two runs");
+        // …and the walk is now provably done, so the cursor wraps.
+        assert_eq!(second["sweep"], "complete");
+        assert_eq!(second["corpus_swept"], true);
+        assert_eq!(second["cursor_next_offset"], 0);
+    }
+
+    /// The wipe: one truncated page used to claim `corpus_swept: true` AND
+    /// reset the cursor to page 1, throwing away every week of walk so far.
+    #[tokio::test]
+    async fn a_short_page_neither_claims_a_sweep_nor_resets_the_cursor() {
+        let store = TempStore::new("cordis-short").await;
+        let params = json!({ "pageSize": 10, "maxProjects": 100 });
+        let api = ScriptedCordis {
+            short_page: Some((3, 4)), // page 3 of 20 comes back 4-of-10
+            ..ScriptedCordis::of(200)
+        };
+        let out = run(&store, api, params).await.expect("run");
+
+        assert_eq!(out["sweep"], "short_page");
+        assert_eq!(out["corpus_swept"], false);
+        // 10 + 10 + 4 consumed; the cursor keeps its place instead of wrapping.
+        assert_eq!(out["cursor_next_offset"], 24);
+        assert_ne!(out["cursor_next_offset"], json!(0), "no wipe");
+        assert!(
+            out["warnings"][0]
+                .as_str()
+                .expect("a truncated page is reported, not swallowed")
+                .contains("TRUNCATED"),
+            "{out}"
+        );
+        // The persisted row agrees with the reported cursor.
+        let ds = store.datasets();
+        let state = ds.get("cordis", "state", "cursor").await.unwrap().unwrap();
+        assert_eq!(state.data["next_offset"], 24);
+    }
+
+    /// The query-grammar drift the crate doc-header warns about, arriving as a
+    /// clean `total: 0` — which every existing guard let through.
+    #[tokio::test]
+    async fn a_total_zero_listing_fails_loudly_and_leaves_the_cursor_alone() {
+        let store = TempStore::new("cordis-drift").await;
+        let params = json!({ "pageSize": 10, "maxProjects": 50 });
+
+        // A healthy run first, so there IS a corpus and a cursor to protect.
+        let good = run(&store, ScriptedCordis::of(200), params.clone())
+            .await
+            .expect("healthy run");
+        assert_eq!(good["cursor_next_offset"], 50);
+
+        // Now the drifted query: syntactically fine, semantically empty.
+        let drifted = ScriptedCordis {
+            corpus: Vec::new(),
+            total_override: Some(0),
+            short_page: None,
+        };
+        let err = run(&store, drifted, params)
+            .await
+            .expect_err("total:0 over a stored corpus must not be a clean sweep");
+        assert!(err.to_string().contains("total:0"), "{err}");
+
+        let ds = store.datasets();
+        let state = ds.get("cordis", "state", "cursor").await.unwrap().unwrap();
+        assert_eq!(
+            state.data["next_offset"], 50,
+            "a drifted listing must not move — let alone wrap — the cursor"
+        );
+    }
+
+    /// The honest complete case still works: a walk that reaches the listing's
+    /// arithmetic end wraps, and says so.
+    #[tokio::test]
+    async fn a_walk_that_reaches_the_end_wraps_and_says_so() {
+        let store = TempStore::new("cordis-complete").await;
+        let out = run(
+            &store,
+            ScriptedCordis::of(25),
+            json!({ "pageSize": 10, "maxProjects": 100 }),
+        )
+        .await
+        .expect("run");
+        assert_eq!(out["ids_enumerated"], 25);
+        assert_eq!(out["pages"], 3);
+        assert_eq!(out["sweep"], "complete");
+        assert_eq!(out["corpus_swept"], true);
+        assert_eq!(out["cursor_next_offset"], 0);
+        assert!(out.get("warnings").is_none(), "nothing to warn about");
     }
 }
