@@ -4,9 +4,9 @@ type: perfect/context
 group: HTTP API
 category: api
 opportunity: 6
-last_proposed: never
-cooldown_until: —
-directions: []
+last_proposed: 2026-08-12
+cooldown_until: 2026-08-14 (2 rounds)
+directions: ["[[job-budget-floor]]", "[[job-control-event-honesty]]", "[[search-degraded-honesty]]"]
 alias_of_old_map: "[[http-api-routes]] (round-1 pass covered jobs pagination; search/recipes/host_weather/remote post-date it)"
 ---
 
@@ -40,6 +40,30 @@ Pre-verified anchors, strongest first:
 ## Direction history
 - (as http-api-routes r1; via search-engine r7 for search.rs.)
 - 2026-08-12 (round 11): scouted, brief banked, no slate (cap). No cooldown.
+- 2026-08-12 (round 12, director-self-gated, SWEEP — banked anchors re-verified inline;
+  jobs.rs lines shifted by r11's 6c3f91a but all three jobs anchors held; host_weather +
+  recipes anchors confirmed; the "token lookup discards attempt key" sub-claim is WEAK —
+  registry holds only the current attempt's token per id, discarding is harmless; dropped
+  from the direction). Slate of 5, ACCEPTED 3:
+  - ACCEPTED [[job-budget-floor]] (robustness S) — budget_usd 0/negative silently means
+    UNLIMITED on a paid path (jobs.rs:126).
+  - ACCEPTED [[job-control-event-honesty]] (robustness M) — bulk-retry/cancel events
+    carry empty app (invisible to app-scoped watchers) + drain-window cancel answers
+    cancelled:true while the job suspends and resurrects.
+  - ACCEPTED [[search-degraded-honesty]] (robustness S) — wiped/disabled index answers
+    200 empty, indistinguishable from no-matches; MEMORY.md invariant #4 says this trap
+    already cost a session.
+  - REJECTED-deferred host-weather-import-atomicity (robustness M) — CONFIRMED real:
+    apply loop at host_weather.rs:218-232 is non-atomic (mid-loop `?` → 500 with partial
+    in-memory raises and save_penalties never reached), empty-bundle 400 documented but
+    unreachable, MAX_IMPORT_ENTRIES dead behind the 1MiB body limit, DefaultHasher
+    node_id unstable across toolchains. Lost the cap-6 tiebreak on reach: manual, rare-
+    path operator surface vs three every-consumer surfaces. BANKED as this context's
+    next anchor — propose first next visit.
+  - REJECTED recipes-surface-honesty — GET /recipes can only return [] (xray has zero
+    callers) and the route doc says so honestly; route polish on a dead surface is
+    cosmetic churn. The REAL fix is discovery wiring, banked on [[tiered-fetcher]] since
+    r9 — do it there, not here.
 
 ## Shipped
 - (inherited via those contexts)

@@ -4,9 +4,9 @@ type: perfect/context
 group: Content & Research Apps
 category: lib
 opportunity: 6
-last_proposed: never
-cooldown_until: —
-directions: []
+last_proposed: 2026-08-12
+cooldown_until: 2026-08-14 (2 rounds)
+directions: ["[[extractor-mode-door]]", "[[extractor-result-honesty]]", "[[extractor-records-echo]]"]
 alias_of_old_map: "[[declarative-extraction-engine]] (round-3 pass; its app-side work lands here)"
 ---
 
@@ -47,6 +47,24 @@ Pre-verified anchors, strongest first:
 - (as declarative-extraction-engine, round 3): 4/4 shipped — see that note. rules:"auto"
   LLM drafting REJECTED (third LLM-feature rejection) — do not re-propose.
 - 2026-08-12 (round 11): scouted, brief banked, no slate (cap). No cooldown.
+- 2026-08-12 (round 12, director-self-gated, SWEEP — banked anchors re-verified inline
+  against live code; all held with line shifts from r11's ee5d8e4/26fb0cc/1b6aebc; NEW
+  decisive fact found: schema uses `anyOf` at lib.rs:654-658 while three descriptions
+  claim exclusivity, and worker.rs:1689 consumes result["records"] for search indexing —
+  the echo is a load-bearing contract, not dead weight). Slate of 5, ACCEPTED 3:
+  - ACCEPTED [[extractor-mode-door]] (robustness M) — silent-wrong-result: multiple mode
+    roots pass the door, run() first-match-wins, 200.
+  - ACCEPTED [[extractor-result-honesty]] (robustness M) — five result lies: phantom
+    output_shape keys, capped source read with no truncated flag, backfill drops
+    health/worst_fields, silent registration failure, write target never named.
+  - ACCEPTED [[extractor-records-echo]] (optimization M) — unbounded record echo into the
+    job row + double clone; must move indexing to index_datasets path first.
+  - REJECTED extractor-versions-nplus1 (optimization) — real N+1 in versions/as_of modes
+    but those are low-traffic archival paths with no volume consumer today; same
+    precedent as r9's fetch-hot-path-batching reject. BANKED as next anchor.
+  - REJECTED-deferred extractor-e2e-coverage (robustness S) — induce/source.archive e2e
+    gaps are real but the three accepted directions each carry tests into these paths;
+    standalone harness doesn't clear the outcome-value bar this round. BANKED.
 
 ## Shipped
 - (inherited — see [[declarative-extraction-engine]])

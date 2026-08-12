@@ -2,19 +2,48 @@
 type: perfect/home
 repo: pumper
 updated: 2026-08-12
-pool: 0
-pool_target: 10
+pool: 6
+pool_target: 6 (round-12 dispatch cap)
 shipped_total: 104
-coverage: "18/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; +14 more inherit old-map passes via aliases, 28 never proposed (banked slate-grade briefs: declarative-extractor, job-search-api)"
-cursor: "round 12: declarative-extractor + job-search-api (banked slate-grade briefs — re-verify anchors first, decay rule)"
-last_session: "[[sessions/2026-08-12]]"
+coverage: "18/46 map contexts covered at round-12 start — round 12 IN FLIGHT covers declarative-extractor + job-search-api (gated slates) → 20/46 at wrap; 26 never proposed after this round"
+cursor: "round 12 BUILDING: wave perfect/2026-08-12-r12, Lot X (extractor ×3) + Lot J (jobs/search ×3)"
+last_session: "[[sessions/2026-08-12-2]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **0** · phase: **round 11 WRAPPED — all 6 shipped** (2 recovered from the dead session's dirty tree, 4 by continuation builders). Next: round-12 propose from the never-proposed queue.
+**State**: pool **6/6** · phase: **round 12 BUILD** (Athena-dispatched sweep, director-self-gated).
+
+### Round-12 pool — 6/6 accepted (2026-08-12, gate: director-self-gated, SWEEP round)
+declarative-extractor, 3/5 (REJECTED: versions-nplus1 — banked; REJECTED-deferred:
+e2e-coverage — banked):
+1. [[extractor-mode-door]] — robustness · M (anyOf admits combined mode roots; run()
+   first-match-wins silently; prose claims exclusivity nothing enforces)
+2. [[extractor-result-honesty]] — robustness · M (five result lies: phantom output_shape
+   keys, uncapped-claim on 10k source read, backfill drops health, silent registration
+   failure, write target unnamed)
+3. [[extractor-records-echo]] — optimization · M (unbounded record echo into the job row;
+   worker indexes FROM the echo — move to index_datasets path first)
+
+job-search-api, 3/5 (REJECTED-deferred: host-weather-import-atomicity — CONFIRMED, banked
+as next anchor; REJECTED: recipes-surface-honesty — dead surface, real fix banked on
+tiered-fetcher):
+4. [[job-budget-floor]] — robustness · S (budget_usd 0/negative → silently unlimited on a
+   paid path)
+5. [[job-control-event-honesty]] — robustness · M (empty-app control events invisible to
+   watchers; drain-window cancel says cancelled:true while the job resurrects)
+6. [[search-degraded-honesty]] — robustness · S (wiped/disabled index answers 200 empty —
+   indistinguishable from no-matches; MEMORY.md invariant #4)
+
+### Wave plan (round 12) — ONE branch `perfect/2026-08-12-r12`, main checkout, 2 CONCURRENT lots
+Write sets disjoint: **Lot X** (opus) = 1,2,3 → crates/apps/extractor/src/*, extractor
+tests, docs/features/extraction.md — worker.rs is OUT of set (any search_docs adjustment
+is REPORTED for a Director commit) · **Lot J** (opus) = 4,5,6 →
+server/routes/{jobs,search}.rs, server/worker.rs, server/mcp/{mod,live}.rs,
+core/storage.rs (retry_bulk), server/e2e/*, docs/features/{http-api,search}.md.
+Class B both lots: routes/mod.rs EXPECTED inventory, e2e/mod.rs.
 
 ### Round-11 pool — ALL 6 SHIPPED (2026-08-12, gate: director-self-gated, Athena-dispatched, SWEEP round; original session died mid-build, continuation recovered + finished)
 extraction-core, 3/5 (REJECTED-deferred: induce-surface — banked with the induce quality bundle;
