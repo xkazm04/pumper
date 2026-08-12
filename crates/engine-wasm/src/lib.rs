@@ -33,6 +33,7 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use async_trait::async_trait;
 use pumper_core::config::PluginConfig;
 use pumper_core::error::PluginFailure;
+use pumper_core::plugin::PluginRunStats;
 use pumper_core::{Error, Plugins, Result};
 use serde_json::Value;
 use tokio::sync::Semaphore;
@@ -57,6 +58,60 @@ pub struct WasmPluginHost {
     /// matter how wide the caller's fan-out is.
     sem: Arc<Semaphore>,
     modules: RwLock<ModuleMap>,
+    /// What each plugin has cost since it was loaded, for `GET /plugins`.
+    ///
+    /// Its own map rather than a field on [`LoadedPlugin`] so a reload — which
+    /// replaces the index wholesale — clears it: after a hot-swap the name
+    /// refers to a different binary, and carrying the old build's cost history
+    /// forward under the new build's name would be the sort of quiet fiction
+    /// this telemetry exists to end.
+    telemetry: RwLock<HashMap<String, PluginTelemetry>>,
+}
+
+/// Per-plugin cost accumulated since the module was loaded. In-memory only:
+/// this is a live gauge for "how close is this plugin running to its caps",
+/// not an evidence ledger, and it deliberately resets with the process and
+/// with every reload.
+#[derive(Debug, Clone, Copy, Default)]
+struct PluginTelemetry {
+    calls: u64,
+    fuel_total: u64,
+    fuel_max: u64,
+    fuel_last: u64,
+    memory_max: usize,
+    memory_last: usize,
+}
+
+impl PluginTelemetry {
+    fn record(&mut self, stats: &PluginRunStats) {
+        self.calls += 1;
+        if let Some(fuel) = stats.fuel_used {
+            self.fuel_total = self.fuel_total.saturating_add(fuel);
+            self.fuel_max = self.fuel_max.max(fuel);
+            self.fuel_last = fuel;
+        }
+        if let Some(bytes) = stats.memory_bytes {
+            self.memory_max = self.memory_max.max(bytes);
+            self.memory_last = bytes;
+        }
+    }
+
+    /// The `GET /plugins` view. Reports the BUDGETS alongside the usage, because
+    /// "18 million fuel" answers nothing on its own — "18 million of 200
+    /// million" is the number an operator can act on.
+    fn to_json(self, fuel_budget: u64, memory_cap: usize) -> Value {
+        let avg_fuel = (self.calls > 0).then(|| self.fuel_total as f64 / self.calls as f64);
+        serde_json::json!({
+            "calls": self.calls,
+            "fuel_last": self.fuel_last,
+            "fuel_max": self.fuel_max,
+            "fuel_avg": avg_fuel,
+            "fuel_budget": fuel_budget,
+            "memory_bytes_last": self.memory_last,
+            "memory_bytes_max": self.memory_max,
+            "memory_bytes_cap": memory_cap,
+        })
+    }
 }
 
 /// A compiled, **pre-instantiated** plugin plus its self-describing manifest
@@ -159,7 +214,31 @@ impl WasmPluginHost {
             probe,
             sem: Arc::new(Semaphore::new(max_concurrent)),
             modules: RwLock::new(modules),
+            telemetry: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Reads the cost gauges, recovering from poisoning like the module index.
+    /// Worst case for a recovered read is one stale counter on a diagnostic
+    /// surface — nothing here is evidence.
+    fn read_telemetry(&self) -> RwLockReadGuard<'_, HashMap<String, PluginTelemetry>> {
+        match self.telemetry.read() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn_poisoned();
+                poisoned.into_inner()
+            }
+        }
+    }
+
+    fn write_telemetry(&self) -> RwLockWriteGuard<'_, HashMap<String, PluginTelemetry>> {
+        match self.telemetry.write() {
+            Ok(guard) => guard,
+            Err(poisoned) => {
+                warn_poisoned();
+                poisoned.into_inner()
+            }
+        }
     }
 
     /// Reads the module index, **recovering** from a poisoned lock rather than
@@ -256,7 +335,21 @@ async fn run_admitted<T: Send + 'static>(
 
 #[async_trait]
 impl Plugins for WasmPluginHost {
+    /// The value-only call, in terms of the metered one — a single execution
+    /// path, so a caller that ignores the cost can never diverge in behaviour
+    /// from one that reads it.
     async fn run(&self, name: &str, input: &str, params: &Value) -> Result<Value> {
+        self.run_metered(name, input, params)
+            .await
+            .map(|(value, _)| value)
+    }
+
+    async fn run_metered(
+        &self,
+        name: &str,
+        input: &str,
+        params: &Value,
+    ) -> Result<(Value, PluginRunStats)> {
         let pre = self
             .read_modules()
             .get(name)
@@ -278,10 +371,18 @@ impl Plugins for WasmPluginHost {
         // spin up 200 stores at once. Wasm execution is synchronous and
         // CPU-bound, so it runs off the async runtime — and the permit rides
         // along with it (see `run_admitted`).
-        run_admitted(self.sem.clone(), name, move || {
+        let (value, stats) = run_admitted(self.sem.clone(), name, move || {
             execute(engine, pre, &plugin, input, params, fuel, max_memory)
         })
-        .await?
+        .await??;
+        // Gauges only — a failed call is reported through the error, and folding
+        // a trap's partial burn into an average would make "how expensive is this
+        // plugin" answer about failures instead of about work done.
+        self.write_telemetry()
+            .entry(name.to_string())
+            .or_default()
+            .record(&stats);
+        Ok((value, stats))
     }
 
     /// The plugins a caller can actually RUN — `executable` only.
@@ -319,6 +420,7 @@ impl Plugins for WasmPluginHost {
         let modules = self.read_modules();
         let mut entries: Vec<(&String, &LoadedPlugin)> = modules.iter().collect();
         entries.sort_by(|a, b| a.0.cmp(b.0));
+        let telemetry = self.read_telemetry();
         entries
             .into_iter()
             .map(|(name, p)| {
@@ -329,6 +431,17 @@ impl Plugins for WasmPluginHost {
                 };
                 m.insert("name".into(), Value::String(name.clone()));
                 m.insert("executable".into(), Value::Bool(p.executable));
+                // Present with `calls: 0` for a plugin nothing has run yet —
+                // "never invoked" is an answer, and omitting the key would make
+                // it indistinguishable from "this host does not measure".
+                m.insert(
+                    "telemetry".into(),
+                    telemetry
+                        .get(name)
+                        .copied()
+                        .unwrap_or_default()
+                        .to_json(self.fuel, self.max_memory),
+                );
                 Value::Object(m)
             })
             .collect()
@@ -351,6 +464,9 @@ impl Plugins for WasmPluginHost {
             })?;
         let count = modules.len();
         *self.write_modules() = modules;
+        // The names now refer to freshly compiled binaries; carrying the old
+        // builds' cost history forward under them would be a fiction.
+        self.write_telemetry().clear();
         tracing::info!(count, "reloaded wasm plugins");
         Ok(count)
     }
@@ -675,7 +791,7 @@ fn execute(
     params: Value,
     fuel: u64,
     max_memory: usize,
-) -> Result<Value> {
+) -> Result<(Value, PluginRunStats)> {
     let (mut store, instance) = instantiate(&engine, &pre, plugin, fuel, max_memory)?;
     let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
         Error::plugin(PluginFailure::MissingExport, plugin, "exports no 'memory'")
@@ -739,13 +855,42 @@ fn execute(
     })?;
 
     let out = read_packed(&mut store, &memory, plugin, packed)?;
-    serde_json::from_slice(&out).map_err(|e| {
+    let value: Value = serde_json::from_slice(&out).map_err(|e| {
         Error::plugin(
             PluginFailure::MalformedOutput,
             plugin,
             format!("returned invalid JSON: {e}"),
         )
-    })
+    })?;
+    Ok((value, measure(&mut store, &memory, fuel, max_memory)))
+}
+
+/// What the call that just finished in `store` cost.
+///
+/// The sandbox metered nothing it enforced: fuel was set and never read back,
+/// and the memory high-water was never observed at all — so an operator could
+/// not see how close a plugin ran to caps the host was already policing, and the
+/// observatory substituted wall-clock elapsed time for cost by its own
+/// admission.
+///
+/// Both numbers are exact rather than sampled. Fuel is the budget minus what
+/// `set_fuel` left; linear memory only ever GROWS inside a store, and every call
+/// gets a fresh store, so the size now is this call's high-water by
+/// construction.
+fn measure(
+    store: &mut Store<StoreLimits>,
+    memory: &Memory,
+    fuel: u64,
+    max_memory: usize,
+) -> PluginRunStats {
+    PluginRunStats {
+        // `get_fuel` errors only when the engine has fuel metering off, which
+        // this host always sets — so a miss means "we cannot say", never 0.
+        fuel_used: store.get_fuel().ok().map(|left| fuel.saturating_sub(left)),
+        fuel_budget: Some(fuel),
+        memory_bytes: Some(memory.data_size(&*store)),
+        memory_cap_bytes: Some(max_memory),
+    }
 }
 
 #[cfg(test)]
@@ -1111,6 +1256,203 @@ mod tests {
                 "the failure must name the module: {err}"
             );
         }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Returns `null`, having spun a counted loop `iters` times — a plugin whose
+    /// fuel appetite is a knob rather than an accident.
+    fn burner_wat(iters: i32) -> String {
+        format!(
+            "(module (memory (export \"memory\") 1) (data (i32.const 16) \"null\") \
+             (func (export \"alloc\") (param i32) (result i32) (i32.const 4096)) \
+             (func (export \"extract_v2\") (param i32 i32) (result i64) (local $i i32) \
+               (local.set $i (i32.const {iters})) \
+               (block $done (loop $l \
+                 (br_if $done (i32.eqz (local.get $i))) \
+                 (local.set $i (i32.sub (local.get $i) (i32.const 1))) \
+                 (br $l))) \
+               (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 4))))"
+        )
+    }
+
+    /// Returns `null` after growing linear memory by `pages` — the memory
+    /// high-water has to reflect what the guest actually took.
+    fn growing_wat(pages: i32) -> String {
+        format!(
+            "(module (memory (export \"memory\") 1) (data (i32.const 16) \"null\") \
+             (func (export \"alloc\") (param i32) (result i32) (i32.const 4096)) \
+             (func (export \"extract_v2\") (param i32 i32) (result i64) \
+               (drop (memory.grow (i32.const {pages}))) \
+               (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 4))))"
+        )
+    }
+
+    /// The sandbox metered nothing it enforced: fuel was set and never read
+    /// back, memory high-water never observed. An operator could not see how
+    /// close a plugin ran to caps the host was already policing, and the
+    /// observatory substituted wall-clock time for cost by its own admission.
+    #[tokio::test]
+    async fn a_call_reports_the_fuel_it_burned_against_the_budget_it_had() {
+        let dir = fresh_host_dir("fuel");
+        std::fs::write(dir.join("idle.wasm"), burner_wat(1)).expect("write");
+        std::fs::write(dir.join("busy.wasm"), burner_wat(20_000)).expect("write");
+        const BUDGET: u64 = 5_000_000;
+        let host = WasmPluginHost::new(&PluginConfig {
+            dir: dir.clone(),
+            fuel: BUDGET,
+            ..Default::default()
+        })
+        .expect("host");
+
+        let (idle_out, idle) = host
+            .run_metered("idle", "<doc/>", &Value::Null)
+            .await
+            .expect("idle runs");
+        assert_eq!(idle_out, Value::Null, "the value is unaffected by metering");
+        let (_, busy) = host
+            .run_metered("busy", "<doc/>", &Value::Null)
+            .await
+            .expect("busy runs");
+
+        let (idle_fuel, busy_fuel) = (
+            idle.fuel_used.expect("the wasm host meters"),
+            busy.fuel_used.expect("the wasm host meters"),
+        );
+        assert!(
+            busy_fuel > idle_fuel,
+            "a plugin that spins 20k times must cost more than one that spins once \
+             ({busy_fuel} vs {idle_fuel})"
+        );
+        assert!(
+            busy_fuel <= BUDGET,
+            "a call that RETURNED cannot have spent more than its budget: {busy_fuel} > {BUDGET}"
+        );
+        assert!(idle_fuel > 0, "even a trivial call executes instructions");
+        assert_eq!(
+            busy.fuel_budget,
+            Some(BUDGET),
+            "the ceiling travels with it"
+        );
+        // …which is what makes "how close to the cap" answerable at all.
+        let fraction = busy.fuel_fraction().expect("metered");
+        assert!((0.0..=1.0).contains(&fraction), "{fraction}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_call_reports_the_memory_high_water_it_reached() {
+        let dir = fresh_host_dir("memory");
+        const PAGE: usize = 64 * 1024;
+        std::fs::write(dir.join("small.wasm"), growing_wat(0)).expect("write");
+        std::fs::write(dir.join("hungry.wasm"), growing_wat(4)).expect("write");
+        let host = WasmPluginHost::new(&PluginConfig {
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .expect("host");
+
+        let (_, small) = host
+            .run_metered("small", "<doc/>", &Value::Null)
+            .await
+            .expect("small runs");
+        let (_, hungry) = host
+            .run_metered("hungry", "<doc/>", &Value::Null)
+            .await
+            .expect("hungry runs");
+        assert_eq!(small.memory_bytes, Some(PAGE));
+        assert_eq!(
+            hungry.memory_bytes,
+            Some(5 * PAGE),
+            "growth inside the call must be reflected — wasm memory only grows, so \
+             the size after the call IS this call's high-water"
+        );
+        assert_eq!(
+            hungry.memory_cap_bytes,
+            Some(PluginConfig::default().max_memory_mb * 1024 * 1024)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A plugin built before the params envelope exports only `extract`. It must
+    /// keep running unchanged — and be metered like any other call.
+    #[tokio::test]
+    async fn the_legacy_extract_fallback_still_runs_and_is_metered() {
+        let dir = fresh_host_dir("legacy");
+        std::fs::write(
+            dir.join("legacy.wasm"),
+            "(module (memory (export \"memory\") 1) (data (i32.const 16) \"null\") \
+             (func (export \"alloc\") (param i32) (result i32) (i32.const 4096)) \
+             (func (export \"extract\") (param i32 i32) (result i64) \
+               (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 4))))",
+        )
+        .expect("write");
+        let host = WasmPluginHost::new(&PluginConfig {
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .expect("host");
+        assert!(
+            host.has("legacy"),
+            "the legacy ABI is still an executable one"
+        );
+        let (out, stats) = host
+            .run_metered("legacy", "<doc/>", &serde_json::json!({"ignored": true}))
+            .await
+            .expect("legacy plugin runs");
+        assert_eq!(out, Value::Null);
+        assert!(stats.is_metered());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The read surface: `GET /plugins` has to answer "how close is this running
+    /// to its caps" without a new subsystem. A plugin nothing has run reports
+    /// `calls: 0` rather than being absent — "never invoked" is an answer, and
+    /// silence would read as "this host does not measure".
+    #[tokio::test]
+    async fn manifests_expose_per_plugin_cost_and_reset_on_reload() {
+        let dir = fresh_host_dir("telemetry");
+        std::fs::write(dir.join("busy.wasm"), burner_wat(5_000)).expect("write");
+        std::fs::write(dir.join("untouched.wasm"), burner_wat(1)).expect("write");
+        let host = WasmPluginHost::new(&PluginConfig {
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .expect("host");
+
+        let entry = |ms: &[Value], name: &str| -> Value {
+            ms.iter()
+                .find(|m| m["name"] == serde_json::json!(name))
+                .expect("listed")
+                .clone()
+        };
+        let before = host.manifests();
+        assert_eq!(entry(&before, "busy")["telemetry"]["calls"], 0);
+
+        for _ in 0..2 {
+            host.run("busy", "<doc/>", &Value::Null).await.expect("run");
+        }
+        let after = host.manifests();
+        let t = entry(&after, "busy")["telemetry"].clone();
+        assert_eq!(t["calls"], 2);
+        assert!(t["fuel_last"].as_u64().expect("fuel") > 0);
+        assert_eq!(
+            t["fuel_max"], t["fuel_last"],
+            "identical calls, identical cost"
+        );
+        assert!(t["fuel_avg"].as_f64().expect("avg") > 0.0);
+        assert_eq!(
+            t["fuel_budget"],
+            serde_json::json!(PluginConfig::default().fuel),
+            "the budget rides along, or the usage number answers nothing"
+        );
+        assert!(t["memory_bytes_last"].as_u64().expect("memory") > 0);
+        // A plugin nobody ran is honest about that rather than absent.
+        assert_eq!(entry(&after, "untouched")["telemetry"]["calls"], 0);
+
+        // A reload swaps the binaries these names refer to; carrying the old
+        // build's cost forward under the new name would be a fiction.
+        host.reload().await.expect("reload");
+        assert_eq!(entry(&host.manifests(), "busy")["telemetry"]["calls"], 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

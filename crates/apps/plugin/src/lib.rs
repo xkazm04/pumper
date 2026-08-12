@@ -93,6 +93,96 @@ fn parse_concurrency(params: &Value) -> usize {
         .unwrap_or(DEFAULT_CONCURRENCY)
 }
 
+/// What a run's plugin calls cost, rolled up across the fan-out.
+///
+/// Deliberately reported on the JOB RESULT, never merged into the dataset
+/// records: fuel varies run to run, so a per-record `fuel_used` would make
+/// change detection mark every single record `changed` on every re-run — the
+/// telemetry would destroy the very signal the datasets exist to carry.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub(crate) struct CostRollup {
+    /// Calls whose cost the host actually measured.
+    metered: u64,
+    /// Calls that ran against a host that does not meter.
+    unmetered: u64,
+    fuel_total: u64,
+    fuel_max: u64,
+    fuel_budget: Option<u64>,
+    memory_max: usize,
+}
+
+impl CostRollup {
+    pub(crate) fn record(&mut self, stats: &pumper_core::plugin::PluginRunStats) {
+        match stats.fuel_used {
+            Some(fuel) => {
+                self.metered += 1;
+                self.fuel_total = self.fuel_total.saturating_add(fuel);
+                self.fuel_max = self.fuel_max.max(fuel);
+                self.fuel_budget = self.fuel_budget.or(stats.fuel_budget);
+            }
+            None => self.unmetered += 1,
+        }
+        if let Some(bytes) = stats.memory_bytes {
+            self.memory_max = self.memory_max.max(bytes);
+        }
+    }
+
+    /// Folds another batch's rollup in — backfill runs the plugin batch by
+    /// batch, and the result reports one cost for the attempt.
+    pub(crate) fn merge(&mut self, other: &CostRollup) {
+        self.metered += other.metered;
+        self.unmetered += other.unmetered;
+        self.fuel_total = self.fuel_total.saturating_add(other.fuel_total);
+        self.fuel_max = self.fuel_max.max(other.fuel_max);
+        self.fuel_budget = self.fuel_budget.or(other.fuel_budget);
+        self.memory_max = self.memory_max.max(other.memory_max);
+    }
+
+    /// Which number a reader should treat as this run's cost. `"fuel"` only when
+    /// something was genuinely measured — a run with nothing metered says
+    /// `"elapsed_ms"` rather than reporting a fuel figure of zero.
+    pub(crate) fn signal(&self) -> &'static str {
+        if self.metered > 0 {
+            "fuel"
+        } else {
+            "elapsed_ms"
+        }
+    }
+
+    pub(crate) fn avg_fuel(&self) -> Option<f64> {
+        (self.metered > 0).then(|| self.fuel_total as f64 / self.metered as f64)
+    }
+
+    pub(crate) fn max_fuel(&self) -> Option<u64> {
+        (self.metered > 0).then_some(self.fuel_max)
+    }
+
+    pub(crate) fn fuel_budget(&self) -> Option<u64> {
+        self.fuel_budget
+    }
+
+    pub(crate) fn max_memory(&self) -> Option<usize> {
+        (self.metered > 0).then_some(self.memory_max)
+    }
+
+    /// The `cost` object for a job result, or `None` when nothing was measured —
+    /// a zeroed object would read as "this run was free".
+    pub(crate) fn to_json(self) -> Option<Value> {
+        (self.metered > 0).then(|| {
+            json!({
+                "signal": "fuel",
+                "calls_metered": self.metered,
+                "calls_unmetered": self.unmetered,
+                "fuel_total": self.fuel_total,
+                "fuel_max": self.fuel_max,
+                "fuel_avg": self.avg_fuel(),
+                "fuel_budget": self.fuel_budget,
+                "memory_bytes_max": self.memory_max,
+            })
+        })
+    }
+}
+
 pub struct Plugin;
 
 /// Max live records pulled from a source dataset when no explicit `keys` (and no
@@ -474,20 +564,30 @@ impl Plugin {
             async move {
                 let doc = match ctx.fetch(req).await {
                     Ok(out) => out.html.or(out.text).unwrap_or_default(),
-                    Err(e) => return json!({ "error": format!("fetch: {e}") }),
+                    Err(e) => return (json!({ "error": format!("fetch: {e}") }), None),
                 };
                 if doc.is_empty() {
-                    return json!({ "error": "empty document" });
+                    return (json!({ "error": "empty document" }), None);
                 }
-                p.run(&name, &doc, &pp)
-                    .await
-                    .unwrap_or_else(|e| json!({ "error": e.to_string() }))
+                match p.run_metered(&name, &doc, &pp).await {
+                    Ok((value, stats)) => (value, Some(stats)),
+                    Err(e) => (json!({ "error": e.to_string() }), None),
+                }
             }
         });
-        let mut results: Vec<Value> = futures::stream::iter(tasks)
-            .buffered(concurrency)
-            .collect()
-            .await;
+        let paired: Vec<(Value, Option<pumper_core::plugin::PluginRunStats>)> =
+            futures::stream::iter(tasks)
+                .buffered(concurrency)
+                .collect()
+                .await;
+        let mut cost = CostRollup::default();
+        let mut results: Vec<Value> = Vec::with_capacity(paired.len());
+        for (value, stats) in paired {
+            if let Some(stats) = &stats {
+                cost.record(stats);
+            }
+            results.push(value);
+        }
 
         let ran = results.iter().filter(|r| r.get("error").is_none()).count();
         let metas: Vec<DocMeta> = urls.iter().map(|u| DocMeta::live(u.clone())).collect();
@@ -504,6 +604,7 @@ impl Plugin {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            "cost": cost.to_json(),
             "records": results,
         }))
     }
@@ -668,7 +769,7 @@ impl Plugin {
             }
         }
 
-        let (metas, mut results) = self.run_plugin_batch(ctx, plugin, keyed).await;
+        let (metas, mut results, cost) = self.run_plugin_batch(ctx, plugin, keyed).await;
         let loaded = metas.len();
         let ran = results.iter().filter(|r| r.get("error").is_none()).count();
         let items = upsert_items(&metas, &mut results);
@@ -688,6 +789,7 @@ impl Plugin {
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            "cost": cost.to_json(),
             "records": results,
         }))
     }
@@ -700,7 +802,7 @@ impl Plugin {
         ctx: &AppContext,
         plugin: &str,
         keyed: Vec<(DocMeta, String)>,
-    ) -> (Vec<DocMeta>, Vec<Value>) {
+    ) -> (Vec<DocMeta>, Vec<Value>, CostRollup) {
         let (metas, docs): (Vec<DocMeta>, Vec<String>) = keyed.into_iter().unzip();
         let concurrency = concurrency(ctx);
         let plugin_params = plugin_params(ctx);
@@ -711,19 +813,29 @@ impl Plugin {
             let pp = plugin_params.clone();
             async move {
                 if doc.is_empty() {
-                    return json!({ "error": "empty document" });
+                    return (json!({ "error": "empty document" }), None);
                 }
-                p.run(&name, &doc, &pp)
-                    .await
-                    .unwrap_or_else(|e| json!({ "error": e.to_string() }))
+                match p.run_metered(&name, &doc, &pp).await {
+                    Ok((value, stats)) => (value, Some(stats)),
+                    Err(e) => (json!({ "error": e.to_string() }), None),
+                }
             }
         });
         // Bounded run fan-out; `buffered` keeps order for the positional zip.
-        let results: Vec<Value> = futures::stream::iter(tasks)
-            .buffered(concurrency)
-            .collect()
-            .await;
-        (metas, results)
+        let paired: Vec<(Value, Option<pumper_core::plugin::PluginRunStats>)> =
+            futures::stream::iter(tasks)
+                .buffered(concurrency)
+                .collect()
+                .await;
+        let mut cost = CostRollup::default();
+        let mut results: Vec<Value> = Vec::with_capacity(paired.len());
+        for (value, stats) in paired {
+            if let Some(stats) = &stats {
+                cost.record(stats);
+            }
+            results.push(value);
+        }
+        (metas, results, cost)
     }
 
     /// Backfill mode: fan the plugin over ALL archived versions in the source
@@ -763,6 +875,10 @@ impl Plugin {
         let mut ran = st.ran;
         let mut batches = st.batches;
         let mut missing: Vec<Value> = Vec::new();
+        // Cost is per ATTEMPT, not per logical run: it is deliberately not in
+        // `BackfillState`, because a resumed attempt did not pay for the batches
+        // a previous one ran, and claiming it did would misprice the plugin.
+        let mut cost = CostRollup::default();
         let (mut new, mut changed, mut unchanged) = (st.new, st.changed, st.unchanged);
         loop {
             let batch = ctx
@@ -814,7 +930,9 @@ impl Plugin {
             if !keyed.is_empty() {
                 loaded += keyed.len();
                 batches += 1;
-                let (metas, mut results) = self.run_plugin_batch(ctx, plugin, keyed).await;
+                let (metas, mut results, batch_cost) =
+                    self.run_plugin_batch(ctx, plugin, keyed).await;
+                cost.merge(&batch_cost);
                 ran += results.iter().filter(|r| r.get("error").is_none()).count();
                 let items = upsert_items(&metas, &mut results);
                 let summary = ctx
@@ -865,6 +983,8 @@ impl Plugin {
             "new": new,
             "changed": changed,
             "unchanged": unchanged,
+            // This attempt's plugin cost only — see `cost` above.
+            "cost": cost.to_json(),
         }))
     }
 }
@@ -894,10 +1014,71 @@ fn upsert_items(metas: &[DocMeta], results: &mut [Value]) -> Vec<(String, Value)
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_provenance, parse_concurrency, pick_as_of, versioned_key, DocMeta,
+        batch_provenance, parse_concurrency, pick_as_of, versioned_key, CostRollup, DocMeta,
         DEFAULT_CONCURRENCY,
     };
+    use pumper_core::plugin::PluginRunStats;
     use serde_json::json;
+
+    fn metered(fuel: u64, memory: usize) -> PluginRunStats {
+        PluginRunStats {
+            fuel_used: Some(fuel),
+            fuel_budget: Some(1_000_000),
+            memory_bytes: Some(memory),
+            memory_cap_bytes: Some(64 * 1024 * 1024),
+        }
+    }
+
+    /// The cost object must be ABSENT rather than zeroed when nothing was
+    /// measured: a `{"fuel_total": 0}` on an unmetered host reads as "this run
+    /// was free", which is the one thing it definitely does not mean.
+    #[test]
+    fn an_unmetered_run_reports_no_cost_rather_than_a_free_one() {
+        let mut roll = CostRollup::default();
+        assert_eq!(roll.to_json(), None, "nothing ran at all");
+        assert_eq!(roll.signal(), "elapsed_ms");
+
+        roll.record(&PluginRunStats::unmetered());
+        roll.record(&PluginRunStats::unmetered());
+        assert_eq!(
+            roll.to_json(),
+            None,
+            "two calls against a host that cannot meter is still no cost signal"
+        );
+        assert_eq!(roll.signal(), "elapsed_ms", "fall back, and say so");
+        assert_eq!(roll.avg_fuel(), None);
+    }
+
+    #[test]
+    fn a_metered_run_rolls_up_total_max_and_average() {
+        let mut roll = CostRollup::default();
+        roll.record(&metered(100, 65_536));
+        roll.record(&metered(300, 131_072));
+        roll.record(&PluginRunStats::unmetered()); // must not drag the average
+        assert_eq!(roll.signal(), "fuel");
+        assert_eq!(roll.avg_fuel(), Some(200.0), "averaged over METERED calls");
+        assert_eq!(roll.max_fuel(), Some(300));
+        assert_eq!(roll.max_memory(), Some(131_072));
+        assert_eq!(roll.fuel_budget(), Some(1_000_000));
+        let cost = roll.to_json().expect("something was measured");
+        assert_eq!(cost["signal"], "fuel");
+        assert_eq!(cost["calls_metered"], 2);
+        assert_eq!(cost["calls_unmetered"], 1);
+        assert_eq!(cost["fuel_total"], 400);
+    }
+
+    /// Backfill runs the plugin batch by batch and reports one cost per attempt.
+    #[test]
+    fn merging_batches_keeps_totals_and_maxima() {
+        let mut a = CostRollup::default();
+        a.record(&metered(100, 65_536));
+        let mut b = CostRollup::default();
+        b.record(&metered(500, 262_144));
+        a.merge(&b);
+        assert_eq!(a.max_fuel(), Some(500));
+        assert_eq!(a.max_memory(), Some(262_144));
+        assert_eq!(a.avg_fuel(), Some(300.0));
+    }
 
     #[test]
     fn batch_source_url_is_claimed_only_when_every_doc_shares_one() {

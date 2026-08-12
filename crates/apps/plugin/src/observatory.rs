@@ -12,9 +12,12 @@
 //! (seeded by site name, so reruns over an unchanged corpus pick the same
 //! pages and drift reflects the plugin/corpus, not sampler noise).
 //!
-//! Fuel note: the `Plugins` trait does not surface per-call fuel consumed (the
-//! wasmtime store is internal to engine-wasm), so rows carry `avg_elapsed_ms`
-//! as the cost signal; fuel exhaustion still shows up as a `trap` outcome.
+//! Cost signal: rows report `cost_signal` — `"fuel"` when the host meters (the
+//! wasmtime sandbox does, via `Plugins::run_metered`), `"elapsed_ms"` otherwise.
+//! Fuel is deterministic, so a rising `avg_fuel_used` between runs is a real
+//! statement about the plugin; `avg_elapsed_ms` also measures whatever else the
+//! machine was doing, and is kept as the labelled fallback rather than as the
+//! headline. Fuel exhaustion still shows up as a `trap` outcome.
 
 use pumper_core::{AppContext, Error, Record, Result};
 use serde_json::{json, Value};
@@ -384,12 +387,19 @@ pub(crate) async fn run_observatory(ctx: &AppContext) -> Result<Value> {
             let mut counts = [0usize; 4];
             let mut oks: Vec<Value> = Vec::new();
             let mut elapsed_total_ms = 0.0f64;
+            let mut cost = crate::CostRollup::default();
             for body in &bodies {
                 let start = std::time::Instant::now();
                 let res: std::result::Result<Value, Error> = if body.is_empty() {
                     Ok(Value::Null)
                 } else {
-                    ctx.plugins.run(plugin, body, &Value::Null).await
+                    match ctx.plugins.run_metered(plugin, body, &Value::Null).await {
+                        Ok((value, stats)) => {
+                            cost.record(&stats);
+                            Ok(value)
+                        }
+                        Err(e) => Err(e),
+                    }
                 };
                 elapsed_total_ms += start.elapsed().as_secs_f64() * 1000.0;
                 let outcome = classify_outcome(&res);
@@ -473,6 +483,15 @@ pub(crate) async fn run_observatory(ctx: &AppContext) -> Result<Value> {
                         "avg_fields": avg_fields,
                     },
                     "avg_elapsed_ms": avg_elapsed_ms,
+                    // Which number to READ as this row's cost. `avg_elapsed_ms`
+                    // stays for continuity (and is the honest answer against an
+                    // unmetered host), but where the sandbox meters, fuel is the
+                    // deterministic signal a drift comparison actually wants.
+                    "cost_signal": cost.signal(),
+                    "avg_fuel_used": cost.avg_fuel(),
+                    "max_fuel_used": cost.max_fuel(),
+                    "fuel_budget": cost.fuel_budget(),
+                    "max_memory_bytes": cost.max_memory(),
                     "drift_score": drift,
                     "empty_rate_rising": rising,
                     "prev_run_at": prev_run_at,

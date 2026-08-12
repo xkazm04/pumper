@@ -132,6 +132,12 @@ answer for executability, so a module without the extract ABI is never offered a
 a usable hook plugin. Loading stays permissive — describe-only modules must keep
 loading for dynamic-app discovery.
 
+Hook calls are metered like any other plugin call, so a predicate's fuel and
+memory cost shows up in that plugin's `GET /plugins` `telemetry` block (see
+[extraction.md](extraction.md)). The hook path itself surfaces no per-hop cost:
+a trigger decision is not a place to price a plugin, and a per-hop cost field
+would ride into target job params.
+
 ## Sandbox limits
 
 Per call, from `[plugins]`: `fuel` (CPU instruction budget, default
