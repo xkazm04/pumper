@@ -489,6 +489,72 @@ try {
                 ($t.inputSchema.properties.submit.const -eq $false) -and
                 ($t.inputSchema.additionalProperties -eq $false)
             }
+
+            # Round 11: door parity + watch honesty, live. Every door that
+            # creates future work answers with the job door's 422, and a watch
+            # that structurally cannot fire is refused with the namespace the
+            # records actually land under.
+            function Test-DoorRefusal {
+                param([string]$Name, [string]$Path, [hashtable]$Body, [int]$Expect, [string]$BodyLike)
+                try {
+                    $resp = Invoke-WebRequest -Method Post -Uri "$baseUrl$Path" `
+                        -Body ($Body | ConvertTo-Json -Depth 8) `
+                        -ContentType 'application/json' -UseBasicParsing -TimeoutSec 10
+                    Add-Result -Name $Name -Status 'FAIL' `
+                        -Detail "expected $Expect, got HTTP $($resp.StatusCode) — the door let it through"
+                } catch {
+                    $code = $_.Exception.Response.StatusCode.value__
+                    $errBody = ''
+                    try { $errBody = $_.ErrorDetails.Message } catch {}
+                    if ($code -eq $Expect -and $errBody -like $BodyLike) {
+                        Add-Result -Name $Name -Status 'PASS'
+                    } else {
+                        Add-Result -Name $Name -Status 'FAIL' `
+                            -Detail "expected $Expect + body like '$BodyLike', got HTTP $code body '$errBody'"
+                    }
+                }
+            }
+            # The schedules door refuses what the job door refuses (bogus key
+            # under transact's additionalProperties:false schema) instead of
+            # storing a standing order whose every firing would fail.
+            Test-DoorRefusal -Name 'POST /schedules invalid params -> 422' -Path '/schedules' `
+                -Body @{ app = 'transact'; cron = '0 0 0 * * *'; params = @{ bogus_key = 1 } } `
+                -Expect 422 -BodyLike '*"unprocessable"*'
+            # The ca-grants/unified trap: accepted-and-dead before round 11; now
+            # a 400 that names the namespace the records actually land under.
+            Test-DoorRefusal -Name 'POST /watches ca-grants/unified trap -> 400 naming grants' -Path '/watches' `
+                -Body @{ app = 'ca-grants'; dataset = 'unified'; sink = 'file' } `
+                -Expect 400 -BodyLike '*grants*'
+            # The virtual namespace every grant revision lands under is watchable.
+            try {
+                $resp = Invoke-WebRequest -Method Post -Uri "$baseUrl/watches" `
+                    -Body (@{ app = 'grants'; sink = 'file' } | ConvertTo-Json) `
+                    -ContentType 'application/json' -UseBasicParsing -TimeoutSec 10
+                if ($resp.StatusCode -eq 201) {
+                    Add-Result -Name 'POST /watches app=grants (virtual namespace) -> 201' -Status 'PASS'
+                } else {
+                    Add-Result -Name 'POST /watches app=grants (virtual namespace) -> 201' -Status 'FAIL' `
+                        -Detail "expected 201, got HTTP $($resp.StatusCode)"
+                }
+            } catch {
+                Add-Result -Name 'POST /watches app=grants (virtual namespace) -> 201' -Status 'FAIL' `
+                    -Detail $_.Exception.Message
+            }
+            # A bogus ?app= filter is a 400 with the known values, not an empty 200.
+            try {
+                $resp = Invoke-WebRequest -Uri "$baseUrl/watches?app=definitely-not-an-app" `
+                    -UseBasicParsing -TimeoutSec 10
+                Add-Result -Name 'GET /watches?app=bogus -> 400' -Status 'FAIL' `
+                    -Detail "expected 400, got HTTP $($resp.StatusCode)"
+            } catch {
+                $code = $_.Exception.Response.StatusCode.value__
+                if ($code -eq 400) {
+                    Add-Result -Name 'GET /watches?app=bogus -> 400' -Status 'PASS'
+                } else {
+                    Add-Result -Name 'GET /watches?app=bogus -> 400' -Status 'FAIL' `
+                        -Detail "expected 400, got HTTP $code"
+                }
+            }
         } else {
             Add-Result -Name 'job runs to completion (hackernews)' -Status 'SKIP' -Detail 'no job id to poll (enqueue failed)'
             Add-Result -Name 'GET /jobs/{id}/receipt' -Status 'SKIP' -Detail 'no job id to fetch a receipt for'
