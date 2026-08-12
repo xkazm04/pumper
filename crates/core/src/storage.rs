@@ -367,17 +367,24 @@ impl Storage {
         Ok(r.rows_affected() > 0)
     }
 
-    /// Cancels a job that has not started yet.
-    pub async fn cancel(&self, id: Uuid) -> Result<bool> {
-        let result = sqlx::query(
+    /// Cancels a job that has not started yet, returning the cancelled job's
+    /// **app** (`None` = there was nothing queued to cancel).
+    ///
+    /// The app rides back with the outcome because the caller has to *announce*
+    /// this transition, and a `JobEvent` with a blank app is invisible to every
+    /// app-scoped watcher (`GET /mcp?app=…` matches the event's app exactly).
+    /// `RETURNING app` keeps it in the same statement: a follow-up `get` would
+    /// be a second round-trip racing the very transition it is describing.
+    pub async fn cancel(&self, id: Uuid) -> Result<Option<String>> {
+        let row: Option<(String,)> = sqlx::query_as(
             "UPDATE jobs SET status = 'cancelled', finished_at = ?2 \
-             WHERE id = ?1 AND status = 'queued'",
+             WHERE id = ?1 AND status = 'queued' RETURNING app",
         )
         .bind(id.to_string())
         .bind(now())
-        .execute(&self.pool)
+        .fetch_optional(&self.pool)
         .await?;
-        Ok(result.rows_affected() > 0)
+        Ok(row.map(|(app,)| app))
     }
 
     /// Marks a `running` job cancelled, guarded on `(status, attempts)`. The
@@ -421,19 +428,25 @@ impl Storage {
     /// Bulk re-queue: re-queues up to `cap` jobs in the given terminal state
     /// (`Failed` | `Cancelled`), optionally scoped to one app, each granted one
     /// more attempt — the per-job `retry` semantics applied to a filtered batch,
-    /// oldest first. Returns the ids re-queued.
+    /// oldest first. Returns the `(id, app)` pairs re-queued.
+    ///
+    /// The **app** travels with each id for the same reason it does on
+    /// [`Storage::cancel`]: the caller announces one `queued` event per job, and
+    /// an event with a blank app never reaches an app-scoped watcher — so a bulk
+    /// retry used to restart work invisibly. Returning the pair keeps the
+    /// announce path at one query instead of N follow-up `get`s.
     pub async fn retry_bulk(
         &self,
         status: JobStatus,
         app: Option<&str>,
         cap: i64,
-    ) -> Result<Vec<Uuid>> {
-        let rows: Vec<(String,)> = sqlx::query_as(
+    ) -> Result<Vec<(Uuid, String)>> {
+        let rows: Vec<(String, String)> = sqlx::query_as(
             "UPDATE jobs SET status = 'queued', error = NULL, finished_at = NULL, \
              available_at = ?1, max_attempts = MAX(max_attempts, attempts + 1) \
              WHERE id IN (SELECT id FROM jobs WHERE status = ?2 AND (?3 IS NULL OR app = ?3) \
                           ORDER BY created_at LIMIT ?4) \
-             RETURNING id",
+             RETURNING id, app",
         )
         .bind(now())
         .bind(status.as_str())
@@ -442,7 +455,11 @@ impl Storage {
         .fetch_all(&self.pool)
         .await?;
         rows.into_iter()
-            .map(|(s,)| Uuid::parse_str(&s).map_err(|e| Error::Parse(format!("job id: {e}"))))
+            .map(|(id, app)| {
+                Uuid::parse_str(&id)
+                    .map(|id| (id, app))
+                    .map_err(|e| Error::Parse(format!("job id: {e}")))
+            })
             .collect()
     }
 

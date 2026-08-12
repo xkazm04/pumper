@@ -216,11 +216,15 @@ async fn retry_bulk_requeues_filtered_batch() {
     let b1 = insert_failed(&pool, "b").await;
 
     // Scoped to app "a": only its two failed jobs re-queue.
-    let ids = storage
+    let requeued = storage
         .retry_bulk(JobStatus::Failed, Some("a"), 500)
         .await
         .unwrap();
-    assert_eq!(ids.len(), 2);
+    assert_eq!(requeued.len(), 2);
+    // The app rides back with each id — the caller announces these re-queues,
+    // and an event with a blank app reaches no app-scoped watcher.
+    assert!(requeued.iter().all(|(_, app)| app == "a"));
+    let ids: Vec<_> = requeued.into_iter().map(|(id, _)| id).collect();
     assert!(ids.contains(&a1) && ids.contains(&a2));
     for id in [a1, a2] {
         let j = storage.get(id).await.unwrap().unwrap();

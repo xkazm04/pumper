@@ -64,6 +64,10 @@ pub async fn run(state: AppState) {
                         if m.get(&job.id).map(|(a, _)| *a) == Some(job.attempts) {
                             m.remove(&job.id);
                         }
+                        // Under the SAME mutex the cancel door marks intent
+                        // through, so a mark can never survive the run it was
+                        // meant for (see `CANCEL_INTENTS`).
+                        forget_cancel_intent(job.id);
                     }
                     {
                         let mut counts = running.lock().await;
@@ -121,6 +125,7 @@ pub(crate) async fn run_one(state: &AppState) -> bool {
                 if m.get(&job.id).map(|(a, _)| *a) == Some(job.attempts) {
                     m.remove(&job.id);
                 }
+                forget_cancel_intent(job.id);
             }
             // The fan-out is deliberately off this task now, so this seam waits
             // for it: `run_one` promises "one job, fully processed", and every
@@ -257,6 +262,112 @@ async fn drain_pool(
     } else {
         info!(pool = what, "drained cleanly");
     }
+}
+
+// ---- what a fired cancellation token MEANS ----------------------------------
+
+/// Why a job's cancellation token fired.
+///
+/// Two callers fire the **same** token and mean opposite things: `DELETE
+/// /jobs/{id}` means *stop this job*, while the drain's phase 2 above means
+/// *checkpoint and resume on the next boot*. [`execute`] used to tell them apart
+/// by asking only "is the process shutting down?", so an operator's explicit
+/// cancel that landed inside the drain window was silently converted into "run
+/// again later" — and the door still answered `{cancelled: true, running: true}`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CancelKind {
+    /// An operator asked for this job to stop. Terminal.
+    User,
+    /// The process is draining: re-queue to the checkpoint.
+    ShutdownSuspend,
+}
+
+/// Pure: what a fired token means for this run.
+///
+/// User intent outranks a concurrent drain, because a suspend is a *promise to
+/// run the work later* — precisely what the operator asked us not to do. With
+/// no shutdown in progress a fired token can only be a cancel.
+fn cancel_kind(user_requested: bool, shutting_down: bool) -> CancelKind {
+    match (user_requested, shutting_down) {
+        (true, _) => CancelKind::User,
+        (false, true) => CancelKind::ShutdownSuspend,
+        (false, false) => CancelKind::User,
+    }
+}
+
+/// The per-run handshake between the cancel door and the worker task: which
+/// runs an operator has claimed, and which have already committed to a suspend.
+///
+/// Deliberately *not* on `AppState`: an entry's lifetime is exactly that of a
+/// registered cancellation token, and both writers already synchronize on
+/// `AppState::job_cancels` — the door marks its intent while holding that
+/// registry mutex (so it cannot interleave with the drain's read of it), and the
+/// worker's existing attempt-matched cleanup clears the entry under the same
+/// mutex, which is what keeps this bounded by the in-flight job count. A `Vec`
+/// rather than a `HashMap` because that bound is the worker's concurrency, and a
+/// `Vec` is `const`-constructible (no `LazyLock` needed for a static).
+///
+/// Lock order is always `job_cancels` → this. Never the reverse.
+static CANCEL_INTENTS: std::sync::Mutex<Vec<(Uuid, CancelKind)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn lock_intents() -> std::sync::MutexGuard<'static, Vec<(Uuid, CancelKind)>> {
+    // Poison-tolerant: the map is advisory routing, and refusing to answer a
+    // cancel because some unrelated task panicked would be strictly worse than
+    // reading a possibly-stale entry.
+    CANCEL_INTENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Claims a running job's cancellation for an operator, and reports what the run
+/// will actually do.
+///
+/// `User` — the run has not decided yet, so the recorded intent wins and the job
+/// will be cancelled. `ShutdownSuspend` — the run already committed to a
+/// checkpoint suspend (the drain beat this call by microseconds), so the honest
+/// answer is "re-queued, not cancelled" rather than a `cancelled: true` the
+/// queue will contradict.
+///
+/// **Must be called while holding `AppState::job_cancels`**, immediately before
+/// firing the token: that is what stops the worker reading the intent in the gap
+/// between the fire and the mark.
+pub(crate) fn claim_user_cancel(id: Uuid) -> CancelKind {
+    let mut intents = lock_intents();
+    match intents.iter_mut().find(|(job, _)| *job == id) {
+        Some((_, CancelKind::ShutdownSuspend)) => CancelKind::ShutdownSuspend,
+        Some((_, kind)) => {
+            *kind = CancelKind::User;
+            CancelKind::User
+        }
+        None => {
+            intents.push((id, CancelKind::User));
+            CancelKind::User
+        }
+    }
+}
+
+/// Resolves a fired token for the run that is handling it, and — when the answer
+/// is a suspend — records that decision so a cancel arriving afterwards is told
+/// the truth instead of being promised a cancellation that already lost.
+fn resolve_cancel(id: Uuid, shutting_down: bool) -> CancelKind {
+    let mut intents = lock_intents();
+    let claimed = intents
+        .iter()
+        .any(|(job, kind)| *job == id && *kind == CancelKind::User);
+    let kind = cancel_kind(claimed, shutting_down);
+    intents.retain(|(job, _)| *job != id);
+    if kind == CancelKind::ShutdownSuspend {
+        intents.push((id, CancelKind::ShutdownSuspend));
+    }
+    kind
+}
+
+/// Drops a finished run's intent entry. Called from the attempt-matched token
+/// cleanup, i.e. under `job_cancels` — so it cannot race a door that is marking
+/// intent, which holds that same mutex.
+fn forget_cancel_intent(id: Uuid) {
+    lock_intents().retain(|(job, _)| *job != id);
 }
 
 /// The checkpoint state to hand a freshly-claimed attempt, applying the
@@ -594,9 +705,19 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         }
     };
     let run_ms = elapsed_ms(run_started);
+    // Which of the two token firers won — resolved exactly once, here, because
+    // it CONSUMES this run's cancel intent (and records a suspend decision so a
+    // cancel arriving a microsecond later is told the truth). Evaluated only for
+    // a cancellation; every other outcome leaves the registry untouched.
+    let cancelled_by = matches!(outcome, Outcome::Cancelled)
+        .then(|| resolve_cancel(job.id, state.shutdown.is_cancelled()));
 
     match outcome {
-        Outcome::Cancelled if state.shutdown.is_cancelled() => {
+        // A shutdown does NOT by itself mean suspend: an operator's `DELETE
+        // /jobs/{id}` inside the drain window outranks the drain, because a
+        // suspend is a promise to run the work later and that is exactly what
+        // the operator asked us not to do.
+        Outcome::Cancelled if cancelled_by == Some(CancelKind::ShutdownSuspend) => {
             // Shutdown suspend, not a user cancel: `drain` fired the per-job
             // cancel tokens ahead of its deadline so in-flight jobs stop *now*,
             // while their latest durable checkpoint (written throttled during
@@ -1862,6 +1983,57 @@ fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
         body: rec.to_string(),
         // Job-result docs carry no record timestamp — index at completion time.
         indexed_at: chrono::Utc::now().timestamp(),
+    }
+}
+
+#[cfg(test)]
+mod cancel_kind_tests {
+    use super::{cancel_kind, claim_user_cancel, resolve_cancel, CancelKind};
+    use uuid::Uuid;
+
+    /// The anti-pattern: the drain's phase 2 fires every in-flight job's cancel
+    /// token to mean SUSPEND, so `DELETE /jobs/{id}` in that window — the same
+    /// token — was read as a suspend too. The operator's "stop this" quietly
+    /// became "run it again after the restart", and the door said `cancelled`.
+    #[test]
+    fn cancel_during_drain_cancels_not_resurrects() {
+        assert_eq!(
+            cancel_kind(true, true),
+            CancelKind::User,
+            "an operator's cancel outranks a concurrent drain: a suspend is a promise to run \
+             the work later, which is what they asked us not to do"
+        );
+        // No claim + shutting down = the drain's own signal: suspend, as before.
+        assert_eq!(cancel_kind(false, true), CancelKind::ShutdownSuspend);
+        // No shutdown at all: a fired token can only be a cancel.
+        assert_eq!(cancel_kind(false, false), CancelKind::User);
+        assert_eq!(cancel_kind(true, false), CancelKind::User);
+    }
+
+    /// The registry half: a claim made before the run resolves wins even under
+    /// shutdown, is consumed exactly once, and a run that already committed to a
+    /// suspend reports that back so the door can stop claiming otherwise.
+    #[test]
+    fn a_claim_wins_once_and_a_committed_suspend_says_so() {
+        let id = Uuid::new_v4();
+        assert_eq!(claim_user_cancel(id), CancelKind::User);
+        assert_eq!(
+            resolve_cancel(id, true),
+            CancelKind::User,
+            "the claim beat the drain"
+        );
+
+        // Second run, nobody claimed: the drain wins and the decision sticks, so
+        // a cancel arriving after it is answered honestly rather than promised a
+        // cancellation that already lost.
+        let late = Uuid::new_v4();
+        assert_eq!(resolve_cancel(late, true), CancelKind::ShutdownSuspend);
+        assert_eq!(
+            claim_user_cancel(late),
+            CancelKind::ShutdownSuspend,
+            "too late to cancel: this run is already being re-queued"
+        );
+        super::forget_cancel_intent(late);
     }
 }
 

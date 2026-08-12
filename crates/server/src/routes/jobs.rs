@@ -295,6 +295,20 @@ pub(crate) struct BulkRetryBody {
     limit: Option<i64>,
 }
 
+/// The `queued` events a bulk retry has to announce — one per job, each
+/// carrying that job's **real** app.
+///
+/// The anti-pattern: `JobEvent::new(id, "", "queued")`. `mcp::live::LiveFilter`
+/// (`GET /mcp?app=…`) keeps an event only when its `app` matches exactly, so an
+/// app-scoped watcher never saw a bulk retry re-queue its jobs — the work
+/// restarted and the one surface watching it showed nothing at all.
+pub(crate) fn requeued_events(requeued: &[(Uuid, String)]) -> Vec<JobEvent> {
+    requeued
+        .iter()
+        .map(|(id, app)| JobEvent::new(*id, app.clone(), "queued"))
+        .collect()
+}
+
 /// Bulk re-queue: re-queues every job in the given terminal state (default
 /// `failed`), optionally scoped to one app, up to a cap — each with one more
 /// attempt. Returns the count and the ids re-queued.
@@ -324,16 +338,19 @@ pub(crate) async fn bulk_retry_jobs(
         }
     };
     let cap = body.limit.unwrap_or(500).clamp(1, 500);
-    let ids = state
+    let requeued = state
         .storage
         .retry_bulk(status, body.app.as_deref(), cap)
         .await?;
-    for id in &ids {
-        state.events.emit(JobEvent::new(*id, "", "queued"));
+    for event in requeued_events(&requeued) {
+        state.events.emit(event);
     }
-    if !ids.is_empty() {
+    if !requeued.is_empty() {
         state.notify.notify_one();
     }
+    // The wire shape is unchanged: `ids` stays a bare uuid array; the app rides
+    // the events, which is where it was missing.
+    let ids: Vec<Uuid> = requeued.iter().map(|(id, _)| *id).collect();
     Ok(Json(json!({ "retried": ids.len(), "ids": ids })))
 }
 
@@ -382,13 +399,19 @@ async fn job_state_error(state: &AppState, id: Uuid, wrong_state: &str) -> ApiEr
 /// has its cancellation token fired so the worker aborts the app future and
 /// marks it `cancelled` (the response reports `running: true`). A terminal job
 /// is `409`, an unknown one `404`.
+///
+/// **During a graceful shutdown** the drain fires those same tokens to mean
+/// *suspend* (checkpoint + re-queue). A cancel that reaches a run before it
+/// resolves still wins — user intent outranks the drain. A cancel that arrives
+/// after the run committed to a suspend cannot win, and says so
+/// (`{cancelled: false, suspended: true}`) instead of claiming otherwise.
 #[utoipa::path(
     delete,
     path = "/jobs/{id}",
     tag = "jobs",
     params(("id" = Uuid, Path, description = "Job id")),
     responses(
-        (status = 200, description = "Cancelled (`{cancelled: true}`; `running: true` when it was in-flight)"),
+        (status = 200, description = "Cancelled (`{cancelled: true}`; `running: true` when it was in-flight). During a graceful shutdown a run that already committed to a checkpoint suspend answers `{cancelled: false, running: true, suspended: true, note}` — it was re-queued, not cancelled."),
         (status = 404, description = "Job not found", body = Object),
         (status = 409, description = "Job already terminal (succeeded/failed/cancelled)", body = Object),
     )
@@ -397,27 +420,51 @@ pub(crate) async fn cancel_job(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
 ) -> Result<Json<Value>, ApiError> {
-    // Queued job: cancel synchronously.
-    if state.storage.cancel(id).await? {
-        state.events.emit(JobEvent::new(id, "", "cancelled"));
+    // Queued job: cancel synchronously. The event carries the job's real app —
+    // `storage.cancel` returns it from the same statement — because a blank app
+    // is filtered out of every app-scoped watcher (`GET /mcp?app=…`), so the
+    // cancellation used to land invisibly for exactly the clients watching it.
+    if let Some(app) = state.storage.cancel(id).await? {
+        state.events.emit(JobEvent::new(id, app, "cancelled"));
         return Ok(Json(json!({ "cancelled": true })));
     }
     // Otherwise it may be running here: fire its cancellation token. The worker
     // task races it against the app future and persists `cancelled` + emits the
     // terminal event, so we don't touch storage or emit from the request path.
-    let token = super::error::lock_advisory(&state.job_cancels, "job_cancels")
-        .get(&id)
-        .map(|(_, t)| t.clone());
-    if let Some(token) = token {
-        token.cancel();
-        return Ok(Json(json!({ "cancelled": true, "running": true })));
+    //
+    // The intent is claimed *under the token registry's mutex, immediately
+    // before the fire*: the drain reads that same registry, so this ordering is
+    // what stops the worker resolving the token in the gap between the fire and
+    // the mark. See `worker::claim_user_cancel`.
+    let outcome = {
+        let registry = super::error::lock_advisory(&state.job_cancels, "job_cancels");
+        registry.get(&id).map(|(_, token)| {
+            let kind = crate::worker::claim_user_cancel(id);
+            token.cancel();
+            kind
+        })
+    };
+    match outcome {
+        Some(crate::worker::CancelKind::User) => {
+            Ok(Json(json!({ "cancelled": true, "running": true })))
+        }
+        // Lost the race with the drain by microseconds. Saying `cancelled: true`
+        // here would be a lie the queue itself contradicts a moment later.
+        Some(crate::worker::CancelKind::ShutdownSuspend) => Ok(Json(json!({
+            "cancelled": false,
+            "running": true,
+            "suspended": true,
+            "note": "the server is shutting down and this run had already committed to a \
+                     checkpoint suspend, so it was re-queued rather than cancelled — it resumes \
+                     on the next boot. Cancel it again once the server is back up.",
+        }))),
+        None => Err(job_state_error(
+            &state,
+            id,
+            "job is already terminal (succeeded/failed/cancelled)",
+        )
+        .await),
     }
-    Err(job_state_error(
-        &state,
-        id,
-        "job is already terminal (succeeded/failed/cancelled)",
-    )
-    .await)
 }
 
 // ---- Costs ------------------------------------------------------------------
@@ -515,6 +562,40 @@ mod merge_tests {
         // A scalar/array body can't merge key-wise, so it replaces (prior behaviour).
         let out = merge_params(json!({ "a": 1 }), Some(json!([1, 2, 3])));
         assert_eq!(out, json!([1, 2, 3]));
+    }
+}
+
+#[cfg(test)]
+mod control_event_tests {
+    use super::requeued_events;
+    use uuid::Uuid;
+
+    /// The anti-pattern: `JobEvent::new(id, "", "queued")` on the bulk-retry
+    /// path. An app-scoped watcher (`GET /mcp?app=…`, whose `LiveFilter::keep`
+    /// compares the event's app exactly) never saw a bulk retry re-queue its
+    /// jobs — work restarted, and the surface watching for it stayed silent.
+    #[test]
+    fn control_events_carry_app_not_blank() {
+        let (a, b) = (Uuid::new_v4(), Uuid::new_v4());
+        let events = requeued_events(&[(a, "grants-gov".into()), (b, "hackernews".into())]);
+        assert_eq!(events.len(), 2, "one event per re-queued job");
+        for ev in &events {
+            assert!(
+                !ev.app.is_empty(),
+                "a blank app is invisible to every app-scoped watcher: {ev:?}"
+            );
+            assert_eq!(ev.status, "queued");
+        }
+        assert_eq!(events[0].job_id, a);
+        assert_eq!(events[0].app, "grants-gov");
+        assert_eq!(
+            events[1].app, "hackernews",
+            "apps are not shared across ids"
+        );
+        assert!(
+            requeued_events(&[]).is_empty(),
+            "an empty batch says nothing"
+        );
     }
 }
 

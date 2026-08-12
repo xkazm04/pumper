@@ -24,6 +24,7 @@ mod host_memory_reset;
 mod host_weather;
 mod ingress_gates;
 mod job_budget_floor;
+mod job_control_honesty;
 mod job_receipt;
 mod mcp;
 mod mcp_live;
