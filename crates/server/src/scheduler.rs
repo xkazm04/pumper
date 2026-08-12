@@ -682,10 +682,26 @@ mod tests {
     /// the first place.
     #[test]
     fn health_and_guard_share_one_predicate() {
+        // Only the NON-test half of each file is scanned. A source-scanning test
+        // that reads its own module matches its own needles: every "this string
+        // must be absent" assertion is then trivially false, and every "must be
+        // present" one trivially true — an inventory guard that cannot fail is
+        // worse than none, because it reads as coverage.
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
-        let scheduler = std::fs::read_to_string(src.join("scheduler.rs")).expect("scheduler.rs");
-        let route =
-            std::fs::read_to_string(src.join("routes/schedules.rs")).expect("routes/schedules.rs");
+        let code = |name: &str| {
+            let body =
+                std::fs::read_to_string(src.join(name)).unwrap_or_else(|e| panic!("{name}: {e}"));
+            body.split("#[cfg(test)]")
+                .next()
+                .expect("split yields the pre-test-module source")
+                .to_string()
+        };
+        let scheduler = code("scheduler.rs");
+        let route = code("routes/schedules.rs");
+        assert!(
+            !scheduler.contains("fn health_and_guard_share_one_predicate"),
+            "the scanned slice still includes this test module"
+        );
 
         // Both readers go through the one read+interpret helper.
         assert!(
@@ -717,12 +733,36 @@ mod tests {
              `run_holds_slot`"
         );
 
-        // The divergent existential twin must stay gone.
+        // The divergent existential twin must stay gone. Spelled in two pieces
+        // so this line is not itself a match for the name it forbids.
+        let existential_twin = concat!("schedule_has", "_active_job");
         assert!(
-            !scheduler.contains("schedule_has_active_job"),
+            !scheduler.contains(existential_twin),
             "the existential overlap query is back; it is what wedged schedules \
              on `POST /jobs/retry`"
         );
+    }
+
+    /// The guard above scans source text, so it has to be able to FAIL. This
+    /// drives it against text that violates each rule and asserts the scan says
+    /// so — the meta-test the self-matching version could never have passed.
+    #[test]
+    fn the_shared_predicate_guard_can_actually_fail() {
+        let matches_active = |body: &str| {
+            body.contains(r#"Some("queued") | Some("running")"#)
+                || body.contains(r#"Some("running") | Some("queued")"#)
+        };
+        assert!(
+            matches_active(r#"let active = matches!(s, Some("queued") | Some("running"));"#),
+            "a hand-rolled active-status match must be detected"
+        );
+        assert!(
+            matches_active(r#"matches!(s, Some("running") | Some("queued"))"#),
+            "...in either order"
+        );
+        assert!(!matches_active("last.holds_slot"));
+        let existential_twin = concat!("schedule_has", "_active_job");
+        assert!("state.storage.schedule_has_active_job(&id)".contains(existential_twin));
     }
 
     #[test]
