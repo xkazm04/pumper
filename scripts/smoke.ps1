@@ -633,6 +633,55 @@ try {
                 Add-Result -Name 'POST /schedules stores + returns budget_usd' -Status 'FAIL' `
                     -Detail $_.Exception.Message
             }
+
+            # Round 14: the plugin host stopped lying. Every /plugins entry now
+            # says whether it is actually runnable (`executable`) and what it
+            # has cost (`telemetry` — present with calls:0 for a never-run
+            # plugin, so "never invoked" is distinguishable from "unmetered").
+            # Shape-only: whether THIS scratch server has any .wasm installed
+            # is state; the honesty surface is the fields.
+            Test-JsonEndpoint -Name 'GET /plugins entries carry executable + telemetry' `
+                -Path '/plugins' -Assert {
+                param($j)
+                if ($null -eq $j.PSObject.Properties['plugins']) { return $false }
+                foreach ($p in @($j.plugins)) {
+                    $names = $p.PSObject.Properties.Name
+                    if (($names -notcontains 'executable') -or ($names -notcontains 'telemetry')) {
+                        return $false
+                    }
+                    if ($null -eq $p.telemetry.PSObject.Properties['calls']) { return $false }
+                }
+                $true
+            }
+            # A dry-run of a trigger gated by a plugin nobody installed used to
+            # answer a clean `would_fire: true` — the exact mis-deployment the
+            # operator is dry-running to discover. It now names the unusable
+            # plugin while still reporting the fail-open verdict honestly.
+            try {
+                $resp = Invoke-WebRequest -Method Post -Uri "$baseUrl/triggers" `
+                    -Body (@{
+                        source_kind  = 'job'; source_app = 'hackernews'; target_app = 'hackernews'
+                        plugin_hooks = @{ predicate = @{ plugin = 'not-a-real-plugin' } }
+                    } | ConvertTo-Json -Depth 5) `
+                    -ContentType 'application/json' -UseBasicParsing -TimeoutSec 10
+                $trig = $resp.Content | ConvertFrom-Json
+                $test = Invoke-WebRequest -Method Post -Uri "$baseUrl/triggers/$($trig.id)/test" `
+                    -UseBasicParsing -TimeoutSec 15
+                $dry = $test.Content | ConvertFrom-Json
+                $unusable = @($dry.hooks.unusable_plugins)
+                if ($test.StatusCode -eq 200 -and $dry.would_fire -eq $true -and
+                    $unusable -contains 'not-a-real-plugin') {
+                    Add-Result -Name 'trigger dry-run names its unusable hook plugin' -Status 'PASS'
+                } else {
+                    Add-Result -Name 'trigger dry-run names its unusable hook plugin' -Status 'FAIL' `
+                        -Detail "HTTP $($test.StatusCode), would_fire '$($dry.would_fire)', unusable [$($unusable -join ',')]"
+                }
+                Invoke-WebRequest -Method Delete -Uri "$baseUrl/triggers/$($trig.id)" `
+                    -UseBasicParsing -TimeoutSec 10 | Out-Null
+            } catch {
+                Add-Result -Name 'trigger dry-run names its unusable hook plugin' -Status 'FAIL' `
+                    -Detail $_.Exception.Message
+            }
         } else {
             Add-Result -Name 'job runs to completion (hackernews)' -Status 'SKIP' -Detail 'no job id to poll (enqueue failed)'
             Add-Result -Name 'GET /jobs/{id}/receipt' -Status 'SKIP' -Detail 'no job id to fetch a receipt for'

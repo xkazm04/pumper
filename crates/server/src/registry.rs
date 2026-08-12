@@ -158,7 +158,7 @@ pub(crate) fn dynamic_app_entries(
     let Some(dir) = &cfg.app_dir else {
         return Vec::new();
     };
-    pumper_engine_wasm::discover_dynamic_apps(dir)
+    pumper_engine_wasm::discover_dynamic_apps_with(dir, cfg)
         .into_iter()
         .filter(|d| {
             let clash = static_apps.contains_key(&d.name);
