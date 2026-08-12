@@ -1,5 +1,6 @@
 ---
 name: "US Trades Wages, Tax & Valuation"
+superseded_by: "[[trades-operator-economics]] + [[trades-pricing]] (2026-08-12 reconciliation)"
 type: perfect/context
 group: "Economic & Labor Market Data Apps"
 category: lib

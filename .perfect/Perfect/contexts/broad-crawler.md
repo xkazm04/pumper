@@ -1,5 +1,6 @@
 ---
 name: "Broad Crawler"
+superseded_by: "[[web-crawler]] + [[crawler-core]] (2026-08-12 reconciliation; files live, history carries over)"
 type: perfect/context
 group: "Data Extraction & Storage"
 category: lib

@@ -1,5 +1,6 @@
 ---
 name: "Tiered Fetcher & Politeness"
+superseded_by: "[[tiered-fetcher]] (2026-08-12 reconciliation)"
 type: perfect/context
 group: "Scraping Runtime Core"
 category: lib

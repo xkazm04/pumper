@@ -1,10 +1,11 @@
 ---
 type: perfect/home
 repo: pumper
-updated: 2026-08-11
+updated: 2026-08-12
 pool: 0
 pool_target: 10
 shipped_total: 98
+coverage: "15/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; +14 more inherit old-map passes via aliases, 17 never touched under any map"
 cursor: "extraction-core (round-11 propose; scout brief banked)"
 last_session: "[[sessions/2026-08-11]]"
 ---
@@ -13,7 +14,34 @@ last_session: "[[sessions/2026-08-11]]"
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **0** · phase: **Propose (round 11)** · round-11 cursor: **extraction-core** (scout brief banked in the context note — re-verify seeds first); app-runtime + tiered-fetcher off cooldown (fetcher anchor: recipe-discovery-wiring); webhook-delivery + dataset-peering off cooldown (anchors banked); browser-transact + api-surface on cooldown until round 12 (anchors: evidence-access endpoint · EventBus lock sweep / metrics-hot-path / doc-coverage test). Rounds 1–10: **98/98 accepted directions shipped**, zero failed, zero dropped (rejections recorded per round).
+**State**: pool **6/6** (round-11 cap reached) · phase: **Build (round 11)** — wave branch `perfect/2026-08-12`, MAIN checkout, 2 concurrent opus lots.
+
+### Round-11 pool — 6 accepted (2026-08-12, gate: director-self-gated, Athena-dispatched, SWEEP round)
+extraction-core, 3/5 (REJECTED-deferred: induce-surface — banked with the induce quality bundle;
+markdown-fidelity — simhash-invalidation coupling needs its own guarded design):
+1. [[each-field-reports]] — robustness · M (Each emits ONE FieldStatus; listing rot invisible to
+   every honesty surface)
+2. [[extract-honesty-sweep]] — robustness · S (XPath Debug garbage + Err→Empty; default dead on
+   blanks; numeric coercion disagreement; 2 untested transforms)
+3. [[url-absolutize]] — feature · M (extracted hrefs stay relative; no page-URL access in
+   transforms; induce emits relative)
+
+automation-api, 3/5 (REJECTED-deferred: trigger-ledger-completeness, schedule-runs-ledger,
+automation-metrics — all banked in the context note):
+4. [[enqueue-door-parity]] — robustness · M (schedules/triggers bypass the params-schema 422;
+   scheduler replaces while HTTP merges)
+5. [[schedule-truth]] — robustness · M (guard/health SQL divergence — retry wedges firing while
+   health says ok; last_run lies under misfire-skip)
+6. [[watch-honesty]] — robustness · M (virtual namespaces unwatchable while the fan-out looks
+   for them; dead watches accepted silently; no watch→deliveries path)
+
+### Wave plan (round 11) — ONE branch `perfect/2026-08-12`, main checkout, 2 CONCURRENT lots
+Write sets disjoint: **Lot E** (opus) = 1,2,3 → core/{extract,induce}.rs, apps/extractor/*,
+core extract tests, docs/features/extraction.md · **Lot A** (opus) = 4,5,6 →
+server/routes/{schedules,watches,triggers,jobs}.rs, server/{scheduler,worker}.rs,
+core/storage.rs, server/e2e/*, mcp/mod.rs (validate helper), docs/features/events-webhooks.md.
+routes/mod.rs EXPECTED + e2e/mod.rs = Class B. Director commit first: fetch_chokepoint guard
+multiline fix (9 invisible raw-engine sites; crates/core/tests/fetch_chokepoint.rs only). · round-11 cursor: **extraction-core** (scout brief banked in the context note — re-verify seeds first); app-runtime + tiered-fetcher off cooldown (fetcher anchor: recipe-discovery-wiring); webhook-delivery + dataset-peering off cooldown (anchors banked); browser-transact + api-surface on cooldown until round 12 (anchors: evidence-access endpoint · EventBus lock sweep / metrics-hot-path / doc-coverage test). Rounds 1–10: **98/98 accepted directions shipped**, zero failed, zero dropped (rejections recorded per round).
 
 ### Round-10 pool — ALL 6 SHIPPED (2026-08-11, gate: director-self-gated, Athena-dispatched)
 browser-transact, 3/5 (REJECTED-deferred: evidence-access endpoint — banked anchor, write-set
@@ -140,6 +168,35 @@ dataset-api, 5/5:
 > `web-crawler`/`crawler-core`; HTTP API→`api-surface`/`dataset-api`/`job-search-api`/
 > `automation-api`; US Trades→`trades-operator-economics`/`trades-pricing`.
 > **Cooldowns are void** — every mapped context's code has changed materially since it was served.
+
+## Sweep campaign (round 11+, Michal via Athena 2026-08-12): cover ALL 46 map contexts
+
+**Covered** = ≥1 proposal pass recorded on the 46-map (slate gated, or an explicit
+nothing-clears-the-bar verdict). Scout-only-with-banked-seeds does NOT count (that is
+queued work, not coverage). Cursor policy: never-proposed first, ties by opportunity.
+
+**Reconciliation 2026-08-12** (map = committed `context-map.json`, generated 2026-08-03 by
+`personas-context-scan` on THIS machine at commit 611360f, committed 598ee37; the local
+Personas app DB's `dev_contexts` for project 512809db agrees EXACTLY — 46 identical names,
+so unlike the Personas repo there is no partition disagreement here): 16 vault notes
+matched map names; 30 map contexts had no note → created 2026-08-12; 8 vault-only
+old-map notes got `superseded_by:` aliases (broad-crawler, declarative-extraction-engine,
+fetch-engines, http-api-routes, job-worker-cron-scheduler, tiered-fetcher-politeness,
+us-grant-opportunities, us-trades-wages-tax-valuation) — history preserved, none retired.
+
+**Covered (15)**: dataset-storage r4 · job-worker r4 · source-resilience r5 ·
+grants-unified-layer r5 · trigger-pipeline r6 · dataset-api r6 · source-provisioner r7 ·
+search-engine r7 · datahub-bridge r7 · webhook-delivery r8 · dataset-peering r8 ·
+app-runtime r9 · tiered-fetcher r9 · browser-transact r10 · api-surface r10.
+
+**Never-proposed queue (31, opportunity-ranked)**:
+| Opp | Contexts |
+|---:|---|
+| 6 | extraction-core (banked brief, r11 cursor) · declarative-extractor · automation-api · job-search-api |
+| 5 | claude-engine · eu-grants · us-business-census · czech-labor-market · cron-scheduler · wasm-plugin-host · web-crawler · crawler-core · engine-contracts |
+| 4 | vcr-testing · http-engine · browser-engine · archive-engine · remote-engine · us-federal-grants · us-state-grants · czech-procurement · trades-operator-economics · trades-pricing · agentic-research · connector-api-watch · page-monitor · maintenance-tooling · plugin-runner |
+| 3 | wasm-plugin-examples · data-pipeline-catalog |
+| 2 | hackernews-example |
 
 ## Queue — round 4 (re-scored 2026-08-03 over the 46-context map)
 

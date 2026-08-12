@@ -2,8 +2,8 @@
 name: extraction-core            type: perfect/context
 group: Core Platform             category: lib
 opportunity: 6                   # engine itself strong (round-3 work); headroom sits in induce.rs + each-report blindness
-last_proposed: never             cooldown_until: —
-directions: []
+last_proposed: 2026-08-12        cooldown_until: round-13
+directions: ["[[each-field-reports]]", "[[extract-honesty-sweep]]", "[[url-absolutize]]"]
 supersedes: "[[declarative-extraction-engine]] (old map; its 4 shipped directions carry over; rules:'auto' LLM drafting REJECTED — do not re-propose)"
 ---
 
@@ -48,6 +48,21 @@ Top candidates for the round-11 slate (all scout-verified with file:line):
   ebe5f89, stored-pages 66b063f, preview 387a509). REJECTED: rules:"auto" LLM drafting — third
   LLM-feature rejection; deterministic substrate only unless the owner asks.
 - 2026-08-11 (round 10): scouted, slate NOT drafted (pool cap). No cooldown — round-11 cursor.
+- 2026-08-12 (round 11, director-self-gated): banked brief re-verified inline. CONFIRMED:
+  each-blindness (:659-671), XPath Debug garbage (:772) + Err→Null→Empty (:747), default dead
+  on blanks (:310 vs is_blank :524), markdown SKIP form/figure, induce all-DOMs (:123),
+  url-absolutize absent. **SEED CORRECTED (decay rule strikes again): run_induce has 9 in-file
+  unit tests (induce.rs:488+) — the "zero tests" claim was false at scout time; the real gap is
+  app-level induce integration + no HTTP surface.**
+  ACCEPTED 3: [[each-field-reports]] (robustness M) · [[extract-honesty-sweep]] (robustness S) ·
+  [[url-absolutize]] (feature M).
+  REJECTED-deferred: **induce-surface** (POST /extract/suggest + the induce quality bundle:
+  Tailwind-utility selectors — usable_class filters only build digests, div.border.flex still
+  passes; census/denominator mismatches; naming; DOM memory ceiling) — BANKED as this context's
+  next anchor; correctness debt outranked new surface at the round cap.
+  REJECTED-deferred: **markdown-fidelity** (form/figure/caption/code-fence) — SKIP-list changes
+  invalidate every stored text simhash (resilience/mod.rs:306 coupling); needs a guarded design
+  (simhash migration or versioned SKIP) as its own direction, never a side-fix.
 
 ## Shipped
 - (carried from declarative-extraction-engine — see that note)

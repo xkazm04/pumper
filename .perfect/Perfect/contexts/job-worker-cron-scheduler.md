@@ -1,5 +1,6 @@
 ---
 name: "Job Worker & Cron Scheduler"
+superseded_by: "[[job-worker]] + [[cron-scheduler]] (2026-08-12 reconciliation)"
 type: perfect/context
 group: "Job Server & API"
 category: lib

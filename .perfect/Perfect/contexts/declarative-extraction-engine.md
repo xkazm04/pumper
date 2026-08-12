@@ -1,5 +1,6 @@
 ---
 name: "Declarative Extraction Engine"
+superseded_by: "[[extraction-core]] + [[declarative-extractor]] (2026-08-12 reconciliation; files live, history carries over)"
 type: perfect/context
 group: "Data Extraction & Storage"
 category: lib

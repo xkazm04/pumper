@@ -1,5 +1,6 @@
 ---
 name: "US Grant Opportunities"
+superseded_by: "[[us-federal-grants]] + [[us-state-grants]] + [[grants-unified-layer]] (2026-08-12 reconciliation)"
 type: perfect/context
 group: "Public Funding & Grants Apps"
 category: lib

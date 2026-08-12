@@ -1,5 +1,6 @@
 ---
 name: "HTTP API & Routes"
+superseded_by: "[[api-surface]] + [[dataset-api]] + [[job-search-api]] + [[automation-api]] (2026-08-12 reconciliation; the round-1 pass predates the split)"
 type: perfect/context
 group: "Job Server & API"
 category: api

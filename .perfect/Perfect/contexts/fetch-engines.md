@@ -1,5 +1,6 @@
 ---
 name: "Fetch Engines (HTTP / Browser / Claude)"
+superseded_by: "[[http-engine]] + [[browser-engine]] + [[claude-engine]] (2026-08-12 reconciliation; archive/remote engines post-date this pass)"
 type: perfect/context
 group: "Scraping Engines"
 category: lib
