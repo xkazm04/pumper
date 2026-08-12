@@ -66,3 +66,14 @@ Top candidates for the round-11 slate (all scout-verified with file:line):
 
 ## Shipped
 - (carried from declarative-extraction-engine — see that note)
+- 2026-08-12 (round 11) · [[each-field-reports]] → `1b6aebc` — listing rot visible the run it
+  starts: `DocReport.each` per-inner-field counts (dead vs sparse), extractor worst_fields
+  item-scoped rows, replay inner_fields diff rows. Consumers still on report.fields only:
+  resilience sketches, provisioner gate, DataHub scoring (recorded follow-up).
+- 2026-08-12 (round 11) · [[extract-honesty-sweep]] → `26fb0cc` — XPath atomics typed (Debug
+  unreachable), xpath runtime failure = Error not Empty, default fires on the shared is_blank,
+  to_int saturation → null; uppercase/regex_replace covered.
+- 2026-08-12 (round 11) · [[url-absolutize]] → `ee5d8e4` — url_absolute transform (per-call
+  base seam), wired through every URL-bearing mode + preview base_url; induce emits it on
+  href/src/poster; base_url_missing honesty counter. KNOWN LIMIT → banked on tiered-fetcher:
+  FetchOutcome discards final_url, so redirect-crossing pages resolve against the requested URL.

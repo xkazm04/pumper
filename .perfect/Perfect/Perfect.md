@@ -4,19 +4,19 @@ repo: pumper
 updated: 2026-08-12
 pool: 0
 pool_target: 10
-shipped_total: 98
-coverage: "15/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; +14 more inherit old-map passes via aliases, 17 never touched under any map"
-cursor: "extraction-core (round-11 propose; scout brief banked)"
-last_session: "[[sessions/2026-08-11]]"
+shipped_total: 104
+coverage: "18/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; +14 more inherit old-map passes via aliases, 28 never proposed (banked slate-grade briefs: declarative-extractor, job-search-api)"
+cursor: "round 12: declarative-extractor + job-search-api (banked slate-grade briefs — re-verify anchors first, decay rule)"
+last_session: "[[sessions/2026-08-12]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **6/6** (round-11 cap reached) · phase: **Build (round 11)** — wave branch `perfect/2026-08-12`, MAIN checkout, 2 concurrent opus lots.
+**State**: pool **0** · phase: **round 11 WRAPPED — all 6 shipped** (2 recovered from the dead session's dirty tree, 4 by continuation builders). Next: round-12 propose from the never-proposed queue.
 
-### Round-11 pool — 6 accepted (2026-08-12, gate: director-self-gated, Athena-dispatched, SWEEP round)
+### Round-11 pool — ALL 6 SHIPPED (2026-08-12, gate: director-self-gated, Athena-dispatched, SWEEP round; original session died mid-build, continuation recovered + finished)
 extraction-core, 3/5 (REJECTED-deferred: induce-surface — banked with the induce quality bundle;
 markdown-fidelity — simhash-invalidation coupling needs its own guarded design):
 1. [[each-field-reports]] — robustness · M (Each emits ONE FieldStatus; listing rot invisible to
@@ -184,19 +184,21 @@ old-map notes got `superseded_by:` aliases (broad-crawler, declarative-extractio
 fetch-engines, http-api-routes, job-worker-cron-scheduler, tiered-fetcher-politeness,
 us-grant-opportunities, us-trades-wages-tax-valuation) — history preserved, none retired.
 
-**Covered (15)**: dataset-storage r4 · job-worker r4 · source-resilience r5 ·
+**Covered (18)**: dataset-storage r4 · job-worker r4 · source-resilience r5 ·
 grants-unified-layer r5 · trigger-pipeline r6 · dataset-api r6 · source-provisioner r7 ·
 search-engine r7 · datahub-bridge r7 · webhook-delivery r8 · dataset-peering r8 ·
-app-runtime r9 · tiered-fetcher r9 · browser-transact r10 · api-surface r10.
+app-runtime r9 · tiered-fetcher r9 · browser-transact r10 · api-surface r10 ·
+**extraction-core r11 (3 shipped)** · **automation-api r11 (3 shipped)** ·
+**archive-engine r11 (nothing-clears-the-bar verdict recorded)**.
 
-**Never-proposed queue (31, opportunity-ranked)**:
+**Never-proposed queue (28, opportunity-ranked)**:
 | Opp | Contexts |
 |---:|---|
-| 6 | extraction-core (banked brief, r11 cursor) · declarative-extractor · automation-api · job-search-api |
+| 6 | declarative-extractor (banked slate-grade brief) · job-search-api (banked slate-grade brief) |
 | 5 | claude-engine · eu-grants · us-business-census · czech-labor-market · cron-scheduler · wasm-plugin-host · web-crawler · crawler-core · engine-contracts |
-| 4 | vcr-testing · http-engine · browser-engine · archive-engine · remote-engine · us-federal-grants · us-state-grants · czech-procurement · trades-operator-economics · trades-pricing · agentic-research · connector-api-watch · page-monitor · maintenance-tooling · plugin-runner |
-| 3 | wasm-plugin-examples · data-pipeline-catalog |
-| 2 | hackernews-example |
+| 4 | vcr-testing · http-engine · browser-engine · remote-engine (banked anchor) · us-federal-grants · us-state-grants · czech-procurement · trades-operator-economics · trades-pricing · agentic-research · connector-api-watch · page-monitor · maintenance-tooling (banked CONFIRMED anchor) · plugin-runner |
+| 3 | wasm-plugin-examples (banked anchor) · data-pipeline-catalog (banked anchor) |
+| 2 | hackernews-example (banked anchor) |
 
 ## Queue — round 4 (re-scored 2026-08-03 over the 46-context map)
 
@@ -345,6 +347,7 @@ spend — was killed at the challenge gate, `worker.rs:528-545` already keeps th
 
 ## Shipped ledger
 
+- 2026-08-12 · **Round 11 (6/6 + 3 Director commits, AUTONOMOUS director-self-gated, SWEEP round, resumed)** — extraction-core 3/5, automation-api 3/5; 5 rejected-deferred (all banked), archive-engine covered with a nothing-clears verdict. Original session died mid-build with ~1,280 uncommitted lines; continuation snapshotted both lots' dirty trees, reviewed and landed the completed first directions, then two fresh opus continuation builders finished the rest — zero work lost. Master `d275fde` → `3216ec7` (ff; third concurrent two-lot wave, zero collisions). extraction: 1b6aebc (per-inner-field listing reports — rot vs sparse distinguishable, worst_fields + replay wired), 26fb0cc (four extraction lies closed: XPath Debug garbage, Err→Empty, default-on-blank via shared is_blank, to_int saturation), ee5d8e4 (url_absolute per-call base seam, every URL-bearing mode + preview + induce; base_url_missing honesty; FetchOutcome-drops-final_url found + banked). automation: 6c3f91a (one params door behind all six work-creators, inventory-enforced; replace→merge resolved; bad_params ledger outcome), 85bb5f9+fb78574 (existential guard twin deleted — retry-wedge dead; migration 0039 skip recording; schedule_reference shared by reconcile + projection; builder self-caught a red-guard ship via full-failure rescan), 5ee2462 (NamespaceIndex registry+seed+store+saved-search; virtual namespaces watchable; separate trigger filter set — ingress ids aren't apps; watch→deliveries route; explicit-null last_delivery; trades gap banked). Director: 1c43ca7 (chokepoint guard sees through rustfmt wrapping — 9 invisible raw-engine sites reviewed into EXPECTED), 84e4ac3+3216ec7 (smoke 21→25: schedules 422 door, grants watchable, bogus-filter 400, last_delivery). **Final gate: 1372/0 full workspace + live smoke 25/25 on the wave tip (= merged master content, ff).** Coverage 15→18/46. Cumulative: 104/104.
 - 2026-08-11 · **Round 10 (6/6 + 2 Director commits, AUTONOMOUS director-self-gated, resumed)** — browser-transact 3/5, api-surface 3/5; 2 rejected outright, 3 rejected-deferred (banked). Session died post-gate pre-build; continuation session re-verified the evidence anchors and ran the recorded wave plan unchanged. Master `95713f0` → `c630a3f` (ff; second concurrent two-lot wave, disjoint write sets, zero collisions). transact: 428d2e9 (evidence bundle distinguishes a total miss from a clean run — per-step outcomes, successes-only count, submit-target probe, profile + DOM truncate-don't-destroy), f0ddec5 (secrets masked in-page + decode-side re-enforcement; end-to-end no-sentinel proof), 8e17ca7 (Error::Transact terminal; door tightened schema+app-side — builder discovered trigger enqueues bypass the validator entirely; missing profile refuses pre-Chrome). api: c9c2c68 (shutdown terminates bounded with the politeness snapshot flushed post-drain; all 3 SSE surfaces end on the token), 0cfc366 (error-code map complete + inventory-enforced; client_facing exhaustive table; 500 bodies redacted+logged; RowNotFound reasoned-stays-500), 4855fcd (CatchPanicLayer in the driven stack; lock_advisory ×5 + no-lock-unwrap sweep; preview clamp). Director: 684d2c7 (core prelude), c630a3f (smoke +4 checks). **Final gate: 1314/0 full workspace + live smoke 21/21 on the merged master's own binary.** Cumulative: 98/98.
 - 2026-08-11 · **Round 9 (6/6 + 2 Director commits, AUTONOMOUS director-self-gated)** — app-runtime 3/5, tiered-fetcher 3/6; 4 rejected outright, 1 rejected-deferred (recipe-discovery-wiring banked as the fetcher anchor). Master `d80dc17` → `4e3647a` (ff; first CONCURRENT two-lot wave on the one-branch shape — disjoint write sets held, zero collisions). app-runtime: 6237cc8 (fetch chokepoint — the last paid-spend/determinism bypass closed; 16-site raw-engine inventory with counts), f918006 (budget exhaustion terminal — fails once, attempts un-burned; governance pauses say so), 4e3647a (VCR cassettes survive retries via the checkpoint-coupled Fresh/Resume rule). tiered-fetcher: a69420a (zombie penalties dead — authoritative snapshot, aged restore, locked reset, tier_memory GC), 65f893e (dead browser degrades the ladder; claude tier traces-and-exhausts), ca4bbe9 (revalidations/research_cache/http_cache all bounded by the always-on store_janitor). Director: cdcbc31 (smoke always builds — stale-binary class dead), 53c30c0 (recipes doc honesty). **Final gate: 1265/0 full workspace + live smoke 17/17 on the merged master's own binary.** Cumulative: 92/92.
 - 2026-08-10 · **Round 8 (6/6 + 2 Director commits, AUTONOMOUS director-self-gated)** — webhook-delivery 3/5 accepted, dataset-peering 3/5 accepted; 2 rejected outright, 2 rejected-deferred (banked). Master `f079c48` → `06b1deb` (sibling agentic-research commits in between; wave forked from Director fmt pin `1fa3b23`). Webhooks: 4d753fc (DLQ recoverable — all 4 kinds signed, replay gated+claimed, stale-pending reclaimed; builder died pre-commit, Director recovered), 614e7e3 (deliveries inside the FanoutPool lifecycle — 4-session flake class structurally dead), c3d1f52 (delivery_health + 4 /metrics series + honest DLQ docs + smoke 15→17). Peering: 54bf16a (five silent-loss windows closed; 1µs-exact inclusive resume; strict cursor 400s), 4ea11b7 (mirror behaves like local data — hook batch widened across run_indexed_apps, (app,dataset)-keyed, wildcard double-fire pinned), 5a7347f (first two-node e2e in repo history — 8 proofs over a live socket; provenance conformance pinned both ways; peering.md born), bb1c462 (chrono lock). Director: 1fa3b23 (toolchain pin + repo-wide fmt re-baseline), 06b1deb (refusal→retry→apply e2e the review found missing). **Final gate: 1219/0 full workspace + TS 7/7 + live smoke 17/17 on the merged master's own binary.** Cumulative: 86/86.

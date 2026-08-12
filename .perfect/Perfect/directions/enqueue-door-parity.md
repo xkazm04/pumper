@@ -3,12 +3,12 @@ slug: enqueue-door-parity
 type: perfect/direction
 context: "[[automation-api]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 6c3f91a
 ---
 
 ## What & why
@@ -52,4 +52,23 @@ work that will fail is refused at the door that accepts it, on every door.
   silently; the recorded skip must be observable on GET /schedules.
 
 ## Build record
-(pending)
+Built by the round-11 Lot A builder, which died pre-commit; the continuation Director
+recovered the dirty tree as a wip snapshot, reviewed the full diff against the criteria,
+and re-committed it as `6c3f91a`. All criteria met: one shared door
+(`mcp::validate_app_params`) behind all six work-creating doors, inventory-enforced via
+`EXPECTED_VALIDATING_DOORS` (+ `EXPECTED_EXEMPT_DOORS` for the datahub actuator, which
+enqueues the app's own defaults); `POST /schedules` 422s on the MERGED effective params
+with the job door's pointer shape; the fire path re-validates legacy rows and skips
+WITHOUT touching last_run, surfaced as derived `health: "invalid_params"` (derived not
+stored — fixing the row clears it the same instant); merge-vs-replace resolved to MERGE
+(`scheduler::schedule_params` shallow-merges over defaults via `routes::merge_params` —
+the side both jobs.rs's contract comment and `default_params`' doc promised; reasoning
+in the fn doc); trigger hops validate via `hop_params_pass_target_schema` and record a
+first-class `bad_params` TRIGGER_OUTCOMES entry with the door's message in detail;
+`POST /triggers/{id}/test?fire=true` 422s. e2e (4 scenarios, real HTTP):
+schedule_door_refuses_what_the_job_door_refuses_not_a_201,
+scheduled_run_merges_over_defaults_not_replaces_them,
+legacy_invalid_schedule_is_skipped_visibly_not_enqueued_or_silently_ok,
+trigger_with_a_bad_template_records_bad_params_instead_of_firing.
+Docs: http-api.md (schedules/triggers rows), runtime.md (health + params semantics),
+triggers.md (bad_params row). Gates: check + lib 450/0 + e2e 4/4 green.

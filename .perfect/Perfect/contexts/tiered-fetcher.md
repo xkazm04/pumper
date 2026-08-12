@@ -57,6 +57,14 @@ Ladder: api_recipe → archive → http → browser → claude, entered via AppC
 - WeatherEntry.challenge_fingerprints always empty on export (reserved schema).
 
 ## Direction history
+- 2026-08-12 (round 11, banked WITHOUT a proposal pass — E2 builder finding during
+  [[url-absolutize]]): **FetchOutcome discards final_url.** The HTTP engine records the
+  post-redirect URL (engine-http/src/lib.rs:425) but every FetchOutcome construction site
+  sets `url: req.url` (fetcher.rs:638, 841, 1015), so url_absolute resolves a
+  redirect-crossing page against the PRE-redirect origin, and any consumer of outcome.url
+  gets the requested, not the landed, URL. Fix = carry final_url through FetchOutcome +
+  use it as the extraction base; S/M, joins recipe-discovery-wiring as this context's
+  anchors.
 - 2026-08-10 (round 9, director-self-gated): ACCEPTED [[politeness-memory-honesty]]
   (robustness M), [[browser-down-ladder]] (robustness M), [[cache-growth-bounds]]
   (robustness/optimization M). REJECTED-DEFERRED recipe-discovery-wiring (feature) —

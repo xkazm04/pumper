@@ -3,12 +3,12 @@ slug: each-field-reports
 type: perfect/direction
 context: "[[extraction-core]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 1b6aebc
 ---
 
 ## What & why
@@ -44,4 +44,18 @@ After this ships, listing rot is visible the run it starts.
 - Risk: report size on wide listings — cap or aggregate (counts, not per-item lists).
 
 ## Build record
-(pending)
+Built by the round-11 Lot E builder, which died pre-commit; the continuation Director
+recovered the dirty tree as a wip snapshot, reviewed the full diff against the criteria,
+and re-committed it as `1b6aebc`. All criteria met: `DocReport.each` (`InnerFieldStats`
+counts keyed by dotted path, additive, serde skip-if-empty pinned byte-identical for
+no-each rule sets); `EachAcc` positional accumulator keeps the report O(rule fields) —
+pinned by `inner_reports_are_bounded_by_rule_width_not_listing_width` (5000 rows → 2
+entries); dead-vs-sparse split (`is_dead`), nested each under dotted paths, empty-listing
+items:0 honesty; extractor `worst_fields` gains item-scoped rows (`scope:"item"`, `dead`)
+via `InnerRollup` + `inner_field_dead`; replay-CI gains `inner_fields` diff rows
+(counts-only by design, no value samples). Consumer inventory recorded in
+docs/features/extraction.md ("Who reads `each` today"): extractor worst_fields + replay
+see it; resilience sketches / provisioner gate / DataHub scoring still key off
+report.fields — recorded follow-up, not wired. Anti-pattern test `listing_rot_not_invisible`
+pins the refuted case (listing still Matched, rot visible only in `each`).
+Gates: cargo check + workspace lib 450/0 + listing_reports 2/2 green on the recovered tree.

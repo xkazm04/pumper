@@ -3,12 +3,12 @@ slug: schedule-truth
 type: perfect/direction
 context: "[[automation-api]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 85bb5f9 (+ fb78574 guard fix)
 ---
 
 ## What & why
@@ -50,4 +50,23 @@ contradict each other in one response, and the eaten-firings count exists only i
   fix must keep "don't double-fire while my job still runs" intact; tests must cover it.
 
 ## Build record
-(pending)
+Continuation builder (A2), commits `85bb5f9` + `fb78574`. The existential twin
+(`storage::schedule_has_active_job`) DELETED outright; both the overlap guard and the
+health derivation now go through `scheduler::latest_run` → `run_holds_slot` (newest
+firing only). Wedge fix: a retried old job keeps its created_at, so it is never the
+newest and cannot hold the slot; a live scheduled run IS the newest (the guard itself
+prevented anything newer) so don't-double-fire survives — both pinned by e2e. Misfire
+skip: migration 0039 adds last_skipped_at + skipped_count; `schedule_reference` =
+MAX(last_run, last_skipped_at) ?? created_at, shared by the reconcile loop AND
+project_next_run so the projected next_run is computed from the reference the next tick
+will use. 4 HTTP e2e (schedule_truth.rs) cover ok/wedge/overlapping/disabled/
+invalid_cron/misfire-skip. Builder refutation (load-bearing): "last_run advances only
+when a job was enqueued" taken literally breaks skip-policy forever (decide() returns
+Skip every tick) — verifying project_next_run's reference, as the criterion instructed,
+forced the MAX() split. PROCESS FAILURE self-reported: 85bb5f9 shipped with the guard
+test red (test scanned its own module's string literals; gate output piped through
+head truncated the failure) — fb78574 fixes the scanner (stops at #[cfg(test)], concat!
+for forbidden symbols) and adds a meta-test proving the guard can fail. Write-set
+exception accepted by Director: +2 test-fixture lines each in core/catalog.rs +
+server/datahub.rs (mechanical Schedule-struct widening; no sibling collision).
+Gates: full workspace 1372/0; smoke 25/25 (schedules 422 door checked live).

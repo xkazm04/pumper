@@ -40,3 +40,20 @@ ledger 5d99cc6). schedules.rs and watches.rs have never been swept on any map.
 
 ## Shipped
 - (inherited via those contexts)
+- 2026-08-12 (round 11) · [[enqueue-door-parity]] → `6c3f91a` — one shared params door
+  (mcp::validate_app_params) behind all six work-creating doors, inventory-enforced
+  (EXPECTED_VALIDATING_DOORS); schedules validate MERGED effective params (replace→merge
+  resolved); trigger hops record bad_params; fire path skips legacy rows as
+  health=invalid_params.
+- 2026-08-12 (round 11) · [[schedule-truth]] → `85bb5f9`+`fb78574` — existential guard twin
+  deleted; run_holds_slot(newest) backs guard AND health (retry-wedge dead, pinned by e2e);
+  migration 0039 last_skipped_at/skipped_count; schedule_reference = MAX(last_run,
+  last_skipped_at) shared by reconcile + project_next_run.
+- 2026-08-12 (round 11) · [[watch-honesty]] → `5ee2462` — NamespaceIndex (registry + virtual
+  seed + STORE + saved-search materialize); virtual namespaces watchable, traps refused with
+  the landing namespace named; validated ?app= on watches (+ separate trigger_filter_values —
+  ingress ids are not apps); GET /watches/{id}/deliveries; explicit-null last_delivery.
+  NEW BANKED: `trades` virtual namespace is accepted but undeliverable — trades-common emits
+  no index_datasets, so 5 apps' unified writes never enter the fan-out batch (fix lives in
+  trades-common; S-sized). Also: VIRTUAL_NAMESPACES pins to the registry, not
+  grants_common::UNIFIED_APP — a rename there fails no test.

@@ -3,12 +3,12 @@ slug: watch-honesty
 type: perfect/direction
 context: "[[automation-api]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 5ee2462
 ---
 
 ## What & why
@@ -53,4 +53,25 @@ unanswerable over the API.
   prefer deriving both from one function/const over a second hand-kept list.
 
 ## Build record
-(pending)
+Continuation builder (A2), commit `5ee2462`. `NamespaceIndex` unions FOUR sources:
+registry + `registry::VIRTUAL_NAMESPACES` bootstrap seed (grants, publisher-pinned to
+the registry by test) + the STORE (`list_all_datasets` — the running authority, since
+index_datasets namespaces are declared in job RESULTS at runtime and app-peer writes
+under caller-supplied params.namespace; no compile-time list can enumerate them) +
+saved-search materialize_app (a second notify_watches call site the evidence missed).
+`watch_target_refusal`: unknown namespace → 404 with publishes_into hint; the
+ca-grants/unified trap → 400 naming grants (store-derived, so e2e-proven; a dataset
+nothing has written is ACCEPTED — a new app's first dataset is indistinguishable from a
+typo, and `last_delivery: null` is the surface that reveals a dead watch).
+`validate_app_filter` on /watches; SEPARATE `trigger_filter_values` on /triggers —
+builder REFUTED the "same honest set" criterion: triggers.source_app for external
+triggers holds ingress source ids/`*`, not apps; the watch set alone would 400 filters
+that return rows. `GET /watches/{id}/deliveries` (OpenAPI + EXPECTED), backed by
+`list_deliveries_for_ref_page`; `GET /watches` carries explicit-null `last_delivery`.
+7 e2e (watch_honesty.rs). Known gaps recorded, not papered over: `trades` virtual
+namespace is accepted but trades-common emits no index_datasets so it never enters the
+fan-out (fix = index_datasets in trades-common — BANKED); VIRTUAL_NAMESPACES pins to
+the registry, not grants_common::UNIFIED_APP (rename there wouldn't fail a test);
+namespace_index adds 2 queries to list/create endpoints (not hot paths, unbenchmarked).
+Gates: full workspace 1372/0; smoke 25/25 (grants watchable 201 + bogus-filter 400 +
+last_delivery checked live).

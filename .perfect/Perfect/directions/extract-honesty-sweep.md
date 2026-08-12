@@ -3,12 +3,12 @@ slug: extract-honesty-sweep
 type: perfect/direction
 context: "[[extraction-core]]"
 lens: robustness
-status: accepted
+status: shipped
 size: S
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: 26fb0cc
 ---
 
 ## What & why
@@ -43,4 +43,15 @@ uppercase + regex_replace are the two transforms with zero test coverage.
 - Non-goal: new transforms (url_absolute is its own direction).
 
 ## Build record
-(pending)
+Continuation builder (E2), commit `26fb0cc`. All four lies closed as extracted named
+functions: `xpath_atomic_value` (atomics typed, Debug unreachable), `xpath_extract` →
+Result with Cow detail (runtime failure = Error not Empty; healthy fields allocate
+nothing), `default` guarded by the SHARED `is_blank` (drift-proof test walks every value
+shape; falsey 0/false stay data), `number_value` (to_int saturation → null; non-finite
+null at both precisions; the FINITE-but-out-of-i64 divergence kept deliberately — an f64
+holds 1e20, an i64 cannot, forcing agreement would be its own lie). uppercase +
+regex_replace covered. Blast radius verified: NO in-repo rule set uses `default`, so the
+blank widening changes no shipped pipeline. Builder refutations (load-bearing): xpath
+predicate errors only on non-empty node sets (first test passed for the wrong reason,
+caught and fixed); to_number/to_int "disagreement" was two distinct cases, only one a bug.
+Gates: check + workspace lib + 30 extract tests green; fmt clean; no new clippy.

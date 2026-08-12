@@ -3,12 +3,12 @@ slug: url-absolutize
 type: perfect/direction
 context: "[[extraction-core]]"
 lens: feature
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-12
+commit: ee5d8e4
 ---
 
 ## What & why
@@ -44,4 +44,23 @@ declarative engine.
   records it; builder verifies what the artifact/meta actually stores before wiring.
 
 ## Build record
-(pending)
+Continuation builder (E2), commit `ee5d8e4`. Seam: base passed PER CALL —
+`CompiledTransform::apply(value, base: Option<&Url>)` — not compile-bound (one
+CompiledRuleSet is shared by reference across a rayon batch of different-URL docs;
+rebinding would recompile every selector per doc). Additive entry points
+`extract_one/batch_with_report_at`; originals delegate with None. `absolutize` via
+url::Url::join (RFC 3986); unresolvable → UNCHANGED never null; blank → blank
+(`base.join("")` returns the base — the fabrication is guarded by
+`absolutize_never_fabricates_a_url_from_nothing`). `DocReport.base_url_missing` (doc
+count in all four extractor result shapes; `#[serde(default)]` on BackfillState — no
+checkpoint bump). Fused extract+fingerprint path carries no URL → rule sets with
+`needs_doc_url()` take base-carrying extraction + signals_batch second parse, paid only
+by opt-ins (proper fusion needs a resilience/mod.rs signature change — follow-up).
+induce emits url_absolute on href/src/poster slots. Preview: `base_url` param, tested
+`preview_base` precedence (explicit > fetched url > none), same code path verified.
+KNOWN LIMIT (builder refutation of the brief): tiered FetchOutcome discards the HTTP
+engine's final_url (fetcher.rs:638/841/1015 set url: req.url) — base is the REQUESTED
+URL; cross-origin redirects resolve against the pre-redirect origin. Fix = plumb
+final_url through FetchOutcome (fetcher.rs, out of write set). **Banked as a
+tiered-fetcher anchor.** Gates: check + workspace lib + 3 app-level tests + routes:: 79
+green; fmt clean; no new clippy in touched files.

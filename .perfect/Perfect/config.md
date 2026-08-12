@@ -53,6 +53,28 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   resource-destructive actions even when they are obviously regenerable.
 
 ## Skill improvement log
+- 2026-08-12 (round 11): **Second mid-build death, and the recovery bill was ~30 minutes
+  with zero work lost** — but only because both dead builders had COMMITTED nothing while
+  having FINISHED their first direction in the working tree. The wip-snapshot →
+  review-from-diff → clean re-commit path (soft reset on an unpushed branch) produced
+  atomic history indistinguishable from a live builder's. Standing rule confirmed: the
+  recovery order is snapshot FIRST (per-lot `--only` commits), analyze second.
+- 2026-08-12 (round 11): **A builder self-caught shipping a red gate and named the cause:
+  piping the gate through `head` truncated the failure line** — the exact anti-pattern the
+  round-6 learning codified for the Director, now proven to need saying in BUILDER briefs
+  too. Add to the brief template: capture the gate's own exit code; never pipe a gate
+  through head/grep without checking `$?`.
+- 2026-08-12 (round 11): **The Director's own smoke checks needed two fixes the builders'
+  code didn't** (assumed the trap-400 fires on a fresh store; assumed a bare-array
+  response shape). Smoke checks are code too: verify response shapes and state
+  dependencies against the source before asserting, exactly like a builder verifying a
+  brief claim.
+- 2026-08-12 (round 11): **Write-set exceptions want a declared-and-judged path, not
+  silence.** A2 needed +2 test-fixture lines in two out-of-set files after widening a
+  core struct — a mechanical ripple no write-set can predict. It declared the exception
+  with reasoning instead of contorting around the boundary, and the Director accepted at
+  review. That is the right protocol; codify "declare the exception in your report" in
+  the template rather than pretending ripples don't happen.
 - 2026-08-11 (round 10): **The vault's in-flight session note made a mid-round death
   nearly free.** The proposing session died after gating but before any builder
   commit; the continuation session reconstructed the entire state from Perfect.md's
