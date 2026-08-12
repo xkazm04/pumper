@@ -1,0 +1,15 @@
+-- Schedules were the last work-creator with no spend ceiling.
+--
+-- Rounds 12 put the budget floor on the jobs door and the trigger door, but a
+-- schedule had no `budget_usd` at all: the fire path built its EnqueueOptions
+-- with `..Default::default()`, so every scheduled run of a Claude-tier app
+-- executed with `budget_usd = NULL`, which the budget system reads as
+-- UNLIMITED. A standing cron order for a paid research app is exactly the
+-- unattended, recurring, spending shape a ceiling exists for.
+--
+-- NULL keeps meaning "no ceiling", identically to the jobs door — this
+-- migration changes no existing row's behaviour, it only makes a ceiling
+-- expressible. Catalog-managed rows stay NULL: `catalog/data-sources.toml` has
+-- no budget vocabulary, and inventing one here would put money in a file whose
+-- reconciler overwrites rows.
+ALTER TABLE schedules ADD COLUMN budget_usd REAL;

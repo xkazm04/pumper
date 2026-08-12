@@ -12,6 +12,10 @@ use utoipa::{IntoParams, ToSchema};
 use crate::routes::error::{
     default_limit, keyset_cursor, parse_cursor, ApiError, EnabledBody, MAX_ATTEMPTS_CAP,
 };
+// The one budget floor, shared with the jobs and trigger doors: `budget_usd`
+// must be a real positive ceiling, because an omitted one means "no ceiling"
+// and so `0` cannot also mean "spend nothing".
+use crate::routes::jobs::validate_budget_usd;
 use crate::state::AppState;
 
 #[derive(Deserialize, IntoParams)]
@@ -27,7 +31,7 @@ pub(crate) struct SchedulesQuery {
     path = "/schedules",
     tag = "schedules",
     params(SchedulesQuery),
-    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `overlapping`) — so a silently-wedged schedule is visible over the API. `last_run` means *a job was enqueued* and is null until one was; firings eaten by `misfire_policy = \"skip\"` are reported separately as `last_skipped_at` + `skipped_count` (cumulative), so the two can no longer contradict each other."))
+    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `overlapping`) — so a silently-wedged schedule is visible over the API. `last_run` means *a job was enqueued* and is null until one was; firings eaten by `misfire_policy = \"skip\"` are reported separately as `last_skipped_at` + `skipped_count` (cumulative), so the two can no longer contradict each other. `budget_usd` is the spend ceiling replayed into every run this schedule enqueues (`null` = no ceiling)."))
 )]
 pub(crate) async fn list_schedules(
     State(state): State<AppState>,
@@ -138,6 +142,13 @@ pub(crate) struct CreateScheduleBody {
     misfire_policy: Option<String>,
     /// Attempt budget for jobs this schedule enqueues; omitted = server default (3).
     max_attempts: Option<i64>,
+    /// Spend ceiling replayed into **every** job this schedule enqueues; metered
+    /// Claude calls abort past it. Must be **> 0** — validated by the same
+    /// `jobs::validate_budget_usd` the enqueue and trigger doors use, so `0`,
+    /// negative, NaN and ∞ are refused with the identical 422 rather than
+    /// silently becoming "no ceiling". Omitted = no ceiling (unchanged
+    /// behaviour, and the only thing catalog-managed schedules can have).
+    budget_usd: Option<f64>,
 }
 
 #[utoipa::path(
@@ -149,7 +160,7 @@ pub(crate) struct CreateScheduleBody {
         (status = 201, description = "Created schedule", body = Object),
         (status = 400, description = "Invalid cron, timezone, or misfire_policy", body = Object),
         (status = 404, description = "Unknown app", body = Object),
-        (status = 422, description = "The effective params (app defaults + this body's `params`) fail the app's declared JSON Schema — same shape as the enqueue door", body = Object),
+        (status = 422, description = "The effective params (app defaults + this body's `params`) fail the app's declared JSON Schema — same shape as the enqueue door — or `budget_usd` is not a positive number of dollars", body = Object),
     )
 )]
 pub(crate) async fn create_schedule(
@@ -196,6 +207,13 @@ pub(crate) async fn create_schedule(
         return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg));
     }
 
+    // The SAME floor the jobs and trigger doors apply. A schedule is the worst
+    // place for `0` to decay into "no ceiling": the value is stored on the row
+    // and replayed into every run forever, so one silent reinterpretation is a
+    // standing unlimited-spend order rather than one bad job.
+    let budget_usd = validate_budget_usd(body.budget_usd)
+        .map_err(|msg| ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg))?;
+
     let schedule = state
         .storage
         .create_schedule(pumper_core::NewSchedule {
@@ -206,9 +224,48 @@ pub(crate) async fn create_schedule(
             timezone: body.timezone.as_deref(),
             misfire_policy,
             max_attempts: body.max_attempts.map(|n| n.clamp(1, MAX_ATTEMPTS_CAP)),
+            budget_usd,
         })
         .await?;
     Ok((StatusCode::CREATED, Json(schedule)))
+}
+
+/// Body of `POST /schedules/{id}/budget`. `null` clears the ceiling.
+#[derive(Deserialize, ToSchema)]
+pub(crate) struct ScheduleBudgetBody {
+    /// New spend ceiling, or `null` to remove it. Must be **> 0** when present —
+    /// same `validate_budget_usd` contract as `POST /schedules`.
+    budget_usd: Option<f64>,
+}
+
+#[utoipa::path(
+    post,
+    path = "/schedules/{id}/budget",
+    tag = "schedules",
+    params(("id" = String, Path, description = "Schedule id")),
+    request_body = ScheduleBudgetBody,
+    responses(
+        (status = 200, description = "`{id, budget_usd}`"),
+        (status = 404, description = "Schedule not found", body = Object),
+        (status = 422, description = "`budget_usd` is not a positive number of dollars", body = Object),
+    )
+)]
+pub(crate) async fn set_schedule_budget(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(body): Json<ScheduleBudgetBody>,
+) -> Result<Json<Value>, ApiError> {
+    // Without this door a ceiling could only be set at create time, which would
+    // leave it unreachable for exactly the schedules that spend: code-seeded
+    // rows (`ScrapeApp::schedule`) and catalog-managed ones are both created
+    // with `budget_usd = NULL` and are not created through `POST /schedules`.
+    let budget_usd = validate_budget_usd(body.budget_usd)
+        .map_err(|msg| ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg))?;
+    if state.storage.set_schedule_budget(&id, budget_usd).await? {
+        Ok(Json(json!({ "id": id, "budget_usd": budget_usd })))
+    } else {
+        Err(ApiError(StatusCode::NOT_FOUND, "schedule not found".into()))
+    }
 }
 
 #[utoipa::path(

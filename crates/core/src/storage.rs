@@ -86,6 +86,15 @@ pub struct Schedule {
     pub misfire_policy: String,
     /// Attempt budget for jobs this schedule enqueues; `None` = server default.
     pub max_attempts: Option<i64>,
+    /// Spend ceiling replayed into every job this schedule enqueues (migration
+    /// 0040). `None` = **no ceiling**, the same meaning the field carries at the
+    /// jobs and trigger doors — not "spend nothing", which is why a non-positive
+    /// value is refused at the door rather than reinterpreted.
+    ///
+    /// Schedules were the last work-creator without one: the fire path built its
+    /// `EnqueueOptions` from `Default`, so every scheduled run of a Claude-tier
+    /// app ran unlimited.
+    pub budget_usd: Option<f64>,
     /// Which controller owns this row: `None` = hand-made / code-seeded (sacred —
     /// the catalog reconciler never touches these); `Some("catalog")` = driven by
     /// `catalog/data-sources.toml` via the reconciler.
@@ -111,7 +120,7 @@ pub struct Schedule {
 /// Column list shared by every `schedules` SELECT (kept in sync with `ScheduleRow`).
 const SCHEDULE_COLUMNS: &str =
     "id, app, cron, params, enabled, priority, timezone, misfire_policy, max_attempts, \
-     managed_by, last_run, last_skipped_at, skipped_count, created_at";
+     budget_usd, managed_by, last_run, last_skipped_at, skipped_count, created_at";
 
 /// Create-time fields for a schedule (borrowed; storage assigns id/enabled/time).
 #[derive(Debug, Clone)]
@@ -126,6 +135,10 @@ pub struct NewSchedule<'a> {
     pub misfire_policy: &'a str,
     /// `None` = server default attempt budget.
     pub max_attempts: Option<i64>,
+    /// Spend ceiling for every job this schedule enqueues; `None` = no ceiling.
+    /// Callers validate the value (`routes::jobs::validate_budget_usd`) — storage
+    /// stores it verbatim.
+    pub budget_usd: Option<f64>,
 }
 
 /// The compile-time-embedded migration chain (`crates/core/migrations`,
@@ -704,8 +717,9 @@ impl Storage {
     async fn insert_schedule(&self, id: &str, s: &NewSchedule<'_>) -> Result<()> {
         sqlx::query(
             "INSERT INTO schedules \
-             (id, app, cron, params, enabled, priority, timezone, misfire_policy, max_attempts, created_at) \
-             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9)",
+             (id, app, cron, params, enabled, priority, timezone, misfire_policy, max_attempts, \
+              budget_usd, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 1, ?5, ?6, ?7, ?8, ?9, ?10)",
         )
         .bind(id)
         .bind(s.app)
@@ -715,6 +729,7 @@ impl Storage {
         .bind(s.timezone)
         .bind(s.misfire_policy)
         .bind(s.max_attempts)
+        .bind(s.budget_usd)
         .bind(now())
         .execute(&self.pool)
         .await?;
@@ -765,6 +780,24 @@ impl Storage {
         let result = sqlx::query("UPDATE schedules SET enabled = ?2 WHERE id = ?1")
             .bind(id)
             .bind(enabled as i64)
+            .execute(&self.pool)
+            .await?;
+        Ok(result.rows_affected() > 0)
+    }
+
+    /// Sets (or clears, with `None`) a schedule's spend ceiling. Returns whether
+    /// the row existed.
+    ///
+    /// A settable ceiling is the difference between the feature applying to
+    /// hand-made schedules only and applying to the ones that actually spend:
+    /// code-seeded and catalog-managed rows are created with `budget_usd = NULL`
+    /// and this is the only way they can ever get one. Callers validate the
+    /// value (`routes::jobs::validate_budget_usd`); `None` is the documented
+    /// "no ceiling" and is stored verbatim.
+    pub async fn set_schedule_budget(&self, id: &str, budget_usd: Option<f64>) -> Result<bool> {
+        let result = sqlx::query("UPDATE schedules SET budget_usd = ?2 WHERE id = ?1")
+            .bind(id)
+            .bind(budget_usd)
             .execute(&self.pool)
             .await?;
         Ok(result.rows_affected() > 0)
@@ -3170,6 +3203,7 @@ struct ScheduleRow {
     timezone: Option<String>,
     misfire_policy: String,
     max_attempts: Option<i64>,
+    budget_usd: Option<f64>,
     managed_by: Option<String>,
     last_run: Option<String>,
     last_skipped_at: Option<String>,
@@ -3191,6 +3225,7 @@ impl TryFrom<ScheduleRow> for Schedule {
             timezone: r.timezone,
             misfire_policy: r.misfire_policy,
             max_attempts: r.max_attempts,
+            budget_usd: r.budget_usd,
             managed_by: r.managed_by,
             last_run: r.last_run.as_deref().map(parse_ts).transpose()?,
             last_skipped_at: r.last_skipped_at.as_deref().map(parse_ts).transpose()?,

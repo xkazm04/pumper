@@ -697,6 +697,7 @@ mod tests {
             timezone: None,
             misfire_policy: "fire_once".into(),
             max_attempts: None,
+            budget_usd: None,
             managed_by: managed.then(|| CATALOG_MANAGED_BY.to_string()),
             last_run: None,
             last_skipped_at: None,
