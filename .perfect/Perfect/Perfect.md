@@ -2,19 +2,61 @@
 type: perfect/home
 repo: pumper
 updated: 2026-08-12
-pool: 0
-pool_target: per-dispatch (r14 cap 6 — round complete)
+pool: 6
+pool_target: per-dispatch (r15 cap 6 — gated, building)
 shipped_total: 122
-coverage: "24/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; wasm-plugin-host + eu-grants SHIPPED r14; us-business-census banked slate-grade fronts r15; 22 never proposed"
-cursor: "r15 PROPOSE: us-business-census first (banked slate-grade r14 prefetch brief — re-verify seeds), then czech-labor-market, web-crawler, crawler-core, engine-contracts (opp 5); never-proposed before re-mining"
-last_session: "[[sessions/2026-08-12-6]]"
+coverage: "26/46 map contexts covered (proposal pass on the 46-map) — sweep campaign active; us-business-census + czech-labor-market GATED r15 (wave in flight); web-crawler banked slate-grade brief fronts r16; 20 never proposed"
+cursor: "r15 BUILD in flight (perfect/2026-08-12-r15, Lot C census 1-3 + Lot M mpsv 4-6); r16 PROPOSE: web-crawler first (banked slate-grade r15 prefetch brief — re-verify seeds; gaps 2+4 are CORE-side → pair with crawler-core, lot-split on the core/app boundary), then crawler-core, engine-contracts (opp 5); never-proposed before re-mining"
+last_session: "[[sessions/2026-08-12-7]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **0** · phase: **round 14 COMPLETE → r15 PROPOSE** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round).
+**State**: pool **6** · phase: **round 15 BUILD** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round).
+
+### Round-15 pool — 6 GATED (2026-08-12, gate: director-self-gated, SWEEP round)
+us-business-census, 3 accepted (REJECTED-deferred banked: observe-extraction
+adoption → fleet-wide sweep on source-resilience; census primary-dataset catalog
+contracts → after the virtual-app pattern proves twice; REJECTED: re-blend
+O(corpus) optimization — no volume consumer, r9 precedent; in-repo ranking
+function — zero-consumer product invention):
+1. [[census-blend-first-class]] — feature · M (market_blend + saturation invisible
+   to watches/triggers/search + Provenance::default() + silent 50k-cap blend reads
+   + catalog contract rows via topic_stats precedent)
+2. [[census-suppression-honesty]] — robustness · M (suppressed receipts fabricate
+   $0 succession dollars end-to-end w/ flagged-not-fixed test; density-only 204
+   run-abort; zero suppression/coverage counters; per-10k coverage mixing)
+3. [[census-vintage-truth]] — robustness · M (backwards-rerun rewrite; saturation
+   {place}-only key; mixed-grain NAICS double-count killed census-side; per-input
+   vintages block on blend rows; velocity contiguity/staleness/NSA labeling)
+
+czech-labor-market, 3 accepted (REJECTED-deferred banked: nowcast backtest — the
+context ANCHOR, needs accumulated ISPV releases; sync_many tombstoning migration —
+after drift guards prove the shape; REJECTED: observe-extraction — same fleet
+reasoning; mpsv-vpm-prirustky delta feed — new-source work, no steer):
+4. [[nowcast-honesty-floor]] — robustness · M (ratio<=0 is the ONLY output guard on
+   a division-derived salary projection; no obs floor; no catalog contract for the
+   cz-labour trio; staleness stamped never judged — closes the round-4 note)
+5. [[mpsv-feed-drift-honesty]] — robustness · M (polozky drift = clean stored:0;
+   region_agg drops czisco-less postings — both bughunt-confirmed unfixed; first
+   run()-level tests both apps)
+6. [[labour-datasets-visible]] — feature · M (12 datasets invisible: index_datasets
+   emission, cz-labour namespace watch/search reachability, key-grain join hazard
+   documented)
+
+### Wave plan (round 15) — ONE branch `perfect/2026-08-12-r15`, main checkout, 2 CONCURRENT lots
+Write sets disjoint: **Lot C** (opus) = 1,2,3 → crates/apps/census-{bfs,density,
+nonemp,nesd,common}/src/lib.rs (+ their Cargo.tomls if needed), docs/features/
+{datasets,resilient-extraction}.md · **Lot M** (opus) = 4,5,6 → crates/apps/
+mpsv-{ispv,vpm}/src/lib.rs (+ Cargo.tomls). Class B BOTH lots (re-read + unique
+anchor): docs/features/apps.md (different table rows), catalog/data-sources.toml
+(different [[source]] blocks), crates/server/src/e2e/mod.rs (only if either adds
+an e2e file — census.rs vs mpsv.rs, separate files). Class C (Director-only,
+report-don't-touch): crates/server/src/worker.rs, crates/core/**, crates/apps/
+trades-common/**, crates/core/tests/fetch_chokepoint.rs EXPECTED inventory.
+Rust-touching lots = 2 ✓.
 
 ### Round-14 pool — ALL 6 SHIPPED (2026-08-12, gate: director-self-gated, SWEEP round; original session died between review and gates, continuation session landed + wrapped — zero work lost)
 wasm-plugin-host, 3/5 (REJECTED-deferred: plugin-app run-door validation — it is
@@ -294,18 +336,19 @@ extraction-core r11 (3 shipped) · automation-api r11 (3 shipped) ·
 archive-engine r11 (nothing-clears-the-bar verdict recorded) ·
 declarative-extractor r12 (3 shipped) · job-search-api r12 (3 shipped) ·
 claude-engine r13 (3 shipped) · cron-scheduler r13 (3 shipped) ·
-**wasm-plugin-host r14 (3 gated)** · **eu-grants r14 (3 gated)**.
+wasm-plugin-host r14 (3 shipped) · eu-grants r14 (3 shipped) ·
+**us-business-census r15 (3 gated)** · **czech-labor-market r15 (3 gated)**.
 
-**Never-proposed queue (22 after r14's two proposals, opportunity-ranked)**:
+**Never-proposed queue (20 after r15's two proposals, opportunity-ranked)**:
 | Opp | Contexts |
 |---:|---|
-| 6 | us-business-census (banked slate-grade brief, r14 prefetch scout — front of r15) |
-| 5 | czech-labor-market · web-crawler · crawler-core · engine-contracts |
+| 6 | web-crawler (banked slate-grade brief, r15 prefetch scout — front of r16; gaps 2+4 CORE-side → pair with crawler-core) |
+| 5 | crawler-core · engine-contracts |
 | 4 | vcr-testing · http-engine · browser-engine · remote-engine (banked anchor) · us-federal-grants · us-state-grants · czech-procurement · trades-operator-economics · trades-pricing · agentic-research · connector-api-watch · page-monitor · maintenance-tooling (banked CONFIRMED anchor) · plugin-runner (banked anchor, r14) |
 | 3 | wasm-plugin-examples (banked anchor) · data-pipeline-catalog (banked anchor) |
 | 2 | hackernews-example (banked anchor) |
 
-(r14 in flight: wasm-plugin-host + eu-grants left this queue 2026-08-12.)
+(r15 in flight: us-business-census + czech-labor-market left this queue 2026-08-12.)
 
 ## Queue — round 4 (re-scored 2026-08-03 over the 46-context map)
 
