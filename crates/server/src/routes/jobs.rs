@@ -32,6 +32,34 @@ pub(crate) fn merge_params(defaults: Value, over: Option<Value>) -> Value {
     }
 }
 
+/// The spend ceiling a job may carry, or the caller-facing refusal.
+///
+/// The anti-pattern this replaces: `budget_usd.filter(|b| *b > 0.0)`. A caller
+/// sending `0.0` ("spend nothing") or a negative number had it silently dropped
+/// to `None` — and `None` at this door means **no ceiling at all**, i.e.
+/// unlimited spend on the paid paths (Claude research, the paid fetch tiers).
+/// The most cautious input produced the least cautious job, silently.
+///
+/// So a non-positive (or non-finite) budget is refused *at the door*, with a
+/// message that names what it would have meant, instead of being reinterpreted.
+/// `None` still passes through unchanged: omitting the field is the documented
+/// "no ceiling" request, and this function does not invent one.
+pub(crate) fn validate_budget_usd(requested: Option<f64>) -> Result<Option<f64>, String> {
+    match requested {
+        None => Ok(None),
+        Some(b) if b.is_finite() && b > 0.0 => Ok(Some(b)),
+        Some(b) => Err(format!(
+            "budget_usd must be a positive number of dollars (got {b}). It is not a way to say \
+             'spend nothing': an omitted budget_usd means this job runs with NO spend ceiling, so \
+             honouring {b} here would have turned the most cautious request into the least \
+             limited job. Pass a real ceiling (e.g. 0.25) to cap the job, or — to run a paid app \
+             on free tiers only — pass that app's own zero budget param (the research app takes \
+             \"max_budget_usd\": 0), or enqueue over MCP, where the [mcp] max_job_budget_usd rail \
+             treats 0 as a real $0 ceiling."
+        )),
+    }
+}
+
 #[derive(Deserialize, Default, ToSchema)]
 pub(crate) struct EnqueueBody {
     /// Job params. An object here **shallow-merges over the app's
@@ -47,6 +75,9 @@ pub(crate) struct EnqueueBody {
     /// If set, the callback body is HMAC-SHA256 signed with this secret.
     callback_secret: Option<String>,
     /// Spend ceiling for the whole job; metered Claude calls abort past it.
+    /// Must be **> 0** — see [`validate_budget_usd`]: omitting it means "no
+    /// ceiling", so `0` cannot also mean "spend nothing" and is refused (422)
+    /// rather than silently reinterpreted as unlimited.
     budget_usd: Option<f64>,
     /// Dedup key: retrying an enqueue with the same key returns the original
     /// job (200) instead of creating a duplicate. The `Idempotency-Key`
@@ -65,7 +96,7 @@ pub(crate) struct EnqueueBody {
         (status = 200, description = "Idempotency-Key replay: the original job", body = Object),
         (status = 404, description = "Unknown app", body = Object),
         (status = 409, description = "The name is a discovered dynamic WASM app (`GET /apps` lists it with `dynamic: true, runnable: false`) — listed but not runnable in this build; the message carries the reason", body = Object),
-        (status = 422, description = "Merged params fail the app's declared JSON Schema (message carries JSON-pointer paths)", body = Object),
+        (status = 422, description = "Merged params fail the app's declared JSON Schema (message carries JSON-pointer paths), or `budget_usd` is not a positive number of dollars", body = Object),
     )
 )]
 pub(crate) async fn enqueue_job(
@@ -116,6 +147,10 @@ pub(crate) async fn enqueue_job(
     if let Err(msg) = crate::mcp::validate_app_params(&state.registry, &name, &params) {
         return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg));
     }
+    // Budget floor: a non-positive ceiling is refused here rather than dropped
+    // to `None` (= unlimited). See `validate_budget_usd`.
+    let budget_usd = validate_budget_usd(body.budget_usd)
+        .map_err(|msg| ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg))?;
     let opts = EnqueueOptions {
         params,
         max_attempts: body.max_attempts.unwrap_or(1).clamp(1, MAX_ATTEMPTS_CAP),
@@ -123,7 +158,7 @@ pub(crate) async fn enqueue_job(
         priority: body.priority.unwrap_or(0),
         callback_url: body.callback_url,
         callback_secret: body.callback_secret,
-        budget_usd: body.budget_usd.filter(|b| *b > 0.0),
+        budget_usd,
         idempotency_key,
         schedule_id: None,
         trigger_id: None,
@@ -480,5 +515,41 @@ mod merge_tests {
         // A scalar/array body can't merge key-wise, so it replaces (prior behaviour).
         let out = merge_params(json!({ "a": 1 }), Some(json!([1, 2, 3])));
         assert_eq!(out, json!([1, 2, 3]));
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::validate_budget_usd;
+
+    /// The anti-pattern: `budget_usd: 0.0` filtered away to `None`, which at
+    /// this door means NO ceiling — so "spend nothing" enqueued the one job
+    /// shape that can spend without limit.
+    #[test]
+    fn budget_zero_is_rejected_not_unlimited() {
+        let err = validate_budget_usd(Some(0.0)).unwrap_err();
+        assert!(
+            err.contains("positive") && err.contains("NO spend ceiling"),
+            "the refusal must say what a zero budget would have meant: {err}"
+        );
+    }
+
+    /// Same class, other side of zero: a negative ceiling is nonsense, and
+    /// nonsense must not decay into "unlimited".
+    #[test]
+    fn negative_budget_is_rejected_not_unlimited() {
+        assert!(validate_budget_usd(Some(-1.5)).is_err());
+        // NaN/∞ are not ceilings either — a NaN comparison is false everywhere,
+        // so `> 0.0` alone would have let them through as `Some(NaN)`.
+        assert!(validate_budget_usd(Some(f64::NAN)).is_err());
+        assert!(validate_budget_usd(Some(f64::INFINITY)).is_err());
+    }
+
+    /// The two legitimate shapes are untouched: omitted stays "no ceiling"
+    /// (this fix narrows nothing), a positive number passes through verbatim.
+    #[test]
+    fn absent_stays_none_and_positive_passes_through() {
+        assert_eq!(validate_budget_usd(None).unwrap(), None);
+        assert_eq!(validate_budget_usd(Some(0.25)).unwrap(), Some(0.25));
     }
 }
