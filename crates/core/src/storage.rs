@@ -2658,6 +2658,12 @@ pub const TRIGGER_OUTCOMES: &[&str] = &[
     "depth",
     // `target_app` is not a registered app.
     "target_unregistered",
+    // The resolved hop params (the trigger's template with `_trigger` merged
+    // over it) fail the TARGET app's declared `params_schema`. The hop is not
+    // enqueued: a job that cannot pass its own door is a job that fails minutes
+    // later with a message nobody connects back to the trigger template.
+    // `detail` carries the pointer-path message the enqueue door would answer.
+    "bad_params",
     // A job already exists for this hop's idempotency key.
     "dedup",
     // The enqueue itself failed.

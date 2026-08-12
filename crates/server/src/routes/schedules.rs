@@ -27,7 +27,7 @@ pub(crate) struct SchedulesQuery {
     path = "/schedules",
     tag = "schedules",
     params(SchedulesQuery),
-    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `overlapping`) — so a silently-wedged schedule is visible over the API."))
+    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `overlapping`) — so a silently-wedged schedule is visible over the API."))
 )]
 pub(crate) async fn list_schedules(
     State(state): State<AppState>,
@@ -79,6 +79,20 @@ async fn enrich_schedules(
             "invalid_cron"
         } else if !state.registry.contains_key(&schedule.app) {
             "unregistered_app"
+        } else if crate::scheduler::validate_schedule_params(
+            &state.registry,
+            &schedule.app,
+            &schedule.params,
+        )
+        .is_err()
+        {
+            // The scheduler skips this row at the fire step; say so here rather
+            // than reporting "ok" for a schedule that will never enqueue again.
+            // Derived (not stored) on purpose: it is computed by the SAME
+            // function the fire path calls, so fixing the row clears the marker
+            // in the same instant the scheduler starts firing it again — a
+            // stored flag would have to be un-set by somebody.
+            "invalid_params"
         } else if last_active {
             "overlapping"
         } else {
@@ -101,6 +115,10 @@ pub(crate) struct CreateScheduleBody {
     app: String,
     /// 6-field cron with seconds: "sec min hour day month weekday".
     cron: String,
+    /// Params for the jobs this schedule enqueues. An object **shallow-merges
+    /// over the app's `default_params`**, exactly like `POST /apps/{name}/jobs`
+    /// — so setting one key keeps the rest of the defaults. Validated here
+    /// against the app's declared schema (422), on the merged result.
     params: Option<Value>,
     priority: Option<i64>,
     /// IANA timezone the cron is evaluated in (e.g. "America/New_York"); omitted
@@ -122,6 +140,7 @@ pub(crate) struct CreateScheduleBody {
         (status = 201, description = "Created schedule", body = Object),
         (status = 400, description = "Invalid cron, timezone, or misfire_policy", body = Object),
         (status = 404, description = "Unknown app", body = Object),
+        (status = 422, description = "The effective params (app defaults + this body's `params`) fail the app's declared JSON Schema — same shape as the enqueue door", body = Object),
     )
 )]
 pub(crate) async fn create_schedule(
@@ -152,6 +171,20 @@ pub(crate) async fn create_schedule(
             StatusCode::BAD_REQUEST,
             format!("unknown misfire_policy '{misfire_policy}' (expected 'fire_once' or 'skip')"),
         ));
+    }
+
+    // Door parity: validate the EFFECTIVE params (the app's defaults with this
+    // body's params merged over them — exactly what the scheduler will enqueue)
+    // against the app's declared schema, with the same 422 + pointer-path shape
+    // `POST /apps/{name}/jobs` answers. Before this, a schedule accepted params
+    // the job door would have refused and the failure only surfaced on the
+    // first cron firing, as a failed job with no link back to this row.
+    if let Err(msg) = crate::scheduler::validate_schedule_params(
+        &state.registry,
+        &body.app,
+        body.params.as_ref().unwrap_or(&Value::Null),
+    ) {
+        return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg));
     }
 
     let schedule = state

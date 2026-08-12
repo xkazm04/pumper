@@ -110,10 +110,11 @@ pub(crate) async fn enqueue_job(
     // enforced at the door — the silent wrong-params job that fails (or worse,
     // half-runs) minutes later becomes an immediate 422 with pointer paths.
     // Validated on the MERGED params, i.e. exactly what the job would run with.
-    if let Some(schema) = &app.manifest().params_schema {
-        if let Err(msg) = crate::mcp::validate_params(schema, &params) {
-            return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg));
-        }
+    // The check itself is `mcp::validate_app_params`, shared with every other
+    // door that creates work (schedules, the scheduler's fire path, trigger
+    // hops) so this door's answer is the only answer.
+    if let Err(msg) = crate::mcp::validate_app_params(&state.registry, &name, &params) {
+        return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg));
     }
     let opts = EnqueueOptions {
         params,

@@ -519,9 +519,7 @@ async fn enqueue_app(
         return Err(format!("unknown app '{name}' — call list_apps first"));
     };
     let params = crate::routes::merge_params(app.default_params(), over);
-    if let Some(schema) = &app.manifest().params_schema {
-        validate_params(schema, &params)?;
-    }
+    validate_app_params(&state.registry, name, &params)?;
     let opts = pumper_core::EnqueueOptions {
         params,
         max_attempts: 1,
@@ -613,7 +611,35 @@ fn resources_read(state: &AppState, params: &Value) -> Result<Value, (i64, Strin
     }))
 }
 
-// ---- Params-schema validation (shared with the HTTP enqueue path) -----------
+// ---- Params-schema validation (shared by every door that creates work) ------
+
+/// The one params check **every door that creates future work** performs, so a
+/// job's effective params are judged identically no matter which door made it.
+///
+/// The anti-pattern this closes: `POST /apps/{name}/jobs` enforced the app's
+/// declared schema (422 with pointer paths) while `POST /schedules` stored
+/// whatever it was handed, the scheduler enqueued it hours later, and the
+/// trigger fire paths never looked at all. Same app, same params, three
+/// different answers — and the two silent ones surfaced as a failed job with a
+/// message nobody connects back to the schedule row or the trigger template.
+///
+/// Unknown app and no declared schema are both `Ok`: the caller owns the
+/// "unknown app" answer (404 vs a skip + ledger row), and an app without a
+/// schema declares no contract to check. Validation runs on the EFFECTIVE
+/// params — what the job would actually run with, after the defaults merge.
+pub(crate) fn validate_app_params(
+    registry: &std::collections::HashMap<String, std::sync::Arc<dyn pumper_core::ScrapeApp>>,
+    app: &str,
+    params: &Value,
+) -> Result<(), String> {
+    let Some(entry) = registry.get(app) else {
+        return Ok(());
+    };
+    let Some(schema) = &entry.manifest().params_schema else {
+        return Ok(());
+    };
+    validate_params(schema, params)
+}
 
 /// Validates a params object against an app's declared JSON Schema. `Err` is a
 /// single human/agent-readable message carrying every violation as
@@ -644,10 +670,233 @@ pub(crate) fn validate_params(schema: &Value, params: &Value) -> Result<(), Stri
     }
 }
 
+/// The doors that create future work, and the shared check they must run.
+///
+/// Inventory in the house EXPECTED-diff style (`routes::mod`'s spec coverage,
+/// `routes::error`'s status contract): the scan walks the server sources for
+/// call sites that create work — `enqueue`, `enqueue_dedup`, `create_schedule`
+/// — and diffs them against these two lists, so a NEW door cannot be added
+/// without either wiring the check or writing down why it doesn't need one.
+///
+/// Test-only enqueues (everything after a file's first `#[cfg(test)]`) are not
+/// doors and are excluded from the scan.
+/// Each entry is `(file, the symbol that file must call)` — either the shared
+/// check itself or the schedule-shaped wrapper around it
+/// (`scheduler::validate_schedule_params`, which resolves the effective params
+/// first and then calls [`validate_app_params`]).
+#[cfg(test)]
+const EXPECTED_VALIDATING_DOORS: &[(&str, &str)] = &[
+    // POST /apps/{name}/jobs — 422 with pointer paths.
+    ("routes/jobs.rs", "validate_app_params"),
+    // POST /schedules — 422, on the merged effective params.
+    ("routes/schedules.rs", "validate_schedule_params"),
+    // POST /triggers/{id}/test?fire=true — 422, same resolution as a live hop.
+    ("routes/triggers.rs", "validate_app_params"),
+    // The cron fire path — skips the row, `GET /schedules` shows invalid_params.
+    ("scheduler.rs", "validate_app_params"),
+    // Dataset/terminal/external trigger hops — records the `bad_params` outcome.
+    ("triggers.rs", "validate_app_params"),
+    // The MCP `enqueue_job` tool and its research sugar.
+    ("mcp/mod.rs", "validate_app_params"),
+];
+
+/// Work-creating call sites that deliberately do NOT run the check, each with
+/// the reason it cannot carry caller-supplied params.
+#[cfg(test)]
+const EXPECTED_EXEMPT_DOORS: &[(&str, &str)] = &[(
+    "datahub.rs",
+    "the governance actuator enqueues the app's OWN default_params verbatim (no caller input), \
+     and `registry::scheduled_apps_default_params_pass_their_schema` pins those",
+)];
+
 #[cfg(test)]
 mod tests {
-    use super::{clamp_budget, validate_params};
+    use super::{clamp_budget, validate_app_params, validate_params};
     use serde_json::json;
+    use std::collections::{BTreeMap, BTreeSet, HashMap};
+    use std::path::Path;
+    use std::sync::Arc;
+
+    /// An app that declares a schema, so the shared door check has something to
+    /// enforce.
+    struct SchemaApp;
+
+    #[async_trait::async_trait]
+    impl pumper_core::ScrapeApp for SchemaApp {
+        fn name(&self) -> &'static str {
+            "schema-app"
+        }
+        fn default_params(&self) -> serde_json::Value {
+            json!({ "query": "default" })
+        }
+        fn manifest(&self) -> pumper_core::AppManifest {
+            pumper_core::AppManifest {
+                params_schema: Some(json!({
+                    "type": "object",
+                    "required": ["query"],
+                    "properties": { "rows": { "type": "integer", "maximum": 10 } }
+                })),
+                ..Default::default()
+            }
+        }
+        async fn run(
+            &self,
+            _ctx: pumper_core::AppContext,
+        ) -> pumper_core::Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+    }
+
+    /// An app with no declared schema — the majority case.
+    struct BareApp;
+
+    #[async_trait::async_trait]
+    impl pumper_core::ScrapeApp for BareApp {
+        fn name(&self) -> &'static str {
+            "bare-app"
+        }
+        async fn run(
+            &self,
+            _ctx: pumper_core::AppContext,
+        ) -> pumper_core::Result<serde_json::Value> {
+            Ok(json!({}))
+        }
+    }
+
+    fn registry() -> HashMap<String, Arc<dyn pumper_core::ScrapeApp>> {
+        let mut registry: HashMap<String, Arc<dyn pumper_core::ScrapeApp>> = HashMap::new();
+        registry.insert("schema-app".into(), Arc::new(SchemaApp));
+        registry.insert("bare-app".into(), Arc::new(BareApp));
+        registry
+    }
+
+    /// The shared door check refuses exactly what the job door refuses, and is
+    /// silent about the two cases it is not the authority on.
+    #[test]
+    fn shared_door_check_refuses_bad_params_and_passes_the_undeclared() {
+        let registry = registry();
+        let err = validate_app_params(&registry, "schema-app", &json!({ "rows": 99 }))
+            .expect_err("a schema violation must be refused at every door");
+        assert!(err.contains("params/rows"), "pointer path preserved: {err}");
+        assert!(err.contains("query"), "missing required named: {err}");
+        validate_app_params(&registry, "schema-app", &json!({ "query": "x", "rows": 3 }))
+            .expect("valid params pass");
+        // No declared schema = no contract to enforce.
+        validate_app_params(&registry, "bare-app", &json!({ "anything": true }))
+            .expect("no schema");
+        // Unknown app: the CALLER owns that answer (404, or a ledger row), so the
+        // check must not turn it into a params complaint.
+        validate_app_params(&registry, "nope", &json!({})).expect("unknown app is not our answer");
+    }
+
+    /// Work-creating call sites in production code, by file (relative to `src`).
+    fn work_creating_files() -> BTreeMap<String, BTreeSet<String>> {
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut found: BTreeMap<String, BTreeSet<String>> = BTreeMap::new();
+        scan(&src, &src, &mut found);
+        assert!(
+            found.len() > 2,
+            "the scan found almost nothing — it is looking in the wrong place, and a test that \
+             cannot see the doors cannot police them"
+        );
+        found
+    }
+
+    fn scan(root: &Path, dir: &Path, found: &mut BTreeMap<String, BTreeSet<String>>) {
+        for entry in
+            std::fs::read_dir(dir).unwrap_or_else(|e| panic!("read {}: {e}", dir.display()))
+        {
+            let path = entry.expect("dir entry").path();
+            if path.is_dir() {
+                // `e2e/` is test-only by construction (its whole module tree is
+                // `#[cfg(test)]`), so nothing in it is a production door.
+                if path.file_name().and_then(|n| n.to_str()) == Some("e2e") {
+                    continue;
+                }
+                scan(root, &path, found);
+                continue;
+            }
+            if path.extension().and_then(|e| e.to_str()) != Some("rs") {
+                continue;
+            }
+            let source = std::fs::read_to_string(&path).expect("read source");
+            // Production half only: a test that enqueues is not a door.
+            let production = match source.find("#[cfg(test)]") {
+                Some(at) => &source[..at],
+                None => &source[..],
+            };
+            let rel = path
+                .strip_prefix(root)
+                .expect("under src")
+                .to_string_lossy()
+                .replace('\\', "/");
+            for line in production
+                .lines()
+                .filter(|l| !l.trim_start().starts_with("//"))
+            {
+                for marker in [".enqueue(", ".enqueue_dedup(", ".create_schedule("] {
+                    if line.contains(marker) {
+                        found.entry(rel.clone()).or_default().insert(marker.into());
+                    }
+                }
+            }
+        }
+    }
+
+    /// The anti-pattern: `POST /apps/{name}/jobs` validated params while
+    /// `POST /schedules`, the cron fire path and every trigger hop did not — so
+    /// the same app ran with params one door had already refused. Any new way to
+    /// create work has to join the list (or be exempted, with a reason).
+    #[test]
+    fn every_door_that_creates_work_runs_the_shared_params_check() {
+        let doors = work_creating_files();
+        let src = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let validating: BTreeSet<&str> = super::EXPECTED_VALIDATING_DOORS
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+        let exempt: BTreeSet<&str> = super::EXPECTED_EXEMPT_DOORS
+            .iter()
+            .map(|(f, _)| *f)
+            .collect();
+
+        let unlisted: Vec<&String> = doors
+            .keys()
+            .filter(|f| !validating.contains(f.as_str()) && !exempt.contains(f.as_str()))
+            .collect();
+        assert!(
+            unlisted.is_empty(),
+            "these files create work without being listed as doors — call \
+             `mcp::validate_app_params` and add them to EXPECTED_VALIDATING_DOORS, or add them to \
+             EXPECTED_EXEMPT_DOORS with the reason: {unlisted:?}"
+        );
+
+        for (door, symbol) in super::EXPECTED_VALIDATING_DOORS {
+            assert!(
+                doors.contains_key(*door),
+                "{door} is listed as a door but no longer creates work — drop it from the list"
+            );
+            let source = std::fs::read_to_string(src.join(door))
+                .unwrap_or_else(|e| panic!("read listed door {door}: {e}"));
+            let production = match source.find("#[cfg(test)]") {
+                Some(at) => &source[..at],
+                None => &source[..],
+            };
+            assert!(
+                production.contains(symbol),
+                "{door} is listed as a validating door but never calls {symbol}"
+            );
+        }
+        // The exemptions have to stay real doors: one that stopped creating work
+        // is stale scaffolding pretending to be a reviewed decision.
+        for (file, reason) in super::EXPECTED_EXEMPT_DOORS {
+            assert!(
+                doors.contains_key(*file),
+                "{file} is exempted but no longer creates work — drop the exemption"
+            );
+            assert!(!reason.is_empty(), "{file}'s exemption needs a reason");
+        }
+    }
 
     #[test]
     fn validate_params_reports_pointer_paths() {

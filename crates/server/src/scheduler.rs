@@ -140,7 +140,28 @@ pub(crate) async fn reconcile(
                     continue;
                 }
 
-                let params = resolve_params(state, &schedule);
+                // Door parity: a schedule whose effective params fail the app's
+                // declared schema is SKIPPED, not enqueued — the same 422 the
+                // HTTP door answers, moved to the only place a legacy row can
+                // still be caught. `last_run` is deliberately NOT touched (as
+                // with an unregistered app), so fixing the row makes the
+                // schedule fire again instead of having silently eaten firings.
+                // Visible on `GET /schedules` as `health: "invalid_params"`.
+                let params = match validate_schedule_params(
+                    &state.registry,
+                    &schedule.app,
+                    &schedule.params,
+                ) {
+                    Ok(params) => params,
+                    Err(msg) => {
+                        warn!(
+                            id = %schedule.id, app = %schedule.app,
+                            "schedule params fail the app's declared schema; not enqueuing \
+                             (GET /schedules shows health=invalid_params): {msg}"
+                        );
+                        continue;
+                    }
+                };
                 let max_attempts = schedule
                     .max_attempts
                     .unwrap_or(DEFAULT_SCHEDULE_MAX_ATTEMPTS);
@@ -393,20 +414,51 @@ fn decide(
     }
 }
 
-/// Uses the schedule's own params, falling back to the app's defaults when none
-/// were configured.
-fn resolve_params(state: &AppState, schedule: &Schedule) -> Value {
-    let empty = matches!(&schedule.params, Value::Null)
-        || matches!(&schedule.params, Value::Object(m) if m.is_empty());
-    if empty {
-        state
-            .registry
-            .get(&schedule.app)
-            .map(|app| app.default_params())
-            .unwrap_or(Value::Null)
-    } else {
-        schedule.params.clone()
-    }
+/// The params a schedule's run would actually carry: the app's defaults with the
+/// schedule's own params **shallow-merged over them** — byte-identical to what
+/// `POST /apps/{name}/jobs` does with a request body (`routes::merge_params`).
+///
+/// Shared by three callers on purpose: the create door (`POST /schedules`
+/// validates *this*, not the raw body), the fire path below, and the
+/// `GET /schedules` health derivation. One resolution means the params the API
+/// validated are the params the scheduler enqueues.
+///
+/// **This used to REPLACE rather than merge** (the schedule's params were used
+/// verbatim whenever they were non-empty, defaults only when they were absent),
+/// so the same app got different effective params depending on which door
+/// created the work — while `routes::jobs`'s own doc comment claimed the two
+/// agreed. Merging is the side that matches both that promise and
+/// `ScrapeApp::default_params`'s contract ("params used for scheduled runs"):
+/// the schedule's own keys still win, it only stops silently dropping the
+/// defaults it didn't mention.
+pub(crate) fn schedule_params(
+    registry: &std::collections::HashMap<String, std::sync::Arc<dyn pumper_core::ScrapeApp>>,
+    app: &str,
+    params: &Value,
+) -> Value {
+    let defaults = registry
+        .get(app)
+        .map(|app| app.default_params())
+        .unwrap_or(Value::Null);
+    let empty = matches!(params, Value::Null) || matches!(params, Value::Object(m) if m.is_empty());
+    let over = if empty { None } else { Some(params.clone()) };
+    crate::routes::merge_params(defaults, over)
+}
+
+/// Whether a schedule's effective params pass the target app's declared schema
+/// — the same check the enqueue door applies, so a schedule can never hold work
+/// the door would refuse. `Err` carries the door's own pointer-path message.
+///
+/// Rows that predate the create-time check (or that were edited in SQL) are the
+/// reason this runs on the FIRE path too, not just at the door.
+pub(crate) fn validate_schedule_params(
+    registry: &std::collections::HashMap<String, std::sync::Arc<dyn pumper_core::ScrapeApp>>,
+    app: &str,
+    params: &Value,
+) -> Result<Value, String> {
+    let effective = schedule_params(registry, app, params);
+    crate::mcp::validate_app_params(registry, app, &effective)?;
+    Ok(effective)
 }
 
 #[cfg(test)]

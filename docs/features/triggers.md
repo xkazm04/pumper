@@ -53,6 +53,7 @@ Every evaluation of a trigger against one source event is recorded, fires and **
 | `plugin_missing` | A **configured** hook names a plugin the host has not loaded, so the hook did nothing — the predicate did not gate, the transform did not shape (`detail` = the plugin name). The hop still fired: fail-open is the contract. Usually means `just plugins-install` was never run — see [trigger-plugins.md](trigger-plugins.md) |
 | `cycle` / `depth` | Provenance guards (`chain`, `[triggers] max_depth`) |
 | `target_unregistered` | `target_app` is not a registered app (`detail` = the app) |
+| `bad_params` | The resolved hop params (the trigger's `params` template with the `_trigger` envelope merged over it) fail the **target** app's declared `params_schema`, so the hop was not enqueued. `detail` is the same pointer-path message `POST /apps/{name}/jobs` answers with. Fix the template — a hop that cannot pass the enqueue door was only ever going to fail on the target app |
 | `dedup` | A job already exists for this hop's idempotency key (`detail` = the key) |
 | `enqueue_failed` | The enqueue itself errored (`detail` = the error) |
 | `eval_set_error` | The evaluation set could not be loaded, dropping **every** edge of that source event. Recorded against the sentinel `trigger_id = "*"`, since no individual trigger was reached — read it with `GET /triggers/*/runs`… which 404s, so query the table directly for now (see gaps) |

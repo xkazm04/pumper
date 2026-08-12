@@ -293,6 +293,7 @@ pub(crate) struct TestTriggerQuery {
     responses(
         (status = 200, description = "Dry-run decision `{would_fire, ...}` or, with `?fire=true`, `{fired, job}`"),
         (status = 404, description = "Trigger not found", body = Object),
+        (status = 422, description = "`?fire=true` only: the resolved params fail the target app's declared JSON Schema (the live fire path records this as a `bad_params` decision instead)", body = Object),
     )
 )]
 pub(crate) async fn test_trigger(
@@ -394,7 +395,14 @@ pub(crate) async fn test_trigger(
             "resolved_params": resolved_params,
         })));
     }
-    // Real fire: no idempotency key so tests are repeatable.
+    // Real fire: the same params door the live fire path applies, so `?fire=true`
+    // cannot create work the trigger itself would have refused.
+    if let Err(msg) =
+        crate::mcp::validate_app_params(&state.registry, &trigger.target_app, &resolved_params)
+    {
+        return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, msg));
+    }
+    // No idempotency key so tests are repeatable.
     let opts = EnqueueOptions {
         params: resolved_params,
         max_attempts: trigger.max_attempts,
@@ -422,10 +430,11 @@ pub(crate) struct RunsQuery {
 /// `runs` is the job lineage (`jobs.trigger_id`) — the jobs the trigger
 /// actually enqueued. `decisions` is the ledger (`trigger_runs`): one row per
 /// evaluation of this trigger against one source event, INCLUDING the negatives
-/// (`no_change_match`, `filter_miss`, `dedup`, `cycle`, `depth`,
-/// `target_unregistered`, `predicate_veto`, `plugin_missing`, `bad_filters`,
-/// `enqueue_failed`), which are otherwise invisible. Decisions page with
-/// `cursor`.
+/// (`no_change_match`, `status_mismatch`, `filter_miss`, `dedup`, `cycle`,
+/// `depth`, `target_unregistered`, `bad_params`, `predicate_veto`,
+/// `plugin_missing`, `bad_filters`, `eval_set_error`, `enqueue_failed`), which
+/// are otherwise invisible. The vocabulary is `pumper_core::TRIGGER_OUTCOMES`.
+/// Decisions page with `cursor`.
 #[utoipa::path(
     get,
     path = "/triggers/{id}/runs",

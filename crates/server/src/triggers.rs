@@ -933,9 +933,13 @@ pub async fn fire_external_triggers(
             .await;
             continue;
         }
+        let params = merged_params(&trigger.params, obj);
+        if !hop_params_pass_target_schema(state, trigger, &params, &ctx).await {
+            continue;
+        }
         let key = idempotency_key(&trigger.id, event_id);
         let opts = EnqueueOptions {
-            params: merged_params(&trigger.params, obj),
+            params,
             max_attempts: trigger.max_attempts,
             priority: trigger.priority,
             budget_usd: trigger.budget_usd,
@@ -992,6 +996,42 @@ pub async fn fire_external_triggers(
     fired
 }
 
+/// The hop's params door: the SAME schema check `POST /apps/{name}/jobs`
+/// applies, run on the resolved params (the trigger's template with the
+/// `_trigger` envelope merged over it) before anything is enqueued.
+///
+/// A trigger template that cannot satisfy its target's declared schema used to
+/// enqueue anyway, so the only trace was a failed job on the target app — the
+/// trigger's own `/runs` ledger said `fired`, which is the one thing that was
+/// not true. `bad_params` is now a first-class outcome carrying the door's
+/// pointer-path message in `detail`, so a broken template is visible where it
+/// was authored.
+///
+/// Returns false (and records the decision) when the hop must not be enqueued.
+async fn hop_params_pass_target_schema(
+    state: &AppState,
+    trigger: &Trigger,
+    params: &Value,
+    ctx: &Ctx<'_>,
+) -> bool {
+    match crate::mcp::validate_app_params(&state.registry, &trigger.target_app, params) {
+        Ok(()) => true,
+        Err(msg) => {
+            warn!(trigger = %trigger.id, app = %trigger.target_app,
+                  "trigger hop not enqueued: resolved params fail the target app's schema: {msg}");
+            record(
+                state,
+                NewTriggerRun {
+                    detail: Some(&msg),
+                    ..ctx.row(&trigger.id, "bad_params")
+                },
+            )
+            .await;
+            false
+        }
+    }
+}
+
 /// Enqueues one triggered hop under `key` (dedup-guarded). Returns 1 when a job
 /// was actually created, 0 when skipped/deduped/failed.
 async fn enqueue_hop(
@@ -1023,8 +1063,12 @@ async fn enqueue_hop(
         .await;
         return 0;
     }
+    let params = merged_params(&trigger.params, obj);
+    if !hop_params_pass_target_schema(state, trigger, &params, ctx).await {
+        return 0;
+    }
     let opts = EnqueueOptions {
-        params: merged_params(&trigger.params, obj),
+        params,
         max_attempts: trigger.max_attempts,
         priority: trigger.priority,
         budget_usd: trigger.budget_usd,
