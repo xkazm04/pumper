@@ -3,12 +3,12 @@ slug: http-transport-errors-terminal
 type: perfect/direction
 context: "[[http-engine]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 2e46fd0
 ---
 
 ## What & why
@@ -76,4 +76,44 @@ switched off in the only cross-engine test that could have seen this.
 
 ## Build record
 
-(filled during build)
+**Shipped `2e46fd0`. Director verdict: KEEP.** All five criteria met.
+
+*Process note*: this commit carries D2 **and** the engine half of
+[[profiled-fetch-is-honest]] — both live in `engine-http/src/lib.rs` and the builder had started
+the jar work before this direction's conformance run finished. Flagged in the report rather than
+papered over; the commit message names both directions and states what it carries, and both
+commits build and pass standalone. Accepted: the skill's own guidance is to commit by file
+boundaries and document the shared commit when directions interleave in one file.
+
+**The best engineering in the wave.** `TransportPredicates` — a struct-of-bools lifted off
+`reqwest::Error` — exists for a reason the direction never anticipated: **`reqwest::Error` has no
+public constructor**, so a classifier taking one could only ever be exercised through a live
+socket, and the cases that matter most here (TLS mismatch, NXDOMAIN) are precisely the ones a
+loopback test cannot produce. Splitting the rule out makes every combination testable and puts
+the decision in one reviewable place.
+
+Criterion 1–3: exactly one class is deterministic — `is_builder` → `Error::BadRequest`, a variant
+`is_terminal_for_job` **already admits, so nothing was widened and no construction-site audit was
+needed**. The exclusions carry more reasoning than the inclusion: `is_connect` stays retryable
+because it bundles NXDOMAIN-from-a-down-resolver, a captive portal failing the TLS handshake, and
+a restarting service, with no reqwest predicate separating them; a redirect-limit overflow stays
+retryable because it is usually a *session* fact an expired cookie causes. Predicates verified
+against reqwest 0.12.28 **source** (`url_bad_scheme` and a URL parse error are both
+`Kind::Builder`) *and* by a live test asserting `is_builder()` for `ftp://` and `::not a url::`.
+
+Criterion 4–5: the conformance battery gained `http_engine_with_retries` (`retries: 2`), so the
+ladder is no longer switched off, plus an EXPECTED map over three seams —
+`fetch (unsupported scheme)=true`, `fetch_bytes (unsupported scheme)=true`,
+**`fetch (connection refused)=false`**, the transient row pinned false on purpose because
+over-classification is this fix's failure mode. Attempt counts asserted as numbers: deterministic
+→ 0 origin hits and < 500 ms (vs 3.5 s of backoff if the ladder ran); transient → the engine's own
+`"failed after 3 attempts"` string plus elapsed ≥ 1.4 s. Battery 5 → 7 tests.
+
+**Builder refutation worth keeping**: `is_connect`/`is_timeout` walk the error's `source()` chain
+rather than matching a `Kind`, so they are **not** mutually exclusive with `is_builder`. A
+classifier written as a `match` on "which predicate is true" would be order-dependent and fragile;
+this one checks `builder` positively and has a test for the `builder + connect` combination.
+
+**Not verified (builder-disclosed)**: no live-network TLS mismatch or real NXDOMAIN was exercised.
+Both judgment calls rest on reading reqwest's source. Both leave the class *retryable*, which is
+the safe direction — a wrong reading costs wasted attempts, not failed jobs.

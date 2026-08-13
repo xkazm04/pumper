@@ -3,12 +3,12 @@ slug: profiled-fetch-is-honest
 type: perfect/direction
 context: "[[http-engine]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 2e46fd0 + 3c806b1
 ---
 
 ## What & why
@@ -94,4 +94,46 @@ session with the empty one**, logging `debug!("cookie jar saved")`.
 
 ## Build record
 
-(filled during build)
+**Shipped `2e46fd0` (engine half) + `3c806b1` (fetcher half). Director verdict: KEEP.** All six
+criteria met.
+
+**Criterion 1 — took lever (b), observable degradation, and the deciding argument was one this
+note listed as a *risk* rather than a reason**: `docs/features/fetching.md:230` documents
+establishing a login by "driving a login POST on the HTTP tier", which **is** a profiled fetch
+with no jar. Refusing at the seam would have broken the tier's own onboarding path. So: a WARN at
+load, plus a reserved `x-pumper-anonymous-profile` header on the `FETCHED_VIA_HEADER` pattern,
+written **both ways round on every profiled response** (so an origin cannot forge it) and read
+only when the caller asked for a profile.
+
+A subtlety neither the brief nor the scout named: **`sent_anonymous` is captured *before* `send`**,
+because a login response's own `Set-Cookie` is applied to the jar by reqwest during the call and
+would otherwise mask the fact that *this* request carried nothing.
+
+Criterion 2: `create_dir_all` moved from jar *load* to the first *save* that has a cookie —
+verified against `GET /profiles`, which enumerates directories, so a typo genuinely stops
+appearing there. Criterion 3: the dirty flag survives an `Err` and the write is retried, bounded
+at `MAX_SAVE_RETRIES = 5` so a permanently unwritable path cannot become a warn-per-second
+forever. Criterion 4: `save_decision` is a three-way enum (`Write` / `NothingToPersist` /
+`WouldClobber`) whose doc **states the cost of the rule honestly** — a genuine logout no longer
+erases the stored jar, so a dead cookie survives until the next login overwrites it; the cheaper
+failure, since the site rejects a dead cookie whereas a clobbered session has no recovery.
+
+Criterion 5: three live tests in `tests/profiles.rs` — absent jar, save-failure re-arm (via a
+blocking file later removed), and the clobber-a-restored-backup sequence. Criterion 6:
+`fetching.md:189` no longer describes this as a live gap, and the conformance battery's profile
+probe now covers the **absent** jar (`an_absent_profile_is_marked_on_the_response_and_never_invents_a_profile`),
+not only the unsafe name.
+
+`3c806b1` lifts the marker into the escalation trail (so it reaches `cost_events.detail` and the
+job receipt) and into `TierTrace.detail` **including the winning entry** — the winning fetch is
+the one about to be stored as a revision. Bonus simplification: the two hand-rolled `detail` match
+arms (winning / losing) collapsed into one `http_tier_detail` renderer, so a third note could not
+drift between two places. `Error::Profile` correctly left non-terminal, per this note's risk.
+
+**Left open, builder-disclosed and now recorded in `fetching.md`'s Known gaps**: no `fsync` before
+the jar rename (named in this note's evidence, not in its criteria); the fixed-path `json.tmp`
+collision between two processes sharing one `profiles_dir`; and flush-on-shutdown. All three were
+explicit non-goals. Also: `ANONYMOUS_PROFILE_HEADER` and its helpers are reachable as
+`pumper_core::engine::…` but not from the crate root, because `crates/core/src/lib.rs` was outside
+the write set — consistent with how `fetcher::REMOTE_NODE_HEADER` is consumed today, so judged a
+non-gap rather than silently worked around.

@@ -3,12 +3,12 @@ slug: http-fetch-has-a-deadline
 type: perfect/direction
 context: "[[http-engine]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 967c409
 ---
 
 ## What & why
@@ -79,4 +79,38 @@ at the source, so every caller inherits the bound instead of re-deriving it.
 
 ## Build record
 
-(filled during build)
+**Shipped `967c409`. Director verdict: KEEP.** All six criteria met.
+
+**Criterion 2 — chose Option B** (`[http] total_budget_secs`, default 300, `0` disables), with
+an argument the direction had not made: redefining `timeout_secs` would, at the shipped default
+of 30 s, *disable retries entirely* for a slow-but-working page plus a short `Retry-After`.
+Justified in a doc comment on the field; `config.toml` and `fetching.md` both updated.
+
+Four extracted pure functions, each with an anti-pattern-named test: `fetch_budget`,
+`capped_retry_sleep`, `attempt_timeout`, `budget_exhausted`. Two judgment calls the builder made
+and the Director did not specify:
+- **`capped_retry_sleep` refuses rather than truncates.** Truncating would retry *earlier* than
+  the server's `Retry-After` — "trading a wall-clock bug for a politeness one".
+- **Governor waits are deliberately not budget-bounded**, with the reasoning in the code:
+  shortening a politeness wait is not this deadline's job. A wait that eats the budget is caught
+  by the next check.
+- `fetch_budget` raises the budget to at least one full per-attempt timeout, so `mpsv-vpm`'s
+  widened 188 MB download still gets one complete attempt.
+
+**Better than asked**: the config test asserts the default sits **above** the worst benign ladder
+*and* **below** `job_timeout_secs` — a guard that keeps a future default change from silently
+crossing either line.
+
+Criterion 4 met with `tests/retry_budget.rs`, the first tests anywhere to execute the loop more
+than once: 3 origin hits with elapsed ∈ [1.4 s, 8 s] on a retryable ladder; **1 hit and < 5 s
+where the old code spent ~37.5 min** on a `Retry-After: 600` host; 2–6 hits against 21 configured
+attempts. Rider (criterion 5) landed: `[http] max_body_bytes = 0` refused, message naming the
+browser tier's opposite meaning for the same number.
+
+**Builder correction to this note**: the "~37.5 minutes" figure counts only the three sleeps; with
+the four attempts the real worst case is ~39.5 min. Conclusion unchanged (still past
+`job_timeout_secs`), understated rather than wrong. Also: criterion 1 over-scoped `fetch_bytes`,
+which has no retry loop and was already bounded end to end — the criterion implied a defect that
+did not exist there. Bound made explicit anyway.
+
+Gates: `cargo test -p pumper-engine-http` 41/0. Full workspace green at the wave gate.

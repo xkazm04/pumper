@@ -3,12 +3,12 @@ slug: plugin-run-door-honest
 type: perfect/direction
 context: "[[plugin-runner]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 7b6d5f1
 ---
 
 ## What & why
@@ -97,4 +97,40 @@ false for the app that *is* extraction.
 
 ## Build record
 
-(filled during build)
+**Shipped `7b6d5f1`. Director verdict: KEEP.** All six criteria met.
+
+Criterion 1: `require_runnable_plugin` refuses via `ctx.plugins.has()` **before any fetch, dataset
+read or `register_rules` write**. `unloadable_plugin_error` distinguishes "typo among these" from
+"nothing loaded at all → check `[plugins] enabled` / `just plugins-install`". Confirmed en route
+that `has()` really does answer executability (`engine-wasm/src/lib.rs:412` filters on the same
+`executable` flag `list()` uses), so a describe-only module is refused too.
+
+Criterion 2: `Error::BadRequest` — and **the audit this note demanded found the reason not to
+widen**: widening `Error::Plugin` would have made `trap` terminal. (Also `core/src/error.rs` was
+the sibling lot's file this round, so a widening would have straddled the partition.)
+
+Criterion 3: `DocOutcome = Result<Value, DocError>` carries
+`DocFailure::{Fetch, EmptyDocument, Plugin(PluginFailure)}` through `run_plugin_batch` into all
+three modes. The result gains `errors`, `errors_by_class` (**absent classes omitted, never
+zeroed** — a zero is a claim), and `plugin_reported_errors`, which is what finally separates a
+plugin's own legitimate `{"error": "no <title> found"}` *data* from a call that failed. Each
+echoed failure carries `error_class`.
+
+Criterion 4 — **policy decided explicitly and documented on the predicate**: partial failure
+succeeds, **total failure fails**, via `every_document_failed` + a *retryable* `Error::App` naming
+the per-class counts (a site being down is transient, unlike the door refusal). A run that
+attempted nothing is a quiet success.
+
+Criterion 5–6, and the part the Director would have missed: the builder gave
+`app_fetch_chokepoint.rs` a real `EchoPlugins` host and asserted `ran == 2 / errors == 0` — then
+**found the same passes-on-a-run-where-nothing-happened shape in the extractor arm of the same
+file** and pinned `fetched == 2` there too. The metering and cost-event-per-URL invariants stayed
+green throughout (`crates/core/tests/fetch_chokepoint.rs` 4/4, untouched). First `run()`-level
+tests in the app: `tests/run_door.rs`, 9 tests, plus `tests/common/mod.rs` harness.
+
+Gates: `cargo test -p app-plugin` 61/0 (42 lib + 9 run_door + 6 + 4);
+`cargo test -p pumper-server app_fetch_chokepoint` 4/0.
+
+**Builder note carried forward**: `TestContext` hard-wires `NoPlugins` and has no seam to override
+it (`core/src/testing.rs`, outside the write set); worked around via the public
+`AppContext::plugins` field. A `TestContext::plugins()` builder is **banked** as a follow-up.

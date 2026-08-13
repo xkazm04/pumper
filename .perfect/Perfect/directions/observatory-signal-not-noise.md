@@ -3,12 +3,12 @@ slug: observatory-signal-not-noise
 type: perfect/direction
 context: "[[plugin-runner]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 3258bf4
 ---
 
 ## What & why
@@ -108,4 +108,44 @@ just fell through the wrong side.)
 
 ## Build record
 
-(filled during build)
+**Shipped `3258bf4`. Director verdict: KEEP.** All five criteria met.
+
+Criteria 1–2: seven volatile fields declared via `derived_paths()` and written through
+`upsert_many_with_derived`, following eu-sedia's shape **including its declaration-equality test**.
+The criterion was behavioral and was met behaviorally:
+`a_rerun_over_an_unchanged_corpus_reports_unchanged_not_every_row_changed` proves run 2 reports
+`unchanged: 1, changed: 0` **and appends no second revision** — paired with
+`a_real_behaviour_change_still_marks_the_row_changed` (a trapping plugin → `changed: 1`,
+`drift_score > 0.9`). That pairing is what makes deriving telemetry *safe* rather than merely
+quiet, and it was the builder's addition, not the criterion's.
+
+Criterion 3: `AuditedPlugin` + `parse_audited_plugins` — an entry may be `"name"` (inheriting
+job-level `plugin_params`) or `{name, params}`. `row_key` gives a configured replay
+`plugin@<fp>|site` while an unconfigured one keeps the historic `plugin|site` key, so no orphaned
+rows on deploy. Test: two configurations → two rows, and the bare host's params are all null.
+
+Criterion 4: `classify_page` → `PageSource::{Replayable, Empty, Unreadable}`; empty stored
+artifacts become `empty_artifacts`/`pages_empty` and are excluded from `classified`, `rates` and
+`pages_replayed`. `classify_outcome` and its anti-regression test untouched, as instructed.
+Criterion 5: the module prose and `extraction.md` now describe what the code does. Rider taken:
+`sample_per_site` gains `maximum: 500` plus a matching code clamp.
+
+**Two builder refutations of this note's criteria, both load-bearing and both Director-verified:**
+1. **`DerivedPaths` takes dot-separated names, not JSON pointers.** Criterion 1 specified
+   `/run_at`, `/avg_elapsed_ms`, …; `DerivedPaths::new` filters empty strings and resolves
+   `.`-separated names through objects (`datasets.rs:3757-3768`), so a leading `/` is a **silent
+   no-op**. The seam would have looked adopted and done nothing — precisely the failure class this
+   direction existed to kill.
+2. **`drift_score` must be derived, not "argued either way".** With it in the identity criterion 2
+   *cannot* pass: run 1 writes `null`, run 2 writes `0.0`. The builder hit this as a real red test.
+   Safe to derive because it is a pure function of `rates`, which stays in the identity.
+
+Gates: `cargo test -p app-plugin --test observatory` 4/0.
+
+**Builder-disclosed limits**: no wasm was executed (every test uses an in-process `StubPlugins`;
+`run_metered` falls through to the unmetered default, so the fuel/memory derived paths are
+exercised as `null` rather than as moving numbers — the real host is only reachable via
+`--ignored` tests with built plugins). Existing live `plugin/observatory` rows will report
+`changed` once on the first run after deploy (the documented one-time re-hash), and a plugin that
+was audited bare and is later given params appears under a **new** key rather than migrating —
+judged acceptable since the dataset has zero readers, but it is not migration-tested.
