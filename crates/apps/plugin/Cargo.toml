@@ -13,3 +13,12 @@ futures.workspace = true
 # Versioned-archive source mode: `as_of` timestamp comparison + backfill URL patterns.
 chrono.workspace = true
 regex.workspace = true
+
+[dev-dependencies]
+# `run()`-level tests: the shared AppContext builder + TempStore fixture. The
+# app crate itself has no tokio edge (the fan-out is `futures`-only), so the
+# runtime is a test-only dependency.
+pumper-core = { workspace = true, features = ["test-support"] }
+tokio.workspace = true
+uuid.workspace = true
+async-trait.workspace = true

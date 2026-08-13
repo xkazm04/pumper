@@ -80,10 +80,37 @@ fn extractor_params(urls: &[&str], strategy: &str) -> Value {
     })
 }
 
-/// Plugin params over `urls` (the plugin itself is never loaded here — the
-/// assertions are about the fetch that happens *before* the module runs).
+/// Plugin params over `urls`. The module named here must be one
+/// [`EchoPlugins`] loads: the plugin app now refuses an unloadable name at the
+/// door, *before any fetch*, which would make these fetch assertions vacuous.
 fn plugin_params(urls: &[&str], strategy: &str) -> Value {
-    json!({ "plugin": "noop", "urls": urls, "strategy": strategy })
+    json!({ "plugin": "echo", "urls": urls, "strategy": strategy })
+}
+
+/// A plugin host that loads one module and echoes the document back.
+///
+/// THE ANTI-PATTERN THIS REPLACES: these two tests ran the plugin app against
+/// the context builder's default `NoPlugins`, where **every** call fails
+/// `plugins_disabled`. Both then `unwrap()`ed a run in which every single
+/// document failed and asserted only on the cost ledger — so they passed green
+/// on a total-failure run for their whole life, and were the proof that nothing
+/// guarded the app's run door. A host that actually runs keeps the metering
+/// invariants meaningful (they are about the fetch that happens *before* the
+/// module) while letting the run reach a real result.
+struct EchoPlugins;
+
+#[async_trait::async_trait]
+impl pumper_core::Plugins for EchoPlugins {
+    async fn run(&self, name: &str, input: &str, _params: &Value) -> Result<Value> {
+        assert_eq!(name, "echo", "the app must call the plugin it was given");
+        Ok(json!({ "doc": input }))
+    }
+    fn list(&self) -> Vec<String> {
+        vec!["echo".to_string()]
+    }
+    async fn reload(&self) -> Result<usize> {
+        Ok(1)
+    }
 }
 
 // ── Criterion: budget exhaustion downgrades, it does not spend ───────────────
@@ -167,7 +194,7 @@ async fn exhausted_budget_downgrades_plugin_instead_of_spending() {
     let thin = "<html><h1>T</h1></html>";
     let store = TempStore::new("chokepoint-plugin-broke").await;
     let claude = Arc::new(ScriptedResearcher::new().always_text("x".repeat(400)));
-    let ctx = TestContext::new(&store.storage, "plugin")
+    let mut ctx = TestContext::new(&store.storage, "plugin")
         .params(plugin_params(
             &["http://a/", "http://b/"],
             "auto_with_research",
@@ -179,11 +206,16 @@ async fn exhausted_budget_downgrades_plugin_instead_of_spending() {
         ))
         .budget_usd(0.10)
         .build();
+    ctx.plugins = Arc::new(EchoPlugins);
     ctx.meter("claude", None, 0.10, Some("prior call")).await;
     let job = ctx.job_id;
     let costs = ctx.costs.clone();
     let out = app_plugin::Plugin.run(ctx).await.unwrap();
 
+    // The fixture has to have RUN, or the metering assertions below are about a
+    // run in which nothing happened.
+    assert_eq!(out["ran"], 2, "both documents must reach the module: {out}");
+    assert_eq!(out["errors"], 0, "{out}");
     assert_eq!(
         claude.call_count(),
         0,
@@ -218,7 +250,7 @@ async fn every_fanned_out_url_lands_a_cost_event() {
         ("plugin", plugin_params(&["http://a/", "http://b/"], "http")),
     ] {
         let store = TempStore::new("chokepoint-meter").await;
-        let ctx = TestContext::new(&store.storage, app)
+        let mut ctx = TestContext::new(&store.storage, app)
             .params(params)
             .engines(engines_with(
                 CannedHttp::new(body),
@@ -226,14 +258,23 @@ async fn every_fanned_out_url_lands_a_cost_event() {
                 Arc::new(Dead),
             ))
             .build();
+        ctx.plugins = Arc::new(EchoPlugins);
         let job = ctx.job_id;
         let costs = ctx.costs.clone();
         match app {
             "extractor" => {
-                app_extractor::Extractor.run(ctx).await.unwrap();
+                let out = app_extractor::Extractor.run(ctx).await.unwrap();
+                assert_eq!(
+                    out["fetched"], 2,
+                    "{app}: the run must have happened: {out}"
+                );
             }
             _ => {
-                app_plugin::Plugin.run(ctx).await.unwrap();
+                let out = app_plugin::Plugin.run(ctx).await.unwrap();
+                // Without this the whole loop passed on a run where every
+                // document failed and no record was ever produced.
+                assert_eq!(out["ran"], 2, "{app}: the run must have happened: {out}");
+                assert_eq!(out["errors"], 0, "{app}: {out}");
             }
         }
 

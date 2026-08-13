@@ -4,8 +4,11 @@
 //! even if untrusted. Two input modes, mirroring `extractor`: fetch live `urls`,
 //! or read stored bodies from a crawl→dataset `source` (no re-fetch).
 
+use std::collections::BTreeMap;
+
 use async_trait::async_trait;
 use futures::StreamExt;
+use pumper_core::error::PluginFailure;
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, FetchRequest, FetchStrategy, ManifestExample,
     Provenance, Record, Result, ScrapeApp,
@@ -91,6 +94,228 @@ fn parse_concurrency(params: &Value) -> usize {
         .and_then(Value::as_u64)
         .map(|n| n.max(1) as usize)
         .unwrap_or(DEFAULT_CONCURRENCY)
+}
+
+/// The refusal for a `plugin` param this host cannot execute.
+///
+/// [`Error::BadRequest`] deliberately, and not by widening anything: it is the
+/// variant the runtime already treats as **terminal for the job**
+/// (`Error::is_terminal_for_job`), and every input a retry would re-read — the
+/// job's `plugin` param, the installed module set, `[plugins] enabled` — is
+/// fixed for the life of the job, so the backoff ladder can only produce three
+/// identical refusals and ~30s of waiting. `Error::Plugin` would carry a richer
+/// class but is retryable, and classifying that whole variant terminal would
+/// silently make a `trap` terminal too — the audit r18's profile fix asks for.
+fn unloadable_plugin_error(plugin: &str, loaded: &[String]) -> Error {
+    let available = if loaded.is_empty() {
+        "no plugins are loaded at all — check `[plugins] enabled` and run \
+         `just plugins-install`"
+            .to_string()
+    } else {
+        format!("loaded and runnable: {}", loaded.join(", "))
+    };
+    Error::BadRequest(format!(
+        "plugin '{plugin}' is not loaded (see GET /plugins); {available}"
+    ))
+}
+
+/// Refuses a run whose named plugin the host cannot execute — **before** any
+/// fetch, any dataset read and any rules-registry write.
+///
+/// THE ANTI-PATTERN THIS CLOSES: the door was `ctx.require_str("plugin")?`, a
+/// type check and nothing more. A typo, an uninstalled build, or
+/// `[plugins] enabled = false` therefore produced one `{"error": ..}` record per
+/// URL, `ran: 0`, zero dataset writes and `Ok(..)` — i.e. a green job on
+/// `GET /jobs`, a `succeeded` SSE event, a fired result webhook and an empty
+/// dataset. Observatory mode in this same app has always validated
+/// (`observatory::parse_config`), as does the trigger pipeline; the asymmetry
+/// inside one app was the whole defect.
+///
+/// [`Plugins::has`] answers **executability**, not mere presence — the wasm host
+/// resolves it through the same `executable` flag `list()` filters on — so a
+/// describe-only module (no `extract`/`extract_v2` export) is refused here
+/// instead of failing once per document.
+///
+/// [`Plugins::has`]: pumper_core::plugin::Plugins::has
+fn require_runnable_plugin(ctx: &AppContext, plugin: &str) -> Result<()> {
+    if ctx.plugins.has(plugin) {
+        return Ok(());
+    }
+    Err(unloadable_plugin_error(plugin, &ctx.plugins.list()))
+}
+
+/// Why one document produced no plugin output.
+///
+/// Round 14 gave the host a typed [`PluginFailure`]; this app threw it away at
+/// the fan-out (`json!({"error": e.to_string()})`), flattening
+/// `Unknown | Disabled | Trap | MalformedOutput` into one opaque string — so the
+/// result could not report failures by class, and `engine-wasm`'s "extraction
+/// propagates the error" was false for the app that *is* extraction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DocFailure {
+    /// The tiered fetch never delivered a document (urls mode only).
+    Fetch,
+    /// The body was empty, so the plugin was never called. A corpus problem,
+    /// not the plugin's — kept distinct for exactly that reason.
+    EmptyDocument,
+    /// The sandbox call failed, carrying the host's own class.
+    Plugin(PluginFailure),
+}
+
+impl DocFailure {
+    /// Stable snake_case token for the result's `errors_by_class` breakdown.
+    /// The plugin classes reuse [`PluginFailure::as_str`], which is already a
+    /// contract (the trigger ledger's outcome vocabulary is built from it), so
+    /// the two surfaces cannot drift apart.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            DocFailure::Fetch => "fetch",
+            DocFailure::EmptyDocument => "empty_document",
+            DocFailure::Plugin(kind) => kind.as_str(),
+        }
+    }
+
+    /// Classify the error a plugin call returned. An error carrying no plugin
+    /// class did not come out of the sandbox at all, so it is reported as a
+    /// host fault rather than promoted into a class it never claimed — the same
+    /// rule `observatory::classify_outcome` applies.
+    pub(crate) fn from_plugin_error(e: &Error) -> Self {
+        DocFailure::Plugin(e.plugin_failure().unwrap_or(PluginFailure::Host))
+    }
+}
+
+/// A classified per-document failure: the class plus the message that produced
+/// it (free to say whatever is useful — nothing classifies on the prose).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DocError {
+    class: DocFailure,
+    message: String,
+}
+
+impl DocError {
+    fn new(class: DocFailure, message: impl Into<String>) -> Self {
+        Self {
+            class,
+            message: message.into(),
+        }
+    }
+}
+
+/// One document's outcome: the plugin's own JSON output, or a classified
+/// failure. Carried through the fan-out instead of being stringified at the
+/// call site, so the result can count failures BY CLASS.
+pub(crate) type DocOutcome = std::result::Result<Value, DocError>;
+
+/// The result-echo record for one document outcome.
+///
+/// A failure keeps the long-standing `{"error": <message>}` shape — readers and
+/// [`upsert_items`] both key on that field's presence — and now names its
+/// `error_class` alongside, so a `trap` is distinguishable from a
+/// `malformed_output` without parsing prose.
+fn echo_record(outcome: &DocOutcome) -> Value {
+    match outcome {
+        Ok(v) => v.clone(),
+        Err(e) => json!({ "error": e.message, "error_class": e.class.as_str() }),
+    }
+}
+
+/// Per-document outcome counts for one run: what ran, what failed and why.
+///
+/// `ran` counts documents whose plugin call **returned**, whatever it returned.
+/// That is deliberately not the same predicate as "was written": a plugin's own
+/// `{"error": "no <title> found"}` output is DATA (the module ran and reported
+/// it could not extract) and is counted separately in `plugin_reported` rather
+/// than being folded into the host-failure classes. Before the typed seam the
+/// two were the same untyped string test, so a run could not say which had
+/// happened.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct OutcomeTally {
+    /// Documents whose plugin call returned.
+    ran: usize,
+    /// Documents that produced no plugin answer at all, counted per class.
+    failures: BTreeMap<&'static str, usize>,
+    /// Returned outputs carrying an `error` key. Not written to the dataset
+    /// (see [`upsert_items`]), so this count is the only place they are visible.
+    plugin_reported: usize,
+}
+
+impl OutcomeTally {
+    fn record(&mut self, outcome: &DocOutcome) {
+        match outcome {
+            Ok(v) => {
+                self.ran += 1;
+                if v.get("error").is_some() {
+                    self.plugin_reported += 1;
+                }
+            }
+            Err(e) => *self.failures.entry(e.class.as_str()).or_default() += 1,
+        }
+    }
+
+    /// Folds another batch's tally in — backfill runs batch by batch and the
+    /// result reports one set of counts for the attempt.
+    fn merge(&mut self, other: &OutcomeTally) {
+        self.ran += other.ran;
+        self.plugin_reported += other.plugin_reported;
+        for (class, n) in &other.failures {
+            *self.failures.entry(class).or_default() += n;
+        }
+    }
+
+    /// Documents that produced no plugin answer.
+    pub(crate) fn errors(&self) -> usize {
+        self.failures.values().sum()
+    }
+
+    /// Documents the run actually attempted to run the plugin over.
+    pub(crate) fn attempted(&self) -> usize {
+        self.ran + self.errors()
+    }
+
+    /// `{class: count}` for the classes that actually occurred — an object of
+    /// zeros would read as "we checked for a trap and found none", which a run
+    /// that never traps has no way to distinguish from one that never looked.
+    fn by_class(&self) -> Value {
+        Value::Object(
+            self.failures
+                .iter()
+                .map(|(class, n)| ((*class).to_string(), json!(n)))
+                .collect(),
+        )
+    }
+}
+
+/// **Partial failure is data; total failure is a failed run.**
+///
+/// The policy, stated deliberately rather than inherited: a run where SOME
+/// documents failed still produced records, and failing it would throw away a
+/// 499-of-500 success — so those runs succeed and report the failures by class.
+/// A run where EVERY attempted document failed produced nothing, and reporting
+/// it `succeeded` is exactly what let a 100%-failed plugin job show green on
+/// `GET /jobs`, emit a `succeeded` SSE event and fire a result webhook over an
+/// empty dataset. A run that attempted **nothing** (an empty key set, a resumed
+/// backfill with no rows left) is not a failure — there was nothing to fail at,
+/// and an empty source is a legitimate quiet run.
+fn every_document_failed(tally: &OutcomeTally) -> bool {
+    tally.attempted() > 0 && tally.ran == 0
+}
+
+/// The failure for a run whose every document failed.
+///
+/// [`Error::App`], so it stays **retryable**: total failure here is usually
+/// transient (a site down, every fetch timing out), unlike the deterministic
+/// door refusal in [`unloadable_plugin_error`], which is terminal.
+fn total_failure_error(plugin: &str, tally: &OutcomeTally) -> Error {
+    let classes: Vec<String> = tally
+        .failures
+        .iter()
+        .map(|(class, n)| format!("{class}={n}"))
+        .collect();
+    Error::App(format!(
+        "plugin '{plugin}': all {} documents failed ({}) — nothing was written",
+        tally.attempted(),
+        classes.join(", ")
+    ))
 }
 
 /// What a run's plugin calls cost, rolled up across the fan-out.
@@ -458,10 +683,20 @@ impl ScrapeApp for Plugin {
                 },
             ],
             output_shape: Some(
-                "{ran, errors, dataset, new, changed, unchanged} — per-document plugin results \
-                 deduped into the output dataset. Observatory mode: {sites, rows, \
-                 pages_replayed, low_confidence_sites, flagged_empty_rising, new, changed, \
-                 unchanged} with per-(plugin, site) drift rows in the observatory dataset",
+                "{mode, plugin, ran, errors, errors_by_class, plugin_reported_errors, new, \
+                 changed, unchanged, cost|null} — per-document plugin results deduped into the \
+                 output dataset. `ran` counts calls that RETURNED; `errors` counts documents \
+                 the plugin never answered for, broken down by class in `errors_by_class` \
+                 (fetch / empty_document / unknown_plugin / plugins_disabled / missing_export / \
+                 trap / malformed_output / host_error); `plugin_reported_errors` counts outputs \
+                 the plugin returned carrying its own `error` key (data, not written). A run \
+                 whose every attempted document failed FAILS the job. Plus, per mode: urls \
+                 {requested, records[]}; source {source{app,dataset}, requested, loaded, \
+                 missing, missing_keys[], records[]}; backfill {resumed_from_checkpoint, \
+                 scanned, skipped_pattern, loaded, batches, missing, missing_keys[]} (no \
+                 records echo). Observatory mode: {sites, rows, pages_replayed, \
+                 low_confidence_sites, flagged_empty_rising, new, changed, unchanged} with \
+                 per-(plugin, site) drift rows in the observatory dataset",
             ),
             cost_class: CostClass::Metered,
         }
@@ -479,6 +714,9 @@ impl ScrapeApp for Plugin {
             return observatory::run_observatory(&ctx).await;
         }
         let plugin = ctx.require_str("plugin")?.to_string();
+        // The door: refuse a plugin this host cannot execute BEFORE the run
+        // spends a fetch, a dataset read or a registry write on it.
+        require_runnable_plugin(&ctx, &plugin)?;
         let dataset = ctx
             .params
             .get("dataset")
@@ -564,49 +802,70 @@ impl Plugin {
             async move {
                 let doc = match ctx.fetch(req).await {
                     Ok(out) => out.html.or(out.text).unwrap_or_default(),
-                    Err(e) => return (json!({ "error": format!("fetch: {e}") }), None),
+                    Err(e) => {
+                        return (
+                            Err(DocError::new(DocFailure::Fetch, format!("fetch: {e}"))),
+                            None,
+                        )
+                    }
                 };
                 if doc.is_empty() {
-                    return (json!({ "error": "empty document" }), None);
+                    return (
+                        Err(DocError::new(DocFailure::EmptyDocument, "empty document")),
+                        None,
+                    );
                 }
                 match p.run_metered(&name, &doc, &pp).await {
-                    Ok((value, stats)) => (value, Some(stats)),
-                    Err(e) => (json!({ "error": e.to_string() }), None),
+                    Ok((value, stats)) => (Ok(value), Some(stats)),
+                    Err(e) => (
+                        Err(DocError::new(
+                            DocFailure::from_plugin_error(&e),
+                            e.to_string(),
+                        )),
+                        None,
+                    ),
                 }
             }
         });
-        let paired: Vec<(Value, Option<pumper_core::plugin::PluginRunStats>)> =
+        let paired: Vec<(DocOutcome, Option<pumper_core::plugin::PluginRunStats>)> =
             futures::stream::iter(tasks)
                 .buffered(concurrency)
                 .collect()
                 .await;
         let mut cost = CostRollup::default();
-        let mut results: Vec<Value> = Vec::with_capacity(paired.len());
-        for (value, stats) in paired {
+        let mut tally = OutcomeTally::default();
+        let mut outcomes: Vec<DocOutcome> = Vec::with_capacity(paired.len());
+        for (outcome, stats) in paired {
             if let Some(stats) = &stats {
                 cost.record(stats);
             }
-            results.push(value);
+            tally.record(&outcome);
+            outcomes.push(outcome);
+        }
+        if every_document_failed(&tally) {
+            return Err(total_failure_error(plugin, &tally));
         }
 
-        let ran = results.iter().filter(|r| r.get("error").is_none()).count();
         let metas: Vec<DocMeta> = urls.iter().map(|u| DocMeta::live(u.clone())).collect();
-        let items = upsert_items(&metas, &mut results);
+        let items = upsert_items(&metas, &mut outcomes);
         let summary = ctx
             .upsert_many_with_provenance(dataset, &items, batch_provenance(&metas, rules_hash))
             .await?;
 
-        Ok(json!({
-            "mode": "urls",
-            "plugin": plugin,
-            "requested": urls.len(),
-            "ran": ran,
-            "new": summary.new.len(),
-            "changed": summary.changed.len(),
-            "unchanged": summary.unchanged,
-            "cost": cost.to_json(),
-            "records": results,
-        }))
+        Ok(with_outcome_fields(
+            json!({
+                "mode": "urls",
+                "plugin": plugin,
+                "requested": urls.len(),
+                "ran": tally.ran,
+                "new": summary.new.len(),
+                "changed": summary.changed.len(),
+                "unchanged": summary.unchanged,
+                "cost": cost.to_json(),
+                "records": outcomes.iter().map(echo_record).collect::<Vec<Value>>(),
+            }),
+            &tally,
+        ))
     }
 
     /// Source mode: run the plugin over already-crawled bodies (no re-fetch).
@@ -769,40 +1028,46 @@ impl Plugin {
             }
         }
 
-        let (metas, mut results, cost) = self.run_plugin_batch(ctx, plugin, keyed).await;
+        let (metas, mut outcomes, cost, tally) = self.run_plugin_batch(ctx, plugin, keyed).await;
         let loaded = metas.len();
-        let ran = results.iter().filter(|r| r.get("error").is_none()).count();
-        let items = upsert_items(&metas, &mut results);
+        if every_document_failed(&tally) {
+            return Err(total_failure_error(plugin, &tally));
+        }
+        let items = upsert_items(&metas, &mut outcomes);
         let summary = ctx
             .upsert_many_with_provenance(dataset, &items, batch_provenance(&metas, rules_hash))
             .await?;
 
-        Ok(json!({
-            "mode": "source",
-            "plugin": plugin,
-            "source": { "app": src_app, "dataset": src_dataset },
-            "requested": requested,
-            "loaded": loaded,
-            "ran": ran,
-            "missing": missing.len(),
-            "missing_keys": missing,
-            "new": summary.new.len(),
-            "changed": summary.changed.len(),
-            "unchanged": summary.unchanged,
-            "cost": cost.to_json(),
-            "records": results,
-        }))
+        Ok(with_outcome_fields(
+            json!({
+                "mode": "source",
+                "plugin": plugin,
+                "source": { "app": src_app, "dataset": src_dataset },
+                "requested": requested,
+                "loaded": loaded,
+                "ran": tally.ran,
+                "missing": missing.len(),
+                "missing_keys": missing,
+                "new": summary.new.len(),
+                "changed": summary.changed.len(),
+                "unchanged": summary.unchanged,
+                "cost": cost.to_json(),
+                "records": outcomes.iter().map(echo_record).collect::<Vec<Value>>(),
+            }),
+            &tally,
+        ))
     }
 
     /// Runs the plugin over one batch of `(meta, body)` pairs with the bounded,
     /// order-preserving fan-out (bodies are moved into the tasks, never cloned);
-    /// returns the metas re-paired positionally with the results.
+    /// returns the metas re-paired positionally with the typed outcomes, the
+    /// cost rollup and the per-class outcome tally.
     async fn run_plugin_batch(
         &self,
         ctx: &AppContext,
         plugin: &str,
         keyed: Vec<(DocMeta, String)>,
-    ) -> (Vec<DocMeta>, Vec<Value>, CostRollup) {
+    ) -> (Vec<DocMeta>, Vec<DocOutcome>, CostRollup, OutcomeTally) {
         let (metas, docs): (Vec<DocMeta>, Vec<String>) = keyed.into_iter().unzip();
         let concurrency = concurrency(ctx);
         let plugin_params = plugin_params(ctx);
@@ -813,29 +1078,40 @@ impl Plugin {
             let pp = plugin_params.clone();
             async move {
                 if doc.is_empty() {
-                    return (json!({ "error": "empty document" }), None);
+                    return (
+                        Err(DocError::new(DocFailure::EmptyDocument, "empty document")),
+                        None,
+                    );
                 }
                 match p.run_metered(&name, &doc, &pp).await {
-                    Ok((value, stats)) => (value, Some(stats)),
-                    Err(e) => (json!({ "error": e.to_string() }), None),
+                    Ok((value, stats)) => (Ok(value), Some(stats)),
+                    Err(e) => (
+                        Err(DocError::new(
+                            DocFailure::from_plugin_error(&e),
+                            e.to_string(),
+                        )),
+                        None,
+                    ),
                 }
             }
         });
         // Bounded run fan-out; `buffered` keeps order for the positional zip.
-        let paired: Vec<(Value, Option<pumper_core::plugin::PluginRunStats>)> =
+        let paired: Vec<(DocOutcome, Option<pumper_core::plugin::PluginRunStats>)> =
             futures::stream::iter(tasks)
                 .buffered(concurrency)
                 .collect()
                 .await;
         let mut cost = CostRollup::default();
-        let mut results: Vec<Value> = Vec::with_capacity(paired.len());
-        for (value, stats) in paired {
+        let mut tally = OutcomeTally::default();
+        let mut outcomes: Vec<DocOutcome> = Vec::with_capacity(paired.len());
+        for (outcome, stats) in paired {
             if let Some(stats) = &stats {
                 cost.record(stats);
             }
-            results.push(value);
+            tally.record(&outcome);
+            outcomes.push(outcome);
         }
-        (metas, results, cost)
+        (metas, outcomes, cost, tally)
     }
 
     /// Backfill mode: fan the plugin over ALL archived versions in the source
@@ -879,6 +1155,12 @@ impl Plugin {
         // `BackfillState`, because a resumed attempt did not pay for the batches
         // a previous one ran, and claiming it did would misprice the plugin.
         let mut cost = CostRollup::default();
+        // Likewise per ATTEMPT: `ran` is checkpointed (it is a fact about the
+        // logical run), but the failure breakdown describes the documents THIS
+        // attempt saw, and restating a prior attempt's traps as this one's
+        // observations would be a fabrication — the same rule `missing_keys`
+        // already follows.
+        let mut tally = OutcomeTally::default();
         let (mut new, mut changed, mut unchanged) = (st.new, st.changed, st.unchanged);
         loop {
             let batch = ctx
@@ -930,11 +1212,12 @@ impl Plugin {
             if !keyed.is_empty() {
                 loaded += keyed.len();
                 batches += 1;
-                let (metas, mut results, batch_cost) =
+                let (metas, mut outcomes, batch_cost, batch_tally) =
                     self.run_plugin_batch(ctx, plugin, keyed).await;
                 cost.merge(&batch_cost);
-                ran += results.iter().filter(|r| r.get("error").is_none()).count();
-                let items = upsert_items(&metas, &mut results);
+                tally.merge(&batch_tally);
+                ran += batch_tally.ran;
+                let items = upsert_items(&metas, &mut outcomes);
                 let summary = ctx
                     .upsert_many_with_provenance(
                         dataset,
@@ -965,38 +1248,72 @@ impl Plugin {
                 break;
             }
         }
+        if every_document_failed(&tally) {
+            return Err(total_failure_error(plugin, &tally));
+        }
         // Bound the per-key echo; the full count is still reported.
         let missing_count = missing.len();
         missing.truncate(MISSING_ECHO_LIMIT);
-        Ok(json!({
-            "mode": "backfill",
-            "resumed_from_checkpoint": resumed,
-            "plugin": plugin,
-            "source": { "app": src_app, "dataset": VERSIONS_DATASET },
-            "scanned": scanned,
-            "skipped_pattern": skipped_pattern,
-            "loaded": loaded,
-            "ran": ran,
-            "batches": batches,
-            "missing": missing_count,
-            "missing_keys": missing,
-            "new": new,
-            "changed": changed,
-            "unchanged": unchanged,
-            // This attempt's plugin cost only — see `cost` above.
-            "cost": cost.to_json(),
-        }))
+        Ok(with_outcome_fields(
+            json!({
+                "mode": "backfill",
+                "resumed_from_checkpoint": resumed,
+                "plugin": plugin,
+                "source": { "app": src_app, "dataset": VERSIONS_DATASET },
+                "scanned": scanned,
+                "skipped_pattern": skipped_pattern,
+                "loaded": loaded,
+                "ran": ran,
+                "batches": batches,
+                "missing": missing_count,
+                "missing_keys": missing,
+                "new": new,
+                "changed": changed,
+                "unchanged": unchanged,
+                // This attempt's plugin cost only — see `cost` above.
+                "cost": cost.to_json(),
+            }),
+            &tally,
+        ))
     }
 }
 
-/// Builds the upsert items from `(meta, result)` pairs: skip plugin/fetch failures
-/// (reported in the summary, not written as records), tag each record with its
-/// natural source URL as `_url` and, for archived versions, its `_observed_at`.
-fn upsert_items(metas: &[DocMeta], results: &mut [Value]) -> Vec<(String, Value)> {
+/// Merges the outcome keys **every** write mode must report into that mode's
+/// result object.
+///
+/// One definition of the manifest contract rather than three: `output_shape`
+/// promised `errors` and no mode emitted it, because each of the three result
+/// builders was written by hand and drifted independently. Anything a reader of
+/// `GET /apps` is told to expect from a write mode belongs here.
+fn with_outcome_fields(mut result: Value, tally: &OutcomeTally) -> Value {
+    if let Value::Object(map) = &mut result {
+        map.insert("errors".into(), json!(tally.errors()));
+        map.insert("errors_by_class".into(), tally.by_class());
+        map.insert(
+            "plugin_reported_errors".into(),
+            json!(tally.plugin_reported),
+        );
+    }
+    result
+}
+
+/// Builds the upsert items from `(meta, outcome)` pairs: skip anything that
+/// produced no record, tag each record with its natural source URL as `_url`
+/// and, for archived versions, its `_observed_at`.
+///
+/// Two different things are skipped and the distinction is deliberate:
+/// a typed [`DocError`] (the plugin never answered), and a returned output that
+/// carries its own `error` key (the plugin ran and reported it could not
+/// extract). The second is the plugin's DATA, but a record that is nothing but
+/// an error message is not a fact about the page either, so it stays out of the
+/// dataset — and [`OutcomeTally::plugin_reported`] counts it, which is the part
+/// that used to be invisible.
+fn upsert_items(metas: &[DocMeta], outcomes: &mut [DocOutcome]) -> Vec<(String, Value)> {
     metas
         .iter()
-        .zip(results.iter_mut())
-        .filter_map(|(meta, rec)| {
+        .zip(outcomes.iter_mut())
+        .filter_map(|(meta, outcome)| {
+            let rec = outcome.as_mut().ok()?;
             if rec.get("error").is_some() {
                 return None;
             }
@@ -1014,11 +1331,26 @@ fn upsert_items(metas: &[DocMeta], results: &mut [Value]) -> Vec<(String, Value)
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_provenance, parse_concurrency, pick_as_of, versioned_key, CostRollup, DocMeta,
-        DEFAULT_CONCURRENCY,
+        batch_provenance, echo_record, every_document_failed, parse_concurrency, pick_as_of,
+        total_failure_error, unloadable_plugin_error, upsert_items, versioned_key, CostRollup,
+        DocError, DocFailure, DocMeta, DocOutcome, OutcomeTally, DEFAULT_CONCURRENCY,
     };
+    use pumper_core::error::PluginFailure;
     use pumper_core::plugin::PluginRunStats;
-    use serde_json::json;
+    use pumper_core::Error;
+    use serde_json::{json, Value};
+
+    fn failed(class: DocFailure, message: &str) -> DocOutcome {
+        Err(DocError::new(class, message))
+    }
+
+    fn tally_of(outcomes: &[DocOutcome]) -> OutcomeTally {
+        let mut t = OutcomeTally::default();
+        for o in outcomes {
+            t.record(o);
+        }
+        t
+    }
 
     fn metered(fuel: u64, memory: usize) -> PluginRunStats {
         PluginRunStats {
@@ -1150,5 +1482,227 @@ mod tests {
             parse_concurrency(&json!({ "concurrency": "lots" })),
             DEFAULT_CONCURRENCY
         );
+    }
+
+    // --- the run door -------------------------------------------------------
+
+    /// THE anti-pattern: the door was a type check, so a job naming a plugin the
+    /// host cannot execute ran the whole fan-out and then reported SUCCESS. The
+    /// refusal has to be terminal too — the plugin set and `[plugins] enabled`
+    /// are fixed for the life of the job, so the retry ladder can only re-read
+    /// them and re-refuse three times.
+    #[test]
+    fn an_unloadable_plugin_is_a_terminal_refusal_not_a_retried_one() {
+        let err = unloadable_plugin_error("titel", &["title".into(), "delta-slim".into()]);
+        assert!(
+            err.is_terminal_for_job(),
+            "a deterministic configuration error must not burn the retry ladder: {err}"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("titel"), "name the plugin that was asked for");
+        assert!(
+            msg.contains("GET /plugins"),
+            "point at the discovery surface"
+        );
+        assert!(msg.contains("title"), "and list what IS runnable: {msg}");
+    }
+
+    /// A host with nothing loaded is a different operator action from a typo —
+    /// `[plugins] enabled = false` is a config change, not a build step — so the
+    /// refusal must not tell an operator to check a list that is empty.
+    #[test]
+    fn an_empty_plugin_host_says_install_or_enable_not_check_the_list() {
+        let msg = unloadable_plugin_error("title", &[]).to_string();
+        assert!(msg.contains("no plugins are loaded"), "{msg}");
+        assert!(msg.contains("plugins-install"), "{msg}");
+        assert!(msg.contains("[plugins] enabled"), "{msg}");
+    }
+
+    // --- typed per-document failures ---------------------------------------
+
+    /// The class survives out of the fan-out instead of being flattened into
+    /// one opaque `{"error": <prose>}`. Rewording a host message must not move
+    /// a document between classes — the same guarantee `PluginFailure` gives
+    /// the observatory.
+    #[test]
+    fn a_document_failure_keeps_its_class_not_just_its_prose() {
+        for (kind, token) in [
+            (PluginFailure::Unknown, "unknown_plugin"),
+            (PluginFailure::Disabled, "plugins_disabled"),
+            (PluginFailure::MissingExport, "missing_export"),
+            (PluginFailure::Trap, "trap"),
+            (PluginFailure::MalformedOutput, "malformed_output"),
+            (PluginFailure::Host, "host_error"),
+        ] {
+            let err = Error::plugin(kind, "title", "wholly reworded prose");
+            assert_eq!(DocFailure::from_plugin_error(&err).as_str(), token);
+        }
+        // An error from outside the sandbox carries no class and must not be
+        // promoted into one it never claimed.
+        let outside = Error::App("the database was busy".into());
+        assert_eq!(
+            DocFailure::from_plugin_error(&outside),
+            DocFailure::Plugin(PluginFailure::Host)
+        );
+        // A fetch that never delivered a document is not a plugin failure at
+        // all, and neither is an empty stored body.
+        assert_eq!(DocFailure::Fetch.as_str(), "fetch");
+        assert_eq!(DocFailure::EmptyDocument.as_str(), "empty_document");
+    }
+
+    /// The echo keeps the `{"error": ..}` shape every existing reader keys on,
+    /// and gains the class beside it.
+    #[test]
+    fn the_echo_names_the_class_without_dropping_the_error_key() {
+        let echoed = echo_record(&failed(
+            DocFailure::Plugin(PluginFailure::Trap),
+            "all fuel consumed",
+        ));
+        assert_eq!(echoed["error"], "all fuel consumed");
+        assert_eq!(echoed["error_class"], "trap");
+        // A successful output passes through untouched.
+        assert_eq!(
+            echo_record(&Ok(json!({ "title": "x" }))),
+            json!({ "title": "x" })
+        );
+    }
+
+    // --- the failure policy -------------------------------------------------
+
+    /// THE anti-pattern this closes: a run where every single document failed
+    /// reported `ran: 0`, wrote nothing, and returned `Ok` — a green job, a
+    /// `succeeded` SSE event, a fired result webhook and an empty dataset.
+    /// Partial failure is a different case and must stay a success.
+    #[test]
+    fn a_total_failure_fails_the_run_while_a_partial_one_still_succeeds() {
+        let all_failed = tally_of(&[
+            failed(DocFailure::Plugin(PluginFailure::Disabled), "off"),
+            failed(DocFailure::Plugin(PluginFailure::Disabled), "off"),
+        ]);
+        assert!(every_document_failed(&all_failed));
+
+        let partial = tally_of(&[
+            Ok(json!({ "title": "x" })),
+            failed(DocFailure::Fetch, "fetch: 503"),
+        ]);
+        assert!(
+            !every_document_failed(&partial),
+            "one good record out of two is not a failed run"
+        );
+
+        // Nothing attempted is not a failure: an empty source, or a resumed
+        // backfill with no rows left, is a legitimate quiet run.
+        assert!(!every_document_failed(&OutcomeTally::default()));
+    }
+
+    /// The failure has to say WHICH classes killed the run — "all 3 documents
+    /// failed" with no breakdown sends an operator to read logs.
+    #[test]
+    fn the_total_failure_error_names_the_classes_and_stays_retryable() {
+        let tally = tally_of(&[
+            failed(DocFailure::Plugin(PluginFailure::Trap), "fuel"),
+            failed(DocFailure::Plugin(PluginFailure::Trap), "fuel"),
+            failed(DocFailure::Fetch, "fetch: timeout"),
+        ]);
+        let err = total_failure_error("title", &tally);
+        let msg = err.to_string();
+        assert!(msg.contains("all 3 documents failed"), "{msg}");
+        assert!(msg.contains("trap=2"), "{msg}");
+        assert!(msg.contains("fetch=1"), "{msg}");
+        assert!(
+            !err.is_terminal_for_job(),
+            "a site being down is transient — this one keeps its retries"
+        );
+    }
+
+    // --- what becomes data --------------------------------------------------
+
+    /// A plugin's own `{"error": "no <title> found"}` output is the module
+    /// saying it could not extract — DATA about the page, not a host failure.
+    /// It must not be counted as an error class, must not fail a total-failure
+    /// check on its own, and must still stay out of the dataset (a record that
+    /// is nothing but an error message is not a fact about the page).
+    #[test]
+    fn a_plugins_own_error_output_is_counted_as_data_not_as_a_host_failure() {
+        let tally = tally_of(&[
+            Ok(json!({ "error": "no <title> found" })),
+            Ok(json!({ "title": "x" })),
+        ]);
+        assert_eq!(tally.ran, 2, "the module ran on both pages");
+        assert_eq!(tally.errors(), 0, "neither is a host failure");
+        assert_eq!(tally.plugin_reported, 1);
+        assert!(!every_document_failed(&tally));
+
+        let metas = [
+            DocMeta::live("https://a/x".into()),
+            DocMeta::live("https://a/y".into()),
+        ];
+        let mut outcomes: Vec<DocOutcome> = vec![
+            Ok(json!({ "error": "no <title> found" })),
+            Ok(json!({ "title": "x" })),
+        ];
+        let items = upsert_items(&metas, &mut outcomes);
+        assert_eq!(items.len(), 1, "only the real extraction is written");
+        assert_eq!(items[0].0, "https://a/y");
+        assert_eq!(items[0].1["_url"], "https://a/y");
+    }
+
+    /// The tally's classes are what the result publishes, so an empty class
+    /// must be ABSENT rather than zero — a `{"trap": 0}` reads as "we looked
+    /// and found none", which a run that never traps cannot distinguish from
+    /// one that never looked.
+    #[test]
+    fn the_class_breakdown_omits_classes_that_did_not_occur() {
+        let tally = tally_of(&[
+            failed(DocFailure::Plugin(PluginFailure::Trap), "fuel"),
+            Ok(json!({ "title": "x" })),
+        ]);
+        assert_eq!(tally.by_class(), json!({ "trap": 1 }));
+        assert_eq!(tally.errors(), 1);
+        assert_eq!(tally.attempted(), 2);
+        assert_eq!(OutcomeTally::default().by_class(), json!({}));
+    }
+
+    /// Backfill runs batch by batch and reports one breakdown for the attempt.
+    #[test]
+    fn merging_batch_tallies_pools_every_class() {
+        let mut a = tally_of(&[failed(DocFailure::Plugin(PluginFailure::Trap), "fuel")]);
+        let b = tally_of(&[
+            failed(DocFailure::Plugin(PluginFailure::Trap), "fuel"),
+            failed(DocFailure::Fetch, "503"),
+            Ok(json!({ "error": "no title" })),
+        ]);
+        a.merge(&b);
+        assert_eq!(a.by_class(), json!({ "trap": 2, "fetch": 1 }));
+        assert_eq!(a.ran, 1);
+        assert_eq!(a.plugin_reported, 1);
+        assert_eq!(a.attempted(), 4);
+    }
+
+    /// Archived-version records carry both tags; a non-object output is written
+    /// as-is rather than being silently dropped or wrapped.
+    #[test]
+    fn upsert_items_tags_url_and_observed_at_without_touching_scalars() {
+        let metas = [
+            DocMeta {
+                key: "https://a/x@2026-01-05".into(),
+                url: "https://a/x".into(),
+                observed_at: Some("2026-01-05T00:00:00+00:00".into()),
+            },
+            DocMeta::live("https://a/y".into()),
+        ];
+        let mut outcomes: Vec<DocOutcome> = vec![Ok(json!({ "title": "v1" })), Ok(json!(42))];
+        let items = upsert_items(&metas, &mut outcomes);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].0, "https://a/x@2026-01-05");
+        assert_eq!(items[0].1["_url"], "https://a/x");
+        assert_eq!(items[0].1["_observed_at"], "2026-01-05T00:00:00+00:00");
+        assert_eq!(items[1].1, json!(42), "a scalar output is data too");
+        // A typed failure never reaches the dataset.
+        let mut only_failures: Vec<DocOutcome> =
+            vec![failed(DocFailure::Fetch, "fetch: 503"), Ok(Value::Null)];
+        let items = upsert_items(&metas, &mut only_failures);
+        assert_eq!(items.len(), 1, "the fetch failure is not a record");
+        assert_eq!(items[0].0, "https://a/y");
     }
 }
