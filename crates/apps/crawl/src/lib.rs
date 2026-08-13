@@ -425,11 +425,7 @@ async fn flush_host_telemetry(
         // its record still says the run is in progress. Close it out with an
         // empty delta, or a completed crawl would leave `partial: true` behind
         // on every host that went quiet early.
-        let mut tail: Vec<String> = progress
-            .started
-            .difference(&flushed_now)
-            .cloned()
-            .collect();
+        let mut tail: Vec<String> = progress.started.difference(&flushed_now).cloned().collect();
         tail.sort();
         for host in tail {
             deltas.push((
@@ -1343,7 +1339,10 @@ mod tests {
         // ...while a real page is still measured, including one that merely
         // mentions robots.
         assert!(is_page_fetch("https://example.com/", false));
-        assert!(is_page_fetch("https://example.com/docs/robots.txt.html", false));
+        assert!(is_page_fetch(
+            "https://example.com/docs/robots.txt.html",
+            false
+        ));
         assert!(is_page_fetch("https://example.com/about/robots.txt", false));
     }
 
@@ -1353,7 +1352,10 @@ mod tests {
         // the crawl never probed for it, it was discovered like any other URL.
         assert!(is_page_fetch("https://example.com/sitemap.xml", false));
         assert!(!is_page_fetch("https://example.com/sitemap.xml", true));
-        assert!(!is_page_fetch("https://example.com/sitemaps/products-1.xml", true));
+        assert!(!is_page_fetch(
+            "https://example.com/sitemaps/products-1.xml",
+            true
+        ));
         assert!(!is_page_fetch("https://example.com/sitemap.xml.gz", true));
         // Not every XML document is a sitemap.
         assert!(is_page_fetch("https://example.com/feed.xml", true));
@@ -1361,7 +1363,10 @@ mod tests {
 
     #[test]
     fn path_of_ignores_authority_query_and_fragment() {
-        assert_eq!(path_of("https://h.example/robots.txt?a=1#f"), Some("/robots.txt"));
+        assert_eq!(
+            path_of("https://h.example/robots.txt?a=1#f"),
+            Some("/robots.txt")
+        );
         assert_eq!(path_of("https://user:pw@h.example:8443/a/b"), Some("/a/b"));
         assert_eq!(path_of("https://h.example"), Some("/"));
         assert_eq!(path_of("https://h.example?q=1"), Some("/"));
@@ -1606,7 +1611,10 @@ mod tests {
             .unwrap();
 
         let obs = day_record(&store, "example.com").await;
-        assert_eq!(obs["crawl"]["fetches"], 5, "every fetch, counted once: {obs}");
+        assert_eq!(
+            obs["crawl"]["fetches"], 5,
+            "every fetch, counted once: {obs}"
+        );
         assert_eq!(obs["crawl"]["runs"], 1, "not one run per flush: {obs}");
         assert_eq!(obs["crawl"]["runs_complete"], 1, "{obs}");
         assert_eq!(obs["crawl"]["partial"], false, "{obs}");
@@ -1673,10 +1681,12 @@ mod tests {
 
         let obs = day_record(&store, "broken.example").await;
         assert_eq!(obs["crawl"]["transport_errors"], 1, "{obs}");
-        assert_eq!(obs["crawl"]["runs_complete"], 1, "a finished-with-error run: {obs}");
+        assert_eq!(
+            obs["crawl"]["runs_complete"], 1,
+            "a finished-with-error run: {obs}"
+        );
     }
 
-    #[tokio::test]
     /// `TierMemory::record` resets a host's strikes the moment the winner is
     /// `"http"`, before it reads `http_lost` at all. Reporting a hardcoded
     /// `"http"` therefore erased the bot-wall signal this call exists to teach —
