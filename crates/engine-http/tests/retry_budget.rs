@@ -187,6 +187,98 @@ async fn a_ten_minute_retry_after_cannot_outlive_the_fetch_budget() {
     let _ = std::fs::remove_dir_all(&root);
 }
 
+/// THE transport-classification bug, in attempt counts. An unsupported scheme
+/// used to burn `retries + 1` attempts and three governor slots re-deriving what
+/// reqwest knew deterministically before the first socket — and then failed with
+/// a *retryable* error, so the worker re-queued and ran the whole ladder again
+/// on every job attempt.
+#[tokio::test]
+async fn a_deterministic_transport_failure_costs_one_attempt_not_the_whole_ladder() {
+    let root = temp_root("badscheme");
+    let (url, origin) = spawn_origin(usize::MAX, None).await;
+    // The same live authority, with a scheme reqwest cannot speak: if any
+    // attempt reached the network the origin's counter would move.
+    let unspeakable = url.replacen("http://", "ftp://", 1);
+    let engine = new_engine(
+        &root,
+        HttpConfig {
+            retries: 3,
+            timeout_secs: 5,
+            ..HttpConfig::default()
+        },
+    )
+    .await;
+
+    let started = Instant::now();
+    let err = engine
+        .fetch(HttpRequest::get(&unspeakable))
+        .await
+        .expect_err("an ftp:// URL must be refused");
+    let elapsed = started.elapsed();
+
+    assert_eq!(
+        origin.hits.load(Ordering::SeqCst),
+        0,
+        "the request was never sendable, so nothing may have reached the origin"
+    );
+    // The ladder's own sleeps are 0.5 s + 1 s + 2 s. Finishing inside half a
+    // second is proof that exactly one iteration ran.
+    assert!(
+        elapsed < Duration::from_millis(500),
+        "the backoff ladder must not have run at all: {elapsed:?}"
+    );
+    assert!(
+        err.is_terminal_for_job(),
+        "a URL that cannot be requested is frozen into the job row — every \
+         attempt re-derives the same refusal: {err}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
+/// The mirror risk, and the reason the classifier is narrow: a *transient*
+/// transport failure must still get every attempt it is configured for. Nothing
+/// listens on loopback port 1, so this is a connect failure — the class that
+/// bundles DNS, TLS and a service mid-restart, all left retryable on purpose.
+#[tokio::test]
+async fn a_transient_transport_failure_still_gets_every_configured_attempt() {
+    let root = temp_root("refused");
+    let engine = new_engine(
+        &root,
+        HttpConfig {
+            retries: 2,
+            timeout_secs: 5,
+            total_budget_secs: 60,
+            ..HttpConfig::default()
+        },
+    )
+    .await;
+
+    let started = Instant::now();
+    let err = engine
+        .fetch(HttpRequest::get("http://127.0.0.1:1/nothing-listens-here"))
+        .await
+        .expect_err("nothing listens on port 1");
+    let elapsed = started.elapsed();
+
+    // The engine reports the count itself, so this is the number, not a proxy.
+    assert!(
+        err.to_string().contains("failed after 3 attempts"),
+        "a connect failure must still ride its full ladder: {err}"
+    );
+    assert!(
+        !err.is_terminal_for_job(),
+        "a connect failure may succeed later (resolver blip, service restart): {err}"
+    );
+    // 0.5 s + 1 s of backoff actually elapsed between those three attempts.
+    assert!(
+        elapsed >= Duration::from_millis(1_400),
+        "the retries were not really spaced: {elapsed:?}"
+    );
+
+    let _ = std::fs::remove_dir_all(&root);
+}
+
 /// The budget also has to cut a ladder that is individually well-behaved: with
 /// `retries = 20` and a 1 s `Retry-After`, every single sleep is reasonable and
 /// the total is not. Before the deadline this fetch made 21 attempts.

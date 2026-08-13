@@ -79,19 +79,37 @@ pub(crate) struct ProfileJar {
 }
 
 impl ProfileJar {
-    /// Loads `<profiles_dir>/<name>/cookies.json`, creating the profile dir on
-    /// first use. A missing file starts an empty jar; an unreadable/corrupt one
-    /// is warned about and also starts empty (a bad jar must not wedge fetches).
+    /// Loads `<profiles_dir>/<name>/cookies.json`. A missing file starts an
+    /// empty jar **with a warning**; an unreadable/corrupt one is warned about
+    /// and also starts empty (a bad jar must not wedge fetches).
+    ///
+    /// It deliberately does **not** create the profile directory. It used to,
+    /// before the open — so a typo'd `profile: "acme_portl"` *materialised*
+    /// `data/profiles/acme_portl/` and the typo then appeared in
+    /// `GET /profiles` as a real, indistinguishable profile. The directory is
+    /// created by the first [`ProfileJar::save`] that actually has a cookie to
+    /// write, which is the first moment the profile is real.
     fn load(name: &str, path: PathBuf) -> Result<Self> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
         let store = match std::fs::File::open(&path) {
             Ok(file) => cookie_store::serde::json::load(BufReader::new(file)).unwrap_or_else(|e| {
                 warn!(profile = %name, "cookie jar {} unreadable ({e}); starting empty", path.display());
                 CookieStore::default()
             }),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => CookieStore::default(),
+            // NotFound covers both a missing jar and a missing profile dir.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                // The signal this seam had none of. A fetch under a profile with
+                // no stored session is not an error — it is how a login is
+                // established on this tier — but it is also exactly what a typo
+                // looks like, and it used to be completely silent.
+                warn!(
+                    profile = %name,
+                    jar = %path.display(),
+                    "session profile has no stored cookies — requests under it go out \
+                     ANONYMOUS until a response sets one (a mistyped profile name looks \
+                     exactly like this)"
+                );
+                CookieStore::default()
+            }
             Err(e) => {
                 return Err(Error::Profile(format!("opening {}: {e}", path.display())));
             }
@@ -105,9 +123,44 @@ impl ProfileJar {
         })
     }
 
+    /// How many cookies the in-memory jar currently holds (expired and session
+    /// ones included — the persisted set).
+    fn cookie_count(&self) -> usize {
+        self.store
+            .lock()
+            .expect("cookie jar mutex poisoned")
+            .iter_any()
+            .count()
+    }
+
+    /// Whether the jar would send nothing: a profiled request made while this is
+    /// true goes out **anonymous**, whatever the profile is called.
+    fn is_empty(&self) -> bool {
+        self.cookie_count() == 0
+    }
+
     /// Serializes the jar and replaces the file atomically (write tmp + rename),
-    /// so a crash mid-write can never leave a truncated jar behind.
+    /// so a crash mid-write can never leave a truncated jar behind. Creates the
+    /// profile directory on the first write that actually has something to
+    /// persist — see [`ProfileJar::load`].
     fn save(&self) -> Result<()> {
+        match save_decision(self.cookie_count(), self.path.exists()) {
+            SaveDecision::Write => {}
+            SaveDecision::NothingToPersist => {
+                debug!(profile = %self.name, "cookie jar is empty; nothing to write");
+                return Ok(());
+            }
+            SaveDecision::WouldClobber => {
+                warn!(
+                    profile = %self.name,
+                    jar = %self.path.display(),
+                    "refusing to overwrite a stored cookie jar with an empty one — \
+                     the in-memory jar holds no cookies, so this write could only \
+                     destroy the session on disk"
+                );
+                return Ok(());
+            }
+        }
         let mut buf: Vec<u8> = Vec::new();
         {
             let store = self.store.lock().expect("cookie jar mutex poisoned");
@@ -117,6 +170,9 @@ impl ProfileJar {
                 .map_err(|e| {
                     Error::Profile(format!("serializing jar for profile '{}': {e}", self.name))
                 })?;
+        }
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)?;
         }
         let tmp = self.path.with_extension("json.tmp");
         std::fs::write(&tmp, &buf)?;
@@ -138,12 +194,41 @@ impl ProfileJar {
     /// Write-behind loop: sleeps the debounce, writes if dirty, and retires once
     /// the jar is clean. The re-arm check closes the race where a `touch` lands
     /// between the clean observation and retiring the flag.
+    ///
+    /// A **failed** write re-arms `dirty` so the next cycle tries again. It used
+    /// to clear the flag *before* saving and drop the error on the floor, so one
+    /// transient failure — a Windows sharing violation while an antivirus or a
+    /// backup holds the file, the exact case `Error::is_terminal_for_job`
+    /// documents as the reason `Error::Profile` stays retryable — silently threw
+    /// the login away: the user stayed logged in for the life of the process and
+    /// was logged out by the restart, with one WARN as the only evidence.
     async fn flush_loop(self: Arc<Self>) {
+        let mut consecutive_failures: u32 = 0;
         loop {
             tokio::time::sleep(COOKIE_FLUSH_DEBOUNCE).await;
             if self.dirty.swap(false, Ordering::SeqCst) {
-                if let Err(e) = self.save() {
-                    warn!(profile = %self.name, "saving cookie jar: {e}");
+                match self.save() {
+                    Ok(()) => consecutive_failures = 0,
+                    Err(e) => {
+                        consecutive_failures += 1;
+                        if should_retry_save(consecutive_failures) {
+                            // The write did NOT happen, so the jar is still
+                            // dirty. Put the flag back rather than pretending.
+                            self.dirty.store(true, Ordering::SeqCst);
+                            warn!(
+                                profile = %self.name,
+                                attempt = consecutive_failures,
+                                "saving cookie jar failed ({e}); retrying on the next flush"
+                            );
+                        } else {
+                            warn!(
+                                profile = %self.name,
+                                attempts = consecutive_failures,
+                                "saving cookie jar failed ({e}) and will not be retried — \
+                                 cookies set in this process will NOT survive a restart"
+                            );
+                        }
+                    }
                 }
                 continue;
             }
@@ -182,6 +267,51 @@ impl reqwest::cookie::CookieStore for ProfileJar {
             return None;
         }
         HeaderValue::from_str(&header).ok()
+    }
+}
+
+/// How many consecutive failed jar writes are retried before the flusher gives
+/// up. Bounded so a permanently unwritable path (a read-only volume, a deleted
+/// `profiles_dir`) cannot turn into a warn-per-second forever; five debounce
+/// cycles is ~5 s, comfortably past the sharing-violation window this exists for.
+const MAX_SAVE_RETRIES: u32 = 5;
+
+/// Whether a failed jar write should stay pending for another debounce cycle.
+fn should_retry_save(consecutive_failures: u32) -> bool {
+    consecutive_failures < MAX_SAVE_RETRIES
+}
+
+/// What [`ProfileJar::save`] should do with the jar it holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SaveDecision {
+    /// Persist it.
+    Write,
+    /// Empty jar, nothing on disk: writing would only create a profile
+    /// directory for a session that does not exist — which is how a typo'd
+    /// profile name used to appear in `GET /profiles` as a real profile.
+    NothingToPersist,
+    /// Empty jar, a real one on disk: writing would **destroy** it.
+    WouldClobber,
+}
+
+/// The save gate. Refuses to replace a stored jar with an empty in-memory one.
+///
+/// The sequence it defends against: the server starts while `cookies.json` is
+/// missing (so the in-memory jar is empty), an operator restores the file from
+/// backup, and the next profiled response `touch`es the jar — whose cached
+/// `Arc` never re-reads disk — so the debounced flush renames an empty jar over
+/// the restored session and logs `cookie jar saved`.
+///
+/// The cost of the rule, stated honestly: a genuine **logout** (the site expires
+/// its own cookie, emptying the jar) no longer erases the stored jar, so a dead
+/// cookie survives on disk until the next login overwrites it. That is the
+/// cheaper failure — the site rejects a dead cookie and the profile re-logs in,
+/// whereas a clobbered session has no recovery at all.
+fn save_decision(cookies_in_memory: usize, jar_on_disk: bool) -> SaveDecision {
+    match (cookies_in_memory, jar_on_disk) {
+        (0, true) => SaveDecision::WouldClobber,
+        (0, false) => SaveDecision::NothingToPersist,
+        _ => SaveDecision::Write,
     }
 }
 
@@ -446,6 +576,10 @@ impl HttpEngine {
                     &last_error,
                 ));
             };
+            // Captured BEFORE the request goes out: a login response's own
+            // Set-Cookie is applied to the jar by reqwest during `send`, which
+            // would otherwise mask the fact that THIS request carried nothing.
+            let sent_anonymous = jar.as_ref().is_some_and(|j| j.is_empty());
             match self.build(&client, req, attempt_timeout).send().await {
                 Ok(response) => {
                     // reqwest has already applied any Set-Cookie (including on
@@ -475,7 +609,7 @@ impl HttpEngine {
                         continue;
                     }
                     let final_url = response.url().to_string();
-                    let headers = response
+                    let mut headers = response
                         .headers()
                         .iter()
                         .map(|(k, v)| {
@@ -485,6 +619,17 @@ impl HttpEngine {
                             )
                         })
                         .collect::<HashMap<_, _>>();
+                    // "This fetch named a login and ran anonymously" is the one
+                    // fact about a profiled body that no consumer could see: an
+                    // empty jar fetches the login wall with a 200, which clears
+                    // `min_content_chars` and is stored as a real revision.
+                    // Written both ways round, so any value from the wire is
+                    // dropped and the marker cannot be forged by an origin.
+                    pumper_core::engine::mark_anonymous_profile(
+                        &mut headers,
+                        req.profile.as_deref(),
+                        sent_anonymous,
+                    );
                     // Charset from the Content-Type header (e.g. `charset=windows-1250`),
                     // captured before the response is consumed by the streamed reader.
                     let header_charset = response
@@ -508,6 +653,14 @@ impl HttpEngine {
                     });
                 }
                 Err(e) => {
+                    // Statuses have always been classified here; transport
+                    // failures were not, so an unparseable URL or an `ftp://`
+                    // scheme burned the whole ladder AND three governor slots
+                    // before failing with a retryable error the worker then
+                    // re-queued. Classify at the source, like the status arm.
+                    if let Some(terminal) = deterministic_transport_error(&req.url, &e) {
+                        return Err(terminal);
+                    }
                     last_error = e.to_string();
                     warn!(url = %req.url, error = %last_error, "request error");
                 }
@@ -624,6 +777,99 @@ fn decode_body(buf: &[u8], header_charset: Option<&str>) -> String {
 /// live server (the cap check `read_body_capped` performs per chunk).
 fn would_exceed_cap(current_len: u64, chunk_len: u64, cap: u64) -> bool {
     current_len + chunk_len > cap
+}
+
+/// Reqwest's typed failure predicates, lifted into a plain value.
+///
+/// The rule below is written against **this**, not against `reqwest::Error`,
+/// for one concrete reason: `reqwest::Error` has no public constructor, so a
+/// classifier that takes one can only ever be exercised through a live socket —
+/// and the cases that matter most here (a TLS mismatch, an NXDOMAIN) are
+/// precisely the ones a loopback test cannot produce. Splitting the rule out
+/// makes every combination testable, and makes the *decision* reviewable in one
+/// place instead of inferred from a `match` on someone else's enum.
+///
+/// Deliberately **not** message substrings: `Error::plugin`'s doc records what
+/// that costs (rewording a message silently reclassified every row it produced).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct TransportPredicates {
+    /// `is_builder` — the request could not be *constructed*: an unparseable
+    /// URL, a URL that is not a valid URI, or a scheme reqwest does not speak
+    /// (`ftp://`, `file://`, `mailto:`). Also a redirect *to* such a scheme.
+    builder: bool,
+    /// `is_connect` — the connection could not be established. Covers DNS
+    /// resolution failure, connection refused/reset, and **TLS handshake
+    /// failures** (they happen inside the connector).
+    connect: bool,
+    /// `is_timeout` — a deadline elapsed (ours, or an OS-level one).
+    timeout: bool,
+    /// `is_redirect` — the redirect policy stopped the request (limit exceeded).
+    redirect: bool,
+    /// `is_body` — the request or response body failed mid-stream.
+    body: bool,
+    /// `is_decode` — the response body could not be decoded (bad gzip/brotli).
+    decode: bool,
+    /// `is_request` — a generic send failure that is none of the above.
+    request: bool,
+}
+
+impl TransportPredicates {
+    fn of(e: &reqwest::Error) -> Self {
+        Self {
+            builder: e.is_builder(),
+            connect: e.is_connect(),
+            timeout: e.is_timeout(),
+            redirect: e.is_redirect(),
+            body: e.is_body(),
+            decode: e.is_decode(),
+            request: e.is_request(),
+        }
+    }
+}
+
+/// Whether a transport failure is **deterministic**: a pure function of the
+/// request, so every retry re-derives the identical refusal.
+///
+/// Exactly one class qualifies, and the ones left out matter more than the one
+/// in — over-classifying turns a recoverable blip into a failed job:
+///
+/// - **`builder` → deterministic.** The request was never sent. An unparseable
+///   URL and an unsupported scheme are facts about the string, and a job's URL
+///   is frozen at enqueue. Nothing about attempt 4 makes `ftp://` speakable.
+/// - **`connect` → retryable, and this is the judgement call.** It bundles
+///   three things that look permanent and are not. **DNS**: an NXDOMAIN from a
+///   resolver that is itself down, mid-failover, or rate-limiting is
+///   indistinguishable here from a domain that does not exist, and the first is
+///   common on a box that just booted. **TLS**: a certificate mismatch is
+///   usually permanent, but the textbook exception is a captive portal — the
+///   one situation where the *next* attempt genuinely succeeds — and reqwest
+///   gives no predicate that separates "wrong hostname" from "intercepted".
+///   **Refused/reset**: a restarting service. Left retryable on purpose.
+/// - **`redirect` → retryable.** A redirect loop is usually a *session* fact
+///   (an expired cookie bouncing every request to a login), not a property of
+///   the URL, so a later attempt with a warmed jar can break it.
+/// - **`timeout` / `body` / `decode` / `request` → retryable.** All transient
+///   by construction; the end-to-end budget (`total_budget_secs`) is what
+///   bounds their cost, not this classifier.
+fn transport_is_deterministic(p: TransportPredicates) -> bool {
+    p.builder
+}
+
+/// Maps a deterministic transport failure to the terminal [`Error::BadRequest`],
+/// or `None` when the failure may legitimately be retried.
+///
+/// `BadRequest` rather than a widened `is_terminal_for_job`: the variant already
+/// means "client-supplied input the server understood and rejected", is already
+/// terminal, and is already the 400 this is at the request boundary — the same
+/// lever `require_safe_profile_name` took for a typo'd profile. Widening
+/// `Error::Http` would have swept up every connect blip and body error with it.
+fn deterministic_transport_error(url: &str, e: &reqwest::Error) -> Option<Error> {
+    transport_is_deterministic(TransportPredicates::of(e)).then(|| {
+        Error::BadRequest(format!(
+            "{url} cannot be requested at all: {e}. The URL is unparseable or its scheme is not \
+             http(s) — a pure function of the request, so no retry can change it."
+        ))
+    })
 }
 
 /// The timeout one *attempt* gets: the per-request override else the
@@ -870,7 +1116,13 @@ impl HttpClient for HttpEngine {
             .build(&client, &req, per_attempt)
             .send()
             .await
-            .map_err(|e| Error::Http(e.to_string()))?;
+            // Same classification as `send`: this method makes a single attempt,
+            // so there is no ladder to save here — but the JOB's ladder is real,
+            // and a URL that cannot be requested at all must not ride it.
+            .map_err(|e| {
+                deterministic_transport_error(&req.url, &e)
+                    .unwrap_or_else(|| Error::Http(e.to_string()))
+            })?;
         if let Some(jar) = &jar {
             jar.touch();
         }
@@ -1156,6 +1408,81 @@ mod tests {
         assert!(none.to_string().contains("no attempt completed"));
     }
 
+    /// THE transport classification. Statuses were classified at this seam and
+    /// transport failures were not, so `ftp://x` and `not a url` each burned
+    /// `retries + 1` attempts, three governor slots and then a *retryable*
+    /// error the worker re-queued — the whole ladder again, per job attempt.
+    ///
+    /// Enumerated over every predicate reqwest exposes, because the failure
+    /// mode of a fix like this is OVER-classification: one transient class
+    /// wrongly marked deterministic turns a recoverable blip into a failed job.
+    #[test]
+    fn only_an_unsendable_request_is_deterministic_not_every_transport_error() {
+        let only = |set: fn(&mut TransportPredicates)| {
+            let mut p = TransportPredicates::default();
+            set(&mut p);
+            p
+        };
+        // The one deterministic class: the request was never sent.
+        assert!(transport_is_deterministic(only(|p| p.builder = true)));
+        // Everything else stays retryable — each for a reason recorded on
+        // `transport_is_deterministic`, and each a real recoverable case.
+        for (name, p) in [
+            // NXDOMAIN from a resolver that is itself down; a captive portal
+            // failing the TLS handshake; a service mid-restart.
+            ("connect", only(|p| p.connect = true)),
+            ("timeout", only(|p| p.timeout = true)),
+            // A login bounce that a warmed cookie jar breaks next time.
+            ("redirect", only(|p| p.redirect = true)),
+            ("body", only(|p| p.body = true)),
+            ("decode", only(|p| p.decode = true)),
+            ("request", only(|p| p.request = true)),
+            ("nothing at all", TransportPredicates::default()),
+        ] {
+            assert!(
+                !transport_is_deterministic(p),
+                "{name} must stay retryable: marking a transient class terminal \
+                 turns a recoverable blip into a failed job"
+            );
+        }
+        // A builder error is still deterministic when it arrives alongside
+        // another predicate (reqwest's `is_timeout`/`is_connect` walk the source
+        // chain, so they are not mutually exclusive with a kind check).
+        assert!(transport_is_deterministic(TransportPredicates {
+            builder: true,
+            connect: true,
+            ..Default::default()
+        }));
+    }
+
+    /// The class has to reach the *worker*, not just this crate: a deterministic
+    /// refusal that comes back retryable is re-queued and re-runs the whole
+    /// ladder on every job attempt.
+    #[test]
+    fn a_deterministic_transport_refusal_is_terminal_for_the_job() {
+        // A real reqwest builder error — the only way to get one is to make
+        // reqwest build it, since `reqwest::Error` has no public constructor.
+        let client = reqwest::Client::new();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        for url in ["ftp://example.test/file", "::definitely not a url::"] {
+            let e = rt
+                .block_on(client.get(url).send())
+                .expect_err("reqwest must refuse this before any socket");
+            assert!(
+                e.is_builder(),
+                "{url}: expected a builder error, got {e:?} — the classification \
+                 rests on this predicate"
+            );
+            let mapped = deterministic_transport_error(url, &e).expect("must classify");
+            assert!(mapped.is_terminal_for_job(), "{url}: {mapped}");
+            assert!(matches!(mapped, Error::BadRequest(_)), "{mapped:?}");
+            assert!(mapped.to_string().contains(url));
+        }
+    }
+
     #[test]
     fn per_attempt_timeout_prefers_the_request_override() {
         assert_eq!(per_attempt_timeout(Some(600), 30), Duration::from_secs(600));
@@ -1292,6 +1619,46 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The anti-pattern: **an empty jar clobbering a real one**. `jar_for`
+    /// returns a cached `Arc` without ever re-reading disk, and `save` renamed
+    /// over the path unconditionally — so a server started while `cookies.json`
+    /// was missing would, on the next profiled response, overwrite an operator's
+    /// restored backup with an empty jar and log `cookie jar saved`.
+    #[test]
+    fn an_empty_jar_never_overwrites_a_stored_one() {
+        // The destructive case: nothing in memory, a real jar on disk.
+        assert_eq!(save_decision(0, true), SaveDecision::WouldClobber);
+        // Nothing in memory, nothing on disk: writing would only create a
+        // profile directory for a session that does not exist — which is how a
+        // typo'd profile name used to appear in `GET /profiles`.
+        assert_eq!(save_decision(0, false), SaveDecision::NothingToPersist);
+        // A real jar is written, whether or not one is already there.
+        assert_eq!(save_decision(1, false), SaveDecision::Write);
+        assert_eq!(save_decision(7, true), SaveDecision::Write);
+    }
+
+    /// The anti-pattern: **a failed write silently dropped**. The flusher used
+    /// to clear `dirty` BEFORE saving, so one transient failure (a Windows
+    /// sharing violation — the exact case that keeps `Error::Profile` retryable)
+    /// left the flag `false` and the cookie was never written: logged in for the
+    /// life of the process, logged out by the restart.
+    #[test]
+    fn a_failed_jar_save_is_retried_a_bounded_number_of_times() {
+        assert!(should_retry_save(1), "the first failure must be retried");
+        assert!(should_retry_save(MAX_SAVE_RETRIES - 1));
+        // ...but a permanently unwritable path must not become a warn-per-second
+        // forever.
+        assert!(!should_retry_save(MAX_SAVE_RETRIES));
+        assert!(!should_retry_save(MAX_SAVE_RETRIES + 100));
+        // Long enough to ride out a sharing violation at a 1 s debounce: the
+        // window this exists for is seconds, not one cycle.
+        assert!(
+            (COOKIE_FLUSH_DEBOUNCE * MAX_SAVE_RETRIES) >= Duration::from_secs(3),
+            "{MAX_SAVE_RETRIES} retries at a {COOKIE_FLUSH_DEBOUNCE:?} debounce is \
+             too short a window for a transient file lock"
+        );
     }
 
     #[test]

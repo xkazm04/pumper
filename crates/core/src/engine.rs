@@ -203,6 +203,63 @@ pub fn snapshot_provenance<'a>(
     })
 }
 
+/// Reserved response header naming a session profile whose cookie jar was
+/// **empty when the request went out** — i.e. a fetch that named a login and
+/// ran anonymously anyway.
+///
+/// The failure it makes visible: `engine-http` maps a missing `cookies.json` to
+/// an empty jar, so a mistyped `profile: "acme_portl"` fetches the login wall
+/// with a `200`, clears `min_content_chars`, records `TierVerdict::Ok`, and is
+/// stored as a real dataset revision. Nothing downstream could tell.
+///
+/// Same transport and the same forgery rule as [`FETCHED_VIA_HEADER`]: the
+/// header map is the only channel that survives an engine boundary, the engine
+/// **overwrites** any value that arrives from the wire, and the fetcher reads it
+/// only when the *caller* asked for a profile — so an origin cannot stamp an
+/// anonymous fetch with someone else's profile name.
+pub const ANONYMOUS_PROFILE_HEADER: &str = "x-pumper-anonymous-profile";
+
+/// The one rendering of "this profiled fetch carried no session", shared by the
+/// escalation trail and the tier trace's `detail` so the two surfaces cannot
+/// drift. Mirrors [`SnapshotProvenance::note`] and `fetcher::egress_note`.
+pub fn anonymous_profile_note(profile: &str) -> String {
+    format!(
+        "profile '{profile}' had no stored session: this fetch went out ANONYMOUS \
+         (a mistyped profile name looks exactly like this)"
+    )
+}
+
+/// Stamps — or clears — the anonymous-profile marker on a response header map.
+///
+/// Called on **every** profiled response, both ways round, which is what makes
+/// the marker unforgeable: any value the origin sent is dropped first, so the
+/// header present means this engine put it there.
+pub fn mark_anonymous_profile(
+    headers: &mut HashMap<String, String>,
+    profile: Option<&str>,
+    jar_was_empty: bool,
+) {
+    headers.retain(|name, _| !name.eq_ignore_ascii_case(ANONYMOUS_PROFILE_HEADER));
+    if let Some(name) = profile {
+        if jar_was_empty {
+            headers.insert(ANONYMOUS_PROFILE_HEADER.to_string(), name.to_string());
+        }
+    }
+}
+
+/// Lifts the anonymous-profile marker off a response header map, or `None` when
+/// the fetch carried a session (or named no profile at all).
+///
+/// ASCII-case-insensitive, and an empty value counts as absent — a marker that
+/// names no profile is not a signal. **Call this only where a profile was
+/// actually requested**; see [`ANONYMOUS_PROFILE_HEADER`].
+pub fn anonymous_profile(headers: &HashMap<String, String>) -> Option<&str> {
+    headers.iter().find_map(|(name, value)| {
+        (name.eq_ignore_ascii_case(ANONYMOUS_PROFILE_HEADER) && !value.trim().is_empty())
+            .then(|| value.trim())
+    })
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 pub enum HttpMethod {
@@ -1951,5 +2008,67 @@ mod tests {
             "{}",
             got.note()
         );
+    }
+
+    // ── the anonymous-profile marker ────────────────────────────────────────
+
+    /// The anti-pattern: **a marker with a single writer and no reader**, which
+    /// is exactly what the two snapshot constants were before 2026-08. The stamp
+    /// and the lift must round-trip through a plain header map.
+    #[test]
+    fn an_empty_jar_marks_the_profile_it_ran_without() {
+        let mut h = HashMap::new();
+        mark_anonymous_profile(&mut h, Some("acme_portl"), true);
+        assert_eq!(anonymous_profile(&h), Some("acme_portl"));
+        assert!(anonymous_profile_note("acme_portl").contains("acme_portl"));
+
+        // A profiled fetch that DID carry a session says nothing.
+        let mut h = HashMap::new();
+        mark_anonymous_profile(&mut h, Some("acme"), false);
+        assert_eq!(anonymous_profile(&h), None);
+        // Neither does an unprofiled one, however the flag is set.
+        let mut h = HashMap::new();
+        mark_anonymous_profile(&mut h, None, true);
+        assert_eq!(anonymous_profile(&h), None);
+    }
+
+    /// The rule every `x-pumper-` marker follows: it is written by the engine on
+    /// **every** profiled response, both ways round, so whatever the origin sent
+    /// is dropped first. Without the clear, a hostile site could stamp a real
+    /// login as anonymous — or, worse, a real anonymous fetch as a login by
+    /// getting the engine to skip the write.
+    #[test]
+    fn an_origin_value_is_overwritten_not_trusted() {
+        // The origin claims a profile went out anonymous; it did not.
+        let mut h = headers(&[(ANONYMOUS_PROFILE_HEADER, "someone-elses-profile")]);
+        mark_anonymous_profile(&mut h, Some("acme"), false);
+        assert_eq!(anonymous_profile(&h), None);
+
+        // Same, with the casing a real HTTP stack may hand back.
+        let mut h = headers(&[("X-Pumper-Anonymous-Profile", "someone-elses-profile")]);
+        mark_anonymous_profile(&mut h, Some("acme"), false);
+        assert_eq!(anonymous_profile(&h), None);
+
+        // And a genuinely empty jar overwrites the origin's value with the real
+        // profile name rather than appending a second entry.
+        let mut h = headers(&[("X-PUMPER-ANONYMOUS-PROFILE", "lies")]);
+        mark_anonymous_profile(&mut h, Some("acme"), true);
+        assert_eq!(anonymous_profile(&h), Some("acme"));
+        assert_eq!(h.len(), 1);
+    }
+
+    /// Casing is not preserved by real HTTP stacks, and a blank value names no
+    /// profile — so it is not a signal, exactly as for the snapshot markers.
+    #[test]
+    fn the_anonymous_marker_is_read_case_insensitively_and_a_blank_is_not_a_signal() {
+        assert_eq!(
+            anonymous_profile(&headers(&[("X-Pumper-Anonymous-Profile", " acme ")])),
+            Some("acme")
+        );
+        assert_eq!(
+            anonymous_profile(&headers(&[(ANONYMOUS_PROFILE_HEADER, "   ")])),
+            None
+        );
+        assert_eq!(anonymous_profile(&HashMap::new()), None);
     }
 }

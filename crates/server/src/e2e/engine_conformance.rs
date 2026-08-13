@@ -147,6 +147,32 @@ fn http_engine(store: &TempStore) -> Arc<HttpEngine> {
     )
 }
 
+/// The same engine with the **retry ladder switched on**.
+///
+/// [`http_engine`] runs at `retries: 0` so the unreachable-URL probes are
+/// instant — which also meant the ladder was off in the only cross-engine test
+/// that could ever have seen it, and the transport arm's missing classification
+/// (an `ftp://` burning four attempts) was invisible here for as long as it
+/// existed. Anything asserting a *retry class* must use this fixture instead.
+/// `total_budget_secs` is short so a probe can never park the suite.
+fn http_engine_with_retries(store: &TempStore) -> Arc<HttpEngine> {
+    let cfg = HttpConfig {
+        retries: 2,
+        timeout_secs: 5,
+        total_budget_secs: 20,
+        ..HttpConfig::default()
+    };
+    let governor = Arc::new(Governor::new(&GovernorConfig::default()));
+    let cache = Arc::new(HttpCache::new(
+        store.storage.pool(),
+        &CacheConfig::default(),
+    ));
+    Arc::new(
+        HttpEngine::new(&cfg, governor, cache, store.path().join("profiles"))
+            .expect("build the real http engine with retries on"),
+    )
+}
+
 // ── the tests ────────────────────────────────────────────────────────────────
 
 /// THE conformance run: the same battery over every production `HttpClient`,
@@ -413,6 +439,130 @@ async fn a_deterministic_profile_refusal_fails_once_on_every_seam() {
          that is a pure function of the request must fail ONCE (`true`); a \
          `false` here is a seam that still spends four attempts re-deriving the \
          same sentence, and must be argued in review."
+    );
+}
+
+/// The other half of the profile contract, and the case the battery's profile
+/// probe never reached: a **valid** name the vault simply does not hold.
+///
+/// An unsafe name is refused; an absent one is not — that is how a login is
+/// established on the HTTP tier in the first place. So the obligation here is
+/// not "fail", it is **"do not look like a login"**: `ProfileJar::load` mapped a
+/// missing `cookies.json` to an empty jar with no signal at all, so a mistyped
+/// `profile: "acme_portl"` fetched the login wall with a 200, cleared
+/// `min_content_chars`, and was stored as a real dataset revision — and the typo
+/// *materialised* `data/profiles/acme_portl/`, so `GET /profiles` then reported
+/// it as a real profile, indistinguishable from one not logged in yet.
+#[tokio::test]
+async fn an_absent_profile_is_marked_on_the_response_and_never_invents_a_profile() {
+    let store = TempStore::new("engine-conformance-absent-profile").await;
+    let vault = store.path().join("profiles");
+    let http = http_engine(&store);
+    let origin = binary_origin().await;
+
+    let mut req = HttpRequest::get(format!("{origin}/portal"));
+    req.profile = Some("acme_portl".into());
+    let resp = http
+        .fetch(req)
+        .await
+        .expect("an absent jar must not fail the fetch — that is how a login starts");
+
+    assert_eq!(
+        pumper_core::engine::anonymous_profile(&resp.headers),
+        Some("acme_portl"),
+        "a profiled fetch that carried no session must say so on the response — \
+         the header map is the only channel that survives an engine boundary. \
+         Headers were {:?}",
+        resp.headers
+    );
+    assert!(
+        !vault.join("acme_portl").exists(),
+        "a typo'd profile name must not materialise a profile directory that \
+         `GET /profiles` then reports as real: {}",
+        vault.join("acme_portl").display()
+    );
+}
+
+/// A URL no HTTP client can ever send: `ftp` is not a scheme reqwest speaks, so
+/// the refusal happens before any socket and is a pure function of the string.
+const UNSPEAKABLE_URL: &str = "ftp://example.test/archive.zip";
+/// A URL that is perfectly well-formed and simply does not answer. The contrast
+/// case: this one MUST stay retryable.
+const REFUSED_URL: &str = DEAD_URL;
+
+/// THE **third** instance of the retry-class bug, and the seam this battery
+/// could not reach until now.
+///
+/// `HttpEngine::send` classified *statuses* (a 404 returns on attempt 1) and did
+/// not classify *transport* failures at all — so an unparseable URL, an `ftp://`
+/// scheme or a `mailto:` link off a crawl frontier each burned `retries + 1`
+/// attempts with full backoff and three governor slots, then failed with
+/// `Error::Http`, which `is_terminal_for_job` classes **retryable** — so the
+/// worker re-queued and ran the whole ladder again on every job attempt.
+///
+/// Run with the retry ladder actually **on** ([`http_engine_with_retries`]),
+/// because the previous two kills of this class were both found by asking "what
+/// does the ladder cost here?" and the battery's own fixture had it disabled.
+///
+/// The map deliberately pins the *transient* case as `false` as well: the
+/// failure mode of this fix is OVER-classification, and a `true` appearing on
+/// the refused-connection row would mean a resolver blip now fails a job.
+#[tokio::test]
+async fn a_deterministic_transport_refusal_fails_once_on_every_seam() {
+    let store = TempStore::new("engine-conformance-transport").await;
+    let http = http_engine_with_retries(&store);
+
+    let mut got: BTreeMap<&str, bool> = BTreeMap::new();
+
+    let err = http
+        .fetch(HttpRequest::get(UNSPEAKABLE_URL))
+        .await
+        .expect_err("an unsendable URL must never produce a response");
+    got.insert(
+        "engine-http::fetch (unsupported scheme)",
+        err.is_terminal_for_job(),
+    );
+
+    let err = http
+        .fetch_bytes(HttpRequest::get(UNSPEAKABLE_URL))
+        .await
+        .expect_err("an unsendable URL must never produce bytes");
+    got.insert(
+        "engine-http::fetch_bytes (unsupported scheme)",
+        err.is_terminal_for_job(),
+    );
+
+    let err = http
+        .fetch(HttpRequest::get(REFUSED_URL))
+        .await
+        .expect_err("nothing listens on loopback port 1");
+    got.insert(
+        "engine-http::fetch (connection refused)",
+        err.is_terminal_for_job(),
+    );
+
+    let expected: BTreeMap<&str, bool> = BTreeMap::from([
+        // Deterministic: the request could not be *constructed*. Typed
+        // `Error::BadRequest` — the variant that already means "input the
+        // service understood and rejected", already terminal, already a 400 at
+        // the request boundary. The same lever the profile-name refusal took.
+        ("engine-http::fetch (unsupported scheme)", true),
+        // One attempt either way, but the JOB's ladder is real and a URL that
+        // cannot be requested must not ride it.
+        ("engine-http::fetch_bytes (unsupported scheme)", true),
+        // Deliberately retryable. `is_connect` bundles DNS (an NXDOMAIN from a
+        // resolver that is itself down), TLS (a captive portal failing the
+        // handshake) and a service mid-restart — all of which the next attempt
+        // can legitimately survive. A `true` here would be the over-correction.
+        ("engine-http::fetch (connection refused)", false),
+    ]);
+
+    assert_eq!(
+        got, expected,
+        "the retry class of a transport failure changed. A failure that is a \
+         pure function of the request must fail ONCE (`true`); a transient one \
+         must keep its attempts (`false`). Both directions cost real money — \
+         four attempts on a dead hostname, or a failed job on a resolver blip."
     );
 }
 
