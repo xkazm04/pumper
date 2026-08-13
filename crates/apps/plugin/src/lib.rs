@@ -831,7 +831,11 @@ impl ScrapeApp for Plugin {
                  malformed_output / host_error — classes that did not occur are absent, never \
                  zero); `plugin_reported_errors` counts outputs the plugin returned carrying \
                  its own `error` key (data, not written). A run whose every attempted document \
-                 failed FAILS the job. Plus, per mode: urls {requested}; source \
+                 failed FAILS the job. Every write mode also declares `index_datasets` \
+                 ([{app, dataset}]) so the run's records are indexed from the dataset change \
+                 feed rather than from the bounded `records` echo — withheld when the source's \
+                 own health verdict says its rows do not belong in the index. Plus, per mode: \
+                 urls {requested}; source \
                  {source{app,dataset}, requested, limit, truncated (the no-keys sweep hit its \
                  cap), loaded, missing, missing_keys[]}; backfill {resumed_from_checkpoint, \
                  scanned, skipped_pattern, loaded, batches, missing, missing_keys[]}. urls and \
@@ -994,7 +998,7 @@ impl Plugin {
 
         let metas: Vec<DocMeta> = urls.iter().map(|u| DocMeta::live(u.clone())).collect();
         let items = upsert_items(&metas, &mut outcomes);
-        let written = write_target(ctx, dataset).await;
+        let target = write_target(ctx, dataset).await;
         let summary = ctx
             .upsert_many_with_provenance(dataset, &items, batch_provenance(&metas, rules_hash))
             .await?;
@@ -1011,7 +1015,8 @@ impl Plugin {
                     "unchanged": summary.unchanged,
                     "cost": cost.to_json(),
                 }),
-                &written,
+                &ctx.app,
+                &target,
                 &tally,
             ),
             &outcomes,
@@ -1192,7 +1197,7 @@ impl Plugin {
             return Err(total_failure_error(plugin, &tally));
         }
         let items = upsert_items(&metas, &mut outcomes);
-        let written = write_target(ctx, dataset).await;
+        let target = write_target(ctx, dataset).await;
         let summary = ctx
             .upsert_many_with_provenance(dataset, &items, batch_provenance(&metas, rules_hash))
             .await?;
@@ -1215,7 +1220,8 @@ impl Plugin {
                     "unchanged": summary.unchanged,
                     "cost": cost.to_json(),
                 }),
-                &written,
+                &ctx.app,
+                &target,
                 &tally,
             ),
             &outcomes,
@@ -1419,7 +1425,7 @@ impl Plugin {
         // Bound the per-key echo; the full count is still reported.
         let missing_count = missing.len();
         missing.truncate(MISSING_ECHO_LIMIT);
-        let written = write_target(ctx, dataset).await;
+        let target = write_target(ctx, dataset).await;
         Ok(with_outcome_fields(
             json!({
                 "mode": "backfill",
@@ -1439,23 +1445,41 @@ impl Plugin {
                 // This attempt's plugin cost only — see `cost` above.
                 "cost": cost.to_json(),
             }),
-            &written,
+            &ctx.app,
+            &target,
             &tally,
         ))
     }
 }
 
-/// Where a batch is ABOUT to land, read at the same point the write path reads
-/// it.
+/// Where a batch is ABOUT to land, and whether its rows may be offered to the
+/// full-text index — both read from the one health verdict, at the same point
+/// the write path reads it.
 ///
 /// A quarantined source is diverted to the shadow `<dataset>@q` inside
 /// `upsert_many_with_provenance`, and until now no field of this app's result
 /// said which of the two a reader should go looking in — a diverted run looked
 /// identical to a normal one. Same call the extractor makes for the same reason
 /// (`AppContext::write_target` is private).
-async fn write_target(ctx: &AppContext, dataset: &str) -> String {
+///
+/// The indexability half is gated HERE, in the producer, deliberately: the
+/// worker's own gate reads the health of the **spec's** pair, and once a
+/// quarantined source is diverted the spec would name `<dataset>@q` — a pair no
+/// `observe_extraction` ever judges, so it always reads `Healthy` and the
+/// quarantined rows would be waved straight into the index that saved-search
+/// alerts fire from. Same reasoning and same vocabulary as `extractor` and
+/// `grants_common::indexable`.
+struct WriteTarget {
+    dataset: String,
+    indexable: bool,
+}
+
+async fn write_target(ctx: &AppContext, dataset: &str) -> WriteTarget {
     let state = ctx.health.enforced_state(&ctx.app, dataset).await;
-    pumper_core::resilience::write_dataset(dataset, state)
+    WriteTarget {
+        dataset: pumper_core::resilience::write_dataset(dataset, state),
+        indexable: !state.skips_search_index(),
+    }
 }
 
 /// Merges the keys **every** write mode must report into that mode's result
@@ -1466,15 +1490,41 @@ async fn write_target(ctx: &AppContext, dataset: &str) -> String {
 /// of the three result builders was written by hand and drifted independently.
 /// Anything a reader of `GET /apps` (or the MCP tool definitions) is told to
 /// expect from a write mode belongs here.
-fn with_outcome_fields(mut result: Value, dataset_written: &str, tally: &OutcomeTally) -> Value {
+///
+/// `index_datasets` is the load-bearing one, and it is **paired with the bounded
+/// `records` echo on purpose**. Without it the app's only search coverage came
+/// from the echo — the worker mints one document per element of the result's
+/// `records` array — so bounding that echo alone would have silently shrunk a
+/// 10,000-output run's index footprint to the first 100 records. Declaring it
+/// routes indexing to the worker's delta-driven dataset indexer
+/// (`dataset_search_docs`), which reads the change feed for the named
+/// `(app, dataset)` and mints stable `<app>:<dataset>:<key>` ids that re-index
+/// in place and honour removals — strictly better than the id-per-result-element
+/// documents — and makes `echo_indexing_delegated` skip the echo, so the first N
+/// records are not double-indexed under a second, divergent id that nothing
+/// would ever update or delete. **Backfill declares it too**: it echoes no
+/// records at all, so before this its output had no per-record search coverage
+/// whatsoever, only the one whole-result `_job` document.
+fn with_outcome_fields(
+    mut result: Value,
+    app: &str,
+    target: &WriteTarget,
+    tally: &OutcomeTally,
+) -> Value {
     if let Value::Object(map) = &mut result {
-        map.insert("dataset".into(), json!(dataset_written));
+        map.insert("dataset".into(), json!(target.dataset));
         map.insert("errors".into(), json!(tally.errors()));
         map.insert("errors_by_class".into(), tally.by_class());
         map.insert(
             "plugin_reported_errors".into(),
             json!(tally.plugin_reported),
         );
+        if target.indexable {
+            map.insert(
+                "index_datasets".into(),
+                json!([{ "app": app, "dataset": target.dataset }]),
+            );
+        }
     }
     result
 }

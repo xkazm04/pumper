@@ -737,6 +737,27 @@ pub(crate) async fn run_observatory(ctx: &AppContext) -> Result<Value> {
             &derived_paths(),
         )
         .await?;
+    // DELIBERATELY no `index_datasets`, unlike the three write modes.
+    //
+    // The pairing that forces it there does not exist here: those modes echo a
+    // BOUNDED `records` sample, so without delegation their search coverage
+    // would silently shrink to the first N outputs of a run. Observatory echoes
+    // no records at all — there is nothing to shrink, so declaring the spec
+    // would be a new capability, not the other half of a fix.
+    //
+    // And it is the wrong capability. These rows are operational diagnostics
+    // about the fleet, not scraped content: `/search` is a corpus of records,
+    // and adding per-(plugin, site) telemetry would dilute its facets and its
+    // `?dataset=` filter with fleet state — the same reason `mpsv-vpm` keeps
+    // `freshness` and `vacancy_ledger` out of its own declaration. A hit would
+    // render untitled too, since the indexer builds a title from a record's
+    // `title`/`name`/`headline`/`full_name` and these rows carry none.
+    //
+    // Crucially, this costs the INTENDED consumer nothing. A watch or dataset
+    // trigger on `plugin/observatory` reads the change feed, not the index, and
+    // the worker's `run_indexed_apps` always includes the job's own app — which
+    // IS `plugin` here — so the hook batch loads these revisions either way.
+    // Making that feed honest was this direction's whole job.
     Ok(json!({
         "mode": "observatory",
         "plugins": cfg.plugins.iter().map(|p| p.name.clone()).collect::<Vec<String>>(),

@@ -305,6 +305,149 @@ async fn the_run_yields_exactly_one_summary_and_never_double_counts_it() {
     assert_eq!(out["dataset"], "plugin_out", "{out}");
 }
 
+/// THE UNPAIRING THIS FORBIDS: bounding the `records` echo without declaring
+/// `index_datasets` silently shrinks search coverage to the first N outputs of
+/// every run — the worker mints one document per element of the echo, and that
+/// was this app's only per-record coverage. The two must ship together (the
+/// extractor learned this in r12; this app forked away before it).
+///
+/// The spec's exact shape is what the worker parses (`spec.app` / `spec.dataset`
+/// in `dataset_search_docs`) and its mere presence is what makes
+/// `echo_indexing_delegated` skip the echo, so the first N records are not also
+/// indexed under a second, divergent `<app>:<url>` id that nothing would ever
+/// update or delete.
+#[tokio::test]
+async fn every_write_mode_delegates_indexing_to_the_dataset_not_the_bounded_echo() {
+    let store = TempStore::new("plugin-contract-index").await;
+    seed_pages(&store, 5, "<h1>Hi</h1>").await;
+
+    // urls — into its own dataset, so the spec is proved to track the dataset
+    // actually requested rather than a constant, and so the change-feed
+    // assertion below is unambiguously about the source-mode run.
+    let out = common::run_urls_mode(
+        &store,
+        json!({ "plugin": "title", "urls": ["http://a/"], "dataset": "urls_out" }),
+        StubPlugins::echoing(),
+    )
+    .await;
+    assert_eq!(
+        out["index_datasets"],
+        json!([{ "app": "plugin", "dataset": "urls_out" }]),
+        "{out}"
+    );
+
+    // source, with the echo capped well below the corpus
+    let out = Plugin
+        .run(ctx_with(
+            &store,
+            source_params(json!({ "records_echo": 1 })),
+            StubPlugins::echoing(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(out["records"].as_array().unwrap().len(), 1, "{out}");
+    assert_eq!(
+        out["index_datasets"],
+        json!([{ "app": "plugin", "dataset": "plugin_out" }]),
+        "{out}"
+    );
+
+    // What `dataset_search_docs` will find in the change feed it reads: one
+    // indexable revision per record WRITTEN — five, not the one echoed.
+    let revs = store
+        .datasets()
+        .changes_since("plugin", Some("plugin_out"), None, 1000, None)
+        .await
+        .unwrap();
+    assert_eq!(
+        revs.len(),
+        5,
+        "the change feed carries every written record"
+    );
+    assert!(
+        revs.iter()
+            .all(|r| r.data.is_some() && r.change != "removed"),
+        "every revision carries the snapshot the indexer needs"
+    );
+
+    // backfill — it echoes NO records, so before the declaration its output had
+    // no per-record search coverage at all, only one whole-result document.
+    let crawl_job = Uuid::new_v4().to_string();
+    let dir = store.path().join("crawl").join(&crawl_job);
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    tokio::fs::write(dir.join("v1.html"), b"<h1>v1</h1>")
+        .await
+        .unwrap();
+    store
+        .datasets()
+        .upsert_many(
+            "crawl",
+            "page_versions",
+            &[(
+                "http://p#1".into(),
+                json!({"url": "http://p", "revision": 1, "artifact_path": "v1.html",
+                       "job_id": crawl_job, "fetched_at": "2026-01-05T00:00:00+00:00"}),
+            )],
+        )
+        .await
+        .unwrap();
+    let out = Plugin
+        .run(ctx_with(
+            &store,
+            json!({
+                "plugin": "title",
+                "source": { "app": "crawl", "dataset": "pages", "backfill": true },
+                "dataset": "title_history"
+            }),
+            StubPlugins::echoing(),
+        ))
+        .await
+        .unwrap();
+    assert!(out.get("records").is_none(), "backfill never echoes: {out}");
+    assert_eq!(
+        out["index_datasets"],
+        json!([{ "app": "plugin", "dataset": "title_history" }]),
+        "…and therefore needs the delegation more than anyone: {out}"
+    );
+}
+
+/// A quarantined source must not offer its rows to the index that saved-search
+/// alerts fire from. Withheld by the PRODUCER: the worker's own gate reads the
+/// health of the spec's pair, and `("plugin", "plugin_out@q")` is a pair no
+/// `observe_extraction` ever judges, so it would always read Healthy.
+#[tokio::test]
+async fn a_quarantined_run_withholds_the_index_declaration_it_would_otherwise_make() {
+    let store = TempStore::new("plugin-contract-index-q").await;
+    seed_pages(&store, 2, "<h1>Hi</h1>").await;
+    let health = Arc::new(Resilience::new(
+        store.storage.pool(),
+        &ResilienceConfig {
+            enforce: true,
+            ..ResilienceConfig::default()
+        },
+    ));
+    let store_h = health.store().expect("resilience store");
+    store_h.ensure_source("plugin", "plugin_out").await.unwrap();
+    store_h
+        .set_state_manual("plugin/plugin_out", SourceState::Quarantined, "test")
+        .await
+        .unwrap();
+
+    let mut ctx = TestContext::new(&store.storage, "plugin")
+        .params(source_params(json!({})))
+        .health(Arc::clone(&health))
+        .artifacts_dir(store.path().join("plugin").join("job"))
+        .build();
+    ctx.plugins = StubPlugins::echoing();
+    let out = Plugin.run(ctx).await.unwrap();
+
+    assert_eq!(out["dataset"], "plugin_out@q", "{out}");
+    assert!(
+        out.get("index_datasets").is_none(),
+        "a quarantined source must not offer its rows to the index: {out}"
+    );
+}
+
 /// The two counts that decide what becomes data, exercised through a real run:
 /// a returned-but-empty-ish output is still a run, and only real extractions
 /// reach the dataset.
