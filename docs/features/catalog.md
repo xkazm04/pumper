@@ -28,6 +28,19 @@ A source that has only been researched still gets an entry, with `status = "plan
 
 `Catalog::load()` reads `$PUMPER_CATALOG` or `./catalog/data-sources.toml` (**CWD-relative**). A **missing** file is an empty catalog plus a warn log, so a deployment without it still boots; a **malformed** file is a hard error.
 
+## Declared data contracts — and when each clause can actually fire
+
+A source may carry a `[source.contract]` block (field reference in [`catalog/README.md`](../../catalog/README.md)): `required_fields`, `types`, `ranges`, `max_row_delta_pct`, `max_staleness_hours`. It is evaluated by `enforce_contracts` in the worker, at the same choke point where `suppress_unhealthy` gates pushes, and the latest verdict per `<app>/<dataset>` surfaces on `/catalog/health` and `/sources`. Verdicts are `pass` / `warn` / `block`; `[contracts] enforce` is `false` by default, so violations are recorded and surfaced but gate nothing.
+
+Two lookups decide whether a declaration does anything at all, and **both key on the `(app, dataset)` pair the data actually lands under** — the pair carried by each stored revision, not the app whose job wrote it:
+
+- `Catalog::contract_for(app, dataset)` finds the contract, so a row filed under an app that never writes that pair is never evaluated.
+- `/catalog/health` reads `datasets.list(source.app, source.dataset)`, so the same mismatch reports the source **permanently stale** rather than reporting nothing.
+
+A row that names a **virtual namespace** (`grants`, `census`) therefore cannot be `live` today: `live_catalog_entries_map_to_registered_apps_with_matching_cron` panics unless `app` is a registered app, and a virtual namespace is by definition not one. `grants/opportunity_details` and `census/market_blend` are the two datasets this blocks; both are documented in place in the TOML. Filing them under a producing app instead is the failure mode above, not a workaround.
+
+**`max_row_delta_pct` is a mass-delete tripwire, and it only fires on a tombstoning write.** `Contract::evaluate` computes the delta only when `removed > 0`, and `removed` is populated only by `Datasets::sync_many` — the full-snapshot variant. On an **upsert-only** source (`upsert_many`, `upsert_many_with_provenance`, `upsert_many_derived`) removals never occur, so the declaration can never fire and reads as coverage it does not provide. Declare it where the write is `sync_many` (`cordis-topic-stats`), and leave it off where the write is upsert-only — `grants-gov`'s was removed for exactly this reason on 2026-08-13, with the reasoning recorded above the block. **Known inert:** `ca-grants` and `eu-sedia` still declare one on upsert-only writes.
+
 ## API
 
 - `GET /catalog/sources?market=&status=&category=` → `{count, sources: [Source]}`. Filters are exact-match on the trimmed field; an absent or empty filter matches everything.

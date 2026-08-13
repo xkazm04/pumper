@@ -50,14 +50,55 @@ notes = "POST-only (bare GET = 403). Verified live: 1366 posted opps, dedup conf
 # Declared data contract (M20): the floor every publish must clear. Fields are
 # the raw Search2 hit shape live-verified 2026-07-30 (`id` arrives as string OR
 # number, so only `title`/`number` are type-pinned).
+#
+# NO max_row_delta_pct, deliberately (removed 2026-08-13). It is a MASS-DELETE
+# tripwire and nothing else: `Contract::evaluate` (crates/core/src/catalog.rs)
+# computes the delta only when `removed > 0`, and `removed` is populated only by
+# `Datasets::sync_many`, the full-snapshot variant that tombstones. This app's
+# listing write is `upsert_many_with_provenance`, which never tombstones — so
+# the 50.0 declared here from M20 until now could not fire on ANY run. A safety
+# net that cannot fire is worse than none: it reads as coverage. The break it was
+# meant to catch (the federal corpus suddenly collapsing) is caught instead by
+# the app's own sweep honesty — `SweepEnd` names how the walk ended, a page the
+# server's own hitCount places inside the corpus that parses zero `oppHits` fails
+# the run, and a `hitCount:0` answer over a stored corpus fails as query-grammar
+# drift. Compare `cordis-topic-stats` below, which DOES write with sync_many and
+# where the identical declaration is live and load-bearing.
+#
+# The same declaration is still inert on `ca-grants` and `eu-sedia` (both
+# upsert-only). They are left untouched here because they belong to their own
+# apps' change sets; the applicability rule is written down in
+# docs/features/catalog.md so the next contract author does not add a third.
 [source.contract]
 required_fields = ["id", "title"]
-max_row_delta_pct = 50.0
 max_staleness_hours = 48
 
 [source.contract.types]
 title = "string"
 number = "string"
+
+# `grants/opportunity_details` — the ONLY source of federal award amounts in the
+# product — still has no `[[source]]` row of its own, and cannot have an honest
+# one today (verified empirically 2026-08-13, same trap as the `census/*` product
+# datasets documented further down):
+#   * grants-gov's detail harvest writes the pair ("grants", "opportunity_details")
+#     — `grants` is a VIRTUAL namespace (crates/server/src/registry.rs), not a
+#     registered app;
+#   * the coverage test `live_catalog_entries_map_to_registered_apps_with_matching_cron`
+#     (crates/server/src/routes/mod.rs) panics on a live row whose `app` is not a
+#     registered app — measured: "live catalog source 'grants-opportunity-details'
+#     names unregistered app 'grants'";
+#   * both consumers key on the pair the data actually lands under —
+#     `enforce_contracts` (worker.rs) reads it off each revision, and
+#     /catalog/health reads `datasets.list(s.app, s.dataset)`.
+# So filing it as app = "grants-gov" would compile and pass the test and be a lie:
+# that pair is never written, so /catalog/health would report the source
+# permanently stale and the contract would never evaluate. `cordis-topic-stats` is
+# NOT a precedent — cordis writes `topic_stats` under its own app namespace.
+# The fix is the same one the census block asks for: teach the coverage test that
+# a row may name a virtual namespace whose publishers are registered. Until then
+# the detail corpus is described in the grants-gov `notes` above and guarded by
+# the app's own tests, not by a contract.
 
 [[source]]
 id = "grants-gov-xml"
