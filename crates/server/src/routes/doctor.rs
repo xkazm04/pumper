@@ -17,7 +17,8 @@ use serde_json::{json, Value};
 use utoipa::IntoParams;
 
 use pumper_core::doctor::{
-    diagnose, DatasetCoverage, MissingBody, StoreFacts, TableGrowth, UNBOUNDED_GROWTH_DAYS,
+    diagnose, DatasetCoverage, MissingBody, SearchFacts, StoreFacts, TableGrowth,
+    UNBOUNDED_GROWTH_DAYS,
 };
 
 use super::error::ApiError;
@@ -58,6 +59,21 @@ fn configured_window(cfg: &pumper_core::config::StorageConfig, table: &str) -> u
     }
 }
 
+/// The search index's state, gathered from the two cheapest sources there are:
+/// Tantivy's `doc_count` is a sum over segment metadata the reader already
+/// holds, and the record side is one `COUNT(*)` aggregate — never a `list()`,
+/// since this route already runs five full scans plus an artifact walk.
+///
+/// A `doc_count` that cannot be read is reported as `None` rather than `0`: the
+/// doctor must not manufacture a finding out of its own failure to measure.
+async fn search_facts(state: &AppState) -> Result<SearchFacts, ApiError> {
+    Ok(SearchFacts {
+        enabled: state.config.search.enabled,
+        doc_count: state.search.doc_count().await.ok(),
+        live_records: state.datasets.live_record_count().await?,
+    })
+}
+
 #[derive(Deserialize, IntoParams)]
 pub(crate) struct DoctorQuery {
     /// Skip the artifact-tree walk and the per-revision body checks. Use on a
@@ -72,8 +88,8 @@ pub(crate) struct DoctorQuery {
     params(DoctorQuery),
     responses((status = 200, description = "Read-only store integrity report: `findings` (each \
         with a concrete remediation; EMPTY on a healthy store), plus descriptive `coverage`, \
-        `tables` and per-app `artifacts` byte usage. Mutates and repairs nothing. Performs full \
-        scans — on-demand only.")),
+        `tables`, `search` (index enabled/doc_count vs live record count) and per-app `artifacts` \
+        byte usage. Mutates and repairs nothing. Performs full scans — on-demand only.")),
 )]
 pub(crate) async fn datasets_doctor(
     State(state): State<AppState>,
@@ -85,7 +101,8 @@ pub(crate) async fn datasets_doctor(
     let mut facts = StoreFacts {
         half_stamped: ds.half_stamped_revisions().await?,
         unregistered_rules: ds.unregistered_rules_hashes().await?,
-        null_simhash: ds.null_simhash_counts().await?,
+        null_simhash: ds.missing_simhash_counts().await?,
+        search: Some(search_facts(&state).await?),
         orphan_derived: ds.orphan_derived_specs().await?,
         stale_rebuild_tables: state.storage.stale_rebuild_tables().await?,
         coverage: ds
@@ -173,6 +190,7 @@ pub(crate) async fn datasets_doctor(
         "healthy": findings.is_empty(),
         "findings": findings,
         "artifacts": artifacts,
+        "search": facts.search,
         "tables": facts.tables,
         "coverage": facts.coverage,
         "thresholds": { "unbounded_growth_days": UNBOUNDED_GROWTH_DAYS },

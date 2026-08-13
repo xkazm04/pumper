@@ -2090,18 +2090,53 @@ impl Datasets {
         .await?)
     }
 
-    /// Live records carrying no SimHash fingerprint, per dataset. `duplicate_pairs`
-    /// skips `simhash = 0` rows as "no textual content", so a dataset full of them
-    /// has a near-duplicate report that is quietly incomplete rather than empty.
-    /// Remediation is the `reindex` binary.
-    pub async fn null_simhash_counts(&self) -> Result<Vec<(String, String, i64)>> {
-        Ok(sqlx::query_as(
-            "SELECT app, dataset, COUNT(*) FROM records \
-             WHERE removed_at IS NULL AND (simhash IS NULL OR simhash = 0) \
-             GROUP BY app, dataset ORDER BY COUNT(*) DESC",
+    /// Live records that HAVE textual content but carry no SimHash fingerprint,
+    /// per dataset. `duplicate_pairs` skips `simhash = 0` rows as "no textual
+    /// content", so a dataset full of them has a near-duplicate report that is
+    /// quietly incomplete rather than empty. Remediation is the `reindex` binary,
+    /// and every row counted here is one `reindex_simhashes` will actually
+    /// rewrite — a record that genuinely hashes to 0 is excluded, because
+    /// reindex skips unchanged rows and the finding could otherwise never clear
+    /// (see [`doctor::simhash_zero_is_a_missing_fingerprint`]).
+    ///
+    /// [`doctor::simhash_zero_is_a_missing_fingerprint`]: crate::doctor::simhash_zero_is_a_missing_fingerprint
+    pub async fn missing_simhash_counts(&self) -> Result<Vec<(String, String, i64)>> {
+        // `simhash` is `INTEGER NOT NULL DEFAULT 0`, so `0` is the ONLY possible
+        // un-fingerprinted marker — but it is also the honest hash of a record
+        // with no textual leaves. Only the JSON can tell those apart, so the
+        // rows are recomputed rather than counted in SQL. This reads `data` only
+        // for rows already at 0, which is empty on a healthy store.
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT app, dataset, data FROM records \
+             WHERE removed_at IS NULL AND simhash = 0 \
+             ORDER BY app, dataset",
         )
         .fetch_all(&self.pool)
-        .await?)
+        .await?;
+
+        let mut counts: std::collections::BTreeMap<(String, String), i64> = Default::default();
+        for (app, dataset, data) in rows {
+            let value: Value = serde_json::from_str(&data).unwrap_or(Value::Null);
+            if crate::doctor::simhash_zero_is_a_missing_fingerprint(&value) {
+                *counts.entry((app, dataset)).or_default() += 1;
+            }
+        }
+        let mut out: Vec<(String, String, i64)> = counts
+            .into_iter()
+            .map(|((app, dataset), n)| (app, dataset, n))
+            .collect();
+        out.sort_by(|a, b| b.2.cmp(&a.2).then_with(|| (&a.0, &a.1).cmp(&(&b.0, &b.1))));
+        Ok(out)
+    }
+
+    /// Live (non-tombstoned) records across every dataset — one aggregate, so the
+    /// doctor can compare the store against the search index's `doc_count`
+    /// without a per-record read.
+    pub async fn live_record_count(&self) -> Result<i64> {
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE removed_at IS NULL")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(n)
     }
 
     /// Derived specs whose source `(app, dataset)` holds no records at all — they

@@ -164,13 +164,40 @@ to set, the route to call — never a bare count, plus up to 10 examples.
 | `missing_artifact_bodies` | a replayable revision's stamped body is not on disk — `rederive` will answer 409 for that key | re-run the producing job; check for manual deletion (retention pins replayable bodies, so it was not retention) |
 | `half_stamped_provenance` | a revision stamps exactly one of `artifact_sha` / `rules_hash` | fix the app's write path to stamp both or neither; stamps are never rewritten retroactively |
 | `unregistered_rulesets` | a stamped `rules_hash` is absent from `rules_versions` | register at write time (`INSERT OR IGNORE`); unrecoverable rulesets stay non-replayable rather than replayed against today's rules |
-| `records_without_simhash` | live records with `simhash = 0`, silently skipped by `/duplicates` | `just reindex` with the server stopped |
+| `records_without_simhash` | live records that **have textual content** but store `simhash = 0`, silently skipped by `/duplicates` | `just reindex` with the server stopped |
 | `unbounded_table_growth` | an append-only table has retention off **and** rows older than 180 days | set the named `[storage]` key, confirm with `GET /retention/preview` |
 | `orphan_derived_specs` | a derived spec's source dataset holds no records | `POST /derived/{id}/backfill` once it has records, or `DELETE /derived/{id}` |
 | `stale_rebuild_tables` | a `*_new` table-rebuild scaffold survived in `sqlite_master` | restore from backup and re-run migrations; do not drop it by hand |
+| `search_index_empty` | `[search] enabled = true`, the index holds **0 documents**, and the store holds at least one live record | `search-backfill -- --all` with the server stopped ([search.md](search.md)) |
 
 `artifacts.per_app` reports files and bytes on disk per app — the numbers that
-make the retention decisions above inspectable.
+make the retention decisions above inspectable. `search` reports
+`{enabled, doc_count, live_records}` — the numbers behind the search finding,
+so the verdict is inspectable without a second request. `doc_count` is `null`
+when it could not be read, which is reported rather than folded into `0`: the
+doctor never manufactures a finding out of its own failure to measure.
+
+**Why the search check is zero-versus-nonzero and not a ratio.** `doc_count` and
+the live record count are not comparable quantities. The index holds documents
+that are not stored records at all (job-result docs under the reserved `_job` /
+`_records` datasets) and legitimately omits nearly every record — the live path
+only maintains datasets an app names in `index_datasets`, today just
+`grants/unified`. A healthy store routinely has millions of records and a few
+thousand documents, so any threshold over that ratio would fire on a correct
+deployment forever. An *enabled* index holding nothing while records exist is
+the one state that is never correct, and it is exactly what a schema-drift wipe,
+a corrupt-dir quarantine, or an `enabled = false` window leaves behind.
+`[search] enabled = false` is a valid deployment and stays `healthy: true`.
+
+**Why `records_without_simhash` now recomputes.** `records.simhash` is
+`INTEGER NOT NULL DEFAULT 0`, so `0` is both the never-fingerprinted sentinel
+(migration 0004 added the column with no backfill) *and* the honest hash of a
+record with no textual leaves — `simhash("")` is 0 by construction. Since
+`reindex` rewrites only rows whose recomputed value **differs**, a textless
+record was counted forever and the prescribed whole-table rewrite provably could
+not clear it, leaving the "a clean store produces zero findings" property
+unreachable on such a store. The check now counts exactly the rows `just
+reindex` will rewrite, so running the remediation clears the finding.
 
 > **On `triggers_new`:** it is **not** a stale table. Migration 0021 rebuilds
 > `triggers` through a `triggers_new` scaffold (SQLite cannot `ALTER` a `CHECK`

@@ -10,6 +10,15 @@ use pumper_core::testing::TempStore;
 use pumper_core::Provenance;
 use serde_json::json;
 
+async fn missing_simhash_total(ds: &pumper_core::Datasets) -> i64 {
+    ds.missing_simhash_counts()
+        .await
+        .unwrap()
+        .iter()
+        .map(|(_, _, n)| n)
+        .sum()
+}
+
 fn replayable() -> Provenance {
     Provenance {
         job_id: Some("job-a".into()),
@@ -62,7 +71,7 @@ async fn a_clean_store_produces_no_findings() {
     let facts = StoreFacts {
         half_stamped: ds.half_stamped_revisions().await.unwrap(),
         unregistered_rules: ds.unregistered_rules_hashes().await.unwrap(),
-        null_simhash: ds.null_simhash_counts().await.unwrap(),
+        null_simhash: ds.missing_simhash_counts().await.unwrap(),
         orphan_derived: ds.orphan_derived_specs().await.unwrap(),
         stale_rebuild_tables: store.storage.stale_rebuild_tables().await.unwrap(),
         ..Default::default()
@@ -287,7 +296,7 @@ async fn gathering_the_report_mutates_nothing() {
 
     let _ = ds.half_stamped_revisions().await.unwrap();
     let _ = ds.unregistered_rules_hashes().await.unwrap();
-    let _ = ds.null_simhash_counts().await.unwrap();
+    let _ = ds.missing_simhash_counts().await.unwrap();
     let _ = ds.orphan_derived_specs().await.unwrap();
     let _ = ds.provenance_coverage_by_dataset().await.unwrap();
     let _ = ds.replayable_revisions(100).await.unwrap();
@@ -295,4 +304,93 @@ async fn gathering_the_report_mutates_nothing() {
     let _ = store.storage.ledger_stats().await.unwrap();
 
     assert_eq!(before, snapshot(store.storage.pool()).await);
+}
+
+/// The anti-pattern: `records_without_simhash` counting every `simhash = 0`
+/// row and prescribing `just reindex`, which rewrites only rows whose
+/// recomputed value DIFFERS. A record with no textual content hashes to 0
+/// honestly, so it was counted forever and the whole-table rewrite provably
+/// could not clear it — making the endpoint's load-bearing "a clean store
+/// produces ZERO findings" property permanently unreachable on such a store.
+///
+/// Driven against the real SQL and the real `reindex_simhashes`, because the
+/// defect lives in the disagreement between the two.
+#[tokio::test]
+async fn the_simhash_finding_is_not_permanently_unclearable() {
+    let store = TempStore::new("doctor-simhash-clears").await;
+    let ds = store.datasets();
+    let pool = store.storage.pool();
+
+    // One record with text, one with none at all. Both are stored with the
+    // `DEFAULT 0` sentinel that migration 0004 left behind.
+    ds.upsert(
+        "app",
+        "d",
+        "has-text",
+        &json!({ "title": "a grant for widgets" }),
+    )
+    .await
+    .unwrap();
+    ds.upsert(
+        "app",
+        "d",
+        "no-text",
+        &json!({ "flag": true, "nothing": null }),
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE records SET simhash = 0")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        missing_simhash_total(&ds).await,
+        1,
+        "only the record reindex will actually rewrite may be counted"
+    );
+
+    // The prescribed remediation, for real.
+    assert_eq!(
+        ds.reindex_simhashes().await.unwrap(),
+        1,
+        "reindex rewrites exactly the counted row"
+    );
+
+    assert_eq!(
+        missing_simhash_total(&ds).await,
+        0,
+        "after the prescribed remediation the finding must CLEAR — the textless \
+         record still stores 0, which is its honest hash"
+    );
+    let facts = StoreFacts {
+        null_simhash: ds.missing_simhash_counts().await.unwrap(),
+        ..Default::default()
+    };
+    assert!(diagnose(&facts).is_empty(), "{:?}", diagnose(&facts));
+}
+
+/// `live_record_count` is what the search-index check compares against, so it
+/// must mean "records the index could be serving" — tombstoned rows are not.
+#[tokio::test]
+async fn a_tombstoned_record_is_not_counted_as_indexable() {
+    let store = TempStore::new("doctor-live-count").await;
+    let ds = store.datasets();
+
+    ds.upsert("app", "d", "a", &json!({ "t": "one" }))
+        .await
+        .unwrap();
+    ds.upsert("app", "d", "b", &json!({ "t": "two" }))
+        .await
+        .unwrap();
+    assert_eq!(ds.live_record_count().await.unwrap(), 2);
+
+    ds.tombstone_keys("app", "d", &["b".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(
+        ds.live_record_count().await.unwrap(),
+        1,
+        "a tombstoned record is not something the index should be holding"
+    );
 }

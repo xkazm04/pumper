@@ -76,6 +76,25 @@ pub struct DatasetCoverage {
     pub replayable: i64,
 }
 
+/// The search index's state, joined to what the store could put in it.
+///
+/// The doctor is the surface an operator runs *before* anyone complains, and
+/// search was the one subsystem it could not see: the wiped-index signal
+/// (`index.degraded`) lives on the `/search` response, so it only reaches
+/// someone after a user reports missing results.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchFacts {
+    /// `[search] enabled`. A disabled index is a valid deployment, never a
+    /// defect — `NoSearch` answers every call with silent success.
+    pub enabled: bool,
+    /// Documents currently in the index. `None` when the count could not be
+    /// read, which is reported descriptively rather than folded into `0` — that
+    /// would slander a healthy index exactly as it would on the query path.
+    pub doc_count: Option<u64>,
+    /// Live (non-tombstoned) records in the whole store.
+    pub live_records: i64,
+}
+
 /// Growth of one append-only table, joined to whether anything bounds it.
 #[derive(Debug, Clone, Serialize)]
 pub struct TableGrowth {
@@ -107,6 +126,8 @@ pub struct StoreFacts {
     pub unregistered_rules: Vec<(String, i64)>,
     /// `(app, dataset, count)` of live records with no SimHash fingerprint.
     pub null_simhash: Vec<(String, String, i64)>,
+    /// The search index, or `None` when the report did not consult it.
+    pub search: Option<SearchFacts>,
     /// `(id, source, target)` of derived specs whose source holds no records.
     pub orphan_derived: Vec<(String, String, String)>,
     /// Leftover `*_new` table-rebuild scaffolds.
@@ -200,20 +221,23 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
     }
 
     // Duplicate detection skips simhash-0 rows, so this is a silently incomplete
-    // report rather than an empty one.
+    // report rather than an empty one. Counts only rows `reindex` would actually
+    // rewrite — see `simhash_zero_is_a_missing_fingerprint` for why the raw
+    // `simhash = 0` predicate made this finding permanently unclearable.
     let null_sim: i64 = facts.null_simhash.iter().map(|(_, _, n)| n).sum();
     if null_sim > 0 {
         out.push(Finding {
             check: "records_without_simhash",
             severity: Severity::Info,
             summary: format!(
-                "{null_sim} live records have no SimHash fingerprint and are skipped by \
-                 near-duplicate detection"
+                "{null_sim} live records have textual content but no SimHash fingerprint, and are \
+                 skipped by near-duplicate detection"
             ),
             count: null_sim,
             remediation: "run `just reindex` with the server stopped — it recomputes simhash from \
-                          the stored JSON and rewrites only the rows that change. Records with \
-                          genuinely no textual content stay at 0 and are correctly skipped."
+                          the stored JSON and rewrites only the rows that change. Every record \
+                          counted here is one it WILL rewrite: records with genuinely no textual \
+                          content hash to 0 honestly and are excluded, so this finding clears."
                 .into(),
             examples: sample(
                 facts
@@ -301,7 +325,76 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
         });
     }
 
+    // The index went empty and nothing on this surface would ever have said so.
+    if facts
+        .search
+        .as_ref()
+        .is_some_and(search_index_is_empty_but_store_is_not)
+    {
+        let live = facts.search.as_ref().map_or(0, |s| s.live_records);
+        out.push(Finding {
+            check: "search_index_empty",
+            severity: Severity::Warn,
+            summary: format!(
+                "search is enabled but the index holds 0 documents while the store holds {live} \
+                 live record(s) — /search answers 200 with no hits"
+            ),
+            count: live,
+            remediation:
+                "run `cargo run -p pumper-server --bin search-backfill -- --all` with the \
+                          server STOPPED (Tantivy holds an exclusive writer lock). A wiped index \
+                          does not self-heal: the live path only indexes records as they change, \
+                          so a retired or weekly app's records never come back on their own."
+                    .into(),
+            examples: vec![json!({ "doc_count": 0, "live_records": live })],
+        });
+    }
+
     out
+}
+
+/// True when the search index is empty while the store holds records it could
+/// be serving — the one comparison between `doc_count` and the store that
+/// cannot cry wolf.
+///
+/// **Why not a ratio or an equality check.** `doc_count` and the live record
+/// count are not comparable quantities in either direction. The index holds
+/// documents that are not stored records at all (job-result docs under the
+/// reserved `_job` / `_records` datasets), and it legitimately omits nearly
+/// every stored record — the live path only maintains datasets an app names in
+/// its result's `index_datasets`, which today is just `grants/unified`. So a
+/// healthy store routinely has millions of records and a few thousand
+/// documents, and any threshold over that ratio would fire on a correct
+/// deployment forever. Zero-versus-nonzero is the only step that means
+/// something: an enabled index holding **nothing** while records exist is never
+/// a correct state, and it is precisely the state (`schema drift wipe`, corrupt
+/// -dir quarantine, an `enabled = false` window) whose recovery is
+/// `search-backfill`.
+///
+/// A disabled index is not a finding: `[search] enabled = false` is a valid
+/// deployment and `NoSearch::doc_count` reports 0 by design, so gating on
+/// `enabled` is what keeps a config-off store `healthy: true`.
+pub fn search_index_is_empty_but_store_is_not(f: &SearchFacts) -> bool {
+    f.enabled && f.doc_count == Some(0) && f.live_records > 0
+}
+
+/// True when a stored SimHash of `0` means "never fingerprinted" rather than
+/// "genuinely has no text".
+///
+/// `records.simhash` is `INTEGER NOT NULL DEFAULT 0` (migration 0004 added it
+/// with no backfill), so `0` is both the un-fingerprinted sentinel AND the
+/// honest hash of a record with no textual leaves — `simhash("")` returns 0 by
+/// construction. `reindex_simhashes` rewrites only rows whose recomputed value
+/// *differs*, so a textless record recomputes to 0, matches, and is never
+/// touched. Counting it made `records_without_simhash` permanently unclearable:
+/// the finding stayed forever, the operator re-ran a whole-table rewrite that
+/// provably could not help, and the endpoint's load-bearing "a clean store
+/// produces ZERO findings" property was unreachable on such a store.
+///
+/// Recomputing is what makes the finding *predictive of its own remediation*:
+/// what it counts is exactly what `just reindex` will rewrite.
+pub fn simhash_zero_is_a_missing_fingerprint(data: &Value) -> bool {
+    crate::simhash::simhash_value(data) != 0
 }
 
 /// A table is worth flagging only when nothing bounds it AND it has actually been
@@ -334,6 +427,14 @@ mod tests {
         }
     }
 
+    fn search(enabled: bool, doc_count: Option<u64>, live_records: i64) -> SearchFacts {
+        SearchFacts {
+            enabled,
+            doc_count,
+            live_records,
+        }
+    }
+
     /// The property the whole feature depends on: a healthy store says NOTHING.
     /// A report that always finds something is a report nobody reads, so an
     /// empty-but-present store — descriptive coverage rows, descriptive table
@@ -342,6 +443,8 @@ mod tests {
     fn a_clean_store_reports_nothing() {
         let facts = StoreFacts {
             replayable_checked: 42,
+            // Search enabled, populated, and in step.
+            search: Some(search(true, Some(4_200), 100_000)),
             coverage: vec![DatasetCoverage {
                 app: "crawl".into(),
                 dataset: "pages".into(),
@@ -407,6 +510,7 @@ mod tests {
             orphan_derived: vec![("d1".into(), "crawl/pages".into(), "crawl/titles".into())],
             stale_rebuild_tables: vec!["triggers_new".into()],
             tables: vec![growth("cost_events", 10, Some(400), 0)],
+            search: Some(search(true, Some(0), 5)),
             ..Default::default()
         };
         let findings = diagnose(&facts);
@@ -421,6 +525,7 @@ mod tests {
                 "unbounded_table_growth",
                 "orphan_derived_specs",
                 "stale_rebuild_tables",
+                "search_index_empty",
             ],
             "the check inventory changed — update this list deliberately"
         );
@@ -434,6 +539,92 @@ mod tests {
             );
             assert!(!f.examples.is_empty(), "{}: no examples", f.check);
         }
+    }
+
+    /// The anti-pattern: `just doctor` reporting `healthy: true` for a week
+    /// while `/search` returned nothing. The wiped-index signal existed, but
+    /// only on the query path — so the operator learned about it from a user.
+    #[test]
+    fn an_empty_index_over_a_full_store_is_not_reported_as_healthy() {
+        let facts = StoreFacts {
+            search: Some(search(true, Some(0), 12_345)),
+            ..Default::default()
+        };
+        let findings = diagnose(&facts);
+        assert_eq!(findings.len(), 1, "{findings:?}");
+        assert_eq!(findings[0].check, "search_index_empty");
+        assert_eq!(findings[0].severity, Severity::Warn);
+        assert_eq!(findings[0].count, 12_345);
+        assert!(
+            findings[0].remediation.contains("search-backfill"),
+            "the remediation must name the binary: {:?}",
+            findings[0].remediation
+        );
+    }
+
+    /// `[search] enabled = false` is a valid deployment — `NoSearch` reports 0
+    /// documents by design, so keying on `doc_count == 0` alone would make every
+    /// search-less store permanently unhealthy.
+    #[test]
+    fn a_disabled_search_index_is_not_a_finding() {
+        let facts = StoreFacts {
+            search: Some(search(false, Some(0), 12_345)),
+            ..Default::default()
+        };
+        assert!(diagnose(&facts).is_empty(), "{:?}", diagnose(&facts));
+        assert!(!search_index_is_empty_but_store_is_not(&search(
+            false,
+            Some(0),
+            12_345
+        )));
+    }
+
+    /// The check must not fire on states it cannot honestly judge: an empty
+    /// store has nothing to index, and a `doc_count` that could not be read is
+    /// the doctor's own failure to measure, not the store's defect.
+    #[test]
+    fn an_index_the_doctor_cannot_measure_is_not_a_finding() {
+        // Empty store, empty index — correct, and correctly silent.
+        assert!(!search_index_is_empty_but_store_is_not(&search(
+            true,
+            Some(0),
+            0
+        )));
+        // Count unreadable — no claim either way.
+        assert!(!search_index_is_empty_but_store_is_not(&search(
+            true, None, 500
+        )));
+        // Populated index over a big store — the normal case; the index is
+        // ALWAYS far smaller than the store and that is not a defect.
+        assert!(!search_index_is_empty_but_store_is_not(&search(
+            true,
+            Some(12),
+            9_000_000
+        )));
+        // A report that never consulted the index says nothing about it.
+        assert!(diagnose(&StoreFacts::default()).is_empty());
+    }
+
+    /// The anti-pattern: counting every `simhash = 0` row, then prescribing
+    /// `just reindex` — which rewrites only rows whose recomputed value DIFFERS.
+    /// A record with no textual content hashes to 0 honestly, so it is counted
+    /// forever, the rewrite provably cannot help, and the load-bearing
+    /// "a clean store produces ZERO findings" property becomes unreachable.
+    #[test]
+    fn a_record_with_no_text_is_not_a_missing_fingerprint() {
+        // Genuinely textless: numbers-free, string-free — hashes to 0 honestly.
+        assert!(!simhash_zero_is_a_missing_fingerprint(&json!({})));
+        assert!(!simhash_zero_is_a_missing_fingerprint(&json!({
+            "flag": true, "nothing": null, "empty": [], "nested": { "also": {} }
+        })));
+        assert!(!simhash_zero_is_a_missing_fingerprint(&Value::Null));
+
+        // Has text, so a stored 0 is the un-fingerprinted sentinel and reindex
+        // WILL rewrite it.
+        assert!(simhash_zero_is_a_missing_fingerprint(
+            &json!({ "title": "a grant for widgets" })
+        ));
+        assert!(simhash_zero_is_a_missing_fingerprint(&json!({ "n": 42 })));
     }
 
     /// Examples are a sample, not a dump: a store with a million broken rows must
