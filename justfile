@@ -61,6 +61,19 @@ fmt-check:
 # The full CI job (.github/workflows/ci.yml) in one command.
 ci: fmt-check lint test
 
+# The doc-sync Stop hook (.claude/settings.json -> check-doc-sync.mjs) is the
+# repo's only same-session doc-drift defense, and it is invisible when it works:
+# a turn that needs no reminder looks exactly like a broken hook. This is how you
+# tell them apart without waiting for a nag. Node only, no dependencies.
+#
+# Replay one recorded transcript through it instead:
+#   node scripts/docs/check-doc-sync.mjs ~/.claude/projects/<project>/<id>.jsonl
+# — exit 2 means it would have nagged, exit 0 means it would have stayed quiet.
+#
+# Prove the doc-sync hook still fires: runs its fixture suite.
+doc-sync:
+    node --test scripts/docs/check-doc-sync.test.mjs
+
 # --- maintenance -------------------------------------------------------------
 
 # Recompute every record's SimHash. Run with the server STOPPED.

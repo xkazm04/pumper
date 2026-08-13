@@ -16,14 +16,46 @@
 // Dismiss path: if the change is internal-only (refactor, bugfix without
 // behavior shift, test-only), reply with one short sentence acknowledging
 // "internal-only, no doc update needed" and stop.
+//
+// ---------------------------------------------------------------------------
+// TURN BOUNDARY — why this is not just `evt.type === 'user'`
+//
+// This hook silently detected nothing for its entire life (replayed over all
+// 31 recorded transcripts of this project: 1,136 Edit/Write tool calls, zero
+// detections). The backward scan stopped at the first `type:'user'` +
+// `message.role:'user'` entry, but Claude Code records every TOOL RESULT in
+// exactly that shape — 3,837 of 4,187 user-role entries in those transcripts
+// are tool results. A turn's last entries are almost always tool results, so
+// the scan broke on line one and the edited set was always empty.
+//
+// The fix layers three independent signals, primary first, so the predicate
+// degrades safely if any one of them changes shape:
+//
+//   1. CONTENT SHAPE (primary). A tool result is a user-role message whose
+//      content is entirely `tool_result` blocks. That is the Anthropic
+//      Messages API wire format, which the transcript embeds verbatim — a
+//      public, versioned contract, unlike the envelope around it.
+//   2. TRANSCRIPT ANNOTATIONS (corroborating). Claude Code tags those same
+//      entries with `toolUseResult` / `sourceToolAssistantUUID`. Internal
+//      fields, so they are a second opinion and never the only one.
+//   3. `isMeta` (corroborating). Synthetic user-role injections — system
+//      reminders, command output — are not a human prompt either, and
+//      stopping on one truncates the scan exactly like the original bug.
+//
+// Rejecting on any signal is the conservative direction: a missed boundary
+// widens the scan (worst case, attributing an older edit to this turn), while
+// a false boundary re-creates the silent-failure bug. Proven by
+// check-doc-sync.test.mjs against fixtures carrying the recorded envelope;
+// run it with `just doc-sync`.
+// ---------------------------------------------------------------------------
 
 import fs from 'node:fs';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
-const REPO_ROOT = process.env.CLAUDE_PROJECT_DIR || process.cwd();
-const MAP_PATH = path.join(REPO_ROOT, 'scripts/docs/feature-doc-map.json');
+export const EDIT_TOOLS = ['Edit', 'Write', 'MultiEdit', 'NotebookEdit'];
 
-const SKIP_PATTERNS = [
+export const SKIP_PATTERNS = [
   /\/tests\//,
   /_test\.rs$/,
   /^docs\//,
@@ -32,8 +64,17 @@ const SKIP_PATTERNS = [
   /^target\//,
   /Cargo\.lock$/,
   /^\.claude\//,
+  /^\.perfect\//,
   /^scripts\//,
 ];
+
+export function defaultRepoRoot() {
+  return process.env.CLAUDE_PROJECT_DIR || process.cwd();
+}
+
+export function mapPath(repoRoot = defaultRepoRoot()) {
+  return path.join(repoRoot, 'scripts/docs/feature-doc-map.json');
+}
 
 function readStdin() {
   try {
@@ -51,11 +92,53 @@ function safeJson(s) {
   }
 }
 
-function normalize(p) {
-  return path.relative(REPO_ROOT, p).split(path.sep).join('/');
+/**
+ * True when a transcript entry is a tool result wearing a user-role costume.
+ *
+ * Primary signal is the content shape (Messages API wire format); the two
+ * Claude Code envelope annotations corroborate it. Any one is enough, so the
+ * predicate survives either half of the format changing.
+ */
+export function isToolResultEntry(evt) {
+  if (!evt || typeof evt !== 'object') return false;
+  if (evt.toolUseResult !== undefined) return true;
+  if (typeof evt.sourceToolAssistantUUID === 'string') return true;
+  const content = evt.message?.content;
+  if (Array.isArray(content) && content.length > 0) {
+    return content.every((block) => block?.type === 'tool_result');
+  }
+  return false;
 }
 
-function compileGlob(pattern) {
+/**
+ * True only for an entry that is a genuine human prompt — the point at which
+ * the backward scan over this turn should stop.
+ */
+export function isUserTurnBoundary(evt) {
+  if (!evt || evt.type !== 'user' || evt.message?.role !== 'user') return false;
+  if (isToolResultEntry(evt)) return false;
+  if (evt.isMeta) return false;
+  const content = evt.message.content;
+  if (typeof content === 'string') return content.trim().length > 0;
+  if (Array.isArray(content)) return content.some((block) => block?.type !== 'tool_result');
+  return false;
+}
+
+/**
+ * Repo-relative, forward-slashed path for an edited file, or null when the
+ * edit landed outside this repo. Sessions routinely edit sibling checkouts
+ * (`../politicas/...`) and the user's memory dir; those are not this repo's
+ * feature source and must never be map-matched.
+ */
+export function normalizeEditedPath(filePath, repoRoot = defaultRepoRoot()) {
+  if (typeof filePath !== 'string' || filePath.length === 0) return null;
+  const root = path.resolve(repoRoot);
+  const rel = path.relative(root, path.resolve(root, filePath)).split(path.sep).join('/');
+  if (rel === '' || rel === '..' || rel.startsWith('../')) return null;
+  return rel;
+}
+
+export function compileGlob(pattern) {
   const re = pattern
     .split('/')
     .map((segment) => {
@@ -72,51 +155,45 @@ function compileGlob(pattern) {
   return new RegExp(`^${re}$`);
 }
 
-function collectEditedFilesFromTranscript(transcriptPath) {
+export function collectEditedFilesFromTranscript(transcriptPath, repoRoot = defaultRepoRoot()) {
   if (!transcriptPath || !fs.existsSync(transcriptPath)) return new Set();
   const lines = fs.readFileSync(transcriptPath, 'utf8').split('\n').filter(Boolean);
   const edited = new Set();
-  // Walk backwards until the most recent user message; assistant events after
-  // that boundary are this turn's tool calls.
+  // Walk backwards until the most recent GENUINE user prompt; assistant events
+  // after that boundary are this turn's tool calls. Tool results share the
+  // user role and must not end the scan — see the TURN BOUNDARY note above.
   for (let i = lines.length - 1; i >= 0; i--) {
     const evt = safeJson(lines[i]);
     if (!evt) continue;
-    if (evt.type === 'user' && evt.message?.role === 'user') break;
+    if (isUserTurnBoundary(evt)) break;
     if (evt.type !== 'assistant') continue;
     const content = evt.message?.content;
     if (!Array.isArray(content)) continue;
     for (const block of content) {
       if (block.type !== 'tool_use') continue;
-      if (!['Edit', 'Write', 'MultiEdit', 'NotebookEdit'].includes(block.name)) continue;
-      const fp = block.input?.file_path;
-      if (typeof fp === 'string' && fp.length) edited.add(normalize(fp));
+      if (!EDIT_TOOLS.includes(block.name)) continue;
+      const rel = normalizeEditedPath(block.input?.file_path, repoRoot);
+      if (rel) edited.add(rel);
     }
   }
   return edited;
 }
 
-function main() {
-  const payload = safeJson(readStdin()) || {};
-  if (payload.stop_hook_active) process.exit(0);
-
-  const edited = collectEditedFilesFromTranscript(payload.transcript_path);
-  if (edited.size === 0) process.exit(0);
-
+/**
+ * The whole decision, as one pure function over an edited-path set: which
+ * feature docs this turn should have touched, or why the hook stays silent.
+ * Returns { fired, reason, docHits } where docHits maps doc path -> files.
+ */
+export function evaluateEditedFiles(edited, map) {
   const editedArr = [...edited];
-  const docsTouched = editedArr.some((f) => f.startsWith('docs/features/'));
-  if (docsTouched) process.exit(0);
+  if (editedArr.length === 0) return { fired: false, reason: 'no-edits', docHits: new Map() };
+  if (editedArr.some((f) => f.startsWith('docs/features/')))
+    return { fired: false, reason: 'docs-touched', docHits: new Map() };
 
   const meaningful = editedArr.filter((f) => !SKIP_PATTERNS.some((re) => re.test(f)));
-  if (meaningful.length === 0) process.exit(0);
+  if (meaningful.length === 0) return { fired: false, reason: 'skipped-only', docHits: new Map() };
 
-  let map;
-  try {
-    map = JSON.parse(fs.readFileSync(MAP_PATH, 'utf8'));
-  } catch {
-    process.exit(0);
-  }
-
-  const compiled = (map.entries || []).map((entry) => ({
+  const compiled = (map?.entries || []).map((entry) => ({
     doc: entry.doc,
     matchers: (entry.sourceGlobs || []).map(compileGlob),
   }));
@@ -129,8 +206,11 @@ function main() {
       docHits.get(entry.doc).push(f);
     }
   }
-  if (docHits.size === 0) process.exit(0);
+  if (docHits.size === 0) return { fired: false, reason: 'unmapped', docHits };
+  return { fired: true, reason: 'mapped-source-without-doc', docHits };
+}
 
+export function formatReminder(docHits) {
   const summary = [...docHits.entries()]
     .map(([doc, files]) => {
       const head = files.slice(0, 4).join(', ');
@@ -139,16 +219,43 @@ function main() {
     })
     .join('\n');
 
-  process.stderr.write(
+  return (
     `Doc-sync reminder: this turn edited feature source but no docs/features/* was touched.\n\n` +
     `Mapped feature doc(s) likely affected:\n${summary}\n\n` +
     `Per CLAUDE.md "Documentation Sync": if the change is user/API-visible (new endpoint or\n` +
     `param, changed dataset shape, new app, changed trigger/webhook contract, new config key),\n` +
     `update the doc in this same session. If it is internal-only (refactor, bugfix without\n` +
     `behavior shift), dismiss with one short sentence — e.g. "internal-only, no doc update\n` +
-    `needed" — and stop.\n`,
+    `needed" — and stop.\n`
   );
+}
+
+function main() {
+  // `node scripts/docs/check-doc-sync.mjs <transcript.jsonl>` replays the hook
+  // over a recorded transcript without a hook payload — see `just doc-sync`.
+  const argvTranscript = process.argv[2];
+  const payload = argvTranscript
+    ? { transcript_path: argvTranscript }
+    : safeJson(readStdin()) || {};
+  if (payload.stop_hook_active) process.exit(0);
+
+  const repoRoot = defaultRepoRoot();
+  const edited = collectEditedFilesFromTranscript(payload.transcript_path, repoRoot);
+
+  let map;
+  try {
+    map = JSON.parse(fs.readFileSync(mapPath(repoRoot), 'utf8'));
+  } catch {
+    process.exit(0);
+  }
+
+  const { fired, docHits } = evaluateEditedFiles(edited, map);
+  if (!fired) process.exit(0);
+
+  process.stderr.write(formatReminder(docHits));
   process.exit(2);
 }
 
-main();
+const invokedDirectly =
+  process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToPath(import.meta.url));
+if (invokedDirectly) main();
