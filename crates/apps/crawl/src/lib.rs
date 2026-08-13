@@ -225,6 +225,27 @@ fn coverage_warning(frontier_dropped: usize, skipped_host_budget: usize) -> Opti
     ))
 }
 
+/// The `warnings` entry for a run whose within-run link-graph bookkeeping hit
+/// [`link_graph::MAX_TRACKED_EDGES`] — the memory bound that keeps a large crawl
+/// from retaining two full URLs per edge for its whole life. `None` when the
+/// budget was never spent, so a normal crawl carries no warning noise.
+///
+/// Separate from [`coverage_warning`] because it is a different truncation: the
+/// crawl saw everything it discovered, the *ranking* is the partial thing.
+fn edge_tracking_warning(untracked: usize) -> Option<String> {
+    if untracked == 0 {
+        return None;
+    }
+    Some(format!(
+        "`top_linked` is PARTIAL: this run's link graph exceeded its \
+         {}-edge in-memory tracking budget, so {untracked} edges were written to the \
+         `edges` dataset but not counted into the in-degree ranking — `top_linked` ranks \
+         the first {} distinct edges of the run, and the `edges` dataset is complete",
+        link_graph::MAX_TRACKED_EDGES,
+        link_graph::MAX_TRACKED_EDGES,
+    ))
+}
+
 /// The manifest's `output_shape`: the leading `{...}` block lists **every key
 /// `run()` always returns**, and nothing else. [`output_shape_keys`] parses that
 /// block so an inventory test can diff it against a real run in both directions.
@@ -240,8 +261,10 @@ const OUTPUT_SHAPE: &str = "{crawled, kept, skipped_duplicates, skipped_robots, 
      pages_new, pages_changed, pages_unchanged, revisit, revisited, unchanged_304, \
      skipped_not_due, cadence_updates, changed, new, gone, versions_archived, \
      reliability_hosts, edges_dataset, edges_written, edges_unchanged, \
-     edges_dropped_out_degree, edges_deduped, top_linked} — crawl tallies plus the `pages` \
-     dataset upsert summary. A truncated crawl (`coverage_complete: false`) additionally \
+     edges_dropped_out_degree, edges_deduped, edges_untracked, top_linked, \
+     top_linked_complete} — crawl tallies plus the `pages` \
+     dataset upsert summary. A run that was cut short — `coverage_complete: false` or \
+     `top_linked_complete: false` — additionally \
      carries a `warnings` array naming what was cut. Bodies land in the job's artifact dir, \
      changed revisions also as revision-suffixed copies recorded in `page_versions`, and the \
      link graph streams into the `edges` dataset (key `{from_url}|{to_url}`).";
@@ -443,6 +466,23 @@ async fn flush_host_telemetry(
 
 /// Max existing `pages` records loaded as revisit seeds per run (bounds the
 /// dataset read and the frontier). A larger known set is revisited across runs.
+///
+/// This is also the bound on [`SeedData`], the run's second app-layer structure
+/// that lives for the whole crawl — and unlike the link graph it is **kept at
+/// full width on purpose**: a `304` rewrites the stored record it merges the
+/// cadence bump into, so a trimmed retained copy would silently truncate
+/// `title` / `excerpt` / `artifact_path` out of every checked page. The
+/// alternative (re-read each record on its 304) is one dataset round-trip per
+/// seed, which is the read this map exists to avoid.
+///
+/// So the retention is justified by measurement rather than reduced. A `pages`
+/// record at the fat end of what [`DatasetPageSink`] writes (long URL, a full
+/// 300-char excerpt, both validators, full cadence) measures **~2.3 KB** of
+/// `serde_json` heap, so 10,000 of them is **~23 MB** — a fixed ceiling in the
+/// same range as the link graph's own budget, reached only in revisit mode, and
+/// two orders below the unbounded edge state that motivated this pass. See
+/// `revisit_seed_retention_stays_inside_its_stated_budget`, which fails if the
+/// record shape ever grows past that justification.
 const REVISIT_SEED_LIMIT: i64 = 10_000;
 
 /// Running new/changed/unchanged tallies shared between the [`DatasetPageSink`]
@@ -905,7 +945,10 @@ impl ScrapeApp for Crawl {
          existing dataset prune API / janitor, no separate knob. Each kept \
          page's outbound links are persisted into the `edges` dataset (key \
          `{from_url}|{to_url}`; per-page out-degree cap 200, dropped counted) — \
-         the run's most-linked-to pages are echoed as `top_linked`. Every write \
+         the run's most-linked-to pages are echoed as `top_linked`. Bounded \
+         memory: the within-run edge bookkeeping is capped at 200,000 distinct \
+         edges; past it edges still stream to the dataset but stop feeding the \
+         ranking (`edges_untracked`, `top_linked_complete: false`). Every write \
          is provenance-stamped with the producing job; archived `page_versions` \
          revisions additionally carry the page URL and the sha256 of the exact \
          archived body."
@@ -1146,12 +1189,22 @@ impl ScrapeApp for Crawl {
         // (a run may fold a host several times; it is still one host).
         let reliability_hosts = telemetry.started.len();
 
-        // Snapshot the link-graph run state (dropped, deduped, top_linked). The
-        // crawl has returned, so the sink holds no lock.
+        // Snapshot the link-graph run state (the three skip classes + the
+        // ranking and its completeness verdict). The crawl has returned, so the
+        // sink holds no lock.
         let edge_summary = {
             let g = edges.lock().unwrap_or_else(|e| e.into_inner());
-            (g.dropped_out_degree, g.deduped, g.top_linked())
+            g.summary()
         };
+        // Both truncation stories, assembled before the result so a partial
+        // ranking is reported even on a crawl whose coverage was complete.
+        let warnings: Vec<String> = [
+            coverage_warning(stats.frontier_dropped, stats.skipped_host_budget),
+            edge_tracking_warning(edge_summary.untracked),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
 
         let pages_new = counts.new.load(Ordering::Relaxed);
         let pages_changed = counts.changed.load(Ordering::Relaxed);
@@ -1214,17 +1267,19 @@ impl ScrapeApp for Crawl {
             "edges_dataset": link_graph::EDGES_DATASET,
             "edges_written": counts.edges_written.load(Ordering::Relaxed),
             "edges_unchanged": counts.edges_unchanged.load(Ordering::Relaxed),
-            "edges_dropped_out_degree": edge_summary.0,
-            "edges_deduped": edge_summary.1,
-            "top_linked": edge_summary.2,
+            "edges_dropped_out_degree": edge_summary.dropped_out_degree,
+            "edges_deduped": edge_summary.deduped,
+            // Bounded memory: edges emitted after the run spent its in-memory
+            // tracking budget (`link_graph::MAX_TRACKED_EDGES`). Written to the
+            // dataset, absent from the in-degree ranking — hence the verdict.
+            "edges_untracked": edge_summary.untracked,
+            "top_linked": edge_summary.top_linked,
+            "top_linked_complete": edge_summary.top_linked_complete,
         });
         // Fleet idiom: a partial result says so in `warnings`, and a complete one
         // stays quiet (cordis `aggregate_truncated`, census `blend_complete`).
-        if let (Some(warning), Value::Object(map)) = (
-            coverage_warning(stats.frontier_dropped, stats.skipped_host_budget),
-            &mut out,
-        ) {
-            map.insert("warnings".into(), json!([warning]));
+        if let (false, Value::Object(map)) = (warnings.is_empty(), &mut out) {
+            map.insert("warnings".into(), json!(warnings));
         }
         Ok(out)
     }
@@ -1412,6 +1467,95 @@ mod tests {
         assert!(
             w.contains(" and "),
             "both causes belong in one warning: {w}"
+        );
+    }
+
+    #[test]
+    fn a_saturated_link_graph_is_not_silent() {
+        // THE REFUTED BEHAVIOR: the within-run edge bookkeeping grew unbounded
+        // for the whole run, so the only honest report was the one that could
+        // not exist. Now the budget is spendable — and spending it is said out
+        // loud, on its own, even when coverage itself was complete.
+        assert_eq!(edge_tracking_warning(0), None, "a normal run stays quiet");
+        let w = edge_tracking_warning(4_212).expect("a spent tracking budget is partial");
+        assert!(w.contains("PARTIAL"), "{w}");
+        assert!(w.contains("4212"), "the gap is named: {w}");
+        assert!(
+            w.contains(&link_graph::MAX_TRACKED_EDGES.to_string()),
+            "the budget is named: {w}"
+        );
+        assert!(
+            w.contains("`edges` dataset is complete"),
+            "the dataset is NOT what was truncated, and saying so is the point: {w}"
+        );
+    }
+
+    /// Approximate heap footprint of one stored record: the text plus the
+    /// per-node `Value` / map-entry overhead `serde_json` actually pays. An
+    /// estimate on purpose — what bounds the revisit seed retention is the
+    /// SHAPE of a `pages` record, and this counts every part of that shape.
+    fn json_footprint_bytes(v: &Value) -> usize {
+        const NODE: usize = std::mem::size_of::<Value>();
+        const KEY: usize = std::mem::size_of::<String>();
+        // Generously rounded per-entry map/vec node overhead.
+        const ENTRY: usize = 32;
+        match v {
+            Value::String(s) => NODE + s.len(),
+            Value::Array(a) => {
+                NODE + a
+                    .iter()
+                    .map(|x| ENTRY + json_footprint_bytes(x))
+                    .sum::<usize>()
+            }
+            Value::Object(m) => {
+                NODE + m
+                    .iter()
+                    .map(|(k, x)| ENTRY + KEY + k.len() + json_footprint_bytes(x))
+                    .sum::<usize>()
+            }
+            _ => NODE,
+        }
+    }
+
+    /// A `pages` record at the fat end of what `DatasetPageSink` writes: a long
+    /// URL, a full [`EXCERPT_CHARS`]-sized excerpt, both validators present.
+    fn fat_pages_record() -> Value {
+        let url = format!("https://www.example.com/{}", "segment/".repeat(11));
+        json!({
+            "url": url,
+            "title": "T".repeat(80),
+            "status": 200,
+            "content_chars": 42_000,
+            "simhash": 12_345_678_901_234_567_890u64,
+            "excerpt": "e".repeat(300),
+            "artifact_path": "page-0123456789abcdef.html",
+            "depth": 3,
+            "etag": "W/\"0123456789abcdef0123456789abcdef\"",
+            "last_modified": "Wed, 21 Oct 2026 07:28:00 GMT",
+            "cadence": serde_json::to_value(RevisitCadence::default()).unwrap(),
+            "job_id": "11111111-2222-3333-4444-555555555555",
+        })
+    }
+
+    #[test]
+    fn revisit_seed_retention_stays_inside_its_stated_budget() {
+        // AC: the OTHER run-long app-layer structure. `SeedData` holds one FULL
+        // stored record per seeded URL for the whole run — deliberately, because
+        // a 304 rewrites the record it merges a cadence bump into, and trimming
+        // the retained copy would silently truncate that rewrite. So the bound
+        // here is REVISIT_SEED_LIMIT itself, and this test is the guard on the
+        // measurement that justified leaving it at 10,000: fatten the `pages`
+        // record shape and the justification has to be re-examined.
+        // Measured 2026-08-13: 2,291 B for the fat record above, so 10,000 of
+        // them is ~23 MB. The ceiling leaves ~40% headroom, i.e. it fires when
+        // the record shape grows MATERIALLY, not on a rounding wobble.
+        let per_record = json_footprint_bytes(&fat_pages_record());
+        let total = per_record * REVISIT_SEED_LIMIT as usize;
+        assert!(
+            total < 32 * 1024 * 1024,
+            "revisit seed retention is {total} bytes ({per_record} B x {REVISIT_SEED_LIMIT}) — \
+             past the ~32 MB ceiling the 10,000-record limit was justified against (~23 MB when \
+             measured); either shrink what the sink retains per seed or lower REVISIT_SEED_LIMIT"
         );
     }
 

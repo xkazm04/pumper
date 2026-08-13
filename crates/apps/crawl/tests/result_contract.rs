@@ -130,6 +130,14 @@ async fn edges_written_is_the_store_summary_not_the_row_count() {
     assert_eq!(out["edges_unchanged"], 0, "{out}");
     assert_eq!(out["edges_deduped"], 0, "{out}");
     assert_eq!(out["edges_dropped_out_degree"], 0, "{out}");
+    // Bounded memory: a four-page site is nowhere near the run's in-memory edge
+    // tracking budget, so the ranking saw every edge and says so.
+    assert_eq!(out["edges_untracked"], 0, "{out}");
+    assert_eq!(out["top_linked_complete"], true, "{out}");
+    assert!(
+        out.get("warnings").is_none(),
+        "a fully-tracked link graph must not warn, or the flag is noise: {out}"
+    );
 
     // ...and the dataset agrees, which `edge_rows.len()` could not guarantee.
     let edges = store.datasets().list("crawl", "edges", 100).await.unwrap();
