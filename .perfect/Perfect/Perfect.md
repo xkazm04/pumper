@@ -22,7 +22,7 @@ with **no new warnings in any file the wave touched** (the 31 remaining are pre-
 sits between the two lots' hunks) · `cargo test --workspace` **1746 passed / 0 failed / 17 ignored**
 (entering baseline 1697, +49 tests) · `just smoke` **36/36** (extended 34→36 with this round's two
 new surfaces, both live-verified against the real binary).
-Director commits: `19f1707` (the `/metrics` egress series + three doc-map globs the hook was blind to),
+Director commits: `96a4ef1` (the `/metrics` egress series + three doc-map globs the hook was blind to),
 `eefdd3b` (the third profile-name seam — class closed), `e1e18db` (smoke checks).
 Phase 0 reconciliation (MANDATORY this round) came back **clean**: the map is the committed
 `context-map.json` — 46 contexts, generator `personas-context-scan`, `generated_at`

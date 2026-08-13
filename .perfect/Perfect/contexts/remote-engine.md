@@ -110,7 +110,7 @@ path; the tier router still learns from remote fetches (only the governor half i
   - [[remote-egress-attributable]] → `d128ae7` — `x-pumper-remote-node` carries the serving node to
     the tier trace and the job receipt's `cost.egress`; the peer echoes the URL it was asked for and
     a mismatched (or unecho'd) envelope is refused.
-- **Director follow-ups this round:** `19f1707` — wired `pumper_remote_egress_fetches` onto `/metrics`
+- **Director follow-ups this round:** `96a4ef1` — wired `pumper_remote_egress_fetches` onto `/metrics`
   with the reviewed `EXPECTED_RAW_ENGINE_CALLS` row the builder correctly refused to game, and added
   `crates/engine-remote/**` + `crates/engine-archive/**` + `routes/remote.rs` to the doc-sync map;
   `e1e18db` — smoke live-checks the egress series.

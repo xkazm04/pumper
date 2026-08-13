@@ -126,7 +126,7 @@ authenticating reverse proxy) — **no in-app auth invented**, as the non-goal r
 **Refuted:** `crates/engine-remote/**` was **not** the only engine crate missing from
 `feature-doc-map.json` — `crates/engine-archive/**` is equally absent, and that one is not hypothetical
 (the archive tier shipped a provenance direction with no map coverage). Director-verified; both added
-in `19f1707`, along with `routes/remote.rs` so the fabric's *serving* half points at the doc that
+in `96a4ef1`, along with `routes/remote.rs` so the fabric's *serving* half points at the doc that
 actually describes its behavior.
 
 **Not closed, stated:** the DNS-name SSRF hole — `http://internal.corp/` resolving into a private range

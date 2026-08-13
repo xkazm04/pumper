@@ -106,7 +106,7 @@ node marker arriving from the wire is overwritten.
 public, but `/metrics` was **not** wired, because the read is a `state.engines.fetch` field access that
 the raw-engine inventory flags by design — and the builder declined both workarounds (rephrasing the
 expression to dodge the scanner; making the counters a process-global). Both refusals were right.
-**The Director wired it in `19f1707`** with the reviewed inventory row plus
+**The Director wired it in `96a4ef1`** with the reviewed inventory row plus
 `a_silent_fallback_to_local_egress_is_not_invisible_to_a_dashboard`, and `just smoke` now live-checks
 the series (36/36).
 
