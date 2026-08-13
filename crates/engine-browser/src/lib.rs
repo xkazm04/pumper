@@ -79,6 +79,11 @@ const DEFAULT_PROFILE_KEY: &str = "";
 /// `launch_timeout` so a wedged launch surfaces a typed error (and releases the
 /// per-key launch gate) rather than parking every waiter for the full 20s.
 const LAUNCH_TIMEOUT_SECS: u64 = 15;
+/// Ceiling on giving one tab back. Cleanup, not work: a Chrome that has already
+/// died never answers `Page.close`, and waiting on it would turn a crash into a
+/// hang on the *cleanup* path — including inside a detached drop task nobody is
+/// awaiting.
+const TAB_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 // ── network capture (API X-ray) caps ─────────────────────────────────────────
 // A `capture_network` render observes the page's own XHR/fetch traffic; every
@@ -147,6 +152,122 @@ fn is_stale(alive: bool, renders: u64, recycle: u64) -> bool {
 /// over the cap fails (exactly at the cap is allowed, mirroring the HTTP tier).
 fn over_html_cap(html_len: u64, cap: u64) -> bool {
     cap > 0 && html_len > cap
+}
+
+// ── render cleanup (RAII) ────────────────────────────────────────────────────
+
+/// The half of a render's cleanup that must `.await`: giving the tab back.
+///
+/// A trait rather than the concrete `chromiumoxide::Page` for one reason —
+/// [`RenderScope`]'s entire job is what it does on **drop**, and a test can only
+/// observe that against a closable it controls. Launching real Chrome to prove a
+/// tab is released would put the guard's whole contract behind an `#[ignore]`.
+#[async_trait]
+trait Closable: Send + Sync + 'static {
+    /// Best-effort by contract: a render whose Chrome already died has nothing
+    /// left to close, and that is the *normal* end of a crashed render, not an
+    /// incident.
+    async fn close(&self);
+}
+
+/// A live Chrome tab.
+struct Tab(chromiumoxide::Page);
+
+#[async_trait]
+impl Closable for Tab {
+    async fn close(&self) {
+        // `Page::close` takes `self` by value; `Page` is a cheap Arc handle, so
+        // the clone costs nothing and leaves ours intact for the (idempotent)
+        // second call that can never happen.
+        match tokio::time::timeout(TAB_CLOSE_TIMEOUT, self.0.clone().close()).await {
+            Ok(Ok(())) => {}
+            // Expected whenever Chrome went away underneath the render: the tab
+            // died with it. Logged quietly so a crash does not report twice.
+            Ok(Err(e)) => tracing::debug!("page close: {e}"),
+            Err(_) => tracing::debug!("page close did not answer in {TAB_CLOSE_TIMEOUT:?}"),
+        }
+    }
+}
+
+/// Everything ONE render must give back, released by [`Drop`] instead of by
+/// remembering to release it on each exit path.
+///
+/// The anti-pattern this replaces: `render` closed its page and aborted its two
+/// auxiliary tasks on the happy path and on the goto-error path — and on no
+/// other. The worker races the app future against `DELETE /jobs/{id}` and the
+/// wall-clock job timeout and `break`s out of its `select!`, which **drops** the
+/// render future; a dropped future runs no cleanup path at all. Dropping a
+/// `JoinHandle` *detaches* its task rather than aborting it, so every cancelled
+/// or timed-out render left a Chrome tab plus one or two tasks still servicing
+/// that dead tab's CDP events, invisibly, until the 200-render recycle relaunched
+/// Chrome. Two of the engine's own `?` early-returns (the interception and
+/// capture listener errors) leaked the same way.
+///
+/// Cleanup therefore lives on **no** path: it lives in `Drop`.
+struct RenderScope {
+    /// `None` once closed — the close-exactly-once latch. `Option::take` is the
+    /// whole double-close guard, so [`Self::release`] followed by a drop (the
+    /// success path) closes once, and a drop alone (cancel/timeout/`?`) also
+    /// closes once.
+    page: Option<Arc<dyn Closable>>,
+    /// Tasks whose only reason to exist is this render's tab.
+    tasks: Vec<tokio::task::JoinHandle<()>>,
+}
+
+impl RenderScope {
+    fn new(page: Arc<dyn Closable>) -> Self {
+        Self {
+            page: Some(page),
+            tasks: Vec::new(),
+        }
+    }
+
+    /// Binds a spawned task's life to this render's tab.
+    fn watch(&mut self, task: tokio::task::JoinHandle<()>) {
+        self.tasks.push(task);
+    }
+
+    fn abort_tasks(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
+
+    /// The success path's explicit release: abort the tasks, then **await** the
+    /// close at exactly the point the old code closed the page. Idempotent — the
+    /// subsequent `Drop` finds nothing to do.
+    async fn release(&mut self) {
+        self.abort_tasks();
+        if let Some(page) = self.page.take() {
+            page.close().await;
+        }
+    }
+}
+
+impl Drop for RenderScope {
+    fn drop(&mut self) {
+        self.abort_tasks();
+        let Some(page) = self.page.take() else {
+            return; // already released on the success path
+        };
+        // `Drop` cannot `.await`, so the close is handed to a detached task.
+        //
+        // FAILURE MODE, stated because it is real: this is best-effort. If the
+        // runtime is shutting down (the usual reason a render future is dropped
+        // during a server drain) the spawned task may never be polled, and if
+        // the drop happens with no runtime entered at all there is nowhere to
+        // spawn it. In both cases the tab is not closed here — the holder's
+        // crash/recycle relaunch (`[browser] recycle_after_renders`) remains the
+        // backstop, exactly as it was for every leak before this guard. What the
+        // guard makes unconditional is the `abort` above: no task outlives its
+        // tab, ever, because that needs no runtime.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move { page.close().await });
+            }
+            Err(_) => warn!("render scope dropped outside a tokio runtime; tab left to recycle"),
+        }
+    }
 }
 
 /// A launched Chrome instance plus liveness/recycle bookkeeping.
@@ -409,11 +530,15 @@ impl Browser for BrowserEngine {
             .new_page("about:blank")
             .await
             .map_err(|e| Error::Browser(format!("new_page: {e}")))?;
+        // From here to the return, EVERY exit path — including the ones that are
+        // not exits at all (a cancelled or timed-out job drops this future
+        // mid-await) — releases the tab and its tasks through this guard.
+        let mut scope = RenderScope::new(Arc::new(Tab(page.clone())));
 
         // Resource-blocking drainer. Only wired when interception is enabled at
         // launch (`block_resources`); otherwise no Fetch events ever fire.
         let blocked = Arc::new(AtomicUsize::new(0));
-        let drainer = if self.cfg.block_resources {
+        if self.cfg.block_resources {
             let block_heavy = !req.load_all_resources;
             let drain_page = page.clone();
             let counter = blocked.clone();
@@ -421,7 +546,7 @@ impl Browser for BrowserEngine {
                 .event_listener::<EventRequestPaused>()
                 .await
                 .map_err(|e| Error::Browser(format!("intercept listener: {e}")))?;
-            Some(tokio::spawn(async move {
+            scope.watch(tokio::spawn(async move {
                 while let Some(ev) = paused.next().await {
                     let drop_it = block_heavy
                         && matches!(
@@ -447,10 +572,8 @@ impl Browser for BrowserEngine {
                             .await;
                     }
                 }
-            }))
-        } else {
-            None
-        };
+            }));
+        }
 
         // Network capture (API X-ray): when requested, remember same-site JSON
         // responses as they arrive; bodies are pulled AFTER settle/actions (and
@@ -458,7 +581,7 @@ impl Browser for BrowserEngine {
         // the page's very first XHR is observed.
         let candidates: Arc<std::sync::Mutex<Vec<PendingCapture>>> =
             Arc::new(std::sync::Mutex::new(Vec::new()));
-        let capture_task = if req.capture_network {
+        if req.capture_network {
             let page_host = url::Url::parse(&req.url)
                 .ok()
                 .and_then(|u| u.host_str().map(str::to_lowercase))
@@ -476,7 +599,7 @@ impl Browser for BrowserEngine {
                 .await
                 .map_err(|e| Error::Browser(format!("capture listener (response): {e}")))?;
             let sink = candidates.clone();
-            Some(tokio::spawn(async move {
+            scope.watch(tokio::spawn(async move {
                 // request-id → method, from the request side of the pair.
                 let mut methods: HashMap<String, String> = HashMap::new();
                 loop {
@@ -517,19 +640,12 @@ impl Browser for BrowserEngine {
                         }
                     }
                 }
-            }))
-        } else {
-            None
-        };
+            }));
+        }
 
         if let Err(e) = page.goto(req.url.as_str()).await {
-            if let Some(d) = &drainer {
-                d.abort();
-            }
-            if let Some(c) = &capture_task {
-                c.abort();
-            }
-            let _ = page.close().await;
+            // No cleanup here on purpose: `scope` releases the tab and both
+            // tasks as it drops out of this early return.
             return Err(Error::Browser(format!("goto {}: {e}", req.url)));
         }
 
@@ -627,20 +743,13 @@ impl Browser for BrowserEngine {
             }
         }
 
-        // Capture content + url, then ALWAYS release the tab and the interception
-        // drainer — even if content() failed, so a failed render does not leak a
-        // Chrome tab plus a background drainer task.
+        // Capture content + url, then release the tab and both auxiliary tasks at
+        // exactly this point — the same point, in the same order, as before the
+        // guard existed. Everything after this is arithmetic over values already
+        // in hand, so a failure there costs nothing.
         let content = page.content().await;
         let final_url = page.url().await.ok().flatten();
-        if let Some(d) = &drainer {
-            d.abort();
-        }
-        if let Some(c) = &capture_task {
-            c.abort();
-        }
-        if let Err(e) = page.close().await {
-            warn!("page close: {e}");
-        }
+        scope.release().await;
         let html = content.map_err(|e| Error::Browser(format!("content: {e}")))?;
 
         // Cap the captured HTML like the HTTP tier caps its body, so a pathological
@@ -1292,6 +1401,119 @@ mod tests {
             "the refusal must not create the profile it refused — and it must \
              happen before any Chrome is launched, which is why this test needs none"
         );
+    }
+
+    // ── render cleanup (RAII) ────────────────────────────────────────────────
+
+    /// A closable that reports every close, so "exactly once" is a fact rather
+    /// than an inspection of the code.
+    struct RecordingTab(tokio::sync::mpsc::UnboundedSender<&'static str>);
+
+    #[async_trait]
+    impl Closable for RecordingTab {
+        async fn close(&self) {
+            let _ = self.0.send("tab-closed");
+        }
+    }
+
+    /// Sends when the task's future is **dropped**, which the runtime does only
+    /// when the task is aborted or finishes. A detached (merely forgotten) task
+    /// parked on an await keeps its future alive, so silence here IS the leak.
+    ///
+    /// Constructed outside the `async` block and moved in, so the signal does
+    /// not depend on the task having been polled first — the sequence a
+    /// cancelled render produces (spawn, then abort before the next poll) is the
+    /// one that must be provable.
+    struct SignalOnDrop(tokio::sync::mpsc::UnboundedSender<&'static str>);
+
+    impl Drop for SignalOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.send("task-dropped");
+        }
+    }
+
+    /// A task that never finishes on its own, exactly like the CDP drainer and
+    /// the capture loop: they end when their event stream ends (i.e. when the
+    /// tab dies) or when someone aborts them.
+    fn parked_task(
+        tx: tokio::sync::mpsc::UnboundedSender<&'static str>,
+    ) -> tokio::task::JoinHandle<()> {
+        let signal = SignalOnDrop(tx);
+        tokio::spawn(async move {
+            let _signal = signal;
+            loop {
+                tokio::time::sleep(Duration::from_secs(3600)).await;
+            }
+        })
+    }
+
+    /// THE leak this guard exists to kill. Every job cancel (`DELETE
+    /// /jobs/{id}`) and every job timeout lands mid-render: the worker `break`s
+    /// out of its `select!`, **dropping** the render future. A dropped future
+    /// runs none of the cleanup that used to live on the success and goto-error
+    /// paths — and dropping a `JoinHandle` *detaches* its task instead of
+    /// aborting it — so the tab and its one or two CDP tasks survived the render
+    /// that owned them, invisibly, until Chrome was recycled 200 renders later.
+    #[tokio::test]
+    async fn dropped_render_not_left_as_a_zombie_tab_with_detached_tasks() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut scope = RenderScope::new(Arc::new(RecordingTab(tx.clone())));
+            scope.watch(parked_task(tx.clone()));
+            scope.watch(parked_task(tx.clone()));
+            // Let both tasks actually start servicing their "tab", the state a
+            // real render is in when the worker's select! fires.
+            tokio::task::yield_now().await;
+            // Nothing is released explicitly: this models the worker dropping
+            // the pinned future mid-render.
+        }
+
+        // Both tasks were aborted (they unpark and drop their locals), and the
+        // tab was closed by the detached drop task.
+        let mut seen: Vec<&'static str> = Vec::new();
+        for _ in 0..3 {
+            seen.push(rx.recv().await.expect("cleanup must report"));
+        }
+        seen.sort_unstable();
+        assert_eq!(
+            seen,
+            vec!["tab-closed", "task-dropped", "task-dropped"],
+            "a dropped render must abort BOTH tasks and close its tab"
+        );
+
+        // ...and exactly once. Give any stray second close a chance to arrive.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            rx.try_recv().is_err(),
+            "cleanup ran twice; the close-once latch is not latching"
+        );
+    }
+
+    /// The mirror risk: the success path still closes at its own point, so the
+    /// guard must not close a second time when it drops a moment later. (Chrome
+    /// answers a second `Page.close` with an error, which the old code would
+    /// have logged as a scary-looking failure on every single render.)
+    #[tokio::test]
+    async fn released_render_not_closed_again_when_the_scope_drops() {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut scope = RenderScope::new(Arc::new(RecordingTab(tx.clone())));
+            scope.watch(parked_task(tx.clone()));
+            tokio::task::yield_now().await;
+            scope.release().await;
+            let mut seen = vec![
+                rx.recv().await.expect("release closes"),
+                rx.recv().await.expect("release aborts too"),
+            ];
+            seen.sort_unstable();
+            assert_eq!(seen, vec!["tab-closed", "task-dropped"]);
+        }
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(rx.try_recv().is_err(), "the tab was closed twice");
     }
 
     #[test]
