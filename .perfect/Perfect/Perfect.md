@@ -2,11 +2,11 @@
 type: perfect/home
 repo: pumper
 updated: 2026-08-13
-pool: 0
-pool_target: per-dispatch (r19 complete — 6/6 shipped; the next dispatch sets the cap)
+pool: 6
+pool_target: 6 (r20 dispatch cap — director-self-gated, autonomous, Athena-dispatched)
 shipped_total: 152
 coverage: "34/46 map contexts covered (12 never proposed). RULE (recomputable — compute it, never inherit it): a map context is COVERED when it has >=1 direction note pointing at it (`context: \"[[<name>]]\"`), OR an explicit nothing-clears-the-bar verdict, OR `last_proposed != never`. **Normalize CRLF before any frontmatter regex** — a naive /^---\\n([\\s\\S]*?)\\n---/ silently skips every CRLF file in this repo and scored coverage at 18/46 in r17, calling claude-engine/eu-grants/wasm-plugin-host never-proposed when each has 3 shipped directions. That trap, plus one genuinely stale note (job-worker said `last_proposed: never` against 5 shipped r4 directions — fixed r17), is why the figure drifted every round (r15 carried 24, r16 carried 26 then 'corrected' to 25, headline said 27). Recomputed honestly in r17: **28 entering**, +engine-contracts +maintenance-tooling gated r17 = **30**. 16 never proposed. Inherited pre-46-map history (browser-engine, http-engine, …) deliberately does NOT count as covered. **r18 recomputed the same rule from scratch with the CRLF normalization in place and got 30/46 entering — the figure is now stable across two independent computations.** +browser-engine +remote-engine gated r18 = **32/46**, 14 never proposed. **r19 recomputed it a THIRD time from scratch (script in the session note) and got 32/46 entering — stable across three independent computations, so the rule is now trustworthy.** +http-engine +plugin-runner gated r19 = **34/46**, 12 never proposed: agentic-research · connector-api-watch · czech-procurement · data-pipeline-catalog · hackernews-example · page-monitor · trades-operator-economics · trades-pricing · us-federal-grants · us-state-grants · vcr-testing · wasm-plugin-examples."
-cursor: "r19 COMPLETE — 6/6 shipped + 4 Director/follow-up commits, ff-merged to master; gate **1814/0/17-ignored** (entering 1746, +68), clippy exit 0 with **zero new warnings in any file the wave touched** (all 31 verified present verbatim on master by CONTENT, not by count), fmt clean, doc-sync self-test 19/19, smoke **38/38** (36 -> 38, both new checks live). **Coverage 32/46 -> 34/46, 12 never proposed.** r20 PROPOSE: pick 2 never-proposed, ties by opportunity — the 12 are agentic-research · connector-api-watch · czech-procurement · data-pipeline-catalog (opp 3) · hackernews-example (opp 2) · page-monitor · trades-operator-economics · trades-pricing · us-federal-grants · us-state-grants · vcr-testing · wasm-plugin-examples (opp 3). **Suggested pairing by disjointness: vcr-testing** (opp 4, Core Platform, core/src/vcr.rs + testing.rs, 1116 lines — and r19 handed it a concrete seed: TestContext hard-wires NoPlugins with no override seam, which every r19 plugin test had to work around via the public field) **with one single-app-crate context** — czech-procurement / us-federal-grants / connector-api-watch (all opp 4, all fully disjoint from core). **page-monitor is opp 4 but THIN** (428 lines across apps/watch + apps/readable, no tests at all) — expect 1-2 directions, not 3; pair it with something substantial rather than skipping it. Do NOT re-mine http-engine or plugin-runner before r21 (cooldown); banked anchors are in their context notes — http-engine: **http-engine-observable** (the last zero-metric engine, and r19 produced two of its best series); plugin-runner: **plugin-search-identity**, now RE-SCOPED not closed (delegation dissolved the id-collapse on the forward path; the residue is a verification test plus orphaned pre-fcc4249 _records docs needing a search-backfill). Still the strongest queued work in the vault: dataset-storage retention-pin-is-dead-code, crawler-core MAX_FRONTIER lifetime cap, browser-engine render-harness-offline, remote-engine remote-scope-honesty."
+cursor: "r20 BUILDING — pool 6/6 gated, branch `perfect/2026-08-13-r20`, 2 concurrent lots (Lot V = vcr-testing in crates/core; Lot G = us-federal-grants in crates/apps). Entering: coverage **34/46**, gates 1814/0/17-ignored, fmt clean, all measured not inherited. On landing, coverage becomes **36/46**, 10 never proposed: agentic-research · connector-api-watch · czech-procurement · data-pipeline-catalog (opp 3) · hackernews-example (opp 2) · page-monitor · trades-operator-economics · trades-pricing · us-state-grants · wasm-plugin-examples (opp 3). r21 PROPOSE: pick 2 never-proposed, ties by opportunity. **Two banked r20 directions are now PAIRED and should be built together in r21**: vcr-testing/harness-expresses-the-run (TestContext has 8 setters against 18 AppContext fields; NoCheckpoints::save returns true unconditionally so there are ZERO CheckpointSink doubles workspace-wide) UNBLOCKS us-federal-grants/grants-detail-delta-survives-restart (a real loss window whose regression test cannot exist today). Two independent scouts converged on that missing seam — that convergence IS the evidence. Also banked r20: grants-drift-is-terminal (deferred only because crates/core/src/error.rs belonged to the sibling lot this round — build it AFTER replay-miss-terminal lands, and note error.rs:585 asserts Error::App must stay retryable, so it needs its own variant or classification site); vcr concurrent-attempt cassette race (becomes live the day anyone ships heartbeat_secs = 0). Do NOT re-mine vcr-testing or us-federal-grants before r22 (cooldown). Still the strongest queued work in the vault: dataset-storage retention-pin-is-dead-code, crawler-core MAX_FRONTIER lifetime cap, browser-engine render-harness-offline, remote-engine remote-scope-honesty, http-engine http-engine-observable, plugin-runner plugin-search-identity (re-scoped: verification test + orphaned pre-fcc4249 _records docs needing a search-backfill)."
 last_session: "[[sessions/2026-08-13-3]]"
 ---
 
@@ -14,7 +14,79 @@ last_session: "[[sessions/2026-08-13-3]]"
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **0** · phase: **round 19 COMPLETE — 6/6 shipped** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 32/46 → 34/46.**
+**State**: pool **6** · phase: **round 20 BUILDING** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 34/46 entering.**
+
+### Round-20 pool — 6 GATED (2026-08-13, `perfect/2026-08-13-r20`)
+Phase 0 reconciliation (MANDATORY this round) came back **clean for the third round running**:
+provenance is this machine's own `context-map.json` — 46 contexts, generator
+`personas-context-scan`, `generated_at` 2026-08-03T19:10:19Z, `provenance.git_commit 611360f`,
+`project.root` = this checkout. **0 map contexts without a note** (46/46), **0 notes to alias**
+(all 8 vault-only names already carry `superseded_by:`), **0 to retire**. Coverage recomputed from
+scratch under the three-clause CRLF-safe rule: **34/46 entering, 12 never-proposed** — the
+**fourth** independent computation to agree, and the first one run after r19's log warned that
+dropping the verdict clause under-reports by one. Entering gates measured, not inherited:
+`cargo fmt --check` clean, `cargo test --workspace` **1814 / 0 / 17-ignored**.
+
+Cursor took two never-proposed opp-4 contexts living in **different crates**, so the partition is
+zero-Class-B by construction. Both scouts read their files end to end; **the Director re-verified
+the severest claim of each brief in source before gating, and one was partially refuted in the
+loop's favour** (see [[replay-means-replay]]).
+
+vcr-testing, 3 accepted (Lot V — `crates/core/**` + `crates/server/src/worker.rs`):
+1. [[replay-miss-terminal]] — robustness · M (a resolve-time `ReplayMiss` rides the whole retry
+   ladder while the **load**-time miss calls `fail_permanently` — same feature, same determinism,
+   opposite handling. `BadRequest`'s own doc states the rationale verbatim: "a pure function of
+   input that is immutable for the life of the job". Fourth instance of the class r17/r18/r19 each
+   killed once)
+2. [[cassette-verified-or-refused]] — robustness · M (replay sells one property and the loader
+   checks none of it: `req_hash` is trusted from the file and never recomputed, so an entry's
+   identity and its payload can disagree; corrupt lines are `warn!`-skipped and the load errors
+   only when **zero** entries survive, so a crash mid-`write_all` silently drops the tail with no
+   `recorded_truncated` marker; and there is no format version on a file that
+   `artifact_retention_include_cassettes = false` deliberately keeps forever)
+3. [[replay-means-replay]] — robustness · M (`vcr.rs:16` promises "Replay runs touch no engine";
+   `transact` calls `ctx.engines.browser.transact` raw, so a `replay_of` job launches a live Chrome
+   session and can submit a real form — and `worker.rs:759` stamps `vcr_replay_of` onto the result
+   anyway, beside a doc comment saying readers "must be able to tell". 32 raw-engine sites are
+   pinned in `fetch_chokepoint.rs`; the limitations block names only the crawler and the operator
+   doc names nothing. **Director-verified: the scout's "meters real work" claim is REFUTED** — both
+   raw meters pass `0.0`, so "spend $0" holds; the defect is engine contact + a false stamp)
+
+us-federal-grants, 3 accepted (Lot G — `crates/apps/**` + catalog + apps.md):
+4. [[grants-sweep-end-proven]] — robustness · M (the walk stops four ways and calls three of them a
+   complete corpus — `truncated` is computed from the `maxPages` arm alone, above a comment
+   claiming that exact class is fixed. A `hitCount` rename makes `start >= hit_count` true at
+   `1000 >= 0`, so the corpus caps at **one page, green, indefinitely**, and the drift guard cannot
+   fire because it requires `hit_count > 0`. Unfixed sibling instance of r14's
+   `cordis-sweep-honesty`, which shipped `SweepEnd` + `empty_listing_is_drift` — 0 hits here)
+5. [[grants-details-first-class]] — robustness · M (`harvested_at: ts(Utc::now())` sits inside the
+   change hash of the **only source of federal award amounts** in the product, so a byte-identical
+   re-harvest writes a new revision and reads `changed` — `DerivedPaths`, r14's own seam for this,
+   has 0 hits in the crate while eu-sedia and the plugin observatory both adopted it, and the
+   dataset is genuinely watchable. It also has **no catalog row at all**, and the one contract that
+   does exist — `max_row_delta_pct = 50.0` — cannot ever fire, because row delta is computed only
+   when `removed > 0` and this app never emits a removal)
+6. [[grants-result-contract-true]] — robustness · M (`output_shape`, which `GET /apps` and the MCP
+   manifest publish as the consumer contract, declares `hit_count` — emitted as `hitCount` — and
+   `removed?`, which `upsert_many_with_provenance` makes **structurally** unemittable, while
+   omitting twelve keys it does emit. Both siblings declare theirs correctly. Plus a crate that
+   contradicts itself three times in one file about its own default, and absent `applicant_types` /
+   `attachments` fabricated as `[]` **with the tests pinning it**, beside honest-Null money in the
+   same block)
+
+### Wave plan (round 20) — ONE branch `perfect/2026-08-13-r20`, main checkout, 2 CONCURRENT lots
+**Zero Class B, by picking two contexts in different crates and then defending it.** Lot V owns
+`crates/core/**` (`vcr.rs`, `error.rs`, `app.rs`, `retention.rs`, `tests/`), `crates/server/src/worker.rs`,
+`docs/features/runtime.md` and `ONBOARDING.md`. Lot G owns `crates/apps/grants-gov/**`,
+`crates/apps/grants-common/src/lib.rs`, `catalog/data-sources.toml`, `docs/features/apps.md` and
+`docs/features/catalog.md`. **Two edits that would have straddled the partition were designed out
+rather than shared**: [[replay-means-replay]] is forbidden to touch any `crates/apps/**` file
+(every such edit drags `docs/features/apps.md` in through the doc-sync map — Lot G's doc), and
+[[grants-result-contract-true]] is forbidden to touch `crates/server/src/registry.rs` (which drags
+in `ONBOARDING.md` + `runtime.md` — Lot V's docs). Both report the edit instead; the Director
+applies. Class C (Director-only): `crates/core/tests/fetch_chokepoint.rs` EXPECTED inventory,
+`crates/server/src/registry.rs`, `scripts/docs/feature-doc-map.json`, `scripts/smoke.ps1`,
+`.perfect/**`. Rust-touching lots = 2 ✓.
 
 ### Round-19 pool — 6 GATED -> ALL 6 SHIPPED + 4 Director/follow-up commits (2026-08-13, `perfect/2026-08-13-r19`)
 Gate on merged master: `cargo fmt --check` clean · `cargo clippy --workspace --all-targets` exit 0,
