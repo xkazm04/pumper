@@ -52,6 +52,26 @@ Dependency rule: **apps depend only on `core`** (plus parsing libs like
 `scraper`). Engines also depend only on `core`. The server wires everything
 together. That keeps every new use case a self-contained crate.
 
+The rule is a **default, not an invariant** — say so plainly, because a builder
+who reads it as absolute duplicates code to obey it. Five app crates carry a
+sanctioned exception today, each one a *sibling app* whose types the dependent
+app genuinely shares rather than a layering shortcut:
+
+| crate | depends on | why |
+| --- | --- | --- |
+| `census-bfs`, `census-nesd`, `census-nonemp` | `app-census-density` | the shared census product/blend types |
+| `cordis` | `app-eu-sedia` | the shared EU-money parser |
+| `extractor` | `app-crawl` | host-observation persistence + `host_of` |
+| `extractor` | `pumper-engine-archive` | Wayback CDX enumeration for `source.archive` |
+
+The line that actually matters: **a new app must not reach for another app or an
+engine to avoid designing its own seam.** Shared behaviour belongs in `core` or
+in a `*-common` crate (`trades-common`, `census-common`, `grants-common`) — that
+is what those crates exist for. When neither fits and the sibling's type really
+is the contract, add the edge and say why in the `Cargo.toml`, as the rows above
+do. Copying a small helper is also a legitimate answer, and is the one round 19
+took for `parse_records_echo`.
+
 ## Rust-specific capabilities
 
 Features that lean on what Rust does well and Python can't (easily):
