@@ -671,7 +671,10 @@ mod tests {
         assert_eq!(idx["scrapeability"]["partial_runs"], true, "{idx}");
         // The read-modify-write fold's known lost update is disclosed rather
         // than left both unfixed and unmentioned — and its direction is stated.
-        assert_eq!(idx["scrapeability"]["counters_may_undercount"], true, "{idx}");
+        assert_eq!(
+            idx["scrapeability"]["counters_may_undercount"], true,
+            "{idx}"
+        );
     }
 
     // ── probes stay out of the score ────────────────────────────────────────

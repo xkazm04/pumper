@@ -98,13 +98,21 @@ async fn a_completed_crawl_commits_one_run_through_all_three_seams() {
     let job_id = ctx.job_id;
     let out = Crawl.run(ctx).await.unwrap();
     assert_eq!(out["crawled"], 20, "{out}");
-    assert_eq!(out["reliability_hosts"], 1, "one host, however many flushes");
+    assert_eq!(
+        out["reliability_hosts"], 1,
+        "one host, however many flushes"
+    );
 
-    let obs = observation(&store, "example.com").await.expect("observation");
+    let obs = observation(&store, "example.com")
+        .await
+        .expect("observation");
     assert_eq!(obs["crawl"]["runs"], 1, "{obs}");
     assert_eq!(obs["crawl"]["runs_complete"], 1, "{obs}");
     assert_eq!(obs["crawl"]["partial"], false, "the run finished: {obs}");
-    assert_eq!(obs["crawl"]["fetches"], 20, "every fetch, counted once: {obs}");
+    assert_eq!(
+        obs["crawl"]["fetches"], 20,
+        "every fetch, counted once: {obs}"
+    );
 
     let idx = index(&store, "example.com").await.expect("index record");
     assert_eq!(idx["observations"], 1, "{idx}");
@@ -166,7 +174,9 @@ async fn a_host_with_no_robots_txt_is_not_recorded_as_serving_dead_pages() {
     );
     assert_eq!(out["crawled"], 2, "{out}");
 
-    let obs = observation(&store, "example.com").await.expect("observation");
+    let obs = observation(&store, "example.com")
+        .await
+        .expect("observation");
     assert_eq!(
         obs["crawl"]["gone"], 0,
         "a missing robots.txt is not a dead page: {obs}"
@@ -207,8 +217,13 @@ async fn a_host_that_really_serves_dead_pages_still_scores_for_it() {
         .await
         .unwrap();
 
-    let obs = observation(&store, "example.com").await.expect("observation");
-    assert_eq!(obs["crawl"]["gone"], 1, "a real 404 page still counts: {obs}");
+    let obs = observation(&store, "example.com")
+        .await
+        .expect("observation");
+    assert_eq!(
+        obs["crawl"]["gone"], 1,
+        "a real 404 page still counts: {obs}"
+    );
     assert_eq!(obs["crawl"]["probes"], 1, "{obs}");
     let idx = index(&store, "example.com").await.expect("index record");
     assert_eq!(
