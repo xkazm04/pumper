@@ -10,6 +10,7 @@
         "crates/core/src/storage.rs",
         "crates/core/src/config.rs",
         "crates/core/src/costs.rs",
+        "crates/core/src/vcr.rs",
         "crates/server/src/worker.rs",
         "crates/server/src/scheduler.rs",
         "crates/server/src/progress.rs",
