@@ -33,7 +33,7 @@
 //! them is a job-model change, not a transact one.
 
 use async_trait::async_trait;
-use pumper_core::engine::{unknown_transact_fields, TRANSACT_FIELDS};
+use pumper_core::engine::{profile_name_pattern, unknown_transact_fields, TRANSACT_FIELDS};
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, ManifestExample, Result, ScrapeApp, TransactRequest,
 };
@@ -81,7 +81,17 @@ impl ScrapeApp for Transact {
                     },
                     "profile": {
                         "type": "string",
-                        "description": "Session-vault profile to act under (logins/cookies)."
+                        // The engine's own rule, not a second copy of it:
+                        // `profile_name_pattern()` is generated from
+                        // `validate_profile_name`'s alphabet + PROFILE_NAME_MAX_LEN
+                        // and pinned to it by a test in core. Without it a typo'd
+                        // profile passed the door and became a job that failed on
+                        // the most expensive tier.
+                        "pattern": profile_name_pattern(),
+                        "description": "Session-vault profile to act under (logins/cookies). \
+                                        1-64 chars of ASCII letters, digits, '-' or '_' — the \
+                                        same rule the engine enforces, so a typo is a 422 here \
+                                        rather than a failed job on the browser tier."
                     },
                     "steps": {
                         "type": "array",
@@ -375,6 +385,29 @@ mod tests {
         );
     }
 
+    /// The anti-pattern: a typo'd `profile` was typed `Error::Profile`, which
+    /// the worker classes **retryable**, so the app that ACTS on live pages
+    /// spent its whole backoff ladder on four identical refusals of a name that
+    /// could never become legal. It must fail ONCE, before any browser work
+    /// (`Dead::transact` panics, so reaching the engine fails this test).
+    #[tokio::test]
+    async fn typod_profile_refused_before_any_browser_work_and_fails_once() {
+        let store = TempStore::new("transact-bad-profile").await;
+        let mut params = dry_run_params();
+        params["profile"] = json!("portal login"); // a space is not legal
+        let ctx = ctx_with_browser(&store.storage, params, Arc::new(Dead)).await;
+        let err = Transact.run(ctx).await.unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)), "got {err:?}");
+        assert!(
+            err.is_terminal_for_job(),
+            "a refusal that cannot change between attempts must not be retried: {err}"
+        );
+        assert!(
+            err.to_string().contains("portal login"),
+            "the refusal names the offending profile: {err}"
+        );
+    }
+
     #[tokio::test]
     async fn missing_idempotency_key_is_a_typed_rejection() {
         let store = TempStore::new("transact-nokey").await;
@@ -494,6 +527,13 @@ mod tests {
             schema["properties"]["idempotency_key"]["pattern"],
             json!("\\S"),
             "an all-whitespace key must not pass"
+        );
+        // A typo'd profile is a 422 at the door, not a job that fails on the
+        // browser tier — and the door's rule IS the engine's rule.
+        assert_eq!(
+            schema["properties"]["profile"]["pattern"],
+            json!(profile_name_pattern()),
+            "the door must enforce the engine's own profile-name rule"
         );
         // Every property the schema declares is one the request understands,
         // so `additionalProperties: false` can never reject a legal field.

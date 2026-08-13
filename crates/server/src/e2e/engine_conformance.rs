@@ -334,6 +334,88 @@ async fn a_flow_refusal_fails_once_instead_of_burning_the_retry_ladder() {
     }
 }
 
+/// A profile name no vault can ever accept: the space is outside
+/// `validate_profile_name`'s alphabet, so the refusal is a pure function of the
+/// request — the same on attempt 1 and attempt 4.
+const UNSAFE_PROFILE: &str = "portal login";
+
+/// THE second retry-class bug, one contract line from the first. A typo'd
+/// `profile` was typed `Error::Profile`, which `is_terminal_for_job` classes
+/// **retryable**, so a job carrying it burned its whole backoff ladder on four
+/// identical refusals — on the most expensive tier, and for an app that ACTS on
+/// live pages. A name is frozen into the job row at enqueue; no attempt can
+/// learn anything the first did not.
+///
+/// Run over **every seam that checks a name**, because the obligation belongs to
+/// the class of refusal, not to one call site: fixing `transact` and leaving
+/// `render` retryable is exactly the half-fix this battery exists to catch. The
+/// answers are pinned as an EXPECTED map so a `false` has to be argued in review
+/// rather than appearing by accident.
+#[tokio::test]
+async fn a_deterministic_profile_refusal_fails_once_on_every_seam() {
+    let store = TempStore::new("engine-conformance-profile").await;
+    let browser = BrowserEngine::new(
+        &pumper_core::config::BrowserConfig::default(),
+        store.path().join("profiles"),
+    );
+    let http = http_engine(&store);
+
+    let mut got: BTreeMap<&str, bool> = BTreeMap::new();
+
+    // 1. The browser engine's RENDER seam.
+    let mut render = RenderRequest::new("https://example.test/page");
+    render.profile = Some(UNSAFE_PROFILE.into());
+    let err = browser
+        .render(render)
+        .await
+        .expect_err("an unsafe profile name must never reach Chrome");
+    got.insert("engine-browser::render", err.is_terminal_for_job());
+
+    // 2. The browser engine's TRANSACT seam (a different validator, same fact).
+    let mut flow = refused_flow();
+    flow.submit = false; // isolate the profile refusal from the submit refusal
+    flow.profile = Some(UNSAFE_PROFILE.into());
+    let err = browser
+        .transact(flow)
+        .await
+        .expect_err("an unsafe profile name must never reach Chrome");
+    got.insert("engine-browser::transact", err.is_terminal_for_job());
+
+    // 3. The HTTP tier takes the same parameter, through a different path
+    //    (`profile_cookies_path`), and is included so the hole is VISIBLE
+    //    rather than merely absent from the battery.
+    let mut req = HttpRequest::get("http://127.0.0.1:1/never-fetched");
+    req.profile = Some(UNSAFE_PROFILE.into());
+    let err = http
+        .fetch(req)
+        .await
+        .expect_err("an unsafe profile name must never open a jar");
+    got.insert("engine-http::fetch", err.is_terminal_for_job());
+
+    let expected: BTreeMap<&str, bool> = BTreeMap::from([
+        // Both browser seams refuse through `require_safe_profile_name`, which
+        // types the refusal `Error::BadRequest` — terminal, and a 400 at the
+        // request boundary.
+        ("engine-browser::render", true),
+        ("engine-browser::transact", true),
+        // KNOWN GAP, deliberately pinned as `false` rather than left untested:
+        // the HTTP tier still refuses with `Error::Profile` (retryable), so a
+        // profiled fetch with a typo'd name still burns its ladder — cheaply,
+        // but it burns it. Closing it means retyping the refusal in
+        // `engine-http` (and updating that crate's two tests, which assert the
+        // `Error::Profile` class). Flip this to `true` in the same change.
+        ("engine-http::fetch", false),
+    ]);
+
+    assert_eq!(
+        got, expected,
+        "the retry class of a deterministic profile refusal changed. A refusal \
+         that is a pure function of the request must fail ONCE (`true`); a \
+         `false` here is a seam that still spends four attempts re-deriving the \
+         same sentence, and must be argued in review."
+    );
+}
+
 // ── inventories: the battery can only run what it can reach ──────────────────
 
 /// Workspace root — `crates/server/../..`.

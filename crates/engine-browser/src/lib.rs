@@ -55,7 +55,8 @@ use futures::StreamExt;
 use pumper_core::config::BrowserConfig;
 use pumper_core::engine::{
     interaction_outcome, parse_transact_probe, pass_fully_succeeded, require_existing_profile,
-    summarize_steps, transact_probe_js, CapturedCall, PageAction, StepOutcome,
+    require_safe_profile_name, summarize_steps, transact_probe_js, CapturedCall, PageAction,
+    StepOutcome,
 };
 use pumper_core::{
     lru_touch_evict, profile_browser_dir, Browser, Error, RenderRequest, RenderedPage, Result,
@@ -462,11 +463,19 @@ impl BrowserEngine {
     }
 
     /// The user-data-dir a render should run under: the profile's `browser/`
-    /// dir, or the shared `[browser] user_data_dir` when profile-less. Validates
-    /// the profile name (typed `Error::Profile` on anything unsafe).
+    /// dir, or the shared `[browser] user_data_dir` when profile-less.
+    ///
+    /// The name is checked through [`require_safe_profile_name`], so an unsafe
+    /// one is a **terminal** refusal (`Error::BadRequest`) rather than a
+    /// retryable `Error::Profile`: it is a pure function of the request, so the
+    /// four attempts a render job used to spend re-deriving it bought nothing.
+    /// Checked before any path is built, exactly as before.
     fn user_data_dir(&self, profile: Option<&str>) -> Result<PathBuf> {
         match profile {
-            Some(name) => profile_browser_dir(&self.profiles_dir, name),
+            Some(name) => {
+                require_safe_profile_name(name)?;
+                profile_browser_dir(&self.profiles_dir, name)
+            }
             None => Ok(self.cfg.user_data_dir.clone()),
         }
     }
@@ -932,6 +941,15 @@ impl Browser for BrowserEngine {
         // Cap the captured HTML like the HTTP tier caps its body, so a pathological
         // JS-built DOM can't balloon memory on the expensive tier — a typed error
         // naming the cap and URL, symmetric with `Error::Http`.
+        //
+        // Deliberately RETRYABLE (`Error::Browser`), unlike the profile-name
+        // refusal above, even though `over_html_cap` is a pure function: its
+        // inputs are not. The cap comes from the request, but the size comes from
+        // a live remote page that is re-rendered on the next attempt — a listing
+        // that went 3 MiB over during a bad deploy can be back under it in a
+        // minute, and a JS-built DOM is not even deterministic between two
+        // renders of the same URL. A refusal is terminal here only when NOTHING
+        // about the next attempt could differ; that is not this.
         let cap = req.max_body_bytes.unwrap_or(self.cfg.max_html_bytes);
         if over_html_cap(html.len() as u64, cap) {
             return Err(Error::Browser(format!(
@@ -1330,9 +1348,12 @@ mod tests {
                 .join("acme")
                 .join("browser")
         );
-        // An unsafe name is rejected before any path exists.
+        // An unsafe name is rejected before any path exists — and TERMINALLY,
+        // so a typo'd profile on a render job fails once instead of launching
+        // the whole backoff ladder at the same sentence.
         let err = engine.user_data_dir(Some("../../etc")).unwrap_err();
-        assert!(matches!(err, Error::Profile(_)), "got {err:?}");
+        assert!(matches!(err, Error::BadRequest(_)), "got {err:?}");
+        assert!(err.is_terminal_for_job(), "{err}");
     }
 
     #[test]

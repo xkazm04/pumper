@@ -56,6 +56,43 @@ pub fn validate_profile_name(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// The regex form of [`validate_profile_name`], for the one place a JSON Schema
+/// needs the rule as a `pattern` (an app's `params_schema`, so a typo'd profile
+/// is a 422 at the door instead of a job that fails on the browser tier).
+///
+/// Built from [`PROFILE_NAME_MAX_LEN`] rather than hard-coded, and pinned to the
+/// validator by `the_schema_pattern_and_the_validator_agree` — a second copy of
+/// this rule that could drift from the function is exactly what would let the
+/// door and the engine disagree about what a legal profile is.
+pub fn profile_name_pattern() -> String {
+    format!("^[A-Za-z0-9_-]{{1,{PROFILE_NAME_MAX_LEN}}}$")
+}
+
+/// [`validate_profile_name`], typed as the **deterministic pre-flight refusal**
+/// it is at a job seam.
+///
+/// Same rule, different variant, for one reason: a name is a pure function of
+/// the request, and the request is frozen into the job row at enqueue — so a
+/// retry can only re-derive the identical refusal. As an `Error::Profile` it was
+/// retryable ([`Error::is_terminal_for_job`]), and a typo'd `profile` on a
+/// transact or render job burned the whole backoff ladder producing the same
+/// sentence four times. `Error::BadRequest` is the honest variant: "input this
+/// service understood and rejected", already a 400 at the request boundary, and
+/// terminal.
+///
+/// The whole `Error::Profile` variant is deliberately NOT reclassified — it also
+/// carries transient jar IO (see [`Error::is_terminal_for_job`]) — so engines
+/// call THIS at their pre-flight seams and keep `validate_profile_name` for
+/// everything that is not a job's one-shot refusal.
+pub fn require_safe_profile_name(name: &str) -> Result<()> {
+    match validate_profile_name(name) {
+        Ok(()) => Ok(()),
+        // The rule's own wording travels verbatim; only the class changes.
+        Err(Error::Profile(why)) => Err(Error::BadRequest(format!("profile {why}"))),
+        Err(other) => Err(other),
+    }
+}
+
 /// `<profiles_dir>/<name>` for a validated name.
 pub fn profile_dir(profiles_dir: &Path, name: &str) -> Result<PathBuf> {
     validate_profile_name(name)?;
@@ -466,8 +503,13 @@ pub struct TransactRequest {
 impl TransactRequest {
     /// Rejects flows this slice must not run: `submit: true` (typed
     /// [`Error::Transact`] pointing at the human-approval design), an empty
-    /// idempotency key, and an invalid profile name. Engines call this before
-    /// touching a browser; apps call it before touching an engine.
+    /// idempotency key (`Error::Transact`), and an unsafe profile name
+    /// ([`Error::BadRequest`], via [`require_safe_profile_name`]). Engines call
+    /// this before touching a browser; apps call it before touching an engine.
+    ///
+    /// All three are **terminal for the job** ([`Error::is_terminal_for_job`]),
+    /// which is the property that matters here: each is a pure function of a
+    /// request that cannot change between attempts, so a refusal fails ONCE.
     pub fn validate(&self) -> Result<()> {
         if self.submit {
             return Err(Error::Transact(
@@ -487,7 +529,9 @@ impl TransactRequest {
             ));
         }
         if let Some(profile) = &self.profile {
-            validate_profile_name(profile)?;
+            // Terminal like its two siblings above: a name the vault can never
+            // accept is not something a retry discovers differently.
+            require_safe_profile_name(profile)?;
         }
         Ok(())
     }
@@ -1376,11 +1420,81 @@ mod tests {
         assert!(matches!(req.validate().unwrap_err(), Error::Transact(_)));
         let mut req = dry_run_flow();
         req.profile = Some("../escape".into());
-        assert!(matches!(req.validate().unwrap_err(), Error::Profile(_)));
+        let err = req.validate().unwrap_err();
+        assert!(matches!(err, Error::BadRequest(_)), "got {err:?}");
+        assert!(
+            err.to_string().contains("../escape"),
+            "the refusal names the offending value: {err}"
+        );
         // A valid profile threads through fine.
         let mut req = dry_run_flow();
         req.profile = Some("acme_login".into());
         assert!(req.validate().is_ok());
+    }
+
+    /// THE anti-pattern this direction exists to kill: a typo'd profile name is
+    /// a pure function of the request, and the request is frozen at enqueue —
+    /// yet it came back `Error::Profile`, which the worker classes retryable, so
+    /// it burned the whole backoff ladder repeating one sentence. It must fail
+    /// ONCE, on both seams that check a name (a flow AND a plain render).
+    #[test]
+    fn a_typod_profile_not_run_down_the_whole_retry_ladder() {
+        let mut req = dry_run_flow();
+        req.profile = Some("portal login".into()); // a space is not legal
+        let refused = req.validate().unwrap_err();
+        assert!(
+            refused.is_terminal_for_job(),
+            "a name the vault can NEVER accept came back retryable: {refused}"
+        );
+        // The shared seam every engine calls gives the same class...
+        let direct = require_safe_profile_name("portal login").unwrap_err();
+        assert!(direct.is_terminal_for_job(), "{direct}");
+        // ...while the underlying rule keeps its own `Error::Profile` typing for
+        // the callers that are not a job's one-shot refusal (the HTTP tier's
+        // cookie-jar path), because that variant also carries transient IO.
+        assert!(matches!(
+            validate_profile_name("portal login").unwrap_err(),
+            Error::Profile(_)
+        ));
+        assert!(require_safe_profile_name("portal_login").is_ok());
+    }
+
+    /// The rule is written twice — once as a function every engine calls, once
+    /// as a JSON-Schema `pattern` the enqueue door compiles — so the two are
+    /// pinned to each other over a corpus that includes every shape the
+    /// validator has an opinion about. A drift here is a name the door accepts
+    /// and the engine refuses (or worse, the reverse).
+    #[test]
+    fn the_schema_pattern_and_the_validator_agree() {
+        let pattern = regex::Regex::new(&profile_name_pattern()).expect("the pattern compiles");
+        let corpus = [
+            "acme",
+            "acme_login",
+            "portal-login-2",
+            "A1",
+            "0",
+            "",
+            " ",
+            "portal login",
+            "..",
+            "../etc",
+            "a/b",
+            "a\\b",
+            "a.b",
+            "C:",
+            "naïve",
+            "a:b",
+            "-*-",
+            &"x".repeat(PROFILE_NAME_MAX_LEN),
+            &"x".repeat(PROFILE_NAME_MAX_LEN + 1),
+        ];
+        for name in corpus {
+            assert_eq!(
+                pattern.is_match(name),
+                validate_profile_name(name).is_ok(),
+                "the door and the engine disagree about {name:?}"
+            );
+        }
     }
 
     /// The EXPECTED-diff idiom: serde is the source of truth for what a

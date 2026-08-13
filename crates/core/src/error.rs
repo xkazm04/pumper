@@ -213,8 +213,13 @@ pub enum Error {
     #[error("vcr replay miss: {0}")]
     ReplayMiss(String),
     /// Client-supplied input the server understood but rejected (a malformed
-    /// query, filter, or rule). Maps to HTTP 400 at the request boundary — unlike
-    /// `Parse`, which also covers server-internal decode failures (HTTP 500).
+    /// query, filter, or rule; an unsafe session-profile name). Maps to HTTP 400
+    /// at the request boundary — unlike `Parse`, which also covers
+    /// server-internal decode failures (HTTP 500).
+    ///
+    /// **Terminal for a job** ([`Error::is_terminal_for_job`]): every producer is
+    /// a pure function of input that is immutable for the life of the job, so a
+    /// retry re-parses the identical text and re-refuses.
     #[error("bad request: {0}")]
     BadRequest(String),
     #[error("io: {0}")]
@@ -284,20 +289,28 @@ impl Error {
     /// retry cannot change the outcome, so the runtime must fail the job once
     /// instead of running it down the retry/backoff ladder.
     ///
-    /// The bar is deliberately high, and today exactly two variants clear it:
+    /// The bar is deliberately high, and today exactly three variants clear it:
     ///
     /// - [`Error::BudgetExhausted`] — a fact about the job's own ledger, which
     ///   a retry re-reads and re-refuses on.
     /// - [`Error::Transact`] — a **pre-flight** flow refusal, from one of two
-    ///   producers. `TransactRequest::validate`'s three refusals (`submit:
-    ///   true`, a blank idempotency key, a profile the vault does not hold) are
-    ///   pure functions of the request; `crate::engine::unsupported_transact`
-    ///   (the `Browser::transact` default) is a pure function of which engine is
-    ///   wired. Request and wiring are both immutable for the life of the job,
-    ///   so every attempt reaches the identical refusal *before touching a
-    ///   browser*. This one matters more than most: transact is the app that
-    ///   ACTS on live pages, and a refusal is precisely the case where the
-    ///   ladder must not keep trying.
+    ///   producers. `TransactRequest::validate`'s refusals (`submit: true`, a
+    ///   blank idempotency key) are pure functions of the request, as is
+    ///   `crate::engine::require_existing_profile` (a profile the vault does not
+    ///   hold); `crate::engine::unsupported_transact` (the `Browser::transact`
+    ///   default) is a pure function of which engine is wired. Request and
+    ///   wiring are both immutable for the life of the job, so every attempt
+    ///   reaches the identical refusal *before touching a browser*. This one
+    ///   matters more than most: transact is the app that ACTS on live pages,
+    ///   and a refusal is precisely the case where the ladder must not keep
+    ///   trying.
+    /// - [`Error::BadRequest`] — client-supplied input the server understood and
+    ///   rejected: a malformed dataset filter/aggregate/derived spec, a
+    ///   syntactically bad search query, an unsafe session-profile name
+    ///   (`crate::engine::require_safe_profile_name`). Every producer is a pure
+    ///   function of text that is immutable for the life of the job, so the
+    ///   ladder can only re-parse it and re-fail. A job's params are fixed at
+    ///   enqueue; nothing about attempt 4 makes `"$.a:bogus:1"` parse.
     ///
     /// Everything else — engine errors, storage errors, parse failures, even a
     /// replay miss — is either transient or caught earlier, and classifying any
@@ -306,13 +319,26 @@ impl Error {
     /// *during* a flow is an `Error::Browser`, which stays retryable; only the
     /// deterministic pre-flight refusal is typed `Transact`.
     ///
+    /// **Why `Error::Profile` is NOT here**, though an unsafe profile name is as
+    /// deterministic as anything above: the variant has a genuinely transient
+    /// producer. `engine-http`'s `ProfileJar::load` types an unreadable cookie
+    /// jar as `Error::Profile` — a sharing violation while the flusher renames
+    /// its temp file, a momentary EACCES — and those succeed on the next
+    /// attempt. Classifying the whole variant terminal to catch the name check
+    /// would take the retries away from the IO case, so the *name* refusal is
+    /// retyped at its seams instead (`require_safe_profile_name`) and the
+    /// variant stays retryable.
+    ///
     /// The anti-pattern this replaces: the worker treated every app error as
     /// transient, so a job that exhausted its budget three seconds into attempt
     /// 1 was re-queued with backoff, re-seeded the same spend from the ledger,
     /// and re-exhausted instantly — three attempts and ~30s of backoff spent
     /// producing the same refusal three times.
     pub fn is_terminal_for_job(&self) -> bool {
-        matches!(self, Error::BudgetExhausted(_) | Error::Transact(_))
+        matches!(
+            self,
+            Error::BudgetExhausted(_) | Error::Transact(_) | Error::BadRequest(_)
+        )
     }
 }
 
@@ -514,6 +540,40 @@ mod tests {
         assert!(!Error::Profile("cookie jar unreadable".into()).is_terminal_for_job());
     }
 
+    /// The anti-pattern, for input the caller cannot fix by waiting: a bad
+    /// dataset filter, a malformed aggregate spec, an unparseable search query
+    /// or an unsafe profile name is a pure function of text that is frozen into
+    /// the job row at enqueue. Every attempt re-parses the identical string and
+    /// re-fails, so the ladder buys nothing and bills four times for it.
+    #[test]
+    fn malformed_input_not_retried_four_times() {
+        for e in [
+            Error::BadRequest("bad filter".into()),
+            Error::BadRequest(
+                "unknown aggregate 'mediun' (expected 'count' or 'sum($.path)')".into(),
+            ),
+            Error::BadRequest("profile name '../etc' contains '/'".into()),
+        ] {
+            assert!(
+                e.is_terminal_for_job(),
+                "{e} is deterministic — retrying it re-parses the same string"
+            );
+        }
+    }
+
+    /// The reason `Error::Profile` is not in the terminal set even though an
+    /// unsafe *name* is deterministic: the variant also carries genuinely
+    /// transient IO (`engine-http`'s cookie-jar load racing its own flusher's
+    /// rename). The name refusal is retyped at its seams instead; the variant
+    /// keeps its retries.
+    #[test]
+    fn a_transient_profile_io_failure_keeps_its_retries() {
+        assert!(!Error::Profile(
+            "opening data/profiles/acme/cookies.json: The process cannot access the file".into()
+        )
+        .is_terminal_for_job());
+    }
+
     /// The mirror risk, and the more dangerous one: over-classifying. A
     /// transient failure marked terminal loses the job its retries silently.
     #[test]
@@ -526,7 +586,10 @@ mod tests {
             Error::Parse("bad html".into()),
             Error::Config("missing key".into()),
             Error::ReplayMiss("no recorded response".into()),
-            Error::BadRequest("bad filter".into()),
+            // NOT `BadRequest`: see `malformed_input_not_retried_four_times`.
+            // It sat here as if transient, which its own doc never claimed —
+            // "input the server understood and rejected" cannot become valid on
+            // attempt 2.
             Error::Io(std::io::Error::other("disk hiccup")),
         ] {
             assert!(
