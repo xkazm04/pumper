@@ -122,3 +122,28 @@ Findings, ranked (scout evidence, file:line verified):
 
 ## Shipped
 - (inherited — see [[broad-crawler]])
+- **Round 16 — 3/3 shipped** (landed on master `5513d61` 2026-08-13, pushed; one lot, one file —
+  `crates/core/src/crawl.rs` only):
+  - [[crawl-resume-loses-nothing]] → `92621fe` — solved **structurally**, not by careful call
+    ordering: `flush_then_checkpoint` is the single door and drains the sink before saving, so
+    "the checkpoint never claims a page the sink has not been handed" cannot be violated by a
+    future edit that forgets. `checkpoint_queue` merges the in-flight set into the persisted
+    queue; the removal key comes from `fetch_outcome_url`, and `fetch_one` moves the
+    **requested** URL into `Fetched.url` in all five variants (never `final_url`), so insert and
+    remove keys can never diverge — Director-verified, that was the one way it could have
+    leaked. `CrawlHarness` records an **ordered event log** of sink-emits vs checkpoint-saves,
+    because an ordering defect is invisible to an end-state assertion.
+  - [[crawl-revisit-dedup-freeze]] → `abef1ea` — `dedup_applies(dedup_distance, known_page)`,
+    with *why the two modes ask opposite questions* written into the doc comment. Membership in
+    the conditional-GET map is the discriminator, so a URL discovered mid-revisit correctly
+    keeps the fresh-crawl gate. First end-to-end coverage of the dedup gate in the file's
+    history — both tests run at `dedup_distance = 3`, the app's real default (every prior e2e
+    test used 0, which is why it shipped).
+  - [[crawl-politeness-truth]] → `10aa549` — found the deeper bug inside the shallow one: the
+    robots **cache key** was the bare host, conflating `http://x` and `https://x`. `origin_of`
+    becomes both the cache key and the base for `robots_url`, and the `/sitemap.xml` fallback
+    probe had the identical https-only bug and moved with it, unbriefed. `RobotsAudit` →
+    `robots_unverified_hosts`, with a test pinning that a **non-2xx robots response is NOT
+    reported as unverified** — "404 = no robots = legitimate allow-all" is a different fact from
+    "we could not ask", and collapsing them would have made the field noise. Per-host budgets
+    persisted behind `CHECKPOINT_VERSION` 2.

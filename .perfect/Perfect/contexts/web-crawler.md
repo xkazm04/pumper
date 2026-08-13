@@ -96,3 +96,27 @@ bounded memory (`:18`), retention pinning (`:56`), and "up to 256 concurrent fet
 
 ## Shipped
 - (inherited — see [[broad-crawler]])
+- **Round 16 — 3/3 shipped** (landed on master `5513d61` 2026-08-13, pushed):
+  - [[crawl-truncation-visible]] → `3151f35` — `frontier_dropped` + `skipped_host_budget`
+    surfaced with **zero core edits**; `coverage_complete()` as a named function plus a
+    `warnings` entry naming *which* cut happened; `edges_written` now reports store-confirmed
+    writes with `edges_unchanged` beside it; `OUTPUT_SHAPE` const + an inventory test that
+    diffs it against a **real run in both directions**. Gave the app its first `run()`-level
+    harness (`tests/common/mod.rs`, `StubSite`).
+  - [[crawl-reliability-survives-interruption]] → `3bb35ef` (+ wip `5edcbd0`, `137f7d4`) —
+    host telemetry now commits **during** the crawl on a 120s wall clock, through all three
+    seams. Found a bug outside its brief: `TierMemory::record` zeroes `http_strikes` on the
+    `winner == "http"` branch **before reading `http_lost`**, so the crawl's hardcoded `"http"`
+    was erasing bot-wall evidence for every host — and, since `tier_memory` is keyed by host
+    alone, erasing what *other apps* had learned. Fixed via `tier_that_won` + a monotone
+    per-run `lost` set. `is_page_fetch` stops robots probes fabricating a "gone page" for every
+    host without a robots.txt. Interruption pinned by abandoning the future mid-flight.
+  - [[crawl-memory-bounded]] → `7f1b6cc` — `MAX_TRACKED_EDGES = 200_000` in core's
+    cap/count/report shape, with the per-edge memory arithmetic (~410 B → ~80 MB) stated where
+    the constant lives. Key structural find: `in_degree.len() <= seen.len()` **by
+    construction**, so one cap bounds both maps. Past the budget edges keep streaming to the
+    dataset (it is the deliverable and it goes to disk) while the *bookkeeping* freezes
+    totally — because an unrecognizable repeat would silently inflate `top_linked`. Reported as
+    `edges_untracked` + `top_linked_complete`. `SeedData` kept at full width and justified by a
+    computed 2,291 B/record footprint, guarded by a test that fires if the shape outgrows it.
+    `docs/features/crawling.md`'s false bounded-memory claim replaced by a four-row cap table.
