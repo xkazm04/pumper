@@ -459,3 +459,11 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   above it. A line-number check calls that a new warning and a count-only check ("31 before, 31
   after") can be fooled by a coincidence. The one warning that WAS new (`registry.rs:106`) was found
   the same way and fixed rather than allowed.
+- 2026-08-13 (round 20, continuation): **The Personas app DB is
+  `%APPDATA%/com.personas.desktop/personas.db`** — project `512809db-…` = Pumper, 46 contexts, and
+  both r20 target names present verbatim (so the outbox anchors are validated, not assumed). Worth
+  pinning because the wrong DB **fails silently**: `%LOCALAPPDATA%/personas-athena-test/personas.db`
+  exists, has the same `dev_contexts` schema, holds 89 rows — and contains no pumper project at all,
+  so every lookup returns zero rows with no error. `dev_projects` has `root_path`, not `path`.
+  Query: `sqlite3 "file:<db>?mode=ro" "select c.name from dev_contexts c join dev_projects p on
+  c.project_id=p.id where p.root_path like '%pumper%';"`
