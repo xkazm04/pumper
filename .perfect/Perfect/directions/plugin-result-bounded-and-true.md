@@ -3,12 +3,12 @@ slug: plugin-result-bounded-and-true
 type: perfect/direction
 context: "[[plugin-runner]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 210fd3e
 ---
 
 ## What & why
@@ -107,4 +107,72 @@ The extractor does both (`extractor/src/lib.rs:235, 252`).
 
 ## Build record
 
-(filled during build)
+**Shipped `210fd3e`, completed by `fcc4249`. Director verdict: KEEP.** All six criteria met, one
+of them by refuting the criterion.
+
+Criterion 1: `with_outcome_fields` / `with_records_echo` are now the single definition of the
+write-mode contract; `dataset` names the real write target (`<name>@q` on quarantine, pinned by
+test). **But the criterion's stated *reason* was wrong — see refutation below.**
+Criterion 2: `records_echo` 100 / 1000 / `0`, with `records_total` + `records_truncated`.
+**Copied, not shared** — an `app-plugin → app-extractor` edge would violate README §Architecture;
+the doc comment says so. Criterion 3: `parse_source_limit` + `sweep_truncated`, judged on the
+store's page **before** the removed/gone filter, which is the only place the count is honest;
+source mode reports `limit` + `truncated`. Criterion 4: `parse_concurrency` clamps `1..=64`, with
+a test asserting the clamp and the schema `maximum` are **the same number**. Criterion 5: both
+docs updated. Criterion 6: `upsert_items` and the `ran` predicate got their first tests at unit
+**and** `run()` level.
+
+**Builder refutation — my criterion 1 was wrong, and this is the useful kind of wrong.**
+`YieldEntry.dataset` is the dot-joined **JSON key path** (`costs.rs:189-193`), `""` at root — not
+a dataset name. Adding a root-level `"dataset": "plugin_out"` changes attribution not at all, and
+`extractor`, which has emitted that field since r12, is attributed to `""` too. Re-keying would
+mean nesting the summary under a dataset-named object, and `walk_yields` **keeps descending below
+a match**, so the run would then report its counts **twice**. Verified in source. They emitted
+`dataset` anyway — it is what a human or agent reading `GET /jobs/{id}` needs — and pinned what is
+actually true: exactly one yield entry, right counts, no double-count. So this was never a
+plugin-app defect; it is a property of the yield convention, and the note above was wrong to call
+it one.
+
+### Director-decided follow-up: `fcc4249` — `index_datasets`
+
+The direction made this a non-goal ("argue for it; don't assume it"). The builder argued for it in
+its report rather than guessing, and it was right: bounding the echo **without** the delegation was
+the one half-fix in the wave, silently dropping a 10 000-output run from 10 000 search docs to 100.
+The decisive precedent it did not have: the extractor pairs the two — `extractor/src/lib.rs:779`
+calls `index_datasets` "the load-bearing one" and sets it at `:802` *because* r12 bounded its echo
+— and `worker.rs:1818-1830` documents the pairing at the guard. Re-briefed with a narrow scope.
+
+What came back was better than the ask on two counts:
+- **A real bug avoided in the quarantine path.** The worker's health gate reads the health of the
+  *spec's* pair, and `("plugin", "plugin_out@q")` is a pair no `observe_extraction` ever judges —
+  so it always reads `Healthy` and would have waved quarantined rows into the index that saved
+  searches alert from. Gated in the producer instead (`write_target` now returns the verdict
+  alongside the diverted name), which is where the extractor gates it for the same reason.
+- **Backfill needed it most, and that was verified rather than assumed** against
+  `echo_indexing_delegated`: backfill echoes nothing, so before this its written records had **no**
+  per-record search coverage at all — only one whole-result `_job` document.
+- **Observatory deliberately does not declare**, with the reasoning in a doc comment, and the
+  load-bearing fact checked rather than asserted: `run_indexed_apps` always includes the job's own
+  app, and observatory writes under `plugin`, so **watches and dataset triggers on
+  `plugin/observatory` load their revisions either way** — the intended consumer costs nothing.
+  Declaring would have been a new capability, not the other half of a fix, and would dilute
+  `/search` with untitled telemetry rows (the failure `apps.md` already records for
+  `mpsv-ispv/wages`).
+
+**Director answer to the builder's one open "Director call"**: the disclosed gap — that its tests
+pin the *inputs* to the indexing path (spec shape, change feed) but cannot call `search_docs` /
+`echo_indexing_delegated`, which are private in `worker.rs` — needs no further work. **It is
+already closed from the other end**: `worker.rs:2138` asserts "echo delegated, fallback kept". App
+produces the right spec (pinned app-side), worker consumes it correctly (pinned worker-side). No
+`pub(crate)` widening needed.
+
+**Banked, re-scoped rather than closed** (builder's own honest framing): the `versions:"all"`
+search-identity collapse is *largely dissolved on the forward path*, because delegation replaces
+the `<app>:<url>` id with `<app>:<dataset>:<key>` and the key there **is** `{url}@{date}` — but it
+is untested from the indexer side, and every plugin record indexed before `fcc4249` is now an
+**orphan** under `<app>:<url>` in the reserved `_records` dataset that nothing updates or deletes
+until a `just search-backfill` / `just reindex`. The residue is a verification test plus that
+migration, and it applies to all modes, not just `versions:"all"`.
+
+Gates: `cargo test -p app-plugin` 63/0 (42 lib + 4 observatory + 8 result_contract + 9 run_door).
+Live smoke pins the door refusal and the declared bounds (checks 37 and 38).

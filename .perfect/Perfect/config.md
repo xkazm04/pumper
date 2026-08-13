@@ -53,6 +53,42 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   resource-destructive actions even when they are obviously regenerable.
 
 ## Skill improvement log
+- 2026-08-13 (round 19): **A wave with ZERO Class B files is achievable and it deletes a whole
+  failure class.** r18's log recommended making every straddler Class C rather than sharing it;
+  taken literally this round, the two lots shared no file at all — the four `crates/core/`
+  straddlers went wholesale to one lot, the docs split by name, and neither lot was allowed to add
+  a new e2e file (so `e2e/mod.rs` needed no append). The `git commit --only` bleed that r9 and r18
+  both recorded **did not happen, because there was nothing to bleed through**. The cost is one
+  constraint at wave-plan time: pick two contexts living in different crates. **Standing rule: aim
+  for zero Class B, and treat "this wave needs a Class B file" as a signal to re-check the
+  pairing** — not as a protocol to execute.
+- 2026-08-13 (round 19): **Write thin findings into acceptance criteria as named riders instead of
+  banking them.** Four findings too small to slate (`max_body_bytes = 0`, the retry-loop test gap,
+  the concurrency upper clamp, a missing schema `maximum`) were named as riders inside the three
+  directions whose files they touched. All four shipped, at near-zero marginal cost, because the
+  builder was already in that code. Banking them would have cost a future round a re-verification
+  pass each — and the decay rule (proven four times now) says at least one would have been stale.
+  The bank is for things that need their own design; riders are for things that need a line.
+- 2026-08-13 (round 19): **Three of four builder refutations were of my acceptance criteria's
+  *stated mechanism*, not its intent — and each would have shipped a silent no-op.** `/run_at`
+  instead of `run_at` for `DerivedPaths` (the seam would have *looked* adopted and done nothing —
+  precisely the class the direction existed to kill); `drift_score` "argue it either way" when the
+  behavioural test provably cannot pass with it in the identity; and "include `dataset` so
+  `extract_yields` attributes correctly" when that field is a JSON *path*, so the fix changes
+  nothing and the obvious re-keying would double-count. **Lesson: when a criterion names a
+  mechanism (a path syntax, a field, an API), the criterion should say "verify this spelling
+  against the implementation first" — I keep specifying mechanisms from a scout's prose rather
+  than from the function signature.**
+- 2026-08-13 (round 19): **A builder's honest "I did half of a known pair" is the highest-value
+  line in a report, and it deserves a same-round decision rather than a bank entry.** Lot P bounded
+  the `records` echo and reported, unprompted, that doing so dropped a 10 000-output run from
+  10 000 search docs to 100 — then argued for the fix the direction had made a non-goal. It was
+  right, and the decisive evidence was a precedent it did not have (the extractor pairs
+  `records_echo` with `index_datasets` for exactly this reason, r12). Re-briefing cost ~10 minutes
+  and the follow-up caught a bug neither of us had seen: the worker's health gate reads the
+  *spec's* pair, and `plugin_out@q` is a pair nothing judges, so it always reads Healthy and would
+  have indexed quarantined rows. **Standing rule: "non-goal" in a direction note means "do not
+  assume", not "do not raise" — say so explicitly in the note, as this round's did.**
 - 2026-08-13 (round 18): **Writing a known hazard into the acceptance criteria as a CHECK, not a
   prescription, produced the round's best outcome.** Criterion said "widening `is_terminal_for_job`
   to all of `Error::Profile` may capture a transient error — check every construction site before

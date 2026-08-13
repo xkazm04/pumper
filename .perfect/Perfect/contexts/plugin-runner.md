@@ -105,4 +105,30 @@ typed dispatch + its anti-regression test (`:571`); `buffered()` vs `buffer_unor
 
 ## Shipped
 
+- **r19 (2026-08-13), 3/3 + 1 Director-decided follow-up** — landed on master via
+  `perfect/2026-08-13-r19`:
+  - [[plugin-run-door-honest]] → `7b6d5f1` — a plugin job that cannot run **fails instead of
+    reporting success**. Refused via `ctx.plugins.has()` before any fetch; `Error::BadRequest`
+    (terminal) after auditing construction sites rather than widening `Error::Plugin`, which would
+    have made `trap` terminal. r14's typed `PluginFailure` now survives the fan-out, so failures
+    report by class instead of as one opaque string, and a plugin's own `{"error": …}` output is
+    finally distinguishable from a failed call. Policy decided and documented: partial failure
+    succeeds, total failure fails. The e2e fixture that *proved* the bug (green on a 100%-failure
+    run against `NoPlugins`) is fixed — and the same shape was found and fixed in its extractor arm.
+  - [[plugin-result-bounded-and-true]] → `210fd3e` — `records_echo` 100/1000/0 with
+    `records_total` + `records_truncated`; `sweep_truncated` + `source.limit`; `parse_concurrency`
+    clamped at both ends so the doc's "enforced twice" claim is true; `output_shape` and the three
+    result builders finally agree. Extractor's r12 fixes **copied, not shared** — an app→app edge
+    would violate the dependency rule.
+  - [[observatory-signal-not-noise]] → `3258bf4` — the drift dataset stops manufacturing the drift
+    it measures. Seven volatile fields declared `DerivedPaths`, so a re-run over an unchanged corpus
+    reports `unchanged` and appends **no** revision, while a real behaviour change still marks the
+    row `changed` (both pinned by test — the pairing is what makes deriving telemetry safe).
+    Plugins are replayed with their configured params instead of `null`; empty stored artifacts are
+    no longer blamed on the plugin.
+  - Director-decided follow-up → `fcc4249` — `index_datasets` on every write mode, because bounding
+    the echo without it silently dropped a 10 000-output run to 100 search docs. Withheld on a
+    quarantined source (the worker's gate would have read `plugin_out@q` as Healthy and indexed
+    degraded rows); observatory deliberately does not declare, verified harmless because
+    `run_indexed_apps` always includes the job's own app.
 - (via [[app-runtime]] r9)

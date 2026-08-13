@@ -102,4 +102,22 @@ ladder is switched off in the only cross-engine test that could see it.
 
 ## Shipped
 
+- **r19 (2026-08-13), 3/3** — landed on master via `perfect/2026-08-13-r19`:
+  - [[http-fetch-has-a-deadline]] → `967c409` — one `fetch()` is bounded end to end by
+    `[http] total_budget_secs` (default 300, `0` disables). The 37.5-minute `Retry-After` fetch is
+    now < 5 s and 1 attempt; a retry sleep the budget cannot hold **fails rather than truncating**,
+    because retrying earlier than the server asked would trade a wall-clock bug for a politeness
+    one. First tests anywhere to run the retry loop more than once. Rider:
+    `[http] max_body_bytes = 0` refused at boot.
+  - [[http-transport-errors-terminal]] → `2e46fd0` — an unparseable URL or `ftp://` off a crawl
+    frontier fails **once** (`Error::BadRequest`, terminal, 400) instead of burning 4 engine
+    attempts × N job attempts. Classified on reqwest's typed predicates via a testable
+    `TransportPredicates` value, never on message text; `is_connect` deliberately left retryable
+    with the DNS/TLS/captive-portal reasoning recorded. Conformance battery 5 → 7 and no longer
+    runs with `retries: 0`.
+  - [[profiled-fetch-is-honest]] → `2e46fd0` + `3c806b1` — a mistyped profile no longer scrapes the
+    login wall in silence: WARN at load, `x-pumper-anonymous-profile` on the response, lifted into
+    the escalation trail, the receipt and `TierTrace.detail` **including the winning entry**. A typo
+    no longer materialises a profile in `GET /profiles`. A failed jar write is retried instead of
+    losing the login forever, and an empty jar can no longer clobber a restored `cookies.json`.
 - (inherited — see [[fetch-engines]])
