@@ -398,13 +398,13 @@ async fn a_deterministic_profile_refusal_fails_once_on_every_seam() {
         // request boundary.
         ("engine-browser::render", true),
         ("engine-browser::transact", true),
-        // KNOWN GAP, deliberately pinned as `false` rather than left untested:
-        // the HTTP tier still refuses with `Error::Profile` (retryable), so a
-        // profiled fetch with a typo'd name still burns its ladder — cheaply,
-        // but it burns it. Closing it means retyping the refusal in
-        // `engine-http` (and updating that crate's two tests, which assert the
-        // `Error::Profile` class). Flip this to `true` in the same change.
-        ("engine-http::fetch", false),
+        // Closed in the same round it was pinned: `HttpEngine::jar_for` now
+        // refuses an unsafe name with the terminal `Error::BadRequest`, before
+        // the jar-cache lookup so a cached entry cannot launder one. All three
+        // seams that check a profile name now agree, which is the point of an
+        // EXPECTED map over seams rather than a test per seam — the gap was
+        // visible here for exactly as long as it existed.
+        ("engine-http::fetch", true),
     ]);
 
     assert_eq!(

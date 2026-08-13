@@ -109,13 +109,14 @@ pub use crawl::{
 pub use engine::{
     filled_fields_js, interaction_outcome, is_sensitive_input, parse_filled_fields,
     parse_transact_probe, pass_fully_succeeded, profile_browser_dir, profile_cookies_path,
-    profile_dir, redact_field, require_existing_profile, submit_target_js, summarize_steps,
-    transact_probe_js, unknown_transact_fields, validate_profile_name, Browser, CapturedCall,
-    EngineSet, FilledField, HttpClient, HttpMethod, HttpRequest, HttpResponse, PageAction,
-    RenderRequest, RenderedPage, ResearchOutput, ResearchRequest, Researcher, StepOutcome,
-    StepSummary, SubmitTarget, TransactEvidence, TransactRequest, FETCHED_VIA_HEADER,
-    FILLED_VALUE_MAX_CHARS, PROFILE_BROWSER_DIR, PROFILE_COOKIES_FILE, PROFILE_NAME_MAX_LEN,
-    SENSITIVE_AUTOCOMPLETE_TOKENS, SNAPSHOT_TS_HEADER, TRANSACT_FIELDS,
+    profile_dir, redact_field, require_existing_profile, require_safe_profile_name,
+    submit_target_js, summarize_steps, transact_probe_js, unknown_transact_fields,
+    validate_profile_name, Browser, CapturedCall, EngineSet, FilledField, HttpClient, HttpMethod,
+    HttpRequest, HttpResponse, PageAction, RenderRequest, RenderedPage, ResearchOutput,
+    ResearchRequest, Researcher, StepOutcome, StepSummary, SubmitTarget, TransactEvidence,
+    TransactRequest, FETCHED_VIA_HEADER, FILLED_VALUE_MAX_CHARS, PROFILE_BROWSER_DIR,
+    PROFILE_COOKIES_FILE, PROFILE_NAME_MAX_LEN, SENSITIVE_AUTOCOMPLETE_TOKENS, SNAPSHOT_TS_HEADER,
+    TRANSACT_FIELDS,
 };
 pub use error::{Error, Result};
 pub use extract::{

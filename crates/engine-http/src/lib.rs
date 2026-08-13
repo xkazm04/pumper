@@ -27,8 +27,8 @@ use async_trait::async_trait;
 use cookie_store::{CookieStore, RawCookie};
 use pumper_core::config::HttpConfig;
 use pumper_core::{
-    profile_cookies_path, Error, Governor, HttpCache, HttpClient, HttpMethod, HttpRequest,
-    HttpResponse, Result,
+    profile_cookies_path, require_safe_profile_name, Error, Governor, HttpCache, HttpClient,
+    HttpMethod, HttpRequest, HttpResponse, Result,
 };
 use reqwest::header::HeaderValue;
 use tracing::{debug, warn};
@@ -290,8 +290,19 @@ impl HttpEngine {
 
     /// The persistent jar for `name`, loading it from disk (and creating the
     /// profile dir) on first use. Validates the name — a bad one is a typed
-    /// [`Error::Profile`] and never touches the filesystem.
+    /// [`Error::BadRequest`] and never touches the filesystem.
     fn jar_for(&self, name: &str) -> Result<Arc<ProfileJar>> {
+        // The name check runs BEFORE the cache lookup, and as the terminal
+        // `Error::BadRequest` rather than the retryable `Error::Profile`.
+        //
+        // The anti-pattern, third seam: a profile name is frozen into the job
+        // row at enqueue, so a typo'd one re-refuses identically on every
+        // attempt — the ladder buys nothing and bills for it. `render` and
+        // `transact` were retyped this round; this seam was left pinned as a
+        // known gap in the conformance battery, and this closes the class.
+        // Before the cache lookup because a cached entry must not be able to
+        // launder a name this rule would reject.
+        require_safe_profile_name(name)?;
         let mut jars = self.jars.lock().expect("jar map mutex poisoned");
         if let Some(jar) = jars.get(name) {
             return Ok(jar.clone());

@@ -150,12 +150,22 @@ async fn profiles_keep_separate_persistent_cookie_jars_across_a_restart() {
         "the session cookie survived the restart via the persisted jar"
     );
 
-    // An unsafe profile name is a typed error, and never creates a directory.
+    // An unsafe profile name is a typed error, never creates a directory, and is
+    // TERMINAL for the job: the name is frozen into the job row at enqueue, so
+    // retrying it re-refuses identically. It used to be a retryable
+    // `Error::Profile`, which burned the whole backoff ladder on a typo.
     let err = restarted
         .fetch(profiled(&format!("{base}/echo"), "../escape"))
         .await
         .expect_err("unsafe profile name must be rejected");
-    assert!(matches!(err, pumper_core::Error::Profile(_)), "got {err:?}");
+    assert!(
+        matches!(err, pumper_core::Error::BadRequest(_)),
+        "got {err:?}"
+    );
+    assert!(
+        err.is_terminal_for_job(),
+        "a typo'd profile name must not be retried: {err:?}"
+    );
 
     let _ = std::fs::remove_dir_all(&root);
 }
