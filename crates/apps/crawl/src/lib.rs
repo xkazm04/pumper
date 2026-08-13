@@ -319,7 +319,9 @@ struct TelemetryProgress {
 /// - `learn_tier` is **not** safely repeatable with a delta — a clean delta
 ///   resets strikes — so it is fed [`TelemetryProgress::lost`], the run's
 ///   cumulative verdict, which makes a completed run's final signal identical to
-///   the one end-of-run call it replaced.
+///   the one end-of-run call it replaced. The verdict also decides the reported
+///   winner ([`tier_that_won`]); passing a hardcoded `"http"` reset the strikes
+///   unconditionally, which is why the cumulative verdict alone was not enough.
 /// - the reliability fold is additive, and `continues_run` / `run_complete` keep
 ///   `runs` counting runs rather than check-ins.
 async fn crawl_flushing_telemetry(
@@ -341,6 +343,33 @@ async fn crawl_flushing_telemetry(
     // observation the reliability index exists to keep.
     flush_host_telemetry(ctx, tallies, telemetry, true).await;
     crawl_result
+}
+
+/// Reported to `learn_tier` when no tier won a host's fetches. Any value other
+/// than a tier name works — `TierMemory::record` branches on `winner == "http"`
+/// and otherwise only reads `http_lost` — but naming it says what happened
+/// rather than picking an arbitrary other tier the crawl never ran.
+const NO_TIER_WON: &str = "none";
+
+/// Which tier to report as having WON this host's fetches.
+///
+/// Anti-pattern this defends — *the crawl erasing the evidence it just
+/// gathered.* `TierMemory::record` resets a host's strikes to 0 whenever the
+/// winner is `"http"`, **before** it ever looks at `http_lost`: that branch IS
+/// the shape of an HTTP win. The crawl passed a hardcoded `"http"` for every
+/// host, so a host that bot-walled or transport-errored the entire run had its
+/// strike count cleared by the very call whose stated purpose is to teach the
+/// router "which hosts bot-wall the HTTP tier" — and cleared what OTHER apps had
+/// learned about that host too, since `tier_memory` is keyed by host alone.
+///
+/// The crawl only ever runs the http tier, so there is no other winner to name:
+/// either http carried the host or nothing did.
+fn tier_that_won(http_lost: bool) -> &'static str {
+    if http_lost {
+        NO_TIER_WON
+    } else {
+        "http"
+    }
 }
 
 /// One commit of the run's accumulated per-host telemetry. See
@@ -372,7 +401,8 @@ async fn flush_host_telemetry(
             tally.fetches, tally.probes
         );
         ctx.meter("http", Some(&url), 0.0, Some(&detail)).await;
-        ctx.learn_tier(&host, "http", progress.lost.contains(&host))
+        let http_lost = progress.lost.contains(&host);
+        ctx.learn_tier(&host, tier_that_won(http_lost), http_lost)
             .await;
         deltas.push((
             host,
@@ -1644,6 +1674,23 @@ mod tests {
         let obs = day_record(&store, "broken.example").await;
         assert_eq!(obs["crawl"]["transport_errors"], 1, "{obs}");
         assert_eq!(obs["crawl"]["runs_complete"], 1, "a finished-with-error run: {obs}");
+    }
+
+    #[tokio::test]
+    /// `TierMemory::record` resets a host's strikes the moment the winner is
+    /// `"http"`, before it reads `http_lost` at all. Reporting a hardcoded
+    /// `"http"` therefore erased the bot-wall signal this call exists to teach —
+    /// and, because `tier_memory` is keyed by host alone, erased what other apps
+    /// had learned about that host too.
+    #[test]
+    fn a_lost_host_does_not_report_an_http_win_that_would_clear_its_strikes() {
+        assert_eq!(tier_that_won(false), "http", "a clean host IS an http win");
+        assert_ne!(
+            tier_that_won(true),
+            "http",
+            "a bot-walled host must not be reported as an http win"
+        );
+        assert_eq!(tier_that_won(true), NO_TIER_WON);
     }
 
     #[tokio::test]
