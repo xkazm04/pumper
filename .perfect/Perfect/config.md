@@ -53,6 +53,20 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   resource-destructive actions even when they are obviously regenerable.
 
 ## Skill improvement log
+- 2026-08-13 (round 19): **The coverage rule has THREE clauses and dropping any one silently
+  under-reports — this is the r17 CRLF trap in a new costume, and it caught me at the wrap.** My
+  final spot-check recomputed 33/46 against a headline of 34, which for a moment looked like the
+  headline was inflated. It was not: the spot-check had omitted the *verdict* clause
+  (`nothing-clears-the-bar`), and `archive-engine` — covered by r11's explicit
+  nothing-clears verdict rather than by a direction or a `last_proposed` date — is the single
+  context that clause carries. Current split: **33 by direction, 1 by verdict, 0 by
+  `last_proposed`-only.** Two rules follow. (a) **Any coverage number computed with fewer than all
+  three clauses is wrong** — paste the rule, don't retype it from memory. (b) **A disagreement
+  between a fresh computation and the ledger is the computation's bug until proven otherwise** —
+  that was r17's finding and it held again, in the opposite direction this time (r17's bug
+  under-reported by ten; this one by one). The `last_proposed`-only clause currently carries
+  **zero** contexts, so it is untested in practice — do not delete it, but know that a bug in it
+  would be invisible today.
 - 2026-08-13 (round 19): **A wave with ZERO Class B files is achievable and it deletes a whole
   failure class.** r18's log recommended making every straddler Class C rather than sharing it;
   taken literally this round, the two lots shared no file at all — the four `crates/core/`
