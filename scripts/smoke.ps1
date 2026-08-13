@@ -713,6 +713,66 @@ try {
                 Add-Result -Name 'trigger dry-run names its unusable hook plugin' -Status 'FAIL' `
                     -Detail $_.Exception.Message
             }
+
+            # Round 19: a plugin job that cannot run must not report success.
+            # THE ANTI-PATTERN: the run door checked only that `plugin` was a
+            # STRING, so a typo (or, as here, a scratch deployment with no
+            # modules installed at all) produced one `{"error": ...}` record per
+            # URL, `ran: 0`, an empty dataset — and a SUCCEEDED job, green on
+            # `GET /jobs`, with a `succeeded` SSE event and a fired webhook.
+            # This is the smoke-level before/after: the door now refuses at
+            # `run()` before any fetch, so the job FAILS and says which plugin.
+            # `just plugins-install` is deliberately NOT a precondition — the
+            # nothing-is-loaded case is exactly the one that used to lie.
+            $pluginJobId = $null
+            try {
+                $pluginEnqueue = Invoke-RestMethod -Method Post -Uri "$baseUrl/apps/plugin/jobs" `
+                    -Body (@{ params = @{
+                        plugin = 'definitely-not-a-loaded-plugin'
+                        urls   = @('https://example.com/')
+                    } } | ConvertTo-Json -Depth 5) -ContentType 'application/json' -TimeoutSec 10
+                $pluginJobId = $pluginEnqueue.id
+            } catch {
+                Add-Result -Name 'plugin job with an unloadable plugin fails (not succeeds)' -Status 'FAIL' `
+                    -Detail "enqueue threw: $($_.Exception.Message)"
+            }
+            if ($pluginJobId) {
+                $pDeadline = (Get-Date).AddSeconds(30)
+                $pStatus = $null; $pError = $null
+                while ((Get-Date) -lt $pDeadline) {
+                    $pj = Invoke-RestMethod -Uri "$baseUrl/jobs/$pluginJobId" -TimeoutSec 5
+                    if ($pj.status -in @('succeeded', 'failed', 'cancelled')) {
+                        $pStatus = $pj.status; $pError = $pj.error; break
+                    }
+                    Start-Sleep -Milliseconds 400
+                }
+                # The failure must NAME the plugin and point at the surface that
+                # lists the real ones — "unknown error" would be the same lie in
+                # a different costume.
+                if ($pStatus -eq 'failed' -and $pError -match 'definitely-not-a-loaded-plugin') {
+                    Add-Result -Name 'plugin job with an unloadable plugin fails (not succeeds)' -Status 'PASS' `
+                        -Detail "job $pluginJobId failed: $pError"
+                } else {
+                    Add-Result -Name 'plugin job with an unloadable plugin fails (not succeeds)' -Status 'FAIL' `
+                        -Detail "status '$pStatus', error '$pError' (expected failed naming the plugin)"
+                }
+            }
+
+            # Round 19: the plugin app's manifest DECLARES the bounds its code
+            # enforces. `docs/features/extraction.md` claimed the concurrency
+            # ceiling was "enforced twice — refused at the door and clamped in
+            # code, so the two layers cannot disagree" and named this app, while
+            # `parse_concurrency` clamped only the lower end. A consumer reads
+            # the tool definition, so a lying schema is a lying contract even
+            # when the server-side validator still rejects.
+            Test-JsonEndpoint -Name 'GET /apps?format=tools declares the plugin app bounds' `
+                -Path '/apps?format=tools' -Assert {
+                param($j)
+                $t = @($j.tools | Where-Object { $_.name -eq 'plugin' })[0]
+                if (-not $t) { return $false }
+                ($t.inputSchema.properties.concurrency.maximum -eq 64) -and
+                ($t.inputSchema.properties.records_echo.maximum -eq 1000)
+            }
         } else {
             Add-Result -Name 'job runs to completion (hackernews)' -Status 'SKIP' -Detail 'no job id to poll (enqueue failed)'
             Add-Result -Name 'GET /jobs/{id}/receipt' -Status 'SKIP' -Detail 'no job id to fetch a receipt for'
