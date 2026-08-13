@@ -1,5 +1,5 @@
 {
-  "_comment": "Source -> feature-doc map used by scripts/docs/check-doc-sync.mjs (Stop hook). Each entry: `doc` (path under docs/features/, required) + `sourceGlobs` (repo-relative globs). When a turn edits matching source without touching docs/features/*, the hook exits 2 with a reminder. Add an entry here in the same change that adds a new feature area. Skip patterns (tests, docs, catalog, plugins-src, scripts) live inside the script.",
+  "_comment": "Source -> feature-doc map used by scripts/docs/check-doc-sync.mjs (Stop hook). Each entry: `doc` (repo-relative path to the doc that answers for this source; usually under docs/features/, but any doc may be a target — ONBOARDING.md is one) + `sourceGlobs` (repo-relative globs). When a turn edits matching source WITHOUT editing that entry`s own `doc`, the hook exits 2 with a reminder naming it. Satisfaction is per entry: editing one feature doc does not answer for another. Add an entry here in the same change that adds a new feature area. Skip patterns (tests, docs, catalog, plugins-src, scripts, .claude, .perfect) live inside the script.",
   "_inert": "The `catalog/**` and `plugins-src/**` globs below are recorded couplings but currently never fire: both directories are in the script's SKIP_PATTERNS, which is applied before the map lookup. Remove those two patterns from check-doc-sync.mjs to activate them.",
   "entries": [
     {
@@ -149,6 +149,7 @@
       "sourceGlobs": [
         "crates/core/src/engine.rs",
         "crates/core/src/app.rs",
+        "crates/core/src/fetcher.rs",
         "crates/core/src/plugin.rs",
         "crates/server/src/registry.rs"
       ]

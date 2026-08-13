@@ -187,8 +187,6 @@ export function collectEditedFilesFromTranscript(transcriptPath, repoRoot = defa
 export function evaluateEditedFiles(edited, map) {
   const editedArr = [...edited];
   if (editedArr.length === 0) return { fired: false, reason: 'no-edits', docHits: new Map() };
-  if (editedArr.some((f) => f.startsWith('docs/features/')))
-    return { fired: false, reason: 'docs-touched', docHits: new Map() };
 
   const meaningful = editedArr.filter((f) => !SKIP_PATTERNS.some((re) => re.test(f)));
   if (meaningful.length === 0) return { fired: false, reason: 'skipped-only', docHits: new Map() };
@@ -207,7 +205,21 @@ export function evaluateEditedFiles(edited, map) {
     }
   }
   if (docHits.size === 0) return { fired: false, reason: 'unmapped', docHits };
-  return { fired: true, reason: 'mapped-source-without-doc', docHits };
+
+  // Satisfaction is PER ENTRY: a mapped doc is answered by editing THAT doc.
+  //
+  // This used to be a blanket "any `docs/features/*` edit silences everything",
+  // which had two failure modes pulling in opposite directions. It let an edit
+  // to one feature doc suppress the reminder for an unrelated one — the loud
+  // failure. And it hardcoded `docs/features/` as the only satisfying prefix, so
+  // a map entry whose `doc` lives elsewhere (ONBOARDING.md) would fire a
+  // reminder the author **could not clear by editing the very file named in
+  // it** — the quiet failure, and the worse of the two: a nag that cannot be
+  // answered is one people learn to ignore, which is how this hook's silence
+  // went unnoticed for its whole life in the first place.
+  const unanswered = new Map([...docHits].filter(([doc]) => !edited.has(doc)));
+  if (unanswered.size === 0) return { fired: false, reason: 'docs-touched', docHits: new Map() };
+  return { fired: true, reason: 'mapped-source-without-doc', docHits: unanswered };
 }
 
 export function formatReminder(docHits) {
@@ -220,7 +232,7 @@ export function formatReminder(docHits) {
     .join('\n');
 
   return (
-    `Doc-sync reminder: this turn edited feature source but no docs/features/* was touched.\n\n` +
+    `Doc-sync reminder: this turn edited feature source without updating the doc mapped to it.\n\n` +
     `Mapped feature doc(s) likely affected:\n${summary}\n\n` +
     `Per CLAUDE.md "Documentation Sync": if the change is user/API-visible (new endpoint or\n` +
     `param, changed dataset shape, new app, changed trigger/webhook contract, new config key),\n` +
