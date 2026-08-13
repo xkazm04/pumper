@@ -644,19 +644,34 @@ pub fn overlay_amounts(unified: &mut Value, detail: &Value) -> bool {
 ///
 /// Coverage is therefore exactly the detail corpus: opportunities the detail
 /// harvest has seen. Everything else keeps `Null`, honestly.
+///
+/// Two properties of the read itself, both of which used to be silent:
+/// - it is **live-only** ([`Datasets::list_filtered`]). The plain
+///   `Datasets::list` has no `removed_at IS NULL` filter, so a tombstoned
+///   detail record kept joining its award amounts onto a live unified row.
+/// - it is **capped, and says so** ([`DETAIL_JOIN_LIMIT`]). A read that comes
+///   back AT its cap is a WINDOW, not the corpus, and the rows outside it keep
+///   honest `Null` money with no signal anywhere that they were never looked
+///   at — the same failure cordis's `aggregate_truncated` tripwire exists for.
 pub async fn enrich_with_detail_amounts(
     ctx: &AppContext,
     items: &mut [(String, Value)],
-) -> Result<usize> {
+) -> Result<DetailJoin> {
     if items.is_empty() {
-        return Ok(0);
+        return Ok(DetailJoin::default());
     }
     let details = ctx
         .datasets
-        .list(UNIFIED_APP, DETAILS_DATASET, 1_000_000)
+        .list_filtered(UNIFIED_APP, DETAILS_DATASET, &[], None, DETAIL_JOIN_LIMIT)
         .await?;
+    let read = details.len();
+    let truncated = detail_join_truncated(read, DETAIL_JOIN_LIMIT);
     if details.is_empty() {
-        return Ok(0);
+        return Ok(DetailJoin {
+            filled: 0,
+            read,
+            truncated,
+        });
     }
     let by_key: std::collections::HashMap<&str, &Value> = details
         .iter()
@@ -675,7 +690,61 @@ pub async fn enrich_with_detail_amounts(
             }
         }
     }
-    Ok(filled)
+    Ok(DetailJoin {
+        filled,
+        read,
+        truncated,
+    })
+}
+
+/// Cap on the `grants/opportunity_details` read behind the money join.
+///
+/// Sized at ~146× the live federal corpus (~1.4k opportunities) so it is not a
+/// throttle in practice — the point of the number is that reaching it is
+/// **reportable**, not that it is tight. A projection would be better than a
+/// cap (the join reads three numbers out of records that carry the verbatim
+/// `synopsis`, i.e. full NOFO announcement HTML at tens of kB each), but
+/// `Datasets` has no projected-read seam and adding one is a `crates/core`
+/// change; the tripwire is what can be built honestly from here.
+pub const DETAIL_JOIN_LIMIT: i64 = 200_000;
+
+/// Whether the detail read came back AT its cap, i.e. is a window rather than
+/// the corpus.
+///
+/// The anti-pattern: silently windowing. Every unified row whose detail fell
+/// outside the window keeps a perfectly honest `Null` award amount, so the
+/// degradation is invisible in the data AND in the result — `amountsFilled`
+/// just comes back lower, which is indistinguishable from a corpus that
+/// genuinely publishes no money.
+fn detail_join_truncated(read: usize, limit: i64) -> bool {
+    read as i64 >= limit
+}
+
+/// What the money join did, and what it rested on.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DetailJoin {
+    /// Unified rows that gained at least one award amount.
+    pub filled: usize,
+    /// Live detail records the join actually read.
+    pub read: usize,
+    /// The read came back at [`DETAIL_JOIN_LIMIT`] — a window, not the corpus.
+    pub truncated: bool,
+}
+
+impl DetailJoin {
+    /// The warning for a windowed read, or `None` when the whole live corpus
+    /// was seen.
+    pub fn warning(&self) -> Option<String> {
+        self.truncated.then(|| {
+            format!(
+                "award-amount join read only {} detail records (DETAIL_JOIN_LIMIT = \
+                 {DETAIL_JOIN_LIMIT}): the money overlay is PARTIAL, and opportunities \
+                 whose detail fell outside that window keep null award amounts that are \
+                 indistinguishable from an agency publishing no figure",
+                self.read
+            )
+        })
+    }
 }
 
 /// The v1 amendment-radar taxonomy: semantic lifecycle transitions on fields
@@ -2393,6 +2462,34 @@ mod tests {
                     money_scalar(&json!({ "estimatedFunding": "55746" }), &["estimatedFunding"]),
             }
         })
+    }
+
+    #[test]
+    fn a_windowed_detail_read_is_reported_it_does_not_pass_as_a_thin_corpus() {
+        // The anti-pattern: silently windowing. Every unified row whose detail
+        // fell outside the window keeps an honest `Null` award amount, so the
+        // degradation is invisible in the data AND in the result —
+        // `amountsFilled` just comes back lower, which reads exactly like a
+        // corpus of agencies that published no figures.
+        assert!(!detail_join_truncated(0, 10));
+        assert!(!detail_join_truncated(9, 10));
+        assert!(detail_join_truncated(10, 10), "a read AT its cap is a window");
+        assert!(detail_join_truncated(11, 10));
+
+        let whole = DetailJoin {
+            filled: 40,
+            read: 1_366,
+            truncated: false,
+        };
+        assert!(whole.warning().is_none(), "silence is only correct here");
+        let window = DetailJoin {
+            filled: 40,
+            read: DETAIL_JOIN_LIMIT as usize,
+            truncated: true,
+        };
+        let msg = window.warning().expect("a window announces itself");
+        assert!(msg.contains("PARTIAL"), "{msg}");
+        assert!(msg.contains("200000"), "{msg}");
     }
 
     #[test]

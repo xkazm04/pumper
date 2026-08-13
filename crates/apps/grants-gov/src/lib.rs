@@ -80,8 +80,8 @@ use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use pumper_core::{
-    AppContext, AppManifest, CostClass, Error, HttpMethod, HttpRequest, ManifestExample,
-    Provenance, Result, ScrapeApp,
+    AppContext, AppManifest, CostClass, DerivedPaths, Error, HttpMethod, HttpRequest,
+    ManifestExample, Provenance, Result, ScrapeApp,
 };
 use serde_json::{json, Value};
 
@@ -194,7 +194,7 @@ impl ScrapeApp for GrantsGov {
             ],
             output_shape: Some(
                 "{hit_count, fetched, new, changed, unchanged, sweep, truncated, removed?, \
-                 amountsFilled, \
+                 amountsFilled, detailCorpus: {read, truncated}, \
                  detailsFailed, details?: {harvested, deltaTotal, capped, attempted, failed, \
                  abortedAfterConsecutiveFailures, errors}} — Search2 sync tallies over the \
                  `opportunities` dataset (keyed by opportunity id); detail harvest writes \
@@ -537,8 +537,10 @@ impl ScrapeApp for GrantsGov {
         // `synopsis` block of the fetchOpportunity detail records this machine
         // already stores, so overlay them from the store — no extra fetch, and
         // an opportunity with no stored detail keeps its honest Null.
-        let amounts_filled =
-            grants_common::enrich_with_detail_amounts(&ctx, &mut unified_items).await?;
+        let amounts = grants_common::enrich_with_detail_amounts(&ctx, &mut unified_items).await?;
+        if let Some(msg) = amounts.warning() {
+            degradation_warnings.push(msg);
+        }
         let cross =
             grants_common::finalize_unified(&ctx, &unified_items, Some(SEARCH2_URL)).await?;
 
@@ -573,7 +575,15 @@ impl ScrapeApp for GrantsGov {
             // How many unified rows got award amounts joined in from the stored
             // detail corpus this run — i.e. how much of the federal corpus
             // `min_award` can actually see.
-            "amountsFilled": amounts_filled,
+            "amountsFilled": amounts.filled,
+            // What that number rests on: how much of the stored detail corpus
+            // the join actually read, and whether that read was a WINDOW. A
+            // silently-windowed join reports a lower `amountsFilled` and is
+            // otherwise indistinguishable from agencies publishing no money.
+            "detailCorpus": {
+                "read": amounts.read,
+                "truncated": amounts.truncated,
+            },
             // Flat, greppable count of detail-stage failures this run. The stage
             // is non-fatal to the listing, so this is the ONLY place a caller
             // learns the enrichment degraded — it is never allowed to be absent.
@@ -1023,10 +1033,40 @@ fn restored_harvest(state: Option<&Value>) -> Option<HarvestState> {
     })
 }
 
+/// The one field of a detail record that is a fact about THIS MACHINE rather
+/// than about the opportunity: when we last fetched it. Declared derived, so it
+/// is stored and readable but excluded from the change-detection hash.
+const HARVESTED_AT_FIELD: &str = "harvested_at";
+
+/// Record paths the detail write declares **derived** — see [`DerivedPaths`].
+///
+/// The anti-pattern this closes: `detail_record` stamps
+/// `harvested_at: ts(Utc::now())` into every record, and change detection
+/// hashes the whole value, so re-harvesting a **byte-identical**
+/// `fetchOpportunity` body wrote a new revision and read `changed`.
+/// `grants/opportunity_details` is the only source of federal award amounts in
+/// the product and it is genuinely watchable (`grants` is a registered virtual
+/// namespace with grants-gov as a publisher), so every notification it could
+/// ever send was noise about our own clock.
+///
+/// Declaring it excludes it from the hash **only**: the stored record and every
+/// revision still carry the timestamp, and a derived-only movement still
+/// rewrites the record body (so "when did we last touch this" stays fresh) —
+/// it just appends no revision.
+///
+/// One-time cost: the first run after deploy re-hashes every stored detail
+/// record, so up to the whole detail corpus reports `changed` once and then
+/// settles. Given they reported `changed` on every harvest before, that is a
+/// strict improvement from run two onwards.
+fn derived_paths() -> DerivedPaths {
+    DerivedPaths::new([HARVESTED_AT_FIELD])
+}
+
 /// Writes the buffered detail records and marks their keys done. Stamped with
 /// the fetchOpportunity endpoint the whole buffer was fetched from (M12) —
 /// per-record bodies differ only by the POSTed id, so the URL is shared and
-/// honest.
+/// honest — and declaring [`derived_paths`] so our own harvest clock is not
+/// mistaken for news about the opportunity.
 async fn flush_details(
     ctx: &AppContext,
     buffer: &mut Vec<(String, Value)>,
@@ -1036,7 +1076,7 @@ async fn flush_details(
         return Ok(());
     }
     ctx.datasets
-        .upsert_many_stamped(
+        .upsert_many_derived(
             grants_common::UNIFIED_APP,
             grants_common::DETAILS_DATASET,
             buffer,
@@ -1046,6 +1086,7 @@ async fn flush_details(
                 source_url: Some(FETCH_OPPORTUNITY_URL.to_string()),
                 ..Provenance::default()
             }),
+            &derived_paths(),
         )
         .await?;
     for (key, _) in buffer.drain(..) {
@@ -1159,7 +1200,10 @@ fn detail_record(opp_id: &str, hit: Option<&Value>, detail: &Value) -> Value {
         "synopsis": synopsis,
         "attachments": attachment_manifest(detail),
         "requirements": requirements_block(detail),
-        "harvested_at": pumper_core::datasets::ts(chrono::Utc::now()),
+        // Declared DERIVED (see `derived_paths`): stored and readable, but out
+        // of the change-detection hash — our fetch clock is not news about the
+        // opportunity.
+        HARVESTED_AT_FIELD: pumper_core::datasets::ts(chrono::Utc::now()),
     })
 }
 
@@ -1645,6 +1689,31 @@ mod tests {
         // Exactly at the cap is not a truncation.
         let (_, capped) = capped_delta(&new, &changed, 4);
         assert!(!capped);
+    }
+
+    /// The declaration names exactly the volatile field the record builder
+/// writes. If those two ever drift apart the seam silently stops working,
+    /// which is indistinguishable from it never having been added.
+    #[test]
+    fn the_derived_declaration_names_the_only_field_that_is_our_clock() {
+        assert_eq!(derived_paths(), DerivedPaths::new([HARVESTED_AT_FIELD]));
+        assert!(!derived_paths().is_empty());
+        let rec = detail_record("356037", None, &sample_detail());
+        assert!(
+            rec.get(HARVESTED_AT_FIELD).is_some(),
+            "declaring a path that is not written is a no-op: {rec}"
+        );
+        // Nothing that carries the SOURCE's own facts may be derived — deriving
+        // `requirements` or `synopsis` would silence the award-amount signal
+        // instead of the noise, which is the opposite failure and a far worse
+        // one (this dataset is the only source of federal money).
+        for source_fact in ["synopsis", "requirements", "attachments", "number", "title"] {
+            assert_ne!(
+                derived_paths(),
+                DerivedPaths::new([HARVESTED_AT_FIELD, source_fact]),
+                "'{source_fact}' is the source's news, never ours"
+            );
+        }
     }
 
     // ---- durable detail harvest (M23) ----
