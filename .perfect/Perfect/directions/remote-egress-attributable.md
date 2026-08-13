@@ -3,12 +3,12 @@ slug: remote-egress-attributable
 type: perfect/direction
 context: "[[remote-engine]]"
 lens: feature
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: d128ae7
 ---
 
 ## What & why
@@ -82,4 +82,43 @@ the same seam r17's `archive-provenance-visible` used for the archive tier.
 
 ## Build record
 
-(filled during build)
+**Shipped `d128ae7` · verdict KEEP.**
+
+Attribution rides a reserved response header (`x-pumper-remote-node`), following `FETCHED_VIA_HEADER`
+rather than forking a parallel system — the header map is the only channel that survives an engine
+boundary. **Constraint honored: `crates/core/src/engine.rs` untouched** (it was Lot B's); constants
+live in `core::fetcher` next to their only reader. Read **only** where the fabric is wired, so an
+origin echoing the header on an ordinary live fetch cannot forge "a peer served this" — the archive
+tier's own forgery rule, with a test.
+
+Reaches three surfaces that already existed: the tier trace's `detail` (**on losing entries too** —
+"the http tier came back blocked" reads very differently once you know whose IP it came back blocked
+at), the job receipt's new `cost.egress = [{node, calls}]`, and the serving node's logs (target,
+status, bytes, duration of every fetch made on someone else's behalf).
+
+**Envelope binding:** the peer echoes the URL it was **asked** for — deliberately not `final_url`,
+which legitimately differs after a redirect — and the coordinator refuses a mismatch, falling back
+like any other node failure. An envelope with **no** echo fails closed too, or the binding would be
+opt-in for the very peer being checked. The echo is stripped before the response flows onward, and any
+node marker arriving from the wire is overwritten.
+
+**Criterion 5 half-shipped, and correctly so:** `Fetcher::egress_counters()` was built, tested and made
+public, but `/metrics` was **not** wired, because the read is a `state.engines.fetch` field access that
+the raw-engine inventory flags by design — and the builder declined both workarounds (rephrasing the
+expression to dodge the scanner; making the counters a process-global). Both refusals were right.
+**The Director wired it in `19f1707`** with the reviewed inventory row plus
+`a_silent_fallback_to_local_egress_is_not_invisible_to_a_dashboard`, and `just smoke` now live-checks
+the series (36/36).
+
+**Also corrected because this change depends on it:** the receipt's `unknown` text claimed "free tiers
+do not write ledger rows". They do — `AppContext::fetch` meters every fetch as a $0.00 row, which is
+exactly why per-job `cost.egress` is possible at all.
+
+**Refuted:** criterion 1's "visible on the fetch trace" as a **typed field** is not reachable from this
+write set — `TierTrace`/`FetchOutcome` are built by struct literal in four files the lot did not own.
+`TierTrace.detail` used instead (the archive tier's precedent), and the typed-field path named in the
+doc rather than silently dropped. `fetching.md:245` now states precisely what remains: no dataset
+revision records the node, and the fact travels as a trail marker rather than a typed field.
+
+**Not verified:** the serving-side log line is not asserted (no capture harness); `fetch_cost_detail` →
+`cost_events.detail` → receipt is proven in unit form, not by driving a real job through a peer.

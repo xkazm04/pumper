@@ -3,12 +3,12 @@ slug: browser-refusals-terminal
 type: perfect/direction
 context: "[[browser-engine]]"
 lens: robustness
-status: accepted
+status: shipped
 size: S
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: f145ad2
 ---
 
 ## What & why
@@ -65,4 +65,36 @@ retryable.
 
 ## Build record
 
-(filled during build)
+**Shipped `f145ad2` · verdict KEEP — and the best refutation of the round.**
+
+The brief flagged a risk to *check before acting*: widening `is_terminal_for_job` to all of
+`Error::Profile` might capture a transient error. **The builder checked and it does** —
+`engine-http`'s `ProfileJar::load` types an unreadable cookie jar as `Error::Profile`, covering a
+sharing violation against its own flusher's `fs::rename`. Reclassifying the variant would silently
+have taken the retries away from that IO. So the refusal is retyped at its seams instead:
+`engine::require_safe_profile_name` → `Error::BadRequest`, applied to **both** `render` and
+`transact`, never one. The *why* now lives in the `is_terminal_for_job` doc comment, so a future
+round cannot undo it by accident.
+
+`Error::BadRequest` joins the terminal set on its own merits (every producer is a pure function of
+input frozen at enqueue) — and it had been sitting in
+`transient_failures_stay_retryable_not_terminal` as if transient, which its own doc never claimed.
+
+**Over-cap HTML: argued retryable**, refuting my framing that it is a pure function of (bytes, cap) —
+the cap is fixed but the size is a live page re-rendered next attempt, and a JS-built DOM is not
+deterministic between two renders of the same URL.
+
+**Door:** `"pattern": profile_name_pattern()` generated from `PROFILE_NAME_MAX_LEN` + the validator's
+own alphabet, pinned by `the_schema_pattern_and_the_validator_agree` over a corpus. No second regex.
+Live-verified end to end by `just smoke` (36/36): an unsafe name is a 422 at the door.
+
+**Conformance:** `a_deterministic_profile_refusal_fails_once_on_every_seam`, an EXPECTED map over
+every seam that checks a name — and it recorded `engine-http::fetch` as **false**, a known gap kept
+*visible* rather than untested. **The Director closed that gap in `eefdd3b` the same round**, flipping
+the row to `true`; all three seams now agree.
+
+**Refuted:** `docs/features/apps.md:59` was **not** the false sentence — "all of these" scopes to its
+four bullets and all four *are* `Error::Transact`. The genuinely false claims were code comments at
+`crates/apps/transact/src/lib.rs:157-161` and `crates/core/src/error.rs:294-300`; both corrected.
+Also: the cost was four job attempts + backoff with **zero** Chrome launches — validation runs before
+`acquire` — so my "four Chrome launches" was wrong. The ladder waste is real; the launch cost was not.

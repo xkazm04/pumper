@@ -100,4 +100,19 @@ field lists are stale; `config.toml:141-150` omits four keys `fetching.md` docum
 ## Shipped
 
 - (inherited — see [[fetch-engines]] and [[browser-transact]])
-- round 18: pending (see the three accepted directions above)
+- **round 18 — 3/3 shipped, merged to master, gate 1746/0, smoke 36/36:**
+  - [[render-cancel-safe]] → `efca07c` — a cancelled or timed-out render no longer leaks its tab or
+    its two CDP tasks. The builder found the leak surface was **four** exits, not the two the scout
+    named. Residual, documented: the drop-path close is best-effort (a shutting-down runtime may
+    never poll the detached task); the task aborts are unconditional.
+  - [[render-has-a-budget]] → `ee4f4f4` — `[browser] render_budget_secs` (180) bounds a whole render;
+    six untimed CDP awaits wrapped; caller waits clamped, not rejected, with a capture reserve.
+  - [[browser-refusals-terminal]] → `f145ad2` — a typo'd profile name fails once instead of burning
+    four attempts, on **both** engine seams and at the door. Director `eefdd3b` closed the third seam
+    (`engine-http`) that the new conformance battery had pinned as a visible gap.
+- **Director follow-ups this round:** `eefdd3b` (the `engine-http` seam — class closed, EXPECTED row
+  flipped to `true`), `e1e18db` (smoke check: an unsafe profile name is a 422 at the door, live).
+- **Next anchor (banked, in priority order):** `render-harness-offline` (resolve does-CI-have-Chrome
+  FIRST) · `RenderedPage.budget_truncated` so the settle-wait truncation is in-band rather than a
+  `warn!` (one `..Default::default()` at `crates/core/tests/eval_tier3_extraction.rs:363`) · the dead
+  `capture_network` X-ray path, still ~170 lines with zero producers.

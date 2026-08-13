@@ -3,12 +3,12 @@ slug: render-has-a-budget
 type: perfect/direction
 context: "[[browser-engine]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: ee4f4f4
 ---
 
 ## What & why
@@ -72,4 +72,33 @@ thing that eventually breaks the wedge is the job timeout — which then leaks a
 
 ## Build record
 
-(filled during build)
+**Shipped `ee4f4f4` · verdict KEEP.** `[browser] render_budget_secs` (default 180, `0` disables) is
+one deadline for the whole render. Stage caps become `min(own cap, budget)`; the untimed CDP awaits
+(`goto`, `evaluate`, `getResponseBody`, `content`, `page.url`, plus `new_page`/`event_listener`) are
+wrapped; `wait_for_selector` probes **under** the deadline; each action runs under `timeout_at`.
+
+**Criterion 2 decided against the alternative I offered, with a reason:** the budget is deliberately
+**not** a multiple of `nav_timeout_secs`, because that key is per-navigation patience and multiplying
+it would silently multiply the tier's worst case for an operator who raised it for one slow site. The
+clock starts once the render owns a Chrome, so queueing behind a busy semaphore costs a render nothing.
+
+**Builder's correction to the design:** *checking the clock between steps cannot cut a step that never
+ends* — so each individual action is wrapped, not just the loop.
+
+Waits are clamped, not rejected, with a 5s `CAPTURE_RESERVE` so a pathological wait cannot sleep the
+budget away and then die at `content()`. A clamped `wait_ms` reports `partial` in `action_outcomes`.
+
+**One considered deviation, accepted:** budget exhaustion stays **retryable** — "this page was slow
+*this time*" is a fact about a live site, not about the request. Stated in the error text and the doc.
+
+Pure functions `budget_deadline`/`stage_deadline`/`clamp_wait_ms`/`budget_exhausted` + 6 tests incl.
+`pathological_wait_not_allowed_to_outlive_the_render_budget` (`u64::MAX` → clamped) and a paused-clock
+proof that an endless await is cut. `max_html_bytes` documented for the first time.
+
+**Refuted:** the brief said "four untimed CDP awaits" — there are **six** (`page.url()` unlisted).
+
+**Not verified:** 180s is argued from the ~91s timed worst case, not measured against real slow pages.
+
+**Banked (Director, deliberately not rushed at round end):** `RenderedPage.budget_truncated` would
+make the *settle-wait* truncation in-band as the `wait_ms` truncation already is; today it is a
+`warn!` only. Needs one `..Default::default()` at `crates/core/tests/eval_tier3_extraction.rs:363`.

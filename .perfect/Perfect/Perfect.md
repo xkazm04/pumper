@@ -2,21 +2,28 @@
 type: perfect/home
 repo: pumper
 updated: 2026-08-13
-pool: 6
-pool_target: 6 (r18 dispatch cap, Athena-set)
-shipped_total: 140
+pool: 0
+pool_target: per-dispatch (r18 complete — 6/6 shipped; the next dispatch sets the cap)
+shipped_total: 146
 coverage: "30/46 map contexts covered. RULE (recomputable — compute it, never inherit it): a map context is COVERED when it has >=1 direction note pointing at it (`context: \"[[<name>]]\"`), OR an explicit nothing-clears-the-bar verdict, OR `last_proposed != never`. **Normalize CRLF before any frontmatter regex** — a naive /^---\\n([\\s\\S]*?)\\n---/ silently skips every CRLF file in this repo and scored coverage at 18/46 in r17, calling claude-engine/eu-grants/wasm-plugin-host never-proposed when each has 3 shipped directions. That trap, plus one genuinely stale note (job-worker said `last_proposed: never` against 5 shipped r4 directions — fixed r17), is why the figure drifted every round (r15 carried 24, r16 carried 26 then 'corrected' to 25, headline said 27). Recomputed honestly in r17: **28 entering**, +engine-contracts +maintenance-tooling gated r17 = **30**. 16 never proposed. Inherited pre-46-map history (browser-engine, http-engine, …) deliberately does NOT count as covered. **r18 recomputed the same rule from scratch with the CRLF normalization in place and got 30/46 entering — the figure is now stable across two independent computations.** +browser-engine +remote-engine gated r18 = **32/46**, 14 never proposed."
-cursor: "r18 IN FLIGHT — browser-engine + remote-engine gated (6 accepted / 6 rejected), branch `perfect/2026-08-13-r18`, entering baseline 1697/0/17-ignored. IF RESUMING: the wave plan is the round-18 section below; Lot B = render-cancel-safe + render-has-a-budget + browser-refusals-terminal, Lot R = remote-failover-not-leakback + remote-egress-attributable + remote-fabric-deployable; `crates/core/src/engine.rs` + `error.rs` belong to Lot B, `crates/core/src/fetcher.rs` to Lot R, `scripts/docs/feature-doc-map.json` is Class C. r19 PROPOSE: pick 2 never-proposed, ties by opportunity — http-engine / vcr-testing / page-monitor / connector-api-watch / plugin-runner (banked r14 anchor) / data-pipeline-catalog / us-federal-grants / us-state-grants / czech-procurement / trades-* / agentic-research / hackernews-example / wasm-plugin-examples. Do NOT re-mine engine-contracts or maintenance-tooling before r19, nor browser-engine/remote-engine before r20 (cooldown); their banked anchors are recorded in the four context notes — browser-engine's is `render-harness-offline` (resolve the does-the-CI-runner-have-Chrome question FIRST), remote-engine's is `remote-scope-honesty` (18 raw `ctx.engines.http` call sites never go through the fabric). Still the strongest queued work in the vault: dataset-storage's retention-pin-is-dead-code, and crawler-core's MAX_FRONTIER lifetime cap."
-last_session: "[[sessions/2026-08-13]]"
+cursor: "r18 COMPLETE — 6/6 shipped + 3 Director commits, ff-merged to master `e1e18db`; gate 1746/0/17-ignored, clippy no new warnings in touched files, smoke 36/36 (34→36, both new checks live). **Coverage 32/46, 14 never proposed.** r19 PROPOSE: pick 2 never-proposed, ties by opportunity — **http-engine is the standout** (opp 4, BANKED ANCHOR from r18, evidenced from two sides while building: the retry loop applies a per-attempt timeout across `retries: 3` — the amplification remote-engine had to route around — and `ProfileJar::load`'s `NotFound => CookieStore::default()` at `lib.rs:89` silently starts an empty jar, the root of the profile leak r18 fixed one layer up. It is the third engine of the ladder and the only one never swept) · then vcr-testing / vcr-testing / page-monitor / connector-api-watch / plugin-runner (banked r14 anchor) / data-pipeline-catalog / us-federal-grants / us-state-grants / czech-procurement / trades-* / agentic-research / hackernews-example / wasm-plugin-examples. Do NOT re-mine engine-contracts or maintenance-tooling before r19, nor browser-engine/remote-engine before r20 (cooldown); their banked anchors are recorded in the four context notes — browser-engine's is `render-harness-offline` (resolve the does-the-CI-runner-have-Chrome question FIRST), remote-engine's is `remote-scope-honesty` (18 raw `ctx.engines.http` call sites never go through the fabric). Still the strongest queued work in the vault: dataset-storage's retention-pin-is-dead-code, and crawler-core's MAX_FRONTIER lifetime cap."
+last_session: "[[sessions/2026-08-13-2]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **6** · phase: **round 18 — gated, building** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 30/46 entering → 32/46 with r18's two contexts.**
+**State**: pool **0** · phase: **round 18 COMPLETE — 6/6 shipped** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 30/46 → 32/46.**
 
-### Round-18 pool — 6 GATED (2026-08-13) · 6 rejected, all recorded
+### Round-18 pool — 6 GATED → ALL 6 SHIPPED + 3 Director commits (2026-08-13, landed `e1e18db`)
+Gate on merged master: `cargo fmt --check` clean · `cargo clippy --workspace --all-targets` exit 0
+with **no new warnings in any file the wave touched** (the 31 remaining are pre-existing; `config.rs:886`
+sits between the two lots' hunks) · `cargo test --workspace` **1746 passed / 0 failed / 17 ignored**
+(entering baseline 1697, +49 tests) · `just smoke` **36/36** (extended 34→36 with this round's two
+new surfaces, both live-verified against the real binary).
+Director commits: `19f1707` (the `/metrics` egress series + three doc-map globs the hook was blind to),
+`eefdd3b` (the third profile-name seam — class closed), `e1e18db` (smoke checks).
 Phase 0 reconciliation (MANDATORY this round) came back **clean**: the map is the committed
 `context-map.json` — 46 contexts, generator `personas-context-scan`, `generated_at`
 2026-08-03T19:10:19Z, provenance `git_commit 611360f` — produced on **this** machine
@@ -517,7 +524,7 @@ wasm-plugin-host r14 (3 shipped) · eu-grants r14 (3 shipped) ·
 us-business-census r15 (3 shipped) · czech-labor-market r15 (3 shipped) ·
 **web-crawler r16 (3 shipped)** · **crawler-core r16 (3 shipped)** ·
 **engine-contracts r17 (3 gated)** · **maintenance-tooling r17 (3 gated)** ·
-**browser-engine r18 (3 gated)** · **remote-engine r18 (3 gated)**.
+**browser-engine r18 (3 shipped)** · **remote-engine r18 (3 shipped)**.
 
 **Reconciliation 2026-08-13 (r18, mandatory pass):** map provenance verified —
 `generator: personas-context-scan`, `generated_at: 2026-08-03T19:10:19Z`,
@@ -528,7 +535,7 @@ adjudicate, unlike the Personas repo where three sources conflict. Diff result: 
 without a note** (all 46 present), **8 vault-only notes, all already carrying `superseded_by:`
 aliases** from the r11/r16 passes, **0 retired**. Coverage recomputed from scratch with CRLF
 normalization: **30/46 entering** — the first round in five where the recomputed figure matched
-the inherited headline.
+the inherited headline. **Exiting: 32/46** (+browser-engine +remote-engine, both 3/3 shipped).
 
 **Never-proposed queue (14 after r18's two proposals, opportunity-ranked)**:
 | Opp | Contexts |

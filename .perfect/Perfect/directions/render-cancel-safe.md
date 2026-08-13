@@ -3,12 +3,12 @@ slug: render-cancel-safe
 type: perfect/direction
 context: "[[browser-engine]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: efca07c
 ---
 
 ## What & why
@@ -71,4 +71,25 @@ metric, no log, no doctor check.
 
 ## Build record
 
-(filled during build)
+**Shipped `efca07c` · verdict KEEP.** `RenderScope` (RAII) owns the tab and both `JoinHandle`s;
+cleanup lives on no path. `Drop` aborts both tasks unconditionally (needs no runtime) and hands the
+tab close to a detached task. Close-exactly-once is an `Option::take` latch, so release-then-drop and
+drop-alone both close once. `TAB_CLOSE_TIMEOUT` (5s) keeps a dead Chrome from hanging cleanup.
+
+**Beyond the brief:** the leak surface was undercounted. Besides the dropped future, the `?`
+early-returns on `page.event_listener::<EventRequestPaused>()` and the two capture listeners leaked
+the tab outright — cleanup was on two paths, but there were **four** ways out that skipped it. The
+guard closes all of them.
+
+**Criterion 6 answered honestly rather than claimed away:** the drop-path close is best-effort by
+construction — during runtime shutdown (the usual reason a render future is dropped) the spawned task
+may never be polled, and with no runtime entered there is nowhere to spawn it. Documented at the call
+site with the recycle relaunch named as the surviving backstop. What the guard makes unconditional is
+the abort.
+
+Tests: `dropped_render_not_left_as_a_zombie_tab_with_detached_tasks`,
+`released_render_not_closed_again_when_the_scope_drops` — Chrome-free via a `Closable` trait. **Both
+hung on their first run** (a task aborted before its first poll never constructs an in-body drop
+signal); the builder fixed the fixture, not the assertion.
+
+**Not verified:** no real Chrome ran; tabs actually closing is proven against a test double.

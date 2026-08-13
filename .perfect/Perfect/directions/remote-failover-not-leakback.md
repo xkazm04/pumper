@@ -3,12 +3,12 @@ slug: remote-failover-not-leakback
 type: perfect/direction
 context: "[[remote-engine]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 53b45ae
 ---
 
 ## What & why
@@ -77,4 +77,36 @@ so a dead peer silently escalates every future fetch of that host to a costlier 
 
 ## Build record
 
-(filled during build)
+**Shipped `53b45ae` · verdict KEEP.**
+
+The round-robin cursor now picks the **starting** node; a failure walks to the next eligible peer and
+local is reached only when they are exhausted. A failed peer is skipped for
+`[remote] node_cooldown_secs` (new, default 60, `0` disables); a success clears it immediately, so
+recovery does not serve out a penalty it no longer deserves. The expiry boundary is a named pure
+function (`still_cooling`) so it is assertable without waiting a minute. `MAX_NODE_ATTEMPTS = 3`
+bounds the total, so a 30-node cluster outage cannot become an N× latency multiplier.
+
+**Amplification fixed at the cause (criterion 3), two ways, with no timeout-shortening:**
+(1) `/fetch-proxy` answers **422, not 502** — 502 is in the shipped `retryable_statuses`, so the
+coordinator's own transport was retrying a deterministic peer-side failure four times. The choice
+reuses r17's reasoning for transact capability refusals and is **guarded by a test against
+`HttpConfig::default().retryable_statuses`**, so it breaks if either side drifts. (2) Each node
+attempt runs under a real end-to-end deadline, which makes the documented "end to end" sentence
+*true* rather than reworded.
+
+**Secondary folded in** (it was ~6 lines): `body_over_cap` checks the decoded body, and the `2×`
+transport multiplier is a named constant with a docstring instead of living only in a test-assertion
+string.
+
+All three false module-doc claims corrected. Tests: engine-remote 15 → 23.
+`a_zero_cooldown_means_no_cooldown_not_a_permanent_one` **failed on first run and the builder's
+expectation was wrong, not the code** — the round-robin cursor means a dead node is only *reached* on
+some fetches; rewritten as a cooldown-on/off contrast.
+
+**Constraint the brief missed, found by the builder:** `routes/error.rs`'s
+`every_status_a_handler_emits_has_a_code` diffs route sources against `EXPECTED_STATUS_USE`, so a new
+`StatusCode::` constant (424 was the first choice) would have broken a Class C file. Everything stays
+inside the existing 403/422 inventory.
+
+**Not verified:** cooldown expiry after a real 60s (proven at the pure boundary instead); no real
+multi-node deployment.

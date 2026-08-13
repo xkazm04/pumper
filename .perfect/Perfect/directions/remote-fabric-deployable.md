@@ -3,12 +3,12 @@ slug: remote-fabric-deployable
 type: perfect/direction
 context: "[[remote-engine]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 6def9cc
 ---
 
 ## What & why
@@ -98,4 +98,36 @@ fix is a target policy plus an honest deployment contract, not authentication.
 
 ## Build record
 
-(filled during build)
+**Shipped `6def9cc` · verdict KEEP.**
+
+**Lever chosen and argued (criterion 1):** profiled fetches **stay on the coordinator**
+(`must_serve_locally`), the doctrine `fetch_bytes` already follows. A profile is a cookie jar on one
+node's disk and nothing replicates it, so no configuration exists in which a peer can serve one
+correctly; peer-refuses-then-fall-back would pay a wasted round trip on *every* profiled fetch forever
+to reach a node that can never legitimately answer. The serving side refuses too (`absent_profile` →
+422), explicitly as defence-in-depth against an older or hostile coordinator. Layered on
+`require_existing_profile` rather than forking a parallel concept.
+
+**`blocked_target`** is a pure predicate (`blocked_v4`/`blocked_v6`/`blocked_name`) covering loopback,
+`0.0.0.0/8`, RFC-1918, link-local incl. `169.254.169.254`, CGNAT, `fc00::/7`, `fe80::/10`,
+broadcast/multicast and non-http(s) schemes. It judges the parsed `Ipv4Addr`, so every WHATWG spelling
+(`127.1`, `2130706433`, `0x7f.0.0.1`, `[::ffff:127.0.0.1]`) is caught by construction rather than by a
+blocklist of strings. `allow_private_targets` relaxes addresses only; the scheme refusal is not
+opt-outable.
+
+**Criterion 3's trap was checked as instructed:** the guard reads the **target**, so the e2e's loopback
+*node* addresses still work, and `a_node_refuses_to_fetch_its_own_loopback_api_for_a_peer` proves it is
+live rather than inert.
+
+Both tests that pinned the leak rewritten. 10 new tests across the two crates, all anti-pattern-named.
+`docs/deployment.md` gains a `[remote]` section with a control table (firewall / private overlay /
+authenticating reverse proxy) — **no in-app auth invented**, as the non-goal required.
+
+**Refuted:** `crates/engine-remote/**` was **not** the only engine crate missing from
+`feature-doc-map.json` — `crates/engine-archive/**` is equally absent, and that one is not hypothetical
+(the archive tier shipped a provenance direction with no map coverage). Director-verified; both added
+in `19f1707`, along with `routes/remote.rs` so the fabric's *serving* half points at the doc that
+actually describes its behavior.
+
+**Not closed, stated:** the DNS-name SSRF hole — `http://internal.corp/` resolving into a private range
+is not caught, because the predicate is pure. Documented as a known limit, not papered over.

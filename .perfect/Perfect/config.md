@@ -53,6 +53,39 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   resource-destructive actions even when they are obviously regenerable.
 
 ## Skill improvement log
+- 2026-08-13 (round 18): **Writing a known hazard into the acceptance criteria as a CHECK, not a
+  prescription, produced the round's best outcome.** Criterion said "widening `is_terminal_for_job`
+  to all of `Error::Profile` may capture a transient error — check every construction site before
+  widening; if any is transient, take the other lever." The builder checked, found one
+  (`ProfileJar::load` on a sharing violation), took the other lever, and left the reasoning in the
+  doc comment so a future round cannot undo it. Compare the failure mode of prescribing the fix: I
+  would have shipped a silent retry regression. **Standing rule: when a lever has a plausible
+  hazard, name the hazard and the alternative lever in the criteria and let the builder decide.**
+- 2026-08-13 (round 18): **A "known gap" pinned in an EXPECTED map is worth more than a gap
+  mentioned in a report, because it names the remaining work precisely enough to finish.** Lot B
+  could not reach the third profile-name seam (outside its write set) and recorded
+  `("engine-http::fetch", false)` with a comment naming the exact edits. The Director closed it the
+  same round in ~20 minutes. A gap in a report would have become a banked seed that decayed. Prefer
+  "pin the gap as a failing-by-design row" over "mention it" whenever the guard shape allows.
+- 2026-08-13 (round 18): **A builder refusing to game a guard is a signal to act on, not just
+  praise.** Lot R declined to wire `/metrics` because the read tripped the raw-engine inventory, and
+  explicitly declined both workarounds (rephrasing the expression to dodge the scanner; making the
+  counters a process-global). That refusal is what let the Director apply a *reviewed* inventory row
+  instead of discovering a laundered one later. Add to the brief template: "if a guard blocks you,
+  report it — never rephrase around it; the row is the Director's to carry."
+- 2026-08-13 (round 18): **The Class B shared-file bleed is now confirmed structural, twice
+  independently, and should be in the brief rather than rediscovered.** `git commit --only` commits
+  working-tree content, so on a genuinely shared file each lot's commit carries the sibling's
+  in-flight hunks. Round 9 found it; both r18 lots reported it unprompted. It is harmless to
+  correctness and fatal to per-commit attribution. Either say so in the brief up front, or stop
+  putting *any* file in Class B and make every straddler Class C — r17's lesson already points that
+  way and r18's one true straddler (`feature-doc-map.json`) cost nothing as Class C.
+- 2026-08-13 (round 18): **Phase 0 reconciliation was a genuine no-op for the first time, and
+  saying so with the numbers is the deliverable.** 0 notes to create, 0 to alias, 0 to retire, and
+  a recomputed 30/46 matching the inherited headline after four rounds of drift. The dispatch
+  demanded "expect real reconciliation work, not a no-op" — the honest answer was that r11/r16/r17
+  had already done it. Report the diff table even when every cell is zero; a verified no-op and an
+  unexamined one look identical otherwise.
 - 2026-08-12 (round 14): **A session note that records reviews AS THEY HAPPEN makes a
   death between review and gates nearly free.** The continuation found all 7 commits
   landed, both lots' KEEP verdicts written with file-level specifics, and an executable

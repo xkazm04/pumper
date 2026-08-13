@@ -97,5 +97,25 @@ path; the tier router still learns from remote fetches (only the governor half i
 
 ## Shipped
 
-- (none on this map)
-- round 18: pending (see the three accepted directions above)
+- **round 18 — 3/3 shipped, merged to master, gate 1746/0, smoke 36/36. First shipped work on this
+  context; the crate went from one moonshot commit to swept.**
+  - [[remote-fabric-deployable]] → `6def9cc` — profiled fetches stay on the coordinator
+    (`must_serve_locally`), the peer refuses a profile it has no jar for, and `blocked_target` refuses
+    loopback/private/link-local/CGNAT targets and non-http(s) schemes by default. `deployment.md`
+    finally states the network precondition the fabric requires.
+  - [[remote-failover-not-leakback]] → `53b45ae` — failover across remaining peers with a per-node
+    cooldown; the peer's own-failure status moved 502 → 422 so the coordinator's transport stops
+    retrying a deterministic failure four times, guarded by a test against the shipped
+    `retryable_statuses`.
+  - [[remote-egress-attributable]] → `d128ae7` — `x-pumper-remote-node` carries the serving node to
+    the tier trace and the job receipt's `cost.egress`; the peer echoes the URL it was asked for and
+    a mismatched (or unecho'd) envelope is refused.
+- **Director follow-ups this round:** `19f1707` — wired `pumper_remote_egress_fetches` onto `/metrics`
+  with the reviewed `EXPECTED_RAW_ENGINE_CALLS` row the builder correctly refused to game, and added
+  `crates/engine-remote/**` + `crates/engine-archive/**` + `routes/remote.rs` to the doc-sync map;
+  `e1e18db` — smoke live-checks the egress series.
+- **Next anchor (banked, in priority order):** `remote-scope-honesty` (18 raw `ctx.engines.http` call
+  sites never go through the fabric — cross-referenced on `app-runtime`) · the **DNS-name SSRF hole**,
+  open and documented: `blocked_target` is pure, so a hostname that *resolves* private is not caught;
+  closing it needs resolve-then-pin inside the HTTP engine and still races rebinding · per-node
+  identities + secret rotation (one cluster-wide secret, `http://` node URLs permitted by `validate`).
