@@ -14,6 +14,9 @@ serde_json.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-tokio.workspace = true
+# `test-util`: `#[tokio::test(start_paused = true)]` drives a render past its
+# whole `[browser] render_budget_secs` in zero real milliseconds (same idiom as
+# apps/crawl). Dev-only, so nothing ships with a pausable clock.
+tokio = { workspace = true, features = ["test-util"] }
 serde_json.workspace = true
 pumper-core.workspace = true

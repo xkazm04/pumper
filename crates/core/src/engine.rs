@@ -349,10 +349,16 @@ pub enum StepOutcome {
     /// The element was found but the interaction itself failed (a click that
     /// CDP refused, a `type` that errored, a scroll `evaluate` that threw).
     ActionFailed,
-    /// **Coarse, `Repeat`-only**: the block ran but not every inner step of
-    /// every iteration succeeded (or an iteration was cut by the deadline).
-    /// Inner outcomes are deliberately NOT rolled up per step — one outcome per
-    /// block, so the evidence never claims granularity it does not have.
+    /// The step ran, but not to the extent that was asked for. Two producers:
+    ///
+    /// - a `Repeat` block whose passes were not all clean (or an iteration cut
+    ///   by the deadline) — **coarse by design**: one outcome for the whole
+    ///   block, inner outcomes are deliberately NOT rolled up per step, so the
+    ///   evidence never claims granularity it does not have;
+    /// - a `WaitMs` truncated by the render budget (`[browser]
+    ///   render_budget_secs`): the wait happened, just shorter than requested.
+    ///   A caller's wait is clamped rather than rejected, so this outcome is the
+    ///   only place the truncation is visible.
     Partial,
 }
 

@@ -115,8 +115,11 @@ enabled = false
 # this node SERVES `POST /fetch-proxy` (peers run fetches through this node's
 # local stack — governor, cache, caps included; shared-secret auth), and when
 # `nodes` is also non-empty the tiered fetcher's live-HTTP tier DISPATCHES to
-# those peers round-robin, falling back to the local engine on any node error.
-# `secret` MUST be set when enabled (an unauthenticated /fetch-proxy would be an
+# those peers: round-robin picks the starting node, a failure moves to the NEXT
+# peer, and only when the eligible peers are exhausted does the fetch fall back
+# to the local engine — local is the last resort, not the second, because
+# leaking egress back to the coordinator's own IP is what the fabric exists to
+# stop. `secret` MUST be set when enabled (an unauthenticated /fetch-proxy would be an
 # open proxy); use the same value on every node of the cluster. Cluster-wide
 # governor state is a later slice — each node stays individually polite.
 #
@@ -133,8 +136,19 @@ enabled = false
 enabled = false
 # nodes = ["http://10.0.0.2:8088"]  # peers to dispatch to; empty = serve-only
 # secret = ""                       # REQUIRED when enabled; shared across the cluster
-# timeout_secs = 60                 # per proxy call, end to end
-# max_body_bytes = 16777216         # cap on a proxied response body (16 MiB)
+# timeout_secs = 60                 # per node attempt, END TO END (a deadline around the
+#                                   # whole proxy call — the HTTP engine under it applies a
+#                                   # timeout per RETRY attempt, which used to multiply this
+#                                   # by [http] retries). At most 3 peers per fetch, so the
+#                                   # fabric's share of one HTTP-tier fetch is <= 3x this.
+# node_cooldown_secs = 60           # a peer that just failed is skipped for this long, so the
+#                                   # next N fetches don't each re-discover the same dead node
+#                                   # and pay a full timeout to do it. 0 = no cooldown; a
+#                                   # success clears it immediately.
+# max_body_bytes = 16777216         # cap on a proxied response body (16 MiB), enforced on the
+#                                   # DECODED body as well as the transport (whose cap is 2x
+#                                   # this + slack, headroom for JSON escaping — not a raised
+#                                   # limit)
 # allow_private_targets = false     # serving side: fetch loopback/private/link-local
 #                                   # targets for a peer. Default false — otherwise a
 #                                   # secret-holder can drive this node's own API
@@ -160,6 +174,12 @@ headless = true
 user_data_dir = "data/browser-profile"
 default_wait_ms = 1000
 nav_timeout_secs = 30
+# TOTAL wall clock for one render (navigation + selector wait + settle + actions +
+# evaluate + DOM capture, and every CDP call inside them). nav_timeout_secs bounds
+# ONE of those waits; this bounds the render, which is what holds a tab and one of
+# max_concurrent_renders slots. Caller waits (extra_wait_ms, the wait_ms action)
+# are clamped to what is left of it. Default 180; 0 = off (unbounded renders).
+# render_budget_secs = 180
 # Cap on captured HTML per render (bytes); mirrors [http] max_body_bytes so a
 # JS-heavy page can't balloon memory on the browser tier. Default 16 MiB; 0 = off.
 # max_html_bytes = 16777216

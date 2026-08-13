@@ -84,6 +84,12 @@ const LAUNCH_TIMEOUT_SECS: u64 = 15;
 /// hang on the *cleanup* path — including inside a detached drop task nobody is
 /// awaiting.
 const TAB_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
+/// Slice of the render budget a caller-requested wait may never eat, so a
+/// pathological `extra_wait_ms` / `wait_ms` is *truncated* rather than turned
+/// into a failed job: sleeping the budget out to the last millisecond would
+/// leave nothing to capture the DOM with, and the render would die at
+/// `content()` having done all the work.
+const CAPTURE_RESERVE: Duration = Duration::from_secs(5);
 
 // ── network capture (API X-ray) caps ─────────────────────────────────────────
 // A `capture_network` render observes the page's own XHR/fetch traffic; every
@@ -152,6 +158,136 @@ fn is_stale(alive: bool, renders: u64, recycle: u64) -> bool {
 /// over the cap fails (exactly at the cap is allowed, mirroring the HTTP tier).
 fn over_html_cap(html_len: u64, cap: u64) -> bool {
     cap > 0 && html_len > cap
+}
+
+// ── the render budget ────────────────────────────────────────────────────────
+//
+// `nav_timeout_secs` reads like a render budget but bounds ONE of a render's
+// waits. Everything else was unbounded: `goto`, `evaluate`,
+// `Network.getResponseBody`, `content()`, `page.url()`, `find_element` inside
+// the selector poll — plus `extra_wait_ms` and the `wait_ms` action, raw `u64`
+// milliseconds a caller supplies with no ceiling. A render holds one of only
+// `max_concurrent_renders` slots for its whole life, so four such calls (or one
+// half-dead Chrome that stays "alive" but never answers CDP) wedge the browser
+// tier for every app on the box, with no error until the job timeout — which
+// then dropped the future and leaked the tab (see `RenderScope`).
+//
+// One deadline now bounds the lot.
+
+/// Deadline for a render starting at `now`, or `None` when the budget is off
+/// (`render_budget_secs = 0`). Pure so the arithmetic is testable without Chrome.
+fn budget_deadline(now: tokio::time::Instant, budget_secs: u64) -> Option<tokio::time::Instant> {
+    (budget_secs > 0).then(|| now + Duration::from_secs(budget_secs))
+}
+
+/// Deadline for one *stage* of a render (a navigation wait, a selector wait, an
+/// action list): its own cap, clamped by whatever is left of the render budget.
+/// Pure.
+fn stage_deadline(
+    now: tokio::time::Instant,
+    cap: Duration,
+    budget: Option<tokio::time::Instant>,
+) -> tokio::time::Instant {
+    let own = now + cap;
+    match budget {
+        Some(end) => own.min(end),
+        None => own,
+    }
+}
+
+/// How long a caller-requested wait may actually sleep, and whether it was cut.
+///
+/// `remaining = None` means the budget is disabled and the caller gets exactly
+/// what they asked for. Otherwise the wait is clamped to the remaining budget
+/// **less [`CAPTURE_RESERVE`]**: the point is a truncated wait with a visible
+/// signal, not a render that sleeps its whole budget away and then fails at
+/// capture time. Pure.
+fn clamp_wait_ms(requested_ms: u64, remaining: Option<Duration>) -> (u64, bool) {
+    let Some(remaining) = remaining else {
+        return (requested_ms, false);
+    };
+    let usable = remaining.saturating_sub(CAPTURE_RESERVE);
+    let usable_ms = u64::try_from(usable.as_millis()).unwrap_or(u64::MAX);
+    if requested_ms <= usable_ms {
+        (requested_ms, false)
+    } else {
+        (usable_ms, true)
+    }
+}
+
+/// The failure a render owes when its total budget runs out: it names the budget
+/// and the stage, because "browser engine: timed out" leaves an operator
+/// guessing which of six waits died and which knob moves it.
+///
+/// Stays an `Error::Browser`, i.e. **retryable**, on purpose: unlike a malformed
+/// request, "this page was too slow *this time*" is a fact about a live remote
+/// site, and the next attempt may well be fast.
+fn budget_exhausted(stage: &str, url: &str, budget_secs: u64) -> Error {
+    Error::Browser(format!(
+        "render budget exhausted after {budget_secs}s while {stage} ({url}): one render may hold \
+         its tab and one of the [browser] max_concurrent_renders slots for at most \
+         [browser] render_budget_secs. Raise that key for genuinely slow pages, or narrow the \
+         render (wait_for_selector, fewer actions, smaller extra_wait_ms) so it fits."
+    ))
+}
+
+/// The single deadline that bounds one render, from the moment it owns a Chrome
+/// to the moment it hands back HTML.
+#[derive(Clone, Copy)]
+struct RenderBudget {
+    /// `[browser] render_budget_secs`, carried so failures can name it.
+    secs: u64,
+    /// `None` = the budget is disabled.
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl RenderBudget {
+    /// Starts the clock. Called AFTER the Chrome handle is acquired: a render
+    /// queued behind a busy semaphore, or waiting on a relaunch, must not burn
+    /// budget it never got to use (the launch has its own `LAUNCH_TIMEOUT_SECS`).
+    fn start(budget_secs: u64) -> Self {
+        Self {
+            secs: budget_secs,
+            deadline: budget_deadline(tokio::time::Instant::now(), budget_secs),
+        }
+    }
+
+    fn remaining(&self) -> Option<Duration> {
+        self.deadline
+            .map(|d| d.saturating_duration_since(tokio::time::Instant::now()))
+    }
+
+    /// Deadline for a stage with its own cap (`nav_timeout_secs`), clamped by
+    /// the budget.
+    fn stage(&self, cap: Duration) -> tokio::time::Instant {
+        stage_deadline(tokio::time::Instant::now(), cap, self.deadline)
+    }
+
+    /// Awaits something the render **cannot proceed without**; running out of
+    /// budget here is a typed failure naming the budget.
+    async fn require<T>(
+        &self,
+        stage: &str,
+        url: &str,
+        fut: impl std::future::Future<Output = T>,
+    ) -> Result<T> {
+        match self.deadline {
+            None => Ok(fut.await),
+            Some(d) => tokio::time::timeout_at(d, fut)
+                .await
+                .map_err(|_| budget_exhausted(stage, url, self.secs)),
+        }
+    }
+
+    /// Awaits something best-effort (an `evaluate`, a captured body, the final
+    /// URL): `None` when the budget ran out, and the render carries on with what
+    /// it already has rather than throwing the page away.
+    async fn attempt<T>(&self, fut: impl std::future::Future<Output = T>) -> Option<T> {
+        match self.deadline {
+            None => Some(fut.await),
+            Some(d) => tokio::time::timeout_at(d, fut).await.ok(),
+        }
+    }
 }
 
 // ── render cleanup (RAII) ────────────────────────────────────────────────────
@@ -522,13 +658,17 @@ impl Browser for BrowserEngine {
 
         let browser = self.acquire(req.profile.as_deref()).await?;
         let nav_timeout = Duration::from_secs(self.cfg.nav_timeout_secs);
+        // ONE deadline for everything from here to the return. Started after the
+        // Chrome handle is in hand, so queueing behind the semaphore or a
+        // relaunch does not eat a render's budget.
+        let budget = RenderBudget::start(self.cfg.render_budget_secs);
 
         // Start blank so the interception drainer is listening before the first
         // (document) request fires; otherwise the initial navigation would pause
         // with no one to resolve it and hang.
-        let page = browser
-            .new_page("about:blank")
-            .await
+        let page = budget
+            .require("opening a tab", &req.url, browser.new_page("about:blank"))
+            .await?
             .map_err(|e| Error::Browser(format!("new_page: {e}")))?;
         // From here to the return, EVERY exit path — including the ones that are
         // not exits at all (a cancelled or timed-out job drops this future
@@ -542,9 +682,13 @@ impl Browser for BrowserEngine {
             let block_heavy = !req.load_all_resources;
             let drain_page = page.clone();
             let counter = blocked.clone();
-            let mut paused = page
-                .event_listener::<EventRequestPaused>()
-                .await
+            let mut paused = budget
+                .require(
+                    "attaching the interception listener",
+                    &req.url,
+                    page.event_listener::<EventRequestPaused>(),
+                )
+                .await?
                 .map_err(|e| Error::Browser(format!("intercept listener: {e}")))?;
             scope.watch(tokio::spawn(async move {
                 while let Some(ev) = paused.next().await {
@@ -587,16 +731,26 @@ impl Browser for BrowserEngine {
                 .and_then(|u| u.host_str().map(str::to_lowercase))
                 .unwrap_or_default();
             // Explicitly enable the Network domain — harmless if already on.
-            if let Err(e) = page.execute(EnableParams::default()).await {
-                warn!("network capture: enable failed: {e}");
+            match budget.attempt(page.execute(EnableParams::default())).await {
+                Some(Err(e)) => warn!("network capture: enable failed: {e}"),
+                None => warn!("network capture: enable hit the render budget"),
+                Some(Ok(_)) => {}
             }
-            let mut sent = page
-                .event_listener::<EventRequestWillBeSent>()
-                .await
+            let mut sent = budget
+                .require(
+                    "attaching the capture listener",
+                    &req.url,
+                    page.event_listener::<EventRequestWillBeSent>(),
+                )
+                .await?
                 .map_err(|e| Error::Browser(format!("capture listener (request): {e}")))?;
-            let mut received = page
-                .event_listener::<EventResponseReceived>()
-                .await
+            let mut received = budget
+                .require(
+                    "attaching the capture listener",
+                    &req.url,
+                    page.event_listener::<EventResponseReceived>(),
+                )
+                .await?
                 .map_err(|e| Error::Browser(format!("capture listener (response): {e}")))?;
             let sink = candidates.clone();
             scope.watch(tokio::spawn(async move {
@@ -643,14 +797,17 @@ impl Browser for BrowserEngine {
             }));
         }
 
-        if let Err(e) = page.goto(req.url.as_str()).await {
+        if let Err(e) = budget
+            .require("navigating", &req.url, page.goto(req.url.as_str()))
+            .await?
+        {
             // No cleanup here on purpose: `scope` releases the tab and both
             // tasks as it drops out of this early return.
             return Err(Error::Browser(format!("goto {}: {e}", req.url)));
         }
 
         let mut nav_timed_out = false;
-        match tokio::time::timeout(nav_timeout, page.wait_for_navigation()).await {
+        match tokio::time::timeout_at(budget.stage(nav_timeout), page.wait_for_navigation()).await {
             Ok(Ok(_)) => {}
             Ok(Err(e)) => warn!(url = %req.url, "navigation: {e}"),
             Err(_) => {
@@ -661,15 +818,23 @@ impl Browser for BrowserEngine {
 
         let mut selector_found = None;
         if let Some(selector) = &req.wait_for_selector {
-            let deadline = tokio::time::Instant::now() + nav_timeout;
-            let found = wait_for_selector(&page, selector, deadline).await;
+            let found = wait_for_selector(&page, selector, budget.stage(nav_timeout)).await;
             if !found {
                 warn!(selector = %selector, "wait_for_selector timed out");
             }
             selector_found = Some(found);
         }
 
-        let settle_ms = req.extra_wait_ms.unwrap_or(self.cfg.default_wait_ms);
+        // The settle wait is raw caller-supplied milliseconds (or the config
+        // default), so it is clamped to the budget rather than trusted.
+        let requested_settle = req.extra_wait_ms.unwrap_or(self.cfg.default_wait_ms);
+        let (settle_ms, settle_truncated) = clamp_wait_ms(requested_settle, budget.remaining());
+        if settle_truncated {
+            warn!(
+                url = %req.url, requested_ms = requested_settle, granted_ms = settle_ms,
+                "settle wait truncated to fit the render budget"
+            );
+        }
         if settle_ms > 0 {
             tokio::time::sleep(Duration::from_millis(settle_ms)).await;
         }
@@ -681,16 +846,19 @@ impl Browser for BrowserEngine {
         let action_outcomes = if req.actions.is_empty() {
             Vec::new()
         } else {
-            let deadline = tokio::time::Instant::now() + nav_timeout;
-            execute_actions(&page, &req.actions, deadline).await
+            execute_actions(&page, &req.actions, budget.stage(nav_timeout)).await
         };
         let actions_completed = action_outcomes.len();
 
         let evaluated = match &req.evaluate {
-            Some(js) => match page.evaluate(js.as_str()).await {
-                Ok(result) => result.into_value::<serde_json::Value>().ok(),
-                Err(e) => {
+            Some(js) => match budget.attempt(page.evaluate(js.as_str())).await {
+                Some(Ok(result)) => result.into_value::<serde_json::Value>().ok(),
+                Some(Err(e)) => {
                     warn!("evaluate failed: {e}");
+                    None
+                }
+                None => {
+                    warn!(url = %req.url, "evaluate hit the render budget; no result");
                     None
                 }
             },
@@ -712,12 +880,15 @@ impl Browser for BrowserEngine {
                 if network.len() >= CAPTURE_MAX_CALLS {
                     break;
                 }
-                let got = match page
-                    .execute(GetResponseBodyParams::new(p.request_id.clone()))
+                let got = match budget
+                    .attempt(page.execute(GetResponseBodyParams::new(p.request_id.clone())))
                     .await
                 {
-                    Ok(res) => res.result,
-                    Err(_) => continue, // body evicted / no body (204, redirects)
+                    Some(Ok(res)) => res.result,
+                    Some(Err(_)) => continue, // body evicted / no body (204, redirects)
+                    // Out of budget: keep the bodies already pulled and get on
+                    // with capturing the DOM, which is what the caller asked for.
+                    None => break,
                 };
                 if got.base64_encoded {
                     // A JSON body is text; base64 here means binary — skip.
@@ -747,10 +918,16 @@ impl Browser for BrowserEngine {
         // exactly this point — the same point, in the same order, as before the
         // guard existed. Everything after this is arithmetic over values already
         // in hand, so a failure there costs nothing.
-        let content = page.content().await;
-        let final_url = page.url().await.ok().flatten();
+        let content = budget
+            .require("capturing the DOM", &req.url, page.content())
+            .await;
+        let final_url = budget
+            .attempt(page.url())
+            .await
+            .and_then(|u| u.ok())
+            .flatten();
         scope.release().await;
-        let html = content.map_err(|e| Error::Browser(format!("content: {e}")))?;
+        let html = content?.map_err(|e| Error::Browser(format!("content: {e}")))?;
 
         // Cap the captured HTML like the HTTP tier caps its body, so a pathological
         // JS-built DOM can't balloon memory on the expensive tier — a typed error
@@ -888,13 +1065,18 @@ fn evidence_from_render(
 
 /// Polls for `selector` until it appears or `deadline` passes. Shared by the
 /// `wait_for_selector` render option and the `WaitForSelector` page action.
+///
+/// Each probe runs **under the deadline**, not merely before it: the loop used
+/// to check the clock only *after* `find_element` returned, so a single CDP call
+/// that never answered (a half-dead Chrome) blew the deadline by an unbounded
+/// amount while the render kept its tab and its concurrency slot.
 async fn wait_for_selector(
     page: &chromiumoxide::Page,
     selector: &str,
     deadline: tokio::time::Instant,
 ) -> bool {
     loop {
-        if page.find_element(selector).await.is_ok() {
+        if let Ok(Ok(_)) = tokio::time::timeout_at(deadline, page.find_element(selector)).await {
             return true;
         }
         if tokio::time::Instant::now() >= deadline {
@@ -940,103 +1122,142 @@ fn execute_actions<'a>(
                 warn!("page actions hit the time budget; capturing current DOM");
                 break;
             }
-            let outcome = match action {
-                PageAction::ScrollBottom => {
-                    let ok = page
-                        .evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                        .await
-                        .is_ok();
-                    interaction_outcome(true, ok)
-                }
-                PageAction::ScrollBy { pixels } => {
-                    let ok = page
-                        .evaluate(format!("window.scrollBy(0, {pixels})"))
-                        .await
-                        .is_ok();
-                    interaction_outcome(true, ok)
-                }
-                PageAction::Click { selector } => match page.find_element(selector).await {
-                    Ok(el) => {
-                        let clicked = el.click().await;
-                        if let Err(e) = &clicked {
-                            warn!(selector = %selector, "page action click failed: {e}");
-                        }
-                        interaction_outcome(true, clicked.is_ok())
-                    }
+            // Bounded *during* the step too, not just before it: a click or a
+            // `find_element` against a wedged Chrome never returns, and checking
+            // the clock between steps cannot cut a step that never ends. Cut
+            // steps are reported exactly like steps the deadline never reached —
+            // absent from `outcomes`, so `attempted < requested` stays the
+            // honest signal that the budget bit.
+            let outcome =
+                match tokio::time::timeout_at(deadline, run_action(page, action, deadline)).await {
+                    Ok(outcome) => outcome,
                     Err(_) => {
-                        warn!(selector = %selector, "page action click: selector not found");
-                        interaction_outcome(false, false)
+                        warn!("a page action hit the time budget mid-step; capturing current DOM");
+                        break;
                     }
-                },
-                PageAction::Type { selector, text } => {
-                    if let Ok(el) = page.find_element(selector).await {
-                        let _ = el.click().await;
-                        let typed = el.type_str(text).await;
-                        if let Err(e) = &typed {
-                            warn!(selector = %selector, "page action type failed: {e}");
-                        }
-                        interaction_outcome(true, typed.is_ok())
-                    } else {
-                        warn!(selector = %selector, "page action type: selector not found");
-                        interaction_outcome(false, false)
-                    }
-                }
-                PageAction::WaitForSelector {
-                    selector,
-                    timeout_ms,
-                } => {
-                    let d = timeout_ms
-                        .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms))
-                        .unwrap_or(deadline)
-                        .min(deadline);
-                    // A selector that never appears is a MISS, not progress:
-                    // that is exactly the confirmation state a reviewer checks.
-                    interaction_outcome(wait_for_selector(page, selector, d).await, true)
-                }
-                PageAction::WaitMs { ms } => {
-                    tokio::time::sleep(Duration::from_millis(*ms)).await;
-                    StepOutcome::Ok
-                }
-                PageAction::Repeat {
-                    times,
-                    steps,
-                    until_selector_count_stable,
-                } => {
-                    let mut last_count: Option<u64> = None;
-                    // Coarse by design: one outcome for the whole block. Only a
-                    // pass where every inner step ran AND succeeded keeps it Ok.
-                    let mut every_pass_clean = true;
-                    for _ in 0..*times {
-                        if tokio::time::Instant::now() >= deadline {
-                            every_pass_clean = false;
-                            break;
-                        }
-                        let inner = execute_actions(page, steps, deadline).await;
-                        if !pass_fully_succeeded(steps.len(), &inner) {
-                            every_pass_clean = false;
-                        }
-                        // Stop early once the tracked selector's match count stops
-                        // growing — "scroll until no new rows load". This is a
-                        // success condition, not a failure.
-                        if let Some(sel) = until_selector_count_stable {
-                            let count = count_matches(page, sel).await;
-                            if last_count.is_some_and(|prev| count <= prev) {
-                                break;
-                            }
-                            last_count = Some(count);
-                        }
-                    }
-                    if every_pass_clean {
-                        StepOutcome::Ok
-                    } else {
-                        StepOutcome::Partial
-                    }
-                }
-            };
+                };
             outcomes.push(outcome);
         }
         outcomes
     })
+}
+
+/// Runs ONE top-level [`PageAction`], best-effort, under the shared `deadline`.
+/// Split out of [`execute_actions`] so each step can be bounded as a whole.
+async fn run_action(
+    page: &chromiumoxide::Page,
+    action: &PageAction,
+    deadline: tokio::time::Instant,
+) -> StepOutcome {
+    match action {
+        PageAction::ScrollBottom => {
+            let ok = page
+                .evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                .await
+                .is_ok();
+            interaction_outcome(true, ok)
+        }
+        PageAction::ScrollBy { pixels } => {
+            let ok = page
+                .evaluate(format!("window.scrollBy(0, {pixels})"))
+                .await
+                .is_ok();
+            interaction_outcome(true, ok)
+        }
+        PageAction::Click { selector } => match page.find_element(selector).await {
+            Ok(el) => {
+                let clicked = el.click().await;
+                if let Err(e) = &clicked {
+                    warn!(selector = %selector, "page action click failed: {e}");
+                }
+                interaction_outcome(true, clicked.is_ok())
+            }
+            Err(_) => {
+                warn!(selector = %selector, "page action click: selector not found");
+                interaction_outcome(false, false)
+            }
+        },
+        PageAction::Type { selector, text } => {
+            if let Ok(el) = page.find_element(selector).await {
+                let _ = el.click().await;
+                let typed = el.type_str(text).await;
+                if let Err(e) = &typed {
+                    warn!(selector = %selector, "page action type failed: {e}");
+                }
+                interaction_outcome(true, typed.is_ok())
+            } else {
+                warn!(selector = %selector, "page action type: selector not found");
+                interaction_outcome(false, false)
+            }
+        }
+        PageAction::WaitForSelector {
+            selector,
+            timeout_ms,
+        } => {
+            let d = timeout_ms
+                .map(|ms| tokio::time::Instant::now() + Duration::from_millis(ms))
+                .unwrap_or(deadline)
+                .min(deadline);
+            // A selector that never appears is a MISS, not progress:
+            // that is exactly the confirmation state a reviewer checks.
+            interaction_outcome(wait_for_selector(page, selector, d).await, true)
+        }
+        PageAction::WaitMs { ms } => {
+            // Raw caller-supplied milliseconds with no schema ceiling:
+            // clamped to what is left, and the truncation is REPORTED
+            // (`Partial`) rather than silently swallowed.
+            let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let (granted, truncated) = clamp_wait_ms(*ms, Some(left));
+            if granted > 0 {
+                tokio::time::sleep(Duration::from_millis(granted)).await;
+            }
+            if truncated {
+                warn!(
+                    requested_ms = *ms,
+                    granted_ms = granted,
+                    "wait_ms truncated to fit the render budget"
+                );
+                StepOutcome::Partial
+            } else {
+                StepOutcome::Ok
+            }
+        }
+        PageAction::Repeat {
+            times,
+            steps,
+            until_selector_count_stable,
+        } => {
+            let mut last_count: Option<u64> = None;
+            // Coarse by design: one outcome for the whole block. Only a
+            // pass where every inner step ran AND succeeded keeps it Ok.
+            let mut every_pass_clean = true;
+            for _ in 0..*times {
+                if tokio::time::Instant::now() >= deadline {
+                    every_pass_clean = false;
+                    break;
+                }
+                let inner = execute_actions(page, steps, deadline).await;
+                if !pass_fully_succeeded(steps.len(), &inner) {
+                    every_pass_clean = false;
+                }
+                // Stop early once the tracked selector's match count stops
+                // growing — "scroll until no new rows load". This is a
+                // success condition, not a failure.
+                if let Some(sel) = until_selector_count_stable {
+                    let count = count_matches(page, sel).await;
+                    if last_count.is_some_and(|prev| count <= prev) {
+                        break;
+                    }
+                    last_count = Some(count);
+                }
+            }
+            if every_pass_clean {
+                StepOutcome::Ok
+            } else {
+                StepOutcome::Partial
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1400,6 +1621,136 @@ mod tests {
             !vault.join("portal_login").exists(),
             "the refusal must not create the profile it refused — and it must \
              happen before any Chrome is launched, which is why this test needs none"
+        );
+    }
+
+    // ── the render budget ────────────────────────────────────────────────────
+
+    /// THE anti-pattern: `extra_wait_ms` and the `wait_ms` action are raw `u64`
+    /// milliseconds with no clamp and no schema `maximum`, so one caller could
+    /// park a render — and one of only four concurrency slots — for 49 days.
+    /// Four of them wedge the browser tier for every app on the box.
+    #[test]
+    fn pathological_wait_not_allowed_to_outlive_the_render_budget() {
+        let budget = Duration::from_secs(180);
+        let (granted, truncated) = clamp_wait_ms(u64::MAX, Some(budget));
+        assert!(truncated, "a 49-day wait must be reported as cut");
+        assert_eq!(
+            granted,
+            (budget - CAPTURE_RESERVE).as_millis() as u64,
+            "a clamped wait leaves CAPTURE_RESERVE to actually capture the DOM"
+        );
+        assert!(
+            Duration::from_millis(granted) < budget,
+            "the wait alone can never consume the whole budget"
+        );
+    }
+
+    #[test]
+    fn a_wait_that_fits_is_untouched_and_a_disabled_budget_clamps_nothing() {
+        // Comfortably inside the budget: exactly what was asked for.
+        assert_eq!(
+            clamp_wait_ms(1_000, Some(Duration::from_secs(180))),
+            (1_000, false)
+        );
+        // Right at the reserve boundary: still not truncated.
+        assert_eq!(
+            clamp_wait_ms(5_000, Some(Duration::from_secs(10))),
+            (5_000, false)
+        );
+        assert_eq!(
+            clamp_wait_ms(5_001, Some(Duration::from_secs(10))),
+            (5_000, true)
+        );
+        // Budget spent: the wait is skipped entirely rather than the render dying.
+        assert_eq!(clamp_wait_ms(30_000, Some(Duration::ZERO)), (0, true));
+        // `render_budget_secs = 0` disables the budget: no clamp at all.
+        assert_eq!(clamp_wait_ms(u64::MAX, None), (u64::MAX, false));
+    }
+
+    /// A stage's own cap and the render budget are both ceilings; the binding
+    /// one wins. Before this, `nav_timeout_secs` was applied from *now* at each
+    /// of three stages, so three stages could each take a full nav timeout.
+    #[test]
+    fn a_stage_never_outlives_the_budget_that_contains_it() {
+        let now = tokio::time::Instant::now();
+        let budget = budget_deadline(now, 180).expect("a positive budget exists");
+        // Early in the render the stage cap binds...
+        assert_eq!(
+            stage_deadline(now, Duration::from_secs(30), Some(budget)),
+            now + Duration::from_secs(30)
+        );
+        // ...late in it, the budget does.
+        let late = now + Duration::from_secs(170);
+        assert_eq!(
+            stage_deadline(late, Duration::from_secs(30), Some(budget)),
+            budget
+        );
+        // Disabled budget: the stage keeps exactly its own cap.
+        assert_eq!(
+            stage_deadline(late, Duration::from_secs(30), None),
+            late + Duration::from_secs(30)
+        );
+        assert!(budget_deadline(now, 0).is_none(), "0 disables the budget");
+    }
+
+    /// A budget failure an operator can act on: it names the budget, the key
+    /// that moves it, the stage that ran out and the URL — not a bare "browser
+    /// engine: deadline has elapsed".
+    #[test]
+    fn budget_exhaustion_names_the_budget_not_a_generic_timeout() {
+        let err = budget_exhausted("capturing the DOM", "https://slow.example/x", 180);
+        let msg = err.to_string();
+        assert!(msg.contains("render_budget_secs"), "{msg}");
+        assert!(msg.contains("180s"), "{msg}");
+        assert!(msg.contains("capturing the DOM"), "{msg}");
+        assert!(msg.contains("https://slow.example/x"), "{msg}");
+        assert!(
+            !err.is_terminal_for_job(),
+            "a slow page may be fast next attempt — budget exhaustion stays retryable"
+        );
+    }
+
+    /// The budget must bound a wait that would otherwise never end. Uses tokio's
+    /// paused clock, so this proves the wiring in zero real milliseconds.
+    #[tokio::test(start_paused = true)]
+    async fn a_never_ending_await_is_cut_by_the_budget_not_left_to_wedge_the_tier() {
+        let budget = RenderBudget::start(180);
+        let forever = async {
+            tokio::time::sleep(Duration::from_secs(86_400)).await;
+        };
+        let err = budget
+            .require("navigating", "https://wedged.example/", forever)
+            .await
+            .expect_err("an unbounded await must not outlive the budget");
+        assert!(err.to_string().contains("render budget exhausted"), "{err}");
+
+        // Best-effort waits report the same fact as `None` instead of failing.
+        let budget = RenderBudget::start(180);
+        assert!(budget
+            .attempt(async {
+                tokio::time::sleep(Duration::from_secs(86_400)).await;
+            })
+            .await
+            .is_none());
+    }
+
+    /// The escape hatch stays honest: `render_budget_secs = 0` disables the
+    /// budget, and then nothing is bounded by it (this is the only way to get
+    /// the old, unbounded behaviour back).
+    #[tokio::test(start_paused = true)]
+    async fn a_disabled_budget_bounds_nothing() {
+        let budget = RenderBudget::start(0);
+        assert!(budget.remaining().is_none());
+        assert_eq!(
+            budget
+                .require("navigating", "https://x.example/", async {
+                    tokio::time::sleep(Duration::from_secs(86_400)).await;
+                    7u8
+                })
+                .await
+                .expect("no budget, no cut"),
+            7
         );
     }
 
