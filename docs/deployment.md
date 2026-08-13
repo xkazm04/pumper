@@ -138,6 +138,52 @@ money-spending, code-loading, data-exporting API to the network. If a remote
 consumer is needed, terminate it in an authenticating reverse proxy that keeps the
 pumper listener on loopback, or add auth to the server first.
 
+### Remote fetch fabric (`[remote]`) — the precondition nobody wrote down
+
+The distributed fetch fabric (`POST /fetch-proxy`, `crates/engine-remote`) is the
+one feature that **contradicts the loopback argument above**, and until now nothing
+said so — not `config.toml`, not `RemoteConfig`, not the route, not this file.
+
+A peer has to be reachable by its coordinator. `[remote] nodes` therefore holds
+routable addresses (the shipped example is `http://10.0.0.2:8088`), which means
+every node in the cluster must bind off loopback — and binding off loopback
+exposes *every other route on that node*: enqueue jobs that spend Claude money,
+`POST /plugins/reload` to load WASM off disk, export every dataset. **The
+`[remote]` shared secret authenticates `/fetch-proxy` and nothing else.** There is
+no API-key auth on the rest of the surface and adding one is deliberately parked.
+
+**So: enabling `[remote]` is a decision to put an unauthenticated pumper API on a
+network, and it is only safe if you add the access control yourself, at the
+network layer.** Pick one and actually do it:
+
+| control | what to do |
+| --- | --- |
+| host firewall | bind `[server] host` to the cluster-facing interface and allow inbound `8088` **only** from the other nodes' addresses (`ufw allow from <peer> to any port 8088`, a cloud security group, or equivalent). The default-deny rule is the one doing the work |
+| private overlay | put the nodes on a WireGuard / Tailscale / VPC-private network and bind to *that* interface only, never to `0.0.0.0` |
+| authenticating reverse proxy | keep pumper on `127.0.0.1`, front it with nginx/Caddy requiring mTLS or an auth header, and point `[remote] nodes` at the proxy |
+
+"It's on a private subnet" is only a control if something enforces it. A cloud
+instance with a public IP and an open security group is not a private subnet.
+
+Two guardrails ship *inside* the app; neither replaces the network control:
+
+- **Target policy.** `/fetch-proxy` refuses to fetch loopback, link-local
+  (incl. `169.254.169.254`, the cloud metadata service), RFC-1918 private and
+  CGNAT addresses on a peer's behalf, plus any non-`http(s)` scheme — so holding
+  the cluster secret does not by itself amount to driving each node's own API and
+  LAN. `[remote] allow_private_targets = true` opts a deliberate LAN-scraping
+  cluster back in (addresses only; the scheme refusal is not opt-outable). The
+  predicate is pure and blocks every WHATWG spelling of an address literal
+  (`127.0.0.1`, `127.1`, `2130706433`, `0x7f.0.0.1`, `[::ffff:127.0.0.1]`); what
+  it does **not** catch is a *hostname that resolves* into a private range.
+- **Profiled fetches never leave the coordinator.** A session profile is a cookie
+  jar on one node's disk (`<profiles_dir>/<name>/cookies.json`) and nothing
+  replicates it. The coordinator keeps profiled fetches local, and a node asked
+  to serve one it does not hold answers `422` instead of fetching through an
+  empty jar and returning the logged-out page with a `200`. The `422` costs the
+  coordinator a fallback fetch — the right trade against silently storing a login
+  wall as a dataset revision.
+
 ### CORS
 
 CORS is **off by default** (`[server] cors_allowed_origins` empty → no CORS layer

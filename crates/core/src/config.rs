@@ -300,6 +300,16 @@ pub struct RemoteConfig {
     /// inner request's `max_body_bytes` to this, and the dispatching side sizes
     /// its transport cap from it.
     pub max_body_bytes: u64,
+    /// Serving-side target policy opt-out. Default `false`: `/fetch-proxy`
+    /// refuses to fetch loopback, link-local, private and CGNAT addresses on a
+    /// peer's behalf, because every *other* route on a pumper node is
+    /// unauthenticated and the fabric is precisely the deployment where the
+    /// "it's only bound to loopback" argument stops holding — without the guard,
+    /// anyone holding the shared secret can drive a node's own API through it.
+    /// Set `true` only when the cluster deliberately scrapes its own network;
+    /// non-http(s) schemes stay refused either way. See
+    /// `pumper_engine_remote::blocked_target`.
+    pub allow_private_targets: bool,
 }
 
 impl Default for RemoteConfig {
@@ -311,6 +321,9 @@ impl Default for RemoteConfig {
             timeout_secs: 60,
             // Matches `[http] max_body_bytes`' 16 MiB default.
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
+            // Defaulted SAFE: an operator who turns the fabric on without
+            // reading this key still cannot be used to reach their own LAN.
+            allow_private_targets: false,
         }
     }
 }
@@ -1190,6 +1203,28 @@ pub struct BrowserConfig {
     /// 16 MiB, matching `[http] max_body_bytes`. `0` disables the cap.
     /// `RenderRequest.max_body_bytes` overrides it per render.
     pub max_html_bytes: u64,
+    /// **Total** wall-clock budget for one render, in seconds: navigation,
+    /// selector wait, settle, scripted actions, `evaluate`, network-body pulls
+    /// and DOM capture together. `0` disables it.
+    ///
+    /// `nav_timeout_secs` bounds ONE of a render's waits; this bounds the whole
+    /// thing, including the CDP calls that had no timeout at all. It exists
+    /// because a render holds one of `max_concurrent_renders` slots for its
+    /// entire life, so an unbounded render — a caller's huge `extra_wait_ms`, or
+    /// a half-dead Chrome that stays "alive" but never answers — wedges the
+    /// browser tier for every app on the box.
+    ///
+    /// Deliberately NOT derived from `nav_timeout_secs`: that key is a
+    /// per-navigation patience setting, and multiplying it would silently
+    /// multiply the tier's worst case for an operator who raised it for one slow
+    /// site. Default 180s — the current *timed* worst case with defaults is
+    /// ~91s (nav 30 + selector 30 + settle 1 + actions 30), so the default cuts
+    /// nothing that works today and only truncates the pathological tail.
+    ///
+    /// The clock starts once the render owns a Chrome (a launch is separately
+    /// bounded), so a render queued behind a busy semaphore never burns budget
+    /// waiting for its turn.
+    pub render_budget_secs: u64,
 }
 
 impl Default for BrowserConfig {
@@ -1205,6 +1240,7 @@ impl Default for BrowserConfig {
             recycle_after_renders: 200,
             proxy: None,
             max_html_bytes: DEFAULT_MAX_BODY_BYTES,
+            render_budget_secs: 180,
         }
     }
 }
@@ -1527,6 +1563,26 @@ mod tests {
         Config::default()
             .validate()
             .expect("default [remote] is valid");
+    }
+
+    /// The anti-pattern: a safety key whose SAFE state is the one you have to
+    /// type. Turning `[remote] enabled = true` is already enough to expose a
+    /// node's own unauthenticated API to whoever holds the shared secret; if the
+    /// target guard had to be opted *in*, the default deployment would be the
+    /// unguarded one.
+    #[test]
+    fn the_target_guard_is_on_unless_an_operator_types_the_opt_out() {
+        assert!(
+            !RemoteConfig::default().allow_private_targets,
+            "private targets must be refused unless the operator says otherwise"
+        );
+        let cfg: Config = toml::from_str(
+            "[remote]\nenabled = true\nsecret = \"s3cret\"\nallow_private_targets = true\n",
+        )
+        .expect("parse");
+        assert!(cfg.remote.allow_private_targets);
+        cfg.validate()
+            .expect("the opt-out is a policy choice, not a config error");
     }
 
     #[test]

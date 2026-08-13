@@ -119,12 +119,27 @@ enabled = false
 # `secret` MUST be set when enabled (an unauthenticated /fetch-proxy would be an
 # open proxy); use the same value on every node of the cluster. Cluster-wide
 # governor state is a later slice — each node stays individually polite.
+#
+# NETWORK PRECONDITION — read docs/deployment.md § "Remote fetch fabric" BEFORE
+# enabling this. A peer must be reachable at a routable address, which means
+# binding off loopback, which exposes EVERY other route on that node (all
+# unauthenticated by design). The fabric's shared secret protects /fetch-proxy
+# and nothing else; the control has to be network-level (firewall / VPN /
+# authenticating reverse proxy).
+#
+# Profiled fetches are NEVER dispatched: a profile is a cookie jar on this node's
+# disk, and a peer would serve the logged-out page with a 200.
 [remote]
 enabled = false
 # nodes = ["http://10.0.0.2:8088"]  # peers to dispatch to; empty = serve-only
 # secret = ""                       # REQUIRED when enabled; shared across the cluster
 # timeout_secs = 60                 # per proxy call, end to end
 # max_body_bytes = 16777216         # cap on a proxied response body (16 MiB)
+# allow_private_targets = false     # serving side: fetch loopback/private/link-local
+#                                   # targets for a peer. Default false — otherwise a
+#                                   # secret-holder can drive this node's own API
+#                                   # through /fetch-proxy. Non-http(s) schemes stay
+#                                   # refused either way.
 
 # Learned API-recipe replay (M05, see GET /recipes). When enabled (or a fetch
 # sets `use_recipes`), a VALIDATED recipe for the request's host replays the

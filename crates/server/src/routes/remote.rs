@@ -7,21 +7,32 @@
 //! [`pumper_core::HttpResponse`] as JSON (the envelope the coordinator-side
 //! `pumper-engine-remote` decodes).
 //!
-//! Guardrails:
+//! Guardrails, in the order they are applied:
 //! - the route answers 404 unless `[remote] enabled` (and a secret is set —
 //!   `Config::validate` enforces that pairing at boot),
 //! - the shared secret must arrive in [`REMOTE_SECRET_HEADER`] (401 otherwise;
 //!   compared as SHA-256 digests so the comparison doesn't leak a prefix),
+//! - **target policy** ([`blocked_target`]): loopback / link-local / private /
+//!   CGNAT addresses and non-http(s) schemes are refused with 403 unless
+//!   `[remote] allow_private_targets`. This is the only route in the service that
+//!   turns a caller-supplied string into an arbitrary outbound request, and it is
+//!   reachable *because* a fabric node must bind off loopback — the precondition
+//!   `docs/deployment.md` now states in the `[remote]` section,
+//! - **session policy** ([`absent_profile`]): a fetch naming a profile this node
+//!   does not hold is refused with 422 rather than served from an empty cookie
+//!   jar (see the doc comment there — this is the correctness half),
 //! - the inner request's `max_body_bytes` / `timeout_secs` are clamped to the
 //!   `[remote]` caps — a peer can lower them, never raise them,
 //! - a local engine failure is 502 (the coordinator treats any non-2xx as
 //!   "this node failed" and falls back to its own local engine).
 
+use std::path::Path;
+
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
 use pumper_core::HttpRequest;
-use pumper_engine_remote::REMOTE_SECRET_HEADER;
+use pumper_engine_remote::{blocked_target, REMOTE_SECRET_HEADER};
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 
@@ -33,6 +44,48 @@ use crate::state::AppState;
 /// value diverges from the real secret.
 fn secret_matches(presented: &str, expected: &str) -> bool {
     Sha256::digest(presented.as_bytes()) == Sha256::digest(expected.as_bytes())
+}
+
+/// Why this node cannot serve a fetch under the profile a peer named — `None`
+/// when the request carries no profile, or when this node genuinely holds it.
+///
+/// A profile is a persistent cookie jar at `<profiles_dir>/<name>/cookies.json`.
+/// `engine-http` treats a **missing** jar as "start an empty one" (a deliberate
+/// create-on-first-use default for local, interactive onboarding), and says
+/// nothing — its one `warn!` covers an *unreadable* jar, not an absent one. On
+/// this route that default is a data-integrity failure: the peer answers `200`
+/// with the logged-out or login-wall page, the coordinator has no field to tell
+/// the difference, and the row is extracted and stored as real content.
+///
+/// So the node refuses instead, and the coordinator falls back like it would for
+/// any node failure. That fallback costs a second fetch — the correct trade,
+/// because the alternative is silently wrong data with no detectable trace.
+/// (In practice a fixed coordinator never sends one: `must_serve_locally` keeps
+/// profiled fetches at home. This guard is what protects a node from an older or
+/// hostile peer.)
+///
+/// Same anti-pattern as `pumper_core::require_existing_profile`, which closed
+/// this hole for browser transact flows: "an empty profile is a LOGGED-OUT
+/// browser".
+fn absent_profile(profiles_dir: &Path, profile: Option<&str>) -> Option<String> {
+    let name = profile?;
+    let jar = match pumper_core::profile_cookies_path(profiles_dir, name) {
+        Ok(jar) => jar,
+        // An unusable name (traversal, too long, illegal chars) is refused for
+        // the same reason — this node cannot hold that session either.
+        Err(e) => return Some(format!("session profile '{name}' is unusable here: {e}")),
+    };
+    if jar.is_file() {
+        return None;
+    }
+    Some(format!(
+        "session profile '{name}' is not present on this node (no jar at {}). Serving a \
+         profiled fetch from a jar this node does not have would run it through an EMPTY \
+         cookie jar and return the logged-out page with a 200 — indistinguishable from real \
+         content by the time it is extracted and stored. Profiled fetches belong on the node \
+         that holds the session.",
+        jar.display()
+    ))
 }
 
 /// Run a peer's serialized fetch through this node's local stack.
@@ -51,7 +104,11 @@ fn secret_matches(presented: &str, expected: &str) -> bool {
         (status = 200, description = "The `HttpResponse` envelope: \
             `{status, headers, body, final_url, cache_hit}`"),
         (status = 401, description = "Missing or wrong `x-pumper-remote-secret`"),
+        (status = 403, description = "Target out of policy: a loopback / link-local / private / \
+            CGNAT address, or a non-http(s) scheme. Relax with `[remote] allow_private_targets`"),
         (status = 404, description = "`[remote]` disabled on this node"),
+        (status = 422, description = "The request names a session profile this node does not \
+            hold — serving it would return the logged-out page with a 200"),
         (status = 502, description = "The local fetch itself failed"),
     )
 )]
@@ -81,6 +138,19 @@ pub(crate) async fn fetch_proxy(
         ));
     }
 
+    // Target policy. Authentication says *who* may ask; this says *what* may be
+    // asked for. Holding the cluster secret must not amount to holding a shell
+    // on every node's private network.
+    if let Some(reason) = blocked_target(&req.url, cfg.allow_private_targets) {
+        return Err(ApiError(StatusCode::FORBIDDEN, reason));
+    }
+    // Session policy: refuse a profile this node does not hold rather than fetch
+    // logged out and answer 200.
+    if let Some(reason) = absent_profile(&state.config.fetcher.profiles_dir, req.profile.as_deref())
+    {
+        return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, reason));
+    }
+
     // Size/time caps: the peer may tighten them per request, never exceed the
     // node's own ceilings.
     req.max_body_bytes = Some(
@@ -107,7 +177,8 @@ pub(crate) async fn fetch_proxy(
 
 #[cfg(test)]
 mod tests {
-    use super::secret_matches;
+    use super::{absent_profile, secret_matches};
+    use std::path::PathBuf;
 
     #[test]
     fn secret_comparison_is_exact() {
@@ -115,5 +186,66 @@ mod tests {
         assert!(!secret_matches("", "sesame"));
         assert!(!secret_matches("sesam", "sesame"));
         assert!(!secret_matches("sesamee", "sesame"));
+    }
+
+    /// A scratch profiles root that is removed when the test ends.
+    struct Vault(PathBuf);
+    impl Vault {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir()
+                .join(format!("pumper-remote-vault-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("create scratch vault");
+            Self(dir)
+        }
+        fn with_profile(self, name: &str) -> Self {
+            let dir = self.0.join(name);
+            std::fs::create_dir_all(&dir).expect("create profile dir");
+            std::fs::write(dir.join("cookies.json"), "[]").expect("write jar");
+            self
+        }
+    }
+    impl Drop for Vault {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The anti-pattern: **create-on-first-use applied to someone else's
+    /// session**. `engine-http` opens a missing `cookies.json` as an empty jar
+    /// and says nothing, which is the right default for a local operator logging
+    /// in by hand and a data-integrity failure on a route a *peer* drives: the
+    /// node answers 200 with the logged-out page and nothing downstream can tell.
+    #[test]
+    fn an_unknown_profile_is_refused_not_served_from_an_empty_jar() {
+        let vault = Vault::new("unknown").with_profile("acme");
+
+        // Held here: serving it is legitimate.
+        assert_eq!(absent_profile(&vault.0, Some("acme")), None);
+        // No profile at all: nothing to be wrong about.
+        assert_eq!(absent_profile(&vault.0, None), None);
+
+        let why = absent_profile(&vault.0, Some("other")).expect("an unheld profile is refused");
+        assert!(why.contains("not present on this node"), "{why}");
+        assert!(
+            why.contains("EMPTY"),
+            "the refusal must say what serving it would actually return: {why}"
+        );
+        // A profile dir with no jar is still not a session.
+        std::fs::create_dir_all(vault.0.join("empty-shell")).unwrap();
+        assert!(absent_profile(&vault.0, Some("empty-shell")).is_some());
+    }
+
+    /// A name that cannot even be turned into a path is refused as such, rather
+    /// than falling through to "no profile" and fetching anonymously.
+    #[test]
+    fn an_unusable_profile_name_is_refused_rather_than_ignored() {
+        let vault = Vault::new("badname");
+        for name in ["../../etc", "", "a/b"] {
+            assert!(
+                absent_profile(&vault.0, Some(name)).is_some(),
+                "{name:?} must be refused"
+            );
+        }
     }
 }

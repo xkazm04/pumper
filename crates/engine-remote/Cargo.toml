@@ -9,6 +9,11 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+# Target policy: the fabric's serving side turns a peer-supplied string into an
+# outbound request, so it has to parse that string the same way the fetching
+# stack will (WHATWG host parsing folds decimal/hex/octal IPv4 forms into a real
+# `Ipv4Addr`, which a hand-rolled string check would miss).
+url.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

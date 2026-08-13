@@ -19,8 +19,26 @@
 //! Nodes are tried by simple round-robin (an atomic cursor over `[remote]
 //! nodes`). **Any** node failure — transport error, non-2xx proxy status,
 //! unparseable envelope — falls back to the local engine for that fetch, so a
-//! dead or misconfigured node degrades throughput, never correctness. With no
-//! nodes configured the engine is a pure pass-through to local.
+//! dead or misconfigured node degrades throughput. With no nodes configured the
+//! engine is a pure pass-through to local.
+//!
+//! ## What never leaves the coordinator
+//!
+//! Substituting a peer for the local stack is only honest while it changes
+//! *where* a fetch egresses from and nothing else. Two kinds of fetch fail that
+//! test and are therefore served locally, always:
+//!
+//! - **binary bodies** (`fetch_bytes`) — the envelope's `body` is a `String`, so
+//!   a binary body cannot travel the wire format at all;
+//! - **profiled fetches** ([`must_serve_locally`]) — a profile is a cookie jar on
+//!   the **coordinator's** disk (`<profiles_dir>/<name>/cookies.json`) and
+//!   nothing replicates it across the cluster. A peer asked to serve one opens a
+//!   jar it does not have; the HTTP engine treats `NotFound` as "start empty",
+//!   so the peer answers `200` with logged-out or login-wall HTML that is
+//!   indistinguishable from the real page at every layer above — and it flows
+//!   through extraction into stored dataset revisions as real records. That is a
+//!   **correctness** failure, and this module comment used to deny it existed
+//!   ("degrades throughput, never correctness").
 //!
 //! The outbound proxy call itself runs through the **local** transport (the
 //! real HTTP engine), so peer nodes are governed/spaced like any other host.
@@ -35,7 +53,7 @@ use async_trait::async_trait;
 use pumper_core::config::RemoteConfig;
 use pumper_core::{Error, HttpClient, HttpMethod, HttpRequest, HttpResponse, Result};
 use serde::{Deserialize, Serialize};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Header carrying the cluster shared secret on every proxy call. The peer's
 /// `/fetch-proxy` route rejects a missing/mismatched value with 401.
@@ -43,6 +61,157 @@ pub const REMOTE_SECRET_HEADER: &str = "x-pumper-remote-secret";
 
 /// Path of the proxy endpoint on a peer node.
 pub const FETCH_PROXY_PATH: &str = "/fetch-proxy";
+
+/// Why a fetch must be served by the coordinator's own stack instead of being
+/// dispatched to a peer — `None` means "a peer may serve this".
+///
+/// Pure and total: this is the guard on the substitution the whole crate makes,
+/// so it has to be assertable without a network, a peer, or a cookie jar.
+///
+/// Today it has exactly one rule, and it is a **data-correctness** rule rather
+/// than a capability one. A `profile` names a persistent cookie jar under the
+/// *coordinator's* `[fetcher] profiles_dir`. Peers have their own vaults and
+/// nothing syncs them, so a peer handed `profile: "acme"` runs the fetch through
+/// an empty jar — `engine-http` maps a missing `cookies.json` to
+/// `CookieStore::default()` with no warning — and returns a perfectly valid
+/// `200` carrying the logged-out page. The coordinator cannot tell, extraction
+/// cannot tell, and the row lands in a dataset revision as real data.
+///
+/// Keeping the fetch local (rather than letting the peer refuse and falling
+/// back) is the cheaper of the two safe answers: the fallback costs a wasted
+/// round-trip on *every* profiled fetch forever, to reach a peer that can never
+/// legitimately serve one. The serving side refuses as well (see
+/// `routes::remote`), but as defence-in-depth against an older or hostile
+/// coordinator, not as the primary lever.
+///
+/// Sibling of `pumper_core::require_existing_profile`, which closed the same
+/// class of hole for browser transact flows ("an empty profile is a LOGGED-OUT
+/// browser").
+pub fn must_serve_locally(req: &HttpRequest) -> Option<&'static str> {
+    req.profile.as_ref().map(|_| {
+        "a profiled fetch runs under a cookie jar that exists only on this node; \
+         a peer would serve it logged out"
+    })
+}
+
+/// Why the serving side must refuse to fetch `url` on a peer's behalf — `None`
+/// means the target is in policy.
+///
+/// `/fetch-proxy` is the one route in this service that turns a caller-supplied
+/// string into an arbitrary outbound request, and every *other* route on a
+/// pumper node is unauthenticated by design (the safety argument is the loopback
+/// bind — see `docs/deployment.md`). But a fabric peer has to be reachable at a
+/// routable address, so the fabric is exactly the deployment where that argument
+/// no longer holds: without this guard a node will happily fetch
+/// `http://127.0.0.1:8088/jobs` — *its own* API — for whoever holds the shared
+/// secret, and any other host on its LAN besides.
+///
+/// `allow_private = true` (`[remote] allow_private_targets`) is the opt-out for
+/// an operator who genuinely proxies a LAN. It relaxes the address ranges only;
+/// the scheme check is unconditional.
+///
+/// **Known limit, stated rather than papered over:** this is a pure predicate
+/// over the URL, so it blocks address *literals* (in every WHATWG form —
+/// `127.0.0.1`, `0x7f.1`, `2130706433` all parse to the same `Ipv4Addr`) and the
+/// `localhost` family by name. A **hostname that resolves into** a private range
+/// is not caught; catching that needs resolve-then-pin plumbing inside the HTTP
+/// engine, which this cannot reach and which would still race DNS rebinding.
+pub fn blocked_target(url: &str, allow_private: bool) -> Option<String> {
+    let parsed = match url::Url::parse(url) {
+        Ok(parsed) => parsed,
+        Err(e) => return Some(format!("target URL is not parseable ({e})")),
+    };
+    match parsed.scheme() {
+        "http" | "https" => {}
+        other => {
+            return Some(format!(
+                "target scheme '{other}' is not fetchable through the remote fabric \
+                 (http/https only)"
+            ))
+        }
+    }
+    let Some(host) = parsed.host() else {
+        return Some("target URL carries no host".to_string());
+    };
+    if allow_private {
+        return None;
+    }
+    let blocked = match &host {
+        url::Host::Ipv4(ip) => blocked_v4(*ip),
+        url::Host::Ipv6(ip) => blocked_v6(*ip),
+        url::Host::Domain(name) => blocked_name(name),
+    }?;
+    Some(format!(
+        "target host '{host}' is {blocked}; this node refuses to fetch it for a peer \
+         (set [remote] allow_private_targets = true if this cluster deliberately \
+         scrapes its own network)"
+    ))
+}
+
+/// The reason an IPv4 target is out of policy, or `None` for a routable address.
+fn blocked_v4(ip: std::net::Ipv4Addr) -> Option<&'static str> {
+    let o = ip.octets();
+    if ip.is_loopback() {
+        Some("a loopback address")
+    } else if ip.is_unspecified() || o[0] == 0 {
+        Some("in the unspecified / this-network block (0.0.0.0/8)")
+    } else if ip.is_private() {
+        Some("a private address (RFC 1918)")
+    } else if ip.is_link_local() {
+        // 169.254.0.0/16 — the cloud metadata services live at 169.254.169.254.
+        Some("a link-local address (169.254.0.0/16, incl. cloud metadata)")
+    } else if o[0] == 100 && (64..128).contains(&o[1]) {
+        Some("in the carrier-grade NAT block (100.64.0.0/10)")
+    } else if ip.is_broadcast() {
+        Some("the broadcast address")
+    } else if ip.is_multicast() {
+        Some("a multicast address")
+    } else {
+        None
+    }
+}
+
+/// The reason an IPv6 target is out of policy, or `None` for a routable address.
+///
+/// `is_unique_local` / `is_unicast_link_local` are still unstable in std, so the
+/// two prefixes are matched here by their defining bits rather than left out.
+fn blocked_v6(ip: std::net::Ipv6Addr) -> Option<&'static str> {
+    if ip.is_loopback() {
+        return Some("a loopback address");
+    }
+    if ip.is_unspecified() {
+        return Some("the unspecified address");
+    }
+    // `::ffff:127.0.0.1` and `::127.0.0.1` are the same destinations wearing a
+    // different notation; judge them by the v4 address they carry.
+    if let Some(v4) = ip.to_ipv4() {
+        return blocked_v4(v4);
+    }
+    let head = ip.segments()[0];
+    if head & 0xfe00 == 0xfc00 {
+        Some("a unique-local address (fc00::/7)")
+    } else if head & 0xffc0 == 0xfe80 {
+        Some("a link-local address (fe80::/10)")
+    } else if ip.is_multicast() {
+        Some("a multicast address")
+    } else {
+        None
+    }
+}
+
+/// The reason a *named* target is out of policy. Only the loopback family is
+/// decidable without DNS; see [`blocked_target`]'s known limit.
+fn blocked_name(name: &str) -> Option<&'static str> {
+    // A fully-qualified name may carry a root dot: `localhost.` resolves exactly
+    // like `localhost`, and comparing the raw string would miss it.
+    let name = name.trim_end_matches('.').to_ascii_lowercase();
+    let loopback = name == "localhost"
+        || name.ends_with(".localhost")
+        || name == "localhost.localdomain"
+        || name == "ip6-localhost"
+        || name == "ip6-loopback";
+    loopback.then_some("a loopback name")
+}
 
 /// Wire mirror of [`HttpResponse`] (which is deliberately `Serialize`-only in
 /// core). Field names/types match its serde output exactly; `#[serde(default)]`
@@ -175,6 +344,12 @@ impl RemoteEngine {
 #[async_trait]
 impl HttpClient for RemoteEngine {
     async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+        // Correctness gate before the routing gate: a fetch a peer cannot serve
+        // *correctly* must not be dispatched even when peers are healthy.
+        if let Some(reason) = must_serve_locally(&req) {
+            debug!(url = %req.url, reason, "remote fabric: serving this fetch locally");
+            return self.local.fetch(req).await;
+        }
         let Some(node) = self.pick_node() else {
             return self.local.fetch(req).await;
         };
@@ -221,6 +396,7 @@ mod tests {
             secret: "sesame".into(),
             timeout_secs: 30,
             max_body_bytes: 1024 * 1024,
+            ..RemoteConfig::default()
         }
     }
 
@@ -331,8 +507,7 @@ mod tests {
             transport.clone(),
             Arc::new(DeadLocal),
         );
-        let mut inner = HttpRequest::get("https://target.example/page");
-        inner.profile = Some("acme".into());
+        let inner = HttpRequest::get("https://target.example/page");
         engine.fetch(inner).await.unwrap();
 
         let seen = transport.seen();
@@ -355,7 +530,147 @@ mod tests {
         // deserializes it straight back into an HttpRequest.
         let round: HttpRequest = serde_json::from_str(proxy.body.as_deref().unwrap()).unwrap();
         assert_eq!(round.url, "https://target.example/page");
-        assert_eq!(round.profile.as_deref(), Some("acme"));
+        // No `profile` assertion here on purpose — a profiled fetch never gets
+        // this far. See `a_profiled_fetch_is_served_locally_not_logged_out_by_a_peer`.
+        assert_eq!(round.profile, None);
+    }
+
+    /// Local stub that answers as the **session holder** — the body only a
+    /// coordinator with the profile's cookie jar could produce.
+    struct LoggedInLocal;
+    #[async_trait]
+    impl HttpClient for LoggedInLocal {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            assert_eq!(
+                req.profile.as_deref(),
+                Some("acme"),
+                "the profile must survive the redirect to local"
+            );
+            Ok(HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: "<html>welcome back, acme</html>".into(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    /// The anti-pattern: **a substitution that changes the answer**. The fabric
+    /// is allowed to change which IP a fetch leaves from; it is not allowed to
+    /// change what comes back. A peer has no copy of the coordinator's cookie
+    /// jar, and `engine-http` starts an empty one for a jar it cannot find, so a
+    /// profiled fetch dispatched to a peer returns a logged-out page with a `200`
+    /// and no signal of any kind — and that page is what gets extracted and
+    /// stored as a dataset revision.
+    ///
+    /// Both halves are asserted: the peer is never asked, AND the body returned
+    /// is the session holder's.
+    #[tokio::test]
+    async fn a_profiled_fetch_is_served_locally_not_logged_out_by_a_peer() {
+        struct NeverDispatched;
+        #[async_trait]
+        impl HttpClient for NeverDispatched {
+            async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
+                panic!("a profiled fetch must never be dispatched to a peer");
+            }
+        }
+        let engine = RemoteEngine::with_transport(
+            &cfg(&["http://node-a:8088", "http://node-b:8088"]),
+            Arc::new(NeverDispatched),
+            Arc::new(LoggedInLocal),
+        );
+        let mut req = HttpRequest::get("https://target.example/dashboard");
+        req.profile = Some("acme".into());
+        let resp = engine.fetch(req).await.unwrap();
+        assert_eq!(resp.body, "<html>welcome back, acme</html>");
+    }
+
+    #[test]
+    fn only_a_profile_pins_a_fetch_to_the_coordinator() {
+        assert!(must_serve_locally(&HttpRequest::get("https://t.example/")).is_none());
+        let mut profiled = HttpRequest::get("https://t.example/");
+        profiled.profile = Some("acme".into());
+        let why = must_serve_locally(&profiled).expect("a profiled fetch stays local");
+        assert!(why.contains("logged out"), "{why}");
+    }
+
+    #[test]
+    fn a_routable_target_is_not_blocked() {
+        for url in [
+            "https://target.example/page",
+            "http://93.184.216.34/",
+            "https://[2606:2800:220:1:248:1893:25c8:1946]/",
+            "http://sub.domain.example.co.uk:8080/a?b=c",
+        ] {
+            assert_eq!(
+                blocked_target(url, false),
+                None,
+                "{url} should be fetchable"
+            );
+        }
+    }
+
+    /// The anti-pattern: an SSRF guard that only knows the **dotted-quad**
+    /// spelling of loopback. `http://2130706433/` and `http://0x7f.1/` reach the
+    /// same socket, and the URL parser the fetching stack uses folds every one of
+    /// these into `127.0.0.1` — so a guard that compares strings passes them all.
+    #[test]
+    fn every_spelling_of_loopback_is_blocked_not_only_the_dotted_quad() {
+        for url in [
+            "http://127.0.0.1:8088/jobs",
+            "http://127.1/",
+            "http://2130706433/",
+            "http://0x7f.0.0.1/",
+            "http://0177.0.0.1/",
+            "http://localhost:8088/jobs",
+            "http://LOCALHOST./",
+            "http://api.localhost/",
+            "http://[::1]:8088/",
+            "http://[::ffff:127.0.0.1]/",
+        ] {
+            let why = blocked_target(url, false).unwrap_or_else(|| panic!("{url} must be refused"));
+            assert!(
+                why.contains("refuses to fetch it for a peer"),
+                "{url}: {why}"
+            );
+        }
+    }
+
+    #[test]
+    fn private_link_local_and_non_http_targets_are_refused() {
+        for url in [
+            "http://10.0.0.2:8088/",
+            "http://192.168.1.1/",
+            "http://172.16.9.9/",
+            "http://169.254.169.254/latest/meta-data/",
+            "http://100.64.0.1/",
+            "http://0.0.0.0/",
+            "http://[fd00::1]/",
+            "http://[fe80::1]/",
+        ] {
+            assert!(
+                blocked_target(url, false).is_some(),
+                "{url} must be refused"
+            );
+        }
+        for url in ["file:///etc/passwd", "ftp://example.com/x", "not a url"] {
+            assert!(
+                blocked_target(url, false).is_some(),
+                "{url} must be refused"
+            );
+        }
+    }
+
+    /// The opt-out relaxes **addresses**, never the scheme: an operator who
+    /// deliberately scrapes their own LAN did not thereby ask this node to read
+    /// its own filesystem.
+    #[test]
+    fn the_opt_out_relaxes_addresses_not_schemes() {
+        assert_eq!(blocked_target("http://10.0.0.2:8088/", true), None);
+        assert_eq!(blocked_target("http://127.0.0.1:8088/jobs", true), None);
+        assert!(blocked_target("file:///etc/passwd", true).is_some());
+        assert!(blocked_target("gopher://10.0.0.2/", true).is_some());
     }
 
     #[tokio::test]

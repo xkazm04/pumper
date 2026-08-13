@@ -58,6 +58,10 @@ async fn proxy_state(http: Arc<dyn HttpClient>, remote: RemoteConfig) -> (AppSta
     let mut config = Config::default();
     config.storage.database_path = store.path().join("pumper.db");
     config.storage.artifacts_dir = store.path().join("artifacts");
+    // Hermetic session vault: the profile guard reads this directory, so a
+    // developer who happens to have `data/profiles/acme` on disk must not be
+    // able to flip these tests.
+    config.fetcher.profiles_dir = store.path().join("profiles");
     config.remote = remote;
     let state = AppState::from_parts(AppStateParts {
         config,
@@ -79,6 +83,7 @@ fn enabled_remote() -> RemoteConfig {
         secret: "sesame".into(),
         timeout_secs: 45,
         max_body_bytes: 2 * 1024 * 1024,
+        ..RemoteConfig::default()
     }
 }
 
@@ -120,7 +125,7 @@ async fn proxy_runs_the_request_through_the_local_stack_and_returns_the_envelope
     let (status, body) = post_proxy(
         &router,
         Some("sesame"),
-        json!({ "url": "https://target.example/page", "profile": "acme" }),
+        json!({ "url": "https://target.example/page" }),
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{body}");
@@ -133,14 +138,125 @@ async fn proxy_runs_the_request_through_the_local_stack_and_returns_the_envelope
     assert_eq!(body["headers"]["x-origin"], "node-local");
 
     // The node's local engine saw the inner request, with the [remote] caps
-    // stamped on (absent in the inner request => the node ceilings apply) and
-    // the profile threaded through.
+    // stamped on (absent in the inner request => the node ceilings apply).
     let seen = http.seen();
     assert_eq!(seen.len(), 1);
     assert_eq!(seen[0].url, "https://target.example/page");
-    assert_eq!(seen[0].profile.as_deref(), Some("acme"));
     assert_eq!(seen[0].max_body_bytes, Some(2 * 1024 * 1024));
     assert_eq!(seen[0].timeout_secs, Some(45));
+}
+
+/// The anti-pattern: **a peer answering a profiled fetch logged out**. This test
+/// used to assert the opposite — that `profile: "acme"` was threaded through to
+/// the node's engine — which pinned the leak as the contract. A node that does
+/// not hold the session cannot serve the session; the coordinator falls back to
+/// the node that does, and pays one extra fetch instead of storing a login wall
+/// as a dataset revision.
+#[tokio::test]
+async fn a_profile_this_node_does_not_hold_is_refused_not_fetched_logged_out() {
+    let http = RecordingHttp::new();
+    let (state, _store) = proxy_state(http.clone(), enabled_remote()).await;
+    let router = routes::router(state);
+
+    let (status, body) = post_proxy(
+        &router,
+        Some("sesame"),
+        json!({ "url": "https://target.example/page", "profile": "acme" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "unprocessable");
+    assert!(
+        body["error"].as_str().unwrap_or_default().contains("acme"),
+        "{body}"
+    );
+    assert!(
+        http.seen().is_empty(),
+        "the refusal must happen BEFORE the fetch — a 200 carrying the logged-out page is \
+         exactly what this guard exists to prevent"
+    );
+}
+
+/// ...and the guard is a *presence* check, not a blanket ban: a node that really
+/// holds the jar still serves the fetch under it.
+#[tokio::test]
+async fn a_profile_this_node_does_hold_is_served_under_it() {
+    let http = RecordingHttp::new();
+    let (state, store) = proxy_state(http.clone(), enabled_remote()).await;
+    let jar = store.path().join("profiles").join("acme");
+    std::fs::create_dir_all(&jar).unwrap();
+    std::fs::write(jar.join("cookies.json"), "[]").unwrap();
+    let router = routes::router(state);
+
+    let (status, body) = post_proxy(
+        &router,
+        Some("sesame"),
+        json!({ "url": "https://target.example/page", "profile": "acme" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(http.seen()[0].profile.as_deref(), Some("acme"));
+}
+
+/// The anti-pattern: **a node that will fetch its own API for whoever holds the
+/// shared secret**. Every other route here is unauthenticated because the bind
+/// is loopback — and a fabric node has to bind off loopback to be reachable at
+/// all, so `/fetch-proxy` is the exact place that argument runs out.
+///
+/// Note what this asserts and what it does not: the guard reads the **target**
+/// URL. The node addresses in this whole test file are `127.0.0.1`, and the
+/// round-trip test below still passes — that is the check that this guard is
+/// applied to the right URL rather than being inert.
+#[tokio::test]
+async fn a_node_refuses_to_fetch_its_own_loopback_api_for_a_peer() {
+    let http = RecordingHttp::new();
+    let (state, _store) = proxy_state(http.clone(), enabled_remote()).await;
+    let router = routes::router(state);
+
+    for target in [
+        "http://127.0.0.1:8088/jobs",
+        "http://localhost:8088/plugins/reload",
+        "http://169.254.169.254/latest/meta-data/",
+        "http://10.0.0.5/internal",
+        "file:///etc/passwd",
+    ] {
+        let (status, body) = post_proxy(&router, Some("sesame"), json!({ "url": target })).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{target}: {body}");
+        assert_eq!(body["code"], "forbidden", "{target}");
+    }
+    assert!(
+        http.seen().is_empty(),
+        "a refused target must never reach the fetch stack"
+    );
+}
+
+/// The opt-out is real: an operator who deliberately proxies a LAN gets their
+/// private targets back — and still cannot make the node read a local file.
+#[tokio::test]
+async fn the_private_target_opt_out_relaxes_addresses_only() {
+    let http = RecordingHttp::new();
+    let mut remote = enabled_remote();
+    remote.allow_private_targets = true;
+    let (state, _store) = proxy_state(http.clone(), remote).await;
+    let router = routes::router(state);
+
+    let (status, body) = post_proxy(
+        &router,
+        Some("sesame"),
+        json!({ "url": "http://10.0.0.5/internal" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(http.seen().len(), 1);
+
+    let (status, _) = post_proxy(
+        &router,
+        Some("sesame"),
+        json!({ "url": "file:///etc/passwd" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(http.seen().len(), 1, "the scheme guard is not opt-outable");
 }
 
 #[tokio::test]
@@ -286,10 +402,14 @@ async fn remote_engine_round_trips_through_a_live_node() {
 
     let coordinator_cfg = RemoteConfig {
         enabled: true,
+        // A loopback NODE address — the target guard reads the target URL, not
+        // this one, and the assertions below are what prove that distinction is
+        // real rather than a comment.
         nodes: vec![format!("http://{addr}")],
         secret: "sesame".into(),
         timeout_secs: 30,
         max_body_bytes: 1024 * 1024,
+        ..RemoteConfig::default()
     };
     // Local fallback must not be needed on the happy path.
     struct PanicLocal;

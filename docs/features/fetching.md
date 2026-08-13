@@ -121,6 +121,7 @@ A single Chrome instance is shared across renders (persistent `[browser] user_da
 - **Render concurrency cap.** `[browser] max_concurrent_renders` (default 4; `0` = unlimited) is a semaphore bounding simultaneous tabs, so N concurrent callers can't spawn N unbounded tabs.
 - **Resource blocking.** `[browser] block_resources` (default true) enables CDP request interception that drops **images, fonts, and media** (never stylesheets — CSS can matter for layout and selector waits) so scraping renders download only what the DOM needs. Enabling interception also disables Chrome's HTTP cache (cookies persist separately via the profile). Per-request `RenderRequest.load_all_resources` (serde-default `false`) opts a single render back into loading everything. When `block_resources` is false, interception is not wired at all (zero overhead).
 - **Memory guards.** Launch args include `--disable-dev-shm-usage` (avoid tiny `/dev/shm` crashing Chrome) and `--js-flags=--max-old-space-size=512` (cap the V8 heap at 512 MB).
+- **Every render gives its tab back — including a cancelled one.** The tab and the one or two background tasks servicing its CDP events are owned by an RAII scope guard, so they are released when the render future is **dropped** as well as when it returns. That matters because `DELETE /jobs/{id}` and the wall-clock `[worker] job_timeout_secs` both drop a running render mid-flight: cleanup that lived on the return paths never ran for them, and a dropped `JoinHandle` detaches its task rather than aborting it, so each cancelled render used to leave a zombie tab plus its tasks behind until the next recycle. Task aborts are unconditional; the tab close is dispatched from `Drop` as a detached best-effort task (a `Drop` cannot await), so during runtime shutdown the close may not land — the crash/recycle relaunch is still the backstop there.
 
 **`RenderRequest`** fields: `url`, `wait_for_selector`, `actions` (scripted page interactions — see below), `extra_wait_ms` (settle time; falls back to `[browser] default_wait_ms`), `evaluate` (JS expression; JSON result lands in `RenderedPage.evaluated`), `load_all_resources`, `profile` (session vault — see below).
 
@@ -129,6 +130,37 @@ A single Chrome instance is shared across renders (persistent `[browser] user_da
 **`RenderedPage`** fields: `html`, `final_url`, `evaluated`, plus honest wait/cost signals — `nav_timed_out: bool` (the navigation-wait deadline elapsed and the DOM was captured mid-load, so HTML may be partial), `selector_found: Option<bool>` (`Some(true)`/`Some(false)` for a requested `wait_for_selector` that did/didn't appear before the deadline; `None` when none was requested), `blocked_resources: usize` (count of subresources dropped by interception this render). All three are serde-defaulted.
 
 Config keys (`[browser]`): `chrome_executable`, `headless` (true), `user_data_dir` (`data/browser-profile`), `default_wait_ms` (1000), `nav_timeout_secs` (30), `max_concurrent_renders` (4), `block_resources` (true), `recycle_after_renders` (200), `proxy` (none; falls back to `[http] proxy`).
+
+## Remote fetch fabric (`[remote]`, default OFF)
+
+One switch drives both sides. **Serving:** with `[remote] enabled` and a `secret`, this node exposes `POST /fetch-proxy` — a peer POSTs a serialized `HttpRequest`, the node runs it through its own local stack (HTTP engine, governor, cache, caps) and returns the `HttpResponse` envelope (`{status, headers, body, final_url, cache_hit}`) as JSON. **Dispatching:** with `nodes` also non-empty, the tiered fetcher's **live-HTTP tier** routes through `RemoteEngine` instead of the plain local engine, so a fetch egresses from a peer's IP/geography. Any node failure falls back to the local engine for that fetch.
+
+Config keys (`[remote]`): `enabled` (false), `nodes` (`[]` — empty means serve-only), `secret` (**required** when enabled; `Config::validate` refuses an enabled fabric without one, since an unauthenticated `/fetch-proxy` is an open proxy), `timeout_secs` (60), `max_body_bytes` (16 MiB), `allow_private_targets` (false).
+
+**Read [deployment.md § Remote fetch fabric](../deployment.md) before enabling it.** A peer must be reachable at a routable address, so every node has to bind off loopback — which exposes every *other* route on that node, all unauthenticated by design. The secret protects `/fetch-proxy` alone; the real control is network-level (firewall / VPN / authenticating reverse proxy).
+
+### What a peer is not allowed to change
+
+The substitution is only honest while it changes *where* a fetch leaves from and nothing else. Three refusals enforce that:
+
+| refusal | where | why |
+| --- | --- | --- |
+| **Binary bodies stay local** (`fetch_bytes`) | coordinator | the envelope's `body` is a `String`; forwarded to the local stack rather than dropping the capability (see the capability contract above) |
+| **Profiled fetches stay local** (`must_serve_locally`) | coordinator | a profile is a cookie jar on the **coordinator's** disk and nothing replicates it. Dispatched, the peer opens a jar it does not have — `engine-http` maps a missing `cookies.json` to an empty store with no warning — and answers `200` with the logged-out or login-wall page. Nothing downstream can tell, so it is extracted and stored as a real dataset revision |
+| **Unheld profiles are refused** (`422`) | serving | defence-in-depth for the same bug against an older or hostile coordinator: a node asked for a profile it has no jar for refuses instead of fetching anonymously. The coordinator treats it like any node failure and falls back — one extra fetch, which is the correct price for not storing a login wall as data |
+
+### Target policy (serving side)
+
+`/fetch-proxy` is the only route that turns a caller-supplied string into an arbitrary outbound request. It refuses (`403`) targets that are:
+
+- **loopback** in any WHATWG spelling — `127.0.0.1`, `127.1`, `2130706433`, `0x7f.0.0.1`, `[::1]`, `[::ffff:127.0.0.1]`, `localhost`, `*.localhost`;
+- **link-local** `169.254.0.0/16` (this is where the cloud metadata service lives) and `fe80::/10`;
+- **private** RFC 1918, **unique-local** `fc00::/7`, **CGNAT** `100.64.0.0/10`, `0.0.0.0/8`, broadcast, multicast;
+- any scheme other than `http`/`https` (`file:`, `gopher:`, …).
+
+`[remote] allow_private_targets = true` relaxes the **address** ranges for a cluster that deliberately scrapes its own LAN. It does not relax the scheme check. The guard reads the **target** URL, not the node address — loopback *nodes* keep working, which is what the round-trip e2e pins.
+
+**Known limit:** the predicate is pure (no DNS), so it blocks address literals and the `localhost` family by name; a **hostname that resolves into** a private range is not caught. Closing that needs resolve-then-pin inside the HTTP engine and still races DNS rebinding.
 
 ## Session vault: named login profiles
 
