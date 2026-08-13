@@ -207,9 +207,16 @@ pub enum Error {
     #[error("budget: {0}")]
     BudgetExhausted(String),
     /// A VCR replay could not be served from the recorded cassette (missing
-    /// cassette, unrecorded request, or a body truncated at record time).
-    /// Typed so a replay MISS is distinguishable from an app failure — and so
-    /// it can never be confused with (or silently downgraded to) a live fetch.
+    /// cassette, unrecorded request, a body truncated at record time, a
+    /// corrupt/unknown-version cassette, or a raw engine reached during a
+    /// replay run). Typed so a replay MISS is distinguishable from an app
+    /// failure — and so it can never be confused with (or silently downgraded
+    /// to) a live fetch.
+    ///
+    /// **Terminal for a job** ([`Error::is_terminal_for_job`]): the cassette is
+    /// a file written by an already-finished job and the request is derived from
+    /// params frozen at enqueue, so a retry re-reads the identical bytes and
+    /// re-misses in the identical place.
     #[error("vcr replay miss: {0}")]
     ReplayMiss(String),
     /// Client-supplied input the server understood but rejected (a malformed
@@ -289,7 +296,7 @@ impl Error {
     /// retry cannot change the outcome, so the runtime must fail the job once
     /// instead of running it down the retry/backoff ladder.
     ///
-    /// The bar is deliberately high, and today exactly three variants clear it:
+    /// The bar is deliberately high, and today exactly four variants clear it:
     ///
     /// - [`Error::BudgetExhausted`] — a fact about the job's own ledger, which
     ///   a retry re-reads and re-refuses on.
@@ -311,13 +318,28 @@ impl Error {
     ///   function of text that is immutable for the life of the job, so the
     ///   ladder can only re-parse it and re-fail. A job's params are fixed at
     ///   enqueue; nothing about attempt 4 makes `"$.a:bogus:1"` parse.
+    /// - [`Error::ReplayMiss`] — a VCR replay that could not be served. Every
+    ///   construction site was audited before this variant was widened, because
+    ///   a variant with one transient producer must NOT be classified here (see
+    ///   `Error::Profile` below):
+    ///   `vcr::Cassette::resolve` (the request is absent from the map),
+    ///   `vcr::truncated_miss` (the body was dropped at record time),
+    ///   `vcr::to_fetch_outcome` (the entry names an engine no tier produces),
+    ///   `vcr::Cassette::load` (no cassette, no readable entries, a forged
+    ///   `req_hash`, an unknown format version) and `vcr::ReplayRefusal` (an app
+    ///   drove a raw engine during a replay). All but one are pure functions of
+    ///   an already-loaded, immutable cassette and a request derived from params
+    ///   frozen at enqueue. The one that touches IO is `load`'s file read — and
+    ///   that site is **already** permanent by call site (the worker resolves
+    ///   the cassette before the run and `fail_permanently`s on any load error),
+    ///   so widening the variant cannot take retries away from it.
     ///
-    /// Everything else — engine errors, storage errors, parse failures, even a
-    /// replay miss — is either transient or caught earlier, and classifying any
-    /// of them here would silently take away the retries that make this runtime
-    /// reliable. Note the boundary that keeps `Transact` honest: a failure
-    /// *during* a flow is an `Error::Browser`, which stays retryable; only the
-    /// deterministic pre-flight refusal is typed `Transact`.
+    /// Everything else — engine errors, storage errors, parse failures — is
+    /// either transient or caught earlier, and classifying any of them here
+    /// would silently take away the retries that make this runtime reliable.
+    /// Note the boundary that keeps `Transact` honest: a failure *during* a flow
+    /// is an `Error::Browser`, which stays retryable; only the deterministic
+    /// pre-flight refusal is typed `Transact`.
     ///
     /// **Why `Error::Profile` is NOT here**, though an unsafe profile name is as
     /// deterministic as anything above: the variant has a genuinely transient
@@ -337,7 +359,10 @@ impl Error {
     pub fn is_terminal_for_job(&self) -> bool {
         matches!(
             self,
-            Error::BudgetExhausted(_) | Error::Transact(_) | Error::BadRequest(_)
+            Error::BudgetExhausted(_)
+                | Error::Transact(_)
+                | Error::BadRequest(_)
+                | Error::ReplayMiss(_)
         )
     }
 }
@@ -585,7 +610,10 @@ mod tests {
             Error::App("the source returned nonsense".into()),
             Error::Parse("bad html".into()),
             Error::Config("missing key".into()),
-            Error::ReplayMiss("no recorded response".into()),
+            // NOT `ReplayMiss`: see `a_replay_miss_does_not_ride_the_retry_ladder`.
+            // It sat here as if transient, while the load-time miss was already
+            // being failed permanently by the worker — same feature, same
+            // determinism, opposite handling.
             // NOT `BadRequest`: see `malformed_input_not_retried_four_times`.
             // It sat here as if transient, which its own doc never claimed —
             // "input the server understood and rejected" cannot become valid on
@@ -595,6 +623,94 @@ mod tests {
             assert!(
                 !e.is_terminal_for_job(),
                 "{e} must stay retryable — marking it terminal takes the job's retries away"
+            );
+        }
+    }
+
+    /// The anti-pattern, and the asymmetry that gave it away: a replay whose
+    /// **cassette** was missing already failed permanently (the worker resolves
+    /// it before the run), while a replay that reached an **unrecorded request**
+    /// was re-queued and re-ran from the top `max_attempts` times — re-doing
+    /// every live-free step that preceded the miss and missing again in exactly
+    /// the same place. Same feature, same determinism, opposite handling.
+    ///
+    /// A miss is a pure function of an immutable cassette and params frozen at
+    /// enqueue: the backoff ladder cannot change the answer.
+    #[test]
+    fn a_replay_miss_does_not_ride_the_retry_ladder() {
+        for e in [
+            Error::ReplayMiss("no recorded response for GET https://x/a".into()),
+            Error::ReplayMiss("cassette entry ... was truncated at record time".into()),
+            Error::ReplayMiss("job ...'s cassette holds no readable entries".into()),
+        ] {
+            assert!(
+                e.is_terminal_for_job(),
+                "{e} is deterministic — retrying re-reads the same cassette"
+            );
+        }
+    }
+
+    /// The classification EVERY variant must have, as an **exhaustive** match.
+    ///
+    /// This is the inventory guard (the EXPECTED-diff idiom): adding a variant
+    /// to `Error` stops this compiling until someone decides whether a retry
+    /// could change its answer. A `_ =>` arm here would make "retryable" the
+    /// silent default again — which is exactly how `BadRequest` and then
+    /// `ReplayMiss` each shipped as deterministic refusals riding the whole
+    /// backoff ladder.
+    fn expected_terminal(e: &Error) -> bool {
+        match e {
+            // Deterministic refusals: the input is immutable for the life of
+            // the job, so every attempt re-derives the identical answer.
+            Error::BudgetExhausted(_)
+            | Error::Transact(_)
+            | Error::BadRequest(_)
+            | Error::ReplayMiss(_) => true,
+            // Everything else can genuinely succeed on the next attempt.
+            Error::Http(_)
+            | Error::Browser(_)
+            | Error::Claude { .. }
+            | Error::Profile(_)
+            | Error::Parse(_)
+            | Error::Config(_)
+            | Error::App(_)
+            | Error::Plugin { .. }
+            | Error::Io(_)
+            | Error::Json(_)
+            | Error::Other(_) => false,
+            #[cfg(feature = "storage")]
+            Error::Storage(_) => false,
+        }
+    }
+
+    /// One instance of every variant, checked against the exhaustive table
+    /// above — so the table cannot drift from `is_terminal_for_job` itself.
+    #[test]
+    fn every_error_variant_has_a_decided_retry_classification() {
+        let all = vec![
+            Error::Http("reset".into()),
+            Error::Browser("chrome died".into()),
+            Error::claude(ClaudeFailure::NonZeroExit, "cli exited 1"),
+            Error::Profile("jar unreadable".into()),
+            Error::Transact("submit: true refused".into()),
+            Error::Parse("bad html".into()),
+            Error::Config("missing key".into()),
+            Error::App("source returned nonsense".into()),
+            Error::plugin(PluginFailure::Trap, "delta-slim", "all fuel consumed"),
+            Error::BudgetExhausted("no headroom".into()),
+            Error::ReplayMiss("no recorded response".into()),
+            Error::BadRequest("bad filter".into()),
+            Error::Io(std::io::Error::other("disk hiccup")),
+            Error::Json(serde_json::from_str::<u8>("nope").unwrap_err()),
+            Error::Other(anyhow::anyhow!("something else")),
+            #[cfg(feature = "storage")]
+            Error::Storage(sqlx::Error::RowNotFound),
+        ];
+        for e in &all {
+            assert_eq!(
+                e.is_terminal_for_job(),
+                expected_terminal(e),
+                "{e} is classified against the table's intent"
             );
         }
     }

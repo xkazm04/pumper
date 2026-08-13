@@ -16,7 +16,8 @@ use std::time::Duration;
 
 use pumper_core::vcr::{fetch_entry, Vcr};
 use pumper_core::{
-    AppContext, Cassette, EnqueueOptions, Error, FetchOutcome, JobStatus, Result, ScrapeApp,
+    AppContext, Cassette, EnqueueOptions, Error, FetchOutcome, FetchRequest, JobStatus, Result,
+    ScrapeApp,
 };
 use serde_json::{json, Value};
 
@@ -227,4 +228,105 @@ async fn a_suspended_recording_resumes_instead_of_restarting() {
     assert_eq!(cassette.len(), 2, "both halves of the job are replayable");
     assert_recorded_by(&cassette, "https://x/page-1", "attempt-1");
     assert_recorded_by(&cassette, "https://x/page-2", "attempt-2");
+}
+
+// ── A resolve-time replay miss is terminal, like the load-time one ───────────
+
+/// Under `record: true` it records one URL; under `replay_of` it fetches a
+/// DIFFERENT one — the resolve-time miss, reached through the real chokepoint.
+struct MissesOnReplay {
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ScrapeApp for MissesOnReplay {
+    fn name(&self) -> &'static str {
+        "misser"
+    }
+    async fn run(&self, ctx: AppContext) -> Result<Value> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        if matches!(ctx.vcr, Vcr::Record(_)) {
+            record(&ctx, "https://x/recorded", "the recorded page").await;
+            return Ok(json!({ "recorded": true }));
+        }
+        let out = ctx
+            .fetch(FetchRequest::new("https://x/never-recorded"))
+            .await?;
+        Ok(json!({ "fetched": out.url }))
+    }
+}
+
+/// **The anti-pattern.** A replay that reached an unrecorded request was
+/// re-queued and re-ran from the top, `max_attempts` times — re-doing every
+/// live-free step that preceded the miss and missing again in exactly the same
+/// place, because a cassette and a job's params are both immutable for the life
+/// of the job.
+///
+/// The asymmetry that gave it away is asserted here too: the **load**-time miss
+/// (no cassette at all) was already permanent. A miss must fail ONCE, with the
+/// remaining attempts visibly un-burned.
+#[tokio::test]
+async fn a_resolve_time_replay_miss_fails_once_instead_of_burning_every_attempt() {
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (state, _store) = test_state(vec![Arc::new(MissesOnReplay { runs: runs.clone() })]).await;
+
+    let recorded = state
+        .storage
+        .enqueue(
+            "misser",
+            EnqueueOptions {
+                params: json!({ "record": true }),
+                max_attempts: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("enqueue");
+    assert!(worker::run_one(&state).await, "the recording run claims");
+    assert_eq!(
+        state
+            .storage
+            .get(recorded.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        JobStatus::Succeeded
+    );
+
+    let replay = state
+        .storage
+        .enqueue(
+            "misser",
+            EnqueueOptions {
+                params: json!({ "replay_of": recorded.id.to_string() }),
+                max_attempts: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("enqueue");
+    assert!(worker::run_one(&state).await, "the replay run claims");
+
+    let job = state.storage.get(replay.id).await.unwrap().unwrap();
+    assert_eq!(
+        job.status,
+        JobStatus::Failed,
+        "a miss is deterministic: the job is failed, not re-queued for a retry"
+    );
+    assert_eq!(
+        (job.attempts, job.max_attempts),
+        (1, 5),
+        "the backoff ladder must be left un-burned — a retry re-reads the same cassette"
+    );
+    let error = job.error.unwrap_or_default();
+    assert!(
+        error.contains("never-recorded"),
+        "the failure names the request that missed: {error}"
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        2,
+        "one run per job — the replay job must not have run four more times"
+    );
 }
