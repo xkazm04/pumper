@@ -2,19 +2,93 @@
 type: perfect/home
 repo: pumper
 updated: 2026-08-13
-pool: 0
-pool_target: per-dispatch (r18 complete — 6/6 shipped; the next dispatch sets the cap)
+pool: 6
+pool_target: 6 (r19 dispatch cap — gated, building)
 shipped_total: 146
-coverage: "30/46 map contexts covered. RULE (recomputable — compute it, never inherit it): a map context is COVERED when it has >=1 direction note pointing at it (`context: \"[[<name>]]\"`), OR an explicit nothing-clears-the-bar verdict, OR `last_proposed != never`. **Normalize CRLF before any frontmatter regex** — a naive /^---\\n([\\s\\S]*?)\\n---/ silently skips every CRLF file in this repo and scored coverage at 18/46 in r17, calling claude-engine/eu-grants/wasm-plugin-host never-proposed when each has 3 shipped directions. That trap, plus one genuinely stale note (job-worker said `last_proposed: never` against 5 shipped r4 directions — fixed r17), is why the figure drifted every round (r15 carried 24, r16 carried 26 then 'corrected' to 25, headline said 27). Recomputed honestly in r17: **28 entering**, +engine-contracts +maintenance-tooling gated r17 = **30**. 16 never proposed. Inherited pre-46-map history (browser-engine, http-engine, …) deliberately does NOT count as covered. **r18 recomputed the same rule from scratch with the CRLF normalization in place and got 30/46 entering — the figure is now stable across two independent computations.** +browser-engine +remote-engine gated r18 = **32/46**, 14 never proposed."
-cursor: "r18 COMPLETE — 6/6 shipped + 3 Director commits, ff-merged to master `e1e18db`; gate 1746/0/17-ignored, clippy no new warnings in touched files, smoke 36/36 (34→36, both new checks live). **Coverage 32/46, 14 never proposed.** r19 PROPOSE: pick 2 never-proposed, ties by opportunity — **http-engine is the standout** (opp 4, BANKED ANCHOR from r18, evidenced from two sides while building: the retry loop applies a per-attempt timeout across `retries: 3` — the amplification remote-engine had to route around — and `ProfileJar::load`'s `NotFound => CookieStore::default()` at `lib.rs:89` silently starts an empty jar, the root of the profile leak r18 fixed one layer up. It is the third engine of the ladder and the only one never swept) · then vcr-testing / vcr-testing / page-monitor / connector-api-watch / plugin-runner (banked r14 anchor) / data-pipeline-catalog / us-federal-grants / us-state-grants / czech-procurement / trades-* / agentic-research / hackernews-example / wasm-plugin-examples. Do NOT re-mine engine-contracts or maintenance-tooling before r19, nor browser-engine/remote-engine before r20 (cooldown); their banked anchors are recorded in the four context notes — browser-engine's is `render-harness-offline` (resolve the does-the-CI-runner-have-Chrome question FIRST), remote-engine's is `remote-scope-honesty` (18 raw `ctx.engines.http` call sites never go through the fabric). Still the strongest queued work in the vault: dataset-storage's retention-pin-is-dead-code, and crawler-core's MAX_FRONTIER lifetime cap."
-last_session: "[[sessions/2026-08-13-2]]"
+coverage: "30/46 map contexts covered. RULE (recomputable — compute it, never inherit it): a map context is COVERED when it has >=1 direction note pointing at it (`context: \"[[<name>]]\"`), OR an explicit nothing-clears-the-bar verdict, OR `last_proposed != never`. **Normalize CRLF before any frontmatter regex** — a naive /^---\\n([\\s\\S]*?)\\n---/ silently skips every CRLF file in this repo and scored coverage at 18/46 in r17, calling claude-engine/eu-grants/wasm-plugin-host never-proposed when each has 3 shipped directions. That trap, plus one genuinely stale note (job-worker said `last_proposed: never` against 5 shipped r4 directions — fixed r17), is why the figure drifted every round (r15 carried 24, r16 carried 26 then 'corrected' to 25, headline said 27). Recomputed honestly in r17: **28 entering**, +engine-contracts +maintenance-tooling gated r17 = **30**. 16 never proposed. Inherited pre-46-map history (browser-engine, http-engine, …) deliberately does NOT count as covered. **r18 recomputed the same rule from scratch with the CRLF normalization in place and got 30/46 entering — the figure is now stable across two independent computations.** +browser-engine +remote-engine gated r18 = **32/46**, 14 never proposed. **r19 recomputed it a THIRD time from scratch (script in the session note) and got 32/46 entering — stable across three independent computations, so the rule is now trustworthy.** +http-engine +plugin-runner gated r19 = **34/46**, 12 never proposed: agentic-research · connector-api-watch · czech-procurement · data-pipeline-catalog · hackernews-example · page-monitor · trades-operator-economics · trades-pricing · us-federal-grants · us-state-grants · vcr-testing · wasm-plugin-examples."
+cursor: "r19 BUILDING — 6 gated (director-self-gated, autonomous), wave branch `perfect/2026-08-13-r19`, 2 concurrent lots. **Coverage 32/46 entering -> 34/46 on gate, 12 never proposed.** Cursor took the two highest-opportunity never-proposed contexts (both opp 4, both carrying banked anchors that were re-verified in source before gating — http-engine BOTH r18 anchors CONFIRMED and sharper; plugin-runner r14 anchor CONFIRMED, SHARPER, and partially REFUTED in the loop favour: the door is now ONE site not three). r20 PROPOSE: 12 never-proposed remain, all opp 2-4. Suggested pairing by disjointness: **vcr-testing** (core, opp 4, crates/core/src/vcr.rs + testing.rs, 1116 lines) with an app-crate context — **czech-procurement** / **us-federal-grants** / **connector-api-watch** (all opp 4, all single-app-crate, all fully disjoint from core). page-monitor is opp 4 but THIN (428 lines across apps/watch + apps/readable, no tests) — expect 1-2 directions, not 3; pair it with something substantial. Do NOT re-mine http-engine or plugin-runner before r21 (cooldown); their banked anchors are in the two context notes — http-engine anchor is **http-engine-observable** (the last zero-metric engine), plugin-runner anchor is **plugin-search-identity**. Still the strongest queued work in the vault: dataset-storage retention-pin-is-dead-code, crawler-core MAX_FRONTIER lifetime cap, browser-engine render-harness-offline, remote-engine remote-scope-honesty (18 raw `ctx.engines.http` call sites never go through the fabric)."
+last_session: "[[sessions/2026-08-13-3]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **0** · phase: **round 18 COMPLETE — 6/6 shipped** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 30/46 → 32/46.**
+**State**: pool **6** · phase: **round 19 BUILDING** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 32/46 → 34/46.**
+
+### Round-19 pool — 6 GATED (2026-08-13, branch `perfect/2026-08-13-r19`)
+Phase 0 reconciliation (MANDATORY this round) came back **clean for the second round running**:
+provenance is this machine's own `context-map.json` — 46 contexts, generator
+`personas-context-scan`, `generated_at` 2026-08-03T19:10:19Z, `provenance.git_commit 611360f`,
+`project.root` = this checkout. **0 map contexts without a note** (46/46), **0 notes to alias**
+(all 8 vault-only names already carry `superseded_by:` from the r11/r16 reconciliations), **0 to
+retire**. Coverage recomputed from scratch under the CRLF-safe rule: **32/46 entering, 14
+never-proposed** — matching the inherited headline, the third independent computation to agree.
+
+Cursor took the two highest-opportunity never-proposed contexts (both opp 4). **Both scouts read
+their files end to end, and the Director re-verified the severest claims in source before gating —
+every banked anchor changed under verification:** http-engine's two r18 anchors both CONFIRMED and
+*sharper* (the 37.5-minute fetch and two brand-new jar seams the anchor did not have);
+plugin-runner's r14 anchor CONFIRMED, sharper, and **partially refuted in the loop's favour** — the
+door is one call site now, not the three the note recorded, so the fix is a one-line change.
+
+http-engine, 3 accepted (Lot H — `crates/engine-http/**`):
+1. [[http-fetch-has-a-deadline]] — robustness · M (the per-attempt timeout sits *inside*
+   `for attempt in 0..=retries`, so nothing bounds one `fetch()`. A `429 Retry-After: 600`
+   host holds it for **~37.5 min** — past `job_timeout_secs` 900 s, killing every other unit
+   of work in that job — and the benign black-hole case is ~127 s against a `config.toml`
+   promise of "~30s, not 300s". `[remote] timeout_secs` already documents *this engine* as
+   the reason it needed its own deadline. Rider: `[http] max_body_bytes = 0` rejects every
+   body, and is the one of three twins `Config::validate` doesn't guard)
+2. [[http-transport-errors-terminal]] — robustness · M (statuses are classified; the
+   transport arm is `Err(e) => { last_error = …; warn! }` — so a bad URL, `ftp://`, NXDOMAIN
+   or a TLS mismatch burns 4 attempts, then `Error::Http` isn't terminal-for-job so the
+   worker runs the whole ladder again. **Third instance of the class r17 and r18 each killed
+   once**, and the conformance battery runs `retries: 0`, so the ladder is switched off in
+   the only cross-engine test that could have seen it)
+3. [[profiled-fetch-is-honest]] — robustness · M (a missing jar starts empty with **no signal
+   at all**, so a typo'd profile scrapes the login wall and stores it as a real revision —
+   documented as a live gap at `fetching.md:189`, fixed one layer up three times in r18,
+   never here; `require_existing_profile` readers here = 0. Plus two seams the anchor never
+   had: the flush loop clears `dirty` *before* saving so a transient write failure loses the
+   login **permanently**, and an empty in-memory jar **clobbers** a restored `cookies.json`)
+
+plugin-runner, 3 accepted (Lot P — `crates/apps/plugin/**`):
+4. [[plugin-run-door-honest]] — robustness · M (a 100%-failed plugin run is a **SUCCEEDED**
+   job — green on `GET /jobs`, a `succeeded` SSE event, a fired webhook, an empty dataset —
+   and **the repo's only `run()`-level test proves it**, passing against `NoPlugins` where
+   every document failed. Observatory validates correctly in the same app; so does the
+   trigger pipeline. Underneath, r14's typed `PluginFailure` is flattened to one opaque
+   string, which is why `engine-wasm`'s "extraction propagates the error" is false for the
+   app that *is* extraction)
+5. [[plugin-result-bounded-and-true]] — robustness · M (`output_shape` promises `errors` and
+   `dataset`; no mode emits either — which also makes the cost ledger attribute every plugin
+   run's yield to the empty-string dataset. The `records` echo is unbounded into the jobs
+   row + SSE + webhook + **one Tantivy doc per element**, while the worker's own comment
+   assumes it's bounded. The corpus truncates at 10k with tombstones consuming slots and no
+   signal. **The sibling `extractor` shipped all three fixes in r12 and this app has zero
+   occurrences of them** — plus a doc claiming a clamp "enforced twice" that is enforced once)
+6. [[observatory-signal-not-noise]] — robustness · M (the feature is sold as "change detection
+   + triggers surface extraction rot for free" and is structurally incapable of it: every row
+   embeds `run_at`/`avg_elapsed_ms`/fuel/`drift_score`/`prev_run_at` and is written via plain
+   `upsert_many`, so **every row is `changed` every run** and `unchanged` is always 0 — while
+   `lib.rs:98-101` documents that exact anti-pattern as the reason cost lives on the result.
+   `DerivedPaths`, built by r14's own direction for this, has one adopter and it isn't this.
+   Plus: every plugin replayed with `params: null`, killing the app's flagship feature inside
+   its own audit, and empty stored artifacts blamed on the plugin)
+
+### Wave plan (round 19) — ONE branch `perfect/2026-08-13-r19`, main checkout, 2 CONCURRENT lots
+**The cleanest partition since r16: one lot, one crate.** Lot H owns `crates/engine-http/**`;
+Lot P owns `crates/apps/plugin/**`. The two `crates/core/` files either lot could want split by
+name and by lot — **`config.rs` and `error.rs` are Lot H's** (the new budget key + validate
+clause, and terminal-error classification); Lot P touches no core file (`upsert_many_with_derived`,
+`plugins.has()` and `PluginFailure` all already exist and are read-only to it). Docs split
+cleanly: `fetching.md` = H, `extraction.md` + `apps.md` = P. e2e files are different
+(`engine_conformance.rs` vs `app_fetch_chokepoint.rs`), and **neither lot may add a NEW e2e file**,
+so `e2e/mod.rs` needs no append and there is **no Class B file in this wave at all** — which
+retires, for one round, the shared-file bleed both r9 and r18 recorded. Class C (Director-only):
+`scripts/docs/feature-doc-map.json`, `crates/core/tests/fetch_chokepoint.rs` EXPECTED inventory,
+`catalog/data-sources.toml`, `scripts/smoke.ps1`. Rust-touching lots = 2 ✓.
 
 ### Round-18 pool — 6 GATED → ALL 6 SHIPPED + 3 Director commits (2026-08-13, landed `e1e18db`)
 Gate on merged master: `cargo fmt --check` clean · `cargo clippy --workspace --all-targets` exit 0
