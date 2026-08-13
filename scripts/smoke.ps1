@@ -773,6 +773,56 @@ try {
                 ($t.inputSchema.properties.concurrency.maximum -eq 64) -and
                 ($t.inputSchema.properties.records_echo.maximum -eq 1000)
             }
+
+            # Round 20: a `replay_of` job against an app that cannot be replayed
+            # must be REFUSED BY NAME, before the app runs.
+            # THE ANTI-PATTERN: `vcr.rs` promised "replay runs touch no engine",
+            # but the cassette is written and read at ONE seam
+            # (AppContext::fetch/research) and 17 app crates reach engines
+            # outside it. `hackernews` is one of them, so this exact request used
+            # to RUN THE APP LIVE — real network, real cost — and the worker then
+            # stamped `vcr_replay_of` on the stored result, which is a provenance
+            # claim that the output came from recorded bytes.
+            # This is the smoke-level before/after. It is deliberately run
+            # against the job the smoke ALREADY recorded nothing for: the refusal
+            # must come from the app's declared fidelity
+            # (`vcr::REPLAY_BYPASS_APPS`), not from a missing cassette file —
+            # which is why the error has to name the app and the reason rather
+            # than say "no cassette", the operator-blaming message that used to
+            # be the only thing standing in the way.
+            $replayJobId = $null
+            try {
+                $replayEnqueue = Invoke-RestMethod -Method Post -Uri "$baseUrl/apps/hackernews/jobs" `
+                    -Body (@{ params = @{ replay_of = $jobId } } | ConvertTo-Json -Depth 5) `
+                    -ContentType 'application/json' -TimeoutSec 10
+                $replayJobId = $replayEnqueue.id
+            } catch {
+                Add-Result -Name 'replay_of an unreplayable app is refused by name' -Status 'FAIL' `
+                    -Detail "enqueue threw: $($_.Exception.Message)"
+            }
+            if ($replayJobId) {
+                $rDeadline = (Get-Date).AddSeconds(30)
+                $rStatus = $null; $rError = $null; $rAttempts = $null
+                while ((Get-Date) -lt $rDeadline) {
+                    $rj = Invoke-RestMethod -Uri "$baseUrl/jobs/$replayJobId" -TimeoutSec 5
+                    if ($rj.status -in @('succeeded', 'failed', 'cancelled')) {
+                        $rStatus = $rj.status; $rError = $rj.error; $rAttempts = $rj.attempts; break
+                    }
+                    Start-Sleep -Milliseconds 400
+                }
+                # Terminal on the FIRST attempt: an app is what it is on every
+                # attempt, so the backoff ladder cannot change the answer. A
+                # refusal that burned four attempts would be the same defect in
+                # a different costume.
+                if ($rStatus -eq 'failed' -and $rError -match 'hackernews' -and
+                    $rError -match 'cannot be replayed' -and $rAttempts -le 1) {
+                    Add-Result -Name 'replay_of an unreplayable app is refused by name' -Status 'PASS' `
+                        -Detail "job $replayJobId failed on attempt $rAttempts : $rError"
+                } else {
+                    Add-Result -Name 'replay_of an unreplayable app is refused by name' -Status 'FAIL' `
+                        -Detail "status '$rStatus', attempts '$rAttempts', error '$rError' (expected failed on attempt 1 naming hackernews)"
+                }
+            }
         } else {
             Add-Result -Name 'job runs to completion (hackernews)' -Status 'SKIP' -Detail 'no job id to poll (enqueue failed)'
             Add-Result -Name 'GET /jobs/{id}/receipt' -Status 'SKIP' -Detail 'no job id to fetch a receipt for'
