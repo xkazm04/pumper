@@ -397,7 +397,7 @@ impl AppContext {
             });
             self.learn_tier(host, outcome.engine, http_lost).await;
         }
-        let detail = (!outcome.escalations.is_empty()).then(|| outcome.escalations.join("; "));
+        let detail = fetch_cost_detail(&outcome);
         self.meter(
             outcome.engine,
             Some(&url),
@@ -752,6 +752,29 @@ fn budget_is_exhausted(remaining: Option<f64>) -> bool {
     matches!(remaining, Some(r) if r <= 0.0)
 }
 
+/// The cost-event `detail` one completed fetch leaves on the job's receipt: the
+/// escalation trail, led by an explicit **snapshot-provenance** line whenever
+/// the body came out of a stored capture instead of the live site.
+///
+/// [`AppContext::fetch`] writes the only row a job's receipt keeps about a
+/// fetch, and it used to write the identical row for a live fetch and for a
+/// 2019 Wayback capture. The `engine` column did say `archive`, but *when* the
+/// page was captured — the freshness the archive tier trades away — was dropped
+/// at the engine boundary, so after the fact a half-archived dataset could not
+/// be told from a fresh one.
+///
+/// The provenance line goes **first**: an escalation trail can run long and
+/// readers truncate from the front, so the fact that decides whether the row is
+/// trustworthy must not sit behind five tier rejections.
+fn fetch_cost_detail(outcome: &FetchOutcome) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(snapshot) = &outcome.snapshot {
+        parts.push(snapshot.note());
+    }
+    parts.extend(outcome.escalations.iter().cloned());
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
 /// The cost event a **successful** research answer must leave, as
 /// `(cost_usd, detail)`.
 ///
@@ -936,8 +959,64 @@ pub trait ScrapeApp: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        budget_exhausted_error, budget_is_exhausted, safe_path_segment, success_spend_event,
+        budget_exhausted_error, budget_is_exhausted, fetch_cost_detail, safe_path_segment,
+        success_spend_event, FetchOutcome,
     };
+
+    fn outcome(escalations: &[&str], snapshot: Option<(&str, Option<&str>)>) -> FetchOutcome {
+        FetchOutcome {
+            url: "https://example.test/p".into(),
+            engine: "archive",
+            status: Some(200),
+            html: Some("<html/>".into()),
+            markdown: None,
+            text: None,
+            escalations: escalations.iter().map(|s| s.to_string()).collect(),
+            trace: Vec::new(),
+            cost_usd: None,
+            snapshot: snapshot.map(|(via, captured_at)| crate::engine::SnapshotProvenance {
+                via: via.into(),
+                captured_at: captured_at.map(str::to_string),
+            }),
+        }
+    }
+
+    /// `AppContext::fetch` writes the only row a job's receipt keeps about a
+    /// fetch, and it used to write the identical row whether the body came off
+    /// the live site or out of a 2019 capture. The `engine` column said
+    /// `archive`; nothing said *when*, so a half-archived dataset could not be
+    /// told from a fresh one after the fact.
+    #[test]
+    fn a_receipt_line_for_an_archived_fetch_is_not_the_same_as_for_a_live_one() {
+        let live = fetch_cost_detail(&outcome(&[], None));
+        assert_eq!(live, None, "a clean live fetch still leaves no detail");
+
+        let archived = fetch_cost_detail(&outcome(
+            &[],
+            Some(("archive", Some("2019-03-11T00:00:00Z"))),
+        ))
+        .expect("an archived fetch always leaves a detail");
+        assert!(archived.contains("2019-03-11"), "{archived}");
+        assert_ne!(Some(archived), live);
+    }
+
+    /// The provenance line leads: an escalation trail can run long and readers
+    /// truncate from the front, so the fact that decides whether the row is
+    /// trustworthy must not sit behind five tier rejections.
+    #[test]
+    fn provenance_leads_the_receipt_line_instead_of_trailing_the_escalations() {
+        let detail = fetch_cost_detail(&outcome(
+            &["archive tier thin: status 200", "http tier blocked: 403"],
+            Some(("archive", Some("2019-03-11T00:00:00Z"))),
+        ))
+        .expect("detail");
+        assert!(
+            detail.starts_with("served from archive snapshot"),
+            "{detail}"
+        );
+        // …and the trail is kept, not replaced.
+        assert!(detail.contains("http tier blocked: 403"), "{detail}");
+    }
 
     /// A priced answer meters its price with no editorial detail — the ordinary
     /// case, and the one the budget clamp reads.

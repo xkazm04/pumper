@@ -20,7 +20,10 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{FetcherConfig, RecipesConfig};
-use crate::engine::{Browser, HttpClient, HttpRequest, RenderRequest, Researcher};
+use crate::engine::{
+    snapshot_provenance, Browser, HttpClient, HttpRequest, RenderRequest, Researcher,
+    SnapshotProvenance,
+};
 use crate::governor::Governor;
 use crate::markdown::{html_to_markdown, text_len_capped};
 use crate::recipes::{payload_overlaps, RecipeSource};
@@ -243,6 +246,17 @@ pub struct FetchOutcome {
     pub trace: Vec<TierTrace>,
     /// Real money spent on this fetch (Claude tier only; None elsewhere).
     pub cost_usd: Option<f64>,
+    /// Set **only** when the body came out of a stored capture instead of the
+    /// live site — i.e. the archive tier won — carrying which store served it
+    /// and when the page was captured. `None` on every live tier.
+    ///
+    /// This is the field to branch on: `engine == "archive"` says *which tier*
+    /// answered, but the capture time is the variable the tier actually trades
+    /// (freshness for availability), and it used to be dropped at the engine
+    /// boundary — a row extracted from a 2019 snapshot was byte-identical to
+    /// one extracted from today's page.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<crate::engine::SnapshotProvenance>,
 }
 
 /// Holds clones of the three engines and orchestrates escalation. Cheap to
@@ -399,6 +413,12 @@ impl Fetcher {
                         };
                         let enough = wall.is_none() && resp.is_success() && text_len >= min_chars;
                         if enough {
+                            // Provenance is lifted **here** — inside the branch
+                            // where the archive engine is the one that answered.
+                            // The header is forgeable by any origin, so reading
+                            // it on the live tiers would let a hostile host
+                            // stamp its own page "archived".
+                            let snapshot = archive_snapshot(&resp.headers);
                             trace.push(TierTrace {
                                 tier: FetchTier::Archive,
                                 verdict: TierVerdict::Ok,
@@ -407,7 +427,10 @@ impl Fetcher {
                                 cache_hit: Some(resp.cache_hit),
                                 latency_ms,
                                 cost_usd: None,
-                                detail: None,
+                                // The trace is the human-facing half of a fetch;
+                                // a `detail: None` archive win read there
+                                // exactly like a live one.
+                                detail: Some(snapshot.note()),
                             });
                             return Ok(outcome(
                                 "archive",
@@ -417,6 +440,7 @@ impl Fetcher {
                                 markdown,
                                 escalations,
                                 trace,
+                                Some(snapshot),
                             ));
                         }
                         let (verdict, detail) = match wall {
@@ -537,6 +561,8 @@ impl Fetcher {
                             markdown,
                             escalations,
                             trace,
+                            // A live render, by definition.
+                            None,
                         ));
                     }
                     let (verdict, detail) = match wall {
@@ -645,6 +671,7 @@ impl Fetcher {
                         escalations,
                         trace,
                         cost_usd: out.cost_usd,
+                        snapshot: None,
                     });
                 }
                 Err(e) => {
@@ -746,6 +773,9 @@ impl Fetcher {
                         markdown,
                         std::mem::take(escalations),
                         std::mem::take(trace),
+                        // The live web: no stored capture, whatever headers the
+                        // origin chose to send.
+                        None,
                     )));
                 }
                 let (verdict, detail) = match wall {
@@ -856,6 +886,8 @@ impl Fetcher {
                         escalations: std::mem::take(escalations),
                         trace: std::mem::take(trace),
                         cost_usd: None,
+                        // A recipe replay is a live API call, not a stored body.
+                        snapshot: None,
                     });
                 }
                 // Thin/failed replay → strike (may un-validate) → fall through.
@@ -1037,6 +1069,28 @@ fn attempted_tiers(trace: &[TierTrace]) -> String {
     names.join(", ")
 }
 
+/// The provenance an **archive-tier win** carries: whatever the serving engine
+/// marked on the response ([`snapshot_provenance`]), falling back to the fact
+/// the fetcher knows on its own — this body came out of the archive tier, and
+/// its capture time was not reported.
+///
+/// The fallback is what stops [`FetchOutcome::snapshot`] and
+/// `FetchOutcome::engine == "archive"` from ever disagreeing. Without it an
+/// archive engine that forgot the header (a wrapper, a second snapshot source,
+/// a stub) would mint an outcome that names the archive tier and simultaneously
+/// reports a live body — the exact indistinguishability this field exists to
+/// end, reintroduced through the back door.
+fn archive_snapshot(headers: &std::collections::HashMap<String, String>) -> SnapshotProvenance {
+    snapshot_provenance(headers).unwrap_or_else(|| SnapshotProvenance {
+        via: FetchTier::Archive.as_str().to_string(),
+        captured_at: None,
+    })
+}
+
+/// `snapshot` is a required argument rather than a defaulted field so every
+/// present and future tier has to answer "did this body come from the live site
+/// or out of a store?" at the one place an outcome is minted. A tier that serves
+/// the live web passes `None`.
 #[allow(clippy::too_many_arguments)]
 fn outcome(
     engine: &'static str,
@@ -1046,6 +1100,7 @@ fn outcome(
     markdown: Option<String>,
     escalations: Vec<String>,
     trace: Vec<TierTrace>,
+    snapshot: Option<crate::engine::SnapshotProvenance>,
 ) -> FetchOutcome {
     FetchOutcome {
         url: req.url.clone(),
@@ -1058,6 +1113,7 @@ fn outcome(
         escalations,
         trace,
         cost_usd: None,
+        snapshot,
     }
 }
 
@@ -1320,6 +1376,33 @@ mod tests {
         }
     }
 
+    /// Archive stub that serves a snapshot **and marks it** exactly as the real
+    /// `ArchiveEngine` does — the two provenance headers on the response.
+    struct MarkedArchive {
+        captured_at: &'static str,
+    }
+    #[async_trait]
+    impl HttpClient for MarkedArchive {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            let mut headers = std::collections::HashMap::new();
+            headers.insert(
+                crate::engine::FETCHED_VIA_HEADER.to_string(),
+                "archive".to_string(),
+            );
+            headers.insert(
+                crate::engine::SNAPSHOT_TS_HEADER.to_string(),
+                self.captured_at.to_string(),
+            );
+            Ok(HttpResponse {
+                status: 200,
+                headers,
+                body: GOOD_PAGE.into(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
     /// Archive stub that always misses (no snapshot within the window).
     struct MissArchive;
     #[async_trait]
@@ -1384,6 +1467,123 @@ mod tests {
         assert_eq!(out.trace[0].tier, FetchTier::Archive);
         assert_eq!(out.trace[0].verdict, TierVerdict::Ok);
         assert_eq!(out.trace[0].http_status, Some(200));
+    }
+
+    /// THE defect this field exists to end: a body served out of a 2019 capture
+    /// used to leave a `FetchOutcome` with nothing on it that a consumer could
+    /// branch on to tell it from today's page. `engine == "archive"` named the
+    /// *tier*; the capture time — the freshness the tier trades away — was
+    /// dropped at the engine boundary and never reached a single consumer.
+    #[tokio::test]
+    async fn an_archived_fetch_is_not_indistinguishable_from_a_live_one() {
+        let archived = archive_fetcher(
+            Arc::new(DeadHttp),
+            Some(Arc::new(MarkedArchive {
+                captured_at: "2019-03-11T09:15:00+00:00",
+            })),
+        );
+        let mut req = FetchRequest::new("https://example.test/page");
+        req.archive_max_age = Some(86_400);
+        let archived = archived.fetch(req).await.unwrap();
+
+        let live = archive_fetcher(Arc::new(StubHttp), None)
+            .fetch(FetchRequest::new("https://example.test/page"))
+            .await
+            .unwrap();
+
+        // The two bodies are byte-identical; the provenance is what separates
+        // them, and it must be a typed field rather than a phrase in the trail.
+        assert_eq!(archived.html, live.html, "same bytes, different provenance");
+        assert!(live.snapshot.is_none(), "a live fetch claims no snapshot");
+        let snapshot = archived
+            .snapshot
+            .as_ref()
+            .expect("an archive win must carry provenance");
+        assert_eq!(snapshot.via, "archive");
+        assert_eq!(
+            snapshot.captured_at.as_deref(),
+            Some("2019-03-11T09:15:00+00:00"),
+            "the capture time is the variable the archive tier trades"
+        );
+        // …and the human half of the fetch says it too.
+        let winner = archived
+            .trace
+            .iter()
+            .find(|t| t.verdict == TierVerdict::Ok)
+            .expect("a winning trace entry");
+        assert_eq!(winner.tier, FetchTier::Archive);
+        assert!(
+            winner
+                .detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("2019-03-11"),
+            "trace detail was {:?}",
+            winner.detail
+        );
+    }
+
+    /// An origin can send any header it likes. Reading provenance off a **live**
+    /// response would therefore let a hostile host stamp its own page
+    /// "archived" — provenance that anyone can forge is worse than none, because
+    /// consumers would trust it. The fetcher reads the header in the archive
+    /// branch only.
+    #[tokio::test]
+    async fn a_live_origin_cannot_forge_archive_provenance() {
+        struct ForgingHttp;
+        #[async_trait]
+        impl HttpClient for ForgingHttp {
+            async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+                let mut headers = std::collections::HashMap::new();
+                headers.insert(
+                    crate::engine::FETCHED_VIA_HEADER.to_string(),
+                    "archive".to_string(),
+                );
+                headers.insert(
+                    crate::engine::SNAPSHOT_TS_HEADER.to_string(),
+                    "1999-01-01T00:00:00Z".to_string(),
+                );
+                Ok(HttpResponse {
+                    status: 200,
+                    headers,
+                    body: GOOD_PAGE.into(),
+                    final_url: req.url,
+                    cache_hit: false,
+                })
+            }
+        }
+        let out = archive_fetcher(Arc::new(ForgingHttp), None)
+            .fetch(FetchRequest::new("https://hostile.test/page"))
+            .await
+            .unwrap();
+        assert_eq!(out.engine, "http");
+        assert!(
+            out.snapshot.is_none(),
+            "an origin header must not become provenance on a live tier"
+        );
+    }
+
+    /// An archive engine that serves a body but forgets to mark it must not
+    /// produce an outcome that names the archive tier and simultaneously reports
+    /// a live body — the fetcher already knows which tier answered.
+    #[tokio::test]
+    async fn an_unmarked_archive_win_does_not_report_itself_as_live() {
+        let fetcher = archive_fetcher(
+            Arc::new(DeadHttp),
+            Some(Arc::new(StubArchive {
+                body: GOOD_PAGE.into(),
+            })),
+        );
+        let mut req = FetchRequest::new("https://example.test/page");
+        req.archive_max_age = Some(86_400);
+        let out = fetcher.fetch(req).await.unwrap();
+        assert_eq!(out.engine, "archive");
+        let snapshot = out.snapshot.as_ref().expect("archive win => provenance");
+        assert_eq!(snapshot.via, "archive");
+        assert!(
+            snapshot.captured_at.is_none(),
+            "nothing reported a capture time, so nothing may claim one"
+        );
     }
 
     #[tokio::test]

@@ -4,7 +4,7 @@ One `Fetcher` escalates across three engines by cost: **http → browser → cla
 
 ## FetchRequest / FetchOutcome
 
-`FetchRequest`: `url`, `strategy` (`http | browser | auto | auto_with_research`), `wait_for_selector`, `min_content_chars`, `research_prompt`, `max_budget_usd` (Claude tier ceiling), `skip_http` (set by the tier router), `to_markdown`, `no_cache` (bypass the HTTP cache — always hit the network), `ttl_override` (per-fetch cache TTL in seconds; caps staleness without a full bypass), `profile` (named login profile, threaded to both tiers — see [Session vault](#session-vault-named-login-profiles)). `FetchOutcome`: winning `engine`, status, html/markdown/text, `escalations` trail (one line per tier rejection + router/budget notes), structured `trace` (see below), `cost_usd` (Claude tier actual).
+`FetchRequest`: `url`, `strategy` (`http | browser | auto | auto_with_research`), `wait_for_selector`, `min_content_chars`, `research_prompt`, `max_budget_usd` (Claude tier ceiling), `skip_http` (set by the tier router), `to_markdown`, `no_cache` (bypass the HTTP cache — always hit the network), `ttl_override` (per-fetch cache TTL in seconds; caps staleness without a full bypass), `archive_max_age` (opt into the archive tier — see below), `profile` (named login profile, threaded to both tiers — see [Session vault](#session-vault-named-login-profiles)). `FetchOutcome`: winning `engine`, status, html/markdown/text, `escalations` trail (one line per tier rejection + router/budget notes), structured `trace` (see below), `cost_usd` (Claude tier actual), `snapshot` (archive provenance — see below).
 
 Always prefer the metered **`AppContext::fetch`** over `ctx.engines.fetch` — it adds cost attribution, budget governance, and tier routing.
 
@@ -33,6 +33,34 @@ Each `TierTrace` entry:
 | `detail` | `string?` | short reason (challenge marker, error text, skip cause); omitted when the tier + verdict already say everything (e.g. a thin http tier) |
 
 Optional fields (`http_status`, `content_chars`, `cache_hit`, `cost_usd`, `detail`) are omitted from JSON when absent; `tier`, `verdict`, and `latency_ms` are always present. The learned tier router keys on the http tier's **`verdict`** (`thin`/`blocked`/`error` = an HTTP loss) rather than the trail wording.
+
+## Tier zero: the archive tier (`archive_max_age`)
+
+Opt-in and default-OFF (`[archive] enabled`). When a request sets `archive_max_age` (seconds) **and** an archive engine is wired, a stored **Wayback** snapshot is tried *before* any live tier: zero load on the target site, zero politeness budget, zero ban risk. Archive coverage is patchy, so the tier is strictly opportunistic — a miss, a snapshot older than the window, a thin body, an archived challenge page, or an engine error always falls through to the live ladder, never fails the fetch. The `browser` strategy is excluded (the caller asked for a JS render; an archived static body is not one).
+
+### Archive provenance: `FetchOutcome.snapshot`
+
+The tier trades **freshness for availability**, so the trade has to be visible. A winning archive fetch carries:
+
+```json
+{ "engine": "archive",
+  "snapshot": { "via": "archive", "captured_at": "2019-03-11T09:15:00+00:00" } }
+```
+
+| field | type | notes |
+| --- | --- | --- |
+| `via` | `string` | which store served the body (`archive` today). A free string, not an enum — a second snapshot source must not need a core type change to be legible |
+| `captured_at` | `string?` | the snapshot's capture time, RFC 3339 UTC, exactly as the serving engine reported it. Omitted when the engine marked provenance without one |
+
+`snapshot` is **absent on every live tier** (http, browser, claude, api_recipe), so `snapshot != null` is a sound test for "this body came out of a store". Branch on it rather than on `engine == "archive"`: the engine string names the *tier*, while `captured_at` is the variable the tier actually trades.
+
+Three properties worth knowing:
+
+- **An archive win always carries provenance.** The engine marks the response with `x-pumper-fetched-via` / `x-pumper-snapshot-ts`, and the fetcher lifts those into `snapshot`; if an engine forgets them, the fetcher still stamps `via: "archive"` with no `captured_at` rather than letting an archive win report itself as live.
+- **A live origin cannot forge it.** Those headers are read *only* inside the archive branch. An origin that returns `x-pumper-fetched-via: archive` on a live fetch gets `snapshot: null` — provenance anyone could forge would be worse than none.
+- **It reaches the receipt and the trace, not just the return value.** The winning `TierTrace.detail` reads `served from archive snapshot captured <ts>`, and `AppContext::fetch` puts the same line **first** in the fetch's `cost_events.detail`, ahead of the escalation trail. Recorded VCR cassettes carry it too (through the entry's header map), so a replayed archive fetch does not come back looking live.
+
+Historical **backfill** over a date range is a different surface — the extractor app's `source.archive` mode, which enumerates CDX captures and tags records `_fetched_via: "wayback"`. See [extraction.md](extraction.md).
 
 ## Engines
 
@@ -199,4 +227,5 @@ Config keys (`[fetcher]`): `min_content_chars` (250), `host_memory_ttl_secs` (60
 
 - Single static proxy per tier (`[http] proxy` / `[browser] proxy`, per-request override on the HTTP tier). No proxy **pool / rotation** and no stealth tier (backlog moonshots). Browser-tier proxy auth (`user:pass@`) is unsupported (Chrome `--proxy-server` limitation).
 - Aging is time-based only; there is no success-rate / half-life model of host reliability.
+- **Archive provenance stops at `FetchOutcome`.** It reaches the outcome, the trace, the job's cost events and the VCR cassette, but nothing stamps it onto a *dataset revision* — `Provenance` (job id, source URL, artifact sha, rules hash) has no snapshot field, so an app that upserts a record extracted from a snapshot must carry the fact itself (the extractor's backfill mode does, as `_fetched_via`). The **remote/peer tier has the same class of gap**: no field says which node served a fetch.
 - **Session vault (phase 1):** session state only — no credential management, no encryption at rest, no login automation. No create/delete/import API for profiles (they appear when first used; delete = remove the directory). Profiled fetches never use the response cache, and cookies set within ~1s of a hard kill aren't on disk. The HTTP jar and the browser profile are separate stores — a login in one is not visible to the other.

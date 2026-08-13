@@ -39,6 +39,7 @@ async fn record(ctx: &AppContext, url: &str, html: &str) {
             escalations: Vec::new(),
             trace: Vec::new(),
             cost_usd: None,
+            snapshot: None,
         }))
         .await;
 }

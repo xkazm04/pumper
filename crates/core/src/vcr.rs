@@ -42,8 +42,9 @@
 //!   the cassette and cannot be recorded or replayed.
 //! - The AppContext seam sits **above** header granularity: a fetch returns a
 //!   [`FetchOutcome`], not an `HttpResponse`, so `headers` is populated only
-//!   with the subset the outcome exposes (currently none) — `engine` + `status`
-//!   are the recorded response metadata instead.
+//!   with the subset the outcome exposes — today the two archive-provenance
+//!   headers, so a replayed snapshot does not come back looking live. `engine` +
+//!   `status` are the rest of the recorded response metadata.
 //! - **Browser-tier renders replay as their final response equivalent**: the
 //!   recorded outcome's `html` is the post-render document. Replay does not
 //!   re-run JS, `actions`, or `wait_for_selector` — it hands back the bytes the
@@ -118,10 +119,10 @@ pub struct CassetteEntry {
     /// HTTP status when the winning tier had one (http/archive/recipe).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<u16>,
-    /// Response-header subset. Currently always empty: the AppContext seam
-    /// returns a `FetchOutcome`, which does not expose headers (see module
-    /// docs) — the field exists so the cassette format doesn't change when a
-    /// lower seam starts populating it.
+    /// Response-header subset. The AppContext seam returns a `FetchOutcome`,
+    /// which exposes no header map (see module docs), so this carries only what
+    /// the outcome *does* surface: the two archive-provenance headers, when the
+    /// body came out of a stored snapshot. Empty for a live fetch.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub headers: BTreeMap<String, String>,
     /// Winning engine: `http`/`browser`/`archive`/`api_recipe`/`claude`.
@@ -151,12 +152,28 @@ pub fn fetch_entry(outcome: &FetchOutcome) -> CassetteEntry {
     if let Some(text) = &outcome.text {
         body.insert("text".into(), Value::String(text.clone()));
     }
+    // Snapshot provenance rides out on the entry's header map (until now an
+    // always-empty field) using the same two header names the archive engine
+    // writes — so a replayed archive fetch does not come back looking live.
+    let mut headers = BTreeMap::new();
+    if let Some(snapshot) = &outcome.snapshot {
+        headers.insert(
+            crate::engine::FETCHED_VIA_HEADER.to_string(),
+            snapshot.via.clone(),
+        );
+        if let Some(captured_at) = &snapshot.captured_at {
+            headers.insert(
+                crate::engine::SNAPSHOT_TS_HEADER.to_string(),
+                captured_at.clone(),
+            );
+        }
+    }
     CassetteEntry {
         url: outcome.url.clone(),
         method: METHOD_GET.into(),
         req_hash: req_hash(METHOD_GET, &outcome.url),
         status: outcome.status,
-        headers: BTreeMap::new(),
+        headers,
         engine: outcome.engine.to_string(),
         body: Some(Value::Object(body)),
         detail: None,
@@ -219,6 +236,9 @@ pub fn to_fetch_outcome(entry: &CassetteEntry, replay_of: Uuid) -> Result<FetchO
         }],
         // Replay spends nothing, whatever the original tier cost.
         cost_usd: None,
+        // A recorded archive win replays as an archive win, capture time and
+        // all — read back through the same seam that wrote it.
+        snapshot: crate::engine::snapshot_provenance(&entry.headers),
     })
 }
 
@@ -559,6 +579,7 @@ mod tests {
             escalations: Vec::new(),
             trace: Vec::new(),
             cost_usd: None,
+            snapshot: None,
         }
     }
 

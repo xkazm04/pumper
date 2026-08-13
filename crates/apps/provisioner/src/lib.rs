@@ -1304,6 +1304,7 @@ mod tests {
             escalations: Vec::new(),
             trace: Vec::new(),
             cost_usd: None,
+            snapshot: None,
         }
     }
 

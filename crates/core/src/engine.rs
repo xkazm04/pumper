@@ -74,11 +74,97 @@ pub fn profile_browser_dir(profiles_dir: &Path, name: &str) -> Result<PathBuf> {
 
 /// Provenance response header set by the archive engine: `"archive"` when the
 /// body was served from a web archive snapshot rather than the live site.
-/// Stored with the response's header map, so provenance survives into records.
+///
+/// **This header is a transport, not the consumer-facing field.** An
+/// [`HttpClient`] that serves stored snapshots has exactly one channel back to
+/// whoever wraps it — the [`HttpResponse`] — and header maps do **not** survive
+/// a tiered fetch ([`crate::FetchOutcome`] has no header map, and never had
+/// one). The wrapper lifts this header off with [`snapshot_provenance`] into
+/// [`crate::FetchOutcome::snapshot`], and *that* typed field is what consumers,
+/// receipts and records read. Before 2026-08 nothing lifted it, so both
+/// constants had a single writer and zero readers, and an archived body was
+/// indistinguishable from a live one everywhere past the engine boundary.
 pub const FETCHED_VIA_HEADER: &str = "x-pumper-fetched-via";
 /// Provenance response header set by the archive engine: the snapshot's capture
-/// timestamp (RFC 3339 UTC). Present only alongside [`FETCHED_VIA_HEADER`].
+/// timestamp (RFC 3339 UTC). Present only alongside [`FETCHED_VIA_HEADER`], and
+/// read through the same [`snapshot_provenance`] seam.
 pub const SNAPSHOT_TS_HEADER: &str = "x-pumper-snapshot-ts";
+
+/// Where a served body actually came from, when that is **not** the live site.
+///
+/// Present on a [`crate::FetchOutcome`] only for a body served out of a stored
+/// capture, so a consumer branches on `Option::is_some` rather than parsing the
+/// `escalations` prose. The freshness/availability trade the archive tier makes
+/// is only safe if the consumer can see it was made.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SnapshotProvenance {
+    /// The store that served the body — `"archive"` for the Wayback tier. A
+    /// free string rather than an enum: the value travels over the wire from
+    /// whatever engine set [`FETCHED_VIA_HEADER`], and a second snapshot source
+    /// must not require a core enum variant to be legible.
+    pub via: String,
+    /// The snapshot's capture time, RFC 3339 UTC, exactly as the serving engine
+    /// reported it. `None` when the engine marked provenance without one —
+    /// "this came from a store" is still worth saying, but "this is what the
+    /// page looked like on 2019-03-11" is the fact the tier actually trades.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub captured_at: Option<String>,
+}
+
+impl SnapshotProvenance {
+    /// One human line for the places that render prose rather than branch on
+    /// types — the fetch trace's `detail` and the job receipt's cost-event
+    /// `detail`. The single renderer for both, so the two surfaces can never
+    /// drift into describing the same fetch differently.
+    ///
+    /// This is a *rendering* of the struct, never the storage: nothing may
+    /// classify a fetch by matching this string, which is why it is free to be
+    /// reworded.
+    pub fn note(&self) -> String {
+        match &self.captured_at {
+            Some(ts) => format!("served from {} snapshot captured {ts}", self.via),
+            None => format!("served from {} snapshot (capture time unknown)", self.via),
+        }
+    }
+}
+
+/// Lifts snapshot provenance off a header map, or `None` when it carries no
+/// [`FETCHED_VIA_HEADER`].
+///
+/// Generic over the map so the one reader serves both header maps in the repo:
+/// [`HttpResponse::headers`] (a `HashMap`, the live seam) and the VCR
+/// cassette entry's ordered map (the replay seam). A second copy of these two
+/// header names is exactly how the constants got a writer and no reader.
+///
+/// Lookup is ASCII-case-insensitive — a header map that has round-tripped
+/// through a real HTTP stack has no guaranteed casing — and an empty value is
+/// treated as absent, because a marker that says nothing is not provenance.
+///
+/// **Call this only where a snapshot-serving engine is the one that answered.**
+/// The header is trivially forgeable by any origin, so reading it off an
+/// ordinary live response would let a hostile host stamp its own page
+/// "archived". The tiered fetcher therefore reads it in the archive branch only.
+pub fn snapshot_provenance<'a>(
+    headers: impl IntoIterator<Item = (&'a String, &'a String)>,
+) -> Option<SnapshotProvenance> {
+    let mut via: Option<&str> = None;
+    let mut captured_at: Option<&str> = None;
+    for (name, value) in headers {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if name.eq_ignore_ascii_case(FETCHED_VIA_HEADER) {
+            via = Some(value);
+        } else if name.eq_ignore_ascii_case(SNAPSHOT_TS_HEADER) {
+            captured_at = Some(value);
+        }
+    }
+    Some(SnapshotProvenance {
+        via: via?.to_string(),
+        captured_at: captured_at.map(str::to_string),
+    })
+}
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
@@ -1647,5 +1733,84 @@ mod tests {
         // A traversal attempt never produces a path at all.
         assert!(profile_cookies_path(root, "../../etc").is_err());
         assert!(profile_browser_dir(root, "..").is_err());
+    }
+
+    fn headers(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    /// The anti-pattern: `FETCHED_VIA_HEADER` and `SNAPSHOT_TS_HEADER` shipped
+    /// with a doc comment promising provenance "survives into records", one
+    /// writer, and **zero readers** anywhere in the workspace. A constant whose
+    /// only reader is its own definition documents an intention, not a contract.
+    ///
+    /// This test is that reader's guard: the names the archive engine writes are
+    /// the names this seam reads, and the capture time comes back with them.
+    #[test]
+    fn snapshot_provenance_is_not_a_constant_with_no_reader() {
+        let got = snapshot_provenance(&headers(&[
+            (FETCHED_VIA_HEADER, "archive"),
+            (SNAPSHOT_TS_HEADER, "2019-03-11T09:15:00+00:00"),
+            ("content-type", "text/html"),
+        ]))
+        .expect("a marked response carries provenance");
+        assert_eq!(got.via, "archive");
+        assert_eq!(
+            got.captured_at.as_deref(),
+            Some("2019-03-11T09:15:00+00:00")
+        );
+        // The whole point of the timestamp: the note names the day, not just
+        // the fact that a store answered.
+        assert!(
+            got.note().contains("2019-03-11"),
+            "note was {:?}",
+            got.note()
+        );
+    }
+
+    /// A live response carries neither header, and a marker with no value is
+    /// not provenance — otherwise an empty string would read as a store name
+    /// and every consumer would branch the wrong way on it.
+    #[test]
+    fn an_unmarked_or_blank_response_reports_no_provenance() {
+        assert!(snapshot_provenance(&headers(&[("content-type", "text/html")])).is_none());
+        assert!(snapshot_provenance(&headers(&[(FETCHED_VIA_HEADER, "   ")])).is_none());
+        // A capture time with no `via` is not enough to claim a stored body.
+        assert!(
+            snapshot_provenance(&headers(&[(SNAPSHOT_TS_HEADER, "2019-03-11T00:00:00Z")]))
+                .is_none()
+        );
+    }
+
+    /// Header casing is not preserved by real HTTP stacks, so an exact-match
+    /// lookup would silently report "live" for a genuinely archived body the
+    /// moment the map round-tripped through one.
+    #[test]
+    fn provenance_survives_a_header_map_that_changed_casing() {
+        let got = snapshot_provenance(&headers(&[
+            ("X-Pumper-Fetched-Via", "archive"),
+            ("X-PUMPER-SNAPSHOT-TS", "2019-03-11T00:00:00Z"),
+        ]))
+        .expect("casing must not decide provenance");
+        assert_eq!(got.via, "archive");
+        assert_eq!(got.captured_at.as_deref(), Some("2019-03-11T00:00:00Z"));
+    }
+
+    /// The engine may mark provenance without a capture time (a store that does
+    /// not report one). That is still provenance — it just says less, and the
+    /// note has to admit it rather than imply freshness.
+    #[test]
+    fn provenance_without_a_capture_time_says_so_instead_of_implying_freshness() {
+        let got = snapshot_provenance(&headers(&[(FETCHED_VIA_HEADER, "archive")]))
+            .expect("a marker alone is still provenance");
+        assert!(got.captured_at.is_none());
+        assert!(
+            got.note().contains("capture time unknown"),
+            "{}",
+            got.note()
+        );
     }
 }
