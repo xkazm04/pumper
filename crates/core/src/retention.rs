@@ -36,10 +36,18 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
 
-/// The VCR cassette filename (mirrors `vcr::CASSETTE_FILE`, which is private to
-/// that module). Cassettes sit in the same per-job directory as scraped bodies
-/// but answer to a different reader, so retention treats them as their own class.
-pub const CASSETTE_FILE: &str = "cassette.ndjson";
+/// The VCR cassette filename. Cassettes sit in the same per-job directory as
+/// scraped bodies but answer to a different reader, so retention treats them as
+/// their own class.
+///
+/// Re-exported from [`crate::vcr`] rather than re-declared: this was a second
+/// `pub const` with the same literal, kept in sync by a comment claiming
+/// `vcr::CASSETTE_FILE` was "private to that module" — it is `pub`, and
+/// re-exported from the crate root. The retention sweep decides whether to
+/// delete a file by NAME, so the day the recorder's filename changed, the two
+/// constants would have disagreed and the sweep would have reclaimed live
+/// cassettes.
+pub use crate::vcr::CASSETTE_FILE;
 
 /// One archived body, addressed exactly the way re-derivation addresses it:
 /// `<artifacts_root>/<app>/<job_id>/<name>`.

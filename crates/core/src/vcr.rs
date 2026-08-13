@@ -11,10 +11,26 @@
 //!
 //! **Replay** (`replay_of: <job_id>` on enqueue): every fetch resolves from
 //! that job's cassette by `req_hash`. A MISS is a **typed error**
-//! ([`crate::Error::ReplayMiss`]) — never a silent live fetch, because
-//! determinism is the whole value of replay. Replay runs touch no engine, obey
-//! no politeness delay, and spend $0 (every metered seam records a
-//! `vcr_replay` cost event at 0.0).
+//! ([`crate::Error::ReplayMiss`], terminal for the job) — never a silent live
+//! fetch, because determinism is the whole value of replay. Replay runs touch
+//! no engine, obey no politeness delay, and spend $0 (every metered seam
+//! records a `vcr_replay` cost event at 0.0).
+//!
+//! ## The cassette is verified, not trusted
+//!
+//! A cassette is a plain NDJSON file under `data/artifacts/`, deliberately
+//! exempt from artifact retention — i.e. designed to outlive releases and to be
+//! readable (and editable) by anything on the box. So the loader checks the one
+//! property replay sells:
+//!
+//! - Every entry carries [`CASSETTE_VERSION`]; a version this build does not
+//!   understand is a named refusal, not a silent per-line skip.
+//! - A `GET` entry's `req_hash` is **recomputed** from its own method+url. An
+//!   entry filed under a hash it does not hash to would be served for a request
+//!   it is not a recording of, and the replayed `FetchOutcome.url` would report
+//!   the URL the entry names. Either defect fails the whole load.
+//! - Unparseable lines (the torn tail of a crash mid-write) are counted and
+//!   reported, not silently dropped — see [`Cassette::unreadable_lines`].
 //!
 //! ## Attempts: one cassette, the attempt that actually did the work
 //!
@@ -69,6 +85,31 @@ use crate::{Error, Result};
 /// Cassette file name inside a job's artifacts dir (NDJSON, one entry per line).
 pub const CASSETTE_FILE: &str = "cassette.ndjson";
 
+/// Format version this build writes, stamped on every entry.
+///
+/// **Per-entry rather than a header line**, because the recorder's write model
+/// is open-append-close *per entry* ([`Recorder::append`]): a header would have
+/// to be written by whoever notices the file is new, which is an ordering
+/// concern the append path deliberately does not have. Six bytes an entry buys
+/// a format stamp with no ordering cost, and it survives the case a header does
+/// not — a cassette appended to across a version bump (the `Resume` start
+/// policy) stays coherent entry by entry instead of being labelled wholesale by
+/// its first line.
+///
+/// A missing `v` reads as `1` ([`serde(default)`]), so **every cassette already
+/// on disk keeps loading unchanged**. A version this build does not understand
+/// is a typed, named refusal — never a silent per-line skip followed by an
+/// all-miss replay, which is the exact failure this stamp exists to prevent.
+pub const CASSETTE_VERSION: u32 = 1;
+
+/// The version a cassette entry written before [`CASSETTE_VERSION`] existed is
+/// read as. Cassettes are deliberately retention-exempt
+/// (`storage.artifact_retention_include_cassettes`), i.e. designed to outlive
+/// releases, so this default is load-bearing rather than cosmetic.
+fn version_default() -> u32 {
+    1
+}
+
 /// Per-entry size cap (serialized line bytes). Over it, the entry's body is
 /// dropped and `recorded_truncated` set.
 pub const ENTRY_CAP_BYTES: usize = 4 * 1024 * 1024;
@@ -109,6 +150,10 @@ pub fn req_hash(method: &str, key: &str) -> String {
 /// One recorded request/response pair.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CassetteEntry {
+    /// Format version ([`CASSETTE_VERSION`]). Absent on pre-versioning
+    /// cassettes, which read as `1`.
+    #[serde(default = "version_default")]
+    pub v: u32,
     /// The fetched URL (empty for research entries — the prompt is not a URL;
     /// `detail` carries its leading window instead).
     pub url: String,
@@ -169,6 +214,7 @@ pub fn fetch_entry(outcome: &FetchOutcome) -> CassetteEntry {
         }
     }
     CassetteEntry {
+        v: CASSETTE_VERSION,
         url: outcome.url.clone(),
         method: METHOD_GET.into(),
         req_hash: req_hash(METHOD_GET, &outcome.url),
@@ -190,6 +236,7 @@ pub fn research_entry(key: &str, req: &ResearchRequest, out: &ResearchOutput) ->
         body.insert("json".into(), json.clone());
     }
     CassetteEntry {
+        v: CASSETTE_VERSION,
         url: String::new(),
         method: METHOD_RESEARCH.into(),
         req_hash: req_hash(METHOD_RESEARCH, key),
@@ -202,6 +249,77 @@ pub fn research_entry(key: &str, req: &ResearchRequest, out: &ResearchOutput) ->
     }
 }
 
+impl CassetteEntry {
+    /// One string field of this entry's recorded body (`html`/`markdown`/
+    /// `text`/`json`…), or `None` when the body is absent (truncated at record
+    /// time) or the field is not a string.
+    ///
+    /// One accessor rather than three hand-rolled
+    /// `body.as_ref().unwrap()["html"].as_str().unwrap()` chains — the shape a
+    /// truncated marker turns into a panic.
+    pub fn body_str(&self, field: &str) -> Option<&str> {
+        self.body.as_ref()?.get(field).and_then(Value::as_str)
+    }
+}
+
+/// Why this entry must not be served, or `None` when it is intact.
+///
+/// Replay sells exactly one property — *the bytes you get back are the bytes
+/// that ran recorded* — and the loader used to check none of it: the map was
+/// keyed on the `req_hash` **as deserialized**, so an entry whose `url` said one
+/// thing and whose `req_hash` said another was served for the request the hash
+/// named, while the replayed [`FetchOutcome::url`] reported the URL the entry
+/// named. Cassettes are plain NDJSON under `data/artifacts/`.
+///
+/// Two defects, both cheap to detect:
+///
+/// - **Unknown format version.** Anything outside `1..=`[`CASSETTE_VERSION`].
+/// - **Forged identity.** For a `GET` entry the lookup key is derivable from the
+///   entry's own fields (`req_hash(METHOD_GET, url)`), so a disagreement is
+///   provable. A `RESEARCH` entry's key is the canonical request key
+///   ([`crate::ResearchCache::key`]), which is deliberately **not stored** (the
+///   entry keeps a 120-char prompt window, not the whole prompt), so its
+///   identity is unverifiable — a documented gap, not an oversight. What is
+///   still checkable there is well-formedness: `req_hash` is a sha256 hex
+///   digest, so a garbled field is caught even when the key is not recomputable.
+fn entry_defect(entry: &CassetteEntry) -> Option<String> {
+    if entry.v == 0 || entry.v > CASSETTE_VERSION {
+        return Some(format!(
+            "entry for {} {} declares cassette format v{}, but this build \
+             understands up to v{CASSETTE_VERSION}",
+            entry.method,
+            display_of(entry),
+            entry.v,
+        ));
+    }
+    if !is_hex_digest(&entry.req_hash) {
+        return Some(format!(
+            "entry for {} {} carries a req_hash that is not a sha256 digest ({:?})",
+            entry.method,
+            display_of(entry),
+            entry.req_hash,
+        ));
+    }
+    if entry.method == METHOD_GET {
+        let computed = req_hash(METHOD_GET, &entry.url);
+        if computed != entry.req_hash {
+            return Some(format!(
+                "entry for GET {} is filed under req_hash {} but its own method+url hash to {} \
+                 — it would be served for a request it is not a recording of",
+                entry.url, entry.req_hash, computed,
+            ));
+        }
+    }
+    None
+}
+
+/// Whether `s` is a lowercase sha256 hex digest — the shape [`req_hash`] emits.
+fn is_hex_digest(s: &str) -> bool {
+    s.len() == 64
+        && s.bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
 /// Reconstructs the [`FetchOutcome`] a replay hands back for a recorded fetch.
 /// The trace carries a single `vcr replay` entry for the recorded tier so
 /// consumers can see (and cost events can mark) that nothing live ran.
@@ -212,10 +330,10 @@ pub fn to_fetch_outcome(entry: &CassetteEntry, replay_of: Uuid) -> Result<FetchO
             entry.url, entry.engine
         ))
     })?;
-    let Some(body) = &entry.body else {
+    if entry.body.is_none() {
         return Err(truncated_miss(entry, replay_of));
-    };
-    let field = |k: &str| body.get(k).and_then(Value::as_str).map(str::to_string);
+    }
+    let field = |k: &str| entry.body_str(k).map(str::to_string);
     Ok(FetchOutcome {
         url: entry.url.clone(),
         engine,
@@ -248,13 +366,8 @@ pub fn to_research_output(entry: &CassetteEntry, replay_of: Uuid) -> Result<Rese
     let Some(body) = &entry.body else {
         return Err(truncated_miss(entry, replay_of));
     };
-    let text = body
-        .get("text")
-        .and_then(Value::as_str)
-        .unwrap_or_default()
-        .to_string();
     Ok(ResearchOutput {
-        text,
+        text: entry.body_str("text").unwrap_or_default().to_string(),
         json: body.get("json").cloned(),
         cost_usd: Some(0.0),
         duration_ms: Some(0),
@@ -483,6 +596,7 @@ impl Recorder {
 pub struct Cassette {
     replay_of: Uuid,
     entries: HashMap<String, CassetteEntry>,
+    unreadable: usize,
 }
 
 impl Cassette {
@@ -490,6 +604,23 @@ impl Cassette {
     /// with zero readable entries is a typed [`Error::ReplayMiss`] — the job
     /// being replayed was not recorded (or its cassette is gone), and running
     /// live instead would silently defeat the point.
+    ///
+    /// **A defective entry fails the whole load, an unparseable line does not.**
+    /// The two are different facts and get different answers:
+    ///
+    /// - An entry that parses but is *wrong about its own identity* (a `req_hash`
+    ///   that disagrees with its method+url) or comes from a format this build
+    ///   does not understand would, if skipped, produce a replay MISS that is
+    ///   byte-identical to "the run never fetched that". That is precisely the
+    ///   confusion this check exists to remove, so it is refused loudly, as a
+    ///   whole file: a cassette that lies about one identity has no claim to be
+    ///   trusted about the other 4,999.
+    /// - A *torn* line — the tail of a crash mid-`write_all` — is expected and
+    ///   benign: the recorded job died, and the entries that landed are real.
+    ///   Refusing the file would throw away a usable recording. It is counted
+    ///   instead ([`unreadable_lines`](Self::unreadable_lines)), so "the cassette
+    ///   lost this" is distinguishable from "the run never fetched this" at the
+    ///   surface that already reports the entry count.
     pub async fn load(artifacts_dir: &Path, replay_of: Uuid) -> Result<Self> {
         let path = artifacts_dir.join(CASSETTE_FILE);
         let raw = match tokio::fs::read_to_string(&path).await {
@@ -503,22 +634,53 @@ impl Cassette {
             }
         };
         let mut entries = HashMap::new();
-        for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+        let mut unreadable = 0usize;
+        for (n, line) in raw
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| !l.trim().is_empty())
+        {
             match serde_json::from_str::<CassetteEntry>(line) {
-                // First recording of a request wins.
                 Ok(entry) => {
+                    if let Some(defect) = entry_defect(&entry) {
+                        return Err(Error::ReplayMiss(format!(
+                            "job {replay_of}'s cassette at {} is not trustworthy: line {} {defect}",
+                            path.display(),
+                            n + 1,
+                        )));
+                    }
+                    // First recording of a request wins.
                     entries.entry(entry.req_hash.clone()).or_insert(entry);
                 }
-                Err(e) => tracing::warn!("vcr: skipping unreadable cassette line: {e}"),
+                Err(e) => {
+                    unreadable += 1;
+                    tracing::warn!("vcr: skipping unreadable cassette line {}: {e}", n + 1);
+                }
             }
         }
         if entries.is_empty() {
             return Err(Error::ReplayMiss(format!(
-                "job {replay_of}'s cassette at {} holds no readable entries",
+                "job {replay_of}'s cassette at {} holds no readable entries ({unreadable} \
+                 unreadable line(s))",
                 path.display()
             )));
         }
-        Ok(Self { replay_of, entries })
+        Ok(Self {
+            replay_of,
+            entries,
+            unreadable,
+        })
+    }
+
+    /// Lines this cassette dropped as unparseable — a torn tail from a crash
+    /// mid-write, or a hand-edit. `0` for an intact file.
+    ///
+    /// This is what makes a partially-readable cassette **distinguishable from a
+    /// complete one at load time**: a replay of a 5,000-entry cassette with one
+    /// readable line used to be a successful load followed by a storm of misses
+    /// that read exactly like "the job never fetched that".
+    pub fn unreadable_lines(&self) -> usize {
+        self.unreadable
     }
 
     /// The job this cassette was recorded by.
@@ -554,13 +716,21 @@ impl Cassette {
         Ok(entry)
     }
 
-    /// Test/tooling constructor: a cassette from already-parsed entries.
+    /// A cassette from already-parsed entries, bypassing the file. The seam for
+    /// tests and tooling that need to exercise [`resolve`](Self::resolve)
+    /// against a hand-built recording — including the ones that build entries
+    /// [`entry_defect`] would refuse, which cannot be reached through
+    /// [`load`](Self::load) by construction.
     pub fn from_entries(replay_of: Uuid, list: Vec<CassetteEntry>) -> Self {
         let mut entries = HashMap::new();
         for entry in list {
             entries.entry(entry.req_hash.clone()).or_insert(entry);
         }
-        Self { replay_of, entries }
+        Self {
+            replay_of,
+            entries,
+            unreadable: 0,
+        }
     }
 }
 
@@ -746,5 +916,182 @@ mod tests {
         entry.engine = "warp_drive".into();
         let err = to_fetch_outcome(&entry, Uuid::new_v4()).unwrap_err();
         assert!(matches!(err, Error::ReplayMiss(_)));
+    }
+
+    // ── Cassette integrity ──────────────────────────────────────────────────
+
+    /// Writes `lines` verbatim as a cassette, bypassing the recorder — the only
+    /// way to build the corrupt files a crash or a hand-edit produces.
+    async fn write_cassette(dir: &Path, lines: &[String]) {
+        tokio::fs::create_dir_all(dir).await.unwrap();
+        tokio::fs::write(dir.join(CASSETTE_FILE), lines.join("\n"))
+            .await
+            .unwrap();
+    }
+
+    fn line(entry: &CassetteEntry) -> String {
+        serde_json::to_string(entry).unwrap()
+    }
+
+    /// **The anti-pattern.** `Cassette::load` keyed its map on the `req_hash`
+    /// field *as deserialized* and `resolve` looked up the *computed* hash of the
+    /// incoming request — with nothing in between ever asserting the two describe
+    /// the same request. An entry whose url says one thing and whose hash says
+    /// another was served for the request the hash named, and the replayed
+    /// outcome reported the URL the entry named. That is the exact opposite of
+    /// what replay sells.
+    #[tokio::test]
+    async fn a_forged_req_hash_is_refused_not_served_under_the_wrong_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let honest = fetch_entry(&outcome("https://x/harmless", "http", "<p>a</p>"));
+        let mut forged = fetch_entry(&outcome("https://x/harmless", "http", "<p>evil</p>"));
+        // Filed under the hash of a DIFFERENT url: a replay of /paid would have
+        // been served /harmless's body while reporting url = /harmless.
+        forged.req_hash = req_hash(METHOD_GET, "https://x/paid");
+        write_cassette(dir.path(), &[line(&honest), line(&forged)]).await;
+
+        let err = Cassette::load(dir.path(), Uuid::new_v4())
+            .await
+            .expect_err("a cassette that lies about one identity is not trustworthy");
+        assert!(matches!(err, Error::ReplayMiss(_)), "got: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("https://x/harmless"), "{msg}");
+        assert!(
+            msg.contains("req_hash") || msg.contains("filed under"),
+            "{msg}"
+        );
+    }
+
+    /// A hash field that is not a digest at all (blanked, truncated, garbled by
+    /// a partial write to the middle of the file) is caught even for RESEARCH
+    /// entries, whose canonical key is not stored and so cannot be recomputed.
+    #[tokio::test]
+    async fn a_garbled_req_hash_is_refused_even_when_it_cannot_be_recomputed() {
+        let dir = tempfile::tempdir().unwrap();
+        let req = ResearchRequest::new("summarize the page");
+        let out = ResearchOutput {
+            text: "answer".into(),
+            json: None,
+            cost_usd: Some(0.1),
+            duration_ms: None,
+            num_turns: None,
+            session_id: None,
+        };
+        let mut entry = research_entry("canonical-key", &req, &out);
+        entry.req_hash = "not-a-digest".into();
+        write_cassette(dir.path(), &[line(&entry)]).await;
+
+        let err = Cassette::load(dir.path(), Uuid::new_v4())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("sha256"), "got: {err}");
+    }
+
+    /// **The anti-pattern.** A crash mid-`write_all` leaves a truncated final
+    /// line. It was `warn!`-skipped and the load errored only if ZERO entries
+    /// survived, so a cassette with 1 readable line out of 5,000 was a
+    /// *successful* load followed by a storm of misses indistinguishable from
+    /// "the run never fetched that". The torn line must still load (the entries
+    /// that landed are real work) but must be COUNTED, so the operator can tell
+    /// the two apart.
+    #[tokio::test]
+    async fn a_torn_final_line_is_counted_not_silently_dropped() {
+        let dir = tempfile::tempdir().unwrap();
+        let good = fetch_entry(&outcome("https://x/a", "http", "<p>a</p>"));
+        let torn = line(&fetch_entry(&outcome("https://x/b", "http", "<p>b</p>")));
+        let torn = torn[..torn.len() / 2].to_string();
+        write_cassette(dir.path(), &[line(&good), torn]).await;
+
+        let cassette = Cassette::load(dir.path(), Uuid::new_v4())
+            .await
+            .expect("the entries that landed are real work, not garbage");
+        assert_eq!(cassette.len(), 1);
+        assert_eq!(
+            cassette.unreadable_lines(),
+            1,
+            "a partially-readable cassette must be distinguishable from a complete one"
+        );
+        // And an intact cassette says so, or the count means nothing.
+        let clean = tempfile::tempdir().unwrap();
+        write_cassette(clean.path(), &[line(&good)]).await;
+        assert_eq!(
+            Cassette::load(clean.path(), Uuid::new_v4())
+                .await
+                .unwrap()
+                .unreadable_lines(),
+            0
+        );
+    }
+
+    /// **The anti-pattern.** With no format version, renaming or retyping a
+    /// `CassetteEntry` field turns every cassette on disk into per-line skips
+    /// and then an all-miss replay — on a file that is deliberately exempt from
+    /// artifact retention, i.e. designed to outlive releases. An unreadable
+    /// version must be a named refusal.
+    #[tokio::test]
+    async fn an_unknown_format_version_is_a_named_refusal_not_an_all_miss_replay() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut future = fetch_entry(&outcome("https://x/a", "http", "<p>a</p>"));
+        future.v = CASSETTE_VERSION + 1;
+        write_cassette(dir.path(), &[line(&future)]).await;
+
+        let err = Cassette::load(dir.path(), Uuid::new_v4())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ReplayMiss(_)), "got: {err}");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("format"),
+            "the refusal must name the cause: {msg}"
+        );
+        assert!(msg.contains(&format!("v{}", CASSETTE_VERSION + 1)), "{msg}");
+    }
+
+    /// The hazard the version stamp itself creates, and the bug this whole
+    /// direction exists to prevent — committed by the fix. Every cassette
+    /// written before `v` existed has no such field, and must keep loading.
+    #[tokio::test]
+    async fn a_cassette_written_before_versioning_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = fetch_entry(&outcome("https://x/a", "http", "<p>a</p>"));
+        // Exactly the bytes the pre-versioning recorder wrote: no `v` key.
+        let mut raw: serde_json::Map<String, Value> = serde_json::from_str(&line(&entry)).unwrap();
+        raw.remove("v");
+        let legacy = serde_json::to_string(&Value::Object(raw)).unwrap();
+        assert!(!legacy.contains("\"v\""), "the fixture must be pre-version");
+        write_cassette(dir.path(), &[legacy]).await;
+
+        let cassette = Cassette::load(dir.path(), Uuid::new_v4())
+            .await
+            .expect("an existing cassette must not be invalidated by the version stamp");
+        assert!(cassette
+            .resolve(METHOD_GET, "https://x/a", "https://x/a")
+            .is_ok());
+    }
+
+    /// The recorder writes what the loader verifies — otherwise the check is a
+    /// guard against a shape nothing produces.
+    #[tokio::test]
+    async fn a_recorded_cassette_passes_its_own_integrity_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Recorder::new(dir.path().to_path_buf());
+        rec.record(fetch_entry(&outcome("https://x/a", "http", "<p>a</p>")))
+            .await;
+        rec.record(research_entry(
+            "k",
+            &ResearchRequest::new("p"),
+            &ResearchOutput {
+                text: "t".into(),
+                json: None,
+                cost_usd: None,
+                duration_ms: None,
+                num_turns: None,
+                session_id: None,
+            },
+        ))
+        .await;
+        let cassette = Cassette::load(dir.path(), Uuid::new_v4()).await.unwrap();
+        assert_eq!(cassette.len(), 2);
+        assert_eq!(cassette.unreadable_lines(), 0);
     }
 }

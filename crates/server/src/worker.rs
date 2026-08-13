@@ -537,6 +537,11 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         .artifacts_dir
         .join(&job.app)
         .join(job.id.to_string());
+    // Lines this replay's cassette dropped as unparseable (a crash mid-write
+    // leaves a torn tail). Carried out of the load so the stored result can say
+    // so: a miss caused by a lost line and a miss caused by "the run never
+    // fetched that" are otherwise byte-identical to whoever reads the job later.
+    let mut cassette_unreadable = 0usize;
     // Replay is resolved first and on its own, because its failure mode is a
     // pre-run refusal (`return`) — nothing below may have run yet.
     let replay_vcr = if let Some(replay_id) = replay_of {
@@ -550,12 +555,23 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             .join(replay_id.to_string());
         match pumper_core::Cassette::load(&recorded_dir, replay_id).await {
             Ok(cassette) => {
+                cassette_unreadable = cassette.unreadable_lines();
                 info!(
                     job = %job.id,
                     replay_of = %replay_id,
                     entries = cassette.len(),
+                    unreadable = cassette_unreadable,
                     "vcr replay: serving fetches from recorded cassette ($0, no network)"
                 );
+                if cassette_unreadable > 0 {
+                    warn!(
+                        job = %job.id,
+                        replay_of = %replay_id,
+                        unreadable = cassette_unreadable,
+                        "vcr replay: cassette is partially unreadable — misses in this run may \
+                         be lost lines rather than requests the recorded job never made"
+                    );
+                }
                 Some(pumper_core::Vcr::Replay(Arc::new(cassette)))
             }
             Err(e) => {
@@ -758,6 +774,17 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             // it later must be able to tell.
             if let (Some(replay_id), Value::Object(map)) = (replay_of, &mut result) {
                 map.insert("vcr_replay_of".into(), Value::String(replay_id.to_string()));
+                // …and how complete the recording it replayed was. A cassette
+                // whose tail was torn by a crash mid-write loads fine and
+                // serves misses that read exactly like requests the recorded
+                // job never made; the count is the only thing that tells them
+                // apart after the fact.
+                if cassette_unreadable > 0 {
+                    map.insert(
+                        "vcr_cassette_unreadable_lines".into(),
+                        Value::from(cassette_unreadable),
+                    );
+                }
             }
             // Information economics (M04): parse the result's UpsertSummary-shaped
             // counts BEFORE `complete` consumes it. Recorded only if the

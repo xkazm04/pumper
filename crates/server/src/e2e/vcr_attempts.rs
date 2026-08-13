@@ -62,7 +62,7 @@ fn assert_recorded_by(cassette: &Cassette, url: &str, tag: &str) {
     let entry = cassette
         .resolve("GET", url, url)
         .unwrap_or_else(|e| panic!("{url} must be replayable: {e}"));
-    let html = entry.body.as_ref().unwrap()["html"].as_str().unwrap();
+    let html = entry.body_str("html").expect("a recorded page has a body");
     assert!(
         html.contains(tag),
         "{url} should carry {tag}'s recording, got: {html}"
@@ -140,13 +140,11 @@ async fn retry_does_not_replay_the_failed_attempt() {
     let stale = cassette
         .resolve("GET", "https://x/page-1", "page-1")
         .unwrap()
-        .body
-        .clone();
+        .body_str("html")
+        .unwrap()
+        .to_string();
     assert!(
-        !stale.unwrap()["html"]
-            .as_str()
-            .unwrap()
-            .contains("attempt-1"),
+        !stale.contains("attempt-1"),
         "the failed attempt's recording must not survive into the replay"
     );
 }

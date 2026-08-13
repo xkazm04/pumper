@@ -177,6 +177,37 @@ async fn research_records_and_replays_at_zero_cost() {
     assert!(matches!(err, Error::ReplayMiss(_)), "got: {err}");
 }
 
+/// A cassette built in memory (`Cassette::from_entries` — the seam for
+/// recordings that never came off disk) still refuses an unrecorded request,
+/// and the refusal is **terminal for the job**: a miss is a pure function of an
+/// immutable cassette, so the backoff ladder can only re-derive it.
+#[tokio::test]
+async fn a_miss_against_a_hand_built_cassette_is_terminal_not_retryable() {
+    let cassette = Cassette::from_entries(
+        uuid::Uuid::new_v4(),
+        vec![pumper_core::vcr::fetch_entry(&pumper_core::FetchOutcome {
+            url: "https://example.test/recorded".into(),
+            engine: "http",
+            status: Some(200),
+            html: Some(GOOD_PAGE.into()),
+            markdown: None,
+            text: None,
+            escalations: Vec::new(),
+            trace: Vec::new(),
+            cost_usd: None,
+            snapshot: None,
+        })],
+    );
+    let err = cassette
+        .resolve("GET", "https://example.test/absent", "absent")
+        .unwrap_err();
+    assert!(matches!(err, Error::ReplayMiss(_)), "got: {err}");
+    assert!(
+        err.is_terminal_for_job(),
+        "retrying a miss re-reads the same cassette and misses in the same place"
+    );
+}
+
 // ── Attempt integrity ───────────────────────────────────────────────────────
 
 /// A page whose body identifies the attempt that fetched it, padded past the
@@ -275,7 +306,7 @@ async fn retry_does_not_replay_failed_attempt() {
         "https://example.test/c",
     ] {
         let entry = cassette.resolve("GET", url, url).unwrap();
-        let body = entry.body.as_ref().unwrap()["html"].as_str().unwrap();
+        let body = entry.body_str("html").expect("a recorded page has a body");
         assert!(
             body.contains("attempt-2") && !body.contains("attempt-1"),
             "{url} replays the FAILED attempt's data: {body}"
@@ -316,10 +347,7 @@ async fn a_resumed_attempt_keeps_the_work_it_is_not_redoing() {
     let first = cassette
         .resolve("GET", "https://example.test/page-1", "page-1")
         .expect("the suspended attempt's fetch must survive the resume");
-    assert!(first.body.as_ref().unwrap()["html"]
-        .as_str()
-        .unwrap()
-        .contains("attempt-1"));
+    assert!(first.body_str("html").unwrap().contains("attempt-1"));
 }
 
 /// An attempt that fetches NOTHING must still not leave the previous attempt's
