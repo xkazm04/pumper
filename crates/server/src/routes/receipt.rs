@@ -47,8 +47,10 @@ const MAX_ARTIFACTS: usize = 200;
     responses(
         (status = 200, description = "`{job, stages, cost, yield, changes, verdicts, artifacts, \
             deliveries, trigger_hops, unknown}` — one run's cost, per-stage wall-clock, and \
-            what it changed. Any figure this server cannot know is `null` and the reason is \
-            listed in `unknown`; nothing is inferred."),
+            what it changed. `cost.egress` is `[{node, calls}]`: which remote-fabric peer nodes \
+            this run's fetches actually left from (empty when nothing went through a peer, i.e. \
+            always on a deployment with `[remote]` off). Any figure this server cannot know is \
+            `null` and the reason is listed in `unknown`; nothing is inferred."),
         (status = 404, description = "Job not found", body = Object),
     )
 )]
@@ -81,12 +83,25 @@ pub(crate) async fn job_receipt(
         "by_engine": by_engine.into_iter().map(|(engine, (calls, cost_usd))| {
             json!({ "engine": engine, "calls": calls, "cost_usd": cost_usd })
         }).collect::<Vec<_>>(),
+        // Which peer nodes this run's fetches actually left from. `by_engine`
+        // says "http" whether a body came off this machine or a peer in another
+        // country, which is precisely the thing the remote fabric exists to
+        // change — so a run that used it has to be able to show it.
+        "egress": egress_by_node(&events),
     });
     if events.is_empty() {
-        // A free run and an unmetered engine look identical in the ledger.
+        // What an empty ledger actually means. The previous wording here said
+        // "free tiers (http, cached, replayed) do not write ledger rows" — which
+        // is false: `AppContext::fetch` meters EVERY fetch, free ones as $0.00
+        // rows carrying the engine, the URL and the trail. So an empty ledger
+        // means this run made no metered engine call *through the AppContext
+        // seam* at all — an app that reached `ctx.engines.http` directly, or one
+        // that fetched nothing.
         unknown.push(
-            "cost: this run metered no engine calls — free tiers (http, cached, replayed) do \
-             not write ledger rows, so $0.00 means 'nothing metered', not 'nothing fetched'"
+            "cost: this run wrote no ledger rows. Every fetch through AppContext::fetch writes \
+             one (free tiers as $0.00), so this means the run made no such call — an app that \
+             used a raw engine handle instead of the metered seam, or one that fetched nothing. \
+             It does NOT mean 'fetched but not priced'."
                 .into(),
         );
     }
@@ -229,6 +244,51 @@ pub(crate) async fn job_receipt(
     })))
 }
 
+/// Which remote-fabric nodes served this run's fetches, `{node: calls}`, sorted
+/// by node. Empty when nothing left through a peer — including every run on a
+/// deployment with `[remote]` off, which is the overwhelmingly common case.
+///
+/// **Why this reads a marker out of `detail`.** A peer-served fetch leaves one
+/// trail line, `"<EGRESS_TRAIL_PREFIX><node>"`, which `AppContext::fetch` folds
+/// into that fetch's `cost_events.detail` exactly as it folds an archive
+/// snapshot's note. There is one writer (the fetcher's HTTP-tier seam) and one
+/// reader (here), both through `pumper_core::fetcher::EGRESS_TRAIL_PREFIX` — the
+/// same single-constant discipline the archive provenance headers use, and the
+/// reason this is a marker contract rather than "parsing the escalation prose".
+///
+/// The structurally better shape is a typed `served_by` on `FetchOutcome`
+/// alongside `snapshot`, read by `fetch_cost_detail`. That needs the literal
+/// `FetchOutcome`/`TierTrace` constructions in `core/src/app.rs`, `core/src/vcr.rs`
+/// and `apps/provisioner` updated in the same change — see the known gap in
+/// `docs/features/fetching.md`.
+fn egress_by_node(events: &[pumper_core::CostEvent]) -> Vec<Value> {
+    let mut by_node: BTreeMap<&str, i64> = BTreeMap::new();
+    for node in events
+        .iter()
+        .filter_map(|e| e.detail.as_deref())
+        .flat_map(egress_nodes)
+    {
+        *by_node.entry(node).or_insert(0) += 1;
+    }
+    by_node
+        .into_iter()
+        .map(|(node, calls)| json!({ "node": node, "calls": calls }))
+        .collect()
+}
+
+/// Every node named by egress markers in one cost event's `detail`.
+///
+/// `detail` is a `"; "`-joined trail, so the marker is matched at a **segment**
+/// boundary rather than anywhere in the string: a target URL or an error message
+/// that happens to contain the phrase must not be mistaken for provenance.
+fn egress_nodes(detail: &str) -> impl Iterator<Item = &str> {
+    detail.split("; ").filter_map(|part| {
+        part.strip_prefix(pumper_core::fetcher::EGRESS_TRAIL_PREFIX)
+            .map(str::trim)
+            .filter(|node| !node.is_empty())
+    })
+}
+
 /// A job's queue-visible wall clock, or `None` when it hasn't both started and
 /// finished.
 ///
@@ -327,9 +387,69 @@ async fn read_artifacts(dir: &std::path::Path) -> std::io::Result<Option<(Value,
 
 #[cfg(test)]
 mod tests {
-    use super::{stage_gap_reason, wall_ms};
+    use super::{egress_by_node, egress_nodes, stage_gap_reason, wall_ms};
     use chrono::{Duration, Utc};
-    use pumper_core::{Job, JobStatus};
+    use pumper_core::{CostEvent, Job, JobStatus};
+
+    fn event(detail: Option<&str>) -> CostEvent {
+        CostEvent {
+            job_id: uuid::Uuid::nil().to_string(),
+            app: "fake".into(),
+            engine: "http".into(),
+            url: Some("https://example.test/p".into()),
+            cost_usd: 0.0,
+            detail: detail.map(str::to_string),
+            created_at: Utc::now(),
+        }
+    }
+
+    /// The anti-pattern: **a marker matched anywhere in a string**. `detail` is a
+    /// `"; "`-joined trail that also carries target URLs and raw error text, so
+    /// a substring search would happily read provenance out of an error message
+    /// that merely quotes the phrase. Segment boundaries are the contract.
+    #[test]
+    fn an_egress_marker_is_read_at_a_segment_boundary_not_anywhere_in_the_text() {
+        let real: Vec<&str> =
+            egress_nodes("egress via remote node http://node-b:8088; http tier thin: status 200")
+                .collect();
+        assert_eq!(real, ["http://node-b:8088"]);
+
+        // Mid-segment prose that quotes the phrase is NOT provenance.
+        let quoted: Vec<&str> =
+            egress_nodes("http tier error: the string 'egress via remote node x' was logged")
+                .collect();
+        assert!(quoted.is_empty(), "{quoted:?}");
+
+        // An empty node name says nothing, so it is not attribution.
+        assert!(egress_nodes("egress via remote node ").next().is_none());
+        assert!(egress_nodes("").next().is_none());
+    }
+
+    /// The overwhelmingly common case — `[remote]` off — must produce an empty
+    /// block, never a null or a fabricated "local" node.
+    #[test]
+    fn a_run_that_used_no_peer_reports_an_empty_egress_block() {
+        assert!(egress_by_node(&[]).is_empty());
+        assert!(
+            egress_by_node(&[event(None), event(Some("http tier thin: status 200"))]).is_empty()
+        );
+    }
+
+    #[test]
+    fn egress_is_counted_per_node_across_a_runs_fetches() {
+        let rows = egress_by_node(&[
+            event(Some("egress via remote node http://b:2")),
+            event(Some("egress via remote node http://a:1")),
+            event(Some("egress via remote node http://b:2")),
+            event(None),
+        ]);
+        assert_eq!(rows.len(), 2);
+        // Sorted by node, so a receipt does not shuffle between reads.
+        assert_eq!(rows[0]["node"], "http://a:1");
+        assert_eq!(rows[0]["calls"], 1);
+        assert_eq!(rows[1]["node"], "http://b:2");
+        assert_eq!(rows[1]["calls"], 2);
+    }
 
     fn job(status: JobStatus) -> Job {
         let now = Utc::now();

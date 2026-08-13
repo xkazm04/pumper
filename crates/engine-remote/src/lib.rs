@@ -95,6 +95,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use pumper_core::config::RemoteConfig;
+use pumper_core::fetcher::{REMOTE_NODE_HEADER, REMOTE_TARGET_HEADER};
 use pumper_core::{Error, HttpClient, HttpMethod, HttpRequest, HttpResponse, Result};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
@@ -464,8 +465,64 @@ impl RemoteEngine {
         if let Some(reason) = body_over_cap(parsed.body.len(), self.max_body_bytes) {
             return Err(Error::Http(format!("node {node} {reason}")));
         }
-        Ok(parsed.into())
+        let mut resp: HttpResponse = parsed.into();
+        if let Some(reason) = envelope_mismatch(&req.url, &resp.headers) {
+            return Err(Error::Http(format!("node {node} {reason}")));
+        }
+        stamp_egress(&mut resp.headers, node);
+        Ok(resp)
     }
+}
+
+/// Why an envelope does not answer the question that was asked — `None` when the
+/// peer echoed the URL it was handed.
+///
+/// **Nothing used to bind the answer to the request.** The coordinator
+/// deserialized whatever the peer sent and the tiered fetcher minted the outcome
+/// with the *requested* URL and the peer's body, so a buggy or hostile peer
+/// could return arbitrary content for any URL and have it stored, indexed and
+/// attributed with no detectable trace. One node quietly serving a cached copy
+/// of the wrong page would have been indistinguishable from the site changing.
+///
+/// The echo is deliberately **not** `final_url`: that is where the fetch *ended*
+/// and legitimately differs after a redirect, which is exactly why it cannot
+/// serve as the binding. A missing echo is a mismatch too — an unmarked envelope
+/// is an unverifiable one, and the failure mode is a fallback, not bad data.
+fn envelope_mismatch(
+    requested: &str,
+    headers: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    let echoed = headers.iter().find_map(|(name, value)| {
+        name.eq_ignore_ascii_case(REMOTE_TARGET_HEADER)
+            .then(|| value.trim())
+    });
+    match echoed {
+        Some(echoed) if echoed == requested => None,
+        Some(echoed) => Some(format!(
+            "answered for '{echoed}' but was asked for '{requested}' — refusing the envelope \
+             rather than storing one node's answer under another URL"
+        )),
+        None => Some(format!(
+            "returned an envelope with no {REMOTE_TARGET_HEADER} echo, so it cannot be bound to \
+             '{requested}' (a peer older than this binding, or one that is not a pumper node)"
+        )),
+    }
+}
+
+/// Replaces the wire-artifact headers with the one fact a consumer wants: which
+/// node served this body.
+///
+/// The echo header is **stripped**, not just ignored: it exists only to bind the
+/// envelope to the request, and leaving it on a response that flows onward would
+/// mean a second reader could mistake a verified marker for a live-origin one.
+/// Any `REMOTE_NODE_HEADER` the target site itself sent is overwritten for the
+/// same reason — the namespace is reserved, and only this function may write it.
+fn stamp_egress(headers: &mut std::collections::HashMap<String, String>, node: &str) {
+    headers.retain(|name, _| {
+        !name.eq_ignore_ascii_case(REMOTE_TARGET_HEADER)
+            && !name.eq_ignore_ascii_case(REMOTE_NODE_HEADER)
+    });
+    headers.insert(REMOTE_NODE_HEADER.to_string(), node.to_string());
 }
 
 /// Why a decoded inner body is over this coordinator's cap — `None` when it
@@ -598,12 +655,27 @@ mod tests {
         }
     }
 
+    /// The one URL these tests fetch. A single constant because every envelope
+    /// must now echo the URL it was asked for — an envelope that answers a
+    /// different question is refused, which is the point of `envelope_mismatch`.
+    const TARGET: &str = "https://target.example/page";
+
     fn envelope(body: &str) -> String {
+        envelope_echoing(TARGET, body)
+    }
+
+    /// An envelope whose `REMOTE_TARGET_HEADER` echo says `echo` — the seam a
+    /// mismatched or unmarked peer answer is caught at.
+    fn envelope_echoing(echo: &str, body: &str) -> String {
+        let mut headers = HashMap::from([("x-served-by".to_string(), "node".to_string())]);
+        if !echo.is_empty() {
+            headers.insert(REMOTE_TARGET_HEADER.to_string(), echo.to_string());
+        }
         serde_json::to_string(&ProxyResponse {
             status: 200,
-            headers: HashMap::from([("x-served-by".into(), "node".into())]),
+            headers,
             body: body.into(),
-            final_url: "https://target.example/page".into(),
+            final_url: TARGET.into(),
             cache_hit: false,
         })
         .unwrap()
@@ -880,10 +952,7 @@ mod tests {
             Arc::new(DeadLocal),
         );
         for _ in 0..4 {
-            engine
-                .fetch(HttpRequest::get("https://t.example/"))
-                .await
-                .unwrap();
+            engine.fetch(HttpRequest::get(TARGET)).await.unwrap();
         }
         let hosts: Vec<String> = transport.seen().iter().map(|r| r.url.clone()).collect();
         assert_eq!(
@@ -1119,10 +1188,7 @@ mod tests {
         c.node_cooldown_secs = cooldown_secs;
         let engine = RemoteEngine::with_transport(&c, transport.clone(), Arc::new(DeadLocal));
         for _ in 0..4 {
-            engine
-                .fetch(HttpRequest::get("https://t.example/"))
-                .await
-                .unwrap();
+            engine.fetch(HttpRequest::get(TARGET)).await.unwrap();
         }
         let hits = transport.seen();
         let count = |prefix: &str| hits.iter().filter(|u| u.starts_with(prefix)).count();
@@ -1194,10 +1260,7 @@ mod tests {
         let transport = PerNode::new(&answers);
         let engine =
             RemoteEngine::with_transport(&cfg(&nodes), transport.clone(), Arc::new(MarkerLocal));
-        let resp = engine
-            .fetch(HttpRequest::get("https://t.example/"))
-            .await
-            .unwrap();
+        let resp = engine.fetch(HttpRequest::get(TARGET)).await.unwrap();
         assert_eq!(resp.body, "served locally");
         assert_eq!(
             transport.seen().len(),
@@ -1219,10 +1282,7 @@ mod tests {
         let big = envelope(&"x".repeat(64));
         let transport = PerNode::new(&[("http://node-a:1", Ok((200, big)))]);
         let engine = RemoteEngine::with_transport(&c, transport, Arc::new(MarkerLocal));
-        let resp = engine
-            .fetch(HttpRequest::get("https://t.example/"))
-            .await
-            .unwrap();
+        let resp = engine.fetch(HttpRequest::get(TARGET)).await.unwrap();
         assert_eq!(
             resp.body, "served locally",
             "an over-cap peer body is a node failure, not content"
@@ -1238,6 +1298,116 @@ mod tests {
         assert!(
             why.contains(&BODY_CAP_TRANSPORT_MULTIPLIER.to_string()),
             "the 2x transport multiplier must be stated somewhere other than a test: {why}"
+        );
+    }
+
+    // ── egress attribution + envelope binding ───────────────────────────────
+
+    /// The anti-pattern: **an answer that was never bound to its question**.
+    /// The coordinator deserialized whatever a peer sent and the tiered fetcher
+    /// minted the outcome with the *requested* URL and the peer's body — so a
+    /// buggy or hostile node could return arbitrary content for any URL and have
+    /// it stored, indexed and attributed with no detectable trace. A node serving
+    /// a cached copy of the wrong page looked exactly like the site changing.
+    #[tokio::test]
+    async fn a_peer_answering_for_the_wrong_url_is_refused_not_stored() {
+        let transport = PerNode::new(&[(
+            "http://node-a:1",
+            Ok((
+                200,
+                envelope_echoing("https://attacker.example/other", "<html>wrong page</html>"),
+            )),
+        )]);
+        let engine = RemoteEngine::with_transport(
+            &cfg(&["http://node-a:1"]),
+            transport,
+            Arc::new(MarkerLocal),
+        );
+        let resp = engine.fetch(HttpRequest::get(TARGET)).await.unwrap();
+        assert_eq!(
+            resp.body, "served locally",
+            "a mismatched envelope is a node failure, not content"
+        );
+    }
+
+    /// An envelope with no echo at all cannot be bound either — and "unverifiable"
+    /// has to fail closed, or the binding is opt-in for the peer being checked.
+    #[tokio::test]
+    async fn an_unmarked_envelope_is_refused_rather_than_trusted() {
+        let transport = PerNode::new(&[(
+            "http://node-a:1",
+            Ok((200, envelope_echoing("", "<html>unbindable</html>"))),
+        )]);
+        let engine = RemoteEngine::with_transport(
+            &cfg(&["http://node-a:1"]),
+            transport,
+            Arc::new(MarkerLocal),
+        );
+        let resp = engine.fetch(HttpRequest::get(TARGET)).await.unwrap();
+        assert_eq!(resp.body, "served locally");
+    }
+
+    #[test]
+    fn the_binding_is_the_requested_url_not_the_final_one() {
+        let headers = |v: &str| HashMap::from([(REMOTE_TARGET_HEADER.to_string(), v.to_string())]);
+        assert_eq!(envelope_mismatch(TARGET, &headers(TARGET)), None);
+        // Case-insensitive header lookup: a real HTTP stack guarantees no casing.
+        let upper = HashMap::from([(REMOTE_TARGET_HEADER.to_uppercase(), TARGET.to_string())]);
+        assert_eq!(envelope_mismatch(TARGET, &upper), None);
+        // A redirect target is NOT the binding — the question was the other URL.
+        let why = envelope_mismatch(TARGET, &headers("https://target.example/after-redirect"))
+            .expect("a different URL is a mismatch");
+        assert!(why.contains("was asked for"), "{why}");
+        assert!(envelope_mismatch(TARGET, &HashMap::new()).is_some());
+    }
+
+    /// The anti-pattern: **a reserved header a target site could forge**. The
+    /// namespace is reserved and only the coordinator may write it, so anything
+    /// arriving under it from the wire is discarded — including the echo, which
+    /// is a wire artifact with no meaning past this seam.
+    #[test]
+    fn wire_artifacts_are_stripped_and_the_node_marker_cannot_be_forged() {
+        let mut headers = HashMap::from([
+            ("content-type".to_string(), "text/html".to_string()),
+            (REMOTE_TARGET_HEADER.to_string(), TARGET.to_string()),
+            (
+                REMOTE_NODE_HEADER.to_uppercase(),
+                "http://attacker.example".to_string(),
+            ),
+        ]);
+        stamp_egress(&mut headers, "http://node-a:1");
+        assert_eq!(
+            headers.get(REMOTE_NODE_HEADER).map(String::as_str),
+            Some("http://node-a:1")
+        );
+        assert_eq!(headers.len(), 2, "the echo is stripped: {headers:?}");
+        assert!(!headers.contains_key(REMOTE_TARGET_HEADER));
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("text/html"),
+            "a real target header must survive"
+        );
+    }
+
+    /// A peer-served body arrives carrying the node that served it — the fact the
+    /// whole fabric exists to produce, and the one nothing in the product could
+    /// previously confirm.
+    #[tokio::test]
+    async fn a_peer_served_body_names_the_node_that_served_it() {
+        let transport = PerNode::new(&[
+            ("http://node-a:1", dead()),
+            ("http://node-b:2", Ok((200, envelope("<html>b</html>")))),
+        ]);
+        let engine = RemoteEngine::with_transport(
+            &cfg(&["http://node-a:1", "http://node-b:2"]),
+            transport,
+            Arc::new(DeadLocal),
+        );
+        let resp = engine.fetch(HttpRequest::get(TARGET)).await.unwrap();
+        assert_eq!(
+            pumper_core::fetcher::remote_egress(&resp.headers),
+            Some("http://node-b:2"),
+            "the node that actually served it, not the one it started at"
         );
     }
 

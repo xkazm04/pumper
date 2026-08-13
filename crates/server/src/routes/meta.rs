@@ -148,6 +148,13 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
         &state.storage.delivery_health().await?,
         chrono::Utc::now(),
     ));
+    // NOT YET: the remote fabric's egress counters (peer-served vs local
+    // fallback) are collected on the `Fetcher` — see
+    // `pumper_core::fetcher::EgressCounters` — but reaching them from here means
+    // a `state.engines.fetch` field access, which `fetch_chokepoint.rs`'s
+    // raw-engine inventory flags by design. Wiring it needs one reviewed row in
+    // that test's EXPECTED_RAW_ENGINE_CALLS; until then the per-job answer lives
+    // on the job receipt (`cost.egress`) and the per-fetch one on the tier trace.
 
     *state.metrics_cache.lock().await = Some((std::time::Instant::now(), out.clone()));
     Ok(metrics_response(out))

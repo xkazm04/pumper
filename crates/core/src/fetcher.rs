@@ -14,6 +14,7 @@
 //! the archive tier is strictly opportunistic: a miss, a stale-only snapshot, a
 //! thin body, or an engine error always falls through to the live ladder.
 
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -174,6 +175,106 @@ impl FetchTier {
     }
 }
 
+// ---- Remote-fabric egress attribution ---------------------------------------
+//
+// The remote fetch fabric's entire product claim is "this fetch left from a
+// different IP/geography", and until now nothing in the product could confirm
+// it happened: `engine` is the literal string `"http"` whether the body came
+// from this machine or a peer in another country, and the fabric's total
+// observability was one coordinator-side `warn!` on the FAILURE path. A
+// misconfigured secret made every peer answer 401 → warn → silent local
+// fallback, forever, with a log line that reads identically whether one fetch
+// or a million fell back.
+//
+// The carrier is a reserved response header rather than a new field on
+// `HttpResponse`, following `engine::FETCHED_VIA_HEADER` exactly: the header map
+// is the only channel that survives an engine boundary, and `FetchOutcome` has
+// never had one. The constants live HERE, next to the only reader, because
+// `pumper-core` cannot depend on `pumper-engine-remote` (engines depend on core,
+// never the reverse) while the reader must be in the fetcher.
+
+/// Reserved response header naming the peer node that served a fetch. Written by
+/// the coordinator-side `RemoteEngine` after it has verified the envelope, read
+/// once at the fetcher's HTTP-tier seam.
+///
+/// Namespaced under `x-pumper-` so it cannot collide with a real target-site
+/// header, and — like [`crate::engine::FETCHED_VIA_HEADER`] — read **only where
+/// the fabric is wired**, so an origin that echoes it on an ordinary live fetch
+/// cannot forge "a peer served this".
+pub const REMOTE_NODE_HEADER: &str = "x-pumper-remote-node";
+
+/// Reserved response header carrying the URL a serving node was **asked** for,
+/// echoed back in the envelope so the coordinator can bind the answer to the
+/// question.
+///
+/// Distinct from `HttpResponse.final_url`, which is where the fetch *ended* and
+/// legitimately differs after a redirect. This is a wire artifact: the
+/// coordinator verifies it and strips it, so it never reaches a consumer.
+pub const REMOTE_TARGET_HEADER: &str = "x-pumper-remote-target";
+
+/// Prefix of the escalation-trail line a peer-served fetch leaves, so the fact
+/// reaches the job's `cost_events.detail` (via `fetch_cost_detail`) and from
+/// there the receipt.
+///
+/// One writer ([`Fetcher::try_http_tier`]) and one reader (the job receipt),
+/// both through this constant — the same single-constant discipline the archive
+/// provenance headers use, and the reason this is not "parsing the prose".
+pub const EGRESS_TRAIL_PREFIX: &str = "egress via remote node ";
+
+/// The one rendering of "a peer served this" — used by the tier trace's `detail`
+/// and the escalation trail, so the two surfaces cannot drift into describing
+/// the same fetch differently. Mirrors `SnapshotProvenance::note()`.
+pub fn egress_note(node: &str) -> String {
+    format!("{EGRESS_TRAIL_PREFIX}{node}")
+}
+
+/// Lifts the serving node off a response header map, or `None` when the body
+/// egressed locally.
+///
+/// ASCII-case-insensitive (a header map that round-tripped a real HTTP stack has
+/// no guaranteed casing) and an empty value counts as absent, because a marker
+/// that says nothing is not attribution.
+pub fn remote_egress(headers: &std::collections::HashMap<String, String>) -> Option<&str> {
+    headers.iter().find_map(|(name, value)| {
+        (name.eq_ignore_ascii_case(REMOTE_NODE_HEADER) && !value.trim().is_empty())
+            .then(|| value.trim())
+    })
+}
+
+/// Process-wide count of how the live-HTTP tier actually egressed while the
+/// remote fabric was wired.
+///
+/// Counts, not just log lines: "a peer served it" and "we fell back" were
+/// previously distinguishable only by grepping for a `warn!` that reads the same
+/// for one fetch and for a million. Held behind an `Arc` because [`Fetcher`] is
+/// cloned into every `EngineSet` and the numbers must be the same numbers.
+#[derive(Debug, Default)]
+pub struct EgressCounters {
+    peer_served: AtomicU64,
+    local_fallback: AtomicU64,
+}
+
+impl EgressCounters {
+    fn record(&self, peer_served: bool) {
+        let counter = if peer_served {
+            &self.peer_served
+        } else {
+            &self.local_fallback
+        };
+        counter.fetch_add(1, AtomicOrdering::Relaxed);
+    }
+    /// Live-HTTP-tier fetches a peer node served.
+    pub fn peer_served(&self) -> u64 {
+        self.peer_served.load(AtomicOrdering::Relaxed)
+    }
+    /// Live-HTTP-tier fetches that egressed from this coordinator despite the
+    /// fabric being configured — every one of these left from the IP the
+    /// operator deployed the fabric to stop using.
+    pub fn local_fallback(&self) -> u64 {
+        self.local_fallback.load(AtomicOrdering::Relaxed)
+    }
+}
+
 /// Why a tier's attempt ended — the structured replacement for string-matching
 /// the free-text escalation trail. Consumers branch on this instead of parsing
 /// prose; the tier router keys on it to detect HTTP losses.
@@ -292,6 +393,10 @@ pub struct Fetcher {
     /// fetch egresses from, never whether it succeeds. The recipe tier and the
     /// archive engine's inner transport deliberately stay local.
     remote: Option<Arc<dyn HttpClient>>,
+    /// Peer-served vs fell-back-to-local counts for the live-HTTP tier, so the
+    /// fabric's success is a number an operator can read rather than the absence
+    /// of a warning. Shared across clones of this `Fetcher`.
+    egress: Arc<EgressCounters>,
     /// The same per-host politeness governor the HTTP engine uses. The HTTP tier
     /// is governed inside `HttpEngine::send` (so raw-HTTP callers like the crawler
     /// are still spaced); the browser tier has no such internal seam, so the
@@ -317,6 +422,7 @@ impl Fetcher {
             claude,
             archive: None,
             remote: None,
+            egress: Arc::new(EgressCounters::default()),
             recipes: None,
             recipes_enabled: false,
             recipes_auto_validate: false,
@@ -359,6 +465,13 @@ impl Fetcher {
     pub fn with_remote(mut self, remote: Option<Arc<dyn HttpClient>>) -> Self {
         self.remote = remote;
         self
+    }
+
+    /// Live-HTTP-tier egress counts (peer-served vs local fallback) while the
+    /// remote fabric is wired. Read by `/metrics`; both stay `0` when `[remote]`
+    /// is off, because nothing is being substituted.
+    pub fn egress_counters(&self) -> &Arc<EgressCounters> {
+        &self.egress
     }
 
     /// The client serving the live-HTTP tier: the remote fabric when wired,
@@ -727,6 +840,29 @@ impl Fetcher {
         match self.live_http().fetch(http_req).await {
             Ok(resp) => {
                 let latency_ms = elapsed_ms(started);
+                // Egress attribution. The remote fabric marks a peer-served body
+                // with `REMOTE_NODE_HEADER`; this is the seam that lifts it off
+                // the header map (which does not survive a tiered fetch) and
+                // into the trail + trace + counters, the same way the archive
+                // tier's provenance header is lifted. Read only when the fabric
+                // is actually wired, so a hostile origin cannot stamp its own
+                // page "served by a peer" — the same forgery rule the archive
+                // provenance follows.
+                let served_by = self
+                    .remote
+                    .is_some()
+                    .then(|| remote_egress(&resp.headers))
+                    .flatten()
+                    .map(str::to_string);
+                if self.remote.is_some() {
+                    self.egress.record(served_by.is_some());
+                }
+                if let Some(node) = &served_by {
+                    // Into the human trail, so it reaches this fetch's
+                    // `cost_events.detail` through `fetch_cost_detail` — the
+                    // same path `SnapshotProvenance::note()` takes.
+                    escalations.push(format!("{EGRESS_TRAIL_PREFIX}{node}"));
+                }
                 // Convert to Markdown at most once, and only when a decision
                 // (escalation) or the caller (to_markdown) actually needs it.
                 // The `Http` strategy returns regardless, so it skips the
@@ -763,7 +899,12 @@ impl Fetcher {
                         cache_hit,
                         latency_ms,
                         cost_usd: None,
-                        detail: None,
+                        // A clean local http win says everything with its tier
+                        // and status; a peer-served one does not, because "this
+                        // left from another IP" is the whole product claim and
+                        // was previously invisible everywhere past the header
+                        // map.
+                        detail: served_by.as_deref().map(egress_note),
                     });
                     return Ok(Some(outcome(
                         "http",
@@ -803,7 +944,16 @@ impl Fetcher {
                     cache_hit,
                     latency_ms,
                     cost_usd: None,
-                    detail,
+                    // A LOSING peer-served tier is the one an operator most
+                    // needs attributed: "the http tier came back blocked" reads
+                    // very differently once you know which node's IP it came
+                    // back blocked at.
+                    detail: match (detail, served_by.as_deref()) {
+                        (Some(why), Some(node)) => Some(format!("{why}; {}", egress_note(node))),
+                        (Some(why), None) => Some(why),
+                        (None, Some(node)) => Some(egress_note(node)),
+                        (None, None) => None,
+                    },
                 });
                 Ok(None)
             }
@@ -1447,6 +1597,132 @@ mod tests {
             },
         )
         .with_archive(archive)
+    }
+
+    // ── remote-fabric egress attribution ────────────────────────────────────
+
+    /// A live-HTTP stub that answers as the remote fabric does: a body plus the
+    /// reserved node marker.
+    struct PeerServedHttp(&'static str);
+    #[async_trait]
+    impl HttpClient for PeerServedHttp {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status: 200,
+                headers: std::collections::HashMap::from([(
+                    REMOTE_NODE_HEADER.to_string(),
+                    self.0.to_string(),
+                )]),
+                body: GOOD_PAGE.into(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    fn remote_fetcher(remote: Option<Arc<dyn HttpClient>>, local: Arc<dyn HttpClient>) -> Fetcher {
+        Fetcher::new(
+            local,
+            Arc::new(DeadBrowser),
+            Arc::new(StubResearcher),
+            enabled_governor(),
+            &FetcherConfig {
+                min_content_chars: 100,
+                ..FetcherConfig::default()
+            },
+        )
+        .with_remote(remote)
+    }
+
+    /// The anti-pattern: **an unattributable substitution**. `engine` reads
+    /// `"http"` whether a body came off this machine or a peer in another
+    /// country, and no field on the outcome, the trace or the receipt said
+    /// otherwise — so the fabric's one product claim was unverifiable from
+    /// inside the product.
+    #[tokio::test]
+    async fn a_peer_served_fetch_names_its_node_where_a_local_one_says_nothing() {
+        let fetcher = remote_fetcher(
+            Some(Arc::new(PeerServedHttp("http://node-b:8088"))),
+            Arc::new(DeadHttp),
+        );
+        let out = fetcher
+            .fetch(FetchRequest::new("https://example.test/page"))
+            .await
+            .unwrap();
+        assert_eq!(out.engine, "http");
+        assert_eq!(
+            out.trace[0].detail.as_deref(),
+            Some("egress via remote node http://node-b:8088"),
+            "the winning tier has to say which node served it"
+        );
+        // And into the trail, which is what carries it to `cost_events.detail`
+        // and from there to the job receipt.
+        assert!(
+            out.escalations
+                .iter()
+                .any(|line| line.starts_with(EGRESS_TRAIL_PREFIX)),
+            "{:?}",
+            out.escalations
+        );
+        assert_eq!(fetcher.egress_counters().peer_served(), 1);
+        assert_eq!(fetcher.egress_counters().local_fallback(), 0);
+
+        // A local-egress fetch through the SAME wired fabric is distinguishable
+        // without reading a log: no detail, and it lands on the other counter.
+        let fell_back = remote_fetcher(Some(Arc::new(StubHttp)), Arc::new(DeadHttp));
+        let out = fell_back
+            .fetch(FetchRequest::new("https://example.test/page"))
+            .await
+            .unwrap();
+        assert_eq!(out.trace[0].detail, None);
+        assert!(out.escalations.is_empty());
+        assert_eq!(fell_back.egress_counters().peer_served(), 0);
+        assert_eq!(fell_back.egress_counters().local_fallback(), 1);
+    }
+
+    /// The anti-pattern: **provenance a hostile origin can forge**. The archive
+    /// tier's marker is read only inside the archive branch for exactly this
+    /// reason; the egress marker follows it. With `[remote]` off, a target site
+    /// that echoes `x-pumper-remote-node` must not be able to claim its page
+    /// left from somewhere else — and the counters must stay silent rather than
+    /// counting fetches on a deployment that has no fabric.
+    #[tokio::test]
+    async fn an_origin_cannot_stamp_itself_as_peer_served_when_the_fabric_is_off() {
+        let fetcher = remote_fetcher(None, Arc::new(PeerServedHttp("http://attacker.example")));
+        let out = fetcher
+            .fetch(FetchRequest::new("https://example.test/page"))
+            .await
+            .unwrap();
+        assert_eq!(out.trace[0].detail, None, "an origin cannot forge egress");
+        assert!(out.escalations.is_empty());
+        assert_eq!(fetcher.egress_counters().peer_served(), 0);
+        assert_eq!(
+            fetcher.egress_counters().local_fallback(),
+            0,
+            "with no fabric wired there is no fallback to count"
+        );
+    }
+
+    #[test]
+    fn the_egress_marker_is_read_case_insensitively_and_a_blank_is_not_attribution() {
+        let map = |k: &str, v: &str| std::collections::HashMap::from([(k.into(), v.into())]);
+        assert_eq!(
+            remote_egress(&map(REMOTE_NODE_HEADER, " http://n:1 ")),
+            Some("http://n:1")
+        );
+        assert_eq!(
+            remote_egress(&map("X-Pumper-Remote-Node", "http://n:1")),
+            Some("http://n:1")
+        );
+        assert_eq!(remote_egress(&map(REMOTE_NODE_HEADER, "   ")), None);
+        assert_eq!(remote_egress(&std::collections::HashMap::new()), None);
+        // One renderer for the trail line and the trace detail, so the two
+        // surfaces cannot describe the same fetch differently.
+        assert_eq!(
+            egress_note("http://n:1"),
+            "egress via remote node http://n:1"
+        );
+        assert!(egress_note("http://n:1").starts_with(EGRESS_TRAIL_PREFIX));
     }
 
     #[tokio::test]

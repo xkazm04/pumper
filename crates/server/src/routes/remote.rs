@@ -32,6 +32,7 @@ use std::path::Path;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::Json;
+use pumper_core::fetcher::REMOTE_TARGET_HEADER;
 use pumper_core::HttpRequest;
 use pumper_engine_remote::{blocked_target, REMOTE_SECRET_HEADER};
 use serde_json::Value;
@@ -191,12 +192,33 @@ pub(crate) async fn fetch_proxy(
 
     // The LOCAL stack: `engines.http` is the real HttpEngine — governor
     // spacing, learned penalties, cache, retries, profile jars all included.
-    let resp = state
-        .engines
-        .http
-        .fetch(req)
-        .await
-        .map_err(|e| ApiError(PROXY_FETCH_FAILED, format!("proxied fetch failed: {e}")))?;
+    let target = req.url.clone();
+    let started = std::time::Instant::now();
+    let mut resp = state.engines.http.fetch(req).await.map_err(|e| {
+        // A node whose IP gets banned has to be able to reconstruct what it
+        // fetched for peers, and until now the serving side logged NOTHING —
+        // success and failure alike. `warn!` for the failure half, at the level
+        // the rest of the fetch stack already uses.
+        tracing::warn!(target_url = %target, error = %e, "fetch-proxy: fetch on a peer's behalf failed");
+        ApiError(PROXY_FETCH_FAILED, format!("proxied fetch failed: {e}"))
+    })?;
+    // The success half. `info!` deliberately, not `debug!`: this is the record of
+    // an outbound request this node made for someone else, and it is the only
+    // place that record exists. Target URLs are a privacy surface, so it stays at
+    // the level the fetch stack already logs URLs at, not above it.
+    tracing::info!(
+        target_url = %target,
+        status = resp.status,
+        bytes = resp.body.len(),
+        cache_hit = resp.cache_hit,
+        ms = started.elapsed().as_millis() as u64,
+        "fetch-proxy: served a fetch on a peer's behalf"
+    );
+    // Bind the envelope to the request: echo the URL this node was ASKED for, so
+    // the coordinator can refuse an answer to a different question. Deliberately
+    // not `final_url`, which legitimately differs after a redirect.
+    resp.headers
+        .insert(REMOTE_TARGET_HEADER.to_string(), target);
     let value = serde_json::to_value(&resp)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(value))

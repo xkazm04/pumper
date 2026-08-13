@@ -451,4 +451,56 @@ async fn remote_engine_round_trips_through_a_live_node() {
     // And the node's local stack really served it.
     assert_eq!(node_http.seen().len(), 1);
     assert_eq!(node_http.seen()[0].url, "https://target.example/page");
+
+    // Attribution survives the whole loop: the body names the node that served
+    // it, and the wire-only echo the coordinator verified it against is gone.
+    assert_eq!(
+        pumper_core::fetcher::remote_egress(&resp.headers),
+        Some(format!("http://{addr}").as_str()),
+        "a peer-served body must name its node end to end"
+    );
+    assert!(
+        !resp
+            .headers
+            .keys()
+            .any(|k| k.eq_ignore_ascii_case(pumper_core::fetcher::REMOTE_TARGET_HEADER)),
+        "the binding echo is a wire artifact and must not reach a consumer: {:?}",
+        resp.headers
+    );
+}
+
+/// The serving side's half of the binding: it echoes the URL it was ASKED for,
+/// which is what lets a coordinator refuse an answer to a different question.
+/// Deliberately distinct from `final_url` — that is where the fetch *ended*.
+#[tokio::test]
+async fn the_node_echoes_the_url_it_was_asked_for_so_the_answer_can_be_bound() {
+    /// Local stub whose `final_url` differs from the request, as a redirect's would.
+    struct RedirectingHttp;
+    #[async_trait::async_trait]
+    impl HttpClient for RedirectingHttp {
+        async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: "<html>landed elsewhere</html>".into(),
+                final_url: "https://target.example/after-redirect".into(),
+                cache_hit: false,
+            })
+        }
+    }
+    let (state, _store) = proxy_state(Arc::new(RedirectingHttp), enabled_remote()).await;
+    let router = routes::router(state);
+    let (status, body) = post_proxy(
+        &router,
+        Some("sesame"),
+        json!({ "url": "https://target.example/page" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        body["headers"][pumper_core::fetcher::REMOTE_TARGET_HEADER],
+        "https://target.example/page",
+        "the echo is the REQUESTED url"
+    );
+    assert_eq!(body["final_url"], "https://target.example/after-redirect");
 }
