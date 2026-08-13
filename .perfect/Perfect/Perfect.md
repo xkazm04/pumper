@@ -2,11 +2,11 @@
 type: perfect/home
 repo: pumper
 updated: 2026-08-13
-pool: 0
-pool_target: per-dispatch (r17 complete — 6/6 shipped; the next dispatch sets the cap)
+pool: 6
+pool_target: 6 (r18 dispatch cap, Athena-set)
 shipped_total: 140
-coverage: "30/46 map contexts covered. RULE (recomputable — compute it, never inherit it): a map context is COVERED when it has >=1 direction note pointing at it (`context: \"[[<name>]]\"`), OR an explicit nothing-clears-the-bar verdict, OR `last_proposed != never`. **Normalize CRLF before any frontmatter regex** — a naive /^---\\n([\\s\\S]*?)\\n---/ silently skips every CRLF file in this repo and scored coverage at 18/46 in r17, calling claude-engine/eu-grants/wasm-plugin-host never-proposed when each has 3 shipped directions. That trap, plus one genuinely stale note (job-worker said `last_proposed: never` against 5 shipped r4 directions — fixed r17), is why the figure drifted every round (r15 carried 24, r16 carried 26 then 'corrected' to 25, headline said 27). Recomputed honestly in r17: **28 entering**, +engine-contracts +maintenance-tooling gated r17 = **30**. 16 never proposed. Inherited pre-46-map history (browser-engine, http-engine, …) deliberately does NOT count as covered."
-cursor: "r17 COMPLETE — 6/6 shipped, merged and pushed (master 782b231); gate 1697/0, smoke 34/34. r18 PROPOSE: pick 2 never-proposed, ties by opportunity — browser-engine (opp 4, BANKED ANCHOR from r17: `Browser::render` is the only required method of its trait and has ZERO CI coverage — all 4 tests in engine-browser/tests/render.rs are #[ignore]d and `just ci` omits --ignored; fix shape known, an offline harness over a local axum server, precedent engine-http/tests/profiles.rs) · remote-engine (opp 4, BANKED ANCHOR: RemoteEngine::fetch swallows EVERY peer failure into a warn! and silently falls back to LOCAL egress, and no field on HttpResponse/TierTrace says which node served a fetch — geo-distributed egress is the engine's whole product claim and it is unverifiable) · then http-engine / vcr-testing / page-monitor / connector-api-watch / plugin-runner (banked r14 anchor) / data-pipeline-catalog / us-federal-grants / us-state-grants / czech-procurement / trades-* / agentic-research / hackernews-example / wasm-plugin-examples. Do NOT re-mine engine-contracts or maintenance-tooling before r19 (cooldown); their banked anchors are recorded in the two context notes. Still the strongest queued work in the vault: dataset-storage's retention-pin-is-dead-code, and crawler-core's MAX_FRONTIER lifetime cap."
+coverage: "30/46 map contexts covered. RULE (recomputable — compute it, never inherit it): a map context is COVERED when it has >=1 direction note pointing at it (`context: \"[[<name>]]\"`), OR an explicit nothing-clears-the-bar verdict, OR `last_proposed != never`. **Normalize CRLF before any frontmatter regex** — a naive /^---\\n([\\s\\S]*?)\\n---/ silently skips every CRLF file in this repo and scored coverage at 18/46 in r17, calling claude-engine/eu-grants/wasm-plugin-host never-proposed when each has 3 shipped directions. That trap, plus one genuinely stale note (job-worker said `last_proposed: never` against 5 shipped r4 directions — fixed r17), is why the figure drifted every round (r15 carried 24, r16 carried 26 then 'corrected' to 25, headline said 27). Recomputed honestly in r17: **28 entering**, +engine-contracts +maintenance-tooling gated r17 = **30**. 16 never proposed. Inherited pre-46-map history (browser-engine, http-engine, …) deliberately does NOT count as covered. **r18 recomputed the same rule from scratch with the CRLF normalization in place and got 30/46 entering — the figure is now stable across two independent computations.** +browser-engine +remote-engine gated r18 = **32/46**, 14 never proposed."
+cursor: "r18 IN FLIGHT — browser-engine + remote-engine gated (6 accepted / 6 rejected), branch `perfect/2026-08-13-r18`, entering baseline 1697/0/17-ignored. IF RESUMING: the wave plan is the round-18 section below; Lot B = render-cancel-safe + render-has-a-budget + browser-refusals-terminal, Lot R = remote-failover-not-leakback + remote-egress-attributable + remote-fabric-deployable; `crates/core/src/engine.rs` + `error.rs` belong to Lot B, `crates/core/src/fetcher.rs` to Lot R, `scripts/docs/feature-doc-map.json` is Class C. r19 PROPOSE: pick 2 never-proposed, ties by opportunity — http-engine / vcr-testing / page-monitor / connector-api-watch / plugin-runner (banked r14 anchor) / data-pipeline-catalog / us-federal-grants / us-state-grants / czech-procurement / trades-* / agentic-research / hackernews-example / wasm-plugin-examples. Do NOT re-mine engine-contracts or maintenance-tooling before r19, nor browser-engine/remote-engine before r20 (cooldown); their banked anchors are recorded in the four context notes — browser-engine's is `render-harness-offline` (resolve the does-the-CI-runner-have-Chrome question FIRST), remote-engine's is `remote-scope-honesty` (18 raw `ctx.engines.http` call sites never go through the fabric). Still the strongest queued work in the vault: dataset-storage's retention-pin-is-dead-code, and crawler-core's MAX_FRONTIER lifetime cap."
 last_session: "[[sessions/2026-08-13]]"
 ---
 
@@ -14,7 +14,69 @@ last_session: "[[sessions/2026-08-13]]"
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **0** · phase: **round 17 COMPLETE — 6/6 shipped** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 30/46.**
+**State**: pool **6** · phase: **round 18 — gated, building** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 30/46 entering → 32/46 with r18's two contexts.**
+
+### Round-18 pool — 6 GATED (2026-08-13) · 6 rejected, all recorded
+Phase 0 reconciliation (MANDATORY this round) came back **clean**: the map is the committed
+`context-map.json` — 46 contexts, generator `personas-context-scan`, `generated_at`
+2026-08-03T19:10:19Z, provenance `git_commit 611360f` — produced on **this** machine
+(`project.root` = this checkout), and the local Personas app DB's `dev_contexts` for project
+`512809db` lists **the same 46 names exactly**. No partition disagreement, so no source had to be
+chosen over another. All 46 map contexts already have notes; all 8 vault-only notes already carry
+`superseded_by:` aliases from the r11/r16 reconciliations; **0 notes to create, 0 to alias.**
+Coverage recomputed from scratch under the CRLF-safe rule: **30/46 entering, 16 never-proposed** —
+matching the inherited headline for the first time in five rounds.
+
+Cursor took the two highest-opportunity never-proposed contexts (both opp 4, both with banked
+anchors). **Every banked anchor was re-verified and four of five changed**: two sharpened, one
+partially **refuted**, one found to be silent where it was recorded as warning.
+
+browser-engine, 3 accepted (Lot B):
+1. [[render-cancel-safe]] — robustness · M (the worker `break`s out of its select and **drops**
+   the pinned render future; `page.close()` and both `.abort()` pairs live only on success-shaped
+   paths, and dropping a `JoinHandle` detaches rather than aborts. Every cancel and every job
+   timeout mid-render leaks a Chrome tab plus two tasks servicing a dead tab's CDP events, up to
+   ~200 before the recycle relaunch — with no metric, no log, no doctor check)
+2. [[render-has-a-budget]] — robustness · M (`nav_timeout_secs` bounds **1 of 6** awaits;
+   `extra_wait_ms` and `wait_ms` are raw `u64` millis with no clamp and no schema `maximum`, and
+   the permit is held for the whole render, so four jobs wedge the browser tier for every app)
+3. [[browser-refusals-terminal]] — robustness · S (`docs/features/apps.md:59` says all four
+   transact refusals are terminal; the profile-name one returns `Error::Profile`, which
+   `is_terminal_for_job` does not match — one contract line from what r17's conformance battery
+   already killed, and the door has no `pattern` to catch it either)
+
+remote-engine, 3 accepted (Lot R):
+4. [[remote-failover-not-leakback]] — robustness · M (one node tried, then straight to local: a
+   dead peer sends a deterministic **1/N of egress out the exact IP the fabric exists to avoid**,
+   and re-pins the host to the browser tier via the learned router. First it burns ~244 s, because
+   `timeout_secs` is documented "end to end" and applied **per attempt** across `retries: 3`, and
+   the peer's own-failure `502` is in `retryable_statuses`)
+5. [[remote-egress-attributable]] — feature · M (closes the gap `docs/features/fetching.md:245`
+   already documents. Nothing names the serving node anywhere in the observable output and
+   `engine` is the literal `"http"` either way; total fabric observability is **one `warn!`, on
+   the failure path only**. Also binds the envelope to the requested URL — today a peer can
+   answer with content for a different URL and it is stored and indexed under the requested one)
+6. [[remote-fabric-deployable]] — robustness · M (a profile-scoped fetch to a peer without that
+   profile hits `NotFound => CookieStore::default()` **silently** and returns logged-out content
+   that flows into stored revisions as real records — and **two passing tests pin the leak as the
+   contract**. Plus: no URL/host policy at all on a route that will fetch the peer's own loopback
+   API, and using `[remote]` requires violating `docs/deployment.md`'s stated safety precondition
+   with nothing anywhere saying so)
+
+### Wave plan (round 18) — ONE branch `perfect/2026-08-13-r18`, main checkout, 2 CONCURRENT lots
+The two crates are disjoint by construction (`crates/engine-browser/` vs `crates/engine-remote/`);
+the work is in splitting `crates/core/` and the shared docs. **`crates/core/src/engine.rs` and
+`crates/core/src/error.rs` belong to Lot B** (error classification, `TransactRequest::validate`);
+**`crates/core/src/fetcher.rs` belongs to Lot R** (`TierTrace`, the http-tier seam) — and Lot R is
+told explicitly to carry node attribution on a reserved response header (the r17
+`FETCHED_VIA_HEADER` precedent) rather than adding a field to `engine.rs`, which is the one edit
+that would have straddled the partition. Class B (re-read + unique anchor): `docs/features/fetching.md`
+(browser-tier section vs remote/known-gaps section), `crates/core/src/config.rs` and `config.toml`
+(`BrowserConfig`/`[browser]` vs `RemoteConfig`/`[remote]` — 900 lines apart). e2e files are
+different (`engine_conformance.rs` vs `fetch_proxy.rs`), so `e2e/mod.rs` needs no append.
+**Class C (Director-only): `scripts/docs/feature-doc-map.json`** — Lot R needs a
+`crates/engine-remote/**` row (the only engine crate the doc-sync hook cannot see), and per r17's
+lesson that row gets reviewed, not just applied. Rust-touching lots = 2 ✓.
 
 ### Round-17 pool — 6 GATED → ALL 6 SHIPPED + 1 Director follow-up (2026-08-13, landed `782b231`, pushed)
 Gate on the wave tip: fmt clean · clippy exit 0, **no new warnings in any file the wave touched**
@@ -454,17 +516,33 @@ claude-engine r13 (3 shipped) · cron-scheduler r13 (3 shipped) ·
 wasm-plugin-host r14 (3 shipped) · eu-grants r14 (3 shipped) ·
 us-business-census r15 (3 shipped) · czech-labor-market r15 (3 shipped) ·
 **web-crawler r16 (3 shipped)** · **crawler-core r16 (3 shipped)** ·
-**engine-contracts r17 (3 gated)** · **maintenance-tooling r17 (3 gated)**.
+**engine-contracts r17 (3 gated)** · **maintenance-tooling r17 (3 gated)** ·
+**browser-engine r18 (3 gated)** · **remote-engine r18 (3 gated)**.
 
-**Never-proposed queue (16 after r17's two proposals, opportunity-ranked)**:
+**Reconciliation 2026-08-13 (r18, mandatory pass):** map provenance verified —
+`generator: personas-context-scan`, `generated_at: 2026-08-03T19:10:19Z`,
+`provenance.git_commit: 611360f`, `project.root` = this checkout, so the committed map was
+produced by **this** machine's scan. The local Personas app DB's `dev_contexts` for project
+`512809db-ba9b-4a0e-80b6-5bfb7e3051e9` returns **the same 46 names exactly** — no disagreement to
+adjudicate, unlike the Personas repo where three sources conflict. Diff result: **0 map contexts
+without a note** (all 46 present), **8 vault-only notes, all already carrying `superseded_by:`
+aliases** from the r11/r16 passes, **0 retired**. Coverage recomputed from scratch with CRLF
+normalization: **30/46 entering** — the first round in five where the recomputed figure matched
+the inherited headline.
+
+**Never-proposed queue (14 after r18's two proposals, opportunity-ranked)**:
 | Opp | Contexts |
 |---:|---|
-| 4 | **browser-engine** (BANKED ANCHOR r17: `Browser::render` — the only *required* method of the trait — has ZERO CI coverage; all 4 tests `#[ignore]`d, `just ci` omits `--ignored`. Fix shape known: offline harness over a local axum server, precedent `engine-http/tests/profiles.rs`) · **remote-engine** (BANKED ANCHOR r17: every peer failure is swallowed into a `warn!` and silently degrades to LOCAL egress; nothing on `HttpResponse`/`TierTrace` names the serving node, so the engine's whole product claim is unverifiable) · vcr-testing · http-engine · us-federal-grants · us-state-grants · czech-procurement · trades-operator-economics · trades-pricing · agentic-research · connector-api-watch · page-monitor · plugin-runner (banked anchor, r14) |
+| 4 | vcr-testing · http-engine · us-federal-grants · us-state-grants · czech-procurement · trades-operator-economics · trades-pricing · agentic-research · connector-api-watch · page-monitor · plugin-runner (banked anchor, r14) |
 | 3 | wasm-plugin-examples (banked anchor) · data-pipeline-catalog (banked anchor) |
 | 2 | hackernews-example (banked anchor) |
 
 (r16 took web-crawler + crawler-core off this queue; r17 took engine-contracts +
-maintenance-tooling. Both r17 contexts are on cooldown until round 19.)
+maintenance-tooling; r18 took browser-engine + remote-engine. r17's two contexts are on cooldown
+until round 19, r18's until round 20. **http-engine is the natural r19 pick** — it is the third
+engine of the ladder and r18 read deep into it from two sides: the retry/timeout loop
+(`engine-http/src/lib.rs:341-344, 386-391`) and the silent `NotFound => CookieStore::default()`
+profile-jar branch at `:89` are both live, unswept, and now evidenced.)
 
 ## Queue — round 4 (re-scored 2026-08-03 over the 46-context map)
 
