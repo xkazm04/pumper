@@ -103,6 +103,17 @@ pub(crate) fn publishes_into(app: &str) -> Option<&'static VirtualNamespace> {
 /// A namespace is a legal `app` for a catalog row (that is the pair the data
 /// lands under), so the catalog's registered-app guard consults this before
 /// declaring a row's app unknown.
+///
+/// **`cfg(test)` on purpose**, and it is the same judgment this wave applied to
+/// `max_row_delta_pct`: that guard is its only consumer today. Every *runtime*
+/// path already keys on the `(app, dataset)` pair the data lands under and needs
+/// no registry lookup at all — `/catalog/health` reads
+/// `datasets.list(s.app, s.dataset)`, `enforce_contracts` reads the pair off each
+/// revision, and `Catalog::reconcile` skips any row without a cron (which a
+/// namespace row must not have). Compiling it into the binary as `pub(crate)`
+/// dead code would advertise a seam nothing uses; when a runtime caller appears,
+/// deleting one attribute is the whole change.
+#[cfg(test)]
 pub(crate) fn virtual_namespace(name: &str) -> Option<&'static VirtualNamespace> {
     VIRTUAL_NAMESPACES.iter().find(|ns| ns.name == name)
 }
