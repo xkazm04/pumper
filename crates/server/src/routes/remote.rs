@@ -23,8 +23,9 @@
 //!   jar (see the doc comment there — this is the correctness half),
 //! - the inner request's `max_body_bytes` / `timeout_secs` are clamped to the
 //!   `[remote]` caps — a peer can lower them, never raise them,
-//! - a local engine failure is 502 (the coordinator treats any non-2xx as
-//!   "this node failed" and falls back to its own local engine).
+//! - a local engine failure is [`PROXY_FETCH_FAILED`] (the coordinator treats
+//!   any non-2xx as "this node failed" and moves to the next peer, then to its
+//!   own local engine).
 
 use std::path::Path;
 
@@ -38,6 +39,30 @@ use sha2::{Digest, Sha256};
 
 use crate::routes::error::ApiError;
 use crate::state::AppState;
+
+/// What this node answers when the fetch it ran on a peer's behalf failed.
+///
+/// **Deliberately not `502`.** The coordinator dispatches its proxy call through
+/// its own `HttpEngine`, whose `[http] retryable_statuses` defaults to
+/// `[429, 502, 503, 504]` and whose `[http] retries` defaults to 3 — so a `502`
+/// here meant one deterministic peer-side failure cost the coordinator **four**
+/// full proxy attempts with exponential backoff, each paying this node's whole
+/// fetch time, before its own failover ladder even learned the node was bad. The
+/// fabric already owns a retry ladder (next peer, then local, with a per-node
+/// cooldown); a second one underneath it multiplies a dead peer's cost for no
+/// benefit.
+///
+/// `422` is the repo's existing answer to exactly this shape: `Browser::transact`
+/// capability refusals became a 422 rather than a retryable 502 precisely because
+/// a job "burned its whole backoff ladder producing the same sentence four
+/// times". The meaning here is the same — *do not re-ask me this*; the
+/// coordinator's move is a different node, not the same one again.
+///
+/// `every_status_a_handler_emits_has_a_code` (routes::error) keeps this inside
+/// the documented status inventory, and
+/// `the_proxy_failure_status_is_not_one_a_coordinator_will_retry` below keeps it
+/// out of the retryable set.
+const PROXY_FETCH_FAILED: StatusCode = StatusCode::UNPROCESSABLE_ENTITY;
 
 /// Constant-shape secret comparison: hash both sides, compare digests. Two
 /// fixed-length digests make the `==` timing independent of where the presented
@@ -107,9 +132,11 @@ fn absent_profile(profiles_dir: &Path, profile: Option<&str>) -> Option<String> 
         (status = 403, description = "Target out of policy: a loopback / link-local / private / \
             CGNAT address, or a non-http(s) scheme. Relax with `[remote] allow_private_targets`"),
         (status = 404, description = "`[remote]` disabled on this node"),
-        (status = 422, description = "The request names a session profile this node does not \
-            hold — serving it would return the logged-out page with a 200"),
-        (status = 502, description = "The local fetch itself failed"),
+        (status = 422, description = "This node will not produce a result for this request — \
+            either the local fetch itself failed, or the request names a session profile this \
+            node does not hold (serving that would return the logged-out page with a 200). \
+            Deliberately NOT 502: a coordinator's transport retries 502 by default, which \
+            multiplied every deterministic peer-side failure by `[http] retries`"),
     )
 )]
 pub(crate) async fn fetch_proxy(
@@ -164,12 +191,12 @@ pub(crate) async fn fetch_proxy(
 
     // The LOCAL stack: `engines.http` is the real HttpEngine — governor
     // spacing, learned penalties, cache, retries, profile jars all included.
-    let resp = state.engines.http.fetch(req).await.map_err(|e| {
-        ApiError(
-            StatusCode::BAD_GATEWAY,
-            format!("proxied fetch failed: {e}"),
-        )
-    })?;
+    let resp = state
+        .engines
+        .http
+        .fetch(req)
+        .await
+        .map_err(|e| ApiError(PROXY_FETCH_FAILED, format!("proxied fetch failed: {e}")))?;
     let value = serde_json::to_value(&resp)
         .map_err(|e| ApiError(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()))?;
     Ok(Json(value))
@@ -177,8 +204,34 @@ pub(crate) async fn fetch_proxy(
 
 #[cfg(test)]
 mod tests {
-    use super::{absent_profile, secret_matches};
+    use super::{absent_profile, secret_matches, PROXY_FETCH_FAILED};
     use std::path::PathBuf;
+
+    /// The anti-pattern: **two retry ladders stacked on the same failure**. The
+    /// coordinator POSTs its proxy call through its own `HttpEngine`, so the
+    /// status this node picks decides whether that call is retried underneath the
+    /// fabric's own failover. With `502` it was — `[http] retries` = 3 — so a
+    /// deterministic peer-side failure cost four full proxy attempts (each paying
+    /// this node's whole fetch time, with exponential backoff between) before the
+    /// coordinator's ladder even started.
+    ///
+    /// This is the guard, not a comment: it fails if someone puts the status back
+    /// to 502, **and** if someone adds this status to the shipped retryable set.
+    #[test]
+    fn the_proxy_failure_status_is_not_one_a_coordinator_will_retry() {
+        let shipped = pumper_core::config::HttpConfig::default().retryable_statuses;
+        assert!(
+            !shipped.contains(&PROXY_FETCH_FAILED.as_u16()),
+            "/fetch-proxy answers {} for a failed proxied fetch, but the default \
+             [http] retryable_statuses is {shipped:?} — a coordinator's transport would retry \
+             this node {} times before its own failover ladder ran",
+            PROXY_FETCH_FAILED.as_u16(),
+            pumper_core::config::HttpConfig::default().retries + 1,
+        );
+        // And it is still an error status, so the coordinator's `!is_success()`
+        // check keeps treating it as "this node failed".
+        assert!(PROXY_FETCH_FAILED.is_client_error() || PROXY_FETCH_FAILED.is_server_error());
+    }
 
     #[test]
     fn secret_comparison_is_exact() {

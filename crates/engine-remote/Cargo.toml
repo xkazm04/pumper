@@ -9,6 +9,10 @@ async-trait.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+# `tokio::time::timeout`: `[remote] timeout_secs` is documented "per proxy call,
+# end to end", but the inner HTTP engine applies a request timeout per *retry
+# attempt*. The deadline here is what makes the documented sentence true.
+tokio.workspace = true
 # Target policy: the fabric's serving side turns a peer-supplied string into an
 # outbound request, so it has to parse that string the same way the fetching
 # stack will (WHATWG host parsing folds decimal/hex/octal IPv4 forms into a real

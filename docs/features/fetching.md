@@ -135,9 +135,25 @@ Config keys (`[browser]`): `chrome_executable`, `headless` (true), `user_data_di
 
 ## Remote fetch fabric (`[remote]`, default OFF)
 
-One switch drives both sides. **Serving:** with `[remote] enabled` and a `secret`, this node exposes `POST /fetch-proxy` — a peer POSTs a serialized `HttpRequest`, the node runs it through its own local stack (HTTP engine, governor, cache, caps) and returns the `HttpResponse` envelope (`{status, headers, body, final_url, cache_hit}`) as JSON. **Dispatching:** with `nodes` also non-empty, the tiered fetcher's **live-HTTP tier** routes through `RemoteEngine` instead of the plain local engine, so a fetch egresses from a peer's IP/geography. Any node failure falls back to the local engine for that fetch.
+One switch drives both sides. **Serving:** with `[remote] enabled` and a `secret`, this node exposes `POST /fetch-proxy` — a peer POSTs a serialized `HttpRequest`, the node runs it through its own local stack (HTTP engine, governor, cache, caps) and returns the `HttpResponse` envelope (`{status, headers, body, final_url, cache_hit}`) as JSON. **Dispatching:** with `nodes` also non-empty, the tiered fetcher's **live-HTTP tier** routes through `RemoteEngine` instead of the plain local engine, so a fetch egresses from a peer's IP/geography.
 
-Config keys (`[remote]`): `enabled` (false), `nodes` (`[]` — empty means serve-only), `secret` (**required** when enabled; `Config::validate` refuses an enabled fabric without one, since an unauthenticated `/fetch-proxy` is an open proxy), `timeout_secs` (60), `max_body_bytes` (16 MiB), `allow_private_targets` (false).
+Config keys (`[remote]`): `enabled` (false), `nodes` (`[]` — empty means serve-only), `secret` (**required** when enabled; `Config::validate` refuses an enabled fabric without one, since an unauthenticated `/fetch-proxy` is an open proxy), `timeout_secs` (60), `node_cooldown_secs` (60), `max_body_bytes` (16 MiB), `allow_private_targets` (false).
+
+### Failover: local is the last resort, not the second
+
+The round-robin cursor picks the **starting** node; a failure — transport error, non-2xx proxy status, unparseable envelope, over-cap body, deadline — moves to the **next eligible peer**, and only when those are exhausted does the fetch fall back to the local engine.
+
+That ordering is the whole point. Previously one node was tried once and any error fell straight to local, so with one dead peer out of three a deterministic **third of all egress left from exactly the IP the fabric was deployed to stop using** — silently, since the fetch then succeeded. On a host that blocks the coordinator, that leaked third comes back thin/blocked, feeds the learned tier router three strikes, and pins the whole host to the **browser** tier for every future fetch. A dead peer therefore used to escalate an entire host to a costlier engine.
+
+Three bounds keep failover from becoming its own outage:
+
+- **Cooldown.** A failed peer is skipped for `[remote] node_cooldown_secs` (default 60; `0` disables), so the next N fetches don't each re-discover the same dead node and pay a full timeout to do it. A success clears it immediately — recovery does not wait out a penalty.
+- **Attempt budget.** At most **3** distinct peers per fetch, whatever the cluster size, so a total outage costs a bounded 3 × `timeout_secs` rather than N × it.
+- **`timeout_secs` is genuinely end to end.** It is enforced as a deadline around the whole node attempt. It has always been *documented* that way, but it was handed to the HTTP engine, which applies a request timeout **per retry attempt** inside `for attempt in 0..=retries` — so a black-holed node cost `[http] retries + 1` full budgets.
+
+Relatedly, a failed proxied fetch is answered **422, not 502**. `502` is in the shipped `[http] retryable_statuses`, and the coordinator POSTs its proxy call through its own `HttpEngine` — so a *deterministic* peer-side failure was retried four times, each paying the peer's whole fetch time with exponential backoff between, before the coordinator's failover ladder even started. The fabric owns its own retry ladder; a second one underneath it only multiplies. (Same reasoning that made a `transact` capability refusal a 422 rather than a retryable 502 — see the capability contract above.)
+
+`max_body_bytes` is enforced on the **decoded** inner body as well as on the transport. The transport cap is deliberately `2× max_body_bytes + 64 KiB` because JSON escaping inflates the envelope, but that is encoding headroom, not a raised limit — nothing used to re-check the body after decoding, so a peer whose own cap had drifted upward could hand the coordinator twice its stated cap and be paid for twice (wire, then decoded string).
 
 **Read [deployment.md § Remote fetch fabric](../deployment.md) before enabling it.** A peer must be reachable at a routable address, so every node has to bind off loopback — which exposes every *other* route on that node, all unauthenticated by design. The secret protects `/fetch-proxy` alone; the real control is network-level (firewall / VPN / authenticating reverse proxy).
 

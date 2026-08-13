@@ -331,8 +331,14 @@ async fn disabled_fabric_is_404_even_with_the_right_secret() {
     assert!(http.seen().is_empty());
 }
 
+/// The anti-pattern: **a failure status the caller's transport will retry**.
+/// This used to be a `502`, which is in the shipped `[http] retryable_statuses`
+/// — so the coordinator's own HTTP engine retried a *deterministic* peer-side
+/// failure `[http] retries` more times, each paying this node's full fetch time
+/// with exponential backoff between, before the fabric's failover ladder even
+/// learned the node was bad.
 #[tokio::test]
-async fn local_engine_failure_surfaces_as_502() {
+async fn a_failed_proxied_fetch_is_not_answered_with_a_retryable_status() {
     struct FailingHttp;
     #[async_trait::async_trait]
     impl HttpClient for FailingHttp {
@@ -348,8 +354,14 @@ async fn local_engine_failure_surfaces_as_502() {
         json!({ "url": "https://t.example/" }),
     )
     .await;
-    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
-    assert_eq!(body["code"], "bad_gateway");
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["code"], "unprocessable");
+    assert!(
+        !pumper_core::config::HttpConfig::default()
+            .retryable_statuses
+            .contains(&status.as_u16()),
+        "a coordinator's transport would retry this status"
+    );
 }
 
 /// Minimal reqwest transport for the loopback round-trip (the real deployment's

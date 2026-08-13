@@ -2,8 +2,17 @@
 //! a serialized [`HttpRequest`] to a peer pumper node's `POST /fetch-proxy`
 //! endpoint and gets the [`HttpResponse`] back as JSON. The peer runs the
 //! request through its own **local** fetch stack — HTTP engine, politeness
-//! governor, cache, body caps — so a proxied fetch is exactly as polite as a
-//! local one, just from a different egress IP/geography.
+//! governor, cache, body caps — just from a different egress IP/geography.
+//!
+//! **Politeness, precisely.** A proxied fetch is as polite as a local one *on
+//! the serving node*: the peer's governor spaces it and learns the target's
+//! `429`/`503` penalties like any host. It is **not** polite in the
+//! coordinator's own governor, which never sees the target at all — so the
+//! coordinator does not learn that host's penalties, and if the fetch later
+//! escalates to the browser tier (governed coordinator-side) or falls back to
+//! local, it starts from an unpenalized spacing. Per-node politeness is
+//! preserved; cluster-wide politeness is not, and that is the v1 trade, not an
+//! oversight (see the shared-brain note at the bottom of this comment).
 //!
 //! ## Wire format
 //!
@@ -14,13 +23,48 @@
 //!   mirror (kept field-for-field identical; a mismatch is a typed error, not
 //!   a silent zero).
 //!
-//! ## Routing + fallback
+//! ## Routing, failover + fallback
 //!
-//! Nodes are tried by simple round-robin (an atomic cursor over `[remote]
-//! nodes`). **Any** node failure — transport error, non-2xx proxy status,
-//! unparseable envelope — falls back to the local engine for that fetch, so a
-//! dead or misconfigured node degrades throughput. With no nodes configured the
-//! engine is a pure pass-through to local.
+//! An atomic cursor over `[remote] nodes` picks the **starting** node (so a
+//! healthy cluster rotates a, b, c, a…); from there the fetch walks the
+//! remaining peers. **Any** node failure — transport error, non-2xx proxy
+//! status, unparseable envelope, over-cap body, deadline — moves to the next
+//! eligible peer, and only when they are exhausted does the fetch fall back to
+//! the **local** engine.
+//!
+//! Local is the last resort, not the second, because the whole point of the
+//! fabric is that traffic leaves from somewhere other than the coordinator's IP.
+//! Before this, one dead peer out of three sent a deterministic **third** of all
+//! egress out of exactly the address the operator deployed the fabric to stop
+//! using — and did it silently, since each of those fetches merely logged one
+//! `warn!` before succeeding locally. Worse, on a host that blocks the
+//! coordinator that leaked third comes back thin/blocked, feeds the learned tier
+//! router three strikes, and pins the whole host to the browser tier for every
+//! future fetch.
+//!
+//! Three bounds keep failover from becoming its own outage:
+//!
+//! - a failed node goes on a **cooldown** (`[remote] node_cooldown_secs`,
+//!   default 60; `0` disables) and is skipped while it lasts, so the next N
+//!   fetches do not each re-discover the same dead peer;
+//! - at most [`MAX_NODE_ATTEMPTS`] distinct peers are tried per fetch — a total
+//!   cluster outage costs a bounded 3 × `timeout_secs`, not N × ;
+//! - each attempt runs under an **end-to-end** deadline of `timeout_secs`
+//!   ([`RemoteEngine::attempt`]).
+//!
+//! That last one is a correction, not a decoration. `timeout_secs` has always
+//! been documented "per proxy call, end to end" and was in fact handed to the
+//! HTTP engine, which applies a request timeout **per attempt** inside its
+//! `for attempt in 0..=retries` loop (`[http] retries` = 3). Worse, `502` — what
+//! `/fetch-proxy` used to return when the peer's own fetch failed — is in the
+//! default `[http] retryable_statuses`, so one deterministic peer-side failure
+//! cost four full proxy attempts with exponential backoff before the local
+//! ladder even started: minutes, against a 900s job timeout. `/fetch-proxy` now
+//! answers **422** for a failed proxied fetch (a status the transport does not
+//! retry — the same reasoning that made a transact capability refusal a 422
+//! rather than a retryable 502), and the deadline here bounds everything else.
+//!
+//! With no nodes configured the engine is a pure pass-through to local.
 //!
 //! ## What never leaves the coordinator
 //!
@@ -46,7 +90,7 @@
 //! governor protects targets independently; the shared-brain merge is M01's
 //! host-weather bundle, later.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -246,6 +290,24 @@ impl From<ProxyResponse> for HttpResponse {
 /// being rejected at the transport layer purely for its JSON escaping overhead.
 const ENVELOPE_SLACK_BYTES: u64 = 64 * 1024;
 
+/// How much bigger than `[remote] max_body_bytes` the *transport* cap on a proxy
+/// call is allowed to be — headroom for JSON escaping, since a body of quotes
+/// and control characters roughly doubles when it is escaped into the envelope's
+/// `body` string. The decoded body is checked against the real cap separately
+/// ([`body_over_cap`]); this multiplier is not a raised limit.
+const BODY_CAP_TRANSPORT_MULTIPLIER: u64 = 2;
+
+/// How many *distinct* peers one fetch will try before giving up on the fabric
+/// and serving locally.
+///
+/// A bound rather than "walk every node": with a 30-node cluster in a total
+/// outage, looping the whole list would spend 30 × `[remote] timeout_secs`
+/// before the local ladder even starts, against a `[worker] job_timeout_secs`
+/// of 900. Three attempts caps the fabric's share of one HTTP-tier fetch at
+/// 3 × `timeout_secs`, which is 90s at the shipped default — and three healthy
+/// peers failing in a row is already a cluster-wide event, not a bad node.
+const MAX_NODE_ATTEMPTS: usize = 3;
+
 /// Coordinator-side remote fetch engine. Construct over the local HTTP engine
 /// (used both as the transport for proxy calls and as the fallback) and wire
 /// into the tiered fetcher via `Fetcher::with_remote`.
@@ -259,12 +321,26 @@ pub struct RemoteEngine {
     transport: Arc<dyn HttpClient>,
     /// Local fallback: serves the fetch when no node can.
     local: Arc<dyn HttpClient>,
-    /// Round-robin cursor over `nodes`.
+    /// Round-robin cursor over `nodes`, bumped once per fetch. It picks the
+    /// *starting* node; the failover walk continues from there.
     next: AtomicUsize,
-    /// `[remote] timeout_secs`: per proxy call, end to end.
+    /// Per-node cooldown deadline, parallel to `nodes`, in [`RemoteEngine::now_ms`]
+    /// units. `0` = healthy. A failed node is skipped until its deadline passes,
+    /// so the next N fetches do not each re-discover the same dead peer (and
+    /// each pay a full timeout budget to do it).
+    cooldown_until: Vec<AtomicU64>,
+    /// Monotonic base for `cooldown_until`.
+    started: std::time::Instant,
+    /// `[remote] node_cooldown_secs` as millis. `0` disables cooldown.
+    cooldown_ms: u64,
+    /// `[remote] timeout_secs`: per proxy call, **end to end** — enforced as a
+    /// deadline around the whole node attempt (see [`RemoteEngine::attempt`]),
+    /// because the inner HTTP engine applies it per *retry attempt*.
     timeout_secs: u64,
-    /// `[remote] max_body_bytes`: cap on the proxied response body. The
-    /// transport-level cap adds [`ENVELOPE_SLACK_BYTES`] of JSON headroom.
+    /// `[remote] max_body_bytes`: cap on the proxied response body, enforced on
+    /// the decoded inner body ([`body_over_cap`]) as well as on the transport,
+    /// where the cap is [`BODY_CAP_TRANSPORT_MULTIPLIER`]× this plus
+    /// [`ENVELOPE_SLACK_BYTES`] of JSON headroom.
     max_body_bytes: u64,
 }
 
@@ -280,33 +356,81 @@ impl RemoteEngine {
         transport: Arc<dyn HttpClient>,
         local: Arc<dyn HttpClient>,
     ) -> Self {
+        let nodes: Vec<String> = cfg
+            .nodes
+            .iter()
+            .map(|n| n.trim_end_matches('/').to_string())
+            .filter(|n| !n.is_empty())
+            .collect();
         Self {
-            nodes: cfg
-                .nodes
-                .iter()
-                .map(|n| n.trim_end_matches('/').to_string())
-                .filter(|n| !n.is_empty())
-                .collect(),
+            // `cooldown_until` is indexed by node position, so it must be built
+            // from the SAME filtered list — sizing it from `cfg.nodes` would
+            // desync the two the moment a blank entry is dropped.
+            cooldown_until: nodes.iter().map(|_| AtomicU64::new(0)).collect(),
+            nodes,
             secret: cfg.secret.clone(),
             transport,
             local,
             next: AtomicUsize::new(0),
+            started: std::time::Instant::now(),
+            cooldown_ms: cfg.node_cooldown_secs.saturating_mul(1_000),
             timeout_secs: cfg.timeout_secs,
             max_body_bytes: cfg.max_body_bytes,
         }
     }
 
-    /// The next node in round-robin order. `None` when no nodes are configured.
-    fn pick_node(&self) -> Option<&str> {
-        if self.nodes.is_empty() {
-            return None;
+    /// Milliseconds since this engine was constructed — the clock the cooldown
+    /// map is written in. A monotonic offset rather than a wall clock, so a
+    /// system clock step can never park a node in cooldown for a century.
+    fn now_ms(&self) -> u64 {
+        self.started.elapsed().as_millis() as u64
+    }
+
+    /// Whether node `idx` is inside its failure cooldown right now.
+    fn is_cooling(&self, idx: usize) -> bool {
+        still_cooling(
+            self.cooldown_until[idx].load(Ordering::Relaxed),
+            self.now_ms(),
+        )
+    }
+
+    /// Records a node failure: skip it until the cooldown expires. `Relaxed`
+    /// for the same reason the round-robin cursor is — this is a scheduling
+    /// *hint*, and the worst a lost update can do is send one extra fetch at a
+    /// node that is already known bad.
+    fn mark_failed(&self, idx: usize) {
+        let until = self.now_ms().saturating_add(self.cooldown_ms);
+        self.cooldown_until[idx].store(until, Ordering::Relaxed);
+    }
+
+    /// Records a node success: clear any cooldown so recovery is immediate
+    /// rather than waiting out a penalty the node no longer deserves.
+    fn mark_healthy(&self, idx: usize) {
+        self.cooldown_until[idx].store(0, Ordering::Relaxed);
+    }
+
+    /// One node attempt under the **end-to-end** `[remote] timeout_secs` budget.
+    ///
+    /// The budget is also handed to the inner request, where `engine-http`
+    /// applies it *per attempt* inside its `for attempt in 0..=retries` loop.
+    /// That is what used to make the documented "per proxy call, end to end"
+    /// false by a factor of `retries + 1`: a black-holed node cost four full
+    /// timeouts. The deadline here is what makes the sentence true again — one
+    /// slow attempt may still use the whole budget, but four cannot.
+    async fn attempt(&self, node: &str, req: &HttpRequest) -> Result<HttpResponse> {
+        let budget = std::time::Duration::from_secs(self.timeout_secs);
+        match tokio::time::timeout(budget, self.try_node(node, req)).await {
+            Ok(result) => result,
+            Err(_) => Err(Error::Http(format!(
+                "node {node} did not answer {FETCH_PROXY_PATH} within the {}s end-to-end \
+                 [remote] timeout_secs budget",
+                self.timeout_secs
+            ))),
         }
-        let idx = self.next.fetch_add(1, Ordering::Relaxed) % self.nodes.len();
-        Some(&self.nodes[idx])
     }
 
     /// One attempt against one node. Every failure mode is a typed error the
-    /// caller turns into a local fallback.
+    /// caller turns into the next node, then into a local fallback.
     async fn try_node(&self, node: &str, req: &HttpRequest) -> Result<HttpResponse> {
         let payload = serde_json::to_string(req)
             .map_err(|e| Error::Http(format!("serialize proxied request: {e}")))?;
@@ -337,8 +461,46 @@ impl RemoteEngine {
         }
         let parsed: ProxyResponse = serde_json::from_str(&resp.body)
             .map_err(|e| Error::Http(format!("node {node} sent an unparseable envelope: {e}")))?;
+        if let Some(reason) = body_over_cap(parsed.body.len(), self.max_body_bytes) {
+            return Err(Error::Http(format!("node {node} {reason}")));
+        }
         Ok(parsed.into())
     }
+}
+
+/// Why a decoded inner body is over this coordinator's cap — `None` when it
+/// fits.
+///
+/// The transport-level cap on the proxy call is deliberately loose
+/// (`2 × max_body_bytes + `[`ENVELOPE_SLACK_BYTES`]) because the JSON envelope,
+/// with its escaped `body` string, is bigger than the body it carries — worst
+/// case roughly double for a body full of quotes and control characters. That
+/// slack is *transport* headroom, not a raised limit, and nothing used to check
+/// the body itself once it was decoded. So a peer whose own `[remote]
+/// max_body_bytes` had drifted upward could hand this coordinator a body up to
+/// twice its stated cap, and the coordinator paid for the whole transfer twice
+/// (once over the wire, once in the decoded `String`) before storing it.
+///
+/// The `2×` multiplier lived only in a test assertion string until now.
+/// Whether a node whose cooldown deadline is `until_ms` is still being skipped
+/// at `now_ms`. Both are [`RemoteEngine::now_ms`] offsets.
+///
+/// A named function rather than an inline `>` so the boundary is assertable
+/// without waiting out a real minute: a deadline that has just been *reached* is
+/// over (the node rejoins), and a healthy node's `0` is never in the future.
+fn still_cooling(until_ms: u64, now_ms: u64) -> bool {
+    until_ms > now_ms
+}
+
+fn body_over_cap(body_len: usize, cap: u64) -> Option<String> {
+    (body_len as u64 > cap).then(|| {
+        format!(
+            "returned a {body_len}-byte body, over this coordinator's [remote] max_body_bytes \
+             of {cap} (the transport cap allows {}× that plus envelope slack for JSON escaping, \
+             which is headroom for encoding — not a raised limit)",
+            BODY_CAP_TRANSPORT_MULTIPLIER
+        )
+    })
 }
 
 #[async_trait]
@@ -350,17 +512,53 @@ impl HttpClient for RemoteEngine {
             debug!(url = %req.url, reason, "remote fabric: serving this fetch locally");
             return self.local.fetch(req).await;
         }
-        let Some(node) = self.pick_node() else {
+        if self.nodes.is_empty() {
             return self.local.fetch(req).await;
-        };
-        let node = node.to_string();
-        match self.try_node(&node, &req).await {
-            Ok(resp) => Ok(resp),
-            Err(e) => {
-                warn!(node = %node, error = %e, "remote fetch node failed — falling back to local");
-                self.local.fetch(req).await
+        }
+        // One cursor bump per fetch (not per attempt), so a healthy cluster
+        // still rotates a, b, c, a... exactly as before.
+        let start = self.next.fetch_add(1, Ordering::Relaxed);
+        let mut attempted = 0usize;
+        let mut skipped_cooling = 0usize;
+        for hop in 0..self.nodes.len() {
+            if attempted >= MAX_NODE_ATTEMPTS {
+                break;
+            }
+            let idx = (start.wrapping_add(hop)) % self.nodes.len();
+            if self.is_cooling(idx) {
+                skipped_cooling += 1;
+                continue;
+            }
+            attempted += 1;
+            let node = self.nodes[idx].clone();
+            match self.attempt(&node, &req).await {
+                Ok(resp) => {
+                    self.mark_healthy(idx);
+                    return Ok(resp);
+                }
+                Err(e) => {
+                    self.mark_failed(idx);
+                    warn!(
+                        node = %node,
+                        error = %e,
+                        cooldown_ms = self.cooldown_ms,
+                        "remote fetch node failed — cooling it down and trying the next peer"
+                    );
+                }
             }
         }
+        // Local is the LAST resort, not the second. Reaching it means every
+        // eligible peer failed (or is cooling), which is the one case where
+        // egress from the coordinator's own IP is better than no fetch at all —
+        // so it is worth a line an operator can count.
+        warn!(
+            url = %req.url,
+            attempted,
+            skipped_cooling,
+            nodes = self.nodes.len(),
+            "remote fabric exhausted — this fetch egresses from the COORDINATOR's own IP"
+        );
+        self.local.fetch(req).await
     }
 
     /// Binary fetches are served **locally**, always — the same engine a fetch
@@ -800,6 +998,247 @@ mod tests {
             .await
             .expect("the wrapped engine can do this, so the wrapper must too");
         assert_eq!(bytes, vec![0x50, 0x4B, 0x03, 0x04]);
+    }
+
+    // ── failover, cooldown, attempt budget ──────────────────────────────────
+
+    /// Transport that answers **per node**: each proxy URL gets its own scripted
+    /// result. The old `Scripted` stub answered the same thing to everyone, which
+    /// is exactly why no test could see that a dead node was never failed over.
+    struct PerNode {
+        answers: HashMap<String, Result<(u16, String)>>,
+        seen: Mutex<Vec<String>>,
+    }
+
+    impl PerNode {
+        fn new(answers: &[(&str, Result<(u16, String)>)]) -> Arc<Self> {
+            Arc::new(Self {
+                answers: answers
+                    .iter()
+                    .map(|(node, r)| {
+                        let key = format!("{node}{FETCH_PROXY_PATH}");
+                        let value = match r {
+                            Ok(ok) => Ok(ok.clone()),
+                            Err(e) => Err(Error::Http(e.to_string())),
+                        };
+                        (key, value)
+                    })
+                    .collect(),
+                seen: Mutex::new(Vec::new()),
+            })
+        }
+        fn seen(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl HttpClient for PerNode {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            self.seen.lock().unwrap().push(req.url.clone());
+            let (status, body) = match self.answers.get(&req.url) {
+                Some(Ok(ok)) => ok.clone(),
+                Some(Err(e)) => return Err(Error::Http(e.to_string())),
+                None => panic!("unscripted node {}", req.url),
+            };
+            Ok(HttpResponse {
+                status,
+                headers: HashMap::new(),
+                body,
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    fn dead() -> Result<(u16, String)> {
+        Err(Error::Http("connection refused".into()))
+    }
+
+    /// The anti-pattern: **failover to the thing the feature exists to avoid**.
+    /// The fabric's entire product claim is "this fetch left from a different
+    /// IP". With one dead peer out of three, the old code sent a deterministic
+    /// third of all egress out of exactly the coordinator's own address — after
+    /// trying precisely one node and giving up. A healthy peer was sitting right
+    /// there.
+    #[tokio::test]
+    async fn a_dead_node_fails_over_to_a_peer_not_to_the_coordinator() {
+        let transport = PerNode::new(&[
+            ("http://node-a:1", dead()),
+            (
+                "http://node-b:2",
+                Ok((200, envelope("<html>from node B</html>"))),
+            ),
+        ]);
+        let engine = RemoteEngine::with_transport(
+            &cfg(&["http://node-a:1", "http://node-b:2"]),
+            transport.clone(),
+            Arc::new(DeadLocal), // reaching local at all is the failure
+        );
+        let resp = engine
+            .fetch(HttpRequest::get("https://target.example/page"))
+            .await
+            .unwrap();
+        assert_eq!(resp.body, "<html>from node B</html>");
+        assert_eq!(
+            transport.seen(),
+            ["http://node-a:1/fetch-proxy", "http://node-b:2/fetch-proxy"]
+        );
+    }
+
+    /// Local is still the floor — it is just no longer the *second* step.
+    #[tokio::test]
+    async fn every_peer_dead_falls_back_to_local() {
+        let transport = PerNode::new(&[
+            ("http://node-a:1", dead()),
+            ("http://node-b:2", Ok((500, "boom".into()))),
+        ]);
+        let engine = RemoteEngine::with_transport(
+            &cfg(&["http://node-a:1", "http://node-b:2"]),
+            transport.clone(),
+            Arc::new(MarkerLocal),
+        );
+        let resp = engine
+            .fetch(HttpRequest::get("https://target.example/page"))
+            .await
+            .unwrap();
+        assert_eq!(resp.body, "served locally");
+        assert_eq!(transport.seen().len(), 2, "both peers tried before local");
+    }
+
+    /// Two dead peers and one healthy one, driven four times — the whole point
+    /// of the cooldown in one number.
+    async fn dead_node_probes(cooldown_secs: u64) -> (usize, usize) {
+        let nodes = ["http://node-a:1", "http://node-b:2", "http://node-c:3"];
+        let transport = PerNode::new(&[
+            ("http://node-a:1", dead()),
+            ("http://node-b:2", dead()),
+            ("http://node-c:3", Ok((200, envelope("c")))),
+        ]);
+        let mut c = cfg(&nodes);
+        c.node_cooldown_secs = cooldown_secs;
+        let engine = RemoteEngine::with_transport(&c, transport.clone(), Arc::new(DeadLocal));
+        for _ in 0..4 {
+            engine
+                .fetch(HttpRequest::get("https://t.example/"))
+                .await
+                .unwrap();
+        }
+        let hits = transport.seen();
+        let count = |prefix: &str| hits.iter().filter(|u| u.starts_with(prefix)).count();
+        (count("http://node-a:1"), count("http://node-b:2"))
+    }
+
+    /// The anti-pattern: **re-discovering the same corpse on every fetch**.
+    /// Without a cooldown, each fetch that reaches a dead node pays its whole
+    /// timeout budget again to learn exactly what the last one learned. With it,
+    /// a dead peer is probed **once** however many fetches follow.
+    #[tokio::test]
+    async fn a_failed_node_is_skipped_while_its_cooldown_holds() {
+        assert_eq!(
+            dead_node_probes(60).await,
+            (1, 1),
+            "each dead peer must be discovered once, not once per fetch"
+        );
+    }
+
+    /// `node_cooldown_secs = 0` is the documented "no cooldown" setting, and it
+    /// has to mean *off* rather than *never expires* — the two obvious readings
+    /// of a zero deadline, only one of which is safe. Contrast with the test
+    /// above: same cluster, same four fetches, dead peers re-probed instead.
+    ///
+    /// The counts are 2 and 3, not 4 and 4, because the round-robin cursor
+    /// decides where each fetch *starts*: a fetch that starts at the healthy
+    /// node never walks to the dead ones at all. That asymmetry is precisely the
+    /// leak this direction closes — it used to decide who got served locally.
+    #[tokio::test]
+    async fn a_zero_cooldown_means_no_cooldown_not_a_permanent_one() {
+        let (a, b) = dead_node_probes(0).await;
+        assert!(
+            a > 1 && b > 1,
+            "with cooldown off the dead peers are re-probed, got a={a} b={b}"
+        );
+        assert_eq!((a, b), (2, 3));
+    }
+
+    /// A node that comes back must come back **immediately**, not after serving
+    /// out a penalty it no longer deserves.
+    #[test]
+    fn a_success_clears_a_cooldown_and_a_reached_deadline_has_expired() {
+        // The pure boundary, so expiry is assertable without waiting a minute.
+        assert!(still_cooling(60_000, 59_999));
+        assert!(
+            !still_cooling(60_000, 60_000),
+            "the deadline itself is over"
+        );
+        assert!(!still_cooling(60_000, 60_001));
+        assert!(!still_cooling(0, 0), "a healthy node is never cooling");
+    }
+
+    /// The anti-pattern: **turning a cluster outage into an N× latency
+    /// multiplier**. Walking every node before falling back means a 30-node
+    /// cluster spends 30 timeout budgets on a fetch that was going to be served
+    /// locally anyway.
+    #[tokio::test]
+    async fn a_total_outage_costs_a_bounded_attempt_budget_not_the_whole_cluster() {
+        let nodes = [
+            "http://n1:1",
+            "http://n2:2",
+            "http://n3:3",
+            "http://n4:4",
+            "http://n5:5",
+            "http://n6:6",
+        ];
+        let answers: Vec<(&str, Result<(u16, String)>)> =
+            nodes.iter().map(|n| (*n, dead())).collect();
+        let transport = PerNode::new(&answers);
+        let engine =
+            RemoteEngine::with_transport(&cfg(&nodes), transport.clone(), Arc::new(MarkerLocal));
+        let resp = engine
+            .fetch(HttpRequest::get("https://t.example/"))
+            .await
+            .unwrap();
+        assert_eq!(resp.body, "served locally");
+        assert_eq!(
+            transport.seen().len(),
+            MAX_NODE_ATTEMPTS,
+            "at most {MAX_NODE_ATTEMPTS} peers per fetch, whatever the cluster size"
+        );
+    }
+
+    /// The anti-pattern: **a cap enforced only where it is cheap to enforce**.
+    /// The transport cap is deliberately `2× + slack` so JSON escaping does not
+    /// reject a legal body — but nothing checked the *decoded* body, so a peer
+    /// whose own `max_body_bytes` had drifted upward silently doubled this
+    /// coordinator's stated cap, and it paid for the bytes twice (wire, then
+    /// decoded String) before finding out.
+    #[tokio::test]
+    async fn a_body_over_this_coordinators_cap_is_refused_not_silently_doubled() {
+        let mut c = cfg(&["http://node-a:1"]);
+        c.max_body_bytes = 32;
+        let big = envelope(&"x".repeat(64));
+        let transport = PerNode::new(&[("http://node-a:1", Ok((200, big)))]);
+        let engine = RemoteEngine::with_transport(&c, transport, Arc::new(MarkerLocal));
+        let resp = engine
+            .fetch(HttpRequest::get("https://t.example/"))
+            .await
+            .unwrap();
+        assert_eq!(
+            resp.body, "served locally",
+            "an over-cap peer body is a node failure, not content"
+        );
+    }
+
+    #[test]
+    fn the_body_cap_is_a_ceiling_not_a_target() {
+        assert_eq!(body_over_cap(32, 32), None, "exactly at the cap fits");
+        assert_eq!(body_over_cap(0, 0), None);
+        let why = body_over_cap(33, 32).expect("over the cap");
+        assert!(why.contains("max_body_bytes"), "{why}");
+        assert!(
+            why.contains(&BODY_CAP_TRANSPORT_MULTIPLIER.to_string()),
+            "the 2x transport multiplier must be stated somewhere other than a test: {why}"
+        );
     }
 
     #[test]

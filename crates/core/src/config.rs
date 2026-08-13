@@ -294,8 +294,19 @@ pub struct RemoteConfig {
     /// MUST be non-empty when `enabled` — an unauthenticated `/fetch-proxy`
     /// would be an open proxy.
     pub secret: String,
-    /// Per proxy call timeout (seconds), end to end, on the dispatching side.
+    /// Per proxy call timeout (seconds), **end to end**, on the dispatching
+    /// side — enforced as a deadline around the whole node attempt, because the
+    /// HTTP engine underneath applies a request timeout per *retry attempt*
+    /// (`[http] retries`), which used to multiply this budget by four. A fetch
+    /// tries at most `MAX_NODE_ATTEMPTS` (3) peers, so the fabric's share of one
+    /// HTTP-tier fetch is bounded at 3 × this.
     pub timeout_secs: u64,
+    /// How long (seconds) a peer that just failed is skipped by the dispatching
+    /// side. Without it, every fetch re-discovers the same dead node and pays a
+    /// full `timeout_secs` to do it. `0` disables cooldown (every node is tried
+    /// on every fetch). A success clears it immediately — recovery does not wait
+    /// out a penalty the node no longer deserves.
+    pub node_cooldown_secs: u64,
     /// Cap (bytes) on a proxied response body: the serving side clamps the
     /// inner request's `max_body_bytes` to this, and the dispatching side sizes
     /// its transport cap from it.
@@ -319,6 +330,11 @@ impl Default for RemoteConfig {
             nodes: Vec::new(),
             secret: String::new(),
             timeout_secs: 60,
+            // Long enough that a peer restart or a brief network blip is ridden
+            // out on the remaining peers instead of leaking egress back to the
+            // coordinator, short enough that a recovered node rejoins within a
+            // minute even if nothing ever succeeds against it in the meantime.
+            node_cooldown_secs: 60,
             // Matches `[http] max_body_bytes`' 16 MiB default.
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             // Defaulted SAFE: an operator who turns the fabric on without
