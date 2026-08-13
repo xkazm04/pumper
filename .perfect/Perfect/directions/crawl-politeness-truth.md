@@ -3,12 +3,12 @@ slug: crawl-politeness-truth
 type: perfect/direction
 context: "[[crawler-core]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 10aa549
 ---
 ## What & why
 Two politeness controls report compliance they did not deliver. Politeness is the one class

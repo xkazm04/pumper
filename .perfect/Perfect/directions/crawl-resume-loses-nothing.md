@@ -3,12 +3,12 @@ slug: crawl-resume-loses-nothing
 type: perfect/direction
 context: "[[crawler-core]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 92621fe
 ---
 ## What & why
 A crawl that is killed, reaped, or simply hits `max_pages` **permanently loses fetched

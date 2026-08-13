@@ -3,12 +3,12 @@ slug: crawl-reliability-survives-interruption
 type: perfect/direction
 context: "[[web-crawler]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 3bb35ef
 ---
 ## What & why
 Everything a crawl *learns* is held in process memory and committed only after `crawl()`

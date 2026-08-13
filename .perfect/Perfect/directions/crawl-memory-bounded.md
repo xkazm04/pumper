@@ -3,12 +3,12 @@ slug: crawl-memory-bounded
 type: perfect/direction
 context: "[[web-crawler]]"
 lens: optimization
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 7f1b6cc
 ---
 ## What & why
 "Bounded memory" is one of this crawler's two headline architectural promises — page bodies

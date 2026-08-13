@@ -1,22 +1,80 @@
 ---
 type: perfect/home
 repo: pumper
-updated: 2026-08-12
+updated: 2026-08-13
 pool: 6
-pool_target: per-dispatch (r16 cap 6 — gated, building)
-shipped_total: 128
-coverage: "27/46 map contexts covered — RULE (recomputable, stated so no round has to guess again): a context is COVERED when it has a proposal pass recorded ON THE 46-MAP, i.e. `last_proposed != never`, OR an explicit nothing-clears-the-bar verdict in its note. r16 recount found the previously-carried 26 was ONE over that rule (26 of the 46 notes could not be made to yield it; archive-engine is the only nothing-clears entry). Entering r16 the honest figure was 25; web-crawler + crawler-core GATED r16 take it to 27. 19 never proposed. Inherited pre-46-map history (browser-engine, http-engine, crawler-core-as-broad-crawler, …) deliberately does NOT count as covered."
-cursor: "r16 BUILD in flight (perfect/2026-08-12-r16, Lot CORE crawl 1-3 + Lot APP crawl 4-6); r17 PROPOSE: engine-contracts (opp 5) + one of remote-engine / maintenance-tooling / data-pipeline-catalog / hackernews-example / wasm-plugin-examples (all five hold r11 banked scout briefs — re-verify seeds, the decay rule has paid in r14, r15 AND r16). Do NOT re-mine web-crawler/crawler-core before r18 (cooldown) — but their two banked anchors are the strongest queued work in the vault: dataset-storage's retention-pin-is-dead-code, and crawler-core's MAX_FRONTIER lifetime cap."
-last_session: "[[sessions/2026-08-12-8]]"
+pool_target: per-dispatch (r17 cap 6 — gated, building)
+shipped_total: 134
+coverage: "30/46 map contexts covered. RULE (recomputable — compute it, never inherit it): a map context is COVERED when it has >=1 direction note pointing at it (`context: \"[[<name>]]\"`), OR an explicit nothing-clears-the-bar verdict, OR `last_proposed != never`. **Normalize CRLF before any frontmatter regex** — a naive /^---\\n([\\s\\S]*?)\\n---/ silently skips every CRLF file in this repo and scored coverage at 18/46 in r17, calling claude-engine/eu-grants/wasm-plugin-host never-proposed when each has 3 shipped directions. That trap, plus one genuinely stale note (job-worker said `last_proposed: never` against 5 shipped r4 directions — fixed r17), is why the figure drifted every round (r15 carried 24, r16 carried 26 then 'corrected' to 25, headline said 27). Recomputed honestly in r17: **28 entering**, +engine-contracts +maintenance-tooling gated r17 = **30**. 16 never proposed. Inherited pre-46-map history (browser-engine, http-engine, …) deliberately does NOT count as covered."
+cursor: "r17 BUILD in flight (perfect/2026-08-13, Lot E engine-contracts 1-3 + Lot M maintenance-tooling 4-6). r18 PROPOSE: pick 2 never-proposed, ties by opportunity — browser-engine (opp 4, BANKED ANCHOR from r17: `Browser::render` is the only required method of its trait and has ZERO CI coverage — all 4 tests in engine-browser/tests/render.rs are #[ignore]d and `just ci` omits --ignored; fix shape known, an offline harness over a local axum server, precedent engine-http/tests/profiles.rs) · remote-engine (opp 4, BANKED ANCHOR: RemoteEngine::fetch swallows EVERY peer failure into a warn! and silently falls back to LOCAL egress, and no field on HttpResponse/TierTrace says which node served a fetch — geo-distributed egress is the engine's whole product claim and it is unverifiable) · then http-engine / vcr-testing / page-monitor / connector-api-watch / plugin-runner (banked r14 anchor) / data-pipeline-catalog / us-federal-grants / us-state-grants / czech-procurement / trades-* / agentic-research / hackernews-example / wasm-plugin-examples. Do NOT re-mine engine-contracts or maintenance-tooling before r19 (cooldown); their banked anchors are recorded in the two context notes. Still the strongest queued work in the vault: dataset-storage's retention-pin-is-dead-code, and crawler-core's MAX_FRONTIER lifetime cap."
+last_session: "[[sessions/2026-08-13]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **6** · phase: **round 16 BUILD** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round).
+**State**: pool **6** · phase: **round 17 BUILD** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 30/46.**
 
-### Round-16 pool — 6 GATED (2026-08-12, gate: director-self-gated, SWEEP round)
+### Round-17 pool — 6 GATED (2026-08-13, gate: director-self-gated, SWEEP round)
+Two never-proposed contexts, both scouted "very thorough" end to end. **The two severest claims
+in each brief were Director-verified before gating, and that verification changed the slate
+twice** — once by refuting a scout's own #5 finding, once by promoting an r11 seed the earlier
+scout had filed as "lesser".
+
+engine-contracts, 3 accepted (Lot E):
+1. [[archive-provenance-visible]] — robustness · M (`engine.rs:78` declares
+   `FETCHED_VIA_HEADER` with the doc "provenance survives into records"; `FetchOutcome` has **no
+   headers field**, `outcome()` drops them on every tier, and both constants have **zero readers
+   workspace-wide**. A record served from a 2019 archive snapshot is byte-indistinguishable from
+   a live fetch — on the one tier whose entire purpose is trading freshness for availability)
+2. [[engine-conformance-suite]] — robustness · M (no shared battery runs over implementors —
+   both existing guard rails police *consumers*. Carries a sharp bug: `Browser::transact`'s
+   default returns retryable `Error::Browser` while `is_terminal_for_job` covers only
+   `BudgetExhausted | Transact`, so an unsupported flow burns a job's whole backoff ladder.
+   Plus `fetch_bytes` overridden by 1 of 4 `HttpClient`s with a live consumer depending on the
+   unpinned wiring, and `Dead::fetch_bytes` missing the panic override its sibling documents)
+3. [[onboarding-compiles]] — robustness · S (the agent-facing contract teaches
+   `ctx.engines.claude.research(...)` — `pub(crate)`, and banned outright by
+   `llm_chokepoint.rs:169`; wrong arity for `plugins.run`; 5 of 7 `ScrapeApp` methods. Survived
+   because `ONBOARDING.md` is the target of no `feature-doc-map.json` entry at all)
+
+maintenance-tooling, 3 accepted (Lot M):
+4. [[doc-sync-hook-fires]] — robustness · M (**the repo's entire same-session doc-drift defense
+   has never fired — measured, not inferred.** `check-doc-sync.mjs:84` breaks its backward scan
+   on the first `type:'user'` entry, and Claude Code records *tool results* in exactly that
+   shape. Director replay on this session's own transcript: 55 of 58 such entries are tool
+   results, 3 edits in the file, scan window saw **0**. Scout replay across all 31 project
+   transcripts: **1,128 edits, zero detections, every time.** Two of this round's other five
+   directions exist because docs drifted unchecked — this is the upstream cause)
+5. [[backfill-purges-ghosts]] — robustness · M (`list_all_datasets` filters
+   `WHERE removed_at IS NULL` while the `--app` path does not, so the documented full rebuild
+   cannot purge the fully-tombstoned datasets it exists to purge — and prints "complete".
+   `resolve_targets` has zero tests; a typo'd scope reports success; a silent 1M cap drops the
+   oldest rows and calls it done)
+6. [[doctor-sees-search]] — feature · M (the 2am store-integrity report runs seven checks and
+   **none about search**, while search has the repo's most manual recovery story: the index can
+   be empty and `just doctor` says `healthy: true`. Also kills `records_without_simhash`'s
+   never-clearing case, which makes the endpoint's documented zero-findings invariant
+   permanently unreachable)
+
+### Wave plan (round 17) — ONE branch `perfect/2026-08-13`, main checkout, 2 CONCURRENT lots
+`crates/core/src/` splits cleanly by filename (Lot E: engine/fetcher/app/testing/error ·
+Lot M: datasets/doctor) and so does `docs/features/` (fetching vs search+datasets). Only
+`crates/server/src/e2e/mod.rs` is shared — Class B, one-line appends each.
+**`scripts/docs/feature-doc-map.json` was made Class C (Director-only)**: both directions need a
+row in it, which is the one true collision in this partition, so neither lot gets it and the
+Director applies both rows at quiescence. Rust-touching lots = 2 ✓.
+
+### Round-16 pool — 6 GATED → ALL 6 SHIPPED (2026-08-12→13, landed `5513d61`, pushed)
+Landed by the r17 session: the r16 session died mid-Phase-B with four directions committed and
+reviewed (its review text uncommitted in the working tree), D5 wip'd, D6 unstarted. **D5 was
+finished, not broken** — a stray `#[tokio::test]` stacked above a sync `#[test]` was the entire
+"failing test" the builder died investigating. Gates: fmt clean · clippy no new warnings in
+touched files · `cargo test --workspace` **1650 passed / 0 failed** (r15 baseline 1602) ·
+`just smoke` **34/34** on merged master.
+
+### Round-16 pool — the original gate record (2026-08-12, gate: director-self-gated, SWEEP round)
 Two never-proposed contexts swept together on the core/app boundary the r15 prefetch brief
 predicted. Both scouts read their files end to end; the banked web-crawler brief was
 re-verified claim by claim (**6/6 CONFIRMED, four SHARPER** — the decay rule paid a third
@@ -380,7 +438,8 @@ old-map notes got `superseded_by:` aliases (broad-crawler, declarative-extractio
 fetch-engines, http-api-routes, job-worker-cron-scheduler, tiered-fetcher-politeness,
 us-grant-opportunities, us-trades-wages-tax-valuation) — history preserved, none retired.
 
-**Covered (24)**: dataset-storage r4 · job-worker r4 · source-resilience r5 ·
+**Covered (30 as of r17 — recomputed, see the `coverage:` frontmatter for the rule and the
+CRLF trap that made every previous count wrong)**: dataset-storage r4 · job-worker r4 · source-resilience r5 ·
 grants-unified-layer r5 · trigger-pipeline r6 · dataset-api r6 · source-provisioner r7 ·
 search-engine r7 · datahub-bridge r7 · webhook-delivery r8 · dataset-peering r8 ·
 app-runtime r9 · tiered-fetcher r9 · browser-transact r10 · api-surface r10 ·
@@ -389,18 +448,19 @@ archive-engine r11 (nothing-clears-the-bar verdict recorded) ·
 declarative-extractor r12 (3 shipped) · job-search-api r12 (3 shipped) ·
 claude-engine r13 (3 shipped) · cron-scheduler r13 (3 shipped) ·
 wasm-plugin-host r14 (3 shipped) · eu-grants r14 (3 shipped) ·
-**us-business-census r15 (3 gated)** · **czech-labor-market r15 (3 gated)**.
+us-business-census r15 (3 shipped) · czech-labor-market r15 (3 shipped) ·
+**web-crawler r16 (3 shipped)** · **crawler-core r16 (3 shipped)** ·
+**engine-contracts r17 (3 gated)** · **maintenance-tooling r17 (3 gated)**.
 
-**Never-proposed queue (20 after r15's two proposals, opportunity-ranked)**:
+**Never-proposed queue (16 after r17's two proposals, opportunity-ranked)**:
 | Opp | Contexts |
 |---:|---|
-| 6 | web-crawler (banked slate-grade brief, r15 prefetch scout — front of r16; gaps 2+4 CORE-side → pair with crawler-core) |
-| 5 | crawler-core · engine-contracts |
-| 4 | vcr-testing · http-engine · browser-engine · remote-engine (banked anchor) · us-federal-grants · us-state-grants · czech-procurement · trades-operator-economics · trades-pricing · agentic-research · connector-api-watch · page-monitor · maintenance-tooling (banked CONFIRMED anchor) · plugin-runner (banked anchor, r14) |
+| 4 | **browser-engine** (BANKED ANCHOR r17: `Browser::render` — the only *required* method of the trait — has ZERO CI coverage; all 4 tests `#[ignore]`d, `just ci` omits `--ignored`. Fix shape known: offline harness over a local axum server, precedent `engine-http/tests/profiles.rs`) · **remote-engine** (BANKED ANCHOR r17: every peer failure is swallowed into a `warn!` and silently degrades to LOCAL egress; nothing on `HttpResponse`/`TierTrace` names the serving node, so the engine's whole product claim is unverifiable) · vcr-testing · http-engine · us-federal-grants · us-state-grants · czech-procurement · trades-operator-economics · trades-pricing · agentic-research · connector-api-watch · page-monitor · plugin-runner (banked anchor, r14) |
 | 3 | wasm-plugin-examples (banked anchor) · data-pipeline-catalog (banked anchor) |
 | 2 | hackernews-example (banked anchor) |
 
-(r15 in flight: us-business-census + czech-labor-market left this queue 2026-08-12.)
+(r16 took web-crawler + crawler-core off this queue; r17 took engine-contracts +
+maintenance-tooling. Both r17 contexts are on cooldown until round 19.)
 
 ## Queue — round 4 (re-scored 2026-08-03 over the 46-context map)
 

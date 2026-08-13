@@ -3,12 +3,12 @@ slug: crawl-truncation-visible
 type: perfect/direction
 context: "[[web-crawler]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-12
 accepted: 2026-08-12
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 3151f35
 ---
 ## What & why
 **A truncated crawl is byte-identical to a complete one in the API response**, and the
