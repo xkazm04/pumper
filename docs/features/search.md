@@ -85,6 +85,18 @@ cargo run -p pumper-server --bin search-backfill -- --all          # every datas
 
 A scope is required so a broad rebuild is always deliberate. The backfill uses the same `SearchDoc::from_dataset_record` builder as the live path, so ids are stable and it upserts rather than duplicates — safe against a partially-populated index. **Tombstoned rows are purged, not skipped**: each removed record's doc id is deleted from the index, because it may already be indexed (indexed while live, then removed during a window the live delete path missed) — the stale-hit state a rebuild exists to repair. The completion line reports both counts: `N record(s) indexed, M tombstoned record(s) purged`. Note that backfilling a dataset no app names in `index_datasets` makes it searchable but nothing keeps it current.
 
+**What each scope covers.** All three resolve targets over **every** stored record, tombstoned rows included — a dataset whose records are *all* tombstoned is the state a purge exists to repair, so it must be reachable. (`--all` previously resolved through the live-only dataset listing, which excluded exactly that dataset: its ghost documents survived every "full" rebuild while the tool reported `0 tombstoned record(s) purged` and exited 0.)
+
+| scope | targets |
+| --- | --- |
+| `--app X --dataset Y` | that one dataset, live or fully tombstoned |
+| `--app X` | every dataset `X` has ever written |
+| `--all` | every `(app, dataset)` pair in `records` |
+
+**A scope that matches nothing fails.** On every path, including `--app X --dataset Y`, which used to be taken on faith: a typo like `--dataset unifed` read zero rows and printed the same cheerful completion line with exit 0 as a real rebuild. It now exits non-zero naming the scope that matched nothing. `GET /datasets/{app}` lists an app's datasets if you need to check the spelling.
+
+**No read ceiling.** The record read is keyset-paged (500/page) rather than a single `LIMIT 1000000`, so a dataset past a million rows no longer has its *oldest* records silently dropped from the rebuild — and memory stays flat at one page regardless of dataset size.
+
 ## Saved searches (standing alerts)
 
 `saved_searches` + `saved_search_seen` tables. `GET/POST /searches`, `DELETE /searches/{id}`, `POST /searches/{id}/enabled`. Body: `{query, app?, dataset?, url, secret?, materialize?}` (400 on an empty `query` or a non-`http(s)` `url`). `GET /searches` is **dual-mode**: bare `{searches: [...]}` by default, or `{items, next_cursor}` when a `cursor` param is present (even empty) — an opaque keyset cursor. `limit` is clamped 1–500 in **both** modes, so an uncursored list can never stream the whole table. After each job's results are indexed, the worker runs enabled saved searches (scoped by their filters) and webhooks a **`search.matched`** event containing only never-before-seen matches — `INSERT OR IGNORE` claim on `(search_id, doc_id)` guarantees exactly-once alerting, including when several source apps publish into one virtual app and each of their runs re-evaluates the same search. **App scoping:** a search with `app` unset runs on every job; a search with `app` set runs when that app is among the run's indexed namespaces — `job.app` plus every `index_datasets` app (see [`index_datasets`](#indexing-a-dataset-from-a-compact-result-index_datasets)). A search that is skipped, matches nothing, or matches only already-alerted docs says so at `debug` rather than passing silently. Deliveries flow through the logged webhook path (DLQ + replay — see [events-webhooks.md](events-webhooks.md)).

@@ -1918,3 +1918,54 @@ async fn batched_lookup_join_matches_the_per_record_join() {
         );
     }
 }
+
+/// The anti-pattern: one `list_all_datasets()` serving both "what can I serve"
+/// and "what must I clean up". Its SQL is `WHERE removed_at IS NULL`, so a
+/// dataset whose every record is tombstoned vanished from it — and that dataset
+/// is exactly the one `search-backfill --all` exists to purge ghosts from. The
+/// live-only view is still correct for the watch registry and the DataHub poll,
+/// so the fix is a second, explicit method rather than a changed contract.
+#[tokio::test]
+async fn a_fully_tombstoned_dataset_is_not_invisible_to_the_full_listing() {
+    let store = fresh_db("datasets-list-all-tombstoned").await;
+    let ds = Datasets::new(store.storage.pool());
+
+    ds.upsert("retired", "old", "a", &json!({ "t": 1 }))
+        .await
+        .unwrap();
+    ds.upsert("grants", "unified", "x", &json!({ "t": 2 }))
+        .await
+        .unwrap();
+
+    // Tombstone every record of `retired/old` — a non-empty snapshot that names
+    // none of its keys is what the removal path acts on.
+    ds.detect_removed("retired", "old", &["__absent__".to_string()], ok_guard())
+        .await
+        .unwrap();
+    assert!(
+        ds.list("retired", "old", 10)
+            .await
+            .unwrap()
+            .iter()
+            .all(|r| r.removed_at.is_some()),
+        "precondition: the dataset must be fully tombstoned"
+    );
+
+    let live = ds.list_all_datasets().await.unwrap();
+    assert_eq!(
+        live,
+        vec![("grants".to_string(), "unified".to_string())],
+        "list_all_datasets keeps its live-only contract for the watch registry \
+         and the DataHub poll"
+    );
+
+    let all = ds.list_all_datasets_including_removed().await.unwrap();
+    assert_eq!(
+        all,
+        vec![
+            ("grants".to_string(), "unified".to_string()),
+            ("retired".to_string(), "old".to_string()),
+        ],
+        "a fully tombstoned dataset must still be reachable for cleanup"
+    );
+}

@@ -1847,8 +1847,14 @@ impl Datasets {
         Ok(count)
     }
 
-    /// Distinct `(app, dataset)` pairs that have at least one live record — the
-    /// set the search-backfill walks to rebuild the index from stored records.
+    /// Distinct `(app, dataset)` pairs that have at least one **live** record —
+    /// the "what is currently servable" view. Used by the watch registry
+    /// (`GET /watches`) and the DataHub governance poll, both of which reason
+    /// about datasets that still have something to serve.
+    ///
+    /// A dataset whose every record is tombstoned is deliberately absent. If you
+    /// are cleaning up after such a dataset rather than serving it, you want
+    /// [`list_all_datasets_including_removed`](Self::list_all_datasets_including_removed).
     pub async fn list_all_datasets(&self) -> Result<Vec<(String, String)>> {
         let rows: Vec<(String, String)> = sqlx::query_as(
             "SELECT DISTINCT app, dataset FROM records WHERE removed_at IS NULL \
@@ -1856,6 +1862,25 @@ impl Datasets {
         )
         .fetch_all(&self.pool)
         .await?;
+        Ok(rows)
+    }
+
+    /// Distinct `(app, dataset)` pairs that have at least one record of any kind,
+    /// tombstoned rows included — the set a full search rebuild must walk.
+    ///
+    /// The distinction is load-bearing, not cosmetic: `search-backfill --all`
+    /// exists to purge documents whose records are gone, and a dataset that is
+    /// *entirely* tombstoned is precisely the state that needs purging. Resolving
+    /// its targets through [`list_all_datasets`](Self::list_all_datasets) made
+    /// that dataset invisible to the one tool that could repair it, so its stale
+    /// documents kept answering `/search` forever while the rebuild reported
+    /// success. Matches the (unfiltered) shape of [`datasets`](Self::datasets),
+    /// which is what the `--app` scope has always used.
+    pub async fn list_all_datasets_including_removed(&self) -> Result<Vec<(String, String)>> {
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT DISTINCT app, dataset FROM records ORDER BY app, dataset")
+                .fetch_all(&self.pool)
+                .await?;
         Ok(rows)
     }
 
