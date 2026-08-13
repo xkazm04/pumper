@@ -20,7 +20,9 @@
     },
     {
       "doc": "docs/features/observability.md",
-      "sourceGlobs": ["crates/server/src/main.rs"]
+      "sourceGlobs": [
+        "crates/server/src/main.rs"
+      ]
     },
     {
       "doc": "docs/features/datasets.md",
@@ -31,7 +33,8 @@
         "crates/core/src/simhash.rs",
         "crates/server/src/routes/doctor.rs",
         "crates/server/src/routes/retention.rs",
-        "crates/core/migrations/**"
+        "crates/core/migrations/**",
+        "crates/server/src/bin/reindex.rs"
       ]
     },
     {
@@ -49,7 +52,10 @@
     },
     {
       "doc": "docs/features/crawling.md",
-      "sourceGlobs": ["crates/core/src/crawl.rs", "crates/apps/crawl/**"]
+      "sourceGlobs": [
+        "crates/core/src/crawl.rs",
+        "crates/apps/crawl/**"
+      ]
     },
     {
       "doc": "docs/features/extraction.md",
@@ -74,7 +80,10 @@
     },
     {
       "doc": "docs/features/events-webhooks.md",
-      "sourceGlobs": ["crates/server/src/webhook.rs", "crates/server/src/events.rs"]
+      "sourceGlobs": [
+        "crates/server/src/webhook.rs",
+        "crates/server/src/events.rs"
+      ]
     },
     {
       "doc": "docs/features/triggers.md",
@@ -93,7 +102,9 @@
     },
     {
       "doc": "docs/features/http-api.md",
-      "sourceGlobs": ["crates/server/src/routes/**"]
+      "sourceGlobs": [
+        "crates/server/src/routes/**"
+      ]
     },
     {
       "doc": "docs/features/catalog.md",
@@ -105,23 +116,42 @@
     },
     {
       "doc": "docs/features/resilient-extraction.md",
-      "sourceGlobs": ["crates/core/src/resilience/**"]
+      "sourceGlobs": [
+        "crates/core/src/resilience/**"
+      ]
     },
     {
       "doc": "docs/features/apps.md",
-      "sourceGlobs": ["crates/apps/**"]
+      "sourceGlobs": [
+        "crates/apps/**"
+      ]
     },
     {
       "doc": "docs/features/datahub.md",
-      "sourceGlobs": ["crates/server/src/datahub.rs"]
+      "sourceGlobs": [
+        "crates/server/src/datahub.rs"
+      ]
     },
     {
       "doc": "docs/features/peering.md",
-      "sourceGlobs": ["crates/apps/peer/**"]
+      "sourceGlobs": [
+        "crates/apps/peer/**"
+      ]
     },
     {
       "doc": "docs/features/sdk-typescript.md",
-      "sourceGlobs": ["clients/typescript/src/**"]
+      "sourceGlobs": [
+        "clients/typescript/src/**"
+      ]
+    },
+    {
+      "doc": "ONBOARDING.md",
+      "sourceGlobs": [
+        "crates/core/src/engine.rs",
+        "crates/core/src/app.rs",
+        "crates/core/src/plugin.rs",
+        "crates/server/src/registry.rs"
+      ]
     }
   ]
 }
