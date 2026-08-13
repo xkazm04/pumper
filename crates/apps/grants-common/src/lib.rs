@@ -1798,7 +1798,15 @@ const AMBIGUOUS_DEADLINE_UTC_HOUR: u32 = 12;
 ///   cost of at most one extra day of a genuinely-expired row.
 ///
 /// `None` when neither field parses — an unknown deadline is never a lapsed one.
-fn deadline_end_utc(
+///
+/// **Public on purpose.** Every surface that decides whether a grant is still
+/// claimable must decide it at THIS instant: the corpus sweep
+/// ([`is_past_due_open`]), the batch sweep ([`past_due_in_batch`]) and — since
+/// they were found disagreeing — the per-source closing-soon digests. A caller
+/// that re-derives "is it over?" from `Utc::now().date_naive()` reopens exactly
+/// the timezone bug this function exists to close, in a surface that is then
+/// ~12 hours out of step with `grants/unified`.
+pub fn deadline_end_utc(
     close_date: Option<&str>,
     close_at: Option<&str>,
 ) -> Option<chrono::DateTime<chrono::Utc>> {
@@ -2473,7 +2481,10 @@ mod tests {
         // corpus of agencies that published no figures.
         assert!(!detail_join_truncated(0, 10));
         assert!(!detail_join_truncated(9, 10));
-        assert!(detail_join_truncated(10, 10), "a read AT its cap is a window");
+        assert!(
+            detail_join_truncated(10, 10),
+            "a read AT its cap is a window"
+        );
         assert!(detail_join_truncated(11, 10));
 
         let whole = DetailJoin {

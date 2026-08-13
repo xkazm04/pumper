@@ -67,12 +67,18 @@
 //! [`REPLAY_BYPASS_APPS`]:
 //!
 //! - [`ReplayFidelity::Unreplayable`] — a `replay_of` job is refused before
-//!   anything runs ([`refuse_replay`]). The alternative was what shipped: a
-//!   live run under a `vcr_replay_of` stamp claiming it came from recorded
-//!   bytes.
+//!   anything runs ([`refuse_replay`]). What used to stand in its way was an
+//!   *accident*: an app that records nothing leaves no cassette file, so
+//!   [`Cassette::load`] failed with "has no cassette … was it enqueued with
+//!   `record: true`?" — which blames the operator for something the app makes
+//!   impossible, and which stops being true the moment a file exists at that
+//!   path.
 //! - [`ReplayFidelity::Partial`] — the app mixes both, so the replay is real
-//!   for the chokepointed part and the result says so
-//!   ([`replay_stamp`] adds `vcr_replay_fidelity` + `vcr_replay_bypass`).
+//!   for the chokepointed part and the result says so ([`replay_stamp`] adds
+//!   `vcr_replay_fidelity` + `vcr_replay_bypass`). This is the grade where the
+//!   defect was directly reachable: the cassette served the recorded half while
+//!   the raw half ran LIVE, under a bare `vcr_replay_of` stamp claiming the
+//!   whole result came from recorded bytes.
 //!
 //! ## Documented limitations
 //! - The AppContext seam sits **above** header granularity: a fetch returns a

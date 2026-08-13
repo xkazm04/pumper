@@ -185,7 +185,10 @@ async fn a_real_detail_change_is_still_reported_as_changed() {
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(stored.data["requirements"]["award_ceiling"], json!(900_000.0));
+    assert_eq!(
+        stored.data["requirements"]["award_ceiling"],
+        json!(900_000.0)
+    );
 }
 
 /// The money join reads the shared detail corpus with `list_filtered`

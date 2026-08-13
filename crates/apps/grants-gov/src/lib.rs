@@ -26,13 +26,20 @@
 //! `hitCount:0` answer to an unfiltered query while opportunities are already
 //! stored is drift rather than a clean sweep.
 //!
-//! Detail harvest (`harvestDetails`, default **ON** since 2026-08-04): for
-//! opportunities the sync just reported NEW or CHANGED (never the whole
-//! corpus), fetch the full announcement record and store it into
-//! `grants/opportunity_details` keyed by opportunity id, with a structured
-//! `requirements` block extracted from the synopsis fields and the NOFO
-//! attachment manifest (URLs + metadata only — v1 does NO PDF fetching or
-//! parsing; a later pass can pull the documents).
+//! Detail harvest (`harvestDetails`, default **ON** since 2026-08-04 — the one
+//! statement of that default is [`HARVEST_DETAILS_DEFAULT`], which both the
+//! absent-param path and `default_params` read): for opportunities the sync just
+//! reported NEW or CHANGED (never the whole corpus), fetch the full announcement
+//! record and store it into `grants/opportunity_details` keyed by opportunity id,
+//! with a structured `requirements` block extracted from the synopsis fields and
+//! the NOFO attachment manifest (URLs + metadata only — v1 does NO PDF fetching
+//! or parsing; a later pass can pull the documents).
+//!
+//! **Absent is not empty**, in the detail record as well as in the money fields:
+//! [`applicant_types`] and [`attachment_manifest`] answer `Null` when the source
+//! did not publish the field at all, and `[]` only when it published an empty
+//! one. A consumer can therefore tell "this NOFO lists no eligible applicant
+//! types" from "`applicantTypes` was renamed".
 //!
 //! The stage is **non-fatal to the listing sync but never silent**: the daily
 //! federal sync's primary obligation is the listing, so a fetchOpportunity
@@ -75,6 +82,12 @@
 //! recognizable detail object, the run FAILS loudly — never a silent empty
 //! detail corpus. Money fields follow the shared honest-Null rule ($0, prose,
 //! absent → Null, never a fabricated zero).
+
+//! The `closing_soon` digest judges "is this still claimable?" with
+//! [`grants_common::deadline_end_utc`] — the SAME instant the unified sweep and
+//! `GET /grants/closing-soon` use — so the three surfaces cannot disagree about
+//! a grant that is past its printed date but not yet past its
+//! anywhere-on-Earth deadline.
 
 use std::collections::{HashMap, HashSet};
 
@@ -192,21 +205,42 @@ impl ScrapeApp for GrantsGov {
                     }),
                 },
             ],
+            // Pinned against a real run by
+            // `tests/result_contract.rs::the_published_output_shape_is_what_the_run_emits`
+            // — the declaration and the `json!` block must agree in BOTH
+            // directions. It previously declared `hit_count` (emitted:
+            // `hitCount`) and `removed?` (emitted: never, and structurally
+            // unemittable — see `OPPORTUNITIES_DATASET`'s upsert-only write),
+            // while omitting twelve keys the run does emit.
             output_shape: Some(
-                "{hit_count, fetched, new, changed, unchanged, sweep, truncated, removed?, \
-                 amountsFilled, detailCorpus: {read, truncated}, \
-                 detailsFailed, details?: {harvested, deltaTotal, capped, attempted, failed, \
-                 abortedAfterConsecutiveFailures, errors}} — Search2 sync tallies over the \
-                 `opportunities` dataset (keyed by opportunity id); detail harvest writes \
-                 grants/opportunity_details; `amountsFilled` counts unified rows that got award \
-                 amounts joined in from that detail corpus (Search2 itself publishes none); \
+                "{source, oppStatuses, hitCount, fetched, pages, new, changed, unchanged, \
+                 digestDays, closingSoonCount, closingSoon[], amountsFilled, \
+                 detailCorpus: {read, truncated}, detailsFailed, sweep, truncated, \
+                 details: {harvested, deltaTotal, capped, resumedFrom, attempted, failed, \
+                 abortedAfterConsecutiveFailures, errors[]}, \
+                 unified: {new, changed, events, dataset, trust, sourceState}, swept, \
+                 crossSourceDups, recurrenceLinks, \
+                 corpusPass: {ran, cycle, batchSwept, corpusSwept}, warnings[], \
+                 index_datasets[]} — Search2 sync tallies over the `opportunities` dataset \
+                 (keyed by opportunity id). `sweep` names how the walk ended \
+                 (`complete` | `capped` | `short_page` | `unknown_total`) and `truncated` is \
+                 its boolean projection; every non-complete arm also lands in `warnings[]`. \
+                 `closingSoon[]` is the FEDERAL-only deadline digest over this run's own hits \
+                 (`digestDays`, default 14), judged at the same anywhere-on-Earth instant the \
+                 unified sweep uses; `GET /grants/closing-soon` is the cross-source view. \
+                 The detail harvest writes grants/opportunity_details and reports `details` \
+                 (**absent when `harvestDetails` is false**); `amountsFilled` counts unified \
+                 rows that got award amounts joined in from that detail corpus (Search2 itself \
+                 publishes none) and `detailCorpus` says how much of it the join read; \
                  `detailsFailed` counts detail-stage failures, which degrade the enrichment \
-                 without failing the listing sync. The cross-source tail also reports \
-                 `crossSourceDups`, `recurrenceLinks` and \
-                 `corpusPass: {ran, cycle, batchSwept, corpusSwept}`: the corpus-wide relation \
-                 pass (sweep + duplicate/recurrence links) runs once per UTC-day cycle on \
-                 whichever grant source gets there first, so a run that did not own it reports \
-                 both link counts as null",
+                 without failing the listing sync. There is deliberately no `removed` key: the \
+                 listing is written with `upsert_many_with_provenance`, which never tombstones. \
+                 The cross-source tail reports `unified`, `swept`, `crossSourceDups`, \
+                 `recurrenceLinks` and `corpusPass`: the corpus-wide relation pass (sweep + \
+                 duplicate/recurrence links) runs once per UTC-day cycle on whichever grant \
+                 source gets there first, so a run that did not own it reports both link counts \
+                 as null. `index_datasets[]` is **withheld entirely** when this source's \
+                 extraction health says its rows must not reach the search index",
             ),
             cost_class: CostClass::Free,
         }
@@ -387,14 +421,11 @@ impl ScrapeApp for GrantsGov {
             )
             .await?;
 
-        // NOFO detail harvest (default OFF): only the delta this sync surfaced —
-        // new + changed keys — ever triggers a fetchOpportunity call, capped per
-        // run, so the daily sweep stays tens of calls, never 25k.
-        let harvest_details = ctx
-            .params
-            .get("harvestDetails")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
+        // NOFO detail harvest (default ON — see `HARVEST_DETAILS_DEFAULT`): only
+        // the delta this sync surfaced — new + changed keys — ever triggers a
+        // fetchOpportunity call, capped per run, so the daily sweep stays tens
+        // of calls, never 25k.
+        let harvest_details = harvest_details_enabled(&ctx.params);
         let max_details = ctx
             .params
             .get("maxDetailsPerRun")
@@ -553,12 +584,19 @@ impl ScrapeApp for GrantsGov {
             .and_then(Value::as_u64)
             .unwrap_or(14)
             .clamp(1, 365) as i64;
-        let closing_soon = closing_soon_digest(&hits, digest_days);
+        let closing_soon = closing_soon_digest(&hits, digest_days, chrono::Utc::now());
         ctx.save_artifact(
             "closing_soon.json",
             &serde_json::to_vec_pretty(&closing_soon)?,
         )
         .await?;
+        // The digest's status filter refuses to read an ABSENT `oppStatus` as
+        // `posted`, which is only safe while the blind case is loud: a renamed
+        // status field would otherwise turn the digest silently empty, and a
+        // quiet fortnight looks identical.
+        if let Some(msg) = digest_status_drift(&hits) {
+            degradation_warnings.push(msg);
+        }
 
         let mut out = json!({
             "source": "grants.gov/search2",
@@ -908,35 +946,128 @@ fn detail_stage_degradation(
     ))
 }
 
+/// The default for [`harvest_details_enabled`] when the param is absent.
+///
+/// **Stated once.** The crate used to state this default three times and
+/// contradict itself twice: the module header and the manifest both said ON,
+/// while the harvest site said `// default OFF` above an `unwrap_or(false)`.
+/// The runtime default was therefore *false* and only `default_params` supplied
+/// true, so a caller who built params by hand — the documented way to narrow a
+/// pull — silently got a different pipeline from the one the scheduler runs,
+/// with no warning and no field in the result to notice it by.
+///
+/// ON is the correct value: `grants/opportunity_details` is the only source of
+/// federal award amounts in the product, the stage is delta-only, capped and
+/// non-fatal, and the scheduled run has harvested since 2026-08-04.
+const HARVEST_DETAILS_DEFAULT: bool = true;
+
+/// Whether this run harvests NOFO details. The absent-param answer is
+/// [`HARVEST_DETAILS_DEFAULT`], i.e. exactly what the scheduler's
+/// `default_params` asks for.
+fn harvest_details_enabled(params: &Value) -> bool {
+    params
+        .get("harvestDetails")
+        .and_then(Value::as_bool)
+        .unwrap_or(HARVEST_DETAILS_DEFAULT)
+}
+
+/// Whether a Search2 hit is a POSTED opportunity.
+///
+/// The anti-pattern: `is_none_or(|s| s == "posted")` read a hit carrying **no**
+/// `oppStatus` as posted. The pinned Search2 contract says every hit carries one
+/// (`id, number, title, agencyCode, agency, openDate, closeDate, oppStatus,
+/// docType, cfdaList`), so an absent status is drift — and under a wholesale
+/// rename the "posted-only" digest would have published the entire *forecasted*
+/// corpus as closing-soon alerts. Absence is not a posting; it is handled by
+/// [`digest_status_drift`].
+fn is_posted_hit(hit: &Value) -> bool {
+    hit.get("oppStatus")
+        .and_then(Value::as_str)
+        .is_some_and(|s| s.trim().eq_ignore_ascii_case("posted"))
+}
+
+/// The warning for a digest whose status filter has gone blind: hits were served
+/// and not one of them carries an `oppStatus`.
+///
+/// Refusing to read an absent status as `posted` is only safe while the blind
+/// case is LOUD — otherwise a renamed field turns the digest silently empty, and
+/// a quiet fortnight of deadlines looks exactly the same.
+fn digest_status_drift(hits: &[Value]) -> Option<String> {
+    let blind = !hits.is_empty()
+        && hits
+            .iter()
+            .all(|h| h.get("oppStatus").and_then(Value::as_str).is_none());
+    blind.then(|| {
+        format!(
+            "closing-soon digest is blind: none of the {} hits carries an `oppStatus`, so the \
+             posted-only filter matched nothing. The listing sync is unaffected; treat the \
+             empty digest as a renamed status field, not as a fortnight with no deadlines",
+            hits.len()
+        )
+    })
+}
+
+/// Days left for a hit that belongs in the closing-soon digest, or `None` when
+/// it does not.
+///
+/// The anti-pattern this closes: the digest filtered on
+/// `chrono::Utc::now().date_naive()` while `is_past_due_open` (the unified
+/// sweep) and `GET /grants/closing-soon` judge the SAME row against
+/// [`grants_common::deadline_end_utc`] — `D+1T12:00:00Z`, the moment the printed
+/// date is over anywhere on Earth. For the ~12 hours between those two instants
+/// a grant was open in `grants/unified` and on the cross-source closing-soon
+/// view while being absent from this job's own digest. `grants-common` names
+/// that exact class as a bug it already fixed for the sweep; the digest was
+/// never brought along.
+///
+/// `days_left` is floored at 0: a grant in the anywhere-on-Earth tail has a
+/// printed date in the past and a deadline that has not lapsed, so it is
+/// claimable TODAY — which is what an alert consumer acts on. The raw
+/// `closeDate` travels in the same entry, so nothing is hidden.
+fn digest_days_left(
+    close_raw: &str,
+    window_days: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Option<i64> {
+    // Search2 publishes `MM/DD/YYYY` with no timezone, so `close_at` is always
+    // absent here and this always takes the conservative anywhere-on-Earth arm —
+    // the SAME arm the sweep takes for these rows.
+    if now > grants_common::deadline_end_utc(Some(close_raw), None)? {
+        return None;
+    }
+    let close = grants_common::parse_date(close_raw)?;
+    let days_left = (close - now.date_naive()).num_days().max(0);
+    (days_left <= window_days).then_some(days_left)
+}
+
 /// Posted opportunities closing within `days` days, sorted soonest-first.
 /// Each entry keeps just what an alert needs: id, number, title, agency,
-/// close date, and days left.
-fn closing_soon_digest(hits: &[Value], days: i64) -> Vec<Value> {
-    let today = chrono::Utc::now().date_naive();
+/// close date, and days left. `now` is a parameter so the two boundary classes
+/// this digest gets wrong when it drifts — the anywhere-on-Earth tail and the
+/// far edge of the window — are testable without waiting for a clock.
+fn closing_soon_digest(
+    hits: &[Value],
+    days: i64,
+    now: chrono::DateTime<chrono::Utc>,
+) -> Vec<Value> {
     let mut digest: Vec<(i64, Value)> = hits
         .iter()
-        .filter(|h| {
-            h.get("oppStatus")
-                .and_then(Value::as_str)
-                .is_none_or(|s| s.eq_ignore_ascii_case("posted"))
-        })
+        .filter(|h| is_posted_hit(h))
         .filter_map(|h| {
-            let close = h.get("closeDate").and_then(Value::as_str)?;
-            let close = grants_common::parse_date(close)?;
-            let days_left = (close - today).num_days();
-            (0..=days).contains(&days_left).then(|| {
-                (
-                    days_left,
-                    json!({
-                        "id": h.get("id"),
-                        "number": h.get("number"),
-                        "title": h.get("title"),
-                        "agency": h.get("agency").or_else(|| h.get("agencyCode")),
-                        "closeDate": close.to_string(),
-                        "daysLeft": days_left,
-                    }),
-                )
-            })
+            let close_raw = h.get("closeDate").and_then(Value::as_str)?;
+            let days_left = digest_days_left(close_raw, days, now)?;
+            let close = grants_common::parse_date(close_raw)?;
+            Some((
+                days_left,
+                json!({
+                    "id": h.get("id"),
+                    "number": h.get("number"),
+                    "title": h.get("title"),
+                    "agency": h.get("agency").or_else(|| h.get("agencyCode")),
+                    "closeDate": close.to_string(),
+                    "daysLeft": days_left,
+                }),
+            ))
         })
         .collect();
     digest.sort_by_key(|(days_left, _)| *days_left);
@@ -1273,10 +1404,20 @@ fn count_value(v: Option<&Value>) -> Value {
 
 /// applicantTypes[] entries are objects with a `description` (or `value`) or
 /// bare strings → a flat array of non-empty strings.
+///
+/// **Absent is not empty.** A payload that carries no `applicantTypes` (or a
+/// drifted non-array one) yields `Null`, exactly as the money fields in the same
+/// synopsis block do via `money_scalar`. `[]` is reserved for the agency
+/// genuinely publishing an empty list, so a consumer can tell "this NOFO lists
+/// no eligible applicant types" from "the field was renamed" — which the old
+/// `_ => Vec::new()` arm made indistinguishable, on the only dataset that
+/// carries federal eligibility at all.
 fn applicant_types(v: Option<&Value>) -> Value {
-    let items: Vec<Value> = match v {
-        Some(Value::Array(a)) => a
-            .iter()
+    let Some(Value::Array(a)) = v else {
+        return Value::Null;
+    };
+    Value::Array(
+        a.iter()
             .filter_map(|e| match e {
                 Value::String(s) => Some(s.trim().to_string()),
                 Value::Object(_) => e
@@ -1288,10 +1429,8 @@ fn applicant_types(v: Option<&Value>) -> Value {
             })
             .filter(|s| !s.is_empty())
             .map(Value::String)
-            .collect(),
-        _ => Vec::new(),
-    };
-    Value::Array(items)
+            .collect::<Vec<Value>>(),
+    )
 }
 
 /// Flattens the NOFO attachment manifest: `synopsisAttachmentFolders[]` (each
@@ -1299,7 +1438,21 @@ fn applicant_types(v: Option<&Value>) -> Value {
 /// Every entry keeps id, file name/description, mime type, size, its folder,
 /// and the ASSUMED download URL (constructed only when an id exists) — enough
 /// for a later PDF pass to fetch, nothing fetched now.
-fn attachment_manifest(detail: &Value) -> Vec<Value> {
+///
+/// **Absent is not empty**, same rule as [`applicant_types`]: when the payload
+/// carries NEITHER attachment block the answer is `Null`, because "this
+/// announcement published no documents" and "the attachment block we only ever
+/// ASSUMED was renamed" are different facts — and the whole point of storing the
+/// manifest is that a later pass can fetch those documents. `[]` means the block
+/// was there and held nothing.
+fn attachment_manifest(detail: &Value) -> Value {
+    let folders = detail
+        .get("synopsisAttachmentFolders")
+        .and_then(Value::as_array);
+    let flat = detail.get("attachments").and_then(Value::as_array);
+    if folders.is_none() && flat.is_none() {
+        return Value::Null;
+    }
     let mut out = Vec::new();
     let mut push = |att: &Value, folder: Option<&str>| {
         let id = att.get("id").cloned().unwrap_or(Value::Null);
@@ -1318,28 +1471,21 @@ fn attachment_manifest(detail: &Value) -> Vec<Value> {
             "download_url": download_url,
         }));
     };
-    if let Some(folders) = detail
-        .get("synopsisAttachmentFolders")
-        .and_then(Value::as_array)
-    {
-        for folder in folders {
-            let name = folder
-                .get("folderName")
-                .or_else(|| folder.get("folderType"))
-                .and_then(Value::as_str);
-            if let Some(atts) = folder.get("synopsisAttachments").and_then(Value::as_array) {
-                for att in atts {
-                    push(att, name);
-                }
+    for folder in folders.into_iter().flatten() {
+        let name = folder
+            .get("folderName")
+            .or_else(|| folder.get("folderType"))
+            .and_then(Value::as_str);
+        if let Some(atts) = folder.get("synopsisAttachments").and_then(Value::as_array) {
+            for att in atts {
+                push(att, name);
             }
         }
     }
-    if let Some(flat) = detail.get("attachments").and_then(Value::as_array) {
-        for att in flat {
-            push(att, None);
-        }
+    for att in flat.into_iter().flatten() {
+        push(att, None);
     }
-    out
+    Value::Array(out)
 }
 
 /// A POST request carrying a JSON body to a grants.gov API endpoint.
@@ -1369,26 +1515,36 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A UTC instant on a fixed day, so the digest's two boundary classes are
+    /// testable without waiting for a clock.
+    fn at(date: &str, hour: u32) -> chrono::DateTime<chrono::Utc> {
+        use chrono::TimeZone;
+        chrono::Utc.from_utc_datetime(
+            &chrono::NaiveDate::parse_from_str(date, "%Y-%m-%d")
+                .unwrap()
+                .and_hms_opt(hour, 0, 0)
+                .unwrap(),
+        )
+    }
+
     #[test]
     fn digest_keeps_only_posted_opps_closing_within_window() {
-        let today = chrono::Utc::now().date_naive();
-        let soon = (today + chrono::Duration::days(3))
-            .format("%m/%d/%Y")
-            .to_string();
-        let far = (today + chrono::Duration::days(90))
-            .format("%m/%d/%Y")
-            .to_string();
-        let past = (today - chrono::Duration::days(1))
-            .format("%m/%d/%Y")
-            .to_string();
+        let now = at("2026-08-13", 9);
+        let today = now.date_naive();
+        let fmt = |n: i64| {
+            (today + chrono::Duration::days(n))
+                .format("%m/%d/%Y")
+                .to_string()
+        };
+        let (soon, far, long_past) = (fmt(3), fmt(90), fmt(-5));
         let hits = vec![
             json!({ "id": "1", "title": "in window", "oppStatus": "posted", "closeDate": soon }),
             json!({ "id": "2", "title": "too far", "oppStatus": "posted", "closeDate": far }),
-            json!({ "id": "3", "title": "already closed", "oppStatus": "posted", "closeDate": past }),
+            json!({ "id": "3", "title": "lapsed", "oppStatus": "posted", "closeDate": long_past }),
             json!({ "id": "4", "title": "forecasted", "oppStatus": "forecasted", "closeDate": soon }),
             json!({ "id": "5", "title": "no close date", "oppStatus": "posted" }),
         ];
-        let digest = closing_soon_digest(&hits, 14);
+        let digest = closing_soon_digest(&hits, 14, now);
         assert_eq!(digest.len(), 1);
         assert_eq!(digest[0]["id"], "1");
         assert_eq!(digest[0]["daysLeft"], 3);
@@ -1396,7 +1552,8 @@ mod tests {
 
     #[test]
     fn digest_sorts_soonest_first_and_tolerates_iso_dates() {
-        let today = chrono::Utc::now().date_naive();
+        let now = at("2026-08-13", 9);
+        let today = now.date_naive();
         let d = |n: i64, iso: bool| {
             let date = today + chrono::Duration::days(n);
             if iso {
@@ -1406,13 +1563,96 @@ mod tests {
             }
         };
         let hits = vec![
-            json!({ "id": "a", "closeDate": d(10, false) }),
-            json!({ "id": "b", "closeDate": d(2, true) }),
-            json!({ "id": "c", "closeDate": d(5, false) }),
+            json!({ "id": "a", "oppStatus": "posted", "closeDate": d(10, false) }),
+            json!({ "id": "b", "oppStatus": "POSTED", "closeDate": d(2, true) }),
+            json!({ "id": "c", "oppStatus": " posted ", "closeDate": d(5, false) }),
         ];
-        let digest = closing_soon_digest(&hits, 14);
+        let digest = closing_soon_digest(&hits, 14, now);
         let ids: Vec<&str> = digest.iter().map(|e| e["id"].as_str().unwrap()).collect();
         assert_eq!(ids, vec!["b", "c", "a"]);
+    }
+
+    #[test]
+    fn a_grant_open_in_unified_is_not_missing_from_this_jobs_own_digest() {
+        // THE anti-pattern (D6/C6). `closeDate: 08/12/2026` lapses at
+        // 2026-08-13T12:00:00Z (anywhere-on-Earth), which is what the unified
+        // sweep and `GET /grants/closing-soon` both use. The digest compared the
+        // date against `Utc::now().date_naive()`, so from 00:00Z to 12:00Z on
+        // the 13th the grant was OPEN in `grants/unified` and absent here.
+        let hit = json!({ "id": "1", "oppStatus": "posted", "closeDate": "08/12/2026" });
+        let hits = vec![hit];
+
+        let morning = at("2026-08-13", 9);
+        assert!(
+            grants_common::deadline_end_utc(Some("08/12/2026"), None)
+                .is_some_and(|end| morning < end),
+            "the sweep still considers this row open at 09:00Z"
+        );
+        let digest = closing_soon_digest(&hits, 14, morning);
+        assert_eq!(digest.len(), 1, "and so must the digest: {digest:?}");
+        // Floored at 0 rather than reported as -1: it is claimable TODAY, which
+        // is the only thing an alert consumer can act on. The printed date
+        // travels alongside.
+        assert_eq!(digest[0]["daysLeft"], json!(0));
+        assert_eq!(digest[0]["closeDate"], json!("2026-08-12"));
+
+        // Past the anywhere-on-Earth end, both surfaces agree it is over.
+        let afternoon = at("2026-08-13", 13);
+        assert!(closing_soon_digest(&hits, 14, afternoon).is_empty());
+    }
+
+    #[test]
+    fn a_hit_with_no_opp_status_is_not_read_as_posted_and_the_blindness_is_loud() {
+        let now = at("2026-08-13", 9);
+        let soon = (now.date_naive() + chrono::Duration::days(3))
+            .format("%m/%d/%Y")
+            .to_string();
+        assert!(is_posted_hit(&json!({ "oppStatus": "posted" })));
+        assert!(is_posted_hit(&json!({ "oppStatus": " Posted " })));
+        assert!(!is_posted_hit(&json!({ "oppStatus": "forecasted" })));
+        // The whole point: absent is NOT posted. Under a wholesale rename the
+        // old `is_none_or` would have published the forecasted corpus as
+        // closing-soon alerts.
+        assert!(!is_posted_hit(&json!({ "id": "1" })));
+        assert!(!is_posted_hit(&json!({ "oppStatus": Value::Null })));
+
+        let blind = vec![json!({ "id": "1", "closeDate": soon })];
+        assert!(closing_soon_digest(&blind, 14, now).is_empty());
+        // …and refusing it is only safe because the blind case says so.
+        let msg = digest_status_drift(&blind).expect("a blind digest warns");
+        assert!(msg.contains("closing-soon digest is blind"), "{msg}");
+        assert!(msg.contains("renamed status field"), "{msg}");
+        // A healthy batch is silent, and so is an empty one (nothing was served,
+        // so nothing went blind).
+        assert!(digest_status_drift(&[json!({ "oppStatus": "forecasted" })]).is_none());
+        assert!(digest_status_drift(&[]).is_none());
+    }
+
+    #[test]
+    fn an_absent_harvest_details_is_the_scheduled_default_not_off() {
+        // The anti-pattern: the runtime default (`unwrap_or(false)`) disagreed
+        // with the declared one (`default_params` → true), so a caller who built
+        // params by hand silently ran a different pipeline from the scheduler's.
+        assert!(harvest_details_enabled(&json!({})));
+        assert!(harvest_details_enabled(
+            &json!({ "keyword": "rural health" })
+        ));
+        // An explicit value still wins, in both directions.
+        assert!(harvest_details_enabled(&json!({ "harvestDetails": true })));
+        assert!(!harvest_details_enabled(
+            &json!({ "harvestDetails": false })
+        ));
+        // A non-boolean is not a decision — it falls back to the one default.
+        assert_eq!(
+            harvest_details_enabled(&json!({ "harvestDetails": "yes" })),
+            HARVEST_DETAILS_DEFAULT
+        );
+        // The default is stated ONCE: the scheduler's params and the
+        // absent-param path read the same constant.
+        assert_eq!(
+            GrantsGov.default_params()["harvestDetails"],
+            json!(HARVEST_DETAILS_DEFAULT)
+        );
     }
 
     // ---- sweep honesty: only a proven walk reads as a complete corpus ----
@@ -1627,7 +1867,9 @@ mod tests {
         assert_eq!(req["estimated_total_funding"], Value::Null);
         assert_eq!(req["expected_awards"], Value::Null);
         assert_eq!(req["eligibility_text"], Value::Null);
-        assert_eq!(req["applicant_types"], json!([]));
+        // Absent is Null, not a fabricated empty list — the same rule the money
+        // fields two lines up already follow.
+        assert_eq!(req["applicant_types"], Value::Null);
         assert_eq!(req["close_date"], Value::Null);
         // No synopsis/forecast at all: still a fully-Null block, never a panic.
         let req = requirements_block(&json!({ "id": 2 }));
@@ -1638,6 +1880,7 @@ mod tests {
     #[test]
     fn attachment_manifest_flattens_folders_with_urls_and_metadata() {
         let atts = attachment_manifest(&sample_detail());
+        let atts = atts.as_array().expect("a published block is an array");
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0]["file_name"], json!("NOFO.pdf"));
         assert_eq!(atts[0]["folder"], json!("Full Announcement"));
@@ -1647,16 +1890,61 @@ mod tests {
             atts[0]["download_url"],
             json!("https://apply07.grants.gov/grantsws/rest/opportunity/att/download/999001")
         );
-        // No attachments → empty manifest; flat `attachments[]` fallback works,
-        // and a missing id means no fabricated download URL.
-        assert!(attachment_manifest(&json!({ "id": 1 })).is_empty());
+        // The flat `attachments[]` fallback works, and a missing id means no
+        // fabricated download URL.
         let flat = attachment_manifest(&json!({
             "attachments": [{ "fileName": "guide.docx" }]
         }));
+        let flat = flat.as_array().unwrap();
         assert_eq!(flat.len(), 1);
         assert_eq!(flat[0]["file_name"], json!("guide.docx"));
         assert_eq!(flat[0]["download_url"], Value::Null);
         assert_eq!(flat[0]["folder"], Value::Null);
+    }
+
+    #[test]
+    fn an_absent_attachment_block_is_null_not_an_empty_manifest() {
+        // The anti-pattern (D6/C5): `[]` for "no attachment block at all" made
+        // "this announcement published no documents" indistinguishable from
+        // "the block we only ever ASSUMED was renamed" — on the one field whose
+        // whole purpose is to let a later pass fetch those documents.
+        assert_eq!(attachment_manifest(&json!({ "id": 1 })), Value::Null);
+        // A drifted non-array block is likewise unknown, never empty.
+        assert_eq!(
+            attachment_manifest(&json!({ "synopsisAttachmentFolders": { "a": 1 } })),
+            Value::Null
+        );
+        // …but a block that IS there and holds nothing is honestly empty.
+        assert_eq!(
+            attachment_manifest(&json!({ "synopsisAttachmentFolders": [] })),
+            json!([])
+        );
+        assert_eq!(
+            attachment_manifest(&json!({ "attachments": [] })),
+            json!([])
+        );
+    }
+
+    #[test]
+    fn an_absent_applicant_types_is_null_not_an_empty_list() {
+        // Same anti-pattern on the sibling field: a consumer must be able to
+        // tell "no eligible applicant types are listed" from "`applicantTypes`
+        // was renamed".
+        assert_eq!(applicant_types(None), Value::Null);
+        assert_eq!(applicant_types(Some(&Value::Null)), Value::Null);
+        assert_eq!(applicant_types(Some(&json!("Nonprofits"))), Value::Null);
+        // A published empty list stays an empty list.
+        assert_eq!(applicant_types(Some(&json!([]))), json!([]));
+        // …and the flattening itself is unchanged.
+        assert_eq!(
+            applicant_types(Some(&json!([
+                { "id": "12", "description": " Nonprofits " },
+                { "value": "Tribal" },
+                "  ",
+                42
+            ]))),
+            json!(["Nonprofits", "Tribal"])
+        );
     }
 
     #[test]
@@ -1692,7 +1980,7 @@ mod tests {
     }
 
     /// The declaration names exactly the volatile field the record builder
-/// writes. If those two ever drift apart the seam silently stops working,
+    /// writes. If those two ever drift apart the seam silently stops working,
     /// which is indistinguishable from it never having been added.
     #[test]
     fn the_derived_declaration_names_the_only_field_that_is_our_clock() {
