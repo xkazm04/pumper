@@ -22,8 +22,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::config::{FetcherConfig, RecipesConfig};
 use crate::engine::{
-    snapshot_provenance, Browser, HttpClient, HttpRequest, RenderRequest, Researcher,
-    SnapshotProvenance,
+    anonymous_profile, anonymous_profile_note, snapshot_provenance, Browser, HttpClient,
+    HttpRequest, RenderRequest, Researcher, SnapshotProvenance,
 };
 use crate::governor::Governor;
 use crate::markdown::{html_to_markdown, text_len_capped};
@@ -226,6 +226,31 @@ pub const EGRESS_TRAIL_PREFIX: &str = "egress via remote node ";
 /// the same fetch differently. Mirrors `SnapshotProvenance::note()`.
 pub fn egress_note(node: &str) -> String {
     format!("{EGRESS_TRAIL_PREFIX}{node}")
+}
+
+/// Joins the http tier's notes into one `TierTrace.detail`.
+///
+/// One renderer for both the winning and the losing entry, so the two can never
+/// drift into describing the same fetch differently — and so a third note (the
+/// anonymous-profile marker) did not have to be threaded through two hand-rolled
+/// `match` arms. `None` when there is nothing to say, which is the common case:
+/// a clean local http win's tier and status already say everything.
+fn http_tier_detail(
+    why: Option<String>,
+    served_by: Option<&str>,
+    anonymous: Option<&str>,
+) -> Option<String> {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(why) = why {
+        parts.push(why);
+    }
+    if let Some(node) = served_by {
+        parts.push(egress_note(node));
+    }
+    if let Some(profile) = anonymous {
+        parts.push(anonymous_profile_note(profile));
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
 }
 
 /// Lifts the serving node off a response header map, or `None` when the body
@@ -863,6 +888,21 @@ impl Fetcher {
                     // same path `SnapshotProvenance::note()` takes.
                     escalations.push(format!("{EGRESS_TRAIL_PREFIX}{node}"));
                 }
+                // "This fetch named a login and went out anonymous" travels the
+                // same way, and for the same reason: the header map is the only
+                // channel that survives an engine boundary. Read ONLY when the
+                // caller actually asked for a profile, so an origin cannot stamp
+                // an ordinary fetch — the forgery rule the archive provenance
+                // and the egress marker both follow.
+                let anonymous = req
+                    .profile
+                    .is_some()
+                    .then(|| anonymous_profile(&resp.headers))
+                    .flatten()
+                    .map(str::to_string);
+                if let Some(name) = &anonymous {
+                    escalations.push(anonymous_profile_note(name));
+                }
                 // Convert to Markdown at most once, and only when a decision
                 // (escalation) or the caller (to_markdown) actually needs it.
                 // The `Http` strategy returns regardless, so it skips the
@@ -903,8 +943,10 @@ impl Fetcher {
                         // and status; a peer-served one does not, because "this
                         // left from another IP" is the whole product claim and
                         // was previously invisible everywhere past the header
-                        // map.
-                        detail: served_by.as_deref().map(egress_note),
+                        // map. Neither does a WINNING profiled fetch that
+                        // carried no session — that is precisely the fetch whose
+                        // 200 is a login wall about to be stored as data.
+                        detail: http_tier_detail(None, served_by.as_deref(), anonymous.as_deref()),
                     });
                     return Ok(Some(outcome(
                         "http",
@@ -947,13 +989,8 @@ impl Fetcher {
                     // A LOSING peer-served tier is the one an operator most
                     // needs attributed: "the http tier came back blocked" reads
                     // very differently once you know which node's IP it came
-                    // back blocked at.
-                    detail: match (detail, served_by.as_deref()) {
-                        (Some(why), Some(node)) => Some(format!("{why}; {}", egress_note(node))),
-                        (Some(why), None) => Some(why),
-                        (None, Some(node)) => Some(egress_note(node)),
-                        (None, None) => None,
-                    },
+                    // back blocked at — or that the login it named was empty.
+                    detail: http_tier_detail(detail, served_by.as_deref(), anonymous.as_deref()),
                 });
                 Ok(None)
             }
@@ -1701,6 +1738,104 @@ mod tests {
             0,
             "with no fabric wired there is no fallback to count"
         );
+    }
+
+    // ── anonymous-profile provenance ────────────────────────────────────────
+
+    /// A live-HTTP stub answering the way `engine-http` answers a profiled fetch
+    /// whose cookie jar turned out to be empty: a perfectly healthy 200, plus
+    /// the reserved marker.
+    struct AnonymousProfileHttp(&'static str);
+    #[async_trait]
+    impl HttpClient for AnonymousProfileHttp {
+        async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+            Ok(HttpResponse {
+                status: 200,
+                headers: std::collections::HashMap::from([(
+                    crate::engine::ANONYMOUS_PROFILE_HEADER.to_string(),
+                    self.0.to_string(),
+                )]),
+                body: GOOD_PAGE.into(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    fn profiled_request(url: &str, profile: Option<&str>) -> FetchRequest {
+        let mut req = FetchRequest::new(url);
+        req.profile = profile.map(str::to_string);
+        req
+    }
+
+    /// The anti-pattern: **a login that silently is not one**. A mistyped
+    /// `profile` fetched the login wall with a 200; it cleared
+    /// `min_content_chars`, the tier recorded `TierVerdict::Ok`, and the
+    /// extractor stored the login page as a real dataset revision. Nothing
+    /// downstream could tell — the http engine mapped a missing `cookies.json`
+    /// to an empty jar with no signal at all.
+    ///
+    /// The fact has to reach the WINNING entry, because the winning fetch is
+    /// exactly the one about to be stored as data.
+    #[tokio::test]
+    async fn a_profiled_fetch_that_carried_no_session_says_so_on_the_winning_tier() {
+        let fetcher = archive_fetcher(Arc::new(AnonymousProfileHttp("acme_portl")), None);
+        let out = fetcher
+            .fetch(profiled_request(
+                "https://example.test/page",
+                Some("acme_portl"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(out.engine, "http");
+        let detail = out.trace[0].detail.as_deref().unwrap_or_default();
+        assert!(
+            detail.contains("acme_portl") && detail.contains("ANONYMOUS"),
+            "the winning tier must name the profile that carried nothing: {detail:?}"
+        );
+        // And into the trail, which is what carries it to `cost_events.detail`
+        // and from there to the job receipt.
+        assert!(
+            out.escalations
+                .iter()
+                .any(|line| line.contains("acme_portl")),
+            "{:?}",
+            out.escalations
+        );
+    }
+
+    /// The mirror risk, and the rule every `x-pumper-` marker follows: an origin
+    /// that echoes the header on a fetch the caller never profiled must not be
+    /// able to invent a profile name in this deployment's trace.
+    #[tokio::test]
+    async fn an_origin_cannot_stamp_an_unprofiled_fetch_as_anonymous() {
+        let fetcher = archive_fetcher(Arc::new(AnonymousProfileHttp("victim")), None);
+        let out = fetcher
+            .fetch(profiled_request("https://example.test/page", None))
+            .await
+            .unwrap();
+        assert_eq!(out.trace[0].detail, None, "an origin cannot forge this");
+        assert!(out.escalations.is_empty());
+    }
+
+    /// One renderer for both the winning and the losing entry, and notes that
+    /// compose rather than overwrite each other — a peer-served fetch under an
+    /// empty profile is two separate facts and both matter.
+    #[test]
+    fn the_http_tier_detail_composes_every_note_it_has() {
+        assert_eq!(http_tier_detail(None, None, None), None);
+        assert_eq!(
+            http_tier_detail(Some("cloudflare".into()), None, None).as_deref(),
+            Some("cloudflare")
+        );
+        assert_eq!(
+            http_tier_detail(None, Some("http://n:1"), None).as_deref(),
+            Some("egress via remote node http://n:1")
+        );
+        let all = http_tier_detail(Some("cloudflare".into()), Some("http://n:1"), Some("acme"))
+            .expect("some");
+        assert!(all.starts_with("cloudflare; egress via remote node http://n:1; "));
+        assert!(all.contains("acme"));
     }
 
     #[test]
