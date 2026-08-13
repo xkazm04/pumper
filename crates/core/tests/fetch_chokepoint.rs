@@ -24,7 +24,7 @@
 //! `crates/server/src/e2e/app_fetch_chokepoint.rs` (the server crate is the one
 //! that can depend on app crates).
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Every raw-engine (`*.engines.fetch` / `.engines.http` / `.engines.browser`)
@@ -275,6 +275,45 @@ fn extractor_and_plugin_url_modes_hold_no_raw_fetcher() {
              budget clamp, and a recorded run of it would hit the live network on replay"
         );
     }
+}
+
+/// The **second half** of every row in the inventory above. A raw-engine call
+/// site costs its app the cost ledger, the budget clamp and the tier router —
+/// and the VCR cassette, in both directions: that traffic is never recorded,
+/// and on replay nothing stops it running live.
+///
+/// What replay DOES about that is declared per app in `REPLAY_BYPASS_APPS`
+/// (`crates/core/src/vcr.rs`), the one place the decision lives. It is matched
+/// on the app's NAME at runtime, so an app that grows a raw-engine call and
+/// never gets a row stays *assumed replayable*: a `replay_of` job runs it LIVE
+/// and the worker stamps `vcr_replay_of` on the result — a provenance claim
+/// that the output came from recorded bytes.
+///
+/// This is the direction the table's own guards cannot cover. `vcr.rs`'s
+/// `every_replay_bypass_row_names_an_app_crate_that_exists` and the server's
+/// `every_declared_replay_bypass_names_a_registered_app` both police rows that
+/// EXIST (stale or misspelled); only the scanner knows about an app that
+/// should have one and does not.
+#[test]
+fn every_raw_engine_app_declares_its_replay_fidelity() {
+    let graded: BTreeSet<&str> = pumper_core::vcr::REPLAY_BYPASS_APPS
+        .iter()
+        .map(|(app, _, _)| *app)
+        .collect();
+    let found = raw_engine_calls();
+    let ungraded: BTreeSet<&str> = found
+        .keys()
+        .filter_map(|site| site.strip_prefix("crates/apps/"))
+        .filter_map(|rest| rest.split('/').next())
+        .filter(|app| !graded.contains(app))
+        .collect();
+    assert!(
+        ungraded.is_empty(),
+        "app(s) driving an engine raw with no row in REPLAY_BYPASS_APPS \
+         (crates/core/src/vcr.rs): {ungraded:?}. Without one the app is assumed replayable, so \
+         a `replay_of` job runs it LIVE and its result is stamped `vcr_replay_of`. Grade it \
+         `Partial` (some run modes go through `ctx.fetch`) or `Unreplayable` (none do)."
+    );
 }
 
 /// The scanner must not be fooled by the prose that documents the chokepoint —
