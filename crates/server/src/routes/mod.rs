@@ -442,6 +442,43 @@ mod catalog_tests {
                 "live catalog source '{}' has no app — a live pipeline must name its serving app",
                 source.id
             );
+            // A row may name a VIRTUAL NAMESPACE instead of an app — the pair
+            // some datasets actually land under (`grants/opportunity_details`
+            // is written by grants-gov as `("grants", "opportunity_details")`).
+            // Such a namespace has no `schedule()` of its own: the write rides
+            // a publisher's job. Requiring a registered app here is what kept
+            // the product's only source of federal award amounts out of the
+            // catalog entirely — an uncataloged dataset gets no contract, no
+            // staleness bound and no /catalog/health row, which is strictly
+            // worse than a row whose cron check is skipped.
+            //
+            // The namespace still has to be real and its publishers registered,
+            // so this widens what may be named, not whether it is checked. And
+            // it MUST carry an empty cron: `Catalog::reconcile` derives desired
+            // schedules from `is_scheduled()`, so a cron here would ask the
+            // scheduler to create a schedule for an app that does not exist.
+            if let Some(ns) = crate::registry::virtual_namespace(&source.app) {
+                for publisher in ns.publishers {
+                    assert!(
+                        apps.iter().any(|a| a.name() == *publisher),
+                        "live catalog source '{}' names virtual namespace '{}', whose publisher \
+                         '{}' is not registered",
+                        source.id,
+                        source.app,
+                        publisher
+                    );
+                }
+                assert!(
+                    source.cron.trim().is_empty(),
+                    "live catalog source '{}' names virtual namespace '{}' AND declares a cron \
+                     ({:?}) — Catalog::reconcile would try to create a schedule for an app that \
+                     does not exist. The write rides a publisher's job; leave cron empty",
+                    source.id,
+                    source.app,
+                    source.cron
+                );
+                continue;
+            }
             let app = apps
                 .iter()
                 .find(|a| a.name() == source.app)

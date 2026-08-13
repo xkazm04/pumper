@@ -78,27 +78,51 @@ title = "string"
 number = "string"
 
 # `grants/opportunity_details` — the ONLY source of federal award amounts in the
-# product — still has no `[[source]]` row of its own, and cannot have an honest
-# one today (verified empirically 2026-08-13, same trap as the `census/*` product
-# datasets documented further down):
-#   * grants-gov's detail harvest writes the pair ("grants", "opportunity_details")
-#     — `grants` is a VIRTUAL namespace (crates/server/src/registry.rs), not a
-#     registered app;
-#   * the coverage test `live_catalog_entries_map_to_registered_apps_with_matching_cron`
-#     (crates/server/src/routes/mod.rs) panics on a live row whose `app` is not a
-#     registered app — measured: "live catalog source 'grants-opportunity-details'
-#     names unregistered app 'grants'";
-#   * both consumers key on the pair the data actually lands under —
-#     `enforce_contracts` (worker.rs) reads it off each revision, and
-#     /catalog/health reads `datasets.list(s.app, s.dataset)`.
-# So filing it as app = "grants-gov" would compile and pass the test and be a lie:
-# that pair is never written, so /catalog/health would report the source
-# permanently stale and the contract would never evaluate. `cordis-topic-stats` is
-# NOT a precedent — cordis writes `topic_stats` under its own app namespace.
-# The fix is the same one the census block asks for: teach the coverage test that
-# a row may name a virtual namespace whose publishers are registered. Until then
-# the detail corpus is described in the grants-gov `notes` above and guarded by
-# the app's own tests, not by a contract.
+# product — gets its own row, filed under the pair the data actually lands under.
+#
+# `app` here is a VIRTUAL NAMESPACE (crates/server/src/registry.rs), not a
+# registered app: grants-gov's detail harvest writes ("grants",
+# "opportunity_details"), and both consumers key on that pair — `enforce_contracts`
+# (worker.rs) reads it off each revision, /catalog/health reads
+# `datasets.list(s.app, s.dataset)`. Filing it under `grants-gov` instead would
+# compile, pass every test, and be a lie: that pair is never written, so health
+# would report it permanently stale and the contract would never evaluate.
+# `cordis-topic-stats` is NOT a precedent — cordis writes `topic_stats` under its
+# own app namespace.
+#
+# `cron` MUST stay empty. `Catalog::reconcile` derives desired schedules from
+# `Source::is_scheduled()`, so any cron here would ask the scheduler to create a
+# schedule for an app that does not exist. The harvest rides grants-gov's 09:00
+# sync as a delta-only, non-fatal enrichment stage; `max_staleness_hours` is what
+# actually holds it to that cadence.
+#
+# No `max_row_delta_pct`: this dataset is written with `upsert_many_derived`,
+# which never tombstones, so the row-delta tripwire could not fire — the same
+# reasoning that removed the inert one from the grants-gov contract above.
+[[source]]
+id = "grants-opportunity-details"
+app = "grants"
+market = "us"
+name = "Grants.gov fetchOpportunity NOFO details (federal award amounts)"
+url = "https://api.grants.gov/v1/api/fetchOpportunity"
+category = "open-calls"
+engine = "http"
+access = "key-free"
+cadence = "daily"
+cron = ""
+status = "live"
+confidence = 4
+dataset = "opportunity_details"
+notes = "Delta-only, capped enrichment stage of grants-gov (not its own schedule). The ONLY source of federal award amounts — Search2 publishes none. Non-fatal to the listing: failures are counted in the result's detailsFailed. `harvested_at` is declared derived, so a byte-identical re-harvest reads unchanged."
+
+[source.contract]
+required_fields = ["opportunity_id", "unified_key", "requirements"]
+max_staleness_hours = 48
+
+[source.contract.types]
+opportunity_id = "string"
+unified_key = "string"
+requirements = "object"
 
 [[source]]
 id = "grants-gov-xml"

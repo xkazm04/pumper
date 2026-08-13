@@ -37,7 +37,14 @@ Two lookups decide whether a declaration does anything at all, and **both key on
 - `Catalog::contract_for(app, dataset)` finds the contract, so a row filed under an app that never writes that pair is never evaluated.
 - `/catalog/health` reads `datasets.list(source.app, source.dataset)`, so the same mismatch reports the source **permanently stale** rather than reporting nothing.
 
-A row that names a **virtual namespace** (`grants`, `census`) therefore cannot be `live` today: `live_catalog_entries_map_to_registered_apps_with_matching_cron` panics unless `app` is a registered app, and a virtual namespace is by definition not one. `grants/opportunity_details` and `census/market_blend` are the two datasets this blocks; both are documented in place in the TOML. Filing them under a producing app instead is the failure mode above, not a workaround.
+**A row may name a virtual namespace** (`grants`, `census`) rather than a registered app, because that is the pair those datasets land under. `live_catalog_entries_map_to_registered_apps_with_matching_cron` accepts a namespace declared in `registry::VIRTUAL_NAMESPACES` provided **every one of its publishers is a registered app**, so this widens what may be named, not whether it is checked. Filing such a dataset under a producing app instead is the failure mode above, not a workaround.
+
+Two rules come with it:
+
+- **`cron` must be empty.** A virtual namespace has no `schedule()` of its own — the write rides a publisher's job — and `Catalog::reconcile` derives desired schedules from `Source::is_scheduled()`, so a cron here would ask the scheduler to create a schedule for an app that does not exist. The guard asserts this rather than trusting it. Hold the cadence with `max_staleness_hours` instead.
+- **The cron-equality check is skipped** for these rows, and only for them; every app-named row still has to match its app's `schedule()` exactly in both directions.
+
+`grants/opportunity_details` is live under this shape as of 2026-08-13. `census/market_blend` is the remaining candidate and is documented in place in the TOML.
 
 **`max_row_delta_pct` is a mass-delete tripwire, and it only fires on a tombstoning write.** `Contract::evaluate` computes the delta only when `removed > 0`, and `removed` is populated only by `Datasets::sync_many` — the full-snapshot variant. On an **upsert-only** source (`upsert_many`, `upsert_many_with_provenance`, `upsert_many_derived`) removals never occur, so the declaration can never fire and reads as coverage it does not provide. Declare it where the write is `sync_many` (`cordis-topic-stats`), and leave it off where the write is upsert-only — `grants-gov`'s was removed for exactly this reason on 2026-08-13, with the reasoning recorded above the block. **Known inert:** `ca-grants` and `eu-sedia` still declare one on upsert-only writes.
 

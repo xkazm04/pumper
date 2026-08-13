@@ -97,6 +97,16 @@ pub(crate) fn publishes_into(app: &str) -> Option<&'static VirtualNamespace> {
         .find(|ns| ns.publishers.contains(&app))
 }
 
+/// The virtual namespace called `name`, if there is one — the lookup in the
+/// other direction from [`publishes_into`].
+///
+/// A namespace is a legal `app` for a catalog row (that is the pair the data
+/// lands under), so the catalog's registered-app guard consults this before
+/// declaring a row's app unknown.
+pub(crate) fn virtual_namespace(name: &str) -> Option<&'static VirtualNamespace> {
+    VIRTUAL_NAMESPACES.iter().find(|ns| ns.name == name)
+}
+
 /// One app rendered as an MCP-compatible tool definition: `name`,
 /// `description`, and `inputSchema` are the MCP tool-definition contract
 /// (an app with no declared schema gets the permissive `{"type":"object"}`);
