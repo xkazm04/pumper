@@ -33,12 +33,29 @@ artifacts_dir = "data/artifacts"
 
 [http]
 user_agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
-# Total per-request timeout (the client-global default). Bulk sources that need
-# longer (e.g. mpsv-vpm's ~188 MB feed) set `HttpRequest.timeout_secs` per request
-# rather than degrading this global — a hung host should free its worker slot in
-# ~30s, not sit for 300s.
+# Timeout for ONE ATTEMPT (the client-global default): connect + redirects +
+# reading the body. Bulk sources that need longer (e.g. mpsv-vpm's ~188 MB feed)
+# set `HttpRequest.timeout_secs` per request rather than degrading this global.
 timeout_secs = 30
 retries = 3
+# Hard ceiling on ONE WHOLE FETCH, end to end — every attempt, every retry sleep
+# and every governor wait in between. `timeout_secs` bounds an attempt and the
+# retry ladder multiplies it, so without this a host answering
+# `429 Retry-After: 600` held a single fetch for ~37 minutes, past
+# `[worker] job_timeout_secs` — one hostile URL killing a whole job's other work.
+# The default sits above the worst BENIGN ladder these defaults can produce
+# (~127s for a black-holed host), so nothing that works today starts failing; it
+# only cuts the pathological case. Raised automatically to at least one full
+# per-attempt timeout, so a widened `HttpRequest.timeout_secs` is never clipped.
+# `0` disables the deadline.
+total_budget_secs = 300
+# Also on [http], absent here (defaults in crates/core/src/config.rs):
+#   max_body_bytes = 16777216   # hard cap per response body; must be > 0
+#                               # (unlike [browser] max_html_bytes, 0 does NOT
+#                               #  mean "no cap" here — it is refused at boot)
+#   redirect_limit = 10
+#   retryable_statuses = [429, 502, 503, 504]
+#   proxy = "http://user:pass@host:port"   # or socks5://…; unset = direct
 
 # Per-domain politeness governor — spaces out requests to the same host.
 [governor]

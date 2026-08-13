@@ -21,7 +21,7 @@ use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use cookie_store::{CookieStore, RawCookie};
@@ -51,6 +51,11 @@ const MAX_POOLED_CLIENTS: usize = 8;
 /// in-process). One write per profile per window bounds the write rate under a
 /// profiled crawl.
 const COOKIE_FLUSH_DEBOUNCE: Duration = Duration::from_secs(1);
+/// The smallest slice of an end-to-end budget worth starting an attempt with.
+/// Below this a request cannot realistically connect, transfer and be read, so
+/// sleeping the last of the budget to reach it only delays the same failure by
+/// the length of the sleep.
+const MIN_ATTEMPT_BUDGET: Duration = Duration::from_secs(1);
 
 /// A persistent, serializable cookie jar for one named profile. Installed as
 /// reqwest's `cookie_provider`, so reqwest reads/writes it exactly like its own
@@ -344,15 +349,21 @@ impl HttpEngine {
         Ok((client, jar))
     }
 
-    fn build(&self, client: &reqwest::Client, req: &HttpRequest) -> reqwest::RequestBuilder {
+    /// Builds one attempt. `attempt_timeout` is always explicit — it is the
+    /// per-attempt timeout ([`HttpRequest::timeout_secs`] else `[http]
+    /// timeout_secs`) already clamped to what is left of the fetch's end-to-end
+    /// budget, so no single attempt can outlive the deadline.
+    fn build(
+        &self,
+        client: &reqwest::Client,
+        req: &HttpRequest,
+        attempt_timeout: Duration,
+    ) -> reqwest::RequestBuilder {
         let mut builder = match req.method {
             HttpMethod::Get => client.get(&req.url),
             HttpMethod::Post => client.post(&req.url),
         };
-        if let Some(secs) = req.timeout_secs {
-            // Per-attempt override of the client-global timeout.
-            builder = builder.timeout(Duration::from_secs(secs));
-        }
+        builder = builder.timeout(attempt_timeout);
         for (key, value) in &req.headers {
             builder = builder.header(key, value);
         }
@@ -390,6 +401,15 @@ impl HttpEngine {
         let retries = self.cfg.retries;
         let cap = req.max_body_bytes.unwrap_or(self.cfg.max_body_bytes);
 
+        // ONE clock for the whole fetch, started before the first attempt: the
+        // retry loop used to bound only each attempt, so `timeout_secs` was
+        // multiplied by `retries + 1` and then had every backoff sleep added on
+        // top. See `HttpConfig::total_budget_secs`.
+        let per_attempt = per_attempt_timeout(req.timeout_secs, self.cfg.timeout_secs);
+        let budget = fetch_budget(self.cfg.total_budget_secs, per_attempt);
+        let started = Instant::now();
+        let deadline = budget.map(|b| started + b);
+
         let mut last_error = String::new();
         // Retry-After from the previous retryable response, so the next sleep can
         // honor the server's requested delay instead of a blind doubling.
@@ -398,14 +418,35 @@ impl HttpEngine {
             if attempt > 0 {
                 let seed = jitter_seed(&req.url, attempt);
                 let delay = retry_delay(attempt, last_retry_after, RETRY_BASE_MS, seed);
+                let Some(delay) = capped_retry_sleep(delay, remaining(deadline)) else {
+                    return Err(budget_exhausted(
+                        &req.url,
+                        started.elapsed(),
+                        attempt,
+                        budget,
+                        &last_error,
+                    ));
+                };
                 debug!(url = %req.url, attempt, "retrying in {delay:?} ({last_error})");
                 tokio::time::sleep(delay).await;
             }
             // Politeness spacing is applied per attempt so retries also wait.
+            // Deliberately NOT bounded by the budget: shortening a governor wait
+            // would trade politeness for latency, which is not this deadline's
+            // job. A wait that eats the budget is caught by the check below.
             if let Some(host) = &host {
                 self.governor.acquire(host).await;
             }
-            match self.build(&client, req).send().await {
+            let Some(attempt_timeout) = attempt_timeout(per_attempt, remaining(deadline)) else {
+                return Err(budget_exhausted(
+                    &req.url,
+                    started.elapsed(),
+                    attempt,
+                    budget,
+                    &last_error,
+                ));
+            };
+            match self.build(&client, req, attempt_timeout).send().await {
                 Ok(response) => {
                     // reqwest has already applied any Set-Cookie (including on
                     // redirect hops) to the profile's jar by now — schedule the
@@ -585,6 +626,82 @@ fn would_exceed_cap(current_len: u64, chunk_len: u64, cap: u64) -> bool {
     current_len + chunk_len > cap
 }
 
+/// The timeout one *attempt* gets: the per-request override else the
+/// client-global `[http] timeout_secs`.
+fn per_attempt_timeout(req_timeout_secs: Option<u64>, cfg_timeout_secs: u64) -> Duration {
+    Duration::from_secs(req_timeout_secs.unwrap_or(cfg_timeout_secs))
+}
+
+/// The end-to-end budget for one `send()`: `[http] total_budget_secs`, raised to
+/// at least one full per-attempt timeout. `None` = no deadline (`0` disables).
+///
+/// The raise is what keeps the budget from becoming a *shorter* timeout than the
+/// caller asked for: `app-cms-fee-schedule` and `mpsv-vpm` widen
+/// `HttpRequest.timeout_secs` for very large downloads, and a global budget
+/// below that would cut the single attempt they need. The budget bounds the
+/// *multiplication* of attempts, never the length of one.
+fn fetch_budget(total_budget_secs: u64, per_attempt: Duration) -> Option<Duration> {
+    (total_budget_secs > 0).then(|| Duration::from_secs(total_budget_secs).max(per_attempt))
+}
+
+/// What is left of the budget right now; `None` when there is no deadline.
+fn remaining(deadline: Option<Instant>) -> Option<Duration> {
+    deadline.map(|d| d.saturating_duration_since(Instant::now()))
+}
+
+/// The sleep a retry may actually take. `None` means **stop now**: the budget
+/// cannot fit this sleep plus an attempt worth starting.
+///
+/// The anti-pattern this guards: `retry_delay` honours a server `Retry-After` up
+/// to 600 s, so a rate-limited host could park a fetch for ten minutes at a time
+/// and then be handed the remains of a budget it had already spent. Truncating
+/// the sleep instead would be worse than failing — it would retry *earlier* than
+/// the server asked, which is the one thing politeness must never do.
+fn capped_retry_sleep(delay: Duration, remaining: Option<Duration>) -> Option<Duration> {
+    let Some(left) = remaining else {
+        return Some(delay); // no deadline configured
+    };
+    (delay + MIN_ATTEMPT_BUDGET <= left).then_some(delay)
+}
+
+/// The timeout one attempt may use: the per-attempt timeout, clamped to what is
+/// left of the end-to-end budget so no attempt can outlive the deadline. `None`
+/// means the budget is spent and no attempt should be started.
+fn attempt_timeout(per_attempt: Duration, remaining: Option<Duration>) -> Option<Duration> {
+    let Some(left) = remaining else {
+        return Some(per_attempt); // no deadline configured
+    };
+    (left >= MIN_ATTEMPT_BUDGET).then(|| per_attempt.min(left))
+}
+
+/// The end-to-end budget failure: names the URL, the wall clock actually spent,
+/// how many attempts that bought and the knob that stopped it — so an operator
+/// can tell "the origin was slow" (a per-attempt `timeout_secs` error, raised by
+/// reqwest) from "we gave up on our own clock" without reading a log.
+///
+/// Stays **retryable** (`Error::Http`), like `[browser] render_budget_secs`
+/// exhaustion: "this host was slow *this time*" is a fact about a live site, not
+/// a pure function of the request, so a job may legitimately try again later.
+fn budget_exhausted(
+    url: &str,
+    elapsed: Duration,
+    attempts: u32,
+    budget: Option<Duration>,
+    last_error: &str,
+) -> Error {
+    let budget_secs = budget.map(|b| b.as_secs()).unwrap_or_default();
+    let why = if last_error.is_empty() {
+        "no attempt completed".to_string()
+    } else {
+        format!("last error: {last_error}")
+    };
+    Error::Http(format!(
+        "{url} exhausted its end-to-end fetch budget ([http] total_budget_secs = {budget_secs}s) \
+         after {:.1}s and {attempts} attempt(s) — {why}",
+        elapsed.as_secs_f64()
+    ))
+}
+
 /// Deterministic per-retry jitter seed from the URL and attempt number — same
 /// URL+attempt always jitters identically (reproducible), distinct URLs spread.
 fn jitter_seed(url: &str, attempt: u32) -> u64 {
@@ -742,11 +859,15 @@ impl HttpClient for HttpEngine {
             .and_then(|u| u.host_str().map(str::to_owned));
         let (client, jar) = self.client_for(&req)?;
         let cap = req.max_body_bytes.unwrap_or(self.cfg.max_body_bytes);
+        // One attempt, so the end-to-end bound IS the attempt timeout — and the
+        // budget is never below one full attempt, which is why a 188 MB feed
+        // that widens `timeout_secs` is not cut short here.
+        let per_attempt = per_attempt_timeout(req.timeout_secs, self.cfg.timeout_secs);
         if let Some(host) = &host {
             self.governor.acquire(host).await;
         }
         let response = self
-            .build(&client, &req)
+            .build(&client, &req, per_attempt)
             .send()
             .await
             .map_err(|e| Error::Http(e.to_string()))?;
@@ -931,6 +1052,114 @@ mod tests {
         let a = retry_delay(2, None, 500, 999);
         let b = retry_delay(2, None, 500, 999);
         assert_eq!(a, b, "same seed/inputs must yield identical delay");
+    }
+
+    /// The anti-pattern the budget exists for: `timeout_secs` bounded one
+    /// ATTEMPT, and the retry loop multiplied it. The budget must never be
+    /// shorter than a single attempt, or turning it on silently shortens the
+    /// per-request timeout callers deliberately widened for large downloads.
+    #[test]
+    fn a_fetch_budget_is_never_shorter_than_one_attempt() {
+        // The shipped shape: 300 s budget over a 30 s attempt.
+        assert_eq!(
+            fetch_budget(300, Duration::from_secs(30)),
+            Some(Duration::from_secs(300))
+        );
+        // A caller who widened `HttpRequest.timeout_secs` past the budget (the
+        // 188 MB feed) still gets one complete attempt, not a truncated one.
+        assert_eq!(
+            fetch_budget(300, Duration::from_secs(600)),
+            Some(Duration::from_secs(600))
+        );
+        // `0` disables the deadline entirely (the pre-2026-08 behaviour).
+        assert_eq!(fetch_budget(0, Duration::from_secs(30)), None);
+    }
+
+    /// A `429 Retry-After: 600` used to buy three sleeps of up to 750 s each on
+    /// top of four attempts — ~37.5 minutes for ONE fetch, past
+    /// `[worker] job_timeout_secs`. The sleep must be refused, never truncated:
+    /// retrying earlier than the server asked is the one thing politeness may
+    /// not do.
+    #[test]
+    fn a_retry_sleep_is_refused_not_truncated_when_the_budget_cannot_hold_it() {
+        let ten_min = Duration::from_secs(600);
+        // No deadline: unchanged behaviour, the full sleep is taken.
+        assert_eq!(capped_retry_sleep(ten_min, None), Some(ten_min));
+        // Budget cannot hold the sleep AND an attempt after it -> stop now.
+        assert_eq!(
+            capped_retry_sleep(ten_min, Some(Duration::from_secs(60))),
+            None
+        );
+        // Exactly enough for the sleep but nothing left to fetch with -> stop.
+        assert_eq!(capped_retry_sleep(ten_min, Some(ten_min)), None);
+        // Room for the sleep plus a usable attempt -> the sleep is unchanged
+        // (never shortened, so the server's Retry-After is still honoured).
+        assert_eq!(
+            capped_retry_sleep(ten_min, Some(Duration::from_secs(700))),
+            Some(ten_min)
+        );
+    }
+
+    /// No attempt may be started that cannot finish inside the deadline: an
+    /// attempt is either given the remaining budget as its timeout, or refused.
+    #[test]
+    fn an_attempt_never_outlives_the_remaining_budget() {
+        let thirty = Duration::from_secs(30);
+        // No deadline: the per-attempt timeout is used as-is.
+        assert_eq!(attempt_timeout(thirty, None), Some(thirty));
+        // Plenty left: the per-attempt timeout still wins (the budget is a
+        // ceiling on the fetch, not a shorter timeout for a healthy attempt).
+        assert_eq!(
+            attempt_timeout(thirty, Some(Duration::from_secs(200))),
+            Some(thirty)
+        );
+        // Less left than one attempt: clamped to the remainder, so the attempt
+        // ends ON the deadline rather than 30 s past it.
+        assert_eq!(
+            attempt_timeout(thirty, Some(Duration::from_secs(4))),
+            Some(Duration::from_secs(4))
+        );
+        // Nothing usable left: refuse rather than fire a doomed request.
+        assert_eq!(
+            attempt_timeout(thirty, Some(Duration::from_millis(10))),
+            None
+        );
+        assert_eq!(attempt_timeout(thirty, Some(Duration::ZERO)), None);
+    }
+
+    /// The operator has to be able to tell "the origin was slow" from "we gave
+    /// up on our own clock" — which means the knob, the URL, the wall clock and
+    /// the attempt count all travel in the failure.
+    #[test]
+    fn the_budget_failure_names_the_knob_the_url_and_the_clock() {
+        let err = budget_exhausted(
+            "https://slow.test/feed",
+            Duration::from_secs_f64(302.4),
+            2,
+            Some(Duration::from_secs(300)),
+            "status 429",
+        );
+        let shown = err.to_string();
+        for needle in [
+            "https://slow.test/feed",
+            "total_budget_secs = 300s",
+            "302.4s",
+            "2 attempt(s)",
+            "status 429",
+        ] {
+            assert!(shown.contains(needle), "{needle:?} missing from {shown}");
+        }
+        // Retryable: a slow site is a fact about the site, not about the request.
+        assert!(!err.is_terminal_for_job());
+        // A budget spent before any attempt reported anything still reads.
+        let none = budget_exhausted("https://x/", Duration::from_secs(1), 0, None, "");
+        assert!(none.to_string().contains("no attempt completed"));
+    }
+
+    #[test]
+    fn per_attempt_timeout_prefers_the_request_override() {
+        assert_eq!(per_attempt_timeout(Some(600), 30), Duration::from_secs(600));
+        assert_eq!(per_attempt_timeout(None, 30), Duration::from_secs(30));
     }
 
     #[test]

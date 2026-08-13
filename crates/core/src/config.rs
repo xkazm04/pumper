@@ -761,6 +761,25 @@ impl Config {
             }
         }
 
+        // The HTTP tier's body cap is checked as `current + chunk > cap`, so a
+        // `0` rejects EVERY non-empty body: the default fetch tier for every app
+        // fails with "exceeds max_body_bytes cap of 0 bytes" on every URL. The
+        // `[remote]` and `[ingress]` twins are already refused above/below; this
+        // one was the odd one out. It is refused rather than reinterpreted
+        // because one tier down `[browser] max_html_bytes = 0` means the
+        // OPPOSITE ("no cap") — an operator who writes `0` here means one of the
+        // two, and guessing which silently is how a total outage or an unbounded
+        // body gets shipped.
+        if self.http.max_body_bytes == 0 {
+            return Err(Error::Config(
+                "[http] max_body_bytes must be > 0 — a zero cap rejects every non-empty \
+                 response body, i.e. every fetch. (Note `[browser] max_html_bytes = 0` \
+                 means the opposite: it DISABLES that tier's cap. There is no \
+                 disable value for this one; set a large number instead.)"
+                    .into(),
+            ));
+        }
+
         // The archive engine builds every CDX/snapshot URL off base_url; a value
         // that isn't an absolute http(s) URL yields requests that fail far from
         // here with an unhelpful reqwest parse error on every single fetch.
@@ -1137,8 +1156,41 @@ impl StorageConfig {
 #[serde(default)]
 pub struct HttpConfig {
     pub user_agent: String,
+    /// Timeout for **one attempt** (seconds), applied by reqwest to the whole
+    /// request — connect, redirects and reading the body. Per-request
+    /// `HttpRequest.timeout_secs` overrides it. This is deliberately NOT the
+    /// bound on one `fetch()`: see [`HttpConfig::total_budget_secs`].
     pub timeout_secs: u64,
     pub retries: u32,
+    /// Hard ceiling (seconds) on **one whole `fetch()` / `fetch_bytes()`**, end
+    /// to end: every attempt, every retry sleep and every governor wait in
+    /// between. `0` disables the deadline (the pre-2026-08 behaviour).
+    ///
+    /// **Why a second key rather than redefining `timeout_secs`.** `timeout_secs`
+    /// is per *attempt*, and the retry loop multiplies it: with the shipped
+    /// `retries = 3` a black-holed host cost `4 × timeout_secs` plus three
+    /// backoff sleeps (~127 s), and a host answering `429 Retry-After: 600` cost
+    /// **~37.5 minutes** — past `[worker] job_timeout_secs` (900 s), so one
+    /// hostile URL killed every other unit of work in its job. Redefining
+    /// `timeout_secs` as end-to-end would have bounded that too, but it also
+    /// silently shortens the *first* attempt for every existing deployment: at
+    /// the default 30 s, one slow-but-working 20 s page plus a 5 s `Retry-After`
+    /// would no longer get its second attempt at all. A separate budget keeps
+    /// per-attempt patience where operators tuned it and bounds only the
+    /// multiplication, which is the actual defect.
+    ///
+    /// The default (300 s) is above the worst *benign* ladder the shipped
+    /// defaults can produce (~127 s), so no fetch that works today starts
+    /// failing; it only cuts the pathological `Retry-After` case. The budget is
+    /// always raised to at least one full per-attempt timeout, so a caller that
+    /// widens `HttpRequest.timeout_secs` for a huge feed (`mpsv-vpm`'s ~188 MB
+    /// download) still gets one complete attempt.
+    ///
+    /// Same shape and same `0 = disabled` semantics as `[browser]
+    /// render_budget_secs`, which bounds one render for exactly this reason, and
+    /// the same end-to-end promise `[remote] timeout_secs` had to make on its own
+    /// because this engine did not.
+    pub total_budget_secs: u64,
     /// Hard cap on a single response body (bytes). The engine streams the body in
     /// chunks and aborts with a typed error the moment the cumulative size would
     /// exceed this, so one huge/hostile URL can't balloon memory. Per-request
@@ -1172,6 +1224,7 @@ impl Default for HttpConfig {
                 .into(),
             timeout_secs: 30,
             retries: 3,
+            total_budget_secs: 300,
             max_body_bytes: DEFAULT_MAX_BODY_BYTES,
             redirect_limit: 10,
             retryable_statuses: vec![429, 502, 503, 504],
@@ -1986,6 +2039,48 @@ mod tests {
         assert_eq!(h.redirect_limit, 10);
         assert_eq!(h.retryable_statuses, vec![429, 502, 503, 504]);
         assert!(h.proxy.is_none());
+    }
+
+    /// The end-to-end budget must leave every ladder that works today alone. The
+    /// worst *benign* case the shipped defaults can produce is
+    /// `(retries + 1) × timeout_secs` plus the three backoff sleeps
+    /// (0.5 + 1 + 2 s, each +25% jitter) ≈ 127 s; the budget has to sit above it
+    /// or the fix becomes a regression for every black-holed host that currently
+    /// recovers on attempt 2.
+    #[test]
+    fn the_fetch_budget_is_larger_than_the_worst_benign_retry_ladder() {
+        let h = HttpConfig::default();
+        assert_eq!(h.total_budget_secs, 300);
+        let attempts = u64::from(h.retries) + 1;
+        let backoff_secs = (500 + 1_000 + 2_000) as f64 * 1.25 / 1000.0;
+        let worst_benign = attempts as f64 * h.timeout_secs as f64 + backoff_secs;
+        assert!(
+            (h.total_budget_secs as f64) > worst_benign,
+            "budget {}s must exceed the worst benign ladder ({worst_benign:.1}s), \
+             or turning it on breaks fetches that work today",
+            h.total_budget_secs
+        );
+        // ...and it must be under `[worker] job_timeout_secs`, which is the whole
+        // point: one hostile URL may not consume a whole job's wall clock.
+        assert!(h.total_budget_secs < WorkerConfig::default().job_timeout_secs);
+    }
+
+    /// The anti-pattern: `[http] max_body_bytes = 0` parsed fine and then made
+    /// the default fetch tier reject **every** non-empty body — a total scraping
+    /// outage whose only symptom was a per-URL "exceeds max_body_bytes cap of 0
+    /// bytes". The `[remote]` and `[ingress]` twins were already guarded.
+    #[test]
+    fn a_zero_http_body_cap_is_refused_not_silently_a_total_outage() {
+        let mut cfg = Config::default();
+        cfg.http.max_body_bytes = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("[http] max_body_bytes"), "{err}");
+        // The message must name the browser tier's OPPOSITE meaning for 0, which
+        // is the reason an operator writes it here in the first place.
+        assert!(err.contains("max_html_bytes"), "{err}");
+        // Any positive cap is fine, however small — smallness is a policy.
+        cfg.http.max_body_bytes = 1;
+        assert!(cfg.validate().is_ok());
     }
 
     #[test]
