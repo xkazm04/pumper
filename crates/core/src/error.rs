@@ -208,10 +208,14 @@ pub enum Error {
     BudgetExhausted(String),
     /// A VCR replay could not be served from the recorded cassette (missing
     /// cassette, unrecorded request, a body truncated at record time, a
-    /// corrupt/unknown-version cassette, or a raw engine reached during a
-    /// replay run). Typed so a replay MISS is distinguishable from an app
-    /// failure — and so it can never be confused with (or silently downgraded
-    /// to) a live fetch.
+    /// corrupt/unknown-version cassette). Typed so a replay MISS is
+    /// distinguishable from an app failure — and so it can never be confused
+    /// with (or silently downgraded to) a live fetch.
+    ///
+    /// Its sibling is [`Error::BadRequest`], which is what
+    /// [`crate::vcr::refuse_replay`] returns when the app *itself* cannot be
+    /// replayed (its work never reaches the chokepoint). That is a fact about
+    /// the app, not about the cassette, so it is not a miss.
     ///
     /// **Terminal for a job** ([`Error::is_terminal_for_job`]): the cassette is
     /// a file written by an already-finished job and the request is derived from
@@ -314,10 +318,13 @@ impl Error {
     /// - [`Error::BadRequest`] — client-supplied input the server understood and
     ///   rejected: a malformed dataset filter/aggregate/derived spec, a
     ///   syntactically bad search query, an unsafe session-profile name
-    ///   (`crate::engine::require_safe_profile_name`). Every producer is a pure
-    ///   function of text that is immutable for the life of the job, so the
-    ///   ladder can only re-parse it and re-fail. A job's params are fixed at
-    ///   enqueue; nothing about attempt 4 makes `"$.a:bogus:1"` parse.
+    ///   (`crate::engine::require_safe_profile_name`), or a `replay_of` against
+    ///   an app that structurally cannot be replayed
+    ///   (`crate::vcr::refuse_replay`). Every producer is a pure function of
+    ///   input that is immutable for the life of the job, so the ladder can only
+    ///   re-derive it and re-fail. A job's params are fixed at enqueue; nothing
+    ///   about attempt 4 makes `"$.a:bogus:1"` parse, or makes an app that
+    ///   drives a browser session route through the fetch chokepoint.
     /// - [`Error::ReplayMiss`] — a VCR replay that could not be served. Every
     ///   construction site was audited before this variant was widened, because
     ///   a variant with one transient producer must NOT be classified here (see
@@ -326,10 +333,12 @@ impl Error {
     ///   `vcr::truncated_miss` (the body was dropped at record time),
     ///   `vcr::to_fetch_outcome` (the entry names an engine no tier produces),
     ///   `vcr::Cassette::load` (no cassette, no readable entries, a forged
-    ///   `req_hash`, an unknown format version) and `vcr::ReplayRefusal` (an app
-    ///   drove a raw engine during a replay). All but one are pure functions of
-    ///   an already-loaded, immutable cassette and a request derived from params
-    ///   frozen at enqueue. The one that touches IO is `load`'s file read — and
+    ///   `req_hash`, an unknown format version). All but one are pure functions
+    ///   of an already-loaded, immutable cassette and a request derived from
+    ///   params frozen at enqueue. (The refusal to replay an app that drives
+    ///   engines raw is NOT one of these sites: nothing about a cassette is in
+    ///   question there, so `vcr::refuse_replay` is a `BadRequest` — see above.)
+    ///   The one that touches IO is `load`'s file read — and
     ///   that site is **already** permanent by call site (the worker resolves
     ///   the cassette before the run and `fail_permanently`s on any load error),
     ///   so widening the variant cannot take retries away from it.

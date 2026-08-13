@@ -545,6 +545,23 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     // Replay is resolved first and on its own, because its failure mode is a
     // pre-run refusal (`return`) — nothing below may have run yet.
     let replay_vcr = if let Some(replay_id) = replay_of {
+        // Can this app be replayed AT ALL? The cassette is written and read at
+        // the AppContext chokepoint, and an app whose work never goes through it
+        // (a transact flow is a browser session; the crawler owns its frontier;
+        // a JSON API needs a POST body) would run entirely live — and then get
+        // stamped `vcr_replay_of`, claiming its output came from recorded bytes.
+        // Refuse before the cassette is even looked for, so the operator is told
+        // about the APP rather than about a missing file.
+        if let Some(refusal) = pumper_core::vcr::refuse_replay(&job.app) {
+            let reason = refusal.to_string();
+            warn!(job = %job.id, app = %job.app, replay_of = %replay_id, "{reason}");
+            let _ = state
+                .storage
+                .fail_permanently(job.id, job.attempts, &reason)
+                .await;
+            finalize(&state, job.id).await;
+            return;
+        }
         // Cassettes live beside the recorded job's other artifacts, under the
         // SAME app (a job can only replay a run of its own app — the fetches
         // it makes are the ones that app's code makes).
@@ -613,6 +630,19 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                 resuming,
                 "vcr record: persisting fetches to this job's cassette"
             );
+            // Say so NOW rather than when the replay is refused a day later:
+            // the recorder only ever sees chokepoint traffic, so for a
+            // raw-engine app this cassette is incomplete (or empty) by
+            // construction — a fact about the app, not about this run.
+            if let Some(why) = pumper_core::vcr::replay_bypass_reason(&job.app) {
+                warn!(
+                    job = %job.id,
+                    app = %job.app,
+                    fidelity = pumper_core::vcr::replay_fidelity(&job.app).as_str(),
+                    "vcr record: this app reaches engines outside the chokepoint, so its \
+                     cassette cannot cover the whole run — {why}"
+                );
+            }
             let recorder = if resuming {
                 pumper_core::Recorder::resuming(artifacts_dir.clone())
             } else {
@@ -771,20 +801,15 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         Outcome::Finished(Ok(mut result)) => {
             // Mark replay runs on the stored result: a replayed job's output is
             // derived from recorded bytes, not the live web, and anyone reading
-            // it later must be able to tell.
+            // it later must be able to tell — including the case where that is
+            // true of only PART of the run (`vcr_replay_fidelity`), which a bare
+            // `vcr_replay_of` used to overstate.
             if let (Some(replay_id), Value::Object(map)) = (replay_of, &mut result) {
-                map.insert("vcr_replay_of".into(), Value::String(replay_id.to_string()));
-                // …and how complete the recording it replayed was. A cassette
-                // whose tail was torn by a crash mid-write loads fine and
-                // serves misses that read exactly like requests the recorded
-                // job never made; the count is the only thing that tells them
-                // apart after the fact.
-                if cassette_unreadable > 0 {
-                    map.insert(
-                        "vcr_cassette_unreadable_lines".into(),
-                        Value::from(cassette_unreadable),
-                    );
-                }
+                map.extend(pumper_core::vcr::replay_stamp(
+                    &job.app,
+                    replay_id,
+                    cassette_unreadable,
+                ));
             }
             // Information economics (M04): parse the result's UpsertSummary-shaped
             // counts BEFORE `complete` consumes it. Recorded only if the

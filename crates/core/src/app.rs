@@ -217,6 +217,11 @@ impl AppContext {
     /// robots and frontier control, so it cannot route through `fetch` — and
     /// would otherwise be invisible to the cost ledger and budget enforcement.
     ///
+    /// Metering is only half of what a raw drive gives up. The other half is
+    /// VCR: that traffic is neither recorded nor replayable, so an app that
+    /// calls this also needs a grade in [`crate::vcr::REPLAY_BYPASS_APPS`] —
+    /// otherwise it is assumed replayable and a `replay_of` job runs it live.
+    ///
     /// Accounting never fails the caller's job: a failed write is warn-logged.
     pub async fn meter(
         &self,

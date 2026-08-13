@@ -14,7 +14,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use pumper_core::vcr::{fetch_entry, Vcr};
+use pumper_core::vcr::{fetch_entry, replay_fidelity, ReplayFidelity, Vcr, REPLAY_BYPASS_APPS};
 use pumper_core::{
     AppContext, Cassette, EnqueueOptions, Error, FetchOutcome, FetchRequest, JobStatus, Result,
     ScrapeApp,
@@ -327,4 +327,147 @@ async fn a_resolve_time_replay_miss_fails_once_instead_of_burning_every_attempt(
         2,
         "one run per job — the replay job must not have run four more times"
     );
+}
+
+// ── An app that cannot be replayed is refused, not run live ─────────────────
+
+/// A registered app that reaches engines outside the chokepoint. `transact` is
+/// the sharpest real member of that class — its runs navigate and fill forms on
+/// live pages — so the stand-in borrows its NAME, which is what the runtime
+/// classifies on. The body is deliberately harmless: what is under test is that
+/// `run` is never entered at all, and the e2e harness wires panicking engines,
+/// so "never entered" is the only way this test can pass.
+const UNREPLAYABLE_APP: &str = "transact";
+
+struct RawEngineApp {
+    runs: Arc<AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl ScrapeApp for RawEngineApp {
+    fn name(&self) -> &'static str {
+        UNREPLAYABLE_APP
+    }
+    async fn run(&self, ctx: AppContext) -> Result<Value> {
+        self.runs.fetch_add(1, Ordering::SeqCst);
+        if matches!(ctx.vcr, Vcr::Record(_)) {
+            // A cassette DOES end up on disk, so the refusal under test cannot
+            // be the missing-cassette path wearing a different hat.
+            record(&ctx, "https://x/recorded", "the recorded page").await;
+            return Ok(json!({ "recorded": true }));
+        }
+        // What today's code reaches: the app runs, drives whatever engines it
+        // drives, and the worker stamps the result `vcr_replay_of`.
+        Ok(json!({ "ran_live": true }))
+    }
+}
+
+/// **The anti-pattern.** `replay_of` was honoured for every app, but the
+/// cassette is written and read at ONE seam — `AppContext::fetch`/`research`.
+/// An app whose work never goes through it (a transact flow IS a browser
+/// session; the crawler owns its frontier; a JSON API needs a POST body) ran
+/// completely live under a `replay_of` job — and the worker then stamped
+/// `vcr_replay_of` on the stored result, whose whole purpose is to say the
+/// output came from recorded bytes rather than the live web.
+///
+/// A replay of such an app must be refused *before the app runs*, and the
+/// refusal must name the app and the reason — otherwise it is indistinguishable
+/// from a missing cassette, which is the operator's fault, not the app's.
+#[tokio::test]
+async fn a_replay_of_a_raw_engine_app_is_refused_not_run_live() {
+    assert_eq!(
+        replay_fidelity(UNREPLAYABLE_APP),
+        ReplayFidelity::Unreplayable,
+        "this test stands on the classification table; regrading {UNREPLAYABLE_APP} means \
+         choosing a different stand-in, not deleting the guard"
+    );
+    let runs = Arc::new(AtomicUsize::new(0));
+    let (state, _store) = test_state(vec![Arc::new(RawEngineApp { runs: runs.clone() })]).await;
+
+    let recorded = state
+        .storage
+        .enqueue(
+            UNREPLAYABLE_APP,
+            EnqueueOptions {
+                params: json!({ "record": true }),
+                max_attempts: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("enqueue");
+    assert!(worker::run_one(&state).await, "the recording run claims");
+    assert_eq!(
+        state
+            .storage
+            .get(recorded.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .status,
+        JobStatus::Succeeded
+    );
+
+    let replay = state
+        .storage
+        .enqueue(
+            UNREPLAYABLE_APP,
+            EnqueueOptions {
+                params: json!({ "replay_of": recorded.id.to_string() }),
+                max_attempts: 5,
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("enqueue");
+    assert!(worker::run_one(&state).await, "the replay run claims");
+
+    let job = state.storage.get(replay.id).await.unwrap().unwrap();
+    assert_eq!(
+        job.status,
+        JobStatus::Failed,
+        "a replay this app cannot serve must fail, not succeed with a live run"
+    );
+    assert_eq!(
+        (job.attempts, job.max_attempts),
+        (1, 5),
+        "an app is what it is on every attempt — the ladder must be left un-burned"
+    );
+    let error = job.error.unwrap_or_default();
+    assert!(
+        error.contains(UNREPLAYABLE_APP) && error.contains("cannot be replayed"),
+        "the refusal must name the app, not read like a missing cassette: {error}"
+    );
+    assert_eq!(
+        runs.load(Ordering::SeqCst),
+        1,
+        "only the recording run ran — the replay must not have reached the app at all"
+    );
+    assert!(
+        !job.result
+            .unwrap_or(Value::Null)
+            .to_string()
+            .contains("vcr_replay_of"),
+        "a run that never replayed anything must not carry a replay provenance stamp"
+    );
+}
+
+/// `REPLAY_BYPASS_APPS` is matched against `job.app` — a string compare, made at
+/// runtime, that nothing else in the workspace checks. A row whose name does not
+/// match the app's registered `name()` (a crate renamed, a `name()` that differs
+/// from its directory) compiles, reads like a decision, and grades exactly zero
+/// jobs: the app it was meant to protect is silently replayable again.
+///
+/// The server crate is the one that can see both the table and the real
+/// registry, so the binding is asserted here.
+#[test]
+fn every_declared_replay_bypass_names_a_registered_app() {
+    let registered: Vec<&'static str> = crate::registry::apps().iter().map(|a| a.name()).collect();
+    for (app, _, _) in REPLAY_BYPASS_APPS {
+        assert!(
+            registered.contains(app),
+            "REPLAY_BYPASS_APPS declares {app:?} unreplayable, but no registered app answers \
+             to that name — the row grades nothing. Registered: {registered:?}"
+        );
+    }
 }

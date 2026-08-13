@@ -419,3 +419,32 @@ async fn the_total_cap_binds_on_the_file_not_on_a_fresh_counter() {
         .expect_err("the second entry must be an honest truncated marker, not a cap breach");
     assert!(err.to_string().contains("truncated"), "got: {err}");
 }
+
+// ── The replay-fidelity table describes apps that exist ─────────────────────
+
+/// `REPLAY_BYPASS_APPS` is the one place replay capability is decided, and its
+/// keys are app *names* matched at runtime against `job.app` — a string compare
+/// nothing else checks. A row naming a crate that was renamed or deleted keeps
+/// compiling, keeps reading like a decision, and grades exactly zero jobs; the
+/// app it was meant to protect silently becomes `Full` and replayable again.
+///
+/// So the table is pinned against the app crates on disk. (The complementary
+/// direction — a NEW raw-engine app that never gets a row — is answered by the
+/// raw-engine scanner in `fetch_chokepoint.rs`, which already walks every
+/// source file in the workspace; duplicating that walk here would be a second
+/// inventory to keep in sync.)
+#[test]
+fn every_replay_bypass_row_names_an_app_crate_that_exists() {
+    let apps_dir = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("apps");
+    for (app, _, _) in pumper_core::vcr::REPLAY_BYPASS_APPS {
+        let crate_dir = apps_dir.join(app);
+        assert!(
+            crate_dir.join("Cargo.toml").is_file(),
+            "REPLAY_BYPASS_APPS names {app:?}, but {} is not an app crate — a stale row \
+             grades nothing, and the app it named is silently replayable again",
+            crate_dir.display()
+        );
+    }
+}

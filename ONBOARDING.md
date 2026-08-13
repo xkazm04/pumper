@@ -284,6 +284,11 @@ impl ScrapeApp for MyApp {
   conditional GET, a binary `fetch_bytes`, a crawler that owns its own
   frontier) — every raw call site in the workspace is inventoried by
   `crates/core/tests/fetch_chokepoint.rs`, so adding one is a reviewed decision.
+  That decision has a **second half**: raw traffic is invisible to the VCR
+  cassette in both directions, so an app that drives engines raw also needs a row
+  in `REPLAY_BYPASS_APPS` (`crates/core/src/vcr.rs`) grading it `Partial` or
+  `Unreplayable`. Without it the app is assumed replayable, and a `replay_of` job
+  runs it live under a `vcr_replay_of` provenance stamp.
   **There is no `ctx.engines.claude`:** the researcher is `pub(crate)` so a model
   call cannot skip metering — use `ctx.research(...)`.
 - `ctx.upsert(dataset, key, &value).await` → `ChangeKind` and

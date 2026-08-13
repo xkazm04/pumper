@@ -51,11 +51,30 @@
 //! The total-size cap is seeded from the cassette actually on disk, so it binds
 //! on real bytes rather than resetting to zero on every attempt.
 //!
+//! ## What replay does NOT cover: the raw-engine class
+//!
+//! The seam is [`crate::AppContext::fetch`] / [`crate::AppContext::research`],
+//! and it is the ONLY seam. A whole class of apps reaches an engine outside it
+//! — `ctx.engines.http` / `ctx.engines.browser` — for reasons that are reviewed
+//! and deliberate (a JSON API needs a POST body or a byte response; the crawler
+//! owns its own frontier; a transact flow is a browser *session*, not a fetch).
+//! Every one of those call sites is pinned in
+//! `crates/core/tests/fetch_chokepoint.rs`.
+//!
+//! Such traffic is invisible to the cassette **in both directions**: nothing of
+//! it is recorded, and on replay nothing stops it running live. So replay
+//! capability is not assumed, it is **declared**, once, per app, in
+//! [`REPLAY_BYPASS_APPS`]:
+//!
+//! - [`ReplayFidelity::Unreplayable`] — a `replay_of` job is refused before
+//!   anything runs ([`refuse_replay`]). The alternative was what shipped: a
+//!   live run under a `vcr_replay_of` stamp claiming it came from recorded
+//!   bytes.
+//! - [`ReplayFidelity::Partial`] — the app mixes both, so the replay is real
+//!   for the chokepointed part and the result says so
+//!   ([`replay_stamp`] adds `vcr_replay_fidelity` + `vcr_replay_bypass`).
+//!
 //! ## Documented limitations
-//! - The seam is [`crate::AppContext::fetch`] / [`crate::AppContext::research`]
-//!   — the choke point every well-behaved app uses. Apps that drive engines
-//!   raw (the crawler owns its own frontier and calls engines directly) bypass
-//!   the cassette and cannot be recorded or replayed.
 //! - The AppContext seam sits **above** header granularity: a fetch returns a
 //!   [`FetchOutcome`], not an `HttpResponse`, so `headers` is populated only
 //!   with the subset the outcome exposes — today the two archive-provenance
@@ -133,6 +152,233 @@ pub enum Vcr {
     Record(Arc<Recorder>),
     /// Serve every AppContext fetch/research from a prior job's cassette.
     Replay(Arc<Cassette>),
+}
+
+// ── Replay fidelity: what a cassette can actually account for ────────────────
+
+/// How much of one app's run a replay can serve from a cassette.
+///
+/// The grade is a fact about the app's *code*, not about any particular
+/// cassette: it answers "does this app's traffic go through the seam the
+/// cassette is written and read at?". See the module docs for the class.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplayFidelity {
+    /// Every fetch and research call goes through the chokepoint, so a replay
+    /// serves the whole run: no engine, no network, no politeness delay, $0.
+    /// The default for an app that is not listed in [`REPLAY_BYPASS_APPS`].
+    Full,
+    /// The app mixes chokepointed calls with raw engine drives. A replay is
+    /// genuine for the recorded part; the raw part still runs live, so the
+    /// stored result carries the grade and the reason rather than a bare
+    /// `vcr_replay_of` that would read as full determinism.
+    Partial,
+    /// The app's work *is* raw engine driving — a replay would reproduce none
+    /// of it and run the whole job live. Refused at the door
+    /// ([`refuse_replay`]).
+    Unreplayable,
+}
+
+impl ReplayFidelity {
+    /// Stable token for the `vcr_replay_fidelity` result key and for logs.
+    /// These strings are a consumer-visible contract; the prose is not.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ReplayFidelity::Full => "full",
+            ReplayFidelity::Partial => "partial",
+            ReplayFidelity::Unreplayable => "unreplayable",
+        }
+    }
+}
+
+/// **The one place replay capability is decided**: every app that reaches an
+/// engine outside [`crate::AppContext::fetch`] / [`crate::AppContext::research`],
+/// with its grade and the reason for the bypass. Anything absent is
+/// [`ReplayFidelity::Full`].
+///
+/// This is the sibling of `EXPECTED_RAW_ENGINE_CALLS` in
+/// `crates/core/tests/fetch_chokepoint.rs` and deliberately not a second copy
+/// of it: that inventory pins *where* the bypasses are and forces a human to
+/// justify a new one; this table records what each one costs **replay**, which
+/// is the half the inventory never answered. A new raw-engine app therefore has
+/// to appear in both, and the cross-check that binds them lives with the
+/// scanner.
+///
+/// **Every row is a decision.** Grading an app `Partial` rather than
+/// `Unreplayable` keeps `replay_of` working for it, so it must be true that a
+/// real part of the run comes back off the cassette — not merely that the app
+/// happens to make one chokepointed call somewhere.
+pub const REPLAY_BYPASS_APPS: &[(&str, ReplayFidelity, &str)] = &[
+    // ── Mixed: the chokepoint covers some run modes and not others ───────────
+    (
+        "extractor",
+        ReplayFidelity::Partial,
+        "its `archive` mode pulls the Wayback CDX index and each snapshot body \
+         through the raw HTTP client (an archive read must not escalate to a live \
+         render); its `urls` and dataset modes go through the chokepoint and do replay",
+    ),
+    // ── Raw all the way down: a replay would reproduce nothing ───────────────
+    (
+        "transact",
+        ReplayFidelity::Unreplayable,
+        "a transact run IS a browser session — navigate, fill, capture evidence — \
+         driven straight off `engines.browser`, with no `FetchOutcome` to record; \
+         replaying it would open a live Chrome against the live page",
+    ),
+    (
+        "crawl",
+        ReplayFidelity::Unreplayable,
+        "the crawler owns its own frontier, robots and concurrency and meters itself \
+         per host, so every page it fetches goes through its own metering client",
+    ),
+    (
+        "ca-grants",
+        ReplayFidelity::Unreplayable,
+        "the CKAN datastore API: a POST with a JSON body, which the tiered fetcher \
+         never issues — and it is the app's whole payload",
+    ),
+    (
+        "census-bfs",
+        ReplayFidelity::Unreplayable,
+        "the Census BFS API: raw JSON, and the app's whole payload",
+    ),
+    (
+        "census-density",
+        ReplayFidelity::Unreplayable,
+        "the Census CBP API: raw JSON, and the app's whole payload",
+    ),
+    (
+        "census-nesd",
+        ReplayFidelity::Unreplayable,
+        "the Census NESD API: raw JSON, and the app's whole payload",
+    ),
+    (
+        "census-nonemp",
+        ReplayFidelity::Unreplayable,
+        "the Census nonemployer API: raw JSON, and the app's whole payload",
+    ),
+    (
+        "cms-fee-schedule",
+        ReplayFidelity::Unreplayable,
+        "the CMS release ZIP, pulled as capped bytes — binary, not a document",
+    ),
+    (
+        "cordis",
+        ReplayFidelity::Unreplayable,
+        "the CORDIS API: raw JSON, and the app's whole payload",
+    ),
+    (
+        "eu-sedia",
+        ReplayFidelity::Unreplayable,
+        "the SEDIA search API: a POST with a JSON body",
+    ),
+    (
+        "grants-gov",
+        ReplayFidelity::Unreplayable,
+        "the Search2 API: a POST with a JSON body, walked page by page",
+    ),
+    (
+        "hackernews",
+        ReplayFidelity::Unreplayable,
+        "fetches its page off the raw HTTP client — it predates the chokepoint, and \
+         the migration is banked rather than done (see the raw-engine inventory)",
+    ),
+    (
+        "mpsv-ispv",
+        ReplayFidelity::Unreplayable,
+        "the ISPV wage API: raw JSON, and the app's whole payload",
+    ),
+    (
+        "mpsv-vpm",
+        ReplayFidelity::Unreplayable,
+        "a ~188 MB bulk feed under a per-request timeout, plus an ARES company \
+         lookup — both raw APIs",
+    ),
+    (
+        "peer",
+        ReplayFidelity::Unreplayable,
+        "conditional GET (`etag`) over a peer node's change feed; the tiered request \
+         carries no validator, so the 304 path a mirror walks exists only raw",
+    ),
+    (
+        "smlouvy-dump-watch",
+        ReplayFidelity::Unreplayable,
+        "the contract-registry dump, fetched raw",
+    ),
+];
+
+/// This app's declared grade — [`ReplayFidelity::Full`] unless
+/// [`REPLAY_BYPASS_APPS`] says otherwise.
+pub fn replay_fidelity(app: &str) -> ReplayFidelity {
+    REPLAY_BYPASS_APPS
+        .iter()
+        .find(|(name, _, _)| *name == app)
+        .map_or(ReplayFidelity::Full, |(_, grade, _)| *grade)
+}
+
+/// Why this app bypasses the cassette, or `None` when it does not.
+pub fn replay_bypass_reason(app: &str) -> Option<&'static str> {
+    REPLAY_BYPASS_APPS
+        .iter()
+        .find(|(name, _, _)| *name == app)
+        .map(|(_, _, why)| *why)
+}
+
+/// The refusal a `replay_of` job against `app` must fail with **before it
+/// runs**, or `None` when the app can be replayed at all.
+///
+/// [`Error::BadRequest`], not [`Error::ReplayMiss`]: nothing about a cassette is
+/// in question here. The caller asked for a mode this app structurally does not
+/// have, which is client-supplied input the server understood and rejected — and
+/// it is deterministic (an app is what it is on every attempt), so the variant's
+/// terminal-for-job classification is exactly right.
+///
+/// The anti-pattern this replaces: the run went ahead, drove live engines, and
+/// the worker stamped `vcr_replay_of` on the result anyway — a provenance claim
+/// that the output was derived from recorded bytes.
+pub fn refuse_replay(app: &str) -> Option<Error> {
+    match replay_fidelity(app) {
+        ReplayFidelity::Full | ReplayFidelity::Partial => None,
+        ReplayFidelity::Unreplayable => Some(Error::BadRequest(format!(
+            "app {app:?} cannot be replayed: {} — a `replay_of` run of it would drive live \
+             engines while its result claimed to come from recorded bytes. Record/replay \
+             covers what goes through AppContext::fetch / AppContext::research",
+            replay_bypass_reason(app).unwrap_or("it drives engines outside the chokepoint"),
+        ))),
+    }
+}
+
+/// The provenance keys a replayed job's stored result must carry: which run it
+/// replayed, **how much of the run the cassette could account for**, and what
+/// the cassette itself lost.
+///
+/// `vcr_replay_fidelity` is written on every replay, including the `full` case,
+/// on purpose: a marker that is present only when something is wrong makes its
+/// absence mean both "this replay is clean" and "this pumper is older than the
+/// check", and those are not the same fact.
+pub fn replay_stamp(
+    app: &str,
+    replay_of: Uuid,
+    unreadable_lines: usize,
+) -> serde_json::Map<String, Value> {
+    let mut stamp = serde_json::Map::new();
+    stamp.insert("vcr_replay_of".into(), Value::String(replay_of.to_string()));
+    stamp.insert(
+        "vcr_replay_fidelity".into(),
+        Value::String(replay_fidelity(app).as_str().into()),
+    );
+    if let Some(why) = replay_bypass_reason(app) {
+        stamp.insert("vcr_replay_bypass".into(), Value::String(why.into()));
+    }
+    // A cassette whose tail was torn by a crash mid-write loads fine and serves
+    // misses that read exactly like requests the recorded job never made; the
+    // count is the only thing that tells them apart after the fact.
+    if unreadable_lines > 0 {
+        stamp.insert(
+            "vcr_cassette_unreadable_lines".into(),
+            Value::from(unreadable_lines),
+        );
+    }
+    stamp
 }
 
 /// Canonical request hash: `sha256(method \0 key)` hex. For fetches `key` is
@@ -916,6 +1162,107 @@ mod tests {
         entry.engine = "warp_drive".into();
         let err = to_fetch_outcome(&entry, Uuid::new_v4()).unwrap_err();
         assert!(matches!(err, Error::ReplayMiss(_)));
+    }
+
+    // ── Replay fidelity ─────────────────────────────────────────────────────
+
+    /// **The anti-pattern.** `replay_of` was honoured for any app at all. An app
+    /// whose work never reaches the chokepoint — `transact` drives
+    /// `engines.browser` directly, and its runs ACT on live pages — therefore
+    /// ran completely live, and the worker stamped `vcr_replay_of` on the
+    /// result, which is a provenance claim that the output came from recorded
+    /// bytes. The refusal has to happen, and it has to name the app and the
+    /// reason, or the operator cannot tell it from a missing cassette.
+    #[test]
+    fn an_unreplayable_app_is_refused_by_name_not_run_live() {
+        let err = refuse_replay("transact").expect("a browser-session app cannot be replayed");
+        assert!(
+            matches!(err, Error::BadRequest(_)),
+            "the caller asked for a mode this app does not have, got: {err}"
+        );
+        assert!(
+            err.is_terminal_for_job(),
+            "an app is what it is on every attempt — the ladder cannot change the answer"
+        );
+        let msg = err.to_string();
+        assert!(msg.contains("transact"), "{msg}");
+        assert!(
+            msg.contains("browser session"),
+            "the reason travels too: {msg}"
+        );
+    }
+
+    /// The mirror risk, and the more expensive one: refusing an app that CAN
+    /// replay silently deletes the feature for it. An app with no raw-engine
+    /// call sites is `Full` by default and is never refused.
+    #[test]
+    fn a_chokepointed_app_is_not_refused() {
+        for app in ["readable", "watch", "plugin", "an-app-invented-tomorrow"] {
+            assert_eq!(replay_fidelity(app), ReplayFidelity::Full);
+            assert!(
+                refuse_replay(app).is_none(),
+                "{app} routes through the chokepoint — replay is exactly what it is for"
+            );
+        }
+    }
+
+    /// The middle grade earns its existence here: `extractor` is the flagship
+    /// replay use case (re-run last week's scrape against the bytes it saw) on
+    /// its `urls` mode, while its `archive` mode reads Wayback raw. Refusing the
+    /// whole app would throw the good half away, so it replays — and says how
+    /// far the claim goes.
+    #[test]
+    fn a_partial_replay_is_stamped_partial_not_bare() {
+        let job = Uuid::new_v4();
+        assert!(
+            refuse_replay("extractor").is_none(),
+            "a mixed app keeps the replay it CAN serve"
+        );
+        let stamp = replay_stamp("extractor", job, 0);
+        assert_eq!(stamp["vcr_replay_of"], Value::String(job.to_string()));
+        assert_eq!(
+            stamp["vcr_replay_fidelity"],
+            Value::String("partial".into())
+        );
+        assert!(
+            stamp["vcr_replay_bypass"]
+                .as_str()
+                .is_some_and(|s| s.contains("archive")),
+            "the stamp names which part did not come off the cassette: {stamp:?}"
+        );
+    }
+
+    /// A clean replay says so positively. A marker written only when something
+    /// is wrong makes its absence mean both "clean" and "older build".
+    #[test]
+    fn a_full_replay_is_stamped_full_not_silent() {
+        let job = Uuid::new_v4();
+        let stamp = replay_stamp("readable", job, 0);
+        assert_eq!(stamp["vcr_replay_fidelity"], Value::String("full".into()));
+        assert!(!stamp.contains_key("vcr_replay_bypass"));
+        assert!(!stamp.contains_key("vcr_cassette_unreadable_lines"));
+        // The torn-tail count still rides along when there is one to report.
+        let torn = replay_stamp("readable", job, 3);
+        assert_eq!(torn["vcr_cassette_unreadable_lines"], Value::from(3usize));
+    }
+
+    /// The table is the ONE place capability is decided, so a row that names
+    /// nothing real, repeats an app, or grades one `Full` is a decision that
+    /// silently applies to no job at all.
+    #[test]
+    fn every_bypass_row_is_a_usable_decision() {
+        let mut seen: Vec<&str> = Vec::new();
+        for (app, grade, why) in REPLAY_BYPASS_APPS {
+            assert!(!app.is_empty() && !why.is_empty(), "{app} needs a reason");
+            assert_ne!(
+                *grade,
+                ReplayFidelity::Full,
+                "{app} is listed as a bypass but graded Full — the row does nothing"
+            );
+            assert!(!seen.contains(app), "{app} is listed twice");
+            seen.push(app);
+            assert_eq!(replay_fidelity(app), *grade, "lookup disagrees for {app}");
+        }
     }
 
     // ── Cassette integrity ──────────────────────────────────────────────────
