@@ -226,16 +226,32 @@ pub trait ScrapeApp: Send + Sync {
     fn name(&self) -> &'static str;               // becomes the API path segment; must be unique
     fn description(&self) -> &'static str { "" }  // shown in GET /apps — document your params here
     fn schedule(&self) -> Option<&'static str> { None }   // 6-field cron w/ seconds; None = manual only
-    fn default_params(&self) -> Value { json!({}) }       // used for scheduled + body-less runs
+    fn requires(&self) -> &'static [Requirement] { &[] }  // preconditions (e.g. an API-key env var)
+    fn default_params(&self) -> Value { Value::Object(Default::default()) } // scheduled + body-less runs
+    fn manifest(&self) -> AppManifest { AppManifest::default() }            // agent-facing contract
     async fn run(&self, ctx: AppContext) -> Result<Value>;// returns JSON stored as the job result
 }
 ```
+
+`run()` is the only required method; the other six have defaults. Two are worth
+overriding on purpose:
+
+- **`manifest()`** — `AppManifest { params_schema, examples, output_shape,
+  cost_class }`. Declaring `params_schema` (JSON Schema draft 2020-12) makes
+  enqueue **enforce** it: a bad `params` body is rejected with **422** and
+  JSON-pointer paths instead of failing halfway through a run. `examples` are
+  worked invocations, and a test asserts each one validates against your own
+  schema, so they cannot rot. This is what makes an app usable by an agent that
+  has never read its source.
+- **`requires()`** — `&[Requirement]`, surfaced by `GET /apps` as a resolved
+  `ready` flag, so a credential-gated app is distinguishable from a working one
+  *before* its first failed job.
 
 Minimal implementation:
 
 ```rust
 use async_trait::async_trait;
-use pumper_core::{AppContext, RenderRequest, Result, ScrapeApp};
+use pumper_core::{AppContext, FetchRequest, Result, ScrapeApp};
 use serde_json::{json, Value};
 
 pub struct MyApp;
@@ -247,9 +263,10 @@ impl ScrapeApp for MyApp {
 
     async fn run(&self, ctx: AppContext) -> Result<Value> {
         let url = ctx.require_str("url")?;                    // typed access to ctx.params
-        let page = ctx.engines.browser.render(RenderRequest::new(url)).await?;
-        ctx.save_artifact("page.html", page.html.as_bytes()).await?;
-        // …parse page.html with `scraper`, build your output…
+        let out = ctx.fetch(FetchRequest::new(url)).await?;   // metered tiered fetch — §6
+        let html = out.html.unwrap_or_default();
+        ctx.save_artifact("page.html", html.as_bytes()).await?;
+        // …parse html with `scraper`, build your output…
         Ok(json!({ "url": url, "items": [] }))
     }
 }
@@ -258,18 +275,37 @@ impl ScrapeApp for MyApp {
 **`AppContext` gives you** (`crates/core/src/app.rs`):
 - `ctx.params: Value` — the enqueue `params`. `ctx.require_str("k")` for a
   required string (errors cleanly if missing).
-- `ctx.engines` — `.http`, `.browser`, `.claude`, and `.fetch` (the tiered
-  fetcher). See §6.
+- **`ctx.fetch(FetchRequest)`** and **`ctx.research(ResearchRequest)`** — the two
+  **metered seams**, and the ones to reach for by default. They add cost
+  attribution, the per-job budget clamp, the learned tier router and VCR
+  record/replay. See §6.
+- `ctx.engines` — `.http`, `.browser` and `.fetch` (the raw engines). Public on
+  purpose, for the cases the metered seam cannot serve (a POST body, a
+  conditional GET, a binary `fetch_bytes`, a crawler that owns its own
+  frontier) — every raw call site in the workspace is inventoried by
+  `crates/core/tests/fetch_chokepoint.rs`, so adding one is a reviewed decision.
+  **There is no `ctx.engines.claude`:** the researcher is `pub(crate)` so a model
+  call cannot skip metering — use `ctx.research(...)`.
 - `ctx.upsert(dataset, key, &value).await` → `ChangeKind` and
-  `ctx.upsert_many(dataset, &items).await` → `UpsertSummary{new,changed,unchanged}`
-  — dedup + change detection, scoped to this app.
-- `ctx.plugins.run(name, doc).await` → JSON — run a sandboxed WASM plugin.
+  `ctx.upsert_many(dataset, &items).await` →
+  `UpsertSummary { new, changed, unchanged, removed }` — dedup + change
+  detection, scoped to this app. (`removed` is only ever populated by
+  `ctx.sync_many`, the full-snapshot variant that also tombstones.)
+- `ctx.plugins.run(name, input, &params).await` → JSON — run a sandboxed WASM
+  plugin. `params` is the per-call config envelope (pass `&json!({})` if the
+  plugin needs none).
 - `ctx.save_artifact(name, bytes).await` — writes under this job's artifact dir.
 - `ctx.app` (this app's name) and `ctx.job_id` (UUID) for correlation.
 
-Free functions in `core` for the Rust-leverage features: `extract_batch(&compiled,
-&docs)` (multi-core extraction — call inside `spawn_blocking`), `crawl(http, cfg,
-out_dir)` (broad crawler), `simhash`/`hamming` (near-dup), `html_to_markdown`.
+Free functions in `core` for the Rust-leverage features:
+
+- `extract_batch(&compiled, &docs)` — multi-core extraction; call inside
+  `spawn_blocking`.
+- `crawl(http, cfg, output_dir, sink, source, progress, checkpointer)` — the
+  broad crawler. The last five are `Option`, so
+  `crawl(http, cfg, Some(dir), None, None, None, None)` is the simple form.
+- `simhash(&text)` / `hamming(a, b)` — near-duplicate detection.
+- `html_to_markdown(&html)` — clean Markdown from a page.
 
 ### Step 3 — Register the crate in the workspace + server
 
@@ -318,17 +354,28 @@ how-to live in `catalog/README.md` and [§10](#10-data-source-catalog).
 
 ## 6. Engine capabilities reference
 
-You call these through `ctx.engines.*`. Signatures live in
-`crates/core/src/engine.rs`. All return `pumper_core::Result<_>`.
+Signatures live in `crates/core/src/engine.rs` and `fetcher.rs`. All return
+`pumper_core::Result<_>`.
+
+**Reach for the metered seams first** — `ctx.fetch(...)` and `ctx.research(...)`.
+The raw engines under `ctx.engines.*` are public for the cases those cannot
+serve, and every raw call site is inventoried (see §5).
 
 ### `ctx.engines.http` — `HttpClient::fetch(HttpRequest) -> HttpResponse`
 ```rust
 let res = ctx.engines.http.fetch(HttpRequest::get("https://api.example.com")).await?;
-// HttpRequest also supports .method (GET/POST), .headers, .body
-// HttpResponse { status, headers, body: String, final_url }; res.is_success()
+// HttpRequest also supports .method (GET/POST), .headers, .body, .etag,
+// .if_modified_since, .max_body_bytes, .timeout_secs, .proxy, .profile, .no_cache
+// HttpResponse { status, headers, body: String, final_url, cache_hit }; res.is_success()
 ```
-Retries `429/502/503/504` with backoff automatically. Shares a cookie jar across
-calls within the process.
+Retries the configured `[http] retryable_statuses` (default `429/502/503/504`)
+with backoff automatically. Shares a cookie jar across calls within the process.
+
+`HttpClient::fetch_bytes(HttpRequest) -> Vec<u8>` is the **binary** seam (no
+charset decoding, no response cache, buffered in memory under `max_body_bytes`).
+It is a default-bodied trait method, so not every engine implements it — the
+one at `ctx.engines.http` does, and a conformance test pins that. See
+[docs/features/fetching.md](docs/features/fetching.md#engine-capability-contract).
 
 ### `ctx.engines.browser` — `Browser::render(RenderRequest) -> RenderedPage`
 ```rust
@@ -336,22 +383,40 @@ let mut req = RenderRequest::new("https://spa.example.com");
 req.wait_for_selector = Some(".results".into());  // wait for an element
 req.extra_wait_ms = Some(1500);                    // extra settle time
 req.evaluate = Some("document.title".into());      // JS → RenderedPage.evaluated (JSON)
-let page = ctx.engines.browser.render(req).await?; // RenderedPage { html, final_url, evaluated }
+let page = ctx.engines.browser.render(req).await?;
+// RenderedPage { html, final_url, evaluated, nav_timed_out, selector_found,
+//                blocked_resources, actions_completed, network }
 ```
 Chrome launches lazily on first use and stays warm. **Logged-in scraping:** set
 `headless = false` in `[browser]`, run a job, log in to the site in the window
 that opens, then set `headless = true` — cookies persist in `data/browser-profile`.
 
-### `ctx.engines.claude` — `Researcher::research(ResearchRequest) -> ResearchOutput`
+`Browser::transact(TransactRequest) -> TransactEvidence` is the declarative
+**dry-run flow** seam (form fill → evidence bundle, stopping before the
+irreversible action). Like `fetch_bytes` it is default-bodied: an engine that
+does not implement it refuses with a **terminal** `Error::Transact`, so the job
+fails once rather than riding the retry ladder.
+
+### `ctx.research(...)` — the ONLY way to reach the model
 ```rust
 let mut req = ResearchRequest::new("Research X. Reply with ONLY JSON: {…schema…}")
     .with_role("compose");          // Opus @ xhigh; or "research" = Sonnet @ high
 req.max_turns = Some(25);
 req.effort = Some("max".into());    // per-job override of the role's effort
 req.resume_session = Some(prev_id); // multi-step: continue a prior CLI session
-let out = ctx.engines.claude.research(req).await?;
+let out = ctx.research(req).await?;
 // ResearchOutput { text, json: Option<Value>, cost_usd, duration_ms, num_turns, session_id }
 ```
+There is **no `ctx.engines.claude`**. The researcher behind `EngineSet` is
+`pub(crate)`, so an app crate cannot name it — a direct call would silently lose
+the research cache, the per-job budget governor and cost metering, and it once
+did (`connector-api-watch` summarized every doc diff off-ledger). The privacy is
+the guard; `crates/core/tests/llm_chokepoint.rs` bans the string in app crates as
+the backstop. `ctx.research` is the metered wrapper: identical requests inside
+the cache TTL are served from disk at $0, misses refuse to start once the job
+budget is spent, and every call — including a failed one that already spent —
+lands in `cost_events`.
+
 Model + reasoning are chosen per job: pass a `role` (presets in `[claude.roles]`),
 or set `model` / `effort` (`low|medium|high|xhigh|max`) directly — request fields
 override the role, which overrides the config default, **per field independently**.
@@ -371,17 +436,29 @@ subprocess runs in `<storage root>/claude-cwd`, not the server's CWD, so it does
 not inherit your checkout's `CLAUDE.md`/hooks. See
 [docs/features/fetching.md](docs/features/fetching.md#what-may-cross-the-cmdexe-shim).
 
-### `ctx.engines.fetch` — `Fetcher::fetch(FetchRequest) -> FetchOutcome`
+### `ctx.fetch(...)` — `Fetcher::fetch(FetchRequest) -> FetchOutcome`, metered
 ```rust
 let mut req = FetchRequest::new("https://…");
 req.strategy = FetchStrategy::AutoWithResearch; // http → browser → claude
 req.to_markdown = true;
-let out = ctx.engines.fetch.fetch(req).await?;
-// FetchOutcome { engine: "http"|"browser"|"claude", html, markdown, text, escalations, .. }
+let out = ctx.fetch(req).await?;
+// FetchOutcome { url, engine, status, html, markdown, text,
+//                escalations, trace, cost_usd, snapshot }
 ```
 The fetcher starts on the cheapest tier and escalates when the extracted text is
-below `min_content_chars` (default 250). `escalations` records why each hop
-happened. `FetchStrategy` = `Http | Browser | Auto | AutoWithResearch`.
+below `min_content_chars` (default 250) **or the response is a bot-wall**.
+`FetchStrategy` = `Http | Browser | Auto | AutoWithResearch`.
+
+- `engine` is the winning tier: `"archive" | "api_recipe" | "http" | "browser" |
+  "claude"` (the first two are opt-in pre-live tiers).
+- `trace` is the **structured** per-tier record — branch on `TierTrace.verdict`
+  (`ok | thin | blocked | error | skipped_by_router`) rather than parsing the
+  human `escalations` lines, which are kept alongside for the trail.
+- `snapshot` is `Some` only when the body came out of a stored capture rather
+  than the live site, carrying its capture time.
+
+`ctx.engines.fetch.fetch(...)` is the same call **unmetered** — no cost event, no
+budget clamp, no tier learning, no VCR. Use `ctx.fetch`.
 
 ### HTML → Markdown — `pumper_core::html_to_markdown(&html) -> String`
 Strips scripts/nav/footer chrome and serializes the meaningful content as clean
