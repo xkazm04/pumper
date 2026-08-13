@@ -4,10 +4,16 @@ type: perfect/context
 group: Job Orchestration
 category: lib
 opportunity: 9
-last_proposed: never
+last_proposed: 2026-08-03
 cooldown_until: —
-directions: []
+directions: ["[[finalize-off-the-slot]]", "[[job-receipt]]", "[[saved-search-virtual-app-scoping]]", "[[worker-lifecycle-harness]]", "[[worker-panic-containment]]"]
 ---
+
+<!-- r17 reconciliation (2026-08-13): this note said `last_proposed: never` with an
+empty `directions:` list while five directions had shipped from it in round 4
+(a372209, 7efdd53, 21c838d, ddebd66, 4b80eb2). The frontmatter was stale, not the
+history. Corrected so the coverage rule is computable from the vault. -->
+
 
 ## Current state (scout brief, 2026-08-03 — CACHED, unused; next cursor candidate)
 
