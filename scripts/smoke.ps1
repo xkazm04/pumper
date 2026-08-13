@@ -388,6 +388,29 @@ try {
                 Add-Result -Name 'GET /metrics carries the webhook delivery series' -Status 'FAIL' -Detail $_.Exception.Message
             }
 
+            # The remote fetch fabric's egress split. BOTH series must be present
+            # with the fabric OFF (this scratch config has no [remote] nodes):
+            # an absent series and a zero series are different answers to "did any
+            # egress leave through a peer", and a fabric that is silently falling
+            # back to the coordinator's own IP is exactly what this exists to show.
+            try {
+                $resp = Invoke-WebRequest -Uri "$baseUrl/metrics" -UseBasicParsing -TimeoutSec 20
+                $body = $resp.Content
+                $wanted = @(
+                    'pumper_remote_egress_fetches{served_by="peer"} 0',
+                    'pumper_remote_egress_fetches{served_by="local_fallback"} 0'
+                )
+                $missing = @($wanted | Where-Object { -not $body.Contains($_) })
+                if ($resp.StatusCode -eq 200 -and $missing.Count -eq 0) {
+                    Add-Result -Name 'GET /metrics carries the remote egress series' -Status 'PASS'
+                } else {
+                    Add-Result -Name 'GET /metrics carries the remote egress series' -Status 'FAIL' `
+                        -Detail "HTTP $($resp.StatusCode), missing: $($missing -join ', ')"
+                }
+            } catch {
+                Add-Result -Name 'GET /metrics carries the remote egress series' -Status 'FAIL' -Detail $_.Exception.Message
+            }
+
             # A bogus ?status= must be a 400 naming the allowed values, NOT an
             # empty 200 — "no such deliveries" and "no such state" are opposite
             # answers on the endpoint that exists to surface undelivered hooks.
@@ -476,6 +499,12 @@ try {
             Test-TransactDoor -Name 'POST /apps/transact/jobs blank idempotency_key -> 422' -JobParams $withBlankKey
             $withTypo = $transactBase.Clone(); $withTypo.step = @(@{ action = 'click'; selector = '#next' })
             Test-TransactDoor -Name "POST /apps/transact/jobs typo'd 'step' key -> 422" -JobParams $withTypo
+            # An unsafe profile name must die at the DOOR, not become a job that
+            # re-refuses on every attempt. The schema's pattern is generated from
+            # the validator's own alphabet, so the door and the engine cannot
+            # disagree about what a legal profile is.
+            $withBadProfile = $transactBase.Clone(); $withBadProfile.profile = '../escape'
+            Test-TransactDoor -Name 'POST /apps/transact/jobs unsafe profile name -> 422' -JobParams $withBadProfile
 
             # ...and the manifest DECLARES the closed door, so a consumer
             # reading the tool definition sees the same contract the door
