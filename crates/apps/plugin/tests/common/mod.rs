@@ -38,6 +38,11 @@ pub enum Answer {
     /// the plugin's own DATA, not a host failure — the distinction the typed
     /// outcome seam exists to keep.
     SelfReportedError,
+    /// A **params-aware** module, like the reference `title-extractor`: it
+    /// produces output only when `params.tag` is set, and an empty object
+    /// otherwise. Replaying it with `params: null` makes it look permanently
+    /// broken — which is exactly what the observatory used to do.
+    OnlyWithTag,
 }
 
 /// An in-process `Plugins` host: a fixed loaded-name list plus one scripted
@@ -50,6 +55,7 @@ pub struct StubPlugins {
     loaded: Vec<String>,
     answer: Answer,
     calls: AtomicUsize,
+    seen_params: std::sync::Mutex<Vec<Value>>,
 }
 
 impl StubPlugins {
@@ -58,6 +64,7 @@ impl StubPlugins {
             loaded: loaded.iter().map(|s| (*s).to_string()).collect(),
             answer,
             calls: AtomicUsize::new(0),
+            seen_params: std::sync::Mutex::new(Vec::new()),
         })
     }
 
@@ -69,12 +76,22 @@ impl StubPlugins {
     pub fn calls(&self) -> usize {
         self.calls.load(Ordering::SeqCst)
     }
+
+    /// Every params envelope the host was handed, in call order — the only way
+    /// to prove a replay was configured rather than merely claimed to be.
+    pub fn seen_params(&self) -> Vec<Value> {
+        self.seen_params.lock().expect("params lock").clone()
+    }
 }
 
 #[async_trait]
 impl Plugins for StubPlugins {
-    async fn run(&self, name: &str, input: &str, _params: &Value) -> Result<Value> {
+    async fn run(&self, name: &str, input: &str, params: &Value) -> Result<Value> {
         self.calls.fetch_add(1, Ordering::SeqCst);
+        self.seen_params
+            .lock()
+            .expect("params lock")
+            .push(params.clone());
         if !self.loaded.iter().any(|n| n == name) {
             return Err(Error::plugin(
                 PluginFailure::Unknown,
@@ -90,6 +107,10 @@ impl Plugins for StubPlugins {
             }
             Answer::FailIf(..) => Ok(json!({ "title": input })),
             Answer::SelfReportedError => Ok(json!({ "error": "no <title> found" })),
+            Answer::OnlyWithTag => match params.get("tag").and_then(Value::as_str) {
+                Some(tag) => Ok(json!({ "tag": tag, "value": input })),
+                None => Ok(json!({})),
+            },
         }
     }
 
@@ -135,6 +156,33 @@ pub async fn seed_pages(store: &TempStore, n: usize, body: &str) -> String {
     let items: Vec<(String, Value)> = (0..n)
         .map(|i| {
             let key = format!("http://p{i}");
+            (
+                key.clone(),
+                json!({ "url": key, "artifact_path": "p.html", "job_id": crawl_job }),
+            )
+        })
+        .collect();
+    store
+        .datasets()
+        .upsert_many("crawl", "pages", &items)
+        .await
+        .unwrap();
+    crawl_job
+}
+
+/// Seeds `n` crawl pages that all share ONE host, keyed
+/// `http://site.test/p{i}` — the observatory buckets by site, so pages keyed
+/// `http://p{i}` would be `n` sites of one page each.
+pub async fn seed_site_pages(store: &TempStore, n: usize, body: &str) -> String {
+    let crawl_job = Uuid::new_v4().to_string();
+    let dir = store.path().join("crawl").join(&crawl_job);
+    tokio::fs::create_dir_all(&dir).await.unwrap();
+    tokio::fs::write(dir.join("p.html"), body.as_bytes())
+        .await
+        .unwrap();
+    let items: Vec<(String, Value)> = (0..n)
+        .map(|i| {
+            let key = format!("http://site.test/p{i}");
             (
                 key.clone(),
                 json!({ "url": key, "artifact_path": "p.html", "job_id": crawl_job }),

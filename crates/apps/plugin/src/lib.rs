@@ -663,11 +663,13 @@ impl ScrapeApp for Plugin {
          + current), or source.backfill: true + url_pattern (batched fan over the whole \
          page_versions archive); historical records are keyed {url}@{date} and tagged \
          _url + _observed_at. Observatory mode: {\"observatory\": true | {\"plugins\": \
-         [..]?, \"sample_per_site\": 25}} replays each plugin (default all loaded) over \
+         [\"name\" | {\"name\": .., \"params\": {..}}]?, \"sample_per_site\": 25}} replays \
+         each plugin (default all loaded) with its configured params over \
          sampled stored pages per site (newest + seeded-random across the live dataset + \
          page_versions), classifies outcomes (ok/trap/empty/schema_invalid) and upserts \
-         per (plugin, site) drift rows into the `observatory` dataset (sampled/total \
-         reported; <5 stored pages => low_confidence; rising empty-rate flagged)."
+         per (plugin, config, site) drift rows into the `observatory` dataset (sampled/total \
+         reported; <5 stored pages => low_confidence; rising empty-rate flagged; unreadable \
+         and zero-byte stored artifacts reported as corpus facts, never as plugin misses)."
     }
 
     fn manifest(&self) -> AppManifest {
@@ -744,14 +746,28 @@ impl ScrapeApp for Plugin {
                                 "properties": {
                                     "plugins": {
                                         "type": "array",
-                                        "items": { "type": "string", "minLength": 1 },
+                                        "items": {
+                                            "oneOf": [
+                                                { "type": "string", "minLength": 1 },
+                                                {
+                                                    "type": "object",
+                                                    "required": ["name"],
+                                                    "properties": {
+                                                        "name": { "type": "string", "minLength": 1 },
+                                                        "params": { "description": "Params envelope this plugin is replayed with; overrides the job-level plugin_params." }
+                                                    },
+                                                    "additionalProperties": false
+                                                }
+                                            ]
+                                        },
                                         "minItems": 1,
-                                        "description": "Plugins to audit (default: all loaded)."
+                                        "description": "Plugins to audit (default: all loaded). A bare name inherits the job-level `plugin_params`; {name, params} overrides it. Two configurations of one plugin are two rows (keyed plugin@<fingerprint>|site), so neither overwrites the other's drift history."
                                     },
                                     "sample_per_site": {
                                         "type": "integer",
                                         "minimum": 1,
-                                        "description": "Stored pages sampled per site: newest half + seeded-random rest (default 25). Rows report sampled/total; sites with <5 stored pages are marked low_confidence."
+                                        "maximum": 500,
+                                        "description": "Stored pages sampled per site: newest half + seeded-random rest (default 25, ceiling 500 — the replay count is sites x plugins x this). Rows report sampled/total; sites with <5 stored pages are marked low_confidence."
                                     }
                                 },
                                 "additionalProperties": false
@@ -821,9 +837,12 @@ impl ScrapeApp for Plugin {
                  scanned, skipped_pattern, loaded, batches, missing, missing_keys[]}. urls and \
                  source also carry {records[] (a BOUNDED echo — see `records_echo`), \
                  records_total, records_truncated}; backfill never echoes. Observatory mode: \
-                 {sites, rows, pages_replayed, low_confidence_sites, flagged_empty_rising, new, \
-                 changed, unchanged} with per-(plugin, site) drift rows in the observatory \
-                 dataset",
+                 {sites, rows, pages_replayed, pages_unreadable, pages_empty, \
+                 low_confidence_sites, flagged_empty_rising, new, changed, unchanged} with \
+                 per-(plugin, config, site) drift rows in the observatory dataset. Those rows' \
+                 measurement fields (run_at, prev_run_at, avg_elapsed_ms, the fuel/memory \
+                 figures) are declared DERIVED, so a re-run over an unchanged corpus reports \
+                 them unchanged instead of marking every row changed",
             ),
             cost_class: CostClass::Metered,
         }
