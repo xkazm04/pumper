@@ -3,12 +3,12 @@ slug: engine-conformance-suite
 type: perfect/direction
 context: "[[engine-contracts]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 9dc0608
 ---
 ## What & why
 Five capability traits define what an engine *is* in this repo, and **nothing anywhere runs a

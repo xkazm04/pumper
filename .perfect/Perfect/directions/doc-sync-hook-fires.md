@@ -3,12 +3,12 @@ slug: doc-sync-hook-fires
 type: perfect/direction
 context: "[[maintenance-tooling]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: f67e1f4
 ---
 ## What & why
 `.claude/CLAUDE.md` devotes its longest section to the **Documentation Sync** rule and calls it

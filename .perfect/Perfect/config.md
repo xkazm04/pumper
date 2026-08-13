@@ -313,3 +313,34 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   `/perfect smoke` mode is written for the Personas desktop app (:17320 bridge) and does not apply
   here. Round 6 should build a pumper-shaped smoke: boot `just run` on a scratch config+port, drive
   one real job, curl the new endpoints, tear down. Four shipped surfaces are waiting on it.
+- 2026-08-13 (round 17): **The Class C mechanism earned its keep for the first time as a
+  collision-avoider rather than ceremony.** Both directions needed a row in
+  `feature-doc-map.json` — the single true overlap in an otherwise clean partition. Making that
+  one file Director-only cost nothing and removed the only reason the two lots could have
+  fought. Rule to keep: when exactly one file straddles a partition, Class C it rather than
+  re-planning the wave or accepting a Class B race.
+- 2026-08-13 (round 17): **Applying Class C is not bookkeeping — review it like a diff.** The
+  `ONBOARDING.md` map row I was about to apply would have been partially inert, because the
+  hook hardcoded `docs/features/` as the only satisfying prefix; the reminder would have named a
+  file that could not answer it. Lot E caught it *while reporting the row it needed*, which is
+  an argument for asking builders to report Class C items with caveats rather than as bare data.
+  I fixed the predicate and re-calibrated rather than shipping the row or dropping it.
+- 2026-08-13 (round 17): **The coverage figure had drifted every round for four rounds because
+  the stated rule was not computable.** Two independent causes: a stale note (`job-worker`) and —
+  the nasty one — a naive `/^---\n([\s\S]*?)\n---/` frontmatter regex that silently skips every
+  CRLF file in this repo, under-reporting coverage by ten contexts. My first computation said
+  18/46 and I only caught it by disbelieving an output that listed `claude-engine` and
+  `eu-grants` as never-proposed. **Any vault metric computed by regex must normalize CRLF first,
+  and any number that disagrees with the shipped ledger is the metric's bug, not the ledger's.**
+- 2026-08-13 (round 17): **"Measure it, don't read it" turned a filed-as-lesser seed into the
+  round's best direction.** r11 scouted the same `check-doc-sync` scan window and banked it as
+  anchor #4, "dev-loop only". r17's scout *replayed the algorithm over real transcripts* and
+  found it had never fired in 1,136 edits. Same code, same reader-quality, opposite verdict —
+  the difference was execution vs. inspection. Add to scout prompts: **for any claim of the form
+  "X never happens" or "X is not reached", run it rather than reasoning about it.**
+- 2026-08-13 (round 17): **Builder death is cheap now; builder *silence* is the residual cost.**
+  The r16 D5 builder died leaving a compile error one line wide, and its wip message said
+  "investigating a failing test" — which cost me a full read of a 540-line diff to discover the
+  work was complete. A wip snapshot that names the *symptom it last saw* (`rustc says: second
+  test attribute is supplied`) would have cut that to seconds. Add to the brief template: if you
+  are about to run out of room, commit a wip whose message pastes the last error verbatim.

@@ -3,12 +3,12 @@ slug: archive-provenance-visible
 type: perfect/direction
 context: "[[engine-contracts]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 2dfa214
 ---
 ## What & why
 The `[archive]` tier exists to trade **freshness for availability**: when a host is dead,

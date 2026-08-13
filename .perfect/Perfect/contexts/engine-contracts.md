@@ -104,4 +104,43 @@ all four tests in `engine-browser/tests/render.rs` are `#[ignore]`d and `just ci
 ## Shipped
 - (rounds 9–10, incidental via other contexts): fetch chokepoint `6237cc8`, `Error::Transact`
   terminality `8e17ca7`, core prelude `684d2c7`, error-code contract `0cfc366`.
-- Round 17: (in flight)
+- **Round 17 — 3/3 shipped** (landed on master `782b231` 2026-08-13, pushed):
+  - [[archive-provenance-visible]] → `2dfa214` — `FetchOutcome.snapshot:
+    Option<SnapshotProvenance{via, captured_at}>`, `None` on every live tier, with **three** real
+    readers (the cost-event detail line, the winning `TierTrace.detail`, and the VCR cassette, so
+    a replayed archive fetch does not come back looking live). Provenance headers are read **only
+    inside the archive branch**, so a live origin returning `x-pumper-fetched-via: archive`
+    forges nothing. `docs/features/fetching.md` gained a "Tier zero: the archive tier" section —
+    it had not documented the archive tier at all.
+    **The builder refuted part of my brief and was right**: "byte-indistinguishable from a live
+    fetch" was overstated — `FetchOutcome.engine == "archive"` and `TierTrace{tier: Archive}` were
+    already branchable. The uncontested gap was the **capture timestamp** — the freshness the tier
+    trades — dropped at the engine boundary with zero readers. It built for that.
+  - [[engine-conformance-suite]] → `9dc0608` — the battery lives in
+    `crates/server/src/e2e/engine_conformance.rs` (core sees no engine crate), asserts **by
+    behavior, never by message text**, and was calibrated red: with the fixes reverted it fails on
+    `RemoteEngine`'s capability and on the retryable flow refusal. `Browser::transact`'s default
+    is now `Error::Transact` — terminal, 422 not 502 — while a failure *during* a flow stays
+    `Error::Browser` and stays retryable, a finer cut than I specified. It deliberately did **not**
+    add a new `Error` variant, because `routes/error.rs` holds an exhaustive match and was Lot M's
+    file — a correct cross-lot collision avoidance. `RemoteEngine` (a decorator) now **forwards**
+    `fetch_bytes` to local; `ArchiveEngine` **refuses as itself**, naming `list_snapshots`.
+  - [[onboarding-compiles]] → `f3e62cd` — swept §5–§7 symbol by symbol and found more than the
+    brief listed: `crawl()` takes **seven** parameters not six (my evidence missed
+    `checkpointer`), `HttpResponse` was missing `cache_hit`, `RenderedPage` missing five fields,
+    `UpsertSummary` missing `removed`, and the minimal-app template taught a raw browser render
+    where `ctx.fetch` is the metered idiom. Guard: `crates/core/tests/onboarding_contract.rs`,
+    four EXPECTED-diff tests over the doc's **fenced code blocks only** (so the prose may now
+    correctly say `ctx.engines.claude` does not exist), all confirmed failing against master's
+    `ONBOARDING.md`.
+
+### Banked from r17's build (for r19+, this context is on cooldown until then)
+- **`MeteringHttpClient` (`crates/apps/crawl/src/lib.rs`) is still a decorator that drops
+  `fetch_bytes`.** Recorded as a **named exemption with its reason** in the conformance
+  inventory test — visible rather than silent — because it is private to `app-crawl` and outside
+  Lot E's write set. Latent today (the crawl frontier never asks for bytes). Fix is one line:
+  forward to `inner`. Belongs to whoever next owns [[web-crawler]].
+- **Archive provenance stops at `FetchOutcome`/receipt/cassette and does not reach a dataset
+  revision** — `Provenance` lives in `datasets.rs` and has no snapshot field. Recorded in
+  `fetching.md` § Known gaps.
+- The same-class gap on the remote/peer tier (no field names the serving node) → [[remote-engine]].

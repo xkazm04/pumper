@@ -3,12 +3,12 @@ slug: doctor-sees-search
 type: perfect/direction
 context: "[[maintenance-tooling]]"
 lens: feature
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 1a1f597
 ---
 ## What & why
 `GET /datasets/doctor` is the store-integrity report — the surface an operator hits at 2am, and

@@ -2,11 +2,11 @@
 type: perfect/home
 repo: pumper
 updated: 2026-08-13
-pool: 6
-pool_target: per-dispatch (r17 cap 6 — gated, building)
-shipped_total: 134
+pool: 0
+pool_target: per-dispatch (r17 complete — 6/6 shipped; the next dispatch sets the cap)
+shipped_total: 140
 coverage: "30/46 map contexts covered. RULE (recomputable — compute it, never inherit it): a map context is COVERED when it has >=1 direction note pointing at it (`context: \"[[<name>]]\"`), OR an explicit nothing-clears-the-bar verdict, OR `last_proposed != never`. **Normalize CRLF before any frontmatter regex** — a naive /^---\\n([\\s\\S]*?)\\n---/ silently skips every CRLF file in this repo and scored coverage at 18/46 in r17, calling claude-engine/eu-grants/wasm-plugin-host never-proposed when each has 3 shipped directions. That trap, plus one genuinely stale note (job-worker said `last_proposed: never` against 5 shipped r4 directions — fixed r17), is why the figure drifted every round (r15 carried 24, r16 carried 26 then 'corrected' to 25, headline said 27). Recomputed honestly in r17: **28 entering**, +engine-contracts +maintenance-tooling gated r17 = **30**. 16 never proposed. Inherited pre-46-map history (browser-engine, http-engine, …) deliberately does NOT count as covered."
-cursor: "r17 BUILD in flight (perfect/2026-08-13, Lot E engine-contracts 1-3 + Lot M maintenance-tooling 4-6). r18 PROPOSE: pick 2 never-proposed, ties by opportunity — browser-engine (opp 4, BANKED ANCHOR from r17: `Browser::render` is the only required method of its trait and has ZERO CI coverage — all 4 tests in engine-browser/tests/render.rs are #[ignore]d and `just ci` omits --ignored; fix shape known, an offline harness over a local axum server, precedent engine-http/tests/profiles.rs) · remote-engine (opp 4, BANKED ANCHOR: RemoteEngine::fetch swallows EVERY peer failure into a warn! and silently falls back to LOCAL egress, and no field on HttpResponse/TierTrace says which node served a fetch — geo-distributed egress is the engine's whole product claim and it is unverifiable) · then http-engine / vcr-testing / page-monitor / connector-api-watch / plugin-runner (banked r14 anchor) / data-pipeline-catalog / us-federal-grants / us-state-grants / czech-procurement / trades-* / agentic-research / hackernews-example / wasm-plugin-examples. Do NOT re-mine engine-contracts or maintenance-tooling before r19 (cooldown); their banked anchors are recorded in the two context notes. Still the strongest queued work in the vault: dataset-storage's retention-pin-is-dead-code, and crawler-core's MAX_FRONTIER lifetime cap."
+cursor: "r17 COMPLETE — 6/6 shipped, merged and pushed (master 782b231); gate 1697/0, smoke 34/34. r18 PROPOSE: pick 2 never-proposed, ties by opportunity — browser-engine (opp 4, BANKED ANCHOR from r17: `Browser::render` is the only required method of its trait and has ZERO CI coverage — all 4 tests in engine-browser/tests/render.rs are #[ignore]d and `just ci` omits --ignored; fix shape known, an offline harness over a local axum server, precedent engine-http/tests/profiles.rs) · remote-engine (opp 4, BANKED ANCHOR: RemoteEngine::fetch swallows EVERY peer failure into a warn! and silently falls back to LOCAL egress, and no field on HttpResponse/TierTrace says which node served a fetch — geo-distributed egress is the engine's whole product claim and it is unverifiable) · then http-engine / vcr-testing / page-monitor / connector-api-watch / plugin-runner (banked r14 anchor) / data-pipeline-catalog / us-federal-grants / us-state-grants / czech-procurement / trades-* / agentic-research / hackernews-example / wasm-plugin-examples. Do NOT re-mine engine-contracts or maintenance-tooling before r19 (cooldown); their banked anchors are recorded in the two context notes. Still the strongest queued work in the vault: dataset-storage's retention-pin-is-dead-code, and crawler-core's MAX_FRONTIER lifetime cap."
 last_session: "[[sessions/2026-08-13]]"
 ---
 
@@ -14,9 +14,13 @@ last_session: "[[sessions/2026-08-13]]"
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **6** · phase: **round 17 BUILD** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 30/46.**
+**State**: pool **0** · phase: **round 17 COMPLETE — 6/6 shipped** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 30/46.**
 
-### Round-17 pool — 6 GATED (2026-08-13, gate: director-self-gated, SWEEP round)
+### Round-17 pool — 6 GATED → ALL 6 SHIPPED + 1 Director follow-up (2026-08-13, landed `782b231`, pushed)
+Gate on the wave tip: fmt clean · clippy exit 0, **no new warnings in any file the wave touched**
+(both hits verified pre-existing on master by content, not line number) ·
+`cargo test --workspace` **1697 passed / 0 failed** (entering baseline 1650, +47 tests) ·
+`just smoke` **34/34** on merged master.
 Two never-proposed contexts, both scouted "very thorough" end to end. **The two severest claims
 in each brief were Director-verified before gating, and that verification changed the slate
 twice** — once by refuting a scout's own #5 finding, once by promoting an r11 seed the earlier

@@ -3,12 +3,12 @@ slug: onboarding-compiles
 type: perfect/direction
 context: "[[engine-contracts]]"
 lens: robustness
-status: accepted
+status: shipped
 size: S
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: f3e62cd
 ---
 ## What & why
 `ONBOARDING.md` is described by `CLAUDE.md` as *"the agent-facing contract"* — the primary

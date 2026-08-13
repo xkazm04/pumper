@@ -3,12 +3,12 @@ slug: backfill-purges-ghosts
 type: perfect/direction
 context: "[[maintenance-tooling]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: db184bc
 ---
 ## What & why
 `search-backfill --all` is the documented full rebuild — the thing an operator runs after a

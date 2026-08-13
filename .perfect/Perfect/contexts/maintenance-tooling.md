@@ -100,4 +100,47 @@ keeps earning — this time by promoting one, not shrinking it.
 
 ## Shipped
 - (via search-engine r7 for backfill internals, `4ca9cc4`.)
-- Round 17: (in flight)
+- **Round 17 — 3/3 shipped** (landed on master `782b231` 2026-08-13, pushed):
+  - [[doc-sync-hook-fires]] → `f67e1f4` (+ Director follow-up `782b231`) — **the hook fires.**
+    Boundary predicate layers three signals with content shape primary (a user-role message whose
+    blocks are all `tool_result` is the Messages API wire format — public and versioned, unlike
+    the Claude Code envelope keys that merely corroborate). 19 tests over 6 checked-in fixtures
+    including a **shape canary** that re-checks the fixture assumption against real transcripts,
+    so a format change fails a test instead of silently re-disarming the hook. `just doc-sync`.
+    Calibrated before shipping: 8 of 308 turns (2.6%; 10.3% of editing turns), never twice in a
+    session — Director-verified independently at 5/31 transcripts firing on their final turn,
+    against 0 ever, anywhere, before. Found a real bug while calibrating: `path.relative` was
+    turning sibling-checkout edits (`../politicas/…`) into map-match candidates.
+  - [[backfill-purges-ghosts]] → `db184bc` — **grepped every caller before touching a fleet-wide
+    function**, found `list_all_datasets` serves the watch registry and the DataHub poll (both
+    genuinely wanting the live view), and therefore left it alone, adding
+    `list_all_datasets_including_removed` with a test pinning the live-only contract. Every scope
+    now validates and exits non-zero (proved with the **real binary**, not a unit test). The 1M
+    ceiling was **removed**, not disclosed — keyset-paged through the repo's existing
+    `list_page`/`backfill_cursor` pager, memory flat at one page: "a rebuild whose whole purpose
+    is completeness cannot have a ceiling."
+  - [[doctor-sees-search]] → `1a1f597` — the rule chosen is **zero-versus-nonzero, not a ratio**,
+    argued from the fact that `doc_count` and the record count are not comparable in either
+    direction (the index holds `_job`/`_records` docs that are not records, and omits nearly every
+    record), so any threshold would fire forever on a correct deployment. Disabled search stays
+    healthy; an unreadable `doc_count` yields `null` and no finding — the doctor must not
+    manufacture a finding from its own failure to measure.
+    **The builder refuted my AC4 and was right:** `records.simhash` is `INTEGER NOT NULL DEFAULT
+    0` (migration `0004_simhash.sql`), so the check's `simhash IS NULL` half was **dead code**;
+    and `simhash("")` returns 0 by construction, so `reindex` skips textless records forever. It
+    now counts only rows `reindex` will actually rewrite, making the finding **predictive of its
+    own remediation**, proved end to end against the real `reindex_simhashes`.
+
+### Banked from r17's build (for r19+, this context is on cooldown until then)
+- **Nothing runs `check-doc-sync.test.mjs` automatically.** The Stop hook is still the only path;
+  `.github/workflows/ci.yml` was outside the lot's write set. The builder deliberately did NOT add
+  it to `just ci`, since the justfile documents `ci` as mirroring the CI workflow and that would
+  make it lie. **Recommended: a CI step running `node --test scripts/docs/check-doc-sync.test.mjs`.**
+- `crates/server/src/e2e/**` is test code under `src/` that `SKIP_PATTERNS` does not cover (it
+  matches `/tests/`, not this). Harmless today — nothing in the map matches it — but the same
+  class of gap. One-line follow-up.
+- **`reindex` guard-rails** (the r17 reject, narrowed): report scanned + the resolved DB path,
+  chunk the unbounded full-table read. The wrong-database ambiguity is the part that bites.
+- `/retention/preview` route tests + the vacuous smoke assertions (`smoke.ps1:704-705` asserts
+  `$true`); justfile recipe gaps (hardcoded ports, missing `skip_artifacts`, `curl -s` without
+  `--fail` exiting 0 on a 503); ONBOARDING's stale "two recipes" count and reindex's missing docs.
