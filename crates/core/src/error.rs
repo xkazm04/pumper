@@ -288,13 +288,16 @@ impl Error {
     ///
     /// - [`Error::BudgetExhausted`] — a fact about the job's own ledger, which
     ///   a retry re-reads and re-refuses on.
-    /// - [`Error::Transact`] — produced **only** by `TransactRequest::validate`,
-    ///   whose three refusals (`submit: true`, a blank idempotency key, a
-    ///   profile the vault does not hold) are pure functions of the request. The
-    ///   request is immutable for the life of the job, so every attempt reaches
-    ///   the identical refusal *before touching a browser*. This one matters
-    ///   more than most: transact is the app that ACTS on live pages, and a
-    ///   refusal is precisely the case where the ladder must not keep trying.
+    /// - [`Error::Transact`] — a **pre-flight** flow refusal, from one of two
+    ///   producers. `TransactRequest::validate`'s three refusals (`submit:
+    ///   true`, a blank idempotency key, a profile the vault does not hold) are
+    ///   pure functions of the request; `crate::engine::unsupported_transact`
+    ///   (the `Browser::transact` default) is a pure function of which engine is
+    ///   wired. Request and wiring are both immutable for the life of the job,
+    ///   so every attempt reaches the identical refusal *before touching a
+    ///   browser*. This one matters more than most: transact is the app that
+    ///   ACTS on live pages, and a refusal is precisely the case where the
+    ///   ladder must not keep trying.
     ///
     /// Everything else — engine errors, storage errors, parse failures, even a
     /// replay miss — is either transient or caught earlier, and classifying any

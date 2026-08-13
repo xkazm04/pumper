@@ -62,6 +62,21 @@ Three properties worth knowing:
 
 Historical **backfill** over a date range is a different surface — the extractor app's `source.archive` mode, which enumerates CDX captures and tags records `_fetched_via: "wayback"`. See [extraction.md](extraction.md).
 
+## Engine capability contract
+
+The capability traits (`HttpClient`, `Browser`, `Researcher`) carry **default-bodied** methods, so an engine that does not implement one still compiles. Two rules keep that from becoming a silent hole, both enforced by the cross-engine conformance battery in `crates/server/src/e2e/engine_conformance.rs` (it lives there because `crates/core` depends on no engine crate, so only the server can see every implementor at once):
+
+- **A capability refusal fails the job ONCE.** `Browser::transact`'s default returns `Error::Transact` — **terminal** (`Error::is_terminal_for_job`), surfacing as HTTP **422** rather than 502. Which engine is wired is fixed for the life of a job, so a retry can only reach the identical refusal; it used to be an `Error::Browser`, i.e. retryable, and a transact job on a deployment without a browser engine burned its whole backoff ladder producing the same sentence four times. A failure *during* a flow is still an `Error::Browser` and still retryable — only the pre-flight refusal is terminal.
+- **Binary capability is declared, not discovered.** `HttpClient::fetch_bytes` (raw bytes, no charset decoding, no response cache) is implemented by:
+
+| engine | `fetch_bytes` | |
+| --- | --- | --- |
+| `engine-http` `HttpEngine` | **yes** | the engine that talks to the network |
+| `engine-remote` `RemoteEngine` | **yes**, served locally | `/fetch-proxy` carries a `String` body, so a binary fetch cannot travel it. It forwards to the local stack rather than dropping a capability the engine it wraps has |
+| `engine-archive` `ArchiveEngine` | **no**, deliberately | "the bytes of a snapshot" is unspecified (which capture? what does a freshness window mean for an immutable artifact?). The refusal names the archive and points at `list_snapshots` + `snapshot_url` |
+
+Apps that need binary bodies (`cms-fee-schedule` downloads a release ZIP) call `ctx.engines.http.fetch_bytes(...)`, which relies on `EngineSet.http` being the binary-capable engine. That wiring is now pinned by a test rather than by luck.
+
 ## Engines
 
 - **http** (`engine-http`): reqwest + cookie jar, retries w/ backoff, fronted by the content-addressed TTL `http_cache` (GET-only; `HttpRequest.no_cache` bypasses) and the governor. **Conditional GET:** `HttpRequest.etag` / `HttpRequest.if_modified_since` (serde-defaulted) are sent as `If-None-Match` / `If-Modified-Since` (explicit `headers` still win); a `304 Not Modified` is passed through with its status intact and is **never** written to the cache over the prior full response (powers the crawler's revisit mode — [crawling.md](crawling.md)).

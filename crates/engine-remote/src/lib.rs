@@ -187,6 +187,24 @@ impl HttpClient for RemoteEngine {
             }
         }
     }
+
+    /// Binary fetches are served **locally**, always — the same engine a fetch
+    /// falls back to when every node is unreachable.
+    ///
+    /// `/fetch-proxy` speaks a JSON envelope whose `body` is a `String`, so a
+    /// binary body cannot travel it at all; dispatching one to a peer could only
+    /// mangle it. Serving locally keeps the substitution this engine makes what
+    /// it claims to be — it changes *where* a fetch egresses from, never whether
+    /// it succeeds.
+    ///
+    /// The anti-pattern this closes: a **decorator that silently drops a
+    /// capability**. Inheriting the trait's default would have made every binary
+    /// fetch through this position answer "this engine does not support binary
+    /// fetch_bytes" — even though the engine it wraps supports it perfectly —
+    /// and the only thing that changed was an operator turning `[remote]` on.
+    async fn fetch_bytes(&self, req: HttpRequest) -> Result<Vec<u8>> {
+        self.local.fetch_bytes(req).await
+    }
 }
 
 #[cfg(test)]
@@ -432,6 +450,41 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.body, "served locally");
+    }
+
+    /// Local stub that can serve binary bodies — i.e. the real `HttpEngine`'s
+    /// capability, which this decorator wraps.
+    struct BinaryLocal;
+    #[async_trait]
+    impl HttpClient for BinaryLocal {
+        async fn fetch(&self, _req: HttpRequest) -> Result<HttpResponse> {
+            panic!("the binary path must not go through fetch");
+        }
+        async fn fetch_bytes(&self, _req: HttpRequest) -> Result<Vec<u8>> {
+            Ok(vec![0x50, 0x4B, 0x03, 0x04])
+        }
+    }
+
+    /// The anti-pattern: a **decorator that drops the capability it wraps**.
+    /// `fetch_bytes` is a default-bodied trait method, so a wrapper that forgets
+    /// it does not fail to compile — it silently answers "this engine does not
+    /// support binary fetch_bytes" on behalf of an engine that supports it
+    /// perfectly. Enabling `[remote]` would have been enough to break every
+    /// binary fetch routed through this position.
+    #[tokio::test]
+    async fn a_decorator_does_not_drop_the_binary_capability_it_wraps() {
+        // Nodes configured: a *fetch* would be dispatched to a peer, and the
+        // binary path must still be served locally rather than inherit a refusal.
+        let engine = RemoteEngine::with_transport(
+            &cfg(&["http://node-a.example"]),
+            Arc::new(DeadLocal),
+            Arc::new(BinaryLocal),
+        );
+        let bytes = engine
+            .fetch_bytes(HttpRequest::get("https://target.example/a.zip"))
+            .await
+            .expect("the wrapped engine can do this, so the wrapper must too");
+        assert_eq!(bytes, vec![0x50, 0x4B, 0x03, 0x04]);
     }
 
     #[test]

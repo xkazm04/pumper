@@ -81,6 +81,15 @@ impl HttpClient for Dead {
     async fn fetch(&self, _: HttpRequest) -> Result<HttpResponse> {
         panic!("no fetching in a write-path test")
     }
+
+    /// Overridden for the same reason `transact` is, one trait over: the trait
+    /// default returns a typed `Error::Http` instead of panicking, which turned
+    /// "the app reached an engine" into an ordinary `Err` a test could mistake
+    /// for the refusal it was asserting on. `Dead`'s contract is that *any*
+    /// engine call is a test bug — a default-bodied method is still a call.
+    async fn fetch_bytes(&self, _: HttpRequest) -> Result<Vec<u8>> {
+        panic!("no binary fetching in a write-path test")
+    }
 }
 #[async_trait]
 impl Browser for Dead {

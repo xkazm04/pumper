@@ -362,6 +362,30 @@ impl HttpClient for ArchiveEngine {
             .insert(SNAPSHOT_TS_HEADER.to_string(), captured.to_rfc3339());
         Ok(resp)
     }
+
+    /// **Deliberately unsupported, and it says so as itself.**
+    ///
+    /// A snapshot body *is* reachable as bytes (`/web/<ts>id_/<url>` serves the
+    /// raw capture), but a binary archive fetch has semantics nobody has
+    /// specified: which capture a caller means when they ask for "the bytes" and
+    /// what a freshness window means for an artifact that is immutable by
+    /// definition. Inventing that here would be worse than refusing.
+    ///
+    /// The point of overriding rather than inheriting is the *message*. The
+    /// trait's default says "this engine does not support binary fetch_bytes",
+    /// which is indistinguishable from a mock, a decorator that forgot to
+    /// forward, or a genuine engine gap — so a capability hole in a wrapper and a
+    /// deliberate refusal read identically. This one names the archive and the
+    /// reason, and points at the surface that *does* enumerate captures.
+    async fn fetch_bytes(&self, req: HttpRequest) -> Result<Vec<u8>> {
+        Err(Error::Http(format!(
+            "the archive engine deliberately does not serve binary bodies ({}): \
+             a snapshot is a point in time, and which capture a byte fetch means \
+             is unspecified. Enumerate captures with `ArchiveEngine::list_snapshots` \
+             and fetch a chosen `snapshot_url` through the HTTP engine instead.",
+            req.url
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -758,6 +782,39 @@ mod tests {
         assert_eq!(
             resp.headers.get(SNAPSHOT_TS_HEADER).map(String::as_str),
             Some("2015-06-01T12:00:00+00:00")
+        );
+    }
+
+    /// The anti-pattern: **a capability hole that reads like a mock**.
+    /// `fetch_bytes` is a default-bodied trait method, so an engine that never
+    /// implements it still compiles and answers "this engine does not support
+    /// binary fetch_bytes" — a sentence that is equally true of a forgetful
+    /// decorator, a test stub, and a deliberate refusal. Only one of those three
+    /// is a bug, and the caller could not tell them apart.
+    ///
+    /// The archive's refusal is deliberate (which capture would "the bytes"
+    /// mean?), so it refuses as itself: naming the archive, the reason, and the
+    /// surface that does enumerate captures. It must also never *fetch* anything
+    /// on its way to refusing.
+    #[tokio::test]
+    async fn a_binary_archive_fetch_refuses_as_itself_not_as_an_anonymous_default() {
+        let (engine, inner) = engine_over(ScriptedInner {
+            cdx_body: fresh_cdx_line(),
+            page_body: "unused".into(),
+            seen: std::sync::Mutex::new(Vec::new()),
+        });
+        let err = engine
+            .fetch_bytes(HttpRequest::get("https://example.com/a.zip"))
+            .await
+            .expect_err("the archive engine does not serve binary bodies");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("archive") && msg.contains("list_snapshots"),
+            "the refusal must name itself and the alternative: {msg}"
+        );
+        assert!(
+            inner.seen.lock().unwrap().is_empty(),
+            "refusing must cost no CDX query and no snapshot fetch"
         );
     }
 

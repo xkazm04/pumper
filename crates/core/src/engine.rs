@@ -1089,6 +1089,18 @@ pub trait HttpClient: Send + Sync {
     }
 }
 
+/// The refusal an engine with no flow support owes a caller — one producer, so
+/// a wrapper that wants to refuse explicitly cannot accidentally mint a
+/// *retryable* version of the same sentence.
+///
+/// Terminal by construction: see [`Browser::transact`]'s default body for why
+/// [`Error::Transact`] is the honest variant here.
+pub fn unsupported_transact(url: &str) -> Error {
+    Error::Transact(format!(
+        "this engine does not support transact flows ({url})"
+    ))
+}
+
 /// Headless-browser rendering — JS-heavy pages, logged-in sessions.
 #[async_trait]
 pub trait Browser: Send + Sync {
@@ -1100,11 +1112,18 @@ pub trait Browser: Send + Sync {
     /// back for human review. Default: unsupported — only engines that opt in
     /// (currently `pumper-engine-browser`) can execute flows; wrappers/mocks
     /// keep compiling and fail loudly if a transact reaches them.
+    ///
+    /// The refusal is [`Error::Transact`], not [`Error::Browser`], because it is
+    /// **deterministic**: which engine sits behind the trait object is fixed for
+    /// the life of the job, so every attempt reaches this identical refusal
+    /// before touching a browser. As an `Error::Browser` it was retryable
+    /// ([`Error::is_terminal_for_job`]), and a job that reached an engine
+    /// without flow support burned its whole backoff ladder producing the same
+    /// sentence four times. It sits exactly on the boundary that variant already
+    /// documents: a failure *during* a flow stays an `Error::Browser`; only a
+    /// pre-flight refusal is typed `Transact`.
     async fn transact(&self, req: TransactRequest) -> Result<TransactEvidence> {
-        Err(Error::Browser(format!(
-            "this engine does not support transact flows ({})",
-            req.url
-        )))
+        Err(unsupported_transact(&req.url))
     }
 }
 
