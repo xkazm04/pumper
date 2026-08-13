@@ -10,12 +10,16 @@ serde_json.workspace = true
 tracing.workspace = true
 # Web Reliability Index: `{host}@{date}` observation keys.
 chrono.workspace = true
-# Version-archive artifact copies (async fs, no new runtime feature surface).
-tokio = { workspace = true, features = ["fs"] }
+# `fs`: version-archive artifact copies. `time`: the periodic host-telemetry
+# flush that keeps an interrupted crawl's observations (`tokio::time::timeout`
+# around the crawl future).
+tokio = { workspace = true, features = ["fs", "time"] }
 # Provenance (M12): sha256 of the archived page body stamped on each
 # `page_versions` revision.
 sha2.workspace = true
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util`: `#[tokio::test(start_paused = true)]` drives a crawl past the
+# 2-minute telemetry flush interval in virtual time instead of real minutes.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 pumper-core = { workspace = true, features = ["test-support"] }

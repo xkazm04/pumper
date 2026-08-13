@@ -57,8 +57,17 @@ const WORST_FIELDS_KEPT: usize = 5;
 /// Per-host fetch-layer tallies from one crawl run — counted at the same
 /// observation point that already feeds `learn_tier` (the metering client),
 /// just kept as counters instead of a single boolean.
+///
+/// A run may contribute **several** of these for the same host: a crawl commits
+/// what it has learned periodically so an interrupted run keeps it (see
+/// `flush_host_telemetry`). The counters are additive, so the sum over a run's
+/// flushes equals the single end-of-run fold this replaced — but `runs` must
+/// count runs, not check-ins, which is what [`Self::continues_run`] and
+/// [`Self::run_complete`] are for.
 #[derive(Debug, Default, Clone)]
 pub struct CrawlHostObs {
+    /// PAGE fetches only. Robots/sitemap probes are counted in [`Self::probes`]
+    /// and deliberately excluded here — see `is_page_fetch` in the app.
     pub fetches: u64,
     /// 2xx responses.
     pub ok: u64,
@@ -72,6 +81,21 @@ pub struct CrawlHostObs {
     pub gone: u64,
     /// Responses carrying an `ETag` or `Last-Modified` validator header.
     pub validators_seen: u64,
+    /// `robots.txt` / sitemap fetches — counted so they are not invisible, and
+    /// kept out of every scored counter above so that a host with no
+    /// `robots.txt` (a legitimate `404`) stops looking like a host serving dead
+    /// pages.
+    pub probes: u64,
+    /// True when this delta CONTINUES a run whose contribution to this host was
+    /// already counted — a mid-crawl flush. Without it, a long crawl's periodic
+    /// flushes would each register as another run and inflate `observations`,
+    /// which is the very count `low_confidence` keys off.
+    pub continues_run: bool,
+    /// True when this is the run's LAST contribution for the host (the crawl
+    /// returned). A record whose `runs_complete` lags `runs` is carrying at
+    /// least one interrupted run's partial numbers, which is what lets a
+    /// consumer weight it instead of trusting it as a whole-run view.
+    pub run_complete: bool,
 }
 
 /// One extraction-health verdict attributed to a host — a rendering of the
@@ -125,7 +149,13 @@ fn add(m: &mut Map<String, Value>, key: &str, delta: u64) {
 }
 
 fn crawl_counters(m: &mut Map<String, Value>, obs: &CrawlHostObs) {
-    add(m, "runs", 1);
+    // A run contributes ONE `runs` fold however many times it checks in: the
+    // counter answers "how many crawls touched this host", not "how often did
+    // they flush". `add(.., 0)` rather than a conditional `add` so both keys are
+    // always PRESENT — an absent `runs_complete` would make a reader distinguish
+    // "no run has finished" from "this record predates the counter".
+    add(m, "runs", u64::from(!obs.continues_run));
+    add(m, "runs_complete", u64::from(obs.run_complete));
     add(m, "fetches", obs.fetches);
     add(m, "ok", obs.ok);
     add(m, "botwall", obs.botwall);
@@ -133,6 +163,13 @@ fn crawl_counters(m: &mut Map<String, Value>, obs: &CrawlHostObs) {
     add(m, "not_modified_304", obs.not_modified);
     add(m, "gone", obs.gone);
     add(m, "validators_seen", obs.validators_seen);
+    add(m, "probes", obs.probes);
+    // Honest partiality, the same rule the rest of the fleet follows for partial
+    // aggregates: a run whose final flush never arrived (reaped, shutdown-drained,
+    // hard-timeout) leaves `runs_complete` behind `runs`, and a consumer can
+    // weight these counters instead of reading them as a whole-run view.
+    let partial = num(m, "runs") > num(m, "runs_complete");
+    m.insert("partial".into(), json!(partial));
 }
 
 fn extraction_counters(m: &mut Map<String, Value>, obs: &ExtractionObs) {
@@ -195,6 +232,21 @@ pub fn merge_observation(
     Value::Object(rec)
 }
 
+/// Whether `delta` BEGINS an observation (a run's first contribution for the
+/// host) or continues one already counted.
+///
+/// Anti-pattern this defends: a crawl now commits its per-host telemetry
+/// periodically so an interrupted run keeps it, and counting every flush as an
+/// observation would let one long crawl of one host manufacture enough
+/// `observations` to clear `low_confidence` on the strength of a single run.
+fn starts_new_observation(delta: &HostDelta) -> bool {
+    match delta {
+        HostDelta::Crawl(o) => !o.continues_run,
+        // Extraction verdicts arrive once per run, at the end.
+        HostDelta::Extraction(_) => true,
+    }
+}
+
 /// Folds one run's delta into the host's rolling `host_index` record and
 /// recomputes the scrapeability score. Pure — callers do the read/write.
 pub fn fold_index(existing: Option<&Value>, host: &str, date: &str, delta: &HostDelta) -> Value {
@@ -204,7 +256,9 @@ pub fn fold_index(existing: Option<&Value>, host: &str, date: &str, delta: &Host
         rec.insert("first_date".into(), json!(date));
     }
     rec.insert("last_date".into(), json!(date));
-    add(&mut rec, "observations", 1);
+    if starts_new_observation(delta) {
+        add(&mut rec, "observations", 1);
+    }
     match delta {
         HostDelta::Crawl(o) => {
             let mut sec = rec.remove("crawl").map(as_map).unwrap_or_default();
@@ -278,22 +332,46 @@ fn scrapeability(rec: &Map<String, Value>) -> Value {
     } else {
         Value::Null
     };
+    // Partial evidence, surfaced where a consumer already looks for confidence:
+    // at least one crawl folded into this host never reached its final flush.
+    let partial_runs = crawl
+        .map(|c| num(c, "runs") > num(c, "runs_complete"))
+        .unwrap_or(false);
     json!({
         "score": score,
         "formula": FORMULA,
         "components": components,
         "low_confidence": observations < MIN_CONFIDENT_OBSERVATIONS,
         "observations": observations,
+        "partial_runs": partial_runs,
+        // Disclosure, not decoration. Folds are read-modify-write (see
+        // `record_observations`), so two runs touching this host in the same
+        // moment can lose one fold. What makes that safe to publish is the
+        // DIRECTION of the error: a lost fold can only ever make `observations`
+        // and every counter UNDERSTATE the evidence behind this score, never
+        // overstate it — and `low_confidence` keys off exactly the count that
+        // can be lost, so the flag fails toward caution.
+        "counters_may_undercount": true,
     })
 }
 
-/// Persists a batch of per-host deltas from one finished run: folds each into
-/// its `{host}@{date}` observation record and the host's rolling index record,
-/// then writes both datasets. Read-modify-write per host (O(hosts), matching
-/// the crawl's existing tally flush); a concurrent run folding the same host
-/// can lose one fold — acceptable for telemetry, never for money. Best-effort
-/// throughout: failures warn and are skipped, the job never fails on this.
-/// Returns how many hosts were recorded.
+/// Persists a batch of per-host deltas from a run: folds each into its
+/// `{host}@{date}` observation record and the host's rolling index record, then
+/// writes both datasets. Called **periodically during** a crawl as well as at
+/// its end, so an interrupted run still contributes what it had learned; the
+/// counters are additive, so the sum over a run's flushes equals the single
+/// end-of-run fold this replaced.
+///
+/// Read-modify-write per host (O(hosts), matching the crawl's tally flush); a
+/// concurrent run folding the same host can lose one fold — acceptable for
+/// telemetry, never for money. That limitation is **not left undisclosed**: the
+/// published `scrapeability` block carries `counters_may_undercount`, and the
+/// error only ever runs in the understating direction. Fixing it properly needs
+/// a compare-and-set (or an append-only delta shape) in the dataset store, which
+/// is a different layer than this module.
+///
+/// Best-effort throughout: failures warn and are skipped, the job never fails on
+/// this. Returns how many hosts were recorded.
 pub async fn record_observations(
     datasets: &Datasets,
     job_id: &str,
@@ -360,6 +438,8 @@ pub async fn record_observations(
 mod tests {
     use super::*;
 
+    /// A whole run's worth of tallies, committed in one flush (the common case:
+    /// a crawl shorter than the telemetry flush interval).
     fn crawl_obs() -> CrawlHostObs {
         CrawlHostObs {
             fetches: 10,
@@ -369,6 +449,9 @@ mod tests {
             not_modified: 0,
             gone: 0,
             validators_seen: 4,
+            probes: 0,
+            continues_run: false,
+            run_complete: true,
         }
     }
 
@@ -522,6 +605,120 @@ mod tests {
         o.validators_seen = 0;
         let idx = fold_index(None, "h", "d", &HostDelta::Crawl(o));
         assert_eq!(idx["scrapeability"]["components"]["conditional_get"], 1.0);
+    }
+
+    // ── periodic flushes (an interrupted crawl keeps what it learned) ───────
+
+    /// One flush of a run's telemetry for a host.
+    fn flush(continues_run: bool, run_complete: bool) -> HostDelta {
+        HostDelta::Crawl(CrawlHostObs {
+            fetches: 5,
+            ok: 5,
+            continues_run,
+            run_complete,
+            ..CrawlHostObs::default()
+        })
+    }
+
+    #[test]
+    fn mid_crawl_flushes_count_one_run_not_one_per_flush() {
+        // A crawl now commits per-host telemetry periodically so an interrupted
+        // run still contributes. The counters must stay per-RUN: `runs` answers
+        // "how many crawls touched this host", not "how often did they check in".
+        let mut rec = merge_observation(None, "h", "d", "job-1", &flush(false, false));
+        rec = merge_observation(Some(&rec), "h", "d", "job-1", &flush(true, false));
+        rec = merge_observation(Some(&rec), "h", "d", "job-1", &flush(true, true));
+        assert_eq!(rec["crawl"]["runs"], 1, "{rec}");
+        assert_eq!(rec["crawl"]["runs_complete"], 1, "{rec}");
+        assert_eq!(rec["crawl"]["fetches"], 15, "counters still sum: {rec}");
+        assert_eq!(rec["crawl"]["partial"], false, "the run finished: {rec}");
+    }
+
+    #[test]
+    fn an_interrupted_run_stays_marked_partial() {
+        // The reaped/drained case: the final flush never arrived, so the record
+        // must say its numbers describe part of a run, not a whole one.
+        let mut rec = merge_observation(None, "h", "d", "job-1", &flush(false, false));
+        rec = merge_observation(Some(&rec), "h", "d", "job-1", &flush(true, false));
+        assert_eq!(rec["crawl"]["runs"], 1, "{rec}");
+        assert_eq!(rec["crawl"]["runs_complete"], 0, "{rec}");
+        assert_eq!(rec["crawl"]["partial"], true, "{rec}");
+
+        // A later, complete run on the same day clears nothing retroactively —
+        // one of the two contributions really was partial.
+        let rec = merge_observation(Some(&rec), "h", "d", "job-2", &flush(false, true));
+        assert_eq!(rec["crawl"]["runs"], 2, "{rec}");
+        assert_eq!(rec["crawl"]["runs_complete"], 1, "{rec}");
+        assert_eq!(rec["crawl"]["partial"], true, "{rec}");
+    }
+
+    #[test]
+    fn periodic_flushes_do_not_manufacture_confidence() {
+        // `low_confidence` keys off `observations`. If every flush counted as an
+        // observation, one long crawl of one host would clear the flag on the
+        // strength of a single run's evidence.
+        let mut idx = fold_index(None, "h", "d", &flush(false, false));
+        idx = fold_index(Some(&idx), "h", "d", &flush(true, false));
+        idx = fold_index(Some(&idx), "h", "d", &flush(true, true));
+        assert_eq!(idx["observations"], 1, "{idx}");
+        assert_eq!(idx["scrapeability"]["low_confidence"], true, "{idx}");
+        assert_eq!(idx["scrapeability"]["partial_runs"], false, "{idx}");
+    }
+
+    #[test]
+    fn an_interrupted_contribution_is_visible_where_confidence_is_read() {
+        let idx = fold_index(None, "h", "d", &flush(false, false));
+        assert_eq!(idx["scrapeability"]["partial_runs"], true, "{idx}");
+        // The read-modify-write fold's known lost update is disclosed rather
+        // than left both unfixed and unmentioned — and its direction is stated.
+        assert_eq!(idx["scrapeability"]["counters_may_undercount"], true, "{idx}");
+    }
+
+    // ── probes stay out of the score ────────────────────────────────────────
+
+    #[test]
+    fn a_robots_probe_does_not_drag_down_availability() {
+        // THE REFUTED BEHAVIOR: a host with no robots.txt answered 404, which
+        // classified as `gone` and pushed `availability` (and `fetch_ok`) down.
+        let mut o = CrawlHostObs {
+            fetches: 10,
+            ok: 10,
+            probes: 1,
+            run_complete: true,
+            ..CrawlHostObs::default()
+        };
+        let clean = fold_index(None, "h", "d", &HostDelta::Crawl(o.clone()));
+        assert_eq!(clean["crawl"]["probes"], 1, "{clean}");
+        assert_eq!(clean["scrapeability"]["components"]["availability"], 1.0);
+        assert_eq!(clean["scrapeability"]["components"]["fetch_ok"], 1.0);
+
+        // The control arm: a host that really does serve dead pages still scores
+        // for it, or the fix would have hidden a real signal.
+        o.ok = 9;
+        o.gone = 1;
+        let dead = fold_index(None, "h", "d", &HostDelta::Crawl(o));
+        assert_eq!(dead["scrapeability"]["components"]["availability"], 0.9);
+    }
+
+    #[test]
+    fn a_host_seen_only_through_probes_scores_null_not_zero() {
+        // Probing a host and never fetching a page of it is NO evidence about
+        // its scrapeability — an honest null, never a fabricated 0.
+        let idx = fold_index(
+            None,
+            "h",
+            "d",
+            &HostDelta::Crawl(CrawlHostObs {
+                probes: 1,
+                run_complete: true,
+                ..CrawlHostObs::default()
+            }),
+        );
+        assert_eq!(idx["scrapeability"]["score"], Value::Null, "{idx}");
+        assert!(idx["scrapeability"]["components"]
+            .as_object()
+            .expect("components")
+            .is_empty());
     }
 
     #[test]

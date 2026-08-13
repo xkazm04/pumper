@@ -44,6 +44,9 @@ struct HostTally {
     gone: usize,
     /// Responses carrying an `ETag` or `Last-Modified` validator header.
     validators_seen: usize,
+    /// `robots.txt` / sitemap fetches — counted, but folded into none of the
+    /// scored counters above. See [`is_page_fetch`].
+    probes: usize,
 }
 
 impl HostTally {
@@ -52,8 +55,14 @@ impl HostTally {
         self.botwall > 0 || self.transport_errors > 0
     }
 
-    /// Folds one fetch outcome into the tally (pure classification, kept out of
-    /// the client so it is unit-testable).
+    /// Folds one PROBE fetch into the tally. Counted so the fetches the crawl
+    /// really made are not invisible, but kept out of every scored counter.
+    fn record_probe(&mut self) {
+        self.probes += 1;
+    }
+
+    /// Folds one PAGE fetch outcome into the tally (pure classification, kept
+    /// out of the client so it is unit-testable).
     fn record(&mut self, result: &Result<HttpResponse>) {
         self.fetches += 1;
         match result {
@@ -87,17 +96,26 @@ impl HostTally {
 struct MeteringHttpClient {
     inner: Arc<dyn HttpClient>,
     tallies: Arc<Mutex<HashMap<String, HostTally>>>,
+    /// Whether this run enabled `sitemap_seeds`, so sitemap documents are only
+    /// treated as probes on runs that actually fetch them (see [`is_page_fetch`]).
+    sitemap_seeding: bool,
 }
 
 #[async_trait]
 impl HttpClient for MeteringHttpClient {
     async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
         let host = host_of(&req.url);
+        let is_page = is_page_fetch(&req.url, self.sitemap_seeding);
         let result = self.inner.fetch(req).await;
         if let Some(host) = host {
             // std Mutex, no `.await` held across the guard.
             let mut tallies = self.tallies.lock().unwrap_or_else(|e| e.into_inner());
-            tallies.entry(host).or_default().record(&result);
+            let tally = tallies.entry(host).or_default();
+            if is_page {
+                tally.record(&result);
+            } else {
+                tally.record_probe();
+            }
         }
         result
     }
@@ -115,6 +133,55 @@ pub fn host_of(url: &str) -> Option<String> {
         .map_or(authority, |(_, host)| host);
     let host = authority.split(':').next()?;
     (!host.is_empty()).then(|| host.to_lowercase())
+}
+
+/// Path component of an http(s) URL (leading `/`, query and fragment stripped),
+/// or `"/"` when the URL names only an authority. Sibling of [`host_of`], same
+/// no-`url`-crate policy.
+fn path_of(url: &str) -> Option<&str> {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let authority_and_path = after_scheme.split(['?', '#']).next()?;
+    Some(match authority_and_path.find('/') {
+        Some(i) => &authority_and_path[i..],
+        None => "/",
+    })
+}
+
+/// Whether a path looks like a sitemap document. Consulted **only** on runs that
+/// actually enabled `sitemap_seeds`, so an ordinary crawl of a page genuinely
+/// named `/sitemap.xml` still measures it as a page.
+fn looks_like_sitemap(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    let stem = lower.strip_suffix(".gz").unwrap_or(lower.as_str());
+    stem.ends_with(".xml") && stem.contains("sitemap")
+}
+
+/// Whether this fetch retrieved a **page of the site**, as opposed to a probe
+/// the crawler makes to learn *how* to crawl the host (`robots.txt`, and — on
+/// sitemap-seeding runs — sitemap documents).
+///
+/// Anti-pattern this defends: **a host with no `robots.txt` looked exactly like
+/// a host serving dead pages.** [`MeteringHttpClient`] wraps the very client
+/// core hands to `robots_for`, so a host without a `robots.txt` answered `404`,
+/// which classified as `gone` and folded straight into the Web Reliability
+/// Index. Every crawl therefore fabricated a gone-page observation for every
+/// host lacking a robots.txt, and the index was not merely sparse — it was wrong
+/// in a consistent direction (`availability` and `fetch_ok` both pushed down by
+/// a fetch that was never about a page at all).
+///
+/// Known residual: a robots-declared sitemap at a URL that does not look like
+/// one (say `/feeds/all.xml`) is still measured as a page. That is the
+/// pre-existing behaviour for that URL, not a new error, and it only occurs on
+/// `sitemap_seeds` runs — unlike the robots probe, which every crawl makes
+/// against every host.
+fn is_page_fetch(url: &str, sitemap_seeding: bool) -> bool {
+    let Some(path) = path_of(url) else {
+        return true; // unparseable — measure it rather than silently drop it
+    };
+    if path == "/robots.txt" {
+        return false;
+    }
+    !(sitemap_seeding && looks_like_sitemap(path))
 }
 
 /// Whether this crawl saw the entire graph it discovered.
@@ -194,6 +261,158 @@ pub fn output_shape_keys() -> Vec<&'static str> {
         .map(str::trim)
         .filter(|k| !k.is_empty())
         .collect()
+}
+
+/// How often a running crawl commits what it has learned about the hosts it is
+/// touching.
+///
+/// **Wall clock, not a page stride.** The app has no hook inside core's crawl
+/// loop — the progress seam is a synchronous `Fn`, and hanging DB writes off it
+/// would put them on the crawl's hot path — and a clock bounds the worst-case
+/// loss by *time*, which is the right unit here: a reaped or shutdown-drained
+/// job loses at most one interval no matter how fast it was crawling. Two
+/// minutes is the compromise between that loss (an interrupted six-hour crawl
+/// keeps ~99% of its telemetry) and fold volume (one read-modify-write per host
+/// per interval, i.e. ~30/hour/host — emphatically not the per-page write the
+/// tally exists to avoid). A crawl shorter than the interval flushes exactly
+/// once, at the end, exactly as before.
+const TELEMETRY_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Per-host bookkeeping that must survive across a run's telemetry flushes.
+#[derive(Default)]
+struct TelemetryProgress {
+    /// Hosts whose run has already been counted into `runs`/`observations`, so a
+    /// later flush continues that contribution instead of registering a new run.
+    started: std::collections::HashSet<String>,
+    /// Hosts that lost the HTTP tier at ANY point this run. Monotone on purpose:
+    /// `learn_tier` **resets** a host's strikes on a win, so feeding it a clean
+    /// mid-crawl delta would erase a bot-wall the run had already seen. With the
+    /// cumulative bit, the last signal a completed run sends is identical to the
+    /// single end-of-run signal it used to send — the periodic commits can only
+    /// make the router learn *earlier*, never differently.
+    lost: std::collections::HashSet<String>,
+}
+
+/// Runs `crawl_fut` to completion while committing the metering client's
+/// per-host tallies every `interval` — through every seam that learns from a
+/// crawl: the cost ledger (`ctx.meter`), the learned tier router
+/// (`ctx.learn_tier`) and the Web Reliability Index.
+///
+/// `interval` is [`TELEMETRY_FLUSH_INTERVAL`] in production; it is a parameter
+/// only so the crate's own tests can drive the loop at millisecond cadence
+/// (a paused tokio clock is not an option here — auto-advance trips the SQLite
+/// pool's acquire timeout).
+///
+/// Anti-pattern this defends: **an interrupted crawl contributed nothing.** All
+/// three commits sat after the `?` on `crawl(...)`, so a reaped job, a shutdown
+/// drain (`worker.rs` drops the pinned `app.run(ctx)` future on cancel or
+/// timeout) or a propagating fetch error skipped the entire loop — and the
+/// durable resume state carries no tallies, so the next attempt could not
+/// recover them either. The runs whose telemetry is worth the most, the
+/// multi-hour ones, are exactly the ones most likely to be interrupted, so the
+/// observatory was missing precisely its best evidence.
+///
+/// All three seams are committed per flush, not just the cheap one:
+/// - `meter` appends one $0 ledger event per host per flush. Repeating it is
+///   safe (the sum is what it always was); only the row count changes, and only
+///   for crawls that outlive one interval.
+/// - `learn_tier` is **not** safely repeatable with a delta — a clean delta
+///   resets strikes — so it is fed [`TelemetryProgress::lost`], the run's
+///   cumulative verdict, which makes a completed run's final signal identical to
+///   the one end-of-run call it replaced.
+/// - the reliability fold is additive, and `continues_run` / `run_complete` keep
+///   `runs` counting runs rather than check-ins.
+async fn crawl_flushing_telemetry(
+    ctx: &AppContext,
+    crawl_fut: impl std::future::Future<Output = Result<pumper_core::CrawlStats>>,
+    tallies: &Mutex<HashMap<String, HostTally>>,
+    telemetry: &mut TelemetryProgress,
+    interval: std::time::Duration,
+) -> Result<pumper_core::CrawlStats> {
+    let mut crawl_fut = std::pin::pin!(crawl_fut);
+    let crawl_result = loop {
+        match tokio::time::timeout(interval, &mut crawl_fut).await {
+            Ok(done) => break done,
+            Err(_elapsed) => flush_host_telemetry(ctx, tallies, telemetry, false).await,
+        }
+    };
+    // The final flush runs BEFORE the caller's `?`: a crawl that failed at the
+    // fetch layer still learned which hosts fail, which is precisely the
+    // observation the reliability index exists to keep.
+    flush_host_telemetry(ctx, tallies, telemetry, true).await;
+    crawl_result
+}
+
+/// One commit of the run's accumulated per-host telemetry. See
+/// [`crawl_flushing_telemetry`] for why it is called during the crawl.
+async fn flush_host_telemetry(
+    ctx: &AppContext,
+    tallies: &Mutex<HashMap<String, HostTally>>,
+    progress: &mut TelemetryProgress,
+    final_flush: bool,
+) {
+    // Drain: a flush commits only what accumulated since the last one.
+    let drained = std::mem::take(&mut *tallies.lock().unwrap_or_else(|e| e.into_inner()));
+    if drained.is_empty() && !final_flush {
+        return;
+    }
+    let mut hosts: Vec<(String, HostTally)> = drained.into_iter().collect();
+    hosts.sort_by(|a, b| a.0.cmp(&b.0)); // deterministic write order
+    let mut deltas: Vec<(String, reliability::HostDelta)> = Vec::with_capacity(hosts.len());
+    let mut flushed_now: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (host, tally) in hosts {
+        let continues_run = !progress.started.insert(host.clone());
+        if tally.http_lost() {
+            progress.lost.insert(host.clone());
+        }
+        flushed_now.insert(host.clone());
+        let url = format!("https://{host}/");
+        let detail = format!(
+            "crawl: {} http fetches ({} robots/sitemap probes)",
+            tally.fetches, tally.probes
+        );
+        ctx.meter("http", Some(&url), 0.0, Some(&detail)).await;
+        ctx.learn_tier(&host, "http", progress.lost.contains(&host))
+            .await;
+        deltas.push((
+            host,
+            reliability::HostDelta::Crawl(reliability::CrawlHostObs {
+                fetches: tally.fetches as u64,
+                ok: tally.ok as u64,
+                botwall: tally.botwall as u64,
+                transport_errors: tally.transport_errors as u64,
+                not_modified: tally.not_modified as u64,
+                gone: tally.gone as u64,
+                validators_seen: tally.validators_seen as u64,
+                probes: tally.probes as u64,
+                continues_run,
+                run_complete: final_flush,
+            }),
+        ));
+    }
+    if final_flush {
+        // A host last touched before the previous flush has no new counters, but
+        // its record still says the run is in progress. Close it out with an
+        // empty delta, or a completed crawl would leave `partial: true` behind
+        // on every host that went quiet early.
+        let mut tail: Vec<String> = progress
+            .started
+            .difference(&flushed_now)
+            .cloned()
+            .collect();
+        tail.sort();
+        for host in tail {
+            deltas.push((
+                host,
+                reliability::HostDelta::Crawl(reliability::CrawlHostObs {
+                    continues_run: true,
+                    run_complete: true,
+                    ..reliability::CrawlHostObs::default()
+                }),
+            ));
+        }
+    }
+    reliability::record_observations(&ctx.datasets, &ctx.job_id.to_string(), deltas).await;
 }
 
 /// Max existing `pages` records loaded as revisit seeds per run (bounds the
@@ -867,9 +1086,10 @@ impl ScrapeApp for Crawl {
         let metered_http: Arc<dyn HttpClient> = Arc::new(MeteringHttpClient {
             inner: ctx.engines.http.clone(),
             tallies: tallies.clone(),
+            sitemap_seeding: cfg.sitemap_seeds,
         });
 
-        let stats = crawl(
+        let crawl_fut = crawl(
             metered_http,
             cfg,
             Some(ctx.artifacts_dir.clone()),
@@ -880,42 +1100,25 @@ impl ScrapeApp for Crawl {
             // through the job's checkpoint sink (runtime-throttled, lineage-
             // guarded), which is what `resume_state` restores on re-claim.
             Some(ctx.checkpoints.clone()),
+        );
+        // Commit host telemetry WHILE the crawl runs, not only after it returns.
+        // The interruption paths that motivate this (reap, shutdown drain, hard
+        // timeout) DROP this future — no unwind, no `Err` — so nothing after it
+        // is guaranteed to execute, and everything the run learned used to die
+        // with it. Driven by `timeout` on one task rather than a spawned one:
+        // `AppContext` is not `Clone`, and a flush must never race itself.
+        let mut telemetry = TelemetryProgress::default();
+        let stats = crawl_flushing_telemetry(
+            &ctx,
+            crawl_fut,
+            &tallies,
+            &mut telemetry,
+            TELEMETRY_FLUSH_INTERVAL,
         )
         .await?;
-
-        // Flush the tally: one cost event + one tier-router signal per host. HTTP
-        // fetches cost $0 (only the Claude tier spends), so this feeds call-count /
-        // ROI accounting and, crucially, teaches the router which hosts bot-wall
-        // the HTTP tier — the crawl's richest signal, previously discarded.
-        let tallies = std::mem::take(&mut *tallies.lock().unwrap_or_else(|e| e.into_inner()));
-        let mut reliability_deltas: Vec<(String, reliability::HostDelta)> =
-            Vec::with_capacity(tallies.len());
-        for (host, tally) in tallies {
-            let url = format!("https://{host}/");
-            let detail = format!("crawl: {} http fetches", tally.fetches);
-            ctx.meter("http", Some(&url), 0.0, Some(&detail)).await;
-            ctx.learn_tier(&host, "http", tally.http_lost()).await;
-            // Web Reliability Index (M41): the same per-host outcomes, persisted
-            // instead of discarded after the router learns from them.
-            reliability_deltas.push((
-                host,
-                reliability::HostDelta::Crawl(reliability::CrawlHostObs {
-                    fetches: tally.fetches as u64,
-                    ok: tally.ok as u64,
-                    botwall: tally.botwall as u64,
-                    transport_errors: tally.transport_errors as u64,
-                    not_modified: tally.not_modified as u64,
-                    gone: tally.gone as u64,
-                    validators_seen: tally.validators_seen as u64,
-                }),
-            ));
-        }
-        let reliability_hosts = reliability::record_observations(
-            &ctx.datasets,
-            &ctx.job_id.to_string(),
-            reliability_deltas,
-        )
-        .await;
+        // Distinct hosts whose fetch telemetry this run folded into the index
+        // (a run may fold a host several times; it is still one host).
+        let reliability_hosts = telemetry.started.len();
 
         // Snapshot the link-graph run state (dropped, deduped, top_linked). The
         // crawl has returned, so the sink holds no lock.
@@ -1097,6 +1300,43 @@ mod tests {
         assert_eq!(host_of(""), None);
     }
 
+    // ── probe vs page ───────────────────────────────────────────────────────
+
+    #[test]
+    fn a_missing_robots_txt_is_not_a_dead_page() {
+        // THE REFUTED BEHAVIOR: the metering client wraps the client core hands
+        // to `robots_for`, so a host with no robots.txt answered 404 → `gone` →
+        // folded into the reliability index. Every crawl fabricated a gone-page
+        // observation for every host that simply has no robots.txt.
+        assert!(!is_page_fetch("https://example.com/robots.txt", false));
+        assert!(!is_page_fetch("http://example.com/robots.txt?x=1", false));
+        // ...while a real page is still measured, including one that merely
+        // mentions robots.
+        assert!(is_page_fetch("https://example.com/", false));
+        assert!(is_page_fetch("https://example.com/docs/robots.txt.html", false));
+        assert!(is_page_fetch("https://example.com/about/robots.txt", false));
+    }
+
+    #[test]
+    fn sitemaps_count_as_probes_only_on_runs_that_fetch_them() {
+        // A page genuinely named /sitemap.xml on an ordinary crawl is a page —
+        // the crawl never probed for it, it was discovered like any other URL.
+        assert!(is_page_fetch("https://example.com/sitemap.xml", false));
+        assert!(!is_page_fetch("https://example.com/sitemap.xml", true));
+        assert!(!is_page_fetch("https://example.com/sitemaps/products-1.xml", true));
+        assert!(!is_page_fetch("https://example.com/sitemap.xml.gz", true));
+        // Not every XML document is a sitemap.
+        assert!(is_page_fetch("https://example.com/feed.xml", true));
+    }
+
+    #[test]
+    fn path_of_ignores_authority_query_and_fragment() {
+        assert_eq!(path_of("https://h.example/robots.txt?a=1#f"), Some("/robots.txt"));
+        assert_eq!(path_of("https://user:pw@h.example:8443/a/b"), Some("/a/b"));
+        assert_eq!(path_of("https://h.example"), Some("/"));
+        assert_eq!(path_of("https://h.example?q=1"), Some("/"));
+    }
+
     // ── truncation honesty ──────────────────────────────────────────────────
 
     #[test]
@@ -1223,6 +1463,232 @@ mod tests {
             .remove(0);
         assert_eq!(edge.provenance.job_id.as_deref(), Some(JOB));
         assert!(edge.provenance.source_url.is_none());
+    }
+
+    // ── telemetry survives interruption ─────────────────────────────────────
+    //
+    // Driven at millisecond cadence against a real store. A paused tokio clock
+    // is not usable here: auto-advance fires the SQLite pool's acquire timeout,
+    // so `TempStore::new` itself fails. `interval` being a parameter of
+    // `crawl_flushing_telemetry` is what makes these tests possible.
+
+    use pumper_core::testing::TestContext;
+    use std::time::Duration;
+
+    const FAST: Duration = Duration::from_millis(25);
+
+    /// One host's worth of successful page fetches.
+    fn tally_of(fetches: usize) -> HostTally {
+        let mut t = HostTally::default();
+        for _ in 0..fetches {
+            t.record(&resp(200, &[]));
+        }
+        t
+    }
+
+    async fn day_record(store: &TempStore, host: &str) -> Value {
+        let key = reliability::obs_key(host, &chrono::Utc::now().format("%Y-%m-%d").to_string());
+        store
+            .datasets()
+            .get(reliability::APP, reliability::OBS_DATASET, &key)
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("no observation recorded for {host}"))
+            .data
+    }
+
+    #[tokio::test]
+    async fn an_abandoned_crawl_has_already_committed_what_it_learned() {
+        // THE REFUTED BEHAVIOR: every commit sat after the `?` on `crawl(...)`,
+        // so dropping the run future — exactly what the worker does on a cancel
+        // or a hard timeout — threw away the whole run's telemetry. The resume
+        // state carries no tallies either, so the next attempt could not
+        // recover them.
+        let store = TempStore::new("crawl-flush-abandoned").await;
+        let ctx = TestContext::new(&store.storage, "crawl").build();
+        let job_id = ctx.job_id;
+        let tallies = Arc::new(Mutex::new(HashMap::new()));
+        tallies
+            .lock()
+            .unwrap()
+            .insert("example.com".to_string(), tally_of(7));
+        let mut telemetry = TelemetryProgress::default();
+
+        // A crawl that never returns, abandoned mid-flight.
+        let never = std::future::pending::<Result<pumper_core::CrawlStats>>();
+        let outcome = tokio::time::timeout(
+            Duration::from_millis(400),
+            crawl_flushing_telemetry(&ctx, never, &tallies, &mut telemetry, FAST),
+        )
+        .await;
+        assert!(outcome.is_err(), "fixture is wrong: this crawl never ends");
+
+        let obs = day_record(&store, "example.com").await;
+        assert_eq!(obs["crawl"]["fetches"], 7, "{obs}");
+        assert_eq!(obs["crawl"]["runs"], 1, "{obs}");
+        // ...and it says so: a consumer can weight a partial contribution.
+        assert_eq!(obs["crawl"]["runs_complete"], 0, "{obs}");
+        assert_eq!(obs["crawl"]["partial"], true, "{obs}");
+
+        // The two seams the end-of-run drain also used to skip.
+        let events = pumper_core::costs::CostLedger::new(store.storage.pool())
+            .job_events(job_id)
+            .await
+            .unwrap();
+        assert!(!events.is_empty(), "the cost ledger lost the run");
+        assert!(
+            pumper_core::tiers::TierMemory::new(store.storage.pool(), 0)
+                .get("example.com")
+                .await
+                .unwrap()
+                .is_some(),
+            "the tier router lost what the run learned about this host"
+        );
+    }
+
+    #[tokio::test]
+    async fn periodic_flushes_of_one_run_stay_one_run() {
+        // The control arm: committing early must not turn one crawl into many.
+        // `low_confidence` keys off `observations`, so an inflated count would
+        // let a single long crawl manufacture confidence in its own numbers.
+        let store = TempStore::new("crawl-flush-one-run").await;
+        let ctx = TestContext::new(&store.storage, "crawl").build();
+        let tallies = Arc::new(Mutex::new(HashMap::new()));
+        let mut telemetry = TelemetryProgress::default();
+
+        let feeding = {
+            let tallies = tallies.clone();
+            async move {
+                for _ in 0..5 {
+                    tokio::time::sleep(Duration::from_millis(30)).await;
+                    tallies
+                        .lock()
+                        .unwrap()
+                        .entry("example.com".to_string())
+                        .or_insert_with(HostTally::default)
+                        .record(&resp(200, &[]));
+                }
+                Ok(pumper_core::CrawlStats::default())
+            }
+        };
+        crawl_flushing_telemetry(&ctx, feeding, &tallies, &mut telemetry, FAST)
+            .await
+            .unwrap();
+
+        let obs = day_record(&store, "example.com").await;
+        assert_eq!(obs["crawl"]["fetches"], 5, "every fetch, counted once: {obs}");
+        assert_eq!(obs["crawl"]["runs"], 1, "not one run per flush: {obs}");
+        assert_eq!(obs["crawl"]["runs_complete"], 1, "{obs}");
+        assert_eq!(obs["crawl"]["partial"], false, "{obs}");
+        let idx = store
+            .datasets()
+            .get(reliability::APP, reliability::INDEX_DATASET, "example.com")
+            .await
+            .unwrap()
+            .expect("index record")
+            .data;
+        assert_eq!(idx["observations"], 1, "{idx}");
+    }
+
+    #[tokio::test]
+    async fn a_host_that_went_quiet_early_is_still_closed_out() {
+        // A host touched only at the start is drained by an early flush and has
+        // nothing left for the final one. Without an explicit completion delta
+        // it would keep `partial: true` forever, so a finished crawl would look
+        // interrupted on every host that stopped appearing.
+        let store = TempStore::new("crawl-flush-quiet-host").await;
+        let ctx = TestContext::new(&store.storage, "crawl").build();
+        let tallies = Arc::new(Mutex::new(HashMap::new()));
+        tallies
+            .lock()
+            .unwrap()
+            .insert("early.example".to_string(), tally_of(3));
+        let mut telemetry = TelemetryProgress::default();
+
+        let later = async {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            Ok(pumper_core::CrawlStats::default())
+        };
+        crawl_flushing_telemetry(&ctx, later, &tallies, &mut telemetry, FAST)
+            .await
+            .unwrap();
+
+        let obs = day_record(&store, "early.example").await;
+        assert_eq!(obs["crawl"]["fetches"], 3, "{obs}");
+        assert_eq!(obs["crawl"]["runs"], 1, "{obs}");
+        assert_eq!(obs["crawl"]["runs_complete"], 1, "{obs}");
+        assert_eq!(obs["crawl"]["partial"], false, "{obs}");
+    }
+
+    #[tokio::test]
+    async fn a_failing_crawl_still_records_which_hosts_failed() {
+        // The `?` used to swallow this: a crawl that dies at the fetch layer is
+        // exactly when the reliability index most wants the observation.
+        let store = TempStore::new("crawl-flush-on-error").await;
+        let ctx = TestContext::new(&store.storage, "crawl").build();
+        let tallies = Arc::new(Mutex::new(HashMap::new()));
+        let mut t = HostTally::default();
+        t.record(&Err(Error::App("dns".into())));
+        tallies
+            .lock()
+            .unwrap()
+            .insert("broken.example".to_string(), t);
+        let mut telemetry = TelemetryProgress::default();
+
+        let failing = async { Err(Error::App("crawl blew up".into())) };
+        let err = crawl_flushing_telemetry(&ctx, failing, &tallies, &mut telemetry, FAST)
+            .await
+            .expect_err("the crawl's error still propagates");
+        assert!(err.to_string().contains("blew up"));
+
+        let obs = day_record(&store, "broken.example").await;
+        assert_eq!(obs["crawl"]["transport_errors"], 1, "{obs}");
+        assert_eq!(obs["crawl"]["runs_complete"], 1, "a finished-with-error run: {obs}");
+    }
+
+    #[tokio::test]
+    async fn a_clean_late_flush_does_not_erase_a_bot_wall_the_run_already_hit() {
+        // `learn_tier` RESETS a host's strikes on a win, so feeding it each
+        // flush's own delta would let a quiet tail of the crawl wipe out a
+        // bot-wall seen earlier. The cumulative verdict is what it gets.
+        let store = TempStore::new("crawl-flush-cumulative-loss").await;
+        let ctx = TestContext::new(&store.storage, "crawl").build();
+        let tiers = pumper_core::tiers::TierMemory::new(store.storage.pool(), 0);
+        let tallies = Arc::new(Mutex::new(HashMap::new()));
+        let mut walled = HostTally::default();
+        walled.record(&resp(429, &[]));
+        tallies
+            .lock()
+            .unwrap()
+            .insert("walled.example".to_string(), walled);
+        let mut telemetry = TelemetryProgress::default();
+
+        let clean_tail = {
+            let tallies = tallies.clone();
+            async move {
+                tokio::time::sleep(Duration::from_millis(120)).await;
+                tallies
+                    .lock()
+                    .unwrap()
+                    .entry("walled.example".to_string())
+                    .or_insert_with(HostTally::default)
+                    .record(&resp(200, &[]));
+                Ok(pumper_core::CrawlStats::default())
+            }
+        };
+        crawl_flushing_telemetry(&ctx, clean_tail, &tallies, &mut telemetry, FAST)
+            .await
+            .unwrap();
+
+        let profile = tiers
+            .get("walled.example")
+            .await
+            .unwrap()
+            .expect("the host is known");
+        assert!(
+            profile.http_strikes > 0,
+            "the bot-wall this run hit must survive its clean tail: {profile:?}"
+        );
     }
 
     #[tokio::test]
