@@ -1,8 +1,19 @@
 //! Run a sandboxed WASM plugin over documents (fuel + memory limited), deduping
 //! the JSON results into a dataset. The extraction logic lives in the .wasm
 //! module — swappable at runtime without recompiling the service, and safe to run
-//! even if untrusted. Two input modes, mirroring `extractor`: fetch live `urls`,
-//! or read stored bodies from a crawl→dataset `source` (no re-fetch).
+//! even if untrusted.
+//!
+//! **Four modes**, sharing one door and one metering path:
+//! - `urls` — fetch each URL live through the metered chokepoint, then run.
+//! - `source` — run over stored bodies from a crawl→dataset `source`, no
+//!   re-fetch. `as_of` / `versions: "all"` resolve through the crawl archive.
+//! - `backfill` (`source.backfill: true`) — fan the plugin over the whole
+//!   `page_versions` archive in checkpointed batches.
+//! - `observatory` — corpus-scale differential replay, see [`observatory`].
+//!
+//! The first three write records and share one result contract (see
+//! [`with_outcome_fields`] and [`with_records_echo`] — one definition, not
+//! three).
 
 use std::collections::BTreeMap;
 
@@ -20,9 +31,21 @@ mod observatory;
 /// Default in-flight cap for the URL/record fan-out, matching `CrawlConfig.concurrency`.
 const DEFAULT_CONCURRENCY: usize = 16;
 
-/// Read the `concurrency` param (max in-flight fetch+run tasks), clamped to `>= 1`
-/// and defaulting to [`DEFAULT_CONCURRENCY`]. Uses ordered buffering so the
-/// positional `zip` of keys against results stays correct.
+/// Hard ceiling on the in-flight fan-out, whatever the caller asks for.
+///
+/// Every in-flight fetch holds a socket (and, on the browser tier, a tab), and
+/// the per-host governor serializes hosts but caps nothing globally — so a
+/// `concurrency: 100000` on a wide URL list is an fd-exhaustion request. The
+/// same number is declared as the schema's `maximum`, so the enqueue door
+/// refuses what this clamp would otherwise silently rewrite: **one bound, two
+/// layers, never two different answers**. `docs/features/extraction.md` claimed
+/// exactly that of this app while the code clamped only the lower end.
+const MAX_CONCURRENCY: usize = 64;
+
+/// Read the `concurrency` param (max in-flight fetch+run tasks), clamped into
+/// `1..=`[`MAX_CONCURRENCY`] and defaulting to [`DEFAULT_CONCURRENCY`]. Uses
+/// ordered buffering so the positional `zip` of keys against results stays
+/// correct.
 fn concurrency(ctx: &AppContext) -> usize {
     parse_concurrency(&ctx.params)
 }
@@ -86,14 +109,91 @@ fn batch_provenance(metas: &[DocMeta], rules_hash: Option<&str>) -> Provenance {
     }
 }
 
-/// Pure param parse for [`concurrency`] — clamps `concurrency` to `>= 1`,
-/// defaulting to [`DEFAULT_CONCURRENCY`].
+/// Pure param parse for [`concurrency`] — clamps `concurrency` into
+/// `1..=`[`MAX_CONCURRENCY`], defaulting to [`DEFAULT_CONCURRENCY`].
 fn parse_concurrency(params: &Value) -> usize {
     params
         .get("concurrency")
         .and_then(Value::as_u64)
-        .map(|n| n.max(1) as usize)
+        .map(|n| (n.max(1) as usize).min(MAX_CONCURRENCY))
         .unwrap_or(DEFAULT_CONCURRENCY)
+}
+
+/// How many plugin outputs a write mode echoes into its persisted job result by
+/// default, and the ceiling `records_echo` clamps to.
+///
+/// The echo used to be EVERY output — up to [`SOURCE_LIST_LIMIT`] of them in
+/// source mode, and one per URL in urls mode with no `maxItems` on the schema.
+/// That blob is stored in the `jobs.result` column, streamed on the terminal SSE
+/// event, POSTed to the result webhook, and turned into **one Tantivy doc per
+/// element** — while the worker's own comment on that indexing path assumes the
+/// echo is bounded. A bounded prefix keeps the result a *sample* (which is what
+/// a human or agent reading a job result wants) while the dataset stays the
+/// record of truth.
+const DEFAULT_RECORDS_ECHO: usize = 100;
+const MAX_RECORDS_ECHO: usize = 1000;
+
+/// Pure param parse for the records echo: `records_echo`, clamped into
+/// `0..=`[`MAX_RECORDS_ECHO`], defaulting to [`DEFAULT_RECORDS_ECHO`].
+///
+/// `0` is legal and means "counts only" — a caller streaming from the dataset
+/// has no use for the echo at all. There is deliberately no "unbounded" option:
+/// the whole point is that the persisted result has a size bound.
+///
+/// **Copied from `crates/apps/extractor/src/lib.rs`, not shared.** The two apps
+/// are declared siblings and this is the same contract, but README §Architecture
+/// forbids an app depending on another app, and lifting it into `core` would put
+/// one app's param vocabulary into the crate every app depends on. Keep the two
+/// in step by hand; the divergence is what this direction existed to close.
+fn parse_records_echo(params: &Value) -> usize {
+    params
+        .get("records_echo")
+        .and_then(Value::as_u64)
+        .map(|n| (n as usize).min(MAX_RECORDS_ECHO))
+        .unwrap_or(DEFAULT_RECORDS_ECHO)
+}
+
+/// The bounded `records` echo for a run: `(sample, total, truncated)`.
+///
+/// `total` is the honest count of outcomes the run produced, echoed or not, so a
+/// reader can tell a 100-record run from the first 100 of a 10,000-record one.
+fn records_echo(outcomes: &[DocOutcome], echo: usize) -> (Vec<Value>, usize, bool) {
+    let total = outcomes.len();
+    let sample: Vec<Value> = outcomes.iter().take(echo).map(echo_record).collect();
+    let truncated = total > sample.len();
+    (sample, total, truncated)
+}
+
+/// The no-keys sweep cap actually in force: `source.limit`, clamped into
+/// `1..=`[`SOURCE_LIST_LIMIT`], defaulting to the ceiling.
+///
+/// Lowering it is the only way to exercise the truncation signal without a
+/// 10,000-record fixture, and it doubles as a bounded smoke run over a large
+/// corpus. It can only narrow the sweep — the ceiling is what keeps one job from
+/// reading an unbounded dataset into memory. (Copied from `extractor` for the
+/// same reason [`parse_records_echo`] is.)
+fn parse_source_limit(source: &serde_json::Map<String, Value>) -> i64 {
+    source
+        .get("limit")
+        .and_then(Value::as_u64)
+        .map(|n| (n.max(1) as i64).min(SOURCE_LIST_LIMIT))
+        .unwrap_or(SOURCE_LIST_LIMIT)
+}
+
+/// Whether a capped dataset sweep may have left records behind.
+///
+/// THE ANTI-PATTERN THIS CLOSES: a full page means the CAP decided where the
+/// sweep stopped, not the dataset. A 12,000-record source ran the plugin over
+/// 10,000 and reported `requested: 10000` — a number indistinguishable from a
+/// dataset that really does hold 10,000 rows, so nothing downstream could tell a
+/// complete run from a silently partial one.
+///
+/// Judged on the page the store returned, **before** the removed/gone filter:
+/// `Datasets::list` does not exclude tombstones in SQL, so tombstones consume
+/// slots, and how many rows survived the filter says nothing about whether more
+/// rows exist past the cap.
+fn sweep_truncated(returned: usize, limit: i64) -> bool {
+    limit > 0 && returned as i64 >= limit
 }
 
 /// The refusal for a `plugin` param this host cannot execute.
@@ -545,14 +645,20 @@ impl ScrapeApp for Plugin {
     }
 
     fn description(&self) -> &'static str {
-        "Run a sandboxed WASM plugin over documents. Params: {\"plugin\": \"title\", \
-         \"urls\": [..] OR \"source\": {\"app\": .., \"dataset\": .., \"keys\": [..]?}, \
+        "Run a sandboxed WASM plugin over documents. The named plugin must be loaded and \
+         runnable (GET /plugins) — an unknown name is refused before any fetch. Params: \
+         {\"plugin\": \"title\", \
+         \"urls\": [..] OR \"source\": {\"app\": .., \"dataset\": .., \"keys\": [..]?, \
+         \"limit\": 10000?}, \
          \"strategy\": \"http|browser|auto|auto_with_research\", \"concurrency\": 16 \
-         (max in-flight fetch+run tasks), \"plugin_params\": {..} (forwarded to a \
+         (max in-flight fetch+run tasks, ceiling 64), \"records_echo\": 100 (how many \
+         outputs the job result echoes; ceiling 1000, 0 = counts only), \
+         \"plugin_params\": {..} (forwarded to a \
          params-aware plugin's extract_v2 envelope), \"dataset\": \"plugin_out\"}. \
          Source mode reads each record's stored body (artifact_path under the origin job's \
          dir) instead of re-fetching; keys default to the firing trigger's _trigger.keys, \
-         else all live records. The crawl's versioned archive is reachable via \
+         else all live records up to source.limit (the result reports `truncated` when the \
+         cap bit). The crawl's versioned archive is reachable via \
          source.as_of (RFC3339 snapshot), source.versions: \"all\" (every archived revision \
          + current), or source.backfill: true + url_pattern (batched fan over the whole \
          page_versions archive); historical records are keyed {url}@{date} and tagged \
@@ -588,6 +694,12 @@ impl ScrapeApp for Plugin {
                             "app": { "type": "string" },
                             "dataset": { "type": "string" },
                             "keys": { "type": "array", "items": { "type": "string" } },
+                            "limit": {
+                                "type": "integer",
+                                "minimum": 1,
+                                "maximum": 10000,
+                                "description": "Cap on the no-keys sweep of live source records (default and ceiling 10000, most-recently-updated first). The result reports `limit` and `truncated` — a full page means the cap decided where the sweep stopped, not the dataset."
+                            },
                             "as_of": {
                                 "type": "string",
                                 "description": "RFC3339 timestamp: resolve each key to the newest archived version (crawl page_versions) observed at or before this instant. Mutually exclusive with `versions`."
@@ -609,7 +721,18 @@ impl ScrapeApp for Plugin {
                         "description": "Source mode: run over stored record bodies (no re-fetch)."
                     },
                     "strategy": { "type": "string", "enum": ["http", "browser", "auto", "auto_with_research"] },
-                    "concurrency": { "type": "integer", "minimum": 1, "maximum": 64 },
+                    "concurrency": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 64,
+                        "description": "Max in-flight fetch+run tasks (default 16, ceiling 64). The ceiling is enforced twice — refused here at the door, clamped in code for callers that reach the app another way — so the two layers can never disagree."
+                    },
+                    "records_echo": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "maximum": 1000,
+                        "description": "How many plugin outputs the persisted job result echoes (default 100, ceiling 1000, 0 = counts only). The echo is a SAMPLE — the records themselves are in the dataset, and the result reports records_total + records_truncated. Not applicable to backfill mode, which never echoes."
+                    },
                     "plugin_params": { "type": "object", "description": "Forwarded to a params-aware plugin's extract_v2 envelope." },
                     "dataset": { "type": "string", "description": "Output dataset name (default \"plugin_out\"; observatory mode defaults to \"observatory\")." },
                     "observatory": {
@@ -683,20 +806,24 @@ impl ScrapeApp for Plugin {
                 },
             ],
             output_shape: Some(
-                "{mode, plugin, ran, errors, errors_by_class, plugin_reported_errors, new, \
-                 changed, unchanged, cost|null} — per-document plugin results deduped into the \
-                 output dataset. `ran` counts calls that RETURNED; `errors` counts documents \
-                 the plugin never answered for, broken down by class in `errors_by_class` \
-                 (fetch / empty_document / unknown_plugin / plugins_disabled / missing_export / \
-                 trap / malformed_output / host_error); `plugin_reported_errors` counts outputs \
-                 the plugin returned carrying its own `error` key (data, not written). A run \
-                 whose every attempted document failed FAILS the job. Plus, per mode: urls \
-                 {requested, records[]}; source {source{app,dataset}, requested, loaded, \
-                 missing, missing_keys[], records[]}; backfill {resumed_from_checkpoint, \
-                 scanned, skipped_pattern, loaded, batches, missing, missing_keys[]} (no \
-                 records echo). Observatory mode: {sites, rows, pages_replayed, \
-                 low_confidence_sites, flagged_empty_rising, new, changed, unchanged} with \
-                 per-(plugin, site) drift rows in the observatory dataset",
+                "Every write mode: {mode, plugin, dataset (where the records actually landed — \
+                 `<name>@q` when a quarantined source was diverted), ran, errors, \
+                 errors_by_class, plugin_reported_errors, new, changed, unchanged, cost|null}. \
+                 `ran` counts calls that RETURNED; `errors` counts documents the plugin never \
+                 answered for, broken down by class in `errors_by_class` (fetch / \
+                 empty_document / unknown_plugin / plugins_disabled / missing_export / trap / \
+                 malformed_output / host_error — classes that did not occur are absent, never \
+                 zero); `plugin_reported_errors` counts outputs the plugin returned carrying \
+                 its own `error` key (data, not written). A run whose every attempted document \
+                 failed FAILS the job. Plus, per mode: urls {requested}; source \
+                 {source{app,dataset}, requested, limit, truncated (the no-keys sweep hit its \
+                 cap), loaded, missing, missing_keys[]}; backfill {resumed_from_checkpoint, \
+                 scanned, skipped_pattern, loaded, batches, missing, missing_keys[]}. urls and \
+                 source also carry {records[] (a BOUNDED echo — see `records_echo`), \
+                 records_total, records_truncated}; backfill never echoes. Observatory mode: \
+                 {sites, rows, pages_replayed, low_confidence_sites, flagged_empty_rising, new, \
+                 changed, unchanged} with per-(plugin, site) drift rows in the observatory \
+                 dataset",
             ),
             cost_class: CostClass::Metered,
         }
@@ -848,23 +975,28 @@ impl Plugin {
 
         let metas: Vec<DocMeta> = urls.iter().map(|u| DocMeta::live(u.clone())).collect();
         let items = upsert_items(&metas, &mut outcomes);
+        let written = write_target(ctx, dataset).await;
         let summary = ctx
             .upsert_many_with_provenance(dataset, &items, batch_provenance(&metas, rules_hash))
             .await?;
 
-        Ok(with_outcome_fields(
-            json!({
-                "mode": "urls",
-                "plugin": plugin,
-                "requested": urls.len(),
-                "ran": tally.ran,
-                "new": summary.new.len(),
-                "changed": summary.changed.len(),
-                "unchanged": summary.unchanged,
-                "cost": cost.to_json(),
-                "records": outcomes.iter().map(echo_record).collect::<Vec<Value>>(),
-            }),
-            &tally,
+        Ok(with_records_echo(
+            with_outcome_fields(
+                json!({
+                    "mode": "urls",
+                    "plugin": plugin,
+                    "requested": urls.len(),
+                    "ran": tally.ran,
+                    "new": summary.new.len(),
+                    "changed": summary.changed.len(),
+                    "unchanged": summary.unchanged,
+                    "cost": cost.to_json(),
+                }),
+                &written,
+                &tally,
+            ),
+            &outcomes,
+            parse_records_echo(&ctx.params),
         ))
     }
 
@@ -935,6 +1067,10 @@ impl Plugin {
         let mut keyed: Vec<(DocMeta, String)> = Vec::new();
         let mut missing: Vec<Value> = Vec::new();
         let requested: usize;
+        let limit = parse_source_limit(source);
+        // `truncated` is always false when the caller named the key set: no cap
+        // applied to it.
+        let mut truncated = false;
 
         // Same key-selection precedence as before (explicit / trigger keys, else
         // the live sweep); the modes differ only in WHICH stored body each key
@@ -943,10 +1079,13 @@ impl Plugin {
             requested = keys.len();
             keys.into_iter().map(|k| (k, None)).collect()
         } else {
-            let records: Vec<Record> = ctx
-                .datasets
-                .list(&src_app, &src_dataset, SOURCE_LIST_LIMIT)
-                .await?
+            let page = ctx.datasets.list(&src_app, &src_dataset, limit).await?;
+            // Judged on the page the STORE returned, before the removed/gone
+            // filter: `list` does not exclude tombstones in SQL, so they consume
+            // slots, and a full page means the cap decided where the sweep
+            // stopped whatever share of it survived the filter.
+            truncated = sweep_truncated(page.len(), limit);
+            let records: Vec<Record> = page
                 .into_iter()
                 .filter(|r| {
                     r.removed_at.is_none()
@@ -1034,27 +1173,34 @@ impl Plugin {
             return Err(total_failure_error(plugin, &tally));
         }
         let items = upsert_items(&metas, &mut outcomes);
+        let written = write_target(ctx, dataset).await;
         let summary = ctx
             .upsert_many_with_provenance(dataset, &items, batch_provenance(&metas, rules_hash))
             .await?;
 
-        Ok(with_outcome_fields(
-            json!({
-                "mode": "source",
-                "plugin": plugin,
-                "source": { "app": src_app, "dataset": src_dataset },
-                "requested": requested,
-                "loaded": loaded,
-                "ran": tally.ran,
-                "missing": missing.len(),
-                "missing_keys": missing,
-                "new": summary.new.len(),
-                "changed": summary.changed.len(),
-                "unchanged": summary.unchanged,
-                "cost": cost.to_json(),
-                "records": outcomes.iter().map(echo_record).collect::<Vec<Value>>(),
-            }),
-            &tally,
+        Ok(with_records_echo(
+            with_outcome_fields(
+                json!({
+                    "mode": "source",
+                    "plugin": plugin,
+                    "source": { "app": src_app, "dataset": src_dataset },
+                    "requested": requested,
+                    "limit": limit,
+                    "truncated": truncated,
+                    "loaded": loaded,
+                    "ran": tally.ran,
+                    "missing": missing.len(),
+                    "missing_keys": missing,
+                    "new": summary.new.len(),
+                    "changed": summary.changed.len(),
+                    "unchanged": summary.unchanged,
+                    "cost": cost.to_json(),
+                }),
+                &written,
+                &tally,
+            ),
+            &outcomes,
+            parse_records_echo(&ctx.params),
         ))
     }
 
@@ -1254,6 +1400,7 @@ impl Plugin {
         // Bound the per-key echo; the full count is still reported.
         let missing_count = missing.len();
         missing.truncate(MISSING_ECHO_LIMIT);
+        let written = write_target(ctx, dataset).await;
         Ok(with_outcome_fields(
             json!({
                 "mode": "backfill",
@@ -1273,26 +1420,56 @@ impl Plugin {
                 // This attempt's plugin cost only — see `cost` above.
                 "cost": cost.to_json(),
             }),
+            &written,
             &tally,
         ))
     }
 }
 
-/// Merges the outcome keys **every** write mode must report into that mode's
-/// result object.
+/// Where a batch is ABOUT to land, read at the same point the write path reads
+/// it.
+///
+/// A quarantined source is diverted to the shadow `<dataset>@q` inside
+/// `upsert_many_with_provenance`, and until now no field of this app's result
+/// said which of the two a reader should go looking in — a diverted run looked
+/// identical to a normal one. Same call the extractor makes for the same reason
+/// (`AppContext::write_target` is private).
+async fn write_target(ctx: &AppContext, dataset: &str) -> String {
+    let state = ctx.health.enforced_state(&ctx.app, dataset).await;
+    pumper_core::resilience::write_dataset(dataset, state)
+}
+
+/// Merges the keys **every** write mode must report into that mode's result
+/// object.
 ///
 /// One definition of the manifest contract rather than three: `output_shape`
-/// promised `errors` and no mode emitted it, because each of the three result
-/// builders was written by hand and drifted independently. Anything a reader of
-/// `GET /apps` is told to expect from a write mode belongs here.
-fn with_outcome_fields(mut result: Value, tally: &OutcomeTally) -> Value {
+/// promised `errors` and `dataset` and **no mode emitted either**, because each
+/// of the three result builders was written by hand and drifted independently.
+/// Anything a reader of `GET /apps` (or the MCP tool definitions) is told to
+/// expect from a write mode belongs here.
+fn with_outcome_fields(mut result: Value, dataset_written: &str, tally: &OutcomeTally) -> Value {
     if let Value::Object(map) = &mut result {
+        map.insert("dataset".into(), json!(dataset_written));
         map.insert("errors".into(), json!(tally.errors()));
         map.insert("errors_by_class".into(), tally.by_class());
         map.insert(
             "plugin_reported_errors".into(),
             json!(tally.plugin_reported),
         );
+    }
+    result
+}
+
+/// Merges the bounded-echo keys into a mode's result object: the sample itself,
+/// the honest `records_total`, and whether the bound bit. Backfill deliberately
+/// echoes nothing (it never has — the records are in the dataset) and therefore
+/// does not call this.
+fn with_records_echo(mut result: Value, outcomes: &[DocOutcome], echo: usize) -> Value {
+    let (records, total, truncated) = records_echo(outcomes, echo);
+    if let Value::Object(map) = &mut result {
+        map.insert("records".into(), Value::Array(records));
+        map.insert("records_total".into(), json!(total));
+        map.insert("records_truncated".into(), json!(truncated));
     }
     result
 }
@@ -1331,13 +1508,15 @@ fn upsert_items(metas: &[DocMeta], outcomes: &mut [DocOutcome]) -> Vec<(String, 
 #[cfg(test)]
 mod tests {
     use super::{
-        batch_provenance, echo_record, every_document_failed, parse_concurrency, pick_as_of,
+        batch_provenance, echo_record, every_document_failed, parse_concurrency,
+        parse_records_echo, parse_source_limit, pick_as_of, records_echo, sweep_truncated,
         total_failure_error, unloadable_plugin_error, upsert_items, versioned_key, CostRollup,
-        DocError, DocFailure, DocMeta, DocOutcome, OutcomeTally, DEFAULT_CONCURRENCY,
+        DocError, DocFailure, DocMeta, DocOutcome, OutcomeTally, Plugin, DEFAULT_CONCURRENCY,
+        DEFAULT_RECORDS_ECHO, MAX_CONCURRENCY, MAX_RECORDS_ECHO, SOURCE_LIST_LIMIT,
     };
     use pumper_core::error::PluginFailure;
     use pumper_core::plugin::PluginRunStats;
-    use pumper_core::Error;
+    use pumper_core::{Error, ScrapeApp};
     use serde_json::{json, Value};
 
     fn failed(class: DocFailure, message: &str) -> DocOutcome {
@@ -1482,6 +1661,124 @@ mod tests {
             parse_concurrency(&json!({ "concurrency": "lots" })),
             DEFAULT_CONCURRENCY
         );
+    }
+
+    /// THE REFUTED CLAIM: `docs/features/extraction.md` said the concurrency
+    /// ceiling was "declared once and enforced twice … so the two layers cannot
+    /// disagree" and named THIS app — while the schema said `maximum: 64` and
+    /// the code clamped only `.max(1)`. A caller reaching the app past the
+    /// enqueue door (a trigger fan-out, an embedder) got exactly the
+    /// fd-exhaustion the sentence promised was impossible.
+    #[test]
+    fn concurrency_is_clamped_at_both_ends_not_only_the_lower_one() {
+        assert_eq!(parse_concurrency(&json!({ "concurrency": 65 })), 64);
+        assert_eq!(parse_concurrency(&json!({ "concurrency": 100_000 })), 64);
+        assert_eq!(parse_concurrency(&json!({ "concurrency": 64 })), 64);
+        // The clamp and the schema's `maximum` are the same number, so the two
+        // layers cannot disagree about what the bound is.
+        assert_eq!(
+            Plugin
+                .manifest()
+                .params_schema
+                .unwrap()
+                .pointer("/properties/concurrency/maximum")
+                .and_then(Value::as_u64),
+            Some(MAX_CONCURRENCY as u64)
+        );
+    }
+
+    // --- the bounded echo ---------------------------------------------------
+
+    #[test]
+    fn records_echo_defaults_clamps_and_allows_counts_only() {
+        assert_eq!(parse_records_echo(&json!({})), DEFAULT_RECORDS_ECHO);
+        assert_eq!(parse_records_echo(&json!({ "records_echo": 5 })), 5);
+        assert_eq!(parse_records_echo(&json!({ "records_echo": 0 })), 0);
+        // No unbounded option: the whole point is a size bound on the stored
+        // job result.
+        assert_eq!(
+            parse_records_echo(&json!({ "records_echo": 999_999 })),
+            MAX_RECORDS_ECHO
+        );
+        assert_eq!(
+            parse_records_echo(&json!({ "records_echo": "all" })),
+            DEFAULT_RECORDS_ECHO
+        );
+    }
+
+    /// THE ANTI-PATTERN: the echo was every output — into the `jobs.result`
+    /// column, the terminal SSE event, the result webhook, and one Tantivy doc
+    /// per element. The bound has to travel with an honest total, or a truncated
+    /// echo is indistinguishable from a short run.
+    #[test]
+    fn the_echo_is_a_bounded_sample_that_says_how_much_it_left_out() {
+        let outcomes: Vec<DocOutcome> = (0..5).map(|i| Ok(json!({ "i": i }))).collect();
+        let (sample, total, truncated) = records_echo(&outcomes, 2);
+        assert_eq!(sample.len(), 2);
+        assert_eq!(sample[0], json!({ "i": 0 }), "a PREFIX, in run order");
+        assert_eq!(total, 5, "the honest total travels with it");
+        assert!(truncated);
+
+        // Under the bound nothing is claimed to be missing.
+        let (sample, total, truncated) = records_echo(&outcomes, 100);
+        assert_eq!(sample.len(), 5);
+        assert_eq!(total, 5);
+        assert!(!truncated);
+
+        // `0` = counts only, and the counts stay honest.
+        let (sample, total, truncated) = records_echo(&outcomes, 0);
+        assert!(sample.is_empty());
+        assert_eq!(total, 5);
+        assert!(truncated);
+
+        // Failures are outcomes too — they are part of the total and echo with
+        // their class.
+        let mixed: Vec<DocOutcome> = vec![
+            failed(DocFailure::Fetch, "fetch: 503"),
+            Ok(json!({ "i": 1 })),
+        ];
+        let (sample, total, _) = records_echo(&mixed, 10);
+        assert_eq!(total, 2);
+        assert_eq!(sample[0]["error_class"], "fetch");
+    }
+
+    // --- the sweep cap ------------------------------------------------------
+
+    #[test]
+    fn source_limit_defaults_to_the_ceiling_and_can_only_narrow() {
+        let obj = |v: Value| v.as_object().unwrap().clone();
+        assert_eq!(parse_source_limit(&obj(json!({}))), SOURCE_LIST_LIMIT);
+        assert_eq!(parse_source_limit(&obj(json!({ "limit": 5 }))), 5);
+        // Never zero (an idle sweep) and never above the ceiling (an unbounded read).
+        assert_eq!(parse_source_limit(&obj(json!({ "limit": 0 }))), 1);
+        assert_eq!(
+            parse_source_limit(&obj(json!({ "limit": 999_999 }))),
+            SOURCE_LIST_LIMIT
+        );
+        assert_eq!(
+            parse_source_limit(&obj(json!({ "limit": "many" }))),
+            SOURCE_LIST_LIMIT
+        );
+    }
+
+    /// THE REFUTED BEHAVIOR: source mode listed at most 10,000 live records and
+    /// reported that count as `requested` with no signal — a 12,000-record
+    /// dataset silently ran over 10,000 and looked like a clean full run.
+    #[test]
+    fn a_full_sweep_page_is_truncation_even_when_most_of_it_was_filtered_out() {
+        assert!(sweep_truncated(10, 10), "a full page may hide more");
+        assert!(sweep_truncated(11, 10), "over-full is still truncated");
+        assert!(!sweep_truncated(9, 10), "a short page IS the whole dataset");
+        assert!(!sweep_truncated(0, 10), "an empty dataset is not truncated");
+        // The subtle case `Datasets::list` creates: the cap returned a full page
+        // that is mostly tombstones (it does not filter them in SQL), so the
+        // LIVE count is small — but the cap still decided where the read
+        // stopped. Judging on the filtered count would call that run complete.
+        assert!(
+            sweep_truncated(10, 10),
+            "judged on the page, not the filter"
+        );
+        assert!(!sweep_truncated(3, 10));
     }
 
     // --- the run door -------------------------------------------------------

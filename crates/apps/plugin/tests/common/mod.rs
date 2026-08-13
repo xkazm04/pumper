@@ -19,8 +19,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use pumper_core::error::PluginFailure;
-use pumper_core::testing::{TempStore, TestContext};
-use pumper_core::{AppContext, Error, Plugins, Result};
+use pumper_core::testing::{engines_with, Dead, TempStore, TestContext};
+use pumper_core::{
+    AppContext, Error, HttpClient, HttpRequest, HttpResponse, Plugins, Result, ScrapeApp,
+};
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -168,6 +170,40 @@ pub async fn seed_page(store: &TempStore, url: &str, file: &str, body: &str) -> 
         .await
         .unwrap();
     crawl_job
+}
+
+/// An HTTP engine answering every request with the same body — enough for a
+/// urls-mode run without a network.
+pub struct CannedHttp(pub String);
+
+#[async_trait]
+impl HttpClient for CannedHttp {
+    async fn fetch(&self, req: HttpRequest) -> Result<HttpResponse> {
+        Ok(HttpResponse {
+            status: 200,
+            headers: Default::default(),
+            body: self.0.clone(),
+            final_url: req.url,
+            cache_hit: false,
+        })
+    }
+}
+
+/// Runs a urls-mode job against a canned HTTP tier (browser + Claude are
+/// `Dead`, so an escalation past the HTTP tier is a loud panic rather than a
+/// silently different code path).
+pub async fn run_urls_mode(store: &TempStore, params: Value, plugins: Arc<dyn Plugins>) -> Value {
+    let mut ctx = TestContext::new(&store.storage, "plugin")
+        .params(params)
+        .engines(engines_with(
+            Arc::new(CannedHttp("<html><h1>Title</h1></html>".repeat(20))),
+            Arc::new(Dead),
+            Arc::new(Dead),
+        ))
+        .artifacts_dir(store.path().join("plugin").join("job"))
+        .build();
+    ctx.plugins = plugins;
+    app_plugin::Plugin.run(ctx).await.expect("urls-mode run")
 }
 
 /// Params for a source-mode run over the seeded `crawl/pages`.
