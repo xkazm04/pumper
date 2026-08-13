@@ -95,4 +95,33 @@ were Director-verified in source before gating and all four CONFIRMED verbatim.
 - (inherited, pre-46-map — see [[us-grant-opportunities]], [[grants-unified-layer]]): round 3
   close-date sweep + taxonomies (`9d18132`, `d59b307`); round 5 federal award amounts joined live
   (`230a766`).
-- Round 20: pending — see the three accepted directions above.
+- **Round 20 — 3/3 shipped, all KEEP.** Observed effect, one line each:
+  - [[grants-sweep-end-proven]] `12ae222` — the Search2 walk's four endings are four named outcomes
+    (`SweepEnd::{Complete,Capped,ShortPage,UnknownTotal}`), and only the arm that proves coverage
+    reads complete. The headline bug is dead: a `hitCount` rename can no longer cap the federal
+    corpus at **one page, green, indefinitely**. Coverage is proven by records COLLECTED, which is a
+    deliberate divergence from cordis's position arithmetic — that test calls a rate-limited page a
+    full sweep. Riders: per-page `oppHits` drift refusal, whole-corpus empty-listing drift, and an
+    `errorcode` that no longer defaults to success when it is absent, null or a string.
+  - [[grants-details-first-class]] `3b8d994` + `6489ec2` + `0154932` — the product's only source of
+    federal award amounts stopped reporting `changed` on every byte-identical re-harvest
+    (`harvested_at` declared derived), got the `[[source]]` row + contract it never had, lost a
+    `max_row_delta_pct` that could not fire on any run, and its 1,000,000-row money join became
+    live-only, bounded and **reportable** (`detailCorpus.{read,truncated}`). The catalog row required
+    widening the registered-app guard to accept a virtual namespace — the builder found that blocker
+    and **reported it instead of filing the row under `grants-gov`**, which would have passed every
+    test while being a lie.
+  - [[grants-result-contract-true]] `8753553` — `output_shape`, published by `GET /apps` and the MCP
+    manifest, is now pinned to a REAL run in both directions by `tests/result_contract.rs`. Three
+    further truths in the same surface: the harvest default is stated once (the runtime default was
+    `false` while the crate said ON twice, so a hand-built params call ran a different pipeline from
+    the scheduler's); absent is no longer fabricated as `[]`; and the closing-soon digest now judges
+    at the same anywhere-on-Earth instant as `grants/unified` and `GET /grants/closing-soon`, closing
+    a ~12-hour window where the three surfaces disagreed about the same grant.
+- **Verdict on the context after r20**: the app's honesty surfaces (sweep, contract, catalog,
+  result) are now guarded by tests that derive truth from a real run rather than restate it in prose.
+  Banked next: `grants-detail-delta-survives-restart` — a real loss window whose regression test
+  **cannot exist today**, blocked on vcr-testing's `harness-expresses-the-run`; and
+  `grants-drift-is-terminal`, deferred this round only because `crates/core/src/error.rs` belonged to
+  the sibling lot (build it AFTER [[replay-miss-terminal]]; note `error.rs` asserts `Error::App` must
+  stay retryable, so it needs its own variant or a classification site). Cooldown: not before r22.

@@ -3,12 +3,12 @@ slug: grants-result-contract-true
 type: perfect/direction
 context: "[[us-federal-grants]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 8753553
 ---
 
 ## What & why
@@ -101,4 +101,38 @@ Two more truth gaps in the same surface:
 
 ## Build record
 
-(filled during build)
+**Verdict: KEEP.** `8753553`. The `output_shape` fix is the least interesting part; the guard behind
+it is the direction.
+
+Prose cannot hold this line — the declaration and the `json!` block sit ~350 lines apart — so
+`tests/result_contract.rs` **derives the emitted shape from a REAL run** and the declared shape from
+the published string, and diffs them **in both directions**, one level deep. Verified non-vacuous:
+re-introducing `hit_count` and `removed?` fails it with exactly those two names. That is the
+difference between fixing a drift and closing the class.
+
+The declaration now carries `sweep`, `truncated`, `detailCorpus`, `unified`, `index_datasets[]`,
+`warnings[]` and the rest of the twelve omitted keys, and it states **why there is deliberately no
+`removed`** — the listing goes through `upsert_many_with_provenance`, which never tombstones. A
+consumer reading the contract now learns the same fact `6489ec2` acted on.
+
+Three more truths in the same surface, each a real user-visible defect:
+
+- **The harvest default is stated ONCE** (`HARVEST_DETAILS_DEFAULT`). The crate contradicted itself
+  three times in one file — header and `params_schema` said ON, `// default OFF` sat above an
+  `unwrap_or(false)` — so the runtime default was *false* and only `default_params` supplied true.
+  A caller who built params by hand (**the documented way to narrow a pull**) silently ran a
+  different pipeline from the scheduler's. The test pins `default_params()["harvestDetails"]` against
+  the same constant, so the two cannot drift again.
+- **Absent is not empty.** `applicant_types` and `attachment_manifest` answer `Null` when the source
+  published no such field and `[]` only when it published an empty one — matching the honest-Null
+  money rule in the same synopsis block, on the only dataset carrying federal eligibility at all.
+  The tests that pinned the fabricated `[]` were corrected, which is what the direction asked for.
+- **Two clock bugs found beyond the brief, and both are real.** `is_posted_hit` no longer reads an
+  *absent* `oppStatus` as `posted` (under a wholesale rename the posted-only digest would have
+  published the entire forecasted corpus as closing-soon alerts) — and refusing absence is made safe
+  by `digest_status_drift`, which is loud when every hit is blind, because *"a quiet fortnight looks
+  identical"*. And `closing_soon_digest` now judges at `grants_common::deadline_end_utc`, the same
+  anywhere-on-Earth instant the unified sweep and `GET /grants/closing-soon` use: for ~12 hours a
+  grant was open in `grants/unified` and absent from this job's own digest. `deadline_end_utc` was
+  made `pub` **with the reason written into its doc** so the next surface does not re-derive it.
+  `now` is now a parameter, so both boundary classes are testable without waiting for a clock.

@@ -3,12 +3,12 @@ slug: replay-miss-terminal
 type: perfect/direction
 context: "[[vcr-testing]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: f1e2eaf
 ---
 
 ## What & why
@@ -67,4 +67,21 @@ This is the fourth instance of a class this loop has killed once per round — r
 
 ## Build record
 
-(filled during build)
+**Verdict: KEEP.** `f1e2eaf`. Lever taken: widen the variant, *after auditing every construction
+site* — and the audit is recorded in the doc comment so a future round cannot silently undo it.
+`Cassette::resolve`, `truncated_miss`, `to_fetch_outcome` and the zero-readable-entries branch are
+pure functions of an immutable cassette plus params frozen at enqueue; the one site that touches IO
+(`Cassette::load`'s file read) is **already permanent BY CALL SITE** — the worker resolves the
+cassette before the run and `fail_permanently`s on any load error — so widening cannot take retries
+away from it. That is the argument criterion 2 asked for, made from the code rather than asserted.
+
+Criterion 4 was over-delivered: instead of extending the existing inventory list, the builder added
+`every_error_variant_has_a_decided_retry_classification` as an **exhaustive `match` over `Error`**,
+so a new variant stops the test compiling until someone decides. The reasoning is the sharp part —
+a `_ =>` arm would make "retryable" the silent default, "which is how `BadRequest` and then
+`ReplayMiss` each shipped mis-classified". The hazard the direction named (`Error::App` must stay
+retryable) is preserved and now guarded structurally rather than by one assertion.
+
+Verified failing first: both new unit tests and the e2e fail against the old classification (the
+e2e's job comes back `Queued`, not `Failed`). The e2e asserts the **attempt count**, not just the
+error type, as criterion 3 required.

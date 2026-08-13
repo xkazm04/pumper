@@ -3,12 +3,12 @@ slug: replay-means-replay
 type: perfect/direction
 context: "[[vcr-testing]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: d329a0d+22325a3
 ---
 
 ## What & why
@@ -89,4 +89,39 @@ defect is engine contact and the false stamp, not cost. Build against the verifi
 
 ## Build record
 
-(filled during build)
+**Verdict: KEEP.** `d329a0d` (app) + `22325a3` (Director-applied scanner guard — `fetch_chokepoint.rs`
+was Class C this round).
+
+The direction asked for a decision about a promise the module made and could not keep. What shipped
+is better than "make the doc true": `REPLAY_BYPASS_APPS` makes replay capability **declared, once,
+per app**, graded three ways — and each grade earns its existence.
+
+- `Unreplayable` (16 apps) → `refuse_replay` returns `Error::BadRequest` and the worker fails the job
+  **before the cassette is even looked for**. `BadRequest`, not `ReplayMiss`, and the reasoning
+  composes with D1 for free: nothing about a cassette is in question, and the variant is already
+  terminal. The doc names what used to stand in the way and why it was never a guard — an app that
+  records nothing leaves no cassette *file*, so `load` failed with "was it enqueued with
+  `record: true`?", blaming the operator for something the app makes impossible, and **ceasing to
+  be true the moment a file exists at that path**.
+- `Partial` (`extractor`) → replays, and `replay_stamp` says how far the claim goes
+  (`vcr_replay_fidelity` + `vcr_replay_bypass`). Refusing it would have deleted the flagship replay
+  use case; this is the grade where the defect was *directly reachable* — the cassette served the
+  recorded half while the raw half ran live under a bare `vcr_replay_of`.
+- `Full` → stamped `"full"` **positively**, with the argument I most wanted: a marker present only
+  when something is wrong makes its absence mean both "clean" and "older build".
+
+**The Director's own gating note was partially refuted and the refutation held.** I recorded the
+scout's "meters real work" claim as REFUTED before gating (both raw meters pass `0.0`, so "spend $0"
+holds); the build confirms the defect is engine contact + a false provenance stamp, which is what
+shipped.
+
+Guarded from **three** sides, and the third is the one that matters: `vcr.rs` pins the table against
+the app crates on disk and the server pins it against the real registry — but both police rows that
+EXIST. Only the workspace scanner knows about an app that *grows* a raw-engine call and never gets a
+row. That guard was **reported by the builder rather than applied by it** (correct — Class C), and I
+verified it non-vacuously before landing: dropping `hackernews` from the graded set fails with
+`app(s) driving an engine raw with no row in REPLAY_BYPASS_APPS: {"hackernews"}`. Probe reverted.
+Scanner-derived set and table are equal, 17 each.
+
+Riders: `app.rs`'s `meter` doc and `ONBOARDING.md` now both say a raw drive has a **second half**, so
+the next app author meets the rule at the seam rather than at a failing test.

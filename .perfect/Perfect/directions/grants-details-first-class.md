@@ -3,12 +3,12 @@ slug: grants-details-first-class
 type: perfect/direction
 context: "[[us-federal-grants]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 3b8d994+6489ec2+0154932
 ---
 
 ## What & why
@@ -95,4 +95,42 @@ the catalog says so in prose — and it is the least governed dataset the repo w
 
 ## Build record
 
-(filled during build)
+**Verdict: KEEP.** `3b8d994` (app half) + `6489ec2` (the inert contract) + `0154932` (the catalog row).
+All four sub-items of the direction, and the hardest one was refused-then-solved rather than faked.
+
+1. **`DerivedPaths` adopted, spelling verified.** `derived_paths()` = `DerivedPaths::new(["harvested_at"])`
+   — dot-separated names, **not** the leading-slash JSON-pointer form r19 shipped as a silent no-op;
+   the criterion demanded the check and it was made. `flush_details` moved
+   `upsert_many_stamped` → `upsert_many_derived`. The one-time cost is stated honestly in the doc:
+   the first run after deploy re-hashes every stored detail record, so up to the whole corpus reports
+   `changed` once and then settles — *"given they reported `changed` on every harvest before, that is
+   a strict improvement from run two onwards."* A declaration-equality test pins the paths.
+2. **The inert contract removed, not commented** (`6489ec2`). `max_row_delta_pct = 50.0` had been
+   declared since M20 and could never fire: `Contract::evaluate` computes row delta only when
+   `removed > 0`, and `removed` comes only from `sync_many`, which this upsert-only app never calls.
+   Removed **with the guards that DO cover the class named in its place** (`SweepEnd`, the per-page
+   `oppHits` refusal, the `hitCount:0`-over-a-stored-corpus refusal), and `cordis-topic-stats` was
+   correctly left alone because it writes with `sync_many` and the tripwire is live there.
+   `docs/features/catalog.md` gained the applicability rule so a third inert one is not added.
+3. **The catalog row, after the blocker was found and reported rather than worked around**
+   (`0154932`). The harvest writes the pair `("grants", "opportunity_details")` and `grants` is a
+   VIRTUAL NAMESPACE, so `live_catalog_entries_map_to_registered_apps_with_matching_cron` panicked —
+   and filing it under `grants-gov` **would have passed every test while being a lie** (that pair is
+   never written, so `/catalog/health` would report it permanently stale and `contract_for` would
+   never match). That is the same class `6489ec2` had just removed one instance of, so shipping it
+   would have contradicted its own sibling commit. The guard now accepts a namespace whose publishers
+   are all registered — widening what may be NAMED, not whether it is checked — plus the rule that
+   makes that safe: such a row **must** carry an empty cron, *asserted* rather than trusted, because
+   `reconcile` derives desired schedules from `is_scheduled()`. Non-vacuity of the new assertion was
+   probe-verified and the probe reverted.
+4. **The 1M-row join bounded and reportable.** `list` → `list_filtered` (live-only: a tombstoned
+   detail record used to keep joining its award amounts onto a live unified row) with
+   `DETAIL_JOIN_LIMIT = 200_000` and a `DetailJoin{filled, read, truncated}` result surfaced as
+   `detailCorpus` + a `warnings[]` entry. The limit's doc is honest about what it is *not*: ~146x the
+   live corpus, so *"the point of the number is that reaching it is reportable, not that it is
+   tight"*, and it names the better fix it could not make from an app crate (a projected-read seam in
+   `Datasets` is a `crates/core` change) instead of pretending the cap is the design.
+
+**Ledger note (process).** The app half sits under `wip(grants-gov): Lot G builder-death snapshot —
+D5 in flight`; the Lot G builder died after finishing it. Content reviewed and complete; message
+undersells it. Carried to the skill log.

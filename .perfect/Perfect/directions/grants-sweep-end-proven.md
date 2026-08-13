@@ -3,12 +3,12 @@ slug: grants-sweep-end-proven
 type: perfect/direction
 context: "[[us-federal-grants]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 12ae222
 ---
 
 ## What & why
@@ -96,4 +96,33 @@ disappearing, which is undetectable from outside.
 
 ## Build record
 
-(filled during build)
+**Verdict: KEEP.** `12ae222`. `SweepEnd` layers on cordis's vocabulary (`Complete`/`Capped`/
+`ShortPage`) rather than inventing a second one — and the two **deliberate divergences** are the
+best judgment in the commit:
+
+1. **Coverage is proven by records COLLECTED, not by page arithmetic.** cordis asks
+   `page * page_size >= total`, which counts positions *requested*; the short-page bug is precisely
+   a page that asked for 1000 and delivered 100, so that test reads `2000 >= 1366` and calls 1100
+   records a full sweep. `walk_end` counts what actually arrived. The cost is stated rather than
+   hidden: a racy upstream `hitCount` ends `ShortPage` with a warning instead of `Complete` — *"a
+   false 'coverage unproven' is recoverable; a false 'corpus covered' is the failure that hides
+   money."*
+2. **`UnknownTotal`**, the arm cordis cannot have, because grants.gov's `hitCount` is read through
+   `unwrap_or(0)`. This is the direction's headline bug — a rename makes `start >= hit_count` true
+   at `1000 >= 0` — and it gets its own name because *the remedy is different*: nothing is wrong
+   with the walk, the proof is missing. The `hit_count == 0 && got == 0` sub-case correctly reads
+   `Complete` (self-consistent; drift is judged against the STORED corpus, never against the same
+   response being doubted).
+
+`start` is now **derived** from the page counter (`pages.saturating_mul(rows)`) rather than
+accumulated, so the request offset and the arithmetic `walk_end` reasons about cannot drift apart —
+a structural fix I did not ask for.
+
+Beyond the criteria: `empty_page_is_drift` fires on **every** page, not just via the post-loop
+`hits.is_empty()` check it subsumes, so a mid-sweep `oppHits` rename fails loudly instead of reading
+as a short page; `empty_listing_is_drift` gates on `whole_corpus_query` because a
+`keyword`/`eligibilities` pull may legitimately match nothing (**the manifest's own second example
+does exactly that**); and `envelope_error` refuses an absent/null/unreadable `errorcode` on *both*
+endpoints, where `as_i64().unwrap_or(0)` used to default every unrecognizable envelope to success —
+with a stringified `"0"` accepted as the same integer, because both endpoints already publish
+numbers as strings (`awardFloor: "55746"`), so that is a live possibility rather than a hypothetical.

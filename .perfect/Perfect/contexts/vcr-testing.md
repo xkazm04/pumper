@@ -98,4 +98,26 @@ live as riders inside [[cassette-verified-or-refused]], which is the right home 
 
 ## Shipped
 - (via app-runtime r9): vcr-attempt-integrity `4e3647a`.
-- Round 20: pending — see the three accepted directions above.
+- **Round 20 — 3/3 shipped, all KEEP.** Observed effect, one line each:
+  - [[replay-miss-terminal]] `f1e2eaf` — a resolve-time `ReplayMiss` now fails the job ONCE instead
+    of re-running the whole live-free prefix `max_attempts` times to miss in the same place. Carries
+    the round's most durable artifact: `every_error_variant_has_a_decided_retry_classification`, an
+    **exhaustive** match over `Error`, so a new variant cannot inherit "retryable" by default — the
+    mechanism by which `BadRequest` and then `ReplayMiss` each shipped mis-classified.
+  - [[cassette-verified-or-refused]] `fd92cdc` — the loader now checks the one property replay
+    sells. A forged `req_hash` or an unknown `v` fails the **whole file**; a torn tail is **counted**
+    and reaches the operator on the stored result (`vcr_cassette_unreadable_lines`), so "the cassette
+    lost this" is finally distinguishable from "the run never fetched this". Every cassette already
+    on disk keeps loading unchanged (`serde(default)` ⇒ v1).
+  - [[replay-means-replay]] `d329a0d` + `22325a3` — replay capability is **declared per app**
+    (`REPLAY_BYPASS_APPS`, 17 rows, three grades) instead of assumed. A `replay_of` against
+    `transact`/`crawl`/13 API apps is refused by name before anything runs; `extractor` keeps its
+    replay and says how far the claim goes. Guarded from three sides, and the third — the workspace
+    scanner in `fetch_chokepoint.rs` — is the only one that can see an app that *grows* a raw-engine
+    call and never gets a row.
+- **Verdict on the context after r20**: the record/replay contract is now enforced rather than
+  documented. The banked items below are the residue: `harness-expresses-the-run` (TestContext has
+  8 setters against 18 AppContext fields; `NoCheckpoints::save` returns `true` unconditionally, so
+  there are ZERO `CheckpointSink` doubles workspace-wide) is the strongest, and it **unblocks**
+  us-federal-grants' `grants-detail-delta-survives-restart` — two independent scouts converged on
+  that missing seam, and that convergence is the evidence. Cooldown: do not re-mine before r22.

@@ -3,12 +3,12 @@ slug: cassette-verified-or-refused
 type: perfect/direction
 context: "[[vcr-testing]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: fd92cdc
 ---
 
 ## What & why
@@ -89,4 +89,36 @@ fetched this". Today those two produce byte-identical output.
 
 ## Build record
 
-(filled during build)
+**Verdict: KEEP.** `fd92cdc`. All five criteria, including both riders.
+
+1. **Whole-file refusal, argued.** `entry_defect` + `Cassette::load` return `Error::ReplayMiss` on
+   the first defect. The reasoning is in the `load` doc and it is the right one: *"a cassette that
+   lies about one identity has no claim to be trusted about the other 4,999"*, whereas a per-entry
+   skip would reproduce case 2 — the exact confusion the check exists to remove. The `RESEARCH`
+   asymmetry is handled honestly rather than hidden: its key (`ResearchCache::key`) is deliberately
+   not stored, so identity is unverifiable there — **documented as a gap**, with well-formedness
+   (`is_hex_digest`) still checked so a garbled field is caught anyway.
+2. **Torn lines counted, not refused** — the opposite answer to (1), and correct: the recorded job
+   died, the entries that landed are real, refusing would throw away a usable recording.
+   `Cassette::unreadable_lines()` reaches the operator through **three** surfaces, not the one the
+   criterion asked for: the `info!` that already reported `entries = N`, a dedicated `warn!`, and
+   `vcr_cassette_unreadable_lines` on the **stored result** — the only one that survives log rotation.
+3. **Per-entry `v`, not a header**, with the ordering argument the criterion demanded made
+   explicitly: `Recorder::append` is open-append-close *per entry*, so a header would need whoever
+   notices the file is new to write it. Six bytes an entry, no ordering cost — and it survives the
+   case a header does not (a cassette appended to across a version bump under the `Resume` start
+   policy stays coherent entry by entry). `serde(default = "version_default")` means **every
+   cassette already on disk keeps loading unchanged**.
+4. Tests for all three, anti-pattern-named, via a `write_cassette` helper that bypasses the recorder
+   so the defects are reachable at all.
+5. Riders both landed: `retention.rs` now `pub use crate::vcr::CASSETTE_FILE` — and the comment
+   explains the *consequence* of the duplication rather than just removing it ("the sweep decides
+   whether to delete a file by NAME, so the day the recorder's filename changed, the two constants
+   would have disagreed and the sweep would have reclaimed live cassettes"). `from_entries` got the
+   honest doc: it is the seam for building entries `entry_defect` would refuse, **which cannot be
+   reached through `load` by construction** — i.e. the direction's own tests are its justification.
+
+**Ledger note (process, not code).** This direction's entire delivery sits under the message
+`wip(vcr): Lot V builder-death snapshot — D2/D3 in flight`, because the Lot V builder died after
+finishing D2 and the snapshot was taken before anyone knew it was complete. The content is a
+finished, reviewed direction; the message undersells it. Carried to the skill log.

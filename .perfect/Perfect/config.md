@@ -427,3 +427,35 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   work was complete. A wip snapshot that names the *symptom it last saw* (`rustc says: second
   test attribute is supplied`) would have cut that to seconds. Add to the brief template: if you
   are about to run out of room, commit a wip whose message pastes the last error verbatim.
+- 2026-08-13 (round 20, continuation): **A `wip(...)` builder-death snapshot that actually holds a
+  FINISHED direction is a ledger bug with a short shelf life.** Two of this wave's six directions
+  (D2 `cassette-verified-or-refused`, D5's app half) shipped in their entirety under
+  `wip(…): builder-death snapshot — Dn in flight`. The content was complete and reviewed; the
+  messages undersell it, and the fix is only cheap until a sibling commit stacks on top — after
+  that, rewording means rewriting history on a branch that `git rebase -i` cannot touch (it hangs
+  this harness). **Rule for the Director: when recovering a dead builder, first check whether the
+  snapshot is already complete, and if it is, `git commit --amend` it under its real message before
+  briefing anything else.** Round 17 logged the mirror of this (a wip message naming the symptom
+  saves a full diff read); this is the case where the wip message names *nothing*.
+- 2026-08-13 (round 20, continuation): **Attribute snapshot commits by the symbols they introduce,
+  never by their message.** Mapping the ten wave commits to six directions took one `git show |
+  grep '^+(pub const|pub enum|fn )'` per commit and was unambiguous; reading the messages would have
+  produced the wrong ledger for two of them and left D2 looking unshipped. Cheap, mechanical,
+  and it is the only way the Shipped ledger stays true across a session death.
+- 2026-08-13 (round 20, continuation): **The coverage script is now a committed file
+  (`.perfect/coverage.mjs`), not a snippet re-typed into each session note.** Four rounds running,
+  the note said "keep this script — it is the honest recomputation" and the next round re-typed a
+  paraphrase of it. A metric the loop claims to *recompute* every round should be executable in one
+  command; transcription is how the CRLF trap survived three rounds.
+- 2026-08-13 (round 20, continuation): **Verify the ENTERING coverage figure, not just the exiting
+  one.** Every round so far recomputed the number *after* its own directions existed, then compared
+  it to an inherited "entering" figure — which cannot detect a drift that happened before the round
+  started. This round checked the pre-propose commit directly (both target contexts read
+  `last_proposed: never`, `directions: []`, and zero of the 152 then-existing direction notes pointed
+  at either), so 34 → 36 is measured at both ends for the first time.
+- 2026-08-13 (round 20, continuation): **Compare a warning's CONTENT against master, never its line
+  number — and this round is the proof.** `grants-common:850` was flagged by clippy in a wave-touched
+  file; on master the identical expression sits at **line 781**, because the wave added ~70 lines
+  above it. A line-number check calls that a new warning and a count-only check ("31 before, 31
+  after") can be fooled by a coincidence. The one warning that WAS new (`registry.rs:106`) was found
+  the same way and fixed rather than allowed.
