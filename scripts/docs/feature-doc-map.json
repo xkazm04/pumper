@@ -47,7 +47,10 @@
         "crates/core/src/tiers.rs",
         "crates/engine-http/**",
         "crates/engine-browser/**",
-        "crates/engine-claude/**"
+        "crates/engine-claude/**",
+        "crates/engine-remote/**",
+        "crates/engine-archive/**",
+        "crates/server/src/routes/remote.rs"
       ]
     },
     {

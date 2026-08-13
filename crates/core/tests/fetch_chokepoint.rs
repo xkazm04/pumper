@@ -108,6 +108,13 @@ const EXPECTED_RAW_ENGINE_CALLS: &[(&str, usize)] = &[
     ),
     // `/remote/*` proxy: forwards a caller's request to a peer node.
     ("crates/server/src/routes/remote.rs::state.engines.http", 1),
+    // `GET /metrics`: reads the remote fabric's egress counters
+    // (`Fetcher::egress_counters`) to emit `pumper_remote_egress_fetches`. Not a
+    // fetch at all — no job, no budget, no cassette, no network — the scanner
+    // matches it because it is a `state.engines.fetch` *field access*. Kept as a
+    // reviewed row rather than an exemption, and deliberately NOT dodged by
+    // rephrasing the expression: gaming a guard is worse than carrying a row.
+    ("crates/server/src/routes/meta.rs::state.engines.fetch", 1),
     // `POST /extract/preview`: a synchronous, jobless rules try-out. There is
     // no job, so no budget, ledger, cassette or tier lineage to attach to.
     (

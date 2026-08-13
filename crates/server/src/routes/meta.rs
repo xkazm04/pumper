@@ -148,13 +148,11 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
         &state.storage.delivery_health().await?,
         chrono::Utc::now(),
     ));
-    // NOT YET: the remote fabric's egress counters (peer-served vs local
-    // fallback) are collected on the `Fetcher` — see
-    // `pumper_core::fetcher::EgressCounters` — but reaching them from here means
-    // a `state.engines.fetch` field access, which `fetch_chokepoint.rs`'s
-    // raw-engine inventory flags by design. Wiring it needs one reviewed row in
-    // that test's EXPECTED_RAW_ENGINE_CALLS; until then the per-job answer lives
-    // on the job receipt (`cost.egress`) and the per-fetch one on the tier trace.
+    // The remote fabric's egress split. This is the ONE `state.engines.fetch`
+    // access in this file and it is a counter read, not a fetch — no job, no
+    // budget, no cassette — so it carries a reviewed row in
+    // `fetch_chokepoint.rs`'s EXPECTED_RAW_ENGINE_CALLS rather than an exemption.
+    out.push_str(&egress_metrics(state.engines.fetch.egress_counters()));
 
     *state.metrics_cache.lock().await = Some((std::time::Instant::now(), out.clone()));
     Ok(metrics_response(out))
@@ -171,6 +169,39 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
 /// janitor can lower `_total` series. The existing `pumper_job_failures_total`
 /// sets that precedent and states it in its HELP; these do the same rather than
 /// pretending to be monotonic.
+/// The remote fetch fabric's egress split, as Prometheus text.
+///
+/// Answers the question the fabric could not answer about itself: *did the
+/// geo-distributed egress actually happen, and how much of it didn't?*
+/// `local_fallback` is the one that matters operationally — every fetch counted
+/// there left from the coordinator's own IP, the address the operator deployed
+/// the fabric to stop using. A misconfigured secret makes every peer answer 401
+/// and every fetch fall back silently, which before this series produced exactly
+/// one `warn!` that read the same whether one fetch or a million had leaked.
+///
+/// Counters are process-lifetime and reset on restart, like the rest of this
+/// endpoint's counters. Both series are emitted even when the fabric is off (a
+/// pure pass-through records neither, so both read 0) — an absent series and a
+/// zero series are different answers, and "0 peer-served" is the honest one.
+fn egress_metrics(counters: &pumper_core::fetcher::EgressCounters) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "# HELP pumper_remote_egress_fetches Live-HTTP-tier fetches by who egressed them: \
+         peer = served by a remote fabric node, local_fallback = egressed from this \
+         coordinator despite the fabric being configured\n\
+         # TYPE pumper_remote_egress_fetches counter\n",
+    );
+    for (served_by, n) in [
+        ("peer", counters.peer_served()),
+        ("local_fallback", counters.local_fallback()),
+    ] {
+        out.push_str(&format!(
+            "pumper_remote_egress_fetches{{served_by=\"{served_by}\"}} {n}\n"
+        ));
+    }
+    out
+}
+
 fn webhook_metrics(
     health: &pumper_core::DeliveryHealth,
     now: chrono::DateTime<chrono::Utc>,
@@ -260,6 +291,31 @@ mod webhook_metric_tests {
         // Every series is declared: an undeclared metric is a scrape warning.
         assert_eq!(body.matches("# HELP ").count(), 4);
         assert_eq!(body.matches("# TYPE ").count(), 4);
+    }
+
+    /// The anti-pattern this series exists to kill: the remote fetch fabric's
+    /// whole claim is "traffic leaves from somewhere else", and a misconfigured
+    /// secret makes every peer answer 401 and every fetch fall silently back to
+    /// the coordinator's own IP — producing one `warn!` that reads identically
+    /// whether one fetch or a million leaked. A fallback that is invisible to a
+    /// dashboard is a fabric that can be entirely off without anyone noticing.
+    #[test]
+    fn a_silent_fallback_to_local_egress_is_not_invisible_to_a_dashboard() {
+        let counters = pumper_core::fetcher::EgressCounters::default();
+        let body = egress_metrics(&counters);
+        // Off/unused reads as an explicit zero on BOTH series: an absent series
+        // and a zero series are different answers to "did any egress go remote".
+        assert!(
+            body.contains("pumper_remote_egress_fetches{served_by=\"peer\"} 0\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("pumper_remote_egress_fetches{served_by=\"local_fallback\"} 0\n"),
+            "{body}"
+        );
+        // Declared exactly once, or the scrape warns.
+        assert_eq!(body.matches("# HELP ").count(), 1);
+        assert_eq!(body.matches("# TYPE ").count(), 1);
     }
 
     /// An empty backlog must read 0, never "unknown" or a stale age — a gauge
