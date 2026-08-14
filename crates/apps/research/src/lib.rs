@@ -115,18 +115,49 @@ fn plan_from_restore(restored: Option<&Value>) -> Plan {
     }
 }
 
+/// Turns to charge the run for one completed step, given what the engine
+/// reported and the `--max-turns` cap that step was launched with.
+///
+/// **Why the reported count is clamped to the step's own cap.** `num_turns`
+/// comes straight off the CLI result envelope (`engine-claude/src/lib.rs:396`),
+/// and on a `--resume`d session that counter is not unambiguously
+/// per-invocation — it may carry the session's cumulative total. The two
+/// readings break in opposite directions: summing a cumulative counter across
+/// up to [`MAX_STEPS`] steps over-counts and truncates the run long before
+/// `max_turns`, while trusting a per-invocation counter as cumulative
+/// under-counts and lets the run overshoot it. The one bound that holds under
+/// BOTH readings is the cap this app itself passed as `--max-turns`: a step
+/// cannot have used more turns than it was allowed. So charge
+/// `min(reported, cap)` — exact under the per-invocation reading, conservative
+/// (never an overshoot of the caller's total) under the cumulative one. Do not
+/// "simplify" this back to the raw reported value without first pinning the
+/// CLI's resume semantics with a live test.
+///
+/// A step with no cap is the uncapped single-call path, which the loop exits
+/// after one step; an engine that omits the count advances by the whole chunk
+/// so the turn budget still terminates the loop.
+fn step_turns_used(reported: Option<u64>, cap: Option<u64>) -> u64 {
+    match (reported, cap) {
+        (Some(reported), Some(cap)) => reported.min(cap),
+        (Some(reported), None) => reported,
+        (None, Some(cap)) => cap,
+        (None, None) => 1,
+    }
+}
+
 /// Folds one completed research step into the state: advances spend and turn
 /// cursors, keeps the freshest session id (a step that returned none keeps the
-/// prior one so the session stays resumable).
+/// prior one so the session stays resumable). `step_cap` is the `--max-turns`
+/// the step ran under — see [`step_turns_used`].
 fn fold_output(
     state: &mut RunState,
     cost_usd: Option<f64>,
     num_turns: Option<u64>,
     session_id: Option<String>,
-    fallback_turns: u64,
+    step_cap: Option<u64>,
 ) {
     state.spent_usd += cost_usd.unwrap_or(0.0);
-    state.turns_used += num_turns.unwrap_or(fallback_turns);
+    state.turns_used += step_turns_used(num_turns, step_cap);
     state.steps_done += 1;
     if session_id.is_some() {
         state.session_id = session_id;
@@ -192,6 +223,53 @@ fn next_step_turns(max_turns: Option<u32>, per_step: Option<u32>, used: u64) -> 
     }
 }
 
+/// Spend budget for the next step.
+#[derive(Debug, PartialEq)]
+enum BudgetPlan {
+    /// Run a step under this per-call `--max-budget-usd` (None = no ceiling).
+    Run(Option<f64>),
+    /// The run's spend ceiling is reached — stop and keep the partial.
+    Exhausted,
+}
+
+/// Smallest headroom worth starting a metered step with. A step launched with
+/// less than this cannot search, fetch and synthesize before its own
+/// `--max-budget-usd` aborts it, so the money buys nothing: stopping with
+/// `budget_exhausted` and keeping the partial beats paying for a call that
+/// cannot finish.
+const MIN_STEP_BUDGET_USD: f64 = 0.01;
+
+/// The run's spend wall, consulted before **every** step.
+///
+/// `max_budget_usd` is documented (param text, manifest example, feature docs)
+/// as a **per-run** ceiling, so it is enforced here against the run's own
+/// cumulative `spent_usd` — which includes spend restored from a checkpoint —
+/// and each call's ceiling is the *remaining* headroom, not the whole budget.
+/// Passing the full value to every one of up to [`MAX_STEPS`] calls, as this
+/// app used to, made the enforced ceiling `MAX_STEPS * max_budget_usd`.
+///
+/// `job_remaining` is [`AppContext::remaining_budget_usd`]: `None` whenever the
+/// job carries no `budget_usd`, which is why it cannot be the only wall.
+/// Whichever headroom is tighter governs.
+fn next_step_budget(
+    run_ceiling: Option<f64>,
+    spent_usd: f64,
+    job_remaining: Option<f64>,
+) -> BudgetPlan {
+    let run_headroom = run_ceiling.map(|ceiling| (ceiling - spent_usd).max(0.0));
+    let headroom = match (run_headroom, job_remaining) {
+        (Some(run), Some(job)) => Some(run.min(job)),
+        (Some(run), None) => Some(run),
+        (None, Some(job)) => Some(job),
+        (None, None) => None,
+    };
+    match headroom {
+        None => BudgetPlan::Run(None),
+        Some(headroom) if headroom < MIN_STEP_BUDGET_USD => BudgetPlan::Exhausted,
+        Some(headroom) => BudgetPlan::Run(Some(headroom)),
+    }
+}
+
 /// Char-boundary-safe truncation for the checkpointed partial text.
 fn truncate_chars(s: &str, max: usize) -> String {
     if s.chars().count() <= max {
@@ -215,7 +293,10 @@ impl ScrapeApp for Research {
          restarting), \"session_id\": \"...\" (resume a prior run's session_id \
          to drill down on its accumulated context instead of researching from \
          scratch — the query is then a follow-up question), \
-         \"max_budget_usd\": 0.0 (per-run Claude spend ceiling)}. Progress is \
+         \"max_budget_usd\": 0.0 (per-run Claude spend ceiling — a TOTAL over \
+         every step of the run, including spend restored from a checkpoint; \
+         the run stops with stop_reason=budget_exhausted and returns its \
+         partial findings rather than exceeding it)}. Progress is \
          checkpointed durably after every step: a crashed/reaped/suspended job \
          resumes where it left off without re-spending restored budget."
     }
@@ -231,7 +312,11 @@ impl ScrapeApp for Research {
                     "role": { "type": "string", "enum": ["research", "compose"] },
                     "model": { "type": "string" },
                     "effort": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max"] },
-                    "max_turns": { "type": "integer", "minimum": 1 },
+                    "max_turns": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Total CLI turns for the whole run, spread across the checkpointed steps — not a per-step limit."
+                    },
                     "turns_per_step": {
                         "type": "integer",
                         "minimum": 1,
@@ -241,7 +326,11 @@ impl ScrapeApp for Research {
                         "type": "string",
                         "description": "Resume a prior run's session to drill down; the query becomes a follow-up."
                     },
-                    "max_budget_usd": { "type": "number", "minimum": 0 }
+                    "max_budget_usd": {
+                        "type": "number",
+                        "minimum": 0,
+                        "description": "Total Claude spend ceiling for the whole run (all steps, plus spend restored from a checkpoint) — not a per-call limit. Each step is capped at the remaining headroom; when less than a cent is left the run stops with stop_reason=budget_exhausted and returns its partial findings."
+                    }
                 },
                 "additionalProperties": true
             })),
@@ -372,18 +461,22 @@ impl ScrapeApp for Research {
                     break;
                 }
             };
-            // Between steps, stop gracefully at the budget ceiling and return
-            // the partial (checkpointed) findings instead of erroring the job.
-            // The FIRST metered call keeps the pre-port behavior: ctx.research
-            // itself refuses to start on an exhausted budget.
-            if state.steps_done > 0 {
-                if let Some(remaining) = ctx.remaining_budget_usd().await? {
-                    if remaining <= 0.0 {
-                        stop_reason = StopReason::BudgetExhausted;
-                        break;
-                    }
+            // Stop gracefully at the spend ceiling and return the partial
+            // (checkpointed) findings instead of erroring the job. Checked
+            // before EVERY step, including the first one of a resumed attempt:
+            // restored `spent_usd` counts against the run ceiling, and the job
+            // ceiling has nothing to say when the job carries no `budget_usd`.
+            let step_ceiling = match next_step_budget(
+                max_budget_usd,
+                state.spent_usd,
+                ctx.remaining_budget_usd().await?,
+            ) {
+                BudgetPlan::Run(ceiling) => ceiling,
+                BudgetPlan::Exhausted => {
+                    stop_reason = StopReason::BudgetExhausted;
+                    break;
                 }
-            }
+            };
 
             let prompt = match (&state.session_id, state.steps_done) {
                 (None, _) => format!(
@@ -407,7 +500,9 @@ impl ScrapeApp for Research {
             request.model = model.clone();
             request.effort = effort.clone();
             request.resume_session = state.session_id.clone();
-            request.max_budget_usd = max_budget_usd;
+            // The run's REMAINING headroom, not the whole run ceiling: the last
+            // step must not be able to overshoot the total.
+            request.max_budget_usd = step_ceiling;
             // Actually use the json_schema guardrail so the model is steered to
             // the shape we promise downstream instead of accepting any object.
             request.json_schema = Some(report_schema.clone());
@@ -415,13 +510,12 @@ impl ScrapeApp for Research {
             // The budget-consuming step. Only NEW spend is metered here —
             // restored spend already lives in the job's ledger + spent_usd.
             let output = ctx.research(request).await?;
-            let fallback_turns = step_turns.map(u64::from).unwrap_or(1);
             fold_output(
                 &mut state,
                 output.cost_usd,
                 output.num_turns,
                 output.session_id.clone(),
-                fallback_turns,
+                step_turns.map(u64::from),
             );
             duration_ms += output.duration_ms.unwrap_or(0);
             last_text = output.text.clone();
@@ -611,7 +705,13 @@ mod tests {
             result: None,
         };
         // …and folds ONLY the new step's cost on top: 0.30 + 0.20 = 0.50.
-        fold_output(&mut state, Some(0.20), Some(7), Some("sess-abc2".into()), 8);
+        fold_output(
+            &mut state,
+            Some(0.20),
+            Some(7),
+            Some("sess-abc2".into()),
+            Some(8),
+        );
         assert!((state.spent_usd - 0.50).abs() < 1e-9);
         assert_eq!(state.steps_done, 2);
         assert_eq!(state.turns_used, 15);
@@ -621,7 +721,7 @@ mod tests {
     #[test]
     fn fold_keeps_prior_session_and_uses_fallback_turns_when_engine_omits_them() {
         let mut state = RunState::fresh(Some("caller-sess".into()));
-        fold_output(&mut state, None, None, None, 8);
+        fold_output(&mut state, None, None, None, Some(8));
         // Missing session id must not clobber a resumable one.
         assert_eq!(state.session_id.as_deref(), Some("caller-sess"));
         // Unknown turn count advances conservatively by the chunk size, so the
@@ -645,6 +745,76 @@ mod tests {
         assert_eq!(next_step_turns(None, None, 0), StepPlan::Run(None));
         // No total cap with a chunk: capped steps (loop bounded by MAX_STEPS).
         assert_eq!(next_step_turns(None, Some(5), 40), StepPlan::Run(Some(5)));
+    }
+
+    #[test]
+    fn turns_charged_are_capped_by_the_step_and_not_a_session_cumulative_count() {
+        // Per-invocation reading: the reported count is the truth.
+        assert_eq!(step_turns_used(Some(5), Some(8)), 5);
+        // Session-cumulative reading: a counter that already includes prior
+        // steps must not be charged in full again — the step's own
+        // `--max-turns` bounds what it could possibly have used.
+        assert_eq!(step_turns_used(Some(37), Some(8)), 8);
+        // Engine omitted the count: advance by the whole chunk so the turn
+        // budget still terminates the loop.
+        assert_eq!(step_turns_used(None, Some(8)), 8);
+        // Uncapped single call: nothing to clamp against.
+        assert_eq!(step_turns_used(Some(42), None), 42);
+        assert_eq!(step_turns_used(None, None), 1);
+    }
+
+    #[test]
+    fn max_budget_usd_is_a_run_total_not_a_per_call_ceiling() {
+        // Fresh run: the first call may use the whole ceiling…
+        assert_eq!(
+            next_step_budget(Some(0.50), 0.0, None),
+            BudgetPlan::Run(Some(0.50))
+        );
+        // …and every later call only what is left of it. Before the fix each
+        // of up to MAX_STEPS calls got the full 0.50.
+        match next_step_budget(Some(0.50), 0.30, None) {
+            BudgetPlan::Run(Some(ceiling)) => assert!((ceiling - 0.20).abs() < 1e-9),
+            other => panic!("expected a clamped ceiling, got {other:?}"),
+        }
+        // Spent out (and over-spent) stops the run instead of issuing a call.
+        assert_eq!(
+            next_step_budget(Some(0.50), 0.50, None),
+            BudgetPlan::Exhausted
+        );
+        assert_eq!(
+            next_step_budget(Some(0.50), 0.90, None),
+            BudgetPlan::Exhausted
+        );
+        // A remainder too small to finish a step is not worth paying for.
+        assert_eq!(
+            next_step_budget(Some(0.50), 0.4999, None),
+            BudgetPlan::Exhausted
+        );
+    }
+
+    #[test]
+    fn the_tighter_of_the_run_and_job_ceilings_governs() {
+        // No ceiling anywhere: uncapped, as before.
+        assert_eq!(next_step_budget(None, 0.0, None), BudgetPlan::Run(None));
+        // Job budget only (the path that already worked) still walls the run.
+        assert_eq!(
+            next_step_budget(None, 0.0, Some(0.0)),
+            BudgetPlan::Exhausted
+        );
+        assert_eq!(
+            next_step_budget(None, 0.0, Some(2.0)),
+            BudgetPlan::Run(Some(2.0))
+        );
+        // Job headroom tighter than the run's remaining ceiling wins…
+        assert_eq!(
+            next_step_budget(Some(5.0), 0.0, Some(0.75)),
+            BudgetPlan::Run(Some(0.75))
+        );
+        // …and vice versa.
+        assert_eq!(
+            next_step_budget(Some(0.25), 0.0, Some(9.0)),
+            BudgetPlan::Run(Some(0.25))
+        );
     }
 
     #[test]
@@ -732,6 +902,151 @@ mod tests {
             assert_eq!(result["structured"], json!(false));
             assert_eq!(result["steps"], json!(MAX_STEPS));
             assert_eq!(researcher.call_count(), MAX_STEPS as usize);
+        }
+
+        /// A researcher that bills like the CLI does under `--max-budget-usd`:
+        /// it never charges more than the ceiling it was handed. The scripted
+        /// stand-in ignores that ceiling, and a run-total test must not assume
+        /// the clamp away — it is half of what keeps the total honest.
+        struct BudgetHonoringResearcher {
+            wanted_usd: f64,
+            text: String,
+            session_id: String,
+            ceilings: std::sync::Mutex<Vec<Option<f64>>>,
+        }
+
+        impl BudgetHonoringResearcher {
+            fn new(wanted_usd: f64, text: &str) -> Self {
+                Self {
+                    wanted_usd,
+                    text: text.to_string(),
+                    session_id: "sess-1".into(),
+                    ceilings: std::sync::Mutex::new(Vec::new()),
+                }
+            }
+
+            fn ceilings(&self) -> Vec<Option<f64>> {
+                self.ceilings.lock().expect("ceiling lock").clone()
+            }
+        }
+
+        #[async_trait]
+        impl pumper_core::Researcher for BudgetHonoringResearcher {
+            async fn research(
+                &self,
+                req: pumper_core::ResearchRequest,
+            ) -> Result<pumper_core::ResearchOutput> {
+                self.ceilings
+                    .lock()
+                    .expect("ceiling lock")
+                    .push(req.max_budget_usd);
+                let billed = req
+                    .max_budget_usd
+                    .map_or(self.wanted_usd, |ceiling| self.wanted_usd.min(ceiling));
+                Ok(pumper_core::ResearchOutput {
+                    text: self.text.clone(),
+                    json: None,
+                    cost_usd: Some(billed),
+                    duration_ms: Some(1),
+                    num_turns: Some(1),
+                    session_id: Some(self.session_id.clone()),
+                })
+            }
+        }
+
+        #[tokio::test]
+        async fn total_run_spend_stops_at_max_budget_usd_not_at_it_per_call() {
+            // The manifest's own example: a `max_budget_usd` and NO job
+            // `budget_usd`. Before the fix the ceiling was handed to every one
+            // of up to MAX_STEPS calls, so 0.50 bought $6.00 of research.
+            let store = TempStore::new("research-run-ceiling").await;
+            let researcher = Arc::new(BudgetHonoringResearcher::new(0.20, "partial findings"));
+            let ctx = ctx_with_researcher(
+                &store.storage,
+                json!({"query": "q", "turns_per_step": 1, "max_budget_usd": 0.5}),
+                researcher.clone(),
+            )
+            .await;
+            let result = Research.run(ctx).await.unwrap();
+            let spent = result["cost_usd"].as_f64().unwrap();
+            assert!(spent <= 0.5 + 1e-9, "run spent {spent}, ceiling was 0.50");
+            assert_eq!(result["stop_reason"], json!("budget_exhausted"));
+            // 0.20 + 0.20 + the 0.10 remainder — then no headroom left.
+            assert_eq!(researcher.ceilings().len(), 3);
+        }
+
+        #[tokio::test]
+        async fn each_call_gets_the_remaining_headroom_not_the_whole_run_ceiling() {
+            let store = TempStore::new("research-headroom").await;
+            let researcher = Arc::new(BudgetHonoringResearcher::new(0.20, "partial findings"));
+            let ctx = ctx_with_researcher(
+                &store.storage,
+                json!({"query": "q", "turns_per_step": 1, "max_budget_usd": 0.5}),
+                researcher.clone(),
+            )
+            .await;
+            Research.run(ctx).await.unwrap();
+            let ceilings: Vec<f64> = researcher
+                .ceilings()
+                .into_iter()
+                .map(|c| c.expect("every call carries a ceiling"))
+                .collect();
+            assert_eq!(ceilings.len(), 3);
+            for (got, want) in ceilings.iter().zip([0.5, 0.3, 0.1]) {
+                assert!((got - want).abs() < 1e-6, "ceilings were {ceilings:?}");
+            }
+        }
+
+        #[tokio::test]
+        async fn restored_spend_counts_against_the_ceiling_before_the_first_step() {
+            // A re-claimed attempt whose checkpoint already spent the ceiling
+            // must not buy another step: `Dead` panics if the loop calls the
+            // researcher. Before the fix the wall was skipped while
+            // `steps_done == 0` and no-op'd anyway without a job budget.
+            let store = TempStore::new("research-restored-ceiling").await;
+            let restored = json!({
+                "v": STATE_VERSION,
+                "session_id": "sess-1",
+                "steps_done": 0,
+                "turns_used": 0,
+                "spent_usd": 0.60,
+                "partial": "what the prior attempt found",
+            });
+            let ctx = TestContext::new(&store.storage, "research")
+                .params(json!({"query": "q", "turns_per_step": 1, "max_budget_usd": 0.5}))
+                .engines(engines_with(Arc::new(Dead), Arc::new(Dead), Arc::new(Dead)))
+                .restored(restored)
+                .build();
+            let result = Research.run(ctx).await.unwrap();
+            assert_eq!(result["stop_reason"], json!("budget_exhausted"));
+            assert_eq!(result["steps"], json!(0));
+            assert_eq!(result["cost_usd"], json!(0.60));
+            // The paid-for partial still comes back.
+            assert_eq!(result["report"], json!("what the prior attempt found"));
+        }
+
+        #[tokio::test]
+        async fn max_turns_is_a_run_total_even_when_the_engine_reports_a_session_count() {
+            // Each step is capped at 1 turn but the envelope reports 9 — the
+            // shape a session-cumulative counter has. Charging 9 to a 3-turn
+            // budget truncates the run after ONE step; charging the step's own
+            // cap spends the budget as the caller asked.
+            let store = TempStore::new("research-turn-total").await;
+            let mut out = research_output("still thinking, not json");
+            out.session_id = Some("sess-1".into());
+            out.num_turns = Some(9);
+            let researcher = Arc::new(ScriptedResearcher::new().on("", out));
+            let ctx = ctx_with_researcher(
+                &store.storage,
+                json!({"query": "q", "max_turns": 3, "turns_per_step": 1}),
+                researcher.clone(),
+            )
+            .await;
+            let result = Research.run(ctx).await.unwrap();
+            assert_eq!(result["stop_reason"], json!("turns_exhausted"));
+            assert_eq!(result["steps"], json!(3));
+            assert_eq!(result["num_turns"], json!(3));
+            assert_eq!(researcher.call_count(), 3);
         }
 
         #[tokio::test]
