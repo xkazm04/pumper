@@ -95,7 +95,8 @@ impl ScrapeApp for HomewysePricing {
                  coverage: {unit, covered, expected, ratio, floor, short, missing}, \
                  warnings: [string], new, \
                  changed, unchanged, rejected: [{key, reasons}], rejected_count, \
-                 unknown_trades, unified: {new, changed}, cost_usd, duration_ms, \
+                 unknown_trades, unified: {dataset, trust, new, changed, unchanged, \
+                 inputs_truncated, join_complete}, index_datasets, cost_usd, duration_ms, \
                  num_turns} — or {source, locality, year, skipped, cost_usd: 0.0} when \
                  the age gate holds",
             ),
@@ -314,9 +315,9 @@ impl ScrapeApp for HomewysePricing {
 
         // Cross-source layer: rebuild trades/operator_economics from all four
         // source datasets (mirrors grants-common's sync_unified).
-        let unified = unified::sync_operator_economics(&ctx).await?;
+        let join = unified::sync_operator_economics(&ctx).await?;
 
-        Ok(json!({
+        let mut out = json!({
             "source": format!("agentic/pricing/{year}"),
             "locality": locality,
             "year": year,
@@ -330,12 +331,15 @@ impl ScrapeApp for HomewysePricing {
             "rejected": rejected.iter().map(Rejection::to_json).collect::<Vec<_>>(),
             "rejected_count": rejected.len(),
             "unknown_trades": unknown_trades,
-            "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
             // Metered-engine telemetry — the console reads cost_usd for the run.
             "cost_usd": output.cost_usd,
             "duration_ms": output.duration_ms,
             "num_turns": output.num_turns,
-        }))
+        });
+        // Shared join report + the `index_datasets` declaration that makes
+        // `trades/*` revisions visible to watches, triggers and search at all.
+        join.merge_into(&mut out);
+        Ok(unified::with_product_index(out))
     }
 }
 

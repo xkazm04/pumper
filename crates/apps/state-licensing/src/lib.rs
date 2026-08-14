@@ -134,7 +134,8 @@ impl ScrapeApp for StateLicensing {
                  expected, ratio, floor, short, missing, states_covered, \
                  states_expected, missing_states}}, warnings: [string], new, \
                  changed, unchanged, rejected: [..], \
-                 rejected_count, unified: {new, changed}, cost_usd (null when no \
+                 rejected_count, unified: {dataset, trust, new, changed, unchanged, \
+                 inputs_truncated, join_complete}, index_datasets, cost_usd (null when no \
                  metered call reported a price), cost_unreported_calls, \
                  duration_ms, \
                  num_turns} — per-trade vintage skips and checkpoint resumes are free; \
@@ -322,13 +323,26 @@ impl ScrapeApp for StateLicensing {
             // once at the end so a reap can't discard a call already paid for.
             ctx.upsert_many_with_provenance(COMPLIANCE, &records, prov.clone())
                 .await?;
+            // The cross-source copy goes through the same target resolution the
+            // join uses: `ctx.datasets` bypasses `AppContext::write_target`, so
+            // this write carried no trust stamp and could not divert to `@q`. The
+            // derivation spec (`prov`) is kept — this copy IS the research answer,
+            // not a re-derivation — and only `job_id` and the target are added.
+            let (compliance_dataset, compliance_trust) =
+                unified::write_target(&ctx, COMPLIANCE).await;
             let unified_prov = pumper_core::Provenance {
                 job_id: Some(ctx.job_id.to_string()),
                 ..prov
             };
             let mut trade_summary = ctx
                 .datasets
-                .upsert_many_stamped(UNIFIED_APP, COMPLIANCE, &records, None, Some(&unified_prov))
+                .upsert_many_stamped(
+                    UNIFIED_APP,
+                    &compliance_dataset,
+                    &records,
+                    compliance_trust,
+                    Some(&unified_prov),
+                )
                 .await?;
             summary.new.append(&mut trade_summary.new);
             summary.changed.append(&mut trade_summary.changed);
@@ -361,9 +375,9 @@ impl ScrapeApp for StateLicensing {
 
         // Land the `compliance` block on the per-state operator_economics rows
         // (mirrors state-tax's end-of-run unified sync).
-        let unified = unified::sync_operator_economics(&ctx).await?;
+        let join = unified::sync_operator_economics(&ctx).await?;
 
-        Ok(json!({
+        let mut out = json!({
             "source": format!("agentic/licensing/{year}"),
             "year": year,
             "trades_run": trades_run,
@@ -379,14 +393,17 @@ impl ScrapeApp for StateLicensing {
             "unchanged": summary.unchanged,
             "rejected": rejected,
             "rejected_count": rejected.len(),
-            "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
             // Null (not 0.0) when no metered call reported a price; when only
             // some did, the sum is a floor and `cost_unreported_calls` says so.
             "cost_usd": spend.total_usd(),
             "cost_unreported_calls": spend.unreported_calls(),
             "duration_ms": duration_ms,
             "num_turns": num_turns,
-        }))
+        });
+        // Shared join report + the `index_datasets` declaration that makes
+        // `trades/*` revisions visible to watches, triggers and search at all.
+        join.merge_into(&mut out);
+        Ok(unified::with_product_index(out))
     }
 }
 

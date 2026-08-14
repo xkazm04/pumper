@@ -817,10 +817,12 @@ pub mod coverage {
         }
     }
 
-    /// The result fields every agentic trades app must carry once it reports
-    /// coverage: the shared `coverage` block and the `warnings[]` a shortfall
-    /// lands in.
-    pub const RESULT_FIELDS: [&str; 2] = ["coverage", "warnings"];
+    /// The result fields every agentic trades app must carry: the shared
+    /// `coverage` block, the `warnings[]` a shortfall lands in, and the
+    /// `index_datasets` declaration without which no `trades/*` revision is
+    /// visible to a watch, trigger, contract or search doc
+    /// (`unified::product_index_datasets`).
+    pub const RESULT_FIELDS: [&str; 3] = ["coverage", "warnings", "index_datasets"];
 
     /// Whether a manifest's `output_shape` declares [`RESULT_FIELDS`].
     ///
@@ -984,10 +986,19 @@ pub mod coverage {
         #[test]
         fn a_shape_missing_warnings_does_not_count_as_declaring_coverage() {
             assert!(shape_declares_coverage(
-                "{records, coverage: {...}, warnings: [string], new}"
+                "{records, coverage: {...}, warnings: [string], index_datasets, new}"
             ));
-            assert!(!shape_declares_coverage("{records, coverage: {...}, new}"));
-            assert!(!shape_declares_coverage("{records, warnings: [string]}"));
+            assert!(!shape_declares_coverage(
+                "{records, coverage: {...}, index_datasets, new}"
+            ));
+            assert!(!shape_declares_coverage(
+                "{records, warnings: [string], index_datasets}"
+            ));
+            // The D6 half: a shape that never declares `index_datasets` is a shape
+            // whose `trades/*` revisions nothing downstream can see.
+            assert!(!shape_declares_coverage(
+                "{records, coverage: {...}, warnings: [string]}"
+            ));
         }
 
         #[test]
@@ -1322,12 +1333,24 @@ pub mod taxonomy {
     /// fallback, so existing callers see zero behavior change until a human
     /// enables registry records.
     pub async fn taxonomy(ctx: &AppContext) -> Result<Vec<TradeEntry>> {
+        Ok(taxonomy_at_cap(ctx).await?.0)
+    }
+
+    /// [`taxonomy`] plus whether the registry read came back AT
+    /// [`TAXONOMY_READ_LIMIT`] — i.e. the trade universe this run reasoned over
+    /// is a WINDOW, not the registry.
+    ///
+    /// Additive rather than a signature change on [`taxonomy`]: three census apps
+    /// outside this family consume this module, and a break there is not worth a
+    /// second return value four of five callers ignore.
+    pub async fn taxonomy_at_cap(ctx: &AppContext) -> Result<(Vec<TradeEntry>, bool)> {
         let recs = ctx
             .datasets
             .list(TAXONOMY_APP, TAXONOMY_DATASET, TAXONOMY_READ_LIMIT)
             .await?;
+        let at_cap = super::unified::read_hit_cap(recs.len(), TAXONOMY_READ_LIMIT);
         let data: Vec<Value> = recs.into_iter().map(|r| r.data).collect();
-        Ok(merge_taxonomy(&data))
+        Ok((merge_taxonomy(&data), at_cap))
     }
 
     /// Comma-joined labels of a taxonomy slice — the registry-aware
@@ -1561,6 +1584,7 @@ pub mod taxonomy {
 /// the virtual `trades/operator_economics` dataset (key `US:<trade>`).
 pub mod unified {
     use super::taxonomy;
+    use pumper_core::datasets::DerivedPaths;
     use pumper_core::{AppContext, Result, UpsertSummary};
     use serde_json::{json, Value};
 
@@ -1579,6 +1603,209 @@ pub mod unified {
     /// Read cap for the pricing dataset: well past 51 localities × 5 trades × 4
     /// jobs (≈1020) so the summary can't silently truncate once localities drive.
     const PRICING_READ_LIMIT: i64 = 50_000;
+    /// Read cap for the state-tax read (50 states + DC + the federal row = 52).
+    const STATE_TAX_READ_LIMIT: i64 = 200;
+
+    /// Whether a capped read came back **at** its cap — i.e. what the join read
+    /// is a WINDOW, not the dataset.
+    ///
+    /// `>=`, never `==`, so an over-fetch fails safe too. Census's
+    /// `inputs_truncated` idiom, reproduced here rather than imported because an
+    /// app may not depend on another app.
+    pub fn read_hit_cap(returned: usize, limit: i64) -> bool {
+        limit > 0 && returned as i64 >= limit
+    }
+
+    /// The `index_datasets` specs a trades run declares: the two PRODUCT
+    /// datasets under the virtual [`UNIFIED_APP`] namespace.
+    ///
+    /// **Nothing about `trades/operator_economics` was watchable before this.**
+    /// `worker::load_run_changes` is scoped by `run_indexed_apps` — the job's own
+    /// app plus the apps named in the result's `index_datasets` — and no app in
+    /// this family declared any. So every revision of the one dataset a consumer
+    /// would actually watch was never loaded: no watch, no dataset trigger, no
+    /// `enforce_contracts` evaluation, no search doc, no DataHub lineage. Five
+    /// apps refreshed it all week and a webhook set on it never fired.
+    ///
+    /// Declared by every app in the family because every app re-derives the join,
+    /// so whichever ran last is the one that must publish. A spec naming a
+    /// dataset this particular run did not touch costs one empty `changes_since`
+    /// and yields no documents — the honest no-op.
+    ///
+    /// Mirrors `census_common::product_index_datasets`; the same two-line shape
+    /// on purpose, so the two families cannot drift.
+    pub fn product_index_datasets() -> Value {
+        json!([
+            { "app": UNIFIED_APP, "dataset": OPERATOR_ECONOMICS },
+            { "app": UNIFIED_APP, "dataset": COMPLIANCE },
+        ])
+    }
+
+    /// Adds [`product_index_datasets`] to a trades run result. A non-object
+    /// result passes through untouched (there is nowhere honest to put the key).
+    pub fn with_product_index(mut result: Value) -> Value {
+        if let Value::Object(map) = &mut result {
+            map.insert("index_datasets".into(), product_index_datasets());
+        }
+        result
+    }
+
+    /// The datasets the join reads, named in the provenance of what it writes.
+    const JOIN_INPUTS: [&str; 5] = [
+        "state-tax/tax",
+        "trade-wages/wages",
+        "homewyse-pricing/pricing",
+        "valuation-multiples/valuation",
+        "trades/compliance",
+    ];
+
+    /// RFC-3339 UTC micros for *now* — the `as_of` a derived write is stamped
+    /// with.
+    ///
+    /// A **provenance** value, never a record field: provenance lives on the
+    /// revision, outside the change-detection hash, so an as-of that moves every
+    /// run cannot mark every joined row `changed`.
+    fn as_of_now() -> String {
+        pumper_core::datasets::ts(chrono::Utc::now())
+    }
+
+    /// Provenance for a write into the virtual [`UNIFIED_APP`] namespace.
+    ///
+    /// These writes go through `ctx.datasets` because the namespace belongs to no
+    /// app, and that bypasses `AppContext`'s automatic stamping — so before this
+    /// the most-derived dataset in the family carried the LEAST provenance:
+    /// `Provenance::default()`, i.e. nothing, not even a `job_id`. Three facts
+    /// are known and are now recorded: the producing job, the datasets the value
+    /// was derived from, and when the derivation ran.
+    ///
+    /// `artifact_sha` / `rules_hash` stay `None` on purpose: a joined row has no
+    /// archived body of its own and no RuleSet, so it is not replayable and must
+    /// not claim to be.
+    ///
+    /// Follows `census_common::derived_provenance` rather than inventing a fourth
+    /// spelling.
+    pub fn derived_provenance(
+        ctx: &AppContext,
+        dataset: &str,
+        inputs: &[&str],
+    ) -> pumper_core::Provenance {
+        pumper_core::Provenance {
+            job_id: Some(ctx.job_id.to_string()),
+            // `derived://` — not an http(s) URL, because nothing was fetched to
+            // produce this row. It names the join's inputs and when it ran.
+            source_url: Some(format!(
+                "derived://{UNIFIED_APP}/{dataset}?inputs={}&as_of={}",
+                inputs.join(","),
+                as_of_now()
+            )),
+            ..pumper_core::Provenance::default()
+        }
+    }
+
+    /// Where a write into the virtual [`UNIFIED_APP`] namespace goes and what
+    /// trust stamp it carries — the app-layer equivalent of
+    /// `AppContext::write_target`, which the raw `ctx.datasets` path bypasses
+    /// entirely.
+    ///
+    /// Resolved for the **written** pair (`trades/<dataset>`), exactly as
+    /// `AppContext::write_target` resolves for the writing app's own pair. A
+    /// quarantined `trades/operator_economics` therefore diverts to the shadow
+    /// dataset `operator_economics@q` and the canonical layer keeps its last
+    /// healthy rows, which is the standard ladder every other surface already
+    /// understands.
+    ///
+    /// **Known limit, stated rather than hidden:** nothing calls
+    /// `observe_extraction` for the `trades` namespace yet, so today this always
+    /// resolves `Healthy` and gates nothing — it is the plumbing, present and
+    /// correct, waiting on a producer of health evidence. `grants-common` avoids
+    /// the same trap by resolving each SOURCE's own pair; the trades join reads
+    /// five sources with no single owning contribution, so there is no equivalent
+    /// source pair to resolve here.
+    pub async fn write_target(ctx: &AppContext, dataset: &str) -> (String, Option<&'static str>) {
+        let state = ctx.health.enforced_state(UNIFIED_APP, dataset).await;
+        (
+            pumper_core::resilience::write_dataset(dataset, state),
+            state.trust(),
+        )
+    }
+
+    /// Record paths on the **per-state** rows that are national roll-ups
+    /// replicated onto every state, and are therefore excluded from those rows'
+    /// change-detection hash.
+    ///
+    /// `wage_band` and `valuation` are the SAME national values on all ~255
+    /// per-state rows, and `tax.federal` is the same federal constants block. So
+    /// one national wage refresh used to mark every per-state row `changed` — 255
+    /// notifications for 5 facts — and a watch, trigger or webhook on
+    /// `trades/operator_economics` could not tell that churn from a real
+    /// per-state change.
+    ///
+    /// Those facts are still announced, exactly once each, on the `US:<trade>`
+    /// roll-up rows, which are written in a separate batch with nothing excluded.
+    /// The stored record and every revision still carry the full block on the
+    /// per-state rows too — `DerivedPaths` narrows the hash and nothing else.
+    ///
+    /// Path spelling is verified against `DerivedPaths::hash_input` /
+    /// `remove_path`: `.`-separated, object-walking, and an absent path is a
+    /// silent no-op — which is why a wrong spelling would make this seam LOOK
+    /// adopted and do nothing. `derived_paths_name_blocks_the_join_actually_writes`
+    /// pins each one against a real joined record.
+    const STATE_ROW_DERIVED_PATHS: [&str; 3] = ["wage_band", "valuation", "tax.federal"];
+
+    fn state_row_derived_paths() -> DerivedPaths {
+        DerivedPaths::new(STATE_ROW_DERIVED_PATHS)
+    }
+
+    /// What one `sync_operator_economics` call did, in the shape every app in the
+    /// family reports it.
+    ///
+    /// Mirrors `grants_common::UnifiedOutcome`: one struct, one `merge_into`, so
+    /// five apps cannot each invent their own summary shape.
+    pub struct JoinOutcome {
+        pub summary: UpsertSummary,
+        /// The dataset the rows actually landed in — `operator_economics`, or the
+        /// shadow `operator_economics@q` when the namespace is quarantined.
+        pub dataset: String,
+        /// The trust stamp the rows carry (`None` = `stable`).
+        pub trust: Option<&'static str>,
+        /// Inputs whose read came back AT its cap, so the join ran over a WINDOW
+        /// of them rather than the whole dataset. Empty = complete.
+        pub inputs_truncated: Vec<String>,
+    }
+
+    impl JoinOutcome {
+        /// Merges the join's report into a source app's result object so every
+        /// trades app reports the shared layer with one identical shape.
+        pub fn merge_into(&self, out: &mut Value) {
+            let Value::Object(map) = out else { return };
+            map.insert(
+                "unified".into(),
+                json!({
+                    "dataset": format!("{UNIFIED_APP}/{}", self.dataset),
+                    "trust": self.trust,
+                    "new": self.summary.new.len(),
+                    "changed": self.summary.changed.len(),
+                    "unchanged": self.summary.unchanged,
+                    // A join over a capped read is a join over a WINDOW: these
+                    // names say which inputs were only partly read.
+                    "inputs_truncated": self.inputs_truncated,
+                    "join_complete": self.inputs_truncated.is_empty(),
+                }),
+            );
+            if !self.inputs_truncated.is_empty() {
+                let warning = format!(
+                    "trades join ran over a truncated read of: {}",
+                    self.inputs_truncated.join(", ")
+                );
+                match map.get_mut("warnings").and_then(Value::as_array_mut) {
+                    Some(existing) => existing.push(json!(warning)),
+                    None => {
+                        map.insert("warnings".into(), json!([warning]));
+                    }
+                }
+            }
+        }
+    }
 
     /// Rebuilds `trades/operator_economics` from the current state of the four
     /// source datasets: wage band (trade-wages), pricing summary (homewyse),
@@ -1587,9 +1814,26 @@ pub mod unified {
     /// `<ST>:<trade>` for every state tax record — the per-state rows carry that
     /// state's REAL top-marginal rate instead of a national median. Wage /
     /// valuation stay the national roll-up on state rows (`wage_grain: national`)
-    /// until per-state OEWS lands. Idempotent `upsert_many` (a join, never a
+    /// until per-state OEWS lands. Idempotent upsert (a join, never a
     /// full-snapshot sync — absent source data must not mark rows removed).
-    pub async fn sync_operator_economics(ctx: &AppContext) -> Result<UpsertSummary> {
+    ///
+    /// **Recomputed once per app run, i.e. five times per refresh cycle — a
+    /// deliberate choice, and here is its cost.** `grants-common` takes a
+    /// once-per-cycle lease (`grants/maintenance` key `corpus_pass`) for its
+    /// corpus-wide sweep, and that is the right shape *there* because the sweep
+    /// is cross-source bookkeeping no single run owns. It is the wrong shape
+    /// here: each of the five apps refreshes a DIFFERENT input, and the join is
+    /// how that input reaches the product. A once-per-cycle lease would mean the
+    /// first run of the day published and the other four apps' fresh data sat
+    /// invisible until the next cycle — trading a real staleness bug for a
+    /// rebuild that costs 5 trades × (1 national + N state) rows ≈ 260 upserts,
+    /// almost all of which hash-compare equal and report `unchanged`. Five
+    /// rebuilds ≈ 1_300 hash comparisons per cycle against a SQLite table of the
+    /// same order. That is the stated price of a product that is never a cycle
+    /// behind its inputs.
+    pub async fn sync_operator_economics(ctx: &AppContext) -> Result<JoinOutcome> {
+        // Inputs whose read came back at its cap — census's `inputs_truncated`.
+        let mut inputs_truncated: Vec<String> = Vec::new();
         // Federal small-business constants — national, same for every trade.
         // `live_record`: `Datasets::get` returns tombstoned rows too.
         let federal = super::live_record(ctx.datasets.get("state-tax", "tax", "federal:US").await?)
@@ -1602,7 +1846,14 @@ pub mod unified {
         // not come back through this join as a live row, and must not enter
         // `median_state_rate` — `Datasets::list` returns removed records by
         // design, so the filter belongs here at the consumer.
-        let state_records = super::live_records(ctx.datasets.list("state-tax", "tax", 200).await?);
+        let state_raw = ctx
+            .datasets
+            .list("state-tax", "tax", STATE_TAX_READ_LIMIT)
+            .await?;
+        if read_hit_cap(state_raw.len(), STATE_TAX_READ_LIMIT) {
+            inputs_truncated.push("state-tax/tax".into());
+        }
+        let state_records = super::live_records(state_raw);
         let mut state_tax: Vec<(String, Value)> = Vec::new();
         let mut state_rates: Vec<f64> = Vec::new();
         for r in &state_records {
@@ -1621,31 +1872,51 @@ pub mod unified {
 
         // All priced jobs. Cap raised well past 51 localities × 5 trades × 4 jobs
         // (≈1020) so the summary can't silently truncate once localities are driven.
-        let pricing_recs = super::live_records(
-            ctx.datasets
-                .list("homewyse-pricing", "pricing", PRICING_READ_LIMIT)
-                .await?,
-        );
+        let pricing_raw = ctx
+            .datasets
+            .list("homewyse-pricing", "pricing", PRICING_READ_LIMIT)
+            .await?;
+        if read_hit_cap(pricing_raw.len(), PRICING_READ_LIMIT) {
+            inputs_truncated.push("homewyse-pricing/pricing".into());
+        }
+        let pricing_recs = super::live_records(pricing_raw);
         let pricing: Vec<&Value> = pricing_recs.iter().map(|r| &r.data).collect();
 
         // Per state × trade compliance (state-licensing app): keyed `<ST>:<trade>`,
         // looked up per-row below. State-grain data, so the national `US:{trade}`
         // roll-up carries no compliance block (Null, never a fabricated average).
-        let compliance_recs = super::live_records(
-            ctx.datasets
-                .list(UNIFIED_APP, COMPLIANCE, COMPLIANCE_READ_LIMIT)
-                .await?,
-        );
+        let compliance_raw = ctx
+            .datasets
+            .list(UNIFIED_APP, COMPLIANCE, COMPLIANCE_READ_LIMIT)
+            .await?;
+        if read_hit_cap(compliance_raw.len(), COMPLIANCE_READ_LIMIT) {
+            inputs_truncated.push(format!("{UNIFIED_APP}/{COMPLIANCE}"));
+        }
+        let compliance_recs = super::live_records(compliance_raw);
         let compliance: std::collections::HashMap<String, Value> = compliance_recs
             .into_iter()
             .map(|r| (r.key, r.data))
             .collect();
 
-        let mut items: Vec<(String, Value)> = Vec::new();
+        // Two batches, written separately, because they get DIFFERENT
+        // change-detection treatment: the national roll-ups announce the national
+        // facts (nothing excluded), and the per-state rows exclude those same
+        // replicated facts so one national refresh does not mark ~255 rows
+        // `changed` — see `state_row_derived_paths`.
+        let mut national: Vec<(String, Value)> = Vec::new();
+        let mut per_state: Vec<(String, Value)> = Vec::new();
         // Trade universe = the governed taxonomy registry, enum as fallback —
         // an enabled registry trade gets its unified rows on the next sync
         // with zero new per-trade code.
-        for entry in taxonomy::taxonomy(ctx).await? {
+        let (trade_entries, taxonomy_at_cap) = taxonomy::taxonomy_at_cap(ctx).await?;
+        if taxonomy_at_cap {
+            inputs_truncated.push(format!(
+                "{}/{}",
+                taxonomy::TAXONOMY_APP,
+                taxonomy::TAXONOMY_DATASET
+            ));
+        }
+        for entry in trade_entries {
             let label = entry.label.as_str();
             // Wage + valuation are national roll-ups (`US:{label}`) — per-state
             // OEWS wages are deferred (trades#2 phase c); valuation stays national
@@ -1671,7 +1942,7 @@ pub mod unified {
                 || national_pricing.is_some()
                 || federal.is_some()
             {
-                items.push((
+                national.push((
                     format!("US:{label}"),
                     json!({
                         "trade": label,
@@ -1696,7 +1967,7 @@ pub mod unified {
             // code is priced, else null (never the contaminated average).
             for (code, trec) in &state_tax {
                 let state_pricing = summarize_pricing(&pricing, label, code);
-                items.push((
+                per_state.push((
                     format!("{code}:{label}"),
                     json!({
                         "trade": label,
@@ -1717,9 +1988,45 @@ pub mod unified {
             }
         }
 
-        ctx.datasets
-            .upsert_many(UNIFIED_APP, OPERATOR_ECONOMICS, &items)
-            .await
+        // Provenance-carrying, quarantine-aware, derived-aware write. Raw
+        // `ctx.datasets.upsert_many` carried no `Provenance`, no `job_id`, no
+        // trust stamp and no `@q` diversion — the most-derived dataset in the
+        // family had the least provenance of any of them.
+        let (dataset, trust) = write_target(ctx, OPERATOR_ECONOMICS).await;
+        let prov = derived_provenance(ctx, &dataset, &JOIN_INPUTS);
+        let mut summary = ctx
+            .datasets
+            .upsert_many_derived(
+                UNIFIED_APP,
+                &dataset,
+                &national,
+                trust,
+                Some(&prov),
+                &DerivedPaths::NONE,
+            )
+            .await?;
+        let mut state_summary = ctx
+            .datasets
+            .upsert_many_derived(
+                UNIFIED_APP,
+                &dataset,
+                &per_state,
+                trust,
+                Some(&prov),
+                &state_row_derived_paths(),
+            )
+            .await?;
+        summary.new.append(&mut state_summary.new);
+        summary.changed.append(&mut state_summary.changed);
+        summary.unchanged += state_summary.unchanged;
+        summary.removed.append(&mut state_summary.removed);
+
+        Ok(JoinOutcome {
+            summary,
+            dataset,
+            trust,
+            inputs_truncated,
+        })
     }
 
     /// Compact wage-band subset lifted from a trade-wages record.
@@ -1862,6 +2169,138 @@ pub mod unified {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// **The failure this direction exists to kill.** A wrong path spelling
+        /// makes `DerivedPaths` LOOK adopted and do nothing — `remove_path` treats
+        /// an absent path as a silent no-op. So each declared path is pinned
+        /// against a record shaped exactly like the join's per-state row.
+        #[test]
+        fn derived_paths_name_blocks_the_join_actually_writes() {
+            let row = json!({
+                "trade": "Plumbing",
+                "state": "CA",
+                "soc_code": "47-2152",
+                "wage_band": { "median_hourly": 30.1 },
+                "wage_grain": "national",
+                "pricing": { "jobs": 3 },
+                "pricing_locality": "CA",
+                "tax": {
+                    "federal": { "self_employment_tax_rate": 15.3 },
+                    "state": { "state": "CA", "top_marginal_rate": 13.3 },
+                },
+                "compliance": { "requirement_level": "exam_license" },
+                "valuation": { "sde_multiple_median": 2.8 },
+            });
+            for path in STATE_ROW_DERIVED_PATHS {
+                assert!(
+                    object_path_exists(&row, path),
+                    "declared path {path:?} is not in the record the join writes —                      `remove_path` would no-op and the seam would do nothing"
+                );
+            }
+            // And the paths that must NOT be excluded are still hashed: these are
+            // real per-state facts and hiding them would hide real changes.
+            for path in ["pricing", "compliance", "tax.state"] {
+                assert!(object_path_exists(&row, path), "fixture drifted: {path}");
+                assert!(
+                    !STATE_ROW_DERIVED_PATHS.contains(&path),
+                    "{path} is a real per-state fact and must stay in the hash"
+                );
+            }
+            // eu-sedia's drift guard: the declaration and the constant are one.
+            assert_eq!(
+                state_row_derived_paths(),
+                DerivedPaths::new(STATE_ROW_DERIVED_PATHS)
+            );
+        }
+
+        /// Mirrors `pumper_core::datasets::remove_path`: `.`-separated, walking
+        /// OBJECTS only. Kept in the test so a path spelling is checked against
+        /// the same traversal the change-detection hash uses.
+        fn object_path_exists(value: &Value, path: &str) -> bool {
+            let mut cursor = value;
+            let mut segments = path.split('.').peekable();
+            while let Some(segment) = segments.next() {
+                let Value::Object(map) = cursor else {
+                    return false;
+                };
+                match map.get(segment) {
+                    Some(next) if segments.peek().is_some() => cursor = next,
+                    Some(_) => return true,
+                    None => return false,
+                }
+            }
+            false
+        }
+
+        #[test]
+        fn product_index_declares_both_trades_datasets() {
+            let specs = product_index_datasets();
+            let specs = specs.as_array().expect("array");
+            assert_eq!(specs.len(), 2);
+            assert_eq!(specs[0]["app"], UNIFIED_APP);
+            assert_eq!(specs[0]["dataset"], OPERATOR_ECONOMICS);
+            assert_eq!(specs[1]["dataset"], COMPLIANCE);
+        }
+
+        /// The anti-pattern: a run result that never names `index_datasets` is a
+        /// run whose `trades/*` revisions `run_indexed_apps` never widens to, so
+        /// no watch, trigger, contract or search doc ever sees them.
+        #[test]
+        fn with_product_index_reaches_the_result_and_leaves_non_objects_alone() {
+            let out = with_product_index(json!({ "records": 3 }));
+            assert_eq!(out["index_datasets"], product_index_datasets());
+            assert_eq!(out["records"], 3);
+            // Nowhere honest to put the key on a non-object.
+            assert_eq!(with_product_index(json!("skipped")), json!("skipped"));
+        }
+
+        /// A read that comes back AT its cap is a window, not the dataset (`>=`,
+        /// never `==`, so an over-fetch fails safe too).
+        #[test]
+        fn a_capped_read_is_truncated_not_a_complete_input() {
+            assert!(!read_hit_cap(0, 10));
+            assert!(!read_hit_cap(9, 10));
+            assert!(read_hit_cap(10, 10));
+            assert!(read_hit_cap(11, 10));
+            assert!(!read_hit_cap(199, STATE_TAX_READ_LIMIT));
+            assert!(read_hit_cap(200, STATE_TAX_READ_LIMIT));
+        }
+
+        #[test]
+        fn a_truncated_input_is_reported_and_warned_about_not_joined_silently() {
+            let complete = JoinOutcome {
+                summary: UpsertSummary::default(),
+                dataset: OPERATOR_ECONOMICS.to_string(),
+                trust: None,
+                inputs_truncated: Vec::new(),
+            };
+            let mut out = json!({ "records": 1 });
+            complete.merge_into(&mut out);
+            assert_eq!(out["unified"]["join_complete"], true);
+            assert_eq!(out["unified"]["dataset"], "trades/operator_economics");
+            assert!(out.get("warnings").is_none(), "nothing to warn about");
+
+            let truncated = JoinOutcome {
+                summary: UpsertSummary::default(),
+                dataset: format!("{OPERATOR_ECONOMICS}@q"),
+                trust: Some("quarantined"),
+                inputs_truncated: vec!["state-tax/tax".into()],
+            };
+            let mut out = json!({ "records": 1, "warnings": ["pre-existing"] });
+            truncated.merge_into(&mut out);
+            assert_eq!(out["unified"]["join_complete"], false);
+            assert_eq!(out["unified"]["inputs_truncated"], json!(["state-tax/tax"]));
+            assert_eq!(out["unified"]["trust"], "quarantined");
+            assert_eq!(
+                out["unified"]["dataset"], "trades/operator_economics@q",
+                "a quarantined namespace diverts to the shadow dataset"
+            );
+            let warnings = out["warnings"].as_array().expect("warnings[]");
+            assert_eq!(warnings.len(), 2, "appended, not replaced: {warnings:?}");
+            assert!(warnings[1]
+                .as_str()
+                .is_some_and(|w| w.contains("truncated read")));
+        }
 
         #[test]
         fn median_handles_odd_and_even() {

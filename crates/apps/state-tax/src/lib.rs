@@ -166,7 +166,8 @@ impl ScrapeApp for StateTax {
                  coverage: {unit, covered, expected, ratio, floor, short, missing}, \
                  warnings: [string], new, changed, unchanged, removed, \
                  removals_suppressed, rejected: [{key, reasons}], rejected_count, \
-                 unified: {new, changed}, cost_usd, duration_ms, num_turns} — or \
+                 unified: {dataset, trust, new, changed, unchanged, \
+                 inputs_truncated, join_complete}, index_datasets, cost_usd, duration_ms, num_turns} — or \
                  {source, year, skipped, records, cost_usd: 0.0} when the vintage gate holds",
             ),
             cost_class: CostClass::Claude,
@@ -369,9 +370,9 @@ impl ScrapeApp for StateTax {
 
         // Cross-source layer: state-tax contributes the federal + illustrative-state
         // tax context to trades/operator_economics (mirrors grants-common's sync).
-        let unified = unified::sync_operator_economics(&ctx).await?;
+        let join = unified::sync_operator_economics(&ctx).await?;
 
-        Ok(json!({
+        let mut out = json!({
             "source": format!("agentic/tax/{year}"),
             "year": year,
             "records": all_records.len(),
@@ -391,11 +392,16 @@ impl ScrapeApp for StateTax {
             "removals_suppressed": write.removals_suppressed,
             "rejected": rejected.iter().map(Rejection::to_json).collect::<Vec<_>>(),
             "rejected_count": rejected.len(),
-            "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
             "cost_usd": output.cost_usd,
             "duration_ms": output.duration_ms,
             "num_turns": output.num_turns,
-        }))
+        });
+        // One shared shape for the join's report (`unified`, incl. the dataset it
+        // actually landed in and any truncated input), and the `index_datasets`
+        // declaration without which no watch, trigger, contract or search doc
+        // ever sees a `trades/*` revision.
+        join.merge_into(&mut out);
+        Ok(unified::with_product_index(out))
     }
 }
 
