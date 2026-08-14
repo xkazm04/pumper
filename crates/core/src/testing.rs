@@ -20,7 +20,7 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
-use crate::app::{AppContext, NoCheckpoints, NoProgress};
+use crate::app::{AppContext, CheckpointSink, NoCheckpoints, NoProgress};
 use crate::cache::ResearchCache;
 use crate::config::{FetcherConfig, GovernorConfig, ResilienceConfig, StorageConfig};
 use crate::costs::{CostLedger, SpentTotal};
@@ -232,6 +232,95 @@ pub fn research_output(text: impl Into<String>) -> ResearchOutput {
     }
 }
 
+/// One recorded call to [`CheckpointSink::save`]: the snapshot the app handed
+/// the seam, and whether it asked for the throttle to be bypassed.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Checkpoint {
+    pub state: Value,
+    pub force: bool,
+}
+
+/// A [`CheckpointSink`] that **records** every save instead of persisting one —
+/// the offline stand-in for the runtime's durable-execution seam, and the only
+/// way a test can observe *that* an app checkpointed, *when*, *what*, and what
+/// it does when the write does not land.
+///
+/// It is to `CheckpointSink` what [`ScriptedResearcher`] is to `Researcher`:
+/// every call is recorded in order and replayed against a script — here the
+/// script is just "does this save land". Configure a failure with
+/// [`failing`](Self::failing) (every save returns `false`) or
+/// [`failing_from`](Self::failing_from) (the Nth save on returns `false`), which
+/// is how the `false` branch of the trait's contract — *"returns `false` when
+/// the write did not land … so apps can count it"* — becomes reachable.
+///
+/// A **failed save is still recorded**: what the app tried to persist is as
+/// interesting as what landed, and a double that hid the attempt would make the
+/// loss it is modelling invisible again. Nothing here panics.
+#[derive(Default)]
+pub struct RecordingCheckpoints {
+    saves: std::sync::Mutex<Vec<Checkpoint>>,
+    /// 1-based ordinal of the first save that fails; `None` = every save lands.
+    fail_from: Option<usize>,
+}
+
+impl RecordingCheckpoints {
+    /// A sink where every save lands (`true`) — the recording-only mode.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Every save fails (`false`), as a job whose attempt lineage went stale
+    /// sees for the rest of its run.
+    #[must_use]
+    pub fn failing() -> Self {
+        Self::failing_from(1)
+    }
+
+    /// Saves land until the `nth` (1-based), which and every later one fails —
+    /// the shape of a run that loses its durability *mid-flight*. `nth = 0` is
+    /// read as 1 (fail from the very first save) rather than panicking.
+    #[must_use]
+    pub fn failing_from(nth: usize) -> Self {
+        Self {
+            saves: std::sync::Mutex::new(Vec::new()),
+            fail_from: Some(nth.max(1)),
+        }
+    }
+
+    /// Every save this sink was handed, in order — landed and failed alike.
+    pub fn saves(&self) -> Vec<Checkpoint> {
+        self.saves
+            .lock()
+            .expect("recording checkpoints lock")
+            .clone()
+    }
+
+    pub fn save_count(&self) -> usize {
+        self.saves.lock().expect("recording checkpoints lock").len()
+    }
+
+    /// The most recent snapshot handed to the seam, if any.
+    pub fn last_state(&self) -> Option<Value> {
+        self.saves
+            .lock()
+            .expect("recording checkpoints lock")
+            .last()
+            .map(|c| c.state.clone())
+    }
+}
+
+#[async_trait]
+impl CheckpointSink for RecordingCheckpoints {
+    async fn save(&self, state: Value, force: bool) -> bool {
+        let mut saves = self.saves.lock().expect("recording checkpoints lock");
+        saves.push(Checkpoint { state, force });
+        let ordinal = saves.len();
+        // Lands until the configured ordinal; from there on the write is
+        // reported as not having landed, for the rest of the run.
+        self.fail_from.is_none_or(|from| ordinal < from)
+    }
+}
+
 /// A full `EngineSet` of [`Dead`] engines (governor + fetcher at defaults).
 pub fn dead_engines() -> Arc<EngineSet> {
     engines_with(Arc::new(Dead), Arc::new(Dead), Arc::new(Dead))
@@ -268,6 +357,7 @@ pub struct TestContext<'a> {
     artifacts_dir: Option<std::path::PathBuf>,
     research_cache_ttl_secs: u64,
     restored: Option<Value>,
+    checkpoints: Option<Arc<dyn CheckpointSink>>,
     vcr: crate::vcr::Vcr,
 }
 
@@ -283,8 +373,18 @@ impl<'a> TestContext<'a> {
             artifacts_dir: None,
             research_cache_ttl_secs: 0,
             restored: None,
+            checkpoints: None,
             vcr: crate::vcr::Vcr::Off,
         }
+    }
+
+    /// Wires the durable-execution seam (default: [`NoCheckpoints`], which
+    /// silently drops every save and reports it landed). Pass a
+    /// [`RecordingCheckpoints`] to assert on what the app checkpointed, in what
+    /// order, and how it behaves when a save does not land.
+    pub fn checkpoints(mut self, sink: Arc<dyn CheckpointSink>) -> Self {
+        self.checkpoints = Some(sink);
+        self
     }
 
     /// Runs the context in a VCR mode (default: `Off`).
@@ -355,12 +455,160 @@ impl<'a> TestContext<'a> {
             recipes: Arc::new(crate::recipes::RecipeStore::new(pool.clone())),
             plugins: Arc::new(NoPlugins),
             progress: Arc::new(NoProgress),
-            checkpoints: Arc::new(NoCheckpoints),
+            checkpoints: self
+                .checkpoints
+                .unwrap_or_else(|| Arc::new(NoCheckpoints) as Arc<dyn CheckpointSink>),
             restored: self.restored,
             vcr: self.vcr,
             artifacts_dir: self
                 .artifacts_dir
                 .unwrap_or_else(|| self.storage.artifacts_dir.join(&self.app).join("job")),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::app::ScrapeApp;
+
+    /// A minimally honest resumable app: it commits its work list to an
+    /// unthrottled checkpoint **before** paying for any of it, then does the
+    /// units one by one — counting the saves that did not land, which is
+    /// exactly what `CheckpointSink`'s doc says the `false` return is for.
+    struct Resumable {
+        work: Vec<&'static str>,
+        seam: Arc<RecordingCheckpoints>,
+        /// How many saves the seam had recorded when the first unit of work was
+        /// paid for. `Some(0)` is the bug this harness exists to catch.
+        saves_at_first_unit: std::sync::Mutex<Option<usize>>,
+    }
+
+    impl Resumable {
+        fn new(seam: &Arc<RecordingCheckpoints>) -> Self {
+            Self {
+                work: vec!["a", "b", "c"],
+                seam: seam.clone(),
+                saves_at_first_unit: std::sync::Mutex::new(None),
+            }
+        }
+
+        fn saves_at_first_unit(&self) -> Option<usize> {
+            *self.saves_at_first_unit.lock().expect("first-unit lock")
+        }
+    }
+
+    #[async_trait]
+    impl ScrapeApp for Resumable {
+        fn name(&self) -> &'static str {
+            "resumable"
+        }
+
+        async fn run(&self, ctx: AppContext) -> Result<Value> {
+            let mut lost = 0usize;
+            if !self.work.is_empty() && !ctx.checkpoint_now(json!({ "pending": self.work })).await {
+                lost += 1;
+            }
+            let mut done: Vec<&str> = Vec::new();
+            for unit in &self.work {
+                if done.is_empty() {
+                    *self.saves_at_first_unit.lock().expect("first-unit lock") =
+                        Some(self.seam.save_count());
+                }
+                done.push(unit);
+                if !ctx
+                    .checkpoint(json!({ "pending": self.work, "done": done }))
+                    .await
+                {
+                    lost += 1;
+                }
+            }
+            Ok(json!({ "done": done.len(), "checkpointsLost": lost }))
+        }
+    }
+
+    /// The ordering claim every durable-execution app in this repo makes and no
+    /// test could check: the resumable unit is persisted BEFORE the work it
+    /// exists to make resumable. Without a recording sink the whole seam is
+    /// invisible — `NoCheckpoints` swallows the state and answers `true`.
+    #[tokio::test]
+    async fn an_app_checkpoints_its_work_before_paying_for_it_not_after() {
+        let store = TempStore::new("recording-checkpoints").await;
+        let seam = Arc::new(RecordingCheckpoints::new());
+        let app = Resumable::new(&seam);
+        let ctx = TestContext::new(&store.storage, "resumable")
+            .checkpoints(seam.clone())
+            .build();
+
+        let out = app.run(ctx).await.expect("run");
+
+        assert_eq!(
+            app.saves_at_first_unit(),
+            Some(1),
+            "the first unit of work was paid for with nothing durable behind it"
+        );
+        let saves = seam.saves();
+        assert_eq!(saves.len(), 4, "one pre-flight snapshot + one per unit");
+        assert_eq!(saves[0].state["pending"], json!(["a", "b", "c"]));
+        assert!(
+            saves[0].force,
+            "the pre-flight snapshot must bypass the throttle — a throttled \
+             first save can be silently dropped, which is the whole loss window"
+        );
+        assert!(!saves[1].force, "in-loop saves stay throttleable");
+        assert_eq!(
+            seam.last_state().expect("a last state")["done"],
+            json!(["a", "b", "c"])
+        );
+        assert_eq!(out["checkpointsLost"], json!(0));
+    }
+
+    /// The trait doc promises `false` "so apps can count it" — before this
+    /// double, no test could produce a single `false` anywhere in the workspace.
+    #[tokio::test]
+    async fn a_failed_save_is_countable_by_the_app_not_reported_as_landed() {
+        let store = TempStore::new("failing-checkpoints").await;
+
+        // Total loss: the run keeps going (persistence failures never fail a
+        // job) but every one of its four saves is reported, and countable.
+        let seam = Arc::new(RecordingCheckpoints::failing());
+        let app = Resumable::new(&seam);
+        let ctx = TestContext::new(&store.storage, "resumable")
+            .checkpoints(seam.clone())
+            .build();
+        let out = app
+            .run(ctx)
+            .await
+            .expect("a dead checkpoint sink never fails the job");
+        assert_eq!(out["done"], json!(3), "the work still completed");
+        assert_eq!(out["checkpointsLost"], json!(4));
+        assert_eq!(
+            seam.save_count(),
+            4,
+            "a failed save is still recorded — what the app TRIED to persist is \
+             the evidence of what the loss cost"
+        );
+
+        // Mid-flight loss (a job reset/reaped after it started): the first two
+        // saves land, the third and fourth do not.
+        let seam = Arc::new(RecordingCheckpoints::failing_from(3));
+        let app = Resumable::new(&seam);
+        let ctx = TestContext::new(&store.storage, "resumable")
+            .checkpoints(seam.clone())
+            .build();
+        let out = app.run(ctx).await.expect("run");
+        assert_eq!(out["checkpointsLost"], json!(2));
+    }
+
+    /// The default is unchanged, so the 39 files that build a `TestContext`
+    /// today observe exactly what they observed before: a silent sink that
+    /// reports every save as landed.
+    #[tokio::test]
+    async fn the_default_sink_is_still_the_silent_no_op() {
+        let store = TempStore::new("default-checkpoints").await;
+        let ctx = TestContext::new(&store.storage, "resumable").build();
+        assert!(ctx.checkpoint(json!({ "n": 1 })).await);
+        assert!(ctx.checkpoint_now(json!({ "n": 2 })).await);
+        assert!(ctx.restore().is_none());
     }
 }

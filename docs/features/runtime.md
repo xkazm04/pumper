@@ -43,6 +43,23 @@ A long-running app reports compact progress snapshots through `AppContext::progr
 - The snapshot rides `progress`-status job SSE events on `/jobs/{id}/stream` and `/events` (non-terminal, so the per-job stream stays open); monotonic ids / replay semantics are unchanged.
 - The `crawl` app reports `{crawled, kept, failed, frontier, hosts}` (see [crawling.md](crawling.md)).
 
+## Durable execution (checkpoints)
+
+A long-running app persists its **resumable unit** through `AppContext::checkpoint(state)` (throttled — safe to call in a tight loop) or `AppContext::checkpoint_now(state)` (unthrottled, for the snapshots whose loss costs real work). The runtime's sink (`JobCheckpointer`, `crates/server/src/progress.rs`) writes the JSON blob to the `checkpoints` table keyed by job id; the next attempt of the same job gets it back as `ctx.restore()`, so a crash, a reaper re-queue, a timeout or a graceful-shutdown suspend costs a *resume* instead of a restart. The state is **advisory**: an app must tolerate any stored shape and start fresh on doubt, and a succeeded job's checkpoint is cleared (spent state).
+
+**The failure contract.** Both calls return a `bool`, and the answers do not all mean the same thing:
+
+| return | when | what it means |
+| --- | --- | --- |
+| `true` | the write landed | the state is durable |
+| `true` | the save was **throttle-skipped** — a non-`force` call inside the 5s `CHECKPOINT_MIN_INTERVAL` | deliberately *not* a failure: the previous snapshot is still durable and the caller keeps its loop cheap. Never count it as a loss |
+| `false` | **stale attempt lineage** — the job was reset, reaped or re-claimed mid-run, so a newer attempt owns the row (`Storage::save_checkpoint`'s `… AND attempts = ?` fence) | this task's state is stale and must never overwrite the live attempt's. Another attempt owns this job |
+| `false` | **storage error** — a locked DB, a full disk, or a blob over `MAX_CHECKPOINT_BYTES` (8 MiB) | this run's durability is gone until it clears: a reap or restart resumes it from nothing |
+
+A failed save **never fails the job** — losing persistence must not take down work that otherwise succeeded. The `false` exists so a run can *count* it.
+
+**Testing the seam.** `pumper_core::testing::RecordingCheckpoints` (in the `test-support` harness) is a `CheckpointSink` that **records** every `(state, force)` pair instead of persisting it — `saves()`, `save_count()`, `last_state()` — and can be told to fail: `failing()` (every save) or `failing_from(n)` (the nth save on), which is the only way the `false` branch above is reachable from a test. Wire it with `TestContext::new(&storage, app).checkpoints(sink)`; the default is unchanged (`NoCheckpoints` — silently drops the state and reports `true`). A failed save is still *recorded*, because what an app tried to persist is the evidence of what the loss cost. This is what makes "the app checkpointed its work list **before** fetching the first item" an assertion instead of a comment.
+
 ## Scheduler
 
 DB-backed cron (6-field, with seconds) reconciled every `schedule_tick_secs`. Apps can declare a static schedule (`ScrapeApp::schedule`, seeded idempotently); runtime CRUD via `GET/POST /schedules`, `DELETE /schedules/{id}`, `POST /schedules/{id}/enabled`, `POST /schedules/{id}/budget`. **Overlap guard:** a schedule whose **most recent** run is still queued/running skips the tick without touching `last_run`, so exactly one catch-up run fires when it frees up. The guard and the `health` field on `GET /schedules` are the same read and the same predicate (`scheduler::latest_run` → `run_holds_slot`), so the API's answer is the scheduler's answer.
@@ -145,7 +162,7 @@ Every join is an index seek on the job id — a receipt is a per-job audit view,
 
 ## AppContext (what a running app gets)
 
-`job_id`, `app`, `params`, `engines`, `datasets`, `costs`, `budget_usd`, `research_cache`, `tiers`, `plugins`, `progress` (throttled live-progress seam — see [Live progress](#live-progress)), `health` (extraction-health judge — see below), `artifacts_dir` + helpers: `fetch` (metered, budget-governed, tier-routed), `research` (metered, cached), `upsert`/`upsert_many`/`sync_many`, `observe_extraction`, `save_artifact`, `require_str`, `remaining_budget_usd`.
+`job_id`, `app`, `params`, `engines`, `datasets`, `costs`, `budget_usd`, `research_cache`, `tiers`, `plugins`, `progress` (throttled live-progress seam — see [Live progress](#live-progress)), `checkpoints`/`restored` (durable-execution seam — see [Durable execution](#durable-execution-checkpoints)), `health` (extraction-health judge — see below), `artifacts_dir` + helpers: `fetch` (metered, budget-governed, tier-routed), `research` (metered, cached), `upsert`/`upsert_many`/`sync_many`, `observe_extraction`, `save_artifact`, `checkpoint`/`checkpoint_now`/`restore`, `require_str`, `remaining_budget_usd`.
 
 **Health-gated writes.** `upsert`/`upsert_many`/`sync_many` consult the source's extraction-health state before writing: a quarantined source's writes are redirected to the shadow dataset `<dataset>@q` (an ordinary dataset, so every existing tool works on it) and stamped with a trust marker, and `sync_many` silently **downgrades to `upsert_many`** when the state suppresses removals — a half-broken run returns a short-but-nonempty batch, and removal detection would then tombstone every key missing from it. The check lives **in the store**: `Datasets::detect_removed` demands a `RemovalGuard`, and the only public way to mint one is `RemovalGuard::for_source_state(state)`, which yields `None` for a degrading source. So an app that hand-rolls `upsert_many` + removal detection cannot skip it either (it previously could, and one did). A caller that already knows which specific records disappeared uses `Datasets::tombstone_keys` instead — removal by name, nothing inferred. `observe_extraction(dataset, docs, fetch)` records the run's verdict and must be called **before** the upserts it is meant to gate. All of this is inert while `[resilience] enforce = false` (the shipping default — verdicts are computed and stored, nothing is gated). Full surface: [resilient-extraction.md](resilient-extraction.md).
 
