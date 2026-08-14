@@ -59,8 +59,13 @@ pub(crate) struct RetentionPreviewQuery {
     tag = "retention",
     params(RetentionPreviewQuery),
     responses((status = 200, description = "Dry run: reclaimable bytes per app under the given \
-        age cutoff, with pinned bytes broken out, plus current row counts of the append-only \
-        ledgers and the configured retention windows. Deletes nothing.")),
+        age cutoff, plus current row counts of the append-only ledgers and the configured \
+        retention windows. Deletes nothing. `artifacts` carries four byte/file classes that \
+        **partition the tree exactly** — `reclaimable_*` (what a sweep would delete), `pinned_*` \
+        (a live record or a replayable revision still addresses it; age cannot override this), \
+        `cassette_*` (protected VCR cassettes, unless `artifact_retention_include_cassettes`) and \
+        `within_window_*` (younger than the cutoff) — so `total_bytes` is fully accounted for and \
+        a sweep that frees little is explainable. `per_app` repeats the same four classes.")),
 )]
 pub(crate) async fn retention_preview(
     State(state): State<AppState>,
@@ -89,6 +94,14 @@ pub(crate) async fn retention_preview(
             "reclaimable_bytes": plan.reclaimable_bytes,
             "pinned_files": plan.pinned_files,
             "pinned_bytes": plan.pinned_bytes,
+            // The other two classes, so the four `*_bytes` add up to
+            // `total_bytes` exactly. Without them the difference read as bytes
+            // nobody could account for — and cassettes and young bodies are
+            // precisely what explains a sweep that frees less than expected.
+            "cassette_files": plan.cassette_files,
+            "cassette_bytes": plan.cassette_bytes,
+            "within_window_files": plan.within_window_files,
+            "within_window_bytes": plan.within_window_bytes,
             "per_app": plan.apps,
         },
         "ledgers": ledgers,

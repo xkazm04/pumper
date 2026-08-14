@@ -64,7 +64,7 @@ The global 1 MiB is sized from what the POST surface actually accepts — all ha
 | Source health | `GET /sources?state=&app=&limit=` · `GET /sources/{id}` (`id` = `<app>/<dataset>`) · `GET /sources/{id}/runs?limit=` · `POST /sources/{id}/state` (`{state, reason?}` — manual override; the only way out of quarantine). All `503` when `[resilience] enabled = false`. See below. |
 | Provisioner proposals | `GET /provisioner/proposals?limit=&cursor=` (backlog of what `provisioner` compiled; see below) · `POST /provisioner/proposals/{key}/validate` (re-checks against a FRESH fetch) · `POST /provisioner/proposals/{key}/promote` (renders the paste-ready TOML fragment; writes nothing to the catalog file) |
 | Store integrity | `GET /datasets/doctor?skip_artifacts=` (**read-only** audit; `findings` empty on a healthy store, each with its remediation — see [datasets.md § `datasets doctor`](datasets.md). Full scans; on-demand only) |
-| Retention | `GET /retention/preview?days=` (**read-only dry run**: reclaimable artifact bytes per app, split reclaimable/pinned/cassette, plus ledger row counts and the configured windows — deletes nothing. See [datasets.md § Retention](datasets.md)) |
+| Retention | `GET /retention/preview?days=` (**read-only dry run**: the artifact tree split into four classes that partition it exactly — `reclaimable`/`pinned`/`cassette`/`within_window`, files and bytes, per app and in total — plus ledger row counts and the configured windows. Deletes nothing. See [datasets.md § Retention](datasets.md)) |
 | Meta | `GET /openapi.json` (OpenAPI 3.1 spec for all routes) |
 
 ## Shutdown behaviour (what a client sees on Ctrl-C / `systemctl stop`)

@@ -168,22 +168,34 @@ pub fn diagnose(facts: &StoreFacts) -> Vec<Finding> {
         });
     }
 
-    // Half a stamp reproduces nothing: rederive refuses it exactly as it refuses
-    // an unstamped revision, so the write path did bookkeeping it cannot cash in.
+    // Half a stamp is not replayable: `rederive` refuses it exactly as it refuses
+    // an unstamped revision. But "not replayable" is not the same as "wrong", and
+    // this check cannot tell the two shapes apart — see the remediation.
     let half: i64 = facts.half_stamped.iter().map(|(_, _, n)| n).sum();
     if half > 0 {
         out.push(Finding {
             check: "half_stamped_provenance",
             severity: Severity::Info,
             summary: format!(
-                "{half} revisions stamp exactly one of artifact_sha / rules_hash, which is not \
-                 replayable"
+                "{half} revisions stamp exactly one of artifact_sha / rules_hash, so \
+                 POST .../rederive refuses them — which is correct for a whole-body archive and \
+                 a defect for an extraction"
             ),
             count: half,
-            remediation: "fix the app's write path to stamp BOTH halves (see \
-                          census-common::http_provenance for the shape) or neither — honest-Null \
-                          is a valid answer. Existing revisions are left alone: provenance \
-                          stamps are never rewritten after the fact."
+            remediation: "Read the shape before changing anything, because the two halves mean \
+                          opposite things. artifact_sha WITHOUT rules_hash is the archives-whole- \
+                          bodies shape and is usually DELIBERATE: the crawl's page_versions \
+                          content-addresses each archived body and leaves rules_hash None on \
+                          purpose ('None = unknown, never a fabricated pin'), because no RuleSet \
+                          extracted the record — there is nothing to stamp and stamping one would \
+                          be a fabrication. Those revisions are also fully protected by artifact \
+                          retention (the pin addresses bodies by job_id + artifact_path, not by \
+                          rules_hash), so this costs nothing; every healthy crawl run adds to this \
+                          count and that is expected. rules_hash WITHOUT artifact_sha is the \
+                          shape worth fixing: a ruleset claim with no body to verify it against, \
+                          so make the write path stamp both (see \
+                          census-common::http_provenance). Existing revisions are left alone \
+                          either way: provenance stamps are never rewritten after the fact."
                 .into(),
             examples: sample(
                 facts
@@ -488,6 +500,53 @@ mod tests {
             Some(UNBOUNDED_GROWTH_DAYS),
             0
         )));
+    }
+
+    /// The anti-pattern: the finding's remediation told the operator to stamp
+    /// both halves or neither — contradicting a *deliberate, commented* decision
+    /// in the crawl (`page_versions` stamps `artifact_sha` and leaves
+    /// `rules_hash` None because no RuleSet extracted the record, and a
+    /// fabricated hash would be worse than an honest unknown). Every healthy
+    /// crawl run grows this count, so the advice was permanent and wrong for the
+    /// dataset that dominates it.
+    #[test]
+    fn half_stamped_advice_does_not_tell_the_operator_to_fabricate_a_stamp() {
+        let facts = StoreFacts {
+            half_stamped: vec![("crawl".into(), "page_versions".into(), 400)],
+            ..Default::default()
+        };
+        let finding = diagnose(&facts)
+            .into_iter()
+            .find(|f| f.check == "half_stamped_provenance")
+            .expect("finding raised");
+        // It names the legitimate shape, and says which half is the real defect.
+        assert!(
+            finding
+                .remediation
+                .contains("artifact_sha WITHOUT rules_hash"),
+            "{}",
+            finding.remediation
+        );
+        assert!(
+            finding
+                .remediation
+                .contains("rules_hash WITHOUT artifact_sha"),
+            "{}",
+            finding.remediation
+        );
+        assert!(
+            finding.remediation.contains("DELIBERATE"),
+            "the archives-whole-bodies case must be named as intended, not as debt: {}",
+            finding.remediation
+        );
+        // And it no longer claims the retention consequence that used to justify
+        // the advice: the pin addresses bodies, not rulesets.
+        assert!(
+            finding.remediation.contains("job_id + artifact_path"),
+            "{}",
+            finding.remediation
+        );
+        assert_eq!(finding.severity, Severity::Info);
     }
 
     /// Every finding must name a concrete action. A bare count is the failure

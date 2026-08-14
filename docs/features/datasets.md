@@ -87,7 +87,7 @@ that happens to you. The single `retention_janitor` in `main.rs` (one loop, ever
 | Key | Bounds | Scoped so this survives |
 | --- | --- | --- |
 | `revision_retention_days` | `record_revisions` past the window | the newest `revision_retention_keep_min` revisions of every record |
-| `artifact_retention_days` | bodies under `artifacts_dir` past the window | **any body a replayable revision points at**, plus VCR cassettes |
+| `artifact_retention_days` | bodies under `artifacts_dir` past the window | **any body a live record or a replayable revision still addresses**, plus VCR cassettes |
 | `artifact_retention_include_cassettes` | (flag) lets retention reclaim `cassette.ndjson` too | — |
 | `cost_event_retention_days` | `cost_events` | events of jobs still `queued`/`running` (they back the budget ceiling) |
 | `webhook_delivery_retention_days` | `delivered` rows in `webhook_deliveries` | `pending`/`failed` — the live retry queue and the replayable DLQ |
@@ -95,24 +95,55 @@ that happens to you. The single `retention_janitor` in `main.rs` (one loop, ever
 | `job_yield_retention_days` | `job_yield` (backs `GET /economics`) | — |
 | `saved_search_seen_retention_days` | `saved_search_seen` | — ⚠ pruning a `seen` row makes an already-alerted doc look new, so a still-matching doc **re-fires its webhook** |
 
-**The pinning rule.** An archived body is reclaimable only when *no replayable
-revision points at it* — replayable meaning `artifact_sha` **and** `rules_hash` are
-both stamped, i.e. exactly what `POST /provenance/{app}/{ds}/{key}/rederive`
-requires. Age proposes; the provenance graph vetoes. Both halves are pinned: the
-snapshot a replayable revision carries (where the body was when it was written)
-and the record's current `job_id`/`artifact_path` (where re-derivation looks
-today, after a crawl revisit moved the body to a new job dir). Without the pin,
-retention would quietly turn reproducible records into permanent
-`archived body unavailable` answers.
+**The pinning rule — which readers it protects, and which it does not.** An
+archived body is reclaimable only when **nothing in the record graph addresses
+it**. Age proposes; the graph vetoes. There are two readers, and they ask
+different questions, so `Datasets::pinned_artifact_refs` has two arms:
 
-Because pins are held by revisions, config validation rejects
+| reader | what pins the body | needs a stamp? |
+| --- | --- | --- |
+| `AppContext::read_source_artifact` (the crawl → extract/plugin seam) | a **live record** whose data carries `job_id` + `artifact_path` — the exact triple the reader resolves | **no** |
+| `POST /provenance/{app}/{ds}/{key}/rederive` | a **replayable revision**'s snapshot (`artifact_sha` **and** `rules_hash` stamped) — where the body was when that revision was written | **yes** |
+
+Round 24 fixed the first arm: it used to also require the key to have a
+replayable revision. `rules_hash` answers *"did a RuleSet make a provenance claim
+about this record"*, which is a question about extraction, not about
+addressability — and the crawl stamps no `rules_hash` at all (`pages` stamps only
+`job_id`; `page_versions` stamps `artifact_sha` and leaves `rules_hash` `None`
+deliberately, since no RuleSet extracted it). Nothing but the crawl writes the
+crawl's keys, so **no crawl body was pinnable at any age under any config**,
+while 11 `read_source_artifact` call sites across four apps read exactly that
+corpus. Nothing has been lost in practice — `artifact_retention_days` defaults to
+`0`, so no deployment following the defaults has ever swept — but turning the
+documented knob on would have quietly destroyed the documented crawl → extract
+pipeline, and the failure is silent-green: the extractor records the body as
+`missing`, finishes `Ok` with clean fetch health, and `/sources` keeps reporting
+the source healthy. Job green, source green, zero records.
+
+**What this pin does NOT protect.** A body no live record addresses: the
+superseded copy a crawl revisit abandons in an older job directory (the growth
+this module was written for), a body whose record has been **tombstoned**
+(`removed_at IS NOT NULL` — no read surface returns it, so no reader can be
+handed one), a body whose record has been deleted or pruned, and anything
+written without a record. Those are still reclaimable by age.
+**A widened pin frees less**: on a crawl-heavy store, expect the current bodies of
+every live `pages` record and every archived `page_versions` body to be reported
+as `pinned` rather than `reclaimable` — a sweep that used to promise the whole
+tree now promises the abandoned copies. `GET /retention/preview` shows the split
+before you enable anything.
+
+Because pins are also held by revisions, config validation rejects
 `revision_retention_days < artifact_retention_days` — history pruned first would
 un-pin bodies before their own window was up.
 
 **Dry run.** `GET /retention/preview?days=` reports, without deleting anything:
-per-app `files`/`bytes` for the artifact tree split into
-`reclaimable` / `pinned` / `cassette`, the totals, current row counts of the
-append-only ledgers, and the configured windows. `days` defaults to the configured
+the artifact tree split into **four classes that partition it exactly** —
+`reclaimable_*`, `pinned_*`, `cassette_*` and `within_window_*` (files and bytes,
+both at the top level and per app) — plus the totals, current row counts of the
+append-only ledgers, and the configured windows. The four add up to
+`total_bytes`; before round 24 the plan-level rollup carried only the first two,
+so cassettes and young bodies were an unlabelled residue and "why did this free
+so little" had no answer in the response. `days` defaults to the configured
 `artifact_retention_days`, so you can model a window the deployment has not
 enabled. The preview and the janitor call the **same** plan builder, so they cannot
 disagree. Both walk the whole artifact tree — on-demand only, never a hot path.
@@ -161,8 +192,8 @@ to set, the route to call — never a bare count, plus up to 10 examples.
 
 | Check | Fires when | Remediation |
 | --- | --- | --- |
-| `missing_artifact_bodies` | a replayable revision's stamped body is not on disk — `rederive` will answer 409 for that key | re-run the producing job; check for manual deletion (retention pins replayable bodies, so it was not retention) |
-| `half_stamped_provenance` | a revision stamps exactly one of `artifact_sha` / `rules_hash` | fix the app's write path to stamp both or neither; stamps are never rewritten retroactively |
+| `missing_artifact_bodies` | a replayable revision's stamped body is not on disk — `rederive` will answer 409 for that key | re-run the producing job; check for manual deletion (retention pins every addressed body, so it was not retention) |
+| `half_stamped_provenance` | a revision stamps exactly one of `artifact_sha` / `rules_hash`, so `rederive` refuses it | **read the shape first.** `artifact_sha` without `rules_hash` is the archives-whole-bodies case and is usually deliberate (the crawl's `page_versions`; no RuleSet extracted the record, and a fabricated hash is worse than an honest unknown) — every healthy crawl run adds to this count, it costs nothing at retention time, and it is not a defect. `rules_hash` without `artifact_sha` is the one to fix: a ruleset claim with no body to verify against. Stamps are never rewritten retroactively either way |
 | `unregistered_rulesets` | a stamped `rules_hash` is absent from `rules_versions` | register at write time (`INSERT OR IGNORE`); unrecoverable rulesets stay non-replayable rather than replayed against today's rules |
 | `records_without_simhash` | live records that **have textual content** but store `simhash = 0`, silently skipped by `/duplicates` | `just reindex` with the server stopped |
 | `unbounded_table_growth` | an append-only table has retention off **and** rows older than 180 days | set the named `[storage]` key, confirm with `GET /retention/preview` |

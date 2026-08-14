@@ -52,55 +52,67 @@ fn everything_is_old() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now() + chrono::Duration::days(1)
 }
 
-/// **The direction's central guarantee.** A body a replayable revision points at
-/// survives past the age cutoff; an identically-aged body whose revision is
-/// merely *stamped* (no `artifact_sha`/`rules_hash`, so `rederive` would refuse
-/// it anyway) does not.
+/// **The direction's central guarantee, on the arm that answers to `rederive`.**
+/// A **historical** body — one no live record addresses any more, because the
+/// key has since been revisited — survives past the age cutoff when its revision
+/// is replayable, and does not when that revision is merely *stamped* (no
+/// `artifact_sha`/`rules_hash`, so `rederive` would refuse it anyway).
 ///
-/// If the pin is removed from `pinned_artifact_refs` or from `keep_reason`, this
-/// test fails — which is the whole point: `POST /provenance/.../rederive` would
-/// otherwise start answering "archived body unavailable" for records the store
-/// still advertises as reproducible.
+/// Both keys are revisited so the current location is out of the picture: since
+/// round 24 a live record pins its own body unconditionally (see
+/// `a_crawl_body_a_live_record_addresses_is_not_reclaimed_by_age_alone`), so the
+/// only place the *replayability* gate is still observable is on the abandoned
+/// snapshot. If that gate is removed from `pinned_artifact_refs` or from
+/// `keep_reason`, this test fails — which is the whole point: `POST
+/// /provenance/.../rederive` would otherwise start answering "archived body
+/// unavailable" for records the store still advertises as reproducible.
 #[tokio::test]
 async fn a_body_pinned_by_a_replayable_revision_survives_the_age_cutoff() {
     let store = TempStore::new("retention-pin").await;
     let ds = store.datasets();
 
-    ds.upsert_stamped(
-        "crawl",
-        "pages",
-        "pinned",
-        &record("job-pinned", "page.html"),
-        None,
-        Some(&replayable("job-pinned")),
-    )
-    .await
-    .unwrap();
-    ds.upsert_stamped(
-        "crawl",
-        "pages",
-        "loose",
-        &record("job-loose", "page.html"),
-        None,
-        Some(&stamped_only("job-loose")),
-    )
-    .await
-    .unwrap();
-
-    write_body(&store, "crawl", "job-pinned", "page.html", b"pinned body");
-    write_body(&store, "crawl", "job-loose", "page.html", b"loose body");
+    // Two keys, identical shape, differing only in whether the stamp makes the
+    // revision replayable. Each is written twice, so revision 1's body is
+    // historical and revision 2's is the live location.
+    for (key, is_replayable) in [("pinned", true), ("loose", false)] {
+        for job in [format!("job-{key}"), format!("job-{key}-v2")] {
+            let prov = if is_replayable {
+                replayable(&job)
+            } else {
+                stamped_only(&job)
+            };
+            ds.upsert_stamped(
+                "crawl",
+                "pages",
+                key,
+                &record(&job, "page.html"),
+                None,
+                Some(&prov),
+            )
+            .await
+            .unwrap();
+            write_body(&store, "crawl", &job, "page.html", b"body");
+        }
+    }
 
     let pinned = ds.pinned_artifact_refs().await.unwrap();
+    // The replayable key's abandoned snapshot is pinned…
     assert!(pinned.contains(&ArtifactRef {
         app: "crawl".into(),
         job_id: "job-pinned".into(),
         name: "page.html".into(),
     }));
-    assert_eq!(
-        pinned.len(),
-        1,
-        "only the replayable revision pins: {pinned:?}"
+    // …the merely-stamped key's is not: rederive would refuse it anyway.
+    assert!(
+        !pinned.contains(&ArtifactRef {
+            app: "crawl".into(),
+            job_id: "job-loose".into(),
+            name: "page.html".into(),
+        }),
+        "a stamp rederive refuses must not pin a body nothing else addresses: {pinned:?}"
     );
+    // Both live locations are pinned, whatever their stamp.
+    assert_eq!(pinned.len(), 3, "{pinned:?}");
 
     let files = scan_artifact_tree(&store.storage.artifacts_dir);
     let plan = plan_artifact_retention(&files, &pinned, everything_is_old(), true);
@@ -155,17 +167,146 @@ async fn a_revisit_pins_both_the_old_snapshot_and_the_current_body() {
     );
 }
 
-/// Nothing is pinned by a record with no provenance at all — otherwise retention
-/// could never reclaim anything on a store full of legacy writes, and the knob
-/// would be decorative.
+/// The crawl's own write shape, verbatim: `pages` stamps `job_id` and nothing
+/// else (`DatasetPageSink::job_prov`), `page_versions` stamps `job_id` +
+/// `artifact_sha` and deliberately leaves `rules_hash` as `None` ("unknown,
+/// never a fabricated pin"). Neither has a `rules_hash`, because a crawl runs no
+/// RuleSet — it archives whole bodies.
+fn crawl_pages_prov(job_id: &str) -> Provenance {
+    Provenance {
+        job_id: Some(job_id.to_string()),
+        ..Provenance::default()
+    }
+}
+
+fn crawl_version_prov(job_id: &str) -> Provenance {
+    Provenance {
+        job_id: Some(job_id.to_string()),
+        source_url: Some("https://example.test/a".into()),
+        artifact_sha: Some("c".repeat(64)),
+        rules_hash: None,
+    }
+}
+
+/// **The anti-pattern this pin exists to kill.** `pinned_artifact_refs` gated
+/// both arms on `artifact_sha AND rules_hash`, so *zero* crawl bodies were
+/// pinnable at any age under any config — while 11 `read_source_artifact` call
+/// sites across four apps read exactly that corpus. `rules_hash` answers "did a
+/// RuleSet make a provenance claim about this record"; the pin has to answer "is
+/// this body still addressable by a live record", which is `artifact_path` +
+/// `job_id` — the triple `read_source_artifact` resolves, and the one crawl
+/// records DO carry.
+///
+/// The failure was silent-green: the extractor pushes an unreadable body onto
+/// `missing` and continues, finishing `Ok` with clean fetch health, so the run
+/// moves neither state nor baseline and `/sources` still reports the source
+/// healthy. Job green, source green, zero records.
 #[tokio::test]
-async fn unstamped_records_pin_nothing() {
-    let store = TempStore::new("retention-unstamped").await;
+async fn a_crawl_body_a_live_record_addresses_is_not_reclaimed_by_age_alone() {
+    let store = TempStore::new("retention-crawl-pin").await;
     let ds = store.datasets();
-    ds.upsert("crawl", "pages", "k", &record("job-a", "page.html"))
+    // Exactly what the crawl writes.
+    ds.upsert_stamped(
+        "crawl",
+        "pages",
+        "https://example.test/a",
+        &record("job-crawl", "page-ab12.html"),
+        None,
+        Some(&crawl_pages_prov("job-crawl")),
+    )
+    .await
+    .unwrap();
+    ds.upsert_stamped(
+        "crawl",
+        "page_versions",
+        "https://example.test/a#2",
+        &record("job-crawl", "page-ab12.r2.html"),
+        None,
+        Some(&crawl_version_prov("job-crawl")),
+    )
+    .await
+    .unwrap();
+    write_body(&store, "crawl", "job-crawl", "page-ab12.html", b"body");
+    write_body(
+        &store,
+        "crawl",
+        "job-crawl",
+        "page-ab12.r2.html",
+        b"archived",
+    );
+
+    let pinned = ds.pinned_artifact_refs().await.unwrap();
+    for name in ["page-ab12.html", "page-ab12.r2.html"] {
+        assert!(
+            pinned.contains(&ArtifactRef {
+                app: "crawl".into(),
+                job_id: "job-crawl".into(),
+                name: name.into(),
+            }),
+            "{name} is addressable by a live record and must be pinned: {pinned:?}"
+        );
+    }
+    // …and the sweep respects it, with every body past the cutoff.
+    let files = scan_artifact_tree(&store.storage.artifacts_dir);
+    let plan = plan_artifact_retention(&files, &pinned, everything_is_old(), true);
+    assert!(
+        plan.delete.is_empty(),
+        "a crawl body the extract seam still reads was condemned: {:?}",
+        plan.delete
+    );
+}
+
+/// **The counter-test: the guard must not turn retention into a no-op.** A body
+/// nothing addresses is still reclaimable, whatever else is in the tables — a
+/// record with no `artifact_path`, and an orphan body in an abandoned job
+/// directory (what a crawl revisit leaves behind, and the growth driver this
+/// module was written for).
+#[tokio::test]
+async fn a_body_no_live_record_addresses_is_still_reclaimable() {
+    let store = TempStore::new("retention-orphan").await;
+    let ds = store.datasets();
+    // A record that addresses nothing: no artifact_path, so nothing to pin.
+    ds.upsert(
+        "crawl",
+        "pages",
+        "no-body",
+        &json!({ "job_id": "job-old", "url": "https://example.test/a" }),
+    )
+    .await
+    .unwrap();
+    // The live record moved to job-new on a revisit; job-old's copy is abandoned.
+    ds.upsert("crawl", "pages", "k", &record("job-new", "page.html"))
         .await
         .unwrap();
-    assert!(ds.pinned_artifact_refs().await.unwrap().is_empty());
+    // A tombstoned record addresses nothing either: no read surface returns it,
+    // so `read_source_artifact` can never be handed one.
+    ds.upsert("crawl", "pages", "gone", &record("job-gone", "page.html"))
+        .await
+        .unwrap();
+    assert_eq!(
+        ds.tombstone_keys("crawl", "pages", &["gone".to_string()])
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
+    write_body(&store, "crawl", "job-old", "page.html", b"superseded");
+    write_body(&store, "crawl", "job-new", "page.html", b"current");
+    write_body(&store, "crawl", "job-gone", "page.html", b"tombstoned");
+
+    let pinned = ds.pinned_artifact_refs().await.unwrap();
+    assert_eq!(pinned.len(), 1, "only the live location pins: {pinned:?}");
+    let files = scan_artifact_tree(&store.storage.artifacts_dir);
+    let plan = plan_artifact_retention(&files, &pinned, everything_is_old(), true);
+    let doomed: HashSet<String> = plan.delete.iter().map(|r| r.job_id.clone()).collect();
+    assert_eq!(
+        doomed,
+        ["job-old".to_string(), "job-gone".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>(),
+        "{:?}",
+        plan.delete
+    );
 }
 
 /// Cassettes are protected by default even though no revision ever points at

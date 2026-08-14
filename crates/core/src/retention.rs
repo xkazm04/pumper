@@ -20,10 +20,17 @@
 //!   substrate of `Vcr::Replay`.
 //!
 //! So this module is not a delete-cron. It is a **pinning** calculation: an age
-//! cutoff proposes, and the provenance graph vetoes. The one rule that matters:
+//! cutoff proposes, and the record graph vetoes. The one rule that matters:
 //!
-//! > A body a *replayable* revision still points at is never reclaimed, however
-//! > old it is. Age alone is not permission.
+//! > A body a live reader still addresses is never reclaimed, however old it is.
+//! > Age alone is not permission.
+//!
+//! "Addresses" is two things, because there are two readers (see
+//! [`crate::datasets::Datasets::pinned_artifact_refs`]): a **live record's own**
+//! `job_id` + `artifact_path`, which is what `read_source_artifact` resolves and
+//! needs no stamp at all; and a **replayable revision's** snapshot, which is what
+//! `rederive` replays and does need `artifact_sha` + `rules_hash`. Requiring the
+//! second of both is what used to leave every crawl body unpinnable.
 //!
 //! Everything here is pure except [`scan_artifact_tree`] (a documented, on-demand
 //! full walk — never on a hot path) and [`delete_artifacts`]. The plan is built,
@@ -89,7 +96,10 @@ pub struct ArtifactFile {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum KeepReason {
-    /// A replayable revision still points at it. Never reclaimed.
+    /// A live reader still addresses it: a live record's own
+    /// `job_id` + `artifact_path` (`read_source_artifact`), or a replayable
+    /// revision's snapshot (`rederive`). Never reclaimed. See
+    /// [`crate::datasets::Datasets::pinned_artifact_refs`].
     Pinned,
     /// A VCR cassette, protected unless the operator opted in.
     Cassette,
@@ -97,8 +107,12 @@ pub enum KeepReason {
     WithinWindow,
 }
 
-/// Per-app reclaim accounting. `bytes` is the whole app subtree; the three
-/// `*_bytes` breakdowns partition it exactly.
+/// Per-app reclaim accounting. `bytes` is the whole app subtree; the **four**
+/// `*_bytes` breakdowns partition it exactly — one per outcome of
+/// [`keep_reason`] plus the reclaimable remainder. Anything less than four
+/// leaves an unlabelled residue: the three-way version silently omitted every
+/// body that was simply younger than the cutoff, which on a freshly-swept store
+/// is most of the tree.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct AppReclaim {
     pub app: String,
@@ -106,12 +120,15 @@ pub struct AppReclaim {
     pub bytes: u64,
     pub reclaimable_files: u64,
     pub reclaimable_bytes: u64,
-    /// Kept because a replayable revision points at it — the pinning rule.
+    /// Kept because a live reader still addresses it — the pinning rule.
     pub pinned_files: u64,
     pub pinned_bytes: u64,
     /// Kept because it is a protected VCR cassette.
     pub cassette_files: u64,
     pub cassette_bytes: u64,
+    /// Kept only because it is younger than the cutoff.
+    pub within_window_files: u64,
+    pub within_window_bytes: u64,
 }
 
 /// What retention *would* do. Building it never touches the filesystem, so the
@@ -129,15 +146,28 @@ pub struct RetentionPlan {
     pub reclaimable_bytes: u64,
     pub pinned_files: u64,
     pub pinned_bytes: u64,
+    /// Kept because it is a protected VCR cassette. Present so the plan-level
+    /// numbers partition `total_bytes` the way [`AppReclaim`]'s already do:
+    /// without it a preview reported `total = reclaimable + pinned + <unlabelled
+    /// residue>`, and on a store with cassettes the residue is exactly the
+    /// bytes an operator would go looking for.
+    pub cassette_files: u64,
+    pub cassette_bytes: u64,
+    /// Kept only because it is younger than the cutoff — the fourth and last
+    /// class, derived so the four `*_bytes` add up to `total_bytes` exactly.
+    pub within_window_files: u64,
+    pub within_window_bytes: u64,
 }
 
 /// **The pinning rule.** A body is reclaimable only when every reader that could
 /// address it has let go:
 ///
-/// 1. no *replayable* revision (`artifact_sha` AND `rules_hash` both stamped)
-///    points at it — this veto is absolute and outranks age, because deleting a
-///    pinned body silently downgrades a reproducible provenance claim into a
-///    permanent "archived body unavailable";
+/// 1. nothing in the record graph points at it — neither a live record's
+///    `job_id` + `artifact_path` (the crawl → extract seam) nor a *replayable*
+///    revision's snapshot (`rederive`). This veto is absolute and outranks age,
+///    because deleting a pinned body silently turns a readable corpus into
+///    "unreadable artifact" or a reproducible provenance claim into a permanent
+///    "archived body unavailable";
 /// 2. it is not a protected VCR cassette;
 /// 3. and only then, it is older than the cutoff.
 ///
@@ -200,7 +230,10 @@ pub fn plan_artifact_retention(
                 entry.cassette_files += 1;
                 entry.cassette_bytes += f.bytes;
             }
-            Some(KeepReason::WithinWindow) => {}
+            Some(KeepReason::WithinWindow) => {
+                entry.within_window_files += 1;
+                entry.within_window_bytes += f.bytes;
+            }
             None => {
                 entry.reclaimable_files += 1;
                 entry.reclaimable_bytes += f.bytes;
@@ -209,6 +242,8 @@ pub fn plan_artifact_retention(
         }
     }
     plan.apps = per_app.into_values().collect();
+    // Every class rolls up, or the plan-level totals do not partition and the
+    // difference reads as bytes nobody can account for.
     for a in &plan.apps {
         plan.total_files += a.files;
         plan.total_bytes += a.bytes;
@@ -216,6 +251,10 @@ pub fn plan_artifact_retention(
         plan.reclaimable_bytes += a.reclaimable_bytes;
         plan.pinned_files += a.pinned_files;
         plan.pinned_bytes += a.pinned_bytes;
+        plan.cassette_files += a.cassette_files;
+        plan.cassette_bytes += a.cassette_bytes;
+        plan.within_window_files += a.within_window_files;
+        plan.within_window_bytes += a.within_window_bytes;
     }
     plan
 }
@@ -367,6 +406,58 @@ mod tests {
         assert_eq!(plan.delete[0].job_id, "job-b");
         assert_eq!(plan.pinned_bytes, 100);
         assert_eq!(plan.reclaimable_bytes, 100);
+    }
+
+    /// The anti-pattern: `/retention/preview`'s plan-level numbers declared
+    /// `total`, `reclaimable` and `pinned` and nothing else, so cassettes (which
+    /// `AppReclaim` did count) and within-window bodies (which nobody counted)
+    /// were an unlabelled residue. An operator reading "total 900, reclaimable
+    /// 100, pinned 100" cannot tell where the other 700 went — and the missing
+    /// classes are exactly the two that explain why a sweep frees so little.
+    #[test]
+    fn preview_totals_partition_the_tree_instead_of_leaving_a_residue() {
+        let pinned_file = file("crawl", "job-a", "page.html", 100, 400);
+        let old = file("crawl", "job-b", "page.html", 200, 400);
+        let young = file("crawl", "job-c", "page.html", 300, 1);
+        let cassette = file("research", "job-d", CASSETTE_FILE, 400, 400);
+        let pinned: HashSet<ArtifactRef> = [pinned_file.reference.clone()].into_iter().collect();
+
+        let plan = plan_artifact_retention(
+            &[pinned_file, old, young, cassette],
+            &pinned,
+            cutoff(30),
+            true,
+        );
+        assert_eq!(plan.total_bytes, 1000);
+        assert_eq!(plan.pinned_bytes, 100);
+        assert_eq!(plan.reclaimable_bytes, 200);
+        assert_eq!(plan.within_window_bytes, 300);
+        assert_eq!(plan.cassette_bytes, 400);
+        assert_eq!(
+            plan.reclaimable_bytes
+                + plan.pinned_bytes
+                + plan.cassette_bytes
+                + plan.within_window_bytes,
+            plan.total_bytes,
+            "the four classes must exhaust the tree"
+        );
+        assert_eq!(
+            plan.reclaimable_files
+                + plan.pinned_files
+                + plan.cassette_files
+                + plan.within_window_files,
+            plan.total_files
+        );
+        // …and the same has to hold per app, which is where the claim was first
+        // made: `crawl` here is 100 pinned + 200 reclaimable + 300 young.
+        for a in &plan.apps {
+            assert_eq!(
+                a.reclaimable_bytes + a.pinned_bytes + a.cassette_bytes + a.within_window_bytes,
+                a.bytes,
+                "app {} does not partition",
+                a.app
+            );
+        }
     }
 
     /// The pin is per-body, not per-job: a job directory holding one pinned body

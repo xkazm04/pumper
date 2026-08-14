@@ -1958,18 +1958,46 @@ impl Datasets {
         Ok(row)
     }
 
-    /// Every archived body a **replayable** revision still points at — the veto
-    /// list artifact retention must respect (see [`crate::retention`]).
+    /// Every archived body a live reader still addresses — the veto list
+    /// artifact retention must respect (see [`crate::retention`]).
     ///
-    /// A revision is replayable when `artifact_sha` AND `rules_hash` are both
-    /// stamped; `POST /provenance/.../rederive` then locates the body by the
-    /// record's `job_id` + `artifact_path` convention and verifies it against the
-    /// stamped hash. So the pin needs both halves: the *snapshot* a replayable
-    /// revision carries (where the body was when that revision was written) and
-    /// the *current* record of any key that has a replayable revision (where
-    /// rederive will actually look today, after a crawl revisit moved the body
-    /// to a new `job_id`). Missing either half would let retention delete a body
-    /// the API still promises to replay.
+    /// **Two readers, two questions, two arms.** They are not the same question,
+    /// and conflating them is what made this query wrong for the platform's
+    /// highest-volume corpus:
+    ///
+    /// 1. **`rederive` (historical).** `POST /provenance/.../rederive` replays a
+    ///    *revision* through the ruleset pinned in its stamp and verifies the
+    ///    file against the stamped sha, so this arm needs the **snapshot**: where
+    ///    the body was when that revision was written. It is gated on
+    ///    `artifact_sha AND rules_hash` because those are exactly the conditions
+    ///    under which rederive will accept the record — unchanged.
+    /// 2. **`read_source_artifact` (current).** `AppContext::read_source_artifact`
+    ///    resolves `<app>/<job_id>/<artifact_path>` from a **live record's own
+    ///    data** and never consults a stamp at all. So this arm asks only "does a
+    ///    live record still address this body", which also covers "where rederive
+    ///    will look today, after a crawl revisit moved the body to a new job_id".
+    ///
+    /// **What changed and why (round 24).** Arm 2 used to require the key to
+    /// *also* have a replayable revision. `rules_hash` means "a RuleSet made a
+    /// provenance claim about this record" — a question about extraction, not
+    /// about addressability. The crawl stamps neither half on `pages` and
+    /// deliberately leaves `rules_hash` as `None` on `page_versions` ("unknown,
+    /// never a fabricated pin"), and nothing but the crawl writes the crawl's
+    /// keys — so **zero crawl bodies were pinnable, at any age, under any
+    /// config**, while 11 `read_source_artifact` call sites across four apps read
+    /// exactly that corpus. The data the pin needs was already present; only the
+    /// gate excluded it.
+    ///
+    /// **This makes retention reclaim less.** Every body a live record addresses
+    /// is now kept regardless of age. What stays reclaimable: bodies no live
+    /// record points at — the superseded copies a crawl revisit abandons in an
+    /// older job directory (the growth driver this module was written for),
+    /// bodies of **tombstoned** records (`removed_at IS NOT NULL`, which no read
+    /// surface returns, hence the filter on arm 2), bodies of records that have
+    /// been deleted or pruned outright, and anything written without a record.
+    /// Retention is narrowed here, not disabled; the counter-test
+    /// `a_body_no_live_record_addresses_is_still_reclaimable` is what keeps that
+    /// true.
     ///
     /// **Full scan of `record_revisions` + `records`.** On-demand only — the
     /// retention janitor and the read-only reports, never a request hot path.
@@ -1983,15 +2011,14 @@ impl Datasets {
                AND json_extract(data, '$.job_id') IS NOT NULL \
                AND json_extract(data, '$.artifact_path') IS NOT NULL \
              UNION \
-             SELECT DISTINCT r.app, \
-                    json_extract(r.data, '$.job_id'), \
-                    json_extract(r.data, '$.artifact_path') \
-             FROM records r \
-             WHERE json_extract(r.data, '$.job_id') IS NOT NULL \
-               AND json_extract(r.data, '$.artifact_path') IS NOT NULL \
-               AND EXISTS (SELECT 1 FROM record_revisions v \
-                           WHERE v.app = r.app AND v.dataset = r.dataset AND v.key = r.key \
-                             AND v.artifact_sha IS NOT NULL AND v.rules_hash IS NOT NULL)",
+             SELECT DISTINCT app, \
+                    json_extract(data, '$.job_id'), \
+                    json_extract(data, '$.artifact_path') \
+             FROM records \
+             WHERE removed_at IS NULL \
+               AND json_extract(data, '$.job_id') IS NOT NULL \
+               AND json_extract(data, '$.artifact_path') IS NOT NULL \
+               AND json_extract(data, '$.artifact_path') <> ''",
         )
         .fetch_all(&self.pool)
         .await?;
