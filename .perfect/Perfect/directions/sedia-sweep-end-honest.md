@@ -3,12 +3,12 @@ slug: sedia-sweep-end-honest
 type: perfect/direction
 context: "[[eu-grants]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-14
 accepted: 2026-08-14
-shipped: —
-commit: —
+shipped: 2026-08-14
+commit: 51ba78b
 ---
 
 ## What & why
@@ -83,4 +83,43 @@ apps exists to express — and eu-sedia is the one grant app that **already depe
   an upsert and eu-sedia's own write is `upsert_many_with_derived` (`:273-283`), so a truncated run
   cannot tombstone. Do not oversell the fix.
 
-## Build record
+## Build record (r24)
+
+**SHIPPED `51ba78b`** — KEEP. `SweepEnd` + `walk_end` + `sweep_warning` + `empty_listing_is_drift` +
+`empty_page_is_drift` landed in `grants-common` as purely additive `pub` items (+302 lines), adopted
+in eu-sedia only.
+
+**Criterion 2 verified by the Director independently, not taken on report:**
+`git diff --stat master..HEAD -- crates/apps/{ca-grants,grants-gov,cordis}` is **empty**. Not one
+existing line of the three sibling apps changed — which is the constraint that made this a
+one-session job where the ~45-reference lift was not.
+
+The rider that "does not come for free" landed correctly: the old `total > 0` gate survives as
+`empty_page_is_drift`, **explicitly labelled as the arm that cannot survive `total = 0`**, with a new
+corpus-relative `empty_listing_is_drift` arm covering exactly that case against the stored corpus.
+`sweep` names four endings; `truncated` becomes its projection rather than a second opinion.
+`sync_unified` got the doc rider and was **not** renamed, as instructed.
+Tests: eu-sedia 13 (`a_renamed_total_does_not_cap_the_corpus_at_one_page`,
+`a_short_served_page_is_a_truncated_page_not_the_end_of_the_corpus`,
+`output_shape_declares_the_sweep_ending_it_now_reports`); grants-common 41 (was 37).
+
+### THE REFUTATION THAT MATTERED — carried into config.md's skill log
+
+My criterion said *"copy the corpus-relative shape from `grants-gov/src/lib.rs:772-779`
+(`empty_listing_is_drift`), not the `total > 0` gate."* At HEAD, `:772-782` is **`empty_page_is_drift`
+— precisely the `total > 0` gate I was telling it to avoid.** The real `empty_listing_is_drift` is at
+`:809-816`. **Copying the lines I cited would have re-shipped the exact defect this direction
+exists to kill.** I specified a mechanism from a scout's prose rather than from the function
+signature — r19 recorded this same failure and it recurred verbatim.
+
+Other refutations, all sound: `output_shape` was already complete for eu-sedia's 19 keys (only
+`sweep` needed adding); the `drift_inventory::every_pre_write_drift_refusal_is_terminal_not_retryable`
+EXPECTED-diff test **failed on the new refusal's first run and was updated with a classification, not
+an assertion edit** — the guard doing its job; and `grants-gov`'s `empty_listing_is_drift` takes a
+fourth `whole_corpus_query` parameter that is vacuous in eu-sedia, so rather than porting a dead
+parameter the builder made the *denominator* precise (corpus count filtered to the requested status
+when the run names exactly one), documented at the call site.
+
+**Carried forward, honestly:** the new corpus-drift refusal's false-positive envelope is reasoned,
+not measured. A multi-status or `types`-narrowed run legitimately returning zero rows while stored
+topics exist would now fail terminally. Recorded so a future round can find it if it ever fires.

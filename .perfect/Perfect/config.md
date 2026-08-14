@@ -53,6 +53,63 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   resource-destructive actions even when they are obviously regenerable.
 
 ## Skill improvement log
+- 2026-08-14 (round 24): **When a criterion names a MECHANISM, verify the spelling against the
+  function signature — not against a scout's prose. This is r19's recorded lesson recurring verbatim,
+  and this time it would have re-shipped the exact defect the direction existed to kill.** My D3
+  criterion said *"copy the corpus-relative shape from `grants-gov:772-779` (`empty_listing_is_drift`),
+  not the `total > 0` gate."* At HEAD those lines are **`empty_page_is_drift` — the `total > 0` gate
+  itself**; the real `empty_listing_is_drift` is 37 lines further down. The scout handed me a symbol
+  name and a line range in one sentence and I passed both through without opening the file. The
+  builder caught it. **Concrete rule: a criterion that cites `file:line` for a symbol must have had
+  that symbol's DEFINITION line read, not its neighbourhood** — and the cheapest way to comply is to
+  paste the signature into the criterion instead of the line number.
+- 2026-08-14 (round 24): **Scout the two lots as two briefs, on the SAME boundary the wave will use.**
+  r21/r22 learned to scout a crate *family* as one brief. The refinement: make the scouting boundary
+  and the build boundary the same line. Each scout's territory became exactly one builder's write set,
+  so every finding landed in a lot that could act on it, and there was **no finding stranded across
+  the partition** — the failure mode where a scout surfaces something excellent that neither lot is
+  allowed to touch. It also made the zero-Class-B check trivial: if the two scout territories don't
+  intersect, neither will the lots.
+- 2026-08-14 (round 24): **Derive the partition FROM `scripts/docs/feature-doc-map.json`, don't
+  validate it against the map afterwards.** Every previous round discovered its straddler by getting
+  bitten (r21: every `crates/apps/**` edit drags `apps.md`). Reading the map at *plan* time took two
+  minutes and produced the doc split as an output rather than a constraint to work around —
+  apps/extraction/triggers to Lot A, catalog/http-api/runtime/datasets/observability to Lot B, zero
+  intersection. **Fourth zero-Class-B wave, and the first one that was designed rather than lucky.**
+- 2026-08-14 (round 24): **Ask the builder to make the claim FAIL first, as an acceptance criterion.**
+  D6's criterion 3 said *"confirm by test, not by reading, what the pin returns today; if arm 2
+  already covers a case I called uncovered, say so and narrow the change."* The builder's new test
+  failed first with `pinned = {}` — so the widening was measured rather than inferred, and a
+  silently-no-op widening (the exact class the direction existed to kill) was structurally impossible.
+  **Generalise: for any direction of the form "X never happens", the criteria should require a test
+  that fails before the fix.** Cheaper than r17's "run it, don't read it" and it leaves a permanent
+  regression guard behind.
+- 2026-08-14 (round 24): **Two builders improved on my criteria by REFUSING a suggested mechanism,
+  and both refusals were about a guard that would have been too wide.** I offered hackernews a
+  "fewer than 30 rows served = short page" floor; the builder refused to gate tombstoning on it,
+  because a genuinely shrinking front page serves fewer rows that all parse — gating there makes the
+  app permanently upsert-only in the one case tombstoning exists for. And on D5 I said the resume log
+  is "false exactly when `storage_error > 0`"; the builder honoured that boundary precisely rather
+  than lumping `stale_lineage` in with it, because a stale lineage means another attempt owns the job
+  and this task's state was *meant* to lose. **Both are the same shape: the criterion named the
+  symptom, and the builder found the boundary. Keep writing criteria as outcomes plus a named hazard,
+  never as prescriptions** — r18 said this and it is now 3-for-3.
+- 2026-08-14 (round 24): **A test whose name states the defect is a ledger bug, and replacing it is
+  the fix — but the Director must check it, not accept it.** D6 replaced
+  `unstamped_records_pin_nothing`, which asserted that a record carrying `job_id` + `artifact_path`
+  pins nothing — i.e. **it encoded the defect as the contract**. That is legitimate, but "the builder
+  deleted a test" is exactly the shape of a bad diff, so it needs a read: I confirmed the rationale
+  survived in the counter-test (`a_body_no_live_record_addresses_is_still_reclaimable`). **Rule: when
+  a diff removes or rewrites an existing test, the review must name what still enforces the old
+  test's intent** — and if nothing does, that is a redo.
+- 2026-08-14 (round 24): **The clippy content-check paid for the third consecutive round, and this
+  time it would have produced THREE false positives.** Four warnings sat in wave-touched files; on
+  master the same expressions live at 850 (vs 862), 2602 (vs 2629) and 617 (vs 671). A line-number
+  check calls all three NEW; a count-only check ("31 before, 31 after") is fooled by coincidence.
+  Only `grep -F` for the expression text against `git show master:<file>` is correct. **This should
+  be a committed script like `.perfect/coverage.mjs`, not prose re-derived every round** — same
+  argument that retired the retyped coverage snippet in r20.
+
 - 2026-08-14 (round 23): **RE-VERIFY EVERY BANKED CLAIM AGAINST HEAD BEFORE GATING IT — this is now
   the most valuable single step in a depth round.** r23 re-scouted 13 banked claims with three family
   scouts and **refuted or narrowed 7**, three of them outright. The bank was written by careful

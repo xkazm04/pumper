@@ -85,3 +85,13 @@ the scout finds drift between catalog and registry.
   forever alongside `contracts_enforce`. Not silence, a green light. Also: no boot-time
   `Catalog::load()` validation exists at all. Rejected on the 6-cap; severity is conditional on
   a non-default flag while all six accepted are unconditional on defaults.
+### r24 — [[catalog-disarm-is-visible]] `694f865`
+`/sources` stops serving a green light it cannot observe. `ContractsStatus` separates
+`enforce_configured` from `enforce_observed`, and every rendered verdict now carries `age_secs` +
+`stale` + `stale_reason` built from the `checked_at` the worker was **already stamping and nobody was
+reading**. The structural win: `Source::freshness_window_secs` — dataset freshness and verdict
+freshness now read one expression instead of each inventing its own, which is the duplication that
+caused the defect. Fail-open stayed fail-open; a boot line `error!`s when the catalog will not parse.
+**Recorded as CONFIRMED-SOUND from the same pass:** the banked "malformed TOML is silent" framing was
+wrong — `/catalog/sources` and `/catalog/health` both 500 loudly. The defect was never silence, it
+was a correct-looking 200. Live-verified: `just smoke` 41 → 42.

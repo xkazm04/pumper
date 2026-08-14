@@ -3,12 +3,12 @@ slug: checkpoint-failures-metric
 type: perfect/direction
 context: "[[api-surface]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-14
 accepted: 2026-08-14
-shipped: —
-commit: —
+shipped: 2026-08-14
+commit: c52bd45
 ---
 
 ## The banked claim — CONFIRMED absent, but the "one-file change" framing is REFUTED
@@ -126,3 +126,25 @@ Vocabulary: `CheckpointFailure::{StaleLineage, StorageError}` (`progress.rs:133-
    the new series and its process-lifetime semantics.
 
 **ACCEPTED r24.** Gate: director-self-gated (autonomous, Athena-dispatched).
+
+## Build record (r24)
+
+**SHIPPED `c52bd45`** — KEEP, with a distinction I did not specify and should have.
+`CheckpointFailureCounter` on `AppState`, threaded by a new `.counting(..)` builder chained beside
+`.announcing(..)` at `worker.rs:678` — **no new dependency threading, exactly as the re-verification
+predicted.** `record_failure` stays the single increment point and counts *every* failure (the
+first-of-kind bound belongs to the announce, so the counter does not silently inherit an event-bus
+throttle). `pumper_checkpoint_failures_total{reason}` renders on `/metrics` following
+`egress_metrics` including its reset-on-restart HELP contract. No `jobs.result` scan, as instructed.
+
+**The builder's judgment call, and it is right: a stale lineage does NOT downgrade the resume
+promise.** That means another attempt owns the job and this task's state was *supposed* to lose, so
+only `storage_error` weakens the claim; `stale_lineage` rides as a structured field. My criterion
+said "false exactly when `storage_error > 0`" and the builder honoured that boundary precisely
+instead of lumping both reasons together — which would have produced an alarming log line on a
+correct fencing event. The extracted `suspend_resume_message` carries the fix and its own
+anti-pattern doc.
+Tests: `checkpoint_failures_count_before_an_outcome_not_only_on_the_success_arm` (real stale-lineage
++ oversized-blob failures with no job ever completing),
+`a_suspend_log_does_not_promise_a_resume_it_cannot_keep`,
+`a_dropped_checkpoint_is_not_invisible_to_a_dashboard`.

@@ -3,12 +3,12 @@ slug: crawl-corpus-stays-addressable
 type: perfect/direction
 context: "[[dataset-storage]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-14
 accepted: 2026-08-14
-shipped: —
-commit: —
+shipped: 2026-08-14
+commit: 0b6be6f
 ---
 
 ## What & why
@@ -100,4 +100,46 @@ source green, zero records, and the only trace is a `missing_keys` array truncat
 - Widening a pin makes retention reclaim *less*. State the new worst-case retention behaviour
   explicitly so an operator is not surprised by a sweep that frees less than before.
 
-## Build record
+## Build record (r24)
+
+**SHIPPED `0b6be6f`** — KEEP. Criterion 3 was honoured literally and it mattered: **the new test
+failed first with `pinned = {}`** for crawl-shaped `pages` + `page_versions` rows, so the claim was
+*measured* rather than inferred before anything was widened.
+
+Arm 1 (rederive's snapshot) is unchanged and still requires both halves. Arm 2 now asks only "does a
+**live** record address this body" — `job_id` + `artifact_path`, non-empty, `removed_at IS NULL`.
+**One tightening beyond the brief, and correct:** `records` retains tombstoned rows, so `removed_at
+IS NULL` was added — a tombstoned record is returned by no read surface and must not pin.
+The `<> ''` guard mirrors `read_source_artifact`'s own empty-check, so the two agree by construction.
+
+**Replacing an existing test was legitimate and I checked it.** `unstamped_records_pin_nothing`
+asserted that a record carrying `job_id` + `artifact_path` pins nothing — i.e. **it encoded the
+defect as the contract.** Its rationale ("retention must not become decorative") is preserved by the
+counter-test `a_body_no_live_record_addresses_is_still_reclaimable`.
+
+Both riders shipped: the doctor's `half_stamped_provenance` remediation now names
+`artifact_sha`-without-`rules_hash` as the legitimate archives-whole-bodies shape (so a healthy crawl
+run stops growing a finding the operator is told to fix); `/retention/preview` gained plan-level
+`cassette_*` **and** `within_window_*` so four classes partition `total_bytes` exactly.
+Tests: retention 9/9, doctor 10/10, core 600/600.
+
+**Builder refutations, both sharpening the note:**
+1. "11 `read_source_artifact` callers across 4 apps" is understated — it is **17 call sites across 6
+   modules** in 4 app crates. Larger blast radius than either scout or Director measured.
+2. My rider claimed the `*_bytes` breakdowns partition "true per-app, false at plan level". **False
+   at BOTH levels:** `WithinWindow` incremented nothing anywhere, so any body younger than the cutoff
+   was unaccounted for per-app too. A cassette-only fix would have left the bigger residue.
+
+**New worst case, stated in the docs rather than discovered by an operator:** on a crawl-heavy store
+the current body of every live `pages` record and every archived `page_versions` body now reports as
+`pinned`. What stays reclaimable: superseded copies in abandoned job dirs (the growth driver this
+module was written for), tombstoned records' bodies, and orphans.
+
+**Director-applied Class C follow-up (`303dbd5`):** `docs/features/extraction.md` still described the
+old pin rule — the doc a source-mode user actually reads. Lot B reported it from outside its doc
+write set rather than reaching in. Now names both readers.
+**Blocked, not skipped:** splitting `half_stamped_provenance` by half needs
+`Datasets::half_stamped_revisions` to return *which* half, forcing an edit to
+`routes/doctor.rs` outside the write set. The builder took the direction's stated alternative (fix
+the summary + remediation text) and explicitly refused the fake fix of adding a `StoreFacts` field
+the live endpoint would never populate. Banked for a future dataset-storage round.

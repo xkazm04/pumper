@@ -88,3 +88,15 @@ the load-bearing joined output); max_row_delta_pct=10 questionable mid-walk.
   still has the collapsed boolean (`:230-231`) that the enum exists to kill — one bool cannot
   distinguish swept-everything / hit-the-cap / short-paged / never-told-the-total — and it is
   the grant app that already depends on `grants-common`. Build THAT, not the lift.
+### r24 — [[sedia-sweep-end-honest]] `51ba78b`
+eu-sedia can no longer cap its corpus at one page, green, forever. A renamed `totalResults` made
+`total = 0`, which simultaneously **disarmed the drift guard** (`total > 0 && got == 0`) and made the
+break test `100 >= 0` fire after page one — the third unpatched instance of a defect ca-grants and
+grants-gov both document having killed. `SweepEnd` + `walk_end` + `sweep_warning` +
+`empty_listing_is_drift` landed **additively** in `grants-common` and were adopted in eu-sedia only:
+**zero lines changed in ca-grants, grants-gov or cordis**, Director-verified by empty diff. The
+~45-reference lift stays rejected (twice now), and `sync_unified` got a doc rider rather than the
+rename.
+**Known gap carried:** the new corpus-drift refusal's false-positive envelope is reasoned, not
+measured — a multi-status or `types`-narrowed run legitimately returning zero rows while stored
+topics exist would now fail *terminally*.

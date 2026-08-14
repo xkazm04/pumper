@@ -82,3 +82,12 @@ Pre-verified anchors, strongest first:
   it yet**, so a hop exceeding `key_cap` still processes the first 200 records and reports a
   clean run. `S`, mechanical, and it closes the loop r23 opened — recommended early for r24,
   with `extractor` + `plugin` as one natural lot.
+### r24 — [[targets-read-keys-truncated]] `7692182`
+A capped trigger hop stops reporting a clean run. Both `extractor` and `plugin` select keys through
+an extracted `select_keys() -> KeySelection {keys, truncated}`; a caller-supplied `source.keys` stays
+uncapped and never inherits the carrying hop's flag. **The seam was the provenance, not the missing
+read** — `.or_else()` had collapsed the two key sources into one `Option`. Closes the loop r23 opened
+(the host had declared `keys_truncated` since `fd88138` and nothing acted on it), and kills a
+published contract lie: `extraction.md` and `triggers.md` had contradicted each other on this path.
+**Known gap carried:** the `plugin` app has no `tracing` dependency, so it cannot log-match the
+extractor's cap warning — reported rather than bought with a new dep.

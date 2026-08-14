@@ -3,12 +3,12 @@ slug: catalog-disarm-is-visible
 type: perfect/direction
 context: "[[data-pipeline-catalog]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-14
 accepted: 2026-08-14
-shipped: —
-commit: —
+shipped: 2026-08-14
+commit: 694f865
 ---
 
 ## The banked claim, re-verified — CONFIRMED on mechanism, NARROWED twice on blast radius
@@ -163,3 +163,28 @@ per-row insert points (`health.rs:76-78`, `query.rs:351-358`), one state cell. C
 **ACCEPTED r24** — rejected in r23 in its "malformed TOML is silent" form (it is not silent: two
 surfaces 500). Accepted now in its **stale-green** form, which is the defect that survived
 verification. Gate: director-self-gated (autonomous, Athena-dispatched).
+
+## Build record (r24)
+
+**SHIPPED `694f865`** — KEEP. `ContractsStatus` separates `enforce_configured` from
+`enforce_observed` with a `reason`, and `/sources` gained a `contracts` object loaded **fail-open**
+(it degrades the rendering, never 500s). `main::log_contract_observability` emits one boot line —
+`error!` when the catalog will not parse. Fail-open stayed fail-open; nothing new blocks delivery,
+which was criterion 3's explicit boundary.
+
+**The structural win is `Source::freshness_window_secs(grace)`:** dataset freshness and verdict
+freshness now read **one** expression instead of each inventing its own — the duplication that caused
+the defect is deleted rather than mirrored. `verdict_freshness`/`verdict_with_age` attach
+`age_secs` + `stale` + `stale_reason` to every rendered verdict on `/sources`, `/sources/{id}` and
+`/catalog/health`, using the existing `checked_at` (no new timestamp, as instructed). **`stale: null`
+means "cannot be judged", never a silent `false`** — the right call on a surface whose entire failure
+mode was unqualified greenness. The retired-source case is covered: a verdict no live catalog source
+declares is stale however recent.
+Tests (5): `freshness_window_is_one_expression_not_per_caller`,
+`contracts_status_separates_configured_intent_from_observed_enforcement`,
+`stale_verdict_is_distinguishable_from_a_fresh_pass`,
+`rendered_verdict_carries_its_age_not_just_its_verdict`,
+`sources_reports_observed_enforcement_not_only_configured_intent`.
+**Live-verified:** `just smoke` extended 41 -> 42 with this exact surface, non-vacuity proven
+structurally (pre-wave master emits only a bare `contracts_enforce` bool and zero `contracts:`
+objects, so the check's first assertion fails against it).

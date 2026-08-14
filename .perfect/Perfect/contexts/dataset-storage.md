@@ -77,3 +77,22 @@ unbounded-table growth.
   its place: `read_source_artifact` is not a pin source, so a crawl body not yet extracted
   from is reclaimable by age alone while that seam still addresses it (latent —
   `artifact_retention_days` defaults to 0).
+### r24 — [[crawl-corpus-stays-addressable]] `0b6be6f` (+ Director `303dbd5`)
+**Zero crawl bodies had ever been pinnable, at any age, under any config.** The pin gated both UNION
+arms on `rules_hash IS NOT NULL`; the crawl stamps `None` on both its datasets by design, and nothing
+but the crawl writes the crawl's keys — while 17 `read_source_artifact` call sites across four app
+crates read exactly that corpus, and a reclaimed body produced a **green job on a green source with
+zero records**. Arm 2 now asks only "does a live record still address this body" (`job_id` +
+`artifact_path`, non-empty, `removed_at IS NULL`); arm 1 (rederive's snapshot) is unchanged.
+The claim was **measured, not inferred** — the new test failed first with `pinned = {}`.
+Riders: the doctor's `half_stamped_provenance` remediation stops telling operators to break the
+crawl's deliberate design, and `/retention/preview` gained plan-level `cassette_*` **and**
+`within_window_*` so four classes partition `total_bytes` exactly (the banked claim understated this
+— `WithinWindow` incremented nothing anywhere, so it was false per-app too).
+**Recorded as sound, not deferred:** [[crawl-write-path-is-sound]] — the crawl's job-id-only
+provenance is a measured decision about write amplification, and fixing the pin never required
+touching it.
+**Blocked and banked for r25:** splitting `half_stamped_provenance` by half needs
+`Datasets::half_stamped_revisions` to report WHICH half, forcing a `routes/doctor.rs` edit outside
+r24's lot. The builder took the stated alternative and explicitly refused the fake version (a
+`StoreFacts` field the live endpoint would never populate).

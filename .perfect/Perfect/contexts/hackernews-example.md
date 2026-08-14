@@ -58,3 +58,14 @@ wrong about the *state*. Findings:
   `rollup_is_complete`, peer `tombstones_would_empty_the_mirror`. Not slated — reach is one
   example app, and it lost the cap to six directions with larger blast radius. `S`, because the
   pattern is shipped twice already and this is its third application.
+### r24 — [[hackernews-snapshot-floor]] `9d6efb2`
+The last unfloored full-snapshot write in the fleet now has a completeness floor, so a garbled page
+cannot tombstone the rows it never read. **The floor as banked was unbuildable** (HN publishes no
+total); it ships against the denominator the parser was throwing away — `tr.athing` rows *served* vs
+stories parsed. Riders: `removed` is emitted (the `output_shape` promise stops being a lie), and the
+`rank-N` fallback key is gone — rank is positional, so each run's `rank-7` had been overwriting a
+different story and manufacturing fake `changed` revisions.
+**Builder improvement, recorded:** it refused to gate tombstoning on the 30-rows-per-page signal I
+suggested, because a genuinely shrinking front page would then make the app permanently upsert-only.
+**Known gap carried:** the denominator premise — that HN drift removes `span.titleline` while leaving
+`tr.athing` — is inferred from the parser's structure and has never been observed against live HN.

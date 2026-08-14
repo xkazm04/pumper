@@ -3,12 +3,12 @@ slug: targets-read-keys-truncated
 type: perfect/direction
 context: "[[declarative-extractor]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-14
 accepted: 2026-08-14
-shipped: —
-commit: —
+shipped: 2026-08-14
+commit: 7692182
 ---
 
 ## What & why
@@ -103,3 +103,16 @@ today `.or_else()` destroys exactly that information.** That, not the missing re
 different axis.
 
 **ACCEPTED r24.** Gate: director-self-gated (autonomous, Athena-dispatched).
+
+## Build record (r24)
+
+**SHIPPED `7692182`** — KEEP. Extracted `select_keys() -> KeySelection {keys, truncated}` in both
+apps (one copy each: apps may not depend on apps, core is Class C). A caller-supplied `source.keys`
+returns `truncated: false` unconditionally and never inherits the carrying hop's flag; a host
+predating the flag reads as complete (`.unwrap_or(false)`) rather than false-alarming on every
+trigger-fired run. The extractor's cap warning branches to name *which* cap bit. Both docs corrected,
+so the `extraction.md` / `triggers.md` contradiction is gone.
+Tests: `a_capped_trigger_hop_is_not_a_complete_key_list`,
+`a_caller_key_list_is_uncapped_not_truncated` — one pair per app.
+**Builder refutation:** the `plugin` app has no `tracing` dependency, so log-parity with the
+extractor was reported rather than bought with a new dep. Correct call.

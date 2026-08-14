@@ -92,3 +92,14 @@ feature context adding routes *through* it.
   maps to **502**, not 500. See [[source-drift-is-terminal]]. Also records the invariant that
   direction's pre-flight missed: **adding a `pumper_core::Error` variant requires an arm in
   `routes/error.rs::client_facing`** (an exhaustive match with no wildcard, by design).
+### r24 — [[checkpoint-failures-metric]] `c52bd45`
+Checkpoint failures are counted on **every** job outcome, not only the success arm (1 of 7), and
+`pumper_checkpoint_failures_total{reason}` renders on `/metrics` as a process-lifetime counter — not
+a `jobs.result` scan, which would undercount exactly the runs that matter and shrink under retention
+pruning. Threaded by a `.counting(..)` builder beside the existing `.announcing(..)`, so no new
+dependency threading.
+**The half that made it worth a slot** (and that overturned r23's "observability-only" rejection):
+the shutdown-suspend arm had logged *"re-queued to resume from checkpoint"* unconditionally — false
+exactly when `storage_error > 0`, with the sink holding that count in scope one line above. Now
+downgraded and named. **A stale lineage deliberately does NOT downgrade it** — that means another
+attempt owns the job and this task's state was supposed to lose.

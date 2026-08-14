@@ -3,12 +3,12 @@ slug: hackernews-snapshot-floor
 type: perfect/direction
 context: "[[hackernews-example]]"
 lens: robustness
-status: accepted
+status: shipped
 size: S
 proposed: 2026-08-14
 accepted: 2026-08-14
-shipped: —
-commit: —
+shipped: 2026-08-14
+commit: 9d6efb2
 ---
 
 ## What & why
@@ -132,3 +132,29 @@ must stay reachable for a genuinely shrinking feed. trades `:700` `COVERAGE_FLOO
 **ACCEPTED r24** — it was rejected in r23 for small reach; it earns the slot now because it closes
 the class fleet-wide (last of four) and the two riders are honesty defects in their own right.
 Gate: director-self-gated (autonomous, Athena-dispatched).
+
+## Build record (r24)
+
+**SHIPPED `9d6efb2`** — KEEP, and the builder improved on the brief. Floor built as **parsed ÷
+story-rows-served** per the re-verification's correction. `parse_front_page` now returns
+`PageParse {stories, rows_seen, skipped_no_title, skipped_no_id}`; the pure named gate
+`removal_suppression_reason` downgrades `sync_many` -> `upsert_many`.
+
+**The improvement:** I offered "a page serving materially fewer than 30 `tr.athing` rows is a short
+page" as a secondary floor signal. The builder **refused to gate tombstoning on it** — a genuinely
+shrinking front page serves fewer rows that all parse, so gating there would make the app permanently
+upsert-only in exactly the case tombstoning exists for. Demoted to a reported warning
+(`short_page_warning`) and pinned by `a_shrinking_but_clean_front_page_still_tombstones`.
+
+Both riders shipped: `removed` is emitted (the `output_shape` promise stops being a lie), and the
+`rank-N` fallback key is gone — id-less rows are dropped and *counted*, which composes with the floor
+instead of fighting it, making `Story.id` a non-optional `String`; rank now counts *served* rows so a
+skipped row does not shift the ranks after it. `output_shape` pinned against a real result object via
+an extracted `run_result`.
+Tests (7): `a_partial_parse_cannot_tombstone_the_rows_it_failed_to_read`,
+`a_shrinking_but_clean_front_page_still_tombstones`,
+`an_idless_row_is_unparsed_not_keyed_by_its_rank`,
+`the_result_declares_the_removals_it_makes_not_only_the_writes`,
+`the_output_shape_names_every_key_the_run_emits`, + 2 pre-existing parser tests.
+**Class C: none needed** — `removal_guard.rs`'s inventory tracks direct `.detect_removed(` callers,
+and hackernews reaches removal through `AppContext::sync_many`. Verified by the builder, not assumed.
