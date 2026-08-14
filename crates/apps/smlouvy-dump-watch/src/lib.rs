@@ -79,12 +79,145 @@ fn tag_text<'a>(block: &'a str, tag: &str) -> Option<&'a str> {
     Some(block[after_open..end].trim())
 }
 
-/// Parse the dump index XML into dumps, in document order. Pure + unit-tested: a
-/// flat, stable government schema, so a scoped tag scan beats pulling in an XML
-/// dependency. Entries missing a URL or an unparseable year/month are skipped
-/// (defensive against a partial/garbled feed) rather than failing the whole run.
-fn parse_dumps(xml: &str) -> Vec<Dump> {
-    let mut out = Vec::new();
+/// The share of the index's `<dump>` blocks that must parse into a record before
+/// a run may write a FULL SNAPSHOT — whose removal detection tombstones every
+/// key absent from the batch.
+///
+/// **1.0: every block, no exceptions.** The floor is deliberately at the tight
+/// end of the range the direction allowed, because of the asymmetry between the
+/// two ways of being wrong here:
+///
+/// - The index is small (~120 blocks), machine-generated from one government
+///   schema that has been stable since 2016, and every block carries the same
+///   six elements. A block that does not parse is therefore *schema drift or a
+///   truncated document*, not the routine noise a model-authored roster has.
+///   There is no "one dump legitimately has no `<odkaz>`" case to tolerate.
+/// - Suppressing removal detection costs nothing but a stale pointer to a month
+///   the Ministry retired (the upsert still refreshes everything present).
+///   Tombstoning wrongly costs a downstream consumer its entire dump index.
+///
+/// **The tombstone path stays reachable**: a genuinely shrinking feed — the
+/// Ministry retiring 2016 — publishes fewer blocks that all still parse, so the
+/// share is 1.0, the snapshot write runs and the retired dumps are removed.
+/// Only a *garbled* feed suppresses removals. Pinned by
+/// `a_shrinking_but_clean_index_still_tombstones`.
+const PARSE_FLOOR: f64 = 1.0;
+
+/// What [`parse_dumps`] **saw**, not only what it kept.
+///
+/// The whole defect this type exists for was that the old signature returned
+/// `Vec<Dump>`: a 30-of-51 parse and a 30-of-30 parse were indistinguishable to
+/// every caller, so the destructive full-snapshot write could not tell them
+/// apart and neither could the operator reading the result JSON.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct IndexParse {
+    /// The dumps that parsed, in document order.
+    dumps: Vec<Dump>,
+    /// `<dump>…</dump>` blocks found in the document, parsed or skipped.
+    blocks_seen: usize,
+    /// Blocks skipped because `<odkaz>` was absent or empty.
+    skipped_missing_url: usize,
+    /// Blocks skipped because `<rok>`/`<mesic>` were absent or unparseable.
+    skipped_unparseable_date: usize,
+}
+
+impl IndexParse {
+    fn parsed(&self) -> usize {
+        self.dumps.len()
+    }
+
+    fn skipped(&self) -> usize {
+        self.skipped_missing_url + self.skipped_unparseable_date
+    }
+
+    /// Parsed / seen. An index with no `<dump>` blocks at all is complete (1.0) —
+    /// nothing was published, so nothing was lost. (That case is refused
+    /// separately, by the empty guard in `run`.)
+    fn share(&self) -> f64 {
+        if self.blocks_seen == 0 {
+            return 1.0;
+        }
+        self.parsed() as f64 / self.blocks_seen as f64
+    }
+
+    /// Whether this batch is a **subset** of the published index rather than the
+    /// whole of it — i.e. whether a full-snapshot write would tombstone dumps
+    /// that are still live upstream.
+    fn is_partial(&self) -> bool {
+        self.share() < PARSE_FLOOR
+    }
+
+    /// The `parse` block of the result: what the index held, what we read out of
+    /// it, and why the rest was dropped.
+    fn to_json(&self) -> Value {
+        json!({
+            "blocks_seen": self.blocks_seen,
+            "parsed": self.parsed(),
+            "skipped": self.skipped(),
+            "skipped_missing_url": self.skipped_missing_url,
+            "skipped_unparseable_date": self.skipped_unparseable_date,
+            // 3 dp: enough to read, short of float noise in a stored result.
+            "share": (self.share() * 1000.0).round() / 1000.0,
+            "floor": PARSE_FLOOR,
+            "partial": self.is_partial(),
+        })
+    }
+
+    /// The one-line `warnings[]` entry a lossy parse contributes, or `None` when
+    /// every block parsed. Separate from [`removal_suppression_reason`] so a
+    /// future looser floor still *reports* the skips it tolerates.
+    fn warning(&self) -> Option<String> {
+        (self.skipped() > 0).then(|| {
+            format!(
+                "partial index parse: {} of {} <dump> blocks parsed ({} skipped: {} missing \
+                 <odkaz>, {} with an unparseable <rok>/<mesic>) — the feed may be truncated or \
+                 its schema changed",
+                self.parsed(),
+                self.blocks_seen,
+                self.skipped(),
+                self.skipped_missing_url,
+                self.skipped_unparseable_date,
+            )
+        })
+    }
+}
+
+/// **The floor on a full-snapshot write.** `Some(reason)` when removal detection
+/// must be skipped because this batch is only part of the published index;
+/// `None` when the parse earned the right to tombstone.
+///
+/// Pure, so the floor is testable without a store — and named, so the fix is
+/// guarded rather than buried in `run()`. Core's own protection against a
+/// partial batch cannot engage here: `sync_many`'s doc says `detect_removed`
+/// "already refuses an *empty* batch; a partial batch is the case that guard
+/// does not cover", the health downgrade needs `[resilience] enforce` (off by
+/// default, documented inert) AND `observe_extraction` calls this app does not
+/// make. So the floor lives at the app layer, where the block count is known.
+fn removal_suppression_reason(parse: &IndexParse) -> Option<String> {
+    parse.is_partial().then(|| {
+        format!(
+            "removal detection suppressed: only {} of {} <dump> blocks parsed ({:.0}% < {:.0}% \
+             floor), so this batch is a SUBSET of the published index — the dumps missing from \
+             it are kept rather than tombstoned",
+            parse.parsed(),
+            parse.blocks_seen,
+            parse.share() * 100.0,
+            PARSE_FLOOR * 100.0,
+        )
+    })
+}
+
+/// Parse the dump index XML into dumps, in document order, **counting what it
+/// skipped**. Pure + unit-tested: a flat, stable government schema, so a scoped
+/// tag scan beats pulling in an XML dependency.
+///
+/// Entries missing a URL or with an unparseable year/month are still skipped
+/// rather than failing the whole run (one malformed block must not cost the
+/// other 120), but the skip is now *counted* by reason — silent skipping is what
+/// let a partially-garbled feed reach a full-snapshot write and tombstone the
+/// dumps it failed to read.
+fn parse_dumps(xml: &str) -> IndexParse {
+    let mut out = IndexParse::default();
     let mut i = 0usize;
     while let Some(rel) = xml[i..].find("<dump>") {
         let start = i + rel + "<dump>".len();
@@ -93,18 +226,23 @@ fn parse_dumps(xml: &str) -> Vec<Dump> {
         };
         let block = &xml[start..start + rel_end];
         i = start + rel_end + "</dump>".len();
+        out.blocks_seen += 1;
 
         let url = match tag_text(block, "odkaz") {
             Some(u) if !u.is_empty() => u.to_string(),
-            _ => continue,
+            _ => {
+                out.skipped_missing_url += 1;
+                continue;
+            }
         };
         let (Some(year), Some(month)) = (
             tag_text(block, "rok").and_then(|s| s.parse::<u32>().ok()),
             tag_text(block, "mesic").and_then(|s| s.parse::<u32>().ok()),
         ) else {
+            out.skipped_unparseable_date += 1;
             continue;
         };
-        out.push(Dump {
+        out.dumps.push(Dump {
             year,
             month,
             hash: tag_text(block, "hashDumpu").unwrap_or("").to_string(),
@@ -180,10 +318,16 @@ impl ScrapeApp for SmlouvyDumpWatch {
                 },
             ],
             output_shape: Some(
-                "{index_url, dumps_in_index, dumps_tracked, year_from, new, changed, unchanged, \
-                 removed, fresh_dumps[], newest_period, newest_url} — full-snapshot sync of the \
-                 `dumps` dataset keyed by dump URL; `fresh_dumps` are the new/re-generated dump \
-                 URLs a dataset trigger should re-download",
+                "{index_url, dumps_in_index, dumps_parsed, dumps_tracked, year_from, \
+                 parse: {blocks_seen, parsed, skipped, skipped_missing_url, \
+                 skipped_unparseable_date, share, floor, partial}, warnings: [string], new, \
+                 changed, unchanged, removed, removals_suppressed, fresh_dumps[], \
+                 newest_period, newest_url} — full-snapshot sync of the `dumps` dataset keyed \
+                 by dump URL; `dumps_in_index` is the number of <dump> blocks SEEN and \
+                 `dumps_parsed` how many of them parsed, so a partial parse is visible; a \
+                 partial parse downgrades the write to upsert-only (`removals_suppressed`) so \
+                 it cannot tombstone the dumps it failed to read; `fresh_dumps` are the \
+                 new/re-generated dump URLs a dataset trigger should re-download",
             ),
             cost_class: CostClass::Free,
         }
@@ -212,46 +356,75 @@ impl ScrapeApp for SmlouvyDumpWatch {
         ctx.save_artifact("index.xml", response.body.as_bytes())
             .await?;
 
-        let mut dumps = parse_dumps(&response.body);
-        if dumps.is_empty() {
+        let parse = parse_dumps(&response.body);
+        if parse.dumps.is_empty() {
             return Err(Error::App(format!(
                 "no <dump> entries parsed from {index_url} — the feed may be empty or its \
-                 schema changed"
+                 schema changed ({} <dump> blocks seen, {} skipped: {} missing <odkaz>, {} \
+                 with an unparseable <rok>/<mesic>)",
+                parse.blocks_seen,
+                parse.skipped(),
+                parse.skipped_missing_url,
+                parse.skipped_unparseable_date,
             )));
         }
-        let total_parsed = dumps.len();
-        if let Some(y) = year_from {
-            dumps.retain(|d| d.year >= y);
+        let mut warnings: Vec<String> = Vec::new();
+        if let Some(w) = parse.warning() {
+            warnings.push(w);
         }
+
+        // `year_from` filters what we TRACK; it never changes what the index was
+        // seen to hold, so the floor below is judged on the parse, not on this.
+        let tracked: Vec<&Dump> = match year_from {
+            Some(y) => parse.dumps.iter().filter(|d| d.year >= y).collect(),
+            None => parse.dumps.iter().collect(),
+        };
 
         // Full snapshot: the index IS the complete current listing, so a dump that
         // vanishes (the Ministry retiring a month) is a real `removed`. Keyed by the
         // dump URL — a re-generated month keeps its URL and surfaces as `changed`
         // because its hash/size differ.
-        let items: Vec<(String, Value)> =
-            dumps.iter().map(|d| (d.url.clone(), d.record())).collect();
+        //
+        // ...unless the parse was partial, in which case the batch is only PART of
+        // the listing and removal detection would tombstone the dumps we failed to
+        // read. See `removal_suppression_reason`.
+        let items: Vec<(String, Value)> = tracked
+            .iter()
+            .map(|d| (d.url.clone(), d.record()))
+            .collect();
         // Provenance (M12): every record is parsed out of THIS index document,
         // so a batch-level `source_url` is a fact here, not an approximation.
-        let summary = ctx
-            .sync_many_with_provenance(
-                "dumps",
-                &items,
-                Provenance {
-                    source_url: Some(index_url.clone()),
-                    ..Provenance::default()
-                },
-            )
-            .await?;
+        let prov = Provenance {
+            source_url: Some(index_url.clone()),
+            ..Provenance::default()
+        };
+        let removals_suppressed = removal_suppression_reason(&parse);
+        let summary = match &removals_suppressed {
+            Some(reason) => {
+                tracing::warn!(dataset = "dumps", "{reason}");
+                warnings.push(reason.clone());
+                ctx.upsert_many_with_provenance("dumps", &items, prov)
+                    .await?
+            }
+            None => ctx.sync_many_with_provenance("dumps", &items, prov).await?,
+        };
 
         // The freshly-changed dumps are the actionable ingest targets — a dataset
         // trigger reads these keys from `_trigger` and re-downloads exactly them.
         let fresh_urls: Vec<&str> = summary.fresh_keys().map(String::as_str).collect();
-        let newest = dumps.iter().max_by_key(|d| (d.year, d.month));
+        let newest = tracked.iter().max_by_key(|d| (d.year, d.month));
 
         Ok(json!({
             "index_url": index_url,
-            "dumps_in_index": total_parsed,
-            "dumps_tracked": dumps.len(),
+            // Blocks SEEN in the index — what its name has always promised. The
+            // count of blocks we managed to read is `dumps_parsed`; before they
+            // were split, a 30-of-51 run and a 30-of-30 run emitted identical JSON.
+            "dumps_in_index": parse.blocks_seen,
+            "dumps_parsed": parse.parsed(),
+            "parse": parse.to_json(),
+            "warnings": warnings,
+            "removals_suppressed": removals_suppressed,
+            "dumps_tracked": tracked.len(),
             "year_from": year_from,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
@@ -320,8 +493,12 @@ mod tests {
 
     #[test]
     fn parses_every_dump_with_fields() {
-        let dumps = parse_dumps(SAMPLE);
+        let parse = parse_dumps(SAMPLE);
+        let dumps = &parse.dumps;
         assert_eq!(dumps.len(), 2);
+        assert_eq!(parse.blocks_seen, 2, "both blocks were seen");
+        assert_eq!(parse.skipped(), 0);
+        assert!(!parse.is_partial(), "a clean parse may write a snapshot");
         let d = &dumps[0];
         assert_eq!((d.year, d.month), (2026, 6));
         assert_eq!(d.hash, "aaaa1111bbbb2222cccc3333dddd4444eeee5555");
@@ -332,7 +509,7 @@ mod tests {
 
     #[test]
     fn record_shape_carries_period_and_key_fields() {
-        let rec = parse_dumps(SAMPLE)[0].record();
+        let rec = parse_dumps(SAMPLE).dumps[0].record();
         assert_eq!(rec["period"], "2026-06");
         assert_eq!(rec["hash_algo"], "sha1");
         assert_eq!(rec["size_bytes"], 84123456);
@@ -347,6 +524,9 @@ mod tests {
         assert_eq!(tag_text(block, "velikostDumpu"), None);
     }
 
+    /// Keeping only the complete entry is still right — but the skip must now be
+    /// **counted by reason**. Silently dropping two of three blocks and returning
+    /// a bare `Vec` is what let a garbled feed reach the full-snapshot write.
     #[test]
     fn skips_entries_missing_url_or_date() {
         let xml = r#"
@@ -354,14 +534,103 @@ mod tests {
           <dump><mesic>4</mesic><rok>2025</rok></dump>
           <dump><rok>2025</rok><odkaz>https://x/no_month.xml</odkaz></dump>
         "#;
-        let dumps = parse_dumps(xml);
-        assert_eq!(dumps.len(), 1, "only the complete entry is kept");
-        assert_eq!(dumps[0].url, "https://x/dump_2025_03.xml");
+        let parse = parse_dumps(xml);
+        assert_eq!(parse.dumps.len(), 1, "only the complete entry is kept");
+        assert_eq!(parse.dumps[0].url, "https://x/dump_2025_03.xml");
+
+        assert_eq!(parse.blocks_seen, 3, "the index published three blocks");
+        assert_eq!(parse.skipped(), 2, "and two of them were skipped, not lost");
+        assert_eq!(parse.skipped_missing_url, 1, "the one with no <odkaz>");
+        assert_eq!(parse.skipped_unparseable_date, 1, "the one with no <mesic>");
+        assert!(parse.warning().is_some(), "a lossy parse warns");
+    }
+
+    /// The anti-pattern this whole change exists for: a 1-of-3 parse must NOT be
+    /// allowed to write a full snapshot, because removal detection would tombstone
+    /// the two dumps we merely failed to read.
+    #[test]
+    fn a_partial_parse_is_not_a_snapshot() {
+        let xml = r#"
+          <dump><mesic>3</mesic><rok>2025</rok><odkaz>https://x/a.xml</odkaz></dump>
+          <dump><mesic>4</mesic><rok>2025</rok></dump>
+          <dump><rok>2025</rok><odkaz>https://x/no_month.xml</odkaz></dump>
+        "#;
+        let parse = parse_dumps(xml);
+        assert!(parse.is_partial());
+        assert!((parse.share() - 1.0 / 3.0).abs() < 1e-9);
+        let reason = removal_suppression_reason(&parse).expect("suppressed");
+        assert!(
+            reason.contains("1 of 3"),
+            "the reason names the shortfall: {reason}"
+        );
+        assert!(
+            reason.contains("tombstoned"),
+            "and what it prevented: {reason}"
+        );
+    }
+
+    /// The floor must not become "never tombstone": a feed that publishes fewer
+    /// blocks which ALL parse is a genuine shrink and keeps snapshot semantics.
+    #[test]
+    fn a_clean_parse_of_any_size_may_still_tombstone() {
+        let xml = r#"
+          <dump><mesic>3</mesic><rok>2025</rok><odkaz>https://x/a.xml</odkaz></dump>
+        "#;
+        let parse = parse_dumps(xml);
+        assert_eq!((parse.blocks_seen, parse.parsed()), (1, 1));
+        assert!(!parse.is_partial());
+        assert!(removal_suppression_reason(&parse).is_none());
+        assert!(parse.warning().is_none());
     }
 
     #[test]
     fn empty_or_unrelated_xml_yields_no_dumps() {
-        assert!(parse_dumps("<index></index>").is_empty());
-        assert!(parse_dumps("not xml at all").is_empty());
+        for xml in ["<index></index>", "not xml at all"] {
+            let parse = parse_dumps(xml);
+            assert!(parse.dumps.is_empty());
+            assert_eq!(parse.blocks_seen, 0);
+            // Nothing was published, so nothing was lost — the empty feed is
+            // refused by `run`'s own guard, not by the completeness floor.
+            assert!(!parse.is_partial());
+        }
+    }
+
+    /// The result block a consumer reads to tell 30-of-51 from 30-of-30 apart.
+    #[test]
+    fn the_parse_block_reports_seen_and_parsed_separately() {
+        let xml = r#"
+          <dump><mesic>3</mesic><rok>2025</rok><odkaz>https://x/a.xml</odkaz></dump>
+          <dump><mesic>4</mesic><rok>2025</rok></dump>
+        "#;
+        let block = parse_dumps(xml).to_json();
+        assert_eq!(block["blocks_seen"], 2);
+        assert_eq!(block["parsed"], 1);
+        assert_eq!(block["skipped"], 1);
+        assert_eq!(block["skipped_missing_url"], 1);
+        assert_eq!(block["skipped_unparseable_date"], 0);
+        assert_eq!(block["share"], 0.5);
+        assert_eq!(block["partial"], true);
+    }
+
+    /// The result keys agents and consumers read are declared. A field that only
+    /// exists in `run` is a field no caller knows to look for.
+    #[test]
+    fn output_shape_declares_the_partial_parse_fields() {
+        let shape = SmlouvyDumpWatch
+            .manifest()
+            .output_shape
+            .expect("agents need the result shape");
+        for field in [
+            "dumps_in_index",
+            "dumps_parsed",
+            "parse",
+            "warnings",
+            "removals_suppressed",
+        ] {
+            assert!(
+                shape.contains(field),
+                "output_shape must declare {field}: {shape}"
+            );
+        }
     }
 }
