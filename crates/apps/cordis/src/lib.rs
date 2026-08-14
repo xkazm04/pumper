@@ -242,7 +242,11 @@ impl ScrapeApp for Cordis {
             // Envelope per the verified contract; a positive total with zero
             // parseable hits means drift — refuse to report an empty success.
             let (page_total, hits) = extract_hits(&parsed).ok_or_else(|| {
-                Error::App(
+                // `SourceDrift`, not `App`: terminal for the job. The envelope
+                // shape is a pure parse of a response fetched from params frozen
+                // at enqueue, so every attempt loses the contract in the same
+                // place.
+                Error::SourceDrift(
                     "cordis: could not locate payload.total+results in the search \
                      envelope — the verified contract drifted (see crate doc \
                      header; page1.json artifact holds the raw body)"
@@ -252,7 +256,8 @@ impl ScrapeApp for Cordis {
             total = page_total;
             let got = hits.len() as u64;
             if pages_fetched == 0 && empty_first_page_is_drift(page, page_size, total, got) {
-                return Err(Error::App(format!(
+                // `SourceDrift`, not `App`: terminal for the job.
+                return Err(Error::SourceDrift(format!(
                     "cordis: API reported {total} results but listing page {page} parsed 0 \
                      hits — likely an upstream schema change (page1.json artifact holds the \
                      raw body). The resume cursor is left untouched."
@@ -305,7 +310,9 @@ impl ScrapeApp for Cordis {
                 .count_filtered(&ctx.app, "projects", &[])
                 .await?;
             if empty_listing_is_drift(total, ids.len(), stored_corpus) {
-                return Err(Error::App(format!(
+                // `SourceDrift`, not `App`: terminal for the job — the drifted
+                // query grammar is fixed for the life of the job.
+                return Err(Error::SourceDrift(format!(
                     "cordis: the search listing reported total:0 while {stored_corpus} projects \
                      are already stored — the query grammar drifted (the older \
                      `/project/frameworkProgramme=` grammar silently returns total:0; the \
@@ -393,7 +400,13 @@ impl ScrapeApp for Cordis {
         // this attempt actually tried — a fully-resumed run legitimately
         // normalizes nothing new.
         if attempted > 0 && normalized == 0 {
-            return Err(Error::App(format!(
+            // `SourceDrift`, not `App`: terminal for the job. This is a
+            // pre-write refusal like the listing guards above — `normalized ==
+            // 0` means nothing reached a dataset — and the detail contract it
+            // reports on is the same shape on every attempt. (Contrast the
+            // per-item degradation paths, which are warn-only and stay
+            // retryable.)
+            return Err(Error::SourceDrift(format!(
                 "cordis: {attempted} project detail fetches attempted but 0 records \
                  normalized ({detail_failed} fetch/parse failures, {skipped} unkeyable) \
                  — the detail contract drifted (detail1.json artifact holds a raw body)"
@@ -1819,5 +1832,91 @@ mod walk_tests {
         assert_eq!(out["corpus_swept"], true);
         assert_eq!(out["cursor_next_offset"], 0);
         assert!(out.get("warnings").is_none(), "nothing to warn about");
+    }
+}
+
+/// **Inventory guard for the drift-refusal classification** (the EXPECTED-diff
+/// idiom — a convention is enforced with a test, never with a sentence in a
+/// doc).
+///
+/// A pre-write drift refusal must be [`pumper_core::Error::SourceDrift`], which
+/// is terminal for the job. Raised as `Error::App` it is *retryable*, so a
+/// permanent upstream rename burns three identical attempts plus backoff on
+/// every scheduled run, indefinitely — and reads in the job log exactly like the
+/// source being down. The next drift guard anyone adds here will be copy-pasted
+/// from an existing one, so the classification is pinned rather than trusted.
+#[cfg(test)]
+mod drift_inventory {
+    /// This file's production source, with its test modules removed — the
+    /// inventory counts call sites, not the literals in these tests.
+    fn production_source() -> &'static str {
+        include_str!("lib.rs")
+            .split(
+                "
+#[cfg(test)]",
+            )
+            .next()
+            .expect("source")
+    }
+
+    /// The message literal of every `Error::App(...)` construction: the text
+    /// between the first pair of quotes after the constructor.
+    ///
+    /// Bounded to the literal on purpose. The first cut of this guard scanned a
+    /// fixed 400-character window instead, which reached past the end of one
+    /// construction into the *next* guard's explanatory comment and reported a
+    /// straggler that did not exist.
+    fn app_error_messages(src: &str) -> Vec<&str> {
+        src.split("Error::App(")
+            .skip(1)
+            .filter_map(|rest| {
+                // Bounded lookahead: an `Error::App(v)` built from a variable
+                // must not borrow a later site's literal and answer for it.
+                let head: String = rest.chars().take(200).collect();
+                let start = head.find('"')? + 1;
+                let tail = &rest[start..];
+                Some(&tail[..tail.find('"')?])
+            })
+            .collect()
+    }
+
+    /// Every pre-write drift refusal in this app, by a stable fragment of its
+    /// message. Adding or removing one fails this test until it is classified.
+    const EXPECTED_TERMINAL: &[&str] = &[
+        "cordis: could not locate payload.total+results",
+        "cordis: API reported {total} results but listing page",
+        "cordis: the search listing reported total:0",
+        "cordis: {attempted} project detail fetches attempted but 0 records",
+    ];
+
+    /// Drift this app reports **without** failing the job.
+    /// None here: every drift signal cordis raises is a pre-write refusal (the
+    /// stage-2 guard fires only when NOTHING normalized, so nothing was written).
+    /// Per-item detail failures are counted into `detail_failed`, not raised.
+    const EXPECTED_RETRYABLE: &[&str] = &[];
+
+    #[test]
+    fn every_pre_write_drift_refusal_is_terminal_not_retryable() {
+        let src = production_source();
+        assert_eq!(
+            src.matches("Error::SourceDrift(").count(),
+            EXPECTED_TERMINAL.len(),
+            "a drift refusal was added or removed without updating EXPECTED_TERMINAL"
+        );
+        for needle in EXPECTED_TERMINAL {
+            assert!(
+                src.contains(needle),
+                "an EXPECTED terminal drift refusal is gone or reworded: {needle}"
+            );
+        }
+        let app_drift: Vec<&str> = app_error_messages(src)
+            .into_iter()
+            .filter(|message| message.contains("drift"))
+            .collect();
+        assert_eq!(
+            app_drift.len(),
+            EXPECTED_RETRYABLE.len(),
+            "a drift refusal is still an Error::App, so it rides the retry ladder              and a permanent rename fails three times a day forever: {app_drift:#?}"
+        );
     }
 }

@@ -233,6 +233,34 @@ pub enum Error {
     /// retry re-parses the identical text and re-refuses.
     #[error("bad request: {0}")]
     BadRequest(String),
+    /// An upstream source's response no longer has the shape the app parses: a
+    /// renamed or moved field, a changed query grammar, a once-verified contract
+    /// the app can no longer find. Raised only by a **pre-write refusal** — the
+    /// app parsed nothing usable and is declining to write, so no dataset is
+    /// touched.
+    ///
+    /// Typed because "the source changed its schema" and "the source was down"
+    /// are different events with different remedies, and an operator reading a
+    /// job row has to be able to tell them apart. Both used to arrive as
+    /// [`Error::App`], whose text is app prose — so the only way to classify was
+    /// to match substrings of a sentence anybody was free to reword, which is
+    /// the same anti-pattern [`crate::error::PluginFailure`] exists to kill.
+    ///
+    /// **Terminal for a job** ([`Error::is_terminal_for_job`]): the refusal is a
+    /// pure function of a response fetched from params frozen at enqueue, so
+    /// attempt #2 re-issues the identical request, re-parses an identically
+    /// shaped response, and re-refuses in the identical place. The grants fleet
+    /// is the worked example — a permanent upstream rename burned three attempts
+    /// plus backoff on every scheduled run, every day, indefinitely, and read in
+    /// the job log exactly like the source being down.
+    ///
+    /// **The boundary that keeps it honest.** Only pre-write *listing* refusals
+    /// are this variant. Warn-only drift signals stay warnings, and a per-item
+    /// degradation that aborts a stage rather than the job stays an
+    /// [`Error::App`] — a partial harvest is a fact about one attempt, not about
+    /// the contract, and it really can come out differently next time.
+    #[error("source drift: {0}")]
+    SourceDrift(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
@@ -300,7 +328,7 @@ impl Error {
     /// retry cannot change the outcome, so the runtime must fail the job once
     /// instead of running it down the retry/backoff ladder.
     ///
-    /// The bar is deliberately high, and today exactly four variants clear it:
+    /// The bar is deliberately high, and today exactly five variants clear it:
     ///
     /// - [`Error::BudgetExhausted`] — a fact about the job's own ledger, which
     ///   a retry re-reads and re-refuses on.
@@ -342,6 +370,22 @@ impl Error {
     ///   that site is **already** permanent by call site (the worker resolves
     ///   the cassette before the run and `fail_permanently`s on any load error),
     ///   so widening the variant cannot take retries away from it.
+    /// - [`Error::SourceDrift`] — a pre-write refusal raised because an
+    ///   upstream response no longer has the shape the app parses. Every
+    ///   producer was audited before the variant was classified here, and all of
+    ///   them are pure functions of one already-fetched response body: the
+    ///   grants fleet's eight listing guards (`ca-grants`'s
+    ///   `total > 0 && records.is_empty()`, `grants-gov`'s `empty_page_is_drift`
+    ///   and `empty_listing_is_drift`, `cordis`'s four, `eu-sedia`'s one). The
+    ///   request that produced the body is derived from params frozen at
+    ///   enqueue, so attempt #2 asks the identical question, gets an identically
+    ///   shaped answer, and re-refuses before writing anything. A rename does
+    ///   not un-rename itself between attempt 1 and attempt 3.
+    ///
+    ///   The transient lookalike is deliberately NOT this variant: a source that
+    ///   is *down* fails in the fetch chokepoint as an `Error::Http` and keeps
+    ///   its retries. That separation is the whole point — the two used to be
+    ///   indistinguishable `Error::App`s.
     ///
     /// Everything else — engine errors, storage errors, parse failures — is
     /// either transient or caught earlier, and classifying any of them here
@@ -372,6 +416,7 @@ impl Error {
                 | Error::Transact(_)
                 | Error::BadRequest(_)
                 | Error::ReplayMiss(_)
+                | Error::SourceDrift(_)
         )
     }
 }
@@ -659,6 +704,44 @@ mod tests {
         }
     }
 
+    /// THE anti-pattern this variant replaces: a schema-drift refusal is
+    /// deterministic — the field is renamed, the params are frozen at enqueue,
+    /// so attempt #2 re-parses an identically shaped response and re-refuses —
+    /// but it shipped as `Error::App`, which is retryable. A permanent upstream
+    /// rename therefore burned three attempts plus backoff on every scheduled
+    /// run, every day, indefinitely.
+    #[test]
+    fn source_drift_is_terminal_not_three_identical_refusals() {
+        let drift = Error::SourceDrift(
+            "grants.gov schema drift: hitCount=8412 but page 1 parsed 0 oppHits".into(),
+        );
+        assert!(
+            drift.is_terminal_for_job(),
+            "a renamed field does not un-rename itself between attempt 1 and 3"
+        );
+        // The lookalike keeps its ladder: a source that is *down* fails in the
+        // fetch chokepoint, and that one really can succeed next time.
+        assert!(!Error::Http("connect grants.gov: timed out".into()).is_terminal_for_job());
+        assert!(!Error::App("partial harvest".into()).is_terminal_for_job());
+    }
+
+    /// The operator-facing half of the same change: the two failures an
+    /// operator has to tell apart must not render as the same kind of line.
+    /// Classification is by TYPE, so it survives any rewording of the message —
+    /// the prefix comes from the variant, not from app prose.
+    #[test]
+    fn a_drift_refusal_does_not_read_like_the_source_being_down() {
+        let drift = Error::SourceDrift("result.records missing or not an array".into());
+        let outage = Error::Http("connect https://data.ca.gov: timed out".into());
+        assert!(drift.to_string().starts_with("source drift:"), "{drift}");
+        assert!(!outage.to_string().starts_with("source drift:"), "{outage}");
+        assert_ne!(drift.is_terminal_for_job(), outage.is_terminal_for_job());
+        // No message wording can move a failure between the two classes.
+        for message in ["", "wholly reworded prose", "the source was down"] {
+            assert!(Error::SourceDrift(message.into()).is_terminal_for_job());
+        }
+    }
+
     /// The classification EVERY variant must have, as an **exhaustive** match.
     ///
     /// This is the inventory guard (the EXPECTED-diff idiom): adding a variant
@@ -674,7 +757,8 @@ mod tests {
             Error::BudgetExhausted(_)
             | Error::Transact(_)
             | Error::BadRequest(_)
-            | Error::ReplayMiss(_) => true,
+            | Error::ReplayMiss(_)
+            | Error::SourceDrift(_) => true,
             // Everything else can genuinely succeed on the next attempt.
             Error::Http(_)
             | Error::Browser(_)
@@ -709,6 +793,7 @@ mod tests {
             Error::BudgetExhausted("no headroom".into()),
             Error::ReplayMiss("no recorded response".into()),
             Error::BadRequest("bad filter".into()),
+            Error::SourceDrift("hitCount>0 but 0 rows parsed".into()),
             Error::Io(std::io::Error::other("disk hiccup")),
             Error::Json(serde_json::from_str::<u8>("nope").unwrap_err()),
             Error::Other(anyhow::anyhow!("something else")),

@@ -339,7 +339,10 @@ impl ScrapeApp for GrantsGov {
             // rename, which used to read as an ordinary short page and end the
             // walk reporting `truncated: false`.
             if empty_page_is_drift(pages, rows, hit_count, got) {
-                return Err(Error::App(format!(
+                // `SourceDrift`, not `App`: terminal for the job. `oppHits`
+                // does not un-rename itself between attempt 1 and attempt 3,
+                // and the query is derived from params frozen at enqueue.
+                return Err(Error::SourceDrift(format!(
                     "grants.gov schema drift: hitCount={hit_count} but page {pages} \
                      (startRecordNum={start}) parsed 0 oppHits (data.oppHits missing \
                      or not an array)"
@@ -371,7 +374,9 @@ impl ScrapeApp for GrantsGov {
                 stored_corpus,
                 whole_corpus_query(&keyword, &eligibilities),
             ) {
-                return Err(Error::App(format!(
+                // `SourceDrift`, not `App`: terminal for the job — a drifted
+                // query grammar re-drifts identically on every attempt.
+                return Err(Error::SourceDrift(format!(
                     "grants.gov schema drift: search2 reported hitCount:0 with no oppHits \
                      for an unfiltered {statuses} query while {stored_corpus} opportunities \
                      are already stored — the query grammar or the response shape drifted. \
@@ -2421,5 +2426,90 @@ mod tests {
         assert_eq!(count_value(Some(&json!("1,200"))), json!(1200));
         assert_eq!(count_value(Some(&json!("several"))), Value::Null);
         assert_eq!(count_value(None), Value::Null);
+    }
+}
+
+/// **Inventory guard for the drift-refusal classification** (the EXPECTED-diff
+/// idiom — a convention is enforced with a test, never with a sentence in a
+/// doc).
+///
+/// A pre-write drift refusal must be [`pumper_core::Error::SourceDrift`], which
+/// is terminal for the job. Raised as `Error::App` it is *retryable*, so a
+/// permanent upstream rename burns three identical attempts plus backoff on
+/// every scheduled run, indefinitely — and reads in the job log exactly like the
+/// source being down. The next drift guard anyone adds here will be copy-pasted
+/// from an existing one, so the classification is pinned rather than trusted.
+#[cfg(test)]
+mod drift_inventory {
+    /// This file's production source, with its test modules removed — the
+    /// inventory counts call sites, not the literals in these tests.
+    fn production_source() -> &'static str {
+        include_str!("lib.rs")
+            .split(
+                "
+#[cfg(test)]",
+            )
+            .next()
+            .expect("source")
+    }
+
+    /// The message literal of every `Error::App(...)` construction: the text
+    /// between the first pair of quotes after the constructor.
+    ///
+    /// Bounded to the literal on purpose. The first cut of this guard scanned a
+    /// fixed 400-character window instead, which reached past the end of one
+    /// construction into the *next* guard's explanatory comment and reported a
+    /// straggler that did not exist.
+    fn app_error_messages(src: &str) -> Vec<&str> {
+        src.split("Error::App(")
+            .skip(1)
+            .filter_map(|rest| {
+                // Bounded lookahead: an `Error::App(v)` built from a variable
+                // must not borrow a later site's literal and answer for it.
+                let head: String = rest.chars().take(200).collect();
+                let start = head.find('"')? + 1;
+                let tail = &rest[start..];
+                Some(&tail[..tail.find('"')?])
+            })
+            .collect()
+    }
+
+    /// Every pre-write drift refusal in this app, by a stable fragment of its
+    /// message. Adding or removing one fails this test until it is classified.
+    const EXPECTED_TERMINAL: &[&str] = &[
+        "grants.gov schema drift: hitCount=",
+        "grants.gov schema drift: search2 reported hitCount:0 with no oppHits",
+    ];
+
+    /// Drift this app reports **without** failing the job.
+    /// The per-item DETAIL refusal is deliberately still an `Error::App`: it aborts
+    /// one opportunity's detail fetch, `detail_stage_is_broken` aborts the stage,
+    /// and neither aborts the job — a partial harvest is a fact about one attempt,
+    /// not about the contract.
+    const EXPECTED_RETRYABLE: &[&str] = &["grants.gov fetchOpportunity({opp_id}) schema drift:"];
+
+    #[test]
+    fn every_pre_write_drift_refusal_is_terminal_not_retryable() {
+        let src = production_source();
+        assert_eq!(
+            src.matches("Error::SourceDrift(").count(),
+            EXPECTED_TERMINAL.len(),
+            "a drift refusal was added or removed without updating EXPECTED_TERMINAL"
+        );
+        for needle in EXPECTED_TERMINAL {
+            assert!(
+                src.contains(needle),
+                "an EXPECTED terminal drift refusal is gone or reworded: {needle}"
+            );
+        }
+        let app_drift: Vec<&str> = app_error_messages(src)
+            .into_iter()
+            .filter(|message| message.contains("drift"))
+            .collect();
+        assert_eq!(
+            app_drift.len(),
+            EXPECTED_RETRYABLE.len(),
+            "a drift refusal is still an Error::App, so it rides the retry ladder              and a permanent rename fails three times a day forever: {app_drift:#?}"
+        );
     }
 }

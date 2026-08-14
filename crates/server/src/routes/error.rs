@@ -121,10 +121,19 @@ pub(crate) fn client_facing(e: &pumper_core::Error) -> (StatusCode, String) {
         E::Plugin { .. } => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_MESSAGE.into()),
         // Genuinely unexpected here. Listed one by one rather than caught by a
         // wildcard so a new core variant has to be given a home on purpose.
+        // `SourceDrift` sits here **deliberately, and provisionally**: every one
+        // of its eight producers was an `E::App` until it was retyped, so putting
+        // it in this bucket leaves the HTTP surface byte-for-byte unchanged. It
+        // is also the variant least likely to reach an HTTP boundary at all — it
+        // is raised inside an app's `run()`, which the worker executes, so its
+        // home is the job row. Whether it should instead join the upstream-fault
+        // group above (502, "somebody else's failure") is a live question, but
+        // one that can be settled without any regression risk from here.
         E::Storage(_)
         | E::Parse(_)
         | E::Config(_)
         | E::App(_)
+        | E::SourceDrift(_)
         | E::Io(_)
         | E::Json(_)
         | E::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_MESSAGE.into()),
