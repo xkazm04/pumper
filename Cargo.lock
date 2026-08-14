@@ -485,6 +485,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -513,6 +514,7 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+ "tokio",
  "trades-common",
 ]
 
