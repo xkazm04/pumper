@@ -4,9 +4,9 @@ type: perfect/context
 group: Core Platform
 category: lib
 opportunity: 8
-last_proposed: 2026-08-04
+last_proposed: 2026-08-14
 cooldown_until: —
-directions: ["[[adaptive-cohort-floor]]", "[[quarantine-recovery-ladder]]", "[[enforcement-preview]]", "[[single-parse-fingerprints]]", "[[detector-false-positive-fixes]]"]
+directions: ["[[observe-extraction-is-vacuous]]", "[[adaptive-cohort-floor]]", "[[quarantine-recovery-ladder]]", "[[enforcement-preview]]", "[[single-parse-fingerprints]]", "[[detector-false-positive-fixes]]"]
 ---
 
 ## Current state (scout brief, 2026-08-04 — engine level, file:line verified)
@@ -69,3 +69,16 @@ automatically; `InvariantKind::Distinctness::holds()` always `None` by design (c
 
 ## Shipped
 (pending build)
+- 2026-08-14 (r23): [[observe-extraction-is-vacuous]] — **REFUTED, not deferred.** r22 banked
+  "the health-based removal guard is structurally unreachable for the smlouvy/watch/ca-grants
+  family". The grep fact is right (`extractor/src/lib.rs:843` is the ONLY `observe_extraction`
+  call site in the repo) but the defect framing is wrong twice over: ca-grants, grants-gov,
+  eu-sedia and both watch apps never call `sync_many` at all — the grants family retires rows
+  by flipping `status` to "closed" — so the guard is **vacuous** for them, not gapped. And it
+  no-ops for a second, independent reason: `enforce` defaults false, so `enforced_state`
+  returns `Healthy` unconditionally, and `Healthy` never suppresses removals. Do not re-bank
+  in this form. **Standing warning preserved:** the smlouvy and trades floors are load-bearing
+  and a future round must not delete them believing the health guard covers it — this note is
+  the evidence that it does not.
+- Honest residue, banked separately: [[hackernews-snapshot-floor]] — the last unfloored
+  `sync_many` in the fleet, in no banked claim before r23.

@@ -6,7 +6,7 @@ category: config
 opportunity: 3
 last_proposed: 2026-08-14
 cooldown_until: —
-directions: ["[[reconciler-refuses-an-unregistered-app]]"]
+directions: ["[[catalog-disarm-is-visible]]", "[[reconciler-refuses-an-unregistered-app]]"]
 ---
 
 ## Current state
@@ -76,3 +76,12 @@ the scout finds drift between catalog and registry.
 
 ## Shipped
 - (none on this map)
+- 2026-08-14 (r23): [[catalog-disarm-is-visible]] — fleet-wide fail-open CONFIRMED (one
+  `toml::from_str` over the whole document; all 12 declared contracts die together), but
+  NARROWED twice: `[contracts] enforce` defaults false so on defaults it costs visibility not
+  enforcement, and `/catalog/sources` + `/catalog/health` both 500 loudly. **Re-banked in a
+  sharper form:** the defect worth building is the stale-green `/sources` — `contract_verdicts`
+  is insert-only and never cleared, so after a typo it serves the last-good `{"verdict":"pass"}`
+  forever alongside `contracts_enforce`. Not silence, a green light. Also: no boot-time
+  `Catalog::load()` validation exists at all. Rejected on the 6-cap; severity is conditional on
+  a non-default flag while all six accepted are unconditional on defaults.

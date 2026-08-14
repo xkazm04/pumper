@@ -4,9 +4,9 @@ type: perfect/context
 group: Grants Intelligence
 category: lib
 opportunity: 7
-last_proposed: 2026-08-04
+last_proposed: 2026-08-14
 cooldown_until: —
-directions: ["[[unified-health-inheritance]]", "[[coalesce-unified-finalize]]", "[[federal-award-amounts]]", "[[close-date-timezone-honesty]]", "[[grant-recurrence-relation]]"]
+directions: ["[[source-drift-is-terminal]]", "[[unified-health-inheritance]]", "[[coalesce-unified-finalize]]", "[[federal-award-amounts]]", "[[close-date-timezone-honesty]]", "[[grant-recurrence-relation]]"]
 ---
 
 ## Current state (scout brief, 2026-08-04 — engine level, file:line verified)
@@ -61,3 +61,12 @@ source declared but unbuilt (and previously rejected at the gate).
 
 ## Shipped
 (pending build)
+- 2026-08-14 (r23): [[source-drift-is-terminal]] -> `fc5f46b` (+ Director `1a8b48d`) — the
+  fleet's eight pre-write drift refusals were correctly fail-closed and typed `Error::App`,
+  which is retryable, so a permanent upstream rename burned three attempts plus backoff on
+  every scheduled run forever and read exactly like an outage. New `Error::SourceDrift`,
+  terminal, with the narrow boundary pinned per crate by an EXPECTED-diff inventory test
+  separating `EXPECTED_TERMINAL` from `EXPECTED_RETRYABLE` (the detail stage stays
+  non-fatal). **The builder refused to decide the HTTP mapping** and escalated it: the
+  Director ratified 502, since the 502 arm's own comment is "somebody else's failure" and a
+  source renaming a field is definitionally not our bug.

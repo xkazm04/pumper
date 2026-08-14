@@ -4,9 +4,9 @@ type: perfect/context
 group: Scraping Engines
 category: lib
 opportunity: 5
-last_proposed: 2026-08-12
+last_proposed: 2026-08-14
 cooldown_until: 2026-08-14 (2 rounds)
-directions: ["[[claude-kill-tree]]", "[[claude-cost-honesty]]", "[[claude-subprocess-hygiene]]"]
+directions: ["[[claude-cancel-actually-kills]]", "[[claude-kill-tree]]", "[[claude-cost-honesty]]", "[[claude-subprocess-hygiene]]"]
 alias_of_old_map: "[[fetch-engines]] (old context named Claude, but no round-3 direction shipped here)"
 ---
 
@@ -68,3 +68,15 @@ total_cost_usd on success only. CONFIRMED-class gaps, Director-verified in sourc
   refuses measured cmd.exe hostiles + 8000-char line budget; system prompts travel
   by file, not argv; unknown role/garbage model refused pre-spawn; subprocess runs
   in `<storage root>/claude-cwd`, ending the 35k-token repo-context leak.
+- 2026-08-14 (r23): [[claude-cancel-actually-kills]] -> `5ea0670` — **a CANCEL now kills
+  the tree too, and this entry corrects an overclaim in the r13 line above.** r13's
+  [[claude-kill-tree]] is recorded as "a timeout/**cancel** kills the whole process tree".
+  The cancel half was never true: `kill_process_tree` was reachable only from
+  `abandon_run`, i.e. from the engine's OWN timeout / wait-error / drain-timeout branches.
+  A cancel does not time out — the worker `break`s out of its `select!` and **drops** the
+  future, and a dropped future runs no cleanup path at all, leaving only `kill_on_drop`
+  (which kills `cmd.exe`, not the grandchild that spends). So `DELETE /jobs/{id}` answered
+  `cancelled` while the agentic loop kept running. Fixed by moving cleanup off every path
+  and into `Drop` (`RunScope`, mirroring engine-browser's `RenderScope`); also aborts the
+  three side tasks, which were being *detached* rather than aborted on every cancel.
+  **Lesson for the ledger: a shipped note that names two paths must have tested both.**

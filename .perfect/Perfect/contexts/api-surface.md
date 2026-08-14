@@ -2,8 +2,8 @@
 name: api-surface                type: perfect/context
 group: HTTP API                  category: api
 opportunity: 6                   # 94 ops ride through it; the surface itself last served 2026-07 at 48 ops
-last_proposed: 2026-08-11        cooldown_until: round-12
-directions: ["[[api-bounded-shutdown]]", "[[api-error-contract]]", "[[api-panic-containment]]"]
+last_proposed: 2026-08-14
+directions: ["[[checkpoint-failures-metric]]", "[[api-bounded-shutdown]]", "[[api-error-contract]]", "[[api-panic-containment]]"]
 supersedes: "[[http-api-routes]] (old 21-context map; its 4 shipped directions + auth rejection carry over)"
 ---
 
@@ -80,3 +80,15 @@ feature context adding routes *through* it.
   preview_runs boundary clamp). Full gate 1314/0 + live smoke 21/21. Observed effect: a stop
   with an attached dashboard terminates in bounded time with the politeness snapshot flushed;
   clients can branch on refusals; a panic is a JSON 500, not a reset that poisons routes forever.
+- 2026-08-14 (r23): [[checkpoint-failures-metric]] — series confirmed absent; the "one-file
+  change to meta.rs" framing REFUTED, and **the banked design would have shipped a metric that
+  lies.** The `checkpoint_failures` block is stamped only on the SUCCESS path
+  (`worker.rs:822`, inside `Outcome::Finished(Ok(_))`), so failed/cancelled/timed-out/panicked
+  runs carry none — a `jobs.result`-derived series systematically undercounts exactly the runs
+  an operator most wants counted, and shrinks under retention pruning. Re-banked as a
+  process-lifetime `AtomicU64` in `JobCheckpointer::record_failure` surfaced through
+  `AppState`: same file count, complete across all outcomes, zero query cost.
+- 2026-08-14 (r23): SHIPPED here as a Director ratification — `1a8b48d`, `Error::SourceDrift`
+  maps to **502**, not 500. See [[source-drift-is-terminal]]. Also records the invariant that
+  direction's pre-flight missed: **adding a `pumper_core::Error` variant requires an arm in
+  `routes/error.rs::client_facing`** (an exhaustive match with no wildcard, by design).

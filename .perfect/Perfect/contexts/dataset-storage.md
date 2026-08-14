@@ -4,9 +4,9 @@ type: perfect/context
 group: Core Platform
 category: data
 opportunity: 9
-last_proposed: 2026-08-03
+last_proposed: 2026-08-14
 cooldown_until: —
-directions: []
+directions: ["[[retention-pin-is-dead-code]]", ]
 ---
 
 ## Current state (scout brief, 2026-08-03 — engine level, file:line verified)
@@ -67,3 +67,13 @@ unbounded-table growth.
 
 ## Shipped
 (none yet)
+- 2026-08-14 (r23): [[retention-pin-is-dead-code]] — **REFUTED decisively; premise fails at
+  every link.** The pin is the FIRST branch of `keep_reason` (`retention.rs:160-173`), ahead
+  of the cassette rule and the age cutoff; `artifact_is_reclaimable` is *defined in terms of*
+  it so the two cannot disagree; preview and the janitor call the SAME function
+  (`main.rs:539`), so they cannot diverge by construction; `/retention/preview` reports
+  `pinned_files`/`pinned_bytes` globally and per-app; and there is a test whose doc reads
+  "the pin is not a comment". Removed from the queue. The one genuine narrow gap banked in
+  its place: `read_source_artifact` is not a pin source, so a crawl body not yet extracted
+  from is reclaimable by age alone while that seam still addresses it (latent —
+  `artifact_retention_days` defaults to 0).

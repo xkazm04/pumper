@@ -4,9 +4,9 @@ type: perfect/context
 group: Content & Research Apps
 category: lib
 opportunity: 6
-last_proposed: 2026-08-12
+last_proposed: 2026-08-14
 cooldown_until: 2026-08-14 (2 rounds)
-directions: ["[[extractor-mode-door]]", "[[extractor-result-honesty]]", "[[extractor-records-echo]]"]
+directions: ["[[targets-read-keys-truncated]]", "[[extractor-mode-door]]", "[[extractor-result-honesty]]", "[[extractor-records-echo]]"]
 alias_of_old_map: "[[declarative-extraction-engine]] (round-3 pass; its app-side work lands here)"
 ---
 
@@ -76,3 +76,9 @@ Pre-verified anchors, strongest first:
   mode names the dataset actually written, @q included) · [[extractor-records-echo]] →
   `742cd44` (+ Director `e9c3c32` worker guard: echo bounded 100/1000/0, index_datasets
   on all write modes gated producer-side, double-index closed, clone gone).
+- 2026-08-14 (r23): [[targets-read-keys-truncated]] — banked from Lot A's `DECISION NEEDED`,
+  raised rather than reached for because both apps were outside its write set. r23 made the
+  host honest (`keys_truncated` is emitted, warned about and unforgeable) but **no app reads
+  it yet**, so a hop exceeding `key_cap` still processes the first 200 records and reports a
+  clean run. `S`, mechanical, and it closes the loop r23 opened — recommended early for r24,
+  with `extractor` + `plugin` as one natural lot.

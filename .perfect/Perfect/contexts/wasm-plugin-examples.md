@@ -6,7 +6,7 @@ category: lib
 opportunity: 6
 last_proposed: 2026-08-14
 cooldown_until: —
-directions: ["[[shipped-plugins-are-verified]]", "[[trigger-gate-honest-across-source-kinds]]"]
+directions: ["[[shipped-plugins-are-verified]]", "[[shipped-plugins-are-verified]]", "[[trigger-gate-honest-across-source-kinds]]"]
 ---
 
 ## Current state
@@ -73,3 +73,18 @@ Files: plugins-src/{title-extractor,delta-slim,trigger-gate,busyloop}/src/lib.rs
 
 ## Shipped
 - (via trigger-pipeline r6)
+- 2026-08-14 (r23): [[shipped-plugins-are-verified]] -> `9256ddd` — the twice-banked
+  enabler. CI now builds all four detached `plugins-src` crates for wasm32 and runs the
+  artifact tests; `just plugins-install` globs all four and owns the `title_extractor.wasm`
+  -> `title.wasm` rename that lived only as README prose (the reason `just test-ignored`
+  could not pass on a clean machine). **The builder refuted the naive design**: deleting
+  `#[no_mangle]` from an export still compiles clean for wasm32, so a build-only CI step
+  would NOT have caught an ABI break. Hence two guards — a source-level EXPECTED-diff ABI
+  test that runs in the ordinary suite, plus the artifact tests asking the host whether each
+  installed module is executable.
+- 2026-08-14 (r23): [[trigger-gate-honest-across-source-kinds]] -> `ce9652c` — the shipped
+  example predicate returned `{"pass": false}` forever on job- and external-kind hops
+  (neither envelope carries `count`), and the ledger recorded it as `predicate_veto` — "a
+  predicate that ran and answered". A rule whose field is **absent** is now *inapplicable*
+  rather than failed. Pair shipped in the order the bank specified: enabler first, and the
+  artifact tests it unlocked FAILED against the previously-installed `.wasm`.

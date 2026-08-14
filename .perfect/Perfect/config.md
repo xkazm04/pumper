@@ -53,6 +53,52 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   resource-destructive actions even when they are obviously regenerable.
 
 ## Skill improvement log
+- 2026-08-14 (round 23): **RE-VERIFY EVERY BANKED CLAIM AGAINST HEAD BEFORE GATING IT — this is now
+  the most valuable single step in a depth round.** r23 re-scouted 13 banked claims with three family
+  scouts and **refuted or narrowed 7**, three of them outright. The bank was written by careful
+  rounds with `file:line` evidence, and it was still wrong that often — because the tree moved under
+  it (r21/r22 shipped the app-layer floors that made the `observe_extraction` claim vacuous), because
+  a claim was framed from the wrong file (`connector-api-watch`'s "third copy" is an inline
+  predicate, and "a one-line change to the core function" would have been a no-op that silently
+  changed two other apps), and because one was simply never true (`retention-pin-is-dead-code`: the
+  pin is the FIRST branch of `keep_reason`, honoured by preview and janitor through the same
+  function, with a test whose doc says "the pin is not a comment"). **A bank note is a LEAD, not a
+  finding.** Budget the re-verification pass explicitly; it is not overhead, it IS the proposal work.
+- 2026-08-14 (round 23): **The re-verification pass is also where the best directions come from.**
+  Two of six accepted did not exist before the scouts ran, and both outscored the claims that
+  prompted them. The `delta-slim` claim was banked as "it rescopes the payload and a test asserts
+  that as correct"; the scout found the test half was false AND that the **documented example config**
+  (`keep: ["dataset","count"]` + `target_app: extractor`) drops `_trigger.keys`, whose absence means
+  "sweep every live record up to 10,000" — a 3-record extract becoming a full sweep, straight out of
+  the docs. The claude claim was banked as "an orphaned process leaks on worker drop"; the scout
+  refuted the stated mechanism (`kill_on_drop` IS set, the deadline exists, tree-kill exists) and
+  then found the one path that matters — `kill_process_tree` is unreachable from the **drop** path,
+  i.e. from every cancel. **Ask a scout to REFUTE, not to confirm; the refutation is where the
+  sharper finding lives.**
+- 2026-08-14 (round 23): **A shipped ledger entry can overclaim, and only a later round catches it.**
+  r13's `claude-kill-tree` is recorded as "a timeout/**cancel** kills the whole process tree". The
+  cancel half was never true and never tested — the only test drove the timeout path. Rule: **when a
+  direction's claim names two paths, the review must ask for a test per path**, and when a later
+  round disproves an entry, amend the entry in place rather than only recording the new fix (done
+  here in `contexts/claude-engine.md`).
+- 2026-08-14 (round 23): **"Purely additive" needs to be checked against the whole workspace, not
+  just the obvious guard.** I verified before accepting `source-drift-is-terminal` that
+  `pumper_core::Error` is not `#[non_exhaustive]` and that `is_terminal_for_job` is a `matches!`, and
+  told the builder the variant was purely additive. It was not: `routes/error.rs::client_facing` is
+  an exhaustive match with **no wildcard by design**, so the workspace did not compile without a new
+  arm. The builder handled it exactly right — took the provable no-op, did not leave the tree broken
+  for its sibling, and escalated the merits instead of deciding — but the Director's pre-flight
+  should have grepped for exhaustive matches on the type, not just for its attributes.
+- 2026-08-14 (round 23): **A builder that refuses to decide is worth more than one that guesses, and
+  the brief should say so explicitly.** Both lots produced refusals that improved the round: Lot B
+  escalated the HTTP mapping rather than picking one, and Lot A raised `keys_truncated`-has-no-reader
+  as a `DECISION NEEDED` rather than reaching into two apps outside its write set (banked as
+  `targets-read-keys-truncated`). Also worth keeping: **builders improved on two briefs.** D5's guard
+  keys on what the window *actually excludes* rather than my suggested `year_from.is_some()` — so a
+  window excluding nothing keeps the right to tombstone, which my version would have silently removed.
+  D3 refuted the naive CI design by proving that deleting `#[no_mangle]` still compiles clean for
+  wasm32. **State the acceptance criteria as outcomes, and let the builder find a better mechanism.**
+
 
 - 2026-08-14 (round 22, POST-MERGE): **The doc-sync Stop hook is satisfied by ANY `docs/features/*`
   edit, so a turn that correctly updates one mapped doc can silently leave a second mapped doc

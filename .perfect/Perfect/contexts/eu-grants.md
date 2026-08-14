@@ -4,9 +4,9 @@ type: perfect/context
 group: Grants Intelligence
 category: lib
 opportunity: 5
-last_proposed: 2026-08-12
+last_proposed: 2026-08-14
 cooldown_until: r16
-directions: ["[[cordis-sweep-honesty]]", "[[topic-stats-honesty]]", "[[derived-change-honesty]]"]
+directions: ["[[sweep-end-lift-to-grants-common]]", "[[cordis-sweep-honesty]]", "[[topic-stats-honesty]]", "[[derived-change-honesty]]"]
 ---
 
 ## Current state (scouted 2026-08-12, r14 — engine-depth; full brief in r14 scout report)
@@ -79,3 +79,12 @@ the load-bearing joined output); max_row_delta_pct=10 questionable mid-walk.
   revisions on every joined topic; cordis finally in the feature docs).
   One-time deploy note: first eu-sedia run reports changed≈historyJoined once
   (documented transition), then settles.
+- 2026-08-14 (r23): [[sweep-end-lift-to-grants-common]] — **"mechanical" REFUTED, and rejected
+  on taste.** r22 banked "SweepEnd exists in three apps with identical semantics". Two are
+  identical; **cordis's is not** — 3 variants vs 4 (no `UnknownTotal`), a different `walk_end`
+  arity, no `sweep_warning`, and no `grants-common` dependency. Correctly scoped the lift is
+  ~45 non-test references whose payoff is "prevents the next divergence", which is the churn
+  side of the config.md taste line. **The one outcome-value half is banked instead:** eu-sedia
+  still has the collapsed boolean (`:230-231`) that the enum exists to kill — one bool cannot
+  distinguish swept-everything / hit-the-cap / short-paged / never-told-the-total — and it is
+  the grant app that already depends on `grants-common`. Build THAT, not the lift.

@@ -4,9 +4,9 @@ type: perfect/context
 group: Event Pipeline
 category: lib
 opportunity: 7
-last_proposed: 2026-08-04
+last_proposed: 2026-08-14
 cooldown_until: 2026-08 +2 rounds
-directions: ["[[per-dataset-trigger-hops]]", "[[trigger-decision-ledger]]", "[[ingress-replay-defense]]", "[[trigger-hot-path]]", "[[activate-wasm-hooks]]", "[[pumper-smoke-harness]]"]
+directions: ["[[trigger-scope-is-host-owned]]", "[[per-dataset-trigger-hops]]", "[[trigger-decision-ledger]]", "[[ingress-replay-defense]]", "[[trigger-hot-path]]", "[[activate-wasm-hooks]]", "[[pumper-smoke-harness]]"]
 ---
 
 ## Current state (scouted 2026-08-04, HEAD 49ca08c)
@@ -76,3 +76,12 @@ ingress handler gates, real-WASM-host hooks, dedup-race branch.
 - [[activate-wasm-hooks]] → `8adfc91` — plugins built+installed via just plugins-install;
   real-host e2e; plugin_missing loud.
 - [[pumper-smoke-harness]] → `c4f3766` — just smoke; 11/11 live on final master.
+- 2026-08-14 (r23): [[trigger-scope-is-host-owned]] -> `fd88138` — a transform plugin
+  could rescope the target job's **WORK**, not just its payload, in both directions. The
+  documented example config (`keep: ["dataset","count"]` + `target_app: extractor`) dropped
+  `_trigger.keys`, and the extractor's fallback is "every live record up to 10,000" — so
+  the config the docs told operators to write turned a 3-record incremental extract into a
+  full sweep. `PROVENANCE_KEYS` -> `HOST_OWNED_KEYS` with two classes (lineage + work
+  scope); the pre-existing host truncation is now declared via `keys_truncated` instead of
+  silently losing record #(cap+1). First test anywhere to assert the **enqueued job's**
+  `params._trigger`, not the hook verdict. Follow-up banked: [[targets-read-keys-truncated]].

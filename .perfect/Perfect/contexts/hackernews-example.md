@@ -6,7 +6,7 @@ category: lib
 opportunity: 2
 last_proposed: 2026-08-14
 cooldown_until: —
-directions: ["[[hackernews-snapshot-extent-is-honest]]"]
+directions: ["[[hackernews-snapshot-floor]]", "[[hackernews-snapshot-extent-is-honest]]"]
 ---
 
 ## Current state
@@ -50,3 +50,11 @@ wrong about the *state*. Findings:
 
 ## Shipped
 - (none on this map)
+- 2026-08-14 (r23): [[hackernews-snapshot-floor]] — **new, surfaced by a scout while REFUTING a
+  different claim.** `hackernews/src/lib.rs:123` is the last full-snapshot `sync_many` in the
+  fleet with no completeness floor (only an all-or-nothing empty check at `:99-106`), so HN
+  markup drift that halves the parsed rows tombstones the complement, green. Every sibling that
+  can tombstone now has one: smlouvy `PARSE_FLOOR` (r22), trades `COVERAGE_FLOOR` (r21), cordis
+  `rollup_is_complete`, peer `tombstones_would_empty_the_mirror`. Not slated — reach is one
+  example app, and it lost the cap to six directions with larger blast radius. `S`, because the
+  pattern is shipped twice already and this is its third application.

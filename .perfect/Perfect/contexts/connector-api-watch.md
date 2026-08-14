@@ -6,7 +6,7 @@ category: lib
 opportunity: 4
 last_proposed: 2026-08-14
 cooldown_until: —
-directions: ["[[connector-watch-failures-are-not-success]]"]
+directions: ["[[connector-watch-blank-predicate]]", "[[connector-watch-failures-are-not-success]]"]
 ---
 
 ## Current state
@@ -48,3 +48,11 @@ w1; this connector variant unswept). Likely shares seams with page-monitor.
 
 ## Shipped
 - (none on this map)
+- 2026-08-14 (r23): [[connector-watch-blank-predicate]] — **REFUTED on both halves.** r22
+  banked "a third copy of `extracted_nothing`, one-line change to the core function". There is
+  no third *copy* — `readable` and `watch` both import the core fn; connector-api-watch has an
+  inline `markdown.trim().is_empty()` (`:260`), and `grep extracted_nothing` in that crate
+  returns 0 hits. And the core fn needs **no change at all**; the work is two lines in the app.
+  Below the bar (zero behavior change, zero user-visible symptom) — worth doing only as a rider
+  on other work in that file. Note the handling divergence is deliberate and must be preserved:
+  readable/watch fail the job, connector-api-watch skips one connector and continues.
