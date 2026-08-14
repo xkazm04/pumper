@@ -107,7 +107,16 @@ pub(crate) fn client_facing(e: &pumper_core::Error) -> (StatusCode, String) {
         // between stored state and what was asked of it, not a missing route.
         E::ReplayMiss(_) => (StatusCode::CONFLICT, REPLAY_MISS_MESSAGE.into()),
         // Somebody else's failure, reported as such rather than as ours.
-        E::Http(_) | E::Browser(_) | E::Claude { .. } => {
+        //
+        // `SourceDrift` belongs here for exactly that reason: an upstream source
+        // renamed a field or changed its envelope, and the refusal to write is
+        // this server working correctly. Grouping it with `App`/`Storage`/`Io`
+        // below would have said the opposite — "our bug" — about the one class
+        // of failure that is definitionally not ours. It reaches this boundary
+        // rarely (it is raised inside an app's `run()`, so its home is the job
+        // row), which is precisely why the mapping was free to make honest: no
+        // route runs an app synchronously today, so nothing observable changed.
+        E::Http(_) | E::Browser(_) | E::Claude { .. } | E::SourceDrift(_) => {
             (StatusCode::BAD_GATEWAY, UPSTREAM_MESSAGE.into())
         }
         // Deliberately NOT a 502: a WASM plugin runs *inside this process*, so
@@ -121,19 +130,10 @@ pub(crate) fn client_facing(e: &pumper_core::Error) -> (StatusCode, String) {
         E::Plugin { .. } => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_MESSAGE.into()),
         // Genuinely unexpected here. Listed one by one rather than caught by a
         // wildcard so a new core variant has to be given a home on purpose.
-        // `SourceDrift` sits here **deliberately, and provisionally**: every one
-        // of its eight producers was an `E::App` until it was retyped, so putting
-        // it in this bucket leaves the HTTP surface byte-for-byte unchanged. It
-        // is also the variant least likely to reach an HTTP boundary at all — it
-        // is raised inside an app's `run()`, which the worker executes, so its
-        // home is the job row. Whether it should instead join the upstream-fault
-        // group above (502, "somebody else's failure") is a live question, but
-        // one that can be settled without any regression risk from here.
         E::Storage(_)
         | E::Parse(_)
         | E::Config(_)
         | E::App(_)
-        | E::SourceDrift(_)
         | E::Io(_)
         | E::Json(_)
         | E::Other(_) => (StatusCode::INTERNAL_SERVER_ERROR, INTERNAL_MESSAGE.into()),
@@ -705,6 +705,33 @@ mod contract_tests {
             assert_eq!(msg, INTERNAL_MESSAGE);
             assert!(!msg.contains("/srv/"), "trap detail leaked: {msg:?}");
         }
+    }
+
+    /// The attribution question the r23 wave had to settle, pinned so it is not
+    /// silently re-decided: schema drift is **upstream's** failure, not ours.
+    ///
+    /// The eight producers were `Error::App` until they were retyped, so the lazy
+    /// move was to leave `SourceDrift` in the 500 bucket beside `App` and change
+    /// nothing. That would have kept saying "our bug" about the one class of
+    /// failure that is definitionally not — the source renamed a field, and this
+    /// server refusing to write a corrupt corpus is it working correctly. The
+    /// mapping was free to make honest precisely because no route runs an app
+    /// synchronously, so nothing observable moved.
+    #[test]
+    fn source_drift_is_an_upstream_fault_not_an_internal_error() {
+        let (status, msg) =
+            client_facing(&pumper_core::Error::SourceDrift("hitCount vanished".into()));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+        assert_ne!(
+            status,
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a source changing its schema is not this server's bug"
+        );
+        assert_eq!(msg, UPSTREAM_MESSAGE);
+        assert!(
+            !msg.contains("hitCount"),
+            "the upstream field name is server-side detail: {msg:?}"
+        );
     }
 
     /// A reasoned NON-mapping, pinned so nobody "fixes" it later: a
