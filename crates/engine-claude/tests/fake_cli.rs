@@ -707,13 +707,7 @@ async fn timeout_kills_the_whole_process_tree_not_just_the_shim() {
         .prefix("pumper-fakecli-tree-")
         .tempdir()
         .expect("temp dir");
-    let marker = dir.path().join(&marker_name);
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
-    std::fs::copy(
-        Path::new(&system_root).join("System32").join("ping.exe"),
-        &marker,
-    )
-    .expect("copy the marker exe");
+    let marker = marker_exe(dir.path(), &marker_name);
 
     // One backgrounded grandchild (the orphan the old code leaked) plus one
     // foreground child that keeps the shim alive past the deadline.
@@ -743,5 +737,80 @@ async fn timeout_kills_the_whole_process_tree_not_just_the_shim() {
         msg.contains("process tree killed"),
         "the error must name what was done to the tree, so an operator can tell \
          this from the old orphan behaviour: {msg}"
+    );
+}
+
+/// Copies `ping.exe` under a unique image name, so a test can find *its own*
+/// long-lived process by name without racing on pids.
+#[cfg(windows)]
+fn marker_exe(dir: &Path, name: &str) -> PathBuf {
+    let marker = dir.join(name);
+    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".into());
+    std::fs::copy(
+        Path::new(&system_root).join("System32").join("ping.exe"),
+        &marker,
+    )
+    .expect("copy the marker exe");
+    marker
+}
+
+/// THE bug this direction exists for, and the one no test anywhere reached: a
+/// cancelled job does not time out — its future is simply **dropped**.
+/// `crates/server/src/worker.rs` races the app future against the cancel token
+/// and `break`s out of its `select!` without polling the run again, so every
+/// path the engine defended (timeout, wait error, drain timeout) is skipped and
+/// the future's `Drop` is all that runs. `kill_on_drop` alone kills the `cmd.exe`
+/// shim; the `claude`/node grandchild behind it — the process holding the API
+/// key — was re-parented and kept running its whole agentic loop. `DELETE
+/// /jobs/{id}` answered `cancelled`, the job row said `cancelled`, and the bill
+/// kept climbing.
+///
+/// The timeout is deliberately far longer than the test: if the deadline is what
+/// kills the tree, this test is not testing the drop.
+#[cfg(windows)]
+#[tokio::test]
+async fn dropping_the_run_kills_the_tree_not_only_the_shim() {
+    let marker_name = format!("pumper-dropped-{}.exe", std::process::id());
+    let _reaper = OrphanReaper(marker_name.clone());
+
+    let dir = tempfile::Builder::new()
+        .prefix("pumper-fakecli-drop-")
+        .tempdir()
+        .expect("temp dir");
+    let marker = marker_exe(dir.path(), &marker_name);
+
+    // Same shape as the timeout test: one backgrounded grandchild (the orphan
+    // that keeps spending) plus one foreground child holding the shim open.
+    let body = format!(
+        "start \"\" /B \"{m}\" -n 300 127.0.0.1 >nul 2>&1\r\n\"{m}\" -n 300 127.0.0.1 >nul 2>&1",
+        m = marker.display()
+    );
+    let cli = FakeCli::new("dropped", &body);
+    // 600s: an eternity next to this test, so nothing here can be the deadline
+    // path in disguise.
+    let engine = cli.engine(600);
+
+    let mut run = Box::pin(engine.research(ResearchRequest::new("hang")));
+    // Poll the future far enough to have spawned the CLI *and* its grandchild,
+    // racing it against the marker appearing — exactly the state a job is in
+    // when a cancel lands.
+    let started = tokio::select! {
+        _ = &mut run => false,
+        ok = poll_image(&marker_name, true, 50) => ok,
+    };
+    assert!(
+        started,
+        "the fake cli never started its child — the test would pass vacuously"
+    );
+
+    // THE MOMENT UNDER TEST. No timeout, no error path, no `?`: the future is
+    // dropped and never polled again, which is what the worker's `select!` does.
+    drop(run);
+
+    assert!(
+        poll_image(&marker_name, false, 50).await,
+        "{marker_name} survived the DROP of the research future — on the real CLI \
+         that is an agentic loop still running, and still spending, after the API \
+         answered `cancelled`"
     );
 }

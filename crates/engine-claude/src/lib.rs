@@ -15,7 +15,7 @@ use pumper_core::error::ClaudeFailure;
 use pumper_core::{Error, ResearchOutput, ResearchRequest, Researcher, Result};
 use serde_json::Value;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::process::{Child, Command};
+use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
 use tracing::{debug, info, warn};
 
 pub struct ClaudeEngine {
@@ -226,38 +226,25 @@ impl Researcher for ClaudeEngine {
         cmd.stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
-            // Backstop only. It kills the DIRECT child, which on the Windows
-            // shim path is `cmd.exe` and not the process that spends money —
-            // see `kill_process_tree`.
+            // Last-resort backstop, and NOT the cancellation path: it kills the
+            // DIRECT child, which on the Windows shim path is `cmd.exe` and not
+            // the process that spends money. `RunScope`'s `Drop` is what walks
+            // the tree — see `kill_process_tree`.
             .kill_on_drop(true);
 
         debug!(timeout_secs = timeout.as_secs(), "spawning claude cli");
-        let mut child = cmd.spawn().map_err(|e| {
+        let child = cmd.spawn().map_err(|e| {
             Error::claude(
                 ClaudeFailure::Spawn,
                 format!("failed to spawn '{}': {e}", self.cfg.binary),
             )
         })?;
-        // Captured BEFORE anything can reap the process: `Child::id` returns
-        // `None` once the child has been waited on, and the tree kill needs the
-        // shim's pid. The live `Child` handle is also what keeps Windows from
-        // recycling that pid — killing a *recycled* pid's tree would be far
-        // worse than the leak this fixes — so the kill must run while the handle
-        // is still held.
-        let pid = child.id();
-
-        let mut stdin = child
-            .stdin
-            .take()
-            .ok_or_else(|| Error::claude(ClaudeFailure::Spawn, "no stdin handle"))?;
-        let mut stdout_pipe = child
-            .stdout
-            .take()
-            .ok_or_else(|| Error::claude(ClaudeFailure::Spawn, "no stdout handle"))?;
-        let mut stderr_pipe = child
-            .stderr
-            .take()
-            .ok_or_else(|| Error::claude(ClaudeFailure::Spawn, "no stderr handle"))?;
+        // From here the run belongs to ONE scope whose `Drop` is the only
+        // cleanup that runs unconditionally — including on the ordinary
+        // cancellation path, where this future is dropped and not one line below
+        // ever executes again. See `RunScope`.
+        let mut scope = RunScope::new(child);
+        let (mut stdin, mut stdout_pipe, mut stderr_pipe) = scope.take_pipes()?;
 
         let prompt = req.prompt.clone();
         let writer = tokio::spawn(async move {
@@ -280,38 +267,40 @@ impl Researcher for ClaudeEngine {
             let _ = stderr_pipe.read_to_end(&mut buf).await;
             buf
         });
-        let side = [
-            writer.abort_handle(),
-            stdout_task.abort_handle(),
-            stderr_task.abort_handle(),
-        ];
+        // Handed to the scope as abort handles rather than kept as
+        // `JoinHandle`s: dropping a `JoinHandle` **detaches** its task instead of
+        // aborting it, so on the cancellation path all three outlived the run
+        // that owned them — the stdin writer parked forever on a pipe nobody
+        // would ever read again.
+        scope.watch(writer.abort_handle());
+        scope.watch(stdout_task.abort_handle());
+        scope.watch(stderr_task.abort_handle());
 
         // ONE deadline governs the whole run — the wait AND the drain — so an
         // orphan holding the stdout pipe open cannot park this call past the
         // caller's timeout after the CLI itself is gone.
         let deadline = tokio::time::Instant::now() + timeout;
-        let status = match tokio::time::timeout_at(deadline, child.wait()).await {
+        // Bound in its own statement, not inlined as the `match` scrutinee: a
+        // match keeps its scrutinee's temporaries alive for the whole match, and
+        // the arms need `scope` free in order to abandon the run.
+        let waited = tokio::time::timeout_at(deadline, scope.wait()).await;
+        let status = match waited {
             Ok(Ok(status)) => status,
-            Ok(Err(e)) => {
-                return Err(abandon_run(&mut child, pid, &side, format!("cli failed: {e}")).await)
-            }
+            Ok(Err(e)) => return Err(scope.abandon(format!("cli failed: {e}")).await),
             Err(_) => {
-                return Err(abandon_run(
-                    &mut child,
-                    pid,
-                    &side,
-                    format!(
+                return Err(scope
+                    .abandon(format!(
                         "timed out after {}s waiting for the cli to exit",
                         timeout.as_secs()
-                    ),
-                )
-                .await)
+                    ))
+                    .await)
             }
         };
         // The child is gone, so the writer's pipe is closed and the task is
         // finished or about to be — this cannot hang.
         let _ = writer.await;
-        let stdout_bytes = match tokio::time::timeout_at(deadline, stdout_task).await {
+        let drained = tokio::time::timeout_at(deadline, stdout_task).await;
+        let stdout_bytes = match drained {
             Ok(Ok(buf)) => buf,
             Ok(Err(e)) => {
                 return Err(Error::claude(
@@ -320,17 +309,13 @@ impl Researcher for ClaudeEngine {
                 ))
             }
             Err(_) => {
-                return Err(abandon_run(
-                    &mut child,
-                    pid,
-                    &side,
-                    format!(
+                return Err(scope
+                    .abandon(format!(
                         "timed out after {}s draining cli stdout — a spawned process is still \
                          holding the pipe open",
                         timeout.as_secs()
-                    ),
-                )
-                .await)
+                    ))
+                    .await)
             }
         };
         // stderr only decorates an error message; never fail the run over it.
@@ -338,6 +323,11 @@ impl Researcher for ClaudeEngine {
             Ok(Ok(buf)) => buf,
             _ => Vec::new(),
         };
+        // The CLI exited AND its stdout reached EOF — nothing is left holding the
+        // write end of that pipe, so the tree is provably gone. Disarming here is
+        // what keeps the success path free: every `return` below goes through the
+        // same `Drop`, and a healthy run must not pay for a `taskkill`.
+        scope.release();
 
         let stdout = String::from_utf8_lossy(&stdout_bytes);
         // A non-zero exit does NOT mean stdout is worthless: the CLI routinely
@@ -399,27 +389,189 @@ impl Researcher for ClaudeEngine {
     }
 }
 
-/// Ends a run that will not be waited on: aborts the side tasks, kills the whole
-/// process tree, and mints the error that says so.
+/// Everything one `claude` run owns and must not outlive: the child process
+/// whose tree spends money, the pid that tree kill needs, and the three tasks
+/// servicing its pipes.
 ///
-/// The stdin writer is aborted rather than left behind: it is parked on
-/// `write_all` into a pipe nobody will ever read again, and dropping the future
-/// (the old behaviour) never even reached the `writer.await` below it — `?`
-/// returned first, so the task leaked for the life of the process.
-async fn abandon_run(
-    child: &mut Child,
+/// **The anti-pattern this exists for.** Cleanup used to live on the engine's
+/// *own* failure paths only — the wait error, the wall-clock timeout, the drain
+/// timeout each reached `abandon_run`. The ordinary cancellation shape reaches
+/// none of them. `crates/server/src/worker.rs` races the app future against
+/// `DELETE /jobs/{id}` and the shutdown signal and `break`s out of its `select!`,
+/// which **drops** the research future; a dropped future runs no cleanup path at
+/// all. All that remained was `kill_on_drop`, which is `TerminateProcess` on the
+/// DIRECT child — and on the default Windows config (`binary = "claude"`, an npm
+/// shim) the direct child is `cmd.exe`, not the `claude`/node grandchild holding
+/// the API key. So `DELETE /jobs/{id}` answered `cancelled`, the job row said
+/// `cancelled`, and the agentic loop kept running and kept spending. Dropping a
+/// `JoinHandle` likewise *detaches* its task rather than aborting it, so all
+/// three side tasks leaked with every cancel too.
+///
+/// Cleanup therefore lives on **no** path: it lives in `Drop`. Modelled directly
+/// on `RenderScope` in `engine-browser`, which fixed the identical shape for
+/// Chrome tabs — the difference is that Chrome is a real `.exe`, so
+/// `kill_on_drop` sufficed there and cannot suffice here.
+struct RunScope {
+    /// `None` once the run has been released or abandoned — the kill-exactly-once
+    /// latch. `Option::take` is the whole double-kill guard: [`Self::release`] on
+    /// the success path and [`Self::abandon`] on the engine's own failure paths
+    /// each disarm the `Drop`, so a healthy run pays for no `taskkill` at all.
+    child: Option<Child>,
+    /// Captured at construction, BEFORE anything can reap the process:
+    /// `Child::id` returns `None` once the child has been waited on, and the tree
+    /// kill needs the shim's pid. The live `Child` handle is also what keeps
+    /// Windows from recycling that pid — killing a *recycled* pid's tree would be
+    /// far worse than the leak this fixes — so every kill path runs while the
+    /// handle is still held, including the detached one in `Drop`.
     pid: Option<u32>,
-    side: &[tokio::task::AbortHandle],
-    why: String,
-) -> Error {
-    for task in side {
-        task.abort();
+    /// Abort handles, never `JoinHandle`s: see the type doc.
+    tasks: Vec<tokio::task::AbortHandle>,
+}
+
+impl RunScope {
+    fn new(child: Child) -> Self {
+        let pid = child.id();
+        Self {
+            child: Some(child),
+            pid,
+            tasks: Vec::new(),
+        }
     }
-    let outcome = kill_process_tree(child, pid).await;
-    // Unreported by construction: a killed run produces no envelope, so what it
-    // spent is unknowable here. The chokepoint still records THAT it happened
-    // (`unmetered_timeout`) rather than leaving the ledger silent.
-    Error::claude(ClaudeFailure::Timeout, format!("{why}; {outcome}"))
+
+    /// Takes the three piped handles. Called once, immediately after
+    /// construction, which is why the child is necessarily still held.
+    fn take_pipes(&mut self) -> Result<(ChildStdin, ChildStdout, ChildStderr)> {
+        let missing = |what: &str| Error::claude(ClaudeFailure::Spawn, format!("no {what} handle"));
+        let child = self.child.as_mut().ok_or_else(|| missing("child"))?;
+        let stdin = child.stdin.take().ok_or_else(|| missing("stdin"))?;
+        let stdout = child.stdout.take().ok_or_else(|| missing("stdout"))?;
+        let stderr = child.stderr.take().ok_or_else(|| missing("stderr"))?;
+        Ok((stdin, stdout, stderr))
+    }
+
+    /// Binds a spawned task's life to this run.
+    fn watch(&mut self, task: tokio::task::AbortHandle) {
+        self.tasks.push(task);
+    }
+
+    /// Unconditional and **runtime-free** — aborting needs no executor, so no
+    /// shutdown state can stop it.
+    fn abort_tasks(&mut self) {
+        for task in self.tasks.drain(..) {
+            task.abort();
+        }
+    }
+
+    /// Waits for the direct child. Called once, before any release/abandon, so
+    /// the child is necessarily still held.
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        self.child
+            .as_mut()
+            .expect("the run is waited on exactly once, before it can be released")
+            .wait()
+            .await
+    }
+
+    /// The success path's explicit disarm: the CLI exited and its pipes reached
+    /// EOF, so there is no tree left to kill and the subsequent `Drop` must find
+    /// nothing to do. Idempotent.
+    fn release(&mut self) {
+        self.abort_tasks();
+        self.child = None;
+    }
+
+    /// Ends a run that will not be waited on: aborts the side tasks, kills the
+    /// whole process tree, and mints the error that says so. Disarms the `Drop`,
+    /// so the tree is killed exactly once.
+    ///
+    /// The stdin writer is aborted rather than left behind: it is parked on
+    /// `write_all` into a pipe nobody will ever read again, and dropping the
+    /// future (the old behaviour) never even reached the `writer.await` below it
+    /// — `?` returned first, so the task leaked for the life of the process.
+    async fn abandon(&mut self, why: String) -> Error {
+        self.abort_tasks();
+        let pid = self.pid;
+        let outcome = match self.child.as_mut() {
+            Some(child) => kill_process_tree(child, pid).await,
+            None => "already ended".to_string(),
+        };
+        self.child = None;
+        // Unreported by construction: a killed run produces no envelope, so what
+        // it spent is unknowable here. The chokepoint still records THAT it
+        // happened (`unmetered_timeout`) rather than leaving the ledger silent.
+        Error::claude(ClaudeFailure::Timeout, format!("{why}; {outcome}"))
+    }
+}
+
+impl Drop for RunScope {
+    fn drop(&mut self) {
+        // First, and without needing a runtime: no side task outlives its run,
+        // ever. This is the half `kill_on_drop` never covered at all.
+        self.abort_tasks();
+        let Some(mut child) = self.child.take() else {
+            return; // released on the success path, or already abandoned
+        };
+        let pid = self.pid;
+        if pid.and_then(tree_kill_argv).is_none() {
+            // POSIX: there is no shim, so the direct child IS the CLI and
+            // `kill_on_drop` — armed at spawn, firing as `child` drops right
+            // here — is the whole kill.
+            return;
+        }
+        // `Drop` cannot `.await` and the tree kill is a subprocess, so it is
+        // handed to a detached task. `child` moves in WITH it, because the live
+        // `Child` handle is what reserves the pid for the length of the kill.
+        //
+        // FAILURE MODES, stated because they are real and asymmetric:
+        //
+        // - **No runtime at all** (`try_current` errors): handled below by
+        //   running the same `taskkill` synchronously on the dropping thread.
+        //   That blocks for the length of one `taskkill` (~tens of ms), which is
+        //   the cheap side of the trade against an agentic loop still spending.
+        // - **A runtime that is already shutting down**: `spawn` succeeds but the
+        //   task may never be polled. Then `child` drops inside the unpolled
+        //   task and `kill_on_drop` terminates the shim only — the residual gap,
+        //   and the reason the fallback below is not the only mechanism. It is
+        //   narrow: the worker drops this future and keeps running (it still has
+        //   a job row to write), so the runtime outlives the drop on every
+        //   `DELETE /jobs/{id}` and on the shutdown-suspend path alike.
+        match tokio::runtime::Handle::try_current() {
+            Ok(handle) => {
+                handle.spawn(async move {
+                    let outcome = kill_process_tree(&mut child, pid).await;
+                    warn!(?pid, "claude run dropped mid-flight: {outcome}");
+                });
+            }
+            Err(_) => {
+                warn!(
+                    ?pid,
+                    "claude run dropped outside a tokio runtime; killing its process tree \
+                     synchronously"
+                );
+                blocking_tree_kill(pid);
+                let _ = child.start_kill();
+            }
+        }
+    }
+}
+
+/// The no-runtime fallback for [`RunScope`]'s `Drop`: the same `taskkill`, run on
+/// the dropping thread because there is no executor to hand it to. Separated so
+/// the fallback is a named thing that can be reasoned about, rather than an
+/// `else` branch that quietly does nothing.
+fn blocking_tree_kill(pid: Option<u32>) {
+    let Some((program, args)) = pid.and_then(tree_kill_argv) else {
+        return;
+    };
+    let killed = std::process::Command::new(program)
+        .args(&args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    if let Err(e) = killed {
+        warn!(?pid, "process tree kill failed: {e}");
+    }
 }
 
 /// Kills the child **and everything it spawned**, returning what was done for
@@ -708,11 +860,12 @@ fn truncate(s: &str, max_chars: usize) -> String {
 mod tests {
     use super::{
         check_shim_argv, envelope_text, is_plain_model_id, parse_loose_json, tree_kill_argv,
-        unknown_role_message, ClaudeEngine, ShimRefusal, MAX_SHIM_COMMAND_LINE,
+        unknown_role_message, ClaudeEngine, RunScope, ShimRefusal, MAX_SHIM_COMMAND_LINE,
     };
     use pumper_core::config::{ClaudeConfig, ClaudeRole};
     use pumper_core::ResearchRequest;
     use serde_json::json;
+    use std::time::Duration;
 
     fn argv(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|s| s.to_string()).collect()
@@ -983,6 +1136,65 @@ mod tests {
     #[test]
     fn posix_needs_no_tree_walk_because_there_is_no_shim() {
         assert!(tree_kill_argv(4242).is_none());
+    }
+
+    /// THE other half of the cancellation leak, and the half that needs no
+    /// subprocess to demonstrate: dropping a `JoinHandle` **detaches** its task
+    /// instead of aborting it. The engine spawns three — the stdin writer plus
+    /// both pipe drains — and held them as `JoinHandle`s, so every cancelled run
+    /// left the writer parked on `write_all` into a pipe nobody would ever read
+    /// again, for the life of the server process.
+    ///
+    /// The scope is built with no child on purpose: this asserts the abort is
+    /// *unconditional*, i.e. that it happens before (and independently of) any
+    /// decision about killing a process tree, and that it needs nothing from the
+    /// runtime beyond being able to run.
+    #[tokio::test]
+    async fn a_dropped_scope_aborts_its_tasks_instead_of_detaching_them() {
+        struct SignalOnDrop(tokio::sync::mpsc::UnboundedSender<()>);
+        impl Drop for SignalOnDrop {
+            fn drop(&mut self) {
+                let _ = self.0.send(());
+            }
+        }
+
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let mut scope = RunScope {
+                child: None,
+                pid: None,
+                tasks: Vec::new(),
+            };
+            for _ in 0..3 {
+                let signal = SignalOnDrop(tx.clone());
+                let task = tokio::spawn(async move {
+                    let _signal = signal;
+                    loop {
+                        tokio::time::sleep(Duration::from_secs(3600)).await;
+                    }
+                });
+                scope.watch(task.abort_handle());
+            }
+            // Let all three actually park, which is the state a real run is in
+            // when the worker's `select!` fires.
+            tokio::task::yield_now().await;
+            // Nothing is released explicitly: this models the worker dropping
+            // the pinned future mid-run.
+        }
+        drop(tx);
+
+        // An aborted task unparks and drops its locals; a *detached* one never
+        // would, so this channel would stay open forever.
+        let mut signals = 0usize;
+        while let Ok(Some(())) = tokio::time::timeout(Duration::from_secs(5), rx.recv()).await {
+            signals += 1;
+        }
+        assert_eq!(
+            signals,
+            3,
+            "a dropped run left {} of its 3 side tasks detached and running",
+            3 - signals
+        );
     }
 
     #[test]
