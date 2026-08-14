@@ -18,7 +18,7 @@ Axum server (default port 8088, `[server]` config). **Local power mode: no auth*
 | 422 | `unprocessable` | understood and deliberately refused (e.g. a transact flow this slice will not run) |
 | 429 | `rate_limited` | per-source ingress rate limit — back off and re-send |
 | 500 | `internal` | an unexpected failure in this service |
-| 502 | `bad_gateway` | an upstream/engine failure (HTTP, browser, Claude) |
+| 502 | `bad_gateway` | an upstream/engine failure (HTTP, browser, Claude) — **and schema drift** (`Error::SourceDrift`): a source whose response no longer parses is somebody else's failure, so the pre-write refusal that protects the corpus is reported as one rather than as an internal error. See [runtime.md](runtime.md) for why it is also *terminal* for the job |
 | 503 | `unavailable` | the subsystem is switched off in config — e.g. the five source-health routes with `[resilience] enabled = false` |
 
 **5xx bodies are deliberately generic** (`internal error`, `upstream engine failure`) and do not vary with the cause: raw SQLite/sqlx text, filesystem paths under the data dir, and upstream URLs used to reach the client verbatim. That detail is logged server-side at `error` (and reaches Sentry when configured) against the same status — branch on `code`, read the server log for the cause. The two 4xx cases whose messages are built from server-side paths (`profile`, replay-miss) are likewise fixed strings that name the *parameter* at fault rather than the path.
