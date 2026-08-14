@@ -3,10 +3,10 @@ slug: trigger-gate-honest-across-source-kinds
 type: perfect/direction
 context: "[[wasm-plugin-examples]]"
 lens: robustness
-status: rejected
+status: accepted
 size: S
 proposed: 2026-08-14
-accepted: —
+accepted: 2026-08-14
 shipped: —
 commit: —
 ---
@@ -58,7 +58,7 @@ edge is dead permanently while every surface reports it working normally.
 - **Risk:** flipping the default changes behavior for anyone relying on the current veto. Nobody
   can be — a permanently-dead edge is not a configuration.
 
-## Why REJECTED this round
+## Why it was rejected in r22 (history — superseded by the r23 acceptance above)
 
 Real and confirmed by the scout against both sides of the seam — **rejected on the 6-direction cap**,
 and structurally: criterion 3 is **unassertable** until
@@ -68,3 +68,33 @@ enabler-blocks-the-fix relationship this round finally paid off for the checkpoi
 
 Banked for r23 as the junior half of that pair. Do not build it without the harness — shipping a fix
 whose regression test cannot exist is exactly what r20's gate refused.
+
+## r23 RE-VERIFICATION (Director, 2026-08-14) — CONFIRMED, every link including the crux
+
+Re-scouted against HEAD `caf5e61`; both plugin sources last touched `12401e0`, `triggers.rs`
+`10fa27d`. The crux was verified by **reading all three envelope constructors**, not by assuming:
+
+| builder | line | `count`? | `dataset`? |
+|---|---|---|---|
+| `dataset_trigger_obj` | `triggers.rs:116-127` | **YES** (`:122` `revs.len()`) | **YES** (`:120`) |
+| `terminal_trigger_obj` (job) | `:145-154` | **NO** | **NO** |
+| `external_trigger_obj` | `:586-595` | **NO** | **NO** |
+
+The job envelope's only numeric content is nested under `result_summary` (`:139-144`), not at the
+top level where `delta.get("count")` looks; the external envelope's is entirely under `payload`
+(`:592`). Neither is reachable. Adding `params.dataset` makes it **worse** — `dataset_ok` also goes
+false since the key is absent.
+
+Confirmed the fail-open net structurally cannot engage here: `predicate_fail_default` is computed at
+`:356` but only consulted inside the `if let Some((outcome, why))` block at `:385`, and the
+`Some(false)` arm returns at `:369` first.
+
+**New evidence:** the gap is structurally untested — the shipped-plugin test
+(`e2e/trigger_plugins.rs:646-676`) exercises `trigger-gate` only against the dataset envelope; its
+fixture `delta()` (`:128-139`) hardcodes `source_kind: "dataset"`, `count: 3`, `dataset: "grants"`.
+
+**The sharpest framing, worth putting in the commit message:** the repo already has the *inverse*
+test — `triggers.rs:1937-1971`, `a_crashed_predicate_is_not_recorded_as_a_veto`, asserting *"a
+crashed sandbox must never read as a gate decision."* r22 worked hard to stop crashes masquerading
+as vetoes. This is the remaining case of a **veto masquerading as a decision** — same class of
+dishonesty, opposite direction.
