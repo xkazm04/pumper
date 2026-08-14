@@ -568,6 +568,27 @@ try {
                 Add-Result -Name 'POST /watches app=grants (virtual namespace) -> 201' -Status 'FAIL' `
                     -Detail $_.Exception.Message
             }
+            # Round 21: `trades` is the second virtual namespace. Before it was
+            # added to registry::VIRTUAL_NAMESPACES this returned 400 — no app is
+            # called `trades`, and on a fresh store (which this smoke run is) the
+            # namespace holds no records either, so neither of the other two
+            # sources `namespace_index` unions could vouch for it. The five trades
+            # apps rebuild `trades/operator_economics` on every run, so the one
+            # dataset a consumer would actually watch was unwatchable.
+            try {
+                $resp = Invoke-WebRequest -Method Post -Uri "$baseUrl/watches" `
+                    -Body (@{ app = 'trades'; sink = 'file' } | ConvertTo-Json) `
+                    -ContentType 'application/json' -UseBasicParsing -TimeoutSec 10
+                if ($resp.StatusCode -eq 201) {
+                    Add-Result -Name 'POST /watches app=trades (virtual namespace) -> 201' -Status 'PASS'
+                } else {
+                    Add-Result -Name 'POST /watches app=trades (virtual namespace) -> 201' -Status 'FAIL' `
+                        -Detail "expected 201, got HTTP $($resp.StatusCode)"
+                }
+            } catch {
+                Add-Result -Name 'POST /watches app=trades (virtual namespace) -> 201' -Status 'FAIL' `
+                    -Detail $_.Exception.Message
+            }
             # A bogus ?app= filter is a 400 with the known values, not an empty 200.
             try {
                 $resp = Invoke-WebRequest -Uri "$baseUrl/watches?app=definitely-not-an-app" `
