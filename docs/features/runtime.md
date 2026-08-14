@@ -56,7 +56,16 @@ A long-running app persists its **resumable unit** through `AppContext::checkpoi
 | `false` | **stale attempt lineage** — the job was reset, reaped or re-claimed mid-run, so a newer attempt owns the row (`Storage::save_checkpoint`'s `… AND attempts = ?` fence) | this task's state is stale and must never overwrite the live attempt's. Another attempt owns this job |
 | `false` | **storage error** — a locked DB, a full disk, or a blob over `MAX_CHECKPOINT_BYTES` (8 MiB) | this run's durability is gone until it clears: a reap or restart resumes it from nothing |
 
-A failed save **never fails the job** — losing persistence must not take down work that otherwise succeeded. The `false` exists so a run can *count* it.
+A failed save **never fails the job** — losing persistence must not take down work that otherwise succeeded.
+
+**Where a dropped checkpoint shows up.** The sink counts its own failed saves, by kind, and reports them on two surfaces (no schema migration, no app-side change — every app's `ctx.checkpoint(..)` call site is untouched):
+
+- **`checkpoint_failed` job events**, emitted the **first** time each kind occurs, on `/events` and `/jobs/{id}/stream` (`{reason: "stale_lineage" | "storage_error", attempt}`). Non-terminal, like `progress`, so the per-job stream stays open. Only the first of each kind is announced: a run whose lineage went stale fails *every* later save, and one event per save would flood the bus with the same fact.
+- **`checkpoint_failures` on the stored result** of a succeeded job — `{stale_lineage, storage_error, total}` — so the loss outlives the run and rides `GET /jobs/{id}`, `GET /jobs/{id}/receipt` and the terminal SSE event. The live progress snapshot could not carry this: `finalize` clears it.
+
+The block is **absent when every save landed** (no fabricated zeros — its presence is the signal), and a throttle-skip never contributes to it. Before this, both `false` paths were a `tracing::warn!` and nothing else: a long harvest whose checkpoints stopped landing at minute 3 resumed from nothing on its next reap or restart and redid hours of governor-paced fetching, while `GET /jobs/{id}` looked healthy the entire time.
+
+**Known gaps.** Apps do not yet *react* to a failed save (none of the 11 call sites reads the `bool`) — the failure is observable, not acted on. And a run that never reaches a stored result (failed, timed out, or shutdown-suspended) carries its tally only on the live event and the log, since there is no result object to stamp; an app whose result is not a JSON object is logged for the same reason.
 
 **Testing the seam.** `pumper_core::testing::RecordingCheckpoints` (in the `test-support` harness) is a `CheckpointSink` that **records** every `(state, force)` pair instead of persisting it — `saves()`, `save_count()`, `last_state()` — and can be told to fail: `failing()` (every save) or `failing_from(n)` (the nth save on), which is the only way the `false` branch above is reachable from a test. Wire it with `TestContext::new(&storage, app).checkpoints(sink)`; the default is unchanged (`NoCheckpoints` — silently drops the state and reports `true`). A failed save is still *recorded*, because what an app tried to persist is the evidence of what the loss cost. This is what makes "the app checkpointed its work list **before** fetching the first item" an assertion instead of a comment.
 

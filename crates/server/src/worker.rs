@@ -670,6 +670,13 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             0.0
         }
     };
+    // Held past the run: the sink is the only place that knows a checkpoint did
+    // not land, and its tally has to outlive the app future to reach the stored
+    // result below.
+    let checkpointer = Arc::new(
+        crate::progress::JobCheckpointer::new(job.id, job.attempts, state.storage.clone())
+            .announcing(job.app.clone(), state.events.clone()),
+    );
     let ctx = AppContext {
         job_id: job.id,
         app: job.app.clone(),
@@ -689,11 +696,7 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         progress: state
             .progress
             .reporter(job.id, job.app.clone(), state.events.clone()),
-        checkpoints: Arc::new(crate::progress::JobCheckpointer::new(
-            job.id,
-            job.attempts,
-            state.storage.clone(),
-        )),
+        checkpoints: checkpointer.clone(),
         restored,
         vcr,
         artifacts_dir,
@@ -810,6 +813,18 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
                     replay_id,
                     cassette_unreadable,
                 ));
+            }
+            // Durability loss, on a surface that outlives the run: the live
+            // progress store is cleared at finalize, so a job whose checkpoints
+            // stopped landing at minute 3 would otherwise look perfectly healthy
+            // forever after. The stored result rides `GET /jobs/{id}`, the
+            // receipt and the terminal event for free.
+            if let Some(orphan) = carry_checkpoint_failures(&mut result, checkpointer.failures()) {
+                warn!(
+                    job = %job.id,
+                    "checkpoints did not land ({orphan}) and this app's result is not a JSON \
+                     object, so the count has nowhere to ride"
+                );
             }
             // Information economics (M04): parse the result's UpsertSummary-shaped
             // counts BEFORE `complete` consumes it. Recorded only if the
@@ -1789,6 +1804,34 @@ async fn materialize_saved_search(
     .await;
 }
 
+/// Carries a run's failed-checkpoint tally onto its **stored result** — the one
+/// surface that outlives the run without a migration (`jobs.result`, so it rides
+/// `GET /jobs/{id}`, the receipt, and the terminal SSE event). Same shape as the
+/// VCR replay stamp above it.
+///
+/// The anti-pattern it defends: a job that silently lost its durability. Every
+/// `false` from the checkpoint sink used to be a `warn!` and nothing else, so a
+/// harvest whose checkpoints stopped landing at minute 3 resumed from nothing
+/// on its next reap — while `GET /jobs/{id}` looked green the whole time.
+///
+/// Returns the block **only when it could not be carried**: an app whose result
+/// is not a JSON object has nowhere to put it, and dropping it silently there
+/// would be the same invisibility this closes, so the caller logs it instead.
+/// Nothing is stamped when every save landed — no fabricated zeros.
+fn carry_checkpoint_failures(
+    result: &mut Value,
+    failures: crate::progress::CheckpointFailures,
+) -> Option<Value> {
+    let block = crate::progress::checkpoint_failure_stamp(failures)?;
+    match result {
+        Value::Object(map) => {
+            map.insert(crate::progress::CHECKPOINT_FAILURES_KEY.into(), block);
+            None
+        }
+        _ => Some(block),
+    }
+}
+
 /// Emits the terminal event and fires the result webhook, if configured.
 async fn finalize(state: &AppState, id: uuid::Uuid) {
     finalize_with_stages(state, id, None).await;
@@ -2117,6 +2160,68 @@ mod cancel_kind_tests {
             "too late to cancel: this run is already being re-queued"
         );
         super::forget_cancel_intent(late);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_failure_stamp_tests {
+    use super::carry_checkpoint_failures;
+    use crate::progress::CheckpointFailures;
+    use serde_json::{json, Value};
+
+    /// The anti-pattern: a run that lost its durability and looked green
+    /// forever after, because the only trace was a `warn!` in a log nobody
+    /// tails and the live progress snapshot is cleared at finalize.
+    #[test]
+    fn a_lost_checkpoint_rides_the_stored_result_not_only_a_log_line() {
+        let mut result = json!({ "fetched": 12 });
+        assert!(carry_checkpoint_failures(
+            &mut result,
+            CheckpointFailures {
+                stale_lineage: 2,
+                storage_error: 1,
+            },
+        )
+        .is_none());
+        assert_eq!(
+            result,
+            json!({
+                "fetched": 12,
+                "checkpoint_failures": {
+                    "stale_lineage": 2, "storage_error": 1, "total": 3
+                }
+            }),
+            "the app's own result is untouched apart from the added block"
+        );
+    }
+
+    /// No fabricated zeros: a healthy run's result is byte-for-byte what the
+    /// app returned, so the presence of the block IS the signal.
+    #[test]
+    fn a_run_whose_saves_all_landed_carries_no_block_at_all() {
+        let mut result = json!({ "fetched": 12 });
+        assert!(carry_checkpoint_failures(&mut result, CheckpointFailures::default()).is_none());
+        assert_eq!(result, json!({ "fetched": 12 }));
+    }
+
+    /// An app may return an array or a scalar. There is nowhere to stamp, so
+    /// the block comes back to the caller to be logged rather than dropped.
+    #[test]
+    fn a_non_object_result_hands_the_block_back_instead_of_swallowing_it() {
+        let mut result = json!([1, 2, 3]);
+        let orphan = carry_checkpoint_failures(
+            &mut result,
+            CheckpointFailures {
+                stale_lineage: 0,
+                storage_error: 5,
+            },
+        )
+        .expect("handed back");
+        assert_eq!(orphan["storage_error"], json!(5));
+        assert_eq!(result, json!([1, 2, 3]));
+        // …and a non-object result with nothing to report stays quiet.
+        let mut result = Value::Null;
+        assert!(carry_checkpoint_failures(&mut result, CheckpointFailures::default()).is_none());
     }
 }
 
