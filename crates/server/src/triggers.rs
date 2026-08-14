@@ -90,8 +90,29 @@ pub fn merged_params(template: &Value, trigger_obj: Value) -> Value {
     Value::Object(obj)
 }
 
-/// The `_trigger` object for a dataset-change hop. Keys are capped at
-/// `cfg.key_cap`; `count` stays exact — targets fetch full data by key.
+/// The key list a dataset hop carries, and whether `cap` cut it short.
+///
+/// The anti-pattern this exists to name: `revs.iter().take(cap)` dropped record
+/// #(cap+1) and everything after it, and the resulting hop was
+/// indistinguishable from a complete one — `count` was exact, `keys` was short,
+/// and nothing said which of the two the target should believe. `keys` is a
+/// **work list** for `extractor`/`plugin` targets, so a truncation nobody
+/// declares is a silent partial run, not a smaller sample.
+pub fn capped_keys<'a>(revs: &[&'a Revision], cap: usize) -> (Vec<&'a str>, bool) {
+    let keys: Vec<&str> = revs.iter().take(cap).map(|r| r.key.as_str()).collect();
+    let truncated = revs.len() > keys.len();
+    (keys, truncated)
+}
+
+/// The `_trigger` object for a dataset-change hop. `count` stays exact; the key
+/// list is capped at `cfg.key_cap`, with `keys_truncated` declaring whether the
+/// cap bit — targets fetch full data by key.
+///
+/// `keys` is the target's **work scope**, not a sample of one: `crates/apps/
+/// extractor` and `crates/apps/plugin` both read `_trigger.keys` as the record
+/// list to process. That is why the truncation is stated rather than left to be
+/// inferred by comparing `keys.len()` against `count`, and why `keys` /
+/// `keys_truncated` are host-owned (see [`HOST_OWNED_KEYS`]).
 ///
 /// `app` is the namespace the CHANGED RECORDS live under, which is not always
 /// the source job's app: a `ca-grants` run's hop off `grants/unified` must tell
@@ -108,11 +129,7 @@ pub fn dataset_trigger_obj(
     chain: &[String],
     cfg: &TriggersConfig,
 ) -> Value {
-    let keys: Vec<&str> = revs
-        .iter()
-        .take(cfg.key_cap)
-        .map(|r| r.key.as_str())
-        .collect();
+    let (keys, keys_truncated) = capped_keys(revs, cfg.key_cap);
     json!({
         "trigger_id": trigger.id,
         "source_kind": "dataset",
@@ -121,6 +138,9 @@ pub fn dataset_trigger_obj(
         "kind": trigger.on_change.as_deref().unwrap_or("any"),
         "count": revs.len(),
         "keys": keys,
+        // Always present, so "did I get the whole delta?" is a field the target
+        // reads rather than an arithmetic guess it has to make.
+        "keys_truncated": keys_truncated,
         "source_job_id": source_job.id,
         "depth": depth,
         "chain": chain,
@@ -174,12 +194,32 @@ pub fn predicate_fail_default(on_error: Option<&str>) -> bool {
     on_error != Some("skip")
 }
 
-/// Provenance/identity keys the host owns on a `_trigger` object. A transform
-/// plugin may shape everything else, but these are re-stamped from the
-/// original after it runs — lineage (`depth`/`chain` cycle guards, delivery
-/// idempotency, the fired-runs view) must not be forgeable or losable from
-/// inside the sandbox.
-const PROVENANCE_KEYS: &[&str] = &[
+/// Keys the HOST owns on a `_trigger` object. A transform plugin may shape
+/// everything else, but these are re-stamped from the original after it runs.
+///
+/// Two classes, and the second one was the gap:
+///
+/// - **Lineage** — `trigger_id`, `source_kind`, `source_job_id`, `event_id`,
+///   `source_id`, `depth`, `chain`. The `depth`/`chain` cycle guards, delivery
+///   idempotency and the fired-runs view must not be forgeable or losable from
+///   inside the sandbox.
+/// - **Work scope** — `keys`, `keys_truncated`. The transform's output *is* the
+///   target job's `params._trigger`, and `crates/apps/extractor` and
+///   `crates/apps/plugin` both read `_trigger.keys` as the list of records to
+///   process. A transform could therefore rescope the target's WORK, not just
+///   its payload, in both directions: `delta-slim`'s `max_keys` (default 10,
+///   against a host `key_cap` of 200) turned a 200-key hop into a 10-record
+///   extract, and its `keep` mode — the configuration
+///   docs/features/trigger-plugins.md pairs with `"target_app": "extractor"` —
+///   dropped `keys` entirely, which makes the extractor's `.or_else(…)` yield
+///   `None` and fall through to "every live record, up to `SOURCE_LIST_LIMIT`
+///   (10,000)". A 3-record incremental extract became a full sweep.
+///
+/// Shrinking what a WEBHOOK carries is legitimate; shrinking what a JOB does is
+/// not. The throttle for the latter is `[triggers] key_cap`, which is the
+/// host's knob and stays the host's.
+const HOST_OWNED_KEYS: &[&str] = &[
+    // lineage
     "trigger_id",
     "source_kind",
     "source_job_id",
@@ -187,17 +227,56 @@ const PROVENANCE_KEYS: &[&str] = &[
     "source_id",
     "depth",
     "chain",
+    // work scope
+    "keys",
+    "keys_truncated",
 ];
 
+/// The work-scope subset of [`HOST_OWNED_KEYS`] — the keys whose DISAPPEARANCE
+/// is itself a rescoping, because absent `keys` is not "no opinion", it is the
+/// extractor's "sweep every live record" instruction.
+const WORK_SCOPE_KEYS: &[&str] = &["keys", "keys_truncated"];
+
+/// Which host-owned keys a transform's output would have changed, had the host
+/// not re-stamped them.
+///
+/// Extracted so the re-stamp is not silent: a plugin author who believes
+/// `max_keys` throttles a hop, and an operator reading logs, both deserve to
+/// find out the sandbox's proposal was overruled rather than diffing two JSON
+/// blobs to notice.
+///
+/// Dropping a LINEAGE key is not an override — shedding provenance is the
+/// normal shape of a keep-list transform, and the host simply puts it back
+/// (that is the documented contract). Dropping a WORK-SCOPE key is, because
+/// absence changes what the target does.
+pub fn host_owned_overrides(original: &Value, transformed: &Value) -> Vec<&'static str> {
+    let (Value::Object(orig), Value::Object(out)) = (original, transformed) else {
+        return Vec::new();
+    };
+    HOST_OWNED_KEYS
+        .iter()
+        .copied()
+        .filter(|k| match (orig.get(*k), out.get(*k)) {
+            // Proposed a different value for a key it does not own.
+            (Some(a), Some(b)) => a != b,
+            // Dropped it: only a rescoping when the key IS the scope.
+            (Some(_), None) => WORK_SCOPE_KEYS.contains(k),
+            // Conjured one the original never had.
+            (None, Some(_)) => true,
+            (None, None) => false,
+        })
+        .collect()
+}
+
 /// Merges a transform plugin's output over the original `_trigger` object,
-/// re-stamping the host-owned provenance keys. Non-object output violates the
+/// re-stamping every [`HOST_OWNED_KEYS`] entry. Non-object output violates the
 /// contract → the original object is kept unchanged.
-pub fn restamp_provenance(original: &Value, transformed: Value) -> Value {
+pub fn restamp_host_owned(original: &Value, transformed: Value) -> Value {
     let Value::Object(mut out) = transformed else {
         return original.clone();
     };
     if let Value::Object(orig) = original {
-        for key in PROVENANCE_KEYS {
+        for key in HOST_OWNED_KEYS {
             match orig.get(*key) {
                 Some(v) => {
                     out.insert((*key).to_string(), v.clone());
@@ -414,7 +493,17 @@ pub async fn apply_plugin_hooks(
     let obj = if let Some(hook) = &hooks.transform {
         let input = obj.to_string();
         match plugins.run(&hook.plugin, &input, &hook.params).await {
-            Ok(out @ Value::Object(_)) => restamp_provenance(&obj, out),
+            Ok(out @ Value::Object(_)) => {
+                let overruled = host_owned_overrides(&obj, &out);
+                if !overruled.is_empty() {
+                    warn!(trigger = %trigger.id, plugin = %hook.plugin, keys = ?overruled,
+                          "transform plugin proposed different values for host-owned keys; \
+                           re-stamped from the original — lineage and the target's work \
+                           scope (`keys`) are not the sandbox's to change (the key throttle \
+                           is [triggers] key_cap)");
+                }
+                restamp_host_owned(&obj, out)
+            }
             Ok(other) => {
                 warn!(trigger = %trigger.id, plugin = %hook.plugin,
                       "transform plugin returned non-object output; keeping the original envelope: {other}");
@@ -975,6 +1064,17 @@ pub async fn fire_dataset_triggers(
                 &chain,
                 &state.config.triggers,
             );
+            // A truncated work list is a partial run, so it is said out loud as
+            // well as declared in the envelope. `keys` targets (extractor,
+            // plugin) process exactly what they are handed: the records past
+            // the cap are simply not in this hop.
+            if obj["keys_truncated"] == Value::Bool(true) {
+                warn!(trigger = %trigger.id, job = %job.id, %app, %dataset,
+                      count = matching.len(), key_cap = state.config.triggers.key_cap,
+                      "dataset hop key list TRUNCATED: the target gets the first \
+                       key_cap keys and `_trigger.keys_truncated: true`; records \
+                       beyond the cap are not in this hop's work list");
+            }
             let key = dataset_idempotency_key(&trigger.id, &source_job_id, batch, app, dataset);
             fired += enqueue_hop(state, trigger, job, obj, key, &ctx).await;
         }
@@ -1793,10 +1893,10 @@ mod tests {
     }
 
     #[test]
-    fn restamp_provenance_pins_host_keys_and_rejects_non_objects() {
+    fn restamp_host_owned_pins_host_keys_and_rejects_non_objects() {
         let original = delta();
         // A transform that reshapes payload AND tries to forge lineage.
-        let shaped = restamp_provenance(
+        let shaped = restamp_host_owned(
             &original,
             json!({ "summary": "3 fresh", "depth": 99, "chain": [], "trigger_id": "EVIL", "event_id": "forged" }),
         );
@@ -1807,11 +1907,129 @@ mod tests {
         assert!(shaped.get("event_id").is_none()); // …and unforgeable when absent
         assert!(
             shaped.get("count").is_none(),
-            "non-provenance keys are the plugin's to drop"
+            "keys the host does not own are the plugin's to drop"
         );
         // Contract violation: non-object output keeps the original untouched.
-        assert_eq!(restamp_provenance(&original, json!("nope")), original);
-        assert_eq!(restamp_provenance(&original, json!([1, 2])), original);
+        assert_eq!(restamp_host_owned(&original, json!("nope")), original);
+        assert_eq!(restamp_host_owned(&original, json!([1, 2])), original);
+    }
+
+    /// The anti-pattern: `_trigger` IS the target job's params, and `extractor`
+    /// / `plugin` read `_trigger.keys` as their WORK LIST. A transform that
+    /// shrank it rescoped the target's work; one that dropped it sent the
+    /// extractor down its "no keys → every live record, up to 10,000" path.
+    /// Both were reachable from the shipped `delta-slim` with the configuration
+    /// the docs demonstrate.
+    #[test]
+    fn a_transform_cannot_narrow_or_delete_the_targets_work_scope() {
+        let original = delta(); // keys: ["k1", "k2"]
+
+        // 1. Narrowing (delta-slim `max_keys`).
+        let shaped = restamp_host_owned(&original, json!({ "keys": ["k1"], "slimmed": true }));
+        assert_eq!(
+            shaped["keys"],
+            json!(["k1", "k2"]),
+            "a sandbox-proposed shorter work list is overruled by the host's"
+        );
+        assert_eq!(shaped["slimmed"], true, "payload shaping still lands");
+
+        // 2. Deleting (delta-slim `keep`, the documented extractor pairing).
+        let shaped = restamp_host_owned(&original, json!({ "dataset": "d", "count": 3 }));
+        assert_eq!(
+            shaped["keys"],
+            json!(["k1", "k2"]),
+            "a dropped work list comes back: its absence means `sweep everything`"
+        );
+
+        // 3. And the partial-delta flag cannot be cleared from inside either.
+        let capped = json!({ "keys": ["k1"], "keys_truncated": true, "count": 9 });
+        let shaped = restamp_host_owned(&capped, json!({ "keys_truncated": false }));
+        assert_eq!(shaped["keys_truncated"], true);
+    }
+
+    /// The re-stamp must not be silent — a plugin author and an operator both
+    /// need to learn the sandbox's proposal was overruled.
+    #[test]
+    fn host_owned_overrides_names_what_was_overruled_and_stays_quiet_otherwise() {
+        assert!(
+            WORK_SCOPE_KEYS.iter().all(|k| HOST_OWNED_KEYS.contains(k)),
+            "the work-scope keys must be a subset of the host-owned ones, or the \
+             host restamps something it never claimed"
+        );
+        let original = delta();
+        assert_eq!(
+            host_owned_overrides(&original, &json!({ "keys": ["k1"], "depth": 99 })),
+            vec!["depth", "keys"],
+            "in HOST_OWNED_KEYS order, and shedding the other lineage keys is not \
+             an override — that is what a keep-list transform normally does"
+        );
+        // Dropping the work list IS one, though: absence is an instruction.
+        assert_eq!(
+            host_owned_overrides(&original, &json!({ "dataset": "d", "count": 3 })),
+            vec!["keys"]
+        );
+        // A shaping that leaves every host key exactly as it found it is silent.
+        let faithful = json!({
+            "trigger_id": "T1", "source_kind": "dataset", "source_job_id": "J1",
+            "depth": 1, "chain": ["T1"], "keys": ["k1", "k2"], "summary": "3 fresh",
+        });
+        assert!(host_owned_overrides(&original, &faithful).is_empty());
+        // …and so is a plugin that adds its own field while leaving the work
+        // list alone — the shape a transform SHOULD have.
+        assert!(host_owned_overrides(
+            &original,
+            &json!({ "summary": "3 fresh", "keys": ["k1", "k2"] })
+        )
+        .is_empty());
+        // Conjuring a host key the original never had is not silent either
+        // (`keys` rides along here because this output also drops it).
+        assert_eq!(
+            host_owned_overrides(&original, &json!({ "event_id": "forged" })),
+            vec!["event_id", "keys"]
+        );
+        // Non-objects have nothing to compare.
+        assert!(host_owned_overrides(&original, &json!("nope")).is_empty());
+    }
+
+    /// The pre-existing, plugin-free half of the same bug: `take(key_cap)`
+    /// dropped record #(cap+1) onward and the hop still looked complete.
+    #[test]
+    fn a_capped_key_list_is_flagged_not_passed_off_as_the_whole_delta() {
+        let revs = [rev("a"), rev("b"), rev("c")];
+        let borrowed: Vec<&Revision> = revs.iter().collect();
+
+        let (keys, truncated) = capped_keys(&borrowed, 2);
+        assert_eq!(keys, vec!["a", "b"]);
+        assert!(truncated, "3 revisions do not fit in a cap of 2");
+
+        // Exactly at the cap is NOT truncated — an off-by-one here would cry
+        // wolf on every full-cap hop.
+        let (keys, truncated) = capped_keys(&borrowed, 3);
+        assert_eq!(keys, vec!["a", "b", "c"]);
+        assert!(!truncated);
+        let (_, truncated) = capped_keys(&borrowed, 99);
+        assert!(!truncated);
+
+        // A cap of 0 hands over no work list at all, and says so — it must not
+        // read as "no keys", which is the extractor's sweep-everything path.
+        let (keys, truncated) = capped_keys(&borrowed, 0);
+        assert!(keys.is_empty());
+        assert!(truncated);
+    }
+
+    fn rev(key: &str) -> Revision {
+        Revision {
+            app: "src".into(),
+            dataset: "d".into(),
+            key: key.into(),
+            revision: 1,
+            change: "new".into(),
+            data: None,
+            diff: None,
+            created_at: chrono::Utc::now(),
+            trust: "stable".into(),
+            provenance: pumper_core::datasets::Provenance::default(),
+        }
     }
 
     /// The object half of a verdict — what `apply_plugin_hooks` used to return

@@ -18,10 +18,12 @@
 //! failing its hop open in production. `just plugins-verify` is the same thing
 //! locally.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use pumper_core::config::PluginConfig;
+use pumper_core::datasets::{Provenance, Revision};
 use pumper_core::{
     EnqueueOptions, JobStatus, NewTrigger, PluginHook, Plugins, Trigger, TriggerPluginHooks,
 };
@@ -31,7 +33,8 @@ use serde_json::{json, Value};
 use super::harness::{test_state_with_plugins, FakeApp};
 use crate::state::AppState;
 use crate::triggers::{
-    apply_plugin_hooks, external_trigger_obj, fire_terminal_triggers, missing_hook_plugins,
+    apply_plugin_hooks, external_trigger_obj, fire_dataset_triggers, fire_terminal_triggers,
+    missing_hook_plugins, DatasetBatch,
 };
 
 /// The object half of a hook verdict — the fail-open behaviour these tests were
@@ -199,7 +202,14 @@ async fn a_real_wasm_transform_reshapes_but_cannot_forge_provenance() {
         .expect("a transform never skips");
     // The plugin's shaping survives…
     assert_eq!(out["summary"], "3 fresh");
-    assert!(out.get("keys").is_none(), "dropped keys stay dropped");
+    assert_eq!(
+        out["keys"],
+        json!(["k1", "k2", "k3"]),
+        "…but a dropped WORK LIST comes back. `_trigger` is the target job's \
+         params and extractor/plugin read `_trigger.keys` as the records to \
+         process, so an absent `keys` is not a slimmer payload — it is the \
+         instruction to sweep every live record"
+    );
     // …and every host-owned key is re-stamped from the original.
     assert_eq!(out["depth"], 1);
     assert_eq!(out["chain"], json!(["T1"]));
@@ -209,6 +219,118 @@ async fn a_real_wasm_transform_reshapes_but_cannot_forge_provenance() {
         out.get("event_id").is_none(),
         "a key absent from the original cannot be conjured by the sandbox"
     );
+}
+
+/// The assertion class that existed nowhere: every `keys` assertion in this
+/// file was **hook-level**, taken off the object a hook returned with no job
+/// ever enqueued. So what a transform could do to a TARGET's work scope — the
+/// thing that actually costs money — was untested.
+///
+/// This fires a real dataset hop through `fire_dataset_triggers` and reads the
+/// enqueued job's `params._trigger.keys` back out of the store. Both directions
+/// of the bug are covered, because the shipped `delta-slim` could reach both
+/// with the configurations the docs demonstrate:
+///
+/// - `max_keys` NARROWED (default 10 vs. the host's `key_cap` of 200), so a
+///   200-key hop extracted 10 records;
+/// - `keep` DELETED, and an absent `keys` makes `extractor` fall through to
+///   "every live record, up to `SOURCE_LIST_LIMIT` (10,000)" — a 3-record
+///   incremental extract became a full sweep.
+#[tokio::test]
+async fn a_transform_cannot_rescope_the_work_of_the_job_it_fires() {
+    let plugins = wat_host(
+        "workscope",
+        200_000_000,
+        &[
+            // Narrows the work list to one key.
+            (
+                "narrow",
+                &returning_wat(r#"{"dataset":"d","count":3,"keys":["k1"],"slimmed":true}"#),
+            ),
+            // Drops it entirely — the `keep: ["dataset","count"]` shape.
+            (
+                "drop",
+                &returning_wat(r#"{"dataset":"d","count":3,"slimmed":true}"#),
+            ),
+        ],
+    );
+    let (state, _store) = test_state_with_plugins(vec![Arc::new(FakeApp)], plugins).await;
+
+    let mut triggers = Vec::new();
+    for plugin in ["narrow", "drop"] {
+        triggers.push(
+            state
+                .storage
+                .create_trigger(&NewTrigger {
+                    name: Some(plugin),
+                    source_kind: "dataset",
+                    source_app: "src",
+                    source_dataset: Some("*"),
+                    on_change: None,
+                    on_status: None,
+                    target_app: "fake",
+                    params: &json!({}),
+                    budget_usd: None,
+                    priority: 0,
+                    max_attempts: 1,
+                    filters: None,
+                    plugin_hooks: Some(&transform_only(plugin, json!({}))),
+                })
+                .await
+                .expect("create trigger"),
+        );
+    }
+
+    let source = state
+        .storage
+        .enqueue("src", EnqueueOptions::default())
+        .await
+        .unwrap();
+    let revs = [rev("k1"), rev("k2"), rev("k3")];
+    let mut by_dataset: HashMap<(&str, &str), Vec<&Revision>> = HashMap::new();
+    by_dataset.insert(("src", "d"), revs.iter().collect());
+    fire_dataset_triggers(&state, &source, DatasetBatch::Run, &by_dataset).await;
+
+    for t in &triggers {
+        let hops = state.storage.jobs_by_trigger(&t.id, 10).await.unwrap();
+        assert_eq!(
+            hops.len(),
+            1,
+            "{} fired one hop",
+            t.name.as_deref().unwrap()
+        );
+        let injected = &hops[0].params["_trigger"];
+        assert_eq!(
+            injected["keys"],
+            json!(["k1", "k2", "k3"]),
+            "the job {} actually received must carry the HOST's work list, not \
+             the sandbox's — got {injected}",
+            t.name.as_deref().unwrap()
+        );
+        assert_eq!(
+            injected["keys_truncated"],
+            json!(false),
+            "and the completeness flag the sandbox never sees"
+        );
+        // The legitimate half of the transform still lands.
+        assert_eq!(injected["slimmed"], json!(true));
+        assert_eq!(injected["depth"], json!(1), "lineage intact: {injected}");
+    }
+}
+
+fn rev(key: &str) -> Revision {
+    Revision {
+        app: "src".into(),
+        dataset: "d".into(),
+        key: key.into(),
+        revision: 1,
+        change: "new".into(),
+        data: Some(json!({ "k": key })),
+        diff: None,
+        created_at: chrono::Utc::now(),
+        trust: "stable".into(),
+        provenance: Provenance::default(),
+    }
 }
 
 /// Fail-OPEN is the contract, and each sandbox failure mode has to honour it
@@ -782,7 +904,9 @@ async fn shipped_delta_slim_slims_the_envelope_without_losing_lineage() {
     assert!(plugins.has("delta-slim"), "{NEEDS_INSTALL}");
     let plugins: Arc<dyn Plugins> = Arc::new(plugins);
 
-    // `keep` mode: only the named keys survive — plus the host's provenance.
+    // `keep` mode: the named keys survive — plus everything the host owns.
+    // This is the exact configuration docs/features/trigger-plugins.md pairs
+    // with `"target_app": "extractor"`.
     let t = trigger(Some(transform_only(
         "delta-slim",
         json!({ "keep": ["dataset", "count"] }),
@@ -793,19 +917,28 @@ async fn shipped_delta_slim_slims_the_envelope_without_losing_lineage() {
     assert_eq!(out["dataset"], "grants");
     assert_eq!(out["count"], 3);
     assert_eq!(out["slimmed"], true);
-    assert!(out.get("keys").is_none(), "keys were not kept");
-    assert_eq!(out["depth"], 1, "provenance is host-restamped regardless");
+    assert_eq!(
+        out["keys"],
+        json!(["k1", "k2", "k3"]),
+        "`keys` is the target's WORK LIST, not payload: leaving it out of `keep` \
+         used to delete it, and an extractor with no keys sweeps every live \
+         record up to SOURCE_LIST_LIMIT (10,000) instead of the 3 that changed"
+    );
+    assert_eq!(out["depth"], 1, "lineage is host-restamped regardless");
     assert_eq!(out["chain"], json!(["T1"]));
     assert_eq!(out["trigger_id"], "T1");
 
-    // `max_keys` mode: the key list is capped, nothing else is dropped.
+    // The removed `max_keys` knob: it read as a payload diet and acted as a
+    // work-scope throttle (default 10 against a host key_cap of 200). It is
+    // gone, and an unknown param must not resurrect the behaviour by accident.
     let t = trigger(Some(transform_only("delta-slim", json!({ "max_keys": 1 }))));
     let out = hook_obj(plugins.as_ref(), &t, delta())
         .await
         .expect("transform never skips");
-    assert_eq!(out["keys"], json!(["k1"]));
     assert_eq!(
-        out["count"], 3,
-        "count stays exact — only the sample shrinks"
+        out["keys"],
+        json!(["k1", "k2", "k3"]),
+        "the key throttle is [triggers] key_cap, and it is the host's"
     );
+    assert_eq!(out["count"], 3, "count was always exact");
 }
