@@ -474,6 +474,16 @@ impl ScrapeApp for GrantsGov {
                 .filter(|k| !done.contains(k.as_str()))
                 .cloned()
                 .collect();
+            // DURABLE BEFORE PAID. The resumable unit has to exist before the
+            // first governor-paced fetch, not after the 25th: the in-loop save
+            // below is gated on a flush AND throttled, and the unthrottled one
+            // is after all the work. Unthrottled here, because losing exactly
+            // this write is the failure mode — see `preflight_harvest_state`.
+            if let Some(snapshot) =
+                preflight_harvest_state(&pending, &delta, &done, capped, delta_total)
+            {
+                ctx.checkpoint_now(snapshot).await;
+            }
             // NON-FATAL, LOUD. The detail stage may not take the listing sync
             // down: the daily federal sync's primary obligation is the listing,
             // and by this point it is already stored. But "non-fatal" must not
@@ -1122,6 +1132,30 @@ fn harvest_state(
         "capped": capped,
         "deltaTotal": delta_total,
     })
+}
+
+/// The **pre-flight** snapshot: the delta this run committed to harvesting,
+/// written before the first detail fetch is paid for.
+///
+/// The anti-pattern it closes: the delta cannot be recomputed. On a re-claim the
+/// listing re-syncs, every opportunity reads back `unchanged`, `summary.new` and
+/// `summary.changed` come back empty and the delta collapses to nothing — which
+/// is exactly why the checkpoint carries the delta itself. But the first
+/// in-loop save is gated on a 25-record flush AND throttled, so a crash, reaper
+/// re-queue, timeout or shutdown-suspend inside the first 24 fetches lost the
+/// delta entirely and the resumed run reported success having harvested nothing.
+///
+/// `None` when there is nothing left to fetch: a snapshot with an empty delta is
+/// one `restored_harvest` reads as "start fresh" anyway, so writing it would
+/// cost a write and reset the sink's throttle clock while promising nothing.
+fn preflight_harvest_state(
+    pending: &[String],
+    delta: &[String],
+    done: &HashSet<String>,
+    capped: bool,
+    delta_total: usize,
+) -> Option<Value> {
+    (!pending.is_empty()).then(|| harvest_state(delta, done, capped, delta_total))
 }
 
 /// Reads a restored checkpoint back, tolerating ANY stored shape: a version
@@ -2049,6 +2083,124 @@ mod tests {
         assert!(restored.done.is_empty());
         assert!(!restored.capped);
         assert_eq!(restored.delta_total, 2);
+    }
+
+    #[test]
+    fn preflight_checkpoint_carries_the_delta_not_an_empty_snapshot() {
+        let delta = vec!["a".to_string(), "b".to_string()];
+        let snap = preflight_harvest_state(&delta, &delta, &HashSet::new(), false, 2)
+            .expect("two keys to fetch is something to resume");
+        assert_eq!(snap["delta"], json!(["a", "b"]));
+        assert_eq!(snap["done"], json!([]));
+        // A pre-flight snapshot is worth nothing unless a re-claimed attempt
+        // actually resumes from it.
+        let restored = restored_harvest(Some(&snap)).expect("resumable");
+        assert_eq!(restored.delta, delta);
+        assert!(restored.done.is_empty());
+
+        // Nothing pending → nothing written. `restored_harvest` rejects an
+        // empty delta anyway, so such a write could only cost a SQLite round
+        // trip and reset the sink's 5s throttle clock.
+        let all_done: HashSet<String> = delta.iter().cloned().collect();
+        assert!(preflight_harvest_state(&[], &delta, &all_done, false, 2).is_none());
+        assert!(preflight_harvest_state(&[], &[], &HashSet::new(), false, 0).is_none());
+    }
+
+    /// A Search2 endpoint answering with two new opportunities and a healthy
+    /// `fetchOpportunity` — recording what the checkpoint seam had already been
+    /// handed at the moment the FIRST detail fetch was paid for. That ordering
+    /// is this stage's entire durability claim.
+    struct WatchedHarvest {
+        seam: std::sync::Arc<pumper_core::testing::RecordingCheckpoints>,
+        at_first_detail: std::sync::Mutex<Option<Vec<pumper_core::testing::Checkpoint>>>,
+    }
+
+    #[async_trait]
+    impl pumper_core::HttpClient for WatchedHarvest {
+        async fn fetch(&self, req: HttpRequest) -> Result<pumper_core::HttpResponse> {
+            let body = if req.url.contains("search2") {
+                json!({
+                    "errorcode": 0,
+                    "data": {
+                        "hitCount": 2,
+                        "oppHits": [
+                            { "id": "141593", "number": "P12AC10113", "title": "Vegetation interns",
+                              "agency": "DOI", "oppStatus": "posted", "closeDate": "08/15/2099" },
+                            { "id": "357305", "number": "TEST-24-002", "title": "Rural Health",
+                              "agency": "HHS", "oppStatus": "posted", "closeDate": "09/30/2099" }
+                        ]
+                    }
+                })
+            } else {
+                let mut seen = self.at_first_detail.lock().expect("first-detail lock");
+                if seen.is_none() {
+                    *seen = Some(self.seam.saves());
+                }
+                json!({ "errorcode": 0, "data": sample_detail() })
+            };
+            Ok(pumper_core::HttpResponse {
+                status: 200,
+                headers: HashMap::new(),
+                body: body.to_string(),
+                final_url: req.url,
+                cache_hit: false,
+            })
+        }
+    }
+
+    /// The loss window: with `DETAIL_FLUSH` at 25, a two-item harvest reached
+    /// its FIRST checkpoint only after every fetch was already paid for. A
+    /// restart anywhere in the first 24 fetches therefore resumed from nothing,
+    /// re-synced the listing, read every opportunity back `unchanged`, and
+    /// reported success having harvested nothing.
+    #[tokio::test]
+    async fn the_delta_is_durable_before_the_first_detail_fetch_not_after_25() {
+        let store = pumper_core::testing::TempStore::new("grants-gov-preflight").await;
+        let seam = std::sync::Arc::new(pumper_core::testing::RecordingCheckpoints::new());
+        let http = std::sync::Arc::new(WatchedHarvest {
+            seam: seam.clone(),
+            at_first_detail: std::sync::Mutex::new(None),
+        });
+        let engines = pumper_core::testing::engines_with(
+            http.clone(),
+            std::sync::Arc::new(pumper_core::testing::Dead),
+            std::sync::Arc::new(pumper_core::testing::Dead),
+        );
+        let ctx = pumper_core::testing::TestContext::new(&store.storage, "grants-gov")
+            .params(GrantsGov.default_params())
+            .engines(engines)
+            .checkpoints(seam.clone())
+            .build();
+
+        let out = GrantsGov.run(ctx).await.expect("a healthy run");
+        assert_eq!(out["details"]["harvested"], json!(2), "both details landed");
+
+        let before = http
+            .at_first_detail
+            .lock()
+            .expect("first-detail lock")
+            .clone()
+            .expect("the detail stage must have fetched at all");
+        let first = before.first().expect(
+            "nothing was checkpointed before the first paid fetch — a crash inside the \
+             first 24 details loses the delta, and the delta cannot be recomputed",
+        );
+        assert!(
+            first.force,
+            "the pre-flight snapshot must bypass the 5s throttle: a throttled first save \
+             can be silently skipped, which is the loss window itself"
+        );
+        assert_eq!(
+            first.state["delta"].as_array().map(Vec::len),
+            Some(2),
+            "the checkpoint must carry the DELTA, not a cursor into a list that \
+             cannot be recomputed: {}",
+            first.state
+        );
+        // …and it is a snapshot a re-claimed attempt genuinely resumes from.
+        let restored = restored_harvest(Some(&first.state)).expect("resumable");
+        assert_eq!(restored.delta.len(), 2);
+        assert!(restored.done.is_empty(), "no work was paid for yet");
     }
 
     #[test]
