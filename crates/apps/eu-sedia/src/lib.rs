@@ -28,6 +28,8 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use grants_common::SweepEnd;
+use pumper_core::datasets::JsonFilter;
 use pumper_core::{
     html_to_markdown, AppContext, AppManifest, CostClass, DerivedPaths, Error, HttpMethod,
     HttpRequest, ManifestExample, Provenance, Record, Result, ScrapeApp,
@@ -93,7 +95,7 @@ impl ScrapeApp for EuSedia {
                     },
                     "maxPages": {
                         "type": "integer", "minimum": 1, "maximum": 50,
-                        "description": "Page cap. SEDIA's match-all window has no stable sort, so a truncated run's uncovered topics drift between runs — reported as `truncated` plus a warning."
+                        "description": "Page cap. Stopping on the cap with topics left is reported as `sweep: \"capped\"` (`truncated: true`) plus a warning, never a silent partial sweep. SEDIA's match-all window has no stable sort, so a truncated run's uncovered topics drift between runs. It also bounds the walk when SEDIA publishes no usable `totalResults` (`sweep: \"unknown_total\"`)."
                     }
                 },
                 "additionalProperties": true
@@ -116,10 +118,16 @@ impl ScrapeApp for EuSedia {
             ],
             output_shape: Some(
                 "{source, types[], statuses[], totalResults, fetched, enriched, pages, new, \
-                 changed, unchanged, historyJoined, truncated, unified: {new, changed, events}, \
+                 changed, unchanged, historyJoined, sweep, truncated, \
+                 unified: {new, changed, events}, \
                  swept, crossSourceDups, recurrenceLinks, \
                  corpusPass: {ran, cycle, batchSwept, corpusSwept}, \
-                 warnings[], index_datasets[]} — the corpus-wide relation pass (sweep + \
+                 warnings[], index_datasets[]} — `sweep` names how the walk ended \
+                 (complete|capped|short_page|unknown_total: swept the corpus, hit maxPages, \
+                 the source served a short page, or it published no usable `totalResults` to \
+                 measure against) and `truncated` is its boolean projection (anything but \
+                 `complete`); every non-complete arm also lands a line in `warnings[]` — the \
+                 corpus-wide relation pass (sweep + \
                  duplicate/recurrence links) runs once per UTC-day cycle on whichever grant \
                  source gets there first, so a run that did not own it reports \
                  `crossSourceDups`/`recurrenceLinks` as null (not 0) — normalized topics in \
@@ -165,6 +173,10 @@ impl ScrapeApp for EuSedia {
         let mut total: u64 = 0;
         let mut page: u64 = 1;
         let mut pages_fetched: u64 = 0;
+        // How the walk ended — four separately-nameable cases, not one boolean.
+        // Left uninitialized on purpose: `walk_end` is the loop's ONLY non-error
+        // exit, so the compiler proves every path out of it names an ending.
+        let end: SweepEnd;
 
         loop {
             let url =
@@ -198,12 +210,21 @@ impl ScrapeApp for EuSedia {
             // only the fields it keeps.
             let hits = parsed.get("results").and_then(Value::as_array);
             let got = hits.map_or(0, Vec::len) as u64;
-            if pages_fetched == 0 && total > 0 && got == 0 {
-                // Positive totalResults but zero parsed rows means the `results`
-                // array was renamed/moved upstream. Refuse to report an empty run
-                // as success (grants-gov guards this same drift). `SourceDrift`,
-                // not `App`: terminal for the job, because the params are frozen
-                // at enqueue and a retry re-parses an identically shaped response.
+            // Positive totalResults but zero parsed rows means the `results`
+            // array was renamed/moved upstream. Refuse to report an empty run
+            // as success. `SourceDrift`, not `App`: terminal for the job, because
+            // the params are frozen at enqueue and a retry re-parses an
+            // identically shaped response.
+            //
+            // Deliberately still scoped to page 1, even though the shared
+            // predicate generalizes to any page: SEDIA's match-all window has no
+            // stable sort, so a mid-walk empty page is not the unambiguous
+            // evidence it is on a deterministically-ordered feed. The case this
+            // guard CANNOT see — a renamed `totalResults`, which disarms its own
+            // `total > 0` gate — is covered after the walk by
+            // `empty_listing_is_drift`, against the stored corpus.
+            if pages_fetched == 0 && grants_common::empty_page_is_drift(page, page_size, total, got)
+            {
                 return Err(Error::SourceDrift(format!(
                     "eu-sedia: API reported {total} results but parsed 0 rows from \
                      'results' — likely an upstream schema change"
@@ -221,16 +242,65 @@ impl ScrapeApp for EuSedia {
             pages_fetched += 1;
             page += 1;
 
-            if got < page_size || (pages_fetched * page_size) >= total || pages_fetched >= max_pages
-            {
+            // THE REFUTED BREAK: `(pages_fetched * page_size) >= total`, over a
+            // `total` read with `.unwrap_or(0)`. A renamed `totalResults` made
+            // that `100 >= 0` after page one, so a 2,000-topic sweep became a
+            // 100-topic corpus reporting a clean run. `walk_end` counts records
+            // COLLECTED (a page that asks for 100 and serves 12 still advanced
+            // the offset by 100) and names which of the four endings happened.
+            if let Some(reached) = grants_common::walk_end(
+                pages_fetched,
+                page_size,
+                total,
+                got,
+                records.len() as u64,
+                max_pages,
+            ) {
+                end = reached;
                 break;
             }
         }
 
-        // Honest coverage: hitting the page cap while topics remain is a
-        // silently-partial, non-deterministic window (SEDIA match-all has no stable
-        // sort), so a truncated run must not read as a clean sweep.
-        let truncated = pages_fetched >= max_pages && (pages_fetched * page_size) < total;
+        // A listing that reported NOTHING at all — no total, no rows — while
+        // topics are already stored is drift, not a clean sweep. This is the arm
+        // that survives `total == 0`: a renamed `totalResults` and a renamed
+        // `results` array are the same upstream change, and the per-page guard
+        // above is gated on the very field that change removes. Gated on the
+        // cheap half first, so the count query only runs in the suspicious case.
+        if total == 0 && records.is_empty() {
+            // Compare like with like where possible: one requested status counts
+            // the stored rows of THAT status, so a legitimately-empty narrow pull
+            // (e.g. forthcoming-only) is not accused of drift by the open topics
+            // sitting next to it. `JsonFilter` has no `In` and two `Eq` on one
+            // path AND to nothing, so a multi-status run falls back to the whole
+            // dataset — it would have to come back empty for every status it
+            // asked for to reach here at all.
+            let filters: Vec<JsonFilter> = match statuses.as_slice() {
+                [only] => vec![JsonFilter::Eq {
+                    path: "status".into(),
+                    value: only.clone(),
+                }],
+                _ => Vec::new(),
+            };
+            let stored_corpus = ctx
+                .datasets
+                .count_filtered(&ctx.app, "opportunities", &filters)
+                .await?;
+            if grants_common::empty_listing_is_drift(total, records.len(), stored_corpus) {
+                return Err(Error::SourceDrift(format!(
+                    "eu-sedia: SEDIA reported totalResults:0 with no rows for statuses \
+                     {statuses:?} while {stored_corpus} topics are stored — the total or the \
+                     results array was renamed or moved upstream"
+                )));
+            }
+        }
+
+        // Honest coverage: `truncated` is the boolean projection of `sweep`, not
+        // a second opinion. It used to be computed from the maxPages arm alone
+        // (`pages_fetched >= max_pages && ... < total`), so BOTH other partial
+        // endings — a short-served page and an unusable total — reported a clean
+        // sweep, and the latter capped the corpus at one page indefinitely.
+        let truncated = end.truncated();
 
         // Win-intelligence join (moonshot M31): annotate each open Horizon topic
         // with its predecessor-family funded-outcomes stats from the `cordis`
@@ -304,17 +374,30 @@ impl ScrapeApp for EuSedia {
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
             "historyJoined": history_joined,
+            // How the walk ended, named — see `grants_common::SweepEnd`.
+            // `truncated` is its boolean projection, kept for consumers that
+            // already read it.
+            "sweep": end.as_str(),
             "truncated": truncated,
         });
         cross.merge_into(&mut out);
-        if truncated {
+        if let Some(msg) = grants_common::sweep_warning(
+            end,
+            pages_fetched,
+            max_pages,
+            page_size,
+            total,
+            records.len(),
+            "totalResults",
+        ) {
             // After merge_into, which sets `warnings` to the drift warnings.
             if let Value::Object(map) = &mut out {
+                // The SEDIA-specific consequence, appended to the shared text:
+                // the match-all window has no stable sort, so what is uncovered
+                // differs between runs.
                 let msg = format!(
-                    "coverage truncated: stopped at maxPages={max_pages} after {} of \
-                     {total} topics — the SEDIA match-all window is non-deterministic, \
-                     so uncovered topics drift in and out between runs",
-                    records.len()
+                    "{msg} (the SEDIA match-all window is non-deterministic, so uncovered \
+                     topics drift in and out between runs)"
                 );
                 match map.get_mut("warnings") {
                     Some(Value::Array(w)) => w.push(json!(msg)),
@@ -562,7 +645,80 @@ fn sedia_request(url: String, body: String) -> HttpRequest {
 #[cfg(test)]
 mod tests {
     use super::{clean_inline, clean_text, normalize, topic_lineage, DESCRIPTION_TEXT_CAP};
+    use grants_common::{walk_end, SweepEnd};
+    use pumper_core::ScrapeApp;
     use serde_json::json;
+
+    /// The app's own defaults, so these tests exercise the walk the scheduled
+    /// run actually performs (`default_params`: pageSize 100, maxPages 50).
+    const PAGE_SIZE: u64 = 100;
+    const MAX_PAGES: u64 = 50;
+
+    #[test]
+    fn a_renamed_total_does_not_cap_the_corpus_at_one_page() {
+        // THE REFUTED BEHAVIOR, and the headline of this app's coverage bug:
+        // `totalResults` was read with `.unwrap_or(0)`, so a rename made it 0 —
+        // and then the break `(pages_fetched * page_size) >= total` read
+        // `100 >= 0` after page ONE. A 2,000-topic sweep silently became a
+        // 100-topic corpus; the drift guard was gated `total > 0 && got == 0` so
+        // it could not fire, and `truncated` needed `pages >= max_pages` so it
+        // stayed false. Green, forever.
+        assert_eq!(
+            walk_end(1, PAGE_SIZE, 0, 100, 100, MAX_PAGES),
+            None,
+            "a full page under a zero total must keep walking"
+        );
+        // It walks on to a real end signal, and never claims a complete sweep.
+        let end = walk_end(50, PAGE_SIZE, 0, 100, 5000, MAX_PAGES).unwrap();
+        assert_eq!(end, SweepEnd::UnknownTotal);
+        assert!(end.truncated(), "unproven coverage is not a clean run");
+        assert_eq!(end.as_str(), "unknown_total");
+
+        // And the honest boundary stays honest: no total AND no rows is an
+        // empty result set, fully swept — not drift, not truncation.
+        assert_eq!(
+            walk_end(1, PAGE_SIZE, 0, 0, 0, MAX_PAGES),
+            Some(SweepEnd::Complete)
+        );
+    }
+
+    #[test]
+    fn a_short_served_page_is_a_truncated_page_not_the_end_of_the_corpus() {
+        // The second silent-partial path, independent of the first: a page that
+        // SERVES fewer rows than it was asked for used to exit the loop via
+        // `got < page_size` and report `truncated: false`, because `truncated`
+        // was computed from the maxPages arm alone. SEDIA's match-all window has
+        // no stable sort, so a partially-served page is indistinguishable in
+        // shape from a genuine tail — which is exactly why it must not be
+        // reported as one.
+        let end = walk_end(2, PAGE_SIZE, 2000, 12, 112, MAX_PAGES).unwrap();
+        assert_eq!(end, SweepEnd::ShortPage);
+        assert!(end.truncated());
+        // The genuine tail — collected reaches the total — still reads complete.
+        assert_eq!(
+            walk_end(20, PAGE_SIZE, 2000, 100, 2000, MAX_PAGES),
+            Some(SweepEnd::Complete)
+        );
+        // ...and the page cap is a THIRD, separately named ending.
+        assert_eq!(
+            walk_end(50, PAGE_SIZE, 10_000, 100, 5000, MAX_PAGES),
+            Some(SweepEnd::Capped)
+        );
+    }
+
+    #[test]
+    fn output_shape_declares_the_sweep_ending_it_now_reports() {
+        let shape = super::EuSedia.manifest().output_shape.expect("shape");
+        for key in [
+            "sweep",
+            "truncated",
+            "unknown_total",
+            "short_page",
+            "capped",
+        ] {
+            assert!(shape.contains(key), "output_shape omits `{key}`: {shape}");
+        }
+    }
 
     #[test]
     fn lineage_strips_year_and_keeps_counters() {
@@ -923,8 +1079,15 @@ mod drift_inventory {
 
     /// Every pre-write drift refusal in this app, by a stable fragment of its
     /// message. Adding or removing one fails this test until it is classified.
-    const EXPECTED_TERMINAL: &[&str] =
-        &["eu-sedia: API reported {total} results but parsed 0 rows"];
+    const EXPECTED_TERMINAL: &[&str] = &[
+        // The `results` array was renamed/moved while `totalResults` still
+        // reports a corpus. Scoped to page 1 (see the call site).
+        "eu-sedia: API reported {total} results but parsed 0 rows",
+        // The arm that survives a renamed `totalResults` — which disarms the
+        // guard above by zeroing the very field it is gated on. Judged against
+        // the STORED corpus, the one denominator upstream cannot rename.
+        "eu-sedia: SEDIA reported totalResults:0 with no rows for statuses",
+    ];
 
     /// Drift this app reports **without** failing the job.
     /// None here: eu-sedia has one listing stage, so its only drift signal is the

@@ -549,6 +549,18 @@ fn sedia_deadline(deadline: &Value, now: chrono::DateTime<chrono::Utc>) -> (Opti
 /// target dataset and the trust stamp via [`contribution_target`]. Callers must
 /// resolve it before the write — judging afterwards would stamp trust from a
 /// verdict that did not exist yet.
+///
+/// **THIS DOES NOT TOMBSTONE, despite the `sync_` name.** It is an
+/// `upsert_many_stamped`: absentees are left alone, not marked removed. In this
+/// codebase `sync_*` is otherwise the load-bearing signal for "full snapshot,
+/// absentees tombstoned" (`AppContext::sync_many` → `detect_removed`), so the
+/// name reads as a promise it does not keep. That is deliberate and must stay:
+/// a source app's batch is one source's slice of a CROSS-SOURCE dataset, and
+/// inferring removals from it would tombstone every other source's rows on
+/// every run. Renaming it is churn across ~45 call sites and was rejected; this
+/// comment exists so nobody "restores" the removal behaviour the name implies.
+/// Past-due rows leave the live set through the explicit `sweep_closed` pass,
+/// which names the keys it retires.
 pub async fn sync_unified(
     ctx: &AppContext,
     items: &[(String, Value)],
@@ -1845,10 +1857,300 @@ fn norm_status(s: Option<&str>) -> Value {
     Value::String(norm.to_string())
 }
 
+// ── sweep coverage vocabulary ───────────────────────────────────────────────
+
+/// **How a paged corpus walk ended, and therefore how much it proved.**
+///
+/// Four endings the single `truncated` boolean collapses into one claim: a
+/// sweep that covered the corpus, one stopped by the caller's page cap, one
+/// stopped by a page the source served short, and one where the source never
+/// published a usable total to measure against. Only the first is complete, and
+/// they need different operator responses — raise `maxPages`, retry, or fix the
+/// parser.
+///
+/// This is `grants-gov`'s and `ca-grants`' vocabulary — same four names, same
+/// meanings, same ordering — lifted here rather than forked a third time.
+/// `ca-grants` (`src/lib.rs`) nominated `grants_common` as its home in a
+/// comment: *"It lives here rather than in `grants-common` only because apps may
+/// not depend on apps and the shared crate was out of this change's write set."*
+/// This IS that home. The two existing copies are deliberately left in place —
+/// re-pointing ~45 references is churn, not a fix — so for now this is the
+/// canonical definition for **new** adopters, of which `eu-sedia` is the first.
+///
+/// The arm apps keep missing is [`SweepEnd::UnknownTotal`], and the ledger
+/// records what it has cost three times: `grants-gov`'s renamed `hitCount`,
+/// `ca-grants`' `result.total`, and `eu-sedia`'s `totalResults` each read the
+/// total with `.unwrap_or(0)` and then broke the walk on `offset >= total`, i.e.
+/// `page_size >= 0` after page one. Each capped its corpus at ONE PAGE,
+/// reporting a clean run with `truncated: false` and a drift guard gated on
+/// `total > 0` that could never fire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SweepEnd {
+    /// The records actually COLLECTED reach the source's own reported total.
+    /// The only ending that reads as complete.
+    Complete,
+    /// Stopped at the caller's page cap with records left to walk.
+    Capped,
+    /// A page came back shorter than the requested page size while the reported
+    /// total says more remains. A transient truncation (a rate-limited or
+    /// partially-served page), NOT the end of the corpus.
+    ShortPage,
+    /// Records served under a reported total of 0 — the total field is absent,
+    /// renamed, or moved. Nothing can prove the end arithmetically, so the walk
+    /// runs on until a short page or the cap and reports coverage as unproven.
+    UnknownTotal,
+}
+
+impl SweepEnd {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            SweepEnd::Complete => "complete",
+            SweepEnd::Capped => "capped",
+            SweepEnd::ShortPage => "short_page",
+            SweepEnd::UnknownTotal => "unknown_total",
+        }
+    }
+
+    /// The boolean projection every one of these apps already publishes as
+    /// `truncated`: anything but a proven complete sweep.
+    pub fn truncated(self) -> bool {
+        self != SweepEnd::Complete
+    }
+}
+
+/// How the walk ends after fetching the 1-based `page`, or `None` to keep going.
+///
+/// `collected` is every record gathered so far **including this page**, and it —
+/// not offset arithmetic — is what proves coverage. The break these apps ship
+/// asks `pages * page_size >= total`, which counts the rows *requested*: a page
+/// that asked for 100 and delivered 12 still advanced the offset by 100, so the
+/// test can read `200 >= 137` and call 112 records a complete sweep. Counting
+/// what actually arrived is the only proof that survives a partially-served
+/// page.
+///
+/// The ordering is load-bearing: proof of coverage first, then the per-run cap,
+/// then the short page — because a short page is **evidence of nothing** (a
+/// rate-limited upstream produces exactly the same shape as a genuine tail) and
+/// must never outrank the proof.
+///
+/// Termination: every path either returns `Some` or leaves `page < max_pages`,
+/// so the page cap still bounds the walk — including on an `unknown_total` feed,
+/// where there is no total left to bound it.
+pub fn walk_end(
+    page: u64,
+    page_size: u64,
+    total: u64,
+    got: u64,
+    collected: u64,
+    max_pages: u64,
+) -> Option<SweepEnd> {
+    if total == 0 {
+        // No usable total. Two sub-cases, told apart by what the SAME response
+        // served — which is the only evidence available here.
+        if got == 0 {
+            // Self-consistent: no total, no records. An honestly empty result
+            // set IS fully swept. This is the boundary that must not be reported
+            // as drift.
+            return Some(SweepEnd::Complete);
+        }
+        // Self-contradictory: records served under a zero total. Keep walking —
+        // a short page or the cap is the only end signal left — but never report
+        // complete.
+        return (got < page_size || page >= max_pages).then_some(SweepEnd::UnknownTotal);
+    }
+    if collected >= total {
+        return Some(SweepEnd::Complete);
+    }
+    if page >= max_pages {
+        return Some(SweepEnd::Capped);
+    }
+    if got < page_size {
+        return Some(SweepEnd::ShortPage);
+    }
+    None
+}
+
+/// The human-readable warning for a walk that did not prove its coverage, or
+/// `None` for a complete sweep.
+///
+/// Every non-complete arm reaches the caller through `warnings[]` as well as
+/// through `sweep`/`truncated`, because a consumer reading only the warnings
+/// channel is exactly the consumer who would otherwise never learn the corpus is
+/// short. `total_field` is the upstream field name the total was read from
+/// (`totalResults`, `hitCount`, `result.total`), because "the total is missing"
+/// is only actionable if the message says WHICH field to go looking for.
+pub fn sweep_warning(
+    end: SweepEnd,
+    pages: u64,
+    max_pages: u64,
+    page_size: u64,
+    total: u64,
+    fetched: usize,
+    total_field: &str,
+) -> Option<String> {
+    match end {
+        SweepEnd::Complete => None,
+        SweepEnd::Capped => Some(format!(
+            "coverage truncated: stopped at maxPages={max_pages} after {fetched} of {total} \
+             records — raise pageSize/maxPages to cover the full corpus"
+        )),
+        SweepEnd::ShortPage => Some(format!(
+            "coverage truncated: page {pages} returned fewer than pageSize={page_size} while \
+             the source reports {total} total, so the walk stopped at {fetched} records — \
+             treated as a TRUNCATED page, not the end of the corpus (a rate-limited or \
+             partially-served page looks exactly like a genuine tail)"
+        )),
+        SweepEnd::UnknownTotal => Some(format!(
+            "coverage unproven: the source served {fetched} records over {pages} page(s) while \
+             reporting `{total_field}`:0 — the total is missing or renamed, so nothing can \
+             prove the corpus was covered. The walk ran to a short page or maxPages={max_pages} \
+             instead of trusting the total"
+        )),
+    }
+}
+
+/// Whether a listing that reported **nothing at all** is contract drift rather
+/// than an honestly empty result set: the source served no total and no records
+/// while opportunities for this app are already stored locally.
+///
+/// This is `grants-gov`'s `empty_listing_is_drift` reasoning, and it is the arm
+/// that **survives `total == 0`**. The per-page guard these apps ship
+/// (`total > 0 && got == 0`) is gated on the very field a schema change removes,
+/// so a renamed total and a renamed results array — the SAME upstream change —
+/// disarm it completely. The stored corpus is the one denominator that cannot be
+/// renamed by the source.
+///
+/// The count must come from the STORED corpus, never from the response being
+/// doubted. `Datasets::count_filtered` counts `removed_at IS NULL`, which is
+/// deliberate in both directions: a tombstoned row is not evidence that the
+/// source still has a corpus to serve.
+pub fn empty_listing_is_drift(total: u64, fetched: usize, stored_corpus: i64) -> bool {
+    total == 0 && fetched == 0 && stored_corpus > 0
+}
+
+/// Whether a page that returned nothing is contract drift.
+///
+/// It is drift when the reported total places this page **inside** the corpus:
+/// the records are there, the results array did not deliver them. A page past
+/// the end of a shrunken listing produces the same empty shape and is not drift
+/// — the arithmetic tells them apart. Complements
+/// [`empty_listing_is_drift`], which covers the case this one cannot see
+/// because it is gated on the total.
+pub fn empty_page_is_drift(page: u64, page_size: u64, total: u64, got: u64) -> bool {
+    total > 0 && got == 0 && page.saturating_sub(1).saturating_mul(page_size) < total
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ---- sweep coverage vocabulary ----
+
+    /// THE REFUTED BEHAVIOR, three apps deep: the total was read with
+    /// `.unwrap_or(0)` and the walk broke on `pages * page_size >= total`, i.e.
+    /// `100 >= 0` after page one. A 2,000-topic corpus became a 100-topic one
+    /// reporting a clean run, with a drift guard gated on `total > 0` that could
+    /// not fire.
+    #[test]
+    fn a_missing_total_is_unknown_coverage_not_a_finished_sweep() {
+        // Page 1 of a renamed-total feed: 100 records served under total 0.
+        assert_eq!(
+            walk_end(1, 100, 0, 100, 100, 50),
+            None,
+            "a full page under a zero total must keep walking, not stop at one page"
+        );
+        // ...and however far it walks, it never reads as complete.
+        assert_eq!(
+            walk_end(3, 100, 0, 40, 240, 50),
+            Some(SweepEnd::UnknownTotal),
+            "a short page ends the unknown-total walk without proving coverage"
+        );
+        assert_eq!(
+            walk_end(50, 100, 0, 100, 5000, 50),
+            Some(SweepEnd::UnknownTotal),
+            "so does the page cap"
+        );
+        assert!(SweepEnd::UnknownTotal.truncated());
+
+        // The boundary that must NOT be drift: no total AND no records is an
+        // honestly empty result set, and it is fully swept.
+        assert_eq!(walk_end(1, 100, 0, 0, 0, 50), Some(SweepEnd::Complete));
+    }
+
+    #[test]
+    fn coverage_is_proven_by_records_collected_not_by_offset_arithmetic() {
+        // 137-record corpus, page size 100. Page 2 serves only 12 (a truncated
+        // page). Offset arithmetic says 200 >= 137 — "complete". Collected says
+        // 112 < 137, and a short page is evidence of nothing.
+        assert_eq!(
+            walk_end(2, 100, 137, 12, 112, 50),
+            Some(SweepEnd::ShortPage),
+            "112 of 137 collected is not a complete sweep, however far the offset ran"
+        );
+        // The same page, fully served, IS the end of the corpus.
+        assert_eq!(walk_end(2, 100, 137, 37, 137, 50), Some(SweepEnd::Complete));
+        // The cap outranks a short page, and coverage outranks both.
+        assert_eq!(
+            walk_end(50, 100, 100_000, 100, 5000, 50),
+            Some(SweepEnd::Capped)
+        );
+        assert_eq!(
+            walk_end(50, 100, 5000, 100, 5000, 50),
+            Some(SweepEnd::Complete)
+        );
+    }
+
+    #[test]
+    fn truncated_is_the_projection_of_sweep_not_a_second_opinion() {
+        for (end, name, truncated) in [
+            (SweepEnd::Complete, "complete", false),
+            (SweepEnd::Capped, "capped", true),
+            (SweepEnd::ShortPage, "short_page", true),
+            (SweepEnd::UnknownTotal, "unknown_total", true),
+        ] {
+            assert_eq!(end.as_str(), name);
+            assert_eq!(end.truncated(), truncated, "{name}");
+            assert_eq!(
+                sweep_warning(end, 1, 50, 100, 10, 5, "totalResults").is_some(),
+                truncated,
+                "{name}: every non-complete arm must reach warnings[] too"
+            );
+        }
+        let unproven =
+            sweep_warning(SweepEnd::UnknownTotal, 3, 50, 100, 0, 240, "totalResults").unwrap();
+        assert!(
+            unproven.contains("totalResults"),
+            "the warning must name the field to go looking for: {unproven}"
+        );
+    }
+
+    /// THE REFUTED BEHAVIOR: the shipped guard is `total > 0 && got == 0`, gated
+    /// on the very field an upstream rename removes. A renamed total and a
+    /// renamed results array are the SAME schema change, so it disarms itself in
+    /// exactly the case it exists for.
+    #[test]
+    fn an_empty_listing_is_drift_against_the_stored_corpus_not_against_the_total() {
+        // Total renamed AND results renamed: nothing came back, but 2,000 rows
+        // are stored. That is drift, and the old guard could not see it.
+        assert!(empty_listing_is_drift(0, 0, 2000));
+        // A first-ever run has nothing stored to contradict: not drift.
+        assert!(!empty_listing_is_drift(0, 0, 0));
+        // Records came back: whatever else is wrong, the array is not gone.
+        assert!(!empty_listing_is_drift(0, 100, 2000));
+
+        // The per-page guard still covers the case it CAN see, and only inside
+        // the corpus the total claims.
+        assert!(empty_page_is_drift(1, 100, 2000, 0));
+        assert!(
+            !empty_page_is_drift(1, 100, 0, 0),
+            "no total, nothing to gate on"
+        );
+        assert!(
+            !empty_page_is_drift(21, 100, 2000, 0),
+            "a page past the end of a shrunken listing is not drift"
+        );
+    }
 
     #[test]
     fn grants_gov_normalizes_to_unified_schema() {
