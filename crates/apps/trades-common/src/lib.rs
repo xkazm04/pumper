@@ -126,6 +126,46 @@ pub fn forced(ctx: &AppContext) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the operator explicitly authorised a **shrinking roster**
+/// (`allow_shrink: true`) — the escape hatch on
+/// [`coverage::write_snapshot`]'s completeness floor.
+///
+/// Separate from [`forced`] on purpose: `force: true` is how an operator
+/// ordinarily re-runs a vintage- or age-gated app, so reusing it here would
+/// switch the floor off on exactly the runs it exists to protect.
+pub fn allow_shrink(ctx: &AppContext) -> bool {
+    ctx.params
+        .get("allow_shrink")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+/// **A tombstone is not live data.** `pumper_core::Datasets::list` deliberately
+/// returns removed records (with `removed_at` set) so exports stay complete —
+/// so every consumer that wants the LIVE view has to filter, and the trades
+/// join did not: a state that a short `state-tax` run had tombstoned still got
+/// a live `<ST>:<trade>` row in `trades/operator_economics` and its rate still
+/// entered `median_state_rate`. The deletion was invisible in the joined product
+/// and visible in the source dataset — the worst of both.
+///
+/// Filtering at the consumer (rather than changing `list`) is deliberate: the
+/// tombstone-returning behaviour is what export and audit surfaces rely on.
+pub fn is_live(rec: &pumper_core::Record) -> bool {
+    rec.removed_at.is_none()
+}
+
+/// [`is_live`] over a whole read: the live view of a `list`/`list_filtered`
+/// result.
+pub fn live_records(recs: Vec<pumper_core::Record>) -> Vec<pumper_core::Record> {
+    recs.into_iter().filter(is_live).collect()
+}
+
+/// [`is_live`] over a single-key read (`Datasets::get`), which returns a
+/// tombstoned record just as `list` does.
+pub fn live_record(rec: Option<pumper_core::Record>) -> Option<pumper_core::Record> {
+    rec.filter(is_live)
+}
+
 /// **Vintage freshness gate** for the frozen-fact apps (`state-tax`,
 /// `trade-wages`): true when the app already holds a record at `sentinel_key`
 /// whose stored `year` equals `year` — i.e. re-deriving would re-pay a 25-30 turn
@@ -386,6 +426,304 @@ pub mod validate {
             require_rate(&mut r, "top", Some(-1.0));
             require_rate(&mut r, "top", Some(133.0));
             assert_eq!(r.len(), 2);
+        }
+    }
+}
+
+/// **Completeness floor** for the agentic trades apps: how much of the roster a
+/// run actually covered, whether that is materially short, and — for the one app
+/// in the family that writes a full snapshot — whether the run has earned the
+/// right to tombstone the keys it did not return.
+///
+/// Round 1 taught these apps to *report* coverage (`state-tax`'s
+/// `missing_states`). This module is the other half: coverage that **acts**.
+pub mod coverage {
+    use pumper_core::{AppContext, Provenance, Result, UpsertSummary};
+    use serde_json::{json, Value};
+
+    /// The fraction of its expected roster a run must cover to count as a
+    /// COMPLETE snapshot. Below this the run is *short*: it is reported as such,
+    /// and a full-snapshot write is downgraded so it cannot tombstone the
+    /// shortfall.
+    ///
+    /// 0.9 rather than 1.0 because a single genuinely-absent jurisdiction is a
+    /// routine, survivable answer from a model; 30 of 51 is not.
+    pub const COVERAGE_FLOOR: f64 = 0.9;
+
+    /// What one run covered of the roster it was asked for.
+    ///
+    /// `unit` names the roster members ("states", "trades", "priced trades") and
+    /// is only ever used in reporting text.
+    #[derive(Debug, Clone)]
+    pub struct Coverage {
+        unit: &'static str,
+        expected: usize,
+        covered: usize,
+        /// `None` when the roster's members are not fixed names (a count-only
+        /// roster) — honest-Null rather than an empty list, which would read as
+        /// "nothing missing".
+        missing: Option<Vec<String>>,
+    }
+
+    impl Coverage {
+        /// Coverage of a NAMED roster: `roster` is the full expected list,
+        /// `present` the members this run actually produced. The missing names
+        /// are kept, so the result can say *which* ones vanished.
+        pub fn of_roster(
+            unit: &'static str,
+            roster: &[&str],
+            present: &std::collections::HashSet<String>,
+        ) -> Self {
+            let missing: Vec<String> = roster
+                .iter()
+                .filter(|m| !present.contains(**m))
+                .map(|m| (*m).to_string())
+                .collect();
+            Self {
+                unit,
+                expected: roster.len(),
+                covered: roster.len().saturating_sub(missing.len()),
+                missing: Some(missing),
+            }
+        }
+
+        /// Coverage by COUNT, for rosters whose members are not a fixed list of
+        /// names (e.g. "trades that came back with at least one priced job").
+        pub fn of_counts(unit: &'static str, expected: usize, covered: usize) -> Self {
+            Self {
+                unit,
+                expected,
+                covered: covered.min(expected),
+                missing: None,
+            }
+        }
+
+        pub fn unit(&self) -> &'static str {
+            self.unit
+        }
+        pub fn expected(&self) -> usize {
+            self.expected
+        }
+        pub fn covered(&self) -> usize {
+            self.covered
+        }
+        /// The roster members this run did not return, or `&[]` for a count-only
+        /// roster (see [`Coverage::missing_named`]).
+        pub fn missing(&self) -> &[String] {
+            self.missing.as_deref().unwrap_or(&[])
+        }
+        /// Whether this coverage knows the *names* of what is missing.
+        pub fn missing_named(&self) -> bool {
+            self.missing.is_some()
+        }
+
+        /// Covered / expected. An empty roster is complete (1.0) — nothing was
+        /// asked for, so nothing is missing.
+        pub fn ratio(&self) -> f64 {
+            if self.expected == 0 {
+                return 1.0;
+            }
+            self.covered as f64 / self.expected as f64
+        }
+
+        /// Whether the run came back materially short of its roster.
+        pub fn is_short(&self) -> bool {
+            self.ratio() < COVERAGE_FLOOR
+        }
+
+        /// The shared `coverage` block every app in the family reports.
+        pub fn to_json(&self) -> Value {
+            json!({
+                "unit": self.unit,
+                "covered": self.covered,
+                "expected": self.expected,
+                // 3 dp: enough to read, short of float noise in a stored result.
+                "ratio": (self.ratio() * 1000.0).round() / 1000.0,
+                "floor": COVERAGE_FLOOR,
+                "short": self.is_short(),
+                "missing": match &self.missing {
+                    Some(m) => json!(m),
+                    None => Value::Null,
+                },
+            })
+        }
+
+        /// The one-line warning a short run contributes to the result's
+        /// `warnings[]`, or `None` when coverage cleared the floor.
+        ///
+        /// This is the family's chosen shape for "a near-total rejection is not a
+        /// silent success": before it, one surviving record out of 51 was a green
+        /// job with `rejected_count: 50` and nothing else to read.
+        pub fn warning(&self) -> Option<String> {
+            self.is_short().then(|| {
+                format!(
+                    "coverage short: {} of {} {} ({:.0}% < {:.0}% floor)",
+                    self.covered,
+                    self.expected,
+                    self.unit,
+                    self.ratio() * 100.0,
+                    COVERAGE_FLOOR * 100.0,
+                )
+            })
+        }
+    }
+
+    /// Whether a full-snapshot write has earned the right to run removal
+    /// detection: only a run that covered its roster, or one an operator
+    /// explicitly told to shrink.
+    pub fn may_tombstone(cov: &Coverage, allow_shrink: bool) -> bool {
+        allow_shrink || !cov.is_short()
+    }
+
+    /// Outcome of a completeness-gated snapshot write.
+    pub struct SnapshotWrite {
+        pub summary: UpsertSummary,
+        /// `Some(reason)` when removal detection was deliberately skipped because
+        /// the run was short. A suppressed removal is visible as such rather than
+        /// silently absent.
+        pub removals_suppressed: Option<String>,
+    }
+
+    /// **The completeness floor on a full-snapshot write.**
+    ///
+    /// `sync_many` marks every previously-live key absent from `items` as
+    /// removed, so a run that returns 30 of 51 states tombstones the other 21 and
+    /// still reports success. Core's designed protection against exactly that is
+    /// the degrading-source removal guard, and **it structurally cannot engage
+    /// for this family**, for two independent reasons:
+    ///
+    /// 1. `Resilience::enforced_state` returns `Healthy` whenever `[resilience]
+    ///    enforce` is off, and off is the shipping default.
+    /// 2. No app in this family calls `AppContext::observe_extraction`, so even
+    ///    with enforcement switched on there is no health history to enforce
+    ///    against.
+    ///
+    /// Core says as much itself: `detect_removed` "already refuses an *empty*
+    /// batch; a partial batch is the case that guard does not cover".
+    ///
+    /// So the floor lives here, at the app layer, where the expected roster is
+    /// known — lever (a) of the two the direction offered. Adopting
+    /// `observe_extraction` (lever (b)) was rejected as *insufficient on its
+    /// own*: it would build the health history, but nothing would read it while
+    /// `enforce` defaults off, so the destructive path would stay open on every
+    /// shipping install. **A later round must not delete this floor believing the
+    /// health guard covers it — it will not, until `enforce` ships on AND this
+    /// family observes its extractions. Adding (b) later is welcome; it does not
+    /// retire (a).**
+    ///
+    /// Escape hatch for a roster that legitimately shrank: `allow_shrink: true`.
+    /// Deliberately NOT `force` — `force` is how an operator ordinarily re-runs a
+    /// vintage-gated app, so hanging the hatch on it would disable the floor on
+    /// exactly the runs it exists for.
+    pub async fn write_snapshot(
+        ctx: &AppContext,
+        dataset: &str,
+        items: &[(String, Value)],
+        prov: Provenance,
+        cov: &Coverage,
+        allow_shrink: bool,
+    ) -> Result<SnapshotWrite> {
+        if may_tombstone(cov, allow_shrink) {
+            let summary = ctx.sync_many_with_provenance(dataset, items, prov).await?;
+            return Ok(SnapshotWrite {
+                summary,
+                removals_suppressed: None,
+            });
+        }
+        let reason = format!(
+            "removal detection suppressed: this run covered {} of {} {} ({:.0}% < {:.0}% floor), \
+             so the {} it did not return are kept rather than tombstoned \
+             (pass allow_shrink:true to override)",
+            cov.covered(),
+            cov.expected(),
+            cov.unit(),
+            cov.ratio() * 100.0,
+            COVERAGE_FLOOR * 100.0,
+            cov.unit(),
+        );
+        tracing::warn!(dataset, "{reason}");
+        let summary = ctx
+            .upsert_many_with_provenance(dataset, items, prov)
+            .await?;
+        Ok(SnapshotWrite {
+            summary,
+            removals_suppressed: Some(reason),
+        })
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn present(codes: &[&str]) -> std::collections::HashSet<String> {
+            codes.iter().map(|c| c.to_string()).collect()
+        }
+
+        const ROSTER: [&str; 5] = ["AL", "AK", "AZ", "AR", "CA"];
+
+        #[test]
+        fn a_partial_roster_is_short_not_complete() {
+            let cov = Coverage::of_roster("states", &ROSTER, &present(&["AL", "AK"]));
+            assert_eq!(cov.covered(), 2);
+            assert_eq!(cov.expected(), 5);
+            assert_eq!(cov.missing(), ["AZ", "AR", "CA"]);
+            assert!(cov.is_short());
+            assert!(cov.warning().is_some());
+        }
+
+        #[test]
+        fn a_full_roster_clears_the_floor() {
+            let cov = Coverage::of_roster("states", &ROSTER, &present(&ROSTER));
+            assert_eq!(cov.covered(), 5);
+            assert!(!cov.is_short());
+            assert!(cov.warning().is_none());
+            assert_eq!(cov.ratio(), 1.0);
+        }
+
+        /// The exact shape the direction names: 30 of 51 must NOT be allowed to
+        /// tombstone the other 21, and one missing state must not block a write.
+        #[test]
+        fn thirty_of_fiftyone_may_not_tombstone_but_fifty_of_fiftyone_may() {
+            let thirty = Coverage::of_counts("states", 51, 30);
+            assert!(thirty.is_short());
+            assert!(!may_tombstone(&thirty, false));
+            // ...unless an operator explicitly says the roster shrank.
+            assert!(may_tombstone(&thirty, true));
+
+            let fifty = Coverage::of_counts("states", 51, 50);
+            assert!(!fifty.is_short(), "50/51 = 98% clears the 90% floor");
+            assert!(may_tombstone(&fifty, false));
+        }
+
+        #[test]
+        fn an_empty_roster_is_complete_rather_than_short() {
+            let cov = Coverage::of_counts("trades", 0, 0);
+            assert_eq!(cov.ratio(), 1.0);
+            assert!(!cov.is_short());
+            assert!(may_tombstone(&cov, false));
+        }
+
+        #[test]
+        fn count_only_coverage_reports_null_missing_not_an_empty_list() {
+            // An empty `missing` list would read as "nothing missing", which is
+            // a lie when the roster's members were never named.
+            let cov = Coverage::of_counts("trades", 5, 2);
+            assert!(!cov.missing_named());
+            assert!(cov.to_json()["missing"].is_null());
+            let named = Coverage::of_roster("states", &ROSTER, &present(&ROSTER));
+            assert_eq!(named.to_json()["missing"], json!([]));
+        }
+
+        #[test]
+        fn coverage_json_carries_the_floor_it_was_judged_against() {
+            let cov = Coverage::of_counts("states", 51, 30);
+            let j = cov.to_json();
+            assert_eq!(j["covered"], 30);
+            assert_eq!(j["expected"], 51);
+            assert_eq!(j["short"], true);
+            assert_eq!(j["floor"], COVERAGE_FLOOR);
+            assert_eq!(j["unit"], "states");
+            assert_eq!(j["ratio"], 0.588);
         }
     }
 }
@@ -977,15 +1315,18 @@ pub mod unified {
     /// full-snapshot sync — absent source data must not mark rows removed).
     pub async fn sync_operator_economics(ctx: &AppContext) -> Result<UpsertSummary> {
         // Federal small-business constants — national, same for every trade.
-        let federal = ctx
-            .datasets
-            .get("state-tax", "tax", "federal:US")
-            .await?
+        // `live_record`: `Datasets::get` returns tombstoned rows too.
+        let federal = super::live_record(ctx.datasets.get("state-tax", "tax", "federal:US").await?)
             .map(|r| r.data);
 
         // Real per-state tax records (code → record) + the illustrative national
         // median used only by the `US:{trade}` roll-up.
-        let state_records = ctx.datasets.list("state-tax", "tax", 200).await?;
+        //
+        // `live_records`: a state a full-snapshot `state-tax` run tombstoned must
+        // not come back through this join as a live row, and must not enter
+        // `median_state_rate` — `Datasets::list` returns removed records by
+        // design, so the filter belongs here at the consumer.
+        let state_records = super::live_records(ctx.datasets.list("state-tax", "tax", 200).await?);
         let mut state_tax: Vec<(String, Value)> = Vec::new();
         let mut state_rates: Vec<f64> = Vec::new();
         for r in &state_records {
@@ -1004,19 +1345,21 @@ pub mod unified {
 
         // All priced jobs. Cap raised well past 51 localities × 5 trades × 4 jobs
         // (≈1020) so the summary can't silently truncate once localities are driven.
-        let pricing_recs = ctx
-            .datasets
-            .list("homewyse-pricing", "pricing", PRICING_READ_LIMIT)
-            .await?;
+        let pricing_recs = super::live_records(
+            ctx.datasets
+                .list("homewyse-pricing", "pricing", PRICING_READ_LIMIT)
+                .await?,
+        );
         let pricing: Vec<&Value> = pricing_recs.iter().map(|r| &r.data).collect();
 
         // Per state × trade compliance (state-licensing app): keyed `<ST>:<trade>`,
         // looked up per-row below. State-grain data, so the national `US:{trade}`
         // roll-up carries no compliance block (Null, never a fabricated average).
-        let compliance_recs = ctx
-            .datasets
-            .list(UNIFIED_APP, COMPLIANCE, COMPLIANCE_READ_LIMIT)
-            .await?;
+        let compliance_recs = super::live_records(
+            ctx.datasets
+                .list(UNIFIED_APP, COMPLIANCE, COMPLIANCE_READ_LIMIT)
+                .await?,
+        );
         let compliance: std::collections::HashMap<String, Value> = compliance_recs
             .into_iter()
             .map(|r| (r.key, r.data))
@@ -1031,16 +1374,18 @@ pub mod unified {
             // Wage + valuation are national roll-ups (`US:{label}`) — per-state
             // OEWS wages are deferred (trades#2 phase c); valuation stays national
             // by design (per-state broker comps are too thin to be honest).
-            let wage = ctx
-                .datasets
-                .get("trade-wages", "wages", &format!("US:{label}"))
-                .await?
-                .map(|r| r.data);
-            let valuation = ctx
-                .datasets
-                .get("valuation-multiples", "valuation", &format!("US:{label}"))
-                .await?
-                .map(|r| r.data);
+            let wage = super::live_record(
+                ctx.datasets
+                    .get("trade-wages", "wages", &format!("US:{label}"))
+                    .await?,
+            )
+            .map(|r| r.data);
+            let valuation = super::live_record(
+                ctx.datasets
+                    .get("valuation-multiples", "valuation", &format!("US:{label}"))
+                    .await?,
+            )
+            .map(|r| r.data);
 
             // National roll-up row (pricing filtered to the national locality, so a
             // Texas price no longer contaminates the national envelope).
@@ -1303,6 +1648,47 @@ pub mod unified {
             assert_eq!(ca_ctx["state"]["top_marginal_rate"], 0.133);
             assert_eq!(tx_ctx["federal"]["top_marginal_rate"], 0.37);
         }
+    }
+}
+
+#[cfg(test)]
+mod live_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rec(key: &str, removed: bool) -> pumper_core::Record {
+        let now = chrono::Utc::now();
+        pumper_core::Record {
+            key: key.to_string(),
+            data: json!({ "state": key }),
+            first_seen: now,
+            last_seen: now,
+            updated_at: now,
+            removed_at: removed.then_some(now),
+            trust: "stable".to_string(),
+        }
+    }
+
+    /// The anti-pattern: `Datasets::list` hands back tombstones, and a consumer
+    /// that forgets to filter serves a deleted record as live data.
+    #[test]
+    fn a_tombstoned_record_is_not_live() {
+        assert!(is_live(&rec("CA", false)));
+        assert!(!is_live(&rec("CA", true)));
+    }
+
+    #[test]
+    fn live_records_drops_tombstones_and_keeps_order() {
+        let recs = vec![rec("CA", false), rec("TX", true), rec("NY", false)];
+        let keys: Vec<String> = live_records(recs).into_iter().map(|r| r.key).collect();
+        assert_eq!(keys, ["CA", "NY"], "TX was tombstoned");
+    }
+
+    #[test]
+    fn live_record_drops_a_tombstoned_single_read() {
+        assert!(live_record(Some(rec("federal:US", false))).is_some());
+        assert!(live_record(Some(rec("federal:US", true))).is_none());
+        assert!(live_record(None).is_none());
     }
 }
 

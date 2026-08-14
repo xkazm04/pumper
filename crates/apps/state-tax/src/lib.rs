@@ -233,12 +233,10 @@ impl ScrapeApp for StateTax {
             }
         }
 
-        // Completeness against the fixed 50-states-+-DC roster.
-        let missing: Vec<&str> = US_JURISDICTIONS
-            .iter()
-            .copied()
-            .filter(|j| !present.contains(*j))
-            .collect();
+        // Completeness against the fixed 50-states-+-DC roster. This is not a
+        // report any more: it decides whether this run may tombstone.
+        let cov = coverage::Coverage::of_roster("states", &US_JURISDICTIONS, &present);
+        let mut warnings: Vec<String> = cov.warning().into_iter().collect();
 
         if present.is_empty() {
             return Err(Error::App(
@@ -246,16 +244,34 @@ impl ScrapeApp for StateTax {
             ));
         }
 
-        // Full 50-state + DC snapshot, so sync_many: a state that drops out of a
-        // later run is marked removed instead of lingering as stale data.
+        // Full 50-state + DC snapshot, so a *complete* run syncs: a state that
+        // drops out is marked removed instead of lingering as stale data.
+        //
+        // A SHORT run does not. `sync_many`'s own protection — the
+        // degrading-source removal guard — cannot engage for this family
+        // (`enforce` defaults off, and nothing here calls `observe_extraction`),
+        // and core's own doc says `detect_removed` "already refuses an *empty*
+        // batch; a partial batch is the case that guard does not cover". So the
+        // completeness floor in `coverage::write_snapshot` is what stands between
+        // a 30-of-51 answer and 21 tombstoned states; read its doc comment before
+        // touching this. `allow_shrink: true` is the escape hatch.
+        //
         // Provenance (M12): the same derivation-spec pin its sibling research
         // apps use — an agentic answer has no single source URL, so rules_hash
-        // is the only honest stamp. Carried through the sync path (rather than
-        // a hand-rolled upsert) so the degrading-source removal guard still
-        // applies.
-        let summary = ctx
-            .sync_many_with_provenance("tax", &all_records, prov)
-            .await?;
+        // is the only honest stamp.
+        let write = coverage::write_snapshot(
+            &ctx,
+            "tax",
+            &all_records,
+            prov,
+            &cov,
+            trades_common::allow_shrink(&ctx),
+        )
+        .await?;
+        let summary = write.summary;
+        if let Some(reason) = &write.removals_suppressed {
+            warnings.push(reason.clone());
+        }
 
         // Cross-source layer: state-tax contributes the federal + illustrative-state
         // tax context to trades/operator_economics (mirrors grants-common's sync).
