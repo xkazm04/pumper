@@ -8,7 +8,7 @@ Multi-stage flows (`crawl → extract → research → alert`) compose declarati
 
 ## The `_trigger` contract (what the target app reads)
 
-The target job's params = template with `_trigger` merged over it (injected wins): `{trigger_id, source_kind, app, dataset|status, kind, count, keys (capped at [triggers] key_cap, default 200), source_job_id, result_summary?, depth, chain}`. Full data is **never inlined** — fetch by key via the datasets API or by `source_job_id` via `GET /jobs/{id}`.
+The target job's params = template with `_trigger` merged over it (injected wins): `{trigger_id, source_kind, app, dataset|status, kind, count, keys (capped at [triggers] key_cap, default 200), keys_truncated, source_job_id, result_summary?, depth, chain}`. `keys` is the target's **work list**, not a sample of one — `extractor` and `plugin` process exactly those records — so `keys_truncated` states whether `key_cap` cut it short rather than leaving the target to infer it by comparing `keys.len()` against `count` (which stays exact). A transform plugin cannot narrow or delete either: both are host-owned, see [trigger-plugins.md](trigger-plugins.md). Full data is **never inlined** — fetch by key via the datasets API or by `source_job_id` via `GET /jobs/{id}`.
 
 ## Guarantees
 

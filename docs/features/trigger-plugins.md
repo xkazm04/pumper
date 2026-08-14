@@ -11,12 +11,24 @@ fire. Two hook slots, both optional, both attachable to any `source_kind`:
 The predicate runs first; a veto short-circuits the transform entirely.
 
 Two example plugins ship in-tree: `plugins-src/trigger-gate` (predicate — fire
-only on batches of at least `min_count`, optionally only for one dataset) and
-`plugins-src/delta-slim` (transform — keep only the named keys, or cap the
-`keys` sample).
+only on batches of at least `min_count`, optionally only for one dataset; both
+rules read fields only **dataset** hops carry, so on job and external hops they
+sit out and the hop passes, with `reason` saying so) and
+`plugins-src/delta-slim` (transform — keep only the named keys; host-owned keys
+come back regardless).
+
+**Both are built and verified by CI.** They live in detached workspaces targeting
+`wasm32-unknown-unknown`, so `cargo test --workspace` never compiled them and a
+break went fail-open in production rather than red in CI — a gate nobody deployed
+reads exactly like a gate that said yes. CI now runs `just plugins-install`,
+`just plugins-test` and the artifact tests (`just plugins-verify` locally). Note a
+build alone is not enough: deleting `#[no_mangle]` from an export still compiles
+clean for wasm32, so `every_shipped_plugin_still_exports_the_host_abi` checks the
+declared ABI from source in the ordinary suite, and the artifact tests ask the
+host whether each installed module is actually executable.
 
 Implementation: `crates/server/src/triggers.rs` (`apply_plugin_hooks`,
-`restamp_provenance`, `missing_hook_plugins`) over the host in
+`restamp_host_owned`, `missing_hook_plugins`) over the host in
 `crates/engine-wasm/`. The ABI and the sandbox itself are shared with
 extraction plugins — see [extraction.md](extraction.md).
 
@@ -67,6 +79,13 @@ POST /triggers
 }
 ```
 
+`keep` shapes the **payload**, never the target's work scope: `keys` and
+`keys_truncated` are re-added by the host afterwards. (This example used to be a
+live footgun — pairing `target_app: extractor` with a keep-list that omits `keys`
+dropped the work list, and the extractor's fallback is a full 10,000-record
+sweep, so a 3-record incremental extract became a full sweep. The host now
+overrules that.)
+
 Create-time validation: a non-empty `plugin` name, and `on_error` limited to
 `fire | skip` and allowed on the **predicate only**. The named plugin need
 **not** be loaded yet — hot reload is the point — so a typo is not caught here;
@@ -81,12 +100,25 @@ same one that would be merged into the target job's params — its shape depends
 on the source kind (dataset delta, terminal-job summary, or inbound ingress
 event); see [triggers.md](triggers.md).
 
-**Provenance is not the plugin's to write.** After a transform runs, the host
-re-stamps `trigger_id`, `source_kind`, `source_job_id`, `event_id`,
-`source_id`, `depth` and `chain` from the original envelope — and *removes* any
-of those the original did not have. Cycle guards, depth limits and delivery
-idempotency all read those keys, so a sandbox that could forge or drop them
-could escape its own lineage. Everything else is the plugin's to reshape or
+**Provenance and work scope are not the plugin's to write.** After a transform
+runs, the host re-stamps two classes of key from the original envelope — and
+*removes* any the original did not have:
+
+- **Lineage** — `trigger_id`, `source_kind`, `source_job_id`, `event_id`,
+  `source_id`, `depth`, `chain`. Cycle guards, depth limits and delivery
+  idempotency all read these, so a sandbox that could forge or drop them could
+  escape its own lineage.
+- **Work scope** — `keys`, `keys_truncated`. `extractor` and `plugin` read
+  `_trigger.keys` as their **work list**, not as a sample, so a transform could
+  rescope the target's *work* rather than merely its payload — in both
+  directions. An *absent* `keys` is not a smaller payload: it means "every live
+  record, up to `SOURCE_LIST_LIMIT` (10,000)". The key throttle is
+  `[triggers] key_cap`, which is the host's knob and stays the host's.
+
+Shrinking what a **webhook** carries is legitimate; shrinking what a **job does**
+is not. A transform that tries is overruled, and the overridden keys are named in
+a `warn!` so the plugin author and the operator both find out, rather than having
+to diff two JSON blobs to notice. Everything else is the plugin's to reshape or
 discard.
 
 ## Failure semantics — fail-open, always
