@@ -9,10 +9,14 @@
 //!
 //! Most of the fixtures are inline `wat`, compiled by wasmtime transparently
 //! when written to a `.wasm` file — so these run unconditionally, with no
-//! dependency on a build step. The two tests that exercise the SHIPPED
-//! plugins (`plugins-src/trigger-gate`, `plugins-src/delta-slim`) need
+//! dependency on a build step. The tests that exercise the SHIPPED plugins
+//! (`plugins-src/trigger-gate`, `plugins-src/delta-slim`) need
 //! `just plugins-install` to have run and are `#[ignore]`d for it, following
-//! `crates/engine-wasm/tests/plugins.rs`.
+//! `crates/engine-wasm/tests/plugins.rs`. They are not optional: CI installs
+//! the artifacts and runs exactly these with `--ignored`, so a shipped plugin
+//! that stops honouring the host ABI turns the build red instead of quietly
+//! failing its hop open in production. `just plugins-verify` is the same thing
+//! locally.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -640,11 +644,11 @@ async fn succeeded_source(state: &AppState) -> pumper_core::Job {
 // ── the SHIPPED plugins (need `just plugins-install`) ────────────────────────
 
 const NEEDS_INSTALL: &str =
-    "requires data/plugins/{trigger-gate,delta-slim}.wasm — run `just plugins-install`; \
-     then `cargo test -- --ignored`";
+    "requires data/plugins/{trigger-gate,delta-slim}.wasm — run `just plugins-verify`, \
+     which installs them and runs exactly these tests (CI runs the same step)";
 
 #[tokio::test]
-#[ignore = "requires data/plugins/trigger-gate.wasm — run `just plugins-install`"]
+#[ignore = "requires the built data/plugins/trigger-gate.wasm — `just plugins-verify` (CI runs this step)"]
 async fn shipped_trigger_gate_gates_on_min_count_and_dataset() {
     let plugins = installed_host();
     assert!(plugins.has("trigger-gate"), "{NEEDS_INSTALL}");
@@ -676,7 +680,7 @@ async fn shipped_trigger_gate_gates_on_min_count_and_dataset() {
 }
 
 #[tokio::test]
-#[ignore = "requires data/plugins/delta-slim.wasm — run `just plugins-install`"]
+#[ignore = "requires the built data/plugins/delta-slim.wasm — `just plugins-verify` (CI runs this step)"]
 async fn shipped_delta_slim_slims_the_envelope_without_losing_lineage() {
     let plugins = installed_host();
     assert!(plugins.has("delta-slim"), "{NEEDS_INSTALL}");

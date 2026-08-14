@@ -21,7 +21,20 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+          # plugins-src/* are cdylib crates targeting wasm32 in their OWN
+          # detached workspaces, so `cargo test --workspace` never compiles
+          # them. Nothing here did either, which meant a shipped trigger-hook
+          # plugin could stop building — or stop exporting the host ABI — and
+          # the only symptom was a fail-open hop in production: a gate nobody
+          # deployed reads exactly like a gate that said yes.
+          targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      # The plugin steps below drive the justfile rather than restating its
+      # loop, so the recipe stays the single definition of "how a plugin is
+      # built and installed" (CLAUDE.md: the justfile is the canonical runner).
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
       - name: Format
         run: cargo fmt --check
       - name: Clippy
@@ -36,6 +49,23 @@ jobs:
         # Environment-dependent tests (real Chrome, wasm artifact, wall-clock
         # timing) are #[ignore]d; run them locally with `cargo test -- --ignored`.
         run: cargo test --workspace
+      # After the main suite, so installing artifacts into data/plugins/ cannot
+      # change what it saw. `data/` is gitignored and no clone ever ships these
+      # artifacts, so this is the first place they exist in CI at all.
+      - name: Build + install every plugins-src crate
+        run: just plugins-install
+      - name: Plugin crate unit tests (host target)
+        run: just plugins-test
+      # The artifact tests are still #[ignore]d — a clean checkout has no wasm
+      # target and no built .wasm, and a default `cargo test` must not depend on
+      # a build step. They are not optional HERE: this is the step that turns a
+      # host-ABI break red, because it loads each installed module and asks the
+      # host whether it is executable (`Plugins::has`), which merely compiling
+      # the crate cannot answer.
+      - name: Artifact tests (the #[ignore]d wasm ones)
+        run: |
+          cargo test -p pumper-engine-wasm --test plugins -- --ignored
+          cargo test -p pumper-server e2e::trigger_plugins -- --ignored
 
   audit:
     name: Dependency audit

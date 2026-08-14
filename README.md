@@ -234,15 +234,27 @@ to the target site in the Chrome window that opens, then flip back to
 
 ## WASM plugins
 
-Example plugins live in `plugins-src/` (Rust → `wasm32-unknown-unknown`). Build
-and install one:
+Example plugins live in `plugins-src/` (Rust → `wasm32-unknown-unknown`). They
+are **detached workspaces**, so `cargo build --workspace` never compiles them —
+and `data/` is gitignored, so no clone starts with the built artifacts. Build
+and install all of them:
 
 ```powershell
-cd plugins-src/title-extractor
-cargo build --release --target wasm32-unknown-unknown
-copy target\wasm32-unknown-unknown\release\title_extractor.wasm ..\..\data\plugins\title.wasm
-# then: irm -Method Post http://127.0.0.1:8088/plugins/reload
+rustup target add wasm32-unknown-unknown   # once
+just plugins-install                        # builds every plugins-src crate, installs to data/plugins/
+irm -Method Post http://127.0.0.1:8088/plugins/reload
 ```
+
+The installed file **stem** is the plugin name the host loads — what a job's
+`params.plugin` and a trigger's `plugins.predicate.plugin` name. It is the
+hyphenated crate name, except `title-extractor`, which installs as `title.wasm`.
+`just plugins-install` owns that mapping; `just plugin <crate>` builds one crate
+without installing it.
+
+`just plugins-verify` builds, installs, and runs the artifact-dependent tests —
+the same steps CI runs. Use it after editing a plugin: a module that drops an
+ABI export still compiles, and the only production symptom is a hook that
+silently fails open.
 
 A plugin exports `alloc(len)->ptr` and `extract(ptr,len)->u64` (output packed as
 `ptr<<32 | len`, UTF-8 JSON). It runs with a CPU-fuel budget and memory cap and

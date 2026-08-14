@@ -130,21 +130,27 @@ search-backfill scope:
     cargo run -p pumper-server --bin search-backfill -- {{scope}}
 
 # Install the resulting .wasm into data/plugins/ and `POST /plugins/reload` —
-# see README.md § WASM plugins for the copy step, or use `just plugins-install`
-# which does the build AND the copy for the trigger plugins.
+# see README.md § WASM plugins, or use `just plugins-install`, which builds AND
+# installs EVERY plugin under plugins-src/ with the right installed name.
 #
-# Build an example WASM plugin from plugins-src/<crate> (detached workspace).
+# Build ONE example WASM plugin from plugins-src/<crate> (detached workspace).
 plugin crate:
     cd plugins-src/{{crate}} && cargo build --release --target wasm32-unknown-unknown
 
-# Builds AND installs the two trigger-hook plugins, which `just plugin` only
-# builds. Without this step every configured `plugins.predicate` /
-# `plugins.transform` hook hits the unknown-plugin path: predicates silently
-# pass and transforms silently no-op (fail-open by design — see
-# docs/features/trigger-plugins.md). Re-run after editing a plugin, then
-# `curl -X POST localhost:8088/plugins/reload` to hot-swap without a restart.
+# Builds AND installs every plugins-src crate, which `just plugin` does for one.
 #
-# Build trigger-gate + delta-slim for wasm32 and install them into data/plugins/.
+# Nothing else in this repo compiles them: each plugins-src crate carries its own
+# `[workspace]` (they target wasm32, not the host), so `cargo test --workspace`
+# never sees them. This recipe and the `plugins` steps in
+# .github/workflows/ci.yml are the ONLY things that build them — which is why
+# both go through here rather than each spelling the loop out.
+#
+# Without this step every configured `plugins.predicate` / `plugins.transform`
+# hook hits the unknown-plugin path: predicates silently pass and transforms
+# silently no-op (fail-open by design — see docs/features/trigger-plugins.md),
+# and the four artifact-dependent #[ignore]d tests have nothing to run against.
+# Re-run after editing a plugin, then
+# `curl -X POST localhost:8088/plugins/reload` to hot-swap without a restart.
 plugins-install:
     #!/usr/bin/env sh
     set -e
@@ -154,16 +160,48 @@ plugins-install:
         exit 1
     fi
     mkdir -p data/plugins
-    # The installed file STEM is the plugin name the host loads and a trigger's
-    # `plugins.predicate.plugin` names — so it must be the hyphenated crate
-    # name, not cargo's underscored artifact name.
-    for crate in trigger-gate delta-slim; do
+    for dir in plugins-src/*/; do
+        crate=$(basename "$dir")
+        # cargo underscores the artifact name; the INSTALLED file stem is the
+        # plugin name the host loads — what a job's `params.plugin` and a
+        # trigger's `plugins.predicate.plugin` name — so it must be the
+        # hyphenated crate name. `title-extractor` is the one exception: README
+        # and the `plugin` app's examples have always called it `title`, and
+        # that rename used to exist only as a line of README prose, which is why
+        # `just test-ignored` could not pass on a clean machine.
         artifact=$(echo "$crate" | tr '-' '_')
-        ( cd "plugins-src/$crate" && cargo build --release --target wasm32-unknown-unknown )
-        cp "plugins-src/$crate/target/wasm32-unknown-unknown/release/$artifact.wasm" \
-           "data/plugins/$crate.wasm"
-        echo "installed data/plugins/$crate.wasm"
+        case "$crate" in
+            title-extractor) name=title ;;
+            *) name="$crate" ;;
+        esac
+        ( cd "$dir" && cargo build --release --target wasm32-unknown-unknown )
+        cp "$dir/target/wasm32-unknown-unknown/release/$artifact.wasm" \
+           "data/plugins/$name.wasm"
+        echo "installed data/plugins/$name.wasm"
     done
+
+# The plugin crates' OWN unit tests, on the HOST target (a detached workspace
+# gets no coverage from `just test`). Crates with no `#[cfg(test)]` module pass
+# with zero tests, which is the point: adding one is enough to get it run.
+plugins-test:
+    #!/usr/bin/env sh
+    set -e
+    for dir in plugins-src/*/; do
+        echo "== $dir"
+        ( cd "$dir" && cargo test )
+    done
+
+# Everything CI's plugin steps run, in one command — so "does my plugin change
+# break the host ABI?" is answerable locally with the same commands.
+#
+# A shipped hook plugin that stops exporting `extract_v2` still COMPILES; what
+# catches it is loading the built artifact and asking the host whether it is
+# executable, which is exactly what the #[ignore]d artifact tests do. Without
+# this recipe such a break reaches production as a fail-open hop (an ungated
+# gate), never as a red build.
+plugins-verify: plugins-install plugins-test
+    cargo test -p pumper-engine-wasm --test plugins -- --ignored
+    cargo test -p pumper-server e2e::trigger_plugins -- --ignored
 
 # --- live verification --------------------------------------------------------
 
