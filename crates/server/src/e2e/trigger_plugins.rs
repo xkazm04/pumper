@@ -30,7 +30,9 @@ use serde_json::{json, Value};
 
 use super::harness::{test_state_with_plugins, FakeApp};
 use crate::state::AppState;
-use crate::triggers::{apply_plugin_hooks, fire_terminal_triggers, missing_hook_plugins};
+use crate::triggers::{
+    apply_plugin_hooks, external_trigger_obj, fire_terminal_triggers, missing_hook_plugins,
+};
 
 /// The object half of a hook verdict — the fail-open behaviour these tests were
 /// written against. The incident half (what the ledger is told) is asserted by
@@ -677,6 +679,100 @@ async fn shipped_trigger_gate_gates_on_min_count_and_dataset() {
         json!({"dataset": "orgs"}),
     )));
     assert_eq!(hook_obj(plugins.as_ref(), &t, delta()).await, None);
+}
+
+/// THE inverted fail-open. `crates/server/src/triggers.rs` already refuses to
+/// record a crashed sandbox as a gate decision
+/// (`a_crashed_predicate_is_not_recorded_as_a_veto`); this is the remaining
+/// half — a **veto masquerading as a decision**.
+///
+/// `count` exists only in `dataset_trigger_obj`. A job hop's numbers live under
+/// `result_summary`, so the shipped gate's `delta.get("count").unwrap_or(0)`
+/// met a `min_count` defaulting to 1, `0 >= 1` was false, and it returned a
+/// well-formed `{"pass": false}` forever. Nothing failed, so the ledger wrote
+/// `predicate_veto` — which docs/features/trigger-plugins.md defines as "a
+/// predicate that ran and answered". The operator attached the shipped,
+/// documented example to a job trigger and the edge was dead permanently while
+/// every surface reported it working.
+///
+/// This drives the REAL fire path, so the envelope is the one
+/// `terminal_trigger_obj` actually builds, not a fixture that could drift.
+#[tokio::test]
+#[ignore = "requires the built data/plugins/trigger-gate.wasm — `just plugins-verify` (CI runs this step)"]
+async fn shipped_trigger_gate_does_not_veto_a_job_hop_that_has_no_count() {
+    let host = installed_host();
+    assert!(host.has("trigger-gate"), "{NEEDS_INSTALL}");
+    let (state, _store) = test_state_with_plugins(vec![Arc::new(FakeApp)], Arc::new(host)).await;
+    // Both knobs the docs show an operator writing, on a JOB trigger. Neither
+    // field they read exists in this envelope.
+    let t = hooked_trigger(
+        &state,
+        predicate_only(
+            "trigger-gate",
+            json!({ "min_count": 2, "dataset": "grants" }),
+        ),
+    )
+    .await;
+
+    let job = succeeded_source(&state).await;
+    fire_terminal_triggers(&state, &job).await;
+
+    let outcomes = outcomes_of(&state, &t.id).await;
+    assert!(
+        !outcomes.iter().any(|o| o == "predicate_veto"),
+        "a job envelope carries no `count` and no `dataset`; a rule that cannot \
+         apply must not be recorded as a gate that said no — got {outcomes:?}"
+    );
+    assert_eq!(
+        state
+            .storage
+            .jobs_by_trigger(&t.id, 10)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "the edge is alive: the hop was enqueued"
+    );
+    assert!(outcomes.iter().any(|o| o == "fired"), "{outcomes:?}");
+}
+
+/// The external half. A full ingress round-trip needs a registered source and a
+/// verified delivery, and what the predicate reads is the ENVELOPE — so this
+/// builds it with the same `external_trigger_obj` the fire path calls. Note the
+/// payload deliberately carries `count`/`dataset`: they are one level down, and
+/// a gate that "found" them there would be guessing.
+#[tokio::test]
+#[ignore = "requires the built data/plugins/trigger-gate.wasm — `just plugins-verify` (CI runs this step)"]
+async fn shipped_trigger_gate_does_not_veto_an_external_hop_that_has_no_count() {
+    let host = installed_host();
+    assert!(host.has("trigger-gate"), "{NEEDS_INSTALL}");
+    let plugins: Arc<dyn Plugins> = Arc::new(host);
+    let mut t = trigger(Some(predicate_only(
+        "trigger-gate",
+        json!({ "min_count": 2, "dataset": "grants" }),
+    )));
+    t.source_kind = "external".into();
+
+    let obj = external_trigger_obj(
+        &t,
+        "S1",
+        "partner",
+        "E1",
+        &json!({ "count": 9, "dataset": "grants" }),
+        1,
+        &["T1".to_string()],
+    );
+    let verdict = apply_plugin_hooks(plugins.as_ref(), &t, obj.clone()).await;
+    assert_eq!(
+        verdict.obj,
+        Some(obj),
+        "an external hop must survive the shipped gate untouched"
+    );
+    assert!(
+        verdict.incidents.is_empty(),
+        "and leave no incident behind: {:?}",
+        verdict.incidents
+    );
 }
 
 #[tokio::test]
