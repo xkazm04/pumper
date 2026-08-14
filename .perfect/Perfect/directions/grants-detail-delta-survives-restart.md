@@ -3,12 +3,12 @@ slug: grants-detail-delta-survives-restart
 type: perfect/direction
 context: "[[us-federal-grants]]"
 lens: robustness
-status: accepted
+status: shipped
 size: S
 proposed: 2026-08-14
 accepted: 2026-08-14
-shipped: —
-commit: —
+shipped: 2026-08-14
+commit: a901707
 ---
 
 ## What & why

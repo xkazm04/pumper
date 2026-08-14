@@ -4,9 +4,9 @@ type: perfect/context
 group: Job Orchestration
 category: lib
 opportunity: 9
-last_proposed: 2026-08-03
-cooldown_until: —
-directions: ["[[finalize-off-the-slot]]", "[[job-receipt]]", "[[saved-search-virtual-app-scoping]]", "[[worker-lifecycle-harness]]", "[[worker-panic-containment]]"]
+last_proposed: 2026-08-14
+cooldown_until: r24 (mined r22)
+directions: ["[[finalize-off-the-slot]]", "[[job-receipt]]", "[[saved-search-virtual-app-scoping]]", "[[worker-lifecycle-harness]]", "[[worker-panic-containment]]", "[[checkpoint-failure-is-visible]]"]
 ---
 
 <!-- r17 reconciliation (2026-08-13): this note said `last_proposed: never` with an
@@ -60,4 +60,14 @@ ordering guarantee, DataHub spawn, and bug (a).
 (not yet proposed)
 
 ## Shipped
+- **2026-08-14 (r22) [[checkpoint-failure-is-visible]] `28fb46a`** — `JobCheckpointer` counts its
+  own failed saves, distinguishing **stale lineage** from **storage error**, and the tally rides
+  **`jobs.result`** — the one surface that outlives the run with no migration, so it reaches
+  `GET /jobs/{id}`, the receipt and the terminal SSE event for free (the live progress store is
+  cleared at finalize, so it could not have carried this). A throttle-skip returns `true` before any
+  counting and is deliberately NOT counted — pinned by a test, because conflating the two would
+  manufacture the alarm it exists to report. An app whose result is not a JSON object is LOGGED,
+  never silently dropped; nothing is stamped when every save landed (no fabricated zeros).
+  **Observed effect:** a job that silently lost its durability — every `false` was a `warn!` and
+  nothing else, at all 11 discarding call sites — is now visible after the fact.
 (none yet)

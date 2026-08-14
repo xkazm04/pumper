@@ -3,12 +3,12 @@ slug: ca-grants-sweep-says-what-it-proved
 type: perfect/direction
 context: "[[us-state-grants]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-14
 accepted: 2026-08-14
-shipped: —
-commit: —
+shipped: 2026-08-14
+commit: 4cb7415
 ---
 
 ## What & why

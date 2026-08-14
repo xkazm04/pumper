@@ -4,9 +4,9 @@ type: perfect/context
 group: Core Platform
 category: lib
 opportunity: 4
-last_proposed: 2026-08-13
-cooldown_until: round 22
-directions: ["[[replay-miss-terminal]]", "[[cassette-verified-or-refused]]", "[[replay-means-replay]]"]
+last_proposed: 2026-08-14
+cooldown_until: r24 (mined r22)
+directions: ["[[replay-miss-terminal]]", "[[cassette-verified-or-refused]]", "[[replay-means-replay]]", "[[harness-expresses-the-run]]"]
 ---
 
 ## Current state
@@ -97,6 +97,15 @@ live as riders inside [[cassette-verified-or-refused]], which is the right home 
   live the day anyone ships `heartbeat_secs = 0`.
 
 ## Shipped
+- **2026-08-14 (r22) [[harness-expresses-the-run]] `b5d500e`** — SHIPPED after being deferred
+  TWICE (r20, r21). `RecordingCheckpoints` (records every `(state, force)` in order; `failing()` /
+  `failing_from(n)` make the `false` branch reachable; failed saves are still recorded, because
+  what an app TRIED to persist is the evidence of what the loss cost) + `TestContext::checkpoints()`.
+  Modelled on `ScriptedResearcher`, one trait over. **Verified PURELY ADDITIVE: the commit touches
+  only `testing.rs` + `runtime.md` — zero of the 39 files constructing a `TestContext` changed**,
+  which is exactly the deferral reason (write-set ripple) that killed it twice, neutralised by
+  scoping it additive-only. **Observed effect:** the repo's durable-execution seam is assertable
+  for the first time; it immediately carried [[grants-detail-delta-survives-restart]].
 - (via app-runtime r9): vcr-attempt-integrity `4e3647a`.
 - **Round 20 — 3/3 shipped, all KEEP.** Observed effect, one line each:
   - [[replay-miss-terminal]] `f1e2eaf` — a resolve-time `ReplayMiss` now fails the job ONCE instead

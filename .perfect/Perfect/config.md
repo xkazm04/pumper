@@ -54,6 +54,54 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
 
 ## Skill improvement log
 
+- 2026-08-14 (round 22): **When a gate goes red, ask "is the failing file in the diff?" BEFORE
+  re-running anything.** Two suites failed across two full-workspace runs and I burned two ~12-minute
+  re-runs half-diagnosing them. One `git diff --name-only master..HEAD` answered it completely:
+  neither `engine-search` nor `engine-claude` appeared anywhere in the wave's 32 files, so neither
+  could be a regression **by construction** — stronger evidence than any re-run, and available in one
+  second. The re-run is then only for confirming flakiness, not for establishing ownership.
+  **Companion trap, and the more dangerous half: `cargo test --workspace` FAIL-FASTS on the first
+  failing test binary.** The runs reported "1433 passed" and "1329 passed" against a 1919 baseline —
+  which reads exactly like a catastrophic regression and is actually a *partial count of an aborted
+  run*. `--no-fail-fast` is mandatory the moment anything goes red, or every number you have is a
+  lie. Same family as r21's tail-truncated log and r17's CRLF trap: **the measurement apparatus
+  fails more often than the thing being measured, and its failures are shaped like disasters.**
+- 2026-08-14 (round 22): **Two runs, two DIFFERENT failures, both outside the diff = environment
+  flakiness, not regression.** A single flaky failure is ambiguous; the *pattern across runs* is not.
+  A real regression is deterministic and lands in the same place. Worth writing down because the
+  instinct on seeing a second red run is "it's getting worse", when a second red run in a *different*
+  untouched crate is actually the strongest available evidence that neither is yours.
+- 2026-08-14 (round 22): **The r21 family-scout trick scales further than r21 claimed — two scouts
+  covered SEVEN contexts and closed the campaign.** r21 said "prefer this wherever a `*-common` crate
+  spans contexts". The generalisation is broader: the spine does not have to be a shared *library*,
+  it can be a shared *registry*. `crates/core/src/catalog.rs` is the GitOps reconciler every thin app
+  declares into, and scouting six apps against that one seam produced a finding no per-context scout
+  could reach — that only 2 of 6 have a catalog row, the other four are exempt *by design*, and the
+  real story is what the exemption COSTS (no contract tripwire, no freshness row) rather than the
+  absence itself. **Look for the seam every member of a group touches, not just the code they share.**
+- 2026-08-14 (round 22): **The twice-deferred enabler+fix pair finally shipped, and the deferral
+  reason died the moment the enabler was scoped ADDITIVE-ONLY.** `harness-expresses-the-run` was
+  rejected twice partly because `testing.rs` "ripples into 33-39 files". Written as *one new setter +
+  one new double, no signature changes, and not one existing caller may need an edit*, the ripple was
+  literally zero — the commit touches 2 files. **When a direction is deferred for write-set blast
+  radius, the next brief's job is to make additivity an acceptance criterion, not to re-argue the
+  value.** And the payoff was immediate and verifiable: the fix it unblocked shipped in the same wave
+  with a regression test that was structurally impossible the day before.
+- 2026-08-14 (round 22): **A rejected direction deserves a real note, not a verdict line — and this
+  round that is what made 46/46 honest rather than a metric game.** Four contexts were covered by
+  rejection. Each got a full direction note with `file:line` evidence, acceptance criteria for
+  whoever builds it, and an explicit *why rejected* naming what it lost the slot to. Two of them
+  ([[shipped-plugins-are-verified]] + [[trigger-gate-honest-across-source-kinds]]) turned out to be
+  the *same enabler-blocks-fix pair shape* r22 had just paid off — which is only visible because the
+  notes were written properly. **A bank note that a future round can build from directly is the
+  difference between coverage and bookkeeping.**
+- 2026-08-14 (round 22): **Also record what is SOUND, not only what is broken.** The catalog
+  reconciler scout came back with "the `managed_by` fence is airtight in both directions, it cannot
+  delete or overwrite a hand-made row, a missing catalog file is safe by design". I wrote all of that
+  into the context note under an explicit heading, because "reconciler" *sounds* like a risk surface
+  and a future round would otherwise re-scout it from scratch. **Confirmed-sound findings are cheap
+  to record and expensive to re-derive.**
+
 - 2026-08-13 (round 21): **A scout finding that survives verification but CHANGES SHAPE is worth more
   than one that is simply confirmed — and this round both of the shape-changes were load-bearing.**
   (a) The scout read research's whole "reports success on failure" class as broken. Verification showed

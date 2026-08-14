@@ -3,12 +3,12 @@ slug: watch-empty-extraction-is-not-a-change
 type: perfect/direction
 context: "[[page-monitor]]"
 lens: robustness
-status: accepted
+status: shipped
 size: S
 proposed: 2026-08-14
 accepted: 2026-08-14
-shipped: —
-commit: —
+shipped: 2026-08-14
+commit: 37d07f3
 ---
 
 ## What & why

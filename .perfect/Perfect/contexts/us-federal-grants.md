@@ -4,9 +4,9 @@ type: perfect/context
 group: Grants Intelligence
 category: lib
 opportunity: 4
-last_proposed: 2026-08-13
-cooldown_until: round 22
-directions: ["[[grants-sweep-end-proven]]", "[[grants-details-first-class]]", "[[grants-result-contract-true]]"]
+last_proposed: 2026-08-14
+cooldown_until: r24 (mined r22)
+directions: ["[[grants-sweep-end-proven]]", "[[grants-details-first-class]]", "[[grants-result-contract-true]]", "[[grants-detail-delta-survives-restart]]"]
 alias_of_old_map: "[[us-grant-opportunities]] (round-3 grants pass + r5 unified work covered this file)"
 ---
 
@@ -92,6 +92,15 @@ were Director-verified in source before gating and all four CONFIRMED verbatim.
   Speculative hardening without a user moment; revisit if a run ever emits a `row-` key.
 
 ## Shipped
+- **2026-08-14 (r22) [[grants-detail-delta-survives-restart]] `a901707`** — SHIPPED, unblocked by
+  [[harness-expresses-the-run]] landing first in the same wave (the pair r20 and r21 both deferred).
+  `preflight_harvest_state` writes the resumable snapshot with `checkpoint_now` **before the first
+  governor-paced fetch**, only when there is something to resume. +152 insertions, **0 deletions** —
+  so both existing harvest-state tests are structurally untouched. Call site verified wired at
+  `:483`, not merely documented. **Observed effect:** a crash/reap/suspend in the first 24 detail
+  fetches no longer loses the delta — which cannot be recomputed, because on re-claim the listing
+  re-syncs, everything reads `unchanged`, and the resumed run used to report success having
+  harvested nothing.
 - (inherited, pre-46-map — see [[us-grant-opportunities]], [[grants-unified-layer]]): round 3
   close-date sweep + taxonomies (`9d18132`, `d59b307`); round 5 federal award amounts joined live
   (`230a766`).

@@ -3,12 +3,12 @@ slug: checkpoint-failure-is-visible
 type: perfect/direction
 context: "[[job-worker]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-14
 accepted: 2026-08-14
-shipped: —
-commit: —
+shipped: 2026-08-14
+commit: 28fb46a
 ---
 
 ## What & why

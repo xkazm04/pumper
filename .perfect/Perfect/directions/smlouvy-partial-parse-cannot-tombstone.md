@@ -3,12 +3,12 @@ slug: smlouvy-partial-parse-cannot-tombstone
 type: perfect/direction
 context: "[[czech-procurement]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-14
 accepted: 2026-08-14
-shipped: —
-commit: —
+shipped: 2026-08-14
+commit: a88af1c
 ---
 
 ## What & why

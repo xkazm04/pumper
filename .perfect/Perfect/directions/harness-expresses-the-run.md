@@ -3,12 +3,12 @@ slug: harness-expresses-the-run
 type: perfect/direction
 context: "[[vcr-testing]]"
 lens: robustness
-status: accepted
+status: shipped
 size: S
 proposed: 2026-08-14
 accepted: 2026-08-14
-shipped: —
-commit: —
+shipped: 2026-08-14
+commit: b5d500e
 ---
 
 ## What & why
