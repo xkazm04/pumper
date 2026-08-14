@@ -312,7 +312,10 @@ pub(crate) async fn catalog_sources(
 
 /// Grace multiplier on a source's cadence window before it is flagged stale —
 /// tolerates one missed run (e.g. a daily source is stale only past ~2 days).
-const CATALOG_STALE_GRACE: i64 = 2;
+///
+/// `pub(crate)` because `/sources` ages contract verdicts against the same
+/// window: one grace, both surfaces.
+pub(crate) const CATALOG_STALE_GRACE: i64 = 2;
 
 /// Freshness monitor for the catalog: for every **live** source that declares a
 /// `dataset` and a cadence with a freshness expectation, report when its dataset
@@ -324,7 +327,7 @@ const CATALOG_STALE_GRACE: i64 = 2;
     get,
     path = "/catalog/health",
     tag = "catalog",
-    responses((status = 200, description = "`{checked, stale, contracts_enforce, sources: [{id, app, dataset, cadence, expected_max_age_secs, last_write_at, age_secs, stale, monitored, reason?, contract?}]}` — per-source freshness for live sources; `monitored:false` when no dataset or no freshness window. `expected_max_age_secs` is the stale threshold (cadence × grace, tightened by a declared contract's `max_staleness_hours`). `contract` appears on sources declaring a `[source.contract]` block: `{declared, enforce, last_verdict}` where `last_verdict` is the worker's most recent publish-time evaluation (`{verdict: pass|warn|block, violations, ...}`, null before the first run since boot)."))
+    responses((status = 200, description = "`{checked, stale, contracts_enforce, sources: [{id, app, dataset, cadence, expected_max_age_secs, last_write_at, age_secs, stale, monitored, reason?, contract?}]}` — per-source freshness for live sources; `monitored:false` when no dataset or no freshness window. `expected_max_age_secs` is the stale threshold (cadence × grace, tightened by a declared contract's `max_staleness_hours`). `contract` appears on sources declaring a `[source.contract]` block: `{declared, enforce, last_verdict}` where `last_verdict` is the worker's most recent publish-time evaluation (`{verdict: pass|warn|block, violations, job_id, checked_at, age_secs, stale, stale_reason?, ...}`, null before the first run since boot). Verdicts live in memory and never expire on their own, so they are aged against this same `expected_max_age_secs` window: `stale: true` marks a verdict describing a run that is no longer current, `stale: null` one that cannot be judged (the source declares no freshness expectation)."))
 )]
 pub(crate) async fn catalog_health(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let catalog = pumper_core::Catalog::load().map_err(|e| {
@@ -341,13 +344,26 @@ pub(crate) async fn catalog_health(State(state): State<AppState>) -> Result<Json
             "id": s.id, "app": s.app, "dataset": s.dataset, "cadence": s.cadence,
         });
         let mut row = base.as_object().unwrap().clone();
+        // Not monitorable: no dataset/app, or no freshness window from either
+        // the cadence or a declared contract. A contract's `max_staleness_hours`
+        // tightens (never loosens) the cadence-derived window, and supplies one
+        // when the cadence has none — see `Source::freshness_window_secs`.
+        let expected = s.freshness_window_secs(CATALOG_STALE_GRACE);
         // Declared data contract (M20): declaration + the latest publish-time
         // verdict recorded by the worker (in-memory; null until the first run
-        // after boot).
+        // after boot). The verdict is aged against the SAME window as the
+        // dataset write below — an old verdict is not a current one.
         if let Some(contract) = &s.contract {
             let latest = super::error::lock_advisory(&state.contract_verdicts, "contract_verdicts")
                 .get(&format!("{}/{}", s.app, s.dataset))
-                .cloned();
+                .cloned()
+                .map(|v| {
+                    super::health::verdict_with_age(
+                        v,
+                        super::health::SourceWindow::of_live(s, CATALOG_STALE_GRACE),
+                        now,
+                    )
+                });
             row.insert(
                 "contract".into(),
                 json!({
@@ -357,20 +373,6 @@ pub(crate) async fn catalog_health(State(state): State<AppState>) -> Result<Json
                 }),
             );
         }
-        // Not monitorable: no dataset/app, or no freshness window from either
-        // the cadence or a declared contract. A contract's `max_staleness_hours`
-        // tightens (never loosens) the cadence-derived window, and supplies one
-        // when the cadence has none.
-        let cadence_window = s.cadence_secs().map(|secs| secs * CATALOG_STALE_GRACE);
-        let contract_window = s
-            .contract
-            .as_ref()
-            .and_then(|c| c.max_staleness_hours)
-            .map(|h| h * 3600);
-        let expected = match (cadence_window, contract_window) {
-            (Some(c), Some(k)) => Some(c.min(k)),
-            (w, k) => w.or(k),
-        };
         if s.dataset.is_empty() || s.app.is_empty() || expected.is_none() {
             row.insert("monitored".into(), json!(false));
             row.insert(

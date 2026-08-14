@@ -89,6 +89,29 @@ impl Source {
             _ => None, // on-demand | one-time | unknown → no freshness expectation
         }
     }
+
+    /// The freshness window (seconds) anything this source produces is judged
+    /// against: [`cadence_secs`](Self::cadence_secs) × `grace`, **tightened —
+    /// never loosened** — by a declared contract's `max_staleness_hours`, and
+    /// supplied by the contract alone when the cadence carries no expectation.
+    ///
+    /// `None` means the source declares no freshness expectation at all, so
+    /// nothing about it can honestly be called stale. Extracted so the two
+    /// consumers that must agree — `/catalog/health`'s *dataset* freshness and
+    /// `/sources`' *contract-verdict* freshness — read one window instead of
+    /// each inventing its own.
+    pub fn freshness_window_secs(&self, grace: i64) -> Option<i64> {
+        let cadence_window = self.cadence_secs().map(|secs| secs * grace);
+        let contract_window = self
+            .contract
+            .as_ref()
+            .and_then(|c| c.max_staleness_hours)
+            .map(|h| h * 3600);
+        match (cadence_window, contract_window) {
+            (Some(c), Some(k)) => Some(c.min(k)),
+            (w, k) => w.or(k),
+        }
+    }
 }
 
 /// A declared data contract for one source (`[source.contract]` in the catalog
@@ -293,6 +316,101 @@ impl Catalog {
         self.live()
             .filter(|s| s.app == app && s.dataset == dataset)
             .find_map(|s| s.contract.as_ref().map(|c| (s, c)))
+    }
+
+    /// Live sources declaring a `[source.contract]` block — the population the
+    /// worker's publish seam can actually judge.
+    pub fn contracted(&self) -> impl Iterator<Item = &Source> {
+        self.live().filter(|s| s.contract.is_some())
+    }
+}
+
+/// What contract enforcement **can be observed to do right now**, as opposed to
+/// what the config asked for.
+///
+/// `[contracts] enforce = true` is an *intent*. Enforcement only happens if the
+/// worker's publish seam can read the catalog, and that seam fails open: an
+/// unreadable `data-sources.toml` makes it warn and return **per job**, so the
+/// whole fleet evaluates zero contracts while every read surface keeps rendering
+/// the configured `true` beside the last-good verdicts. This type is that
+/// difference, so `/sources` and the boot log can *state* it instead of implying
+/// it. Fail-open is deliberate (delivery is never blocked by a broken catalog) —
+/// this is about visibility, not gating.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContractsStatus {
+    /// `[contracts] enforce` — the configured intent.
+    pub enforce_configured: bool,
+    /// Whether that intent is actually reachable: `enforce_configured` AND the
+    /// catalog parses. False here beside `true` above means "asked for, not
+    /// happening".
+    pub enforce_observed: bool,
+    /// Did the catalog load and parse?
+    pub catalog_ok: bool,
+    /// The load/parse error, when it did not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub catalog_error: Option<String>,
+    /// Live sources declaring a `[source.contract]` block. `0` with a readable
+    /// catalog means enforcement is real but has nothing to judge.
+    pub declared: usize,
+    /// Why `enforce_observed` is not simply `enforce_configured`, or why an
+    /// enabled enforcement has nothing to do. `None` when there is nothing to
+    /// qualify.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+}
+
+impl ContractsStatus {
+    /// Loads the catalog and reports both it and what enforcement can observe.
+    /// Never fails: an unreadable catalog is *reported*, exactly as the worker
+    /// seam treats it.
+    pub fn load(enforce: bool) -> (Option<Catalog>, Self) {
+        match Catalog::load() {
+            Ok(catalog) => {
+                let status = Self::of(&catalog, enforce);
+                (Some(catalog), status)
+            }
+            Err(e) => (None, Self::unreadable(e.to_string(), enforce)),
+        }
+    }
+
+    /// The status of a catalog that parsed.
+    pub fn of(catalog: &Catalog, enforce: bool) -> Self {
+        let declared = catalog.contracted().count();
+        let reason = if !enforce {
+            Some(
+                "[contracts] enforce = false: verdicts are recorded and surfaced, nothing is gated"
+                    .to_string(),
+            )
+        } else if declared == 0 {
+            Some("no live catalog source declares a [source.contract] block".to_string())
+        } else {
+            None
+        };
+        Self {
+            enforce_configured: enforce,
+            enforce_observed: enforce,
+            catalog_ok: true,
+            catalog_error: None,
+            declared,
+            reason,
+        }
+    }
+
+    /// The status of a catalog that would not load — the case the whole type
+    /// exists for.
+    pub fn unreadable(error: impl Into<String>, enforce: bool) -> Self {
+        let error = error.into();
+        Self {
+            enforce_configured: enforce,
+            enforce_observed: false,
+            catalog_ok: false,
+            catalog_error: Some(error.clone()),
+            declared: 0,
+            reason: Some(format!(
+                "catalog unreadable ({error}): the publish seam skips contract evaluation for \
+                 every job, so no contract is being checked"
+            )),
+        }
     }
 }
 
@@ -593,6 +711,104 @@ mod tests {
 
     fn contract(toml: &str) -> Contract {
         toml::from_str(toml).expect("valid contract")
+    }
+
+    /// The anti-pattern: `/catalog/health` derived its stale window from an
+    /// inline expression, so the second consumer that needed the same window
+    /// (contract-verdict freshness on `/sources`) had to re-invent it — two
+    /// windows, one source, guaranteed to drift.
+    #[test]
+    fn freshness_window_is_one_expression_not_per_caller() {
+        let toml = r#"
+            [[source]]
+            id = "daily-plain"
+            name = "Daily"
+            status = "live"
+            cadence = "daily"
+
+            [[source]]
+            id = "daily-tight"
+            name = "Daily, tight contract"
+            status = "live"
+            cadence = "daily"
+            [source.contract]
+            max_staleness_hours = 6
+
+            [[source]]
+            id = "daily-loose"
+            name = "Daily, loose contract"
+            status = "live"
+            cadence = "daily"
+            [source.contract]
+            max_staleness_hours = 999
+
+            [[source]]
+            id = "on-demand-contract"
+            name = "No cadence, contract only"
+            status = "live"
+            cadence = "on-demand"
+            [source.contract]
+            max_staleness_hours = 12
+
+            [[source]]
+            id = "unjudgeable"
+            name = "Neither"
+            status = "live"
+            cadence = "on-demand"
+        "#;
+        let c = cat(toml);
+        let w = |i: usize| c.sources[i].freshness_window_secs(2);
+        // Cadence × grace.
+        assert_eq!(w(0), Some(2 * 86_400));
+        // A contract tightens…
+        assert_eq!(w(1), Some(6 * 3600));
+        // …but never loosens.
+        assert_eq!(w(2), Some(2 * 86_400));
+        // …and supplies the window when the cadence has none.
+        assert_eq!(w(3), Some(12 * 3600));
+        // Nothing to judge against: not stale, *unjudgeable*.
+        assert_eq!(w(4), None);
+    }
+
+    /// The anti-pattern this whole type exists for: a fleet whose catalog will
+    /// not parse renders `contracts_enforce: true` while the publish seam fails
+    /// open and checks nothing. Configured intent must be distinguishable from
+    /// observed enforcement.
+    #[test]
+    fn contracts_status_separates_configured_intent_from_observed_enforcement() {
+        let toml = r#"
+            [[source]]
+            id = "contracted"
+            app = "grants-gov"
+            dataset = "opportunities"
+            name = "Contracted"
+            status = "live"
+            [source.contract]
+            required_fields = ["id"]
+        "#;
+        let ok = ContractsStatus::of(&cat(toml), true);
+        assert!(ok.catalog_ok && ok.enforce_observed && ok.enforce_configured);
+        assert_eq!(ok.declared, 1);
+        assert_eq!(ok.reason, None);
+
+        // The defect: intent true, observation false — and the reason says so.
+        let broken = ContractsStatus::unreadable("expected `=`, found `!`", true);
+        assert!(broken.enforce_configured);
+        assert!(
+            !broken.enforce_observed,
+            "a broken catalog enforces nothing"
+        );
+        assert!(!broken.catalog_ok);
+        assert_eq!(broken.declared, 0);
+        assert!(broken.reason.unwrap().contains("skips contract evaluation"));
+
+        // Soak mode and an empty catalog are both qualified, not silently green.
+        let soak = ContractsStatus::of(&cat(toml), false);
+        assert!(!soak.enforce_observed);
+        assert!(soak.reason.unwrap().contains("enforce = false"));
+        let empty = ContractsStatus::of(&Catalog::default(), true);
+        assert!(empty.enforce_observed && empty.declared == 0);
+        assert!(empty.reason.unwrap().contains("no live catalog source"));
     }
 
     #[test]

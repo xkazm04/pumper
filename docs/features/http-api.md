@@ -144,12 +144,21 @@ The catalog is no longer inert prose: a server-crate test cross-checks it agains
 
 The other half of source liveness. `/catalog/health` answers *did this source run recently*; `/sources` answers *was what it produced right*. Neither subsumes the other, so each response links to the other. Full design and signal reference: [resilient-extraction.md](resilient-extraction.md).
 
-- `GET /sources?state=&app=&limit=` — `{enabled, enforcing, count, sources}`, worst degradation score first. **`enforcing: false` means verdicts are recorded and nothing is gated** — the shipping default.
+- `GET /sources?state=&app=&limit=` — `{enabled, enforcing, contracts_enforce, contracts, count, unmonitored, sources}`, worst degradation score first. **`enforcing: false` means verdicts are recorded and nothing is gated** — the shipping default.
 - `GET /sources/{id}` — one source in full: state, the last 10 runs with the tests behind each verdict, this run's per-field sketch next to its baseline (`miss_rate`, `coercion_failure_rate`, `distinct_ratio`, `mean_len` vs baseline medians), the mined invariants, and `statistical_coverage` (`false` = the source never reaches the cohort floor, so only the assumption-free rules watch it). `id` is `<app>/<dataset>`, e.g. `/sources/extractor/products`.
 - `GET /sources/{id}/runs?limit=` — verdict history. Each run carries `reasons`: every test that ran with its value and threshold, so a verdict explains itself without re-running anything.
 - `POST /sources/{id}/state` `{state, reason?}` — manual override, and the **only** way out of `quarantined`. Quarantine is deliberately terminal without an operator: a stuck source is an acceptable outcome, a source that silently un-quarantines itself and resumes pushing garbage downstream is not. An unrecognized state is `400`.
 
 All four return `503` when `[resilience] enabled = false` — a health question asked of a disabled detector has no honest answer, and an empty list would read as "everything is fine".
+
+### What `/sources` observes about declared contracts — and what it does not
+
+`/sources` renders two different things about `[contracts] enforce`, and they are not the same claim:
+
+- `contracts_enforce` — the **configured** value, unchanged.
+- `contracts` — `{enforce_configured, enforce_observed, catalog_ok, catalog_error?, declared, reason?}`, what enforcement can be **observed** to do. `enforce_observed: false` beside `enforce_configured: true` means `catalog/data-sources.toml` would not parse, so the worker's publish seam fails open and **no contract is being checked anywhere in the fleet**. The catalog is loaded fail-open here: a broken catalog degrades this response, it never makes `/sources` a 500 (unlike `/catalog/sources` and `/catalog/health`, which do 500).
+
+A row's `contract` object is the latest recorded verdict plus `age_secs`, `stale` and `stale_reason?` derived from the `checked_at` the worker stamps. Verdicts are in-memory and are only ever *written* — never expired, never removed — so a bare `pass` could otherwise describe a run from weeks ago, a dataset that has since stopped producing, or a source that has since been retired. `stale: null` means the pair cannot be judged (the catalog is unreadable, or the source declares no freshness expectation); it is never rendered as a silent `false`. What `/sources` still does **not** do: re-evaluate a contract, expire a verdict, or notice a source's disappearance any way other than by the catalog no longer listing it as `live`. Details and window arithmetic: [catalog.md](catalog.md).
 
 ## Provisioner proposal lifecycle (`/provisioner/proposals`)
 

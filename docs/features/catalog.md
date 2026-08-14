@@ -48,6 +48,27 @@ Two rules come with it:
 
 **`max_row_delta_pct` is a mass-delete tripwire, and it only fires on a tombstoning write.** `Contract::evaluate` computes the delta only when `removed > 0`, and `removed` is populated only by `Datasets::sync_many` — the full-snapshot variant. On an **upsert-only** source (`upsert_many`, `upsert_many_with_provenance`, `upsert_many_derived`) removals never occur, so the declaration can never fire and reads as coverage it does not provide. Declare it where the write is `sync_many` (`cordis-topic-stats`), and leave it off where the write is upsert-only — `grants-gov`'s was removed for exactly this reason on 2026-08-13, with the reasoning recorded above the block. **Known inert:** `ca-grants`, `eu-sedia` and `state-licensing` still declare one on upsert-only writes (`state-licensing` writes via `upsert_many_with_provenance` + `upsert_many_stamped`; found in the round-21 sweep, which is also why this list is now three names and not two — an audit found the list itself had drifted).
 
+### A verdict is recorded, not maintained — so it is served with its age
+
+`enforce_contracts` writes the latest verdict per `<app>/<dataset>` into an in-memory map on `AppState`. That map has exactly one mutation in the whole workspace — the worker's `insert`. There is no remove, no clear, no catalog generation, and the worker only iterates *this run's* datasets. A verdict therefore outlives the run that produced it, the dataset that stopped producing, and the source that was retired.
+
+Since round 24 both read surfaces age the verdict instead of serving it bare. Each rendered verdict carries, beside the `job_id`/`checked_at` the worker already stamps:
+
+- `age_secs` — seconds since `checked_at` (null if the stamp is unparsable).
+- `stale` — `true` when the verdict is older than the source's freshness window, or when **no live catalog source declares that `<app>/<dataset>` any more** (retired/renamed/deleted: `/sources` joins by health-store id, which keeps rows through `retired`). `false` when inside the window. **`null` = cannot be judged**, never a silent `false`.
+- `stale_reason` — present whenever `stale` is `true` for a non-age reason or `null`.
+
+The window is `Source::freshness_window_secs(grace)` — the *same* expression `/catalog/health` judges dataset writes by (cadence × grace 2, tightened but never loosened by `max_staleness_hours`), so "did it run" and "was the last verdict current" cannot drift apart. A source with neither a cadence expectation nor `max_staleness_hours` yields `stale: null`.
+
+### Configured enforcement vs observed enforcement
+
+`Catalog::load()` treats a malformed file as a hard error, and `enforce_contracts` is **deliberately fail-open**: it warns and returns *per job*, so one unparsable TOML file means the whole fleet evaluates zero contracts while nothing blocks delivery. That is the intended trade — but until round 24 the only evidence was two log lines and two 500s (`/catalog/sources`, `/catalog/health`), while `/sources` kept serving `contracts_enforce: true` beside the last-good verdicts.
+
+`ContractsStatus` (`crates/core/src/catalog.rs`) is now that difference, and it is reported in two places:
+
+- **At boot**, one line from `main::log_contract_observability`: `error!` naming the parse error and its consequence when the catalog will not load, `info!` with `declared`/`enforce` when it will. Nothing blocks — visibility only.
+- **On `GET /sources`**, as the `contracts` object: `{enforce_configured, enforce_observed, catalog_ok, catalog_error?, declared, reason?}`. `enforce_observed: false` beside `enforce_configured: true` means the catalog would not parse and nothing is being checked. `declared: 0` with `catalog_ok: true` means enforcement is real but has nothing to judge. The older top-level `contracts_enforce` is unchanged and remains the *configured* value.
+
 **Virtual namespaces are watchable before their first record.** `trades` joins `grants` as a virtual
 namespace in `registry::VIRTUAL_NAMESPACES`: no app is called `trades`, and five apps
 (`state-tax`, `state-licensing`, `trade-wages`, `homewyse-pricing`, `valuation-multiples`) publish
@@ -61,7 +82,7 @@ it is in the same product group but writes only its own datasets and never rebui
 ## API
 
 - `GET /catalog/sources?market=&status=&category=` → `{count, sources: [Source]}`. Filters are exact-match on the trimmed field; an absent or empty filter matches everything.
-- `GET /catalog/health` → `{checked, stale, sources: [{id, app, dataset, cadence, expected_max_age_secs, last_write_at, age_secs, stale, monitored, reason?}]}`. The freshness monitor: for every **live** source that names a `dataset` and a cadence with a freshness expectation, it reports when that dataset was last written and whether the age exceeds the cadence window × a grace multiplier of **2** (so a daily source is flagged only past ~2 days). `monitored: false` when the source names no dataset/app or its cadence carries no expectation (`on-demand`, `one-time`, unknown). Cadence windows: daily 1d, weekly 7d, monthly 31d, quarterly 93d, annual 366d.
+- `GET /catalog/health` → `{checked, stale, contracts_enforce, sources: [{id, app, dataset, cadence, expected_max_age_secs, last_write_at, age_secs, stale, monitored, reason?, contract?}]}`. `contract.last_verdict` carries its own `age_secs`/`stale`/`stale_reason?` (see above). The freshness monitor: for every **live** source that names a `dataset` and a cadence with a freshness expectation, it reports when that dataset was last written and whether the age exceeds the cadence window × a grace multiplier of **2** (so a daily source is flagged only past ~2 days). `monitored: false` when the source names no dataset/app or its cadence carries no expectation (`on-demand`, `one-time`, unknown). Cadence windows: daily 1d, weekly 7d, monthly 31d, quarterly 93d, annual 366d.
 
 `/catalog/health` answers "did this source run recently?"; `GET /sources` (see [resilient-extraction.md](resilient-extraction.md)) answers "was what it produced any good?" — the two are complementary and cross-link in their responses.
 
@@ -81,3 +102,6 @@ Two tests in `crates/server/src/routes/mod.rs` embed the TOML at compile time (s
 - The rendered overview table in `catalog/README.md` is maintained by hand from the TOML; nothing regenerates or verifies it, so it can lag the TOML it summarizes.
 - `catalog/` is in the doc-sync hook's `SKIP_PATTERNS` (`scripts/docs/check-doc-sync.mjs`), so editing the catalog does **not** trigger the reminder for this doc even though a map entry exists.
 - `confidence` and `notes` are advisory: nothing reads them programmatically.
+- **`/sources` observes the catalog, it does not police it.** A verdict is marked stale; it is never removed, and a stale `pass` is still the last thing the source actually did. Nothing re-evaluates a contract for a dataset that stopped producing — only a new run writes a new verdict.
+- Verdicts are per-process and in-memory: after a restart every `contract` key is absent until the source runs again, which reads as "no verdict", not as a failure.
+- The boot catalog check logs; it does not gate. A fleet can start, and keep running, with a catalog that will not parse.

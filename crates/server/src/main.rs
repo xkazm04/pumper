@@ -16,6 +16,7 @@ mod worker;
 
 use std::time::Duration;
 
+use pumper_core::catalog::ContractsStatus;
 use pumper_core::Config;
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::layer::SubscriberExt;
@@ -179,6 +180,36 @@ fn main() -> anyhow::Result<()> {
         .block_on(run())
 }
 
+/// One boot line saying what declared-contract enforcement can be **observed**
+/// to do, from [`ContractsStatus`].
+///
+/// The anti-pattern: a malformed `catalog/data-sources.toml` was discovered only
+/// as a per-job `warn` from the worker's publish seam plus two 500s on the
+/// `/catalog/*` routes, while `/sources` kept rendering `contracts_enforce:
+/// true` beside the last-good verdicts. Nothing ever said, in one place and
+/// before any job ran, that the fleet was checking zero contracts. `error!`
+/// rather than `warn!` because it is a silent, fleet-wide loss of a configured
+/// guarantee — but still only a log: fail-open is the deliberate design
+/// (`enforce_contracts`), and delivery must not stop because a TOML file broke.
+fn log_contract_observability(status: &ContractsStatus) {
+    if !status.catalog_ok {
+        tracing::error!(
+            enforce_configured = status.enforce_configured,
+            error = status.catalog_error.as_deref().unwrap_or("unknown"),
+            "catalog will not parse: every job skips declared-contract evaluation (fail-open), \
+             and /catalog/sources + /catalog/health will fail — GET /sources reports this as \
+             contracts.enforce_observed = false"
+        );
+    } else if status.declared > 0 || status.enforce_configured {
+        tracing::info!(
+            declared = status.declared,
+            enforce = status.enforce_configured,
+            reason = status.reason.as_deref().unwrap_or(""),
+            "declared data contracts loaded from the catalog"
+        );
+    }
+}
+
 async fn run() -> anyhow::Result<()> {
     let config = Config::load()?;
     let state = AppState::init(config).await?;
@@ -187,6 +218,11 @@ async fn run() -> anyhow::Result<()> {
     if recovered > 0 {
         tracing::info!(recovered, "re-queued jobs interrupted by previous shutdown");
     }
+
+    // Say what declared-contract enforcement can actually be observed to do,
+    // once, before the first job runs. Never blocking: the publish seam is
+    // deliberately fail-open on an unreadable catalog, so this is visibility.
+    log_contract_observability(&ContractsStatus::load(state.config.contracts.enforce).1);
 
     // Seed code-declared schedules into the DB (idempotent) so they become
     // editable rows the scheduler and API share.
