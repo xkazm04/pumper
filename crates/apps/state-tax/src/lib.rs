@@ -20,6 +20,7 @@ use pumper_core::{
     AppContext, AppManifest, CostClass, Error, ManifestExample, ResearchRequest, Result, ScrapeApp,
 };
 use serde_json::{json, Value};
+use trades_common::coverage;
 use trades_common::unified;
 use trades_common::validate::{self, Rejection};
 
@@ -73,6 +74,10 @@ impl ScrapeApp for StateTax {
                     "force": {
                         "type": "boolean",
                         "description": "Bypass the vintage freshness gate and re-pay the ~30-turn research run."
+                    },
+                    "allow_shrink": {
+                        "type": "boolean",
+                        "description": "Let a run that covered materially less than the 50-states-+-DC roster still tombstone the jurisdictions it did not return. Off by default: a short answer suppresses removal detection instead of deleting the shortfall."
                     }
                 },
                 "additionalProperties": true
@@ -90,7 +95,9 @@ impl ScrapeApp for StateTax {
             ],
             output_shape: Some(
                 "{source, year, records, states_covered, states_expected, missing_states, \
-                 new, changed, unchanged, rejected: [{key, reasons}], rejected_count, \
+                 coverage: {unit, covered, expected, ratio, floor, short, missing}, \
+                 warnings: [string], new, changed, unchanged, removed, \
+                 removals_suppressed, rejected: [{key, reasons}], rejected_count, \
                  unified: {new, changed}, cost_usd, duration_ms, num_turns} — or \
                  {source, year, skipped, records, cost_usd: 0.0} when the vintage gate holds",
             ),
@@ -283,10 +290,18 @@ impl ScrapeApp for StateTax {
             "records": all_records.len(),
             "states_covered": present.len(),
             "states_expected": US_JURISDICTIONS.len(),
-            "missing_states": missing,
+            "missing_states": cov.missing(),
+            "coverage": cov.to_json(),
+            "warnings": warnings,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
+            // Honest removal reporting: this is the one app in the family whose
+            // write path can tombstone, so the count is always present — 0 when
+            // nothing was removed, and accompanied by a `warnings[]` entry when
+            // the completeness floor suppressed removal detection entirely.
+            "removed": summary.removed.len(),
+            "removals_suppressed": write.removals_suppressed,
             "rejected": rejected.iter().map(Rejection::to_json).collect::<Vec<_>>(),
             "rejected_count": rejected.len(),
             "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
@@ -352,7 +367,14 @@ mod tests {
             .as_object()
             .expect("schema declares properties");
         assert!(!m.examples.is_empty(), "a schema needs worked examples");
-        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let shape = m.output_shape.expect("agents need the result shape");
+        // Family contract: every agentic trades app reports the shared
+        // `coverage` block and the `warnings[]` a shortfall lands in.
+        assert!(
+            trades_common::coverage::shape_declares_coverage(shape),
+            "output_shape must declare {:?}: {shape}",
+            trades_common::coverage::RESULT_FIELDS
+        );
         let mut shipped = vec![app.default_params()];
         shipped.extend(m.examples.iter().map(|e| e.params.clone()));
         for params in shipped {

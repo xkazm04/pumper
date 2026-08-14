@@ -19,6 +19,7 @@ use pumper_core::{
     AppContext, AppManifest, CostClass, Error, ManifestExample, ResearchRequest, Result, ScrapeApp,
 };
 use serde_json::{json, Value};
+use trades_common::coverage;
 use trades_common::taxonomy;
 use trades_common::unified;
 use trades_common::validate::{self, Rejection};
@@ -90,7 +91,9 @@ impl ScrapeApp for HomewysePricing {
                 },
             ],
             output_shape: Some(
-                "{source, locality, year, trades: [{trade, jobs_priced}], records, new, \
+                "{source, locality, year, trades: [{trade, jobs_priced}], records, \
+                 coverage: {unit, covered, expected, ratio, floor, short, missing}, \
+                 warnings: [string], new, \
                  changed, unchanged, rejected: [{key, reasons}], rejected_count, \
                  unknown_trades, unified: {new, changed}, cost_usd, duration_ms, \
                  num_turns} — or {source, locality, year, skipped, cost_usd: 0.0} when \
@@ -267,6 +270,21 @@ impl ScrapeApp for HomewysePricing {
             }
         }
 
+        // Coverage of the trade roster — the family's shared shape for "a
+        // near-total rejection is not a silent success" (see
+        // `trades_common::coverage`). A trade counts as covered only if it came
+        // back with at least one *priced* job: a trade whose every job was
+        // rejected contributed a `jobs_priced: 0` summary and nothing else,
+        // which used to read as a green run.
+        let present: std::collections::HashSet<String> = trade_summaries
+            .iter()
+            .filter(|s| s["jobs_priced"].as_u64().unwrap_or(0) > 0)
+            .filter_map(|s| s["trade"].as_str().map(str::to_string))
+            .collect();
+        let roster: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+        let cov = coverage::Coverage::of_roster("priced trades", &roster, &present);
+        let warnings: Vec<String> = cov.warning().into_iter().collect();
+
         if all_records.is_empty() {
             return Err(Error::App(
                 "homewyse-pricing: agent JSON contained no priced jobs".into(),
@@ -289,6 +307,8 @@ impl ScrapeApp for HomewysePricing {
             "year": year,
             "trades": trade_summaries,
             "records": all_records.len(),
+            "coverage": cov.to_json(),
+            "warnings": warnings,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
@@ -381,7 +401,14 @@ mod tests {
             .as_object()
             .expect("schema declares properties");
         assert!(!m.examples.is_empty(), "a schema needs worked examples");
-        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let shape = m.output_shape.expect("agents need the result shape");
+        // Family contract: every agentic trades app reports the shared
+        // `coverage` block and the `warnings[]` a shortfall lands in.
+        assert!(
+            trades_common::coverage::shape_declares_coverage(shape),
+            "output_shape must declare {:?}: {shape}",
+            trades_common::coverage::RESULT_FIELDS
+        );
         let mut shipped = vec![app.default_params()];
         shipped.extend(m.examples.iter().map(|e| e.params.clone()));
         for params in shipped {

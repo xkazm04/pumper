@@ -568,6 +568,21 @@ pub mod coverage {
         }
     }
 
+    /// The result fields every agentic trades app must carry once it reports
+    /// coverage: the shared `coverage` block and the `warnings[]` a shortfall
+    /// lands in.
+    pub const RESULT_FIELDS: [&str; 2] = ["coverage", "warnings"];
+
+    /// Whether a manifest's `output_shape` declares [`RESULT_FIELDS`].
+    ///
+    /// Each of the five agentic apps asserts this over its own manifest, because
+    /// **a fix applied to four of five apps is how the silent-partial-success
+    /// defect this module exists to kill was born.** A convention stated only in
+    /// a doc is a convention the fifth app will miss.
+    pub fn shape_declares_coverage(output_shape: &str) -> bool {
+        RESULT_FIELDS.iter().all(|f| output_shape.contains(f))
+    }
+
     /// Whether a full-snapshot write has earned the right to run removal
     /// detection: only a run that covered its roster, or one an operator
     /// explicitly told to shrink.
@@ -712,6 +727,18 @@ pub mod coverage {
             assert!(cov.to_json()["missing"].is_null());
             let named = Coverage::of_roster("states", &ROSTER, &present(&ROSTER));
             assert_eq!(named.to_json()["missing"], json!([]));
+        }
+
+        /// A shape that declares only half the contract is not declared — the
+        /// four-of-five failure mode, caught at the assertion rather than in
+        /// production.
+        #[test]
+        fn a_shape_missing_warnings_does_not_count_as_declaring_coverage() {
+            assert!(shape_declares_coverage(
+                "{records, coverage: {...}, warnings: [string], new}"
+            ));
+            assert!(!shape_declares_coverage("{records, coverage: {...}, new}"));
+            assert!(!shape_declares_coverage("{records, warnings: [string]}"));
         }
 
         #[test]

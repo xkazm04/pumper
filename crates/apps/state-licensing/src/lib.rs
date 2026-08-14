@@ -26,6 +26,7 @@ use pumper_core::{
     AppContext, AppManifest, CostClass, Error, ManifestExample, ResearchRequest, Result, ScrapeApp,
 };
 use serde_json::{json, Value};
+use trades_common::coverage::Coverage;
 use trades_common::taxonomy;
 use trades_common::unified::{self, COMPLIANCE, UNIFIED_APP};
 use trades_common::validate::{self, Rejection};
@@ -129,8 +130,10 @@ impl ScrapeApp for StateLicensing {
             ],
             output_shape: Some(
                 "{source, year, trades_run: [..], trades_skipped: [..], \
-                 trades_resumed: [..], records, coverage: {<trade>: {states_covered, \
-                 missing_states}}, new, changed, unchanged, rejected: [..], \
+                 trades_resumed: [..], records, coverage: {<trade>: {unit, covered, \
+                 expected, ratio, floor, short, missing, states_covered, \
+                 states_expected, missing_states}}, warnings: [string], new, \
+                 changed, unchanged, rejected: [..], \
                  rejected_count, unified: {new, changed}, cost_usd, duration_ms, \
                  num_turns} — per-trade vintage skips and checkpoint resumes are free; \
                  cost fields cover only the metered calls THIS attempt made",
@@ -202,6 +205,10 @@ impl ScrapeApp for StateLicensing {
         let mut trades_resumed: Vec<String> = Vec::new();
         let mut trades_skipped: Vec<String> = Vec::new();
         let mut coverage = serde_json::Map::new();
+        // The family's shared "a near-total rejection is not a silent success"
+        // channel (see `trades_common::coverage`). Per trade, because this app's
+        // roster is per trade.
+        let mut warnings: Vec<String> = Vec::new();
         let mut records_total: usize = 0;
         let (mut cost_usd, mut duration_ms, mut num_turns) = (0.0_f64, 0_u64, 0_u64);
         let mut summary = pumper_core::UpsertSummary::default();
@@ -215,6 +222,13 @@ impl ScrapeApp for StateLicensing {
                 trades_resumed.push(label.to_string());
                 if let Some(cov) = done.get("coverage") {
                     coverage.insert(label.to_string(), cov.clone());
+                }
+                // A resumed trade replays its recorded warning verbatim: a
+                // shortfall paid for in an earlier attempt is still a shortfall
+                // in this result, and recomputing it would need the answer that
+                // attempt already consumed.
+                if let Some(w) = done.get("warning").and_then(Value::as_str) {
+                    warnings.push(format!("{label}: {w}"));
                 }
                 records_total += done.get("records").and_then(Value::as_u64).unwrap_or(0) as usize;
                 if let Some(rej) = done.get("rejected").and_then(Value::as_array) {
@@ -268,17 +282,20 @@ impl ScrapeApp for StateLicensing {
 
             let (records, trade_rejected, present) =
                 parse_trade_records(&data, label, &trade.soc_code, &year);
-            let missing: Vec<&str> = US_JURISDICTIONS
-                .iter()
-                .copied()
-                .filter(|j| !present.contains(*j))
-                .collect();
-            let trade_coverage = json!({
-                "states_covered": present.len(),
-                "states_expected": US_JURISDICTIONS.len(),
-                "missing_states": missing,
-            });
+            let cov = Coverage::of_roster("states", &US_JURISDICTIONS, &present);
+            let trade_warning = cov.warning();
+            let mut trade_coverage = cov.to_json();
+            // Legacy aliases: `states_covered` / `states_expected` /
+            // `missing_states` were this block's field names before the family
+            // adopted the shared shape, and console + docs read them. Kept
+            // alongside the canonical `covered` / `expected` / `missing`.
+            trade_coverage["states_covered"] = json!(cov.covered());
+            trade_coverage["states_expected"] = json!(cov.expected());
+            trade_coverage["missing_states"] = json!(cov.missing());
             coverage.insert(label.to_string(), trade_coverage.clone());
+            if let Some(w) = &trade_warning {
+                warnings.push(format!("{label}: {w}"));
+            }
             if present.is_empty() {
                 return Err(Error::App(format!(
                     "state-licensing: agent JSON for trade {label} contained no plausible \
@@ -322,6 +339,7 @@ impl ScrapeApp for StateLicensing {
                 label.to_string(),
                 json!({
                     "coverage": trade_coverage,
+                    "warning": trade_warning,
                     "records": records.len(),
                     "rejected": trade_rejected_json,
                 }),
@@ -348,6 +366,7 @@ impl ScrapeApp for StateLicensing {
             "trades_resumed": trades_resumed,
             "records": records_total,
             "coverage": coverage,
+            "warnings": warnings,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
@@ -597,7 +616,14 @@ mod tests {
             .as_object()
             .expect("schema declares properties");
         assert!(!m.examples.is_empty(), "a schema needs worked examples");
-        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let shape = m.output_shape.expect("agents need the result shape");
+        // Family contract: every agentic trades app reports the shared
+        // `coverage` block and the `warnings[]` a shortfall lands in.
+        assert!(
+            trades_common::coverage::shape_declares_coverage(shape),
+            "output_shape must declare {:?}: {shape}",
+            trades_common::coverage::RESULT_FIELDS
+        );
         let mut shipped = vec![app.default_params()];
         shipped.extend(m.examples.iter().map(|e| e.params.clone()));
         for params in shipped {

@@ -30,6 +30,7 @@ use pumper_core::{
     AppContext, AppManifest, CostClass, Error, ManifestExample, ResearchRequest, Result, ScrapeApp,
 };
 use serde_json::{json, Value};
+use trades_common::coverage;
 use trades_common::taxonomy;
 use trades_common::unified;
 use trades_common::validate::{self, Rejection};
@@ -98,7 +99,9 @@ impl ScrapeApp for TradeWages {
                 },
             ],
             output_shape: Some(
-                "{source, year, records, new, changed, unchanged, rejected: [{key, \
+                "{source, year, records, coverage: {unit, covered, expected, ratio, \
+                 floor, short, missing}, warnings: [string], new, changed, unchanged, \
+                 rejected: [{key, \
                  reasons}], rejected_count, unknown_trades, unified: {new, changed}, \
                  cost_usd, duration_ms, num_turns}; the vintage gate returns {source, \
                  year, skipped, records, cost_usd: 0.0}; propose_trade mode returns the \
@@ -196,6 +199,19 @@ impl ScrapeApp for TradeWages {
 
         let (all_records, rejected, unknown_trades) = collect_wage_records(&entries, &data, &year);
 
+        // Coverage of the trade roster this run was asked for. Before this, one
+        // surviving trade out of five was a green job with `rejected_count: 4`
+        // and nothing else to read; the shared `coverage` block + `warnings[]`
+        // is the family's answer to that (see `trades_common::coverage`).
+        // Keys are `US:{label}`, so the label is the roster member.
+        let present: std::collections::HashSet<String> = all_records
+            .iter()
+            .map(|(k, _)| k.trim_start_matches("US:").to_string())
+            .collect();
+        let roster: Vec<&str> = entries.iter().map(|e| e.label.as_str()).collect();
+        let cov = coverage::Coverage::of_roster("trades", &roster, &present);
+        let warnings: Vec<String> = cov.warning().into_iter().collect();
+
         if all_records.is_empty() {
             return Err(Error::App(
                 "trade-wages: agent JSON contained no plausible trades".into(),
@@ -215,6 +231,8 @@ impl ScrapeApp for TradeWages {
             "source": format!("agentic/wages/{year}"),
             "year": year,
             "records": all_records.len(),
+            "coverage": cov.to_json(),
+            "warnings": warnings,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
             "unchanged": summary.unchanged,
@@ -643,7 +661,14 @@ mod tests {
             .as_object()
             .expect("schema declares properties");
         assert!(!m.examples.is_empty(), "a schema needs worked examples");
-        assert!(m.output_shape.is_some(), "agents need the result shape");
+        let shape = m.output_shape.expect("agents need the result shape");
+        // Family contract: every agentic trades app reports the shared
+        // `coverage` block and the `warnings[]` a shortfall lands in.
+        assert!(
+            trades_common::coverage::shape_declares_coverage(shape),
+            "output_shape must declare {:?}: {shape}",
+            trades_common::coverage::RESULT_FIELDS
+        );
         let mut shipped = vec![app.default_params()];
         shipped.extend(m.examples.iter().map(|e| e.params.clone()));
         for params in shipped {
