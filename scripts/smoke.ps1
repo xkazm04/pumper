@@ -795,6 +795,38 @@ try {
                 ($t.inputSchema.properties.records_echo.maximum -eq 1000)
             }
 
+            # Round 22: the two apps whose PARTIAL-HARVEST honesty was fixed this
+            # round must DECLARE the fields that make a partial harvest visible.
+            # Both defects were invisible precisely because the result JSON of a
+            # partial run was byte-identical to a clean one, so the declaration
+            # is the contract a consumer needs in order to tell them apart —
+            # and `output_shape` is what `GET /apps` and the MCP manifest publish.
+            #
+            # THE ANTI-PATTERN, in the apps' own words:
+            #  - smlouvy `dumps_in_index` was the POST-parse count, so a 30-of-51
+            #    parse reported the same numbers as 30-of-30 and the full-snapshot
+            #    write tombstoned the 21 dumps it had merely failed to READ.
+            #  - ca-grants read `result.total` once, page 1 only, `unwrap_or(0)`,
+            #    then broke on `offset >= total` — so a renamed total capped
+            #    California at one page indefinitely with `truncated: false`.
+            # A declaration that loses these keys again is the regression.
+            Test-JsonEndpoint -Name 'GET /apps declares the partial-harvest honesty fields' `
+                -Path '/apps' -Assert {
+                param($j)
+                $apps = if ($j.apps) { $j.apps } else { $j }
+                $sm = @($apps | Where-Object { $_.name -eq 'smlouvy-dump-watch' })[0]
+                $ca = @($apps | Where-Object { $_.name -eq 'ca-grants' })[0]
+                if (-not $sm -or -not $ca) { return $false }
+                # smlouvy: seen-vs-parsed must both be nameable, and the
+                # suppression of removals must be reportable.
+                ($sm.output_shape -match 'dumps_parsed') -and
+                ($sm.output_shape -match 'removals_suppressed') -and
+                # ca-grants: the four-arm sweep vocabulary, not a lone boolean.
+                ($ca.output_shape -match 'sweep') -and
+                ($ca.output_shape -match 'unknown_total') -and
+                ($ca.output_shape -match 'short_page')
+            }
+
             # Round 20: a `replay_of` job against an app that cannot be replayed
             # must be REFUSED BY NAME, before the app runs.
             # THE ANTI-PATTERN: `vcr.rs` promised "replay runs touch no engine",
