@@ -207,6 +207,85 @@ fn removal_suppression_reason(parse: &IndexParse) -> Option<String> {
     })
 }
 
+/// The subset of a parse this run **tracks**, and what the narrowing left out.
+///
+/// The exclusion count is the safety-relevant fact about a `year_from` run, and
+/// it exists nowhere else: [`IndexParse`] is built *before* the window is
+/// applied, so no field of it can ever carry this number (see
+/// [`TrackedWindow::suppression_reason`]).
+struct TrackedWindow<'a> {
+    /// The dumps kept, in document order.
+    dumps: Vec<&'a Dump>,
+    /// The window this run was scoped to, or `None` for the whole history.
+    year_from: Option<u32>,
+    /// Parsed dumps the window left out. `0` with no window at all — and also
+    /// when a window happens to exclude nothing, which is the case that keeps
+    /// the tombstone path reachable.
+    excluded: usize,
+}
+
+impl<'a> TrackedWindow<'a> {
+    /// Applies `year_from` to a parse. Named, and returning the count rather
+    /// than only the survivors, because "how many did we drop?" is precisely the
+    /// question the write below has to answer and the old inline `filter` threw
+    /// away.
+    fn of(parse: &'a IndexParse, year_from: Option<u32>) -> Self {
+        let dumps: Vec<&Dump> = match year_from {
+            Some(y) => parse.dumps.iter().filter(|d| d.year >= y).collect(),
+            None => parse.dumps.iter().collect(),
+        };
+        Self {
+            excluded: parse.parsed().saturating_sub(dumps.len()),
+            dumps,
+            year_from,
+        }
+    }
+
+    /// **The second floor on a full-snapshot write — the one the parse floor
+    /// structurally cannot reach.** `Some(reason)` when `year_from` narrows this
+    /// run to a SUBSET of the index it is about to write as a full snapshot.
+    ///
+    /// The two floors measure different things and neither can see the other.
+    /// [`removal_suppression_reason`] is a *document-fidelity* measure ("did we
+    /// read every block the feed published?"), computed from an [`IndexParse`]
+    /// that is built before the window exists. `year_from` is a *request-scoping*
+    /// measure ("which of the blocks we read do we want?"). A clean 120-of-120
+    /// parse with `year_from: 2024` has `share() == 1.0`, so the parse floor
+    /// passes it — and then the snapshot write tombstones the ~96 pre-2024 dumps
+    /// that are still live upstream. That is not a gap in the floor to be
+    /// widened; the two guards are orthogonal by construction.
+    ///
+    /// **Why this was worse than "rows go missing": they come back.** `dumps` is
+    /// ONE shared dataset. The scheduled daily run (no window) and any consumer
+    /// run with a `year_from` alternated tombstoning and resurrecting the
+    /// excluded dumps, and every resurrection lands in `fresh_dumps` — which this
+    /// app's own manifest tells a dataset trigger to fan out as a targeted
+    /// re-download of ~100 MB files. Each flip is ~10 GB of downstream traffic,
+    /// and two consumers with different `year_from` values is a supported
+    /// configuration today.
+    ///
+    /// Keyed on what the window **actually excludes**, not on
+    /// `year_from.is_some()`: a window that excludes nothing produces exactly the
+    /// batch an unwindowed run would, so it keeps the right to tombstone. That
+    /// matters — a consumer pinned at `year_from: 2016` must still see the
+    /// Ministry retiring 2016.
+    fn suppression_reason(&self) -> Option<String> {
+        let year_from = self.year_from?;
+        (self.excluded > 0).then(|| {
+            format!(
+                "removal detection suppressed: year_from={year_from} narrows this run to {} of \
+                 the {} dumps parsed, so this batch is a SUBSET of the published index — the {} \
+                 dumps outside the window are kept rather than tombstoned. A full-snapshot write \
+                 would delete them, and the next run without a window would resurrect every one \
+                 into fresh_dumps",
+                self.dumps.len(),
+                self.dumps.len() + self.excluded,
+                self.excluded,
+            )
+        })
+    }
+}
+
 /// Parse the dump index XML into dumps, in document order, **counting what it
 /// skipped**. Pure + unit-tested: a flat, stable government schema, so a scoped
 /// tag scan beats pulling in an XML dependency.
@@ -299,9 +378,15 @@ impl ScrapeApp for SmlouvyDumpWatch {
                         "minimum": 2016,
                         "description": "Keep only dumps whose `rok` >= this year, so a consumer \
                                         that only cares about recent months doesn't track the \
-                                        full 2016→now history. Omitted = all dumps. NOTE: \
-                                        raising it tombstones the now-excluded dumps (the sync \
-                                        is a full snapshot)."
+                                        full 2016→now history. Omitted = all dumps. A windowed \
+                                        run NEVER tombstones: whenever the window actually \
+                                        excludes something, the write is downgraded to \
+                                        upsert-only (reported in `removals_suppressed`), so the \
+                                        dumps outside the window are KEPT, not deleted. `dumps` \
+                                        is one shared dataset, so this is what stops two \
+                                        consumers with different windows from alternately \
+                                        deleting and resurrecting each other's dumps. Only a run \
+                                        without a window may tombstone."
                     }
                 },
                 "additionalProperties": true
@@ -324,10 +409,14 @@ impl ScrapeApp for SmlouvyDumpWatch {
                  changed, unchanged, removed, removals_suppressed, fresh_dumps[], \
                  newest_period, newest_url} — full-snapshot sync of the `dumps` dataset keyed \
                  by dump URL; `dumps_in_index` is the number of <dump> blocks SEEN and \
-                 `dumps_parsed` how many of them parsed, so a partial parse is visible; a \
-                 partial parse downgrades the write to upsert-only (`removals_suppressed`) so \
-                 it cannot tombstone the dumps it failed to read; `fresh_dumps` are the \
-                 new/re-generated dump URLs a dataset trigger should re-download",
+                 `dumps_parsed` how many of them parsed, so a partial parse is visible; TWO \
+                 orthogonal floors downgrade the write to upsert-only and each names itself in \
+                 `removals_suppressed` — a partial parse (so it cannot tombstone the dumps it \
+                 failed to read) and a `year_from` window that actually excludes dumps (so a \
+                 request-scoped run cannot tombstone the dumps it merely scoped out, and cannot \
+                 flip them against an unwindowed run); `dumps_tracked` vs `dumps_parsed` is what \
+                 the window excluded; `fresh_dumps` are the new/re-generated dump URLs a dataset \
+                 trigger should re-download",
             ),
             cost_class: CostClass::Free,
         }
@@ -374,21 +463,21 @@ impl ScrapeApp for SmlouvyDumpWatch {
         }
 
         // `year_from` filters what we TRACK; it never changes what the index was
-        // seen to hold, so the floor below is judged on the parse, not on this.
-        let tracked: Vec<&Dump> = match year_from {
-            Some(y) => parse.dumps.iter().filter(|d| d.year >= y).collect(),
-            None => parse.dumps.iter().collect(),
-        };
+        // seen to hold, so the parse floor is judged on the parse, not on this.
+        // The window has its OWN floor — see `TrackedWindow::suppression_reason`.
+        let window = TrackedWindow::of(&parse, year_from);
 
         // Full snapshot: the index IS the complete current listing, so a dump that
         // vanishes (the Ministry retiring a month) is a real `removed`. Keyed by the
         // dump URL — a re-generated month keeps its URL and surfaces as `changed`
         // because its hash/size differ.
         //
-        // ...unless the parse was partial, in which case the batch is only PART of
-        // the listing and removal detection would tombstone the dumps we failed to
-        // read. See `removal_suppression_reason`.
-        let items: Vec<(String, Value)> = tracked
+        // ...unless one of the two floors says this batch is only PART of that
+        // listing, in which case removal detection would tombstone dumps that are
+        // still live upstream — the ones we failed to read (the parse floor) or
+        // the ones we deliberately scoped out (the window floor).
+        let items: Vec<(String, Value)> = window
+            .dumps
             .iter()
             .map(|d| (d.url.clone(), d.record()))
             .collect();
@@ -398,11 +487,23 @@ impl ScrapeApp for SmlouvyDumpWatch {
             source_url: Some(index_url.clone()),
             ..Provenance::default()
         };
-        let removals_suppressed = removal_suppression_reason(&parse);
+        // Two ORTHOGONAL floors; either one alone downgrades the write to
+        // upsert-only, and both are reported when both apply.
+        let suppressions: Vec<String> = [
+            removal_suppression_reason(&parse),
+            window.suppression_reason(),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        for reason in &suppressions {
+            tracing::warn!(dataset = "dumps", "{reason}");
+            warnings.push(reason.clone());
+        }
+        let removals_suppressed: Option<String> =
+            (!suppressions.is_empty()).then(|| suppressions.join(" | "));
         let summary = match &removals_suppressed {
-            Some(reason) => {
-                tracing::warn!(dataset = "dumps", "{reason}");
-                warnings.push(reason.clone());
+            Some(_) => {
                 ctx.upsert_many_with_provenance("dumps", &items, prov)
                     .await?
             }
@@ -412,7 +513,7 @@ impl ScrapeApp for SmlouvyDumpWatch {
         // The freshly-changed dumps are the actionable ingest targets — a dataset
         // trigger reads these keys from `_trigger` and re-downloads exactly them.
         let fresh_urls: Vec<&str> = summary.fresh_keys().map(String::as_str).collect();
-        let newest = tracked.iter().max_by_key(|d| (d.year, d.month));
+        let newest = window.dumps.iter().max_by_key(|d| (d.year, d.month));
 
         Ok(json!({
             "index_url": index_url,
@@ -424,7 +525,7 @@ impl ScrapeApp for SmlouvyDumpWatch {
             "parse": parse.to_json(),
             "warnings": warnings,
             "removals_suppressed": removals_suppressed,
-            "dumps_tracked": tracked.len(),
+            "dumps_tracked": window.dumps.len(),
             "year_from": year_from,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
@@ -581,6 +682,103 @@ mod tests {
         assert!(!parse.is_partial());
         assert!(removal_suppression_reason(&parse).is_none());
         assert!(parse.warning().is_none());
+    }
+
+    /// Three years of clean blocks, one per year — the smallest index that has
+    /// something for a window to exclude.
+    fn three_year_parse() -> IndexParse {
+        parse_dumps(
+            r#"
+          <dump><mesic>1</mesic><rok>2023</rok><odkaz>https://x/2023.xml</odkaz></dump>
+          <dump><mesic>1</mesic><rok>2024</rok><odkaz>https://x/2024.xml</odkaz></dump>
+          <dump><mesic>1</mesic><rok>2025</rok><odkaz>https://x/2025.xml</odkaz></dump>
+        "#,
+        )
+    }
+
+    /// THE anti-pattern this guard exists for, and the one the parse floor
+    /// structurally cannot see: a **clean** parse with a `year_from` window is a
+    /// full-fidelity read of the document (`share() == 1.0`, `is_partial()`
+    /// false, so the parse floor waves it through) and *still* a SUBSET of what
+    /// the index published. A full-snapshot write of it tombstones every dump
+    /// outside the window — on the real feed, ~96 of ~120.
+    #[test]
+    fn a_clean_parse_inside_a_year_window_is_still_not_a_snapshot() {
+        let parse = three_year_parse();
+        // The parse floor's verdict, unchanged and unhelpful here by design.
+        assert_eq!((parse.blocks_seen, parse.parsed()), (3, 3));
+        assert!(!parse.is_partial(), "the document was read perfectly");
+        assert!(
+            removal_suppression_reason(&parse).is_none(),
+            "the parse floor cannot see a request-scoping problem, and must not \
+             be widened to try"
+        );
+
+        let window = TrackedWindow::of(&parse, Some(2025));
+        assert_eq!(window.dumps.len(), 1);
+        assert_eq!(window.excluded, 2);
+        let reason = window
+            .suppression_reason()
+            .expect("a window that drops 2 of 3 dumps must not write a snapshot");
+        assert!(
+            reason.contains("year_from=2025"),
+            "the reason must name the window, so an operator can tell it from a \
+             partial parse: {reason}"
+        );
+        assert!(
+            reason.contains("tombstoned") && reason.contains("resurrect"),
+            "the reason must name both halves of the cost — the delete AND the \
+             flip back that re-triggers a ~100 MB re-download: {reason}"
+        );
+    }
+
+    /// The counter-case that keeps the guard honest: **no window at all** is the
+    /// scheduled daily run, and it must keep full-snapshot semantics.
+    #[test]
+    fn a_run_without_a_window_still_tombstones() {
+        let parse = three_year_parse();
+        let window = TrackedWindow::of(&parse, None);
+        assert_eq!(window.dumps.len(), 3, "everything is tracked");
+        assert_eq!(window.excluded, 0);
+        assert!(
+            window.suppression_reason().is_none(),
+            "the daily unwindowed run is the one that MUST be able to tombstone a \
+             month the Ministry retired"
+        );
+    }
+
+    /// The guard is keyed on what the window *actually excludes*, not on
+    /// `year_from.is_some()`. A consumer pinned at the first published year sees
+    /// exactly the batch an unwindowed run would build, so it keeps the right to
+    /// tombstone — otherwise setting `year_from` at all would silently turn the
+    /// app into an append-only index forever.
+    #[test]
+    fn a_window_that_excludes_nothing_keeps_the_right_to_tombstone() {
+        let parse = three_year_parse();
+        for year in [2016, 2023] {
+            let window = TrackedWindow::of(&parse, Some(year));
+            assert_eq!(window.excluded, 0, "year_from={year} excludes nothing");
+            assert!(
+                window.suppression_reason().is_none(),
+                "year_from={year} drops no dump, so this batch IS the full index"
+            );
+        }
+    }
+
+    /// Both floors can fire at once — a garbled feed read through a window — and
+    /// neither may mask the other in the report.
+    #[test]
+    fn a_partial_parse_inside_a_window_reports_both_floors() {
+        let xml = r#"
+          <dump><mesic>1</mesic><rok>2023</rok><odkaz>https://x/2023.xml</odkaz></dump>
+          <dump><mesic>1</mesic><rok>2025</rok><odkaz>https://x/2025.xml</odkaz></dump>
+          <dump><mesic>2</mesic><rok>2025</rok></dump>
+        "#;
+        let parse = parse_dumps(xml);
+        assert!(parse.is_partial(), "one block lost its <odkaz>");
+        let window = TrackedWindow::of(&parse, Some(2025));
+        assert!(removal_suppression_reason(&parse).is_some());
+        assert!(window.suppression_reason().is_some());
     }
 
     #[test]

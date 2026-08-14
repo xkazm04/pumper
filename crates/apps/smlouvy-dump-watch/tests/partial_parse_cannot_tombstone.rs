@@ -8,6 +8,12 @@
 //! count. Core's own doc names the hole: `detect_removed` "already refuses an
 //! *empty* batch; a partial batch is the case that guard does not cover".
 //!
+//! It now also covers the **second, orthogonal** way a batch turns out to be a
+//! subset of the published index: the `year_from` window. That one is a
+//! *request-scoping* measure, not a document-fidelity one, so the parsed-share
+//! floor structurally cannot see it — a 120-of-120 parse read through a window
+//! has `share() == 1.0` and used to tombstone every dump outside it.
+//!
 //! Every test here is named after the anti-pattern it defends.
 
 use std::collections::HashMap;
@@ -37,16 +43,22 @@ impl HttpClient for StubIndex {
     }
 }
 
-/// One well-formed `<dump>` block for month `m` of 2025.
-fn block(m: u32) -> String {
+/// One well-formed `<dump>` block for month `m` of year `y`.
+fn block_in(y: u32, m: u32) -> String {
     format!(
-        "<dump><mesic>{m}</mesic><rok>2025</rok>\
-         <hashDumpu algoritmus=\"sha1\">{m:040}</hashDumpu>\
+        "<dump><mesic>{m}</mesic><rok>{y}</rok>\
+         <hashDumpu algoritmus=\"sha1\">{:040}</hashDumpu>\
          <velikostDumpu>{}</velikostDumpu>\
-         <casGenerovani>2025-{m:02}-01T00:11:51+02:00</casGenerovani>\
-         <odkaz>https://data.smlouvy.gov.cz/dump_2025_{m:02}.xml</odkaz></dump>",
+         <casGenerovani>{y}-{m:02}-01T00:11:51+02:00</casGenerovani>\
+         <odkaz>https://data.smlouvy.gov.cz/dump_{y}_{m:02}.xml</odkaz></dump>",
+        y * 100 + m,
         1_000_000 + m as u64,
     )
+}
+
+/// One well-formed `<dump>` block for month `m` of 2025.
+fn block(m: u32) -> String {
+    block_in(2025, m)
 }
 
 /// A block the parser must skip: no `<odkaz>`.
@@ -62,14 +74,23 @@ fn index_of(blocks: Vec<String>) -> String {
     )
 }
 
-fn dump_url(m: u32) -> String {
-    format!("https://data.smlouvy.gov.cz/dump_2025_{m:02}.xml")
+fn dump_url_in(y: u32, m: u32) -> String {
+    format!("https://data.smlouvy.gov.cz/dump_{y}_{m:02}.xml")
 }
 
-/// Drive one `run()` against a canned index document.
-async fn run_index(store: &TempStore, xml: String) -> Value {
+fn dump_url(m: u32) -> String {
+    dump_url_in(2025, m)
+}
+
+/// Drive one `run()` against a canned index document, with extra params merged
+/// over `index_url`.
+async fn run_index_with(store: &TempStore, xml: String, extra: Value) -> Value {
+    let mut params = json!({ "index_url": INDEX_URL });
+    for (k, v) in extra.as_object().expect("params object") {
+        params[k] = v.clone();
+    }
     let ctx = TestContext::new(&store.storage, "smlouvy-dump-watch")
-        .params(json!({ "index_url": INDEX_URL }))
+        .params(params)
         .engines(engines_with(
             Arc::new(StubIndex(xml)),
             Arc::new(Dead),
@@ -77,6 +98,11 @@ async fn run_index(store: &TempStore, xml: String) -> Value {
         ))
         .build();
     SmlouvyDumpWatch.run(ctx).await.expect("run")
+}
+
+/// Drive one `run()` against a canned index document.
+async fn run_index(store: &TempStore, xml: String) -> Value {
+    run_index_with(store, xml, json!({})).await
 }
 
 /// Live (non-tombstoned) dump keys currently in the store, sorted.
@@ -198,6 +224,138 @@ async fn a_shrinking_but_clean_index_still_tombstones() {
     assert_eq!(live.len(), 3);
     assert!(!live.contains(&dump_url(1)));
     assert!(live.contains(&dump_url(5)));
+}
+
+// ---------------------------------------------------------------------------
+// The window floor: a per-run SCOPE must not mutate a global SNAPSHOT
+// ---------------------------------------------------------------------------
+
+/// A five-dump index spanning two years: 2023-01, 2023-02, 2025-01..03.
+fn two_year_index() -> String {
+    index_of(vec![
+        block_in(2023, 1),
+        block_in(2023, 2),
+        block_in(2025, 1),
+        block_in(2025, 2),
+        block_in(2025, 3),
+    ])
+}
+
+/// **THE anti-pattern this direction exists for.** `year_from` is a per-run
+/// SCOPE parameter, and it was being applied to a global SNAPSHOT write: the
+/// narrowing happened after the parse, the batch handed to
+/// `sync_many_with_provenance` held only the in-window dumps, and
+/// `detect_removed` tombstoned every dump outside it. On the real feed that is
+/// ~96 of ~120 dumps deleted by a run that read the document perfectly.
+///
+/// The parsed-share floor shipped for the garbled-feed case cannot cover this,
+/// by construction: this parse is 5-of-5, `share() == 1.0`, `partial == false`.
+#[tokio::test]
+async fn a_year_window_does_not_tombstone_the_dumps_outside_it() {
+    let store = TempStore::new("smlouvy-window").await;
+    let datasets = store.datasets();
+
+    // Seed the shared dataset the way the scheduled daily run does: no window.
+    let seeded = run_index(&store, two_year_index()).await;
+    assert_eq!(seeded["dumps_tracked"], 5);
+    assert_eq!(live_dumps(&datasets).await.len(), 5, "seeded index");
+
+    // A consumer asks for 2025 onward. Same document, read perfectly.
+    let out = run_index_with(&store, two_year_index(), json!({ "year_from": 2025 })).await;
+
+    assert_eq!(
+        out["parse"]["partial"], false,
+        "the document parsed completely — the parse floor is NOT what has to \
+         catch this: {out}"
+    );
+    assert_eq!(out["dumps_parsed"], 5, "five blocks parsed");
+    assert_eq!(out["dumps_tracked"], 3, "three of them are in the window");
+    assert_eq!(
+        out["removed"], 0,
+        "a request-scoped run tombstoned dumps that are still live upstream"
+    );
+    assert_eq!(
+        live_dumps(&datasets).await.len(),
+        5,
+        "the two 2023 dumps were deleted by a run that merely scoped them out"
+    );
+    let reason = out["removals_suppressed"]
+        .as_str()
+        .expect("a suppressed removal is visible as such, not silently absent");
+    assert!(
+        reason.contains("year_from=2025"),
+        "the reason must name the window, so an operator can tell it apart from \
+         a partial parse: {reason}"
+    );
+}
+
+/// The counter-test, and the failure mode that would be worse than the bug:
+/// the guard must not turn `dumps` into an append-only index. A run **without**
+/// a window still tombstones a month the Ministry genuinely retired — and so
+/// does a window that happens to exclude nothing, because that batch IS the
+/// full index.
+#[tokio::test]
+async fn removal_still_works_without_a_window_and_with_a_vacuous_one() {
+    let store = TempStore::new("smlouvy-window-counter").await;
+    let datasets = store.datasets();
+
+    run_index(&store, two_year_index()).await;
+    assert_eq!(live_dumps(&datasets).await.len(), 5);
+
+    // A window that excludes nothing: every dump is 2023 or later.
+    let vacuous = run_index_with(&store, two_year_index(), json!({ "year_from": 2016 })).await;
+    assert_eq!(vacuous["dumps_tracked"], 5);
+    assert!(
+        vacuous["removals_suppressed"].is_null(),
+        "a window that drops no dump must keep full-snapshot semantics, or \
+         setting year_from at all would silently make the app append-only: \
+         {vacuous}"
+    );
+
+    // The Ministry retires 2023-01. Unwindowed run: a real removal.
+    let shrunk = index_of(vec![
+        block_in(2023, 2),
+        block_in(2025, 1),
+        block_in(2025, 2),
+        block_in(2025, 3),
+    ]);
+    let out = run_index(&store, shrunk).await;
+    assert!(out["removals_suppressed"].is_null());
+    assert_eq!(
+        out["removed"], 1,
+        "a genuinely vanished dump is still removed"
+    );
+    let live = live_dumps(&datasets).await;
+    assert_eq!(live.len(), 4);
+    assert!(!live.contains(&dump_url_in(2023, 1)));
+}
+
+/// **The user cost, reproduced end to end.** `dumps` is ONE shared dataset, and
+/// two consumers with different `year_from` values is a supported configuration.
+/// Before the window floor the pair alternated: the windowed run tombstoned the
+/// out-of-window dumps, the next unwindowed run resurrected all of them — and
+/// every resurrection lands in `fresh_dumps`, which this app's manifest tells a
+/// dataset trigger to fan out as a targeted re-download of ~100 MB files. The
+/// third run's `fresh_dumps` being empty is the whole point: nothing changed
+/// upstream, so nothing may be re-downloaded.
+#[tokio::test]
+async fn alternating_windows_do_not_flip_the_shared_dataset() {
+    let store = TempStore::new("smlouvy-window-flip").await;
+    let datasets = store.datasets();
+
+    run_index(&store, two_year_index()).await;
+    run_index_with(&store, two_year_index(), json!({ "year_from": 2025 })).await;
+    let back = run_index(&store, two_year_index()).await;
+
+    assert_eq!(
+        back["fresh_dumps"].as_array().expect("fresh_dumps[]").len(),
+        0,
+        "the unwindowed run RESURRECTED dumps the windowed run had tombstoned, \
+         and every resurrection is a ~100 MB re-download a dataset trigger will \
+         fan out: {back}"
+    );
+    assert_eq!(back["new"], 0, "nothing upstream is actually new: {back}");
+    assert_eq!(live_dumps(&datasets).await.len(), 5);
 }
 
 /// An index that parses to nothing is still a hard failure, not an empty
