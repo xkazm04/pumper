@@ -16,8 +16,8 @@
 
 use async_trait::async_trait;
 use pumper_core::{
-    salvage_json, AppContext, AppManifest, CostClass, ManifestExample, ResearchRequest, Result,
-    ScrapeApp,
+    salvage_json, AppContext, AppManifest, CostClass, Error, ManifestExample, ResearchRequest,
+    Result, ScrapeApp,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -418,8 +418,7 @@ impl ScrapeApp for Research {
                 if let Value::Object(map) = &mut result {
                     map.insert("resumed_from_checkpoint".into(), Value::Bool(true));
                 }
-                ctx.save_artifact("report.json", &serde_json::to_vec_pretty(&result)?)
-                    .await?;
+                save_report_artifact(&ctx, &result).await;
                 return Ok(result);
             }
             Plan::Resume(state) => (state, true),
@@ -550,6 +549,19 @@ impl ScrapeApp for Research {
         }
 
         let structured = final_parsed.is_some();
+        // A run that produced nothing at any price is a failure, not an empty
+        // success: letting it return `Ok` marks the job SUCCEEDED, fires the
+        // result webhook and indexes a search doc for `{report: ""}`. The
+        // result is deliberately NOT checkpointed here — a `result` in the
+        // blob would make the next attempt take `Plan::Done` and hand the same
+        // nothing back as a success.
+        if produced_nothing(structured, &last_text) {
+            return Err(empty_run_failure(
+                stop_reason,
+                state.steps_done,
+                state.spent_usd,
+            ));
+        }
         let report = match final_parsed {
             Some(v) => v,
             None => Value::String(last_text),
@@ -574,19 +586,111 @@ impl ScrapeApp for Research {
         state.result = Some(result.clone());
         ctx.checkpoint_now(state.to_value()).await;
 
-        ctx.save_artifact("report.json", &serde_json::to_vec_pretty(&result)?)
-            .await?;
+        save_report_artifact(&ctx, &result).await;
         Ok(result)
     }
 }
 
-/// True when a research report matches the promised shape: a `summary` string
-/// plus `key_findings` and `sources` arrays. Guards against marking a
-/// hallucinated or wrong-shape object as `structured`.
+/// True when a research report matches the promised shape — a `summary` string
+/// plus `key_findings` and `sources` arrays — **and carries something to read**.
+/// Guards against marking a hallucinated or wrong-shape object as `structured`.
+///
+/// The content half of the check exists because the `json_schema` guardrail is
+/// good at its job: a model that has nothing to say still answers in the
+/// promised shape, and `{"summary": "", "key_findings": [], "sources": []}` used
+/// to be stamped `structured: true` / `stop_reason: completed`. That is the most
+/// expensive lie this app can tell — the job goes green, the result webhook
+/// fires and a search doc is written for a report that says nothing.
+///
+/// The bar is deliberately low: ONE non-blank summary or key finding is enough.
+/// A real summary with an empty `sources` array is thin, not empty — sourcing
+/// quality is a judgement for the consumer, and rejecting it here would spend
+/// more steps re-asking a model that already answered.
 fn is_report_shaped(v: &Value) -> bool {
-    v.get("summary").is_some_and(Value::is_string)
-        && v.get("key_findings").is_some_and(Value::is_array)
-        && v.get("sources").is_some_and(Value::is_array)
+    let Some(summary) = v.get("summary").and_then(Value::as_str) else {
+        return false;
+    };
+    let Some(findings) = v.get("key_findings").and_then(Value::as_array) else {
+        return false;
+    };
+    if !v.get("sources").is_some_and(Value::is_array) {
+        return false;
+    }
+    !summary.trim().is_empty() || findings.iter().any(has_content)
+}
+
+/// Whether one `key_findings` entry carries anything. The promised shape is
+/// `string[]`, but a model that returns richer entries has still said
+/// something, so only blanks, nulls and empty containers count as nothing.
+fn has_content(v: &Value) -> bool {
+    match v {
+        Value::Null => false,
+        Value::String(s) => !s.trim().is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        Value::Object(map) => !map.is_empty(),
+        Value::Bool(_) | Value::Number(_) => true,
+    }
+}
+
+/// Whether the run produced nothing a consumer could use.
+///
+/// Narrow on purpose: **only** an unstructured run whose whole accumulated text
+/// is empty or whitespace. A truncated run that carries real prose — the
+/// `budget_exhausted` partial above all — is a *success*: the caller paid for
+/// those findings and `stop_reason` already says the report is unfinished.
+/// Widening this to "unstructured" or "truncated" would throw away work that
+/// was bought and is worth reading.
+fn produced_nothing(structured: bool, accumulated_text: &str) -> bool {
+    !structured && accumulated_text.trim().is_empty()
+}
+
+/// The failure a content-free run reports, carrying what it cost.
+///
+/// A run that stopped on the spend ceiling with nothing to show is
+/// **deterministic**: the checkpoint holds the spend, so every retry restores
+/// it, re-hits the same wall and produces the same nothing while the resume
+/// counter climbs toward the checkpoint-discarding cap. That is exactly the
+/// case [`pumper_core::Error::BudgetExhausted`] is typed for (see
+/// `core/src/error.rs:200-206`), so it is reported as terminal rather than
+/// retried into the ground. Every other empty run — a CLI hiccup, a session
+/// that vanished, a step cap hit on silence — can genuinely differ next
+/// attempt, so it stays a retryable `Error::App`.
+///
+/// Either way the message names the spend: a failed run must not also lose the
+/// record of what it cost (the cost events themselves are already in the
+/// ledger — `ctx.research` meters each call as it happens).
+fn empty_run_failure(stop_reason: StopReason, steps: u32, spent_usd: f64) -> Error {
+    let why = format!(
+        "research produced no content: {} step(s) ran, ${spent_usd:.4} spent, stop_reason={}",
+        steps,
+        stop_reason.as_str()
+    );
+    match stop_reason {
+        StopReason::BudgetExhausted => Error::BudgetExhausted(why),
+        _ => Error::App(why),
+    }
+}
+
+/// Best-effort `report.json` dump.
+///
+/// The artifact is decorative — every byte of it is already in the job result —
+/// but writing it with `?` turned a transient `tokio::fs` failure into a
+/// *retryable* `Error::Io` on a run that had already finished. The retry
+/// restores the finished checkpoint, takes [`Plan::Done`], and hits the same
+/// write; `max_resume_failures` of those and the worker discards the checkpoint
+/// and re-runs the whole research at full price. A JSON dump nobody reads is
+/// not worth a paid re-run, so a failure here is logged and swallowed.
+async fn save_report_artifact(ctx: &AppContext, result: &Value) {
+    let bytes = match serde_json::to_vec_pretty(result) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            tracing::warn!("research: report.json could not be serialized: {e}");
+            return;
+        }
+    };
+    if let Err(e) = ctx.save_artifact("report.json", &bytes).await {
+        tracing::warn!("research: report.json artifact write failed (result unaffected): {e}");
+    }
 }
 
 #[cfg(test)]
@@ -617,6 +721,28 @@ mod tests {
         assert!(!is_report_shaped(
             &json!({"summary": "s", "key_findings": []})
         ));
+    }
+
+    #[test]
+    fn an_in_shape_refusal_with_nothing_in_it_is_not_structured() {
+        // What the json_schema guardrail turns a model that has nothing to say
+        // into: perfect shape, zero research. Stamping it `completed` reports a
+        // finished report that says nothing.
+        assert!(!is_report_shaped(&json!({
+            "summary": "", "key_findings": [], "sources": []
+        })));
+        // Whitespace is not content either.
+        assert!(!is_report_shaped(&json!({
+            "summary": "   \n\t ", "key_findings": ["", "  "], "sources": []
+        })));
+        // One real finding is enough even without a summary…
+        assert!(is_report_shaped(&json!({
+            "summary": "", "key_findings": ["VAT threshold is 2m CZK"], "sources": []
+        })));
+        // …and a real summary is enough without sources: thin is not empty.
+        assert!(is_report_shaped(&json!({
+            "summary": "The threshold rose in 2023.", "key_findings": [], "sources": []
+        })));
     }
 
     #[test]
@@ -818,6 +944,40 @@ mod tests {
     }
 
     #[test]
+    fn nothing_produced_means_empty_text_not_merely_unfinished() {
+        // The failure case: no structure and no text at all.
+        assert!(produced_nothing(false, ""));
+        assert!(produced_nothing(false, "  \n\t "));
+        // NOT failures — a paid-for partial is worth returning, and this is the
+        // exact boundary that keeps the budget_exhausted partial a success.
+        assert!(!produced_nothing(false, "partial findings, not json"));
+        assert!(!produced_nothing(true, ""));
+    }
+
+    #[test]
+    fn an_empty_run_that_spent_the_ceiling_fails_terminally_not_retryably() {
+        // Deterministic: the checkpoint holds the spend, so every retry
+        // restores it, re-hits the wall and produces the same nothing.
+        let spent = empty_run_failure(StopReason::BudgetExhausted, 2, 0.5);
+        assert!(spent.is_terminal_for_job(), "{spent}");
+        // Everything else can differ next attempt.
+        for reason in [
+            StopReason::NoSession,
+            StopReason::StepCap,
+            StopReason::TurnsExhausted,
+            StopReason::SingleCall,
+        ] {
+            let e = empty_run_failure(reason, 1, 0.0);
+            assert!(!e.is_terminal_for_job(), "{reason:?} should be retryable");
+        }
+        // What it cost is never lost in the failure.
+        let msg = empty_run_failure(StopReason::NoSession, 3, 0.4237).to_string();
+        assert!(msg.contains("$0.4237"), "{msg}");
+        assert!(msg.contains("3 step(s)"), "{msg}");
+        assert!(msg.contains("no_session"), "{msg}");
+    }
+
+    #[test]
     fn partial_truncation_is_char_boundary_safe() {
         assert_eq!(truncate_chars("héllo", 3), "hél");
         assert_eq!(truncate_chars("short", 100), "short");
@@ -864,9 +1024,15 @@ mod tests {
         }
 
         #[tokio::test]
-        async fn an_unshaped_reply_with_no_session_id_stops_immediately() {
+        async fn an_unshaped_but_nonempty_reply_still_succeeds_at_no_session() {
             // research_output() defaults session_id to None: the loop's
             // "nothing to resume" exit, not a step cap or budget wall.
+            //
+            // This is the deliberate boundary of the empty-run failure: the
+            // reply never made the promised shape, but it is REAL TEXT the
+            // caller paid for, and `stop_reason` already says the report is
+            // unfinished. Only a run with nothing at all fails (see
+            // `an_empty_reply_fails_the_job_instead_of_reporting_it_as_done`).
             let store = TempStore::new("research-nosession").await;
             let researcher =
                 Arc::new(ScriptedResearcher::new().on("", research_output("not json at all")));
@@ -880,6 +1046,101 @@ mod tests {
             assert_eq!(result["stop_reason"], json!("no_session"));
             assert_eq!(result["structured"], json!(false));
             assert_eq!(result["steps"], json!(1));
+            assert_eq!(result["report"], json!("not json at all"));
+        }
+
+        #[tokio::test]
+        async fn an_empty_reply_fails_the_job_instead_of_reporting_it_as_done() {
+            // Nothing came back at any price. Returning Ok marks the job
+            // SUCCEEDED, fires the result webhook and indexes a search doc for
+            // `{report: ""}` — the fleet's answer everywhere else is to fail.
+            let store = TempStore::new("research-empty").await;
+            let mut out = research_output("   \n  ");
+            out.cost_usd = Some(0.25);
+            let researcher = Arc::new(ScriptedResearcher::new().on("", out));
+            let ctx = ctx_with_researcher(
+                &store.storage,
+                json!({"query": "q", "turns_per_step": 1}),
+                researcher.clone(),
+            )
+            .await;
+            let err = Research
+                .run(ctx)
+                .await
+                .expect_err("an empty research run is a failure, not an empty success");
+            let msg = err.to_string();
+            assert!(msg.contains("produced no content"), "{msg}");
+            // Criterion: the failure still reports what it cost.
+            assert!(msg.contains("$0.2500"), "{msg}");
+            assert!(
+                !err.is_terminal_for_job(),
+                "an empty step can differ next attempt: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_failed_report_dump_does_not_fail_a_finished_run() {
+            // The artifact is decorative; with `?` a transient fs failure made
+            // it retryable, and the retry restores the finished checkpoint and
+            // fails on the SAME write until the checkpoint is discarded and the
+            // whole research is re-bought. Both write sites are covered here.
+            let store = TempStore::new("research-artifact-fail").await;
+            // A regular FILE where the artifacts dir should be: create_dir_all
+            // under it cannot succeed on any platform.
+            let blocker = std::env::temp_dir().join(format!(
+                "research-artifact-blocker-{}-{:?}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            ));
+            std::fs::write(&blocker, b"not a directory").unwrap();
+            // Without this the test could pass vacuously on a platform where
+            // the write actually succeeds.
+            assert!(
+                std::fs::create_dir_all(blocker.join("job")).is_err(),
+                "the artifact dir must be un-creatable for this test to mean anything"
+            );
+
+            // Site 1 — a fresh run that finished.
+            let researcher = Arc::new(
+                ScriptedResearcher::new()
+                    .always_text(r#"{"summary":"s","key_findings":["f"],"sources":[]}"#),
+            );
+            let ctx = TestContext::new(&store.storage, "research")
+                .params(json!({"query": "q"}))
+                .engines(engines_with(Arc::new(Dead), Arc::new(Dead), researcher))
+                .artifacts_dir(blocker.join("job"))
+                .build();
+            let result = Research
+                .run(ctx)
+                .await
+                .expect("a finished run is not undone by a failed artifact dump");
+            assert_eq!(result["stop_reason"], json!("completed"));
+
+            // Site 2 — the Plan::Done restore path, which re-dumps the stored
+            // result and used to fail on the very same write.
+            let done = json!({
+                "v": STATE_VERSION,
+                "session_id": "sess-1",
+                "steps_done": 1,
+                "spent_usd": 0.42,
+                "result": {"query": "q", "structured": true, "cost_usd": 0.42},
+            });
+            let ctx = TestContext::new(&store.storage, "research")
+                .params(json!({"query": "q"}))
+                .engines(engines_with(Arc::new(Dead), Arc::new(Dead), Arc::new(Dead)))
+                .artifacts_dir(blocker.join("job"))
+                .restored(done)
+                .build();
+            let restored = Research
+                .run(ctx)
+                .await
+                .expect("a restored finished result is not undone by a failed artifact dump");
+            assert_eq!(restored["resumed_from_checkpoint"], json!(true));
+
+            let _ = std::fs::remove_file(&blocker);
         }
 
         #[tokio::test]
