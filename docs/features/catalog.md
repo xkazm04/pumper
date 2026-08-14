@@ -46,7 +46,17 @@ Two rules come with it:
 
 `grants/opportunity_details` is live under this shape as of 2026-08-13. `census/market_blend` is the remaining candidate and is documented in place in the TOML.
 
-**`max_row_delta_pct` is a mass-delete tripwire, and it only fires on a tombstoning write.** `Contract::evaluate` computes the delta only when `removed > 0`, and `removed` is populated only by `Datasets::sync_many` — the full-snapshot variant. On an **upsert-only** source (`upsert_many`, `upsert_many_with_provenance`, `upsert_many_derived`) removals never occur, so the declaration can never fire and reads as coverage it does not provide. Declare it where the write is `sync_many` (`cordis-topic-stats`), and leave it off where the write is upsert-only — `grants-gov`'s was removed for exactly this reason on 2026-08-13, with the reasoning recorded above the block. **Known inert:** `ca-grants` and `eu-sedia` still declare one on upsert-only writes.
+**`max_row_delta_pct` is a mass-delete tripwire, and it only fires on a tombstoning write.** `Contract::evaluate` computes the delta only when `removed > 0`, and `removed` is populated only by `Datasets::sync_many` — the full-snapshot variant. On an **upsert-only** source (`upsert_many`, `upsert_many_with_provenance`, `upsert_many_derived`) removals never occur, so the declaration can never fire and reads as coverage it does not provide. Declare it where the write is `sync_many` (`cordis-topic-stats`), and leave it off where the write is upsert-only — `grants-gov`'s was removed for exactly this reason on 2026-08-13, with the reasoning recorded above the block. **Known inert:** `ca-grants`, `eu-sedia` and `state-licensing` still declare one on upsert-only writes (`state-licensing` writes via `upsert_many_with_provenance` + `upsert_many_stamped`; found in the round-21 sweep, which is also why this list is now three names and not two — an audit found the list itself had drifted).
+
+**Virtual namespaces are watchable before their first record.** `trades` joins `grants` as a virtual
+namespace in `registry::VIRTUAL_NAMESPACES`: no app is called `trades`, and five apps
+(`state-tax`, `state-licensing`, `trade-wages`, `homewyse-pricing`, `valuation-multiples`) publish
+`trades/operator_economics` + `trades/compliance` into it. Since round 21 every one of them declares
+those datasets via `index_datasets`, which is what lets `/catalog/health`, watches, dataset triggers
+and `enforce_contracts` see their revisions at all — the worker's fan-out is scoped by
+`run_indexed_apps`, so an undeclared cross-source dataset is invisible to every one of those
+mechanisms no matter how often it is rewritten. `cms-fee-schedule` is deliberately not a publisher:
+it is in the same product group but writes only its own datasets and never rebuilds the join.
 
 ## API
 

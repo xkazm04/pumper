@@ -75,19 +75,42 @@ pub(crate) struct VirtualNamespace {
 /// Deliberately tiny, and deliberately not the only source: keep it to
 /// namespaces a caller would reasonably watch on a fresh install. Anything else
 /// becomes watchable the moment it holds a record.
-pub(crate) const VIRTUAL_NAMESPACES: &[VirtualNamespace] = &[VirtualNamespace {
-    // `grants_common::UNIFIED_APP`. Not imported: `pumper-server` depends on the
-    // grant source apps, not on `grants-common`; `virtual_namespace_publishers_are_registered`
-    // pins the entry against the registry instead.
-    name: "grants",
-    // `cordis` is deliberately NOT here. It is an EU-funding app, but it writes
-    // only its own `cordis/projects` + `cordis/topic_stats` and never calls
-    // `grants_common::finalize_unified` — so `publishes_into("cordis")` used to
-    // redirect an operator who watched `cordis` to a namespace that will never
-    // carry one of its revisions.
-    publishers: &["grants-gov", "ca-grants", "eu-sedia"],
-    note: "the cross-source unified grants namespace every grant source publishes into",
-}];
+pub(crate) const VIRTUAL_NAMESPACES: &[VirtualNamespace] = &[
+    VirtualNamespace {
+        // `grants_common::UNIFIED_APP`. Not imported: `pumper-server` depends on the
+        // grant source apps, not on `grants-common`; `virtual_namespace_publishers_are_registered`
+        // pins the entry against the registry instead.
+        name: "grants",
+        // `cordis` is deliberately NOT here. It is an EU-funding app, but it writes
+        // only its own `cordis/projects` + `cordis/topic_stats` and never calls
+        // `grants_common::finalize_unified` — so `publishes_into("cordis")` used to
+        // redirect an operator who watched `cordis` to a namespace that will never
+        // carry one of its revisions.
+        publishers: &["grants-gov", "ca-grants", "eu-sedia"],
+        note: "the cross-source unified grants namespace every grant source publishes into",
+    },
+    VirtualNamespace {
+        // `trades_common::unified::UNIFIED_APP`. Not imported, for the same reason
+        // `grants` is not: `pumper-server` depends on the trades source apps, not on
+        // `trades-common`; `virtual_namespace_publishers_are_registered` pins it.
+        //
+        // `cms-fee-schedule` is deliberately NOT here — it is a Market Data app in
+        // the same group, but it drives no LLM, writes only its own `releases` +
+        // `fee_schedule*` datasets, and never calls `unified::sync_operator_economics`.
+        // Listing it would redirect an operator who watched it to a namespace that
+        // will never carry one of its revisions — the same trap `cordis` documents above.
+        name: "trades",
+        publishers: &[
+            "state-tax",
+            "state-licensing",
+            "trade-wages",
+            "homewyse-pricing",
+            "valuation-multiples",
+        ],
+        note: "the cross-source trades namespace holding operator_economics + compliance, \
+           which all five trades apps publish into",
+    },
+];
 
 /// The virtual namespace a registered app publishes into, if any — the hint
 /// behind "you watched the source app, but the records land somewhere else".
