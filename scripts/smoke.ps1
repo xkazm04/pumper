@@ -827,6 +827,38 @@ try {
                 ($ca.output_shape -match 'short_page')
             }
 
+            # Round 24: /sources must distinguish what enforcement was CONFIGURED
+            # to do from what it can be OBSERVED doing.
+            # THE ANTI-PATTERN: `contracts_enforce` rendered `state.config.
+            # contracts.enforce` — a statement of intent — beside per-row verdicts
+            # from a map with exactly one mutation in the workspace (the worker's
+            # insert; no remove, no clear, no generation). An unparsable catalog
+            # makes the publish seam warn-and-return PER JOB, so the whole fleet
+            # evaluates zero contracts while that green claim keeps rendering
+            # next to a `pass` that outlived its run. Two other endpoints 500 in
+            # that state; this one served 200 OK and looked healthy.
+            # Asserted live because the failure was never a crash — it was a
+            # correct-looking 200, which is exactly what a unit test on the
+            # handler is worst at catching.
+            Test-JsonEndpoint -Name 'GET /sources separates configured intent from observed enforcement' `
+                -Path '/sources' -Assert {
+                param($j)
+                $c = $j.contracts
+                if (-not $c) { return $false }
+                # The two halves must be separately present — not one field
+                # standing in for both. `declared` is what the catalog actually
+                # gave enforcement to judge.
+                ($null -ne $c.enforce_configured) -and
+                ($null -ne $c.enforce_observed) -and
+                ($null -ne $c.catalog_ok) -and
+                ($null -ne $c.declared) -and
+                # On a healthy scratch store the catalog parses, so observed
+                # enforcement must agree with the configured intent. A mismatch
+                # here would mean the fleet is silently checking nothing.
+                ($c.catalog_ok -eq $true) -and
+                ($c.enforce_observed -eq $c.enforce_configured)
+            }
+
             # Round 20: a `replay_of` job against an app that cannot be replayed
             # must be REFUSED BY NAME, before the app runs.
             # THE ANTI-PATTERN: `vcr.rs` promised "replay runs touch no engine",
