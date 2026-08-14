@@ -54,6 +54,26 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
 
 ## Skill improvement log
 
+- 2026-08-14 (round 22, POST-MERGE): **The doc-sync Stop hook is satisfied by ANY `docs/features/*`
+  edit, so a turn that correctly updates one mapped doc can silently leave a second mapped doc
+  stale — and this round it did.** Lot B's D3 added a new non-terminal job event
+  (`checkpoint_failed`) and correctly updated `runtime.md`. That edit satisfied the hook, which then
+  had nothing to say about `events-webhooks.md` — the one doc whose entire job is to enumerate which
+  statuses do *not* close a per-job stream, and which named only `progress`. **The hook proves a doc
+  was touched, never that the RIGHT docs were.** Standing rule: when a diff adds a new *member of an
+  enumerated set* (an event kind, a status, an outcome, a `sweep` arm, a trust level), grep the docs
+  for the other members by name and update every place the set is listed — the hook structurally
+  cannot do this for you. Cost this round: one post-merge commit (`0f50193`); the fix was two lines.
+- 2026-08-14 (round 22, POST-MERGE): **Read a late builder report even after the round has merged.**
+  Lot B's report arrived after the wrap, the push, and the final summary. It was still worth reading:
+  it independently confirmed my flake classification, supplied the exact failed-before-the-fix
+  measurement for D2 (`29 passed; 1 failed` at `lib.rs:2174` with the call site unwired), corrected
+  the ledger's clippy figure (**31 warnings = 16 distinct sites**; the rest are lib+test duplicates
+  of the same sites, so future rounds should compare SITES not counts), disclosed that it had caught
+  and fixed a new `nonminimal_bool` warning in `testing.rs:318` *before* committing, and found the
+  doc gap above. **A report is not merely a formality to collect before merging — it is the only
+  channel for what the builder knows and the diff does not show.** Do not treat "already reviewed
+  the diff, already merged" as a reason to skip it.
 - 2026-08-14 (round 22): **When a gate goes red, ask "is the failing file in the diff?" BEFORE
   re-running anything.** Two suites failed across two full-workspace runs and I burned two ~12-minute
   re-runs half-diagnosing them. One `git diff --name-only master..HEAD` answered it completely:
