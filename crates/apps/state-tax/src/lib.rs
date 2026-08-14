@@ -37,6 +37,74 @@ const US_JURISDICTIONS: [&str; 51] = [
     "WI", "WY", "DC",
 ];
 
+/// Federal fields validated as rates (percentage points — `validate::RATE_UNIT`).
+const FEDERAL_RATE_FIELDS: [&str; 3] = [
+    "self_employment_tax_rate",
+    "qbi_deduction_pct",
+    "top_marginal_rate",
+];
+
+/// Every federal field that must be stored as a JSON NUMBER. The dollar
+/// constants are here too: they are not rate-validated, but the model quotes
+/// them just as readily (`"$1,250,000"`), and a quoted dollar figure drops out
+/// of a consumer exactly the same way a quoted rate does.
+const FEDERAL_NUMERIC_FIELDS: [&str; 5] = [
+    "self_employment_tax_rate",
+    "qbi_deduction_pct",
+    "top_marginal_rate",
+    "standard_deduction_single",
+    "section_179_limit",
+];
+
+/// Every per-state field that must be stored as a JSON number.
+const STATE_NUMERIC_FIELDS: [&str; 2] = ["top_marginal_rate", "top_bracket_threshold"];
+
+/// The closed vocabulary `income_tax_type` may hold, and the phrasings a model
+/// reaches for. Order is precedence: the `none` rule has to see "no income tax"
+/// before the `graduated` rule's substrings do.
+const INCOME_TAX_TYPES: &[(&str, &[validate::Phrase])] = &[
+    (
+        "none",
+        &[
+            validate::Phrase::Exact("none"),
+            validate::Phrase::Exact("n/a"),
+            validate::Phrase::Prefix("no "),
+            validate::Phrase::Contains("no income tax"),
+            validate::Phrase::Contains("no state income tax"),
+        ],
+    ),
+    (
+        "flat",
+        &[
+            validate::Phrase::Contains("flat"),
+            validate::Phrase::Contains("single rate"),
+            validate::Phrase::Contains("single-rate"),
+        ],
+    ),
+    (
+        "graduated",
+        &[
+            validate::Phrase::Contains("graduat"),
+            validate::Phrase::Contains("progressiv"),
+            validate::Phrase::Contains("bracket"),
+            validate::Phrase::Contains("tiered"),
+            validate::Phrase::Contains("marginal"),
+        ],
+    ),
+];
+
+/// Normalize the agent's phrasing of a state's income-tax structure onto the
+/// closed vocabulary the prompt asks for. `None` for anything unclassifiable —
+/// the record is REJECTED, never guessed at.
+///
+/// Left out of `tax_schema()`'s `income_tax_type` as a JSON-schema `enum` on
+/// purpose: the schema constrains the CLI's final answer, so a hard enum turns
+/// a recoverable "progressive" into a failed 30-turn call. Normalizing here
+/// keeps the answer and still closes the vocabulary at the store.
+fn normalize_income_tax_type(raw: &str) -> Option<&'static str> {
+    validate::normalize_choice(raw, INCOME_TAX_TYPES)
+}
+
 #[async_trait]
 impl ScrapeApp for StateTax {
     fn name(&self) -> &'static str {
@@ -180,18 +248,19 @@ impl ScrapeApp for StateTax {
         let mut rejected: Vec<Rejection> = Vec::new();
 
         // Federal small-business constants — one national record (state = "US" so the
-        // ingest lifts market = "US"). Rate fields must fall in [0,100].
+        // ingest lifts market = "US"). Rate fields must fall in [0,100] and be
+        // percentage points, not fractions (`validate::RATE_UNIT`).
         if let Some(fed) = data.get("federal").filter(|v| v.is_object()) {
             let mut reasons = Vec::new();
-            for f in [
-                "self_employment_tax_rate",
-                "qbi_deduction_pct",
-                "top_marginal_rate",
-            ] {
+            for f in FEDERAL_RATE_FIELDS {
                 validate::require_rate(&mut reasons, f, validate::num(fed, f));
             }
             if reasons.is_empty() {
                 let mut rec = fed.clone();
+                // Store the validated NUMBER, not the model's raw value: a quoted
+                // `"15.3"` validates via `validate::num` but, stored raw, reads
+                // back as a non-number and drops out of every `as_f64` consumer.
+                validate::store_numbers(&mut rec, &FEDERAL_NUMERIC_FIELDS);
                 rec["level"] = json!("federal");
                 rec["state"] = json!("US");
                 rec["state_name"] = json!("United States");
@@ -224,6 +293,22 @@ impl ScrapeApp for StateTax {
                     "top_marginal_rate",
                     validate::num(s, "top_marginal_rate"),
                 );
+                // `income_tax_type` is a CLOSED vocabulary the prompt states and
+                // nothing enforced: "progressive", "Graduated" and "N/A" all
+                // stored and flowed into `state_tax_context`. Normalize onto the
+                // three canonical values, reject what will not classify — the
+                // shape `state-licensing::normalize_requirement_level` already
+                // established, now shared as `validate::normalize_choice`.
+                let tax_type = s
+                    .get("income_tax_type")
+                    .and_then(Value::as_str)
+                    .and_then(normalize_income_tax_type);
+                if tax_type.is_none() {
+                    reasons.push(format!(
+                        "income_tax_type: {:?} not one of none|flat|graduated",
+                        s.get("income_tax_type")
+                    ));
+                }
                 if !reasons.is_empty() {
                     rejected.push(Rejection {
                         key: format!("state:{st}"),
@@ -232,8 +317,10 @@ impl ScrapeApp for StateTax {
                     continue;
                 }
                 let mut rec = s.clone();
+                validate::store_numbers(&mut rec, &STATE_NUMERIC_FIELDS);
                 rec["level"] = json!("state");
                 rec["state"] = json!(st);
+                rec["income_tax_type"] = json!(tax_type.expect("checked above"));
                 rec["year"] = json!(year);
                 present.insert(st.clone());
                 all_records.push((format!("state:{st}"), rec));

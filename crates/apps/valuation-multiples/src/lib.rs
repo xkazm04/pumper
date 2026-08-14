@@ -223,6 +223,14 @@ impl ScrapeApp for ValuationMultiples {
     }
 }
 
+/// Every multiple that is validated as a number and must be STORED as one.
+const MULTIPLE_NUMERIC_FIELDS: [&str; 4] = [
+    "sde_multiple_low",
+    "sde_multiple_median",
+    "sde_multiple_high",
+    "revenue_multiple",
+];
+
 /// Validate + normalize the agent's `trades` array into upsertable records.
 /// Returns `(records, rejected, unknown_trades)`:
 /// - Plausibility guards: the SDE band must be ordered (low ≤ median ≤ high)
@@ -254,12 +262,7 @@ fn collect_valuation_records(
             }
             let key = format!("US:{trade}");
             let mut reasons = Vec::new();
-            for f in [
-                "sde_multiple_low",
-                "sde_multiple_median",
-                "sde_multiple_high",
-                "revenue_multiple",
-            ] {
+            for f in MULTIPLE_NUMERIC_FIELDS {
                 validate::require_positive(&mut reasons, f, validate::num(t, f));
             }
             validate::require_monotone(
@@ -274,6 +277,10 @@ fn collect_valuation_records(
                 continue;
             }
             let mut rec = t.clone();
+            // Store the validated NUMBER, not the model's raw value: a quoted
+            // `"2.5"` validates via `validate::num` but, stored raw, reads back
+            // as a non-number and silently drops out of every `as_f64` consumer.
+            validate::store_numbers(&mut rec, &MULTIPLE_NUMERIC_FIELDS);
             // Store the canonical label so key and `trade` field agree.
             rec["trade"] = json!(trade);
             // National by trade — state = "US" so the ingest lifts market = "US".
@@ -357,6 +364,24 @@ mod tests {
             "revenue_multiple": 0.65,
             "notes": "BizBuySell Insight, 2025 broker reports",
         })
+    }
+
+    /// The anti-pattern: a quoted multiple validates via `validate::num` and is
+    /// then stored raw, so the store holds the STRING and every `as_f64`
+    /// consumer drops the record without a word.
+    #[test]
+    fn a_quoted_multiple_is_stored_as_a_number_not_a_string() {
+        let mut quoted = multiples_entry("Plumbing");
+        quoted["sde_multiple_median"] = json!("2.8");
+        quoted["revenue_multiple"] = json!("0.65");
+        let data = json!({ "trades": [quoted] });
+        let (records, rejected, _) =
+            collect_valuation_records(&taxonomy::seed_entries(), &data, "2025");
+        assert!(rejected.is_empty(), "{rejected:?}");
+        let rec = &records[0].1;
+        assert!(rec["sde_multiple_median"].is_number());
+        assert_eq!(rec["sde_multiple_median"].as_f64(), Some(2.8));
+        assert_eq!(rec["revenue_multiple"].as_f64(), Some(0.65));
     }
 
     #[test]

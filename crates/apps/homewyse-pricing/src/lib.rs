@@ -254,11 +254,26 @@ impl ScrapeApp for HomewysePricing {
                                 "year": year,
                                 "trade": trade,
                                 "job": job,
-                                "unit": j.get("unit").and_then(Value::as_str).unwrap_or("flat"),
+                                // Honest-Null, NOT `unwrap_or("flat")`. `unit` is
+                                // not in the schema's required list, so an omitted
+                                // one used to be *fabricated* as a flat job price
+                                // — turning a $150/hour labor rate into a $150
+                                // job. Every other figure in this family reports
+                                // absence as absence; a semantic field is no
+                                // different. Rejecting the row instead would throw
+                                // away a validated price band over a missing
+                                // display label, so the band is kept and the unit
+                                // is null.
+                                "unit": price_unit(j),
                                 // Store the validated numbers, not the raw values:
                                 // a string-quoted price ("1234") passes validation
                                 // via validate::num but, stored raw, is read back as
                                 // a non-number and silently dropped from the rollup.
+                                // This is the fix `trades_common::validate::
+                                // store_numbers` generalized for the four siblings
+                                // that cloned raw model JSON; constructing the
+                                // record from the parsed numbers, as here, is the
+                                // same guarantee.
                                 "low": low,
                                 "median": median,
                                 "high": high,
@@ -324,6 +339,22 @@ impl ScrapeApp for HomewysePricing {
     }
 }
 
+/// The price unit the model reported, or `Null` when it reported none.
+///
+/// **Never a default.** `unit` is not in `pricing_schema`'s required list, and
+/// the old `unwrap_or("flat")` therefore fabricated a semantic field: a job the
+/// model priced per hour, whose `unit` it happened to omit, was stored as a flat
+/// job price — $150/hour read back as a $150 job. That is the one outright
+/// fabrication in a family whose stated convention is honest-Null everywhere
+/// else. A blank or whitespace-only unit is treated as absent for the same
+/// reason.
+fn price_unit(job: &Value) -> Value {
+    match job.get("unit").and_then(Value::as_str).map(str::trim) {
+        Some(u) if !u.is_empty() => json!(u),
+        _ => Value::Null,
+    }
+}
+
 /// The structured-output contract for `claude --json-schema`. Constrains the agent's
 /// final answer so the CLI returns validated JSON of exactly this shape — the root-cause
 /// fix for the malformed-JSON runs. Kept intentionally lenient (unit is a free string the
@@ -384,8 +415,9 @@ fn slugify(s: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{slugify, HomewysePricing};
+    use super::{price_unit, slugify, HomewysePricing};
     use pumper_core::ScrapeApp;
+    use serde_json::json;
 
     /// The manifest must describe the params the app actually ships: every key
     /// in `default_params` and in every worked example has to be a declared
@@ -416,6 +448,23 @@ mod tests {
                 assert!(props.contains_key(key), "undeclared param '{key}'");
             }
         }
+    }
+
+    /// The one outright fabrication in the family: `unit` is not required by the
+    /// schema, and `unwrap_or("flat")` turned a job the model priced per hour
+    /// into a flat job price — $150/hour stored as a $150 job.
+    #[test]
+    fn an_absent_unit_is_null_not_a_fabricated_flat() {
+        assert_eq!(price_unit(&json!({ "unit": "hour" })), json!("hour"));
+        assert!(price_unit(&json!({ "low": 1 })).is_null(), "no unit at all");
+        assert!(price_unit(&json!({ "unit": "" })).is_null(), "empty string");
+        assert!(
+            price_unit(&json!({ "unit": "   " })).is_null(),
+            "whitespace"
+        );
+        assert!(price_unit(&json!({ "unit": null })).is_null());
+        // A non-string unit is not silently coerced into one either.
+        assert!(price_unit(&json!({ "unit": 3 })).is_null());
     }
 
     #[test]

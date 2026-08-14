@@ -247,6 +247,17 @@ impl ScrapeApp for TradeWages {
     }
 }
 
+/// Every wage field that is validated as a number and must be STORED as one.
+const WAGE_NUMERIC_FIELDS: [&str; 7] = [
+    "entry_hourly",
+    "median_hourly",
+    "experienced_hourly",
+    "entry_annual",
+    "median_annual",
+    "experienced_annual",
+    "employment",
+];
+
 /// Validate + normalize the agent's `trades` array into upsertable records.
 /// Returns `(records, rejected, unknown_trades)`:
 /// - Plausibility guards: wage bands must be ordered (entry ≤ median ≤
@@ -283,15 +294,7 @@ fn collect_wage_records(
             }
             let key = format!("US:{trade}");
             let mut reasons = Vec::new();
-            for f in [
-                "entry_hourly",
-                "median_hourly",
-                "experienced_hourly",
-                "entry_annual",
-                "median_annual",
-                "experienced_annual",
-                "employment",
-            ] {
+            for f in WAGE_NUMERIC_FIELDS {
                 validate::require_positive(&mut reasons, f, validate::num(t, f));
             }
             validate::require_monotone(
@@ -313,6 +316,10 @@ fn collect_wage_records(
                 continue;
             }
             let mut rec = t.clone();
+            // Store the validated NUMBER, not the model's raw value: a quoted
+            // `"30.10"` validates via `validate::num` but, stored raw, reads back
+            // as a non-number and silently drops out of every `as_f64` consumer.
+            validate::store_numbers(&mut rec, &WAGE_NUMERIC_FIELDS);
             // Store the canonical label so the record key and its `trade`
             // field agree, regardless of the model's phrasing.
             rec["trade"] = json!(trade);
@@ -688,6 +695,25 @@ mod tests {
             "entry_annual": 38_300, "median_annual": 62_600, "experienced_annual": 104_000,
             "employment": 469_000,
         })
+    }
+
+    /// The anti-pattern: `validate::num` accepts `"30.10"`, the app cloned the
+    /// raw model JSON, and the store ended up holding the STRING — which every
+    /// `as_f64` consumer downstream drops without a word.
+    #[test]
+    fn a_quoted_wage_is_stored_as_a_number_not_a_string() {
+        let mut quoted = wage_entry("Plumbing");
+        quoted["median_hourly"] = json!("30.10");
+        quoted["median_annual"] = json!("$62,600");
+        quoted["employment"] = json!("469,000");
+        let data = json!({ "trades": [quoted] });
+        let (records, rejected, _) = collect_wage_records(&taxonomy::seed_entries(), &data, "2024");
+        assert!(rejected.is_empty(), "{rejected:?}");
+        let rec = &records[0].1;
+        assert!(rec["median_hourly"].is_number(), "{}", rec["median_hourly"]);
+        assert_eq!(rec["median_hourly"].as_f64(), Some(30.10));
+        assert_eq!(rec["median_annual"].as_f64(), Some(62_600.0));
+        assert_eq!(rec["employment"].as_f64(), Some(469_000.0));
     }
 
     #[test]

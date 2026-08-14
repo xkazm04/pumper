@@ -255,6 +255,54 @@ pub fn max_age_days(ctx: &AppContext, default_days: i64) -> i64 {
         .unwrap_or(default_days)
 }
 
+/// **A `$0.00` is not the same as a price we could not read.** Running spend
+/// across the several metered calls one chunked job makes.
+///
+/// `output.cost_usd.unwrap_or(0.0)` reproduces verbatim the anti-pattern
+/// `pumper_core`'s `success_spend_event` was written to kill: *"An envelope with
+/// no `total_cost_usd` is not a free call… Recording it as a bare `$0` makes it
+/// indistinguishable from a genuinely free cache hit."* The ledger already
+/// records `cost_unreported` for that call; the job result said `$0.00`, and the
+/// two disagreed.
+///
+/// The single-call apps in this family (`state-tax`, `trade-wages`,
+/// `valuation-multiples`, `homewyse-pricing`) pass `output.cost_usd` — an
+/// `Option` — straight into their result, so they are already honest-Null and
+/// legitimately do not need this. `state-licensing` is the one app that sums
+/// across calls, which is the only place a sum can hide an unreported one.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Spend {
+    reported_usd: f64,
+    reported_calls: usize,
+    unreported_calls: usize,
+}
+
+impl Spend {
+    /// Fold in one metered call's reported cost (`None` = the envelope carried
+    /// no price).
+    pub fn add(&mut self, cost_usd: Option<f64>) {
+        match cost_usd {
+            Some(c) => {
+                self.reported_usd += c;
+                self.reported_calls += 1;
+            }
+            None => self.unreported_calls += 1,
+        }
+    }
+
+    /// The summed cost of the calls that reported one — or `None` when NO call
+    /// did, so absence is reported as absence rather than as a free run.
+    pub fn total_usd(&self) -> Option<f64> {
+        (self.reported_calls > 0).then_some(self.reported_usd)
+    }
+
+    /// How many metered calls came back with no price. Non-zero means
+    /// [`Spend::total_usd`] is a floor, not the whole bill.
+    pub fn unreported_calls(&self) -> usize {
+        self.unreported_calls
+    }
+}
+
 /// Plausibility validation for parsed trades records. These are cheap sanity
 /// gates — NOT a re-run loop: a record that fails is rejected (with reasons)
 /// and reported in the job result; valid siblings still upsert. The agent's
@@ -344,14 +392,137 @@ pub mod validate {
         }
     }
 
+    /// **The family's rate unit is PERCENTAGE POINTS**: `13.3` means 13.3%, not
+    /// 1330%. This is not a preference — it is what every producer prompt in the
+    /// family asks for verbatim ("Rates are percentages (e.g. 13.3, and 0 for
+    /// no-income-tax states)", `state-tax`), and the stored records were written
+    /// under it.
+    ///
+    /// It has to be stated somewhere load-bearing because `[0,100]` admits `13.3`
+    /// and `0.133` identically, and a consumer that reads a percentage as a
+    /// fraction computes a 1330% tax set-aside — or, reading the other way, a
+    /// 0.133% one. `trades-common`'s own consumer test used fractions while the
+    /// producer prompt demanded percentages; the prompt is authoritative and the
+    /// test was wrong.
+    pub const RATE_UNIT: &str = "percentage points (13.3 = 13.3%)";
+
+    /// Push a violation if the value looks like a FRACTION where the family's
+    /// [`RATE_UNIT`] demands percentage points: strictly between 0 and 1.
+    ///
+    /// Zero is untouched (a no-income-tax state legitimately answers 0), and so
+    /// is anything ≥ 1. The exclusive `(0,1)` window is the only band where the
+    /// two conventions are distinguishable at all, and no rate this family
+    /// records lives in it: the lowest non-zero US state top marginal individual
+    /// rate is ~2.5%, self-employment tax is 15.3%, QBI is 20%.
+    ///
+    /// Risk this deliberately accepts: a genuine sub-1% rate would be rejected
+    /// rather than stored. That is the right trade — a silent 100× unit error in
+    /// stored market data is worse than a visible rejection with a reason.
+    pub fn require_percent_not_fraction(reasons: &mut Vec<String>, label: &str, v: Option<f64>) {
+        if let Some(v) = v {
+            if v > 0.0 && v < 1.0 {
+                reasons.push(format!(
+                    "{label}: rate {v} looks like a fraction; this family stores {RATE_UNIT}"
+                ));
+            }
+        }
+    }
+
     /// Push a violation if the value is present and outside the percentage
-    /// range [0, 100].
+    /// range [0, 100], **or** if it is fraction-shaped (see
+    /// [`require_percent_not_fraction`] and [`RATE_UNIT`]).
+    ///
+    /// The unit check lives inside `require_rate` rather than beside it on
+    /// purpose: every rate field in the family already routes through here, so
+    /// enforcement cannot be adopted by four apps out of five.
     pub fn require_rate(reasons: &mut Vec<String>, label: &str, v: Option<f64>) {
         if let Some(v) = v {
             if !(0.0..=100.0).contains(&v) {
                 reasons.push(format!("{label}: rate {v} outside [0,100]"));
+                return;
             }
         }
+        require_percent_not_fraction(reasons, label, v);
+    }
+
+    /// **Store the validated NUMBER, not the model's raw value.**
+    ///
+    /// [`num`] deliberately accepts a quoted figure (`"13.3"`, `"$1,200"`) so a
+    /// model that quotes its numbers still validates. But four apps in this
+    /// family then stored `s.clone()` — the raw model JSON — so `"13.3"` passed
+    /// `require_rate` as 13.3 and landed in the store as the **string** `"13.3"`.
+    /// The join then does `.and_then(Value::as_f64)`, gets `None`, and that
+    /// record silently drops out of `median_state_rate`. The catalog's `ranges`
+    /// contract cannot catch it either: ranges are only checked when the field is
+    /// present *and numeric*.
+    ///
+    /// For each field: a parseable value is rewritten as a JSON number; a present
+    /// but unparseable one becomes `Null` (honest-Null — a declared numeric field
+    /// holding `"N/A"` is not a value, and leaving it raw is exactly what made
+    /// these drop silently); an absent field is left absent.
+    ///
+    /// `homewyse-pricing` already did this by constructing its records from the
+    /// parsed numbers instead of cloning; this is that fix, made shared so the
+    /// other four cannot skip it.
+    pub fn store_numbers(rec: &mut Value, fields: &[&str]) {
+        for f in fields {
+            match rec.get(*f) {
+                None | Some(Value::Null) => continue,
+                Some(Value::Number(_)) => continue,
+                Some(_) => {
+                    rec[*f] = match num(rec, f) {
+                        Some(n) => serde_json::json!(n),
+                        None => Value::Null,
+                    };
+                }
+            }
+        }
+    }
+
+    /// How one phrasing rule matches a lowercased, trimmed input.
+    #[derive(Debug, Clone, Copy)]
+    pub enum Phrase {
+        /// The whole input equals this.
+        Exact(&'static str),
+        /// The input starts with this.
+        Prefix(&'static str),
+        /// The input contains this anywhere.
+        Contains(&'static str),
+    }
+
+    impl Phrase {
+        fn hits(&self, lowered: &str) -> bool {
+            match self {
+                Phrase::Exact(p) => lowered == *p,
+                Phrase::Prefix(p) => lowered.starts_with(p),
+                Phrase::Contains(p) => lowered.contains(p),
+            }
+        }
+    }
+
+    /// **Closed-vocabulary normalizer**: map a model's free phrasing onto one of
+    /// a fixed set of canonical values, or `None` for genuinely unclassifiable
+    /// input — which the caller must turn into a REJECTION, never a guess.
+    ///
+    /// Rules are tried in order and the first hit wins, so order encodes
+    /// precedence: "no license required" has to reach the `none` rule before the
+    /// `licen` rule sees it.
+    ///
+    /// This is `state-licensing::normalize_requirement_level`'s shape, lifted so
+    /// the third and fourth closed vocabularies in this family reuse it instead
+    /// of forking a fourth spelling.
+    pub fn normalize_choice(
+        raw: &str,
+        rules: &[(&'static str, &[Phrase])],
+    ) -> Option<&'static str> {
+        let lowered = raw.trim().to_lowercase();
+        if lowered.is_empty() {
+            return None;
+        }
+        rules
+            .iter()
+            .find(|(_, phrases)| phrases.iter().any(|p| p.hits(&lowered)))
+            .map(|(canonical, _)| *canonical)
     }
 
     #[cfg(test)]
@@ -426,6 +597,84 @@ pub mod validate {
             require_rate(&mut r, "top", Some(-1.0));
             require_rate(&mut r, "top", Some(133.0));
             assert_eq!(r.len(), 2);
+        }
+
+        /// The anti-pattern: `[0,100]` admits `13.3` and `0.133` identically, so
+        /// a fraction slipped through as a legal "rate" and a consumer reading it
+        /// as percent computed a 0.133% set-aside.
+        #[test]
+        fn a_fraction_is_not_a_rate_but_zero_still_is() {
+            let mut r = Vec::new();
+            require_rate(&mut r, "top", Some(0.0)); // no-income-tax state
+            require_rate(&mut r, "top", Some(2.5)); // lowest real state rate
+            require_rate(&mut r, "top", Some(1.0));
+            assert!(r.is_empty(), "{r:?}");
+            require_rate(&mut r, "top", Some(0.133));
+            assert_eq!(r.len(), 1);
+            assert!(r[0].contains("looks like a fraction"), "{r:?}");
+            // Out of range reports the range, not the unit — one reason per value.
+            let mut r2 = Vec::new();
+            require_rate(&mut r2, "top", Some(133.0));
+            assert_eq!(r2.len(), 1);
+            assert!(r2[0].contains("outside [0,100]"));
+        }
+
+        /// The anti-pattern: a quoted figure validates via [`num`] and is then
+        /// stored raw, so the store holds the STRING `"13.3"` and every
+        /// `as_f64()` consumer silently drops the record.
+        #[test]
+        fn a_quoted_number_is_stored_as_a_number_not_a_string() {
+            let mut rec = json!({
+                "top_marginal_rate": "13.3",
+                "threshold": "$1,000,000",
+                "already_a_number": 5.0,
+                "junk": "N/A",
+                "untouched": "California",
+            });
+            store_numbers(
+                &mut rec,
+                &[
+                    "top_marginal_rate",
+                    "threshold",
+                    "already_a_number",
+                    "junk",
+                    "absent",
+                ],
+            );
+            assert_eq!(rec["top_marginal_rate"], json!(13.3));
+            assert!(rec["top_marginal_rate"].is_number());
+            assert_eq!(rec["threshold"], json!(1_000_000.0));
+            assert_eq!(rec["already_a_number"], json!(5.0));
+            // Honest-Null: a declared numeric field holding "N/A" is not a value.
+            assert!(rec["junk"].is_null());
+            // A field not in the list, and an absent one, are left alone.
+            assert_eq!(rec["untouched"], json!("California"));
+            assert!(rec.get("absent").is_none());
+        }
+
+        /// Rule order is precedence: "no license required" must reach the `none`
+        /// rule before the `licen` rule sees it.
+        #[test]
+        fn normalize_choice_prefers_the_earlier_rule_over_a_later_substring() {
+            const RULES: &[(&str, &[Phrase])] = &[
+                (
+                    "none",
+                    &[
+                        Phrase::Exact("none"),
+                        Phrase::Prefix("no "),
+                        Phrase::Exact("n/a"),
+                    ],
+                ),
+                ("exam_license", &[Phrase::Contains("licen")]),
+            ];
+            assert_eq!(normalize_choice("no license required", RULES), Some("none"));
+            assert_eq!(normalize_choice("  NONE ", RULES), Some("none"));
+            assert_eq!(
+                normalize_choice("State license", RULES),
+                Some("exam_license")
+            );
+            assert_eq!(normalize_choice("banana", RULES), None);
+            assert_eq!(normalize_choice("   ", RULES), None);
         }
     }
 }
@@ -1663,18 +1912,89 @@ pub mod unified {
             assert!(sparse["bond_amount_usd"].is_null());
         }
 
+        /// Rates here are **percentage points** — `super::super::validate::RATE_UNIT`.
+        /// This test used to encode fractions (`0.133`, `0.37`, `0.153`) while
+        /// every producer prompt in the family demands percentages ("Rates are
+        /// percentages (e.g. 13.3, and 0 for no-income-tax states)"). The prompt
+        /// is authoritative: it is what the stored records were written under and
+        /// what `require_rate`'s `[0,100]` range was chosen for. The test was the
+        /// wrong side of the disagreement, and it was the family's ONLY pin on the
+        /// unit — so it taught the wrong convention to anything that read it.
         #[test]
         fn state_tax_context_carries_the_real_rate_not_a_median() {
-            let federal = json!({ "self_employment_tax_rate": 0.153, "top_marginal_rate": 0.37 });
+            let federal = json!({ "self_employment_tax_rate": 15.3, "top_marginal_rate": 37.0 });
             let tx = json!({ "state": "TX", "income_tax_type": "none", "top_marginal_rate": 0.0 });
-            let ca = json!({ "state": "CA", "income_tax_type": "graduated", "top_marginal_rate": 0.133 });
+            let ca =
+                json!({ "state": "CA", "income_tax_type": "graduated", "top_marginal_rate": 13.3 });
             let tx_ctx = state_tax_context(Some(&federal), &tx);
             let ca_ctx = state_tax_context(Some(&federal), &ca);
             // Texan gets 0%, Californian gets 13.3% — not the same middle number.
             assert_eq!(tx_ctx["state"]["top_marginal_rate"], 0.0);
-            assert_eq!(ca_ctx["state"]["top_marginal_rate"], 0.133);
-            assert_eq!(tx_ctx["federal"]["top_marginal_rate"], 0.37);
+            assert_eq!(ca_ctx["state"]["top_marginal_rate"], 13.3);
+            assert_eq!(tx_ctx["federal"]["top_marginal_rate"], 37.0);
+            assert_eq!(tx_ctx["federal"]["self_employment_tax_rate"], 15.3);
         }
+
+        /// The unit the producers write and the unit the consumers read are the
+        /// same one, and it is percentage points. Pinned here, in the shared
+        /// crate, because this is where the wrong convention was pinned before.
+        #[test]
+        fn a_fraction_rate_would_not_survive_the_producer_validator() {
+            let mut reasons = Vec::new();
+            crate::validate::require_rate(&mut reasons, "top_marginal_rate", Some(0.133));
+            assert_eq!(reasons.len(), 1, "0.133 is not 13.3% in this family");
+            let mut ok = Vec::new();
+            crate::validate::require_rate(&mut ok, "top_marginal_rate", Some(13.3));
+            assert!(ok.is_empty());
+        }
+    }
+}
+
+#[cfg(test)]
+mod spend_tests {
+    use super::Spend;
+
+    /// The anti-pattern: `unwrap_or(0.0)` makes a call whose price we could not
+    /// read indistinguishable from a genuinely free one.
+    #[test]
+    fn an_unreported_cost_is_absent_not_zero() {
+        let mut s = Spend::default();
+        s.add(None);
+        s.add(None);
+        assert_eq!(s.total_usd(), None, "$0.00 would be a lie");
+        assert_eq!(s.unreported_calls(), 2);
+    }
+
+    #[test]
+    fn a_partly_reported_run_sums_what_it_has_and_counts_the_gap() {
+        let mut s = Spend::default();
+        s.add(Some(1.25));
+        s.add(None);
+        s.add(Some(0.75));
+        assert_eq!(s.total_usd(), Some(2.0));
+        assert_eq!(
+            s.unreported_calls(),
+            1,
+            "the total is a floor, not the bill"
+        );
+    }
+
+    /// A run that made no metered calls at all (every trade vintage-skipped)
+    /// spent nothing knowable — still absence, not a fabricated zero.
+    #[test]
+    fn a_run_with_no_metered_calls_reports_no_cost_rather_than_zero() {
+        assert_eq!(Spend::default().total_usd(), None);
+        assert_eq!(Spend::default().unreported_calls(), 0);
+    }
+
+    /// A genuinely free reported call is $0.00 and says so — the case
+    /// `unwrap_or(0.0)` was impersonating.
+    #[test]
+    fn a_reported_zero_is_a_real_zero() {
+        let mut s = Spend::default();
+        s.add(Some(0.0));
+        assert_eq!(s.total_usd(), Some(0.0));
+        assert_eq!(s.unreported_calls(), 0);
     }
 }
 

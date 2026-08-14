@@ -134,7 +134,9 @@ impl ScrapeApp for StateLicensing {
                  expected, ratio, floor, short, missing, states_covered, \
                  states_expected, missing_states}}, warnings: [string], new, \
                  changed, unchanged, rejected: [..], \
-                 rejected_count, unified: {new, changed}, cost_usd, duration_ms, \
+                 rejected_count, unified: {new, changed}, cost_usd (null when no \
+                 metered call reported a price), cost_unreported_calls, \
+                 duration_ms, \
                  num_turns} — per-trade vintage skips and checkpoint resumes are free; \
                  cost fields cover only the metered calls THIS attempt made",
             ),
@@ -210,7 +212,12 @@ impl ScrapeApp for StateLicensing {
         // roster is per trade.
         let mut warnings: Vec<String> = Vec::new();
         let mut records_total: usize = 0;
-        let (mut cost_usd, mut duration_ms, mut num_turns) = (0.0_f64, 0_u64, 0_u64);
+        // `Spend`, not `+= cost.unwrap_or(0.0)`: a call whose envelope carried no
+        // price is not a free call, and summing it as $0.00 made the result
+        // contradict the ledger, which records `cost_unreported` for exactly
+        // that call.
+        let mut spend = trades_common::Spend::default();
+        let (mut duration_ms, mut num_turns) = (0_u64, 0_u64);
         let mut summary = pumper_core::UpsertSummary::default();
 
         for trade in trades {
@@ -275,7 +282,7 @@ impl ScrapeApp for StateLicensing {
             let (data, output) =
                 trades_common::research_json_named(&ctx, "state-licensing", request, &artifact)
                     .await?;
-            cost_usd += output.cost_usd.unwrap_or(0.0);
+            spend.add(output.cost_usd);
             duration_ms += output.duration_ms.unwrap_or(0);
             num_turns += output.num_turns.unwrap_or(0);
             trades_run.push(label.to_string());
@@ -373,7 +380,10 @@ impl ScrapeApp for StateLicensing {
             "rejected": rejected,
             "rejected_count": rejected.len(),
             "unified": { "new": unified.new.len(), "changed": unified.changed.len() },
-            "cost_usd": cost_usd,
+            // Null (not 0.0) when no metered call reported a price; when only
+            // some did, the sum is a floor and `cost_unreported_calls` says so.
+            "cost_usd": spend.total_usd(),
+            "cost_unreported_calls": spend.unreported_calls(),
             "duration_ms": duration_ms,
             "num_turns": num_turns,
         }))
@@ -510,6 +520,10 @@ fn parse_trade_records(
         }
 
         let mut rec = s.clone();
+        // Store the validated NUMBER, not the model's raw value: a quoted
+        // `"$15,000"` validates via `validate::num` but, stored raw, reads back
+        // as a non-number and silently drops out of every `as_f64` consumer.
+        validate::store_numbers(&mut rec, &LICENSING_NUMERIC_FIELDS);
         rec["state"] = json!(st);
         rec["trade"] = json!(trade_label);
         rec["soc_code"] = json!(soc_code);
@@ -538,23 +552,48 @@ fn parse_trade_records(
     (records, rejected, present)
 }
 
+/// Every licensing field that is validated as a number and must be STORED as
+/// one.
+const LICENSING_NUMERIC_FIELDS: [&str; 3] = [
+    "license_cost_usd",
+    "bond_amount_usd",
+    "insurance_min_liability_usd",
+];
+
+/// The closed taxonomy `requirement_level` may hold, and the phrasings a model
+/// reaches for. Order is precedence: "no license required" must reach the `none`
+/// rule before the `exam_license` rule's `licen` substring sees it.
+const REQUIREMENT_LEVELS: &[(&str, &[validate::Phrase])] = &[
+    (
+        "none",
+        &[
+            validate::Phrase::Exact("none"),
+            validate::Phrase::Exact("not required"),
+            validate::Phrase::Exact("n/a"),
+            validate::Phrase::Prefix("no "),
+        ],
+    ),
+    ("registration", &[validate::Phrase::Contains("regist")]),
+    (
+        "exam_license",
+        &[
+            validate::Phrase::Contains("exam"),
+            validate::Phrase::Contains("licen"),
+            validate::Phrase::Contains("certif"),
+        ],
+    ),
+];
+
 /// Normalize the agent's phrasing of a requirement level onto the closed
 /// taxonomy. Returns None for genuinely unclassifiable strings (rejected, not
 /// guessed).
+///
+/// The rule-table shape this app introduced now lives in
+/// `trades_common::validate::normalize_choice`, so `state-tax`'s
+/// `income_tax_type` reuses it rather than forking a fourth hand-rolled
+/// if/else chain.
 fn normalize_requirement_level(raw: &str) -> Option<&'static str> {
-    let l = raw.trim().to_lowercase();
-    if l.is_empty() {
-        return None;
-    }
-    if l == "none" || l.starts_with("no ") || l == "not required" || l == "n/a" {
-        Some("none")
-    } else if l.contains("regist") {
-        Some("registration")
-    } else if l.contains("exam") || l.contains("licen") || l.contains("certif") {
-        Some("exam_license")
-    } else {
-        None
-    }
+    validate::normalize_choice(raw, REQUIREMENT_LEVELS)
 }
 
 /// Artifact-name-safe slug for a trade label ("Pool service" → "pool-service").
@@ -698,6 +737,28 @@ mod tests {
         );
         assert_eq!(normalize_requirement_level("varies wildly"), None);
         assert_eq!(normalize_requirement_level(""), None);
+    }
+
+    /// The anti-pattern: a quoted dollar magnitude validates via `validate::num`
+    /// and is then stored raw, so the store holds the STRING `"$25,000"` and
+    /// every `as_f64` consumer drops it without a word.
+    #[test]
+    fn a_quoted_dollar_magnitude_is_stored_as_a_number_not_a_string() {
+        let data = json!({
+            "year": "2026", "trade": "Plumbing",
+            "states": [
+                { "state": "CA", "requirement_level": "exam_license",
+                  "license_cost_usd": "$600", "bond_amount_usd": "25,000",
+                  "insurance_min_liability_usd": "N/A" },
+            ],
+        });
+        let (records, rejected, _) = parse_trade_records(&data, "Plumbing", "47-2152", "2026");
+        assert!(rejected.is_empty(), "{rejected:?}");
+        let rec = &records[0].1;
+        assert_eq!(rec["license_cost_usd"].as_f64(), Some(600.0));
+        assert_eq!(rec["bond_amount_usd"].as_f64(), Some(25_000.0));
+        // Honest-Null: a declared numeric field holding "N/A" is not a value.
+        assert!(rec["insurance_min_liability_usd"].is_null());
     }
 
     #[test]
