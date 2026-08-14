@@ -94,4 +94,19 @@ rejected-deferred. Every rejection is banked with its evidence, not dropped.
   evidence. It is a fleet-wide sweep across 11 crates + core, so it needs its own round.
 
 ## Shipped
-(round 21 in flight — filled at wrap)
+Round 21 (2026-08-13) — **3/3 shipped**, all reviewed by the Director, merged to master in
+`perfect/2026-08-13-r21`.
+- [[research-run-budget-is-real]] → `1642e26` — `max_budget_usd` is now a **run total**. The
+  documented-vs-implemented 12× gap is closed: the wall runs before every step, restored spend counts,
+  and each call gets only the remaining headroom. The `max_turns` ambiguity was resolved with a clamp
+  that is correct under both readings of the CLI's counter rather than guessed.
+- [[research-empty-is-not-success]] → `3f50df7` — an empty run fails instead of firing the whole
+  success fan-out over `{report: ""}`; an in-shape refusal is no longer `structured: true`; the
+  decorative `report.json` write can no longer cost a full-price re-research. The Director's narrowing
+  held: partial-but-nonempty is still a success and its test passes unchanged.
+- [[research-contract-is-what-it-emits]] → `df6fab1` — the published `output_shape` (3 phantom keys,
+  6 undeclared, live on `/apps` and `/mcp`) matches the run, pinned by the repo's fourth
+  `result_contract.rs`. Also the app's **first** test to exercise the restore path at all.
+
+Observed effect: `cargo test --workspace` 1859 → 1919 (+60 across both lots); `docs/features/apps.md`'s
+research row rewritten to the real contract.

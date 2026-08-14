@@ -3,12 +3,12 @@ slug: trades-partial-run-cannot-delete
 type: perfect/direction
 context: "[[trades-operator-economics]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 74dac1f
 ---
 
 ## What & why
@@ -86,4 +86,27 @@ is invisible in the joined product and visible in the source dataset — the wor
   forever. Provide the escape hatch the family already uses (`force`) and name it in the doc comment.
 
 ## Build record
-(filled during build)
+**The round's highest-value direction: real user-visible data loss on a green job.**
+Landed across two builder sessions — the first died to a harness stall mid-wiring and was snapshotted as
+`8ac7f1f`; the continuation finished it and re-committed under a real message rather than leaving work
+under a `wip` heading (r20's recorded lesson, applied).
+
+The completeness floor (lever a) stands: `coverage::write_snapshot` downgrades to
+`upsert_many_with_provenance` below a 0.9 floor and returns `removals_suppressed` carrying the reason.
+`allow_shrink` is deliberately **separate from `force`** — `force` is the ordinary way to re-run a
+vintage-gated app, so reusing it would switch the floor off on exactly the runs it protects. The doc
+comment records why lever (b) alone was insufficient (default-off `enforce` + zero `observe_extraction`),
+so a later round cannot undo the floor believing the health guard covers it.
+
+**Made to fail first:** `a_thirty_of_fiftyone_run_does_not_tombstone_the_other_twentyone` failed
+`left: 30, right: 51`; `a_tombstoned_state_does_not_reappear_as_a_live_joined_row` failed with
+*"NM:Plumbing was tombstoned in state-tax/tax but came back live in the join"*. Also passing:
+`a_complete_run_still_tombstones_and_reports_the_removal` — which matters, because it proves the floor is
+not "never delete" — and `allow_shrink_lets_a_short_run_delete_but_force_alone_does_not`.
+
+Criterion 4 is **enforced, not asserted in prose**: `coverage::RESULT_FIELDS` + `shape_declares_coverage`,
+checked inside each of the five apps' own `manifest_declares_every_param_it_ships`. A sixth app cannot
+join the family and quietly omit the coverage block.
+
+**Director review: keep.** Verified `write_snapshot` genuinely downgrades the write rather than just
+reporting.

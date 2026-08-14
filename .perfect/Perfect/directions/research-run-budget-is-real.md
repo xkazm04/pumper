@@ -3,12 +3,12 @@ slug: research-run-budget-is-real
 type: perfect/direction
 context: "[[agentic-research]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 1642e26
 ---
 
 ## What & why
@@ -74,4 +74,25 @@ remaining headroom.
   stopping with `stop_reason: budget_exhausted` over issuing a call that cannot finish.
 
 ## Build record
-(filled during build)
+`next_step_budget(run_ceiling, spent_usd, job_remaining) -> BudgetPlan` is now the single wall and it
+is consulted **before every step** — the `steps_done > 0` gate is gone entirely (grep: 0 occurrences),
+so spend restored from a checkpoint counts on the first step after a re-claim. The tighter of the run
+and job headrooms governs, and each call's `--max-budget-usd` is the *remaining* headroom, so the last
+step cannot overshoot. Headroom under `MIN_STEP_BUDGET_USD` (1c) stops with `budget_exhausted` and
+keeps the partial rather than buying a call that cannot finish.
+
+**Criterion 4's hazard was resolved rather than guessed** — the outcome the criterion was written for.
+`num_turns` is not unambiguously per-invocation on a `--resume`, so `step_turns_used(reported, cap)`
+charges `min(reported, cap)`: exact under the per-invocation reading, conservative under the cumulative
+one, because a step cannot have used more turns than the `--max-turns` it was handed. The reasoning and
+a "do not simplify this back" warning are in the doc comment.
+
+**Made to fail first** (loop temporarily reverted, run, restored):
+`total_run_spend_stops_at_max_budget_usd_not_at_it_per_call` failed with *"run spent 2.4, ceiling was
+0.50"*; `each_call_gets_the_remaining_headroom_not_the_whole_run_ceiling` (12 calls vs 3);
+`restored_spend_counts_against_the_ceiling_before_the_first_step` (the `Dead` researcher panicked,
+proving the loop bought a step); plus two turn-total tests. Both pre-existing tests the direction
+protected pass **unchanged**.
+
+**Director review: keep.** Verified in source that the `steps_done > 0` gate is gone and that
+`next_step_budget` guards the metered call.

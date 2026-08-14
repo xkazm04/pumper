@@ -3,19 +3,94 @@ type: perfect/home
 repo: pumper
 updated: 2026-08-13
 pool: 0
-pool_target: 6 (r20 dispatch cap — director-self-gated, autonomous, Athena-dispatched)
-shipped_total: 158
-coverage: "**36/46 map contexts covered (10 never proposed)** — r20 landed. RULE (recomputable — compute it, never inherit it): a map context is COVERED when it has >=1 direction note pointing at it (`context: \"[[<name>]]\"`), OR an explicit nothing-clears-the-bar verdict, OR `last_proposed != never`. **The script now lives at `.perfect/coverage.mjs` — run `node .perfect/coverage.mjs .`; do not re-type it into a session note again.** **Normalize CRLF before any frontmatter regex** — a naive /^---\\n([\\s\\S]*?)\\n---/ silently skips every CRLF file in this repo and scored coverage at 18/46 in r17, calling claude-engine/eu-grants/wasm-plugin-host never-proposed when each has 3 shipped directions. That trap, plus one genuinely stale note (job-worker said `last_proposed: never` against 5 shipped r4 directions — fixed r17), is why the figure drifted every round (r15 carried 24, r16 carried 26 then 'corrected' to 25, headline said 27). Recomputed honestly in r17: **28 entering**, +engine-contracts +maintenance-tooling gated r17 = **30**. 16 never proposed. Inherited pre-46-map history (browser-engine, http-engine, …) deliberately does NOT count as covered. **r18 recomputed the same rule from scratch with the CRLF normalization in place and got 30/46 entering — the figure is now stable across two independent computations.** +browser-engine +remote-engine gated r18 = **32/46**, 14 never proposed. **r19 recomputed it a THIRD time from scratch (script in the session note) and got 32/46 entering — stable across three independent computations, so the rule is now trustworthy.** +http-engine +plugin-runner gated r19 = **34/46**, 12 never proposed. **r20 recomputed it a FIFTH time — and this time verified the ENTERING figure independently instead of inheriting it: at `8f17391` (the commit before r20's propose-state) both target contexts read `last_proposed: never`, `directions: []`, and ZERO of the 152 direction notes then in the vault pointed at either. So 34 entering is measured, not carried.** +vcr-testing +us-federal-grants shipped r20 = **36/46**, 10 never proposed: agentic-research · connector-api-watch · czech-procurement · data-pipeline-catalog (opp 3) · hackernews-example (opp 2) · page-monitor (opp 4 but THIN — 428 lines, no tests; pair it) · trades-operator-economics · trades-pricing · us-state-grants · wasm-plugin-examples (opp 3)."
-cursor: "**r20 CLOSED, merged and pushed** — 6/6 shipped + 1 Director commit, coverage **34/46 -> 36/46**. Gates on merged master: fmt clean, clippy exit 0 / 31 warnings / zero new in any wave-touched file, `cargo test --workspace` **1859/0/17-ignored** (+45), doc-sync 19/19, `just smoke` 39/39. **r21 PROPOSE: pool 0.** Pick 2 never-proposed contexts in DIFFERENT crates (the zero-Class-B partition has now held three rounds), ties by opportunity — best pairing is czech-procurement or connector-api-watch against page-monitor, but page-monitor is thin so it must be the junior half. **Two banked r20 directions are now PAIRED and should be built together in r21**: vcr-testing/harness-expresses-the-run (TestContext has 8 setters against 18 AppContext fields; NoCheckpoints::save returns true unconditionally so there are ZERO CheckpointSink doubles workspace-wide) UNBLOCKS us-federal-grants/grants-detail-delta-survives-restart (a real loss window whose regression test cannot exist today). Two independent scouts converged on that missing seam — that convergence IS the evidence. Also banked r20: grants-drift-is-terminal (deferred only because crates/core/src/error.rs belonged to the sibling lot this round — build it AFTER replay-miss-terminal lands, and note error.rs:585 asserts Error::App must stay retryable, so it needs its own variant or classification site); vcr concurrent-attempt cassette race (becomes live the day anyone ships heartbeat_secs = 0). Do NOT re-mine vcr-testing or us-federal-grants before r22 (cooldown). Still the strongest queued work in the vault: dataset-storage retention-pin-is-dead-code, crawler-core MAX_FRONTIER lifetime cap, browser-engine render-harness-offline, remote-engine remote-scope-honesty, http-engine http-engine-observable, plugin-runner plugin-search-identity (re-scoped: verification test + orphaned pre-fcc4249 _records docs needing a search-backfill)."
-last_session: "[[sessions/2026-08-13-4]]"
+pool_target: 6 (r21 dispatch cap — director-self-gated, autonomous, Athena-dispatched)
+shipped_total: 164
+coverage: "**39/46 map contexts covered (7 never proposed)** — r21 landed. RULE (recomputable — compute it, never inherit it): a map context is COVERED when it has >=1 direction note pointing at it (`context: \"[[<name>]]\"`), OR an explicit nothing-clears-the-bar verdict, OR `last_proposed != never`. **Run `node .perfect/coverage.mjs .` — do not re-type it into a session note.** **Normalize CRLF before any frontmatter regex** — a naive /^---\n([\s\S]*?)\n---/ silently skips every CRLF file here and scored 18/46 in r17. All three clauses are load-bearing: dropping the verdict clause under-reports by one (`archive-engine` is carried by it alone). **r21 recomputed it a SIXTH time from scratch and got 36/46 entering — matching the inherited headline, so the rule is stable.** +agentic-research +trades-operator-economics +trades-pricing shipped r21 = **39/46**. 7 never proposed: connector-api-watch · czech-procurement · data-pipeline-catalog (opp 3) · hackernews-example (opp 2) · page-monitor (opp 4 but THIN — 428 lines, no tests; pair it as the junior half) · us-state-grants · wasm-plugin-examples (opp 3). **One wave covered THREE contexts** by scouting the trades family as a single brief — `trades-common` is the shared spine, so a per-context scout would have seen half of every defect. Repeat that trick where a crate family spans map contexts."
+cursor: "**r21 CLOSED and merged** — 6/6 shipped + 2 Director commits, coverage **36/46 -> 39/46**. Gates on merged master `4d947c2`: fmt clean, clippy exit 0 / 31 warnings / zero new in any wave-touched file (the one hit in `trade-wages` verified verbatim on master at line 740 vs the branch 795 — a line-number check would have called it NEW), `cargo test --workspace` **1919/0/17** (+60), doc-sync 19/19, `just smoke` **40/40**. **r22 PROPOSE: pool 0.** Pick never-proposed contexts in DIFFERENT crates (zero-Class-B has held four rounds); best pairing is `connector-api-watch` or `czech-procurement` (single app crates, opp 4) against `us-state-grants`, with `page-monitor` only ever as a junior half. **BUILD THE BANKED WORK FIRST — it is now overdue.** The r20 PAIR has been deferred TWICE: [[vcr-testing]] `harness-expresses-the-run` (TestContext has 8 setters against 18 AppContext fields; `NoCheckpoints::save` returns true unconditionally so there are ZERO CheckpointSink doubles workspace-wide) UNBLOCKS [[us-federal-grants]] `grants-detail-delta-survives-restart`. If r22 defers it again, build it INSTEAD of a sweep context — a twice-deferred pair is a ledger smell. Also banked r21, and strong: **`checkpoint_now`'s bool discarded at all 11 production call sites** — TWO independent scouts converged on it this round, and it is a fleet-wide sweep deserving its own round; the orphaned `claude` process on worker drop (remaining seam of r13's claude-kill-tree); research findings surviving search (app-side, reopens CATALOG_EXEMPT); the trades schema-is-advisory validation seam; grants-drift-is-terminal. Still queued: dataset-storage retention-pin-is-dead-code, crawler-core MAX_FRONTIER lifetime cap, browser-engine render-harness-offline, remote-engine remote-scope-honesty, http-engine http-engine-observable, plugin-runner plugin-search-identity. Do NOT re-mine agentic-research or the trades family before r23. WATCH: `trigger dry-run names its unusable hook plugin` failed once in three identical smoke runs this round."
+last_session: "[[sessions/2026-08-13-5]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **0** · phase: **round 20 CLOSED — merged and pushed** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 36/46**, 10 never proposed.
+**State**: pool **0** · phase: **round 21 CLOSED — merged** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 39/46**, 7 never proposed.
 
+### Round-21 pool — 6 GATED → ALL 6 SHIPPED + 2 Director commits (2026-08-13, `perfect/2026-08-13-r21`)
+Gates on merged master `4d947c2`: `cargo fmt --check` clean · `cargo clippy --workspace --all-targets`
+**exit 0, 31 warnings, zero new in any wave-touched file** — the single hit in a wave-touched file
+(`trade-wages:795`) verified present **verbatim on master by CONTENT at line 740**, so a line-number
+check would have called it new · `cargo test --workspace` **1919 passed / 0 failed / 17 ignored**
+(entering 1859, **+60 tests**) · doc-sync self-test **19/19** · `just smoke` **40/40** (extended 39 → 40
+with this round's headline surface, live against the real binary; non-vacuity proven structurally from
+`namespace_index`'s union, not inferred from the PASS).
+
+**One wave covered THREE map contexts** — the reusable trick of the round. The trades family
+(`trades-operator-economics` + `trades-pricing`) was scouted as ONE brief across seven crates, because
+`trades-common` is their shared spine and a per-context scout would have seen half of every defect.
+
+Phase 0 reconciliation (MANDATORY) came back **clean for the sixth round running**: provenance is this
+machine's own `context-map.json` (46 contexts, `personas-context-scan`, 2026-08-03T19:10:19Z,
+`git_commit 611360f`, `project.root` = this checkout). **0 map contexts without a note** (46/46), **0
+notes to alias** (all 8 vault-only names already carry `superseded_by:`), **0 to retire**. Coverage
+recomputed from scratch: **36/46 entering** — the sixth independent computation to agree.
+
+**Director verification before the gate changed two of the four severest claims**, which is the round's
+methodological result: research's "reports success on failure" class was **NARROWED** (a
+`budget_exhausted` run carrying real partial text is CORRECT and its test had to keep passing — the
+narrowing became the direction's load-bearing criterion), and the search-eviction finding was
+**PARTIALLY REFUTED** (the `_job` sweep is a deliberate, documented ghost-doc GC; research is merely the
+one app whose `_job` doc IS the product) and therefore banked instead of slated. Two other claims came
+back **sharper**.
+
+agentic-research, 3 accepted (Lot R — `crates/apps/research/**`):
+1. [[research-run-budget-is-real]] — robustness · M (`max_budget_usd`'s own param text reads *"per-run
+   Claude spend ceiling"* while the value is written onto **every** one of up to 12 calls; the
+   between-steps wall is `if let Some(..)` over a headroom that is `None` whenever the job carries no
+   `budget_usd` — a no-op on exactly the shape the manifest example models, so $0.50 buys $6.00)
+2. [[research-empty-is-not-success]] — robustness · M (a run producing `{report: ""}` fires the whole
+   success fan-out — green job, webhook, search doc; `is_report_shaped` stamps a content-free report
+   `completed`/`structured: true`; and a filesystem error on the decorative `report.json` write costs a
+   full-price re-research three attempts later)
+3. [[research-contract-is-what-it-emits]] — robustness · M (`output_shape`, published on `/apps` and
+   `/mcp`, declares 3 keys `run()` never emits and omits 6 it does — the worst drift measured in this
+   repo, with no `tests/` dir at all while three siblings ship the exact instrument)
+
+trades family, 3 accepted (Lot T — the six trades crates):
+4. [[trades-partial-run-cannot-delete]] — robustness · M (**the round's headline: real user-visible data
+   loss on a green job.** A `state-tax` run returning 30 of 51 jurisdictions tombstones the other 21 and
+   reports SUCCESS. The app deliberately routed through `sync_many_with_provenance` *"so the
+   degrading-source removal guard still applies"* — and that guard cannot engage, because `enforce` is
+   off by default AND the family makes **zero** `observe_extraction` calls. Unfinished half of round-1's
+   own `[[trades-output-guards]]`, which taught these apps to *report* coverage and never to enforce it)
+5. [[trades-numbers-mean-what-they-say]] — robustness · M (four of five siblings store the raw model
+   JSON, so `"13.3"` passes `require_rate` and is stored as a **string** that `as_f64` then silently
+   drops from `median_state_rate` — `homewyse` fixed it and wrote the reasoning in a comment. Plus the
+   rate unit is undeclared and **the family's one wrong-contract test, in the shared crate, encodes the
+   opposite convention from the producer prompt**; plus `unwrap_or("flat")` turning a $150/hour rate
+   into a $150 flat job)
+6. [[trades-join-derived-and-visible]] — robustness · M (`trades/operator_economics`, the joined product
+   five apps exist to produce, is invisible to the entire fan-out — zero `index_datasets`, so no watch,
+   trigger, contract check, search doc or lineage ever sees it — and is a pure derived dataset written
+   raw with `DerivedPaths::NONE`, no `Provenance`, no `job_id`, `write_target` bypassed, recomputed 5×
+   per cycle)
+
+### Wave plan (round 21) — ONE branch `perfect/2026-08-13-r21`, main checkout, 2 CONCURRENT lots
+**Zero Class B, for the second time in the campaign.** Lot R owned `crates/apps/research/**`; Lot T owned
+`crates/apps/{state-tax,state-licensing,trade-wages,homewyse-pricing,valuation-multiples,trades-common}/**`.
+Disjoint by crate. The one true straddler — `docs/features/apps.md`, which **every** `crates/apps/**`
+edit drags in through the doc-sync map — was made **Class C** rather than shared, so the
+`git commit --only` bleed r9 and r18 both recorded could not occur. Class C (Director-only):
+`docs/features/{apps,catalog}.md`, `catalog/data-sources.toml`, `crates/server/src/registry.rs`
+(Lot T needed the `trades` `VIRTUAL_NAMESPACES` entry and was forbidden the file — it reported the exact
+edit and the Director applied it), `crates/core/**`, `scripts/**`, `.perfect/**`. Rust-touching lots = 2 ✓.
+
+**Three builder deaths, zero work lost.** Both first attempts died to a harness stream-watchdog stall
+while fanning out large parallel reads, before writing anything; relaunched with incremental-read
+guidance. Lot T stalled a second time mid-wiring with 439 uncommitted insertions — snapshotted as
+`8ac7f1f` (touching only its own two dirty files, deliberately NOT the live sibling's
+`research/src/lib.rs`), then finished by a continuation that re-committed under a real message rather
+than shipping work under a `wip` heading — r20's recorded lesson, applied.
 ### Round-20 pool — 6 GATED → ALL 6 SHIPPED + 1 Director commit (2026-08-13, `perfect/2026-08-13-r20`)
 **Landed by a continuation session**: the r20 session died mid-Phase-B with all six directions
 committed but *none reviewed*, no session note, and two of them sitting under `wip(...)`

@@ -3,12 +3,12 @@ slug: research-empty-is-not-success
 type: perfect/direction
 context: "[[agentic-research]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 3f50df7
 ---
 
 ## What & why
@@ -76,4 +76,24 @@ research at full price**. A JSON dump nobody reads is not worth a paid re-run.
   if you find a concrete counter-example in the code, report it instead of guessing.
 
 ## Build record
-(filled during build)
+`produced_nothing(structured, text)` is narrow by design — unstructured **and** empty/whitespace
+accumulated text — and `empty_run_failure()` names the stop reason, step count and spend. The builder
+made a classification call worth keeping: the failure is terminal `Error::BudgetExhausted` only when the
+ceiling was the wall (deterministic across retries, since the checkpoint restores the spend and re-hits
+the same wall, and burning the resume counter ends in a full-price re-run); every other empty run stays
+a retryable `Error::App`. The result is deliberately **not** checkpointed on this path, so a retry cannot
+take `Plan::Done` and hand the same nothing back as a success.
+
+`is_report_shaped` now requires content — one non-blank summary *or* key finding, so thin sourcing is not
+treated as emptiness. Rider shipped: `report.json` is best-effort at both sites via `save_report_artifact`,
+and its test blocks the artifact dir with a regular file and **first asserts the dir is genuinely
+un-creatable**, so it cannot pass vacuously.
+
+**Criterion 2 held**: `budget_exhaustion_between_steps_stops_the_loop_and_keeps_the_partial` — the test the
+Director's narrowing identified as CORRECT — passes unchanged. The other test was renamed to
+`an_unshaped_but_nonempty_reply_still_succeeds_at_no_session` and now pins the boundary explicitly.
+New: `an_empty_reply_fails_the_job_instead_of_reporting_it_as_done` (asserts the $0.25 spent is still
+reported — criterion 6), `an_in_shape_refusal_with_nothing_in_it_is_not_structured`,
+`an_empty_run_that_spent_the_ceiling_fails_terminally_not_retryably`.
+
+**Director review: keep.** The two banked non-goals were left alone, as the note asked.

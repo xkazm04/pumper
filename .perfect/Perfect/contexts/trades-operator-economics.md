@@ -95,5 +95,21 @@ limits in the join, `state-licensing`'s `unwrap_or(0.0)` cost, `homewyse`'s `unw
 `income_tax_type`'s unclosed vocabulary.
 
 ## Shipped
-- (round 21 in flight — filled at wrap)
+Round 21 (2026-08-13) — **2/2 shipped from this context** (+1 from [[trades-pricing]]), all reviewed by
+the Director, merged in `perfect/2026-08-13-r21`.
+- [[trades-partial-run-cannot-delete]] → `74dac1f` — **the round's headline.** A `state-tax` run
+  returning 30 of 51 jurisdictions can no longer tombstone the other 21 and report SUCCESS. A
+  completeness floor downgrades the write below 0.9 coverage and says so in `removals_suppressed`;
+  `allow_shrink` is the escape hatch and is deliberately not `force`. The join stopped re-serving
+  tombstoned states as live rows. All five apps now surface `coverage` + `warnings[]`, enforced by a
+  shared `RESULT_FIELDS` check inside each app's own manifest test.
+- [[trades-join-derived-and-visible]] → `b77d489` (+ Director `d3c5b24`, `4d947c2`) — the joined product
+  five apps exist to produce is finally visible to watches, triggers, contracts, search and lineage
+  (`index_datasets`), carries `Provenance` + `job_id`, honours quarantine diversion, and stops marking
+  ~260 rows `changed` for a national fact that changed on 5. `trades` joined `grants` as the second
+  virtual namespace, verified live by smoke check 40.
+
+Landed across two builder sessions: the first died to a harness stall mid-wiring and was snapshotted as
+`8ac7f1f`; the continuation finished it and re-committed under a real message. Zero work lost.
+
 - (inherited, pre-46-map — see [[us-trades-wages-tax-valuation]])

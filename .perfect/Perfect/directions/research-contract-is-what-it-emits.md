@@ -3,12 +3,12 @@ slug: research-contract-is-what-it-emits
 type: perfect/direction
 context: "[[agentic-research]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: df6fab1
 ---
 
 ## What & why
@@ -74,4 +74,22 @@ Research has no `tests/` directory at all.
   either sibling's output.
 
 ## Build record
-(filled during build)
+New `crates/apps/research/tests/result_contract.rs` (272 lines) parses the `output_shape` declaration
+and diffs it against shapes derived from **real runs**. **Ran before the fix: 3 of 4 failed** —
+*"output_shape promises keys the structured run never emits: [key_findings, sources, summary]"* plus the
+six undeclared emitted keys. `output_shape` now declares all eleven with `report: {summary, key_findings,
+sources}` nested honestly and states in prose that `report` is a bare string when `structured` is false.
+
+Tests cover the structured run, the unstructured run, the restored-finished zero-spend path, and that
+every `stop_reason` the declaration lists is producible. **Side effect worth recording: this is the first
+use of `TestContext::restored` in this app**, so it also closed the scout's separate finding that the
+`Plan::Done`/`Plan::Resume` branches were unexecuted by any test in the workspace.
+
+Riders shipped: `resumed_callers_session()` (a re-claim reports `resumed: false` / `resumed_from_checkpoint:
+true`, and the test asserts the engine got the *checkpoint's* session, not the discarded param);
+`duration_ms` moved into `RunState` so all four counters share one grain — **additive + `serde(default)`,
+deliberately no `STATE_VERSION` bump, because a bump would discard live checkpoints and re-buy their
+research**; the role comment corrected to Sonnet @ effort `high`.
+
+**Director review: keep.** Verified the test genuinely derives from `run()` output rather than restating
+the declaration.

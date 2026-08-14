@@ -80,5 +80,20 @@ documents two dead functions (`taxonomy::canonicalize`, `prompt_list`) as the on
 The doc items are Director-applied Class C this round.
 
 ## Shipped
-- (round 21 in flight — filled at wrap)
+Round 21 (2026-08-13) — **1/1 shipped from this context** (3 across the family), Director-reviewed,
+merged in `perfect/2026-08-13-r21`.
+- [[trades-numbers-mean-what-they-say]] → `0904501` — a stored number now means what it says across all
+  five agentic apps. `validate::store_numbers` ends the four-of-five adoption that created the defect;
+  the rate unit is declared as **percentage points** and fraction-shaped values are rejected;
+  `income_tax_type` is a closed vocabulary via a helper lifted from `state-licensing` rather than a
+  fourth fork. `homewyse-pricing` stopped fabricating `unit: "flat"` (a $150/hour rate stored as a $150
+  job), and `state-licensing` stopped reporting `$0.00` for an unreported cost.
+  **The family's one wrong-contract test was corrected to the authoritative unit, not the code bent to
+  the test** — Director-verified: it now carries the real 13.3 / 37.0 / 15.3 values.
+
+`cms-fee-schedule` was scouted end to end and **nothing in it cleared the bar** — it is the best-tested
+surface in the family, and its one real defect (a failed corpus ingest reported as a green job) is
+*deliberate and documented*, so changing it is a product decision banked for r23+ rather than a
+correctness fix to fold into this sweep.
+
 - (inherited, pre-46-map — see [[us-trades-wages-tax-valuation]])

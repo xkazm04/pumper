@@ -3,12 +3,12 @@ slug: trades-numbers-mean-what-they-say
 type: perfect/direction
 context: "[[trades-pricing]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: 0904501
 ---
 
 ## What & why
@@ -102,4 +102,27 @@ the job result says `$0.00`; the two disagree.
   write; if a read-path migration is implied, report it rather than performing it.
 
 ## Build record
-(filled during build)
+`validate::store_numbers` — parseable to a JSON number, present-but-unparseable to honest-Null, absent
+untouched — adopted by state-tax, trade-wages, valuation-multiples and state-licensing, with homewyse
+carrying a comment saying it already constructed from parsed numbers. **Criterion 6 was the point of the
+direction and it held**: the defect was born from a four-of-five adoption, and this is five of five.
+
+**The unit was decided, not split.** Percentage points; the producer prompts say so verbatim and are
+authoritative. `validate::RATE_UNIT` states it and `require_percent_not_fraction` rejects fraction-shaped
+values on an exclusive `(0,1)` test, so a real `0` and any `>= 1` are untouched.
+`state_tax_context_carries_the_real_rate_not_a_median` — the family's one test pinning a wrong contract,
+sitting in the shared crate — **was corrected to percentages; the code was not bent to the test.**
+Director-verified: it now carries 13.3 / 37.0 / 15.3, the real-world values.
+
+`validate::normalize_choice` + `Phrase::{Exact,Prefix,Contains}` lifts `normalize_requirement_level`'s
+rule-table shape rather than forking a fourth spelling; both `requirement_level` and the new
+`income_tax_type` run through it, and state-licensing's existing behaviour tests pass unchanged.
+Riders: `homewyse::price_unit` returns Null for an absent/blank unit (no more $150/hour stored as a
+$150 flat job); `trades_common::Spend` gives state-licensing `cost_usd: null` + `cost_unreported_calls`
+instead of a `$0.00` indistinguishable from a free cache hit.
+
+**Made to fail first:** `a_quoted_rate_round_trips_as_a_number_and_reaches_the_median`,
+`a_quoted_rate_reaches_the_per_state_joined_row_as_a_number` (`None != Some(13.3)`), and
+`a_fraction_shaped_rate_is_rejected_not_stored_as_a_percentage`.
+
+**Director review: keep.**

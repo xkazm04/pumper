@@ -3,12 +3,12 @@ slug: trades-join-derived-and-visible
 type: perfect/direction
 context: "[[trades-operator-economics]]"
 lens: robustness
-status: accepted
+status: shipped
 size: M
 proposed: 2026-08-13
 accepted: 2026-08-13
-shipped: —
-commit: —
+shipped: 2026-08-13
+commit: b77d489
 ---
 
 ## What & why
@@ -95,4 +95,39 @@ exists in-repo and was not adopted.
   additive change; report any signature break.
 
 ## Build record
-(filled during build)
+`unified::product_index_datasets()` / `with_product_index()` declared by all five apps and enforced via
+`RESULT_FIELDS`, so `trades/operator_economics` + `trades/compliance` revisions are finally visible to
+watches, dataset triggers, `enforce_contracts`, search and DataHub lineage. `unified::derived_provenance`
+(following `census_common`) + `unified::write_target` give the join `Provenance` + `job_id` and honour
+quarantine diversion; state-licensing's second raw `trades/compliance` write goes through it too.
+
+**The `DerivedPaths` spelling hazard — the exact failure this direction existed to kill — was defended
+properly.** The batch is split: `US:<trade>` roll-ups write with `NONE`, per-state rows exclude
+`["wage_band", "valuation", "tax.federal"]` (national values replicated onto every state row). The guard
+`derived_paths_name_blocks_the_join_actually_writes` walks a real joined record with a traversal mirroring
+core's `remove_path`, asserts each declared path *resolves*, and asserts the paths that must stay hashed
+(`pricing`, `compliance`, `tax.state`) are **not** excluded, plus eu-sedia's
+`assert_eq!(fn(), DerivedPaths::new(CONST))` drift guard. **Director-verified independently:**
+`object_path_exists` matches `crates/core/src/datasets.rs`'s `remove_path` exactly (dot-split, objects
+only, same peek pattern), so the guard is non-vacuous.
+
+**Criterion 4 was answered with a documented refusal, which is the right outcome:** the 5x-per-cycle
+recompute was **kept deliberately**, because a `grants-common`-style once-per-cycle lease would leave four
+of five apps' fresh data invisible until the next cycle. The price (~1,300 mostly-`unchanged` hash
+comparisons per cycle) is stated in the doc comment rather than hidden.
+
+All four capped reads now use `read_hit_cap` -> `inputs_truncated` + a `warnings[]` entry; the taxonomy
+read got an **additive** `taxonomy_at_cap` so the three census apps' `taxonomy()` signature is untouched.
+Signature change: `sync_operator_economics` returns `JoinOutcome`; all five callers were inside the write
+set and `cargo check --workspace` is clean.
+
+**Made to fail first:** `the_index_declaration_reaches_the_result_naming_both_trades_datasets` (`left: Null`),
+`every_joined_row_carries_a_job_id_and_names_its_inputs`,
+`a_national_fact_is_announced_on_the_rollups_not_on_every_state_row` (20 changed vs 5). The builder
+**honestly flagged** that two other tests pass before and after, pinning behaviour that was already
+correct, rather than presenting them as fixes.
+
+Director-applied Class C: `trades` added to `registry::VIRTUAL_NAMESPACES` (`d3c5b24`), and verified live
+by a new smoke check (`4d947c2`, 39 -> 40).
+
+**Director review: keep.**

@@ -53,6 +53,50 @@ Default **sonnet**; escalate a whole brief to **opus** if any direction in it tr
   resource-destructive actions even when they are obviously regenerable.
 
 ## Skill improvement log
+
+- 2026-08-13 (round 21): **A scout finding that survives verification but CHANGES SHAPE is worth more
+  than one that is simply confirmed — and this round both of the shape-changes were load-bearing.**
+  (a) The scout read research's whole "reports success on failure" class as broken. Verification showed
+  a `budget_exhausted` run carrying real partial text is *correct* — the user paid for those findings —
+  so the defect is only the **empty** case. That narrowing went into the criteria as "this existing test
+  must keep passing, unchanged; if your change breaks it your definition of failure is too wide", and it
+  is the single line that kept the builder from shipping a regression. (b) The search-eviction finding
+  was partially refuted (a deliberate documented GC, not a bug), which kept a bad direction OUT of the
+  slate. **Standing rule: when a scout generalizes a defect into a class, verify the class boundary, not
+  just the exemplar — and write the boundary into the criteria as a test that must survive.**
+- 2026-08-13 (round 21): **Scout a CRATE FAMILY as one brief when it spans map contexts — it covered
+  three contexts in a two-lot wave.** `trades-operator-economics` and `trades-pricing` share
+  `trades-common`; two per-context scouts would each have seen half of every defect (the numeric-string
+  hole is *stored* in four apps and *dropped* in the shared join; the reference fix lives in a third).
+  Cost: one context's directions get filed under a sibling note. Benefit: +2 coverage for one scout, and
+  findings no per-context scout could have produced. **Prefer this wherever a `*-common` crate spans
+  contexts** — the grants and census families are the obvious next candidates.
+- 2026-08-13 (round 21): **The harness stream-watchdog kills builders that fan out many large Reads at
+  once — three deaths this round, all at the 600s no-progress mark.** Two died before writing anything.
+  The fix that worked was one paragraph in the brief: *at most 2 files per turn, offset/limit over ~600
+  lines, do not issue six large Reads in one message*, plus a suggested reading ORDER matched to the
+  direction sequence. **Put that paragraph in every brief whose write set exceeds ~2,000 lines**, and
+  size the reading plan in the brief rather than leaving the builder to discover the ceiling.
+- 2026-08-13 (round 21): **A builder-death snapshot must be scoped to the dead builder's OWN dirty files
+  when a sibling is still live.** `git status` showed three modified files; two were Lot T's and one was
+  the still-running Lot R's `research/src/lib.rs` mid-edit. `git commit --only <the two>` was correct and
+  a wider snapshot would have committed a sibling's half-written source under a `wip(trades)` message.
+  Also: **inspect the snapshot before re-briefing.** Reading it showed the shared-crate half was complete
+  and good and only the wiring was broken (3 compile errors), which turned the continuation brief from
+  "redo D4" into "finish these three errors, do not relitigate the lever choice" — and the continuation
+  honoured it exactly.
+- 2026-08-13 (round 21): **A parse that returns 0 is not a measurement of 0.** The entering test baseline
+  summed to `passed=0 failed=0` because the background log had been tail-truncated to its last 5 lines,
+  not because no tests ran. I caught it only because 0 was absurd. **Any gate figure that arrives as a
+  suspiciously round or empty number is a parse bug until proven otherwise** — re-run capturing to a file
+  you control. Same family as r17's CRLF trap and r19's dropped-clause: the measurement apparatus fails
+  more often than the thing being measured.
+- 2026-08-13 (round 21): **Making the one true straddler Class C beat sharing it, again.** Every
+  `crates/apps/**` edit drags `docs/features/apps.md` through the doc-sync map, so two app-lot waves can
+  never be zero-Class-B by pairing alone. Handing that ONE file to the Director (builders report their
+  doc text) preserved zero Class B at a cost of ~15 minutes of Director doc-writing, and the builders'
+  proposed text was good enough to use nearly verbatim. **For app-vs-app pairings, budget the shared
+  feature doc as Director work from the start rather than treating it as a pairing failure.**
 - 2026-08-13 (round 19): **The coverage rule has THREE clauses and dropping any one silently
   under-reports — this is the r17 CRLF trap in a new costume, and it caught me at the wrap.** My
   final spot-check recomputed 33/46 against a headline of 34, which for a moment looked like the
