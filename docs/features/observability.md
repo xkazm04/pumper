@@ -76,9 +76,31 @@ flushes queued events.
 
 `GET /metrics` serves Prometheus text (body cached ~5s so scrape bursts don't
 re-run the aggregates): job counts by status, per-app permanent-failure counts,
-job duration and queue-wait summaries, cost gauges, app and schedule counts. The
-full series list is in [runtime.md](runtime.md#metrics). `GET /health` is the
+job duration and queue-wait summaries, cost gauges, app and schedule counts,
+webhook delivery health, remote egress split, and checkpoint failures by reason.
+The full series list is in [runtime.md](runtime.md#metrics). `GET /health` is the
 liveness probe.
+
+**Two of those series are process counters** (`pumper_remote_egress_fetches`,
+`pumper_checkpoint_failures_total`) and reset on restart; the rest are DB-derived
+and can therefore go *down* when retention prunes. Both contracts are stated in
+each series' own `# HELP`, because a counter that silently resets and one that
+silently shrinks fail an alert rule in different ways.
+
+## Boot-time logs that state what the process can observe
+
+Two boot lines exist to close a gap between what is configured and what is
+actually happening, and both are logs — neither blocks startup:
+
+- **Extraction health** (`AppState::init`): one `info!` naming whether verdicts
+  gate anything or the fleet is in soak mode.
+- **Declared contracts** (`main::log_contract_observability`): `error!` when
+  `catalog/data-sources.toml` will not parse — the worker's publish seam fails
+  open per job, so an unparsable catalog means the whole fleet checks zero
+  contracts while `/sources` used to keep rendering `contracts_enforce: true`.
+  `info!` with the declared count otherwise. The same fact is served as
+  `contracts.enforce_observed` on `GET /sources`; see
+  [catalog.md](catalog.md).
 
 Job-level live telemetry is a different surface: progress snapshots and terminal
 outcomes stream over SSE (`GET /jobs/{id}/stream`, `GET /events` — see

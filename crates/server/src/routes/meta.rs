@@ -153,6 +153,7 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
     // budget, no cassette — so it carries a reviewed row in
     // `fetch_chokepoint.rs`'s EXPECTED_RAW_ENGINE_CALLS rather than an exemption.
     out.push_str(&egress_metrics(state.engines.fetch.egress_counters()));
+    out.push_str(&checkpoint_metrics(state.checkpoint_failures.totals()));
 
     *state.metrics_cache.lock().await = Some((std::time::Instant::now(), out.clone()));
     Ok(metrics_response(out))
@@ -197,6 +198,50 @@ fn egress_metrics(counters: &pumper_core::fetcher::EgressCounters) -> String {
     ] {
         out.push_str(&format!(
             "pumper_remote_egress_fetches{{served_by=\"{served_by}\"}} {n}\n"
+        ));
+    }
+    out
+}
+
+/// Checkpoint saves that did not land, by reason, as Prometheus text.
+///
+/// Answers the durability question the platform could not answer about itself:
+/// *is anything resuming from nothing?* A `storage_error` means a run has no
+/// durable state at all — the next reap or restart resumes it from whatever
+/// older snapshot survives; a `stale_lineage` means another attempt owns the job
+/// and this task's save was correctly discarded (routine during a reap, alarming
+/// in a steady state).
+///
+/// **Process-lifetime counters, reset on restart** — like `egress_metrics`
+/// above, and deliberately NOT a `jobs.result` scan: the per-run stamp is
+/// carried onto the stored result on the worker's success arm only, so a scan
+/// would undercount exactly the cancelled/failed/panicked/timed-out/suspended
+/// runs an operator most wants counted, and retention pruning would make the
+/// total shrink over time.
+///
+/// Both series are emitted even at zero: an absent series and a zero series are
+/// different answers, and "0 checkpoint failures" is the honest one.
+fn checkpoint_metrics(failures: crate::progress::CheckpointFailures) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "# HELP pumper_checkpoint_failures_total Checkpoint saves that did not land, by reason: \
+         storage_error = the write failed, so the run has no durable state of its own; \
+         stale_lineage = another attempt owns the job and this save was discarded. \
+         Process-lifetime, reset on restart\n\
+         # TYPE pumper_checkpoint_failures_total counter\n",
+    );
+    for (reason, n) in [
+        (
+            crate::progress::CheckpointFailure::StaleLineage.as_str(),
+            failures.stale_lineage,
+        ),
+        (
+            crate::progress::CheckpointFailure::StorageError.as_str(),
+            failures.storage_error,
+        ),
+    ] {
+        out.push_str(&format!(
+            "pumper_checkpoint_failures_total{{reason=\"{reason}\"}} {n}\n"
         ));
     }
     out
@@ -316,6 +361,43 @@ mod webhook_metric_tests {
         // Declared exactly once, or the scrape warns.
         assert_eq!(body.matches("# HELP ").count(), 1);
         assert_eq!(body.matches("# TYPE ").count(), 1);
+    }
+
+    /// The anti-pattern: a checkpoint that stopped landing was counted in an
+    /// `AtomicU64` the worker read in ONE of its seven outcome arms, and
+    /// `/metrics` carried fourteen series and not one of them. "Is anything
+    /// resuming from nothing?" had no answer a dashboard could ask.
+    #[test]
+    fn a_dropped_checkpoint_is_not_invisible_to_a_dashboard() {
+        use crate::progress::CheckpointFailures;
+        let body = checkpoint_metrics(CheckpointFailures {
+            stale_lineage: 2,
+            storage_error: 5,
+        });
+        assert!(
+            body.contains("pumper_checkpoint_failures_total{reason=\"stale_lineage\"} 2\n"),
+            "{body}"
+        );
+        assert!(
+            body.contains("pumper_checkpoint_failures_total{reason=\"storage_error\"} 5\n"),
+            "{body}"
+        );
+        // A healthy process reads as explicit zeros on BOTH reasons: an absent
+        // series and a zero series are different answers.
+        let quiet = checkpoint_metrics(CheckpointFailures::default());
+        assert!(
+            quiet.contains("pumper_checkpoint_failures_total{reason=\"stale_lineage\"} 0\n"),
+            "{quiet}"
+        );
+        assert!(
+            quiet.contains("pumper_checkpoint_failures_total{reason=\"storage_error\"} 0\n"),
+            "{quiet}"
+        );
+        // Declared exactly once, or the scrape warns. The reset-on-restart
+        // contract is stated in the HELP, like the egress counters above.
+        assert_eq!(quiet.matches("# HELP ").count(), 1);
+        assert_eq!(quiet.matches("# TYPE ").count(), 1);
+        assert!(quiet.contains("reset on restart"), "{quiet}");
     }
 
     /// An empty backlog must read 0, never "unknown" or a stale age — a gauge

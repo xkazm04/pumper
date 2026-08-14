@@ -92,6 +92,12 @@ pub struct AppState {
     /// Latest live-progress snapshot per in-flight job (in-memory; surfaced on
     /// `GET /jobs/{id}`). Dropped on restart — progress is ephemeral telemetry.
     pub progress: Arc<ProgressStore>,
+    /// Process-lifetime tally of checkpoint saves that did not land, by reason,
+    /// rendered as `pumper_checkpoint_failures_total{reason}` on `/metrics`.
+    /// Handed to each run's `JobCheckpointer` via `.counting(..)`, so the count
+    /// is independent of which outcome arm the job ends on — the stored-result
+    /// stamp only ever rides the success arm. In-memory, reset on restart.
+    pub checkpoint_failures: Arc<crate::progress::CheckpointFailureCounter>,
     /// Cancelled on SIGTERM/Ctrl-C to drive graceful shutdown: the worker stops
     /// claiming, in-flight jobs drain, and `axum::serve` stops accepting.
     pub shutdown: CancellationToken,
@@ -226,6 +232,7 @@ impl AppState {
             webhook_client,
             events,
             progress: Arc::new(ProgressStore::new()),
+            checkpoint_failures: Arc::new(Default::default()),
             shutdown: CancellationToken::new(),
             job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),

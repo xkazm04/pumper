@@ -115,6 +115,11 @@ pub struct JobCheckpointer {
     /// failure is announced on. `None` in tests and embedders — the counting
     /// works either way.
     events: Option<(String, Arc<EventBus>)>,
+    /// Set by [`counting`](Self::counting): the process-lifetime tally on
+    /// `AppState`, incremented on EVERY failure (not just the first of a kind),
+    /// so a run's checkpoint losses survive whichever outcome arm the job takes.
+    /// `None` in tests and embedders.
+    totals: Option<Arc<CheckpointFailureCounter>>,
 }
 
 /// Job-event status for a checkpoint that did not land. Non-terminal (like
@@ -164,6 +169,48 @@ impl CheckpointFailures {
     }
 }
 
+/// Process-lifetime tally of checkpoint saves that did not land, by reason —
+/// one instance per process, held on `AppState` and handed to every
+/// [`JobCheckpointer`] through [`JobCheckpointer::counting`].
+///
+/// **Why this exists beside the per-run tally.** The per-run count reaches an
+/// operator only through [`checkpoint_failure_stamp`], which the worker carries
+/// onto the stored result in exactly ONE of its seven outcome arms (the success
+/// arm). A job that was cancelled, failed, panicked, timed out or was suspended
+/// for shutdown dropped its count on the floor — i.e. precisely the runs whose
+/// checkpoints most plausibly stopped landing.
+///
+/// **Why not a `jobs.result` scan.** The stamp is only ever written on success,
+/// so a scan would undercount exactly those runs, and `jobs` rows are pruned by
+/// retention, so the total would *shrink*. A process counter is honest about
+/// what it is: monotonic within a process, reset on restart (the same contract
+/// `/metrics`' egress counters state).
+#[derive(Debug, Default)]
+pub struct CheckpointFailureCounter {
+    stale_lineage: AtomicU64,
+    storage_error: AtomicU64,
+}
+
+impl CheckpointFailureCounter {
+    /// Counts one failed save. `Relaxed` for the same reason as the per-run
+    /// atomics: a tally published by nothing else.
+    pub fn record(&self, kind: CheckpointFailure) {
+        match kind {
+            CheckpointFailure::StaleLineage => &self.stale_lineage,
+            CheckpointFailure::StorageError => &self.storage_error,
+        }
+        .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// The process's totals, by reason.
+    pub fn totals(&self) -> CheckpointFailures {
+        CheckpointFailures {
+            stale_lineage: self.stale_lineage.load(Ordering::Relaxed),
+            storage_error: self.storage_error.load(Ordering::Relaxed),
+        }
+    }
+}
+
 /// Whether a failure of this kind announces itself on the bus. Only the first
 /// of each kind does: a run whose lineage went stale fails **every** later save,
 /// and one event per save would turn a durability alarm into a flood. The
@@ -195,6 +242,7 @@ impl JobCheckpointer {
             stale_lineage: AtomicU64::new(0),
             storage_error: AtomicU64::new(0),
             events: None,
+            totals: None,
         }
     }
 
@@ -204,6 +252,16 @@ impl JobCheckpointer {
     #[must_use]
     pub fn announcing(mut self, app: impl Into<String>, events: Arc<EventBus>) -> Self {
         self.events = Some((app.into(), events));
+        self
+    }
+
+    /// Adds this run's failed saves to the process-lifetime tally rendered on
+    /// `/metrics` — the only surface that survives an outcome arm which never
+    /// stamps the result (cancel, terminal failure, retry, panic, timeout,
+    /// shutdown suspend: six of the worker's seven).
+    #[must_use]
+    pub fn counting(mut self, totals: Arc<CheckpointFailureCounter>) -> Self {
+        self.totals = Some(totals);
         self
     }
 
@@ -217,6 +275,12 @@ impl JobCheckpointer {
 
     /// Counts one failed save and, if it is the first of its kind, announces it.
     fn record_failure(&self, kind: CheckpointFailure) {
+        // Process tally first, and on EVERY failure: the announce below is
+        // first-of-kind by design, and the per-run tally reaches an operator
+        // only on the success arm — this is the count that always survives.
+        if let Some(totals) = &self.totals {
+            totals.record(kind);
+        }
         let counter = match kind {
             CheckpointFailure::StaleLineage => &self.stale_lineage,
             CheckpointFailure::StorageError => &self.storage_error,
@@ -422,6 +486,65 @@ mod tests {
             checkpoint_failure_stamp(cp.failures()),
             Some(json!({ "stale_lineage": 0, "storage_error": 1, "total": 1 })),
             "the surviving surface names WHICH failure, not just that one happened"
+        );
+    }
+
+    /// The anti-pattern: the per-run tally reaches an operator only through the
+    /// result stamp, and the worker carries that stamp in exactly ONE of its
+    /// seven outcome arms — `Finished(Ok)`. A run that was cancelled, failed
+    /// (terminal or retryable), panicked, timed out or was suspended for
+    /// shutdown dropped its checkpoint losses on the floor: precisely the runs
+    /// whose checkpoints most plausibly stopped landing. The process counter is
+    /// incremented at the failure itself, before any outcome exists.
+    #[tokio::test]
+    async fn checkpoint_failures_count_before_an_outcome_not_only_on_the_success_arm() {
+        use pumper_core::CheckpointSink;
+        let store = pumper_core::testing::TempStore::new("cp-process-tally").await;
+        let storage = std::sync::Arc::new(store.storage.clone());
+        let job = storage
+            .enqueue("crawl", pumper_core::EnqueueOptions::default())
+            .await
+            .unwrap();
+        let claimed = storage.claim_next(&[], 0.0).await.unwrap().unwrap();
+
+        // Wired exactly as the worker wires it, minus the bus.
+        let totals = Arc::new(CheckpointFailureCounter::default());
+        let stale = JobCheckpointer::new(job.id, claimed.attempts - 1, storage.clone())
+            .counting(totals.clone());
+        assert!(!stale.save(json!({ "n": 1 }), true).await);
+        assert!(!stale.save(json!({ "n": 2 }), true).await);
+        // Every failure counts, not just the first of its kind (that bound is
+        // the *announce*, which would otherwise flood the bus).
+        assert_eq!(totals.totals().stale_lineage, 2);
+
+        // A different kind, on a live lineage, sharing the same process tally.
+        let live = JobCheckpointer::new(job.id, claimed.attempts, storage.clone())
+            .counting(totals.clone());
+        let oversized = json!({ "big": "x".repeat(pumper_core::MAX_CHECKPOINT_BYTES) });
+        assert!(!live.save(oversized, true).await);
+        assert_eq!(
+            totals.totals(),
+            CheckpointFailures {
+                stale_lineage: 2,
+                storage_error: 1
+            },
+            "reasons stay apart in the process tally too"
+        );
+
+        // The point: no job completed, so nothing ever stamped a result — and
+        // the count exists anyway. `carry_checkpoint_failures` (success arm
+        // only) is not what carried this.
+        assert_eq!(totals.totals().total(), 3);
+
+        // A checkpointer with no tally attached still works — embedders and the
+        // older tests construct one, and counting is additive, not required.
+        let bare = JobCheckpointer::new(job.id, claimed.attempts - 1, storage.clone());
+        assert!(!bare.save(json!({ "n": 3 }), true).await);
+        assert_eq!(bare.failures().stale_lineage, 1);
+        assert_eq!(
+            totals.totals().stale_lineage,
+            2,
+            "an uncounted checkpointer must not touch the process tally"
         );
     }
 

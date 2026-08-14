@@ -675,7 +675,12 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     // result below.
     let checkpointer = Arc::new(
         crate::progress::JobCheckpointer::new(job.id, job.attempts, state.storage.clone())
-            .announcing(job.app.clone(), state.events.clone()),
+            .announcing(job.app.clone(), state.events.clone())
+            // Process-lifetime tally: the per-run count below reaches the stored
+            // result on the success arm ONLY, so without this a checkpoint that
+            // stopped landing on a job that was cancelled, failed, panicked,
+            // timed out or was suspended is counted nowhere at all.
+            .counting(state.checkpoint_failures.clone()),
     );
     let ctx = AppContext {
         job_id: job.id,
@@ -775,7 +780,16 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
             // the next boot instead of being abandoned mid-work.
             match state.storage.reset(job.id).await {
                 Ok(Some(_)) => {
-                    warn!(job = %job.id, "job suspended for shutdown; re-queued to resume from checkpoint");
+                    // The resume promise is only true if this run's checkpoints
+                    // actually landed — and the sink that knows is in scope.
+                    let failures = checkpointer.failures();
+                    warn!(
+                        job = %job.id,
+                        checkpoint_storage_errors = failures.storage_error,
+                        checkpoint_stale_lineage = failures.stale_lineage,
+                        "{}",
+                        suspend_resume_message(failures)
+                    );
                     publish(&state, JobEvent::new(job.id, job.app.clone(), "queued"));
                 }
                 Ok(None) => {}
@@ -1832,6 +1846,29 @@ fn carry_checkpoint_failures(
     }
 }
 
+/// The line a shutdown suspend earns, given this run's checkpoint tally.
+///
+/// The anti-pattern it defends: the suspend arm logged *"re-queued to resume
+/// from checkpoint"* unconditionally — a durability assertion that is **false
+/// exactly when `storage_error > 0`**, because those are the saves that never
+/// reached the disk. The job is still re-queued (that part is unconditional and
+/// correct); what it resumes *from* is the last snapshot that landed, which may
+/// be far older than the work already done, or nothing at all. A stale lineage
+/// is not part of the claim — that means another attempt owns the job and this
+/// task's state was supposed to lose — so it is reported as a field, not as a
+/// downgrade.
+fn suspend_resume_message(failures: crate::progress::CheckpointFailures) -> String {
+    if failures.storage_error == 0 {
+        return "job suspended for shutdown; re-queued to resume from checkpoint".to_string();
+    }
+    format!(
+        "job suspended for shutdown; re-queued, but {} checkpoint write(s) failed on this run: \
+         it resumes from the last snapshot that landed — which may be older than the work \
+         already done, or absent entirely",
+        failures.storage_error
+    )
+}
+
 /// Emits the terminal event and fires the result webhook, if configured.
 async fn finalize(state: &AppState, id: uuid::Uuid) {
     finalize_with_stages(state, id, None).await;
@@ -2165,9 +2202,42 @@ mod cancel_kind_tests {
 
 #[cfg(test)]
 mod checkpoint_failure_stamp_tests {
-    use super::carry_checkpoint_failures;
+    use super::{carry_checkpoint_failures, suspend_resume_message};
     use crate::progress::CheckpointFailures;
     use serde_json::{json, Value};
+
+    /// The anti-pattern: the shutdown-suspend arm logged *"re-queued to resume
+    /// from checkpoint"* unconditionally — a durability promise that is false
+    /// exactly when this run's saves never reached the disk, with the sink
+    /// holding that count alive and in scope one line away.
+    #[test]
+    fn a_suspend_log_does_not_promise_a_resume_it_cannot_keep() {
+        let clean = suspend_resume_message(CheckpointFailures::default());
+        assert!(clean.contains("resume from checkpoint"), "{clean}");
+
+        let lost = suspend_resume_message(CheckpointFailures {
+            stale_lineage: 0,
+            storage_error: 3,
+        });
+        assert!(
+            !lost.contains("resume from checkpoint"),
+            "the unqualified promise must not survive a failed write: {lost}"
+        );
+        assert!(lost.contains('3'), "the count is named: {lost}");
+        assert!(
+            lost.contains("re-queued"),
+            "requeueing still happened: {lost}"
+        );
+
+        // A stale lineage is not part of the claim — another attempt owns the
+        // job and this task's state was supposed to lose — so it does not
+        // downgrade the line (it rides as a structured field instead).
+        let stale_only = suspend_resume_message(CheckpointFailures {
+            stale_lineage: 4,
+            storage_error: 0,
+        });
+        assert_eq!(stale_only, clean);
+    }
 
     /// The anti-pattern: a run that lost its durability and looked green
     /// forever after, because the only trace was a `warn!` in a log nobody
