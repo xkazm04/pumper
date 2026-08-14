@@ -58,6 +58,17 @@ struct RunState {
     /// `cost_usd`, NEVER re-metered (the ledger already holds those events).
     #[serde(default)]
     spent_usd: f64,
+    /// Cumulative agent wall time across all attempts. Restored like `steps`,
+    /// `spent_usd` and `turns_used` so the result reports ONE grain: it used to
+    /// be reset to 0 on every re-claim, which published a resumed run's
+    /// this-attempt-only duration next to three cumulative counters.
+    ///
+    /// Additive and `#[serde(default)]`, so a v1 blob written before this field
+    /// existed still restores — a missing value means exactly what the old code
+    /// did (0), which is why this is not a [`STATE_VERSION`] bump: bumping would
+    /// discard live checkpoints and re-buy their research.
+    #[serde(default)]
+    duration_ms: u64,
     /// Truncated raw text of the last unfinished step (partial findings).
     #[serde(default)]
     partial: Option<String>,
@@ -75,6 +86,7 @@ impl RunState {
             steps_done: 0,
             turns_used: 0,
             spent_usd: 0.0,
+            duration_ms: 0,
             partial: None,
             result: None,
         }
@@ -155,8 +167,10 @@ fn fold_output(
     num_turns: Option<u64>,
     session_id: Option<String>,
     step_cap: Option<u64>,
+    duration_ms: Option<u64>,
 ) {
     state.spent_usd += cost_usd.unwrap_or(0.0);
+    state.duration_ms += duration_ms.unwrap_or(0);
     state.turns_used += step_turns_used(num_turns, step_cap);
     state.steps_done += 1;
     if session_id.is_some() {
@@ -355,12 +369,21 @@ impl ScrapeApp for Research {
                 },
             ],
             output_shape: Some(
-                "{summary, key_findings: [..], sources: [..], session_id, cost_usd, steps, \
-                 resumed_from_checkpoint, stop_reason} — structured research output; \
-                 `session_id` is resumable; `cost_usd` is cumulative across resumed attempts; \
-                 `stop_reason` explains why the loop ended (completed, step_cap, \
-                 turns_exhausted, budget_exhausted, no_session, single_call) — `structured: \
-                 false` alone can't distinguish a truncated report from other causes",
+                "{query, report: {summary, key_findings, sources}, structured, resumed, \
+                 resumed_from_checkpoint, steps, cost_usd, duration_ms, num_turns, session_id, \
+                 stop_reason} — the research report is NESTED under `report`, and only when \
+                 `structured` is true; when it is false `report` is the agent's raw answer as a \
+                 bare string, so `summary`/`key_findings`/`sources` are never top-level keys. \
+                 `session_id` is resumable — pass it back as the `session_id` param to drill \
+                 down on the context it built. `steps`, `cost_usd`, `duration_ms` and \
+                 `num_turns` are all cumulative across resumed attempts. `resumed` means this \
+                 run continued a session the CALLER named; `resumed_from_checkpoint` means the \
+                 runtime re-claimed an interrupted attempt (the two are independent, and a \
+                 re-claim uses the checkpoint's session, not the caller's). `stop_reason` \
+                 explains why the loop ended (completed, step_cap, turns_exhausted, \
+                 budget_exhausted, no_session, single_call) — `structured: false` alone can't \
+                 distinguish a truncated report from other causes. A run that produced no \
+                 content at all fails the job instead of returning an empty report.",
             ),
             cost_class: CostClass::Claude,
         }
@@ -389,9 +412,12 @@ impl ScrapeApp for Research {
             .map(String::from);
         let caller_resumed = caller_session.is_some();
         let max_budget_usd = ctx.params.get("max_budget_usd").and_then(Value::as_f64);
-        // Model/effort are chosen by the caller: default to the "research" role
-        // (Sonnet, normal reasoning); an app can pass "compose" for Opus @ xhigh,
-        // or override model/effort directly.
+        // Model/effort are chosen by the caller: default to the "research" role,
+        // which `[claude.roles]` configures as Sonnet @ effort "high" (see
+        // `ClaudeConfig::default` in core/src/config.rs — NOT "normal
+        // reasoning", which this comment claimed for a cost-relevant knob).
+        // An app can pass "compose" for Opus @ xhigh, or override
+        // model/effort directly.
         let role = ctx
             .params
             .get("role")
@@ -444,7 +470,6 @@ impl ScrapeApp for Research {
 
         let mut final_parsed: Option<Value> = None;
         let mut last_text = state.partial.clone().unwrap_or_default();
-        let mut duration_ms: u64 = 0;
         // The step-cap check below is the loop's own initial value, so no
         // branch leaves `stop_reason` unset.
         let mut stop_reason = StopReason::StepCap;
@@ -515,8 +540,8 @@ impl ScrapeApp for Research {
                 output.num_turns,
                 output.session_id.clone(),
                 step_turns.map(u64::from),
+                output.duration_ms,
             );
-            duration_ms += output.duration_ms.unwrap_or(0);
             last_text = output.text.clone();
 
             // Before giving up on structure, salvage a fenced/prose-wrapped object
@@ -570,11 +595,11 @@ impl ScrapeApp for Research {
             "query": query,
             "report": report,
             "structured": structured,
-            "resumed": caller_resumed,
+            "resumed": resumed_callers_session(caller_resumed, resumed_from_checkpoint),
             "resumed_from_checkpoint": resumed_from_checkpoint,
             "steps": state.steps_done,
             "cost_usd": state.spent_usd,
-            "duration_ms": duration_ms,
+            "duration_ms": state.duration_ms,
             "num_turns": state.turns_used,
             "session_id": state.session_id,
             "stop_reason": stop_reason.as_str(),
@@ -630,6 +655,18 @@ fn has_content(v: &Value) -> bool {
         Value::Object(map) => !map.is_empty(),
         Value::Bool(_) | Value::Number(_) => true,
     }
+}
+
+/// Whether this attempt actually continued the session the CALLER named.
+///
+/// The published `resumed` key used to report the `session_id` param verbatim,
+/// but a re-claimed attempt takes [`Plan::Resume`] and **discards** that param
+/// in favour of the checkpoint's session — so a crashed job whose params
+/// happened to carry a `session_id` claimed a caller drill-down that never
+/// happened. The two resume kinds are independent and both are published:
+/// `resumed_from_checkpoint` is the runtime re-claiming an interrupted attempt.
+fn resumed_callers_session(caller_named_a_session: bool, resumed_from_checkpoint: bool) -> bool {
+    caller_named_a_session && !resumed_from_checkpoint
 }
 
 /// Whether the run produced nothing a consumer could use.
@@ -761,6 +798,7 @@ mod tests {
             steps_done: 2,
             turns_used: 16,
             spent_usd: 0.37,
+            duration_ms: 4200,
             partial: Some("partial findings so far".into()),
             result: None,
         };
@@ -809,6 +847,7 @@ mod tests {
             steps_done: 1,
             turns_used: 8,
             spent_usd: 0.42,
+            duration_ms: 900,
             partial: None,
             result: Some(json!({"query": "q", "structured": true, "cost_usd": 0.42})),
         };
@@ -827,6 +866,7 @@ mod tests {
             steps_done: 1,
             turns_used: 8,
             spent_usd: 0.30,
+            duration_ms: 1000,
             partial: None,
             result: None,
         };
@@ -837,6 +877,7 @@ mod tests {
             Some(7),
             Some("sess-abc2".into()),
             Some(8),
+            Some(250),
         );
         assert!((state.spent_usd - 0.50).abs() < 1e-9);
         assert_eq!(state.steps_done, 2);
@@ -847,7 +888,7 @@ mod tests {
     #[test]
     fn fold_keeps_prior_session_and_uses_fallback_turns_when_engine_omits_them() {
         let mut state = RunState::fresh(Some("caller-sess".into()));
-        fold_output(&mut state, None, None, None, Some(8));
+        fold_output(&mut state, None, None, None, Some(8), None);
         // Missing session id must not clobber a resumable one.
         assert_eq!(state.session_id.as_deref(), Some("caller-sess"));
         // Unknown turn count advances conservatively by the chunk size, so the
@@ -941,6 +982,45 @@ mod tests {
             next_step_budget(Some(0.25), 0.0, Some(9.0)),
             BudgetPlan::Run(Some(0.25))
         );
+    }
+
+    #[test]
+    fn resumed_reports_the_callers_session_not_a_runtime_reclaim() {
+        // The caller asked to drill down on a session and got it.
+        assert!(resumed_callers_session(true, false));
+        // A re-claimed attempt uses the CHECKPOINT's session; the caller's
+        // `session_id` param was discarded, so claiming a drill-down would be
+        // a lie even though the param is there.
+        assert!(!resumed_callers_session(true, true));
+        // Plain runs and plain re-claims are not caller resumes at all.
+        assert!(!resumed_callers_session(false, false));
+        assert!(!resumed_callers_session(false, true));
+    }
+
+    #[test]
+    fn duration_is_cumulative_like_the_other_three_counters() {
+        // `steps`, `cost_usd` and `num_turns` all survive a re-claim; duration
+        // used to restart at 0, publishing two grains in one result.
+        let mut state = RunState {
+            v: STATE_VERSION,
+            session_id: Some("sess-abc".into()),
+            steps_done: 1,
+            turns_used: 8,
+            spent_usd: 0.30,
+            duration_ms: 12_000,
+            partial: None,
+            result: None,
+        };
+        fold_output(&mut state, None, Some(1), None, Some(8), Some(3_500));
+        assert_eq!(state.duration_ms, 15_500);
+        // A v1 blob written before the field existed restores as 0 rather than
+        // failing to parse — no STATE_VERSION bump, no discarded checkpoints.
+        match plan_from_restore(Some(
+            &json!({"v": 1, "session_id": "s", "steps_done": 1, "spent_usd": 0.1}),
+        )) {
+            Plan::Resume(restored) => assert_eq!(restored.duration_ms, 0),
+            other => panic!("expected Resume, got {other:?}"),
+        }
     }
 
     #[test]
@@ -1075,6 +1155,51 @@ mod tests {
             assert!(
                 !err.is_terminal_for_job(),
                 "an empty step can differ next attempt: {msg}"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_reclaimed_attempt_reports_the_checkpoints_grain_not_a_caller_resume() {
+            // The params carry a `session_id`, but Plan::Resume discarded it in
+            // favour of the checkpoint's — so `resumed` must be false while
+            // `resumed_from_checkpoint` is true, and duration must continue
+            // from the restored total instead of restarting at 0.
+            let store = TempStore::new("research-reclaim-grain").await;
+            let mut out =
+                research_output(r#"{"summary":"done","key_findings":["f"],"sources":[]}"#);
+            out.session_id = Some("sess-checkpoint".into());
+            out.duration_ms = Some(2_000);
+            let researcher = Arc::new(ScriptedResearcher::new().on("", out));
+            let ctx = TestContext::new(&store.storage, "research")
+                .params(json!({"query": "q", "session_id": "caller-sess"}))
+                .engines(engines_with(
+                    Arc::new(Dead),
+                    Arc::new(Dead),
+                    researcher.clone(),
+                ))
+                .restored(json!({
+                    "v": STATE_VERSION,
+                    "session_id": "sess-checkpoint",
+                    "steps_done": 1,
+                    "turns_used": 8,
+                    "spent_usd": 0.10,
+                    "duration_ms": 9_000,
+                    "partial": "found so far",
+                }))
+                .build();
+            let result = Research.run(ctx).await.unwrap();
+            assert_eq!(result["resumed_from_checkpoint"], json!(true));
+            assert_eq!(
+                result["resumed"],
+                json!(false),
+                "the caller's session_id was discarded by the re-claim"
+            );
+            assert_eq!(result["duration_ms"], json!(11_000));
+            assert_eq!(result["steps"], json!(2));
+            // The engine really was asked to resume the CHECKPOINT's session.
+            assert_eq!(
+                researcher.calls()[0].resume_session.as_deref(),
+                Some("sess-checkpoint")
             );
         }
 
