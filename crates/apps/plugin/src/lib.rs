@@ -196,6 +196,60 @@ fn sweep_truncated(returned: usize, limit: i64) -> bool {
     limit > 0 && returned as i64 >= limit
 }
 
+/// Which key list a source-mode run is working from, and whether that list is
+/// the WHOLE work scope.
+///
+/// THE ANTI-PATTERN THIS CLOSES: `source.keys` and the firing trigger's
+/// `_trigger.keys` used to be collapsed into one `Option<Vec<String>>` by an
+/// `.or_else()`, which destroyed exactly the provenance the result has to
+/// report. A caller-supplied `keys` list is genuinely uncapped; a trigger hop's
+/// list is capped at `[triggers] key_cap` (default 200) and the host declares
+/// the cap in the unforgeable `_trigger.keys_truncated`. With the two collapsed,
+/// a hop that ran the plugin over 200 of 5,000 changed records emitted
+/// `truncated: false` — a clean, complete run — because `truncated` was only
+/// ever written by the no-keys sweep branch.
+#[derive(Debug, Default, PartialEq)]
+struct KeySelection {
+    /// The keys to process, or `None` for "sweep every live record".
+    keys: Option<Vec<String>>,
+    /// This key list is a PARTIAL work scope: the host capped the firing
+    /// trigger's key list. Never set for a caller-supplied `source.keys`.
+    truncated: bool,
+}
+
+/// Key precedence: explicit `source.keys` > `_trigger.keys` (a dataset-trigger
+/// fan-out) > all live records in the source dataset.
+fn select_keys(source: &serde_json::Map<String, Value>, params: &Value) -> KeySelection {
+    fn str_array(v: Option<&Value>) -> Option<Vec<String>> {
+        v.and_then(Value::as_array).map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(String::from))
+                .collect()
+        })
+    }
+    if let Some(keys) = str_array(source.get("keys")) {
+        // The caller named the set: no cap applied to it, whatever the hop that
+        // carried the job said about ITS key list.
+        return KeySelection {
+            keys: Some(keys),
+            truncated: false,
+        };
+    }
+    match str_array(params.pointer("/_trigger/keys")) {
+        // Host-owned and unforgeable (`crates/server/src/triggers.rs`
+        // HOST_OWNED_KEYS), so it is read rather than inferred by comparing
+        // `keys.len()` against `_trigger.count`.
+        Some(keys) => KeySelection {
+            truncated: params
+                .pointer("/_trigger/keys_truncated")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            keys: Some(keys),
+        },
+        None => KeySelection::default(),
+    }
+}
+
 /// The refusal for a `plugin` param this host cannot execute.
 ///
 /// [`Error::BadRequest`] deliberately, and not by widening anything: it is the
@@ -657,8 +711,9 @@ impl ScrapeApp for Plugin {
          params-aware plugin's extract_v2 envelope), \"dataset\": \"plugin_out\"}. \
          Source mode reads each record's stored body (artifact_path under the origin job's \
          dir) instead of re-fetching; keys default to the firing trigger's _trigger.keys, \
-         else all live records up to source.limit (the result reports `truncated` when the \
-         cap bit). The crawl's versioned archive is reachable via \
+         else all live records up to source.limit (the result reports `truncated` when either \
+         cap bit — the sweep's, or the trigger key list's). The crawl's versioned archive is \
+         reachable via \
          source.as_of (RFC3339 snapshot), source.versions: \"all\" (every archived revision \
          + current), or source.backfill: true + url_pattern (batched fan over the whole \
          page_versions archive); historical records are keyed {url}@{date} and tagged \
@@ -700,7 +755,7 @@ impl ScrapeApp for Plugin {
                                 "type": "integer",
                                 "minimum": 1,
                                 "maximum": 10000,
-                                "description": "Cap on the no-keys sweep of live source records (default and ceiling 10000, most-recently-updated first). The result reports `limit` and `truncated` — a full page means the cap decided where the sweep stopped, not the dataset."
+                                "description": "Cap on the no-keys sweep of live source records (default and ceiling 10000, most-recently-updated first). The result reports `limit` and `truncated` — a full page means the cap decided where the sweep stopped, not the dataset. `truncated` is also true when the firing trigger's key list was capped (`_trigger.keys_truncated`)."
                             },
                             "as_of": {
                                 "type": "string",
@@ -836,8 +891,10 @@ impl ScrapeApp for Plugin {
                  feed rather than from the bounded `records` echo — withheld when the source's \
                  own health verdict says its rows do not belong in the index. Plus, per mode: \
                  urls {requested}; source \
-                 {source{app,dataset}, requested, limit, truncated (the no-keys sweep hit its \
-                 cap), loaded, missing, missing_keys[]}; backfill {resumed_from_checkpoint, \
+                 {source{app,dataset}, requested, limit, truncated (this run is PARTIAL: the \
+                 no-keys sweep hit its cap, or the firing trigger's key list did — \
+                 `_trigger.keys_truncated`), loaded, missing, missing_keys[]}; backfill \
+                 {resumed_from_checkpoint, \
                  scanned, skipped_pattern, loaded, batches, missing, missing_keys[]}. urls and \
                  source also carry {records[] (a BOUNDED echo — see `records_echo`), \
                  records_total, records_truncated}; backfill never echoes. Observatory mode: \
@@ -1052,15 +1109,9 @@ impl Plugin {
             .ok_or_else(|| Error::App("source.dataset is required".into()))?
             .to_string();
 
-        let str_array = |v: Option<&Value>| -> Option<Vec<String>> {
-            v.and_then(Value::as_array).map(|a| {
-                a.iter()
-                    .filter_map(|v| v.as_str().map(String::from))
-                    .collect()
-            })
-        };
-        let explicit_keys = str_array(source.get("keys"))
-            .or_else(|| str_array(ctx.params.pointer("/_trigger/keys")));
+        // The selection carries WHICH of the two key sources it got, because only
+        // the trigger's list can have been capped by the host.
+        let selection = select_keys(source, &ctx.params);
 
         // Versioned-archive resolution (crawl `page_versions`): `backfill` fans the
         // plugin over ALL archived versions matching a URL pattern (its own batched
@@ -1092,14 +1143,18 @@ impl Plugin {
         let mut missing: Vec<Value> = Vec::new();
         let requested: usize;
         let limit = parse_source_limit(source);
-        // `truncated` is always false when the caller named the key set: no cap
-        // applied to it.
-        let mut truncated = false;
+        // Two independent ways this run can be partial, reported through the one
+        // `truncated` field: the host capped the trigger hop's key list, or the
+        // no-keys sweep hit `limit`. They cannot both apply (a key list means no
+        // sweep). `truncated` is always false when the CALLER named the key set:
+        // no cap applied to it.
+        let trigger_capped = selection.truncated;
+        let mut truncated = trigger_capped;
 
         // Same key-selection precedence as before (explicit / trigger keys, else
         // the live sweep); the modes differ only in WHICH stored body each key
         // resolves to. The sweep carries its records instead of re-fetching.
-        let selected: Vec<(String, Option<Record>)> = if let Some(keys) = explicit_keys {
+        let selected: Vec<(String, Option<Record>)> = if let Some(keys) = selection.keys {
             requested = keys.len();
             keys.into_iter().map(|k| (k, None)).collect()
         } else {
@@ -1578,10 +1633,11 @@ fn upsert_items(metas: &[DocMeta], outcomes: &mut [DocOutcome]) -> Vec<(String, 
 mod tests {
     use super::{
         batch_provenance, echo_record, every_document_failed, parse_concurrency,
-        parse_records_echo, parse_source_limit, pick_as_of, records_echo, sweep_truncated,
-        total_failure_error, unloadable_plugin_error, upsert_items, versioned_key, CostRollup,
-        DocError, DocFailure, DocMeta, DocOutcome, OutcomeTally, Plugin, DEFAULT_CONCURRENCY,
-        DEFAULT_RECORDS_ECHO, MAX_CONCURRENCY, MAX_RECORDS_ECHO, SOURCE_LIST_LIMIT,
+        parse_records_echo, parse_source_limit, pick_as_of, records_echo, select_keys,
+        sweep_truncated, total_failure_error, unloadable_plugin_error, upsert_items, versioned_key,
+        CostRollup, DocError, DocFailure, DocMeta, DocOutcome, KeySelection, OutcomeTally, Plugin,
+        DEFAULT_CONCURRENCY, DEFAULT_RECORDS_ECHO, MAX_CONCURRENCY, MAX_RECORDS_ECHO,
+        SOURCE_LIST_LIMIT,
     };
     use pumper_core::error::PluginFailure;
     use pumper_core::plugin::PluginRunStats;
@@ -1828,6 +1884,62 @@ mod tests {
             parse_source_limit(&obj(json!({ "limit": "many" }))),
             SOURCE_LIST_LIMIT
         );
+    }
+
+    /// THE REFUTED BEHAVIOR: `source.keys` and `_trigger.keys` were collapsed
+    /// with `.or_else()`, and `truncated` was only ever written by the no-keys
+    /// sweep branch. So a hop the host capped at `[triggers] key_cap` — 200 of
+    /// 5,000 changed records — reported `truncated: false`: a clean, complete
+    /// run over a fortieth of the delta.
+    #[test]
+    fn a_capped_trigger_hop_is_not_a_complete_key_list() {
+        let obj = |v: Value| v.as_object().unwrap().clone();
+        let src = obj(json!({"app": "crawl", "dataset": "pages"}));
+
+        let capped = select_keys(
+            &src,
+            &json!({"_trigger": {"keys": ["a", "b"], "keys_truncated": true, "count": 5000}}),
+        );
+        assert_eq!(capped.keys.as_deref(), Some(&["a".into(), "b".into()][..]));
+        assert!(
+            capped.truncated,
+            "a capped hop must be distinguishable from a complete one"
+        );
+
+        // The same hop, uncapped: unchanged, and NOT truncated.
+        let whole = select_keys(
+            &src,
+            &json!({"_trigger": {"keys": ["a", "b"], "keys_truncated": false, "count": 2}}),
+        );
+        assert_eq!(whole.keys.as_deref(), Some(&["a".into(), "b".into()][..]));
+        assert!(!whole.truncated);
+
+        // A hop from a host that predates the flag reads as complete, not as a
+        // false alarm on every trigger-fired run.
+        let legacy = select_keys(&src, &json!({"_trigger": {"keys": ["a"]}}));
+        assert!(!legacy.truncated);
+    }
+
+    /// The other half of the seam: `source.keys` is the CALLER's list, which no
+    /// cap applied to. It must not inherit the `keys_truncated` of the hop that
+    /// happened to carry the job.
+    #[test]
+    fn a_caller_key_list_is_uncapped_not_truncated() {
+        let obj = |v: Value| v.as_object().unwrap().clone();
+        let sel = select_keys(
+            &obj(json!({"app": "crawl", "dataset": "pages", "keys": ["x"]})),
+            &json!({"_trigger": {"keys": ["a", "b"], "keys_truncated": true}}),
+        );
+        assert_eq!(sel.keys.as_deref(), Some(&["x".into()][..]));
+        assert!(!sel.truncated, "a caller-named key set is never capped");
+
+        // And no keys anywhere is "sweep everything" — the sweep decides.
+        let sweep = select_keys(
+            &obj(json!({"app": "crawl", "dataset": "pages"})),
+            &json!({}),
+        );
+        assert_eq!(sweep, KeySelection::default());
+        assert!(sweep.keys.is_none());
     }
 
     /// THE REFUTED BEHAVIOR: source mode listed at most 10,000 live records and
