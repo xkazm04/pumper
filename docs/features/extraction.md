@@ -161,6 +161,14 @@ On success (`200`): `{values, report, fields_matched, fields_total}` — the ext
 
 `pumper_core::html_to_markdown` — boilerplate-skipping converter used by the fetcher (`to_markdown`), `readable`/`watch` apps, and SEDIA clean-text enrichment.
 
+### An empty extraction is a failure, not an empty-but-valid result
+
+`pumper_core::extract::extracted_nothing(&str)` — true when a *successful* fetch produced no readable content (empty or whitespace-only). Escalation on `min_content_chars` is best-effort: the fetch ladder returns the last tier's body however thin, so an interstitial, a JS-only shell or an empty `200` reaches the app routinely.
+
+Every app that turns a fetched body into a record checks it and returns an error naming the URL, engine and status rather than storing a zero-length document: `readable` (no `page.md`, no result) and `watch` (**no `pages` record, no revision, no alert** — fingerprinting an empty body upserted as `changed` and fired every subscribed webhook with "the page vanished", then fired again when the next healthy run flipped it back). It is a guard, not a policy knob — there is no minimum-length param; a one-character page is content.
+
+The field-level `is_blank` (which decides `FieldStatus::Empty` and `CoercionStatus::CoercionFailed`) delegates its string arm to the same function, so document-level and field-level "nothing" cannot drift apart.
+
 `<table>` renders as a **GitHub pipe table**. The first row is the header: `<th>` cells become the headers, and a `<th>`-less table promotes its first `<tr>` to the header. `<thead>`/`<tbody>`/`<tfoot>` wrappers are traversed; ragged rows are padded to a rectangular grid; cells with nested block content degrade to inline text (whitespace collapsed, `|` escaped); a nested table's text is flattened into its enclosing cell.
 
 ## WASM plugin sandbox (`engine-wasm`, `plugin` app)

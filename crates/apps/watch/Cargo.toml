@@ -8,3 +8,7 @@ pumper-core.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+
+[dev-dependencies]
+tokio.workspace = true
+pumper-core = { workspace = true, features = ["test-support"] }

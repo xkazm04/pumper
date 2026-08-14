@@ -3,6 +3,7 @@
 //! HTML-to-Markdown preprocessing pipeline in one call.
 
 use async_trait::async_trait;
+use pumper_core::extract::extracted_nothing;
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, FetchRequest, FetchStrategy, ManifestExample,
     Result, ScrapeApp,
@@ -171,16 +172,15 @@ impl ScrapeApp for Readable {
     }
 }
 
-/// True when a "successful" fetch produced no readable content — a failed
-/// extraction that must surface as an error, never as an empty-but-OK result.
-fn extracted_nothing(markdown: &str) -> bool {
-    markdown.trim().is_empty()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The predicate this app used to own now lives in
+    /// `pumper_core::extract::extracted_nothing` — `watch` needed the same check
+    /// and apps may not depend on each other, so a shared home in core was the
+    /// only way to avoid a third copy. This test stays here because `readable`
+    /// is the app whose contract it defines.
     #[test]
     fn whitespace_only_extraction_is_a_failure_not_an_empty_success() {
         assert!(extracted_nothing(""));

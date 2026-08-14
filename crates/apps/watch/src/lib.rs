@@ -7,9 +7,10 @@
 //! (`POST /watches`) for a Visualping-style monitor with webhook alerts.
 
 use async_trait::async_trait;
+use pumper_core::extract::extracted_nothing;
 use pumper_core::{
-    AppContext, AppManifest, CostClass, FetchRequest, FetchStrategy, ManifestExample, Provenance,
-    Result, ScrapeApp,
+    AppContext, AppManifest, CostClass, Error, FetchRequest, FetchStrategy, ManifestExample,
+    Provenance, Result, ScrapeApp,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -34,7 +35,10 @@ impl ScrapeApp for Watch {
          {\"url\": \"...\", \"strategy\": \"http|browser|auto|auto_with_research\", \
          \"wait_for_selector\": \".main\", \"min_content_chars\": 250, \
          \"cache_ttl_secs\": 60}. Bypasses the HTTP cache by default so it sees \
-         live bodies; set `cache_ttl_secs` to cap staleness instead. \
+         live bodies; set `cache_ttl_secs` to cap staleness instead. A fetch that \
+         yields no readable content FAILS the run instead of recording a 0-char \
+         page — an empty extraction is a failed fetch, not a page change, and \
+         alerting on it would cry wolf twice. \
          Schedule it via POST /schedules and subscribe via POST /watches."
     }
 
@@ -127,6 +131,23 @@ impl ScrapeApp for Watch {
             .clone()
             .or_else(|| outcome.text.clone())
             .unwrap_or_default();
+        if extracted_nothing(&markdown) {
+            // A successful fetch that yields no readable content is a failed
+            // extraction, not an empty-but-valid result — and fingerprinting it
+            // is worse here than anywhere else in the fleet: the empty body
+            // hashes to e3b0c442…, the record upserts as `changed`, and every
+            // subscribed webhook fires "the entire page vanished". The next
+            // healthy run flips it back and fires a second false alarm. The
+            // escalation that would rescue a thin body is best-effort (the
+            // ladder returns the last tier's output however thin), so an
+            // interstitial or an empty 200 reaches this line routinely. A failed
+            // job is visible; a false alert is actively misleading.
+            return Err(Error::App(format!(
+                "watch: extracted no content from {} (engine {}, status {:?}) — refusing to \
+                 fingerprint an empty body as a page change",
+                outcome.url, outcome.engine, outcome.status
+            )));
+        }
         ctx.save_artifact("page.md", markdown.as_bytes()).await?;
 
         // Compact fingerprint: change detection runs on this record, so keep it

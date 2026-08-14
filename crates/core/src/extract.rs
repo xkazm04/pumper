@@ -629,13 +629,30 @@ impl FieldStatus {
     }
 }
 
+/// True when a "successful" fetch produced **no readable content** — a failed
+/// extraction that must surface as an error, never as an empty-but-OK result.
+///
+/// The document-level sibling of the field-level [`is_blank`], which delegates
+/// its string arm here so the two can never disagree about what "nothing" is.
+///
+/// Lives in core because escalation on `min_content_chars` is best-effort — the
+/// fetch ladder returns the last tier's body however thin — so *every* app that
+/// turns a fetched body into a record needs this check, and each app writing its
+/// own is how one of them ends up without it. `watch` was that app: it
+/// fingerprinted the empty body, stored `{chars: 0, content_sha256: e3b0c442…}`
+/// as a **changed** revision, and fired every subscribed webhook with "the page
+/// vanished" — then fired again when the next healthy run flipped it back.
+pub fn extracted_nothing(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
 /// Whether a rule's output counts as "produced nothing": `null`, a
 /// whitespace-only string, or an empty array. Shared by the pre-transform status
 /// and the post-transform coercion check so the two can't disagree.
 fn is_blank(value: &Value) -> bool {
     match value {
         Value::Null => true,
-        Value::String(s) => s.trim().is_empty(),
+        Value::String(s) => extracted_nothing(s),
         Value::Array(a) => a.is_empty(),
         _ => false,
     }
@@ -1351,7 +1368,7 @@ fn extract_scoped(
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_batch, RuleSet};
+    use super::{extract_batch, extracted_nothing, RuleSet};
     use serde_json::json;
 
     fn ruleset(v: serde_json::Value) -> super::CompiledRuleSet {
@@ -1359,6 +1376,35 @@ mod tests {
             .unwrap()
             .compile()
             .unwrap()
+    }
+
+    #[test]
+    fn whitespace_only_extraction_is_a_failure_not_an_empty_success() {
+        assert!(extracted_nothing(""));
+        // Realistic failure mode: the markdown converter reduces a JS-only page,
+        // an interstitial or an empty 200 to bare whitespace/newlines.
+        assert!(extracted_nothing("  \n\t\n   \n"));
+    }
+
+    #[test]
+    fn real_content_is_not_flagged_as_failed_extraction() {
+        assert!(!extracted_nothing("# Title\n\nBody paragraph."));
+        // A single visible character is content: the guard is "nothing at all",
+        // not a minimum-length policy.
+        assert!(!extracted_nothing("."));
+    }
+
+    /// The field-level blank check delegates to the document-level one, so a
+    /// future change to what "nothing" means cannot move only one of them.
+    #[test]
+    fn field_blankness_agrees_with_document_blankness() {
+        for s in ["", "  \n\t ", "content"] {
+            assert_eq!(
+                super::is_blank(&json!(s)),
+                extracted_nothing(s),
+                "disagreement on {s:?}"
+            );
+        }
     }
 
     #[test]
