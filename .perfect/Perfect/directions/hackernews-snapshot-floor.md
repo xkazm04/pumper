@@ -3,10 +3,10 @@ slug: hackernews-snapshot-floor
 type: perfect/direction
 context: "[[hackernews-example]]"
 lens: robustness
-status: proposed
+status: accepted
 size: S
 proposed: 2026-08-14
-accepted: —
+accepted: 2026-08-14
 shipped: —
 commit: —
 ---
@@ -71,3 +71,64 @@ claim, and it is the honest residue of that refutation.
 Not slated — lost the cap to six directions with larger blast radius (money leak on cancel, a
 documented config causing a 10,000-record sweep, a permanently-dead trigger edge, ~10 GB of
 re-download churn, and a fleet-wide retry loop).
+
+---
+
+## r24 re-verification (2026-08-14) — CONFIRMED as the last unfloored write; the SPECIFIED FLOOR IS REFUTED
+
+**"Last one" holds.** Every `sync_many*` call site under `crates/apps/**`:
+
+| site | floored? |
+|---|---|
+| `cordis/src/lib.rs:450` | yes — `rollup_is_complete` (`:448`, fn `:921`), falls back to `upsert_many` `:459`, emits `aggregate_truncated` `:495` |
+| `smlouvy-dump-watch/src/lib.rs:510` | yes — `removal_suppression_reason` |
+| `trades-common/src/lib.rs:893` | yes — `may_tombstone` inside `write_snapshot` |
+| **`hackernews/src/lib.rs:123`** | **no** |
+
+`crates/core/tests/removal_guard.rs:219-274` pins the allowed `detect_removed` sites, so nothing can
+tombstone off-seam. hackernews is genuinely the last.
+
+### REFUTED: the floor as this note specified it is UNBUILDABLE
+
+The note said "parses materially fewer stories **than the page published**". **HN publishes no
+total.** `parse_front_page` (`hackernews/src/lib.rs:139-198`) returns `Vec<Story>` only — the exact
+signature defect smlouvy's `IndexParse` doc names at `:106-111`.
+
+**But the denominator exists and is thrown away.** `doc.select(&row_sel)` (`:152`) enumerates every
+`tr.athing`; `.filter_map` (`:154-155`) silently drops any row whose `span.titleline > a` is missing.
+So the buildable floor is **parsed ÷ story-rows-served**, which is smlouvy's `blocks_seen` shape
+exactly. Secondary: HN serves 30 rows/page and `pages` is clamped 1..=5 (`:73-78`), so a page
+returning materially fewer than 30 `tr.athing` rows is a short page — detectable with no upstream
+total. **A floor phrased "of the N stories the page claimed" cannot be built; "of the N story rows
+the page served" can, and it is the same defect class.** This correction is load-bearing — build the
+second phrasing.
+
+### Two riders found in the same file, both worth more than the floor alone
+
+**Rider 1 — `summary.removed` is dropped on the floor.** `output_shape` (`:63-67`) *promises* the
+tombstoning (*"stories that fell off the listing are tombstoned"*), but the result (`:125-131`) emits
+only `{count, new, changed, unchanged, stories}`. `UpsertSummary` carries `removed` and cordis reads
+it (`cordis/src/lib.rs:494`). **The run that tombstones 15 of 30 stories and the run that tombstones
+nothing produce byte-identical results** — so even after a floor lands, an operator cannot see
+removals. Cheapest high-value fix in the sweep.
+
+**Rider 2 — rank is used as a primary key.** `:117`
+`s.id.clone().unwrap_or_else(|| format!("rank-{}", s.rank))`. Ids come from the `tr.athing` `id`
+attribute (`:189`); when it is absent, the record is keyed `rank-7`. Rank is positional and changes
+every run, so each run's `rank-N` record **silently overwrites a different story**, manufacturing
+fake `changed` revisions and polluting the change feed — and with `pages > 1` the rank offset
+(`:95`, `:188`) makes cross-page collisions avoidable only by accident. The parser test at `:252-257`
+covers fully-drifted markup, but an id-less row inside *valid* markup takes the `rank-N` path, which
+nothing covers.
+
+**Reference patterns to copy** (read these, do not invent): smlouvy `:104` `PARSE_FLOOR`, `:112-122`
+`IndexParse`, `:136-141` `share()` (returns 1.0 on a zero denominator), `:146` `is_partial`,
+`:152-164` `to_json`, `:169-182` `warning`, `:196-208` `removal_suppression_reason` (the pure gate),
+called `:493`; test file `tests/partial_parse_cannot_tombstone.rs` — note `:248`, the tombstone path
+must stay reachable for a genuinely shrinking feed. trades `:700` `COVERAGE_FLOOR`, `:840-842`
+`may_tombstone`, `:884-918` `write_snapshot`, plus `:825` `RESULT_FIELDS` + `:833`
+`shape_declares_coverage` — the manifest-assertion trick that keeps `output_shape` honest.
+
+**ACCEPTED r24** — it was rejected in r23 for small reach; it earns the slot now because it closes
+the class fleet-wide (last of four) and the two riders are honesty defects in their own right.
+Gate: director-self-gated (autonomous, Athena-dispatched).

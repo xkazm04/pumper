@@ -6,7 +6,7 @@ category: lib
 opportunity: 5
 last_proposed: 2026-08-14
 cooldown_until: r16
-directions: ["[[sweep-end-lift-to-grants-common]]", "[[cordis-sweep-honesty]]", "[[topic-stats-honesty]]", "[[derived-change-honesty]]"]
+directions: ["[[sweep-end-lift-to-grants-common]]", "[[cordis-sweep-honesty]]", "[[topic-stats-honesty]]", "[[derived-change-honesty]]", "[[sedia-sweep-end-honest]]"]
 ---
 
 ## Current state (scouted 2026-08-12, r14 — engine-depth; full brief in r14 scout report)

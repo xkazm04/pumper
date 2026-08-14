@@ -3,10 +3,10 @@ slug: targets-read-keys-truncated
 type: perfect/direction
 context: "[[declarative-extractor]]"
 lens: robustness
-status: proposed
-size: S
+status: accepted
+size: M
 proposed: 2026-08-14
-accepted: —
+accepted: 2026-08-14
 shipped: —
 commit: —
 ---
@@ -61,3 +61,45 @@ write set — correctly, since both apps belonged to no lot this round.
 **Banked r23**, raised by Lot A as a `DECISION NEEDED` it declined to answer from outside its write
 set. Recommended as an early r24 slate item: it is cheap, it finishes shipped work, and the two
 apps are a natural single lot.
+
+---
+
+## r24 re-verification (2026-08-14) — CONFIRMED, and SHARPER than banked
+
+**Host emission is universal.** `crates/server/src/triggers.rs:141-143` inserts `keys_truncated`
+unconditionally in `dataset_trigger_obj`'s `json!` literal; the only two production callers
+(`triggers.rs:1057` fire path, `routes/triggers.rs:404` dry-run) both route through it. `capped_keys`
+(`:101-105`) is the workspace's only truncation site and returns `(keys, truncated)` as one tuple —
+**the cap cannot be applied without the flag being computed.** No unflagged path exists.
+
+**Readers: still zero.** Workspace grep for `keys_truncated` hits only `triggers.rs`, one e2e test,
+`plugins-src/delta-slim` (a fixture the host overwrites), docs, and `.perfect/`. The only two
+`_trigger` readers in `crates/apps/**` are `extractor/src/lib.rs:1532` and `plugin/src/lib.rs:1063`,
+and they read `/_trigger/keys` and nothing else — not even `_trigger.count`.
+
+### The sharpening that upgrades this from S to M
+
+**Neither app merely ignores the flag — each emits a positive `truncated: false` that is FALSE on a
+capped hop.**
+
+- `extractor/src/lib.rs:1562` `let mut truncated = false;` → set only at `:1578`, inside the
+  **no-keys sweep** branch. The trigger-keys branch (`:1568-1570`) leaves it false → emitted `:1694`.
+- `plugin/src/lib.rs:1097` identical → set only at `:1111` → emitted `:1213`.
+
+And **three artifacts assert the now-false invariant** and must move together:
+- `plugin/src/lib.rs:1095-1096` — comment: *"`truncated` is always false when the caller named the
+  key set: no cap applied to it."*
+- `docs/features/extraction.md:104` — the **published contract**, same sentence.
+- `docs/features/triggers.md:11` — says `keys_truncated` exists so the target need not infer
+  truncation. **The two docs now contradict each other on the trigger path.**
+
+**The seam:** `explicit_keys` (`extractor:1531-1532`, `plugin:1062-1063`) collapses two provenances
+into one `Option<Vec<String>>` via `.or_else()` — caller-supplied `source.keys` (genuinely uncapped)
+and host-supplied `_trigger.keys` (capped at `key_cap`). **The fix must preserve which one it got;
+today `.or_else()` destroys exactly that information.** That, not the missing read, is the real work.
+
+**Field to layer on: `truncated`** (siblings `requested`, `limit`, `missing`, `missing_keys`).
+**Do NOT reuse `records_truncated`** (`extractor:796`) — that bounds the result's record *echo*, a
+different axis.
+
+**ACCEPTED r24.** Gate: director-self-gated (autonomous, Athena-dispatched).

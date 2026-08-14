@@ -2,19 +2,115 @@
 type: perfect/home
 repo: pumper
 updated: 2026-08-14
-pool: 0
-pool_target: 6 (r23 dispatch cap — director-self-gated, autonomous, Athena-dispatched)
+pool: 6
+pool_target: 6 (r24 dispatch cap - director-self-gated, autonomous, Athena-dispatched)
 shipped_total: 176
-coverage: "**46/46 map contexts covered (0 never proposed) — CLOSED since r22, and it cannot go up.** Recomputed from scratch with `node .perfect/coverage.mjs .` (from the repo root; it resolves `context-map.json` relative to CWD) — **r23 is the EIGHTH independent computation to agree**. Phase 0 has been a verified no-op for eight rounds: 0 to create, 0 to alias, 0 to retire; provenance is this machine's own `personas-context-scan`, `project.root` = this checkout, and the app DB's `dev_contexts` holds the same 46 names under the same project id. **THE CAMPAIGN MEASURE HAS CHANGED: coverage is no longer the scoreboard — DEPTH is.** Rank by opportunity and by the banked ledger. **And the rule r23 proved the hard way: RE-VERIFY EVERY BANKED CLAIM AGAINST HEAD BEFORE GATING IT.** r23 re-scouted 13 banked claims and **refuted or narrowed 7**, including 3 outright (`observe_extraction` fleet gap — those apps never call `sync_many`, so the guard is vacuous not gapped; `retention-pin-is-dead-code` — the pin is the FIRST branch of `keep_reason` and has its own regression test whose doc reads \"the pin is not a comment\"; connector-api-watch's \"third copy\" — an inline predicate, and the core fn needs no change at all). **Two of r23's six accepted directions did not exist before that pass ran.** A bank note is a LEAD, never a finding. PRIOR RULE, still load-bearing: a map context is COVERED when it has >=1 direction note pointing at it (`context: \"[[<name>]]\"`), OR an explicit nothing-clears-the-bar verdict, OR `last_proposed != never`. **Normalize CRLF before any frontmatter regex** — a naive anchored-newline frontmatter regex silently skips every CRLF file here and scored 18/46 in r17."
+coverage: "**46/46 map contexts covered - CLOSED since r22; r24 is the NINTH independent computation to agree** (`node .perfect/coverage.mjs .` from the repo root: 46 map contexts, 54 vault notes, 0 without a note, 8 vault-only all aliased, 187 direction notes entering). Phase 0 has been a verified no-op for nine rounds: 0 to create, 0 to alias, 0 to retire. Provenance re-verified r24: generator `personas-context-scan`, `generated_at` 2026-08-03T19:10:19Z, `git_commit 611360f`, `project.root` = this checkout, and the app DB `dev_contexts` returns the same 46 names under project `512809db` - no partition disagreement, so no source had to be chosen over another. **DEPTH is the measure now, not coverage.** **46/46 map contexts covered (0 never proposed) — CLOSED since r22, and it cannot go up.** Recomputed from scratch with `node .perfect/coverage.mjs .` (from the repo root; it resolves `context-map.json` relative to CWD) — **r23 is the EIGHTH independent computation to agree**. Phase 0 has been a verified no-op for eight rounds: 0 to create, 0 to alias, 0 to retire; provenance is this machine's own `personas-context-scan`, `project.root` = this checkout, and the app DB's `dev_contexts` holds the same 46 names under the same project id. **THE CAMPAIGN MEASURE HAS CHANGED: coverage is no longer the scoreboard — DEPTH is.** Rank by opportunity and by the banked ledger. **And the rule r23 proved the hard way: RE-VERIFY EVERY BANKED CLAIM AGAINST HEAD BEFORE GATING IT.** r23 re-scouted 13 banked claims and **refuted or narrowed 7**, including 3 outright (`observe_extraction` fleet gap — those apps never call `sync_many`, so the guard is vacuous not gapped; `retention-pin-is-dead-code` — the pin is the FIRST branch of `keep_reason` and has its own regression test whose doc reads \"the pin is not a comment\"; connector-api-watch's \"third copy\" — an inline predicate, and the core fn needs no change at all). **Two of r23's six accepted directions did not exist before that pass ran.** A bank note is a LEAD, never a finding. PRIOR RULE, still load-bearing: a map context is COVERED when it has >=1 direction note pointing at it (`context: \"[[<name>]]\"`), OR an explicit nothing-clears-the-bar verdict, OR `last_proposed != never`. **Normalize CRLF before any frontmatter regex** — a naive anchored-newline frontmatter regex silently skips every CRLF file here and scored 18/46 in r17."
 cursor: "**r22 CLOSED and merged (ff) and pushed** — 6/6 shipped + 3 Director commits, and **THE CONTEXT-MAP SWEEP IS CLOSED: coverage 39/46 -> 46/46.** Master `4928f7d` -> `afd940d`. Gates: `cargo test --workspace --no-fail-fast` **1953/0/17** across 143 suites (baseline measured, not inherited: 1919/0/17 across 141 = **+34 tests**), clippy exit 0 / 31 warnings / identical file-by-file distribution to master / **zero new in any wave-touched file verified by CONTENT**, fmt clean, doc-sync 19/19, `just smoke` **41/41**. **r23 IS THE FIRST DEPTH ROUND — coverage cannot go up, so STOP using never-proposed status as the cursor policy.** Rank by opportunity score and by what the banked ledger says is overdue. **BUILD THE BANKED PAIR FIRST, before mining anything new:** [[shipped-plugins-are-verified]] -> [[trigger-gate-honest-across-source-kinds]] is now in exactly the position the checkpoint pair occupied entering r22 — real, evidenced, and the junior half structurally unassertable without the senior half. r22 proved that shape pays off (it shipped the twice-deferred [[harness-expresses-the-run]] -> [[grants-detail-delta-survives-restart]], and the enabler is what made the fix assertable); do not defer this one twice. **Standing hazard to carry forward: NO app in the smlouvy/watch/ca-grants family calls `observe_extraction`, so core's health-based removal guard is structurally unreachable for all of them — the two app-layer floors shipped in r22 are the ONLY thing between a partial batch and a tombstone. A later round must not delete them believing the health guard covers it.** Next-strongest banked: a `pumper_checkpoint_failures_total{app,reason}` Prometheus series (`/metrics` renders in `routes/meta.rs`, which was Class C in r22 — a genuine one-file follow-up); lift `SweepEnd` into `grants-common` (now in three apps with identical semantics, mechanical); `connector-api-watch`'s third copy of `extracted_nothing`; the malformed-TOML fleet-wide contract fail-open (`worker.rs:1430-1436`); `delta-slim` shaping silently rescoping the target's WORK not just its payload (and `trigger_plugins.rs:702-709` currently asserts that state as CORRECT); smlouvy `year_from` tombstoning; the orphaned `claude` process on worker drop; grants-drift-is-terminal. Still queued: dataset-storage retention-pin-is-dead-code, crawler-core MAX_FRONTIER lifetime cap, browser-engine render-harness-offline, remote-engine remote-scope-honesty, http-engine http-engine-observable, plugin-runner plugin-search-identity. Do NOT re-mine the six r22 contexts before r24. **GATE METHOD (r22, cost two 12-minute re-runs to learn): `cargo test --workspace` FAIL-FASTS on the first failing binary, so any total from a red run is a PARTIAL count of an aborted run, not a regression** — use `--no-fail-fast` the moment anything goes red, and answer 'is this ours?' with `git diff --name-only master..HEAD` BEFORE re-running anything."
-last_session: "[[sessions/2026-08-14-2]]"
+last_session: "[[sessions/2026-08-14-3]]"
 ---
 
 # Perfect — pumper
 
 **Mission**: make pumper the best possible scraping/data-product service — API ergonomics, dataset quality, runtime robustness, and cost efficiency — one gated, shipped direction at a time.
 
-**State**: pool **0** · phase: **round 21 CLOSED — merged** (gate: director-self-gated, autonomous, Athena-dispatched, SWEEP round). **Coverage 39/46**, 7 never proposed.
+**State**: pool **6** - phase: **round 24 BUILDING** (gate: director-self-gated, autonomous, Athena-dispatched; second DEPTH round). **Coverage 46/46 - CLOSED, ninth independent computation.**
+
+### Round-24 pool — 6 GATED, the SECOND DEPTH round (2026-08-14, `perfect/2026-08-14-r24`)
+Gate: **director-self-gated (autonomous, Athena-dispatched)**. Coverage is closed at 46/46 and
+**cannot rise**, so the cursor ranked by opportunity and by what the banked ledger said was overdue —
+exactly as r23's `next:` pointer instructed.
+
+**Entering gates MEASURED, not inherited:** `cargo test --workspace --no-fail-fast` **143 suites /
+1974 passed / 0 failed / 19 ignored** — identical to r23's exit figure, confirming master unchanged.
+
+**The round's method, and its result.** r23's hardest-won rule — *a bank note is a LEAD, never a
+finding* — was applied to all six banked claims before anything was gated. Two refutation scouts
+(one per intended lot, prompted to REFUTE rather than confirm) re-verified every claim against HEAD.
+**Outcome: 4 CONFIRMED-and-SHARPER, 1 NARROWED with a sub-claim outright REFUTED, 1 with its
+specified mechanism REFUTED as unbuildable.** Three of the six directions changed shape before
+gating, and two rejected-in-r23 directions were accepted on evidence that did not exist in the bank.
+The Director then re-verified the two severest claims in source personally, and **sharpened one
+beyond what its scout claimed**.
+
+Lot A — `crates/apps/**`, 3 accepted:
+1. [[targets-read-keys-truncated]] — robustness · M (banked as "no app reads `keys_truncated`".
+   **Sharper:** neither app merely ignores it — each emits a positive **`truncated: false` that is
+   false** on a capped hop (`extractor:1562/1578/1694`, `plugin:1097/1111/1213`), and **three
+   artifacts assert the now-false invariant**, one of them the *published* contract at
+   `docs/features/extraction.md:104`, which now contradicts `docs/features/triggers.md:11`. The real
+   work is that `explicit_keys`'s `.or_else()` destroys the distinction between caller-supplied
+   uncapped keys and host-supplied capped ones)
+2. [[hackernews-snapshot-floor]] — robustness · S (**last unfloored `sync_many` in the fleet,
+   confirmed by enumerating all four call sites.** Its specified floor was **REFUTED as
+   unbuildable** — HN publishes no total — and replaced with the buildable denominator the parser
+   throws away: `tr.athing` rows served vs stories parsed. Two riders found in the same file are
+   worth more than the floor: `summary.removed` is **dropped entirely** while `output_shape` promises
+   the tombstoning, and `rank-N` is used as a **fallback primary key**, so each run silently
+   overwrites a different story)
+3. [[sedia-sweep-end-honest]] — robustness · M (**the round's headline in Lot A.** A renamed
+   `totalResults` makes `total = 0`, which **disarms the drift guard written for that exact schema
+   change** *and* makes the break test `100 >= 0` fire after page one, with `truncated` computing
+   false — **a 2,000-topic sweep becomes a 100-topic corpus reporting a clean run, indefinitely.**
+   Third unpatched instance of a defect ca-grants and grants-gov both document having killed. Scoped
+   **additive**: enum into `grants-common`, adopted in eu-sedia only, zero lines changed in the other
+   three apps — which is what makes it a one-session job where the ~45-reference lift was not)
+
+Lot B — `crates/core/**` + `crates/server/**`, 3 accepted:
+4. [[catalog-disarm-is-visible]] — robustness · M (**NARROWED, and one sub-claim REFUTED.** The
+   staleness marker is not missing: `checked_at` + `job_id` already ride onto every verdict row
+   (`worker.rs:1476-1477`) — **nobody derives anything from them**, while the identical `age_secs` +
+   `stale` idiom sits ~45 lines away *in the same function* (`query.rs:399-406`). Reframed onto the
+   defect that survived: **`contracts_enforce` reports configured intent, not observed enforcement**,
+   reading `true` while zero contracts are evaluated, beside a `pass` that is insert-only and never
+   cleared — one mutation workspace-wide, no `remove`/`clear`/`retain`/`drain`)
+5. [[checkpoint-failures-metric]] — robustness · M (**rejected in r23 as observability-only; that
+   reasoning died under re-verification.** The stamp is **1 of 7 outcome arms**, and the worst arm is
+   shutdown-suspend, which logs *"re-queued to resume from checkpoint"* — **a durability assertion
+   that is false exactly when `storage_error > 0`, with the sink in scope two lines above.** The
+   sizing objection also died: `.announcing` is an existing `#[must_use]` builder that already hands
+   an `AppState` `Arc` into the checkpointer, making this 3-4 files with `egress_metrics` as an exact
+   copy-target — and `meta.rs:168-171` already states the repo's own rule against the DB-derived
+   design)
+6. [[crawl-corpus-stays-addressable]] — robustness · M (**the round's headline.** Not "a crawl body
+   not yet extracted from" but **every crawl body, always, by construction**: the pin gates both UNION
+   arms on `rules_hash IS NOT NULL`, the crawl deliberately stamps `None` on both datasets, and
+   nothing else writes its keys — so **zero crawl bodies are pinnable under any config**, while
+   **11 `read_source_artifact` callers across 4 apps** depend on that corpus. Failure surface traced
+   and it is **silent green**: job succeeds, `/sources` still reports `healthy`, zero records, only a
+   truncated `missing_keys` array. **Director-sharpened beyond the scout:** `pages` records already
+   carry `artifact_path` + `job_id` (`crawl:760`) — the exact triple `read_source_artifact` resolves
+   and `ArtifactRef` is built from — so the pin is buildable from the *pin* side and the crawl's
+   measured write path never has to change)
+
+**Rejected, with reasoning** — the `SweepEnd` lift to `grants-common` (**second rejection**; sizing
+re-measured unchanged at 21 + 24 non-test refs, no user-visible symptom, churn by the taste filter —
+its one outcome-value half became D3); **cordis unification** (separate architectural decision: no
+`grants-common` dependency, 3 arms not 4, and *requested* rather than *collected* arithmetic);
+[[retention-pin-is-dead-code]] (stays refuted, not re-banked — D6 is its honest replacement and a
+different claim); [[crawl-write-path-is-sound]] (**recorded as CONFIRMED-SOUND rather than deferred** —
+the write path is a deliberate, commented, measured decision, and D6 fixes the consequence without
+touching it); `grants_common::sync_unified`'s misleading name (a rename in a shared crate is the same
+churn class — folded into D3 as a one-line doc rider instead).
+
+**Four findings too small to slate were written into the criteria as named riders** rather than
+banked (r19's rule): eu-sedia's unfireable drift guard, hackernews's `removed`/`rank-N` pair, the
+doctor's `half_stamped_provenance` false positive on every healthy crawl run, and
+`/retention/preview`'s plan-level totals that do not partition.
+
+### Wave plan (round 24) — ONE branch `perfect/2026-08-14-r24`, main checkout, 2 CONCURRENT lots
+**Zero Class B, for the fourth time in the campaign** — and this time the partition was chosen *from
+the doc-sync map* rather than validated against it afterwards. Lot A owns `crates/apps/**`
+(`extractor`, `plugin`, `hackernews`, `eu-sedia`, `grants-common`), which drags `apps.md` +
+`extraction.md`; Lot B owns `crates/core/**` + `crates/server/**`, which drags `catalog.md`,
+`http-api.md`, `runtime.md`, `datasets.md`, `observability.md`. **The two sets do not intersect at any
+file**, so the `git commit --only` bleed r9/r18 recorded cannot occur. `triggers.md` goes to Lot A
+(doc half only — the host side is explicitly a non-goal, so Lot A never touches
+`crates/server/src/triggers.rs`). D6's app callers are **read-only evidence**: Lot B is forbidden
+`crates/apps/**` entirely. Class C (Director-only): `catalog/data-sources.toml`,
+`crates/server/src/registry.rs`, `crates/core/tests/{fetch_chokepoint,removal_guard}.rs`,
+`scripts/docs/feature-doc-map.json`, `scripts/smoke.ps1`, `ONBOARDING.md`, `.perfect/**`.
+Rust-touching lots = 2 ✓.
 
 ### Round-21 pool — 6 GATED → ALL 6 SHIPPED + 2 Director commits (2026-08-13, `perfect/2026-08-13-r21`)
 Gates on merged master `4d947c2`: `cargo fmt --check` clean · `cargo clippy --workspace --all-targets`

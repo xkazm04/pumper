@@ -3,10 +3,10 @@ slug: catalog-disarm-is-visible
 type: perfect/direction
 context: "[[data-pipeline-catalog]]"
 lens: robustness
-status: rejected
+status: accepted
 size: M
 proposed: 2026-08-14
-accepted: —
+accepted: 2026-08-14
 shipped: —
 commit: —
 ---
@@ -98,3 +98,68 @@ fail-open is documented and deliberate; the green light is the lie.
 **Sizing note: M, and the design call is the work** — deciding what a stale verdict *means* once the
 catalog is unreadable (invalidate vs mark-stale) and threading that through `/sources`. The
 `worker.rs` guard itself is S.
+
+---
+
+## r24 re-verification (2026-08-14) — core CONFIRMED, sub-claim REFUTED, and the direction is REFRAMED
+
+**CONFIRMED.** `/sources` (`routes/health.rs:53-91`, `list_sources`) reads only `health_store`
+(`:57`), renders `"contracts_enforce": state.config.contracts.enforce` (`:86`), and attaches verdicts
+via `contract_verdict` (`:76-78`, defined `:341-345`). No `Catalog::load()` in the file. Same join on
+the detail view (`:155`). `contract_verdicts` is **insert-only — exactly one mutation workspace-wide**
+(`worker.rs:1479-1483`); no `remove`/`clear`/`retain`/`drain` exists. Readers: `health.rs:342`,
+`query.rs:348`, `receipt.rs:327`. The worker's fail-open early return (`worker.rs:1445-1451`) is
+per job, so a malformed catalog skips contract evaluation for the whole fleet. `main.rs` contains
+**zero** occurrences of `catalog`/`Catalog`; the only boot-adjacent load is `scheduler.rs:560-566`
+`boot_reconcile`, which also warns and returns. `routes/doctor.rs` has no catalog check.
+
+**Net at HEAD: a malformed catalog produces two log lines, two 500s, and one green 200.**
+
+### REFUTED — "there is no staleness marker"
+
+There is. `worker.rs:1470-1478` writes `{verdict, violations, records, removed, enforced, job_id,
+checked_at}` — **`job_id` at `:1476`, `checked_at` at `:1477`** — and both ride verbatim onto
+`/sources` (`health.rs:77`) and `/catalog/health` (`query.rs:356`). **The defect is not a missing
+timestamp; it is that no consumer derives anything from it.** And the idiom is *in the same
+function*: `query.rs:399-406` computes `age_secs` + `stale` against `expected_max_age_secs` for
+*dataset* freshness, ~45 lines below `query.rs:351-358` where it inserts the raw verdict blob without
+computing the identical pair for *verdict* freshness.
+
+### The reframed direction — name the real lie
+
+**`contracts_enforce` at `health.rs:86` reports configured INTENT, not observed enforcement.** It
+reads `true` while zero contracts are being evaluated. That, plus a `pass` with no age, is the green
+light. Two further instances of the same root cause, both worth closing in the same pass:
+
+- **A contracted dataset that stops producing is never re-evaluated.** `worker.rs:1456-1457` iterates
+  only *this* run's `by_dataset`, so its last `pass` sits in the map indefinitely — while
+  `query.rs:400-406` correctly flags `stale: true` in the **same JSON object**. The freshness half is
+  honest, the contract half is not, and they render side by side.
+- **A retired source keeps serving a verdict.** `worker.rs:1483` keys `{app}/{dataset}` with no
+  catalog generation. `/catalog/health` is immune (it iterates `catalog.live()`, `query.rs:339`), but
+  `/sources` joins by health-store id (`health.rs:76`), which retains rows through `retired`
+  (`health.rs:21`). Two surfaces, two truths, one map.
+
+**Sizing:** three emit sites (`health.rs:83-90`, `health.rs:153-162`, `query.rs:419-428`), two
+per-row insert points (`health.rs:76-78`, `query.rs:351-358`), one state cell. Copy-targets:
+`routes/provisioner.rs:67-88` (`proposal_summary` age/`expired` against a config max-age,
+`proposal_is_expired` `:70`) and `query.rs:396-406`.
+
+## Acceptance criteria (r24)
+
+1. A verdict rendered on `/sources` **carries its own age** and is marked stale rather than served as
+   an unqualified `pass` forever. Use the existing `checked_at`/`job_id` — do not add a new timestamp.
+2. `contracts_enforce` (or a companion field beside it) distinguishes **configured intent** from
+   **observed enforcement**, so a fleet whose catalog will not parse cannot render a green
+   enforcement claim.
+3. The catalog is validated somewhere an operator will see it **before** a job runs — boot, doctor, or
+   both. Fail-open stays fail-open (`worker.rs:1438-1439` documents that on purpose); this is about
+   *visibility*, not about blocking delivery. If you make anything blocking, stop and report.
+4. A test proving a stale/absent verdict is distinguishable from a fresh `pass`, named after the
+   anti-pattern.
+5. `docs/features/catalog.md` + `docs/features/http-api.md` describe the new fields and say plainly
+   what `/sources` does and does not observe.
+
+**ACCEPTED r24** — rejected in r23 in its "malformed TOML is silent" form (it is not silent: two
+surfaces 500). Accepted now in its **stale-green** form, which is the defect that survived
+verification. Gate: director-self-gated (autonomous, Athena-dispatched).

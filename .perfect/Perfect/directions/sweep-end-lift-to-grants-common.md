@@ -68,3 +68,25 @@ same way as a complete one). **If a future round takes this context, build that 
 Scope it as: *ca-grants + grants-gov → `grants-common`, then adopt in eu-sedia.* **cordis is out of
 scope and is a separate decision.** The trades family has no equivalent — its `Coverage`/
 `COVERAGE_FLOOR` measures roster coverage, an orthogonal axis.
+
+---
+
+## r24 — REJECTED A SECOND TIME (the lift), and the eu-sedia half was ACCEPTED as [[sedia-sweep-end-honest]]
+
+Scout sizing re-measured at HEAD: **ca-grants 21 non-test refs, grants-gov 24** (= the 45 this note
+recorded), cordis 17. Nothing changed, so nothing overturns the taste verdict: a 45-reference
+refactor whose stated payoff is "prevents the next divergence", with no user-visible symptom today,
+is the churn side of the line `config.md -> ## User taste` has drawn for four rounds.
+
+**cordis stays rejected separately and for a stronger reason:** it does not depend on
+`grants-common`, its enum has 3 arms not 4, and its `walk_end` uses *requested* arithmetic
+(`cordis:550-552`) where the other two use *collected* — which is the exact bug `ca-grants:327-332`
+and `grants-gov:719-726` record having replaced. Unifying it is an architectural decision, not a lift.
+
+**What this note predicted, r24 built.** The "ONE outcome-value half" banked above became
+[[sedia-sweep-end-honest]] — and re-verification made it considerably bigger than this note knew:
+the `total = 0` path caps eu-sedia's corpus at **one page, green, indefinitely**, and disarms the
+drift guard written for that same schema change. Scoped additive (enum lands in `grants-common`,
+adopted in eu-sedia only, **zero lines changed in ca-grants/grants-gov/cordis**), it is a one-session
+job — which is exactly the shape r22's log says a blast-radius-deferred direction should be rewritten
+into.

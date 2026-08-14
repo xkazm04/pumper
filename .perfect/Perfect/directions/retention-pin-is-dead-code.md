@@ -80,3 +80,17 @@ of a provenance claim — it is therefore never pinned, and is governed by age a
 ordering hazard is already caught by config validation (`config.rs:1755-1774`). Size **M** — a real
 query widening with real correctness stakes. Worth a slate slot in a future dataset-storage round;
 worth nothing as "the pin is dead code."
+
+---
+
+## r24 — still REJECTED in its original form; its replacement was ACCEPTED
+
+The refutation above stands and was not re-litigated. **The "one genuine narrow gap" banked at the
+end of this note became [[crawl-corpus-stays-addressable]]**, and re-verification made it much
+larger than "a crawl body not yet extracted from": the pin query gates both UNION arms on
+`rules_hash IS NOT NULL`, the crawl deliberately stamps `rules_hash: None` on both its datasets, and
+nothing else writes into the crawl's keys — so **zero crawl bodies are pinnable, at any age, under
+any config**. Eleven `read_source_artifact` callers across four apps depend on that corpus.
+
+Do not re-bank the "the pin is dead code" claim. The pin works; it just does not cover the repo's
+highest-volume producer.

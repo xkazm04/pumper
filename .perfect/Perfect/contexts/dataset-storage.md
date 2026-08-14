@@ -6,7 +6,7 @@ category: data
 opportunity: 9
 last_proposed: 2026-08-14
 cooldown_until: —
-directions: ["[[retention-pin-is-dead-code]]", ]
+directions: ["[[retention-pin-is-dead-code]]",, "[[crawl-corpus-stays-addressable]]"]
 ---
 
 ## Current state (scout brief, 2026-08-03 — engine level, file:line verified)

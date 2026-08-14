@@ -3,10 +3,10 @@ slug: checkpoint-failures-metric
 type: perfect/direction
 context: "[[api-surface]]"
 lens: robustness
-status: rejected
-size: S
+status: accepted
+size: M
 proposed: 2026-08-14
-accepted: —
+accepted: 2026-08-14
 shipped: —
 commit: —
 ---
@@ -70,3 +70,59 @@ of them.
 
 **Banked with the design correction above** — which is worth more than the original claim, since the
 banked framing would have shipped a metric that lies about the runs that matter most.
+
+---
+
+## r24 re-verification (2026-08-14) — CONFIRMED, sizing question ANSWERED, and a live defect found that changes the verdict
+
+**Absence confirmed.** Full `/metrics` inventory at HEAD is 14 series (`meta.rs:68-146`, `:186-203`,
+`:210-252`); no checkpoint series. **Stamp confirmed success-path-only — 1 of 7 arms.**
+`carry_checkpoint_failures` is called exactly once, `worker.rs:822`, inside `Outcome::Finished(Ok)`
+(`:804`). The other six arms carry nothing: `Cancelled if ShutdownSuspend` (`:769`), `Cancelled`
+(`:786`), `Finished(Err)` terminal (`:885`), `Finished(Err)` retryable (`:903`), `Panicked` (`:921`),
+`TimedOut` (`:937`).
+
+### The finding that flips this from observability-only to a real defect
+
+**The shutdown-suspend arm logs a durability assertion it knows may be false.** `worker.rs:769-784`
+calls `state.storage.reset(job.id)` and logs *"job suspended for shutdown; re-queued to resume from
+checkpoint"* (`:778`) — **which is false exactly when `storage_error > 0`**, and the sink holding
+that count is alive and in scope at `:776`. A green log line asserting a resume the process already
+knows may not exist. r23 rejected this direction as *"a view of defects rather than closing one"*;
+that reasoning no longer holds.
+
+### The sizing question, answered decisively — 3-4 files, not 6
+
+`AppState` is **already in scope at the construction site**, `worker.rs:676-679`:
+`JobCheckpointer::new(job.id, job.attempts, state.storage.clone()).announcing(job.app.clone(),
+state.events.clone())`. **`.announcing` (`progress.rs:204-208`) is a `#[must_use]` builder that
+exists solely to hand an `Arc` from `AppState` into this sink** — a process counter copies that exact
+pattern: field on `AppState` (`state.rs`), sibling builder on `JobCheckpointer` (`progress.rs`), one
+chained call at `worker.rs:678`, one render block in `meta.rs`. `record_failure` (`progress.rs:219-236`)
+is the single increment point. **No new dependency threading.**
+
+**Precedent to copy for the rendering half:** `pumper_remote_egress_fetches{served_by}` — counter type
+`EgressCounters`, read `meta.rs:155`, rendered by `egress_metrics` `meta.rs:186-203`, with
+`meta.rs:182-185` documenting the process-lifetime/reset-on-restart contract. And **`meta.rs:168-171`
+already states the repo's own rule that DB-derived `_total` series are dishonest because retention can
+lower them** — which is the argument against the `jobs.result` design, in the repo's own words.
+
+Vocabulary: `CheckpointFailure::{StaleLineage, StorageError}` (`progress.rs:133-137`), strings
+`"stale_lineage"`/`"storage_error"` (`:141-143`), stamp shape `:178-186`,
+`CHECKPOINT_FAILURES_KEY` `:126`, `CHECKPOINT_FAILED_STATUS` `:123`.
+
+## Acceptance criteria (r24)
+
+1. A checkpoint failure is counted **on every job outcome**, not only on success — process-lifetime
+   `AtomicU64` per reason, surfaced through `AppState`. **Do NOT build the `jobs.result` scan**; it
+   undercounts exactly the runs that matter and shrinks under retention pruning.
+2. `pumper_checkpoint_failures_total{reason}` renders on `/metrics`, following the `egress_metrics`
+   shape including its process-lifetime/reset-on-restart doc contract.
+3. **The shutdown-suspend log at `worker.rs:769-784` stops asserting a resume it cannot promise** when
+   `storage_error > 0`. The sink is in scope at `:776` — the information is already there. Choose the
+   lever (downgrade the claim, name the failure count in the line, or both) and say why in the diff.
+4. A test proving the counter moves on a non-success outcome, named after the anti-pattern.
+5. `docs/features/runtime.md` (+ `http-api.md` if the `/metrics` surface list lives there) documents
+   the new series and its process-lifetime semantics.
+
+**ACCEPTED r24.** Gate: director-self-gated (autonomous, Athena-dispatched).
