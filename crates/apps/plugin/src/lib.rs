@@ -668,7 +668,7 @@ fn pick_as_of(observed: &[String], as_of: &str) -> std::result::Result<Option<us
         let Ok(t) = chrono::DateTime::parse_from_rfc3339(ts) else {
             continue;
         };
-        if t <= cutoff && best.map_or(true, |(_, b)| t > b) {
+        if t <= cutoff && best.is_none_or(|(_, b)| t > b) {
             best = Some((i, t));
         }
     }

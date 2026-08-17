@@ -951,8 +951,7 @@ mod tests {
 
     #[test]
     fn low_confidence_floor_is_five() {
-        assert!(4 < LOW_CONFIDENCE_FLOOR);
-        assert!(!(5 < LOW_CONFIDENCE_FLOOR));
+        assert_eq!(LOW_CONFIDENCE_FLOOR, 5);
     }
 
     // --- shape stats + site bucketing --------------------------------------
