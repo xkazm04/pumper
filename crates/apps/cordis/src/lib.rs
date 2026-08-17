@@ -1211,7 +1211,7 @@ mod tests {
         let snap = stage2_state(7, &done);
         assert_eq!(restored_done(Some(&snap), 7), done);
         // The remaining work is the enumerated ids minus what already landed.
-        let ids = vec![
+        let ids = [
             "101070522".to_string(),
             "101059379".to_string(),
             "101099999".to_string(),
