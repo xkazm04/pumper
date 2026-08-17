@@ -226,8 +226,8 @@ fn walk(node: NodeRef<Node>, out: &mut String, ctx: &mut Ctx) {
                     let start = out.len();
                     walk_children(node, out, ctx);
                     // Only emit link syntax when there's visible text and a real href.
-                    let has_text = out[start..].trim().is_empty();
-                    if !href.is_empty() && !href.starts_with('#') && !has_text {
+                    let has_text = !out[start..].trim().is_empty();
+                    if !href.is_empty() && !href.starts_with('#') && has_text {
                         out.push_str(&format!("]({href})"));
                         out.insert(start, '[');
                     }
