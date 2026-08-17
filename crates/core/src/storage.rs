@@ -3296,8 +3296,6 @@ impl TryFrom<IngressSourceRow> for IngressSource {
     }
 }
 
-/// Splits an optional keyset cursor pair into two bind-ready Options, so a
-/// single SQL `WHERE (?1 IS NULL OR ...)` clause covers the first-page case.
 /// The append-only tables with no natural bound, in report order. Kept as one
 /// list so `ledger_row_counts` and the store report cannot drift from what
 /// [`Storage::prune_ledgers`] actually knows how to bound.
@@ -3359,6 +3357,8 @@ impl LedgerPruned {
     }
 }
 
+/// Splits an optional keyset cursor pair into two bind-ready Options, so a
+/// single SQL `WHERE (?1 IS NULL OR ...)` clause covers the first-page case.
 fn split_after(after: Option<(String, String)>) -> (Option<String>, Option<String>) {
     after
         .map(|(t, i)| (Some(t), Some(i)))
