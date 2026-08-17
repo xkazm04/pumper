@@ -859,7 +859,7 @@ pub fn classify_events(
         (Some("forecasted"), Some("open")) => Some(EventKind::ForecastPosted),
         // Guard: only a reopening whose deadline is not already past (or has no
         // deadline yet) is real — see the sweep flip-flop note above.
-        (Some("closed"), Some("open")) if !new_close.is_some_and(|d| d < observed_on) => {
+        (Some("closed"), Some("open")) if new_close.is_none_or(|d| d >= observed_on) => {
             Some(EventKind::Reopened)
         }
         // Closed while the published deadline is still ahead of us.
