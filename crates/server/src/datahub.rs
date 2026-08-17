@@ -306,8 +306,6 @@ fn upstream_lineage_with_fields(
     aspect
 }
 
-/// POSTs entity batches to `{gms}/openapi/entities/v1/`. Returns the entity
-/// count on success, the first error otherwise.
 /// Own client, not the 15s webhook one: GMS ingestion can take >15s on a
 /// cold instance (first write observed at ~18s on the quickstart stack).
 fn client() -> &'static reqwest::Client {
@@ -333,6 +331,8 @@ pub(crate) fn partial_abort_note(sent: usize, total: usize) -> String {
     }
 }
 
+/// POSTs entity batches to `{gms}/openapi/entities/v1/`. Returns the entity
+/// count on success, the first error otherwise.
 async fn post_entities(state: &AppState, entities: Vec<Value>) -> Result<usize, String> {
     let client = client();
     let cfg = &state.config.datahub;

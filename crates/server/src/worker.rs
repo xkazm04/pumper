@@ -2116,8 +2116,10 @@ fn dataset_docs_from_revisions(
     (docs, deletes)
 }
 
-/// One search document for a stored dataset record (stable id, app+dataset
-/// preserved for facets). Mirrors `record_doc`'s title/url field picking.
+/// One search document for a single job-result array element (app+dataset
+/// preserved for facets). A record carrying a url gets a stable `app:url` id in
+/// the durable record namespace (upserts on re-run); one without is tied to this
+/// job id and lives in the sweepable latest-run snapshot.
 fn record_doc(app: &str, job_id: Uuid, i: usize, rec: &Value) -> SearchDoc {
     let url = ["_url", "url"]
         .iter()

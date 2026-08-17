@@ -159,17 +159,6 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
     Ok(metrics_response(out))
 }
 
-/// Renders the webhook-delivery block of `/metrics` from one health snapshot.
-///
-/// Split out from [`metrics`] and pure (`now` is passed in) because this is the
-/// answer to "has everything been failing for six hours?", and until it existed
-/// the only way to ask was to hand-poll `GET /webhooks/deliveries` — with the
-/// docs naming the wrong status.
-///
-/// Gauges, not process counters: every number is DB-derived, so the retention
-/// janitor can lower `_total` series. The existing `pumper_job_failures_total`
-/// sets that precedent and states it in its HELP; these do the same rather than
-/// pretending to be monotonic.
 /// The remote fetch fabric's egress split, as Prometheus text.
 ///
 /// Answers the question the fabric could not answer about itself: *did the
@@ -247,6 +236,17 @@ fn checkpoint_metrics(failures: crate::progress::CheckpointFailures) -> String {
     out
 }
 
+/// Renders the webhook-delivery block of `/metrics` from one health snapshot.
+///
+/// Split out from [`metrics`] and pure (`now` is passed in) because this is the
+/// answer to "has everything been failing for six hours?", and until it existed
+/// the only way to ask was to hand-poll `GET /webhooks/deliveries` — with the
+/// docs naming the wrong status.
+///
+/// Gauges, not process counters: every number is DB-derived, so the retention
+/// janitor can lower `_total` series. The existing `pumper_job_failures_total`
+/// sets that precedent and states it in its HELP; these do the same rather than
+/// pretending to be monotonic.
 fn webhook_metrics(
     health: &pumper_core::DeliveryHealth,
     now: chrono::DateTime<chrono::Utc>,
