@@ -159,6 +159,19 @@ impl ClaudeEngine {
             Command::new(&self.cfg.binary)
         };
         cmd.args(&args);
+        // The child runs a model over UNTRUSTED scraped content, so it must not
+        // inherit pumper's secrets (SENTRY_DSN, per-app API keys, webhook signing
+        // secrets from `.env`): an indirect prompt-injection that gets the CLI to
+        // echo its `env` would exfiltrate them. Build the env deliberately —
+        // clear it, then re-add only the allowlist. `CLAUDE_EXTRA_ENV` hands back
+        // the one secret the CLI legitimately needs (its Anthropic auth) and
+        // nothing else. On the Windows shim path this env is what cmd.exe AND the
+        // node CLI both run under, so the allowlist carries COMSPEC/SYSTEMROOT/
+        // USERPROFILE for them (see `pumper_core::process_env`).
+        cmd.env_clear();
+        cmd.envs(pumper_core::process_env::allowed_env(
+            pumper_core::process_env::CLAUDE_EXTRA_ENV,
+        ));
         if let Some(dir) = &workdir {
             cmd.current_dir(dir);
         }

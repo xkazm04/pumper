@@ -38,6 +38,7 @@ pub mod json_salvage;
 pub mod lru;
 pub mod markdown;
 pub mod plugin;
+pub mod process_env;
 pub mod recipes;
 pub mod resilience;
 #[cfg(feature = "storage")]

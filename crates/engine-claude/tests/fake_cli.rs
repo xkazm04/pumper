@@ -214,6 +214,73 @@ async fn happy_path_envelope_becomes_a_research_output() {
     assert_eq!(out.session_id.as_deref(), Some("sess-abc"));
 }
 
+/// THE credential-exfiltration defect (field-report v2, D1): the Claude child
+/// runs a model over untrusted scraped content, so it must NOT inherit pumper's
+/// secrets. This drives the real launch path — on Windows through the `cmd.exe`
+/// shim, the same path that spends money — with a fake CLI that dumps its own
+/// environment, then proves a secret the parent process holds never reached the
+/// child, while the `PATH` it needs to run still did.
+#[tokio::test]
+async fn the_child_does_not_inherit_the_parents_secrets() {
+    // Secrets pumper's own process holds (as `.env`/`load_dotenv` would put them
+    // on the environment). Unique names so no sibling test is disturbed.
+    const SECRET_NAME: &str = "PUMPER_TEST_SENTRY_DSN";
+    const SECRET_VALUE: &str = "https://public@o0.ingest.sentry.io/should-not-leak";
+    std::env::set_var(SECRET_NAME, SECRET_VALUE);
+    std::env::set_var("PUMPER_TEST_CENSUS_API_KEY", "super-secret-census-key");
+
+    // A fake CLI that dumps its whole environment beside the envelope it prints.
+    let dir = FakeCli::temp_dir("envscrub");
+    let env_file = dir.path().join("env.txt");
+    let payload = dir.path().join("envelope.json");
+    std::fs::write(
+        &payload,
+        serde_json::to_vec(&ok_envelope()).expect("envelope"),
+    )
+    .expect("write envelope");
+    let body = if cfg!(windows) {
+        format!(
+            "> \"{env}\" set\ntype \"{payload}\"",
+            env = env_file.display(),
+            payload = payload.display()
+        )
+    } else {
+        format!(
+            "env > \"{env}\"\ncat \"{payload}\"",
+            env = env_file.display(),
+            payload = payload.display()
+        )
+    };
+    let cli = FakeCli::in_dir(dir, &body);
+
+    cli.engine(30)
+        .research(ResearchRequest::new("anything"))
+        .await
+        .expect("the fake cli prints a well-formed envelope");
+
+    let dump = std::fs::read_to_string(cli.artifact("env.txt"))
+        .expect("the fake cli did not record its environment — did it run at all?");
+
+    assert!(
+        !dump.contains(SECRET_NAME) && !dump.contains(SECRET_VALUE),
+        "a parent secret leaked into the child that runs over untrusted content:\n{dump}"
+    );
+    assert!(
+        !dump.contains("PUMPER_TEST_CENSUS_API_KEY"),
+        "a parent API key leaked into the child:\n{dump}"
+    );
+    let has_path = dump.lines().any(|line| {
+        line.split('=')
+            .next()
+            .map(|key| key.trim().eq_ignore_ascii_case("PATH"))
+            .unwrap_or(false)
+    });
+    assert!(
+        has_path,
+        "the sanitized env dropped PATH — the child cannot spawn its tools:\n{dump}"
+    );
+}
+
 #[tokio::test]
 async fn non_zero_exit_reports_the_status_and_stderr() {
     let body = if cfg!(windows) {
