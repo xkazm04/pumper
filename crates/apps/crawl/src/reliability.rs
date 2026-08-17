@@ -41,6 +41,9 @@ use pumper_core::datasets::Provenance;
 use pumper_core::Datasets;
 use serde_json::{json, Map, Value};
 
+/// Folds one delta's counters into a section map, dispatched by `HostDelta` kind.
+type SectionFold = fn(&mut Map<String, Value>, &HostDelta);
+
 /// Data-only app namespace holding both datasets.
 pub const APP: &str = "web-reliability";
 /// Per-host per-day observation dataset (key `{host}@{date}`).
@@ -214,7 +217,7 @@ pub fn merge_observation(
     rec.insert("host".into(), json!(host));
     rec.insert("date".into(), json!(date));
     rec.insert("last_job_id".into(), json!(job_id));
-    let (section, fold): (&str, fn(&mut Map<String, Value>, &HostDelta)) = match delta {
+    let (section, fold): (&str, SectionFold) = match delta {
         HostDelta::Crawl(_) => ("crawl", |m, d| {
             if let HostDelta::Crawl(o) = d {
                 crawl_counters(m, o)
