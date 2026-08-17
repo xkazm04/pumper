@@ -3270,9 +3270,9 @@ mod tests {
 
     // ── salary nowcast (ratio-carry) ────────────────────────────────────────
 
-    fn anchor_map(
-        entries: &[((&str, &str), (i32, u32, u32))],
-    ) -> HashMap<(String, String), NaiveDate> {
+    type AnchorEntry<'a> = ((&'a str, &'a str), (i32, u32, u32));
+
+    fn anchor_map(entries: &[AnchorEntry]) -> HashMap<(String, String), NaiveDate> {
         entries
             .iter()
             .map(|((g, s), (y, m, d))| {

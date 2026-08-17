@@ -792,7 +792,7 @@ mod tests {
         assert_eq!(rec["proposed_from"], "roofing");
         assert_eq!(rec["aliases"][0], "roof", "aliases lowercased");
         // The record must merge into the taxonomy ONLY once a human flips enabled.
-        assert_eq!(taxonomy::merge_taxonomy(&[rec.clone()]).len(), 5);
+        assert_eq!(taxonomy::merge_taxonomy(std::slice::from_ref(&rec)).len(), 5);
         let mut flipped = rec.clone();
         flipped["enabled"] = json!(true);
         assert_eq!(taxonomy::merge_taxonomy(&[flipped]).len(), 6);
