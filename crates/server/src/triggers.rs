@@ -2068,14 +2068,17 @@ mod tests {
         });
         assert_eq!(hook_obj(&plugins, &trigger, delta()).await, None);
         // The plugin saw the delta envelope as input and its own params.
-        let calls = plugins.calls.lock().unwrap();
-        assert_eq!(calls[0].0, "gate");
-        assert_eq!(
-            serde_json::from_str::<Value>(&calls[0].1).unwrap()["count"],
-            3
-        );
-        assert_eq!(calls[0].2, json!({ "min_count": 5 }));
-        drop(calls);
+        // Scoped so the MutexGuard is dropped before the next await (clippy
+        // await_holding_lock does not recognise an explicit `drop()`).
+        {
+            let calls = plugins.calls.lock().unwrap();
+            assert_eq!(calls[0].0, "gate");
+            assert_eq!(
+                serde_json::from_str::<Value>(&calls[0].1).unwrap()["count"],
+                3
+            );
+            assert_eq!(calls[0].2, json!({ "min_count": 5 }));
+        }
 
         let plugins = StubPlugins::new(vec![("gate", Ok(json!({ "pass": true })))]);
         assert_eq!(hook_obj(&plugins, &trigger, delta()).await, Some(delta()));
