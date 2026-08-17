@@ -450,7 +450,7 @@ impl RemoteEngine {
         proxy.timeout_secs = Some(self.timeout_secs);
         proxy.max_body_bytes = Some(
             self.max_body_bytes
-                .saturating_mul(2)
+                .saturating_mul(BODY_CAP_TRANSPORT_MULTIPLIER)
                 .saturating_add(ENVELOPE_SLACK_BYTES),
         );
         let resp = self.transport.fetch(proxy).await?;
@@ -525,6 +525,16 @@ fn stamp_egress(headers: &mut std::collections::HashMap<String, String>, node: &
     headers.insert(REMOTE_NODE_HEADER.to_string(), node.to_string());
 }
 
+/// Whether a node whose cooldown deadline is `until_ms` is still being skipped
+/// at `now_ms`. Both are [`RemoteEngine::now_ms`] offsets.
+///
+/// A named function rather than an inline `>` so the boundary is assertable
+/// without waiting out a real minute: a deadline that has just been *reached* is
+/// over (the node rejoins), and a healthy node's `0` is never in the future.
+fn still_cooling(until_ms: u64, now_ms: u64) -> bool {
+    until_ms > now_ms
+}
+
 /// Why a decoded inner body is over this coordinator's cap — `None` when it
 /// fits.
 ///
@@ -539,16 +549,6 @@ fn stamp_egress(headers: &mut std::collections::HashMap<String, String>, node: &
 /// (once over the wire, once in the decoded `String`) before storing it.
 ///
 /// The `2×` multiplier lived only in a test assertion string until now.
-/// Whether a node whose cooldown deadline is `until_ms` is still being skipped
-/// at `now_ms`. Both are [`RemoteEngine::now_ms`] offsets.
-///
-/// A named function rather than an inline `>` so the boundary is assertable
-/// without waiting out a real minute: a deadline that has just been *reached* is
-/// over (the node rejoins), and a healthy node's `0` is never in the future.
-fn still_cooling(until_ms: u64, now_ms: u64) -> bool {
-    until_ms > now_ms
-}
-
 fn body_over_cap(body_len: usize, cap: u64) -> Option<String> {
     (body_len as u64 > cap).then(|| {
         format!(
