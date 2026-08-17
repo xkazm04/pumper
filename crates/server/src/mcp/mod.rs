@@ -89,9 +89,7 @@ pub(crate) async fn handle_rpc(state: &AppState, msg: &Value) -> Option<Value> {
     let params = msg.get("params").cloned().unwrap_or_else(|| json!({}));
 
     // Notifications get handled (all are no-ops here) and produce no response.
-    let Some(id) = id.filter(|id| !id.is_null()) else {
-        return None;
-    };
+    let id = id.filter(|id| !id.is_null())?;
 
     let result = match method {
         "initialize" => Ok(initialize_result(&params)),
