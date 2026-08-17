@@ -351,6 +351,7 @@ impl RecipeStore {
 
     /// Lists recipes, best score first, optionally filtered by host.
     pub async fn list(&self, host: Option<&str>, limit: i64) -> crate::Result<Vec<Value>> {
+        #[allow(clippy::type_complexity)]
         let rows: Vec<(
             String,
             String,

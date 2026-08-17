@@ -853,9 +853,10 @@ impl Requirement {
 /// How a run of this app spends money — coarse, static, and honest, so an
 /// agent (or a human) can tell a free API sync from a Claude-driven job
 /// before enqueueing anything.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CostClass {
     /// Free engines only (HTTP/browser); a run never produces spend events.
+    #[default]
     Free,
     /// May spend via metered escalation (e.g. a fetch strategy that can reach
     /// the Claude tier), but doesn't drive the model by design.
@@ -910,12 +911,6 @@ pub struct AppManifest {
     pub output_shape: Option<&'static str>,
     /// How runs of this app spend money.
     pub cost_class: CostClass,
-}
-
-impl Default for CostClass {
-    fn default() -> Self {
-        CostClass::Free
-    }
 }
 
 /// One scraping use case. Implement this in a crate under `crates/apps/` and

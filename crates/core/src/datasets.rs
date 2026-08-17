@@ -2626,7 +2626,7 @@ impl Datasets {
                     moved = true;
                     entry.get("from").and_then(group_value_text)
                 }
-                None => lookup_json_path(new_data, path).and_then(|v| group_value_text(v)),
+                None => lookup_json_path(new_data, path).and_then(group_value_text),
             };
             match v {
                 Some(v) => old.push(v),

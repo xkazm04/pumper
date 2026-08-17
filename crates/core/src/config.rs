@@ -902,7 +902,12 @@ impl Config {
         // MCP: a negative budget ceiling parses fine and then makes every
         // clamped enqueue budget negative — which `filter(|b| *b > 0.0)`-style
         // guards downstream silently turn into "unlimited". Reject at the door.
-        if self.mcp.enabled && !(self.mcp.max_job_budget_usd >= 0.0) {
+        if self.mcp.enabled
+            && matches!(
+                self.mcp.max_job_budget_usd.partial_cmp(&0.0),
+                Some(std::cmp::Ordering::Less) | None
+            )
+        {
             return Err(Error::Config(format!(
                 "[mcp] max_job_budget_usd ({}) must be >= 0 when mcp is enabled",
                 self.mcp.max_job_budget_usd
