@@ -47,23 +47,6 @@ struct Fields {
     event_date: Field,
 }
 
-/// Field names the current build's schema expects. An opened index missing any of
-/// these (or with body not stored) is an older schema and is rebuilt.
-/// `amount`/`event_date` are the entity-typed enrichment fields (M14) — adding
-/// them here IS the schema version bump: an index built before them is wiped
-/// empty on open and must be rebuilt via the `search-backfill` bin.
-const SCHEMA_FIELDS: &[&str] = &[
-    "id",
-    "app",
-    "dataset",
-    "url",
-    "title",
-    "body",
-    "indexed_at",
-    "amount",
-    "event_date",
-];
-
 /// Background-commit cadence: the committer flushes at most this often, so a
 /// burst of jobs amortizes into a handful of commits instead of one fsync each.
 /// Small enough that search freshness lags by no more than this on the happy
@@ -159,21 +142,50 @@ fn spawn_committer(
     });
 }
 
-/// True when the opened index matches the current build's schema: every expected
-/// field is present and `body` is stored (snippet-capable). A mismatch — an older
-/// index missing a field this build added (e.g. `indexed_at`) — triggers a
-/// rebuild. Generalizes the old body-stored probe so future field additions are
-/// deliberate schema versions rather than silent incompatibilities.
+/// The current build's index schema — the single authority. `TantivyIndex::new`
+/// creates the index from it and [`schema_is_current`] compares against it, so
+/// the two can never drift. `amount`/`event_date` are the entity-typed
+/// enrichment fields (M14); adding a field here IS the schema-version bump — an
+/// index built before it fails the equality check below, is wiped empty on open,
+/// and must be rebuilt via the `search-backfill` bin.
+fn build_schema() -> Schema {
+    let mut builder = Schema::builder();
+    // `id` is a single indexed term so we can delete-before-insert (upsert).
+    builder.add_text_field("id", STRING | STORED);
+    builder.add_text_field("app", STRING | STORED);
+    builder.add_text_field("dataset", STRING | STORED);
+    builder.add_text_field("url", STRING | STORED);
+    builder.add_text_field("title", TEXT | STORED);
+    // Body is stored so hits can carry highlighted snippets.
+    builder.add_text_field("body", TEXT | STORED);
+    // Recency dimension: FAST for order-by + range, INDEXED for the range
+    // query, STORED so it can be returned. Unix seconds.
+    builder.add_i64_field("indexed_at", INDEXED | STORED | FAST);
+    // Entity-typed enrichment (M14): both OPTIONAL per doc — absent when
+    // extraction found nothing (never guessed). `amount` = largest currency
+    // amount in the doc, whole US dollars. `event_date` = earliest upcoming
+    // deadline-like date, unix seconds (UTC midnight). FAST + INDEXED for
+    // range predicates; STORED so hits could surface them later.
+    builder.add_u64_field("amount", INDEXED | STORED | FAST);
+    builder.add_i64_field("event_date", INDEXED | STORED | FAST);
+    builder.build()
+}
+
+/// True when the opened index matches the current build's schema EXACTLY —
+/// same fields, same names, same TYPES, same stored/indexed/fast options,
+/// in the same order — via Tantivy's structural `Schema` equality.
+///
+/// The gate must see the real target, not a proxy for it. The old check tested
+/// field-name PRESENCE only: a field whose TYPE changed (e.g. `amount` retyped
+/// from u64 to text) or an index carrying EXTRA fields (a newer index opened by
+/// an older build — a downgrade) both passed the name check and then surfaced
+/// as a runtime query error instead of triggering the rebuild that recovers
+/// them. Comparing the whole schema closes that: any structural difference is
+/// drift, and drift rebuilds. `build_schema` is the sole authority both this and
+/// index creation read, so a fresh index always matches and only a real change
+/// trips it.
 fn schema_is_current(index: &Index) -> bool {
-    let schema = index.schema();
-    let all_present = SCHEMA_FIELDS
-        .iter()
-        .all(|name| schema.get_field(name).is_ok());
-    let body_stored = schema
-        .get_field("body")
-        .map(|f| schema.get_field_entry(f).is_stored())
-        .unwrap_or(false);
-    all_present && body_stored
+    index.schema() == build_schema()
 }
 
 // ---- Index lifecycle: opening, and the two destructive recoveries -----------
@@ -417,26 +429,7 @@ fn dir_size_bytes(dir: &std::path::Path) -> u64 {
 
 impl TantivyIndex {
     pub fn new(cfg: &SearchConfig) -> Result<Self> {
-        let mut builder = Schema::builder();
-        // `id` is a single indexed term so we can delete-before-insert (upsert).
-        builder.add_text_field("id", STRING | STORED);
-        builder.add_text_field("app", STRING | STORED);
-        builder.add_text_field("dataset", STRING | STORED);
-        builder.add_text_field("url", STRING | STORED);
-        builder.add_text_field("title", TEXT | STORED);
-        // Body is stored so hits can carry highlighted snippets.
-        builder.add_text_field("body", TEXT | STORED);
-        // Recency dimension: FAST for order-by + range, INDEXED for the range
-        // query, STORED so it can be returned. Unix seconds.
-        builder.add_i64_field("indexed_at", INDEXED | STORED | FAST);
-        // Entity-typed enrichment (M14): both OPTIONAL per doc — absent when
-        // extraction found nothing (never guessed). `amount` = largest currency
-        // amount in the doc, whole US dollars. `event_date` = earliest upcoming
-        // deadline-like date, unix seconds (UTC midnight). FAST + INDEXED for
-        // range predicates; STORED so hits could surface them later.
-        builder.add_u64_field("amount", INDEXED | STORED | FAST);
-        builder.add_i64_field("event_date", INDEXED | STORED | FAST);
-        let schema = builder.build();
+        let schema = build_schema();
 
         // Opening is where the index's two destructive recoveries live (schema
         // drift → wipe, corrupt meta.json → quarantine). Both are guarded by the
@@ -872,8 +865,13 @@ impl Search for TantivyIndex {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_open_failure, drain_dir, quarantine_path, OpenFailure};
+    use super::{
+        build_schema, classify_open_failure, drain_dir, quarantine_path, schema_is_current,
+        OpenFailure,
+    };
     use std::path::PathBuf;
+    use tantivy::schema::{Schema, FAST, INDEXED, STORED, STRING, TEXT};
+    use tantivy::Index;
 
     fn scratch(tag: &str) -> PathBuf {
         static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -923,6 +921,67 @@ mod tests {
         // quarantining exists to unblock.
         std::fs::write(dir.join("meta.json"), b"{ not json").unwrap();
         assert_eq!(classify_open_failure(&dir), OpenFailure::Corrupt);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The anti-pattern the strengthened gate closes: `schema_is_current` tested
+    /// field-name PRESENCE only, so a field whose TYPE changed — or an index
+    /// carrying EXTRA fields (a downgrade) — passed the drift gate and surfaced
+    /// later as a runtime query error instead of triggering a rebuild. The gate
+    /// now compares the whole schema structurally.
+    #[test]
+    fn schema_drift_is_caught_by_type_not_only_by_field_name() {
+        // The canonical schema an index this build created always matches.
+        let dir = scratch("schema-match");
+        let index = Index::create_in_dir(&dir, build_schema()).unwrap();
+        assert!(
+            schema_is_current(&index),
+            "an index built from build_schema() is current"
+        );
+        drop(index);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Same field NAMES and `body` stored (so the old presence check passed),
+        // but `amount` is retyped u64 -> text. Structural equality rejects it.
+        let mut b = Schema::builder();
+        b.add_text_field("id", STRING | STORED);
+        b.add_text_field("app", STRING | STORED);
+        b.add_text_field("dataset", STRING | STORED);
+        b.add_text_field("url", STRING | STORED);
+        b.add_text_field("title", TEXT | STORED);
+        b.add_text_field("body", TEXT | STORED);
+        b.add_i64_field("indexed_at", INDEXED | STORED | FAST);
+        b.add_text_field("amount", TEXT | STORED); // <- drifted type
+        b.add_i64_field("event_date", INDEXED | STORED | FAST);
+        let dir = scratch("schema-retyped");
+        let drifted = Index::create_in_dir(&dir, b.build()).unwrap();
+        assert!(
+            !schema_is_current(&drifted),
+            "a field whose TYPE changed must read as drift, not as current"
+        );
+        drop(drifted);
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Downgrade: every canonical field present AND stored, plus an EXTRA
+        // field a newer build added. The old check passed; equality rejects it.
+        let mut b = Schema::builder();
+        b.add_text_field("id", STRING | STORED);
+        b.add_text_field("app", STRING | STORED);
+        b.add_text_field("dataset", STRING | STORED);
+        b.add_text_field("url", STRING | STORED);
+        b.add_text_field("title", TEXT | STORED);
+        b.add_text_field("body", TEXT | STORED);
+        b.add_i64_field("indexed_at", INDEXED | STORED | FAST);
+        b.add_u64_field("amount", INDEXED | STORED | FAST);
+        b.add_i64_field("event_date", INDEXED | STORED | FAST);
+        b.add_text_field("summary", TEXT | STORED); // <- extra field (downgrade)
+        let dir = scratch("schema-extra");
+        let newer = Index::create_in_dir(&dir, b.build()).unwrap();
+        assert!(
+            !schema_is_current(&newer),
+            "an index with EXTRA fields (a downgrade) must read as drift"
+        );
+        drop(newer);
         let _ = std::fs::remove_dir_all(&dir);
     }
 
