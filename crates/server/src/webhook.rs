@@ -34,7 +34,7 @@
 //! WASM sinks are deliberately OUT of v1. The seam for them is the transport
 //! branch in [`deliver`]: a future `plugin:<name>` sink value would resolve
 //! through the plugin host with the same `(delivery_id, event, body)` contract
-//! and report `(delivered, attempts, last_error)` like the built-ins.
+//! and report `(delivered, attempts, last_error, permanent)` like the built-ins.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -50,6 +50,49 @@ use crate::state::AppState;
 type HmacSha256 = Hmac<Sha256>;
 
 const MAX_ATTEMPTS: u64 = 3;
+
+/// Upper bound on how long a receiver's `Retry-After` hint may delay the NEXT
+/// in-process attempt. A large hint ("come back in 300s") belongs to the DLQ
+/// ladder, not a parked delivery-pool slot — the ladder's first rung (30s)
+/// already covers it — so in-process honoring is capped here and the ladder
+/// takes anything longer.
+const RETRY_AFTER_INPROC_CAP: Duration = Duration::from_secs(5);
+
+/// How the retry ladder should treat one attempt's HTTP outcome.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DeliveryClass {
+    /// 2xx — delivered.
+    Success,
+    /// Worth retrying: 5xx, 429 (rate-limited — honor `Retry-After`), and any
+    /// unexpected non-4xx status. The receiver may accept the same body later.
+    Transient,
+    /// A 4xx the receiver will keep rejecting the same body for (400, 404, 405,
+    /// 410, 422…). Retrying only burns attempts and delays the `dead` state; the
+    /// sender should stop now.
+    Permanent,
+}
+
+/// Classify a response status for the retry ladder. The split is by class, not a
+/// hand-maintained list: 2xx succeeds; 429 is transient (rate-limited, carries a
+/// `Retry-After` the loop honors); every OTHER 4xx is permanent; everything else
+/// (5xx, and the odd 3xx that escaped redirect-following) is transient.
+fn classify_status(status: u16) -> DeliveryClass {
+    match status {
+        200..=299 => DeliveryClass::Success,
+        429 => DeliveryClass::Transient,
+        400..=499 => DeliveryClass::Permanent,
+        _ => DeliveryClass::Transient,
+    }
+}
+
+/// Parses a `Retry-After` header value into a delay. Handles the delta-seconds
+/// form (`Retry-After: 120`); the HTTP-date form is intentionally not honored in
+/// this in-process loop (it returns `None`, so the caller falls back to its
+/// linear backoff and the DLQ ladder still applies). Negative/garbage → `None`.
+fn parse_retry_after(value: &str) -> Option<Duration> {
+    let secs: i64 = value.trim().parse().ok()?;
+    (secs >= 0).then(|| Duration::from_secs(secs as u64))
+}
 
 /// Auto-drain backoff schedule (seconds) indexed by a delivery's `retry_count`:
 /// 30s → 1m → 5m → 30m → 2h. Past the last entry the row is marked `dead`.
@@ -308,8 +351,8 @@ pub async fn replay(
 /// system whose fate nothing anywhere could report, not the DLQ, not the log,
 /// not `/metrics`. A `warn!` line carrying attempts and the last error is the
 /// honest ceiling when the durable store is the thing that failed.
-fn unlogged_outcome_summary(outcome: &(bool, i64, Option<String>)) -> String {
-    let (delivered, attempts, last_error) = outcome;
+fn unlogged_outcome_summary(outcome: &(bool, i64, Option<String>, bool)) -> String {
+    let (delivered, attempts, last_error, _permanent) = outcome;
     if *delivered {
         format!("delivered after {attempts} attempt(s)")
     } else {
@@ -391,13 +434,22 @@ async fn log_outcome(
     storage: &Storage,
     delivery_id: &str,
     url: &str,
-    outcome: (bool, i64, Option<String>),
+    outcome: (bool, i64, Option<String>, bool),
 ) {
-    let (delivered, attempts, last_error) = outcome;
+    let (delivered, attempts, last_error, permanent) = outcome;
     let result = if delivered {
         debug!(delivery = %delivery_id, url = %url, "webhook delivered");
         storage
             .finish_delivery(delivery_id, true, attempts, last_error.as_deref())
+            .await
+    } else if permanent {
+        // A permanent 4xx: the receiver will keep rejecting this body, so the
+        // DLQ ladder would only spend 30s→…→2h to reach the same `dead` state.
+        // Mark it `dead` now — a delivery the operator can see and replay, but
+        // that stops pretending a resend will change the answer.
+        debug!(delivery = %delivery_id, url = %url, "webhook delivery permanently rejected; marking dead");
+        storage
+            .kill_delivery(delivery_id, attempts, last_error.as_deref())
             .await
     } else {
         // Don't give up: schedule a backed-off auto-drain retry (or mark the row
@@ -581,9 +633,12 @@ pub async fn drain_due(state: &AppState) {
 /// The sink transport. `file://` pseudo-URLs append to the local sinks dir;
 /// everything else (webhook + slack) is the HTTP retry loop: up to
 /// MAX_ATTEMPTS sends with linear backoff. Returns
-/// (delivered, attempts_made, last_error). This is the single branch point
-/// every path (fresh dispatch, DLQ drain, manual replay) funnels through —
-/// and the seam where a future WASM `plugin:` sink would hook in.
+/// `(delivered, attempts_made, last_error, permanent)`. `permanent` is set when
+/// the receiver returned a 4xx it will keep rejecting — the caller then marks
+/// the row `dead` immediately instead of climbing the DLQ ladder. This is the
+/// single branch point every path (fresh dispatch, DLQ drain, manual replay)
+/// funnels through — and the seam where a future WASM `plugin:` sink would hook
+/// in.
 #[allow(clippy::too_many_arguments)]
 async fn deliver(
     storage: &Storage,
@@ -593,15 +648,20 @@ async fn deliver(
     delivery_id: &str,
     body: &[u8],
     secret: Option<&str>,
-) -> (bool, i64, Option<String>) {
+) -> (bool, i64, Option<String>, bool) {
     if url.starts_with(FILE_SINK_SCHEME) {
         return deliver_file(&sinks_dir(storage), url, event, delivery_id, body).await;
     }
     let mut last_error = None;
+    // Sleep before the NEXT attempt: linear backoff by default, overridden by a
+    // transient response's `Retry-After` (capped). Recomputed after each attempt.
+    let mut next_sleep = Duration::from_secs(0);
     for attempt in 0..MAX_ATTEMPTS {
-        if attempt > 0 {
-            tokio::time::sleep(Duration::from_secs(2 * attempt)).await;
+        if attempt > 0 && !next_sleep.is_zero() {
+            tokio::time::sleep(next_sleep).await;
         }
+        // Default backoff for the attempt that follows this one (linear: 2s, 4s).
+        next_sleep = Duration::from_secs(2 * (attempt + 1));
         // Per-attempt timestamp, covered by the signature so the receiver can
         // reject stale deliveries. The delivery id is STABLE across retries and
         // replays — that stability is what makes it a usable idempotency key.
@@ -619,13 +679,42 @@ async fn deliver(
         }
         match req.send().await {
             Ok(resp) if resp.status().is_success() => {
-                return (true, attempt as i64 + 1, None);
+                return (true, attempt as i64 + 1, None, false);
             }
-            Ok(resp) => last_error = Some(format!("non-2xx: {}", resp.status())),
+            Ok(resp) => {
+                let status = resp.status();
+                match classify_status(status.as_u16()) {
+                    DeliveryClass::Permanent => {
+                        // A 4xx the receiver will keep rejecting: stop now rather
+                        // than burning the remaining in-process attempts AND the
+                        // whole DLQ ladder to reach the same `dead` state.
+                        return (
+                            false,
+                            attempt as i64 + 1,
+                            Some(format!("non-2xx (permanent): {status}")),
+                            true,
+                        );
+                    }
+                    _ => {
+                        last_error = Some(format!("non-2xx: {status}"));
+                        // Rate-limited / transient: honor a Retry-After hint for
+                        // the next in-process sleep, capped so a huge hint can't
+                        // park the pool slot (the DLQ ladder covers longer waits).
+                        if let Some(ra) = resp
+                            .headers()
+                            .get("retry-after")
+                            .and_then(|v| v.to_str().ok())
+                            .and_then(parse_retry_after)
+                        {
+                            next_sleep = ra.min(RETRY_AFTER_INPROC_CAP);
+                        }
+                    }
+                }
+            }
             Err(e) => last_error = Some(format!("send error: {e}")),
         }
     }
-    (false, MAX_ATTEMPTS as i64, last_error)
+    (false, MAX_ATTEMPTS as i64, last_error, false)
 }
 
 /// File-sink transport: append one NDJSON envelope line. The envelope carries
@@ -640,9 +729,15 @@ async fn deliver_file(
     event: &str,
     delivery_id: &str,
     body: &[u8],
-) -> (bool, i64, Option<String>) {
+) -> (bool, i64, Option<String>, bool) {
     let Some(path) = file_sink_path(dir, url) else {
-        return (false, 1, Some(format!("invalid file-sink url '{url}'")));
+        // A malformed file-sink URL will never parse on a retry — permanent.
+        return (
+            false,
+            1,
+            Some(format!("invalid file-sink url '{url}'")),
+            true,
+        );
     };
     // serde_json output is single-line; a body that fails to parse (shouldn't
     // happen — we serialized it) is embedded as a JSON string, keeping every
@@ -656,8 +751,9 @@ async fn deliver_file(
         "payload": payload,
     });
     match append_line(&path, &line).await {
-        Ok(()) => (true, 1, None),
-        Err(e) => (false, 1, Some(format!("file sink append: {e}"))),
+        Ok(()) => (true, 1, None, false),
+        // A disk/permissions failure may clear — leave it to the DLQ ladder.
+        Err(e) => (false, 1, Some(format!("file sink append: {e}")), false),
     }
 }
 
@@ -881,7 +977,7 @@ mod tests {
     /// the floor, so the ONE delivery with no DLQ row also had no report.
     #[test]
     fn unlogged_fallback_reports_outcome_not_silence() {
-        let failed = unlogged_outcome_summary(&(false, 3, Some("non-2xx: 503".into())));
+        let failed = unlogged_outcome_summary(&(false, 3, Some("non-2xx: 503".into()), false));
         assert!(failed.contains('3'), "attempts are in the line: {failed}");
         assert!(
             failed.contains("503"),
@@ -892,19 +988,109 @@ mod tests {
             "says both what happened and why it isn't recoverable: {failed}"
         );
         // A missing error string must not render as an empty tail.
-        let no_error = unlogged_outcome_summary(&(false, 1, None));
+        let no_error = unlogged_outcome_summary(&(false, 1, None, false));
         assert!(no_error.contains("no error recorded"), "{no_error}");
         // The success case is still reported — "it went out" is the fact an
         // operator needs when the log row is missing.
-        let ok = unlogged_outcome_summary(&(true, 2, None));
+        let ok = unlogged_outcome_summary(&(true, 2, None, false));
         assert!(ok.starts_with("delivered after 2"), "{ok}");
+    }
+
+    /// THE anti-pattern this closes: `deliver` treated every non-2xx identically,
+    /// so a receiver that returns a PERMANENT 4xx (410 Gone, 400 malformed, 404,
+    /// 422) burned all 3 in-process attempts AND climbed the full 5-rung DLQ
+    /// ladder (30s→1m→5m→30m→2h) — ~8 sends over ~2.6h — before the row read
+    /// `dead`. A permanent error is retried as if transient. Only 429 among the
+    /// 4xx is transient (rate-limited); 5xx stays transient.
+    #[test]
+    fn permanent_4xx_is_not_retried_but_429_and_5xx_are() {
+        use DeliveryClass::*;
+        assert_eq!(classify_status(200), Success);
+        assert_eq!(classify_status(204), Success);
+        // The permanent set: a resend cannot fix these.
+        for s in [400u16, 401, 403, 404, 405, 410, 422] {
+            assert_eq!(classify_status(s), Permanent, "status {s} must be permanent");
+        }
+        // Rate-limited and server errors are worth retrying.
+        assert_eq!(classify_status(429), Transient, "429 is rate-limited, not permanent");
+        for s in [500u16, 502, 503, 504] {
+            assert_eq!(classify_status(s), Transient, "status {s} must be transient");
+        }
+    }
+
+    /// A 429's `Retry-After` hint is honored (delta-seconds), capped so a large
+    /// hint can't park a delivery-pool slot; the HTTP-date form and garbage yield
+    /// `None` so the loop falls back to its linear backoff.
+    #[test]
+    fn retry_after_delta_seconds_is_parsed_and_capped() {
+        assert_eq!(parse_retry_after("2"), Some(Duration::from_secs(2)));
+        assert_eq!(parse_retry_after("  120 "), Some(Duration::from_secs(120)));
+        assert_eq!(parse_retry_after("0"), Some(Duration::from_secs(0)));
+        // Not honored in this loop: HTTP-date form and garbage.
+        assert_eq!(parse_retry_after("Wed, 21 Oct 2026 07:28:00 GMT"), None);
+        assert_eq!(parse_retry_after("-5"), None);
+        assert_eq!(parse_retry_after(""), None);
+        // The in-process honoring is capped: a big hint is clamped to the cap
+        // (the DLQ ladder covers anything longer).
+        let honored = parse_retry_after("300").unwrap().min(RETRY_AFTER_INPROC_CAP);
+        assert_eq!(honored, RETRY_AFTER_INPROC_CAP);
+    }
+
+    #[tokio::test]
+    async fn a_permanent_rejection_marks_the_row_dead_now_not_after_the_ladder() {
+        let store = TempStore::new("permanent-dead").await;
+        let id = store
+            .storage
+            .create_delivery("job", "ref", "https://x/hook", "evt", "{}")
+            .await
+            .expect("create delivery");
+        // The permanent branch of log_outcome: kill_delivery, not fail_delivery.
+        log_outcome(
+            &store.storage,
+            &id,
+            "https://x/hook",
+            (false, 1, Some("non-2xx (permanent): 410 Gone".into()), true),
+        )
+        .await;
+        let row = store
+            .storage
+            .get_delivery(&id)
+            .await
+            .expect("read delivery")
+            .expect("row exists");
+        assert_eq!(row.status, "dead", "a permanent 4xx is dead immediately");
+        // Contrast: a transient failure schedules a retry (status `failed`), it
+        // does NOT jump to dead.
+        let id2 = store
+            .storage
+            .create_delivery("job", "ref", "https://x/hook", "evt", "{}")
+            .await
+            .expect("create delivery");
+        log_outcome(
+            &store.storage,
+            &id2,
+            "https://x/hook",
+            (false, 3, Some("non-2xx: 503".into()), false),
+        )
+        .await;
+        let row2 = store
+            .storage
+            .get_delivery(&id2)
+            .await
+            .expect("read delivery")
+            .expect("row exists");
+        assert_eq!(row2.status, "failed", "a transient 5xx ladders, not dies");
     }
 
     #[test]
     fn stale_pending_threshold_clears_the_worst_case_in_process_delivery() {
-        // 3 attempts x 15s client timeout + backoff sleeps (0 + 2 + 4).
-        let worst_case_secs = (MAX_ATTEMPTS as i64) * 15 + 2 + 4;
-        assert_eq!(worst_case_secs, 51);
+        // 3 attempts x 15s client timeout + the between-attempt sleeps. Each of
+        // the 2 gaps is linear backoff (2s, 4s) OR, when a transient response
+        // carried a Retry-After, at most RETRY_AFTER_INPROC_CAP — so the worst
+        // case is 2 gaps of the cap.
+        let cap = RETRY_AFTER_INPROC_CAP.as_secs() as i64;
+        let worst_gap = cap.max(4); // the larger of the linear tail and the cap
+        let worst_case_secs = (MAX_ATTEMPTS as i64) * 15 + 2 * worst_gap;
         assert!(
             STALE_PENDING_SECS >= worst_case_secs * 10,
             "reclaim must not race a merely-slow delivery: {STALE_PENDING_SECS}s vs \

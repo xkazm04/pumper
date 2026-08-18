@@ -1558,6 +1558,26 @@ impl Storage {
         Ok(())
     }
 
+    /// Marks a delivery `dead` immediately, skipping the retry ladder. Used when
+    /// the sender classified the failure as PERMANENT (a 4xx the receiver will
+    /// keep rejecting): laddering it would burn the full backoff schedule
+    /// (30s → 1m → 5m → 30m → 2h) only to reach the same `dead` state a human
+    /// needs to see now. Same terminal UPDATE as [`fail_delivery`]'s past-the-cap
+    /// branch, reached without spending the attempts. No-op if the row vanished.
+    pub async fn kill_delivery(&self, id: &str, attempts: i64, last_error: Option<&str>) -> Result<()> {
+        sqlx::query(
+            "UPDATE webhook_deliveries SET status = 'dead', attempts = attempts + ?2, \
+             last_error = ?3, next_retry_at = NULL, updated_at = ?4 WHERE id = ?1",
+        )
+        .bind(id)
+        .bind(attempts)
+        .bind(last_error)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     /// Failed deliveries whose scheduled retry is due (`next_retry_at <= now`),
     /// soonest first — the auto-drain's work list. Includes the body so the drain
     /// can re-send without a second read.
