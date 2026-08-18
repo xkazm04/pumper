@@ -602,7 +602,8 @@ impl Storage {
         schedule_id: &str,
     ) -> Result<Option<(String, String)>> {
         let row: Option<(String, String)> = sqlx::query_as(
-            "SELECT id, status FROM jobs WHERE schedule_id = ?1 ORDER BY created_at DESC LIMIT 1",
+            "SELECT id, status FROM jobs WHERE schedule_id = ?1 \
+             ORDER BY created_at DESC, id DESC LIMIT 1",
         )
         .bind(schedule_id)
         .fetch_optional(&self.pool)
@@ -3385,4 +3386,65 @@ fn parse_ts(s: &str) -> Result<DateTime<Utc>> {
     DateTime::parse_from_rfc3339(s)
         .map(|d| d.with_timezone(&Utc))
         .map_err(|e| Error::Parse(format!("bad timestamp '{s}': {e}")))
+}
+
+#[cfg(test)]
+mod latest_job_tiebreaker_tests {
+    use crate::testing::TempStore;
+    use crate::EnqueueOptions;
+
+    /// The overlap guard reads `latest_job_for_schedule` to decide "don't stack a
+    /// run while mine is still going". Its `ORDER BY created_at DESC LIMIT 1` had
+    /// no `id` tiebreaker, so two jobs of one schedule sharing the exact
+    /// `created_at` selected an ARBITRARY newest — the one query in the group
+    /// that deviated from the house `created_at DESC, id DESC` keyset. This pins
+    /// the deterministic choice: among tied timestamps, the greatest id wins.
+    #[tokio::test]
+    async fn latest_job_for_schedule_breaks_created_at_ties_by_id() {
+        let store = TempStore::new("latest-job-tiebreak").await;
+        let sched = "sched-tiebreak";
+
+        // Two jobs of the SAME schedule. Enqueue order fixes their rowids
+        // (job_a first, job_b second).
+        let opts = |()| EnqueueOptions {
+            schedule_id: Some(sched.to_string()),
+            ..Default::default()
+        };
+        let job_a = store.storage.enqueue("fake", opts(())).await.unwrap();
+        let job_b = store.storage.enqueue("fake", opts(())).await.unwrap();
+
+        // Force the ambiguity the finding names: assign deterministic ids so the
+        // greatest id (`zzzz…`) is on the LATER-inserted row, and collapse both
+        // timestamps onto one value. Now only an `id` tiebreaker can decide.
+        let pool = store.storage.pool();
+        let low_id = "00000000-0000-0000-0000-000000000000";
+        let high_id = "ffffffff-ffff-ffff-ffff-ffffffffffff";
+        let same_ts = "2026-08-18T00:00:00.000000Z";
+        sqlx::query("UPDATE jobs SET id = ?2, created_at = ?3 WHERE id = ?1")
+            .bind(job_a.id.to_string())
+            .bind(low_id)
+            .bind(same_ts)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE jobs SET id = ?2, created_at = ?3 WHERE id = ?1")
+            .bind(job_b.id.to_string())
+            .bind(high_id)
+            .bind(same_ts)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let (id, _status) = store
+            .storage
+            .latest_job_for_schedule(sched)
+            .await
+            .unwrap()
+            .expect("a job exists for the schedule");
+        assert_eq!(
+            id, high_id,
+            "a created_at tie must resolve to the greatest id (house keyset), not \
+             an arbitrary row"
+        );
+    }
 }
