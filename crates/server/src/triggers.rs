@@ -9,7 +9,7 @@
 //! the IO around these.
 
 use pumper_core::config::TriggersConfig;
-use pumper_core::{Job, Revision, Trigger};
+use pumper_core::{Job, JobStatus, Revision, Trigger};
 use serde_json::{json, Value};
 
 /// Whether a hop may fire, per the provenance riding in the source job's
@@ -74,7 +74,7 @@ pub fn change_matches(on_change: Option<&str>, change: &str) -> bool {
 /// True when a terminal status passes the trigger's `on_status` filter.
 pub fn status_matches(on_status: Option<&str>, status: &str) -> bool {
     match on_status.unwrap_or("succeeded") {
-        "any" => matches!(status, "succeeded" | "failed" | "cancelled"),
+        "any" => JobStatus::parse(status).is_some_and(|s| s.is_terminal()),
         filter => filter == status,
     }
 }

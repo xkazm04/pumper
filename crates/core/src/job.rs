@@ -34,6 +34,17 @@ impl JobStatus {
             _ => None,
         }
     }
+
+    /// The single authority for "is this job in a terminal state?". Every SSE
+    /// self-termination check and trigger filter routes through here so adding a
+    /// new terminal variant can never silently leave a stream open (or a trigger
+    /// unfired) at one forgotten call site.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
+        )
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -62,4 +73,45 @@ pub struct Job {
     pub available_at: DateTime<Utc>,
     pub started_at: Option<DateTime<Utc>>,
     pub finished_at: Option<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::JobStatus;
+
+    const ALL: [JobStatus; 5] = [
+        JobStatus::Queued,
+        JobStatus::Running,
+        JobStatus::Succeeded,
+        JobStatus::Failed,
+        JobStatus::Cancelled,
+    ];
+
+    #[test]
+    fn is_terminal_matches_intended_set() {
+        assert!(JobStatus::Succeeded.is_terminal());
+        assert!(JobStatus::Failed.is_terminal());
+        assert!(JobStatus::Cancelled.is_terminal());
+        assert!(!JobStatus::Queued.is_terminal());
+        assert!(!JobStatus::Running.is_terminal());
+    }
+
+    /// Meta-test: the string-literal terminal predicate that the SSE and trigger
+    /// call sites replaced (`matches!(s, "succeeded" | "failed" | "cancelled")`)
+    /// must agree, variant for variant, with the enum authority — so routing a
+    /// string through `parse(..).is_terminal()` cannot drift from the source of
+    /// truth if a new terminal variant is ever added.
+    #[test]
+    fn string_sites_agree_with_enum_authority() {
+        for status in ALL {
+            let via_enum = status.is_terminal();
+            let via_string =
+                JobStatus::parse(status.as_str()).is_some_and(|j| j.is_terminal());
+            assert_eq!(
+                via_enum, via_string,
+                "string predicate disagrees with enum for {:?}",
+                status
+            );
+        }
+    }
 }

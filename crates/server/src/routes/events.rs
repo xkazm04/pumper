@@ -123,7 +123,7 @@ pub(crate) async fn stream_job(
             event.result = job.result.clone();
             event.error = job.error.clone();
             yield Ok(snapshot_event(&event));
-            if is_terminal(job.status) {
+            if job.status.is_terminal() {
                 return;
             }
         }
@@ -143,7 +143,8 @@ pub(crate) async fn stream_job(
                     if event.job_id != id {
                         continue;
                     }
-                    let done = matches!(event.status.as_str(), "succeeded" | "failed" | "cancelled");
+                    let done = JobStatus::parse(event.status.as_str())
+                        .is_some_and(|s| s.is_terminal());
                     yield Ok(sse_event(seq, &event));
                     if done {
                         break;
@@ -250,9 +251,3 @@ fn reset_event(latest: u64) -> Event {
         .data("replay gap: reconnect point too old, resync state")
 }
 
-fn is_terminal(status: JobStatus) -> bool {
-    matches!(
-        status,
-        JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
-    )
-}

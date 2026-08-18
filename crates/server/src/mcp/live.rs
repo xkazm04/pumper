@@ -203,13 +203,6 @@ fn reset_event(latest: u64) -> Event {
 
 // ---- wait_job ----------------------------------------------------------------
 
-fn is_terminal(status: JobStatus) -> bool {
-    matches!(
-        status,
-        JobStatus::Succeeded | JobStatus::Failed | JobStatus::Cancelled
-    )
-}
-
 /// The `wait_job` tool: blocks (bounded) until the job reaches a terminal
 /// status, watching the event bus rather than polling storage. `timeout_secs`
 /// is clamped to `[mcp] wait_job_max_secs`; hitting the deadline is a normal
@@ -229,7 +222,7 @@ pub(crate) async fn wait_job(state: &AppState, args: &Value) -> Result<Value, St
     // and the listen loop cannot be missed.
     let mut rx = state.events.subscribe();
     let job = fetch(state, id).await?;
-    if is_terminal(job.status) {
+    if job.status.is_terminal() {
         let status = job.status.as_str().to_string();
         return Ok(finished(job, &status));
     }
@@ -242,14 +235,14 @@ pub(crate) async fn wait_job(state: &AppState, args: &Value) -> Result<Value, St
                 // The terminal transition may be among the dropped events —
                 // storage is the truth, so re-check it instead of the ring.
                 let job = fetch(state, id).await?;
-                if is_terminal(job.status) {
+                if job.status.is_terminal() {
                     let status = job.status.as_str().to_string();
                     return Ok(finished(job, &status));
                 }
             }
             Ok(Ok((_seq, event))) => {
                 if event.job_id == id
-                    && matches!(event.status.as_str(), "succeeded" | "failed" | "cancelled")
+                    && JobStatus::parse(event.status.as_str()).is_some_and(|s| s.is_terminal())
                 {
                     let job = fetch(state, id).await?;
                     return Ok(finished(job, &event.status));
