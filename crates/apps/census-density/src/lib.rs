@@ -270,8 +270,10 @@ impl ScrapeApp for CensusDensity {
         let mut summary = pumper_core::UpsertSummary::default();
         let mut record_count = 0usize;
         let mut trade_summaries: Vec<Value> = Vec::new();
-        // place label -> combined establishments across all trades (overall ranking).
-        let mut overall: BTreeMap<String, i64> = BTreeMap::new();
+        // Per-trade ranked place->establishments, folded into the overall ranking
+        // AFTER the loop by `overall_ranking`, which drops overlapping-grain NAICS
+        // (a covering code plus a finer subset of it) so they are not summed twice.
+        let mut trades_ranked: Vec<(String, Vec<(String, i64)>)> = Vec::new();
         // Run-level suppression telemetry: what the API declined to tell us.
         let mut empty_answers = 0usize;
         let mut suppression = Suppression::default();
@@ -365,9 +367,7 @@ impl ScrapeApp for CensusDensity {
                 paired,
             } = map_cbp_rows(&rows, &cols, naics, label, &geo, &year);
             suppression.merge(&suppressed);
-            for (place, estab) in &ranked {
-                *overall.entry(place.clone()).or_insert(0) += estab;
-            }
+            trades_ranked.push((naics.clone(), ranked.clone()));
 
             ranked.sort_by_key(|(_, e)| std::cmp::Reverse(*e));
             let top: Vec<Value> = ranked
@@ -404,6 +404,7 @@ impl ScrapeApp for CensusDensity {
             );
         }
 
+        let overall = overall_ranking(&trades_ranked);
         let mut overall_vec: Vec<(String, i64)> =
             overall.iter().map(|(k, v)| (k.clone(), *v)).collect();
         overall_vec.sort_by_key(|(_, e)| std::cmp::Reverse(*e));
@@ -805,6 +806,33 @@ pub struct Normalized {
     /// Places whose chosen base is 0 or negative (an ACS jam value, or a
     /// genuinely empty base) — dividing would fabricate an infinity.
     pub base_not_positive: usize,
+}
+
+/// Fold each trade's ranked place->establishments into one cross-trade overall
+/// ranking, dropping overlapping-grain NAICS so they are not double-counted.
+///
+/// When the requested trades span overlapping grains — a covering code and a
+/// finer subset of it (e.g. sector `"23"` and its subgroup `"2382"`, or `"2382"`
+/// and its 6-digit component `"238220"`) — the CBP request for the covering code
+/// ALREADY contains the subset's establishments, so summing both inflates every
+/// place. This mirrors the blend's guard exactly: reuse
+/// [`census_common::covering_naics`] (keep the covering code, drop the covered)
+/// and only fold the kept codes into the overall map.
+fn overall_ranking(trades_ranked: &[(String, Vec<(String, i64)>)]) -> BTreeMap<String, i64> {
+    let contributing: BTreeSet<String> =
+        trades_ranked.iter().map(|(n, _)| n.clone()).collect();
+    let (counted, _dropped) = census_common::covering_naics(&contributing);
+    let counted: BTreeSet<String> = counted.into_iter().collect();
+    let mut overall: BTreeMap<String, i64> = BTreeMap::new();
+    for (naics, ranked) in trades_ranked {
+        if !counted.contains(naics) {
+            continue;
+        }
+        for (place, estab) in ranked {
+            *overall.entry(place.clone()).or_insert(0) += *estab;
+        }
+    }
+    overall
 }
 
 /// Join establishment counts to an ACS base and rank by establishments per 10k.
@@ -2297,6 +2325,28 @@ mod tests {
         assert_eq!(plain[0].1["employer_establishments"], 150);
         assert_eq!(plain[0].1["employer_naics"], json!(["238210", "238220"]));
         assert_eq!(plain[0].1["employer_naics_covered"], json!([]));
+    }
+
+    /// The same anti-pattern as `a_covering_naics_is_not_double_summed_with_its_components`,
+    /// but on the OTHER path: the cross-trade overall ranking. Requested trades
+    /// span overlapping grains — sector `"23"` and its subgroup `"2382"`. CBP's
+    /// request for `"23"` already contains `"2382"`'s establishments, so folding
+    /// both into `overall` double-counts. `overall_ranking` reuses the blend's
+    /// `covering_naics` guard: keep the covering code, drop the covered subset.
+    #[test]
+    fn overall_ranking_does_not_double_count_overlapping_naics_grains() {
+        let sector = ("23".to_string(), vec![("Austin, TX".to_string(), 100i64)]);
+        let subgroup = ("2382".to_string(), vec![("Austin, TX".to_string(), 40i64)]);
+        let overall = overall_ranking(&[sector, subgroup]);
+        // 100 (the covering sector's total), NOT 140 — the subgroup is subsumed.
+        assert_eq!(overall.get("Austin, TX"), Some(&100));
+
+        // Single-grain (the normal case) is untouched: two non-overlapping codes
+        // both contribute to the combined total.
+        let a = ("238210".to_string(), vec![("Austin, TX".to_string(), 30i64)]);
+        let b = ("238220".to_string(), vec![("Austin, TX".to_string(), 40i64)]);
+        let plain = overall_ranking(&[a, b]);
+        assert_eq!(plain.get("Austin, TX"), Some(&70));
     }
 
     /// The anti-pattern: `updated_at` moving weekly (four apps re-derive the
