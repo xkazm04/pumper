@@ -333,7 +333,14 @@ pub fn census_num(cell: Option<&String>) -> Option<i64> {
 /// skipped-and-noted (bughunt 2026-07-14 #3). One definition, used by all four,
 /// so the guard cannot land in only part of the fleet again.
 pub fn is_empty_answer(status: u16, body: &str) -> bool {
-    status == 204 || body.trim().is_empty()
+    // "Nothing published at this grain" is only a valid answer on a SUCCESS
+    // status. A `204 No Content` says so on its own; a `2xx` with an empty body
+    // says the same by another route. But an empty body on a `5xx` (or any
+    // non-2xx) is a TRANSIENT FAILURE, not an empty answer — reading it as
+    // "nothing published" would silently drop the request instead of letting the
+    // non-success path fail it into the job's retry ladder. So the empty-body
+    // case is gated on a success status; only a bare 204 is unconditional.
+    status == 204 || ((200..300).contains(&status) && body.trim().is_empty())
 }
 
 /// Resolves the free Census API key: `params.api_key`, else env
@@ -644,6 +651,25 @@ mod tests {
         assert!(!is_empty_answer(200, "[[\"NAME\",\"ESTAB\"]]"));
         assert!(!is_empty_answer(200, "<html>missing key</html>"));
         assert!(!is_empty_answer(400, "unknown predicate variable"));
+    }
+
+    /// Regression: an EMPTY body on a non-success status is a transient failure,
+    /// not "nothing published". Reading a 5xx-with-no-body as an empty answer
+    /// swallowed the request and dropped it from the run instead of letting the
+    /// non-success path fail it into the retry ladder — silent data loss on a
+    /// server hiccup. Only an empty body on a SUCCESS status is an empty answer.
+    #[test]
+    fn an_empty_body_on_a_non_success_status_is_a_failure_not_an_empty_answer() {
+        // The bug: these must NOT be read as "nothing published".
+        assert!(!is_empty_answer(500, ""), "500 with no body is a transient failure");
+        assert!(!is_empty_answer(503, "   \n "), "503 with a blank body is a failure");
+        assert!(!is_empty_answer(502, ""));
+        assert!(!is_empty_answer(429, ""), "rate-limit with no body must retry, not skip");
+        assert!(!is_empty_answer(400, ""), "a 4xx with no body is still not an empty answer");
+        // The success cases are unchanged — an empty answer still means empty.
+        assert!(is_empty_answer(200, ""));
+        assert!(is_empty_answer(204, ""));
+        assert!(is_empty_answer(204, "[[\"NAME\"]]"), "204 still wins on its own");
     }
 
     /// All four census apps must route their empty-answer check through
