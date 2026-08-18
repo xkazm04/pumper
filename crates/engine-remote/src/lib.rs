@@ -1415,6 +1415,9 @@ mod tests {
     fn proxy_response_mirrors_http_response_serde() {
         // HttpResponse is Serialize-only in core; the mirror must read its
         // exact output. Serialize a real HttpResponse, read it back here.
+        // (The exhaustive literal is a compile-time canary: a new core field
+        // forces this line — and the `From<ProxyResponse>` impl — to be updated,
+        // which forces the field onto the mirror.)
         let real = HttpResponse {
             status: 203,
             headers: HashMap::from([("k".into(), "v".into())]),
@@ -1430,5 +1433,19 @@ mod tests {
         assert_eq!(back.body, "b");
         assert_eq!(back.final_url, "https://f.example/");
         assert!(back.cache_hit);
+
+        // The additive-drift guard: every field HttpResponse serializes must
+        // survive the round-trip THROUGH the mirror. A field present on
+        // HttpResponse but absent from ProxyResponse is silently dropped by
+        // serde (unknown keys are ignored) and would come back defaulted — this
+        // whole-value identity catches that where the per-field asserts above
+        // cannot (they only know the fields that exist today).
+        let before = serde_json::to_value(&real).unwrap();
+        let after = serde_json::to_value(&back).unwrap();
+        assert_eq!(
+            before, after,
+            "the wire mirror dropped a field HttpResponse emits — add it to \
+             ProxyResponse (or share the type)"
+        );
     }
 }
