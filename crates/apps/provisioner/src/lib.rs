@@ -1204,7 +1204,13 @@ impl ScrapeApp for Provisioner {
                 }
                 Err(e) => {
                     feedback = Some(format!("rules failed to compile: {e}"));
-                    last_rules_value = Some(draft);
+                    // Do NOT record this draft as `last_rules_value`: it did not
+                    // compile, so there is no `last_dry` verdict that describes
+                    // it. Overwriting the rule set without also replacing the
+                    // dry-run would desync the pair the emit stage reads at
+                    // `(last_rules_value, last_dry)` — pairing an uncompilable
+                    // rule set with an EARLIER draft's verdict. The last
+                    // successfully dry-run pair stays coupled and is what emits.
                 }
             }
         }
@@ -2034,6 +2040,94 @@ mod tests {
         assert!(
             calls[1].prompt.contains("class=\"card\""),
             "the drafting prompt must carry the sampled DOM"
+        );
+    }
+
+    /// Regression: the drafting loop keeps `(last_rules_value, last_dry)` as a
+    /// pair that describes the SAME rule set. When the FINAL draft fails to
+    /// COMPILE (the `Err` arm of `dry_run`), it must not overwrite the recorded
+    /// rule set while leaving an earlier draft's dry-run verdict in place — that
+    /// desync would emit a proposal whose `rule_set` cannot compile, paired with
+    /// a verdict that actually describes a different, compilable draft.
+    #[tokio::test]
+    async fn an_uncompilable_final_draft_never_desyncs_the_emitted_pair() {
+        use pumper_core::testing::{
+            engines_with, research_output, Dead, ScriptedResearcher, TempStore, TestContext,
+        };
+        use std::sync::Arc;
+
+        // Draft 1 compiles, but its selector holds nothing on the page, so the
+        // dry run is Ok-but-not-accepted → the loop takes a repair iteration.
+        let draft1 = json!({ "headline": { "type": "css", "selector": ".nope" } });
+        // Draft 2 (the repair) parses as a RuleSet but its regex does not
+        // compile → the `Err` arm. This is the draft that must NOT be emitted.
+        let draft2 = json!({ "broken": { "type": "regex", "pattern": "([unclosed" } });
+
+        let researcher = Arc::new(
+            ScriptedResearcher::new()
+                .on(
+                    "Goal:",
+                    research_output(
+                        json!({"candidates": [{
+                            "url": "https://a.example/widgets",
+                            "name": "Widget Price Index",
+                            "cadence": "weekly",
+                            "expected_fields": ["headline"]
+                        }]})
+                        .to_string(),
+                    ),
+                )
+                // First (no-feedback) draft prompt.
+                .on("Draft extraction rules", research_output(draft1.to_string()))
+                // Repair prompt (feedback present) — a distinct substring.
+                .on("failed the dry run", research_output(draft2.to_string())),
+        );
+        let store = TempStore::new("provisioner-desync").await;
+        let ctx = TestContext::new(&store.storage, "provisioner")
+            .params(json!({ "prompt": "track widget prices weekly", "max_iterations": 2 }))
+            .engines(engines_with(
+                Arc::new(ListingHost),
+                Arc::new(Dead),
+                researcher.clone(),
+            ))
+            .build();
+
+        let out = Provisioner
+            .run(ctx)
+            .await
+            .expect("emits a proposal from the last runnable draft");
+
+        // Both drafts were tried: one discovery call + two draft calls.
+        assert_eq!(researcher.call_count(), 3);
+        assert_eq!(out["iterations"], json!(2));
+        // The emitted verdict is the (unaccepted) one for draft 1.
+        assert_eq!(out["accepted"], json!(false));
+
+        // The emitted proposal's rule set is draft 1 (compilable), never the
+        // uncompilable draft 2 — and it is the rule set the emitted verdict
+        // actually describes.
+        let key = out["proposal_key"].as_str().unwrap();
+        let rec = store
+            .datasets()
+            .get("provisioner", "proposals", key)
+            .await
+            .unwrap()
+            .expect("proposal was upserted");
+        assert_eq!(
+            rec.data["rule_set"], draft1,
+            "the emitted rules must be the compilable draft, not the uncompilable one"
+        );
+        assert!(
+            rec.data["rule_set"].get("broken").is_none(),
+            "the uncompilable draft must never reach the emitted proposal"
+        );
+        // The rule set the proposal ships must itself compile — the concrete
+        // invariant the desync broke.
+        let rules: RuleSet =
+            serde_json::from_value(rec.data["rule_set"].clone()).expect("emitted rules parse");
+        assert!(
+            rules.compile().is_ok(),
+            "an emitted rule set must compile"
         );
     }
 
