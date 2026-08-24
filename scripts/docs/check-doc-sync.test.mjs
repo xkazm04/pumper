@@ -177,9 +177,55 @@ test('a_stop_hook_reentry_is_not_a_second_reminder', () => {
   assert.equal(r.stderr, '');
 });
 
-test('a_missing_transcript_is_not_a_hook_crash', () => {
+// --- the third outcome: could-not-check is not a pass -----------------------
+//
+// Both cases below used to exit 0 — a dead instrument reporting its own absence
+// in the voice of success, in a hook whose entire history is exactly that
+// failure. `3` is "could not check": loud, distinct from a finding (2), and
+// impossible to mistake for a clean turn.
+
+/** Run the hook against a throwaway repo root whose rule map is `content`. */
+function runHookWithMap(content, payload) {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'doc-sync-root-'));
+  fs.mkdirSync(path.join(root, 'scripts/docs'), { recursive: true });
+  if (content !== null) {
+    fs.writeFileSync(path.join(root, 'scripts/docs/feature-doc-map.json'), content);
+  }
+  return spawnSync(process.execPath, [HOOK], {
+    input: JSON.stringify(payload),
+    encoding: 'utf8',
+    env: { ...process.env, CLAUDE_PROJECT_DIR: root },
+  });
+}
+
+test('a_missing_transcript_is_cannot_check_not_a_pass', () => {
   const r = runHook({ transcript_path: path.join(os.tmpdir(), 'no-such-transcript.jsonl') });
-  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /CANNOT CHECK/);
+});
+
+test('an_empty_payload_is_cannot_check_not_a_pass', () => {
+  const r = runHook({});
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /transcript_path/);
+});
+
+test('an_unreadable_rule_map_is_cannot_check_not_a_pass', () => {
+  const transcript = materialize('turn-with-edits.jsonl');
+  const absent = runHookWithMap(null, { transcript_path: transcript });
+  assert.equal(absent.status, 3, absent.stderr);
+  const corrupt = runHookWithMap('{ not json', { transcript_path: transcript });
+  assert.equal(corrupt.status, 3, corrupt.stderr);
+  assert.match(corrupt.stderr, /rule map/);
+});
+
+test('a_rule_map_with_zero_entries_is_cannot_check_not_a_pass', () => {
+  // The empty standard: it loads, it parses, and it would pass every turn.
+  const r = runHookWithMap('{"entries": []}', {
+    transcript_path: materialize('turn-with-edits.jsonl'),
+  });
+  assert.equal(r.status, 3, r.stderr);
+  assert.match(r.stderr, /zero entries/);
 });
 
 test('a_transcript_argument_replays_the_hook_without_a_payload', () => {

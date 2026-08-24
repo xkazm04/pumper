@@ -242,6 +242,39 @@ export function formatReminder(docHits) {
   );
 }
 
+/**
+ * Exit code for "could not check" — the third outcome, and the whole point of
+ * having one.
+ *
+ * This hook used to answer 0 (pass) when its rule map was unreadable and 0
+ * again when the transcript it was pointed at did not exist: two independent
+ * ways for a dead gate to radiate confidence, in a checker whose entire history
+ * is one such silence (see the TURN BOUNDARY note above — it detected nothing
+ * for its whole life and looked exactly like a clean repo). Pass, fail and
+ * could-not-run are three states and get three exit codes:
+ *
+ *   0 — checked, and this turn is consistent.
+ *   2 — checked, and a mapped doc was not updated. Claude Code feeds a `2` back
+ *       to the model, which is what makes the reminder actionable in-session.
+ *   3 — could NOT check. Claude Code surfaces any other non-zero to the human
+ *       as a non-blocking error, which is the right audience: an operator has
+ *       to fix the instrument, and the model cannot.
+ *
+ * Nothing here ever blocks; the distinction is between a green that means
+ * something and a green that means nobody looked.
+ */
+export const EXIT_CANNOT_CHECK = 3;
+
+function cannotCheck(reason) {
+  process.stderr.write(
+    `doc-sync: CANNOT CHECK — ${reason}.\n` +
+      `This is not a pass: no doc-drift check ran for this turn. Fix the instrument \n` +
+      `(scripts/docs/feature-doc-map.json, and the Stop hook wiring in .claude/settings.json), \n` +
+      `then re-run \`just doc-sync\` to prove it works.\n`
+  );
+  process.exit(EXIT_CANNOT_CHECK);
+}
+
 function main() {
   // `node scripts/docs/check-doc-sync.mjs <transcript.jsonl>` replays the hook
   // over a recorded transcript without a hook payload — see `just doc-sync`.
@@ -252,15 +285,29 @@ function main() {
   if (payload.stop_hook_active) process.exit(0);
 
   const repoRoot = defaultRepoRoot();
-  const edited = collectEditedFilesFromTranscript(payload.transcript_path, repoRoot);
 
+  // Instrument assertion #1: the target. No transcript path, or a path that is
+  // not there, means the hook was handed nothing to read — the shape a broken
+  // trigger has, and previously indistinguishable from a clean turn.
+  if (!payload.transcript_path) cannotCheck('no transcript_path in the hook payload');
+  if (!fs.existsSync(payload.transcript_path)) {
+    cannotCheck(`the transcript does not exist: ${payload.transcript_path}`);
+  }
+
+  // Instrument assertion #2: the standard. A rule map that will not load, or
+  // one that loads to zero entries, leaves this checker running with an empty
+  // standard — it would pass every turn, forever.
   let map;
   try {
     map = JSON.parse(fs.readFileSync(mapPath(repoRoot), 'utf8'));
-  } catch {
-    process.exit(0);
+  } catch (e) {
+    cannotCheck(`the rule map could not be read or parsed (${e.message})`);
+  }
+  if (!Array.isArray(map?.entries) || map.entries.length === 0) {
+    cannotCheck('the rule map loaded with zero entries, so nothing could be matched');
   }
 
+  const edited = collectEditedFilesFromTranscript(payload.transcript_path, repoRoot);
   const { fired, docHits } = evaluateEditedFiles(edited, map);
   if (!fired) process.exit(0);
 
