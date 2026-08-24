@@ -1,0 +1,166 @@
+{
+  "doctrine": [
+    "An agent NEVER quarantines a test to make a build green. Adding a row here to",
+    "clear a red build is the build-fixing shortcut in its most respectable disguise;",
+    "it requires a human author, always. See .flake/README.md.",
+    "Every #[ignore] in crates/** must appear in exactly ONE of `quarantine` (a flake,",
+    "owned and expiring) or `exempt` (environment-gated, not a flake). Both directions",
+    "are checked: `just flake-check` fails on an unregistered ignore AND on a row that",
+    "names a test the tree no longer has."
+  ],
+  "ceiling": 4,
+  "ceilingRationale": [
+    "Stop-the-line at 5 quarantined tests. The suite has 2039 passing tests and 19",
+    "ignores, of which exactly 2 are flakes; a register that reached 5 would mean the",
+    "flake rate more than doubled without anyone fixing one, which is the point at",
+    "which the suite has quietly stopped certifying timing behaviour at all."
+  ],
+  "windowDays": 14,
+  "labelThreshold": 2,
+  "quarantine": [
+    {
+      "id": "pumper-core::lib::governor::tests::distinct_hosts_run_in_parallel_but_each_host_spaces",
+      "owner": "xkazm04",
+      "entered": "2026-08-24",
+      "expires": "2026-10-26",
+      "cause": "test",
+      "form": "skipped",
+      "formReason": [
+        "libtest has no `muted` form: #[ignore] is a skip, so the preferred 'still runs,",
+        "result recorded, does not block' shape is not available in-process. The",
+        "compensating control is the nightly `long-lanes` CI leg, which runs the whole",
+        "--ignored set through scripts/ci/flake-record.mjs — so the outcome history a",
+        "mute would have produced accumulates anyway, off the blocking path."
+      ],
+      "evidence": [
+        "crates/core/src/governor.rs:340. Asserts a wall-clock lower bound",
+        "(`elapsed >= 350ms` for two 200ms per-host gaps) and an upper bound proving 32",
+        "hosts did not serialize. The lower bound is sound; the upper bound is what",
+        "slips under load, because a loaded machine can serialize the 32 spawned tasks",
+        "onto fewer worker threads. Failure signature: `per-host spacing lost` /",
+        "the concurrency upper-bound assert, never a logic error in the sharded map.",
+        "Accumulating evidence: .flake/history/ (nightly `long-lanes`), queried with",
+        "`just flake-report`."
+      ],
+      "exitPlan": [
+        "Replace the wall-clock upper bound with an observation of the sharded map's",
+        "own state (per-host next-allowed instants), which is the property the test",
+        "actually claims. Wall clock stays only for the lower bound."
+      ]
+    },
+    {
+      "id": "pumper-engine-wasm::lib::tests::instance_pre_instantiation_is_never_slower_than_relinking_per_call",
+      "owner": "xkazm04",
+      "entered": "2026-08-24",
+      "expires": "2026-11-23",
+      "cause": "harness",
+      "form": "skipped",
+      "formReason": [
+        "Same as above — #[ignore] is libtest's only form. Staggered a month behind the",
+        "governor entry on purpose: two entries expiring on the same day produce one",
+        "review that clears both by extension, which is how expiry stops escalating."
+      ],
+      "evidence": [
+        "crates/engine-wasm/src/lib.rs:995. A 2000-iteration microbenchmark comparing",
+        "pre-instantiation against per-call relinking. The gate is deliberately",
+        "one-sided (pre-instantiation must not be a REGRESSION), but the margin is",
+        "small enough that scheduler noise on a shared runner can invert it — the",
+        "cause is the harness's resolution, not the product's speed, which is why this",
+        "is graded `harness` and not `product`.",
+        "Accumulating evidence: .flake/history/ (nightly `long-lanes`)."
+      ],
+      "exitPlan": [
+        "Take the best-of-N per path rather than the total of N, so a single descheduled",
+        "iteration cannot decide the comparison; release once the nightly lane shows a",
+        "full 14-day window with no outcome transition."
+      ]
+    }
+  ],
+  "exempt": [
+    {
+      "id": "pumper-core::test:datasets_bulk_perf::bulk_upsert_50k_cost_report",
+      "gate": "perf-harness",
+      "reason": "Cost harness over a ~50k-record corpus; minutes, not seconds. Certified by the `datasets-bulk-upsert` lane in .lanes/criteria.json, not by the per-change gate."
+    },
+    {
+      "id": "pumper-core::test:datasets_bulk_perf::duplicate_scan_50k_cost_report",
+      "gate": "perf-harness",
+      "reason": "Banded-vs-all-pairs duplicate scan over 50k rows. Certified by the `datasets-duplicate-scan` lane."
+    },
+    {
+      "id": "pumper-core::test:derived_backfill_perf::backfill_with_lookup_batches_its_joins",
+      "gate": "perf-harness",
+      "reason": "50k-row derived backfill against the per-record reference implementation. Certified by the `derived-backfill` lane."
+    },
+    {
+      "id": "pumper-core::test:fingerprint_shared_dom::perf_two_parses_per_document",
+      "gate": "perf-harness",
+      "reason": "The two-parse reference half of the shared-DOM cost comparison. Certified by the `fingerprint-shared-dom` lane."
+    },
+    {
+      "id": "pumper-core::test:fingerprint_shared_dom::perf_one_shared_parse_per_document",
+      "gate": "perf-harness",
+      "reason": "The fused half of the same comparison. Certified by the `fingerprint-shared-dom` lane."
+    },
+    {
+      "id": "pumper-engine-archive::lib::tests::live_wayback_snapshot_roundtrip",
+      "gate": "live-network",
+      "reason": "Hits web.archive.org. A hosted runner has egress but the lane would certify a third party's availability, not this repo's code — recorded as cannot-run in .lanes/criteria.json rather than scheduled."
+    },
+    {
+      "id": "pumper-engine-archive::lib::tests::live_wayback_list_snapshots_range",
+      "gate": "live-network",
+      "reason": "Same: CDX range query against web.archive.org."
+    },
+    {
+      "id": "pumper-engine-browser::test:render::renders_example_dot_com",
+      "gate": "local-chrome",
+      "reason": "Needs a real Chrome binary plus live network. Recorded as cannot-run on hosted runners."
+    },
+    {
+      "id": "pumper-engine-browser::test:render::blocks_heavy_resources_and_opt_out_loads_them",
+      "gate": "local-chrome",
+      "reason": "Same lane: drives a real browser through the resource-blocking path."
+    },
+    {
+      "id": "pumper-engine-browser::test:render::reuses_browser_across_renders",
+      "gate": "local-chrome",
+      "reason": "Same lane: proves the persistent-profile browser is reused, not relaunched."
+    },
+    {
+      "id": "pumper-engine-browser::test:render::renders_under_named_profiles_with_separate_user_data_dirs",
+      "gate": "local-chrome",
+      "reason": "Same lane: named profiles get separate user-data dirs."
+    },
+    {
+      "id": "pumper-engine-wasm::test:plugins::extract_v2_envelope_forwards_params",
+      "gate": "wasm-artifact",
+      "reason": "Requires the BUILT data/plugins/title.wasm. Runs today in CI's Linux `test` job after `just plugins-install`, and is certified as the `wasm-plugin-artifacts` lane."
+    },
+    {
+      "id": "pumper-engine-wasm::test:plugins::describe_manifest_surfaces_in_metadata",
+      "gate": "wasm-artifact",
+      "reason": "Same artifact, same lane: the host's describe/manifest surface."
+    },
+    {
+      "id": "pumper-server::bin:pumper::e2e::trigger_plugins::shipped_trigger_gate_gates_on_min_count_and_dataset",
+      "gate": "wasm-artifact",
+      "reason": "Requires the BUILT data/plugins/trigger-gate.wasm. Runs today in CI's Linux `test` job; certified as the `server-trigger-plugins` lane."
+    },
+    {
+      "id": "pumper-server::bin:pumper::e2e::trigger_plugins::shipped_trigger_gate_does_not_veto_a_job_hop_that_has_no_count",
+      "gate": "wasm-artifact",
+      "reason": "Same artifact, same lane: the fail-open hop with no count."
+    },
+    {
+      "id": "pumper-server::bin:pumper::e2e::trigger_plugins::shipped_trigger_gate_does_not_veto_an_external_hop_that_has_no_count",
+      "gate": "wasm-artifact",
+      "reason": "Same artifact, same lane: the external hop with no count."
+    },
+    {
+      "id": "pumper-server::bin:pumper::e2e::trigger_plugins::shipped_delta_slim_slims_the_envelope_without_losing_lineage",
+      "gate": "wasm-artifact",
+      "reason": "Requires the BUILT data/plugins/delta-slim.wasm; same lane."
+    }
+  ]
+}

@@ -988,10 +988,17 @@ mod tests {
     /// REGRESSION — rather than "must be faster". Plugins declare no imports,
     /// so the linking this hoists out of the call path is genuinely small for
     /// them; the win is bounded, and asserting a speedup would be asserting
-    /// scheduler noise. `#[ignore]`d with the other timing-dependent tests
-    /// (`just test-ignored`).
+    /// scheduler noise.
+    ///
+    /// **Quarantined as a flake**, not merely ignored: the bounded win is small
+    /// enough that scheduler noise on a shared runner can invert it, which makes
+    /// the cause the harness's resolution rather than the product's speed. The
+    /// entry — owner, entry date, expiry, cause and evidence — is in
+    /// `.flake/register.json`, and `just flake-check` fails if it expires or
+    /// stops naming a real test. Runs nightly through the `long-lanes` CI leg so
+    /// the history that will release it keeps accumulating.
     #[test]
-    #[ignore = "timing-dependent microbenchmark; run with `cargo test -- --ignored`"]
+    #[ignore = "QUARANTINED flake — .flake/register.json (owner xkazm04, entered 2026-08-24, expires 2026-11-23, cause=harness): a descheduled iteration can invert the comparison. `just flake-check` / `just test-ignored`"]
     fn instance_pre_instantiation_is_never_slower_than_relinking_per_call() {
         const N: u32 = 2_000;
         let (engine, module) = fixture_engine_and_module();
