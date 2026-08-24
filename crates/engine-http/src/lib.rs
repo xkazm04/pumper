@@ -96,7 +96,26 @@ impl ProfileJar {
                 CookieStore::default()
             }),
             // NotFound covers both a missing jar and a missing profile dir.
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            //
+            // `NotADirectory` is the SAME FACT wearing a different errno: a path
+            // component is a regular file, so the jar definitively is not there
+            // and never was. Unix reports `ENOTDIR` (os error 20) for that shape
+            // where Windows reports a NotFound-class error, and reading it as a
+            // hard failure made a *read* seam platform-dependent — the ubuntu
+            // leg failed `a_failed_jar_save_is_retried_instead_of_losing_the_login`
+            // ("login succeeds in memory even though the jar cannot be written")
+            // while Windows passed, on a test whose whole subject is that an
+            // unwritable jar must NOT cost you the login.
+            //
+            // Only the READ degrades here. The write path is untouched and still
+            // fails retryably, which is what keeps the pending cookie alive until
+            // the blocker clears — the actual guarantee under test.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
                 // The signal this seam had none of. A fetch under a profile with
                 // no stored session is not an error — it is how a login is
                 // established on this tier — but it is also exactly what a typo
