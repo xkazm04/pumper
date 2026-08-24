@@ -76,6 +76,29 @@ A quarantined source writes to the shadow dataset `<ds>@q`, which is an ordinary
 - **Virtual namespaces**: several apps may feed one cross-source dataset by passing an explicit app name to `ctx.datasets` (e.g. `grants/unified`, `census/market_blend`, `cz-labour/salary_gap`). The key shape is whatever makes concurrent writers agree rather than collide, and it differs per namespace: `grants/unified` prefixes the source (`<source>:<id>`) because two sources can list the same grant; `census/market_blend` keys on the join's own dimensions (`{naics4}:{state_fips}`), `census/saturation` on `{geo}|{denominator_kind}|{place}` and `cz-labour/salary_gap` on `{isco4}|{sphere}` — there every writer recomputes the same cell, so a source prefix would fork one cell into several. Writing through `ctx.datasets` bypasses `AppContext`'s automatic provenance stamping, so a virtual-namespace writer must pass its own `Provenance` (`upsert_many_stamped`) or every revision it appends is anonymous.
 - Big payloads go to `ctx.save_artifact` (files under `data/artifacts/<app>/<job>/`); records and results stay compact.
 
+## Hard deletes
+
+Two verbs remove data outright rather than tombstoning it, and neither is
+recoverable from the store:
+
+- `Datasets::delete_record` — one record and its whole history.
+- `Datasets::delete_dataset_mode` — a whole dataset: every record, every
+  revision, one transaction. It is a **mode**, not a pair of functions: the same
+  code counts the population and (in `Execute`) destroys it, so a preview can
+  never report numbers the delete does not act on. `Preview` and a refused
+  execute both roll back, so nothing ever leaves a trace claiming a deletion that
+  did not happen; `Deleted` reports `rows_affected`, i.e. what actually went.
+  `Execute { expect_records: Some(n) }` refuses unless the live count is exactly
+  `n` — the guard checked *inside* the transaction, so it cannot be raced.
+- `Datasets::delete_dataset` is the unguarded shorthand (`expect_records: None`)
+  for an app sweeping a dataset it owns — the `_job` snapshot sweeps. It
+  delegates to the mode above, so the guarded and unguarded doors share one
+  transaction and one predicate.
+
+The HTTP door adds the operator ladder — preview, echo, yield guard, and an
+NDJSON export of everything before it is destroyed. See
+[http-api.md § Deleting a dataset](http-api.md#deleting-a-dataset-delete-datasetsappds--the-two-step-gate).
+
 ## Retention
 
 Everything here is **off by default** and enabled per key under `[storage]`. Each

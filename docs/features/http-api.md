@@ -47,7 +47,7 @@ The global 1 MiB is sized from what the POST surface actually accepts — all ha
 | Jobs | `GET /jobs?app=&status=&limit=&cursor=` (cursor ⇒ `{items,next_cursor}`) · `GET /jobs/{id}` (adds a `progress` field with the latest live snapshot while running) · `DELETE /jobs/{id}` (cancel: queued synchronously, or a `running` job via its cancellation token — response adds `running:true`; 404 no job, 409 already terminal. During a graceful shutdown a cancel still wins over the drain's suspend; a run that already committed to a suspend answers `{cancelled:false, running:true, suspended:true, note}` — see [runtime.md](runtime.md#jobs)) · `POST /jobs/{id}/retry` (404 no job, 409 wrong state) · `POST /jobs/retry` bulk (body `{status=failed\|cancelled, app?, limit≤500}` ⇒ `{retried,ids}`; 400 bad status) · `POST /jobs/{id}/reset` (re-queue a `running` job; 404 no job, 409 not running) · `GET /jobs/{id}/stream` (SSE) · `GET /jobs/{id}/costs` · `GET /jobs/{id}/receipt` (one run's cost + stage timings + what it changed; 404 no job) |
 | Costs | `GET /costs?app=&since=` |
 | Schedules | `GET /schedules?limit=&cursor=` (each row enriched with `next_run`, `last_job_id`/`last_status`, `last_skipped_at`/`skipped_count` and `health`; `last_run` is set only when a job was actually enqueued; `budget_usd` is the row's spend ceiling, `null` = none) · `POST /schedules` (`{app, cron, params?, priority?, timezone?, misfire_policy?, max_attempts?, budget_usd?}` — `timezone` IANA/chrono-tz default UTC, `misfire_policy` `fire_once`\|`skip` default `fire_once`, `max_attempts` default server 3; unknown `timezone`/`misfire_policy` → 400; `params` shallow-merge over the app's `default_params` and the **merged** object is schema-validated → 422 with JSON-pointer paths, exactly like the enqueue door; `budget_usd` is the ceiling replayed into every run this schedule enqueues and must be **> 0** — omitted = *no* ceiling, so `0`/negative is the same 422 the enqueue door answers) · `DELETE /schedules/{id}` · `POST /schedules/{id}/enabled` · `POST /schedules/{id}/budget` (`{budget_usd}` ⇒ `{id, budget_usd}`; `null` removes the ceiling, `0`/negative → 422, unknown id → 404. The only way to give a ceiling to a row that wasn't created here — code-seeded `ScrapeApp::schedule()` rows and catalog-managed ones both start `null`, and no catalog reconcile clears one that was set. See [runtime.md § Scheduler](runtime.md#scheduler)) |
-| Datasets | `GET /datasets/{app}/{ds}?limit=&cursor=&filter=&trust=&removed=` (`trust` defaults `all`, `removed` defaults `exclude` — see below) · `GET .../export?format=json\|ndjson\|csv&filter=&trust=&removed=` (all stream; see below) · `GET .../duplicates?distance=` (413 above 10k records) · `GET .../changes?since=&limit=&cursor=&trust=` (defaults to `trust=stable`) · `GET .../history?key=&limit=&cursor=` |
+| Datasets | `GET /datasets/{app}/{ds}?limit=&cursor=&filter=&trust=&removed=` (`trust` defaults `all`, `removed` defaults `exclude` — see below) · `GET .../export?format=json\|ndjson\|csv&filter=&trust=&removed=` (all stream; see below) · `GET .../duplicates?distance=` (413 above 10k records) · `GET .../changes?since=&limit=&cursor=&trust=` (defaults to `trust=stable`) · `GET .../history?key=&limit=&cursor=` · `DELETE /datasets/{app}/{ds}?confirm=&expect_records=` (**two-step hard delete** — a bare call previews and destroys nothing; see below) · `DELETE .../records/{key}` (one record + its history; 404 unknown) |
 | Watches | `GET /watches?app=&limit=&cursor=` (rows enriched with `last_delivery`, explicit `null` when never fired; unknown `app` → 400 naming the accepted namespaces) · `POST /watches` (`app` is the **namespace records land under** — registered apps plus the virtual/observed ones; unknown → 404, an `(app, dataset)` pair that could never fire → 400 naming where those records land) · `DELETE /watches/{id}` · `POST /watches/{id}/enabled` · `GET /watches/{id}/deliveries?status=&limit=&cursor=` (that watch's own delivery log; unknown id → 404). See [events-webhooks.md § Watchable namespaces](events-webhooks.md#watch-namespaces) |
 | Webhook deliveries | `GET /webhooks/deliveries?status=&limit=&cursor=` · `GET /webhooks/deliveries/{id}` · `POST /webhooks/deliveries/{id}/replay` |
 | Triggers | `GET /triggers?app=&limit=&cursor=` (filters `source_app`; unknown value → 400 — accepted set is the watch namespaces plus ingress source ids, `*`, and whatever is already stored) · `POST /triggers` · `DELETE /triggers/{id}` · `POST /triggers/{id}/enabled` · `POST /triggers/{id}/test?fire=` (with `fire=true`, resolved params that fail the target app's schema → 422; the live fire path records the same refusal as a `bad_params` decision) · `GET /triggers/{id}/runs` |
@@ -94,6 +94,42 @@ The value keeps any `:` after the op (so timestamps/URLs pass through). Example:
 **`removed=include|exclude`, default `exclude`.** Tombstoned records (`removed_at` set) are left out of every read shape — default, cursor-paged, filtered, and export — unless `removed=include` is passed. This is a **behavior change**: previously the unfiltered page and its cursor form always included removed records, `?filter=` silently switched to excluding them, and `/export`'s formats disagreed with each other too. `trust=` (see [datasets.md § Trust](datasets.md#trust)) is likewise now honored identically across all four shapes — presence of `filter=` no longer changes what either param means.
 
 `GET /datasets/{app}/{ds}/duplicates` runs an in-memory SimHash sweep (banded candidate lookup, exact-Hamming verified), so it is bounded: datasets over **10,000 records** return `413 too_large` (the message carries the actual count and the cap) rather than pinning a core. Narrow the dataset or run the scan offline. Banding only filters at small distances — above `distance=5` the scan degrades to the pairwise walk, which the 10k cap keeps bounded.
+
+## Deleting a dataset (`DELETE /datasets/{app}/{ds}`) — the two-step gate
+
+The most destructive verb in this API: it removes every record of a dataset **and its entire revision history**, with no restore path in the store. It used to do that on a bare `DELETE`, unauthenticated, with no preview and no receipt. Three rungs now stand in front of it, and a call that satisfies none of them is a read.
+
+**Step 1 — preview (no parameters).** `DELETE /datasets/{app}/{ds}` with neither `confirm` nor `expect_records` **deletes nothing** and answers `428 confirmation_required`:
+
+```json
+{ "preview": true, "code": "confirmation_required",
+  "app": "grants", "dataset": "unified",
+  "records": 8123, "revisions": 41022,
+  "confirm": "grants/unified", "expect_records": 8123,
+  "as_of": "2026-08-24T15:04:11.221Z",
+  "error": "this deletes 8123 record(s) and 41022 revision(s) permanently. Retry with ?confirm=grants/unified&expect_records=8123 to proceed." }
+```
+
+The counts come from the deleter itself running in count mode — the same transaction, the same `WHERE` clause — not from a second implementation that could drift from it. There is no `deleted` field: a preview must never be readable as proof that something was destroyed.
+
+**Step 2 — confirm.** `DELETE /datasets/{app}/{ds}?confirm=<app>/<ds>&expect_records=<n>`:
+- `confirm` is compared server-side against the identity the store resolved, trimmed, **case-sensitive**. A mismatch is `400 bad_request` and the expected string is not restated — step 1 is where it is rendered. This rung proves *intent* (a bare or copied `DELETE` URL is inert), not comprehension.
+- `expect_records` is the rung that proves comprehension: it cannot be known without reading the target, and it is re-checked **inside the deleting transaction**. If the dataset moved since the preview, the answer is `409 conflict` naming the live count, and nothing is deleted.
+
+**Before anything is destroyed**, every record and every revision is written to an NDJSON file under `<artifacts_dir>/deleted-datasets/<app>__<ds>__<UTC stamp>.ndjson` (line 1 is a header naming the export and the expected record count; the rest are `{"kind":"record"|"revision", …}` objects, written a page at a time and fsynced). If that write fails, the delete is refused with `500` and nothing is removed. The path is in the receipt:
+
+```json
+{ "preview": false, "app": "grants", "dataset": "unified",
+  "deleted": 8123, "records": 8123, "revisions": 41022,
+  "export": "data/artifacts/deleted-datasets/grants__unified__20260824T150500123Z.ndjson",
+  "as_of": "..." }
+```
+
+`deleted` is unchanged from before the gate existed, and `records`/`revisions` are what the `DELETE`s actually removed — the execution, not the forecast, is the record of truth. Search docs are dropped afterwards (best-effort; a stale doc would only return a hit for a record that is gone).
+
+**What this does not do.** It does not authenticate. This server has no identity concept — the only credential anywhere is the ingress HMAC, which authenticates a webhook *sender*, not an operator — so these rungs contain the accident (a stale tab, a copied curl line, the wrong dataset name), not an attacker who can already reach the port. Bind the listener accordingly; the gap is tracked in `.ai/registry-conformance.md`.
+
+The in-process verb apps use to sweep datasets they own (`Datasets::delete_dataset`, e.g. the `_job` snapshot sweeps) is deliberately ungated — it has no operator and no preview — but it runs the same transaction as the guarded door, so the two cannot drift.
 
 ## RuleSet preview (`POST /extract/preview`)
 

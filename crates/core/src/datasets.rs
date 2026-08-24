@@ -226,6 +226,74 @@ pub struct RevisionPage {
     pub next_cursor: Option<String>,
 }
 
+/// What a dataset-wide hard delete would destroy — or, after execution, what it
+/// actually destroyed.
+///
+/// `preview` is carried in the payload rather than only in the request that
+/// asked for it: a summary that reads identically whether it counted or deleted
+/// will eventually be pasted into a ticket as proof of what happened. Every
+/// count carries its predicate — the app and dataset it counted, and the `as_of`
+/// moment it counted at, because retention populations move while you read them.
+#[derive(Debug, Clone, Serialize)]
+pub struct DatasetDeletion {
+    /// True when nothing was written and the counts are a forecast.
+    pub preview: bool,
+    pub app: String,
+    pub dataset: String,
+    /// Rows in `records` (tombstoned ones included — they are rows).
+    pub records: u64,
+    /// Rows in `record_revisions`: the full history, which the delete takes with it.
+    pub revisions: u64,
+    /// When the counts were taken, inside the deleting transaction.
+    pub as_of: DateTime<Utc>,
+}
+
+/// Which mode [`Datasets::delete_dataset_mode`] runs in.
+#[derive(Debug, Clone, Copy)]
+pub enum DeleteMode {
+    /// Count the population and roll back.
+    Preview,
+    /// Destroy the population, unless `expect_records` disagrees with what is
+    /// actually there. `None` skips the yield guard — for an in-process caller
+    /// acting on a dataset it owns, which has no operator and no preview.
+    Execute { expect_records: Option<u64> },
+}
+
+/// The three outcomes of a dataset-wide delete, kept apart so a caller cannot
+/// mistake one for another: it counted, it destroyed, or it refused.
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "outcome", rename_all = "snake_case")]
+pub enum DeleteVerdict {
+    /// Counted only. Nothing was written.
+    Preview(DatasetDeletion),
+    /// Committed. The counts are what was actually removed.
+    Deleted(DatasetDeletion),
+    /// Refused: the population moved between the preview and this call, so the
+    /// operator would be destroying something other than what they consented
+    /// to. Nothing was written; `found` is a fresh preview to re-read.
+    YieldChanged {
+        expected: u64,
+        found: DatasetDeletion,
+    },
+}
+
+impl DeleteVerdict {
+    /// Whether this verdict's transaction may commit. Only [`Self::Deleted`]
+    /// wrote anything; a preview and a refusal must both roll back, so that no
+    /// trail entry ever claims a deletion that did not happen.
+    pub fn wrote(&self) -> bool {
+        matches!(self, Self::Deleted(_))
+    }
+
+    /// The counts, whichever arm this is.
+    pub fn counts(&self) -> &DatasetDeletion {
+        match self {
+            Self::Preview(d) | Self::Deleted(d) => d,
+            Self::YieldChanged { found, .. } => found,
+        }
+    }
+}
+
 /// A predicate over the JSON `data` column, letting callers build filtered views
 /// of a dataset without denormalizing fields into real columns. Paths are SQLite
 /// JSON paths (`$.status`) and are *bound as parameters*, never interpolated, so
@@ -1445,34 +1513,168 @@ impl Datasets {
     /// Permanently deletes an entire dataset — every record and all revision
     /// history — in one transaction; returns the number of records removed. For
     /// retiring a dataset or a full re-import. The caller drops the search docs.
+    ///
+    /// The **unguarded** verb, for an app deleting a dataset it owns (the
+    /// `_job` snapshot sweeps). The operator door is
+    /// [`delete_dataset_mode`](Self::delete_dataset_mode), which is the same
+    /// code with a preview mode and a yield guard in front of it; both share
+    /// this function's transaction and predicate, so neither can drift from the
+    /// other.
     pub async fn delete_dataset(&self, app: &str, dataset: &str) -> Result<u64> {
+        match self
+            .delete_dataset_mode(
+                app,
+                dataset,
+                DeleteMode::Execute {
+                    expect_records: None,
+                },
+            )
+            .await?
+        {
+            DeleteVerdict::Deleted(done) => Ok(done.records),
+            // Unreachable by construction: `expect_records: None` cannot refuse,
+            // and `Execute` never previews. A panic here would be a library bug
+            // in a delete path, so it degrades to a typed error instead.
+            other => Err(crate::Error::App(format!(
+                "delete_dataset: unguarded execute returned {other:?}"
+            ))),
+        }
+    }
+
+    /// The dataset-wide hard delete as a **mode**: count the population, then
+    /// either report it (writing nothing) or destroy it (reporting what was
+    /// actually destroyed).
+    ///
+    /// One function, one predicate, one transaction — because a preview that
+    /// counts through a second implementation is a forecast of a different
+    /// operation, and it passes review exactly when it has drifted
+    /// (registry: data-retention/dry-run-preview, "same predicate, or it is a
+    /// lie"). The count and the `DELETE` run inside the same `BEGIN IMMEDIATE`,
+    /// so the guard below cannot be raced by a concurrent writer.
+    ///
+    /// - [`DeleteMode::Preview`] counts and rolls back. Nothing is written, and
+    ///   the verdict says so in the payload rather than only in the request that
+    ///   asked for it.
+    /// - [`DeleteMode::Execute`] with `expect_records: Some(n)` refuses unless
+    ///   the live record count is exactly `n` — the yield guard that turns a
+    ///   preview from advice into a precondition. `None` skips the guard and is
+    ///   reserved for in-process callers acting on their own datasets.
+    ///
+    /// Revision history is deleted with the records; the caller drops the search
+    /// docs, and (at the HTTP door) exports the history first.
+    pub async fn delete_dataset_mode(
+        &self,
+        app: &str,
+        dataset: &str,
+        mode: DeleteMode,
+    ) -> Result<DeleteVerdict> {
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-        let outcome: Result<u64> = async {
-            let removed = sqlx::query("DELETE FROM records WHERE app = ?1 AND dataset = ?2")
-                .bind(app)
-                .bind(dataset)
-                .execute(&mut *conn)
-                .await?
-                .rows_affected();
-            sqlx::query("DELETE FROM record_revisions WHERE app = ?1 AND dataset = ?2")
-                .bind(app)
-                .bind(dataset)
-                .execute(&mut *conn)
-                .await?;
-            Ok(removed)
+        let outcome: Result<DeleteVerdict> = async {
+            // The population, by the same predicate the DELETEs below use.
+            let records: i64 =
+                sqlx::query_scalar("SELECT COUNT(*) FROM records WHERE app = ?1 AND dataset = ?2")
+                    .bind(app)
+                    .bind(dataset)
+                    .fetch_one(&mut *conn)
+                    .await?;
+            let revisions: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM record_revisions WHERE app = ?1 AND dataset = ?2",
+            )
+            .bind(app)
+            .bind(dataset)
+            .fetch_one(&mut *conn)
+            .await?;
+            let found = DatasetDeletion {
+                preview: true,
+                app: app.to_string(),
+                dataset: dataset.to_string(),
+                records: records.max(0) as u64,
+                revisions: revisions.max(0) as u64,
+                as_of: Utc::now(),
+            };
+            let expect = match mode {
+                DeleteMode::Preview => return Ok(DeleteVerdict::Preview(found)),
+                DeleteMode::Execute { expect_records } => expect_records,
+            };
+            if let Some(expected) = expect {
+                if expected != found.records {
+                    return Ok(DeleteVerdict::YieldChanged { expected, found });
+                }
+            }
+            let removed_records =
+                sqlx::query("DELETE FROM records WHERE app = ?1 AND dataset = ?2")
+                    .bind(app)
+                    .bind(dataset)
+                    .execute(&mut *conn)
+                    .await?
+                    .rows_affected();
+            let removed_revisions =
+                sqlx::query("DELETE FROM record_revisions WHERE app = ?1 AND dataset = ?2")
+                    .bind(app)
+                    .bind(dataset)
+                    .execute(&mut *conn)
+                    .await?
+                    .rows_affected();
+            // What it ACTUALLY destroyed, not the forecast — the execution is the
+            // record of truth, so the numbers come from `rows_affected`.
+            Ok(DeleteVerdict::Deleted(DatasetDeletion {
+                preview: false,
+                records: removed_records,
+                revisions: removed_revisions,
+                ..found
+            }))
         }
         .await;
         match outcome {
-            Ok(removed) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                Ok(removed)
+            // A preview and a refusal both roll back: neither may leave a trace
+            // claiming a deletion that did not happen.
+            Ok(verdict) => {
+                let sql = if verdict.wrote() {
+                    "COMMIT"
+                } else {
+                    "ROLLBACK"
+                };
+                sqlx::query(sql).execute(&mut *conn).await?;
+                Ok(verdict)
             }
             Err(e) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                 Err(e)
             }
         }
+    }
+
+    /// One keyset page of a whole dataset's revision history, oldest key first,
+    /// for the export-before-delete at the HTTP delete door. Ordered
+    /// `(key, revision)` — a total order over the table's own primary key, so a
+    /// full walk cannot skip or repeat a row the way a `created_at` walk can
+    /// under clock skew. `after` is the previous page's last `(key, revision)`.
+    pub async fn dataset_revisions_page(
+        &self,
+        app: &str,
+        dataset: &str,
+        after: Option<(String, i64)>,
+        limit: i64,
+    ) -> Result<Vec<Revision>> {
+        let (after_key, after_rev) = after
+            .map(|(k, r)| (Some(k), Some(r)))
+            .unwrap_or((None, None));
+        let rows: Vec<RevisionRow> = sqlx::query_as(
+            "SELECT app, dataset, key, revision, change, data, diff, created_at, trust, \
+                    job_id, source_url, artifact_sha, rules_hash \
+             FROM record_revisions WHERE app = ?1 AND dataset = ?2 \
+             AND (?3 IS NULL OR key > ?3 OR (key = ?3 AND revision > ?4)) \
+             ORDER BY key ASC, revision ASC LIMIT ?5",
+        )
+        .bind(app)
+        .bind(dataset)
+        .bind(after_key)
+        .bind(after_rev)
+        .bind(limit)
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter().map(Revision::try_from).collect()
     }
 
     /// Trims revision history: deletes revisions created before `older_than`, but

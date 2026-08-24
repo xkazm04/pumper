@@ -283,6 +283,25 @@ pub(crate) async fn list_records(
     ))
 }
 
+#[derive(Deserialize, IntoParams)]
+pub(crate) struct DeleteDatasetQuery {
+    /// The echo: the exact `<app>/<dataset>` string, trimmed, compared
+    /// case-sensitively against the identity the store resolved. Absent means
+    /// "preview only".
+    confirm: Option<String>,
+    /// The record count the preview reported. The delete refuses unless the live
+    /// count is exactly this, so an operator can only destroy the population they
+    /// were actually shown. Absent means "preview only".
+    expect_records: Option<u64>,
+}
+
+/// How many rows the export-before-delete reads per page. Bounded so a
+/// million-revision dataset exports in constant memory.
+const DELETE_EXPORT_PAGE: i64 = 500;
+
+/// Directory under `artifacts_dir` where a deleted dataset's export lands.
+const DELETED_EXPORT_DIR: &str = "deleted-datasets";
+
 #[utoipa::path(
     delete,
     path = "/datasets/{app}/{dataset}",
@@ -290,22 +309,308 @@ pub(crate) async fn list_records(
     params(
         ("app" = String, Path, description = "App name"),
         ("dataset" = String, Path, description = "Dataset name"),
+        DeleteDatasetQuery,
     ),
-    responses((status = 200, description = "`{app, dataset, deleted}` — records removed (with their full revision history and search docs). Hard delete; use for retiring or re-importing a dataset."))
+    responses(
+        (status = 200, description = "`{preview: false, app, dataset, deleted, records, revisions, export, as_of}` — the receipt: what was ACTUALLY destroyed, and the NDJSON export written before it was. Search docs are dropped too."),
+        (status = 400, description = "`confirm` did not match `<app>/<dataset>`", body = Object),
+        (status = 409, description = "The record count moved since the preview — nothing was deleted; re-preview and retry", body = Object),
+        (status = 428, description = "Two-step gate: no `confirm`/`expect_records`, so this call PREVIEWED and deleted nothing. Body is `{preview: true, records, revisions, confirm, expect_records, as_of}` — the exact parameters to retry with.", body = Object),
+        (status = 500, description = "The pre-delete export could not be written; nothing was deleted", body = Object),
+    )
 )]
+/// Hard-deletes a whole dataset behind a two-step gate.
+///
+/// This route used to destroy every record and its full revision history on a
+/// bare `DELETE`, with no echo, no preview and no receipt — the single most
+/// destructive verb in the API, reachable by a stale browser tab or a copied
+/// curl line. Three rungs now stand in front of it, in cost order (registry:
+/// data-retention/confirm-by-echo, "echo is one rung of a ladder"):
+///
+/// 1. **Preview.** Without both parameters the call counts and returns 428.
+///    Nothing is written, and the payload says `preview: true` so a saved
+///    response can never be read as proof of a deletion.
+/// 2. **The echo** (`confirm=<app>/<dataset>`). Its honest value is narrow and
+///    worth stating: `app` and `dataset` are already in the path, so this rung
+///    proves intent, not comprehension — it is what makes an accidental bare
+///    `DELETE` inert. It is compared against the identity the store resolved
+///    (`counts.app`/`counts.dataset`, the strings the `WHERE` clause binds),
+///    trimmed, exactly.
+/// 3. **The yield guard** (`expect_records=<n>`). This is the rung that measures
+///    comprehension: `n` cannot be known without having read the target, and it
+///    is re-checked inside the deleting transaction, so a population that moved
+///    between the preview and the delete is a 409 rather than a surprise.
+///
+/// Authentication is a fourth rung this server cannot climb: it has no identity
+/// concept at all (the only credential anywhere is the ingress HMAC, which
+/// authenticates a webhook *sender*, not an operator). That gap is recorded in
+/// `.ai/registry-conformance.md` rather than papered over with an invented
+/// scheme — these rungs contain the accident, not an attacker on the port.
+///
+/// Before anything is destroyed, every record and every revision is written to
+/// an NDJSON export under `artifacts_dir/deleted-datasets/`, and its path is in
+/// the receipt. If that write fails, nothing is deleted.
 pub(crate) async fn delete_dataset_route(
     State(state): State<AppState>,
     Path((app, dataset)): Path<(String, String)>,
-) -> Result<Json<Value>, ApiError> {
-    let deleted = state.datasets.delete_dataset(&app, &dataset).await?;
+    Query(query): Query<DeleteDatasetQuery>,
+) -> Result<Response, ApiError> {
+    use pumper_core::datasets::{DeleteMode, DeleteVerdict};
+
+    // Rung 1. One code path computes the population — this is a MODE of the
+    // deleter, not a second implementation that counts, so the numbers shown
+    // here are the numbers the delete acts on.
+    let previewed = state
+        .datasets
+        .delete_dataset_mode(&app, &dataset, DeleteMode::Preview)
+        .await?;
+    let counts = previewed.counts();
+    let expected_confirm = format!("{}/{}", counts.app, counts.dataset);
+    let (Some(confirm), Some(expect_records)) = (query.confirm.as_deref(), query.expect_records)
+    else {
+        return Ok((
+            StatusCode::PRECONDITION_REQUIRED,
+            Json(json!({
+                "preview": true,
+                "code": "confirmation_required",
+                "error": format!(
+                    "this deletes {} record(s) and {} revision(s) permanently. Retry with \
+                     ?confirm={}&expect_records={} to proceed.",
+                    counts.records, counts.revisions, expected_confirm, counts.records
+                ),
+                "app": counts.app,
+                "dataset": counts.dataset,
+                "records": counts.records,
+                "revisions": counts.revisions,
+                "expect_records": counts.records,
+                "confirm": expected_confirm,
+                "as_of": pumper_core::datasets::ts(counts.as_of),
+            })),
+        )
+            .into_response());
+    };
+
+    // Rung 2. Trimmed, case-sensitive — the identifier's own equality rule
+    // everywhere else in this API. The expected string is NOT restated here:
+    // the preview above is where it is rendered.
+    if confirm.trim() != expected_confirm {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "confirm must be the exact '<app>/<dataset>' string this DELETE targets — \
+             call without ?confirm= to see it and the record count"
+                .into(),
+        ));
+    }
+
+    // Export BEFORE the delete: a hard delete of a whole history is the one
+    // operation in this service with no restore path, and an export is the
+    // cheapest one that needs no schema change. A failure here refuses the
+    // delete — an unrecoverable destruction whose safety net silently did not
+    // write is worse than no net at all.
+    let export = export_before_delete(&state, &app, &dataset, counts.records).await?;
+
+    // Rung 3, re-checked inside the deleting transaction.
+    let verdict = state
+        .datasets
+        .delete_dataset_mode(
+            &app,
+            &dataset,
+            DeleteMode::Execute {
+                expect_records: Some(expect_records),
+            },
+        )
+        .await?;
+    let done = match verdict {
+        DeleteVerdict::Deleted(done) => done,
+        DeleteVerdict::YieldChanged { expected, found } => {
+            tracing::warn!(
+                %app, %dataset, expected, found = found.records,
+                "dataset delete refused: the population moved since the preview"
+            );
+            return Err(ApiError(
+                StatusCode::CONFLICT,
+                format!(
+                    "the dataset moved since the preview: you confirmed {expected} record(s), \
+                     it now holds {}. Nothing was deleted — re-preview and retry.",
+                    found.records
+                ),
+            ));
+        }
+        // `Execute` never previews; a `Preview` arm here would be a library bug.
+        DeleteVerdict::Preview(_) => {
+            return Err(ApiError(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                crate::routes::error::INTERNAL_MESSAGE.into(),
+            ))
+        }
+    };
     // Drop the dataset's search docs too (best-effort — the records are already
     // gone; a stale search doc would just return a hit for a deleted record).
     if let Err(e) = state.search.delete_dataset(&app, &dataset).await {
         tracing::warn!(%app, %dataset, "dataset deleted but search cleanup failed: {e}");
     }
-    Ok(Json(
-        json!({ "app": app, "dataset": dataset, "deleted": deleted }),
-    ))
+    tracing::info!(
+        %app, %dataset, records = done.records, revisions = done.revisions,
+        export = %export.display(),
+        "dataset hard-deleted after confirmation"
+    );
+    Ok(Json(json!({
+        "preview": false,
+        "app": done.app,
+        "dataset": done.dataset,
+        // `deleted` is the record count, unchanged from before the gate existed.
+        "deleted": done.records,
+        "records": done.records,
+        "revisions": done.revisions,
+        "export": export.display().to_string(),
+        "as_of": pumper_core::datasets::ts(done.as_of),
+    }))
+    .into_response())
+}
+
+/// Writes every record and every revision of `app/dataset` to one NDJSON file
+/// under `artifacts_dir/deleted-datasets/`, and returns its path.
+///
+/// Line 1 is a header stating what this file is and what it claims to contain;
+/// the rest are `{"kind":"record"|"revision", ...}` objects, read and written a
+/// page at a time so the memory cost does not scale with the dataset.
+async fn export_before_delete(
+    state: &AppState,
+    app: &str,
+    dataset: &str,
+    records_expected: u64,
+) -> Result<std::path::PathBuf, ApiError> {
+    use tokio::io::AsyncWriteExt;
+
+    let failed = |what: &str, e: &dyn std::fmt::Display| {
+        tracing::error!(%app, %dataset, "pre-delete export failed ({what}): {e}");
+        ApiError(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "the pre-delete export could not be written, so nothing was deleted".into(),
+        )
+    };
+    let dir = state.storage.artifacts_dir.join(DELETED_EXPORT_DIR);
+    tokio::fs::create_dir_all(&dir)
+        .await
+        .map_err(|e| failed("mkdir", &e))?;
+    // `app` and `dataset` come straight off the URL path, so they are composed
+    // into a filename only after every separator and traversal character is
+    // mapped away — the store is happy to bind "../.." as a name.
+    let path = dir.join(format!(
+        "{}__{}__{}.ndjson",
+        file_component(app),
+        file_component(dataset),
+        chrono::Utc::now().format("%Y%m%dT%H%M%S%3fZ")
+    ));
+    let file = tokio::fs::File::create(&path)
+        .await
+        .map_err(|e| failed("create", &e))?;
+    let mut out = tokio::io::BufWriter::new(file);
+    let write = |value: Value| -> Vec<u8> {
+        let mut line = serde_json::to_vec(&value).unwrap_or_else(|_| b"{}".to_vec());
+        line.push(b'\n');
+        line
+    };
+    out.write_all(&write(json!({
+        "kind": "header",
+        "export": "pumper.dataset.pre-delete",
+        "version": 1,
+        "app": app,
+        "dataset": dataset,
+        "exported_at": pumper_core::datasets::ts(chrono::Utc::now()),
+        "records_expected": records_expected,
+    })))
+    .await
+    .map_err(|e| failed("header", &e))?;
+
+    let mut after: Option<(String, String)> = None;
+    loop {
+        let page = state
+            .datasets
+            .list_records_view(
+                app,
+                dataset,
+                &[],
+                after.clone(),
+                DELETE_EXPORT_PAGE,
+                None,
+                true,
+            )
+            .await?;
+        let Some(last) = page.last() else { break };
+        after = Some((pumper_core::datasets::ts(last.updated_at), last.key.clone()));
+        let full = page.len() as i64 == DELETE_EXPORT_PAGE;
+        for record in &page {
+            let mut value = serde_json::to_value(record).unwrap_or(Value::Null);
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("kind".into(), json!("record"));
+            }
+            out.write_all(&write(value))
+                .await
+                .map_err(|e| failed("record", &e))?;
+        }
+        if !full {
+            break;
+        }
+    }
+
+    let mut after: Option<(String, i64)> = None;
+    loop {
+        let page = state
+            .datasets
+            .dataset_revisions_page(app, dataset, after.clone(), DELETE_EXPORT_PAGE)
+            .await?;
+        let Some(last) = page.last() else { break };
+        after = Some((last.key.clone(), last.revision));
+        let full = page.len() as i64 == DELETE_EXPORT_PAGE;
+        for revision in &page {
+            let mut value = serde_json::to_value(revision).unwrap_or(Value::Null);
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert("kind".into(), json!("revision"));
+            }
+            out.write_all(&write(value))
+                .await
+                .map_err(|e| failed("revision", &e))?;
+        }
+        if !full {
+            break;
+        }
+    }
+    // Flush AND fsync: this file is the only copy of what the next statement
+    // destroys, so "the OS has it in a buffer" is not good enough.
+    out.flush().await.map_err(|e| failed("flush", &e))?;
+    out.into_inner()
+        .sync_all()
+        .await
+        .map_err(|e| failed("fsync", &e))?;
+    Ok(path)
+}
+
+/// Maps one untrusted name onto a single safe filename component: everything
+/// outside `[A-Za-z0-9_-]` becomes `_`, an empty name becomes `_`, and the
+/// result is capped so a long name cannot blow the path limit. The dot is
+/// mapped too — not because `..` can traverse without a separator, but because
+/// the only reader of this name is a human scanning a directory listing, and
+/// leaving `..` in a filename this route composes is a shape nobody should have
+/// to reason about twice. Mapping rather than refusing: a dataset whose name has
+/// a slash is still deletable, it just exports under a flattened filename.
+fn file_component(raw: &str) -> String {
+    let mapped: String = raw
+        .chars()
+        .take(64)
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    if mapped.is_empty() {
+        "_".to_string()
+    } else {
+        mapped
+    }
 }
 
 #[utoipa::path(

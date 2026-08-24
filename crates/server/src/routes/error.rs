@@ -40,6 +40,11 @@ pub(crate) fn error_code(status: StatusCode) -> &'static str {
         StatusCode::CONFLICT => "conflict",
         StatusCode::PAYLOAD_TOO_LARGE => "too_large",
         StatusCode::UNPROCESSABLE_ENTITY => "unprocessable",
+        // 428 has exactly one producer: the two-step gate in front of
+        // `DELETE /datasets/{app}/{dataset}`. `precondition_required` would name
+        // the RFC; `confirmation_required` names what the client must do — send
+        // the `confirm` echo and the `expect_records` count the preview returned.
+        StatusCode::PRECONDITION_REQUIRED => "confirmation_required",
         StatusCode::TOO_MANY_REQUESTS => "rate_limited",
         StatusCode::BAD_GATEWAY => "bad_gateway",
         StatusCode::SERVICE_UNAVAILABLE => "unavailable",
@@ -350,6 +355,7 @@ mod contract_tests {
         ("CONFLICT", 409, Some("conflict")),
         ("PAYLOAD_TOO_LARGE", 413, Some("too_large")),
         ("UNPROCESSABLE_ENTITY", 422, Some("unprocessable")),
+        ("PRECONDITION_REQUIRED", 428, Some("confirmation_required")),
         ("TOO_MANY_REQUESTS", 429, Some("rate_limited")),
         ("INTERNAL_SERVER_ERROR", 500, Some("internal")),
         ("BAD_GATEWAY", 502, Some("bad_gateway")),
