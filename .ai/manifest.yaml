@@ -26,7 +26,10 @@ capabilities:
   fmt-check: { command: "cargo fmt --check", verified: false }
   ci: { command: "just ci", verified: false }
   audit: { command: "cargo deny check advisories bans sources", verified: false }
-  doc-sync: { command: "node scripts/docs/check-doc-sync.mjs", verified: false }
+  # The fixture suite, NOT the hook itself: the hook reads a Stop-hook payload on
+  # stdin, so invoking it bare now exits 3 ("cannot check" — it used to exit 0,
+  # which is the false green this capability would have advertised as a pass).
+  doc-sync: { command: "just doc-sync", verified: false }
   smoke: { command: "pwsh -File scripts/smoke.ps1", verified: false }
   plugins-verify: { command: "just plugins-verify", verified: false }
   sdk-typecheck: { command: "npm --prefix clients/typescript run typecheck", verified: false }
