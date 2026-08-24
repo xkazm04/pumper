@@ -14,13 +14,53 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
+  # Formatting is its OWN job, and deliberately not a step of `test`.
+  #
+  # It used to be step 1 of the single job below, and between 2026-07-26 and
+  # 2026-08-24 that ordering aborted 85 of 86 runs: `cargo fmt --check` failed,
+  # every later step reported `skipped`, and Clippy, the whole test suite and
+  # each plugin/artifact step never executed once. A rung that has never bound
+  # is not a gate — so the whole ladder was advisory for a month while the badge
+  # said otherwise (registry: quality-gates/gate-laddering, "the binding rung
+  # binds only if it can be green").
+  #
+  # As a parallel job it still BLOCKS — a failed job fails the workflow and the
+  # required-status-check list on master should name `Format` alongside `test`
+  # and `Dependency audit` — but a stray space can no longer blind the suite:
+  # every rung now reports its own verdict independently, on the same commit.
+  # Seconds to run, so it needs neither the wasm target nor the build cache.
+  format:
+    name: Format
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: rustfmt
+      - name: Format
+        run: cargo fmt --check
+
+  # Two legs, because the primary development box is Windows and CI was
+  # ubuntu-only: every `#[cfg(windows)]` path and every file-locking absorption
+  # in `crates/core/src/testing.rs` was gated nowhere, and the platform whose
+  # quirks the code works around was the one platform no gate ever ran on
+  # (registry: test-harness/platform-quirk-absorption).
+  #
+  # `fail-fast: false` so a Windows-only failure still lets the Linux leg report
+  # — the same reason Format is its own job. The wasm/plugin rungs stay
+  # Linux-only (see the `if:` on those steps): they drive justfile recipes
+  # written for `sh`, and the artifact they build is platform-independent.
+  test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
           # plugins-src/* are cdylib crates targeting wasm32 in their OWN
           # detached workspaces, so `cargo test --workspace` never compiles
           # them. Nothing here did either, which meant a shipped trigger-hook
@@ -33,10 +73,16 @@ jobs:
       # loop, so the recipe stays the single definition of "how a plugin is
       # built and installed" (CLAUDE.md: the justfile is the canonical runner).
       - uses: taiki-e/install-action@v2
+        if: runner.os == 'Linux'
         with:
           tool: just
-      - name: Format
-        run: cargo fmt --check
+      # Every verdict step below carries `if: ${{ !cancelled() }}` for the same
+      # reason Format is now its own job: a failing rung must not silence the
+      # rungs after it. The job still FAILS if any of them fails — this only
+      # buys the full report, so one clippy lint cannot hide a broken test the
+      # same commit also introduced. `!cancelled()` rather than `always()` so a
+      # cancelled run still stops promptly. The setup steps above stay
+      # short-circuiting: without a toolchain there is nothing to report.
       - name: Clippy
         # `-D warnings` makes lints gate the build rather than scroll past in the
         # log. The workspace is clippy-clean as of the commit that added this;
@@ -46,6 +92,7 @@ jobs:
         # the 8-argument webhook wire contract).
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Test
+        if: ${{ !cancelled() }}
         # Environment-dependent tests (real Chrome, wasm artifact, wall-clock
         # timing) are #[ignore]d; run them locally with `cargo test -- --ignored`.
         run: cargo test --workspace
@@ -53,8 +100,10 @@ jobs:
       # change what it saw. `data/` is gitignored and no clone ever ships these
       # artifacts, so this is the first place they exist in CI at all.
       - name: Build + install every plugins-src crate
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: just plugins-install
       - name: Plugin crate unit tests (host target)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: just plugins-test
       # The artifact tests are still #[ignore]d — a clean checkout has no wasm
       # target and no built .wasm, and a default `cargo test` must not depend on
@@ -63,9 +112,59 @@ jobs:
       # host whether it is executable (`Plugins::has`), which merely compiling
       # the crate cannot answer.
       - name: Artifact tests (the #[ignore]d wasm ones)
+        if: ${{ !cancelled() && runner.os == 'Linux' }}
         run: |
           cargo test -p pumper-engine-wasm --test plugins -- --ignored
           cargo test -p pumper-server e2e::trigger_plugins -- --ignored
+
+  # Named after the artifact, not after the tool, so the checks list can be read
+  # against the ship inventory. `clients/typescript` is a PUBLISHED consumer SDK
+  # in its own npm project: `cargo test --workspace` cannot reach it, nothing
+  # else here compiled it, and `.ai/manifest.yaml` advertised an `sdk-typecheck`
+  # capability no job invoked. It depends on this server's wire contract by
+  # convention rather than by a type, so the break it is exposed to is a route
+  # or payload change made over here with a green board over there.
+  #
+  # It names its own manifest, scopes its own cache to its own lockfile, and
+  # runs what the artifact ships (its test script, which builds first) rather
+  # than merely type-checking it.
+  sdk:
+    name: "@pumper/sync (TypeScript SDK)"
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: clients/typescript/package-lock.json
+      - name: Install
+        run: npm --prefix clients/typescript ci
+      - name: Typecheck
+        run: npm --prefix clients/typescript run typecheck
+      - name: Test
+        if: ${{ !cancelled() }}
+        run: npm --prefix clients/typescript test
+
+  # The two node-only gates, together because both are seconds and neither needs
+  # a toolchain: the ship-inventory walk (does every package manifest in the tree
+  # name a job) and the doc-sync hook's own fixture suite (does the repo's only
+  # doc-drift instrument still fire). The hook is a local Stop hook, so on a
+  # clone without .claude/settings.json it does not exist at all — this is the
+  # rung that at least keeps it from rotting unnoticed.
+  inventory:
+    name: Ship inventory + doc-sync hook
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Ship inventory
+        run: node --test scripts/ci/ship-inventory.test.mjs
+      - name: Doc-sync hook fixtures
+        if: ${{ !cancelled() }}
+        run: node --test scripts/docs/check-doc-sync.test.mjs
 
   audit:
     name: Dependency audit
