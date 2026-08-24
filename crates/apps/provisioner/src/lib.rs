@@ -2078,7 +2078,10 @@ mod tests {
                     ),
                 )
                 // First (no-feedback) draft prompt.
-                .on("Draft extraction rules", research_output(draft1.to_string()))
+                .on(
+                    "Draft extraction rules",
+                    research_output(draft1.to_string()),
+                )
                 // Repair prompt (feedback present) — a distinct substring.
                 .on("failed the dry run", research_output(draft2.to_string())),
         );
@@ -2125,10 +2128,7 @@ mod tests {
         // invariant the desync broke.
         let rules: RuleSet =
             serde_json::from_value(rec.data["rule_set"].clone()).expect("emitted rules parse");
-        assert!(
-            rules.compile().is_ok(),
-            "an emitted rule set must compile"
-        );
+        assert!(rules.compile().is_ok(), "an emitted rule set must compile");
     }
 
     #[test]

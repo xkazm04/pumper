@@ -930,6 +930,23 @@ promoted one.
 | `quarantined` | **shadow dataset `<ds>@q`** | `quarantined` | **suppressed** | **skipped** | not in live feed | active |
 | `probation` | live dataset | `provisional` | fire (payload carries `trust`) | index | filtered out by default (`provisional`) | shadow compare |
 | `retired` | none | — | — | — | — | no |
+| `unknown` | live dataset | `NULL` | fire | index | included | n/a |
+
+`unknown` is **rendered, never stored** — the `CHECK` on `sources.state` (§5) does
+not permit it, and `POST /sources/{id}/state` refuses it. It is what a health
+*read* answers when it failed: the lookup errored, or the column held a value this
+build does not recognize. It gates exactly nothing, which is the fail-open the
+write path has always had — a health lookup that errors must never be able to stop
+a working pipeline, because the cost of failing open is one unsuppressed run and
+the cost of failing closed is the whole fleet stopping on a locked database.
+
+What changed is what that failure is *called*. Both cases used to resolve to
+`healthy`, so a database error published a confident claim ("producing what it
+always did") about a check that had not run, and it reached the job result, the
+worker's logs and the enforcement preview as an ordinary green. Distinguish it
+from `monitored: false`, which is narrower in the other direction: that source is
+readable and watched only by the assumption-free rules, because it has never
+produced a cohort at or above `min_cohort_docs`.
 
 `suspect` deliberately changes nothing downstream. A single tripped run is
 dominated by transient causes, and a system that quarantines on one bad run on an
@@ -1101,10 +1118,24 @@ ladder enforcement would have walked, and a preview is a *replay of stored rows*
 a `SELECT`, and `crates/core/tests/enforcement_preview.rs` snapshots every health
 table plus the database file bytes around a preview and requires them identical.
 
-The four consequences, each traced to the live call site that applies it — the
-list is an inventory test (`every_enforcement_consequence_is_previewed`), so a
-fifth consumer of `enforced_state` cannot be added without the preview learning
-about it:
+The four consequences, each traced to the live call site that applies it. A fifth
+consumer of `enforced_state` cannot be added without the preview learning about
+it, and that is checked by **scanning the workspace**, not by trusting the list:
+`every_enforced_state_consumer_is_named_in_the_preview_inventory`
+(`crates/core/tests/enforcement_preview.rs`) walks every `.rs` file, finds each
+`enforced_state` call site with its count, and fails on one that no row in
+`ENFORCED_STATE_CONSUMERS` accounts for. A preview that under-reports what
+enforcement changes is wrong in the *optimistic* direction — it would claim
+flipping the flag changes nothing while an unlisted consequence waits behind it —
+which is the one direction a rollout gate may not be wrong in.
+
+(Until 2026-08-24 this was asserted by comparing `CONSEQUENCES` to a hand-copied
+literal twelve lines below it in the same test. Two copies of one list agree with
+each other and with nothing else: it could catch a typo, and could not catch the
+new consumer — the single failure the check exists for. `preview::CONSEQUENCES`
+is now additionally cross-checked against the `PreviewConsequences` counters the
+preview actually reports, so a consequence with no counter, or a counter no call
+site produces, fails too.)
 
 | Count | What it would have done | Call site |
 |---|---|---|

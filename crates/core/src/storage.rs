@@ -331,9 +331,10 @@ impl Storage {
     }
 
     /// Records a running job's failure, guarded on `(status, attempts)` like
-    /// `complete`. Re-queues with exponential backoff while attempts remain,
-    /// else fails permanently. Returns the resulting status, or `None` when the
-    /// write was discarded as stale (the job had already moved on).
+    /// `complete`. Re-queues with exponential backoff **plus jitter** while
+    /// attempts remain, else fails permanently. Returns the resulting status, or
+    /// `None` when the write was discarded as stale (the job had already moved
+    /// on).
     pub async fn fail(&self, id: Uuid, attempt: i64, error: &str) -> Result<Option<JobStatus>> {
         let Some(job) = self.get(id).await? else {
             return Ok(None);
@@ -346,7 +347,21 @@ impl Storage {
             let backoff_secs = 10u64
                 .saturating_mul(2u64.saturating_pow(job.attempts.max(0) as u32))
                 .min(3600);
-            let available = Utc::now() + chrono::Duration::seconds(backoff_secs as i64);
+            // Jitter up to +25%, exactly as `fail_delivery` already does for the
+            // webhook ladder. Without it the ladder is a pure function of the
+            // attempt number, so the whole fleet fails together during one outage
+            // and then re-queues at the same instant — the synchronized retry that
+            // turns a recovering dependency back into a failing one, and does it
+            // harder on each rung. Deterministic seed (job id bytes + attempt), no
+            // wall-clock RNG: a resumed or replayed run picks the same delay.
+            let seed = id
+                .as_bytes()
+                .iter()
+                .fold(job.attempts.max(0) as u64, |a, b| {
+                    a.wrapping_mul(31).wrapping_add(*b as u64)
+                });
+            let jitter = (crate::jitter::lcg_fraction(seed) * (backoff_secs as f64) * 0.25) as i64;
+            let available = Utc::now() + chrono::Duration::seconds(backoff_secs as i64 + jitter);
             let r = sqlx::query(
                 "UPDATE jobs SET status = 'queued', error = ?2, available_at = ?3 \
                  WHERE id = ?1 AND status = 'running' AND attempts = ?4",
@@ -1564,7 +1579,12 @@ impl Storage {
     /// (30s → 1m → 5m → 30m → 2h) only to reach the same `dead` state a human
     /// needs to see now. Same terminal UPDATE as [`fail_delivery`]'s past-the-cap
     /// branch, reached without spending the attempts. No-op if the row vanished.
-    pub async fn kill_delivery(&self, id: &str, attempts: i64, last_error: Option<&str>) -> Result<()> {
+    pub async fn kill_delivery(
+        &self,
+        id: &str,
+        attempts: i64,
+        last_error: Option<&str>,
+    ) -> Result<()> {
         sqlx::query(
             "UPDATE webhook_deliveries SET status = 'dead', attempts = attempts + ?2, \
              last_error = ?3, next_retry_at = NULL, updated_at = ?4 WHERE id = ?1",

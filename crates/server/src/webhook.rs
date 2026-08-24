@@ -1009,12 +1009,24 @@ mod tests {
         assert_eq!(classify_status(204), Success);
         // The permanent set: a resend cannot fix these.
         for s in [400u16, 401, 403, 404, 405, 410, 422] {
-            assert_eq!(classify_status(s), Permanent, "status {s} must be permanent");
+            assert_eq!(
+                classify_status(s),
+                Permanent,
+                "status {s} must be permanent"
+            );
         }
         // Rate-limited and server errors are worth retrying.
-        assert_eq!(classify_status(429), Transient, "429 is rate-limited, not permanent");
+        assert_eq!(
+            classify_status(429),
+            Transient,
+            "429 is rate-limited, not permanent"
+        );
         for s in [500u16, 502, 503, 504] {
-            assert_eq!(classify_status(s), Transient, "status {s} must be transient");
+            assert_eq!(
+                classify_status(s),
+                Transient,
+                "status {s} must be transient"
+            );
         }
     }
 
@@ -1032,7 +1044,9 @@ mod tests {
         assert_eq!(parse_retry_after(""), None);
         // The in-process honoring is capped: a big hint is clamped to the cap
         // (the DLQ ladder covers anything longer).
-        let honored = parse_retry_after("300").unwrap().min(RETRY_AFTER_INPROC_CAP);
+        let honored = parse_retry_after("300")
+            .unwrap()
+            .min(RETRY_AFTER_INPROC_CAP);
         assert_eq!(honored, RETRY_AFTER_INPROC_CAP);
     }
 

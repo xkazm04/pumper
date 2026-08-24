@@ -338,3 +338,56 @@ async fn heartbeat_refresh_keeps_a_job_off_the_reaper() {
     // Attempt-guarded: a stale task can't refresh a row it no longer owns.
     assert!(!storage.heartbeat(running, 2).await.unwrap());
 }
+
+/// The retry ladder must not be a pure function of the attempt number.
+///
+/// The anti-pattern: `10s · 2^attempts` exactly. One dependency outage fails
+/// every job in flight within the same second, and a deterministic ladder then
+/// re-queues all of them at the same instant — the synchronized retry that turns
+/// a recovering dependency straight back into a failing one, and does it harder
+/// on each rung because the herd only grows. `fail_delivery` already jittered its
+/// webhook ladder for exactly this reason; the job ladder did not.
+#[tokio::test]
+async fn the_retry_ladder_is_jittered_so_a_fleet_wide_outage_does_not_re_queue_in_lockstep() {
+    let store = fresh_db("retry-jitter").await;
+    let storage = &store.storage;
+    let pool = storage.pool();
+
+    // Twenty jobs, all on the same rung (attempt 3 -> base 80s), all failed at
+    // once — the shape of a dependency outage.
+    let mut whens: Vec<chrono::DateTime<Utc>> = Vec::new();
+    let before = Utc::now();
+    for _ in 0..20 {
+        let id = insert_running(&pool, "a", 3, 5, 0).await;
+        assert_eq!(
+            storage.fail(id, 3, "dependency down").await.unwrap(),
+            Some(JobStatus::Queued)
+        );
+        let job = storage.get(id).await.unwrap().unwrap();
+        whens.push(job.available_at);
+    }
+
+    // The band: never earlier than the base delay (jitter only ever adds, so a
+    // retry can't come back sooner than the ladder promised), never more than
+    // +25% past it.
+    let base = 80i64;
+    for when in &whens {
+        let delay = (*when - before).num_seconds();
+        assert!(
+            (base..=base + base / 4 + 2).contains(&delay),
+            "delay {delay}s is outside [{base}, {}]s",
+            base + base / 4 + 2
+        );
+    }
+
+    // …and they really are spread. A deterministic ladder would put all twenty
+    // on one timestamp; this is the assertion that fails if the jitter is
+    // removed.
+    let distinct: std::collections::BTreeSet<i64> =
+        whens.iter().map(|w| w.timestamp_millis()).collect();
+    assert!(
+        distinct.len() >= 10,
+        "only {} distinct retry times across 20 jobs — the ladder is re-synchronizing the herd",
+        distinct.len()
+    );
+}

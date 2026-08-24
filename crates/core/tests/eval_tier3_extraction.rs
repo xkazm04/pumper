@@ -527,6 +527,54 @@ async fn tier3_extraction_eval() {
     );
 }
 
+/// Recordings that already open with commentary — a real prompt-adherence miss
+/// by the model, kept in the corpus deliberately rather than re-recorded away.
+///
+/// `oh-grants-portal` is the one: the Ohio portal returned an empty result set,
+/// and the model answered *"The page has no actual funding opportunities
+/// listed…"* instead of extracting the (nearly empty) content. That is a genuine
+/// tier-3 weakness on a genuine page, and a corpus that only holds answers the
+/// model got right cannot ratchet the thing it is meant to measure — so the case
+/// stays, at a baseline (0.80) that already prices the missing preamble credit.
+///
+/// It costs one assertion. `adversarial_mutations_score_below_the_recording_not_
+/// the_same` cannot demand that *adding* commentary to an answer which already
+/// opens with commentary lowers the score, because it does not: the preamble
+/// term is already forfeit. The weakening is fenced to exactly these ids —
+/// [`preamble_misses_are_exactly_the_ones_declared`] fails if a second recording
+/// starts opening with commentary, and fails just as loudly if one of these stops
+/// (a re-record that fixed it must tighten the test, not keep the exemption).
+const RECORDED_PREAMBLE_MISSES: &[&str] = &["oh-grants-portal"];
+
+/// The fence around the weakened assertion above. Without it, a re-recording that
+/// introduced a preamble on a second case would take the same `if` branch and
+/// simply stop being checked — one silent miss becomes two, and the corpus's
+/// commentary-freeness signal quietly dies.
+#[test]
+fn preamble_misses_are_exactly_the_ones_declared() {
+    let (_, cases) = load_cases();
+    let observed: Vec<&str> = cases
+        .iter()
+        .filter(|c| commentary_preamble(&c.recorded_output().text).is_some())
+        .map(|c| c.id.as_str())
+        .collect();
+    assert_eq!(
+        observed, RECORDED_PREAMBLE_MISSES,
+        "the set of recordings that open with commentary changed. A NEW one is a real \
+         prompt-adherence regression — grade it, do not add it to RECORDED_PREAMBLE_MISSES \
+         reflexively. One that DISAPPEARED means a re-record fixed it: drop its id, so the \
+         adversarial test starts demanding that a preamble costs on that case too."
+    );
+    // The declared ids exist in the corpus at all — an exemption for a case that
+    // was deleted is an exemption that can never be re-examined.
+    for id in RECORDED_PREAMBLE_MISSES {
+        assert!(
+            cases.iter().any(|c| c.id == *id),
+            "RECORDED_PREAMBLE_MISSES names {id:?}, which is not in the corpus"
+        );
+    }
+}
+
 /// The scorer is only worth something if it can say "worse". Each mutation of a
 /// recorded answer must score strictly below the answer it was derived from, and
 /// trip the specific signal it was built to trip.
@@ -560,10 +608,33 @@ fn adversarial_mutations_score_below_the_recording_not_the_same() {
             case.id
         );
         // A recording that already opens with commentary cannot be made worse by
-        // adding more of it — oh-grants-portal is that case, and it is a real
-        // prompt-adherence miss rather than a fixture defect.
-        if base.preamble.is_none() {
+        // adding more of it: the 0.20 preamble term is already forfeit, so the
+        // two scores are equal by arithmetic, not by the scorer being blind.
+        //
+        // That weakening applies to the declared misses and to nothing else —
+        // `preamble_misses_are_exactly_the_ones_declared` is what keeps a SECOND
+        // silent miss from hiding under this same branch, and this assertion is
+        // the local restatement of it: an undeclared case that took the weak
+        // branch fails here, in the test that was weakened, rather than only in
+        // the one that guards it.
+        let declared_miss = RECORDED_PREAMBLE_MISSES.contains(&case.id.as_str());
+        assert_eq!(
+            base.preamble.is_some(),
+            declared_miss,
+            "{}: recording opens with commentary {:?} but is not a declared miss (or is \
+             declared and no longer misses) — see RECORDED_PREAMBLE_MISSES",
+            case.id,
+            base.preamble,
+        );
+        if !declared_miss {
             assert!(s.total < base.total, "{}: preamble did not cost", case.id);
+            // The strict form, spelled out: the preamble term is the whole cost.
+            assert!(
+                (base.total - s.total - 0.20).abs() < 1e-9,
+                "{}: a commentary preamble cost {:.4}, not the 0.20 the scorer weights it at",
+                case.id,
+                base.total - s.total
+            );
         }
 
         // 3. Refusal.

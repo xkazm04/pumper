@@ -43,8 +43,17 @@ pub const DEFAULT_REPLAY_RUNS: i64 = 60;
 
 /// The four enforcement consequences, each named after the live call site that
 /// applies it. This list is the preview's contract with the runtime: if a fifth
-/// consumer ever gates on `enforced_state`, it belongs here too, and
-/// `every_enforcement_consequence_is_previewed` fails until it is.
+/// consumer ever gates on `enforced_state`, it belongs here too.
+///
+/// That is **enforced by scanning, not by trust**:
+/// `every_enforced_state_consumer_is_named_in_the_preview_inventory`
+/// (`crates/core/tests/enforcement_preview.rs`) walks every `.rs` file in the
+/// workspace, finds each `enforced_state` call site, and fails on one that no
+/// row here accounts for. A preview that under-reports what enforcement changes
+/// is wrong in the optimistic direction, which is the one direction a rollout
+/// gate may not be wrong in — so the list cannot be allowed to decay quietly.
+///
+/// The order is load-bearing: [`gates_of`] indexes this array positionally.
 pub const CONSEQUENCES: &[(&str, &str)] = &[
     ("diverted_writes", "core::app::AppContext::write_target"),
     (
@@ -529,34 +538,90 @@ mod tests {
         assert!(!p.gates.is_empty());
     }
 
+    /// The inventory has to be checked against something the enforcement path
+    /// itself uses. This checks it against [`PreviewConsequences`] — the struct
+    /// the preview actually reports — and against `gates_of`'s positional
+    /// binding.
+    ///
+    /// **The anti-pattern it replaces:** this test used to compare `CONSEQUENCES`
+    /// to a hand-copied literal twelve lines below it. That passes whenever the
+    /// two copies agree, which is to say it detects a typo and nothing else — and
+    /// a *fifth consumer of `enforced_state`* is the single failure a rollout gate
+    /// exists to catch, since the preview would then under-report what enforcement
+    /// changes, in the optimistic direction. The guard for that one lives in
+    /// `crates/core/tests/enforcement_preview.rs`
+    /// (`every_enforced_state_consumer_is_named_in_the_preview_inventory`), which
+    /// scans the workspace for call sites rather than trusting a list.
     #[test]
     fn every_enforcement_consequence_is_previewed() {
-        // Inventory: the four things `enforced_state` gates in the runtime. A
-        // fifth consumer that reads `enforced_state` and is not listed here is
-        // a consequence the preview would silently omit — which is the one
-        // failure mode a rollout gate cannot have.
-        const EXPECTED: &[(&str, &str)] = &[
-            ("diverted_writes", "core::app::AppContext::write_target"),
-            (
-                "withheld_removals",
-                "core::app::AppContext::sync_many_with_provenance",
-            ),
-            ("suppressed_pushes", "server::worker::suppress_unhealthy"),
-            (
-                "skipped_index_writes",
-                "server::worker::dataset_search_docs",
-            ),
-        ];
-        assert_eq!(CONSEQUENCES, EXPECTED);
+        use std::collections::BTreeSet;
+
+        // The reported shape, read off the serialization rather than retyped: a
+        // counter the preview reports and the inventory does not name is a
+        // consequence with no call site attached to it, and a name in the
+        // inventory with no counter is a consequence nothing counts.
+        let reported: BTreeSet<String> =
+            match serde_json::to_value(PreviewConsequences::default()).expect("serializes") {
+                Value::Object(map) => map.keys().cloned().collect(),
+                other => panic!("PreviewConsequences is not an object: {other:?}"),
+            };
+        let named: BTreeSet<String> = CONSEQUENCES.iter().map(|(n, _)| n.to_string()).collect();
+        assert_eq!(
+            named.len(),
+            CONSEQUENCES.len(),
+            "duplicate consequence name"
+        );
+        let unnamed: Vec<&String> = reported.difference(&named).collect();
+        assert_eq!(
+            unnamed,
+            vec![&"trust_stamped".to_string()],
+            "`trust_stamped` is the one reported counter that is a LABEL, not a gate — every \
+             other counter must name the call site that applies it in CONSEQUENCES"
+        );
+        let uncounted: Vec<&String> = named.difference(&reported).collect();
+        assert!(
+            uncounted.is_empty(),
+            "CONSEQUENCES names {uncounted:?}, which the preview does not count"
+        );
+
+        // Each entry names a call site, not a shrug.
+        for (name, site) in CONSEQUENCES {
+            assert!(
+                site.contains("::"),
+                "{name} must name the path that applies it, got {site:?}"
+            );
+        }
+
+        // `gates_of` reads CONSEQUENCES **positionally**, so the order is load-
+        // bearing: pinning it through the states proves index 0 really is the
+        // write-diversion consequence, without retyping the list.
+        assert_eq!(
+            gates_of(SourceState::Quarantined),
+            vec![
+                CONSEQUENCES[0].0,
+                CONSEQUENCES[1].0,
+                CONSEQUENCES[2].0,
+                CONSEQUENCES[3].0
+            ]
+        );
+        assert_eq!(gates_of(SourceState::Quarantined)[0], "diverted_writes");
+        assert_eq!(
+            gates_of(SourceState::Degraded),
+            vec![CONSEQUENCES[1].0, CONSEQUENCES[2].0, CONSEQUENCES[3].0],
+            "degraded keeps writing to the live dataset"
+        );
+        assert_eq!(gates_of(SourceState::Retired), vec![CONSEQUENCES[2].0]);
+
         // Every consequence name is reachable from some state, so none of them
         // is a label nothing can ever produce.
-        let all: std::collections::BTreeSet<&str> = [
+        let all: BTreeSet<&str> = [
             SourceState::Healthy,
             SourceState::Suspect,
             SourceState::Degraded,
             SourceState::Quarantined,
             SourceState::Probation,
             SourceState::Retired,
+            SourceState::Unknown,
         ]
         .into_iter()
         .flat_map(gates_of)
@@ -564,10 +629,12 @@ mod tests {
         for (name, _) in CONSEQUENCES {
             assert!(all.contains(name), "{name} is never produced by any state");
         }
-        // And the inert rungs really are inert.
+        // And the inert rungs really are inert — `unknown` among them, which is
+        // what makes a failed health read reportable without gating anything.
         assert!(gates_of(SourceState::Healthy).is_empty());
         assert!(gates_of(SourceState::Suspect).is_empty());
         assert!(gates_of(SourceState::Probation).is_empty());
+        assert!(gates_of(SourceState::Unknown).is_empty());
     }
 
     #[test]

@@ -105,8 +105,7 @@ mod tests {
     fn string_sites_agree_with_enum_authority() {
         for status in ALL {
             let via_enum = status.is_terminal();
-            let via_string =
-                JobStatus::parse(status.as_str()).is_some_and(|j| j.is_terminal());
+            let via_string = JobStatus::parse(status.as_str()).is_some_and(|j| j.is_terminal());
             assert_eq!(
                 via_enum, via_string,
                 "string predicate disagrees with enum for {:?}",

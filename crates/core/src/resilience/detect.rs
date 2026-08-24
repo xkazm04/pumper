@@ -899,6 +899,18 @@ pub fn next_state(
             }
         }
         Retired => Retired,
+        // `Unknown` is what a health read that FAILED reports, so it is never
+        // written and should never arrive here — but if a row this build cannot
+        // parse does reach the ladder, the first judged run is exactly what
+        // resolves the unknown into a real rung. Treating it as a floor the
+        // source can never leave would freeze it silently.
+        Unknown => {
+            if tripped {
+                Suspect
+            } else {
+                Healthy
+            }
+        }
     }
 }
 

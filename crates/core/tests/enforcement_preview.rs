@@ -9,6 +9,9 @@
 //! 2. **Provably zero side effects** — the store is byte-identical afterwards.
 //!    A dry run that mutates is worse than no dry run: it is the exact thing an
 //!    operator ran it to avoid.
+//! 3. **The consequence inventory is complete** — a workspace scan proves that
+//!    every consumer of `enforced_state` is accounted for by a row in
+//!    `preview::CONSEQUENCES`. See `ENFORCED_STATE_CONSUMERS` below.
 
 use pumper_core::config::ResilienceConfig;
 use pumper_core::extract::{CoercionStatus, DocReport, FieldStatus};
@@ -311,5 +314,263 @@ async fn a_preview_leaves_the_store_byte_identical() {
     assert_eq!(
         before_bytes.1, after_bytes.1,
         "the WAL grew under a preview"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The consequence inventory, checked against the workspace rather than a copy
+// ---------------------------------------------------------------------------
+
+/// Every `enforced_state` call site in the workspace, as
+/// `<repo-relative path>::<expr>` → (occurrences, the [`CONSEQUENCES`] names
+/// that call site applies).
+///
+/// **Why a scan and not a list.** `preview::CONSEQUENCES` is the preview's claim
+/// about what `[resilience] enforce = true` would change, and the way that claim
+/// rots is textbook: a fifth consumer starts gating on `enforced_state`, nobody
+/// adds a row, and the preview keeps reporting the old four. The failure is
+/// silent and it is optimistic — the preview says *flipping the flag today would
+/// change nothing about the next run* while a consequence it never heard of
+/// waits behind the flag. That is the one direction a rollout gate may not be
+/// wrong in.
+///
+/// The test this replaced compared `CONSEQUENCES` to a hand-copied literal
+/// twelve lines below it: two copies of one list, agreeing with each other and
+/// with nothing else. It could catch a typo and could not catch the new
+/// consumer.
+///
+/// Counts are pinned so a *second* `enforced_state` read inside an already-listed
+/// file is caught too — file granularity would wave it through.
+///
+/// **Every row is a decision.** Before adding one: does this call site apply a
+/// consequence `CONSEQUENCES` already names, or a NEW one? A new one needs a
+/// `CONSEQUENCES` entry, a `PreviewConsequences` counter, and a `record` arm, or
+/// the preview under-reports it.
+const ENFORCED_STATE_CONSUMERS: &[(&str, usize, &[&str])] = &[
+    // ── The two core seams the inventory is written against ──────────────────
+    // `AppContext::write_target` (diversion + trust stamp) and
+    // `AppContext::sync_many_with_provenance` (the withheld `RemovalGuard`).
+    (
+        "crates/core/src/app.rs::self.health.enforced_state",
+        2,
+        &["diverted_writes", "withheld_removals"],
+    ),
+    // `suppress_unhealthy` (pushes) and `dataset_search_docs` (index writes).
+    (
+        "crates/server/src/worker.rs::state.health.enforced_state",
+        2,
+        &["suppressed_pushes", "skipped_index_writes"],
+    ),
+    // ── Producer-side reads of the SAME consequences ─────────────────────────
+    // These are apps resolving the state themselves, at the point the core seam
+    // would resolve it, to report or pre-apply a consequence already inventoried
+    // — not new consequences. Each is listed so that a call site which stops
+    // being one of these has to be re-justified here.
+    //
+    // extractor: names which of `<dataset>` / `<dataset>@q` the batch landed in,
+    // via `resilience::write_dataset` — the diversion, reported.
+    (
+        "crates/apps/extractor/src/lib.rs::ctx.health.enforced_state",
+        1,
+        &["diverted_writes"],
+    ),
+    // grants-common: `contribution_target` picks the shadow dataset and the trust
+    // stamp, and `indexable` withholds the search spec for a degrading source —
+    // the producer-side half of the index gate, because the worker's gate reads
+    // the VIRTUAL `grants/unified` pair that no `observe_extraction` judges.
+    (
+        "crates/apps/grants-common/src/lib.rs::ctx.health.enforced_state",
+        1,
+        &["diverted_writes", "skipped_index_writes"],
+    ),
+    // plugin: same reasoning as grants-common, spelled as `WriteTarget`.
+    (
+        "crates/apps/plugin/src/lib.rs::ctx.health.enforced_state",
+        1,
+        &["diverted_writes", "skipped_index_writes"],
+    ),
+    // trades-common: `write_target` for the cross-source `trades` join. Nothing
+    // calls `observe_extraction` for that namespace yet, so it resolves `Healthy`
+    // and gates nothing today — the plumbing, present and correct, declared
+    // anyway so it is not a surprise the day a producer starts judging it.
+    (
+        "crates/apps/trades-common/src/lib.rs::ctx.health.enforced_state",
+        1,
+        &["diverted_writes"],
+    ),
+];
+
+/// This file — its string literals are full of `enforced_state` expressions (the
+/// inventory above), so scanning it would make the guard report itself.
+const SELF_PATH: &str = "crates/core/tests/enforcement_preview.rs";
+
+fn workspace_root() -> std::path::PathBuf {
+    std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .canonicalize()
+        .expect("workspace root")
+}
+
+fn rust_sources(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            // `target/` holds generated + vendored code, not our call sites.
+            if path.file_name().is_some_and(|n| n == "target") {
+                continue;
+            }
+            rust_sources(&path, out);
+        } else if path.extension().is_some_and(|e| e == "rs") {
+            out.push(path);
+        }
+    }
+}
+
+/// One source file as the scanner must see it: comment and doc lines dropped
+/// (the split is *documented* in a dozen places and prose must never read as a
+/// call site), the rest joined with no separator so a rustfmt-wrapped chain
+/// (`state\n.health\n.enforced_state(..)`) is still one site.
+fn scannable_source(text: &str) -> String {
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.starts_with("//") && !l.starts_with('*'))
+        .collect()
+}
+
+/// The `<receiver>.health.enforced_state` expressions on one scannable line.
+fn enforced_state_exprs(line: &str) -> Vec<String> {
+    let needle = ".health.enforced_state";
+    let mut found = Vec::new();
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(needle) {
+        let at = from + rel;
+        // Walk back over the receiver identifier (`ctx`, `state`, `self`).
+        let recv_start = line[..at]
+            .char_indices()
+            .rev()
+            .take_while(|(_, c)| c.is_alphanumeric() || *c == '_')
+            .last()
+            .map_or(at, |(i, _)| i);
+        found.push(format!("{}{needle}", &line[recv_start..at]));
+        from = at + needle.len();
+    }
+    found
+}
+
+fn enforced_state_calls() -> std::collections::BTreeMap<String, usize> {
+    let root = workspace_root();
+    let mut files = Vec::new();
+    rust_sources(&root.join("crates"), &mut files);
+
+    let mut found: std::collections::BTreeMap<String, usize> = Default::default();
+    for file in files {
+        let Ok(text) = std::fs::read_to_string(&file) else {
+            continue;
+        };
+        let rel = file
+            .strip_prefix(&root)
+            .unwrap_or(&file)
+            .to_string_lossy()
+            .replace('\\', "/");
+        if rel == SELF_PATH {
+            continue;
+        }
+        for expr in enforced_state_exprs(&scannable_source(&text)) {
+            *found.entry(format!("{rel}::{expr}")).or_default() += 1;
+        }
+    }
+    found
+}
+
+/// The guard the copied literal could not be: a NEW consumer of `enforced_state`
+/// anywhere in the workspace fails this test, by construction.
+#[test]
+fn every_enforced_state_consumer_is_named_in_the_preview_inventory() {
+    let found = enforced_state_calls();
+    let expected: std::collections::BTreeMap<&str, usize> = ENFORCED_STATE_CONSUMERS
+        .iter()
+        .map(|(site, n, _)| (*site, *n))
+        .collect();
+
+    let added: Vec<String> = found
+        .iter()
+        .filter(|(site, n)| expected.get(site.as_str()).is_none_or(|e| *n > e))
+        .map(|(site, n)| format!("{site} x{n} (declared: {:?})", expected.get(site.as_str())))
+        .collect();
+    assert!(
+        added.is_empty(),
+        "NEW consumer(s) of `enforced_state`: {added:?}. Every one of them is something \
+         `[resilience] enforce = true` changes, and the enforcement preview reports only what \
+         `preview::CONSEQUENCES` names — so an unlisted consumer makes \
+         `GET /enforcement/preview` claim, optimistically and silently, that flipping the flag \
+         would change less than it would. Decide which consequence this applies (adding one to \
+         CONSEQUENCES, PreviewConsequences and `record` if it is new), then add a row to \
+         ENFORCED_STATE_CONSUMERS."
+    );
+
+    let gone: Vec<String> = expected
+        .iter()
+        .filter(|(site, n)| found.get(**site).is_none_or(|f| f < n))
+        .map(|(site, n)| format!("{site} x{n} (actual: {:?})", found.get(*site)))
+        .collect();
+    assert!(
+        gone.is_empty(),
+        "ENFORCED_STATE_CONSUMERS over-counts call sites that no longer exist — a consumer was \
+         removed (fine) but the inventory still claims it: {gone:?}"
+    );
+}
+
+/// The other half: the inventory's consequence labels must be the preview's own
+/// vocabulary, and every consequence the preview reports must be applied by some
+/// real call site. A `CONSEQUENCES` row nothing in the workspace applies is a
+/// consequence the preview counts and enforcement never produces.
+#[test]
+fn the_inventory_and_the_previewed_consequences_name_the_same_things() {
+    use pumper_core::resilience::preview::CONSEQUENCES;
+    use std::collections::BTreeSet;
+
+    let previewed: BTreeSet<&str> = CONSEQUENCES.iter().map(|(name, _)| *name).collect();
+    let applied: BTreeSet<&str> = ENFORCED_STATE_CONSUMERS
+        .iter()
+        .flat_map(|(_, _, names)| names.iter().copied())
+        .collect();
+
+    let invented: Vec<&&str> = applied.difference(&previewed).collect();
+    assert!(
+        invented.is_empty(),
+        "ENFORCED_STATE_CONSUMERS labels {invented:?}, which `preview::CONSEQUENCES` does not \
+         name — a consequence the preview would never count"
+    );
+    let unapplied: Vec<&&str> = previewed.difference(&applied).collect();
+    assert!(
+        unapplied.is_empty(),
+        "`preview::CONSEQUENCES` names {unapplied:?}, which no scanned call site applies — the \
+         preview reports a consequence enforcement cannot produce"
+    );
+}
+
+/// The scanner must not be fooled by the prose that documents the observe/enforce
+/// split, and must not miss a rustfmt-wrapped chain — the two ways a source scan
+/// silently degrades into a test that passes on everything.
+#[test]
+fn prose_is_not_a_call_site_and_a_wrapped_chain_still_is() {
+    assert!(enforced_state_exprs(&scannable_source(
+        "// `enforced_state` answers Healthy while soaking\n/// see ctx.health.enforced_state\n"
+    ))
+    .is_empty());
+    assert_eq!(
+        enforced_state_exprs(&scannable_source(
+            "        let state = ctx.health.enforced_state(&ctx.app, dataset).await;\n"
+        )),
+        vec!["ctx.health.enforced_state".to_string()]
+    );
+    let wrapped = "let s = state\n            .health\n            .enforced_state(app, dataset)\n            .await;\n";
+    assert_eq!(
+        enforced_state_exprs(&scannable_source(wrapped)),
+        vec!["state.health.enforced_state".to_string()]
     );
 }

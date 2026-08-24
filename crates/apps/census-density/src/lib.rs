@@ -819,8 +819,7 @@ pub struct Normalized {
 /// [`census_common::covering_naics`] (keep the covering code, drop the covered)
 /// and only fold the kept codes into the overall map.
 fn overall_ranking(trades_ranked: &[(String, Vec<(String, i64)>)]) -> BTreeMap<String, i64> {
-    let contributing: BTreeSet<String> =
-        trades_ranked.iter().map(|(n, _)| n.clone()).collect();
+    let contributing: BTreeSet<String> = trades_ranked.iter().map(|(n, _)| n.clone()).collect();
     let (counted, _dropped) = census_common::covering_naics(&contributing);
     let counted: BTreeSet<String> = counted.into_iter().collect();
     let mut overall: BTreeMap<String, i64> = BTreeMap::new();
@@ -2343,8 +2342,14 @@ mod tests {
 
         // Single-grain (the normal case) is untouched: two non-overlapping codes
         // both contribute to the combined total.
-        let a = ("238210".to_string(), vec![("Austin, TX".to_string(), 30i64)]);
-        let b = ("238220".to_string(), vec![("Austin, TX".to_string(), 40i64)]);
+        let a = (
+            "238210".to_string(),
+            vec![("Austin, TX".to_string(), 30i64)],
+        );
+        let b = (
+            "238220".to_string(),
+            vec![("Austin, TX".to_string(), 40i64)],
+        );
         let plain = overall_ranking(&[a, b]);
         assert_eq!(plain.get("Austin, TX"), Some(&70));
     }

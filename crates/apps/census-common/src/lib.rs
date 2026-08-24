@@ -661,15 +661,30 @@ mod tests {
     #[test]
     fn an_empty_body_on_a_non_success_status_is_a_failure_not_an_empty_answer() {
         // The bug: these must NOT be read as "nothing published".
-        assert!(!is_empty_answer(500, ""), "500 with no body is a transient failure");
-        assert!(!is_empty_answer(503, "   \n "), "503 with a blank body is a failure");
+        assert!(
+            !is_empty_answer(500, ""),
+            "500 with no body is a transient failure"
+        );
+        assert!(
+            !is_empty_answer(503, "   \n "),
+            "503 with a blank body is a failure"
+        );
         assert!(!is_empty_answer(502, ""));
-        assert!(!is_empty_answer(429, ""), "rate-limit with no body must retry, not skip");
-        assert!(!is_empty_answer(400, ""), "a 4xx with no body is still not an empty answer");
+        assert!(
+            !is_empty_answer(429, ""),
+            "rate-limit with no body must retry, not skip"
+        );
+        assert!(
+            !is_empty_answer(400, ""),
+            "a 4xx with no body is still not an empty answer"
+        );
         // The success cases are unchanged — an empty answer still means empty.
         assert!(is_empty_answer(200, ""));
         assert!(is_empty_answer(204, ""));
-        assert!(is_empty_answer(204, "[[\"NAME\"]]"), "204 still wins on its own");
+        assert!(
+            is_empty_answer(204, "[[\"NAME\"]]"),
+            "204 still wins on its own"
+        );
     }
 
     /// All four census apps must route their empty-answer check through

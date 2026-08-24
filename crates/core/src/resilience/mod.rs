@@ -95,6 +95,24 @@ pub enum SourceState {
     /// A dead source (permanently gone URLs), not a broken extractor. Set
     /// manually; nothing auto-retires.
     Retired,
+    /// **Not a rung: the absence of one.** The health of this source could not
+    /// be read — the state column held a value this build does not know, or the
+    /// lookup itself failed.
+    ///
+    /// It exists because the alternative was worse. Both of those cases used to
+    /// resolve to [`Healthy`](Self::Healthy), so a database error on the health
+    /// table published a confident green about a check that had not run — the
+    /// exact shape of "unknown rendering as a definite value" the enforcement
+    /// design is built to avoid. Rendering it as its own state costs nothing
+    /// downstream: `Unknown` gates nothing, stamps nothing and diverts nothing,
+    /// so the fail-open behaviour on the write path of every app is byte-for-byte
+    /// what it was — only the *reported* state changed, from a lie to a fact.
+    ///
+    /// Nothing writes it. The ladder never produces it (see
+    /// [`detect::next_state`]), the operator cannot set it (`POST
+    /// /sources/{id}/state` rejects it), and it is only ever the answer to a read
+    /// that failed.
+    Unknown,
 }
 
 impl SourceState {
@@ -106,28 +124,37 @@ impl SourceState {
             Self::Quarantined => "quarantined",
             Self::Probation => "probation",
             Self::Retired => "retired",
+            Self::Unknown => "unknown",
         }
     }
 
-    /// Parses a stored state. An unrecognized value reads as `healthy` rather
-    /// than failing the run: a state column that cannot be parsed must not be
-    /// able to take the whole pipeline down.
+    /// Parses a stored state. An unrecognized value reads as
+    /// [`Unknown`](Self::Unknown) rather than failing the run: a state column
+    /// that cannot be parsed must not be able to take the whole pipeline down —
+    /// and must not be able to claim the source is fine either. `Unknown` gates
+    /// nothing, so this is the same fail-open it always was, told honestly.
     pub fn parse(s: &str) -> Self {
         match s {
+            "healthy" => Self::Healthy,
             "suspect" => Self::Suspect,
             "degraded" => Self::Degraded,
             "quarantined" => Self::Quarantined,
             "probation" => Self::Probation,
             "retired" => Self::Retired,
-            _ => Self::Healthy,
+            _ => Self::Unknown,
         }
     }
 
     /// The trust stamp records written in this state carry. `None` means
     /// `stable`, which is also what `NULL` in the column means.
+    ///
+    /// `Unknown` stamps nothing, deliberately: the stamp is persisted onto every
+    /// record, so inventing a new trust value for a transient read failure would
+    /// write the failure into the dataset. The honesty belongs on the state
+    /// surface, which is where it now is.
     pub fn trust(self) -> Option<&'static str> {
         match self {
-            Self::Healthy | Self::Suspect | Self::Retired => None,
+            Self::Healthy | Self::Suspect | Self::Retired | Self::Unknown => None,
             Self::Degraded | Self::Probation => Some("provisional"),
             Self::Quarantined => Some("quarantined"),
         }
@@ -450,7 +477,7 @@ mod tests {
     }
 
     #[test]
-    fn state_round_trips_and_an_unknown_value_reads_as_healthy() {
+    fn state_round_trips_and_an_unreadable_value_reads_as_unknown_not_healthy() {
         for state in [
             SourceState::Healthy,
             SourceState::Suspect,
@@ -458,11 +485,30 @@ mod tests {
             SourceState::Quarantined,
             SourceState::Probation,
             SourceState::Retired,
+            SourceState::Unknown,
         ] {
             assert_eq!(SourceState::parse(state.as_str()), state);
         }
-        // Fail-open: an unparseable state must not be able to stop a pipeline.
-        assert_eq!(SourceState::parse("nonsense"), SourceState::Healthy);
+        // The anti-pattern: an unparseable state column resolved to `healthy`,
+        // so a row this build could not read published a confident green.
+        assert_eq!(SourceState::parse("nonsense"), SourceState::Unknown);
+        assert_eq!(SourceState::parse(""), SourceState::Unknown);
+        // …and it is still fail-open, which is the property that made the lie
+        // tempting: `unknown` gates nothing, stamps nothing, diverts nothing, so
+        // a health read that failed cannot stop a working pipeline.
+        assert!(!SourceState::Unknown.suppresses_pushes());
+        assert!(!SourceState::Unknown.suppresses_removals());
+        assert!(!SourceState::Unknown.skips_search_index());
+        assert!(!SourceState::Unknown.diverts_writes());
+        assert_eq!(SourceState::Unknown.trust(), None);
+        assert_eq!(write_dataset("products", SourceState::Unknown), "products");
+        // It renders as itself, and is never mistaken for the healthy rung.
+        assert_eq!(SourceState::Unknown.as_str(), "unknown");
+        assert_ne!(SourceState::Unknown, SourceState::Healthy);
+        assert_eq!(
+            serde_json::to_value(SourceState::Unknown).unwrap(),
+            serde_json::json!("unknown")
+        );
     }
 
     #[test]

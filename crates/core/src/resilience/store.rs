@@ -137,7 +137,13 @@ impl HealthStore {
     }
 
     /// Just the state — the read on the hot path of every gated write, so it
-    /// stays one indexed lookup and returns the default for an unknown source.
+    /// stays one indexed lookup.
+    ///
+    /// A source with **no row** is `Healthy`: it has never reported a run, which
+    /// is the ordinary state of a source on its first pass and says nothing bad.
+    /// A row whose state string this build cannot parse is
+    /// [`SourceState::Unknown`] — that one is a read that failed, not a source
+    /// that is fine.
     pub async fn state(&self, app: &str, dataset: &str) -> Result<SourceState> {
         let state: Option<String> = sqlx::query_scalar("SELECT state FROM sources WHERE id = ?1")
             .bind(source_id(app, dataset))
@@ -696,13 +702,21 @@ impl Resilience {
         self.store.as_ref()
     }
 
-    /// The source's state, or `Healthy` when detection is off, the source is
-    /// unknown, or the read fails.
+    /// The source's state: `Healthy` when detection is off or the source has
+    /// never reported a run, and [`SourceState::Unknown`] when the read itself
+    /// failed.
     ///
     /// Fail-open is deliberate and load-bearing: this sits on the write path of
     /// every app, and a health lookup that errors must never be able to stop a
     /// working pipeline. The cost of failing open is one unsuppressed run; the
     /// cost of failing closed is the whole fleet stopping on a locked database.
+    ///
+    /// What changed is *what the failure is called*, not what it does. A failed
+    /// read used to answer `Healthy` — a state with a meaning ("this source is
+    /// producing what it always did") that a database error is in no position to
+    /// claim, and one that reached the job result, the worker's logs and the
+    /// preview as an ordinary green. `Unknown` gates nothing, stamps nothing and
+    /// diverts nothing, so it is the identical fail-open, reported honestly.
     pub async fn state(&self, app: &str, dataset: &str) -> SourceState {
         let Some(store) = &self.store else {
             return SourceState::Healthy;
@@ -711,9 +725,10 @@ impl Resilience {
             Ok(state) => state,
             Err(e) => {
                 tracing::warn!(
-                    "health state read failed for {app}/{dataset}, assuming healthy: {e}"
+                    "health state read failed for {app}/{dataset}, reported as `unknown` \
+                     (gates nothing, exactly as before): {e}"
                 );
-                SourceState::Healthy
+                SourceState::Unknown
             }
         }
     }

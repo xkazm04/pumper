@@ -23,6 +23,8 @@ const SOURCE_RUN_PREVIEW: i64 = 10;
 #[derive(Deserialize, IntoParams)]
 pub(crate) struct SourcesQuery {
     /// Only sources in this state (`healthy|suspect|degraded|quarantined|probation|retired`).
+    /// Matches the stored column, so `unknown` — the rendered state of a row this
+    /// build cannot read — is never a stored value to filter on.
     state: Option<String>,
     /// Only sources served by this app.
     app: Option<String>,
@@ -47,7 +49,10 @@ pub(crate) struct SourcesQuery {
             `monitored: false` means the source has never produced a cohort at or above \
             `[resilience] min_cohort_docs`, so the distributional tests have never applied to \
             it — `state: \"healthy\"` on such a row means *unwatched*, not *verified*, and \
-            `unmonitored` counts those rows. \
+            `unmonitored` counts those rows. `state: \"unknown\"` is narrower and means the \
+            health could not be READ (a stored state this build does not recognize, or a \
+            failed lookup); it gates nothing, exactly as a failed read always did, but it is \
+            no longer reported as `healthy`. \
             `enforcing: false` means verdicts are recorded but nothing is gated. \
             `contracts_enforce` is the configured `[contracts] enforce`; `contracts` \
             (`{enforce_configured, enforce_observed, catalog_ok, catalog_error?, declared, \
@@ -344,13 +349,17 @@ pub(crate) async fn set_source_state(
 ) -> Result<Json<Value>, ApiError> {
     let store = health_store(&state)?;
     // Parse strictly here, unlike the fail-open read path: an operator typo must
-    // not silently reset a source to healthy.
+    // not silently reset a source to healthy. `unknown` is rejected alongside the
+    // typos — it is the answer a FAILED read gives, never a rung, and writing it
+    // into the column would manufacture the very unreadable row it exists to
+    // report.
     let parsed = pumper_core::SourceState::parse(&body.state);
-    if parsed.as_str() != body.state {
+    if parsed == pumper_core::SourceState::Unknown || parsed.as_str() != body.state {
         return Err(ApiError(
             StatusCode::BAD_REQUEST,
             format!(
-                "unknown state '{}' — expected one of healthy|suspect|degraded|quarantined|probation|retired",
+                "unsettable state '{}' — expected one of healthy|suspect|degraded|quarantined|probation|retired \
+                 (`unknown` is read-only: it is what a health read that failed reports)",
                 body.state
             ),
         ));

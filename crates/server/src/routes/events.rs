@@ -250,4 +250,3 @@ fn reset_event(latest: u64) -> Event {
         .event("reset")
         .data("replay gap: reconnect point too old, resync state")
 }
-

@@ -75,6 +75,54 @@ async fn the_detection_off_503s_report_unavailable_not_internal() {
     assert_eq!(body["code"], "unavailable", "{body}");
 }
 
+/// `unknown` is a state the API **renders** and never **accepts**.
+///
+/// It is what a health read that failed reports — the honest replacement for the
+/// `healthy` a failed read used to claim. Letting an operator POST it would
+/// write the string into `sources.state`, manufacturing the very unreadable row
+/// the value exists to describe, and the next read would report `unknown` about
+/// a row that is perfectly readable and says so.
+#[tokio::test]
+async fn unknown_is_a_rendered_state_the_operator_cannot_set() {
+    let (state, _store) = test_state_with(vec![], |_| {}).await;
+    assert!(
+        state.health.store().is_some(),
+        "detection must be on, or this route answers 503 and proves nothing"
+    );
+    let router = routes::router(state);
+
+    for bad in ["unknown", "not-a-state", ""] {
+        let (status, body) = send(
+            &router,
+            "POST",
+            "/sources/fake%2Fitems/state",
+            json!({ "state": bad }),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "state {bad:?} was not refused: {body}"
+        );
+        assert!(
+            body["error"].as_str().is_some_and(|e| e.contains(bad)),
+            "the refusal must echo what was sent: {body}"
+        );
+    }
+
+    // …and a real rung is still refused only for the right reason (no such
+    // source), not for being unparseable — otherwise the guard above would pass
+    // by rejecting everything.
+    let (status, body) = send(
+        &router,
+        "POST",
+        "/sources/fake%2Fitems/state",
+        json!({ "state": "quarantined" }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+}
+
 /// The codes that were already right stay right — the widened map must not have
 /// renamed anything a consumer already branches on (`@pumper/sync` reads
 /// `.code` and nothing else).
