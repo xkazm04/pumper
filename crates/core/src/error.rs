@@ -419,6 +419,57 @@ impl Error {
                 | Error::SourceDrift(_)
         )
     }
+
+    /// Whether this failure is the store reporting **contention** rather than a
+    /// defect: SQLite answering `SQLITE_BUSY` / `SQLITE_LOCKED`, or the
+    /// connection pool timing out before a connection came free.
+    ///
+    /// The store instrumentation counts these under their own outcome, because
+    /// they are the database-specific fact that separates engine work from
+    /// contention: a p95 driven by lock waits indicts the pool sizing or a
+    /// writer-hog, not the query plan, and the two have disjoint remedies.
+    ///
+    /// **Classified by code, never by message.** The driver renders SQLite's
+    /// extended result code through `DatabaseError::code()`; the primary code
+    /// is its low byte (`5` = busy, `6` = locked), so `SQLITE_BUSY_SNAPSHOT`
+    /// (517) and `SQLITE_BUSY_TIMEOUT` (261) classify with plain busy without
+    /// this having to enumerate them. The messages SQLite attaches — "database
+    /// is locked", "database table is locked" — are famously ambiguous prose
+    /// that the driver itself apologises for; matching on them is the anti-
+    /// pattern [`PluginFailure`] exists to kill, one layer down.
+    ///
+    /// Pool timeouts join the set because they are contention too, and the
+    /// instrument's `phase` label is what keeps them distinguishable: an
+    /// acquire-phase busy is a pool-sizing finding, an execute-phase busy is a
+    /// writer-hog finding.
+    #[cfg(feature = "storage")]
+    pub fn is_store_contention(&self) -> bool {
+        match self {
+            Error::Storage(sqlx::Error::PoolTimedOut) => true,
+            Error::Storage(sqlx::Error::Database(db)) => {
+                matches!(sqlite_primary_code(db.as_ref()), Some(5 | 6))
+            }
+            _ => false,
+        }
+    }
+
+    /// Without the `storage` feature there is no database to be contended over.
+    #[cfg(not(feature = "storage"))]
+    pub fn is_store_contention(&self) -> bool {
+        false
+    }
+}
+
+/// SQLite's **primary** result code for a driver error, extracted from the
+/// extended code the driver reports. `None` when the error carries no code at
+/// all (a non-SQLite `DatabaseError`, or one that never reached the engine).
+///
+/// Extracted as a named function rather than inlined so the classification is
+/// testable against a fabricated code without needing a genuinely locked
+/// database — and so the "low byte is the primary code" rule appears once.
+#[cfg(feature = "storage")]
+fn sqlite_primary_code(db: &dyn sqlx::error::DatabaseError) -> Option<i32> {
+    db.code()?.parse::<i32>().ok().map(|code| code & 0xff)
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
@@ -807,5 +858,99 @@ mod tests {
                 "{e} is classified against the table's intent"
             );
         }
+    }
+
+    // ---- store contention -------------------------------------------------
+
+    /// A `DatabaseError` carrying an arbitrary SQLite result code, so the
+    /// classification can be driven across the whole code space without
+    /// arranging a genuinely locked file for each one. The real thing is
+    /// exercised end-to-end in `crates/core/tests/store_instrument_chokepoint.rs`,
+    /// which takes an actual `SQLITE_BUSY` off a second connection.
+    #[cfg(feature = "storage")]
+    #[derive(Debug)]
+    struct CodedDbError(i32);
+
+    #[cfg(feature = "storage")]
+    impl std::fmt::Display for CodedDbError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            // Deliberately prose that says nothing recognisable: the class must
+            // survive ANY message, exactly as `PluginFailure` must.
+            write!(f, "something went wrong somewhere")
+        }
+    }
+
+    #[cfg(feature = "storage")]
+    impl std::error::Error for CodedDbError {}
+
+    #[cfg(feature = "storage")]
+    impl sqlx::error::DatabaseError for CodedDbError {
+        fn message(&self) -> &str {
+            "something went wrong somewhere"
+        }
+        fn code(&self) -> Option<std::borrow::Cow<'_, str>> {
+            Some(self.0.to_string().into())
+        }
+        fn as_error(&self) -> &(dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn as_error_mut(&mut self) -> &mut (dyn std::error::Error + Send + Sync + 'static) {
+            self
+        }
+        fn into_error(self: Box<Self>) -> Box<dyn std::error::Error + Send + Sync + 'static> {
+            self
+        }
+        fn kind(&self) -> sqlx::error::ErrorKind {
+            sqlx::error::ErrorKind::Other
+        }
+    }
+
+    #[cfg(feature = "storage")]
+    fn coded(code: i32) -> Error {
+        Error::Storage(sqlx::Error::Database(Box::new(CodedDbError(code))))
+    }
+
+    /// The anti-pattern this classifier replaces: SQLite's own messages for the
+    /// two contention codes are "database is locked" and "database table is
+    /// locked" — near-identical prose the driver itself flags as ambiguous — so
+    /// any classifier built on them is one upstream reword away from
+    /// misfiling every lock wait in the store. The code is the fact.
+    #[cfg(feature = "storage")]
+    #[test]
+    fn contention_is_classified_by_result_code_not_by_sqlite_prose() {
+        // SQLITE_BUSY (5) and SQLITE_LOCKED (6), plus the extended forms that
+        // share their low byte: BUSY_RECOVERY 261, BUSY_SNAPSHOT 517,
+        // BUSY_TIMEOUT 773, LOCKED_SHAREDCACHE 262, LOCKED_VTAB 518.
+        for code in [5, 6, 261, 517, 773, 262, 518] {
+            assert!(
+                coded(code).is_store_contention(),
+                "extended code {code} has primary code {} — contention",
+                code & 0xff
+            );
+        }
+        // The pool's own refusal is contention too; the instrument's phase
+        // label is what keeps a sizing finding distinct from a writer-hog one.
+        assert!(Error::Storage(sqlx::Error::PoolTimedOut).is_store_contention());
+    }
+
+    /// The mirror risk, and the more dangerous one: over-classifying. A
+    /// constraint violation or a syntax error counted as "busy" would send an
+    /// operator to the pool sizing while the actual defect sat untouched.
+    #[cfg(feature = "storage")]
+    #[test]
+    fn a_real_defect_is_never_counted_as_contention() {
+        // SQLITE_ERROR (1), SQLITE_CONSTRAINT (19), CONSTRAINT_UNIQUE (2067),
+        // SQLITE_READONLY (8), SQLITE_FULL (13), SQLITE_CORRUPT (11).
+        for code in [1, 19, 2067, 8, 13, 11] {
+            assert!(
+                !coded(code).is_store_contention(),
+                "code {code} is a defect, not contention"
+            );
+        }
+        assert!(!Error::Storage(sqlx::Error::RowNotFound).is_store_contention());
+        // And nothing outside the storage variant may answer this at all, or a
+        // `match` on the outcome silently swallows unrelated failures.
+        assert!(!Error::App("database is locked, allegedly".into()).is_store_contention());
+        assert!(!Error::Http("connection reset".into()).is_store_contention());
     }
 }

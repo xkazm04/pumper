@@ -5,6 +5,7 @@
 //! diffs), turning one-off scrapes into datasets that accrue over time.
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
@@ -13,6 +14,7 @@ use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 
 use crate::retention::ArtifactRef;
+use crate::store_instrument::{StoreInstrument, StoreOp};
 use crate::{Error, Result};
 
 /// Upper bound on the pairs returned by `duplicate_pairs`, so a pathological
@@ -402,6 +404,16 @@ pub struct Datasets {
     /// the whole source anyway — computes it exactly and clears the flag.
     /// See `[derived] max_group_scan`.
     max_group_scan: i64,
+    /// The store's self-instrument, so dataset writes land in the SAME rings as
+    /// the job queue's — keyed by table, which is what makes "the `records`
+    /// table is big AND its writes are degrading" one finding instead of two
+    /// unrelated numbers.
+    ///
+    /// Defaults to a private instrument so `Datasets::new` stays a pure
+    /// constructor; the server shares `Storage`'s via
+    /// [`Datasets::with_instrument`]. A `Datasets` nobody wired is measured
+    /// into a ring nobody reads — wasteful, never wrong.
+    instrument: Arc<StoreInstrument>,
 }
 
 /// Default for [`Datasets::derived_max_depth`] — mirrors
@@ -442,7 +454,15 @@ impl Datasets {
             pool,
             derived_max_depth: DERIVED_MAX_DEPTH_DEFAULT,
             max_group_scan: DERIVED_MAX_GROUP_SCAN_DEFAULT,
+            instrument: Arc::new(StoreInstrument::new()),
         }
+    }
+
+    /// Shares the store's self-instrument, so this handle's writes are measured
+    /// into the same rings `/metrics` and the doctor report render.
+    pub fn with_instrument(mut self, instrument: Arc<StoreInstrument>) -> Self {
+        self.instrument = instrument;
+        self
     }
 
     /// Overrides the derived-chain depth cap (from `[derived] max_depth`).
@@ -511,31 +531,39 @@ impl Datasets {
         // front so writers serialize (busy_timeout makes the second wait); a plain
         // DEFERRED begin would instead fail the read-then-write upgrade with
         // SQLITE_BUSY_SNAPSHOT under WAL.
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-        let result = Self::upsert_in_tx(
-            &mut conn,
-            app,
-            dataset,
-            key,
-            value,
-            hash.as_str(),
-            sim,
-            now,
-            trust,
-            prov,
-        )
-        .await;
-        match result {
-            Ok(kind) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                Ok(kind)
-            }
-            Err(e) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(e)
-            }
-        }
+        // Measured: the acquisition and the transaction are timed under their
+        // own phases, so a writer parked on the pool never reads as a slow
+        // statement (disjoint remedies — pool sizing versus the write itself).
+        self.instrument
+            .metered(&self.pool, StoreOp::DatasetWrite, |mut conn| async move {
+                sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+                let result = Self::upsert_in_tx(
+                    &mut conn,
+                    app,
+                    dataset,
+                    key,
+                    value,
+                    hash.as_str(),
+                    sim,
+                    now,
+                    trust,
+                    prov,
+                )
+                .await;
+                match result {
+                    Ok(kind) => {
+                        sqlx::query("COMMIT").execute(&mut *conn).await?;
+                        // One record considered; `Unchanged` still cost a read
+                        // and the write lock, so it counts as touched.
+                        Ok((kind, 1))
+                    }
+                    Err(e) => {
+                        let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                        Err(e)
+                    }
+                }
+            })
+            .await
     }
 
     /// Transactional body of `upsert`: the SELECT + record write + revision append
@@ -1226,27 +1254,33 @@ impl Datasets {
         // per-record loop did — billed every other app's writer for this batch's
         // CPU, and on a large sync that dominates the lock hold time.
         let prints = fingerprint_batch(items, derived);
-        let mut conn = self.pool.acquire().await?;
-        for (chunk, prints) in items.chunks(UPSERT_CHUNK).zip(prints.chunks(UPSERT_CHUNK)) {
-            sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-            // Accumulate this chunk separately so a mid-chunk failure that rolls
-            // back doesn't leave the returned summary claiming uncommitted rows.
-            let chunk_result =
-                Self::upsert_chunk_in_tx(&mut conn, app, dataset, chunk, prints, trust, prov).await;
-            match chunk_result {
-                Ok(chunk_summary) => {
-                    sqlx::query("COMMIT").execute(&mut *conn).await?;
-                    summary.new.extend(chunk_summary.new);
-                    summary.changed.extend(chunk_summary.changed);
-                    summary.unchanged += chunk_summary.unchanged;
+        self.instrument
+            .metered(&self.pool, StoreOp::DatasetWrite, |mut conn| async move {
+                for (chunk, prints) in items.chunks(UPSERT_CHUNK).zip(prints.chunks(UPSERT_CHUNK)) {
+                    sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+                    // Accumulate this chunk separately so a mid-chunk failure that rolls
+                    // back doesn't leave the returned summary claiming uncommitted rows.
+                    let chunk_result = Self::upsert_chunk_in_tx(
+                        &mut conn, app, dataset, chunk, prints, trust, prov,
+                    )
+                    .await;
+                    match chunk_result {
+                        Ok(chunk_summary) => {
+                            sqlx::query("COMMIT").execute(&mut *conn).await?;
+                            summary.new.extend(chunk_summary.new);
+                            summary.changed.extend(chunk_summary.changed);
+                            summary.unchanged += chunk_summary.unchanged;
+                        }
+                        Err(e) => {
+                            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                            return Err(e);
+                        }
+                    }
                 }
-                Err(e) => {
-                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                    return Err(e);
-                }
-            }
-        }
-        Ok(summary)
+                let touched = items.len() as u64;
+                Ok((summary, touched))
+            })
+            .await
     }
 
     /// One chunk of a batch upsert, inside the caller's write transaction:

@@ -16,6 +16,8 @@ pub mod datasets;
 pub mod doctor;
 #[cfg(feature = "storage")]
 pub mod storage;
+#[cfg(feature = "storage")]
+pub mod store_instrument;
 #[cfg(feature = "test-support")]
 pub mod testing;
 #[cfg(feature = "storage")]
@@ -87,8 +89,13 @@ pub use retention::{
 pub use storage::{
     Delivery, DeliveryHealth, EnqueueOptions, IngressSource, JobStages, JobTimingStats,
     LedgerPruned, LedgerRetention, LedgerStat, NewDerivedSpec, NewSchedule, NewTrigger, PluginHook,
-    RevisionCount, SavedSearch, Schedule, SearchMaterialize, Storage, Trigger, TriggerPluginHooks,
-    Watch, YieldSummary, LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
+    QueueAges, RevisionCount, SavedSearch, Schedule, SearchMaterialize, Storage, Trigger,
+    TriggerPluginHooks, Watch, YieldSummary, LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
+};
+#[cfg(feature = "storage")]
+pub use store_instrument::{
+    KeyReport, MaintenancePass, MaintenanceTask, OpOutcome, PassOutcome, PassTrigger,
+    StoreInstrument, StoreOp, StorePhase, StoreSize,
 };
 #[cfg(feature = "storage")]
 pub use tiers::{

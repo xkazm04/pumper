@@ -13,6 +13,7 @@ use uuid::Uuid;
 use crate::config::StorageConfig;
 use crate::datasets::DerivedSpec;
 use crate::job::{Job, JobStatus};
+use crate::store_instrument::{StoreInstrument, StoreOp, StoreSize};
 use crate::{Error, Result};
 
 const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, priority, \
@@ -200,7 +201,21 @@ pub fn migrator() -> sqlx::migrate::Migrator {
 #[derive(Clone)]
 pub struct Storage {
     pool: SqlitePool,
+    /// The main database file. Kept so the store can measure **its own files**
+    /// — the `-wal` sidecar's size on disk has no SQL to read it, and a store
+    /// that cannot say how big it is cannot answer "why is my disk full?".
+    database_path: PathBuf,
     pub artifacts_dir: PathBuf,
+    /// The in-memory self-instrument every measured statement in this file
+    /// reports through. `Arc` for the same reason `trigger_generation` is one:
+    /// `Storage` is `Clone`, and per-clone rings would split one store's
+    /// history across however many handles happen to exist.
+    ///
+    /// Shared outward via [`Storage::instrument`] so the dataset write path and
+    /// the maintenance passes land in the SAME rings — the join the technique
+    /// asks for ("this table is big AND its writes are degrading") is only
+    /// possible when both halves are keyed alike in one place.
+    instrument: Arc<StoreInstrument>,
     /// Monotonic version of the `triggers` table, bumped by every mutation
     /// (create / enable-toggle / delete) **after** the write commits. Callers
     /// that cache an evaluation set stamp it with the value they read *before*
@@ -242,7 +257,9 @@ impl Storage {
 
         Ok(Self {
             pool,
+            database_path: cfg.database_path.clone(),
             artifacts_dir: cfg.artifacts_dir.clone(),
+            instrument: Arc::new(StoreInstrument::new()),
             trigger_generation: Arc::new(AtomicU64::new(0)),
         })
     }
@@ -251,6 +268,37 @@ impl Storage {
     /// run against the same SQLite database and migrations.
     pub fn pool(&self) -> SqlitePool {
         self.pool.clone()
+    }
+
+    /// Shares the self-instrument with sibling stores and with the maintenance
+    /// gate. One instrument per database, not one per handle.
+    pub fn instrument(&self) -> Arc<StoreInstrument> {
+        self.instrument.clone()
+    }
+
+    /// The main database file's path — the anchor for the sidecar file set.
+    pub fn database_path(&self) -> &std::path::Path {
+        &self.database_path
+    }
+
+    /// **The one measured chokepoint** for this file.
+    ///
+    /// Every statement family enumerated on [`StoreOp`] runs through here and
+    /// nothing else does. The wait for a connection is timed under its own
+    /// phase before the closure ever runs, so a saturated pool can never hide
+    /// behind fast-looking queries.
+    ///
+    /// The honest census: this file issues well over a hundred statements and
+    /// this wraps seven families of them. Schedules, watches, triggers,
+    /// deliveries, saved searches, checkpoints and the recipe store are
+    /// **unmeasured** — stated here, and on every surface that renders the
+    /// numbers, so a partial census is never quoted as a total one.
+    async fn metered<T, F, Fut>(&self, op: StoreOp, f: F) -> Result<T>
+    where
+        F: FnOnce(sqlx::pool::PoolConnection<sqlx::Sqlite>) -> Fut,
+        Fut: std::future::Future<Output = Result<(T, u64)>>,
+    {
+        self.instrument.metered(&self.pool, op, f).await
     }
 
     pub async fn enqueue(&self, app: &str, opts: EnqueueOptions) -> Result<Job> {
@@ -268,28 +316,45 @@ impl Storage {
         let id = Uuid::new_v4();
         let created = Utc::now();
         let available = created + chrono::Duration::seconds(opts.delay_secs as i64);
-        let insert = sqlx::query(
-            "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
-             callback_url, callback_secret, budget_usd, idempotency_key, schedule_id, \
-             trigger_id, source_job_id, created_at, available_at) \
-             VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
-        )
-        .bind(id.to_string())
-        .bind(app)
-        .bind(opts.params.to_string())
-        .bind(opts.max_attempts.max(1))
-        .bind(opts.priority)
-        .bind(opts.callback_url)
-        .bind(opts.callback_secret)
-        .bind(opts.budget_usd)
-        .bind(&opts.idempotency_key)
-        .bind(&opts.schedule_id)
-        .bind(&opts.trigger_id)
-        .bind(&opts.source_job_id)
-        .bind(ts(created))
-        .bind(ts(available))
-        .execute(&self.pool)
-        .await;
+        // Bound before the measured closure so the closure captures borrows,
+        // not `opts` itself — the unique-key race arm below still needs it.
+        let params = opts.params.to_string();
+        let max_attempts = opts.max_attempts.max(1);
+        let (priority, budget) = (opts.priority, opts.budget_usd);
+        let cb_url = opts.callback_url.as_deref();
+        let cb_secret = opts.callback_secret.as_deref();
+        let idem = opts.idempotency_key.as_deref();
+        let sched = opts.schedule_id.as_deref();
+        let trig = opts.trigger_id.as_deref();
+        let src = opts.source_job_id.as_deref();
+        let insert = self
+            .metered(StoreOp::JobEnqueue, |mut conn| async move {
+                let r = sqlx::query(
+                    "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
+                     callback_url, callback_secret, budget_usd, idempotency_key, schedule_id, \
+                     trigger_id, source_job_id, created_at, available_at) \
+                     VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+                )
+                .bind(id.to_string())
+                .bind(app)
+                .bind(params)
+                .bind(max_attempts)
+                .bind(priority)
+                .bind(cb_url)
+                .bind(cb_secret)
+                .bind(budget)
+                .bind(idem)
+                .bind(sched)
+                .bind(trig)
+                .bind(src)
+                .bind(ts(created))
+                .bind(ts(available))
+                .execute(&mut *conn)
+                .await?;
+                let rows = r.rows_affected();
+                Ok(((), rows))
+            })
+            .await;
         if let Err(e) = insert {
             // Lost a concurrent race on the unique key — return the winner.
             if let Some(key) = &opts.idempotency_key {
@@ -297,7 +362,7 @@ impl Storage {
                     return Ok((existing, false));
                 }
             }
-            return Err(e.into());
+            return Err(e);
         }
         let job = self
             .get(id)
@@ -350,11 +415,19 @@ impl Storage {
                          ORDER BY {order} LIMIT 1) \
              RETURNING {JOB_COLUMNS}"
         );
-        let mut query = sqlx::query_as::<_, JobRow>(&sql).bind(now());
-        for app in blocked {
-            query = query.bind(app);
-        }
-        let row = query.fetch_optional(&self.pool).await?;
+        let row = self
+            .metered(StoreOp::JobClaim, |mut conn| async move {
+                let mut query = sqlx::query_as::<_, JobRow>(&sql).bind(now());
+                for app in blocked {
+                    query = query.bind(app);
+                }
+                let row = query.fetch_optional(&mut *conn).await?;
+                // An empty queue touches zero rows — the honest number, and the
+                // one that keeps `rows / ops` readable as a claim hit rate.
+                let rows = row.is_some() as u64;
+                Ok((row, rows))
+            })
+            .await?;
         row.map(Job::try_from).transpose()
     }
 
@@ -364,17 +437,25 @@ impl Storage {
     /// attempt number) can't overwrite the live row. Returns whether the write
     /// landed (`false` = discarded as stale).
     pub async fn complete(&self, id: Uuid, attempt: i64, result: Value) -> Result<bool> {
-        let r = sqlx::query(
-            "UPDATE jobs SET status = 'succeeded', result = ?2, error = NULL, finished_at = ?3 \
-             WHERE id = ?1 AND status = 'running' AND attempts = ?4",
-        )
-        .bind(id.to_string())
-        .bind(result.to_string())
-        .bind(now())
-        .bind(attempt)
-        .execute(&self.pool)
-        .await?;
-        Ok(r.rows_affected() > 0)
+        let payload = result.to_string();
+        let rows = self
+            .metered(StoreOp::JobVerdict, |mut conn| async move {
+                let r = sqlx::query(
+                    "UPDATE jobs SET status = 'succeeded', result = ?2, error = NULL, \
+                     finished_at = ?3 \
+                     WHERE id = ?1 AND status = 'running' AND attempts = ?4",
+                )
+                .bind(id.to_string())
+                .bind(payload)
+                .bind(now())
+                .bind(attempt)
+                .execute(&mut *conn)
+                .await?;
+                let rows = r.rows_affected();
+                Ok((rows, rows))
+            })
+            .await?;
+        Ok(rows > 0)
     }
 
     /// Records a running job's failure, guarded on `(status, attempts)` like
@@ -409,17 +490,23 @@ impl Storage {
                 });
             let jitter = (crate::jitter::lcg_fraction(seed) * (backoff_secs as f64) * 0.25) as i64;
             let available = Utc::now() + chrono::Duration::seconds(backoff_secs as i64 + jitter);
-            let r = sqlx::query(
-                "UPDATE jobs SET status = 'queued', error = ?2, available_at = ?3 \
-                 WHERE id = ?1 AND status = 'running' AND attempts = ?4",
-            )
-            .bind(id.to_string())
-            .bind(error)
-            .bind(ts(available))
-            .bind(attempt)
-            .execute(&self.pool)
-            .await?;
-            Ok((r.rows_affected() > 0).then_some(JobStatus::Queued))
+            let rows = self
+                .metered(StoreOp::JobVerdict, |mut conn| async move {
+                    let r = sqlx::query(
+                        "UPDATE jobs SET status = 'queued', error = ?2, available_at = ?3 \
+                         WHERE id = ?1 AND status = 'running' AND attempts = ?4",
+                    )
+                    .bind(id.to_string())
+                    .bind(error)
+                    .bind(ts(available))
+                    .bind(attempt)
+                    .execute(&mut *conn)
+                    .await?;
+                    let rows = r.rows_affected();
+                    Ok((rows, rows))
+                })
+                .await?;
+            Ok((rows > 0).then_some(JobStatus::Queued))
         } else {
             let ok = self.fail_permanently(id, attempt, error).await?;
             Ok(ok.then_some(JobStatus::Failed))
@@ -429,17 +516,23 @@ impl Storage {
     /// Marks a running job permanently failed, guarded on `(status, attempts)`.
     /// Returns whether the write landed (`false` = stale, discarded).
     pub async fn fail_permanently(&self, id: Uuid, attempt: i64, error: &str) -> Result<bool> {
-        let r = sqlx::query(
-            "UPDATE jobs SET status = 'failed', error = ?2, finished_at = ?3 \
-             WHERE id = ?1 AND status = 'running' AND attempts = ?4",
-        )
-        .bind(id.to_string())
-        .bind(error)
-        .bind(now())
-        .bind(attempt)
-        .execute(&self.pool)
-        .await?;
-        Ok(r.rows_affected() > 0)
+        let rows = self
+            .metered(StoreOp::JobVerdict, |mut conn| async move {
+                let r = sqlx::query(
+                    "UPDATE jobs SET status = 'failed', error = ?2, finished_at = ?3 \
+                     WHERE id = ?1 AND status = 'running' AND attempts = ?4",
+                )
+                .bind(id.to_string())
+                .bind(error)
+                .bind(now())
+                .bind(attempt)
+                .execute(&mut *conn)
+                .await?;
+                let rows = r.rows_affected();
+                Ok((rows, rows))
+            })
+            .await?;
+        Ok(rows > 0)
     }
 
     /// Cancels a job that has not started yet, returning the cancelled job's
@@ -598,11 +691,92 @@ impl Storage {
 
     /// Counts jobs grouped by status — for the metrics endpoint.
     pub async fn status_counts(&self) -> Result<Vec<(String, i64)>> {
-        let rows: Vec<(String, i64)> =
-            sqlx::query_as("SELECT status, COUNT(*) FROM jobs GROUP BY status")
-                .fetch_all(&self.pool)
+        self.metered(StoreOp::JobStatusCounts, |mut conn| async move {
+            let rows: Vec<(String, i64)> =
+                sqlx::query_as("SELECT status, COUNT(*) FROM jobs GROUP BY status")
+                    .fetch_all(&mut *conn)
+                    .await?;
+            // Rows *touched*, not rows returned: this aggregates the whole
+            // table, and the whole point of the figure is to separate "the
+            // query got slower" from "the table got bigger".
+            let scanned = rows.iter().map(|(_, n)| *n as u64).sum();
+            Ok((rows, scanned))
+        })
+        .await
+    }
+
+    /// Age of the oldest job in each of the two states an operator alerts on.
+    ///
+    /// `pumper_jobs{status}` already says *how many* are queued; a depth alone
+    /// cannot tell a healthy busy queue from a wedged one. The ages can: a
+    /// steady depth with a growing oldest-queued age is a worker that has
+    /// stopped claiming, and a growing oldest-running age is a job that has
+    /// stopped finishing.
+    ///
+    /// Both read `0` when the state is empty rather than carrying their last
+    /// value — a gauge that keeps its last age once the queue clears is an
+    /// alert that never resolves. Clock skew (a row stamped in the future) is
+    /// clamped at `0` for the same reason the delivery gauge clamps it.
+    pub async fn queue_ages(&self) -> Result<QueueAges> {
+        self.metered(StoreOp::JobStatusCounts, |mut conn| async move {
+            let ages: QueueAges = sqlx::query_as(
+                "SELECT \
+                   COALESCE(MAX(0.0, (julianday(?1) - julianday(MIN(CASE WHEN status = 'queued' \
+                     THEN created_at END))) * 86400.0), 0.0) AS oldest_queued_secs, \
+                   COALESCE(MAX(0.0, (julianday(?1) - julianday(MIN(CASE WHEN status = 'running' \
+                     THEN started_at END))) * 86400.0), 0.0) AS oldest_running_secs \
+                 FROM jobs",
+            )
+            .bind(now())
+            .fetch_one(&mut *conn)
+            .await?;
+            Ok((ages, 1))
+        })
+        .await
+    }
+
+    /// What this store costs on disk, measured from the engine's own page
+    /// accounting plus a `stat` of the sidecar.
+    ///
+    /// Three separate facts, deliberately not one "size": pages allocated,
+    /// pages on the freelist (allocated but recycled — the gap between "rows
+    /// deleted" and "bytes returned to the disk"), and the write-ahead
+    /// sidecar, which under WAL is a **permanent resident** whose growth is
+    /// bounded only by checkpoints actually happening.
+    ///
+    /// An unreadable sidecar reports `0` bytes rather than failing the report:
+    /// there genuinely is no `-wal` file on a store that has never been
+    /// written, and the accounting must not manufacture a finding out of its
+    /// own failure to measure.
+    pub async fn size_facts(&self) -> Result<StoreSize> {
+        let path = self.database_path.clone();
+        self.metered(StoreOp::Maintenance, |mut conn| async move {
+            let (page_size,): (i64,) = sqlx::query_as("PRAGMA page_size")
+                .fetch_one(&mut *conn)
                 .await?;
-        Ok(rows)
+            let (page_count,): (i64,) = sqlx::query_as("PRAGMA page_count")
+                .fetch_one(&mut *conn)
+                .await?;
+            let (freelist,): (i64,) = sqlx::query_as("PRAGMA freelist_count")
+                .fetch_one(&mut *conn)
+                .await?;
+            let page_size = page_size.max(0) as u64;
+            let page_count = page_count.max(0) as u64;
+            let freelist_pages = freelist.max(0) as u64;
+            let wal_bytes = wal_sidecar_bytes(&path);
+            Ok((
+                StoreSize {
+                    page_size,
+                    page_count,
+                    freelist_pages,
+                    main_bytes: page_size * page_count,
+                    free_bytes: page_size * freelist_pages,
+                    wal_bytes,
+                },
+                page_count,
+            ))
+        })
+        .await
     }
 
     /// Permanently-failed job count per app — the DB-derived source for the
@@ -714,9 +888,15 @@ impl Storage {
             "SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'running' \
              ORDER BY started_at ASC, id ASC LIMIT ?1"
         );
-        let rows: Vec<JobRow> = sqlx::query_as(&sql)
-            .bind(RECOVERY_SWEEP_LIMIT)
-            .fetch_all(&self.pool)
+        let rows: Vec<JobRow> = self
+            .metered(StoreOp::JobRecovery, |mut conn| async move {
+                let rows: Vec<JobRow> = sqlx::query_as(&sql)
+                    .bind(RECOVERY_SWEEP_LIMIT)
+                    .fetch_all(&mut *conn)
+                    .await?;
+                let n = rows.len() as u64;
+                Ok((rows, n))
+            })
             .await?;
         let truncated = rows.len() as i64 == RECOVERY_SWEEP_LIMIT;
         let mut sweep = self.issue_recovery_verdicts(rows, reason).await?;
@@ -805,10 +985,16 @@ impl Storage {
              AND COALESCE(heartbeat_at, started_at, created_at) < ?1 \
              ORDER BY COALESCE(heartbeat_at, started_at, created_at) ASC, id ASC LIMIT ?2"
         );
-        let rows: Vec<JobRow> = sqlx::query_as(&sql)
-            .bind(&cutoff)
-            .bind(RECOVERY_SWEEP_LIMIT)
-            .fetch_all(&self.pool)
+        let rows: Vec<JobRow> = self
+            .metered(StoreOp::JobRecovery, |mut conn| async move {
+                let rows: Vec<JobRow> = sqlx::query_as(&sql)
+                    .bind(&cutoff)
+                    .bind(RECOVERY_SWEEP_LIMIT)
+                    .fetch_all(&mut *conn)
+                    .await?;
+                let n = rows.len() as u64;
+                Ok((rows, n))
+            })
             .await?;
         // Same verdict function as the boot sweep: only the SELECTION differs
         // between "its lease went stale" and "the process it ran in is gone".
@@ -2736,6 +2922,35 @@ pub struct JobTimingStats {
     pub wait_sum: f64,
     pub wait_count: i64,
     pub wait_max: f64,
+}
+
+/// How long the oldest job in each waiting state has been waiting, in seconds.
+///
+/// The companion to `pumper_jobs{status}`: a depth says how much work is
+/// piled up, an age says whether the pile is moving.
+#[derive(Debug, Clone, Copy, Default, Serialize, sqlx::FromRow)]
+pub struct QueueAges {
+    /// Age of the oldest `queued` row, measured from `created_at`. `0` when
+    /// nothing is queued.
+    pub oldest_queued_secs: f64,
+    /// Age of the oldest `running` row, measured from `started_at`. `0` when
+    /// nothing is running.
+    pub oldest_running_secs: f64,
+}
+
+/// Size of the `-wal` sidecar beside `db`, or `0` when there is none.
+///
+/// Extracted and named because the **file set** is the part of the durability
+/// contract that gets forgotten: under WAL the database is not one file, and a
+/// size report that measures only the main file understates the store by
+/// exactly the commits that have not been checkpointed yet — which is the one
+/// number the maintenance gate escalates on.
+fn wal_sidecar_bytes(db: &std::path::Path) -> u64 {
+    let mut name = db.as_os_str().to_os_string();
+    name.push("-wal");
+    std::fs::metadata(std::path::Path::new(&name))
+        .map(|m| m.len())
+        .unwrap_or(0)
 }
 
 #[derive(sqlx::FromRow)]
