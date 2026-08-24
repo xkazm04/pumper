@@ -126,11 +126,37 @@ async fn background_committer_flushes_without_explicit_flush() {
     .unwrap();
 
     index.index(vec![doc("y", 1)]).await.unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(400)).await; // past COMMIT_INTERVAL
+
+    // POLL to a generous deadline; do NOT sleep a fixed 400 ms.
+    //
+    // `COMMIT_INTERVAL` is 250 ms, so 400 ms "past the interval" looks like
+    // plenty on a developer's machine and is a coin toss on a loaded shared
+    // runner, where the committer's tick can simply not get scheduled in time.
+    // That is what it was: `test (windows-latest)` failed here with 0 where 1
+    // was expected, intermittently, while every local run passed.
+    //
+    // Polling keeps the ASSERTION identical — the background committer makes the
+    // document visible with no explicit `flush()` — while removing the wall
+    // clock from the verdict. It is also strictly faster in the common case: it
+    // returns as soon as the commit lands instead of always burning 400 ms.
+    // Same reasoning as `poll_image` in engine-claude's fake-CLI tests.
+    //
+    // The deadline is long enough that exhausting it is a real finding (the
+    // committer never ran), not a slow runner.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let visible = loop {
+        let n = index.doc_count().await.unwrap();
+        if n == 1 || std::time::Instant::now() >= deadline {
+            break n;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    };
     assert_eq!(
-        index.doc_count().await.unwrap(),
+        visible,
         1,
-        "background committer made it visible"
+        "background committer made it visible without an explicit flush \
+         (polled for 30s at a {COMMIT_INTERVAL_MS}ms commit interval)",
+        COMMIT_INTERVAL_MS = 250
     );
 
     drop(index);
