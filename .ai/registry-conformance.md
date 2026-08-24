@@ -126,7 +126,7 @@ what shipped.
 | test-harness | long-lane-certification | followed | `.lanes/criteria.json` — 8 lanes, 13 pre-declared bounds, each carrying its own `predicate` and `basis`; measurement stays in Rust (`crates/core/tests/lane_artifact/`, one artifact per run) and judgement moves to `scripts/ci/lane-certify.mjs`, so a verdict is reproducible from artifact + criteria alone (both are written into each verdict file). **Percentiles not averages**, and ratio bounds preferred over absolutes so a bound certifies the index rather than the runner. The bulk harness now emits a 100-sample per-chunk hold *sequence*, giving a **slope-over-the-second-half** leak criterion — which earned itself immediately: a seeded defect broke `chunk-hold-growth` while `chunk-hold-p95` still passed, the entire argument for a trend criterion. Runs on its own clock (nightly cron `41 5 * * *` + `workflow_dispatch`, routed by `github.event.schedule` so the existing weekly jobs were not promoted to nightly). `first-green` is tracked as an explicit lane event and "NO RUNS RECORDED" / "never attempted here" / "**NEVER GREEN**" are three different sentences; a lane that emits no artifact reports CANNOT-SEE and exits 3 rather than passing. The 4 lanes needing Chrome, live network or the Linux-only plugin rung stay listed as `cannot-run` so the gap stays counted |
 | test-harness | negative-control-tests | followed | `crates/core/tests/eval_tier3_extraction.rs:582` mutates each recorded answer and demands the score drop, with an instrument floor and the one absorbable case fenced by `RECORDED_PREAMBLE_MISSES` (fixed this wave) |
 | test-harness | out-of-graph-artifacts | followed | `.github/workflows/ci.yml` job `@pumper/sync (TypeScript SDK)` names the artifact, its manifest and its own cache, and runs the SDK's test script; `scripts/ci/ship-inventory.test.mjs` fails on any manifest no job claims — an inventory gate, not a memory |
-| test-harness | platform-quirk-absorption | partial | Quirks are absorbed with the incident attached (`crates/core/src/testing.rs:43`) and CI now runs a `windows-latest` leg (`ci.yml:53`, `fail-fast: false`), so the platform the absorptions exist for is gated; there is still no zero-tests-executed floor |
+| test-harness | platform-quirk-absorption | partial | Quirks are absorbed with the incident attached (`crates/core/src/testing.rs:43`) and CI now runs a `windows-latest` leg (`ci.yml:53`, `fail-fast: false`), so the platform the absorptions exist for is gated; there is still no zero-tests-executed floor. **Wave 2b found the cost of that gap being open**: the `Artifact tests` step had been failing on every run with "data/plugins/title.wasm not built" — the wasm target was installed against `stable` while `rust-toolchain.toml` pins 1.96.1, so the plugin build refused and the only rung that catches a host-ABI break was reporting its own non-execution as a test failure. A zero-tests-executed floor is exactly the instrument that would have named it as *cannot run* on day one instead. Fixed in `6c8e767`; the floor itself is still open and is now the strongest remaining item in this subject |
 | test-harness | suite-partitioning | partial | Lanes exist by command and plugins-src membership by location; no per-suite budget or tier, and the `--ignored` lane's membership is annotation-based |
 | quality-gates | blocking-by-input-determinism | partial | `deny.toml:78` leaves `licenses` off CI with a named promotion trigger, but `ci.yml:84` blocks on `advisories` (an external feed) bundled with the deterministic `bans`+`sources` |
 | quality-gates | chokepoint-tag-registry | followed | `crates/core/tests/fetch_chokepoint.rs:39` pins every raw-engine site with counts and per-row reasons, checked in both directions; extended to `enforcement_preview.rs` this wave |
@@ -277,6 +277,23 @@ nothing behind it; it now writes a part file, with a test pinning the property.
 pace and no reclamation to schedule. The half that was in scope — making
 unbounded growth *visible* in bytes, pages and WAL sidecar size — shipped, so
 when retention unparks the accounting needed to size it already exists.
+
+**Three pre-existing CI reds, found because this wave actually looked.** master's
+`test` legs had been red since at least 2026-08-24 16:50 and nobody had looked —
+the exact pathology `long-lane-certification` names, where red becomes normal and
+every failure after the first is wallpaper. All three were repaired, and none of
+them was a test disagreeing with the code:
+
+| red | cause | commit |
+|---|---|---|
+| `vcr::…::total_cap_truncates_later_entries…`, ubuntu-only | the cassette recorder never flushed; `tokio::fs::File` is buffered and does not complete pending writes on drop, so a recording could lose its tail | `8c627d0` |
+| `Clippy`, ubuntu-only | `fake_cli.rs` imported `Path`/`Duration` that only the `#[cfg(windows)]` tests use — dead code on Linux, an error under `-D warnings` | `6c8e767` |
+| `Artifact tests`, every run | the wasm target was installed against `stable` while `rust-toolchain.toml` pins 1.96.1, so the plugin build refused and the host-ABI rung reported its own non-execution as a failure | `6c8e767` |
+
+The first was verified the only way it could be: **red on the parent commit,
+green on the child**, in CI, on the platform that has it. It could not be shown
+red locally — the race does not manifest on Windows — and that limitation is
+recorded in its commit message rather than glossed.
 
 **Still owed to the operator, unchanged from wave 2:** `.claude/CLAUDE.md` still
 describes the doc-sync hook as "exit 2 is a reminder" and there is now also an
