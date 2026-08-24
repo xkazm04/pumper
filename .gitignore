@@ -17,6 +17,21 @@ plugins-src/*/Cargo.lock
 # fresh checkout (or another machine) gets the same workflows.
 !.claude/skills/
 
+# Registry lane-skill OVERLAYS. The skill bodies are symlinks into ai-registry's
+# skills/ lane (machine state, ignored in the managed block at the bottom of this
+# file); everything pumper-specific lives in these overlays and IS versioned, so a
+# fresh checkout gets the same gates, taste and repo law.
+!.claude/architect/
+!.claude/explorer/
+!.claude/perfect/
+!.claude/research/
+# ship-loop keeps its mutable loop state in the same directory — track only the
+# hand-maintained overlay, never state.md / backlog.md / journal.md / decisions.md.
+!.claude/ship-loop/
+.claude/ship-loop/*
+!.claude/ship-loop/config.md
+!.claude/ship-loop/references/
+
 # Secrets / local environment overrides
 .env
 *.local
@@ -33,3 +48,20 @@ app-cost.json
 # OS files
 .DS_Store
 Thumbs.db
+
+# BEGIN ai-registry linked skills (managed by ai-registry/scripts/link-registry.mjs)
+# Links are machine state; the declarations live in .ai/manifest.yaml (`skills:` and `knowledge.domains`).
+/.claude/skills/architect
+/.claude/skills/conform
+/.claude/skills/consult
+/.claude/skills/explorer
+/.claude/skills/perfect
+/.claude/skills/research
+/.claude/skills/scan-sweep
+/.claude/skills/ship-loop
+/.claude/skills/test-before-commit
+/.claude/skills/tiger
+/.claude/rules/ai-registry-access.md
+/.claude/rules/ai-registry-software-engineering.md
+/.claude/rules/ai-registry-llm-observability.md
+# END ai-registry linked skills
