@@ -10,12 +10,21 @@
 //!    "cross-app write stalls during a large sync": the DB-wide write lock is
 //!    held for a whole chunk, so the other app's `BEGIN IMMEDIATE` waits.
 //!
-//! Timing-dependent by construction, so it asserts nothing tight — it prints.
+//! It used to print those numbers and assert nothing about them — no percentile,
+//! no ceiling, no schedule, no artifact, no trend, which is a harness that can
+//! only ever report that it ran. It now **measures and emits**; the pass criteria
+//! are pre-declared in `.lanes/criteria.json` and judged by
+//! `scripts/ci/lane-certify.mjs` (`just lanes`, and the nightly `long-lanes` CI
+//! leg). Keeping the judgement out of here is what stops a bound being quietly
+//! relaxed in the same commit that broke it.
+
+mod lane_artifact;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use lane_artifact::Lane;
 use pumper_core::testing::TempStore;
 use pumper_core::Datasets;
 use serde_json::json;
@@ -69,7 +78,12 @@ where
                     Ok(_) => r.writes += 1,
                     Err(_) => r.starved += 1,
                 }
-                r.worst = r.worst.max(t.elapsed());
+                let waited = t.elapsed();
+                // Every sample, not just the worst: a single maximum cannot be
+                // judged at a percentile, and the whole point of the lane is
+                // that an average hides exactly the tail it exists to see.
+                r.samples.push(waited);
+                r.worst = r.worst.max(waited);
                 tokio::time::sleep(Duration::from_millis(1)).await;
             }
             r
@@ -93,6 +107,8 @@ struct Rival {
     starved: u64,
     /// Worst single-write latency, i.e. the observed write-lock hold time.
     worst: Duration,
+    /// Every single-write latency, for the percentile bounds the lane judges.
+    samples: Vec<Duration>,
 }
 
 impl std::fmt::Display for Rival {
@@ -108,7 +124,7 @@ impl std::fmt::Display for Rival {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "perf harness: ~50k records, timing-dependent"]
+#[ignore = "long lane `datasets-bulk-upsert` — needs a ~50k-record corpus, minutes not seconds; criteria in .lanes/criteria.json, run by `just lanes` and the nightly CI leg"]
 async fn bulk_upsert_50k_cost_report() {
     let store = TempStore::new("datasets-bulk-perf").await;
     let ds = Arc::new(Datasets::new(store.storage.pool()));
@@ -148,32 +164,74 @@ async fn bulk_upsert_50k_cost_report() {
         changed_wall.as_secs_f64()
     );
 
-    // Write-lock HOLD time, measured directly: a batch of exactly one commit
-    // chunk is one `BEGIN IMMEDIATE` … `COMMIT` window, so its wall clock IS how
-    // long the DB-wide write lock is denied to every other app.
+    // Write-lock HOLD time, measured directly and AS A SEQUENCE: a batch of
+    // exactly one commit chunk is one `BEGIN IMMEDIATE` … `COMMIT` window, so
+    // its wall clock IS how long the DB-wide write lock is denied to every
+    // other app. Taking a hundred of them as the table grows from 0 to 50k rows
+    // is what separates warm-up from growth: a single endpoint number is
+    // compatible with a per-chunk cost that has been climbing all along, and
+    // the criterion the lane judges is the SLOPE over the run's second half.
+    const CHUNK: usize = 500;
+    const CHUNKS: usize = N / CHUNK;
     let store = TempStore::new("datasets-bulk-perf-chunk").await;
     let ds = Datasets::new(store.storage.pool());
-    let one_chunk = corpus(500, 0);
-    let t = Instant::now();
-    ds.upsert_many("bench", "one", &one_chunk).await.unwrap();
-    let hold_new = t.elapsed();
-    let t = Instant::now();
-    ds.upsert_many("bench", "one", &one_chunk).await.unwrap();
-    let hold_unchanged = t.elapsed();
-    let touched_chunk = corpus(500, 1);
-    let t = Instant::now();
-    ds.upsert_many("bench", "one", &touched_chunk)
-        .await
-        .unwrap();
-    let hold_changed = t.elapsed();
-    println!("\n=== write-lock hold time, one 500-record chunk (1 transaction) ===");
-    println!("new       {:>7.1}ms", hold_new.as_secs_f64() * 1000.0);
-    println!("unchanged {:>7.1}ms", hold_unchanged.as_secs_f64() * 1000.0);
-    println!("changed   {:>7.1}ms", hold_changed.as_secs_f64() * 1000.0);
+    let mut hold_new: Vec<Duration> = Vec::with_capacity(CHUNKS);
+    for c in 0..CHUNKS {
+        let slice = fresh[c * CHUNK..(c + 1) * CHUNK].to_vec();
+        let t = Instant::now();
+        ds.upsert_many("bench", "chunked", &slice).await.unwrap();
+        hold_new.push(t.elapsed());
+    }
+    let mut hold_unchanged: Vec<Duration> = Vec::with_capacity(CHUNKS);
+    for c in 0..CHUNKS {
+        let slice = fresh[c * CHUNK..(c + 1) * CHUNK].to_vec();
+        let t = Instant::now();
+        ds.upsert_many("bench", "chunked", &slice).await.unwrap();
+        hold_unchanged.push(t.elapsed());
+    }
+    let ms = |d: &Duration| d.as_secs_f64() * 1000.0;
+    println!(
+        "\n=== write-lock hold time, {CHUNKS} x {CHUNK}-record chunks (1 transaction each) ==="
+    );
+    println!(
+        "new       first {:>7.1}ms  last {:>7.1}ms",
+        ms(&hold_new[0]),
+        ms(hold_new.last().unwrap())
+    );
+    println!(
+        "unchanged first {:>7.1}ms  last {:>7.1}ms",
+        ms(&hold_unchanged[0]),
+        ms(hold_unchanged.last().unwrap())
+    );
+
+    let mut lane = Lane::new(
+        "datasets-bulk-upsert",
+        json!({
+            "records": N,
+            "chunk_records": CHUNK,
+            "chunks": CHUNKS,
+            "record_shape": "synthetic job posting: id, title, location, salary, description (~250 bytes of JSON)",
+            "competing_writer": "one rival app upserting a single-key record on a SECOND connection every 1ms, sqlite busy_timeout 5s",
+            "shape_fidelity": "DECLARED-APPROXIMATE. The record shape is modelled on the grants/postings corpora this store actually holds, but the real arrival mix — burstiness, per-source size skew, concurrent readers — is NOT reproduced. Every bound in .lanes/criteria.json certifies THIS traffic and no other.",
+        }),
+    );
+    lane.durations_ms("chunk_hold_ms_new", &hold_new)
+        .durations_ms("chunk_hold_ms_unchanged", &hold_unchanged)
+        .durations_ms("rival_stall_ms", &insert_rival.samples)
+        .secs("all_new_wall_s", insert_wall)
+        .secs("all_unchanged_wall_s", unchanged_wall)
+        .secs("all_changed_wall_s", changed_wall)
+        .scalar(
+            "rival_starved",
+            (insert_rival.starved + unchanged_rival.starved + changed_rival.starved) as f64,
+        )
+        .scalar("rival_writes", insert_rival.writes as f64)
+        .ms("rival_worst_ms", insert_rival.worst);
+    lane.emit();
 }
 
 #[tokio::test]
-#[ignore = "perf harness: ~50k records, timing-dependent"]
+#[ignore = "long lane `datasets-duplicate-scan` — needs a ~50k-record corpus; criteria in .lanes/criteria.json, run by `just lanes` and the nightly CI leg"]
 async fn duplicate_scan_50k_cost_report() {
     // Banded candidate lookup vs the all-pairs scan it replaced, on the same
     // 50k rows. The all-pairs reference runs here (not in the store) so the
@@ -194,6 +252,16 @@ async fn duplicate_scan_50k_cost_report() {
     assert_eq!(rows.len(), N);
 
     println!("\n=== duplicate scan, N={N} ===");
+    let mut lane = Lane::new(
+        "datasets-duplicate-scan",
+        json!({
+            "records": N,
+            "record_shape": "24 tokens drawn from a 200k vocabulary, so fingerprints spread across band buckets the way a corpus of genuinely distinct documents does; every 500th record is a planted near-duplicate",
+            "distances": [3, 8, 20],
+            "reference": "the O(n^2) all-pairs scan `duplicate_pairs` replaced, run in-process on the SAME fingerprints",
+            "shape_fidelity": "DECLARED-APPROXIMATE for absolute cost, EXACT for the comparison — both halves see identical input, which is why the lane's bounds are ratios against the reference rather than milliseconds that would only certify this runner's CPU.",
+        }),
+    );
     for distance in [3u32, 8, 20] {
         let t = Instant::now();
         let banded = ds
@@ -212,7 +280,11 @@ async fn duplicate_scan_50k_cost_report() {
              ({} pairs)",
             banded.len()
         );
+        lane.scalar(&format!("banded_ms_d{distance}"), banded_ms)
+            .scalar(&format!("all_pairs_ms_d{distance}"), brute_ms)
+            .scalar(&format!("pairs_d{distance}"), banded.len() as f64);
     }
+    lane.emit();
 }
 
 /// A corpus of genuinely DISTINCT records — the shape a duplicate scan is

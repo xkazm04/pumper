@@ -8,14 +8,23 @@
 //!    re-parsed for every row scanned (the group path always hoisted it).
 //! 2. The `lookup` join — one `SELECT ... WHERE key = ?` point query per row.
 //!
-//! This prints the wall clock of a 50k-row backfill with a lookup join against
-//! the same work done the old way (parse-per-row + point-query-per-row), which
-//! is what the `naive_` half of this harness reproduces. Timing-dependent by
-//! construction, so it asserts only that the two produce the same rows.
+//! This measures the wall clock of a 50k-row backfill with a lookup join
+//! against the same work done the old way (parse-per-row + point-query-per-row),
+//! which is what the `naive_` half of this harness reproduces.
+//!
+//! Both halves run in the same process against the same store, so the lane's
+//! criterion is a **ratio** rather than a millisecond count: an absolute bound
+//! would certify the runner's CPU, while "the batched path must not be slower
+//! than the reference it replaced" holds on any machine and is exactly the
+//! regression this harness exists to catch. Criteria live in
+//! `.lanes/criteria.json`; the verdict is the certifier's, not this file's.
+
+mod lane_artifact;
 
 use std::collections::BTreeMap;
 use std::time::Instant;
 
+use lane_artifact::Lane;
 use pumper_core::testing::TempStore;
 use pumper_core::{DerivedLookup, NewDerivedSpec};
 use serde_json::json;
@@ -23,7 +32,7 @@ use serde_json::json;
 const N: usize = 50_000;
 
 #[tokio::test]
-#[ignore = "perf harness; run with --ignored"]
+#[ignore = "long lane `derived-backfill` — needs a 50k-row corpus; criteria in .lanes/criteria.json, run by `just lanes` and the nightly CI leg"]
 async fn backfill_with_lookup_batches_its_joins() {
     let store = TempStore::new("derived-backfill-perf").await;
     let ds = store.datasets();
@@ -131,4 +140,21 @@ async fn backfill_with_lookup_batches_its_joins() {
     println!("derived backfill over {N} rows with a 500-key lookup join");
     println!("  batched (hoisted parse + chunked joins): {batched:?}");
     println!("  per-record parse + point-query join:     {naive:?}");
+
+    let mut lane = Lane::new(
+        "derived-backfill",
+        json!({
+            "source_rows": N,
+            "lookup_keys": 500,
+            "batch": 500,
+            "record_shape": "grant rows with a state filter (one third match) and an agency key joined against a 500-row lookup dataset",
+            "reference": "the pre-hoist shape: filter specs re-parsed per record, join resolved with one point query per record, writing the same rows to a second target",
+            "shape_fidelity": "EXACT for the comparison — both halves scan the same 50k rows and write the same matched set, so the ratio isolates the read side.",
+        }),
+    );
+    lane.secs("batched_s", batched)
+        .secs("naive_s", naive)
+        .scalar("scanned", report.scanned as f64)
+        .scalar("matched", report.matched as f64);
+    lane.emit();
 }

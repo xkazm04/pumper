@@ -1,0 +1,238 @@
+{
+  "schema": 1,
+  "declaredBefore": [
+    "These are the LONG LANES' pass criteria, and they are declared before the run,",
+    "not after. Criteria adjusted while looking at a result are commentary, not",
+    "criteria — so a commit that loosens a bound must say what it observed, on which",
+    "build, and why the old bound was wrong. It must never ride along with the change",
+    "that breached it.",
+    "Judgement lives here and in scripts/ci/lane-certify.mjs; the Rust harnesses only",
+    "measure and emit. That split is what makes the verdict reproducible from",
+    "artifact + criteria by anyone holding both."
+  ],
+  "boundPolicy": [
+    "Two kinds of bound, and the difference matters:",
+    "RATIO bounds compare two halves measured in the SAME run on the SAME input, so",
+    "they hold on any runner and certify the code rather than the CPU. Prefer them.",
+    "ABSOLUTE bounds (milliseconds, seconds) certify this runner class too, so each",
+    "one names its `basis`: the recorded baseline it was derived from, the build that",
+    "baseline came from, and the multiple applied. The baseline itself is committed in",
+    "./baseline.json so a basis can be checked rather than believed. Re-baselining is",
+    "its own commit with its own reason. A bound with no basis is a number somebody",
+    "liked.",
+    "Every criterion carries a `predicate` — the window, the workload and the",
+    "population the figure was measured over. A bound without one is not a finding."
+  ],
+  "lanes": {
+    "datasets-bulk-upsert": {
+      "kind": "perf",
+      "description": "Bulk upsert of a ~50k-record corpus, and the write-lock hold time another app experiences while it runs.",
+      "runsOn": ["linux", "win32", "darwin"],
+      "command": "cargo test -p pumper-core --test datasets_bulk_perf bulk_upsert_50k_cost_report -- --ignored --nocapture",
+      "criteria": [
+        {
+          "id": "chunk-hold-p95",
+          "kind": "percentile",
+          "series": "chunk_hold_ms_new",
+          "percentile": 95,
+          "max": 600,
+          "predicate": "95th percentile of 100 sequential 500-record upsert_many transactions inserting 50k all-new records into a fresh store; each transaction is one BEGIN IMMEDIATE..COMMIT window, so the figure IS the write lock's hold time as every other app experiences it.",
+          "basis": "Baseline p95 162.7 ms (baseline.json, 2026-08-24). 3x for a shared runner whose neighbours are not ours, then rounded up again because the baseline box has 12 cores and the nightly runner has 2-4."
+        },
+        {
+          "id": "chunk-hold-growth",
+          "kind": "slope",
+          "series": "chunk_hold_ms_new",
+          "half": "second",
+          "maxPerSample": 2.0,
+          "predicate": "Least-squares slope in ms-per-chunk over the SECOND HALF (chunks 51-100) of the same 100-transaction insert, i.e. as the table grows from 25k to 50k rows. The second half specifically, because the first is warm-up and a ceiling met at the finish line is compatible with growth that clears it an hour later.",
+          "basis": "Derived, not observed: the baseline median chunk is 91.6 ms, so 2.0 ms/chunk over 50 chunks is 100 ms of drift — a per-chunk cost that has DOUBLED across a doubling of table size. That is the regression this series exists to catch. Machine-independent, because it bounds the slope and not the level; the baseline's own slope was -0.57 ms/chunk (cost flat or falling as the table grew)."
+        },
+        {
+          "id": "rival-stall-p95",
+          "kind": "percentile",
+          "series": "rival_stall_ms",
+          "percentile": 95,
+          "max": 150,
+          "predicate": "95th percentile of every single-record write a competing app made on a SECOND connection, at ~1ms intervals, across all three bulk phases (all-new, all-unchanged, all-changed). This is the cross-app write stall the harness was built to measure.",
+          "basis": "Baseline p95 11.8 ms. The bound sits an order of magnitude above it on purpose: this distribution is violently heavy-tailed (same run: p50 2.1 ms, p99 134.9 ms, max 2386.7 ms), so a bound near the baseline would redden on scheduler noise instead of on a change in lock behaviour. What 150 ms catches is the p95 JOINING the tail — stalls becoming typical rather than exceptional, which is the thing an operator would actually feel. Reported at p95 and never as an average: the mean of this series is 55 ms and reads fine."
+        },
+        {
+          "id": "rival-starvation-rate",
+          "kind": "ratio",
+          "numerator": "rival_starved",
+          "denominator": "rival_writes",
+          "max": 0.01,
+          "predicate": "Competing writes that gave up with SQLITE_BUSY after the 5s busy_timeout, as a fraction of the competing writes that succeeded, summed over all three bulk phases. A starved write is another app LOSING a write while a bulk sync holds the DB-wide lock — the failure this harness exists to see.",
+          "basis": "This started life as `rival_starved <= 0`, which is the right ANSWER and the wrong BOUND. Baseline: 0 of 504 on an idle box, then 2 of 504 (0.4%) on the SAME box a few minutes later with a competing cargo build running — the starvation was real, and it was a fact about the machine's spare capacity rather than about the write path. A bound that reddens on the runner's neighbours is a bound people learn to ignore, and a lane that is routinely red certifies nothing (registry: long-lane-certification, on lanes whose red is wallpaper). 1% catches starvation becoming systematic while tolerating the odd loaded-runner casualty. If this ever fires, read it as: the lock is now held long enough that another app loses writes at a rate a user would notice."
+        },
+        {
+          "id": "all-new-wall",
+          "kind": "scalar",
+          "scalar": "all_new_wall_s",
+          "max": 120,
+          "predicate": "Wall clock of a single 50k-record all-new upsert_many, with the competing writer running.",
+          "basis": "Baseline runs measured 11.95 s and 17.48 s — a 46% spread between two runs on the same box, which is itself the reason this bound is the loosest here. 3x the slower run, then doubled for a hosted 2-4 core runner against a 12-core baseline box. It is the criterion most sensitive to runner class; the percentile and slope criteria above are what actually certify the write path."
+        }
+      ]
+    },
+    "datasets-duplicate-scan": {
+      "kind": "perf",
+      "description": "Banded SimHash candidate lookup against the all-pairs scan it replaced, on the same 50k fingerprints.",
+      "runsOn": ["linux", "win32", "darwin"],
+      "command": "cargo test -p pumper-core --test datasets_bulk_perf duplicate_scan_50k_cost_report -- --ignored --nocapture",
+      "criteria": [
+        {
+          "id": "banded-beats-all-pairs-d3",
+          "kind": "ratio",
+          "numerator": "banded_ms_d3",
+          "denominator": "all_pairs_ms_d3",
+          "max": 0.2,
+          "predicate": "Banded lookup wall clock divided by the in-process O(n^2) reference over the SAME 50k fingerprints, at Hamming distance 3, in the same run. A ratio rather than a millisecond count so the bound certifies the index and not the runner.",
+          "basis": "Baseline ratio 0.035 — a 28x win (593 ms against 16.9 s). Bound at 0.2, i.e. the index must still win by at least 5x. Distance 3 is the tight-duplicate case the band index exists for; if this ever fails, the banding has stopped selecting."
+        },
+        {
+          "id": "banded-does-not-blow-up-d8",
+          "kind": "ratio",
+          "numerator": "banded_ms_d8",
+          "denominator": "all_pairs_ms_d8",
+          "max": 2.5,
+          "predicate": "Same ratio at Hamming distance 8, where the candidate set is materially wider.",
+          "basis": "Baseline ratio 1.161 — at d8 the banded index is already SLOWER than the all-pairs scan it replaced (24.7 s against 21.3 s). That is not a regression introduced by this lane; it is the first time the number the harness has always printed was judged, and it is recorded as a finding in baseline.json. The bound is therefore set to catch a further blow-up rather than to assert a win the design never promised. Do not tighten this to 1.0 without first widening the band count with the requested distance."
+        },
+        {
+          "id": "d20-stays-bounded",
+          "kind": "scalar",
+          "scalar": "banded_ms_d20",
+          "max": 2000,
+          "predicate": "Absolute wall clock of the banded lookup at Hamming distance 20, where the candidate set approaches the whole corpus.",
+          "basis": "Baseline 308.8 ms; 3x, then doubled for runner class. Absolute rather than a ratio ON PURPOSE: at d20 the all-pairs reference hits its MAX_DUP_PAIRS cap of 10000 within 89 ms and STOPS, so the reference is a bail-out and not a scan, and a ratio against it would be arithmetic rather than a comparison. Saying that plainly is better than shipping a ratio that looks rigorous and means nothing."
+        },
+        {
+          "id": "the-scan-found-the-planted-duplicates",
+          "kind": "scalar",
+          "scalar": "pairs_d3",
+          "min": 10,
+          "predicate": "Near-duplicate pairs found at distance 3 over a corpus that plants one near-copy every 500 records. Baseline: 22.",
+          "basis": "Liveness. A scan that found nothing would be extremely fast and would satisfy every timing criterion above perfectly. Found-nothing must not read as fast."
+        }
+      ]
+    },
+    "derived-backfill": {
+      "kind": "perf",
+      "description": "50k-row derived backfill with a lookup join, against the per-record parse + point-query shape it replaced.",
+      "runsOn": ["linux", "win32", "darwin"],
+      "command": "cargo test -p pumper-core --test derived_backfill_perf -- --ignored --nocapture",
+      "criteria": [
+        {
+          "id": "batched-not-slower-than-per-record",
+          "kind": "ratio",
+          "numerator": "batched_s",
+          "denominator": "naive_s",
+          "max": 1.0,
+          "predicate": "Batched backfill wall clock divided by the per-record reference, both scanning the same 50k rows and writing the same matched set in the same run. The harness separately asserts both halves produce identical row counts, so the ratio isolates the read side.",
+          "basis": "The hoisted parse and the chunked join were introduced to remove per-row cost; 'not slower than what it replaced' is the weakest bound that can still catch their removal, and it needs no baseline."
+        },
+        {
+          "id": "scan-covered-the-corpus",
+          "kind": "scalar",
+          "scalar": "scanned",
+          "min": 50000,
+          "predicate": "Rows the backfill reported scanning. A liveness bound: a backfill that scanned nothing would pass every timing criterion above trivially.",
+          "basis": "The corpus size the harness builds. Found-nothing must not read as fast."
+        }
+      ]
+    },
+    "fingerprint-shared-dom": {
+      "kind": "perf",
+      "description": "One shared DOM parse per document against the two-parse path it replaced, over the real captured-page corpus.",
+      "runsOn": ["linux", "win32", "darwin"],
+      "command": "cargo test -p pumper-core --test fingerprint_shared_dom perf_ -- --ignored --nocapture",
+      "criteria": [
+        {
+          "id": "shared-parse-not-slower",
+          "kind": "ratio",
+          "numerator": "shared_parse_s",
+          "denominator": "two_parse_s",
+          "max": 1.0,
+          "predicate": "Fused extract+fingerprint wall clock divided by the two-parse reference, over the same 2000-document corpus (ten captured tier-3 fixtures x200, each perturbed per repeat) with the same css rule set. Both halves are separate #[test]s in one binary; if only one ran, this criterion reports cannot-see rather than passing on half the evidence.",
+          "basis": "The fusion's entire justification is one parse instead of two. A ratio needs no baseline and holds on any runner."
+        },
+        {
+          "id": "corpus-was-the-real-one",
+          "kind": "scalar",
+          "scalar": "documents",
+          "min": 2000,
+          "predicate": "Documents actually processed. A liveness bound on the corpus: the fixtures live on disk and a shrunken fixture directory would make both halves fast and the ratio meaningless.",
+          "basis": "Ten fixtures x PERF_REPEATS=200. The differential half of this file already asserts the fixture count separately."
+        }
+      ]
+    },
+    "wasm-plugin-artifacts": {
+      "kind": "suite",
+      "description": "The #[ignore]d wasm artifact tests: load each BUILT .wasm and ask the host whether it is executable — the only thing that turns a host-ABI break red.",
+      "runsOn": ["linux"],
+      "unavailableReason": "The plugin build+install rung is Linux-only in CI (.github/workflows/ci.yml gates those steps on runner.os == 'Linux'), and this lane needs `just plugins-install` to have produced data/plugins/*.wasm first. On any other runner it is cannot-run, never a pass.",
+      "command": "node scripts/ci/flake-record.mjs --lane wasm-plugin-artifacts -- cargo test -p pumper-engine-wasm --test plugins -- --ignored",
+      "criteria": [
+        {
+          "id": "no-failures",
+          "kind": "scalar",
+          "scalar": "tests_failed",
+          "max": 0,
+          "predicate": "Tests reported FAILED by libtest in this lane's run, parsed from the run's own output.",
+          "basis": "A suite lane's bound is its own verdict."
+        },
+        {
+          "id": "the-tests-actually-ran",
+          "kind": "scalar",
+          "scalar": "tests_run",
+          "min": 2,
+          "predicate": "Non-ignored tests observed in this lane's run. Both artifact tests must have executed.",
+          "basis": "A run where the .wasm was missing skips instead of failing, and zero-tests-run would otherwise satisfy `no-failures` perfectly. Empty success is the failure mode this lane is most exposed to."
+        }
+      ]
+    },
+    "server-trigger-plugins": {
+      "kind": "suite",
+      "description": "The #[ignore]d server e2e tests that drive real trigger-hook plugins end to end — the gate that keeps a fail-open hop from reaching production as a green build.",
+      "runsOn": ["linux"],
+      "unavailableReason": "Same Linux-only plugin rung as wasm-plugin-artifacts; needs the built data/plugins/trigger-gate.wasm and delta-slim.wasm.",
+      "command": "node scripts/ci/flake-record.mjs --lane server-trigger-plugins -- cargo test -p pumper-server e2e::trigger_plugins -- --ignored",
+      "criteria": [
+        {
+          "id": "no-failures",
+          "kind": "scalar",
+          "scalar": "tests_failed",
+          "max": 0,
+          "predicate": "Tests reported FAILED by libtest in this lane's run.",
+          "basis": "A suite lane's bound is its own verdict."
+        },
+        {
+          "id": "the-tests-actually-ran",
+          "kind": "scalar",
+          "scalar": "tests_run",
+          "min": 4,
+          "predicate": "Non-ignored tests observed in this lane's run: three trigger-gate cases and one delta-slim case.",
+          "basis": "Without the built artifacts these skip rather than fail, so counting them is the only way to tell a pass from an empty run."
+        }
+      ]
+    },
+    "browser-render": {
+      "kind": "suite",
+      "description": "The four #[ignore]d browser render tests — real Chrome, real navigation, persistent profile reuse.",
+      "runsOn": [],
+      "unavailableReason": "Needs a local Chrome binary AND live network. Hosted GitHub runners ship a browser but the lane would then be certifying a third party's availability alongside this repo's code, and a red from example.com is not a finding about pumper. Recorded as cannot-run on every runner until a pinned, local target exists — deliberately visible in every report rather than dropped from the lane list.",
+      "command": "cargo test -p pumper-engine-browser --test render -- --ignored",
+      "criteria": []
+    },
+    "archive-wayback": {
+      "kind": "suite",
+      "description": "The two #[ignore]d Wayback tests — a live CDX index query and a snapshot round trip against web.archive.org.",
+      "runsOn": [],
+      "unavailableReason": "Needs live web.archive.org. Same reasoning as browser-render: the lane would certify a third party's uptime. Listed as cannot-run so the gap stays counted.",
+      "command": "cargo test -p pumper-engine-archive -- --ignored live_wayback",
+      "criteria": []
+    }
+  }
+}

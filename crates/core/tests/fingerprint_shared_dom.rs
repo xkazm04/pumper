@@ -13,9 +13,17 @@
 //! So this file runs a real fixture corpus through both paths and compares the
 //! fingerprints, the extracted records and the per-field reports.
 //!
-//! The `#[ignore]`d tail is the cost harness (`just test-ignored`): wall clock
-//! and peak RSS for both paths over the same corpus.
+//! The `#[ignore]`d tail is the `fingerprint-shared-dom` long lane: both paths
+//! over the same corpus, each emitting its half of one lane artifact. The
+//! criterion is a ratio (the fused path must not be slower than the two-parse
+//! reference), pre-declared in `.lanes/criteria.json` and judged by the
+//! certifier — the two halves are separate `#[test]`s, so each writes its own
+//! `<lane>--<part>.json` and the certifier merges them. A run where only one
+//! half emitted is therefore reported as cannot-see, not as a pass.
 
+mod lane_artifact;
+
+use lane_artifact::Lane;
 use pumper_core::extract::{extract_batch_with_report, CompiledRuleSet, DocReport, RuleSet};
 use pumper_core::{doc_signals, extract_and_fingerprint_batch, signals_batch, DocSignals};
 use serde_json::Value;
@@ -216,7 +224,7 @@ fn report(label: &str, docs: usize, bytes: usize, elapsed: std::time::Duration) 
 }
 
 #[test]
-#[ignore = "cost harness; run with `just test-ignored`"]
+#[ignore = "long lane `fingerprint-shared-dom` — needs the 2000-document perf corpus; criteria in .lanes/criteria.json, run by `just lanes` and the nightly CI leg"]
 fn perf_two_parses_per_document() {
     let docs = perf_corpus();
     let bytes: usize = docs.iter().map(String::len).sum();
@@ -227,10 +235,11 @@ fn perf_two_parses_per_document() {
     let out = two_parse_reference(&rules, &docs.clone());
     let elapsed = started.elapsed();
     report("two parses", out.len(), bytes, elapsed);
+    emit_half("two-parse", "two_parse_s", out.len(), bytes, elapsed);
 }
 
 #[test]
-#[ignore = "cost harness; run with `just test-ignored`"]
+#[ignore = "long lane `fingerprint-shared-dom` — needs the 2000-document perf corpus; criteria in .lanes/criteria.json, run by `just lanes` and the nightly CI leg"]
 fn perf_one_shared_parse_per_document() {
     let docs = perf_corpus();
     let bytes: usize = docs.iter().map(String::len).sum();
@@ -239,4 +248,38 @@ fn perf_one_shared_parse_per_document() {
     let out = extract_and_fingerprint_batch(&rules, &docs);
     let elapsed = started.elapsed();
     report("shared parse", out.len(), bytes, elapsed);
+    emit_half("shared-parse", "shared_parse_s", out.len(), bytes, elapsed);
+}
+
+/// One half of the `fingerprint-shared-dom` lane artifact.
+///
+/// Each half names the same workload, because the ratio the certifier judges is
+/// only meaningful if both halves saw the same corpus — and a workload described
+/// once per artifact is a workload that can silently differ between the two.
+fn emit_half(
+    part: &'static str,
+    scalar: &str,
+    docs: usize,
+    bytes: usize,
+    elapsed: std::time::Duration,
+) {
+    let mut lane = Lane::new(
+        "fingerprint-shared-dom",
+        serde_json::json!({
+            "documents": docs,
+            "bytes": bytes,
+            "corpus": "the ten captured tier-3 extraction fixtures (15-100 KB of real, messy markup: inline scripts, SVG, tables, deep nesting), each repeated 200 times with a per-repeat perturbation so the allocator cannot serve the batch from one hot arena",
+            "rules": "the `css` rule set — title, all h1/h2, canonical link",
+            "shape_fidelity": "REAL for markup shape (captured pages, not synthetic HTML); DECLARED-APPROXIMATE for batch composition, since a live extractor run fans out over documents from one source rather than a round-robin of ten.",
+        }),
+    )
+    .part(part);
+    lane.secs(scalar, elapsed)
+        .scalar("documents", docs as f64)
+        .scalar("bytes", bytes as f64)
+        .scalar(
+            &format!("{}_docs_per_s", scalar.trim_end_matches("_s")),
+            docs as f64 / elapsed.as_secs_f64(),
+        );
+    lane.emit();
 }

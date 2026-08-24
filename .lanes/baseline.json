@@ -1,0 +1,74 @@
+{
+  "schema": 1,
+  "recordedAt": "2026-08-24",
+  "commit": "9f266d90dc57af339a193307beb225c7e572ebbb",
+  "why": [
+    "Every ABSOLUTE bound in criteria.json (a millisecond count, a second count)",
+    "certifies this runner class as well as this code, so it needs a recorded",
+    "number to be derived from. This file is that number: what the lanes actually",
+    "measured on a known-good build, so `basis` on each criterion can be checked",
+    "rather than believed.",
+    "RATIO bounds are not listed here and do not need to be — they compare two",
+    "halves measured in the same run on the same input, which is why they are",
+    "preferred and why two of the four perf lanes have no absolute bound at all.",
+    "Re-baselining is its own commit, with its own reason. A bound moved in the",
+    "same change that breached it is not a bound."
+  ],
+  "host": {
+    "os": "win32",
+    "arch": "aarch64",
+    "cpu": "Snapdragon X Elite X1E78100, 12 cores",
+    "profile": "cargo test, debug profile (unoptimized + debuginfo) — the same profile CI runs",
+    "caveat": "A 12-core Windows dev box with a second cargo build competing for the machine. The nightly lane runs on a 2-4 core hosted ubuntu runner, so absolute bounds carry an extra multiple on top of the usual 3x; each criterion's `basis` states its own."
+  },
+  "runs": {
+    "datasets-bulk-upsert": {
+      "samples": 2,
+      "chunk_hold_ms_new_p50": 91.6,
+      "chunk_hold_ms_new_p95": 162.7,
+      "chunk_hold_ms_new_p99": 186.1,
+      "chunk_hold_ms_new_second_half_slope": -0.5703,
+      "chunk_hold_ms_unchanged_p95": 83.3,
+      "rival_stall_ms_p50": 2.1,
+      "rival_stall_ms_p95": 11.8,
+      "rival_stall_ms_p99": 134.9,
+      "rival_stall_ms_max": 2386.7,
+      "rival_starved": 0,
+      "rival_starved_under_machine_load": 2,
+      "rival_starvation_note": "0 of 504 competing writes starved on an idle box; 2 of 504 (0.4%) on the SAME box minutes later with a competing cargo build running. Real starvation, caused by the machine's spare capacity rather than by the write path — which is why the criterion is a RATE with a 1% ceiling and not a zero count. See the `basis` on rival-starvation-rate.",
+      "all_new_wall_s": [17.48, 11.95],
+      "all_unchanged_wall_s": [17.27, 8.49],
+      "all_changed_wall_s": [21.06, 14.67]
+    },
+    "datasets-duplicate-scan": {
+      "samples": 1,
+      "banded_ms_d3": 593.2,
+      "all_pairs_ms_d3": 16898.8,
+      "ratio_d3": 0.0351,
+      "banded_ms_d8": 24679.7,
+      "all_pairs_ms_d8": 21265.1,
+      "ratio_d8": 1.161,
+      "banded_ms_d20": 308.8,
+      "all_pairs_ms_d20": 89.1,
+      "pairs_d3": 22,
+      "pairs_d8": 97,
+      "pairs_d20": 10000,
+      "finding": "At Hamming distance 8 the banded index is SLOWER than the all-pairs scan it replaced (1.16x), which the harness has been printing unbounded for its whole life and nobody read. It is not a regression introduced here — it is the first time the number was judged. The d8 bound is set to catch a further blow-up, not to assert a win the design never promised. Worth a separate look at whether the band count should widen with the requested distance.",
+      "d20_is_not_a_fair_comparison": "At distance 20 the all-pairs reference hits its MAX_DUP_PAIRS cap (10000) almost immediately and stops, so its 89ms is a bail-out and not a scan. The ratio is therefore meaningless at d20 and criteria.json bounds the banded time absolutely instead, and says so."
+    },
+    "derived-backfill": {
+      "samples": 1,
+      "batched_s": 6.697,
+      "naive_s": 11.490,
+      "ratio": 0.583
+    },
+    "fingerprint-shared-dom": {
+      "samples": 1,
+      "shared_parse_s": 18.494,
+      "two_parse_s": 29.901,
+      "ratio": 0.618,
+      "documents": 2000,
+      "bytes": 115200000
+    }
+  }
+}

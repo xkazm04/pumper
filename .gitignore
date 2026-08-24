@@ -7,6 +7,22 @@ plugins-src/*/Cargo.lock
 # Local runtime data: SQLite DB, scraped artifacts, browser profile (login cookies)
 /data
 
+# Test-harness EVIDENCE, as opposed to test-harness STANDARD.
+#
+# Versioned, because they are the standard and a change to either is a reviewable
+# decision: .flake/register.json (the quarantine register, its exemption table and
+# its ceiling) and .lanes/criteria.json (every long lane's pre-declared bounds).
+#
+# Ignored, because they are evidence — one file per run, accumulating. The lane's
+# dashboard is the SEQUENCE of them, kept by CI's actions/cache rolling key and by
+# uploaded run artifacts; a commit per nightly run is not a dashboard, it is noise
+# with a git history. A lost cache therefore reads as "no runs recorded", which
+# both reports spell differently from "never green" and from "no flakes".
+/.flake/history/
+/.lanes/runs/
+/.lanes/verdicts/
+/.lanes/health.json
+
 # Claude Code session logs and local settings — but the shared session
 # contract (CLAUDE.md) and the doc-sync Stop hook (settings.json) are
 # versioned so every checkout gets the same enforcement.
