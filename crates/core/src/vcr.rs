@@ -834,7 +834,18 @@ impl Recorder {
             .append(true)
             .open(self.cassette_path())
             .await?;
-        file.write_all(line.as_bytes()).await
+        file.write_all(line.as_bytes()).await?;
+        // **The flush is load-bearing, not hygiene.** `tokio::fs::File` is
+        // buffered and its writes are handed to the blocking pool; `write_all`
+        // returns once the data is accepted, NOT once it has reached the file.
+        // Dropping the handle does not wait for a pending write, so without
+        // this the most recently recorded entries can be silently lost — in a
+        // recorder whose entire purpose is that a later replay sees what the
+        // run actually did. The loss is timing-dependent, which is why it
+        // presented as an ubuntu-only test failure while every Windows run went
+        // green (`vcr::tests::total_cap_truncates_later_entries_but_keeps_their_identity`,
+        // cassette.len() 1 where 2 were recorded).
+        file.flush().await
     }
 }
 
@@ -1080,6 +1091,53 @@ mod tests {
             .unwrap_err();
         assert!(matches!(err, Error::ReplayMiss(_)));
         assert!(err.to_string().contains("truncated"));
+    }
+
+    /// The recorder's durability contract, stated as bytes on disk rather than
+    /// as a replay that happens to work.
+    ///
+    /// `record` maintains a running `written` count and the cap logic trusts it,
+    /// so the file must actually hold what that count claims **the moment
+    /// `record` returns** — a later reader (the replaying attempt) is a separate
+    /// process and gets no chance to wait. `tokio::fs::File` is buffered and
+    /// does not complete pending writes on drop, so without an explicit flush
+    /// the tail of a cassette is lost on a schedule nobody controls: green on
+    /// one platform, red on another, and a silent hole in a recording either
+    /// way. Asserting the byte length makes the accounting and the file agree by
+    /// test rather than by luck.
+    #[tokio::test]
+    async fn every_recorded_entry_is_on_disk_before_record_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let rec = Recorder::new(dir.path().to_path_buf());
+        let mut expected = 0u64;
+        for i in 0..8 {
+            let url = format!("https://x/{i}");
+            rec.record(fetch_entry(&outcome(&url, "http", "<p>body</p>")))
+                .await;
+            expected = tokio::fs::metadata(rec.cassette_path())
+                .await
+                .expect("the cassette exists as soon as one entry is recorded")
+                .len()
+                .max(expected);
+            // Every entry recorded so far must be readable RIGHT NOW.
+            let cassette = Cassette::load(dir.path(), Uuid::new_v4()).await.unwrap();
+            assert_eq!(
+                cassette.len(),
+                i + 1,
+                "entry {i} was accepted by record() but is not in the file yet"
+            );
+        }
+        // And the recorder's own accounting agrees with the bytes on disk — the
+        // number the total cap is enforced against.
+        let on_disk = tokio::fs::metadata(rec.cassette_path())
+            .await
+            .unwrap()
+            .len();
+        assert_eq!(
+            rec.written.lock().await.unwrap(),
+            on_disk,
+            "the cap is enforced against a byte count the file does not match"
+        );
     }
 
     #[tokio::test]
