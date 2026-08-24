@@ -81,8 +81,8 @@ webhook delivery health, remote egress split, and checkpoint failures by reason.
 The full series list is in [runtime.md](runtime.md#metrics). `GET /health` is the
 liveness probe.
 
-**Two of those series are process counters** (`pumper_remote_egress_fetches`,
-`pumper_checkpoint_failures_total`) and reset on restart; the rest are DB-derived
+**Three of those series are process counters** (`pumper_remote_egress_fetches`,
+`pumper_checkpoint_failures_total`, `pumper_worker_claim_failures_total`) and reset on restart; the rest are DB-derived
 and can therefore go *down* when retention prunes. Both contracts are stated in
 each series' own `# HELP`, because a counter that silently resets and one that
 silently shrinks fail an alert rule in different ways.

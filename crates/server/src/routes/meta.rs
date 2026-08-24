@@ -154,6 +154,11 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
     // `fetch_chokepoint.rs`'s EXPECTED_RAW_ENGINE_CALLS rather than an exemption.
     out.push_str(&egress_metrics(state.engines.fetch.egress_counters()));
     out.push_str(&checkpoint_metrics(state.checkpoint_failures.totals()));
+    out.push_str(&claim_failure_metrics(
+        state
+            .claim_failures
+            .load(std::sync::atomic::Ordering::Relaxed),
+    ));
 
     *state.metrics_cache.lock().await = Some((std::time::Instant::now(), out.clone()));
     Ok(metrics_response(out))
@@ -234,6 +239,26 @@ fn checkpoint_metrics(failures: crate::progress::CheckpointFailures) -> String {
         ));
     }
     out
+}
+
+/// Failed job-claim attempts, process-lifetime.
+///
+/// The claim loop's failure arm is rate-limited before it reaches the remote
+/// telemetry channel — the first failure of an outage and one report every five
+/// minutes thereafter, instead of one event per two-second poll. This series is
+/// what keeps that limiter from being a blindfold: the events are capped, the
+/// count is not, and it lives in the LOCAL sink, because a channel that is
+/// itself down cannot be where its own outage is counted.
+///
+/// Emitted at zero like every other counter here: an absent series and a zero
+/// series are different answers.
+fn claim_failure_metrics(total: u64) -> String {
+    format!(
+        "# HELP pumper_worker_claim_failures_total Job-claim attempts that failed (store          unreachable or erroring). Process-lifetime, reset on restart. The matching log lines are          rate-limited; this count is not
+         # TYPE pumper_worker_claim_failures_total counter
+         pumper_worker_claim_failures_total {total}
+"
+    )
 }
 
 /// Renders the webhook-delivery block of `/metrics` from one health snapshot.
@@ -398,6 +423,34 @@ mod webhook_metric_tests {
         assert_eq!(quiet.matches("# HELP ").count(), 1);
         assert_eq!(quiet.matches("# TYPE ").count(), 1);
         assert!(quiet.contains("reset on restart"), "{quiet}");
+    }
+
+    /// The rate limiter in front of the claim loop's failure arm is only
+    /// legitimate because the COUNT survives it: an unreachable store now ships
+    /// one telemetry event per five minutes instead of one per poll, and this
+    /// series is where the other 149 went.
+    #[test]
+    fn a_rate_limited_claim_outage_still_has_a_full_count() {
+        let body = claim_failure_metrics(150);
+        assert!(
+            body.contains(
+                "pumper_worker_claim_failures_total 150
+"
+            ),
+            "{body}"
+        );
+        // Explicit zero on a healthy process, like every other counter here.
+        let quiet = claim_failure_metrics(0);
+        assert!(
+            quiet.contains(
+                "pumper_worker_claim_failures_total 0
+"
+            ),
+            "{quiet}"
+        );
+        assert_eq!(quiet.matches("# HELP ").count(), 1);
+        assert_eq!(quiet.matches("# TYPE ").count(), 1);
+        assert!(quiet.contains("rate-limited"), "{quiet}");
     }
 
     /// An empty backlog must read 0, never "unknown" or a stale age — a gauge

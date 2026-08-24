@@ -98,6 +98,15 @@ pub struct AppState {
     /// is independent of which outcome arm the job ends on — the stored-result
     /// stamp only ever rides the success arm. In-memory, reset on restart.
     pub checkpoint_failures: Arc<crate::progress::CheckpointFailureCounter>,
+    /// Process-lifetime count of failed job-claim attempts, rendered as
+    /// `pumper_worker_claim_failures_total` on `/metrics`.
+    ///
+    /// The claim loop's failure arm is rate-limited on the way to the remote
+    /// telemetry channel (see `worker::ClaimOutage`), so this counter is what
+    /// keeps the rate limiter from becoming a blindfold: the events are capped,
+    /// the count is not. A local sink, because a channel that is itself down
+    /// cannot be the place its own outage is counted.
+    pub claim_failures: Arc<std::sync::atomic::AtomicU64>,
     /// Cancelled on SIGTERM/Ctrl-C to drive graceful shutdown: the worker stops
     /// claiming, in-flight jobs drain, and `axum::serve` stops accepting.
     pub shutdown: CancellationToken,
@@ -233,6 +242,7 @@ impl AppState {
             events,
             progress: Arc::new(ProgressStore::new()),
             checkpoint_failures: Arc::new(Default::default()),
+            claim_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             shutdown: CancellationToken::new(),
             job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),

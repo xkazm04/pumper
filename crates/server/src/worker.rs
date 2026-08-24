@@ -21,6 +21,7 @@ pub async fn run(state: AppState) {
     let poll = Duration::from_secs(state.config.worker.poll_interval_secs.max(1));
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let running: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
+    let mut claim_outage = ClaimOutage::default();
     info!(concurrency, "job worker started");
 
     loop {
@@ -38,7 +39,19 @@ pub async fn run(state: AppState) {
 
         let blocked = blocked_apps(&state, &running).await;
         let aging = state.config.worker.priority_aging_coefficient_secs;
-        match state.storage.claim_next(&blocked, aging).await {
+        let claimed = state.storage.claim_next(&blocked, aging).await;
+        if claimed.is_ok() {
+            // The end of an outage is news, and the only place its true length
+            // is known — the intervening failures were deliberately not shipped.
+            let outage = claim_outage.recovered();
+            if outage > 0 {
+                info!(
+                    consecutive = outage,
+                    "job claim recovered after {outage} consecutive failures"
+                );
+            }
+        }
+        match claimed {
             Ok(Some(job)) => {
                 {
                     let mut counts = running.lock().await;
@@ -90,7 +103,7 @@ pub async fn run(state: AppState) {
             }
             Err(e) => {
                 drop(permit);
-                error!("failed to claim job: {e}");
+                report_claim_failure(&state, &mut claim_outage, &e);
                 tokio::select! {
                     _ = state.shutdown.cancelled() => break,
                     _ = tokio::time::sleep(poll) => {}
@@ -100,6 +113,75 @@ pub async fn run(state: AppState) {
     }
 
     drain(&state, &semaphore, concurrency).await;
+}
+
+/// How often a CONTINUING claim outage may re-report at error level.
+///
+/// The claim loop polls every `worker.poll_interval_secs` (default 2s), and its
+/// failure arm used to `error!` on every pass. `error!` is the level wired to
+/// the remote telemetry channel, so an unreachable store shipped one event
+/// every two seconds — 1,800 an hour, all of them the same fact, spending quota
+/// and triage attention on a metronome (registry:
+/// observability-telemetry/remote-telemetry-economics, "the loop without a
+/// limiter"). Five minutes is short enough that a continuing outage is visibly
+/// continuing and long enough that the channel is not the outage's biggest cost.
+const CLAIM_OUTAGE_REPORT_EVERY: Duration = Duration::from_secs(300);
+
+/// Client-side limiter for the claim loop's failure arm: report the FIRST
+/// failure, then one periodic "still failing, N since", then the recovery.
+///
+/// Silence in between is not information loss — the intervening failures are
+/// counted, the count travels with every report, and
+/// `pumper_worker_claim_failures_total` on `/metrics` carries the full total,
+/// which is the local sink a dead remote channel cannot suppress.
+#[derive(Debug, Default)]
+struct ClaimOutage {
+    consecutive: u64,
+    last_report: Option<std::time::Instant>,
+}
+
+impl ClaimOutage {
+    /// Records one failure and answers whether it earns a remote-visible event.
+    fn failed(&mut self) -> bool {
+        self.consecutive += 1;
+        let due = match self.last_report {
+            None => true,
+            Some(at) => at.elapsed() >= CLAIM_OUTAGE_REPORT_EVERY,
+        };
+        if due {
+            self.last_report = Some(std::time::Instant::now());
+        }
+        due
+    }
+
+    /// Clears the outage, answering how many failures it lasted (0 = there was
+    /// no outage, so nothing to say).
+    fn recovered(&mut self) -> u64 {
+        let n = std::mem::take(&mut self.consecutive);
+        self.last_report = None;
+        n
+    }
+}
+
+/// The claim loop's failure arm: count it locally, always; report it remotely,
+/// rarely. The first failure of an outage and every
+/// [`CLAIM_OUTAGE_REPORT_EVERY`] thereafter go out at `error!` (the level the
+/// remote channel watches); the ones in between are `debug!`, present in the
+/// local log and absent from the triage queue.
+fn report_claim_failure(state: &AppState, outage: &mut ClaimOutage, e: &impl std::fmt::Display) {
+    state
+        .claim_failures
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let consecutive = outage.consecutive + 1;
+    if outage.failed() {
+        error!(
+            consecutive,
+            "failed to claim job: {e} (further identical failures are logged at debug until this              outage ends or {}s pass)",
+            CLAIM_OUTAGE_REPORT_EVERY.as_secs()
+        );
+    } else {
+        debug!(consecutive, "failed to claim job: {e}");
+    }
 }
 
 /// One claim→execute→finalize pass with no loop, semaphore, or per-app caps —
@@ -2207,6 +2289,46 @@ mod cancel_kind_tests {
             "too late to cancel: this run is already being re-queued"
         );
         super::forget_cancel_intent(late);
+    }
+}
+
+#[cfg(test)]
+mod claim_outage_tests {
+    use super::ClaimOutage;
+
+    /// The anti-pattern: the claim loop's failure arm called `error!` — the
+    /// level wired to the remote telemetry channel — on every poll. A store
+    /// unreachable for an hour shipped 1,800 events carrying one fact, spending
+    /// quota and triage attention on a metronome.
+    #[test]
+    fn only_the_first_failure_of_an_outage_is_reported() {
+        let mut outage = ClaimOutage::default();
+        assert!(outage.failed(), "the first failure is always news");
+        for _ in 0..500 {
+            assert!(
+                !outage.failed(),
+                "a continuing outage must not re-report until its interval elapses"
+            );
+        }
+        assert_eq!(outage.consecutive, 501, "every failure is still counted");
+    }
+
+    /// Recovery is news, carries the outage's true length, and re-arms the
+    /// report — otherwise the SECOND outage of a process would be silent, which
+    /// is the failure mode a rate limiter is most likely to introduce.
+    #[test]
+    fn recovery_reports_the_length_and_re_arms_the_next_outage() {
+        let mut outage = ClaimOutage::default();
+        outage.failed();
+        outage.failed();
+        outage.failed();
+        assert_eq!(outage.recovered(), 3);
+        assert_eq!(outage.recovered(), 0, "no outage, nothing to say");
+
+        assert!(
+            outage.failed(),
+            "the first failure after a recovery is news again"
+        );
     }
 }
 
