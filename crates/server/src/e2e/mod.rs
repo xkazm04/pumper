@@ -34,6 +34,7 @@ mod mpsv;
 mod panic_containment;
 mod peer_mirror;
 mod provisioner_lifecycle;
+mod quiet_window;
 mod request_panics;
 mod router;
 mod schedule_budget;

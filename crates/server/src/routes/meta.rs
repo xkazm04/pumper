@@ -169,6 +169,10 @@ pub(crate) async fn metrics(State(state): State<AppState>) -> Result<Response, A
     out.push_str(&queue_age_metrics(&state.storage.queue_ages().await?));
     out.push_str(&store_size_metrics(&state.storage.size_facts().await?));
     out.push_str(&maintenance_metrics(&pass_counts(&instrument)));
+    out.push_str(&activity_metrics(
+        state.activity.reading(),
+        instrument.pool_saturated(),
+    ));
 
     *state.metrics_cache.lock().await = Some((std::time::Instant::now(), out.clone()));
     Ok(metrics_response(out))
@@ -555,6 +559,41 @@ fn maintenance_metrics(
             outcome.as_str()
         ));
     }
+    out
+}
+
+/// The activity gauge the maintenance gate reads, as Prometheus text.
+///
+/// Publishing the gate's own input is what makes the gate auditable rather than
+/// a black box: an operator looking at a `deferred` count that never stops
+/// climbing needs to see WHAT the gate was seeing. A gauge stuck above zero
+/// with an idle process is a leaked guard, and until this series existed there
+/// was no way to tell that from a genuinely busy server.
+///
+/// `pumper_store_pool_saturated` is the second half of the same picture: it is
+/// demand for the machine that a count of requests and jobs cannot see, and it
+/// alone can hold maintenance off.
+fn activity_metrics(reading: u64, pool_saturated: bool) -> String {
+    let mut out = String::new();
+    out.push_str(
+        "# HELP pumper_store_activity_gauge In-flight foreground work: HTTP requests being          handled plus jobs currently running. The input to the quiet-window maintenance gate          — a pass runs only when this reads 0 and the minimum interval has elapsed
+         # TYPE pumper_store_activity_gauge gauge
+",
+    );
+    out.push_str(&format!(
+        "pumper_store_activity_gauge {reading}
+"
+    ));
+    out.push_str(
+        "# HELP pumper_store_pool_saturated 1 when the most recent connection acquisition on          any measured family waited past its slow line. Counts as busy for the maintenance          gate: a saturated pool is demand for the machine that the activity gauge cannot          see
+         # TYPE pumper_store_pool_saturated gauge
+",
+    );
+    out.push_str(&format!(
+        "pumper_store_pool_saturated {}
+",
+        pool_saturated as u8
+    ));
     out
 }
 

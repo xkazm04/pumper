@@ -226,6 +226,15 @@ Webhook delivery health, all four read in one aggregate pass so they describe th
 
 `pumper_checkpoint_failures_total{reason="stale_lineage|storage_error"}` — checkpoint saves that did not land. **Process-lifetime, reset on restart** (like `pumper_remote_egress_fetches`, and unlike the DB-derived series above), because the alternative — scanning `jobs.result` for the `checkpoint_failures` stamp — would undercount exactly the runs that matter (see below) and shrink under retention pruning. Both reasons are always emitted, at `0` when nothing failed. `storage_error` is the durability alarm: that run has no state of its own. `stale_lineage` is routine during a reap (another attempt owns the job) and only alarming in a steady state.
 
+The store's own telemetry — per-`(op, table, phase)` durations, slow counts with
+their published slow line, busy waits, rows touched, p95s with their window,
+queue ages, size on disk (main / freelist / `-wal` sidecar), maintenance passes
+by outcome, and the activity gauge — is listed in
+[observability.md § The store's report on itself](observability.md#the-stores-report-on-itself).
+It is a **partial census by design** and says so in its own `# HELP` text: seven
+instrumented statement families, with schedules, watches, triggers, deliveries,
+saved searches, the caches and the search index explicitly unmeasured.
+
 ## Known gaps
 
 - No auth on the HTTP API (deliberate local power mode; API-key auth is a parked product decision).

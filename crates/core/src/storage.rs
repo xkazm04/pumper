@@ -705,6 +705,61 @@ impl Storage {
         .await
     }
 
+    /// One `PRAGMA wal_checkpoint(PASSIVE)` round — the **lossless, chunked,
+    /// never-blocking** form.
+    ///
+    /// PASSIVE moves as many committed frames from the `-wal` sidecar into the
+    /// main file as it can without waiting for anybody, and gives up the moment
+    /// a reader or writer would have to be blocked. That is what makes it the
+    /// routine one: TRUNCATE and RESTART block writers, which is precisely the
+    /// stall quiet-window gating exists to avoid, and there is no version of
+    /// "wait for the writer" that is safe to run under an application's own
+    /// foreground load.
+    ///
+    /// It **discards nothing** — a checkpoint relocates committed data, it does
+    /// not expire it — so this is safe under a deferred-retention posture where
+    /// keeping data is the pattern.
+    ///
+    /// One round takes and releases its own connection, which is what lets the
+    /// caller re-read the activity gauge between rounds with **no lock held**.
+    /// Checkpointing zero pages is a legitimate result (a reader held a
+    /// snapshot, or there was nothing to move), never a failure.
+    pub async fn wal_checkpoint_passive(&self) -> Result<CheckpointRound> {
+        self.metered(StoreOp::Maintenance, |mut conn| async move {
+            let row: (i64, i64, i64) = sqlx::query_as("PRAGMA wal_checkpoint(PASSIVE)")
+                .fetch_one(&mut *conn)
+                .await?;
+            let round = CheckpointRound {
+                blocked: row.0 != 0,
+                log_frames: row.1.max(0) as u64,
+                checkpointed_pages: row.2.max(0) as u64,
+            };
+            let pages = round.checkpointed_pages;
+            Ok((round, pages))
+        })
+        .await
+    }
+
+    /// `PRAGMA optimize` — lossless planner-statistics upkeep. Cheap by design:
+    /// SQLite only does work for tables whose statistics it believes are stale.
+    pub async fn optimize(&self) -> Result<()> {
+        self.metered(StoreOp::Maintenance, |mut conn| async move {
+            sqlx::query("PRAGMA optimize").execute(&mut *conn).await?;
+            Ok(((), 0))
+        })
+        .await
+    }
+
+    /// `ANALYZE` — the longer rung. Scans indexes and rewrites `sqlite_stat1`;
+    /// no row of user data is read out, changed or removed.
+    pub async fn analyze(&self) -> Result<()> {
+        self.metered(StoreOp::Maintenance, |mut conn| async move {
+            sqlx::query("ANALYZE").execute(&mut *conn).await?;
+            Ok(((), 0))
+        })
+        .await
+    }
+
     /// Age of the oldest job in each of the two states an operator alerts on.
     ///
     /// `pumper_jobs{status}` already says *how many* are queued; a depth alone
@@ -2922,6 +2977,36 @@ pub struct JobTimingStats {
     pub wait_sum: f64,
     pub wait_count: i64,
     pub wait_max: f64,
+}
+
+/// What one `wal_checkpoint(PASSIVE)` round accomplished.
+///
+/// `blocked` is the fact a page count alone cannot carry: PASSIVE returning
+/// zero pages because a reader held a snapshot and PASSIVE returning zero pages
+/// because the sidecar was already empty are the same number and completely
+/// different situations — one says "try again in a quieter window", the other
+/// says "there is nothing to do".
+#[derive(Debug, Clone, Copy, Default, Serialize)]
+pub struct CheckpointRound {
+    /// A reader or writer held the checkpointer off. Not an error: PASSIVE
+    /// never waits, which is exactly why it is safe to run under load.
+    pub blocked: bool,
+    /// Frames the sidecar held when this round started — SQLite's second
+    /// column. **Not** "frames remaining": the pragma reports the log's size,
+    /// so completeness is `checkpointed_pages >= log_frames`, and reading this
+    /// as a remainder makes a finished pass look like a stalled one (which is
+    /// exactly what `the_checkpoint_pass_shrinks_the_sidecar_and_loses_nothing`
+    /// caught the first time this shipped).
+    pub log_frames: u64,
+    /// Frames moved back into the main file — SQLite's third column.
+    pub checkpointed_pages: u64,
+}
+
+impl CheckpointRound {
+    /// Frames still waiting in the sidecar after this round.
+    pub fn remaining(&self) -> u64 {
+        self.log_frames.saturating_sub(self.checkpointed_pages)
+    }
 }
 
 /// How long the oldest job in each waiting state has been waiting, in seconds.

@@ -70,8 +70,16 @@ pub async fn run(state: AppState) {
                         .lock()
                         .unwrap()
                         .insert(job.id, (job.attempts, cancel.clone()));
+                    // The worker's half of the activity gauge. A running job IS
+                    // demand for the machine — it is about to fetch, extract and
+                    // write — so maintenance must not take the writer lock
+                    // underneath it. RAII, so a panicking app (contained below)
+                    // cannot leave the gauge pinned above zero forever, which
+                    // would silently disable maintenance for the process's life.
+                    let busy = state.activity.enter();
                     publish(&state, JobEvent::new(job.id, job.app.clone(), "running"));
                     execute(state.clone(), job.clone(), cancel).await;
+                    drop(busy);
                     {
                         let mut m = state.job_cancels.lock().unwrap();
                         if m.get(&job.id).map(|(a, _)| *a) == Some(job.attempts) {
@@ -200,8 +208,14 @@ pub(crate) async fn run_one(state: &AppState) -> bool {
                 .lock()
                 .unwrap()
                 .insert(job.id, (job.attempts, cancel.clone()));
+            // Same gauge accounting as the spawn body in `run()`: this seam
+            // exists to mirror it, and a mirror that omits the gauge would let
+            // every e2e test observe a quiet window that the real worker never
+            // presents.
+            let busy = state.activity.enter();
             publish(state, JobEvent::new(job.id, job.app.clone(), "running"));
             execute(state.clone(), job.clone(), cancel).await;
+            drop(busy);
             {
                 let mut m = state.job_cancels.lock().unwrap();
                 if m.get(&job.id).map(|(a, _)| *a) == Some(job.attempts) {

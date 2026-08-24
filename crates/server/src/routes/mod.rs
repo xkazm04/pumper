@@ -295,6 +295,13 @@ pub fn router(state: AppState) -> Router {
         .iter()
         .filter_map(|o| o.parse().ok())
         .collect();
+    // The activity gauge's HTTP front door, applied OUTERMOST so it covers
+    // every route including the ones the stack below short-circuits (a body
+    // rejected by the size limit still occupied this process). It lives here
+    // rather than in `with_middleware` because it needs the state's gauge, and
+    // that function is deliberately state-agnostic so a test can drive the
+    // exact stack over a synthetic router.
+    let router = crate::activity::with_activity(router, state.activity.clone());
     with_middleware(router, origins).with_state(state)
 }
 

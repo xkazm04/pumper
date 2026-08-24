@@ -107,6 +107,18 @@ no second operator to ask, so retention is something you turn on — never somet
 that happens to you. The single `retention_janitor` in `main.rs` (one loop, every
 6h) runs all of it.
 
+Since the quiet-window gate landed, that loop's 6h tick makes a pass **due**; it
+does not make it run. Each pass is gated on the live activity gauge (in-flight
+requests + running jobs + pool saturation) and records one of three outcomes —
+`ran`, `deferred`, `failed` — on
+`pumper_store_maintenance_passes_total{task="retention_janitor",outcome}`. The
+janitor deletes **exactly** what it always did, under exactly the same knobs;
+only when it runs and how it reports changed. It carries no harm bound, so under
+permanent load it defers indefinitely rather than taking the writer lock out from
+under a scrape, and the deferral count is what makes that visible instead of
+folklore. See
+[observability.md § Quiet-window maintenance](observability.md#quiet-window-maintenance).
+
 | Key | Bounds | Scoped so this survives |
 | --- | --- | --- |
 | `revision_retention_days` | `record_revisions` past the window | the newest `revision_retention_keep_min` revisions of every record |

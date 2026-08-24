@@ -190,6 +190,8 @@ pub(crate) async fn datasets_doctor(
         &state.storage.size_facts().await?,
         &instrument.recent_passes(),
         &pass_totals(&instrument),
+        state.activity.raw(),
+        instrument.pool_saturated(),
     );
     Ok(Json(json!({
         "read_only": true,
@@ -252,6 +254,8 @@ fn store_report(
     size: &pumper_core::StoreSize,
     passes: &[pumper_core::MaintenancePass],
     pass_totals: &[(&'static str, &'static str, u64)],
+    activity_raw: i64,
+    pool_saturated: bool,
 ) -> Value {
     let operations: Vec<Value> = reports
         .iter()
@@ -317,6 +321,17 @@ fn store_report(
                 figure the maintenance gate escalates on",
         },
         "size": size,
+        // The gate's own inputs, so a deferral count that never stops climbing
+        // can be diagnosed rather than guessed at. `inflight_raw` is the
+        // UNCLAMPED counter on purpose: a negative reading is an unbalanced
+        // guard — a real bug — and laundering it to 0 here would hide the one
+        // failure that silently disables maintenance for the process's life.
+        "activity": {
+            "inflight": activity_raw.max(0),
+            "inflight_raw": activity_raw,
+            "pool_saturated": pool_saturated,
+            "means": "in-flight foreground work: HTTP requests being handled plus jobs                 currently running. A pass runs only when this reads 0 (and the pool is not                 saturated) and the minimum interval has elapsed",
+        },
         "operations": operations,
         "maintenance": {
             "passes": Value::Object(totals),
@@ -372,6 +387,8 @@ mod tests {
             &pumper_core::StoreSize::default(),
             &inst.recent_passes(),
             &pass_totals(&inst),
+            0,
+            false,
         );
         let derived = report["derived_by"].as_object().expect("derived_by block");
         for figure in [
@@ -422,6 +439,8 @@ mod tests {
             &pumper_core::StoreSize::default(),
             &[],
             &pass_totals(&inst),
+            0,
+            false,
         );
         let measured = report["measured"].as_array().expect("measured list");
         assert_eq!(measured.len(), pumper_core::StoreOp::ALL.len());

@@ -1,8 +1,10 @@
+mod activity;
 mod datahub;
 #[cfg(test)]
 mod e2e;
 mod events;
 mod fanout;
+mod maintenance;
 mod mcp;
 mod progress;
 mod refresher;
@@ -264,6 +266,10 @@ async fn run() -> anyhow::Result<()> {
     let scheduler = tokio::spawn(scheduler::run(state.clone()));
     tokio::spawn(store_janitor(state.clone()));
     tokio::spawn(retention_janitor(state.clone()));
+    // The lossless quiet-window pass: WAL checkpoint, `PRAGMA optimize`,
+    // `ANALYZE`. Gated on the same activity gauge the two janitors above now
+    // consult, and it deletes nothing.
+    tokio::spawn(maintenance::run(state.clone()));
 
     let addr = format!("{}:{}", state.config.server.host, state.config.server.port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
@@ -464,51 +470,124 @@ fn load_dotenv() {
 /// Every pass is bounded work: three indexed deletes plus one `LIMIT`ed
 /// eviction. Nothing here is data an operator would miss, which is what lets it
 /// run without an opt-in.
+/// **Gated, not scheduled.** The loop below still ticks on a timer, but the
+/// timer only makes a pass *due*; whether it runs is decided by
+/// [`crate::maintenance::decide`] against the live activity gauge, and the
+/// outcome — ran / deferred / failed — is recorded three ways. Before this, a
+/// tick was an unconditional five-delete burst that could land mid-scrape
+/// holding the writer lock, and a pass that did nothing was indistinguishable
+/// from a pass that never happened.
+///
+/// **Its deletion semantics are unchanged.** The same five statements delete
+/// the same rows under the same knobs; only *when* they run and *how they
+/// report* moved. This janitor has no harm bound, so it never escalates past a
+/// busy gauge — see `maintenance::harm_bound_for` for why that direction is the
+/// safe one for a task whose work is deletion.
 async fn store_janitor(state: AppState) {
     let interval = std::time::Duration::from_secs(3600);
     let revalidation_days = state.config.refresher.retention_days;
+    let instrument = state.storage.instrument();
+    let gated = state.config.maintenance.enabled;
     loop {
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
             _ = tokio::time::sleep(interval) => {}
         }
+        // One pass = one gate consultation, then the same work as before. The
+        // config's `min_interval_secs` is not consulted here: this loop's own
+        // hourly cadence IS its interval, and stacking a second one would let
+        // the two disagree about what "due" means.
+        let started = std::time::Instant::now();
+        let reading = state.activity.reading();
+        let saturated = instrument.pool_saturated();
+        if gated && (reading > 0 || saturated) {
+            crate::maintenance::record(
+                &instrument,
+                pumper_core::MaintenanceTask::StoreJanitor,
+                None,
+                reading.max(saturated as u64),
+                started,
+                0,
+                pumper_core::PassOutcome::Deferred,
+                if saturated {
+                    "pool saturated".into()
+                } else {
+                    "foreground work in flight".into()
+                },
+            );
+            continue;
+        }
+        // Counted so "ran and found nothing to do" is distinguishable from
+        // "deferred" and from "failed" — three results, never two.
+        let mut purged = 0u64;
+        let mut failures: Vec<String> = Vec::new();
         match state.cache.purge_expired().await {
             Ok(n) if n > 0 => tracing::info!(purged = n, "store janitor evicted expired entries"),
-            Ok(_) => {}
-            Err(e) => tracing::warn!("cache purge failed: {e}"),
+            Ok(n) => purged += n,
+            Err(e) => failures.push(format!("cache purge failed: {e}")),
         }
         match state.research_cache.purge_expired().await {
             Ok(n) if n > 0 => {
+                purged += n;
                 tracing::info!(purged = n, "store janitor evicted expired research answers")
             }
             Ok(_) => {}
-            Err(e) => tracing::warn!("research cache purge failed: {e}"),
+            Err(e) => failures.push(format!("research cache purge failed: {e}")),
         }
         match state.cache.prune_revalidations(revalidation_days).await {
-            Ok(n) if n > 0 => tracing::info!(
-                pruned = n,
-                days = revalidation_days,
-                "store janitor pruned the revalidation log"
-            ),
-            Ok(_) => {}
-            Err(e) => tracing::warn!("revalidation prune failed: {e}"),
+            Ok(n) => {
+                purged += n;
+                if n > 0 {
+                    tracing::info!(
+                        pruned = n,
+                        days = revalidation_days,
+                        "store janitor pruned the revalidation log"
+                    );
+                }
+            }
+            Err(e) => failures.push(format!("revalidation prune failed: {e}")),
         }
         match state.cache.evict_over_cap().await {
-            Ok(n) if n > 0 => tracing::info!(
-                evicted = n,
-                max_rows = state.cache.max_rows(),
-                "store janitor evicted over-cap cache entries"
-            ),
-            Ok(_) => {}
-            Err(e) => tracing::warn!("cache cap eviction failed: {e}"),
+            Ok(n) => {
+                purged += n;
+                if n > 0 {
+                    tracing::info!(
+                        evicted = n,
+                        max_rows = state.cache.max_rows(),
+                        "store janitor evicted over-cap cache entries"
+                    );
+                }
+            }
+            Err(e) => failures.push(format!("cache cap eviction failed: {e}")),
         }
         match state.tiers.prune_stale().await {
-            Ok(n) if n > 0 => {
-                tracing::info!(pruned = n, "store janitor reclaimed stale host memory")
+            Ok(n) => {
+                purged += n;
+                if n > 0 {
+                    tracing::info!(pruned = n, "store janitor reclaimed stale host memory");
+                }
             }
-            Ok(_) => {}
-            Err(e) => tracing::warn!("host memory prune failed: {e}"),
+            Err(e) => failures.push(format!("host memory prune failed: {e}")),
         }
+        // `attempted and failed` is its own outcome. Before this, every one of
+        // the five arms above logged a `warn!` and the pass reported nothing at
+        // all, so a janitor whose every statement had been erroring for a month
+        // looked exactly like a healthy one with nothing to do.
+        let (outcome, detail) = if failures.is_empty() {
+            (pumper_core::PassOutcome::Ran, String::new())
+        } else {
+            (pumper_core::PassOutcome::Failed, failures.join("; "))
+        };
+        crate::maintenance::record(
+            &instrument,
+            pumper_core::MaintenanceTask::StoreJanitor,
+            Some(pumper_core::PassTrigger::Quiet),
+            reading,
+            started,
+            purged,
+            outcome,
+            detail,
+        );
     }
 }
 
@@ -560,28 +639,65 @@ async fn retention_janitor(state: AppState) {
         ?sketch_runs,
         "retention janitor enabled"
     );
+    let instrument = state.storage.instrument();
+    let gated = state.config.maintenance.enabled;
     loop {
         tokio::select! {
             _ = state.shutdown.cancelled() => break,
             _ = tokio::time::sleep(interval) => {}
         }
+        // Gated on the same live activity reading as everything else, and for
+        // the sharpest reason in the process: this loop deletes, inside
+        // transactions, on the one writer lane a running scrape also needs.
+        //
+        // What it deletes has NOT changed — same statements, same knobs, same
+        // rows. Only when it runs and how it reports moved. It carries no harm
+        // bound, so under permanent load it defers indefinitely and says so on
+        // every tick; keeping data is the operator's stated posture, and the
+        // deferral count is what stops "it never runs" from being folklore.
+        let started = std::time::Instant::now();
+        let reading = state.activity.reading();
+        let saturated = instrument.pool_saturated();
+        if gated && (reading > 0 || saturated) {
+            crate::maintenance::record(
+                &instrument,
+                pumper_core::MaintenanceTask::RetentionJanitor,
+                None,
+                reading.max(saturated as u64),
+                started,
+                0,
+                pumper_core::PassOutcome::Deferred,
+                if saturated {
+                    "pool saturated".into()
+                } else {
+                    "foreground work in flight".into()
+                },
+            );
+            continue;
+        }
+        let mut removed = 0u64;
+        let mut failures: Vec<String> = Vec::new();
         if days > 0 {
             let cutoff = chrono::Utc::now() - chrono::Duration::days(days as i64);
             match state.datasets.prune_revisions(cutoff, keep_min).await {
-                Ok(n) if n > 0 => {
-                    tracing::info!(pruned = n, days, "retention janitor pruned old revisions")
+                Ok(n) => {
+                    removed += n;
+                    if n > 0 {
+                        tracing::info!(pruned = n, days, "retention janitor pruned old revisions");
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!("revision prune failed: {e}"),
+                Err(e) => failures.push(format!("revision prune failed: {e}")),
             }
         }
         if ledgers.any_enabled() {
             match state.storage.prune_ledgers(&ledgers).await {
-                Ok(p) if p.total() > 0 => {
-                    tracing::info!(?p, "retention janitor pruned ledgers")
+                Ok(p) => {
+                    removed += p.total();
+                    if p.total() > 0 {
+                        tracing::info!(?p, "retention janitor pruned ledgers");
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!("ledger prune failed: {e}"),
+                Err(e) => failures.push(format!("ledger prune failed: {e}")),
             }
         }
         if artifact_days > 0 {
@@ -595,6 +711,7 @@ async fn retention_janitor(state: AppState) {
                         &files,
                         &plan,
                     );
+                    removed += n;
                     if n > 0 {
                         tracing::info!(
                             files = n,
@@ -604,18 +721,43 @@ async fn retention_janitor(state: AppState) {
                         );
                     }
                 }
-                Err(e) => tracing::warn!("artifact retention plan failed: {e}"),
+                Err(e) => failures.push(format!("artifact retention plan failed: {e}")),
             }
         }
         if let (Some(keep), Some(store)) = (sketch_runs, state.health.store()) {
             match store.prune(keep).await {
-                Ok(n) if n > 0 => {
-                    tracing::info!(pruned = n, keep, "retention janitor pruned health sketches")
+                Ok(n) => {
+                    removed += n;
+                    if n > 0 {
+                        tracing::info!(
+                            pruned = n,
+                            keep,
+                            "retention janitor pruned health sketches"
+                        );
+                    }
                 }
-                Ok(_) => {}
-                Err(e) => tracing::warn!("health sketch prune failed: {e}"),
+                Err(e) => failures.push(format!("health sketch prune failed: {e}")),
             }
         }
+        // Three outcomes, never two. A pass whose every arm errored used to
+        // produce four `warn!`s and no record at all, so a retention janitor
+        // that had been failing for a month looked exactly like one with
+        // nothing to prune.
+        let (outcome, detail) = if failures.is_empty() {
+            (pumper_core::PassOutcome::Ran, String::new())
+        } else {
+            (pumper_core::PassOutcome::Failed, failures.join("; "))
+        };
+        crate::maintenance::record(
+            &instrument,
+            pumper_core::MaintenanceTask::RetentionJanitor,
+            Some(pumper_core::PassTrigger::Quiet),
+            reading,
+            started,
+            removed,
+            outcome,
+            detail,
+        );
     }
 }
 

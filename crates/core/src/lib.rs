@@ -87,10 +87,10 @@ pub use retention::{
 };
 #[cfg(feature = "storage")]
 pub use storage::{
-    Delivery, DeliveryHealth, EnqueueOptions, IngressSource, JobStages, JobTimingStats,
-    LedgerPruned, LedgerRetention, LedgerStat, NewDerivedSpec, NewSchedule, NewTrigger, PluginHook,
-    QueueAges, RevisionCount, SavedSearch, Schedule, SearchMaterialize, Storage, Trigger,
-    TriggerPluginHooks, Watch, YieldSummary, LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
+    CheckpointRound, Delivery, DeliveryHealth, EnqueueOptions, IngressSource, JobStages,
+    JobTimingStats, LedgerPruned, LedgerRetention, LedgerStat, NewDerivedSpec, NewSchedule,
+    NewTrigger, PluginHook, QueueAges, RevisionCount, SavedSearch, Schedule, SearchMaterialize,
+    Storage, Trigger, TriggerPluginHooks, Watch, YieldSummary, LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
 };
 #[cfg(feature = "storage")]
 pub use store_instrument::{

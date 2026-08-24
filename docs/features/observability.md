@@ -132,6 +132,59 @@ block.
 window's sample count and span, the size facts, the recent maintenance passes,
 and a `derived_by` block stating how every figure was recomputed.
 
+### Quiet-window maintenance
+
+Store housekeeping is **gated, not scheduled**. Before this, both janitors fired
+on a bare `sleep(interval)`; a wall clock does not know about interactions, so
+over enough sessions one was guaranteed to land mid-scrape holding SQLite's
+writer lock — and the stall got charged to whatever was running.
+
+The gate reads an **activity gauge**: in-flight HTTP requests plus running jobs,
+fed by RAII guards at the application's own front doors, plus connection-pool
+saturation (demand for the machine that a request count cannot see). Both are
+published — `pumper_store_activity_gauge` and `pumper_store_pool_saturated` — so
+a deferral count that never stops climbing can be diagnosed instead of guessed
+at.
+
+Two conditions, and neither alone is enough: the gauge must read **zero** AND the
+minimum interval must have elapsed. The interval bounds cost; the gauge bounds
+interference.
+
+Deferral then has an escalation ladder, or "quiet window" degrades into "never":
+
+| Rung | Fires when | Chunk |
+| --- | --- | --- |
+| `quiet` | gauge at 0, past `min_interval_secs` | full |
+| `stale` | deferred past `staleness_secs`, gauge ≤ `quiet_enough` | one round |
+| `harm` | the `-wal` sidecar is over `wal_harm_bytes` | full, regardless of activity |
+
+Rung 3's bound is a **byte count, not a duration**, on purpose: "the sidecar
+exceeds 64 MiB" is a reason a human can weigh; "it has been a week" would be the
+wall-clock timer sneaking back in through the ladder. Only the checkpoint task
+has a harm bound — stale planner statistics cost query plans rather than disk,
+and the two janitors *delete*, so under permanent load the safe direction for
+them is to keep deferring visibly.
+
+**Deferral is an outcome.** `ran` (work = 0 is still a run), `deferred` and
+`failed` are three different results, all counted on
+`pumper_store_maintenance_passes_total{task,outcome}` and all recorded into the
+store instrument's bounded flight recorder (visible under
+`GET /datasets/doctor` → `store.maintenance.recent`, with trigger, gauge
+reading, duration and work done per pass). A log that recorded only successes
+could not tell a healthy store from a gate that had been deferring for a month.
+
+**What runs is lossless only**: `PRAGMA wal_checkpoint(PASSIVE)` (chunked — the
+pooled connection is released and the gauge re-read between rounds, so an
+abandoned pass is incomplete, never corrupt), `PRAGMA optimize`, and `ANALYZE` on
+a longer rung. Nothing here deletes, expires or prunes. The two existing
+janitors keep their deletion semantics exactly; only *when* they run and *how
+they report* changed. Migrations and crash recovery are **not** gated — they run
+at their own mandated moment regardless of activity.
+
+Knobs: `[maintenance]` in `config.toml` (defaults documented there). Config
+validation refuses a ladder with an unreachable rung — a tick rarer than the
+interval, an inverted staleness window, a zero harm bound, or zero chunks.
+
 ## Boot-time logs that state what the process can observe
 
 Two boot lines exist to close a gap between what is configured and what is

@@ -34,6 +34,92 @@ pub struct Config {
     pub mcp: McpConfig,
     pub economics: EconomicsConfig,
     pub refresher: RefresherConfig,
+    pub maintenance: MaintenanceConfig,
+}
+
+/// Quiet-window maintenance: when the store's housekeeping is allowed to run.
+///
+/// The problem this replaces is a **wall clock**. Both janitors fired on a bare
+/// `sleep(interval)`, and wall clocks do not know about interactions — over
+/// enough sessions a timer is guaranteed to fire mid-scrape, and the resulting
+/// stall gets charged to whatever the user was doing (registry:
+/// embedded-db/quiet-window-maintenance). The replacement is an **activity
+/// gauge**: a live count of in-flight foreground work, read at the moment the
+/// pass would start and re-read while it runs.
+///
+/// The gate is two conditions, and neither alone is the technique: the interval
+/// bounds cost, the gauge bounds interference. The interval alone IS the timer
+/// failure; the gauge alone runs maintenance in every momentary gap, turning
+/// idle detection into a busy loop.
+///
+/// Deferral then needs its own policy or quiet-window maintenance degrades into
+/// no maintenance, so there is an escalation ladder: prefer true quiet
+/// ([`Self::min_interval_secs`]); past [`Self::staleness_secs`] accept
+/// "quieter" ([`Self::quiet_enough`]) at a reduced chunk size; past a bound
+/// stated in terms of **harm** ([`Self::wal_harm_bytes`]) run regardless and
+/// say so. The hard bound is deliberately a byte count and not a duration: "the
+/// sidecar exceeds 64 MiB" is a reason a human can weigh, "it has been a week"
+/// is a timer sneaking back in.
+///
+/// Everything scheduled here is **lossless**. Checkpointing folds the sidecar
+/// into the main file, `PRAGMA optimize` and `ANALYZE` refresh planner
+/// statistics; none of them discard a row. The two janitors' *deletion*
+/// semantics are untouched by this section — it changes only WHEN they run and
+/// HOW they report.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct MaintenanceConfig {
+    /// Master switch for the quiet-window pass (checkpoint / optimize /
+    /// analyze) **and** for gating the two janitors. `false` restores the bare
+    /// wall-clock janitors and runs no checkpoint pass.
+    ///
+    /// Default ON: a fresh deployment's WAL sidecar grows from the first write,
+    /// and the pass is lossless, chunked and gated — the safe default is the
+    /// one where the sidecar has a reader.
+    pub enabled: bool,
+    /// How often the gate is consulted. Cheap: reading the gauge is an atomic
+    /// load, and a tick that is not due does nothing at all and records
+    /// nothing (a "not due" is not a deferral — it is not a pass attempt).
+    pub tick_secs: u64,
+    /// Rung 1. Minimum wall clock between passes of one task. Bounds cost.
+    pub min_interval_secs: u64,
+    /// Rung 2. Once a task has been deferred this long, it stops holding out
+    /// for perfect quiet and accepts "quieter" — at a reduced chunk size, so
+    /// the interference it does cause is smaller.
+    pub staleness_secs: u64,
+    /// What counts as "quiet enough" at rung 2: the highest activity-gauge
+    /// reading the stale rung will still run under. `0` makes rung 2 identical
+    /// to rung 1 (a legitimate, more conservative choice).
+    pub quiet_enough: u64,
+    /// Rung 3, the hard bound, stated as **harm**: once the `-wal` sidecar
+    /// exceeds this many bytes, the checkpoint pass runs regardless of activity
+    /// and records that it did. Only the checkpoint task has one — see
+    /// `maintenance::harm_bound_for`.
+    pub wal_harm_bytes: u64,
+    /// Chunk size for the checkpoint pass: how many `wal_checkpoint(PASSIVE)`
+    /// rounds one pass may run before yielding. The gauge is re-read between
+    /// rounds with no connection held, so an abandoned pass is incomplete,
+    /// never corrupt. Rung 2 runs a single round.
+    pub checkpoint_rounds: u32,
+    /// How many passes must elapse between `ANALYZE` runs — the longer rung.
+    /// `PRAGMA optimize` runs every pass; a full `ANALYZE` scans indexes and
+    /// only earns its cost occasionally.
+    pub analyze_every_passes: u64,
+}
+
+impl Default for MaintenanceConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            tick_secs: 60,
+            min_interval_secs: 900,
+            staleness_secs: 21_600,
+            quiet_enough: 1,
+            wal_harm_bytes: 64 * 1024 * 1024,
+            checkpoint_rounds: 4,
+            analyze_every_passes: 24,
+        }
+    }
 }
 
 /// Background cache refresher (M02 self-refreshing mirror): a scheduler-tick
@@ -945,6 +1031,53 @@ impl Config {
                  otherwise the cap never applies",
                 g.penalty_cap_secs, g.penalty_base_secs
             )));
+        }
+
+        // Quiet-window maintenance. Every rule below guards a combination that
+        // parses fine and then produces a ladder with a rung that can never be
+        // reached — i.e. maintenance that silently never runs, which is exactly
+        // the failure mode the gate exists to make visible rather than create.
+        let m = &self.maintenance;
+        if m.enabled {
+            // The gate is consulted on the tick. A tick rarer than the interval
+            // means the interval is not the interval — the real cadence is the
+            // tick, and every stated bound below it is fiction.
+            if m.tick_secs == 0 || m.tick_secs > m.min_interval_secs {
+                return Err(Error::Config(format!(
+                    "[maintenance] tick_secs ({}) must be > 0 and <= min_interval_secs ({}) — \
+                     the gate cannot honour an interval it is consulted less often than",
+                    m.tick_secs, m.min_interval_secs
+                )));
+            }
+            // An inverted window makes the staleness rung fire before the
+            // quiet rung ever could, so "prefer true quiet" would never be the
+            // preference — the ladder would start on its second rung.
+            if m.staleness_secs < m.min_interval_secs {
+                return Err(Error::Config(format!(
+                    "[maintenance] staleness_secs ({}) must be >= min_interval_secs ({}) — \
+                     otherwise the reduced-chunk rung fires before the quiet rung can",
+                    m.staleness_secs, m.min_interval_secs
+                )));
+            }
+            // A zero harm bound turns rung 3 into "always run regardless of
+            // activity", which is the wall-clock timer with extra steps and no
+            // gate at all.
+            if m.wal_harm_bytes == 0 {
+                return Err(Error::Config(
+                    "[maintenance] wal_harm_bytes must be > 0 — a zero harm bound makes every \
+                     pass an emergency, which is the ungated timer this gate replaces"
+                        .into(),
+                ));
+            }
+            // Zero rounds is a pass that checkpoints nothing and still reports
+            // `ran` — a maintenance log that would read healthy forever.
+            if m.checkpoint_rounds == 0 {
+                return Err(Error::Config(
+                    "[maintenance] checkpoint_rounds must be >= 1 — a pass with no rounds \
+                     reports `ran` having done nothing"
+                        .into(),
+                ));
+            }
         }
 
         Ok(())
@@ -1974,6 +2107,73 @@ mod tests {
         // Disabled => the rules don't bind (nothing reaches the surface).
         let mut cfg = Config::default();
         cfg.ingress.max_body_bytes = 0;
+        assert!(cfg.validate().is_ok());
+    }
+
+    /// The defaults have to be safe on a fresh deployment, because the pass is
+    /// on by default: gated, lossless, and rung 3 reachable but not trivially.
+    #[test]
+    fn maintenance_defaults_are_gated_and_reachable() {
+        let m = MaintenanceConfig::default();
+        assert!(m.enabled, "the sidecar grows from the first write");
+        assert!(m.tick_secs > 0 && m.tick_secs <= m.min_interval_secs);
+        assert!(
+            m.staleness_secs >= m.min_interval_secs,
+            "rung 2 must not fire before rung 1 can"
+        );
+        assert!(
+            m.wal_harm_bytes > 0,
+            "a zero harm bound is an ungated timer"
+        );
+        assert!(m.checkpoint_rounds >= 1);
+        assert!(Config::default().validate().is_ok());
+    }
+
+    /// Each rule below guards a combination that parses fine and then produces
+    /// a ladder with an unreachable rung — i.e. maintenance that silently never
+    /// runs, or one that always runs regardless of activity. Both are the exact
+    /// failures the gate exists to prevent, so they are refused at boot rather
+    /// than discovered from a disk-full report months later.
+    #[test]
+    fn maintenance_refuses_a_ladder_with_an_unreachable_rung() {
+        // A gate consulted less often than its own interval: the real cadence
+        // is the tick, and every stated bound below it is fiction.
+        let mut cfg = Config::default();
+        cfg.maintenance.tick_secs = cfg.maintenance.min_interval_secs + 1;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("tick_secs"), "{err}");
+
+        let mut cfg = Config::default();
+        cfg.maintenance.tick_secs = 0;
+        assert!(cfg.validate().is_err());
+
+        // An inverted window: the reduced-chunk rung would fire before the
+        // quiet rung ever could, so "prefer true quiet" would never be the
+        // preference — the ladder would start on its second rung.
+        let mut cfg = Config::default();
+        cfg.maintenance.staleness_secs = cfg.maintenance.min_interval_secs - 1;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("staleness_secs"), "{err}");
+
+        // A zero harm bound makes EVERY pass an emergency — the ungated
+        // wall-clock timer this whole gate replaces, wearing a ladder.
+        let mut cfg = Config::default();
+        cfg.maintenance.wal_harm_bytes = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("wal_harm_bytes"), "{err}");
+
+        // Zero rounds: a pass that checkpoints nothing and still reports `ran`,
+        // i.e. a maintenance log that reads healthy forever.
+        let mut cfg = Config::default();
+        cfg.maintenance.checkpoint_rounds = 0;
+        let err = cfg.validate().unwrap_err().to_string();
+        assert!(err.contains("checkpoint_rounds"), "{err}");
+
+        // Switched off => none of the rules bind, because no ladder exists.
+        let mut cfg = Config::default();
+        cfg.maintenance.enabled = false;
+        cfg.maintenance.wal_harm_bytes = 0;
+        cfg.maintenance.checkpoint_rounds = 0;
         assert!(cfg.validate().is_ok());
     }
 

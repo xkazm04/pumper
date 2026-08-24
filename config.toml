@@ -347,3 +347,48 @@ enforce = false          # DEFERRED seam — inert today, ships OFF so landing e
 [economics.weights]
 # grants-gov = 5.0
 # hackernews = 0.2
+
+# Quiet-window maintenance — WHEN the store's housekeeping is allowed to run.
+#
+# What this replaces is a wall clock. The two janitors used to fire on a bare
+# sleep(interval), and a wall clock does not know about interactions, so over
+# enough sessions one was guaranteed to land mid-scrape holding SQLite's writer
+# lock — and the stall got charged to whatever was running at the time. Every
+# pass is now gated on a live ACTIVITY GAUGE: in-flight HTTP requests plus
+# running jobs, plus connection-pool saturation (a saturated pool is demand for
+# the machine that a request count cannot see).
+#
+# The gate is TWO conditions and neither alone is enough: the gauge must read
+# zero AND the minimum interval must have elapsed. The interval bounds cost; the
+# gauge bounds interference.
+#
+# Deferral then needs its own policy, or "quiet window" degrades into "never":
+#   rung 1  quiet  — gauge at zero past min_interval_secs
+#   rung 2  stale  — deferred past staleness_secs, so accept "quieter"
+#                    (gauge <= quiet_enough) at a single chunk
+#   rung 3  harm   — the -wal sidecar is over wal_harm_bytes, so run regardless
+#                    and say so in the record
+# Rung 3's bound is a BYTE COUNT on purpose. "The sidecar exceeds 64 MiB" is a
+# reason a human can weigh; "it has been a week" would be the timer sneaking
+# back in through the escalation ladder.
+#
+# What runs in the window is LOSSLESS ONLY: wal_checkpoint(PASSIVE) (folds
+# committed frames into the main file), PRAGMA optimize, and ANALYZE on a longer
+# rung. Nothing here deletes, expires or prunes anything. The two existing
+# janitors keep their deletion semantics exactly — this section changes only when
+# they run and how they report (ran / deferred / failed, three different results,
+# all on /metrics as pumper_store_maintenance_passes_total{task,outcome}).
+[maintenance]
+# enabled = true                # false restores the ungated wall-clock janitors and runs no
+#                               # checkpoint pass. Default ON: the sidecar grows from the first
+#                               # write, and the pass is lossless, chunked and gated.
+# tick_secs = 60                # how often the gate is consulted (must be <= min_interval_secs)
+# min_interval_secs = 900       # rung 1: minimum wall clock between passes of one task
+# staleness_secs = 21600        # rung 2: after this long deferring, accept a "quieter" window
+# quiet_enough = 1              # highest gauge reading rung 2 will still run under (0 = rung 2
+#                               # behaves exactly like rung 1, a more conservative choice)
+# wal_harm_bytes = 67108864     # rung 3: run regardless once the -wal sidecar passes this
+# checkpoint_rounds = 4         # PASSIVE checkpoint rounds per pass; the gauge is re-read between
+#                               # rounds with NO connection held, so an abandoned pass is
+#                               # incomplete, never corrupt. Rung 2 runs a single round.
+# analyze_every_passes = 24     # one ANALYZE per this many optimize passes

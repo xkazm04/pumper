@@ -107,6 +107,17 @@ pub struct AppState {
     /// the count is not. A local sink, because a channel that is itself down
     /// cannot be the place its own outage is counted.
     pub claim_failures: Arc<std::sync::atomic::AtomicU64>,
+    /// Live count of in-flight **foreground** work — HTTP requests being
+    /// handled plus jobs currently running — fed at the application's own front
+    /// doors by RAII guards.
+    ///
+    /// This is what makes maintenance gated rather than scheduled. Both
+    /// janitors used to fire on a bare wall-clock `sleep`, and a wall clock does
+    /// not know about interactions, so over enough sessions one was guaranteed
+    /// to land mid-scrape holding the writer lock. The gate reads THIS instead
+    /// (plus pool saturation from the store instrument, which a count of
+    /// requests and jobs cannot see). See `crate::activity`.
+    pub activity: Arc<crate::activity::ActivityGauge>,
     /// Cancelled on SIGTERM/Ctrl-C to drive graceful shutdown: the worker stops
     /// claiming, in-flight jobs drain, and `axum::serve` stops accepting.
     pub shutdown: CancellationToken,
@@ -248,6 +259,7 @@ impl AppState {
             progress: Arc::new(ProgressStore::new()),
             checkpoint_failures: Arc::new(Default::default()),
             claim_failures: Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            activity: Arc::new(crate::activity::ActivityGauge::new()),
             shutdown: CancellationToken::new(),
             job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
