@@ -18,9 +18,15 @@ Everything runs **from the repo root**: the `.env` loader and the default
 | `just check` | `cargo check --workspace` |
 | `just test` | `cargo test --workspace` — what CI runs |
 | `just test-ignored` | `cargo test --workspace -- --ignored` — env-dependent (real Chrome, built wasm, timing) |
+| `just test-recorded` | `just test` through the flake recorder, so the run lands in the retained history detection queries over |
 | `just lint` | `cargo clippy --workspace --all-targets` — CI gate |
 | `just fmt` / `just fmt-check` | `cargo fmt` / `cargo fmt --check` — CI gate |
-| `just ci` | `fmt-check` + `lint` + `test`, i.e. the whole CI job |
+| `just flake-check` | the quarantine register as a gate — expiry, ceiling, and both reconciliation directions; 0 clean / 2 findings / **3 cannot check** |
+| `just flake-report` | register size **with its trend**, age of the oldest entry, and the labelled set with its full predicate |
+| `just harness-test` | the fixture suites that prove `flake-check` and `lane-certify` can still go red |
+| `just lanes` | run every long lane runnable on this platform, then certify it — **minutes**, on its own clock (the nightly CI leg) |
+| `just lane-certify` / `just lane-health` | judge the existing lane artifacts against the declared bounds / publish each lane's pass-rate history, with *never green* as its own category |
+| `just ci` | every rung CI blocks on: `fmt-check lint test audit plugins-verify sdk inventory flake-check harness-test`. The long lanes are deliberately **absent** — a minutes-long certification hung off the pre-push habit is how the habit stops happening |
 | `just build` | `cargo build -p pumper-server` |
 | `just run` | `cargo run -p pumper-server --bin pumper` → http://127.0.0.1:8088 |
 | `just dev` | same, with `RUST_LOG=debug` |

@@ -35,6 +35,17 @@ capabilities:
   sdk-typecheck: { command: "npm --prefix clients/typescript run typecheck", verified: false }
   sdk: { command: "just sdk", verified: false }
   inventory: { command: "just inventory", verified: false }
+  # The quarantine register as a gate: expiry, ceiling, and the two-direction
+  # reconciliation between the register and the tree's #[ignore]s. Three outcomes,
+  # three exit codes (0 clean / 2 findings / 3 CANNOT CHECK) — a 3 is not a pass.
+  flake-check: { command: "just flake-check", verified: false }
+  # The fixture suites behind flake-check and lane-certify. A gate never observed
+  # going red is indistinguishable from a gate that cannot.
+  harness-test: { command: "just harness-test", verified: false }
+  # Long-lane CERTIFICATION, not a gate: its own clock (the nightly CI leg), its
+  # own pre-declared statistical criteria, one artifact per run. Minutes — which
+  # is exactly why it is not in `ci` below.
+  lanes: { command: "just lanes", verified: false }
 
 # Pointers — these subsystems can change format underneath without breaking this contract.
 paths:
@@ -71,7 +82,13 @@ controls:
   # reminder that never blocks, and it runs on no clone that lacks the settings.
   localAdvisory: [doc-sync]
   # The binding rung. Everything below it is a latency optimization.
-  ciHardPass: [fmt-check, lint, test, audit, plugins-verify, sdk, inventory]
+  ciHardPass: [fmt-check, lint, test, audit, plugins-verify, sdk, inventory, flake-check, harness-test]
+  # Certification, NOT a gate — and the distinction is the technique's, not a
+  # convenience: a long lane judges behaviour over time, which is not a property
+  # of any single change, so blocking a merge on it would destroy the merge
+  # cadence without improving the certification. Runs on the nightly cron
+  # (`41 5 * * *`) and on workflow_dispatch; its verdicts are trend data.
+  scheduledCertification: [lanes]
 
 # The organization's AI registry - knowledge bundles this repo consumes and the skill
 # marketplace it installs from. Unknown fields MUST be ignored by a reader.
