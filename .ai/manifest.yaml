@@ -64,6 +64,10 @@ registry:
   local: ../ai-registry
   machine: secondary
   contributor: mkdol-dev-box
+  # This repo audited against the bundle: per-technique verdicts plus the ranked
+  # backlog future waves drain. A pointer, not an embed — the file's own format
+  # can change underneath without touching this contract.
+  conformance: .ai/registry-conformance.md
 knowledge:
   domains: [software-engineering, llm-observability]
 
