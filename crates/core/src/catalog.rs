@@ -67,6 +67,36 @@ pub struct Source {
     pub contract: Option<Contract>,
 }
 
+/// Closed vocabulary for `status`. Required on every row.
+pub const STATUSES: &[&str] = &["live", "planned", "blocked"];
+/// Closed vocabulary for `cadence`. Empty = not declared; the five recurring
+/// values are the ones [`Source::cadence_secs`] gives a freshness window to,
+/// and `one-time`/`on-demand` are the two that deliberately have none — which
+/// is exactly why an unknown value must not quietly join them.
+pub const CADENCES: &[&str] = &[
+    "one-time",
+    "on-demand",
+    "daily",
+    "weekly",
+    "monthly",
+    "quarterly",
+    "annual",
+];
+/// Closed vocabulary for `engine`.
+pub const ENGINES: &[&str] = &["http", "browser", "claude", "bulk"];
+/// Closed vocabulary for `access`.
+pub const ACCESS_KINDS: &[&str] = &["key-free", "api-key", "bulk", "scrape"];
+/// Closed vocabulary for `category` — the browsing axis.
+pub const CATEGORIES: &[&str] = &[
+    "open-calls",
+    "awarded-history",
+    "registry",
+    "labor-market",
+    "market-stats",
+];
+/// Top of the `confidence` scale (1-5; 0 = not declared).
+pub const MAX_CONFIDENCE: u8 = 5;
+
 impl Source {
     /// A source is on the scheduler iff it declares a non-empty cron.
     pub fn is_scheduled(&self) -> bool {
@@ -301,8 +331,72 @@ impl Catalog {
     }
 
     /// Parses catalog TOML from a string (the testable core of [`load`]).
+    ///
+    /// Parsing is not the whole gate: every closed vocabulary in a row is
+    /// checked here too, because *code gets exercised and data gets believed*.
+    /// A `cadence` of `"dayly"` used to parse cleanly and then fall through
+    /// `cadence_secs`'s `_ => None` arm — which is the same answer as
+    /// `on-demand` — so one typo silently switched that source's freshness
+    /// monitoring off and nothing anywhere said so (registry:
+    /// connector-catalog/catalog-as-data, "declarations rot without a consumer
+    /// that checks them").
     pub fn parse(raw: &str) -> Result<Catalog> {
-        toml::from_str(raw).map_err(|e| Error::Config(e.to_string()))
+        let catalog: Catalog = toml::from_str(raw).map_err(|e| Error::Config(e.to_string()))?;
+        let findings = catalog.vocabulary_findings();
+        if !findings.is_empty() {
+            return Err(Error::Config(format!(
+                "catalog vocabulary: {}",
+                findings.join("; ")
+            )));
+        }
+        Ok(catalog)
+    }
+
+    /// Every out-of-vocabulary value in the catalog, one finding per field —
+    /// all of them, not the first, so one edit fixes one round of complaints.
+    ///
+    /// An EMPTY value means "not declared" for the optional axes and is fine;
+    /// a non-empty value outside the closed set is the typo this exists to
+    /// catch. The sets are the ones `catalog/README.md` and the header comment
+    /// of `data-sources.toml` document, and the consumers below read them:
+    /// `cadence` drives the freshness monitor, `status` decides what is live,
+    /// and `engine`/`access`/`category`/`confidence` are the discovery axes
+    /// every listing surface groups by.
+    pub fn vocabulary_findings(&self) -> Vec<String> {
+        let mut out = Vec::new();
+        for source in &self.sources {
+            let id = if source.id.trim().is_empty() {
+                "<no id>"
+            } else {
+                source.id.trim()
+            };
+            let mut check = |field: &str, value: &str, allowed: &[&str], optional: bool| {
+                let v = value.trim();
+                if v.is_empty() && optional {
+                    return;
+                }
+                if !allowed.contains(&v) {
+                    out.push(format!(
+                        "source '{id}': {field} = {v:?} is not one of [{}]",
+                        allowed.join(" | ")
+                    ));
+                }
+            };
+            check("status", &source.status, STATUSES, false);
+            check("cadence", &source.cadence, CADENCES, true);
+            check("engine", &source.engine, ENGINES, true);
+            check("access", &source.access, ACCESS_KINDS, true);
+            check("category", &source.category, CATEGORIES, true);
+            // 0 is "not declared" (the serde default for an absent field);
+            // anything above the scale is a typo, not a stronger claim.
+            if source.confidence > MAX_CONFIDENCE {
+                out.push(format!(
+                    "source '{id}': confidence = {} is outside 1..={MAX_CONFIDENCE}",
+                    source.confidence
+                ));
+            }
+        }
+        out
     }
 
     /// Sources with `status == "live"` — the pipelines actually running.
@@ -898,6 +992,101 @@ mod tests {
             ContractVerdict::Block
         );
         assert_eq!(ContractVerdict::Block.as_str(), "block");
+    }
+
+    // ---- closed vocabularies ----------------------------------------------
+
+    fn row(extra: &str) -> String {
+        format!(
+            "[[source]]
+id = \"s\"
+app = \"a\"
+market = \"us\"
+name = \"S\"
+             status = \"live\"
+{extra}
+"
+        )
+    }
+
+    /// The anti-pattern: `cadence_secs`'s `_ => None` arm gives a typo the same
+    /// answer it gives `on-demand` — "this source has no freshness
+    /// expectation". So `cadence = "dayly"` parsed, monitored nothing, and
+    /// reported nothing. Data gets believed; this is the consumer that checks.
+    #[test]
+    fn a_misspelled_cadence_is_refused_at_parse_not_silently_unmonitored() {
+        let err = Catalog::parse(&row("cadence = \"dayly\""))
+            .expect_err("a cadence outside the closed set must not parse");
+        let msg = err.to_string();
+        assert!(msg.contains("dayly"), "{msg}");
+        assert!(msg.contains("cadence"), "{msg}");
+        assert!(msg.contains("daily"), "the accepted set is named: {msg}");
+
+        // And the value it would have been confused with still works.
+        let ok = Catalog::parse(&row("cadence = \"on-demand\"")).expect("a declared cadence");
+        assert_eq!(
+            ok.sources[0].cadence_secs(),
+            None,
+            "deliberately unmonitored"
+        );
+        let daily = Catalog::parse(&row("cadence = \"daily\"")).expect("a declared cadence");
+        assert_eq!(daily.sources[0].cadence_secs(), Some(86_400));
+    }
+
+    #[test]
+    fn every_closed_axis_is_checked_and_absence_is_still_allowed() {
+        for bad in [
+            "status = \"alive\"",
+            "engine = \"curl\"",
+            "access = \"oauth\"",
+            "category = \"grants\"",
+            "confidence = 9",
+        ] {
+            // `row()` already sets status, so replace it for the status case.
+            let raw = if bad.starts_with("status") {
+                row("").replace("status = \"live\"", bad)
+            } else {
+                row(bad)
+            };
+            assert!(
+                Catalog::parse(&raw).is_err(),
+                "{bad} must not parse into the catalog"
+            );
+        }
+        // The optional axes may be absent — "not declared" is a legal answer,
+        // and a check that refused it would make the gate unusable.
+        let sparse = Catalog::parse(&row("")).expect("optional axes may be omitted");
+        assert_eq!(sparse.sources[0].cadence, "");
+        assert_eq!(sparse.sources.len(), 1);
+    }
+
+    /// A finding per field, not per file: fixing one typo must not simply
+    /// reveal the next one on the following run.
+    #[test]
+    fn every_out_of_vocabulary_value_is_reported_at_once() {
+        let raw = row("cadence = \"dayly\"
+engine = \"curl\"
+access = \"oauth\"");
+        let catalog: Catalog = toml::from_str(&raw).expect("shape parses");
+        let findings = catalog.vocabulary_findings();
+        assert_eq!(findings.len(), 3, "{findings:?}");
+    }
+
+    /// The gate is worthless if the catalog this repo ships does not pass it.
+    #[test]
+    fn the_shipped_catalog_uses_only_declared_vocabulary() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../catalog/data-sources.toml"
+        ))
+        .expect("the shipped catalog");
+        let catalog = Catalog::parse(&raw).expect("the shipped catalog must parse");
+        assert!(
+            catalog.sources.len() > 20,
+            "the walk found {} sources — it is reading the wrong file",
+            catalog.sources.len()
+        );
+        assert_eq!(catalog.vocabulary_findings(), Vec::<String>::new());
     }
 
     // ---- reconcile plan ---------------------------------------------------

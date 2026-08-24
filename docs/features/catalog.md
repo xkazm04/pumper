@@ -6,7 +6,7 @@ Schema reference and a rendered overview table live in [`catalog/README.md`](../
 
 ## Source entry
 
-Fields (all optional except `id`, `name`, `status`; missing values default rather than failing the parse):
+Fields (all optional except `id`, `name`, `status`; an **absent** field defaults rather than failing the parse — but a **present** one whose value is outside its closed vocabulary is a hard parse error, see below):
 
 | field | meaning |
 | --- | --- |
@@ -14,7 +14,7 @@ Fields (all optional except `id`, `name`, `status`; missing values default rathe
 | `app` | serving crate under `crates/apps/<app>`; `""` when not built yet |
 | `market` | jurisdiction in the app's scheme — `us`, `us-ca` (California), `eu`, `au`, `gb`, `cz`, `ca` (Canada). **`us-ca` = California, `ca` = Canada** |
 | `name` / `url` | human name and primary endpoint |
-| `category` | `open-calls` · `awarded-history` · `registry` · `labor-market` |
+| `category` | `open-calls` · `awarded-history` · `registry` · `labor-market` · `market-stats` |
 | `engine` | `http` · `browser` · `claude` · `bulk` (import mechanism, not the Pumper engine trait) |
 | `access` | `key-free` · `api-key` · `bulk` · `scrape` |
 | `cadence` | `one-time` · `on-demand` · `daily` · `weekly` · `monthly` · `quarterly` · `annual` |
@@ -27,6 +27,10 @@ Fields (all optional except `id`, `name`, `status`; missing values default rathe
 A source that has only been researched still gets an entry, with `status = "planned"` and `app = ""` — so the catalog doubles as the roadmap and "live vs planned" stays honest.
 
 `Catalog::load()` reads `$PUMPER_CATALOG` or `./catalog/data-sources.toml` (**CWD-relative**). A **missing** file is an empty catalog plus a warn log, so a deployment without it still boots; a **malformed** file is a hard error.
+
+**The closed vocabularies are enforced at parse time**, not merely documented here. `status`, `cadence`, `engine`, `access`, `category` and the 1–5 `confidence` scale are checked in `Catalog::parse` (`Catalog::vocabulary_findings` is the enumeration; every offending field is reported at once, not one per run), and an out-of-set value fails the parse the same way malformed TOML does. An empty string still means *not declared* for the optional axes.
+
+This exists because the consumers of these fields are silent about a typo. `cadence = "dayly"` used to parse, then fall through `cadence_secs`'s catch-all to `None` — the identical answer `on-demand` gives — so the source's freshness monitoring switched itself off and `/catalog/health` reported `monitored: false` as if that had been declared. Code gets exercised; data gets believed.
 
 ## Declared data contracts — and when each clause can actually fire
 
