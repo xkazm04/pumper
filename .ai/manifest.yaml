@@ -1,0 +1,84 @@
+# .ai/manifest.yaml — the agent-facing contract for this repo.
+# Capabilities are tool-NEUTRAL (a name -> the command that fulfils it), the heavy subsystems are
+# referenced by path, and unknown fields MUST be ignored — so this survives tool churn and schema
+# growth. Shape reference: personas/.ai/manifest.yaml + docs/AI_MANIFEST_SPEC.md there.
+schema: ai-manifest
+schemaVersion: 0.1.0
+generatedAt: "2026-08-24"
+generatedFrom: [Cargo.toml, justfile, .github/workflows/ci.yml, rust-toolchain.toml]
+
+repo:
+  name: pumper
+  purpose: "Local-first scraping service: one Rust binary exposing an HTTP API over a durable SQLite job queue and pluggable scrape engines"
+  languages: [rust, typescript]
+  archetype: service
+
+# Capabilities, not tools. Add keys freely; older readers ignore unknown ones.
+# `verified` is a claim the doctor flips to true once it has actually run the command.
+# The repo-root justfile is the canonical task runner; these are its raw-cargo equivalents,
+# which is what .github/workflows/ci.yml actually invokes. Everything runs from the repo root.
+capabilities:
+  build: { command: "cargo build -p pumper-server", verified: false }
+  test: { command: "cargo test --workspace", verified: false }
+  test-ignored: { command: "cargo test --workspace -- --ignored", verified: false }
+  lint: { command: "cargo clippy --workspace --all-targets -- -D warnings", verified: false }
+  typecheck: { command: "cargo check --workspace", verified: false }
+  fmt-check: { command: "cargo fmt --check", verified: false }
+  ci: { command: "just ci", verified: false }
+  audit: { command: "cargo deny check advisories bans sources", verified: false }
+  doc-sync: { command: "node scripts/docs/check-doc-sync.mjs", verified: false }
+  smoke: { command: "pwsh -File scripts/smoke.ps1", verified: false }
+  plugins-verify: { command: "just plugins-verify", verified: false }
+  sdk-typecheck: { command: "npm --prefix clients/typescript run typecheck", verified: false }
+
+# Pointers — these subsystems can change format underneath without breaking this contract.
+paths:
+  contextMap: context-map.json
+  memory: MEMORY.md
+  vault: .perfect/
+  evals: evals/
+  policy: .claude/CLAUDE.md
+  onboarding: ONBOARDING.md
+  catalog: catalog/data-sources.toml
+  featureDocs: docs/features/
+  docSyncMap: scripts/docs/feature-doc-map.json
+
+context:
+  rule: "46 contexts across 8 groups in context-map.json; read it at task start to scope edits"
+
+boundaries:
+  neverTouch: [target/, data/, Cargo.lock]
+  dependencyRule: "apps depend only on core (plus parsing libs); engines depend only on core; the server wires everything. Never make an app depend on another app or on an engine crate."
+  secretsFrom: ".env at the repo root (CWD-relative loader); config.toml or $PUMPER_CONFIG for non-secret keys"
+
+# The control model (shift-left): where each capability is PRIMARILY enforced.
+controls:
+  prePush: [fmt-check, lint, doc-sync]
+  ciHardPass: [fmt-check, lint, test, audit, plugins-verify]
+
+# The organization's AI registry - knowledge bundles this repo consumes and the skill
+# marketplace it installs from. Unknown fields MUST be ignored by a reader.
+# registered from the secondary machine (mkdol) 2026-08-24
+registry:
+  remote: github:xkazm04/ai-registry
+  local: ../ai-registry
+  machine: secondary
+  contributor: mkdol-dev-box
+knowledge:
+  domains: [software-engineering, llm-observability]
+
+# Shared skills this project uses, from the registry's skills/ lane. The LINK is machine
+# state (gitignored, made by ai-registry/scripts/link-skills.mjs); THIS list is the
+# reviewable declaration. A skill not listed here is project-owned and lives in
+# .claude/skills/ as a real directory.
+skills:
+  - architect
+  - conform
+  - consult
+  - explorer
+  - perfect
+  - research
+  - scan-sweep
+  - ship-loop
+  - test-before-commit
+  - tiger
