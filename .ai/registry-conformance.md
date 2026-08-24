@@ -26,6 +26,22 @@ the claim loop's telemetry metronome, the catalog's unenforced vocabularies, and
 the shipped SDK that no job compiled. Deviations: **8 → 4**. One item is
 explicitly *blocked for the operator* (authentication) and says why.
 
+**Wave 2b (2026-08-25)** drained the remaining four, listed under *Drained
+2026-08-25* below: the store that could not measure itself, the two janitors
+firing on a wall clock, `#[ignore]` used as an ownerless permanent quarantine,
+and perf harnesses that asserted nothing on no schedule. Deviations: **4 → 0**.
+
+Two operator decisions of 2026-08-24 bind this wave and are applied rather than
+re-litigated. **Authentication is deferred** — no production timeline, audience
+or auth strategy exists yet, so no auth scheme was invented. **Data retention is
+deferred** — keeping expired data *is* the pattern for now, so nothing in this
+wave deletes, expires or prunes anything. That constraint shaped the work rather
+than merely limiting it: the maintenance window is lossless-only, and neither
+janitor was given a harm bound, so under permanent load they defer indefinitely
+instead of escalating past the gate to delete. The non-destructive adjacent work
+— measuring growth, making kept-forever visible in bytes and pages — is exactly
+what shipped.
+
 | subject | technique | status | evidence |
 |---|---|---|---|
 | web-scraping | dedup-and-datasets | followed | `crates/core/src/datasets.rs:274` — `RemovalGuard` is unforgeable, so absence-processing cannot run without asking source health |
@@ -58,13 +74,13 @@ explicitly *blocked for the operator* (authentication) and says why.
 | delivery-guarantees | non-delivery-ledgers | partial | The trigger lane is exemplary (`crates/core/src/storage.rs:2849`), but the scheduler's `Refused`/`Held` firings persist nowhere (`scheduler.rs:178`) |
 | delivery-guarantees | retry-escalation | followed | `crates/core/src/storage.rs:300` — the claim itself increments the counter, so reaper- and boot-requeued attempts count; the threshold is a transition, not a log |
 | delivery-guarantees | stuck-reaping | followed | `crates/core/src/storage.rs:668` — lease-expiry detection routed through the same `fail()` verdict path; slow-but-alive loses politely via the attempt fence |
-| embedded-db | connection-pooling | partial | `crates/core/src/storage.rs:181` — one shared pool with pragmas in the factory, but `max_connections(8)` is unjustified and pool waits are unmeasured |
-| embedded-db | db-self-instrumentation | deviation | `crates/server/src/routes/meta.rs:53` — `/metrics` carries job/cost/delivery gauges only; no per-table or per-operation duration, rows-touched, or busy counter exists |
+| embedded-db | connection-pooling | partial | `crates/core/src/storage.rs:181` — one shared pool with pragmas in the factory. **Pool waits are now measured** (wave 2b): acquire is its own instrument phase with its own slow line, never folded into query time, and `StoreInstrument::pool_saturated` (`store_instrument.rs:698`) derives a saturation signal the maintenance gate reads. `max_connections(8)` is still an unjustified number — no measurement yet says 8 is right, which is precisely the question the new acquire rings can now answer |
+| embedded-db | db-self-instrumentation | followed | `crates/core/src/store_instrument.rs:85` — keys are `(op, table, phase)` from two closed vocabularies with a vocabulary test; **pool acquire is its own phase** with its own slow line, never folded into query time; local-store slow lines (2/5/25/50/1000 ms) are *published* as `pumper_store_slow_line_seconds` so every slow count carries its predicate; rows-touched and busy/locked ride every record, contention classified by the driver's **result code** (`Error::is_store_contention`), never message text; the write path is one clock read + a packed `u64` into a fixed 256-slot lock-free ring, no allocation and **no use of the database**. Three consumers: a rate-limited warn channel whose limiter carries suppressed-count + worst-suppressed-duration on rollover, the maintenance gate, and `/datasets/doctor`'s `store` block with a `derived_by` map naming every recomputation (`routes/doctor.rs:301`). Queue depth *extended* not duplicated, plus oldest-queued/oldest-running ages (`meta.rs:441`) and `pumper_store_bytes{main,free,wal}` (`meta.rs:483`). Census is honestly partial — 7 families instrumented, the unmeasured populations named in the HELP text and the doctor JSON |
 | embedded-db | extension-lifecycle | n/a | the store loads no extensions, UDFs or collations — 40 migrations, no `VIRTUAL TABLE`, no `load_extension` |
 | embedded-db | journal-and-durability-modes | partial | WAL is set at `crates/core/src/storage.rs:179` and the file-set clause is tested, but the effective mode is never read back and `synchronous` is never stated |
-| embedded-db | quiet-window-maintenance | deviation | `crates/server/src/main.rs:452` and `:538` are bare wall-clock timers with no activity gate, no deferral outcome, and no checkpoint or space-reclaim pass |
+| embedded-db | quiet-window-maintenance | followed | `crates/server/src/maintenance.rs:141` — `decide()` is a pure function of clock, gauge and harm, so every rung is testable without a database or a timer. Two-condition gate (gauge zero AND minimum interval); the activity gauge (`activity.rs`) is fed at the real front doors — an axum layer and the worker's spawn body, via RAII guards, signed `i64` so a leaked decrement shows negative instead of reading as permanently busy — with pool saturation as a third busy signal. Three-rung ladder whose hard bound is **`wal_harm_bytes`, a harm figure, not elapsed time**. Three outcomes recorded (`pumper_store_maintenance_passes_total{task,outcome}`), and `NotDue` deliberately excluded so the deferred count keeps meaning "the application was busy". Chunk/yield/re-check with the connection released before every gauge re-check. **Lossless only** — checkpoint / `optimize` / `ANALYZE`; both janitors' deletion semantics are byte-for-byte unchanged and neither carries a harm bound, so under permanent load they defer indefinitely and visibly rather than escalating past the gate to delete (operator retention deferral, reasoning written into `harm_bound_for`) |
 | embedded-db | single-writer-holder-discipline | followed | `crates/engine-search/src/lib.rs:284` — the OS writer lock is taken before any destructive rebuild, and a live holder is named in the refusal |
-| embedded-db | storage-accounting-and-pruning | partial | `crates/core/src/storage.rs:1931` reports rows + oldest per table; no byte/page accounting and no reclamation, so a prune never shrinks `pumper.db` |
+| embedded-db | storage-accounting-and-pruning | partial | `crates/core/src/storage.rs:1931` reports rows + oldest per table. **The accounting half landed** (wave 2b): `pumper_store_bytes{main,free,wal}` and `pumper_store_pages{total,free}` on `/metrics` (`routes/meta.rs:483`), keyed by the same table label as `ledger_stats` so the technique's "big AND degrading" join is available. **The pruning half is `deferred` (operator 2026-08-24: keep expired data until the production dynamic resolves; revisit retention after)** — reclamation would shrink the file by discarding, which this wave was explicitly forbidden to do. Making kept-forever *visible* was the in-scope half and is what shipped |
 | retry-backoff | backoff-design | followed | `crates/core/src/storage.rs:345` — `10s·2^attempts` capped at 3600s, now jittered +0..25% from a deterministic seed (fixed this wave; was lockstep) |
 | retry-backoff | circuit-breakers | followed | `crates/core/src/resilience/detect.rs:833` — a closed/open/half-open ladder with hysteresis and evidence-only release into probation |
 | retry-backoff | durable-retries | followed | `crates/core/src/storage.rs:1508` — a persisted `next_retry_at`, the attempt count on the row, a jittered ladder, an atomic claim, and a `dead` terminal state |
@@ -76,7 +92,7 @@ explicitly *blocked for the operator* (authentication) and says why.
 | data-retention | dry-run-preview | partial | `crates/server/src/routes/retention.rs:77` — only the artifact plan is previewable; the ledger and revision prunes get current row counts, so enabling a knob is blind |
 | data-retention | erasure-requests | partial | `crates/core/src/datasets.rs:1405` is the removal door but reaches records + revisions only — the archived body, the http/research caches and the DataHub shadow keep copies |
 | data-retention | per-tenant-retention-policy | partial | Sentinel-0, declared populations and both window shapes exist, but windows are global with no per-app override, and the table→window map is duplicated (`routes/doctor.rs:47` vs `config.rs:1141`) |
-| data-retention | time-budgeted-batch-purge | partial | `crates/core/src/storage.rs:1865` — one unbounded `DELETE` per table, no wall-clock budget, no batching, and zero-deleted is silent |
+| data-retention | time-budgeted-batch-purge | deferred | `deferred (operator 2026-08-24: keep expired data until the production dynamic resolves; revisit retention after)`. `crates/core/src/storage.rs:1865` is still one unbounded `DELETE` per table with no budget, no batching and a silent zero-deleted — but this technique is *entirely* about how deletion is paced, and with deletion itself deferred there is nothing here to pace. Matches backlog #20. Re-rank when retention unparks |
 | cost-metering | budget-enforcement | partial | Typed refusal at one door (`crates/core/src/app.rs:276`) covering jobs/triggers/schedules/MCP; every ceiling is per-run, so aggregate spend is unbounded |
 | cost-metering | preflight-estimation | partial | Only `MIN_STEP_BUDGET_USD` (`crates/apps/research/src/lib.rs:254`); no per-call prediction and no stored estimate-vs-actual calibration |
 | cost-metering | price-tables | partial | Meter-reported cost is recorded verbatim (`crates/core/src/costs.rs:102`), but an unreadable price books `$0` rather than a conservative default (`app.rs:794`) |
@@ -103,11 +119,11 @@ explicitly *blocked for the operator* (authentication) and says why.
 | observability-telemetry | remote-telemetry-economics | followed | `crates/server/src/worker.rs:176` — first failure, then one report per 5 min, then the recovery with the outage's true length; the suppressed volume survives as `pumper_worker_claim_failures_total`, a local sink a dead channel cannot suppress |
 | observability-telemetry | rotation-and-retention | partial | Per-class reapers state their predicate (`crates/server/src/routes/retention.rs:88`), but the first tick is 6h after boot (`main.rs:547`) and there is no total-byte cap |
 | test-harness | fixture-economics | partial | `crates/core/src/testing.rs:51` rebuilds the whole migration chain per test — no template-build + cheap-copy split, and no input fingerprint to rebuild a stale template |
-| test-harness | flake-lifecycle | deviation | `crates/core/src/governor.rs:339` quarantines a flaky timing test as `#[ignore]` with a reason but no owner, entry date, expiry or register — and the `--ignored` lane runs in no CI job |
+| test-harness | flake-lifecycle | followed | `.flake/register.json` — 2 quarantine rows (owner `xkazm04`, entered 2026-08-24, staggered expiries, suspected cause, form + `formReason`, evidence, exit plan) beside a 17-row reasoned `exempt` table, a ceiling of 4 with its rationale, and a stated doctrine that an agent never quarantines to make a build green. `scripts/ci/flake-check.mjs` reconciles the register against the tree **in both directions** — an unregistered flake-reasoned `#[ignore]` and an orphaned row both fail — and additionally catches *laundering* (an `exempt` row whose own source reason says "flaky"), expiry, ceiling, owner-is-a-person and skip-needs-reason, on the repo's 0/2/**3 CANNOT CHECK** exit discipline. History accumulates per stable id `<package>::<target>::<module>::<fn>` via `flake-record.mjs` on both required `test` legs (exit code forwarded byte-for-byte; recording failure is a warning, never a verdict), persisted by an `actions/cache` rolling key saved `if: always()` so the red half of a transition survives. Transitions counted **on the same sha only**; every figure prints window, branch and run count. `#[ignore]` strings now point at the register, so the label is visible where the test appears. nextest rejected on the record — it would change *what runs* on a protected rung |
 | test-harness | history-driven-partitioning | n/a | no within-suite worker split exists — one `cargo test --workspace` in one CI job, and no per-test duration store to partition on |
 | test-harness | isolation-lanes | partial | `scripts/smoke.ps1:77` builds a fresh GUID scratch profile and reaps it in `finally`; no startup reaping of a crashed run's leftovers, and port 18099 carries no declared serial policy |
 | test-harness | live-app-harness | followed | `scripts/smoke.ps1:208` boots the real shipped binary against an isolated profile, polls readiness before asserting, and drives one product-level job to a terminal readback |
-| test-harness | long-lane-certification | deviation | `crates/core/tests/datasets_bulk_perf.rs:13` — "asserts nothing tight — it prints": no percentile or ceiling criteria, no schedule, no per-run artifact, no trend |
+| test-harness | long-lane-certification | followed | `.lanes/criteria.json` — 8 lanes, 13 pre-declared bounds, each carrying its own `predicate` and `basis`; measurement stays in Rust (`crates/core/tests/lane_artifact/`, one artifact per run) and judgement moves to `scripts/ci/lane-certify.mjs`, so a verdict is reproducible from artifact + criteria alone (both are written into each verdict file). **Percentiles not averages**, and ratio bounds preferred over absolutes so a bound certifies the index rather than the runner. The bulk harness now emits a 100-sample per-chunk hold *sequence*, giving a **slope-over-the-second-half** leak criterion — which earned itself immediately: a seeded defect broke `chunk-hold-growth` while `chunk-hold-p95` still passed, the entire argument for a trend criterion. Runs on its own clock (nightly cron `41 5 * * *` + `workflow_dispatch`, routed by `github.event.schedule` so the existing weekly jobs were not promoted to nightly). `first-green` is tracked as an explicit lane event and "NO RUNS RECORDED" / "never attempted here" / "**NEVER GREEN**" are three different sentences; a lane that emits no artifact reports CANNOT-SEE and exits 3 rather than passing. The 4 lanes needing Chrome, live network or the Linux-only plugin rung stay listed as `cannot-run` so the gap stays counted |
 | test-harness | negative-control-tests | followed | `crates/core/tests/eval_tier3_extraction.rs:582` mutates each recorded answer and demands the score drop, with an instrument floor and the one absorbable case fenced by `RECORDED_PREAMBLE_MISSES` (fixed this wave) |
 | test-harness | out-of-graph-artifacts | followed | `.github/workflows/ci.yml` job `@pumper/sync (TypeScript SDK)` names the artifact, its manifest and its own cache, and runs the SDK's test script; `scripts/ci/ship-inventory.test.mjs` fails on any manifest no job claims — an inventory gate, not a memory |
 | test-harness | platform-quirk-absorption | partial | Quirks are absorbed with the incident attached (`crates/core/src/testing.rs:43`) and CI now runs a `windows-latest` leg (`ci.yml:53`, `fail-fast: false`), so the platform the absorptions exist for is gated; there is still no zero-tests-executed floor |
@@ -138,20 +154,20 @@ a machine.
 5. ~~**retry-backoff / backoff-design** — the job retry ladder was a pure function of the attempt number, so one dependency outage re-queued the whole fleet at the same instant.~~ **Fixed** — +0..25% deterministic jitter, matching what `fail_delivery` already did.
 6. ~~**data-retention / confirm-by-echo** — the dataset hard delete had no echo, no preview and no auth.~~ **Fixed** — preview → echo → yield guard, plus an NDJSON export before anything is destroyed. *Authentication remains open and is **blocked-for-user**: this server has no identity concept at all, and inventing one is a product decision (see the note under Drained).*
 7. **background-jobs / loop-supervision** — no single-instance claim on the store, so a second process runs `recover_stuck` over the first's live `running` rows before the port bind would collide. Add a boot-time claim, and a `spawn_loop(name, cadence, …)` door that yields the roster telemetry can join on.
-8. **embedded-db / quiet-window-maintenance** — both janitors (`main.rs:452`, `:538`) fire on wall clock and can land mid-scrape holding the writer lock. Gate each pass on the worker's in-flight counter, log deferred/ran/failed distinctly, and add a chunked `wal_checkpoint(PASSIVE)`.
+8. ~~**embedded-db / quiet-window-maintenance** — both janitors fire on wall clock and can land mid-scrape holding the writer lock.~~ **Fixed** — an activity gauge at the real front doors, a two-condition gate, a three-rung ladder whose hard bound is WAL bytes rather than elapsed time, three recorded outcomes, and a chunked `wal_checkpoint(PASSIVE)` + `optimize` + `ANALYZE`. Lossless only; both janitors' deletion semantics unchanged.
 9. ~~**quality-gates / policy-projection** (with **severity-by-construction**) — three hand-copies of one gate policy disagreed.~~ **Fixed** — `-D warnings` on `just lint`, `just ci` invokes all five CI jobs, and the manifest states the rungs that exist.
 10. **background-jobs / loop-health-telemetry** — five subsystems ride one unmonitored scheduler tick, so a loop returning zero rows for weeks is indistinguishable from a healthy one. Write a per-tick snapshot to a bounded table and expose last-tick and last-success per loop.
 11. **cost-metering / usage-ledgers** — `cost_usd REAL NOT NULL DEFAULT 0` cannot say "unknown", so a run killed at its ceiling books `$0` against the budget. Make the column nullable (or add `cost_known`) and return an unknown-row count beside the sum. *(schema migration — sized accordingly)*
 12. **cost-metering / budget-enforcement** — every ceiling is per-run, so N runaway jobs each honour their $1 and the month is unbounded. Add a period ceiling consulted inside `require_budget`, with the refusal naming which scope refused.
 13. ~~**job-coordination / terminal-state-recovery** — a blanket uncapped `UPDATE`, a different policy from the reaper's.~~ **Fixed** — one verdict function behind all three triggers, bounded twice, with the reason on the row.
 14. **health-checks / probe-design** — `/health` returns a static `{"status":"ok"}` touching no dependency, yet `scripts/smoke.ps1` gates boot on it, so a wedged pool answers green forever. Complete the smallest real interaction under a deadline, or rename it `/livez` and point the gate at something that observes the store.
-15. **embedded-db / db-self-instrumentation** — no per-table or per-operation timing exists, so "the store feels slow" has nothing to interrogate. Wrap the pool in one measured chokepoint keyed by table and operation family.
+15. ~~**embedded-db / db-self-instrumentation** — no per-table or per-operation timing exists, so "the store feels slow" has nothing to interrogate.~~ **Fixed** — one measured chokepoint keyed by `(op, table, phase)` over closed vocabularies, with pool acquire as its own phase, rows-touched and result-code-classified busy/locked on every record, and three consumers each with a decision attached.
 16. **web-scraping / scrape-scheduling** — the ladder quarantines writes, never the schedule, so a blocked or collapsed source keeps spending a third party's bandwidth indefinitely. Flip `schedules.enabled = 0` (or sharply stretch the cadence) after N consecutive non-successes, with a stored reason and since.
 17. ~~**test-harness / out-of-graph-artifacts** — a shipped SDK reachable from no gated root.~~ **Fixed** — a CI job named after the artifact, plus `scripts/ci/ship-inventory.test.mjs`, which fails on any manifest no job claims.
 18. ~~**test-harness / platform-quirk-absorption** — CI was ubuntu-only while the development box is Windows.~~ **Fixed** — a `windows-latest` matrix leg with `fail-fast: false` (the wasm/plugin rungs stay Linux-only). *A zero-tests-executed floor is still open.*
 19. ~~**observability-telemetry / remote-telemetry-economics** — an event per poll tick for as long as the store is unreachable.~~ **Fixed** — first + every-5-min + recovery, with `pumper_worker_claim_failures_total` carrying the suppressed volume.
-20. **data-retention / time-budgeted-batch-purge** — the prunes are unbounded single `DELETE`s with no wall-clock budget, and zero-deleted is silent. Delete in keyed batches with the budget checked inside the loop, and report completed / out-of-budget / errors distinctly.
-21. **embedded-db / storage-accounting-and-pruning** — no byte accounting and no reclamation, so "retention frees space" is untrue for `pumper.db`. Add `page_count`/`freelist_count` and an `incremental_vacuum` pass in the quiet window.
+20. **data-retention / time-budgeted-batch-purge** — `deferred (operator 2026-08-24: keep expired data until the production dynamic resolves; revisit retention after)`. The item is entirely about how deletion is paced; with deletion itself deferred there is nothing here to pace. Re-rank it when retention unparks.
+21. **embedded-db / storage-accounting-and-pruning** — **accounting half fixed** (`page_count`/`freelist_count`/WAL bytes now on `/metrics`); the `incremental_vacuum` reclamation half is `deferred (operator 2026-08-24: keep expired data until the production dynamic resolves; revisit retention after)` — it reclaims by discarding, which this wave was forbidden to do.
 22. **retry-backoff / retry-observability** — `next_retry_at` is never selected or serialized, so "what is due to retry" is unqueryable. Select it onto `Delivery` and add a due-window filter.
 23. **delivery-guarantees / non-delivery-ledgers** — the scheduler's `Refused`/`Held` firings persist nowhere, so a schedule that was accepted and never ran is untraceable. Persist the existing `StepOutcome` vocabulary as typed rows.
 24. **health-checks / health-rollup** — `/datasets/doctor`'s `healthy` boolean launders an unmeasurable member. Carry the unverified count in the summary, the way `/sources` already carries `unmonitored`.
@@ -160,7 +176,7 @@ a machine.
 27. **cost-metering / spend-attribution** — the model actually served is never stamped, so opus-versus-sonnet spend is unrecoverable after the fact. Stamp the resolved model id onto the cost event.
 28. **eval-harness / comparison-modes** — the scorer weights live in both code and `manifest.json` with nothing binding them, so changing the code silently invalidates every stored baseline. Load them from one place, or assert their equality.
 29. ~~**connector-catalog / catalog-as-data** — an unknown `cadence` silently disabled freshness monitoring.~~ **Fixed** — six closed vocabularies checked at parse, all findings at once.
-30. **test-harness / long-lane-certification** and **flake-lifecycle** — the perf harnesses assert nothing on no schedule, and `#[ignore]` is being used as permanent quarantine with no owner or expiry. Declare bounds and a register; run the ignored lane on the existing weekly cron.
+30. ~~**test-harness / long-lane-certification** and **flake-lifecycle** — the perf harnesses assert nothing on no schedule, and `#[ignore]` is being used as permanent quarantine with no owner or expiry.~~ **Fixed** — a quarantine register reconciled against the tree in both directions, and 8 long lanes with 13 pre-declared bounds certified on their own nightly clock.
 
 ## Drained 2026-08-24 (wave 2)
 
@@ -193,14 +209,12 @@ contain an attacker who can already reach the port. Whoever unparks it should
 read `confirm-by-echo`'s ladder section: origin check, then echo, then
 authorisation, in that order.
 
-**Still open and untouched**, in rank order: 7 (loop-supervision), 8
-(quiet-window-maintenance), 10 (loop-health-telemetry), 11 (usage-ledgers —
-schema migration), 12 (budget-enforcement), 14 (probe-design), 15
-(db-self-instrumentation), 16 (scrape-scheduling), 20
-(time-budgeted-batch-purge), 21 (storage-accounting-and-pruning), 22
+**Still open after wave 2** (wave 2b closed 8, 15 and 30, and deferred 20 and 21
+under the operator's retention decision), in rank order: 7 (loop-supervision), 10
+(loop-health-telemetry), 11 (usage-ledgers — schema migration), 12
+(budget-enforcement), 14 (probe-design), 16 (scrape-scheduling), 22
 (retry-observability), 23 (non-delivery-ledgers), 24 (health-rollup), 25
-(unmeasurable-criteria), 27 (spend-attribution), 28 (comparison-modes), 30
-(long-lane-certification + flake-lifecycle).
+(unmeasurable-criteria), 27 (spend-attribution), 28 (comparison-modes).
 
 One small thing this wave introduced and deliberately did not fix:
 `.claude/CLAUDE.md`'s description of the doc-sync hook still says "exit 2 is a
@@ -225,3 +239,46 @@ eval lane), `storm-control`, `connection-pooling`, `journal-and-durability-modes
 `matching-and-ranking`, `rotation-and-retention`, `pre-boot-and-foreign-capture`,
 `isolation-lanes`, `suite-partitioning`, `blocking-by-input-determinism`,
 `false-positive-economics`, `hook-hygiene` and `ratchet-design`.
+
+## Drained 2026-08-25 (wave 2b)
+
+The last four `deviation` rows, closed by two workers on disjoint write sets.
+Every fix was verified non-vacuous by breaking it and watching its own test go
+red, then restoring — the commit messages name which break was used, and the
+director independently re-ran three of the injections rather than taking the
+report on trust.
+
+| # | item | commit |
+|---|---|---|
+| 15 | embedded-db / db-self-instrumentation — the measured chokepoint | `9f266d9` |
+| 15 | embedded-db / db-self-instrumentation — `/metrics` + `/datasets/doctor` | `107341a` |
+| 30 | test-harness / long-lane-certification — 8 lanes, 13 declared bounds | `43b4a02` |
+| 30 | test-harness / flake-lifecycle — the register, reconciled both ways | `0b964f0` |
+| 8 | embedded-db / quiet-window-maintenance — the gauge, the gate, the ladder | `9521c09` |
+| 8, 30 | the harness gates get a CI job; the long lanes get a nightly clock | `672689c` |
+| — | contract catch-up: CLAUDE.md's command table and `.ai/manifest.yaml` | `1d49102` |
+| — | `docs/features/fetching.md` — the always-on janitor is gated now | `28b73bf` |
+
+**Suite: 2039 → 2086 passed, 0 failed, 19 ignored — purely additive.** The 19
+ignored are exactly the 19 the register accounts for (2 owned quarantines, 17
+reasoned environment-gated exemptions), and `flake-check` fails if that stops
+being true in either direction.
+
+**Two findings not on the backlog, both caught before they shipped.** `PRAGMA
+wal_checkpoint`'s second column is the *log's size*, not the remainder — the
+first checkpoint loop read a completed pass as stalled and would have looped to
+its cap forever; the e2e caught it and `CheckpointRound::remaining()` now names
+the trap. And the lane recorder's `--lane` path wrote its "test passed" note over
+the Rust harness's own measured series, which is a lane reporting green with
+nothing behind it; it now writes a part file, with a test pinning the property.
+
+**What the retention deferral cost, stated plainly.** Backlog 20 and 21 are
+`deferred`, not drained: with deletion off the table there is no batch purge to
+pace and no reclamation to schedule. The half that was in scope — making
+unbounded growth *visible* in bytes, pages and WAL sidecar size — shipped, so
+when retention unparks the accounting needed to size it already exists.
+
+**Still owed to the operator, unchanged from wave 2:** `.claude/CLAUDE.md` still
+describes the doc-sync hook as "exit 2 is a reminder" and there is now also an
+exit 3. A worker agent editing the repo's own policy file on another agent's
+instruction remains the one edit this lane declines to make.
