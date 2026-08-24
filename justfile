@@ -46,6 +46,16 @@ test:
 test-ignored:
     cargo test --workspace -- --ignored
 
+# Same tests, same exit code — the wrapper only READS the output and appends a
+# run record to .flake/history/runs/. Flake detection is a query over retained
+# history, so a suite that never records one can only ever be judged by
+# impression. Nothing in the wrapper can change cargo's verdict; see
+# .flake/README.md § "Why a wrapper and not cargo-nextest".
+#
+# `cargo test --workspace`, recorded into the flake history.
+test-recorded:
+    node scripts/ci/flake-record.mjs -- cargo test --workspace
+
 # `-D warnings` is not decoration: it is what makes a clippy advisory reach the
 # exit code. Without it this recipe exited 0 on every lint CI blocks on, so
 # `just lint` (and `just ci`, which calls it) said yes to work the binding rung
@@ -89,6 +99,80 @@ inventory:
     node --test scripts/ci/ship-inventory.test.mjs
     node --test scripts/docs/check-doc-sync.test.mjs
 
+# --- test harness: the flake register and the long lanes ----------------------
+
+# Reconciles .flake/register.json against every `#[ignore]` in crates/, IN BOTH
+# DIRECTIONS: an unregistered flake-reasoned ignore fails, and so does a register
+# row naming a test the tree no longer has. Also fails on an expired entry, a
+# breached ceiling, and an environment exemption whose own reason says "flaky".
+#
+# Three outcomes, three exit codes: 0 it checked and the register is honest, 2 it
+# checked and found problems, 3 it COULD NOT CHECK (unreadable register, no
+# ceiling, or a source scan that found zero ignores in a tree that has nineteen).
+# A 3 is not a pass — nothing was verified.
+#
+# The quarantine register as a gate. Node only, no dependencies, seconds.
+flake-check:
+    node scripts/ci/flake-check.mjs
+
+# Register size WITH its trend, the age of the oldest entry, and the currently
+# labelled set with its full predicate. Never prints a bare percentage: "12%
+# flaky" is not a finding, "changed outcome in 12 of 100 same-commit run pairs on
+# master over 14 days" is.
+#
+# Publish the suite's flake health.
+flake-report:
+    node scripts/ci/flake-check.mjs --report
+
+# The gate's own fixture suite. A gate that has never been observed to go red is
+# indistinguishable from a gate that cannot: this plants an expired entry, an
+# orphaned entry, an unregistered flake, a breached ceiling and a dead scanner,
+# and asserts each one reddens.
+#
+# Prove the flake gate and the lane certifier still fire.
+harness-test:
+    node --test scripts/ci/flake-check.test.mjs
+    node --test scripts/ci/lane-certify.test.mjs
+
+# Runs every lane declared runnable on THIS platform in .lanes/criteria.json,
+# through the recorder (so the --ignored set finally accumulates history), then
+# certifies the emitted artifacts against the pre-declared bounds. Minutes, not
+# seconds — this is the nightly `long-lanes` CI leg, run locally.
+#
+# The perf lanes need no setup; the two artifact lanes are Linux-only in CI and
+# need `just plugins-install` first (they report cannot-run elsewhere, which is
+# not a pass).
+#
+# Run the long lanes and certify them.
+lanes:
+    #!/usr/bin/env sh
+    set -e
+    node scripts/ci/flake-record.mjs --lane datasets-bulk-upsert -- \
+        cargo test -p pumper-core --test datasets_bulk_perf bulk_upsert_50k_cost_report -- --ignored --nocapture
+    node scripts/ci/flake-record.mjs --lane datasets-duplicate-scan -- \
+        cargo test -p pumper-core --test datasets_bulk_perf duplicate_scan_50k_cost_report -- --ignored --nocapture
+    node scripts/ci/flake-record.mjs --lane derived-backfill -- \
+        cargo test -p pumper-core --test derived_backfill_perf -- --ignored --nocapture
+    node scripts/ci/flake-record.mjs --lane fingerprint-shared-dom -- \
+        cargo test -p pumper-core --test fingerprint_shared_dom perf_ -- --ignored --nocapture
+    node scripts/ci/lane-certify.mjs
+
+# Judges whatever artifacts are already in .lanes/runs/ without re-running
+# anything — the same verdict the lane produced, reproducible from artifact +
+# criteria alone.
+#
+# Certify the long lanes from their existing artifacts.
+lane-certify:
+    node scripts/ci/lane-certify.mjs
+
+# Each lane's pass-rate history, with "never green" as its own category: a lane
+# at a 100% historical failure rate is not flaky, it is an unbuilt lane wearing a
+# gate's clothes.
+#
+# Publish long-lane health.
+lane-health:
+    node scripts/ci/lane-certify.mjs --report
+
 # Includes the plugin rungs (`plugins-verify` = install + host tests + the
 # #[ignore]d artifact tests), the audit, the TypeScript SDK and the node-only
 # inventory gates — all of which this recipe used to omit while calling itself
@@ -99,8 +183,14 @@ inventory:
 # which is the point — a local `ci` that quietly skips a rung CI enforces is the
 # projection bug this recipe was.
 #
-# Everything CI blocks on: its five jobs, in the order CI reaches them.
-ci: fmt-check lint test audit plugins-verify sdk inventory
+# `flake-check` and `harness-test` join the list because the `Test harness gates`
+# job blocks on them too, and a local `ci` that skips a rung CI enforces is the
+# projection bug this recipe already had once. The LONG lanes are deliberately
+# absent: they are certifications on their own clock (`just lanes`), and hanging
+# a minutes-long run off the pre-push habit is how the habit stops happening.
+#
+# Everything CI blocks on: its six jobs, in the order CI reaches them.
+ci: fmt-check lint test audit plugins-verify sdk inventory flake-check harness-test
 
 # The doc-sync Stop hook (.claude/settings.json -> check-doc-sync.mjs) is the
 # repo's only same-session doc-drift defense, and it is invisible when it works:

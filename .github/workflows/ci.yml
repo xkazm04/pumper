@@ -4,11 +4,31 @@ on:
   push:
     branches: [master]
   pull_request:
-  # The RUSTSEC advisory database changes independently of this repo, so a crate
-  # we already depend on can become vulnerable with no commit of ours. The weekly
-  # run surfaces that instead of waiting for the next PR.
+  # TWO crons, and each one reaches only the jobs it is for.
+  #
+  # A workflow's `schedule:` list fires the WHOLE workflow, so adding the nightly
+  # entry below would have silently promoted every job here — format, both test
+  # legs, the SDK, the inventory walk and the audit — from weekly to nightly.
+  # That is a five-fold CI spend increase bought by accident, and the kind of
+  # change nobody notices until the bill. `github.event.schedule` carries the
+  # cron expression that fired, so every job below states which schedule it
+  # answers to; see the `if:` on each.
+  #
+  #   17 6 * * 1  weekly — the RUSTSEC advisory database changes independently of
+  #               this repo, so a crate we already depend on can become vulnerable
+  #               with no commit of ours. Everything that runs per-change also
+  #               runs here, unchanged from before.
+  #   41 5 * * *  nightly — the long lanes ONLY. Certifications on their own
+  #               clock: blocking a merge on them would destroy the merge cadence
+  #               without improving the certification, because the property they
+  #               certify (behaviour over time and pressure) is not a property of
+  #               any single change.
   schedule:
     - cron: "17 6 * * 1"
+    - cron: "41 5 * * *"
+  # So a human can run the long lanes on demand — before a release, or to confirm
+  # a fix, without waiting for the next night.
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,6 +51,10 @@ jobs:
   # Seconds to run, so it needs neither the wasm target nor the build cache.
   format:
     name: Format
+    # Weekly cron only, never the nightly one — see the `schedule:` note above.
+    # True for push, pull_request and workflow_dispatch, so nothing about this
+    # job's per-change behaviour (or its required-check status) changes.
+    if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -51,6 +75,7 @@ jobs:
   # Linux-only (see the `if:` on those steps): they drive justfile recipes
   # written for `sh`, and the artifact they build is platform-independent.
   test:
+    if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -91,11 +116,40 @@ jobs:
         # required for closure lifetime inference; crates/server/src/webhook.rs —
         # the 8-argument webhook wire contract).
         run: cargo clippy --workspace --all-targets -- -D warnings
+      # Flake detection is a query over RETAINED history, so the history has to
+      # accumulate across runs — a per-run artifact does not accumulate, it just
+      # piles up. The rolling key is the standard shape: every run saves under a
+      # unique key and restores from the newest prefix match, so each run starts
+      # from the previous one's records instead of from nothing.
+      - name: Restore flake history
+        if: ${{ !cancelled() }}
+        uses: actions/cache/restore@v4
+        with:
+          path: .flake/history
+          key: flake-history-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: flake-history-${{ runner.os }}-
       - name: Test
         if: ${{ !cancelled() }}
         # Environment-dependent tests (real Chrome, wasm artifact, wall-clock
-        # timing) are #[ignore]d; run them locally with `cargo test -- --ignored`.
-        run: cargo test --workspace
+        # timing) are #[ignore]d; run them locally with `just test-ignored`.
+        #
+        # This is a REQUIRED check, so the wrapper's contract is narrow and
+        # absolute: it forwards cargo's exit code byte for byte, changes nothing
+        # about what runs, and wraps every recording step so an instrument
+        # failure is a warning on stderr and never a verdict. It only reads the
+        # output — which is why this is a wrapper and not cargo-nextest, whose
+        # process-per-test model and absent doctests would change what this rung
+        # measures. See .flake/README.md.
+        run: node scripts/ci/flake-record.mjs -- cargo test --workspace
+      - name: Save flake history
+        # Not `!cancelled()`: a FAILING run is the most valuable sample this
+        # history can hold — an outcome transition needs the red half — so the
+        # save must survive the step above going red.
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: .flake/history
+          key: flake-history-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
       # After the main suite, so installing artifacts into data/plugins/ cannot
       # change what it saw. `data/` is gitignored and no clone ever ships these
       # artifacts, so this is the first place they exist in CI at all.
@@ -130,6 +184,7 @@ jobs:
   # than merely type-checking it.
   sdk:
     name: "@pumper/sync (TypeScript SDK)"
+    if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -154,6 +209,7 @@ jobs:
   # rung that at least keeps it from rotting unnoticed.
   inventory:
     name: Ship inventory + doc-sync hook
+    if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -166,8 +222,167 @@ jobs:
         if: ${{ !cancelled() }}
         run: node --test scripts/docs/check-doc-sync.test.mjs
 
+  # The quarantine register as a gate, plus the fixture suites that prove both
+  # this gate and the lane certifier can still go red.
+  #
+  # Its own job, not a step of `test`, for the reason `Format` is its own job:
+  # every rung reports its own verdict on the same commit, and a broken register
+  # must not be able to hide behind a compile error (or the other way round).
+  # Node only, seconds, no toolchain.
+  harness:
+    name: Test harness gates
+    if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      # Restore-only: this job records nothing, it just wants the history so the
+      # published figures below carry a real trend instead of "first sample".
+      - name: Restore flake history
+        uses: actions/cache/restore@v4
+        with:
+          path: .flake/history
+          key: flake-history-Linux-report-${{ github.run_id }}
+          restore-keys: flake-history-Linux-
+      - name: Flake register
+        # Exit 2 = findings (an expired entry, an orphan, an unregistered flake,
+        # a breached ceiling). Exit 3 = COULD NOT CHECK, which is not a pass.
+        run: node scripts/ci/flake-check.mjs
+      - name: Harness gate fixtures
+        if: ${{ !cancelled() }}
+        run: |
+          node --test scripts/ci/flake-check.test.mjs
+          node --test scripts/ci/lane-certify.test.mjs
+      # Register size WITH its trend and the age of the oldest entry, published
+      # wherever the suite's health is published — a size with no trend is a
+      # number, and a register growing monotonically is deletion with a slower
+      # fuse. Lane health goes in the same summary so "never green" is visible
+      # to whoever is already looking at the board.
+      - name: Publish harness health
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo '## Test harness health'
+            echo '```'
+            node scripts/ci/flake-check.mjs --report || true
+            node scripts/ci/lane-certify.mjs --report || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # The long lanes: nightly and on demand, never on a per-change gate.
+  #
+  # These are certifications, not gates. They judge against bounds declared in
+  # .lanes/criteria.json BEFORE the run, they emit one artifact per run, and the
+  # lane's dashboard is the sequence of artifacts rather than any single verdict
+  # — which is why the health ledger is cached across runs and the verdicts are
+  # uploaded with a retention long enough to outlive a cache eviction.
+  #
+  # It does NOT replace the artifact-test steps in the Linux `test` job above:
+  # those still run on every change and still turn a host-ABI break red. This
+  # adds the schedule and the lane-health record on top.
+  long-lanes:
+    name: Long lanes (nightly)
+    if: ${{ github.event_name == 'workflow_dispatch' || (github.event_name == 'schedule' && github.event.schedule == '41 5 * * *') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: just
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Restore lane health + flake history
+        uses: actions/cache/restore@v4
+        with:
+          path: |
+            .flake/history
+            .lanes/health.json
+          key: lane-health-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: lane-health-
+      # The two artifact lanes need the built plugins; without them their tests
+      # skip rather than fail, which is exactly why those lanes carry a
+      # `tests_run` minimum as well as a `tests_failed` maximum.
+      - name: Build + install every plugins-src crate
+        run: just plugins-install
+      # Every lane below carries `!cancelled()` so one red lane cannot silence
+      # the rest — the same reason `Format` is its own job. The certifier still
+      # sees whatever artifacts were produced, and a lane that produced none is
+      # reported as cannot-see rather than as a pass.
+      - name: Lane — datasets-bulk-upsert
+        if: ${{ !cancelled() }}
+        run: node scripts/ci/flake-record.mjs --lane datasets-bulk-upsert -- cargo test -p pumper-core --test datasets_bulk_perf bulk_upsert_50k_cost_report -- --ignored --nocapture
+      - name: Lane — datasets-duplicate-scan
+        if: ${{ !cancelled() }}
+        run: node scripts/ci/flake-record.mjs --lane datasets-duplicate-scan -- cargo test -p pumper-core --test datasets_bulk_perf duplicate_scan_50k_cost_report -- --ignored --nocapture
+      - name: Lane — derived-backfill
+        if: ${{ !cancelled() }}
+        run: node scripts/ci/flake-record.mjs --lane derived-backfill -- cargo test -p pumper-core --test derived_backfill_perf -- --ignored --nocapture
+      - name: Lane — fingerprint-shared-dom
+        if: ${{ !cancelled() }}
+        run: node scripts/ci/flake-record.mjs --lane fingerprint-shared-dom -- cargo test -p pumper-core --test fingerprint_shared_dom perf_ -- --ignored --nocapture
+      - name: Lane — wasm-plugin-artifacts
+        if: ${{ !cancelled() }}
+        run: node scripts/ci/flake-record.mjs --lane wasm-plugin-artifacts -- cargo test -p pumper-engine-wasm --test plugins -- --ignored
+      - name: Lane — server-trigger-plugins
+        if: ${{ !cancelled() }}
+        run: node scripts/ci/flake-record.mjs --lane server-trigger-plugins -- cargo test -p pumper-server e2e::trigger_plugins -- --ignored
+      # The rest of the --ignored set, recorded but not certified: the timing
+      # tests in the flake register. This is the compensating control for
+      # libtest having no `muted` form — the two quarantined tests keep
+      # producing the outcome history that will eventually release them,
+      # entirely off the blocking path.
+      - name: Quarantined tests (recorded, not blocking)
+        if: ${{ !cancelled() }}
+        continue-on-error: true
+        run: node scripts/ci/flake-record.mjs --lane quarantine-watch -- cargo test -p pumper-core --lib governor -- --ignored
+      - name: Certify
+        if: ${{ !cancelled() }}
+        run: node scripts/ci/lane-certify.mjs
+      - name: Publish lane health
+        if: ${{ !cancelled() }}
+        run: |
+          {
+            echo '## Long lanes'
+            echo '```'
+            node scripts/ci/lane-certify.mjs --report || true
+            node scripts/ci/flake-check.mjs --report || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+      - name: Save lane health + flake history
+        # `always()`, because a failed lane is the run whose record matters most.
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: |
+            .flake/history
+            .lanes/health.json
+          key: lane-health-${{ github.run_id }}-${{ github.run_attempt }}
+      # The lane's dashboard is the SEQUENCE of artifacts, and a cache entry can
+      # be evicted; 90 days of uploads is what keeps a trend readable after one.
+      - name: Upload lane artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lane-artifacts-${{ github.run_id }}
+          path: |
+            .lanes/runs
+            .lanes/verdicts
+          retention-days: 90
+          if-no-files-found: warn
+
   audit:
     name: Dependency audit
+    # The job the weekly cron exists FOR — and now the one that must say so, or
+    # the nightly lane cron would have quietly started running it every night.
+    if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
