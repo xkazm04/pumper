@@ -94,6 +94,25 @@ jobs:
           # deployed reads exactly like a gate that said yes.
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      # The `targets:` above is NOT enough, and the way it fails is silent.
+      #
+      # `rust-toolchain.toml` pins this repo to 1.96.1, so every cargo/rustup
+      # invocation made inside the checkout resolves to 1.96.1 — while the action
+      # above installed wasm32 against `stable`. The target therefore lands on a
+      # toolchain nothing here ever uses, `rustup target list --installed` (which
+      # reports for the PINNED toolchain) does not list it, and `just
+      # plugins-install` correctly refuses with "the wasm32-unknown-unknown
+      # target is not installed".
+      #
+      # Consequence while this was broken: the plugin build failed, so
+      # data/plugins/*.wasm never existed, so the artifact lanes — the ONLY rung
+      # that catches a host-ABI break — failed with "not built" on every run. A
+      # gate that cannot run is not a gate, and this one had been reporting its
+      # own absence as a test failure rather than as a setup error.
+      #
+      # Adding an already-installed target is idempotent and costs seconds.
+      - name: Add the wasm target to the PINNED toolchain
+        run: rustup target add wasm32-unknown-unknown
       # The plugin steps below drive the justfile rather than restating its
       # loop, so the recipe stays the single definition of "how a plugin is
       # built and installed" (CLAUDE.md: the justfile is the canonical runner).
@@ -293,6 +312,25 @@ jobs:
         with:
           targets: wasm32-unknown-unknown
       - uses: Swatinem/rust-cache@v2
+      # The `targets:` above is NOT enough, and the way it fails is silent.
+      #
+      # `rust-toolchain.toml` pins this repo to 1.96.1, so every cargo/rustup
+      # invocation made inside the checkout resolves to 1.96.1 — while the action
+      # above installed wasm32 against `stable`. The target therefore lands on a
+      # toolchain nothing here ever uses, `rustup target list --installed` (which
+      # reports for the PINNED toolchain) does not list it, and `just
+      # plugins-install` correctly refuses with "the wasm32-unknown-unknown
+      # target is not installed".
+      #
+      # Consequence while this was broken: the plugin build failed, so
+      # data/plugins/*.wasm never existed, so the artifact lanes — the ONLY rung
+      # that catches a host-ABI break — failed with "not built" on every run. A
+      # gate that cannot run is not a gate, and this one had been reporting its
+      # own absence as a test failure rather than as a setup error.
+      #
+      # Adding an already-installed target is idempotent and costs seconds.
+      - name: Add the wasm target to the PINNED toolchain
+        run: rustup target add wasm32-unknown-unknown
       - uses: taiki-e/install-action@v2
         with:
           tool: just

@@ -7,7 +7,15 @@
 //! Windows a `.cmd` is not a PE image, so it is launched through the `cmd.exe`
 //! shim — which is precisely the path the process-tree bug lived on.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
+// `Path` and `Duration` are reachable ONLY from the `#[cfg(windows)]`
+// process-tree tests at the foot of this file. Imported unconditionally they are
+// dead code on every other target, and `cargo clippy -- -D warnings` — which CI
+// runs on both legs — turns that into an error rather than a warning. This is
+// why the ubuntu leg was red on a file whose tests all pass there.
+#[cfg(windows)]
+use std::path::Path;
+#[cfg(windows)]
 use std::time::Duration;
 
 use pumper_core::config::ClaudeConfig;
