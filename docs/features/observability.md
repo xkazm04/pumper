@@ -87,6 +87,51 @@ and can therefore go *down* when retention prunes. Both contracts are stated in
 each series' own `# HELP`, because a counter that silently resets and one that
 silently shrinks fail an alert rule in different ways.
 
+### The store's report on itself
+
+The SQLite layer measures its own behaviour and exports it on the same endpoint.
+Without it, "the store feels slow after a few weeks" has nothing to interrogate:
+no monitoring agent watches an embedded database.
+
+Keys are `(op, table, phase)` — an operation **family** and the table it touches,
+never statement text (statements embed values, which is unbounded cardinality).
+`phase` splits the wait for a pooled connection (`acquire`) from the statements
+themselves (`execute`); they are never summed, because one indicts pool sizing
+and the other indicts the query.
+
+| Series | What it is |
+| --- | --- |
+| `pumper_store_ops_total{op,table,phase}` | Measured operations, process-lifetime |
+| `pumper_store_slow_ops_total{op,table,phase}` | Operations at or past this key's slow line |
+| `pumper_store_slow_line_seconds{op,table,phase}` | **The predicate** behind the count above — published on the same labels so "N slow ops" is never quoted without its N |
+| `pumper_store_busy_total{op,table,phase}` | `SQLITE_BUSY` / `SQLITE_LOCKED` (or a pool timeout on `acquire`), classified by result code, never by message text |
+| `pumper_store_errors_total{op,table,phase}` | Every other failure |
+| `pumper_store_rows_total{op,table,phase}` | Rows touched — separates "the query got slower" from "the table got bigger" |
+| `pumper_store_duration_p95_seconds{op,table,phase}` | Nearest-rank p95 over the key's 256-record window |
+| `pumper_store_window_samples` / `pumper_store_window_seconds` | The window the p95 is derived over — n, and the wall-clock span it covers |
+| `pumper_store_op_worst_seconds{op,table,phase}` | Worst single duration since start (lifetime; survives the ring wrapping) |
+| `pumper_jobs_oldest_queued_age_seconds` / `..._running_age_seconds` | Whether the queue is **moving**, which `pumper_jobs{status}` cannot say |
+| `pumper_store_bytes{part}` | `main` (page_count × page_size), `free` (freelist), `wal` (the sidecar on disk) |
+| `pumper_store_pages{kind}`, `pumper_store_page_size_bytes` | The page accounting behind those bytes |
+| `pumper_store_maintenance_passes_total{task,outcome}` | Maintenance passes — `ran` / `deferred` / `failed`, three different results |
+
+Slow lines are **local-store** lines (2 ms for a pool handoff, 5 ms for an
+indexed point write, 25 ms for the scanning families, 50 ms for a batch chunk
+holding the writer lock). A server-derived 100 ms threshold would sit above every
+pathology this exists to catch.
+
+**The census is partial and stated.** Seven families are instrumented — job
+enqueue, the atomic claim, the terminal verdicts, the recovery sweep, the status
+aggregate, dataset writes, and maintenance passes. Schedules, watches, triggers,
+deliveries, saved searches, the HTTP/research caches and the search index are
+**not measured**, and a percentile here says nothing about them. The same
+statement rides in the `# HELP` text and in `GET /datasets/doctor`'s `store`
+block.
+
+`GET /datasets/doctor` carries the on-demand version: p50 and p95 per key, the
+window's sample count and span, the size facts, the recent maintenance passes,
+and a `derived_by` block stating how every figure was recomputed.
+
 ## Boot-time logs that state what the process can observe
 
 Two boot lines exist to close a gap between what is configured and what is

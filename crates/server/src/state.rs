@@ -184,7 +184,12 @@ impl AppState {
         let datasets = Arc::new(
             Datasets::new(storage.pool())
                 .with_derived_max_depth(config.derived.max_depth)
-                .with_max_group_scan(config.derived.max_group_scan),
+                .with_max_group_scan(config.derived.max_group_scan)
+                // One instrument per database, not one per handle: the dataset
+                // write path has to land in the SAME rings as the job queue's,
+                // or "the records table is big AND its writes are degrading"
+                // is two unrelated numbers instead of one finding.
+                .with_instrument(storage.instrument()),
         );
         let costs = Arc::new(CostLedger::new(storage.pool()));
         let cache = Arc::new(HttpCache::new(storage.pool(), &config.cache));
