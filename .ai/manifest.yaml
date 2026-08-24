@@ -30,6 +30,8 @@ capabilities:
   smoke: { command: "pwsh -File scripts/smoke.ps1", verified: false }
   plugins-verify: { command: "just plugins-verify", verified: false }
   sdk-typecheck: { command: "npm --prefix clients/typescript run typecheck", verified: false }
+  sdk: { command: "just sdk", verified: false }
+  inventory: { command: "just inventory", verified: false }
 
 # Pointers — these subsystems can change format underneath without breaking this contract.
 paths:
@@ -51,10 +53,22 @@ boundaries:
   dependencyRule: "apps depend only on core (plus parsing libs); engines depend only on core; the server wires everything. Never make an app depend on another app or on an engine crate."
   secretsFrom: ".env at the repo root (CWD-relative loader); config.toml or $PUMPER_CONFIG for non-secret keys"
 
-# The control model (shift-left): where each capability is PRIMARILY enforced.
+# The control model: where each capability is ACTUALLY enforced, which is not the
+# same list as where we would like it enforced. This file used to advertise a
+# `prePush: [fmt-check, lint, doc-sync]` rung; no pre-push hook exists in this
+# repo (git hooks are not versioned and no core.hooksPath is set), so that rung
+# refused nothing on any clone. A projection that overstates a gate is worse than
+# a missing one — it is read as authoritative.
 controls:
-  prePush: [fmt-check, lint, doc-sync]
-  ciHardPass: [fmt-check, lint, test, audit, plugins-verify]
+  # Habit, not gate: what an author runs before pushing. `just ci` now invokes
+  # exactly the same jobs CI runs, so a local green predicts the remote one.
+  prePushHabit: [ci]
+  # The only installed local hook: a Claude Code Stop hook (.claude/settings.json
+  # -> scripts/docs/check-doc-sync.mjs). Advisory by construction — exit 2 is a
+  # reminder that never blocks, and it runs on no clone that lacks the settings.
+  localAdvisory: [doc-sync]
+  # The binding rung. Everything below it is a latency optimization.
+  ciHardPass: [fmt-check, lint, test, audit, plugins-verify, sdk, inventory]
 
 # The organization's AI registry - knowledge bundles this repo consumes and the skill
 # marketplace it installs from. Unknown fields MUST be ignored by a reader.

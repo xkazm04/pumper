@@ -46,9 +46,15 @@ test:
 test-ignored:
     cargo test --workspace -- --ignored
 
-# Lint exactly as CI does.
+# `-D warnings` is not decoration: it is what makes a clippy advisory reach the
+# exit code. Without it this recipe exited 0 on every lint CI blocks on, so
+# `just lint` (and `just ci`, which calls it) said yes to work the binding rung
+# refuses — the projection understating the enforced policy, which is the only
+# direction this drift ever goes.
+#
+# Lint exactly as CI does (.github/workflows/ci.yml, job `test`, step `Clippy`).
 lint:
-    cargo clippy --workspace --all-targets
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Format in place.
 fmt:
@@ -58,8 +64,43 @@ fmt:
 fmt-check:
     cargo fmt --check
 
-# The full CI job (.github/workflows/ci.yml) in one command.
-ci: fmt-check lint test
+# Needs `cargo install cargo-deny`. `licenses` is deliberately absent from the
+# checked list; deny.toml names the one-step trigger that promotes it.
+#
+# The dependency audit exactly as CI does (ci.yml, job `Dependency audit`).
+audit:
+    cargo deny check advisories bans sources
+
+# The published consumer SDK in clients/typescript — its own npm project, which
+# `cargo test --workspace` cannot reach and nothing here compiled until the
+# `@pumper/sync` CI job existed. Needs `npm --prefix clients/typescript ci` once.
+#
+# Typecheck + test the TypeScript SDK, as its CI job does.
+sdk:
+    npm --prefix clients/typescript run typecheck
+    npm --prefix clients/typescript test
+
+# Walks the tree for package manifests and fails on any that no CI job claims
+# (the out-of-graph check), then replays the doc-sync hook against its fixtures.
+# Node only, no dependencies, seconds.
+#
+# The two node-only gates, as the `Ship inventory + doc-sync hook` job runs them.
+inventory:
+    node --test scripts/ci/ship-inventory.test.mjs
+    node --test scripts/docs/check-doc-sync.test.mjs
+
+# Includes the plugin rungs (`plugins-verify` = install + host tests + the
+# #[ignore]d artifact tests), the audit, the TypeScript SDK and the node-only
+# inventory gates — all of which this recipe used to omit while calling itself
+# "the full CI job".
+#
+# Two prerequisites CI installs for itself: `cargo install cargo-deny` and
+# `rustup target add wasm32-unknown-unknown`. A missing one fails loudly here,
+# which is the point — a local `ci` that quietly skips a rung CI enforces is the
+# projection bug this recipe was.
+#
+# Everything CI blocks on: its five jobs, in the order CI reaches them.
+ci: fmt-check lint test audit plugins-verify sdk inventory
 
 # The doc-sync Stop hook (.claude/settings.json -> check-doc-sync.mjs) is the
 # repo's only same-session doc-drift defense, and it is invisible when it works:
@@ -68,7 +109,10 @@ ci: fmt-check lint test
 #
 # Replay one recorded transcript through it instead:
 #   node scripts/docs/check-doc-sync.mjs ~/.claude/projects/<project>/<id>.jsonl
-# — exit 2 means it would have nagged, exit 0 means it would have stayed quiet.
+# — three outcomes, three exit codes: 0 it checked and stayed quiet, 2 it checked
+# and would have nagged, 3 it COULD NOT CHECK (no transcript, or an unreadable /
+# empty rule map). A 3 is not a pass — the instrument is broken, and nothing was
+# verified for that turn.
 #
 # Prove the doc-sync hook still fires: runs its fixture suite.
 doc-sync:
