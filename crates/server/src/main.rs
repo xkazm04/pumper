@@ -214,9 +214,25 @@ async fn run() -> anyhow::Result<()> {
     let config = Config::load()?;
     let state = AppState::init(config).await?;
 
-    let recovered = state.storage.recover_stuck().await?;
-    if recovered > 0 {
-        tracing::info!(recovered, "re-queued jobs interrupted by previous shutdown");
+    // The boot recovery sweep. Reports per class — a sweep that re-queued 40,
+    // permanently failed 2 and gave up with more to do is three different facts
+    // about the last crash, and the old single count said none of them.
+    let sweep = state.storage.recover_stuck().await?;
+    if sweep.verdicted() > 0 || sweep.skipped > 0 {
+        tracing::info!(
+            requeued = sweep.requeued,
+            failed = sweep.failed,
+            skipped = sweep.skipped,
+            truncated = sweep.truncated,
+            "recovered jobs interrupted by the previous shutdown"
+        );
+    }
+    if sweep.truncated {
+        tracing::warn!(
+            limit = pumper_core::storage::RECOVERY_SWEEP_LIMIT,
+            "boot recovery sweep hit its bound with rows still running — the next sweep \
+             (or the lease reaper) continues from here"
+        );
     }
 
     // Say what declared-contract enforcement can actually be observed to do,

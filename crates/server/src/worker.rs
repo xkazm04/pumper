@@ -201,10 +201,18 @@ async fn drain(state: &AppState, semaphore: &Arc<Semaphore>, concurrency: usize)
     }
     match tokio::time::timeout(grace, &mut acquire).await {
         Ok(_) => info!("in-flight jobs suspended; checkpoints will resume them on next boot"),
-        Err(_) => match state.storage.recover_stuck().await {
-            Ok(n) => warn!(
-                requeued = n,
-                "drain deadline reached; re-queued still-running jobs"
+        // Same verdict function the boot sweep and the lease reaper use, with
+        // the reason that says which of the three noticed.
+        Err(_) => match state
+            .storage
+            .recover_stuck_with_reason(pumper_core::storage::RECOVERY_REASON_DRAIN)
+            .await
+        {
+            Ok(sweep) => warn!(
+                requeued = sweep.requeued,
+                failed = sweep.failed,
+                skipped = sweep.skipped,
+                "drain deadline reached; recovered still-running jobs"
             ),
             Err(e) => error!("drain re-queue failed: {e}"),
         },

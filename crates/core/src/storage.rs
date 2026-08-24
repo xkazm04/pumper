@@ -19,6 +19,53 @@ const JOB_COLUMNS: &str = "id, app, params, status, attempts, max_attempts, prio
                            callback_url, callback_secret, budget_usd, schedule_id, trigger_id, \
                            result, error, created_at, available_at, started_at, finished_at";
 
+/// Rows one recovery sweep will verdict before stopping. The sweep runs inside
+/// boot, so it is bounded rather than proportional to how bad the last crash
+/// was; the remainder is picked up by the next sweep, and by the lease reaper
+/// as soon as the worker starts ticking.
+pub const RECOVERY_SWEEP_LIMIT: i64 = 1_000;
+
+/// Wall-clock budget for one recovery sweep, checked between rows. The row cap
+/// bounds the count; this bounds the *time*, which is the thing boot actually
+/// spends when the store is slow rather than large.
+pub const RECOVERY_SWEEP_BUDGET: Duration = Duration::from_secs(5);
+
+/// Reason stamped by the startup sweep.
+pub const RECOVERY_REASON_BOOT: &str = "interrupted at boot (executor gone)";
+/// Reason stamped by the lease reaper.
+pub const RECOVERY_REASON_LEASE: &str = "lease expired (heartbeat stale)";
+/// Reason stamped when the shutdown drain gives up on a still-running job.
+pub const RECOVERY_REASON_DRAIN: &str = "drain deadline reached (shutdown)";
+
+/// What one recovery sweep did, per class — so "the sweep ran" and "the sweep
+/// found nothing" and "the sweep gave up early" are three distinguishable
+/// answers instead of one number.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct RecoverySweep {
+    /// Rows re-queued with the attempt ladder's backoff applied.
+    pub requeued: u64,
+    /// Rows whose attempt budget was already exhausted: permanently failed,
+    /// carrying the sweep's reason.
+    pub failed: u64,
+    /// Rows a live worker resolved between the scan and the verdict, discarded
+    /// by the `(status, attempts)` fence. Healthy concurrency — counted so it
+    /// stays distinguishable from a sweep that silently did nothing.
+    pub skipped: u64,
+    /// The row cap or the time budget cut this sweep short. Idempotent: the
+    /// next sweep continues.
+    pub truncated: bool,
+    /// `(id, app, resulting status)` per verdicted row, for the caller that has
+    /// to announce them.
+    pub verdicts: Vec<(Uuid, String, JobStatus)>,
+}
+
+impl RecoverySweep {
+    /// Rows this sweep issued a verdict for.
+    pub fn verdicted(&self) -> u64 {
+        self.requeued + self.failed
+    }
+}
+
 /// Options for enqueuing a job. Defaults: 1 attempt, no delay, priority 0.
 #[derive(Debug, Clone, Default)]
 pub struct EnqueueOptions {
@@ -645,15 +692,86 @@ impl Storage {
         self.get(id).await
     }
 
-    /// Re-queues jobs left in `running` by a previous crash/shutdown.
-    pub async fn recover_stuck(&self) -> Result<u64> {
-        let result = sqlx::query(
-            "UPDATE jobs SET status = 'queued', available_at = ?1 WHERE status = 'running'",
-        )
-        .bind(now())
-        .execute(&self.pool)
-        .await?;
-        Ok(result.rows_affected())
+    /// Issues the recovery verdict for jobs left in `running` by a previous
+    /// crash or an abandoned shutdown drain.
+    ///
+    /// `reason` is stamped on every row it verdicts — "interrupted at boot",
+    /// "drain deadline reached" — so the lineage forever distinguishes *the
+    /// executor failed this* from *a sweep failed this*, and a post-incident
+    /// "what did the restart cost us" has an answer per row instead of one
+    /// blanket status change with no trace.
+    ///
+    /// This used to be a single uncapped `UPDATE … WHERE status='running'`,
+    /// which is a *different policy* from the one the lease reaper applies to
+    /// the very same class of row: it re-queued instantly with no backoff, no
+    /// reason, and no respect for an exhausted attempt budget, so a job's fate
+    /// depended on whether its executor died before or after the process did
+    /// (registry: job-coordination/terminal-state-recovery, "build one verdict
+    /// function and give it two callers"). Both callers now go through
+    /// [`issue_recovery_verdicts`](Self::issue_recovery_verdicts).
+    pub async fn recover_stuck_with_reason(&self, reason: &str) -> Result<RecoverySweep> {
+        let sql = format!(
+            "SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'running' \
+             ORDER BY started_at ASC, id ASC LIMIT ?1"
+        );
+        let rows: Vec<JobRow> = sqlx::query_as(&sql)
+            .bind(RECOVERY_SWEEP_LIMIT)
+            .fetch_all(&self.pool)
+            .await?;
+        let truncated = rows.len() as i64 == RECOVERY_SWEEP_LIMIT;
+        let mut sweep = self.issue_recovery_verdicts(rows, reason).await?;
+        sweep.truncated |= truncated;
+        Ok(sweep)
+    }
+
+    /// [`recover_stuck_with_reason`](Self::recover_stuck_with_reason) with the
+    /// boot reason — the startup sweep.
+    pub async fn recover_stuck(&self) -> Result<RecoverySweep> {
+        self.recover_stuck_with_reason(RECOVERY_REASON_BOOT).await
+    }
+
+    /// The one verdict path for a `running` row whose executor is gone.
+    ///
+    /// Every row goes through [`fail`](Self::fail) — the same door the lease
+    /// reaper uses — so the attempt ladder, the jittered backoff and the
+    /// permanent-failure threshold apply identically no matter what noticed.
+    /// The `(status, attempts)` fence inside `fail` means a job a live worker
+    /// finishes between the scan and the verdict is *skipped*, not clobbered;
+    /// those are counted rather than silently dropped, because a sweep that
+    /// verdicts fewer rows than it scanned is either healthy concurrency or a
+    /// bug, and the count is what tells them apart.
+    ///
+    /// Bounded twice — by [`RECOVERY_SWEEP_LIMIT`] rows and by
+    /// [`RECOVERY_SWEEP_BUDGET`] of wall clock — because this runs inside boot,
+    /// and a store holding a hundred thousand orphaned rows must not decide how
+    /// long the process takes to answer its port. Cutting the sweep short is
+    /// safe: it is idempotent, and the next sweep picks up the remainder.
+    async fn issue_recovery_verdicts(
+        &self,
+        rows: Vec<JobRow>,
+        reason: &str,
+    ) -> Result<RecoverySweep> {
+        let started = std::time::Instant::now();
+        let mut sweep = RecoverySweep::default();
+        for row in rows {
+            if started.elapsed() >= RECOVERY_SWEEP_BUDGET {
+                sweep.truncated = true;
+                break;
+            }
+            let job = Job::try_from(row)?;
+            match self.fail(job.id, job.attempts, reason).await? {
+                Some(status) => {
+                    match status {
+                        JobStatus::Failed => sweep.failed += 1,
+                        _ => sweep.requeued += 1,
+                    }
+                    sweep.verdicts.push((job.id, job.app, status));
+                }
+                // The fence discarded it: the row is no longer the one we read.
+                None => sweep.skipped += 1,
+            }
+        }
+        Ok(sweep)
     }
 
     /// Stamps a liveness heartbeat on a running job, guarded on `(status,
@@ -684,23 +802,20 @@ impl Storage {
         let cutoff = ts(Utc::now() - chrono::Duration::seconds(stale_secs));
         let sql = format!(
             "SELECT {JOB_COLUMNS} FROM jobs WHERE status = 'running' \
-             AND COALESCE(heartbeat_at, started_at, created_at) < ?1"
+             AND COALESCE(heartbeat_at, started_at, created_at) < ?1 \
+             ORDER BY COALESCE(heartbeat_at, started_at, created_at) ASC, id ASC LIMIT ?2"
         );
         let rows: Vec<JobRow> = sqlx::query_as(&sql)
             .bind(&cutoff)
+            .bind(RECOVERY_SWEEP_LIMIT)
             .fetch_all(&self.pool)
             .await?;
-        let mut reaped = Vec::new();
-        for row in rows {
-            let job = Job::try_from(row)?;
-            if let Some(status) = self
-                .fail(job.id, job.attempts, "lease expired (heartbeat stale)")
-                .await?
-            {
-                reaped.push((job.id, job.app, status));
-            }
-        }
-        Ok(reaped)
+        // Same verdict function as the boot sweep: only the SELECTION differs
+        // between "its lease went stale" and "the process it ran in is gone".
+        let sweep = self
+            .issue_recovery_verdicts(rows, RECOVERY_REASON_LEASE)
+            .await?;
+        Ok(sweep.verdicts)
     }
 
     // ---- Schedules --------------------------------------------------------

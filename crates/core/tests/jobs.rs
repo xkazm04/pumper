@@ -322,6 +322,84 @@ async fn reaper_fails_permanently_when_attempts_exhausted() {
     assert!(job.error.unwrap().contains("lease expired"));
 }
 
+/// The boot sweep and the lease reaper act on the SAME class of row — a
+/// `running` job whose executor is gone — and used to apply two different
+/// policies to it. The sweep was one blanket `UPDATE … WHERE status='running'`:
+/// instant re-queue, no backoff, no reason, and no respect for an exhausted
+/// attempt budget, so a job that had burned its last attempt crashing the
+/// process got a free one, forever, as long as it crashed the process.
+#[tokio::test]
+async fn the_boot_sweep_issues_the_same_verdict_the_reaper_does() {
+    let store = fresh_db("boot-sweep").await;
+    let storage = &store.storage;
+    let pool = storage.pool();
+
+    // Attempts remain -> re-queued, with the ladder's backoff, not instantly.
+    let retryable = insert_running(&pool, "a", 1, 3, 1).await;
+    // Attempts exhausted -> permanently failed, exactly as the reaper would.
+    let exhausted = insert_running(&pool, "a", 3, 3, 1).await;
+
+    let before = Utc::now();
+    let sweep = storage.recover_stuck().await.unwrap();
+    assert_eq!((sweep.requeued, sweep.failed, sweep.skipped), (1, 1, 0));
+    assert!(!sweep.truncated);
+    assert_eq!(sweep.verdicts.len(), 2);
+
+    let job = storage.get(retryable).await.unwrap().unwrap();
+    assert_eq!(job.status, JobStatus::Queued);
+    assert!(
+        job.available_at > before,
+        "a boot re-queue takes the backoff ladder, like every other recovery"
+    );
+    // The reason is on the row: "the boot sweep did this" must stay
+    // distinguishable from "the executor failed this", forever.
+    assert!(
+        job.error.as_deref().unwrap_or_default().contains("boot"),
+        "error was {:?}",
+        job.error
+    );
+
+    let job = storage.get(exhausted).await.unwrap().unwrap();
+    assert_eq!(
+        job.status,
+        JobStatus::Failed,
+        "an exhausted job must not earn an extra attempt by killing the process"
+    );
+    assert!(job.error.as_deref().unwrap_or_default().contains("boot"));
+}
+
+/// A sweep is only meaningful if it left the rows it did NOT verdict alone,
+/// and if re-running it is safe.
+#[tokio::test]
+async fn the_boot_sweep_is_idempotent_and_touches_only_running_rows() {
+    let store = fresh_db("boot-sweep-idempotent").await;
+    let storage = &store.storage;
+    let pool = storage.pool();
+
+    let running = insert_running(&pool, "a", 1, 3, 1).await;
+    let queued = storage
+        .enqueue("a", EnqueueOptions::default())
+        .await
+        .unwrap();
+
+    assert_eq!(storage.recover_stuck().await.unwrap().requeued, 1);
+    // Second pass: nothing is `running` any more, so nothing is verdicted.
+    let again = storage.recover_stuck().await.unwrap();
+    assert_eq!((again.requeued, again.failed, again.skipped), (0, 0, 0));
+
+    assert_eq!(
+        storage.get(running).await.unwrap().unwrap().attempts,
+        1,
+        "recovery does not spend an attempt; the claim does"
+    );
+    let untouched = storage.get(queued.id).await.unwrap().unwrap();
+    assert_eq!(untouched.status, JobStatus::Queued);
+    assert!(
+        untouched.error.is_none(),
+        "a queued job was never running and must carry no recovery reason"
+    );
+}
+
 #[tokio::test]
 async fn heartbeat_refresh_keeps_a_job_off_the_reaper() {
     let store = fresh_db("heartbeat").await;
