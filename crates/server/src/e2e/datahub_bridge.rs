@@ -661,19 +661,49 @@ async fn a_pause_expires_loudly_when_the_outage_outlasts_the_staleness_window() 
         "a short outage must not drop the pause"
     );
 
-    // The outage outlasts `govern_pause_max_stale_secs` (900s by default).
+    // The outage outlasts `govern_pause_max_stale_secs`.
+    //
+    // Driven by SHRINKING THE WINDOW, not by backdating the clock an hour.
+    // `Instant::checked_sub` returns `None` when the result would predate the
+    // monotonic clock's origin — which on Windows is BOOT — so a 3600 s backdate
+    // is `None` on any machine that has been up for less than an hour. A freshly
+    // provisioned CI runner is exactly that machine. The old line therefore set
+    // `last_success = None`, which `pauses_are_stale` correctly reads as "no
+    // successful poll since boot, so nothing was ever paused and there is
+    // nothing to expire" — and the pause was never expired. The test failed on
+    // `test (windows-latest)` while passing on every developer box, whose uptime
+    // is measured in days. The production logic was right the whole time; only
+    // the test's lever was unavailable.
+    //
+    // A 5 s backdate against a 1 s window is the same scenario with both halves
+    // reachable on any machine that has been up for five seconds.
+    let blind = AppState {
+        config: Arc::new(pumper_core::Config {
+            datahub: pumper_core::config::DatahubConfig {
+                govern_pause_max_stale_secs: 1,
+                ..state.config.datahub.clone()
+            },
+            ..(*state.config).clone()
+        }),
+        ..state.clone()
+    };
     {
-        let mut g = state.datahub_govern.lock().unwrap();
-        g.last_success = std::time::Instant::now().checked_sub(Duration::from_secs(3600));
+        let mut g = blind.datahub_govern.lock().unwrap();
+        g.last_success = std::time::Instant::now().checked_sub(Duration::from_secs(5));
+        assert!(
+            g.last_success.is_some(),
+            "the monotonic clock cannot be read 5s into the past — the backdate this \
+             test depends on is unavailable, so the scenario was never set up"
+        );
     }
-    poll_once(&state, &gms).await;
+    poll_once(&blind, &gms).await;
     assert_eq!(
-        crate::datahub::status(&state)["govern"]["paused_apps"],
+        crate::datahub::status(&blind)["govern"]["paused_apps"],
         json!([]),
         "governance that has gone blind must stop enforcing, not freeze at $0 forever"
     );
     assert_eq!(
-        crate::datahub::effective_budget(&state, "fake", Some(5.0)),
+        crate::datahub::effective_budget(&blind, "fake", Some(5.0)),
         Some(5.0)
     );
     // Loudly: an audit row names the expiry and why.
