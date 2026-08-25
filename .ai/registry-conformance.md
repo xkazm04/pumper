@@ -278,7 +278,7 @@ pace and no reclamation to schedule. The half that was in scope — making
 unbounded growth *visible* in bytes, pages and WAL sidecar size — shipped, so
 when retention unparks the accounting needed to size it already exists.
 
-**Three pre-existing CI reds, found because this wave actually looked.** master's
+**Five pre-existing CI reds, found because this wave actually looked.** master's
 `test` legs had been red since at least 2026-08-24 16:50 and nobody had looked —
 the exact pathology `long-lane-certification` names, where red becomes normal and
 every failure after the first is wallpaper. All three were repaired, and none of
@@ -289,11 +289,29 @@ them was a test disagreeing with the code:
 | `vcr::…::total_cap_truncates_later_entries…`, ubuntu-only | the cassette recorder never flushed; `tokio::fs::File` is buffered and does not complete pending writes on drop, so a recording could lose its tail | `8c627d0` |
 | `Clippy`, ubuntu-only | `fake_cli.rs` imported `Path`/`Duration` that only the `#[cfg(windows)]` tests use — dead code on Linux, an error under `-D warnings` | `6c8e767` |
 | `Artifact tests`, every run | the wasm target was installed against `stable` while `rust-toolchain.toml` pins 1.96.1, so the plugin build refused and the host-ABI rung reported its own non-execution as a failure | `6c8e767` |
+| `a_failed_jar_save_is_retried…`, ubuntu-only | the cookie-jar READ treated only `NotFound` as "no stored session"; Unix answers `ENOTDIR` where Windows answers NotFound for the same fact (a path component is a file), so a read seam became platform-dependent | `953c2e6` |
+| `background_committer_flushes…`, windows-only | a fixed 400 ms sleep against a 250 ms commit interval — plenty on a developer box, a coin toss on a loaded runner. Now polls to a deadline; the assertion is unchanged | `dc6eb05` |
+| `a_pause_expires_loudly…`, windows-only | `Instant::checked_sub(3600s)` returns `None` on a machine up less than an hour (the monotonic origin is boot), so the "governance has gone blind" state was never built and a FAILED SETUP was indistinguishable from the real regression. Driven by shrinking the window now, and the backdate is asserted | `71971fc` |
 
 The first was verified the only way it could be: **red on the parent commit,
 green on the child**, in CI, on the platform that has it. It could not be shown
 red locally — the race does not manifest on Windows — and that limitation is
 recorded in its commit message rather than glossed.
+
+**Not one of the five was a test disagreeing with the code.** Three were rungs
+that could not run, and two were test setups that could not be built on the
+machine CI runs on. That distribution is itself the finding: the suite was not
+wrong about the product, it was wrong about its own environment — and every one
+of them was invisible to a local green, because this development box is Windows
+and three of the five were ubuntu-only. **A local green on one platform is not
+evidence about a two-platform gate.**
+
+None was quarantined. The register this wave built carries the rule that an agent
+never quarantines a test to make a build green, and the two timing-shaped reds
+(`background_committer…`, `a_pause_expires…`) are exactly the ones where that
+rule bites: both were repaired as harness defects — a poll instead of a sleep, an
+asserted setup instead of a silent `None` — because neither was ever flaky about
+the product.
 
 **Still owed to the operator, unchanged from wave 2:** `.claude/CLAUDE.md` still
 describes the doc-sync hook as "exit 2 is a reminder" and there is now also an
