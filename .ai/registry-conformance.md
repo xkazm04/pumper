@@ -314,6 +314,15 @@ rule bites: both were repaired as harness defects — a poll instead of a sleep,
 asserted setup instead of a silent `None` — because neither was ever flaky about
 the product.
 
+**master is green.** Run `32822818338` on `67f7fd3`: `Format`,
+`test (ubuntu-latest)`, `test (windows-latest)`, `@pumper/sync (TypeScript SDK)`,
+`Ship inventory + doc-sync hook`, `Dependency audit` and the new
+`Test harness gates` all pass; `Long lanes (nightly)` correctly skips on a push,
+which is the cron routing working. That is the first fully green run on this
+repository, and it is the verdict every claim above is measured against — three
+of the six reds were ubuntu-only, so no local run on this Windows box could have
+established it.
+
 **Still owed to the operator, unchanged from wave 2:** `.claude/CLAUDE.md` still
 describes the doc-sync hook as "exit 2 is a reminder" and there is now also an
 exit 3. A worker agent editing the repo's own policy file on another agent's
