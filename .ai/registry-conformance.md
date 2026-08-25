@@ -278,7 +278,7 @@ pace and no reclamation to schedule. The half that was in scope — making
 unbounded growth *visible* in bytes, pages and WAL sidecar size — shipped, so
 when retention unparks the accounting needed to size it already exists.
 
-**Five pre-existing CI reds, found because this wave actually looked.** master's
+**Six pre-existing CI reds, found because this wave actually looked.** master's
 `test` legs had been red since at least 2026-08-24 16:50 and nobody had looked —
 the exact pathology `long-lane-certification` names, where red becomes normal and
 every failure after the first is wallpaper. All three were repaired, and none of
@@ -292,18 +292,19 @@ them was a test disagreeing with the code:
 | `a_failed_jar_save_is_retried…`, ubuntu-only | the cookie-jar READ treated only `NotFound` as "no stored session"; Unix answers `ENOTDIR` where Windows answers NotFound for the same fact (a path component is a file), so a read seam became platform-dependent | `953c2e6` |
 | `background_committer_flushes…`, windows-only | a fixed 400 ms sleep against a 250 ms commit interval — plenty on a developer box, a coin toss on a loaded runner. Now polls to a deadline; the assertion is unchanged | `dc6eb05` |
 | `a_pause_expires_loudly…`, windows-only | `Instant::checked_sub(3600s)` returns `None` on a machine up less than an hour (the monotonic origin is boot), so the "governance has gone blind" state was never built and a FAILED SETUP was indistinguishable from the real regression. Driven by shrinking the window now, and the backdate is asserted | `71971fc` |
+| `the_subprocess_runs_in_its_own_dir…`, ubuntu-only | ETXTBSY. A multi-threaded test binary writes executables and runs them; another thread's fork briefly inherits the write handle, so the kernel refuses the exec. Every unix fake CLI now proves it is executable at the one seam that creates it | `67f7fd3` |
 
 The first was verified the only way it could be: **red on the parent commit,
 green on the child**, in CI, on the platform that has it. It could not be shown
 red locally — the race does not manifest on Windows — and that limitation is
 recorded in its commit message rather than glossed.
 
-**Not one of the five was a test disagreeing with the code.** Three were rungs
-that could not run, and two were test setups that could not be built on the
+**Not one of the six was a test disagreeing with the code.** Three were rungs
+that could not run, and three were test setups that could not be built on the
 machine CI runs on. That distribution is itself the finding: the suite was not
 wrong about the product, it was wrong about its own environment — and every one
 of them was invisible to a local green, because this development box is Windows
-and three of the five were ubuntu-only. **A local green on one platform is not
+and four of the six were ubuntu-only. **A local green on one platform is not
 evidence about a two-platform gate.**
 
 None was quarantined. The register this wave built carries the rule that an agent
