@@ -7,20 +7,60 @@
 //! Windows a `.cmd` is not a PE image, so it is launched through the `cmd.exe`
 //! shim — which is precisely the path the process-tree bug lived on.
 
-use std::path::PathBuf;
-// `Path` and `Duration` are reachable ONLY from the `#[cfg(windows)]`
-// process-tree tests at the foot of this file. Imported unconditionally they are
-// dead code on every other target, and `cargo clippy -- -D warnings` — which CI
-// runs on both legs — turns that into an error rather than a warning. This is
-// why the ubuntu leg was red on a file whose tests all pass there.
-#[cfg(windows)]
-use std::path::Path;
-#[cfg(windows)]
+// `Path` and `Duration` are used on BOTH platforms, but by different code:
+// `settle_exec` (unix) and the process-tree tests (windows). They were briefly
+// gated behind `#[cfg(windows)]`, because before `settle_exec` existed they were
+// genuinely dead on Linux and `cargo clippy -- -D warnings` — which CI runs on
+// both legs — makes an unused import an error rather than a warning. Now that
+// each target has a real user, the gate would break the other leg instead.
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use pumper_core::config::ClaudeConfig;
 use pumper_core::{ResearchRequest, Researcher};
 use pumper_engine_claude::ClaudeEngine;
+
+/// Argument that makes a fake CLI exit 0 immediately, without running its body.
+/// Only [`settle_exec`] passes it.
+#[cfg_attr(windows, allow(dead_code))]
+const EXEC_PROBE_ARG: &str = "--pumper-exec-probe";
+
+/// Waits until the freshly written script can actually be `exec`'d.
+///
+/// THE RACE: this is a multi-threaded test binary that writes executables and
+/// then runs them. When any other thread forks to spawn its own subprocess, the
+/// child inherits every open descriptor — including, for a few microseconds, the
+/// write handle to a script another thread has just created. Between that fork
+/// and its exec, the kernel sees our file as open-for-writing and refuses to
+/// execute it: **ETXTBSY, "Text file busy" (os error 26)**.
+///
+/// It is a property of the harness, not of the engine: nothing in production
+/// writes the binary it is about to launch. It is also invisible on Windows,
+/// which has no ETXTBSY — which is why `test (ubuntu-latest)` failed here on
+/// `the_subprocess_runs_in_its_own_dir_not_the_servers_cwd` while every local run
+/// passed.
+///
+/// The condition is transient (it clears as soon as the other child execs), so
+/// the fix is to confirm executability once, here, instead of letting a random
+/// test inherit the failure. Probing with [`EXEC_PROBE_ARG`] runs the guard line
+/// and exits 0 without touching the body, so this costs one no-op spawn and has
+/// no side effects a test could observe.
+#[cfg(unix)]
+fn settle_exec(binary: &Path) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        match std::process::Command::new(binary)
+            .arg(EXEC_PROBE_ARG)
+            .output()
+        {
+            Ok(_) => return,
+            Err(e) if e.raw_os_error() == Some(26) && std::time::Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            Err(e) => panic!("fake cli at {} is not executable: {e}", binary.display()),
+        }
+    }
+}
 
 /// A temp-dir fake `claude`, removed on drop.
 struct FakeCli {
@@ -53,7 +93,11 @@ impl FakeCli {
         let script = if cfg!(windows) {
             format!("@echo off\r\n{}\r\n", body.replace('\n', "\r\n"))
         } else {
-            format!("#!/bin/sh\n{body}\n")
+            // The probe guard is the FIRST line of every fake CLI: it lets
+            // `settle_exec` below prove the script is executable without running
+            // the body. The engine never passes this argument, so no test's
+            // behaviour changes.
+            format!("#!/bin/sh\n[ \"$1\" = \"{EXEC_PROBE_ARG}\" ] && exit 0\n{body}\n")
         };
         std::fs::write(&binary, script).expect("write fake cli");
         #[cfg(unix)]
@@ -61,6 +105,7 @@ impl FakeCli {
             use std::os::unix::fs::PermissionsExt;
             std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o755))
                 .expect("chmod fake cli");
+            settle_exec(&binary);
         }
         Self { _dir: dir, binary }
     }
