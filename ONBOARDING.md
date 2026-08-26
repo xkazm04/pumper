@@ -527,6 +527,20 @@ demand. See [docs/features/datasets.md](docs/features/datasets.md).
 Install once with `cargo install just`; `just --list` shows them all. Keep the
 recipes and this section in sync.
 
+**Iterate narrow; sweep wide once, at the end.** The commands above are the
+*finishing* loop, not the inner one. While you are still changing code, run
+`cargo test -p <crate>` (or `cargo test -p <crate> --test <file>`) for the crate
+you are actually touching. A full `cargo test --workspace` links ~200 separate
+test binaries, and cargo garbage-collects `target/` **never** — every run leaves
+another generation of artifacts behind forever. Reaching for the whole workspace
+on every edit is how this repo put 280.8 GB in `target/` in a single month
+(measured 2026-08-26), against 0.28 GB of actual scraped data. Run the wide
+sweep when you are finishing, which is what `just ci` is for.
+
+`just disk` shows where the disk went, `just disk-prune` reclaims superseded
+generations safely, and `just disk-check` — a rung of `just ci` — prunes for you
+and only goes red when pruning could not bring `target/` back under its ceiling.
+
 Then exercise your change against the running server:
 
 ```powershell
