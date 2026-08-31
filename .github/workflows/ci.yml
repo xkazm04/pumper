@@ -57,7 +57,7 @@ jobs:
     if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
@@ -82,7 +82,7 @@ jobs:
       matrix:
         os: [ubuntu-latest, windows-latest]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -142,7 +142,7 @@ jobs:
       # from the previous one's records instead of from nothing.
       - name: Restore flake history
         if: ${{ !cancelled() }}
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .flake/history
           key: flake-history-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -165,7 +165,7 @@ jobs:
         # history can hold — an outcome transition needs the red half — so the
         # save must survive the step above going red.
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: .flake/history
           key: flake-history-${{ runner.os }}-${{ github.run_id }}-${{ github.run_attempt }}
@@ -206,8 +206,8 @@ jobs:
     if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
           cache: npm
@@ -231,8 +231,8 @@ jobs:
     if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       - name: Ship inventory
@@ -253,14 +253,14 @@ jobs:
     if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       # Restore-only: this job records nothing, it just wants the history so the
       # published figures below carry a real trend instead of "first sample".
       - name: Restore flake history
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: .flake/history
           key: flake-history-Linux-report-${{ github.run_id }}
@@ -307,7 +307,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
@@ -334,11 +334,11 @@ jobs:
       - uses: taiki-e/install-action@v2
         with:
           tool: just
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: "20"
       - name: Restore lane health + flake history
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: |
             .flake/history
@@ -397,7 +397,7 @@ jobs:
       - name: Save lane health + flake history
         # `always()`, because a failed lane is the run whose record matters most.
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: |
             .flake/history
@@ -407,7 +407,7 @@ jobs:
       # be evicted; 90 days of uploads is what keeps a trend readable after one.
       - name: Upload lane artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lane-artifacts-${{ github.run_id }}
           path: |
@@ -423,7 +423,7 @@ jobs:
     if: ${{ github.event_name != 'schedule' || github.event.schedule == '17 6 * * 1' }}
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       # cargo-deny over cargo-audit: this service fetches untrusted web content
       # and executes operator-supplied WASM, so "is there a CVE" (advisories) is
       # only part of the question — `sources` proves every crate still comes from
