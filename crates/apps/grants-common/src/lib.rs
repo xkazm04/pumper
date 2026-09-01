@@ -1120,6 +1120,36 @@ fn is_past_due_open(
 /// signal — forecasted grants legitimately have no close date.
 pub const TITLE_NULL_DRIFT_THRESHOLD: f64 = 0.5;
 
+/// The `warnings[]` line a source owes when records it fetched did not reach
+/// `grants/unified`, or `None` when every fetched record normalized (or nothing
+/// was fetched — an empty pull has nothing to drop).
+///
+/// The `normalize_*` functions return `None` for a record with no usable id,
+/// and the callers `filter_map` them — so a renamed id column silently dropped
+/// the WHOLE batch from the cross-source layer while the listing sync reported
+/// `fetched: 1366, sweep: complete`, and [`drift_warnings`] (which returns
+/// early on an empty batch) could not see it either. A total drop is named as
+/// such: it is the shape of contract drift, not of a few malformed rows.
+pub fn unnormalized_warning(source: &str, fetched: usize, normalized: usize) -> Option<String> {
+    let dropped = fetched.saturating_sub(normalized);
+    if fetched == 0 || dropped == 0 {
+        return None;
+    }
+    Some(if normalized == 0 {
+        format!(
+            "{source}: ALL {fetched} fetched records failed to normalize into grants/unified \
+             (no usable id) — the id field was renamed or moved upstream, so this run \
+             contributed nothing to the cross-source layer while its own listing sync \
+             succeeded"
+        )
+    } else {
+        format!(
+            "{source}: {dropped} of {fetched} fetched records did not normalize into \
+             grants/unified (no usable id) and were left out of the cross-source layer"
+        )
+    })
+}
+
 /// Non-fatal schema-drift warnings over a run's normalized unified items. Empty
 /// when nothing looks wrong; otherwise human-readable strings for the result's
 /// `warnings` array. (The hard drift case — a positive server hitCount with zero
@@ -1282,6 +1312,27 @@ pub fn classify_relation(a: &Value, b: &Value, same_source: bool) -> Option<Pair
         Some(period_days) => Some(PairRelation::Recurrence { period_days }),
         None => fallback,
     }
+}
+
+/// Recurrence pairs pooled per [`chain_key`]: `(a, b, distance, observed period)`.
+type RecurrenceChains =
+    std::collections::BTreeMap<(String, String), Vec<(String, String, u32, i64)>>;
+
+/// The chain a recurrence pair belongs to: `(normalized agency, program title)`.
+///
+/// [`classify_relation`] accepts a pair only when the two rows share an agency,
+/// so the chain — where the pairs of one program are pooled to corroborate a
+/// period and predict the next window — must be scoped the same way. Keyed by
+/// program title alone, two agencies running a same-named program ("Community
+/// Development Block Grant" is run by dozens) pooled into one chain: one
+/// blended median period, one bogus predicted window, and every row stamped
+/// with the first pair's agency and ALN. On the output whose doc says
+/// precision over recall, that is a fabricated prediction.
+fn chain_key(row: &Value) -> (String, String) {
+    (
+        norm_text(row.get("agency").and_then(Value::as_str).unwrap_or("")),
+        program_title(row.get("title").and_then(Value::as_str).unwrap_or("")),
+    )
 }
 
 /// The canonical orientation of a pair link: lexicographically smaller key
@@ -1526,9 +1577,11 @@ pub async fn link_relations(ctx: &AppContext, max_distance: u32) -> Result<(usiz
 
     let mut dups: Vec<(String, Value)> = Vec::new();
     // Recurrence pairs, grouped by the program they belong to, so a third cycle
-    // can corroborate the period the first two only observed.
-    let mut chains: std::collections::BTreeMap<String, Vec<(String, String, u32, i64)>> =
-        std::collections::BTreeMap::new();
+    // can corroborate the period the first two only observed. Keyed by
+    // [`chain_key`] — agency AND program — because `classify_relation` requires
+    // the same agency per PAIR, and a title-only chain re-merged what it had
+    // just kept apart.
+    let mut chains: RecurrenceChains = RecurrenceChains::new();
     for p in &pairs {
         // The SimHash scan hands pairs back in table order, which nothing orders.
         // Canonicalize before the orientation reaches a key or a payload, so the
@@ -1544,8 +1597,7 @@ pub async fn link_relations(ctx: &AppContext, max_distance: u32) -> Result<(usiz
                 json!({ "a": key_a, "b": key_b, "distance": p.distance, "relation": "duplicate" }),
             )),
             Some(PairRelation::Recurrence { period_days }) => {
-                let program = program_title(a.get("title").and_then(Value::as_str).unwrap_or(""));
-                chains.entry(program).or_default().push((
+                chains.entry(chain_key(a)).or_default().push((
                     key_a.to_string(),
                     key_b.to_string(),
                     p.distance,
@@ -1557,7 +1609,7 @@ pub async fn link_relations(ctx: &AppContext, max_distance: u32) -> Result<(usiz
     }
 
     let mut recurrences: Vec<(String, Value)> = Vec::new();
-    for (program, pairs) in &chains {
+    for ((_, program), pairs) in &chains {
         // Every distinct opportunity this program's pairs touch is one cycle.
         let mut cycles: Vec<ProgramCycle> = Vec::new();
         for key in pairs.iter().flat_map(|(a, b, _, _)| [a, b]) {
@@ -1584,8 +1636,11 @@ pub async fn link_relations(ctx: &AppContext, max_distance: u32) -> Result<(usiz
         let Some(projection) = project_recurrence(&cycles) else {
             continue;
         };
-        let sample = rows.get(&pairs[0].0);
         for (a, b, distance, period_days) in pairs {
+            // This pair's OWN row, never the chain's first pair: the chain is
+            // one agency by construction now, but the ALN can still differ
+            // across pairs where one side publishes none.
+            let own = rows.get(a);
             recurrences.push((
                 format!("{a}|{b}"),
                 json!({
@@ -1594,8 +1649,8 @@ pub async fn link_relations(ctx: &AppContext, max_distance: u32) -> Result<(usiz
                     "distance": distance,
                     "relation": "recurrence",
                     "program": program,
-                    "agency": sample.and_then(|r| r.get("agency")).cloned().unwrap_or(Value::Null),
-                    "aln": sample.and_then(|r| r.get("aln")).cloned().unwrap_or(Value::Null),
+                    "agency": own.and_then(|r| r.get("agency")).cloned().unwrap_or(Value::Null),
+                    "aln": own.and_then(|r| r.get("aln")).cloned().unwrap_or(Value::Null),
                     // This pair's own observed gap, and the program-level median
                     // the projection is built on.
                     "observed_period_days": period_days,
@@ -2110,6 +2165,48 @@ mod tests {
         };
         merge_warnings(map, &[]);
         assert_eq!(foreign["warnings"], json!([]));
+    }
+
+    // ---- unified drop ----
+
+    /// THE REFUTED BEHAVIOR: `filter_map(normalize_*)` dropped a batch whose id
+    /// column was renamed, and nothing counted the gap — `fetched: 1366` with
+    /// zero unified rows and no warning.
+    #[test]
+    fn a_batch_that_normalizes_to_nothing_is_named_as_drift_not_silence() {
+        assert_eq!(
+            unnormalized_warning("ca-grants", 0, 0),
+            None,
+            "nothing fetched"
+        );
+        assert_eq!(
+            unnormalized_warning("ca-grants", 10, 10),
+            None,
+            "nothing dropped"
+        );
+        let total = unnormalized_warning("ca-grants", 1366, 0).expect("a total drop warns");
+        assert!(total.contains("ALL 1366"), "{total}");
+        assert!(total.contains("renamed"), "{total}");
+        let partial = unnormalized_warning("grants-gov", 10, 7).expect("a partial drop warns");
+        assert!(partial.contains("3 of 10"), "{partial}");
+        assert!(!partial.contains("ALL"), "{partial}");
+    }
+
+    // ---- recurrence chains ----
+
+    /// THE REFUTED BEHAVIOR: chains were keyed by `program_title` alone, so two
+    /// agencies' same-named programs pooled into one chain that stamped every
+    /// row with the first pair's agency.
+    #[test]
+    fn a_recurrence_chain_is_one_agency_not_one_title() {
+        let hud = json!({ "title": "Community Development Block Grant FY2026", "agency": "HUD" });
+        let state =
+            json!({ "title": "Community Development Block Grant 2026", "agency": "CA HCD" });
+        assert_ne!(chain_key(&hud), chain_key(&state));
+        assert_eq!(chain_key(&hud).1, chain_key(&state).1, "same program title");
+        // The same agency spelled differently is still one chain.
+        let hud2 = json!({ "title": "Community Development Block Grant FY2027", "agency": "hud " });
+        assert_eq!(chain_key(&hud), chain_key(&hud2));
     }
 
     // ---- pair links ----

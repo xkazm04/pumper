@@ -218,7 +218,8 @@ impl ScrapeApp for GrantsGov {
                  detailCorpus: {read, truncated}, detailsFailed, sweep, truncated, \
                  details: {harvested, deltaTotal, capped, resumedFrom, attempted, failed, \
                  abortedAfterConsecutiveFailures, errors[]}, \
-                 unified: {new, changed, events, dataset, trust, sourceState}, swept, \
+                 unifiedDropped, unified: {new, changed, events, dataset, trust, sourceState}, \
+                 swept, \
                  crossSourceDups, recurrenceLinks, \
                  corpusPass: {ran, cycle, batchSwept, corpusSwept}, warnings[], \
                  index_datasets[]} — Search2 sync tallies over the `opportunities` dataset \
@@ -577,6 +578,15 @@ impl ScrapeApp for GrantsGov {
             .iter()
             .filter_map(grants_common::normalize_grants_gov)
             .collect();
+        // Hits that did not normalize (no `id`/`number`) used to vanish from the
+        // cross-source layer uncounted — a renamed id column dropped the whole
+        // batch while the listing sync reported complete.
+        let unified_dropped = hits.len().saturating_sub(unified_items.len());
+        if let Some(msg) =
+            grants_common::unnormalized_warning("grants-gov", hits.len(), unified_items.len())
+        {
+            degradation_warnings.push(msg);
+        }
         // Money join: Search2 publishes no award amounts (live-verified), so a
         // federal unified row is permanently null on all three money fields and
         // `GET /grants?min_award=` can never match it. The figures live in the
@@ -629,6 +639,7 @@ impl ScrapeApp for GrantsGov {
             // detail corpus this run — i.e. how much of the federal corpus
             // `min_award` can actually see.
             "amountsFilled": amounts.filled,
+            "unifiedDropped": unified_dropped,
             // What that number rests on: how much of the stored detail corpus
             // the join actually read, and whether that read was a WINDOW. A
             // silently-windowed join reports a lower `amountsFilled` and is

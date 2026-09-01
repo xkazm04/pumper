@@ -82,7 +82,8 @@ impl ScrapeApp for CaGrants {
             ],
             output_shape: Some(
                 "{source, status, total, fetched, pages, new, changed, unchanged, sweep, \
-                 truncated, unified: {new, changed, events, dataset, trust, sourceState}, \
+                 truncated, unifiedDropped, unified: {new, changed, events, dataset, trust, \
+                 sourceState}, \
                  swept, crossSourceDups, recurrenceLinks, \
                  corpusPass: {ran, cycle, batchSwept, corpusSwept}, warnings[], \
                  index_datasets[]} — CKAN sync tallies over the `opportunities` dataset \
@@ -301,6 +302,9 @@ impl ScrapeApp for CaGrants {
             "status": status,
             "total": total,
             "fetched": records.len(),
+            // Fetched records that did not normalize into grants/unified (no
+            // usable id). Non-zero is a warning; equal to `fetched` is drift.
+            "unifiedDropped": records.len().saturating_sub(unified_items.len()),
             "pages": pages,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
@@ -312,6 +316,11 @@ impl ScrapeApp for CaGrants {
             "truncated": truncated,
         });
         cross.merge_into(&mut out);
+        if let Some(msg) =
+            grants_common::unnormalized_warning("ca-grants", records.len(), unified_items.len())
+        {
+            append_warning(&mut out, msg);
+        }
         // Pushed after the merge, which appended the drift warnings.
         if let Some(msg) = sweep_warning(end, pages, max_pages, limit, total, records.len()) {
             append_warning(&mut out, msg);

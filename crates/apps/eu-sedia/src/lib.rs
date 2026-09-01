@@ -119,7 +119,7 @@ impl ScrapeApp for EuSedia {
             output_shape: Some(
                 "{source, types[], statuses[], totalResults, fetched, enriched, skipped_unkeyed, pages, new, \
                  changed, unchanged, historyJoined, sweep, truncated, \
-                 unified: {new, changed, events}, \
+                 unifiedDropped, unified: {new, changed, events}, \
                  swept, crossSourceDups, recurrenceLinks, \
                  corpusPass: {ran, cycle, batchSwept, corpusSwept}, \
                  warnings[], index_datasets[]} — `sweep` names how the walk ended \
@@ -376,6 +376,17 @@ impl ScrapeApp for EuSedia {
             // Hits with no identifier and no reference: counted, never written
             // under the empty key.
             "skipped_unkeyed": skipped_unkeyed,
+            // Stored records that did not normalize into grants/unified (no
+            // usable identifier). Non-zero is a warning; equal to `fetched` is
+            // drift. The warning is seeded here and `merge_into` extends it.
+            "unifiedDropped": records.len().saturating_sub(unified_items.len()),
+            "warnings": grants_common::unnormalized_warning(
+                "eu-sedia",
+                records.len(),
+                unified_items.len()
+            )
+            .into_iter()
+            .collect::<Vec<_>>(),
             "pages": pages_fetched,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
