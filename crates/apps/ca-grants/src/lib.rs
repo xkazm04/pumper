@@ -13,6 +13,7 @@
 use std::collections::HashMap;
 
 use async_trait::async_trait;
+use pumper_core::datasets::JsonFilter;
 use pumper_core::{
     AppContext, AppManifest, CostClass, Error, HttpMethod, HttpRequest, ManifestExample,
     Provenance, Result, ScrapeApp,
@@ -186,6 +187,20 @@ impl ScrapeApp for CaGrants {
             pages += 1;
             offset += limit;
 
+            // Drift guard, per PAGE: a page that CKAN's own `result.total` places
+            // inside the corpus came back with nothing in it — `result.records`
+            // was renamed/moved and `unwrap_or_default` emptied it. Catches the
+            // mid-sweep rename too, which otherwise reads as an ordinary short
+            // page (a warning) while the post-loop guard sees a non-empty batch.
+            if grants_common::empty_page_is_drift(pages, limit, total, got) {
+                // `SourceDrift`, not `App`: terminal for the job — see below.
+                return Err(Error::SourceDrift(format!(
+                    "ca-grants schema drift: result.total={total} but page {pages} \
+                     (offset={}) parsed 0 records (result.records missing or not an array)",
+                    offset - limit
+                )));
+            }
+
             if let Some(reason) =
                 walk_end(pages, limit, total, got, records.len() as u64, max_pages)
             {
@@ -202,10 +217,42 @@ impl ScrapeApp for CaGrants {
         // See [`SweepEnd`].
         let truncated = end != SweepEnd::Complete;
 
+        // A listing that reports nothing at all while grants are already stored
+        // is drift, not a clean sweep: `result.total` AND `result.records` both
+        // renamed reads as `total:0, records:[]`, which `walk_end` (rightly)
+        // calls Complete — the guard below is gated on `total > 0` and can never
+        // see it. The stored corpus is the one denominator the source cannot
+        // rename. Compare like with like: a `Status` filter counts the stored
+        // rows of THAT status, so a narrow pull that honestly matches nothing is
+        // not accused of drift by the rows sitting next to it.
+        if total == 0 && records.is_empty() {
+            let filters: Vec<JsonFilter> = if status.is_empty() {
+                Vec::new()
+            } else {
+                vec![JsonFilter::Eq {
+                    path: "Status".into(),
+                    value: status.clone(),
+                }]
+            };
+            let stored_corpus = ctx
+                .datasets
+                .count_filtered(&ctx.app, "opportunities", &filters)
+                .await?;
+            if grants_common::empty_listing_is_drift(total, records.len(), stored_corpus) {
+                return Err(Error::SourceDrift(format!(
+                    "ca-grants schema drift: CKAN reported result.total=0 with no records \
+                     for Status={status:?} while {stored_corpus} grants of that status are \
+                     already stored — result.total or result.records was renamed or moved. \
+                     Nothing was written; the stored corpus is left untouched."
+                )));
+            }
+        }
+
         // Drift guard: CKAN reported a positive `result.total` but we parsed zero
         // records — the `result.records` array was renamed/moved and
         // `unwrap_or_default` silently emptied it. Fail loudly instead of
-        // reporting a successful empty run.
+        // reporting a successful empty run. (Page 1 of the per-page guard above
+        // fires first for the same shape; this stays as the belt to that brace.)
         if total > 0 && records.is_empty() {
             // `SourceDrift`, not `App`: terminal for the job. A rename does not
             // un-rename itself between attempts, and the params are frozen at
@@ -663,9 +710,36 @@ mod drift_inventory {
             .collect()
     }
 
+    /// THE REFUTED BEHAVIOR: with `result.total` AND `result.records` both
+    /// renamed, page 1 reads `total:0, got:0`, which `walk_end` (rightly) calls
+    /// Complete — and the only drift guard was gated on `total > 0`. A green,
+    /// empty run against a corpus of stored grants. `Complete` is not evidence;
+    /// the stored corpus is the denominator the source cannot rename.
+    #[test]
+    fn a_complete_empty_walk_over_a_stored_corpus_is_drift_not_a_clean_sweep() {
+        assert_eq!(
+            crate::walk_end(1, 100, 0, 0, 0, 25),
+            Some(crate::SweepEnd::Complete)
+        );
+        assert!(grants_common::empty_listing_is_drift(0, 0, 1366));
+        // An honestly empty portal (nothing stored either) stays a clean sweep.
+        assert!(!grants_common::empty_listing_is_drift(0, 0, 0));
+        // And the mid-sweep rename the post-loop guard cannot see: page 3 of a
+        // 1366-grant listing served nothing.
+        assert!(grants_common::empty_page_is_drift(3, 100, 1366, 0));
+        assert!(
+            !grants_common::empty_page_is_drift(15, 100, 1366, 0),
+            "past the end"
+        );
+    }
+
     /// Every pre-write drift refusal in this app, by a stable fragment of its
     /// message. Adding or removing one fails this test until it is classified.
-    const EXPECTED_TERMINAL: &[&str] = &["ca-grants schema drift: result.total="];
+    const EXPECTED_TERMINAL: &[&str] = &[
+        "ca-grants schema drift: result.total=",
+        "ca-grants schema drift: result.total={total} but page",
+        "ca-grants schema drift: CKAN reported result.total=0",
+    ];
 
     /// Drift this app reports **without** failing the job. None here: ca-grants
     /// has one stage, so its only drift signal is the pre-write listing refusal.
