@@ -27,7 +27,7 @@ use crate::engine::{
 };
 use crate::governor::Governor;
 use crate::markdown::{html_to_markdown, text_len_capped};
-use crate::recipes::{payload_overlaps, RecipeSource};
+use crate::recipes::RecipeSource;
 use crate::{Error, ResearchRequest, Result};
 
 /// Case-insensitive marker phrases that identify a bot-wall / interstitial
@@ -383,6 +383,54 @@ pub struct FetchOutcome {
     /// one extracted from today's page.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<crate::engine::SnapshotProvenance>,
+    /// Same-origin JSON calls the *browser tier* observed while rendering this
+    /// page, when the render was an escalation and `[fetcher] xray` is on (see
+    /// [`capture_on_escalation`]). Empty on every other tier and on every fetch
+    /// with the X-ray off — which is why it is skipped when empty: a fetch that
+    /// captured nothing serializes exactly as it did before.
+    ///
+    /// This is the raw material of the API X-ray loop: an app hands it, plus
+    /// the records it extracted from the same page, to `AppContext::xray`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub network: Vec<crate::engine::CapturedCall>,
+}
+
+/// Whether a browser render should capture the page's JSON calls: only with the
+/// X-ray loop on (`[fetcher] xray`), and only when this render is an
+/// **escalation** — the http tier was skipped by the learned router, or it
+/// already lost on this fetch.
+///
+/// THE ANTI-PATTERN THIS CLOSES (`capture_not_on_every_render`): capturing on
+/// every render would pay the CDP body pulls (bounded, but not free) on the
+/// browser-first strategy every caller uses for a JS page it already knows how
+/// to read. The escalated render is the one worth X-raying: the page rendered
+/// *because* the cheap tier could not read it, which is exactly the population
+/// where a discovered JSON API replaces a Chrome render forever after.
+pub(crate) fn capture_on_escalation(xray: bool, skip_http: bool, trace: &[TierTrace]) -> bool {
+    xray && (skip_http
+        || trace.iter().any(|t| {
+            t.tier == FetchTier::Http
+                && matches!(
+                    t.verdict,
+                    TierVerdict::Thin | TierVerdict::Blocked | TierVerdict::Error
+                )
+        }))
+}
+
+/// Whether this fetch consults learned API recipes ahead of the ladder.
+///
+/// Three ways in, one predicate: the per-request `use_recipes` opt-in, the
+/// `[recipes] enabled` master switch, or the X-ray loop (`[fetcher] xray`),
+/// which would otherwise discover recipes nothing ever reads. The explicit
+/// `Browser` strategy is always excluded — the caller asked for a JS render,
+/// and an API payload is not one.
+pub(crate) fn recipes_consulted(
+    use_recipes: bool,
+    enabled: bool,
+    xray: bool,
+    strategy: FetchStrategy,
+) -> bool {
+    (use_recipes || enabled || xray) && strategy != FetchStrategy::Browser
 }
 
 /// Holds clones of the three engines and orchestrates escalation. Cheap to
@@ -431,6 +479,10 @@ pub struct Fetcher {
     /// Default escalation threshold from `[fetcher] min_content_chars`; a
     /// per-request `min_content_chars` overrides it.
     min_content_chars: usize,
+    /// `[fetcher] xray` (N14, default OFF): capture the JSON calls of escalated
+    /// renders, consult learned recipes on every fetch, and let an unvalidated
+    /// candidate prove itself on one replay. OFF leaves the ladder untouched.
+    xray: bool,
 }
 
 impl Fetcher {
@@ -454,6 +506,7 @@ impl Fetcher {
             recipes_max_failures: RecipesConfig::default().max_failures,
             governor,
             min_content_chars: cfg.min_content_chars,
+            xray: cfg.xray,
         }
     }
 
@@ -499,6 +552,17 @@ impl Fetcher {
         &self.egress
     }
 
+    /// Whether an unvalidated candidate may be replayed opportunistically and
+    /// promoted by a replay that still overlaps its expected paths.
+    ///
+    /// `[recipes] auto_validate` says so explicitly; `[fetcher] xray` implies
+    /// it, because a loop that discovers candidates and never proves them
+    /// leaves `validated: false` rows nothing will ever read — the exact state
+    /// this item exists to end.
+    fn auto_validate(&self) -> bool {
+        self.recipes_auto_validate || self.xray
+    }
+
     /// The client serving the live-HTTP tier: the remote fabric when wired,
     /// the plain local engine otherwise.
     fn live_http(&self) -> &Arc<dyn HttpClient> {
@@ -517,7 +581,12 @@ impl Fetcher {
         // tier: any miss/thin/error records a strike and falls through. The
         // browser-only strategy is excluded — the caller explicitly wants a JS
         // render, which an API payload cannot be.
-        if (req.use_recipes || self.recipes_enabled) && req.strategy != FetchStrategy::Browser {
+        if recipes_consulted(
+            req.use_recipes,
+            self.recipes_enabled,
+            self.xray,
+            req.strategy,
+        ) {
             if let Some(out) = self.try_recipe(&req, &mut escalations, &mut trace).await {
                 return Ok(out);
             }
@@ -641,6 +710,10 @@ impl Fetcher {
             render.wait_for_selector = req.wait_for_selector.clone();
             render.actions = req.actions.clone();
             render.profile = req.profile.clone();
+            // API X-ray: an escalated render is the one worth capturing — the
+            // page is being rendered precisely because the cheap tier could not
+            // read it. Bounded by the engine's own capture caps.
+            render.capture_network = capture_on_escalation(self.xray, req.skip_http, &trace);
             // Space the browser render per-host, exactly as the HTTP tier is
             // spaced inside its engine. Critical because the learned tier router
             // pins repeatedly-blocked hosts to the browser tier — so without this
@@ -653,7 +726,9 @@ impl Fetcher {
             }
             let started = Instant::now();
             match self.browser.render(render).await {
-                Ok(page) => {
+                Ok(mut page) => {
+                    // Lifted before the html is moved into the outcome below.
+                    let network = std::mem::take(&mut page.network);
                     let latency_ms = elapsed_ms(started);
                     // Only AutoWithResearch escalates past the browser, so the
                     // char count only decides anything there; every other
@@ -691,7 +766,7 @@ impl Fetcher {
                             cost_usd: None,
                             detail: None,
                         });
-                        return Ok(outcome(
+                        let mut out = outcome(
                             "browser",
                             &req,
                             None,
@@ -701,7 +776,12 @@ impl Fetcher {
                             trace,
                             // A live render, by definition.
                             None,
-                        ));
+                        );
+                        // The X-ray's raw material rides back with the page it
+                        // was observed on, so the discovery caller can score the
+                        // captures against what it extracted from that HTML.
+                        out.network = network;
+                        return Ok(out);
                     }
                     let (verdict, detail) = match wall {
                         Some(reason) => {
@@ -810,6 +890,7 @@ impl Fetcher {
                         trace,
                         cost_usd: out.cost_usd,
                         snapshot: None,
+                        network: Vec::new(),
                     });
                 }
                 Err(e) => {
@@ -1019,7 +1100,7 @@ impl Fetcher {
         // Unvalidated recipes are only tried opportunistically when
         // auto-validation is on; otherwise validated-only.
         let recipe = match source
-            .best_for_host(&host, self.recipes_auto_validate)
+            .best_for_host(&host, self.auto_validate(), self.recipes_max_failures)
             .await
         {
             Ok(Some(r)) => r,
@@ -1041,13 +1122,18 @@ impl Fetcher {
             Ok(resp) => {
                 let latency_ms = elapsed_ms(started);
                 let parsed = serde_json::from_str::<serde_json::Value>(&resp.body).ok();
-                let overlaps = parsed
-                    .as_ref()
-                    .is_some_and(|v| payload_overlaps(&recipe.json_paths, v));
-                if resp.is_success() && overlaps {
+                // One renderer for the verdict, so the trail line, the trace
+                // detail and the STORED `validation_reason` cannot disagree
+                // about why a replay was refused.
+                let refused = crate::recipes::replay_reason(
+                    resp.is_success(),
+                    parsed.as_ref(),
+                    &recipe.json_paths,
+                );
+                if refused.is_none() {
                     // A successful overlapping replay resets the strike counter
                     // and — under auto_validate — proves an unvalidated recipe.
-                    let validate = self.recipes_auto_validate && !recipe.validated;
+                    let validate = self.auto_validate() && !recipe.validated;
                     if let Err(e) = source.record_success(&recipe.id, validate).await {
                         escalations.push(format!("api_recipe tier: recording success failed: {e}"));
                     }
@@ -1075,20 +1161,15 @@ impl Fetcher {
                         cost_usd: None,
                         // A recipe replay is a live API call, not a stored body.
                         snapshot: None,
+                        network: Vec::new(),
                     });
                 }
                 // Thin/failed replay → strike (may un-validate) → fall through.
+                let why = refused.unwrap_or("payload lost the expected field paths");
                 let demoted = source
-                    .record_failure(&recipe.id, self.recipes_max_failures)
+                    .record_failure(&recipe.id, self.recipes_max_failures, why)
                     .await
                     .unwrap_or(false);
-                let why = if !resp.is_success() {
-                    "non-success status"
-                } else if parsed.is_none() {
-                    "non-JSON payload"
-                } else {
-                    "payload lost the expected field paths"
-                };
                 escalations.push(format!(
                     "api_recipe tier thin: status {}, {why}{}",
                     resp.status,
@@ -1114,7 +1195,7 @@ impl Fetcher {
                 // Engine error is a strike too — a recipe pointing at a dead
                 // endpoint must eventually un-validate itself.
                 let _ = source
-                    .record_failure(&recipe.id, self.recipes_max_failures)
+                    .record_failure(&recipe.id, self.recipes_max_failures, "replay failed")
                     .await;
                 trace_tier_error(
                     escalations,
@@ -1301,6 +1382,10 @@ fn outcome(
         trace,
         cost_usd: None,
         snapshot,
+        // Captures are attached by the browser branch itself (the only tier
+        // that can observe a page's JSON calls); every other tier leaves the
+        // list empty, and an empty list serializes away entirely.
+        network: Vec::new(),
     }
 }
 
@@ -1340,6 +1425,85 @@ fn challenge_marker(body: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A trace entry for one tier's verdict — the router's own evidence shape.
+    fn traced(tier: FetchTier, verdict: TierVerdict) -> TierTrace {
+        TierTrace {
+            tier,
+            verdict,
+            http_status: None,
+            content_chars: None,
+            cache_hit: None,
+            latency_ms: 0,
+            cost_usd: None,
+            detail: None,
+        }
+    }
+
+    /// N14. The X-ray captures the JSON calls of the render that happened
+    /// BECAUSE the cheap tier lost — never of every render, and never at all
+    /// while `[fetcher] xray` is off (the shipping default).
+    #[test]
+    fn capture_only_on_escalated_renders_not_on_every_render() {
+        let http_lost = [traced(FetchTier::Http, TierVerdict::Thin)];
+        let http_won = [traced(FetchTier::Http, TierVerdict::Ok)];
+
+        // OFF: nothing captures, whatever the ladder did — the default must
+        // leave the browser tier byte-for-byte as it was.
+        assert!(!capture_on_escalation(false, true, &http_lost));
+        assert!(!capture_on_escalation(false, false, &http_lost));
+
+        // ON + escalation: the router skipped http, or http already lost here.
+        assert!(capture_on_escalation(true, true, &[]));
+        assert!(capture_on_escalation(true, false, &http_lost));
+        assert!(capture_on_escalation(
+            true,
+            false,
+            &[traced(FetchTier::Http, TierVerdict::Blocked)]
+        ));
+        assert!(capture_on_escalation(
+            true,
+            false,
+            &[traced(FetchTier::Http, TierVerdict::Error)]
+        ));
+
+        // ON but NOT an escalation: a browser-first render (no http attempt at
+        // all, or an http tier that won and is not why we are rendering).
+        assert!(
+            !capture_on_escalation(true, false, &[]),
+            "a first-choice render is not an escalation"
+        );
+        assert!(!capture_on_escalation(true, false, &http_won));
+        // A *skipped-by-router* entry is a skip, not a loss — but `skip_http`
+        // carries that case, and a non-http tier's loss teaches nothing.
+        assert!(!capture_on_escalation(
+            true,
+            false,
+            &[traced(FetchTier::Archive, TierVerdict::Thin)]
+        ));
+    }
+
+    /// N14. The X-ray implies recipe consultation — a loop that discovers
+    /// recipes nothing ever reads is the exact state this closes — but the
+    /// explicit `browser` strategy still never takes the recipe branch: the
+    /// caller asked for a JS render and an API payload is not one.
+    #[test]
+    fn xray_consults_recipes_but_never_on_an_explicit_browser_render() {
+        // Every door in.
+        assert!(recipes_consulted(true, false, false, FetchStrategy::Auto));
+        assert!(recipes_consulted(false, true, false, FetchStrategy::Auto));
+        assert!(recipes_consulted(false, false, true, FetchStrategy::Auto));
+        assert!(recipes_consulted(
+            false,
+            false,
+            true,
+            FetchStrategy::AutoWithResearch
+        ));
+        // All doors shut = today's behaviour.
+        assert!(!recipes_consulted(false, false, false, FetchStrategy::Auto));
+        // The browser strategy is excluded however loudly recipes are on.
+        assert!(!recipes_consulted(true, true, true, FetchStrategy::Browser));
+    }
 
     #[test]
     fn block_statuses_are_bot_walls() {
@@ -2498,6 +2662,9 @@ mod tests {
         lookups: Mutex<Vec<(String, bool)>>,
         successes: Mutex<Vec<(String, bool)>>,
         failures: Mutex<Vec<(String, u32)>>,
+        /// The verdict handed to each strike — the string that becomes the
+        /// stored `validation_reason` a reader of `GET /recipes` sees.
+        reasons: Mutex<Vec<String>>,
     }
     #[async_trait]
     impl RecipeSource for ScriptedRecipes {
@@ -2505,6 +2672,7 @@ mod tests {
             &self,
             host: &str,
             include_unvalidated: bool,
+            _max_failures: u32,
         ) -> Result<Option<ApiRecipe>> {
             self.lookups
                 .lock()
@@ -2522,11 +2690,17 @@ mod tests {
                 .push((id.to_string(), validate));
             Ok(())
         }
-        async fn record_failure(&self, id: &str, unvalidate_after: u32) -> Result<bool> {
+        async fn record_failure(
+            &self,
+            id: &str,
+            unvalidate_after: u32,
+            reason: &str,
+        ) -> Result<bool> {
             self.failures
                 .lock()
                 .unwrap()
                 .push((id.to_string(), unvalidate_after));
+            self.reasons.lock().unwrap().push(reason.to_string());
             Ok(false)
         }
     }
@@ -2535,13 +2709,13 @@ mod tests {
     struct PanicRecipes;
     #[async_trait]
     impl RecipeSource for PanicRecipes {
-        async fn best_for_host(&self, _: &str, _: bool) -> Result<Option<ApiRecipe>> {
+        async fn best_for_host(&self, _: &str, _: bool, _: u32) -> Result<Option<ApiRecipe>> {
             panic!("recipes must not be consulted without an opt-in");
         }
         async fn record_success(&self, _: &str, _: bool) -> Result<()> {
             unreachable!()
         }
-        async fn record_failure(&self, _: &str, _: u32) -> Result<bool> {
+        async fn record_failure(&self, _: &str, _: u32, _: &str) -> Result<bool> {
             unreachable!()
         }
     }

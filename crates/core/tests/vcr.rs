@@ -196,6 +196,7 @@ async fn a_miss_against_a_hand_built_cassette_is_terminal_not_retryable() {
             trace: Vec::new(),
             cost_usd: None,
             snapshot: None,
+            network: Vec::new(),
         })],
     );
     let err = cassette
