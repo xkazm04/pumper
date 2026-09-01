@@ -50,6 +50,7 @@ pub mod detect;
 pub mod invariants;
 #[cfg(feature = "storage")]
 pub mod preview;
+pub mod profiles;
 pub mod sketch;
 #[cfg(feature = "storage")]
 pub mod store;
@@ -64,6 +65,9 @@ pub use detect::{
     Baseline, CohortAdequacy, FetchHealth, InvariantCheck, Reason, Recovery, RunEvaluation,
 };
 pub use invariants::{Invariant, InvariantKind};
+pub use profiles::{
+    known_origin, repairability, rules_source, Repairability, RulesSource, RulesSourceConflict,
+};
 pub use sketch::FieldSketch;
 #[cfg(feature = "storage")]
 pub use store::{HealthStore, Resilience, SourceHealth, SourceRun};

@@ -599,11 +599,21 @@ otherwise would be the dishonest part of the design.
 
 ## 4. Where rules live: the profile registry (prerequisite for everything in §6)
 
-> **Not built.** Rules remain a job parameter. This section is a prerequisite
-> only for repair, which is also not built; detection keys on `(app, dataset)`
-> and needs none of it. The cost is that `source_runs` cannot stamp a
-> `profile_version`, so the `self_inflicted` diagnosis (§2.3) narrows the era by
-> `build_id` alone.
+> **Built (N12 step 1), store-side.** Migration `0041_extraction_profiles.sql`
+> adds `extraction_profiles` + immutable `profile_versions` and the
+> `source_runs.profile_version` column. The store API is
+> `Datasets::ensure_profile` / `add_profile_version` /
+> `set_active_profile_version` / `profile_rules` / `profile_versions`, and
+> `HealthStore::stamp_profile_version` records which version produced a run
+> (`NULL` keeps meaning *not profile-backed*, so pre-migration rows need no
+> backfill). The pure origin question — did this job say `profile` or `rules`,
+> and is it therefore repairable — is `resilience::profiles::rules_source` +
+> `repairability`.
+>
+> **Not yet wired into the `extractor` app's params door**: `POST
+> /apps/extractor/jobs {"profile": …}` is not accepted yet, so today the
+> registry is written by the `repair` app (§6) and by direct store calls.
+> Everything an existing job does is byte-for-byte unchanged.
 
 Today a `RuleSet` is a **job parameter**. It has no identity, no version, and no
 home — it arrives in `POST /apps/extractor/jobs` or sits inside a `schedules`

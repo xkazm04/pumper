@@ -119,7 +119,16 @@ The honest consequence: a degrading source is detected, quarantined, and reporte
 fixing it is an operator action followed by `POST /sources/{id}/state`. The design
 calls a stuck source "an acceptable terminal state", and that is what it is.
 
-### The profile registry (§4)
+### The profile registry (§4) — BUILT, store-side (N12 step 1)
+
+`0041_extraction_profiles.sql` ships `extraction_profiles` + immutable
+`profile_versions` + `source_runs.profile_version`, with the append-only
+promotion/rollback semantics (`Datasets::add_profile_version` never moves the
+active pointer; `set_active_profile_version` does, and refuses a version nobody
+wrote). What is still NOT built is the `extractor` params door: a job cannot yet
+say `{"profile": "…"}` instead of `{"rules": {…}}`, so the registry is populated
+by the `repair` app and by direct store calls. The paragraph below is the
+historical statement of why it was absent and what that cost.
 
 Rules stay a job parameter. It is a prerequisite for repair only — detection keys
 on `(app, dataset)` and needs none of it.

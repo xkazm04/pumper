@@ -622,6 +622,47 @@ impl HealthStore {
             .collect())
     }
 
+    /// Stamps which profile version produced a recorded run.
+    ///
+    /// Separate from `observe` on purpose. `RunReport` is built by the app, and
+    /// the app that knows the profile version is the one that resolved it —
+    /// which is not necessarily the one reporting the run. Writing it as its own
+    /// UPDATE keeps the stamp additive: a run nobody stamped keeps
+    /// `profile_version = NULL`, which means "not profile-backed", not "version
+    /// zero".
+    ///
+    /// Returns whether a row was actually stamped, so a caller can tell a
+    /// stamped run from a run that had already been pruned.
+    pub async fn stamp_profile_version(
+        &self,
+        source_id: &str,
+        job_id: &str,
+        version: i64,
+    ) -> Result<bool> {
+        let n = sqlx::query(
+            "UPDATE source_runs SET profile_version = ?3 WHERE source_id = ?1 AND job_id = ?2",
+        )
+        .bind(source_id)
+        .bind(job_id)
+        .bind(version)
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n > 0)
+    }
+
+    /// The profile version a recorded run ran under, when one was stamped.
+    pub async fn run_profile_version(&self, source_id: &str, job_id: &str) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar::<_, Option<i64>>(
+            "SELECT profile_version FROM source_runs WHERE source_id = ?1 AND job_id = ?2",
+        )
+        .bind(source_id)
+        .bind(job_id)
+        .fetch_optional(&self.pool)
+        .await?
+        .flatten())
+    }
+
     /// Drops sketches and run rows beyond the newest `keep` runs per source — the
     /// `prune_revisions` sibling the retention janitor calls. Returns rows removed.
     pub async fn prune(&self, keep: u32) -> Result<u64> {

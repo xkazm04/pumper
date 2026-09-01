@@ -63,8 +63,9 @@ pub use datasets::{
     parse_aggregate, parse_aggregates, parse_backfill_cursor, parse_filter_spec,
     parse_filter_specs, parse_stored_join, project_value, trust_label, validate_group,
     weakest_trust, Aggregate, BackfillOpts, ChangeKind, Datasets, DerivedBackfill, DerivedGroup,
-    DerivedLookup, DerivedPaths, DerivedSpec, DupPair, Provenance, Record, ReplayableRevision,
-    Revision, RevisionPage, UpsertSummary, DEFAULT_BACKFILL_MAX_ROWS, TRUST_STABLE,
+    DerivedLookup, DerivedPaths, DerivedSpec, DupPair, ExtractionProfile, ProfileVersion,
+    Provenance, Record, ReplayableRevision, Revision, RevisionPage, UpsertSummary,
+    DEFAULT_BACKFILL_MAX_ROWS, TRUST_STABLE,
 };
 #[cfg(feature = "storage")]
 pub use doctor::{
@@ -73,8 +74,9 @@ pub use doctor::{
 #[cfg(feature = "storage")]
 pub use resilience::preview::{preview_fleet, FleetPreview, SourcePreview};
 pub use resilience::{
-    doc_signals, doc_signals_parsed, extract_and_fingerprint_batch, signals_batch, CohortAdequacy,
-    CohortDrift, Diagnosis, DocSignals, FetchHealth, ObservedDoc, RunReport, RunVerdict,
+    doc_signals, doc_signals_parsed, extract_and_fingerprint_batch, known_origin, repairability,
+    rules_source, signals_batch, CohortAdequacy, CohortDrift, Diagnosis, DocSignals, FetchHealth,
+    ObservedDoc, Repairability, RulesSource, RulesSourceConflict, RunReport, RunVerdict,
     SourceState, SourceVerdict,
 };
 #[cfg(feature = "storage")]
