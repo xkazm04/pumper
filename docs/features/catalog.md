@@ -15,7 +15,7 @@ Fields (all optional except `id`, `name`, `status`; an **absent** field defaults
 | `market` | jurisdiction in the app's scheme — `us`, `us-ca` (California), `eu`, `au`, `gb`, `cz`, `ca` (Canada). **`us-ca` = California, `ca` = Canada** |
 | `name` / `url` | human name and primary endpoint |
 | `category` | `open-calls` · `awarded-history` · `registry` · `labor-market` · `market-stats` |
-| `engine` | `http` · `browser` · `claude` · `bulk` (import mechanism, not the Pumper engine trait) |
+| `engine` | `http` · `browser` · `claude` · `bulk` · `wasm` (import mechanism, not the Pumper engine trait). `wasm` = a **dynamic app**: the unit serving this source is a component-model `.wasm` in `[plugins] app_dir`, not a compiled-in crate — see [apps.md](apps.md#dynamic-wasm-apps) |
 | `access` | `key-free` · `api-key` · `bulk` · `scrape` |
 | `cadence` | `one-time` · `on-demand` · `daily` · `weekly` · `monthly` · `quarterly` · `annual` |
 | `cron` | exact 6-field expression when on the scheduler; `""` otherwise |
@@ -23,14 +23,17 @@ Fields (all optional except `id`, `name`, `status`; an **absent** field defaults
 | `confidence` | 1–5, how much this source makes downstream output trustworthy |
 | `dataset` | the dataset it writes via `ctx.upsert`; `""` if n/a |
 | `notes` | freeform flags / gotchas |
+| `module_sha256` | lowercase-hex SHA-256 of the component serving this source. **Required on, and only on, `engine = "wasm"` rows** — the dynamic-app loader hashes the module on disk and refuses to register an app whose bytes do not match this pin, so a module swapped under the same filename stops being runnable instead of quietly becoming a different app writing into the same dataset's history |
 
 A source that has only been researched still gets an entry, with `status = "planned"` and `app = ""` — so the catalog doubles as the roadmap and "live vs planned" stays honest.
 
 `Catalog::load()` reads `$PUMPER_CATALOG` or `./catalog/data-sources.toml` (**CWD-relative**). A **missing** file is an empty catalog plus a warn log, so a deployment without it still boots; a **malformed** file is a hard error.
 
-**The closed vocabularies are enforced at parse time**, not merely documented here. `status`, `cadence`, `engine`, `access`, `category` and the 1–5 `confidence` scale are checked in `Catalog::parse` (`Catalog::vocabulary_findings` is the enumeration; every offending field is reported at once, not one per run), and an out-of-set value fails the parse the same way malformed TOML does. An empty string still means *not declared* for the optional axes.
+**The closed vocabularies are enforced at parse time**, not merely documented here. `status`, `cadence`, `engine`, `access`, `category`, the 1–5 `confidence` scale and the `(engine, module_sha256)` pair are checked in `Catalog::parse` (`Catalog::vocabulary_findings` is the enumeration; every offending field is reported at once, not one per run), and an out-of-set value fails the parse the same way malformed TOML does. An empty string still means *not declared* for the optional axes.
 
 This exists because the consumers of these fields are silent about a typo. `cadence = "dayly"` used to parse, then fall through `cadence_secs`'s catch-all to `None` — the identical answer `on-demand` gives — so the source's freshness monitoring switched itself off and `/catalog/health` reported `monitored: false` as if that had been declared. Code gets exercised; data gets believed.
+
+The same rule covers the module pin, in both directions: an `engine = "wasm"` row **without** a `module_sha256` claims a deployment record it does not have (any module that happens to carry the filename would run as this source), and a `module_sha256` on an `http`/`browser` row is a note that looks like a guard — nothing hashes those. Both are parse-time findings; a pin that is not a 64-char hex digest (`"latest"`) is a third.
 
 ## Declared data contracts — and when each clause can actually fire
 

@@ -35,6 +35,7 @@ pub struct Config {
     pub economics: EconomicsConfig,
     pub refresher: RefresherConfig,
     pub maintenance: MaintenanceConfig,
+    pub wasm_apps: WasmAppsConfig,
 }
 
 /// Quiet-window maintenance: when the store's housekeeping is allowed to run.
@@ -2355,5 +2356,86 @@ mod tests {
         .unwrap();
         cfg.normalize();
         assert_eq!(cfg.browser.proxy.as_deref(), Some("http://browser-gw:9090"));
+    }
+}
+
+/// `[wasm_apps]` — running the `.wasm` **dynamic apps** discovered in
+/// `[plugins] app_dir` (N09).
+///
+/// Discovery itself is older and unchanged: any module in `app_dir` that
+/// exports a `describe()` manifest is LISTED by `GET /apps`. What this section
+/// governs is whether a discovered **component** (component-model binary, not a
+/// core module) may also be *registered as a runnable app* — enqueued,
+/// scheduled, budgeted, and given host imports onto the metered `AppContext`
+/// seams.
+///
+/// `enabled = false` is the default and means the build behaves exactly as it
+/// did before this section existed: every dynamic app stays `runnable: false`
+/// and every enqueue of one is refused. Running third-party code with fetch and
+/// dataset-write authority is an operator decision, so it is opt-in even when
+/// modules are already present on disk.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct WasmAppsConfig {
+    /// Master switch. `false` (default) = discovered components are listed but
+    /// never registered as runnable apps.
+    pub enabled: bool,
+    /// Whole-job CPU instruction budget (fuel) for ONE dynamic-app run. The
+    /// guest traps when it is exhausted — the deterministic half of the bound,
+    /// paired with `max_wall_secs` for the wall-clock half.
+    pub fuel_per_job: u64,
+    /// How much fuel the guest may burn between yields back to the async
+    /// runtime. Bounds how long one `poll` can sit in wasm, which is what keeps
+    /// a busy guest from pinning a tokio worker and what makes the run
+    /// cancellable at all. Must be > 0.
+    pub yield_interval: u64,
+    /// Hard cap on one instance's linear memory. Live instances are bounded by
+    /// `max_concurrent`, so the aggregate ceiling is `max_concurrent ×
+    /// max_memory_mb`.
+    pub max_memory_mb: usize,
+    /// Wall-clock ceiling for one run, enforced around the whole call (the
+    /// guest yields, so the timeout can actually fire) and re-checked at every
+    /// host import.
+    pub max_wall_secs: u64,
+    /// Max dynamic-app runs executing at once. Each holds an instance (and its
+    /// memory cap) across every host call it awaits, so this bounds live wasm
+    /// memory, not call rate. `0` → `available_parallelism()` (fallback 4).
+    pub max_concurrent: usize,
+    /// Cap on host imports one run may make. A guest that loops over `fetch`
+    /// burns fuel slowly (the work happens in the host), so fuel alone does not
+    /// bound it; this does.
+    pub max_host_calls: u64,
+    /// Cap on the bytes one host call may hand across the boundary in either
+    /// direction (a fetched body, an upsert batch, an artifact). Refused as a
+    /// typed host error, never truncated silently.
+    pub max_payload_bytes: usize,
+}
+
+impl Default for WasmAppsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            fuel_per_job: 2_000_000_000,
+            yield_interval: 10_000_000,
+            max_memory_mb: 128,
+            max_wall_secs: 900,
+            max_concurrent: 0,
+            max_host_calls: 10_000,
+            max_payload_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
+
+impl WasmAppsConfig {
+    /// Linear-memory cap in bytes.
+    pub fn max_memory_bytes(&self) -> usize {
+        self.max_memory_mb.saturating_mul(1024 * 1024)
+    }
+
+    /// The yield interval actually usable by wasmtime: `Some(n)` only for a
+    /// non-zero `n`, since `fuel_async_yield_interval(Some(0))` is an error and
+    /// a zero here means "not configured", not "yield constantly".
+    pub fn yield_interval_or_none(&self) -> Option<u64> {
+        (self.yield_interval > 0).then_some(self.yield_interval)
     }
 }

@@ -656,6 +656,9 @@ pub fn build_catalog_row(
         confidence: confidence_1_to_5(score_0_100),
         dataset: proposed_dataset(&key),
         notes: row_notes(prompt, dry, score_0_100),
+        // Only `engine = "wasm"` rows carry a module pin, and this app never
+        // proposes one (it proposes crawl/extractor sources).
+        module_sha256: String::new(),
         contract: None, // contracts are human-declared, never machine-proposed
     }
 }
