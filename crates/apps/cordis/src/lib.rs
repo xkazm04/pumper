@@ -60,8 +60,8 @@
 
 use std::collections::{HashMap, HashSet};
 
-use app_eu_sedia::topic_lineage;
 use async_trait::async_trait;
+use grants_common::{empty_listing_is_drift, empty_page_is_drift, topic_lineage, SweepEnd};
 use pumper_core::{
     AppContext, AppManifest, ChangeKind, CostClass, Error, HttpRequest, ManifestExample,
     Provenance, Result, ScrapeApp,
@@ -263,7 +263,7 @@ impl ScrapeApp for Cordis {
             total = page_total;
             let got = hits.len() as u64;
             last_got = got;
-            if pages_fetched == 0 && empty_first_page_is_drift(page, page_size, total, got) {
+            if pages_fetched == 0 && empty_page_is_drift(page, page_size, total, got) {
                 // `SourceDrift`, not `App`: terminal for the job.
                 return Err(Error::SourceDrift(format!(
                     "cordis: API reported {total} results but listing page {page} parsed 0 \
@@ -525,43 +525,10 @@ impl ScrapeApp for Cordis {
     }
 }
 
-/// How the listing walk ended — the four-way distinction the single
-/// `exhausted` flag used to collapse into one lie.
-///
-/// The arm-set (and its `as_str` spellings) is deliberately kept in lockstep
-/// with the sibling grants apps' `SweepEnd` — `grants-common`, `grants-gov`,
-/// `ca-grants` all publish the same four names. cordis was the last copy still
-/// missing [`SweepEnd::UnknownTotal`], and that gap let a `total:0` served
-/// alongside real records read as a proven-complete sweep.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SweepEnd {
-    /// Page arithmetic against the listing's OWN reported total proves the walk
-    /// reached the end of the corpus. The only ending that wraps the resume
-    /// cursor and reports `corpus_swept: true`.
-    Complete,
-    /// Stopped at the per-run `maxProjects` cap with corpus left to walk.
-    Capped,
-    /// A page came back shorter than `pageSize` while the reported total says
-    /// more remains. A transient truncation, NOT the end of the corpus.
-    ShortPage,
-    /// Records were served under a reported total of 0 — the total field is
-    /// absent, renamed, or the query grammar drifted. Nothing can prove the end
-    /// arithmetically (`page * page_size >= 0` is trivially true), so the walk
-    /// runs on until a short page or the cap and reports coverage as UNPROVEN
-    /// rather than wrapping the cursor on a phantom "complete".
-    UnknownTotal,
-}
-
-impl SweepEnd {
-    fn as_str(self) -> &'static str {
-        match self {
-            SweepEnd::Complete => "complete",
-            SweepEnd::Capped => "capped",
-            SweepEnd::ShortPage => "short_page",
-            SweepEnd::UnknownTotal => "unknown_total",
-        }
-    }
-}
+// `SweepEnd` — how the listing walk ended, the four-way distinction the single
+// `exhausted` flag used to collapse into one lie — is `grants_common::SweepEnd`,
+// the same arms and `as_str` spellings the sibling grants apps publish. cordis
+// kept a private copy in lockstep by hand; the compiler holds the lockstep now.
 
 /// The `warnings[]` line an UNPROVEN ending owes the result, or `None`.
 ///
@@ -659,25 +626,11 @@ fn walk_end(
     }
 }
 
-/// Whether the FIRST page of this run coming back empty is contract drift.
-///
-/// It is drift when the listing says there are results AND the arithmetic puts
-/// this page inside the corpus. A resume cursor that has run past a shrunken
-/// listing produces the same empty page and is NOT drift — it is the ordinary
-/// end of a sweep, which [`reached_listing_end`] then wraps.
-fn empty_first_page_is_drift(page: u64, page_size: u64, total: u64, got: u64) -> bool {
-    total > 0 && got == 0 && page.saturating_sub(1).saturating_mul(page_size) < total
-}
-
-/// Whether an empty listing result is contract drift rather than an honest
-/// empty corpus: the API reported nothing at all while projects are already
-/// stored locally. The verified-then-drifted query grammar (`total: 0` for a
-/// syntactically valid but wrong query) lands exactly here, and it used to walk
-/// straight through the stage-2 drift guard — that guard is gated on
-/// `attempted > 0`, and a listing with no ids attempts no detail fetch.
-fn empty_listing_is_drift(total: u64, enumerated: usize, stored_corpus: i64) -> bool {
-    total == 0 && enumerated == 0 && stored_corpus > 0
-}
+// `empty_page_is_drift` / `empty_listing_is_drift` are `grants_common`'s: an
+// empty page the reported total places INSIDE the corpus is drift (a resume
+// cursor past a shrunken listing is not), and a listing that reports nothing at
+// all while projects are already stored is drift, not an honest empty corpus.
+// Byte-identical private copies used to live here.
 
 /// The persisted resume cursor. `next_offset` is the canonical field — an
 /// absolute 0-based position in the listing, so it survives a change of
@@ -1218,17 +1171,17 @@ mod tests {
     #[test]
     fn an_empty_first_page_inside_the_corpus_is_drift_but_past_the_end_is_not() {
         // Page 1 empty while 23,361 results are claimed: drift (the old guard).
-        assert!(empty_first_page_is_drift(1, 100, 23_361, 0));
+        assert!(empty_page_is_drift(1, 100, 23_361, 0));
         // …and now ALSO drift when the run resumed mid-corpus, which the old
         // `start_page == 1` gate silently exempted — i.e. every scheduled run
         // after the first.
-        assert!(empty_first_page_is_drift(50, 100, 23_361, 0));
+        assert!(empty_page_is_drift(50, 100, 23_361, 0));
         // A cursor past the end of a shrunken listing is an ordinary sweep end.
-        assert!(!empty_first_page_is_drift(300, 100, 23_361, 0));
+        assert!(!empty_page_is_drift(300, 100, 23_361, 0));
         // A page with hits is never this kind of drift, and neither is an
         // honestly empty corpus.
-        assert!(!empty_first_page_is_drift(1, 100, 23_361, 100));
-        assert!(!empty_first_page_is_drift(1, 100, 0, 0));
+        assert!(!empty_page_is_drift(1, 100, 23_361, 100));
+        assert!(!empty_page_is_drift(1, 100, 0, 0));
     }
 
     /// The `attempted == 0` hole: the stage-2 drift guard only fires once a

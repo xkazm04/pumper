@@ -226,6 +226,44 @@ fn merge_warnings(map: &mut serde_json::Map<String, Value>, warnings: &[String])
     }
 }
 
+/// Horizon topic-family key: the identifier with its call-year segment removed,
+/// so successor topics across work programmes collapse onto one lineage key
+/// (`HORIZON-CL4-2026-DATA-01` and `HORIZON-CL4-2024-DATA-01` →
+/// `HORIZON-CL4-DATA-01`). This is the join key between open SEDIA topics and
+/// funded CORDIS outcomes (the `cordis` app aggregates `topic_stats` per family; it lives here, not in eu-sedia, so that join side and aggregation side share one implementation without an app depending on an app).
+///
+/// **Horizon-only by design**: identifiers must start with `HORIZON-` and carry
+/// exactly one plausible call-year segment (2020–2039). Other programmes
+/// (Erasmus+, LIFE, CERV, …) use different, less regular grammars — returning
+/// `None` there is honest; guessing a family would fabricate lineage. Counter
+/// segments (`-01`, `-01-05`) are kept: they distinguish topics within a
+/// destination, which is exactly the granularity predecessor matching needs.
+/// If a second year-like segment appears, only the first is removed.
+pub fn topic_lineage(identifier: &str) -> Option<String> {
+    let id = identifier.trim();
+    let segments: Vec<&str> = id.split('-').collect();
+    if segments.first() != Some(&"HORIZON") || segments.len() < 3 {
+        return None;
+    }
+    let is_year = |s: &str| {
+        s.len() == 4
+            && s.chars().all(|c| c.is_ascii_digit())
+            && (2020..=2039).contains(&s.parse::<u32>().unwrap_or(0))
+    };
+    let year_pos = segments.iter().position(|s| is_year(s))?;
+    let family: Vec<&str> = segments
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != year_pos)
+        .map(|(_, s)| *s)
+        .collect();
+    // A family must still name something beyond the programme prefix.
+    if family.len() < 2 {
+        return None;
+    }
+    Some(family.join("-"))
+}
+
 /// The cross-source tail every grant source runs after storing its raw records:
 /// publish the normalized batch into `grants/unified`, sweep past-due rows to
 /// closed, link near-duplicates, and collect drift warnings.

@@ -321,8 +321,8 @@ dependencies = [
 name = "app-cordis"
 version = "0.1.0"
 dependencies = [
- "app-eu-sedia",
  "async-trait",
+ "grants-common",
  "pumper-core",
  "serde_json",
  "tokio",
