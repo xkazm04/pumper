@@ -1,0 +1,69 @@
+// The `pumper:app` world — the public ABI of a **dynamic app**: a WASM
+// component that IS a `ScrapeApp`, dropped into `[plugins] app_dir` instead of
+// compiled into the binary.
+//
+// This file is a versioned contract. The host links exactly the imports below
+// and nothing else, so a guest that reaches for anything more fails to LINK —
+// it never half-runs. Everything crossing the boundary is JSON text: the Rust
+// types on the other side (`FetchRequest`, `FetchOutcome`, `UpsertSummary`)
+// already have stable serde shapes, and re-declaring them as WIT records would
+// make every field addition a breaking ABI change.
+//
+// Adding an import is a MINOR version of this package; changing or removing one
+// is a MAJOR. The host reports the world it links in `GET /apps`.
+
+package pumper:app@0.1.0;
+
+/// The metered `AppContext` seams, and only those. There is no socket, no
+/// filesystem, no clock and no environment here: a dynamic app cannot reach the
+/// network except through `fetch`, which is the same governed, budgeted,
+/// VCR-recorded chokepoint every compiled-in app uses.
+interface host {
+    /// Tiered fetch through `AppContext::fetch`.
+    ///
+    /// `request-json` is a serialized `FetchRequest` (`{"url": "…"}` is the
+    /// minimum; every other field defaults). Returns a serialized
+    /// `FetchOutcome`, or the host error's message on the `err` arm — a failed
+    /// fetch is the guest's to handle, not automatically fatal.
+    fetch: func(request-json: string) -> result<string, string>;
+
+    /// Batch upsert into `<this app>/<dataset>` through
+    /// `AppContext::upsert_many`, with change detection and health gating.
+    ///
+    /// `items-json` is a JSON array of `[key, value]` pairs or of
+    /// `{"key": …, "value": …}` objects. Returns a serialized `UpsertSummary`
+    /// (`{"new": n, "changed": n, "unchanged": n}`). The revision provenance
+    /// carries the module's own SHA-256 as `rules_hash`, so records written by
+    /// one build of an app are identifiable after the module is replaced.
+    upsert-many: func(dataset: string, items-json: string) -> result<string, string>;
+
+    /// Persists resumable state (throttled). Returns whether the write landed.
+    checkpoint: func(state-json: string) -> bool;
+
+    /// The last checkpoint persisted by a prior attempt of this job, if any.
+    restore: func() -> option<string>;
+
+    /// Writes a file under this job's artifacts dir; returns its path.
+    save-artifact: func(name: string, bytes: list<u8>) -> result<string, string>;
+
+    /// Throttled live-progress snapshot (`GET /jobs/{id}`, `progress` SSE).
+    progress: func(snapshot-json: string);
+
+    /// Structured log line at `level` (`error` | `warn` | `info` | `debug`;
+    /// anything else is treated as `info`), tagged with the app and job id.
+    log: func(level: string, message: string);
+}
+
+world app {
+    import host;
+
+    /// The app's manifest as JSON: `{description, params_schema, examples,
+    /// output_shape, cost_class, schedule}`. Read once at load, validated, and
+    /// served by `GET /apps`. Examples are checked against `params_schema` at
+    /// load exactly as a compiled-in app's are by test.
+    export describe: func() -> string;
+
+    /// One job. `params-json` is the merged job params object; the `ok` arm is
+    /// the JSON job result, the `err` arm a message that fails the job.
+    export run: func(params-json: string) -> result<string, string>;
+}

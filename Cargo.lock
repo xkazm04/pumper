@@ -3784,6 +3784,7 @@ dependencies = [
  "async-trait",
  "pumper-core",
  "serde_json",
+ "sha2",
  "tokio",
  "tracing",
  "wasmtime",
