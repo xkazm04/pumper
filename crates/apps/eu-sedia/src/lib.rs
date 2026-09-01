@@ -117,7 +117,7 @@ impl ScrapeApp for EuSedia {
                 },
             ],
             output_shape: Some(
-                "{source, types[], statuses[], totalResults, fetched, enriched, pages, new, \
+                "{source, types[], statuses[], totalResults, fetched, enriched, skipped_unkeyed, pages, new, \
                  changed, unchanged, historyJoined, sweep, truncated, \
                  unified: {new, changed, events}, \
                  swept, crossSourceDups, recurrenceLinks, \
@@ -170,6 +170,7 @@ impl ScrapeApp for EuSedia {
 
         let mut records: Vec<(String, Value)> = Vec::new();
         let mut enriched: u64 = 0;
+        let mut skipped_unkeyed: u64 = 0;
         let mut total: u64 = 0;
         let mut page: u64 = 1;
         let mut pages_fetched: u64 = 0;
@@ -232,7 +233,10 @@ impl ScrapeApp for EuSedia {
             }
             if let Some(hits) = hits {
                 for hit in hits {
-                    let (key, record) = normalize(hit);
+                    let Some((key, record)) = normalize(hit) else {
+                        skipped_unkeyed += 1;
+                        continue;
+                    };
                     if record.get("description_text").is_some_and(|v| !v.is_null()) {
                         enriched += 1;
                     }
@@ -369,6 +373,9 @@ impl ScrapeApp for EuSedia {
             "totalResults": total,
             "fetched": records.len(),
             "enriched": enriched,
+            // Hits with no identifier and no reference: counted, never written
+            // under the empty key.
+            "skipped_unkeyed": skipped_unkeyed,
             "pages": pages_fetched,
             "new": summary.new.len(),
             "changed": summary.changed.len(),
@@ -516,10 +523,24 @@ fn string_array(params: &Value, key: &str, fallback: &[&str]) -> Vec<String> {
 /// Normalize one SEDIA hit to a stable grant record (dropping volatile fields
 /// like weight/checksum/highlightedFragments so change-detection is meaningful).
 /// SEDIA metadata values are arrays — take the first, except deadlines (kept whole).
-fn normalize(hit: &Value) -> (String, Value) {
+///
+/// `None` when the hit carries neither `metadata.identifier` nor `reference`:
+/// an unkeyable hit is counted (`skipped_unkeyed`), never written. It used to
+/// fall through as key `""`, so every such hit in a batch overwrote one
+/// `opportunities` row — a key that identified nothing. The unified layer was
+/// already guarded (`normalize_eu_sedia` rejects an empty identifier); this
+/// closes the same hole on the app's own dataset.
+fn normalize(hit: &Value) -> Option<(String, Value)> {
     let m = hit.get("metadata").cloned().unwrap_or(Value::Null);
     let reference = hit.get("reference").and_then(Value::as_str).unwrap_or("");
-    let identifier = first(&m, "identifier").unwrap_or(reference).to_string();
+    let identifier = first(&m, "identifier")
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or(reference)
+        .trim()
+        .to_string();
+    if identifier.is_empty() {
+        return None;
+    }
 
     let record = json!({
         "identifier": identifier,
@@ -548,7 +569,7 @@ fn normalize(hit: &Value) -> (String, Value) {
         "deadlineModel": first(&m, "deadlineModel"),
         "budgetOverview": first(&m, "budgetOverview"),
     });
-    (identifier.clone(), record)
+    Some((identifier.clone(), record))
 }
 
 /// First element of a SEDIA metadata array field, as a &str.
@@ -706,6 +727,25 @@ mod tests {
         );
     }
 
+    /// THE REFUTED BEHAVIOR: `identifier` fell back to `reference`, and
+    /// `reference` fell back to `""` — so a hit with neither was WRITTEN under
+    /// the empty key, and every such hit in the batch overwrote the same row.
+    #[test]
+    fn an_unkeyable_hit_is_counted_not_written_under_the_empty_key() {
+        assert!(normalize(&json!({ "metadata": { "title": ["orphan"] } })).is_none());
+        assert!(
+            normalize(&json!({ "reference": "  ", "metadata": { "identifier": [""] } })).is_none()
+        );
+        // `reference` still keys a hit whose metadata carries no identifier.
+        let (key, _) = normalize(&json!({ "reference": "REF-1", "metadata": {} })).expect("keyed");
+        assert_eq!(key, "REF-1");
+        let shape = super::EuSedia.manifest().output_shape.expect("shape");
+        assert!(
+            shape.contains("skipped_unkeyed"),
+            "output_shape omits the counter: {shape}"
+        );
+    }
+
     #[test]
     fn output_shape_declares_the_sweep_ending_it_now_reports() {
         let shape = super::EuSedia.manifest().output_shape.expect("shape");
@@ -829,7 +869,7 @@ mod tests {
                 "descriptionByte": [SEDIA_HTML],
             }
         });
-        let (key, rec) = normalize(&hit);
+        let (key, rec) = normalize(&hit).expect("keyed by identifier");
         assert_eq!(key, "HORIZON-CL4-2026-DATA-01");
         // Raw HTML preserved, clean text added alongside.
         assert_eq!(rec["descriptionByte"].as_str().unwrap(), SEDIA_HTML);
@@ -849,7 +889,7 @@ mod tests {
             "reference": "REF-2",
             "metadata": { "identifier": ["ID-2"], "title": ["T"] }
         });
-        let (_, rec) = normalize(&hit);
+        let (_, rec) = normalize(&hit).expect("keyed by identifier");
         assert!(rec["description_text"].is_null());
         assert!(rec["descriptionByte"].is_null());
     }
