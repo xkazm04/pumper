@@ -4,6 +4,12 @@ Durable queue of architectural decisions. Sorted by (reach × payoff) / (risk ×
 Status values: `proposed | approved | in-progress | shipped | abandoned | blocked`.
 
 ## Pending
+- **[2026-09-01] Moonshot generation 2 — 37 L/XL deck items, all pending triage** — type: portfolio, risk: n/a, effort: xl, payoff: 5, reach: all 8 groups
+  Output of `/scan-sweep moonshot-architect` (8 read-only group scouts, 44 cards -> 37 items). Ranked table with
+  corroboration + decision column: [docs/harness/moonshot-2026-09-01/INDEX.md](../../docs/harness/moonshot-2026-09-01/INDEX.md).
+  Top spines by independent-scout agreement: act-on-the-web (transact v2 + waiting job state), federation
+  (mesh/fabric v2/executor plane/artifact peering), workflow runs with fan-in, as-of dataset reads, WASM apps v2,
+  self-healing sources. Top 30 bodies also in the Personas outbox. Status: proposed (0 accepted, 0 rejected)
 - **[2026-07-26] Tier-2/3 bug-class guards — the tail** — type: structural-bug-class, risk: 1, effort: m, payoff: 3, reach: 3 classes
   Remaining from [[Architect/decisions/2026-07-26-prose-only-bug-class-guards]]: (f) `sync_many`
   allowlist inventory test (EXPECTED-diff style over app sources);

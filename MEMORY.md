@@ -23,6 +23,7 @@ rediscover. Anything you can learn from a five-minute skim does not belong here.
 
 Other durable references live outside `.perfect/`:
 `docs/harness/harness-learnings.md` (structural facts + pattern catalogue),
+`docs/harness/moonshot-2026-09-01/INDEX.md` (generation-2 moonshot deck: 37 L/XL items ranked by scout corroboration, decisions pending — M01–M44 of the 2026-07-30 scan are all shipped, do not re-propose them),
 `docs/features/` (what the product does today), `context-map.json` (file → feature).
 
 ## Invariants and gotchas
