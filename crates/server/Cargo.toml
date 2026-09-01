@@ -38,6 +38,10 @@ app-valuation-multiples.workspace = true
 app-trade-wages.workspace = true
 app-ca-grants.workspace = true
 app-eu-sedia.workspace = true
+# The unified-grants vocabulary the read views must agree with the producers on
+# (`deadline_end_utc`: when a grant is actually over). Server -> shared app
+# crate is within the dependency rule; only app -> app and app -> engine are not.
+grants-common.workspace = true
 app-mpsv-vpm.workspace = true
 app-mpsv-ispv.workspace = true
 app-extractor.workspace = true

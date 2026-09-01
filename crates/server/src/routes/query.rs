@@ -185,7 +185,7 @@ pub(crate) struct ClosingSoonQuery {
     path = "/grants/closing-soon",
     tag = "grants",
     params(ClosingSoonQuery),
-    responses((status = 200, description = "`{days, count, grants}` — live open grants closing within the window, soonest first. Each grant is its unified record `data` plus `key` and `days_left`. `count` is the window total; `grants` is capped at 200."))
+    responses((status = 200, description = "`{days, count, grants}` — live open grants closing within the window, soonest first. Each grant is its unified record `data` plus `key` and `days_left`. `count` is the window total; `grants` is capped at 200. \"Still open\" is decided at `deadline_end_utc` — the exact `close_at` instant, or midday UTC the day after a date-only `close_date` — so a grant in that anywhere-on-Earth tail is listed with `days_left: 0`, exactly as `grants/unified` still calls it `open`."))
 )]
 pub(crate) async fn closing_soon(
     State(state): State<AppState>,
@@ -196,18 +196,30 @@ pub(crate) async fn closing_soon(
         .days
         .unwrap_or(CLOSING_SOON_DEFAULT_DAYS)
         .clamp(1, 365);
-    let today = chrono::Utc::now().date_naive();
+    let now = chrono::Utc::now();
+    let today = now.date_naive();
     let until = today + chrono::Duration::days(days);
+    let status_open = JsonFilter::Eq {
+        path: "$.status".into(),
+        value: "open".into(),
+    };
 
     // Computed on read rather than materialized as a dataset: a read view can
     // never go stale between syncs — which a "closing soon" list, whose membership
     // changes with the calendar and not with the data, absolutely would if it were
     // snapshotted.
+    //
+    // "Still open" is decided where the producers decide it — at
+    // `deadline_end_utc`, not at `Utc::now().date_naive()`. A date-only deadline
+    // `D` is over at `D+1T12:00:00Z` (the moment `D` has ended everywhere on
+    // Earth), so `grants/unified` still says `open` for the whole of `D+1`'s
+    // first half while a `close_date >= today` filter had already dropped the
+    // row at `00:00Z`: ~12 hours a day in which the corpus and this view
+    // disagreed about live money. The SQL window therefore starts one day
+    // early, and that one-day tail — small, and sorted first — is judged in
+    // Rust by the shared predicate before it is counted or returned.
     let filters = vec![
-        JsonFilter::Eq {
-            path: "$.status".into(),
-            value: "open".into(),
-        },
+        status_open.clone(),
         JsonFilter::Gte {
             path: "$.close_date".into(),
             value: today.to_string(),
@@ -215,6 +227,13 @@ pub(crate) async fn closing_soon(
         JsonFilter::Lte {
             path: "$.close_date".into(),
             value: until.to_string(),
+        },
+    ];
+    let tail_filters = vec![
+        status_open,
+        JsonFilter::Eq {
+            path: "$.close_date".into(),
+            value: (today - chrono::Duration::days(1)).to_string(),
         },
     ];
     // Order by close_date ASC and cap in SQL, so the returned rows are genuinely
@@ -225,6 +244,16 @@ pub(crate) async fn closing_soon(
     let count = state
         .datasets
         .count_filtered(GRANTS_APP, GRANTS_DATASET, &filters)
+        .await?;
+    let tail = state
+        .datasets
+        .list_filtered_ordered(
+            GRANTS_APP,
+            GRANTS_DATASET,
+            &tail_filters,
+            "$.close_date",
+            CLOSING_SOON_TAIL_CAP,
+        )
         .await?;
     let records = state
         .datasets
@@ -237,22 +266,91 @@ pub(crate) async fn closing_soon(
         )
         .await?;
 
-    // SQL already returns these soonest-first; just attach key + days_left.
-    let grants: Vec<Value> = records
+    // The tail rows that are genuinely still open come first (they close
+    // soonest), then SQL's soonest-first window; attach key + days_left.
+    let still_open_tail: Vec<_> = tail
         .into_iter()
+        .filter(|r| still_claimable(&r.data, now))
+        .collect();
+    let count = count + still_open_tail.len() as i64;
+    let grants: Vec<Value> = still_open_tail
+        .into_iter()
+        .chain(records)
+        .take(CLOSING_SOON_CAP)
         .filter_map(|r| {
             let close = r.data.get("close_date").and_then(Value::as_str)?;
             let close = chrono::NaiveDate::parse_from_str(close, "%Y-%m-%d").ok()?;
-            let days_left = (close - today).num_days();
             let mut grant = r.data.as_object()?.clone();
             grant.insert("key".into(), json!(r.key));
-            grant.insert("days_left".into(), json!(days_left));
+            grant.insert("days_left".into(), json!(days_left(close, today)));
             Some(Value::Object(grant))
         })
         .collect();
     Ok(Json(
         json!({ "days": days, "count": count, "grants": grants }),
     ))
+}
+
+/// Rows in the one-day anywhere-on-Earth tail the closing-soon view re-judges
+/// in Rust. A day's worth of deadlines, not a corpus, so a generous bound.
+const CLOSING_SOON_TAIL_CAP: i64 = 1000;
+
+/// Whether a unified grant row is still claimable at `now` — decided at
+/// `grants_common::deadline_end_utc`, the same instant the corpus sweep and the
+/// producers' digests use, so this view cannot disagree with `grants/unified`.
+/// An unparseable deadline is never a lapsed one (the sweep's rule too).
+fn still_claimable(data: &Value, now: chrono::DateTime<chrono::Utc>) -> bool {
+    let close_date = data.get("close_date").and_then(Value::as_str);
+    let close_at = data.get("close_at").and_then(Value::as_str);
+    match grants_common::deadline_end_utc(close_date, close_at) {
+        Some(end) => end > now,
+        None => true,
+    }
+}
+
+/// Whole days until `close`, floored at 0: a grant in the anywhere-on-Earth
+/// tail is closing *today* from the caller's point of view, never `-1`.
+fn days_left(close: chrono::NaiveDate, today: chrono::NaiveDate) -> i64 {
+    (close - today).num_days().max(0)
+}
+
+#[cfg(test)]
+mod closing_soon_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    /// THE REFUTED BEHAVIOR: the route filtered `close_date >= today` (UTC
+    /// date), so a date-only deadline of yesterday was gone at `00:00Z` while
+    /// `grants/unified` — judged at `D+1T12:00:00Z` — still called it open.
+    #[test]
+    fn a_grant_in_the_anywhere_on_earth_tail_is_still_claimable_not_yesterdays() {
+        let row = json!({ "close_date": "2026-09-01", "close_at": Value::Null });
+        let early = chrono::Utc.with_ymd_and_hms(2026, 9, 2, 3, 0, 0).unwrap();
+        let late = chrono::Utc.with_ymd_and_hms(2026, 9, 2, 13, 0, 0).unwrap();
+        assert!(
+            still_claimable(&row, early),
+            "D+1T03:00Z: still on D somewhere"
+        );
+        assert!(!still_claimable(&row, late), "D+1T13:00Z: over everywhere");
+        // A zoned deadline retires to the second.
+        let zoned = json!({ "close_date": "2026-09-01", "close_at": "2026-09-01T17:00:00Z" });
+        let before = chrono::Utc.with_ymd_and_hms(2026, 9, 1, 16, 59, 0).unwrap();
+        let after = chrono::Utc.with_ymd_and_hms(2026, 9, 1, 17, 1, 0).unwrap();
+        assert!(still_claimable(&zoned, before));
+        assert!(!still_claimable(&zoned, after));
+        // No parseable deadline is never a lapsed one.
+        assert!(still_claimable(&json!({ "close_date": "soon" }), late));
+    }
+
+    #[test]
+    fn days_left_is_floored_at_zero_for_the_tail() {
+        let today = chrono::NaiveDate::from_ymd_opt(2026, 9, 2).unwrap();
+        let yesterday = chrono::NaiveDate::from_ymd_opt(2026, 9, 1).unwrap();
+        let next_week = chrono::NaiveDate::from_ymd_opt(2026, 9, 9).unwrap();
+        assert_eq!(days_left(yesterday, today), 0);
+        assert_eq!(days_left(today, today), 0);
+        assert_eq!(days_left(next_week, today), 7);
+    }
 }
 
 // ---- Data-source catalog --------------------------------------------------

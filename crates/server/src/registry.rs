@@ -77,9 +77,10 @@ pub(crate) struct VirtualNamespace {
 /// becomes watchable the moment it holds a record.
 pub(crate) const VIRTUAL_NAMESPACES: &[VirtualNamespace] = &[
     VirtualNamespace {
-        // `grants_common::UNIFIED_APP`. Not imported: `pumper-server` depends on the
-        // grant source apps, not on `grants-common`; `virtual_namespace_publishers_are_registered`
-        // pins the entry against the registry instead.
+        // `grants_common::UNIFIED_APP`. Kept as a literal on purpose even though
+        // the server now depends on `grants-common` (for `deadline_end_utc`):
+        // `virtual_namespace_publishers_are_registered` pins the entry against
+        // the registry, which is the guard that matters here.
         name: "grants",
         // `cordis` is deliberately NOT here. It is an EU-funding app, but it writes
         // only its own `cordis/projects` + `cordis/topic_stats` and never calls
