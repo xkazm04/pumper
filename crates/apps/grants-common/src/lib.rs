@@ -37,7 +37,7 @@ pub const UNIFIED_DATASET: &str = "unified";
 pub const DUP_DATASET: &str = "duplicate_links";
 
 /// Annual-cycle links (`grants/recurrence_links`), keyed `a|b` like
-/// [`DUP_DATASET`]. A DISTINCT relation, not a tighter duplicate: these two rows
+/// [`DUP_DATASET`] (see [`oriented_pair`] for which key is `a`). A DISTINCT relation, not a tighter duplicate: these two rows
 /// are the same program in two different years, so the earlier one is over and
 /// the later one is the live opportunity. See [`classify_relation`].
 pub const RECURRENCE_DATASET: &str = "recurrence_links";
@@ -1284,6 +1284,21 @@ pub fn classify_relation(a: &Value, b: &Value, same_source: bool) -> Option<Pair
     }
 }
 
+/// The canonical orientation of a pair link: lexicographically smaller key
+/// first. `DUP_DATASET` / `RECURRENCE_DATASET` are keyed `a|b`, and the pair
+/// scan iterates `records` with no `ORDER BY` — so without this a vacuum,
+/// restore or rebuild that flips the scan order would upsert the same relation
+/// again as `b|a` and leave the stale `a|b` row standing, never tombstoned.
+/// [`classify_relation`] is orientation-blind, so canonicalizing first costs
+/// nothing.
+fn oriented_pair<'k>(a: &'k str, b: &'k str) -> (&'k str, &'k str) {
+    if a <= b {
+        (a, b)
+    } else {
+        (b, a)
+    }
+}
+
 /// True when both rows publish an ALN and they share no listing number. A row
 /// without an ALN (every non-federal source) vetoes nothing — absence is not
 /// disagreement.
@@ -1515,20 +1530,24 @@ pub async fn link_relations(ctx: &AppContext, max_distance: u32) -> Result<(usiz
     let mut chains: std::collections::BTreeMap<String, Vec<(String, String, u32, i64)>> =
         std::collections::BTreeMap::new();
     for p in &pairs {
-        let (Some(a), Some(b)) = (rows.get(&p.a), rows.get(&p.b)) else {
+        // The SimHash scan hands pairs back in table order, which nothing orders.
+        // Canonicalize before the orientation reaches a key or a payload, so the
+        // same relation is one row however the store happened to iterate.
+        let (key_a, key_b) = oriented_pair(&p.a, &p.b);
+        let (Some(a), Some(b)) = (rows.get(key_a), rows.get(key_b)) else {
             continue;
         };
-        let same_source = source_of(&p.a) == source_of(&p.b);
+        let same_source = source_of(key_a) == source_of(key_b);
         match classify_relation(a, b, same_source) {
             Some(PairRelation::Duplicate) => dups.push((
-                format!("{}|{}", p.a, p.b),
-                json!({ "a": p.a, "b": p.b, "distance": p.distance, "relation": "duplicate" }),
+                format!("{key_a}|{key_b}"),
+                json!({ "a": key_a, "b": key_b, "distance": p.distance, "relation": "duplicate" }),
             )),
             Some(PairRelation::Recurrence { period_days }) => {
                 let program = program_title(a.get("title").and_then(Value::as_str).unwrap_or(""));
                 chains.entry(program).or_default().push((
-                    p.a.clone(),
-                    p.b.clone(),
+                    key_a.to_string(),
+                    key_b.to_string(),
                     p.distance,
                     period_days,
                 ));
@@ -2091,6 +2110,26 @@ mod tests {
         };
         merge_warnings(map, &[]);
         assert_eq!(foreign["warnings"], json!([]));
+    }
+
+    // ---- pair links ----
+
+    /// THE REFUTED BEHAVIOR: the link key was `format!("{}|{}", p.a, p.b)` in
+    /// whatever order the unordered SimHash scan returned the pair, so a flipped
+    /// scan order minted a second key for one relation.
+    #[test]
+    fn a_pair_link_key_is_orientation_independent() {
+        assert_eq!(
+            oriented_pair("grants-gov:2", "ca-grants:9"),
+            ("ca-grants:9", "grants-gov:2")
+        );
+        assert_eq!(
+            oriented_pair("ca-grants:9", "grants-gov:2"),
+            ("ca-grants:9", "grants-gov:2")
+        );
+        let (x, y) = oriented_pair("b", "a");
+        let (p, q) = oriented_pair("a", "b");
+        assert_eq!(format!("{x}|{y}"), format!("{p}|{q}"));
     }
 
     // ---- sweep coverage vocabulary ----
@@ -3333,9 +3372,11 @@ mod tests {
             .list(UNIFIED_APP, DUP_DATASET, 100)
             .await
             .unwrap();
+        // Canonical orientation (smaller key first), NOT the order the corpus was
+        // inserted in — the key must not depend on how the store iterated.
         assert!(dup_rows
             .iter()
-            .any(|r| r.key == "grants-gov:100|ca-grants:CA-7"));
+            .any(|r| r.key == "ca-grants:CA-7|grants-gov:100"));
         assert!(dup_rows.iter().all(|r| r.data["relation"] == "duplicate"));
         // The annual cycle is NOT also filed as a duplicate — that conflation is
         // the whole thing this direction removes.
