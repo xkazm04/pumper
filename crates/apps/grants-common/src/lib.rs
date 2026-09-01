@@ -178,7 +178,11 @@ impl UnifiedOutcome {
             }),
         );
         map.insert("swept".into(), json!(self.swept));
-        map.insert("warnings".into(), json!(self.warnings));
+        // EXTEND, never replace: a caller that already has warnings in `out`
+        // (a sweep or detail-stage warning pushed before the merge) must not
+        // lose them. Every consumer used to push after the merge and guard the
+        // ordering with a comment — the ordering is now irrelevant.
+        merge_warnings(map, &self.warnings);
         // Null when this run did not own the corpus pass — see the field docs.
         map.insert("crossSourceDups".into(), json!(self.cross_source_dups));
         // The sibling relation: same program, next annual cycle. Reported
@@ -206,6 +210,18 @@ impl UnifiedOutcome {
                 "index_datasets".into(),
                 json!([{ "app": UNIFIED_APP, "dataset": self.dataset }]),
             );
+        }
+    }
+}
+
+/// Appends `warnings` to the result's `warnings` array, creating it when absent
+/// and keeping whatever a caller put there first. A non-array `warnings` value
+/// (a foreign shape) is replaced, not extended.
+fn merge_warnings(map: &mut serde_json::Map<String, Value>, warnings: &[String]) {
+    match map.get_mut("warnings") {
+        Some(Value::Array(existing)) => existing.extend(warnings.iter().map(|w| json!(w))),
+        _ => {
+            map.insert("warnings".into(), json!(warnings));
         }
     }
 }
@@ -2044,6 +2060,38 @@ pub fn empty_page_is_drift(page: u64, page_size: u64, total: u64, got: u64) -> b
 mod tests {
     use super::*;
     use serde_json::json;
+
+    // ---- result merge ----
+
+    /// THE REFUTED BEHAVIOR: `merge_into` did `map.insert("warnings", ...)`, so
+    /// a warning the app pushed BEFORE the merge vanished. Three consumers
+    /// worked only because each pushed after the merge behind a comment.
+    #[test]
+    fn merge_into_extends_preexisting_warnings_not_clobbers_them() {
+        let mut out = json!({ "warnings": ["sweep: short page"] });
+        let Value::Object(map) = &mut out else {
+            unreachable!()
+        };
+        merge_warnings(map, &["drift: 60% null titles".to_string()]);
+        assert_eq!(
+            out["warnings"],
+            json!(["sweep: short page", "drift: 60% null titles"])
+        );
+
+        // Absent -> created; a foreign non-array shape -> replaced, not extended.
+        let mut fresh = json!({});
+        let Value::Object(map) = &mut fresh else {
+            unreachable!()
+        };
+        merge_warnings(map, &["w".to_string()]);
+        assert_eq!(fresh["warnings"], json!(["w"]));
+        let mut foreign = json!({ "warnings": "not-an-array" });
+        let Value::Object(map) = &mut foreign else {
+            unreachable!()
+        };
+        merge_warnings(map, &[]);
+        assert_eq!(foreign["warnings"], json!([]));
+    }
 
     // ---- sweep coverage vocabulary ----
 

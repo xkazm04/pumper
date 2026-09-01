@@ -390,7 +390,7 @@ impl ScrapeApp for EuSedia {
             records.len(),
             "totalResults",
         ) {
-            // After merge_into, which sets `warnings` to the drift warnings.
+            // After merge_into, which appended the drift warnings.
             if let Value::Object(map) = &mut out {
                 // The SEDIA-specific consequence, appended to the shared text:
                 // the match-all window has no stable sort, so what is uncovered

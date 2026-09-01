@@ -265,7 +265,7 @@ impl ScrapeApp for CaGrants {
             "truncated": truncated,
         });
         cross.merge_into(&mut out);
-        // Pushed after the merge, which sets `warnings` to the drift warnings.
+        // Pushed after the merge, which appended the drift warnings.
         if let Some(msg) = sweep_warning(end, pages, max_pages, limit, total, records.len()) {
             append_warning(&mut out, msg);
         }
@@ -410,8 +410,8 @@ fn sweep_warning(
 }
 
 /// Appends a warning to a result's `warnings` array (creating it if absent).
-/// `UnifiedOutcome::merge_into` sets `warnings` to the drift warnings, so any
-/// coverage warning must be pushed *after* the merge to survive.
+/// `UnifiedOutcome::merge_into` extends `warnings` rather than replacing it, so any
+/// coverage warning survives whichever side of the merge pushes it.
 fn append_warning(out: &mut Value, msg: String) {
     if let Value::Object(map) = out {
         match map.get_mut("warnings") {
