@@ -84,7 +84,7 @@ scraper = "0.23"
 # streamed-body path, which bypasses reqwest's `.text()` charset handling.
 encoding_rs = "0.8"
 ego-tree = "0.10"
-chromiumoxide = { version = "0.7", default-features = false, features = ["tokio-runtime"] }
+chromiumoxide = { version = "0.8", default-features = false, features = ["tokio-runtime"] }
 futures = "0.3"
 
 # high-throughput extraction (no-GIL parallelism + SIMD)
@@ -110,7 +110,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 # Params-schema validation for app manifests (enqueue 422s + the MCP surface).
 jsonschema = { version = "0.30", default-features = false }
-toml = "0.8"
+toml = "0.9"
 thiserror = "2"
 anyhow = "1"
 tracing = "0.1"
@@ -126,7 +126,7 @@ sentry-tracing = "0.48"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.9"
-cron = "0.12"
+cron = "0.17"
 
 [profile.release]
 lto = "thin"

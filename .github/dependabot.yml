@@ -18,6 +18,13 @@ updates:
         update-types:
           - minor
           - patch
+    ignore:
+      # ego-tree is not ours to choose: `crates/core/src/markdown.rs` walks the
+      # tree that `scraper` hands back, so our version must be the exact one
+      # scraper links against (scraper 0.23 -> ego-tree 0.10). Taking a bump on
+      # its own puts two ego-trees in the graph and `NodeRef` stops matching.
+      # It moves when scraper moves; until then every such PR is a false lead.
+      - dependency-name: "ego-tree"
 
   # The workflow's own actions (checkout, rust-toolchain, rust-cache,
   # cargo-deny-action). These are third-party code running with repo credentials,
