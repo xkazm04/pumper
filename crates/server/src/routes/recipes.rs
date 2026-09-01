@@ -3,11 +3,20 @@
 //!
 //! Recipes are written by the discovery pass over `capture_network` renders
 //! (`AppContext::xray`, `pumper_core::recipes`) and stay `validated: false`
-//! until a successful replay proves them. This route is the read surface; the
-//! fetcher's pre-HTTP "api_recipe" tier that consumes them IS wired
-//! (`Fetcher::try_recipe`, opt-in via `[recipes] enabled` or
-//! `FetchRequest.use_recipes`). What is NOT wired is discovery: no app calls
-//! `xray` yet, so this table stays empty until a discovery caller ships.
+//! until a replay proves them. This route is the read surface; the fetcher's
+//! pre-HTTP "api_recipe" tier consumes them (`Fetcher::try_recipe`, opt-in via
+//! `[recipes] enabled`, `[fetcher] xray` or `FetchRequest.use_recipes`).
+//!
+//! The discovery caller ships with N14: the `extractor` runs the heuristic over
+//! the JSON calls an *escalated* render observed, scored against the records it
+//! extracted from that same page (`[fetcher] xray`, default OFF — with it off
+//! nothing captures and this table stays empty, as it always has).
+//!
+//! Each row carries the full validation state, so a reader can tell a candidate
+//! nothing has tried yet (`validated: false`, `validation_reason: null`) from
+//! one that was tried and refused (`validation_reason` naming why, plus
+//! `consecutive_failures`; at `[recipes] max_failures` the candidate is burned
+//! and never replayed again).
 
 use axum::extract::{Query, State};
 use axum::Json;
@@ -40,7 +49,8 @@ fn default_limit() -> i64 {
     ),
     responses(
         (status = 200, description = "`{recipes: [{id, host, url_template, params, json_paths, \
-            score, validated, discovered_at, last_seen_at}]}`"),
+            score, validated, validation_reason, validated_at, consecutive_failures, \
+            discovered_at, last_seen_at}]}`"),
     )
 )]
 pub(crate) async fn list_recipes(

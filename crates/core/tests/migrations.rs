@@ -160,6 +160,18 @@ async fn replay_keeps_columns_added_by_later_migrations() {
         );
     }
 
+    let api_recipes = column_names(&pool, "api_recipes").await;
+    for col in [
+        "consecutive_failures", // 0028 recipe strikes
+        "validation_reason",    // 0041 X-ray validation verdict
+        "validated_at",         // 0041 X-ray validation verdict
+    ] {
+        assert!(
+            api_recipes.contains(col),
+            "api_recipes lost column `{col}`: {api_recipes:?}"
+        );
+    }
+
     let triggers = column_names(&pool, "triggers").await;
     for col in [
         "filters",      // 0021 external triggers
