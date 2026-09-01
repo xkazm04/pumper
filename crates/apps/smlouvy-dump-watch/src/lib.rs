@@ -39,10 +39,12 @@ const DEFAULT_INDEX_URL: &str = "https://data.smlouvy.gov.cz/index.xml";
 struct Dump {
     year: u32,
     month: u32,
-    /// sha1 hex of the dump file (the `hashDumpu` element text).
-    hash: String,
-    /// Dump size in bytes (`velikostDumpu`).
-    size_bytes: u64,
+    /// sha1 hex of the dump file (the `hashDumpu` element text), or `None` when
+    /// the index published no usable hash — stored as `null`, never `""`, so a
+    /// blind row is legible as blind (see [`IndexParse::missing_hash`]).
+    hash: Option<String>,
+    /// Dump size in bytes (`velikostDumpu`), `None` when absent or unparseable.
+    size_bytes: Option<u64>,
     /// Generation timestamp as published (`casGenerovani`, RFC-3339-ish).
     generated_at: String,
     /// Absolute download URL (`odkaz`) — the stable natural key.
@@ -119,6 +121,12 @@ struct IndexParse {
     skipped_missing_url: usize,
     /// Blocks skipped because `<rok>`/`<mesic>` were absent or unparseable.
     skipped_unparseable_date: usize,
+    /// Blocks KEPT whose `<hashDumpu>` was absent or empty. Not a skip — the dump
+    /// is real and listed — but regeneration detection is blind for that row,
+    /// which is the one thing this app promises. It used to be stored as
+    /// `hash: ""`: a renamed tag made every dump churn `changed` once and then go
+    /// permanently quiet, with nothing in the result saying so.
+    missing_hash: usize,
 }
 
 impl IndexParse {
@@ -156,6 +164,7 @@ impl IndexParse {
             "skipped": self.skipped(),
             "skipped_missing_url": self.skipped_missing_url,
             "skipped_unparseable_date": self.skipped_unparseable_date,
+            "missing_hash": self.missing_hash,
             // 3 dp: enough to read, short of float noise in a stored result.
             "share": (self.share() * 1000.0).round() / 1000.0,
             "floor": PARSE_FLOOR,
@@ -177,6 +186,22 @@ impl IndexParse {
                 self.skipped(),
                 self.skipped_missing_url,
                 self.skipped_unparseable_date,
+            )
+        })
+    }
+
+    /// The `warnings[]` entry for dumps kept without a hash, or `None` when every
+    /// kept dump published one. Its own line, not folded into [`Self::warning`]:
+    /// a missing hash does not make the batch partial (nothing is tombstoned
+    /// over it), it makes regeneration detection blind.
+    fn missing_hash_warning(&self) -> Option<String> {
+        (self.missing_hash > 0).then(|| {
+            format!(
+                "{} of {} parsed <dump> blocks published no <hashDumpu> — stored with \
+                 hash: null, so a re-generated dump cannot be told from an unchanged one \
+                 for those rows (the feed's schema may have changed)",
+                self.missing_hash,
+                self.parsed(),
             )
         })
     }
@@ -321,13 +346,18 @@ fn parse_dumps(xml: &str) -> IndexParse {
             out.skipped_unparseable_date += 1;
             continue;
         };
+        let hash = tag_text(block, "hashDumpu")
+            .map(str::trim)
+            .filter(|h| !h.is_empty())
+            .map(str::to_string);
+        if hash.is_none() {
+            out.missing_hash += 1;
+        }
         out.dumps.push(Dump {
             year,
             month,
-            hash: tag_text(block, "hashDumpu").unwrap_or("").to_string(),
-            size_bytes: tag_text(block, "velikostDumpu")
-                .and_then(|s| s.parse::<u64>().ok())
-                .unwrap_or(0),
+            hash,
+            size_bytes: tag_text(block, "velikostDumpu").and_then(|s| s.trim().parse::<u64>().ok()),
             generated_at: tag_text(block, "casGenerovani").unwrap_or("").to_string(),
             url,
         });
@@ -405,7 +435,7 @@ impl ScrapeApp for SmlouvyDumpWatch {
             output_shape: Some(
                 "{index_url, dumps_in_index, dumps_parsed, dumps_tracked, year_from, \
                  parse: {blocks_seen, parsed, skipped, skipped_missing_url, \
-                 skipped_unparseable_date, share, floor, partial}, warnings: [string], new, \
+                 skipped_unparseable_date, missing_hash, share, floor, partial}, warnings: [string], new, \
                  changed, unchanged, removed, removals_suppressed, fresh_dumps[], \
                  newest_period, newest_url} — full-snapshot sync of the `dumps` dataset keyed \
                  by dump URL; `dumps_in_index` is the number of <dump> blocks SEEN and \
@@ -459,6 +489,9 @@ impl ScrapeApp for SmlouvyDumpWatch {
         }
         let mut warnings: Vec<String> = Vec::new();
         if let Some(w) = parse.warning() {
+            warnings.push(w);
+        }
+        if let Some(w) = parse.missing_hash_warning() {
             warnings.push(w);
         }
 
@@ -602,8 +635,11 @@ mod tests {
         assert!(!parse.is_partial(), "a clean parse may write a snapshot");
         let d = &dumps[0];
         assert_eq!((d.year, d.month), (2026, 6));
-        assert_eq!(d.hash, "aaaa1111bbbb2222cccc3333dddd4444eeee5555");
-        assert_eq!(d.size_bytes, 84123456);
+        assert_eq!(
+            d.hash.as_deref(),
+            Some("aaaa1111bbbb2222cccc3333dddd4444eeee5555")
+        );
+        assert_eq!(d.size_bytes, Some(84123456));
         assert_eq!(d.url, "https://data.smlouvy.gov.cz/dump_2026_06.xml");
         assert_eq!(d.generated_at, "2026-07-01T00:11:51+02:00");
     }
@@ -810,6 +846,45 @@ mod tests {
         assert_eq!(block["partial"], true);
     }
 
+    /// THE REFUTED BEHAVIOR: `hash: tag_text(..).unwrap_or("")` — a renamed or
+    /// absent `<hashDumpu>` stored `""` on every dump, one silent `changed`
+    /// churn and then permanent blindness to regeneration, with `size_bytes: 0`
+    /// fabricated alongside.
+    #[test]
+    fn a_missing_hash_is_null_and_counted_not_an_empty_string() {
+        let xml = r#"
+          <dump><mesic>3</mesic><rok>2025</rok><odkaz>https://x/a.xml</odkaz>
+                <hashDumpu algoritmus="sha1">abc</hashDumpu><velikostDumpu>12</velikostDumpu></dump>
+          <dump><mesic>4</mesic><rok>2025</rok><odkaz>https://x/b.xml</odkaz>
+                <hashDumpu algoritmus="sha1">  </hashDumpu><velikostDumpu>n/a</velikostDumpu></dump>
+        "#;
+        let parse = parse_dumps(xml);
+        assert_eq!(parse.parsed(), 2, "a hashless dump is still a listed dump");
+        assert_eq!(
+            parse.skipped(),
+            0,
+            "...and not a skip: nothing is tombstoned over it"
+        );
+        assert_eq!(parse.missing_hash, 1);
+        let kept = parse.dumps[1].record();
+        assert_eq!(
+            kept["hash"],
+            Value::Null,
+            "null, not a fabricated empty string"
+        );
+        assert_eq!(kept["size_bytes"], Value::Null, "null, not a fabricated 0");
+        assert_eq!(parse.dumps[0].record()["size_bytes"], 12);
+        assert!(parse.warning().is_none(), "the parse floor is untouched");
+        let warning = parse
+            .missing_hash_warning()
+            .expect("blind rows are reported");
+        assert!(warning.contains("1 of 2"), "{warning}");
+        assert_eq!(parse.to_json()["missing_hash"], 1);
+        let hashed =
+            "<dump><mesic>1</mesic><rok>2025</rok><odkaz>u</odkaz><hashDumpu>h</hashDumpu></dump>";
+        assert!(parse_dumps(hashed).missing_hash_warning().is_none());
+    }
+
     /// The result keys agents and consumers read are declared. A field that only
     /// exists in `run` is a field no caller knows to look for.
     #[test]
@@ -822,6 +897,7 @@ mod tests {
             "dumps_in_index",
             "dumps_parsed",
             "parse",
+            "missing_hash",
             "warnings",
             "removals_suppressed",
         ] {
