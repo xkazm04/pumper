@@ -87,14 +87,43 @@ fmt-check:
 audit:
     cargo deny check advisories bans sources
 
-# The published consumer SDK in clients/typescript — its own npm project, which
-# `cargo test --workspace` cannot reach and nothing here compiled until the
-# `@pumper/sync` CI job existed. Needs `npm --prefix clients/typescript ci` once.
+# The published consumer clients under clients/ — their own npm/python projects,
+# which `cargo test --workspace` cannot reach and nothing here compiled until the
+# `@pumper/sync` CI job existed. Needs `npm --prefix clients/typescript ci` and
+# `npm --prefix clients/cli ci` once.
 #
-# Typecheck + test the TypeScript SDK, as its CI job does.
-sdk:
+# Typecheck + test every client, as their CI job does.
+sdk: clients-check
     npm --prefix clients/typescript run typecheck
     npm --prefix clients/typescript test
+    npm --prefix clients/cli run typecheck
+    npm --prefix clients/cli test
+    python -m unittest discover -s clients/python -t clients/python
+
+# --- the consumer plane: one document, every client generated from it ---------
+
+# Regenerates clients/openapi.json from the ROUTER, which is the only place the
+# document exists. Needs the Rust toolchain, which is why it is separate from
+# `clients` below: the generators are Node-only and run in a job with no cargo.
+#
+# The same test asserts the committed copy matches on every `cargo test`, so a
+# route or DTO change that skips this step fails the Rust suite rather than
+# silently shipping clients built from last week's contract.
+openapi:
+    UPDATE_OPENAPI=1 cargo test -p pumper-server --bin pumper spec_snapshot
+
+# Regenerate every client's wire types from the committed document: TypeScript
+# (openapi-typescript, a devDependency of clients/typescript), the CLI's copy,
+# and the Python TypedDicts. Node only, seconds, no network.
+clients:
+    node scripts/gen/generate-clients.mjs
+
+# The generated-client drift gate: regenerate into memory and diff against what
+# is committed. Exit 1 when the spec moved and the clients did not — the failure
+# this whole item exists to make impossible to ship. Part of `sdk`, so `just ci`
+# blocks on it.
+clients-check:
+    node scripts/gen/generate-clients.mjs --check
 
 # Walks the tree for package manifests and fails on any that no CI job claims
 # (the out-of-graph check), then replays the doc-sync hook against its fixtures.

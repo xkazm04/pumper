@@ -1,0 +1,27 @@
+# pumper-sync — the Python twin of @pumper/sync.
+#
+# No runtime dependencies, on purpose: an SDK whose whole pitch is "stop
+# re-deriving the mirror loop in every product" should not arrive with a
+# dependency tree of its own. `urllib` is enough for a batch reader.
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pumper-sync"
+version = "0.1.0"
+description = "Shared consumer SDK for Pumper's canonical datasets — incremental, watermark-driven mirroring into any product store."
+readme = "README.md"
+license = { text = "Apache-2.0" }
+# 3.11 for `typing.NotRequired`, which the generated TypedDicts use to say
+# "the server may omit this key" — the distinction that keeps an absent field
+# from reading like a null one.
+requires-python = ">=3.11"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: Apache Software License",
+    "Typing :: Typed",
+]
+
+[tool.setuptools]
+packages = ["pumper_sync"]
