@@ -138,6 +138,11 @@ pub(crate) async fn job_context(
         engines: state.engines.clone(),
         datasets: state.datasets.clone(),
         costs: state.costs.clone(),
+        // No post-run fan-out drains THIS context (it is a token-scoped
+        // sub-fetch, not a job run), so `request_schedule` refuses rather than
+        // collecting requests nobody would ever apply.
+        schedule_requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        max_schedule_requests: 0,
         budget_usd: crate::datahub::effective_budget(state, &job.app, job.budget_usd),
         spent_usd: Arc::new(pumper_core::SpentTotal::new(spent)),
         research_cache: state.research_cache.clone(),

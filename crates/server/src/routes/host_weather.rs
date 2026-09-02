@@ -36,13 +36,13 @@
 
 use std::collections::BTreeSet;
 
-use app_peer::envelope::{open_envelope, SCHEMA_WEATHER_V1, SCHEMA_WEATHER_V2};
-// Shared with the puller that consumes this export, so export and import can
-// never drift apart on what an entry is.
-use app_peer::mesh::weather_entries;
+// One implementation of the wire format, in core, shared with the puller that
+// consumes this export (`app-peer`), so export and import can never drift apart
+// on what an envelope or an entry is.
 use axum::extract::{Query, State};
 use axum::http::StatusCode;
 use axum::Json;
+use pumper_core::mesh::{open_envelope, weather_entries, SCHEMA_WEATHER_V1, SCHEMA_WEATHER_V2};
 use pumper_core::{plan_weather_import, WeatherEntry, WeatherPlan};
 use serde::Deserialize;
 use serde_json::{json, Value};

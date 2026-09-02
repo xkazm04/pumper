@@ -391,7 +391,7 @@ impl AppState {
         // would silently overwrite the earlier app — it vanishes with no route, no
         // schedule, and a startup log that still claims success. A duplicate id is
         // a registration mistake, so fail loudly at boot.
-        let apps = crate::registry::apps();
+        let apps = crate::registry::apps(&config);
         let mut registry: HashMap<String, Arc<dyn ScrapeApp>> = HashMap::with_capacity(apps.len());
         for app in apps {
             let name = app.name().to_string();

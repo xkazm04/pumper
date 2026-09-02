@@ -11,6 +11,7 @@ use futures::StreamExt;
 use pumper_core::config::ArchiveConfig;
 use pumper_core::engine::{CapturedCall, RenderedPage};
 use pumper_core::extract::extract_batch_with_report_at;
+use pumper_core::resilience::profiles::{self, Repairability, RulesSource};
 use pumper_core::{
     extract_and_fingerprint_batch, signals_batch, AppContext, AppManifest, CompiledRuleSet,
     CostClass, DocReport, DocSignals, Error, FetchHealth, FetchRequest, FetchStrategy, FieldStatus,
@@ -341,8 +342,12 @@ enum RunMode {
 /// `rules` is in the set even though it is not a mode by itself: it is the
 /// marker of "this job intends to WRITE records", and a `rules` sitting next to
 /// a `replay` (which carries its own `replay.rules`) is exactly the confusion
-/// this check exists to refuse.
-const MODE_ROOTS: [&str; 5] = ["replay", "induce", "rules", "source", "urls"];
+/// this check exists to refuse. `profile` is the OTHER way to say the same
+/// thing (N12: a named, versioned rule set out of the registry), so it carries
+/// the same marker weight — a `profile` beside a `replay` is the identical
+/// confusion, and one beside a `rules` is the conflict
+/// `profiles::rules_source` refuses.
+const MODE_ROOTS: [&str; 6] = ["replay", "induce", "profile", "rules", "source", "urls"];
 
 /// The read-only modes — each one owns the whole params object.
 const READ_ONLY_ROOTS: [&str; 2] = ["replay", "induce"];
@@ -361,11 +366,27 @@ const READ_ONLY_ROOTS: [&str; 2] = ["replay", "induce"];
 /// A JSON `null` counts as absent: `{"replay": null}` is how a params template
 /// spells "not this run", and treating it as a declaration would refuse jobs
 /// that ask for nothing at all.
+/// Whether a params root is DECLARED.
+///
+/// A JSON `null` is absent — that is how a params template spells "not this
+/// run". So is a BLANK string root: `profiles::rules_source` reads
+/// `{"profile": "   "}` as no profile at all (a caller who templated an empty
+/// variable must not get a registry lookup for `""`), and a door that read the
+/// same object as a declaration would answer "conflicting modes" where the
+/// resolver answers "inline rules". Two doors, one reading.
+fn root_declared(params: &Value, root: &str) -> bool {
+    match params.get(root) {
+        None | Some(Value::Null) => false,
+        Some(Value::String(s)) => !s.trim().is_empty(),
+        Some(_) => true,
+    }
+}
+
 fn resolve_run_mode(params: &Value) -> std::result::Result<RunMode, String> {
     let declared: Vec<&'static str> = MODE_ROOTS
         .iter()
         .copied()
-        .filter(|k| params.get(*k).is_some_and(|v| !v.is_null()))
+        .filter(|k| root_declared(params, k))
         .collect();
     let conflict = || {
         Err(format!(
@@ -383,6 +404,12 @@ fn resolve_run_mode(params: &Value) -> std::result::Result<RunMode, String> {
     // Inside write mode the two input roots are the exclusive pair: `source`
     // used to win and the `urls` list was never fetched.
     if has("source") && has("urls") {
+        return conflict();
+    }
+    // ...and the two RULE roots are the other exclusive pair. Refused here as
+    // well as in `profiles::rules_source` so the answer is the same whether the
+    // door validated the schema or not.
+    if has("profile") && has("rules") {
         return conflict();
     }
     if has("replay") {
@@ -622,7 +649,7 @@ async fn extract_and_upsert(
     dataset: &str,
     keyed: Vec<SourceDoc>,
     fetch: FetchHealth,
-    rules_hash: Option<&str>,
+    registration: &RulesRegistration,
     echo: usize,
 ) -> Result<ExtractOutcome> {
     // Split keys/meta from bodies without copying the bodies — `keyed` is owned
@@ -669,7 +696,17 @@ async fn extract_and_upsert(
     // Health verdict FIRST, then the write: the state settled here is what the
     // upsert below gates on (trust stamp, quarantine dataset, removal
     // suppression). Judging afterwards would stamp a verdict that did not exist.
-    let verdict = observe(ctx, dataset, &keys, signals, &reported, fetch, &worst).await;
+    let verdict = observe(
+        ctx,
+        dataset,
+        &keys,
+        signals,
+        &reported,
+        fetch,
+        &worst,
+        registration.profile_version,
+    )
+    .await;
 
     // Provenance (M12). `rules_hash` is the batch's honest shared fact: ONE
     // registered RuleSet produced every record here, so stamping it batch-wide
@@ -679,7 +716,7 @@ async fn extract_and_upsert(
     // the batch came from the same URL (a single-URL run, or a Wayback backfill
     // of one page); a mixed batch leaves it Null rather than naming one of many.
     let prov = Provenance {
-        rules_hash: rules_hash.map(str::to_string),
+        rules_hash: registration.hash().map(str::to_string),
         source_url: single_source_url(&metas),
         ..Provenance::default()
     };
@@ -784,6 +821,13 @@ async fn xray_captures(
 struct RulesRegistration {
     hash: Option<String>,
     error: Option<String>,
+    /// Where this run's rules came from, and whether a repair could ever be
+    /// written back to it (`profiles::repairability`). `None` only for the
+    /// read-only modes, which register nothing.
+    origin: Option<Repairability>,
+    /// The `profile_versions` number this run resolved — `None` for inline
+    /// rules, which have no version to stamp.
+    profile_version: Option<i64>,
 }
 
 impl RulesRegistration {
@@ -796,12 +840,23 @@ impl RulesRegistration {
             Ok(hash) => Self {
                 hash: Some(hash),
                 error: None,
+                ..Self::default()
             },
             Err(e) => Self {
                 hash: None,
                 error: Some(e.to_string()),
+                ..Self::default()
             },
         }
+    }
+
+    /// Attaches the rules ORIGIN (N12): what a repair loop could do with this
+    /// run, decided by `pumper_core::resilience::profiles` so the extractor and
+    /// `GET /sources/{id}` can never disagree about it.
+    fn with_origin(mut self, source: &RulesSource, profile_version: Option<i64>) -> Self {
+        self.origin = Some(profiles::repairability(source));
+        self.profile_version = profile_version;
+        self
     }
 
     fn hash(&self) -> Option<&str> {
@@ -815,6 +870,20 @@ impl RulesRegistration {
         map.insert("rules_hash".into(), json!(self.hash));
         if let Some(e) = &self.error {
             map.insert("rules_registration_error".into(), json!(e));
+        }
+        // The migration incentive, stated as a fact about THIS run rather than
+        // as a warning nobody reads: an inline run reports `repairable: false,
+        // repair_reason: "inline rules"`, a profile run names the profile and
+        // the version it executed.
+        if let Some(origin) = &self.origin {
+            map.insert("repairable".into(), json!(origin.repairable));
+            if let Some(reason) = origin.reason {
+                map.insert("repair_reason".into(), json!(reason));
+            }
+            if let Some(profile) = &origin.profile {
+                map.insert("profile".into(), json!(profile));
+                map.insert("profile_version".into(), json!(self.profile_version));
+            }
         }
     }
 }
@@ -928,6 +997,7 @@ impl ExtractOutcome {
 /// Reports this run to the health detector and renders its verdict for the job
 /// result. Best-effort: a detection failure is logged and the run still succeeds,
 /// because health is a derived judgement and must never fail a working scrape.
+#[allow(clippy::too_many_arguments)]
 async fn observe(
     ctx: &AppContext,
     dataset: &str,
@@ -936,6 +1006,7 @@ async fn observe(
     reported: &[(Value, DocReport)],
     fetch: FetchHealth,
     worst: &[Value],
+    profile_version: Option<i64>,
 ) -> Option<Value> {
     if !ctx.health.enabled() {
         return None;
@@ -961,6 +1032,19 @@ async fn observe(
         .collect();
     match ctx.observe_extraction(dataset, &observed, fetch).await {
         Ok(Some(v)) => {
+            // N12: the run row records WHICH profile version produced it, so a
+            // repair can be judged against the rules that actually ran rather
+            // than against whatever is active by the time anyone looks. A run
+            // with inline rules stamps nothing and keeps `profile_version =
+            // NULL`, which means "not profile-backed", not "version zero".
+            if let (Some(version), Some(store)) = (profile_version, ctx.health.store()) {
+                if let Err(e) = store
+                    .stamp_profile_version(&v.source_id, &ctx.job_id.to_string(), version)
+                    .await
+                {
+                    tracing::warn!(source = %v.source_id, "profile version stamp failed: {e}");
+                }
+            }
             if v.state != v.previous_state {
                 tracing::warn!(
                     source = %v.source_id,
@@ -1046,7 +1130,9 @@ impl ScrapeApp for Extractor {
         "Fetch many URLs (or read stored crawl bodies) and extract fields in parallel via a \
          declarative rule set. Params: {\"urls\": [..] OR \"source\": {\"app\": .., \
          \"dataset\": .., \"keys\": [..]?}, \"rules\": {\"field\": {\"type\": \
-         \"css|regex|json|xpath|const\", ..}}, \"strategy\": \"http|browser|auto\", \
+         \"css|regex|json|xpath|const\", ..}} OR \"profile\": \"<name>\" (runs the ACTIVE \
+         version of a named extraction profile; the only origin a repair can be written \
+         back to, never both), \"strategy\": \"http|browser|auto\", \
          \"concurrency\": 16 (max in-flight fetches), \"dataset\": \"extracted\"}. \
          Source mode reads each record's stored body \
          (artifact_path under the origin job's dir) instead of re-fetching; keys default to \
@@ -1090,6 +1176,7 @@ impl ScrapeApp for Extractor {
                         "required": ["replay"],
                         "not": { "anyOf": [
                             { "required": ["induce"] }, { "required": ["rules"] },
+                            { "required": ["profile"] },
                             { "required": ["urls"] },   { "required": ["source"] }
                         ]}
                     },
@@ -1098,23 +1185,36 @@ impl ScrapeApp for Extractor {
                         "required": ["induce"],
                         "not": { "anyOf": [
                             { "required": ["replay"] }, { "required": ["rules"] },
+                            { "required": ["profile"] },
                             { "required": ["urls"] },   { "required": ["source"] }
                         ]}
                     },
                     {
+                        // The rule set arrives as inline `rules` OR as a named
+                        // `profile` — exactly one of them, which is why the
+                        // `not` forbids the pair rather than the `anyOf`
+                        // admitting it.
                         "title": "urls mode (fetch live, write records)",
-                        "required": ["rules", "urls"],
+                        "required": ["urls"],
+                        "anyOf": [
+                            { "required": ["rules"] }, { "required": ["profile"] }
+                        ],
                         "not": { "anyOf": [
                             { "required": ["replay"] }, { "required": ["induce"] },
-                            { "required": ["source"] }
+                            { "required": ["source"] },
+                            { "required": ["rules", "profile"] }
                         ]}
                     },
                     {
                         "title": "source mode (stored bodies, write records)",
-                        "required": ["rules", "source"],
+                        "required": ["source"],
+                        "anyOf": [
+                            { "required": ["rules"] }, { "required": ["profile"] }
+                        ],
                         "not": { "anyOf": [
                             { "required": ["replay"] }, { "required": ["induce"] },
-                            { "required": ["urls"] }
+                            { "required": ["urls"] },
+                            { "required": ["rules", "profile"] }
                         ]}
                     }
                 ],
@@ -1122,7 +1222,12 @@ impl ScrapeApp for Extractor {
                     "rules": {
                         "type": "object",
                         "minProperties": 1,
-                        "description": "Write mode: field -> rule; each rule is {\"type\": \"css|regex|json|xpath|const\", ...type-specific keys}. Pair with exactly one of `urls`/`source`. REFUSED alongside `replay`/`induce`, which carry their own rules."
+                        "description": "Write mode: field -> rule; each rule is {\"type\": \"css|regex|json|xpath|const\", ...type-specific keys}. Pair with exactly one of `urls`/`source`. REFUSED alongside `replay`/`induce`, which carry their own rules, and alongside `profile`, which is the other way to say the same thing. An inline run reports `repairable: false, repair_reason: \"inline rules\"` — nothing refuses it, but there is no versioned entity for a repair to write back to."
+                    },
+                    "profile": {
+                        "type": "string",
+                        "minLength": 1,
+                        "description": "Write mode, profile-backed: the name of an extraction profile; the run executes its ACTIVE version, reports `repairable: true` with `profile`/`profile_version`, and stamps that version onto its source_runs row. The alternative to inline `rules`, never both."
                     },
                     "replay": {
                         "type": "object",
@@ -1435,11 +1540,38 @@ impl ScrapeApp for Extractor {
             RunMode::Induce => return induce::run_induce(&ctx, &mode_object("induce")?).await,
             RunMode::Urls | RunMode::Source => {}
         }
-        let rules_json = ctx
-            .params
-            .get("rules")
-            .cloned()
-            .ok_or_else(|| Error::App("param 'rules' is required".into()))?;
+        // N12 profile door: `{"profile": "<name>"}` runs the registry's ACTIVE
+        // version of a named rule set — the only origin a repair loop can write
+        // back to. Inline `{"rules": {…}}` is not deprecated and keeps working
+        // byte for byte; what changed is that the result now SAYS which of the
+        // two ran and what that means for repair.
+        let origin = profiles::rules_source(&ctx.params).map_err(|c| {
+            Error::App(format!(
+                "params carry BOTH 'profile' ({}) and inline 'rules' — a run extracts with                  exactly one rule set; drop one",
+                c.profile
+            ))
+        })?;
+        let (rules_json, profile_version) = match &origin {
+            RulesSource::Profile { name } => {
+                let (version, rules) = ctx
+                    .datasets
+                    .profile_rules(name, None)
+                    .await?
+                    .ok_or_else(|| {
+                        Error::App(format!(
+                            "extraction profile '{name}' has no active version (create it with                              POST /profiles, or pass inline 'rules')"
+                        ))
+                    })?;
+                (rules, Some(version))
+            }
+            RulesSource::Inline | RulesSource::None => (
+                ctx.params
+                    .get("rules")
+                    .cloned()
+                    .ok_or_else(|| Error::App("param 'rules' (or 'profile') is required".into()))?,
+                None,
+            ),
+        };
         let rules: RuleSet = serde_json::from_value(rules_json.clone())
             .map_err(|e| Error::App(format!("bad rules: {e}")))?;
         // Compile (and validate selectors/regex) once, before the fan-out.
@@ -1452,7 +1584,8 @@ impl ScrapeApp for Extractor {
         // failure must never fail a working extraction — but it IS reported
         // (`rules_hash: null` + `rules_registration_error`), because unstamped
         // revisions are permanently non-replayable.
-        let registration = RulesRegistration::from_outcome(ctx.register_rules(&rules_json).await);
+        let registration = RulesRegistration::from_outcome(ctx.register_rules(&rules_json).await)
+            .with_origin(&origin, profile_version);
         if let Some(e) = &registration.error {
             tracing::warn!("ruleset registration failed, revisions unstamped: {e}");
         }
@@ -1581,7 +1714,7 @@ impl Extractor {
             dataset,
             keyed,
             fetch,
-            registration.hash(),
+            registration,
             parse_records_echo(&ctx.params),
         )
         .await?;
@@ -1815,7 +1948,7 @@ impl Extractor {
             dataset,
             keyed,
             FetchHealth::default(),
-            registration.hash(),
+            registration,
             parse_records_echo(&ctx.params),
         )
         .await?;
@@ -1960,7 +2093,7 @@ impl Extractor {
                     dataset,
                     keyed,
                     FetchHealth::default(),
-                    registration.hash(),
+                    registration,
                     // Backfill has never echoed records and must not start: it
                     // is the mode that fans over a WHOLE archive. Zero here is
                     // also what makes the write path clone-free for it.
@@ -2151,7 +2284,7 @@ impl Extractor {
             dataset,
             keyed,
             fetch,
-            registration.hash(),
+            registration,
             parse_records_echo(&ctx.params),
         )
         .await?;
@@ -2883,8 +3016,9 @@ mod tests {
 
 #[cfg(test)]
 mod run_mode_tests {
-    use super::{resolve_run_mode, RunMode};
-    use serde_json::json;
+    use super::{profiles, resolve_run_mode, Extractor, RulesRegistration, RulesSource, RunMode};
+    use pumper_core::ScrapeApp;
+    use serde_json::{json, Value};
 
     fn rules() -> serde_json::Value {
         json!({ "title": { "type": "css", "selector": "h1" } })
@@ -2945,6 +3079,7 @@ mod run_mode_tests {
     fn every_conflicting_pair_is_refused() {
         let value = |root: &str| match root {
             "rules" => rules(),
+            "profile" => json!("acme-products"),
             "urls" => json!(["https://a/"]),
             "source" => json!({ "app": "crawl", "dataset": "pages" }),
             _ => json!({ "rules": rules() }),
@@ -2954,12 +3089,15 @@ mod run_mode_tests {
         let pairs = [
             ("replay", "induce"),
             ("replay", "rules"),
+            ("replay", "profile"),
             ("replay", "urls"),
             ("replay", "source"),
             ("induce", "rules"),
+            ("induce", "profile"),
             ("induce", "urls"),
             ("induce", "source"),
             ("urls", "source"),
+            ("profile", "rules"),
         ];
         for (a, b) in pairs {
             let params = json!({ a: value(a), b: value(b) });
@@ -2980,5 +3118,99 @@ mod run_mode_tests {
             resolve_run_mode(&json!({ "replay": null, "induce": null })).unwrap(),
             RunMode::Urls
         );
+    }
+
+    // ── N12 profile door ────────────────────────────────────────────────────
+
+    #[test]
+    fn a_profile_run_declares_a_write_mode_exactly_as_inline_rules_do() {
+        // THE REFUTED BEHAVIOR: `profile` was not a mode root, so
+        // `{profile, urls}` resolved to urls mode by falling through the
+        // `rules`-absent branch — and `{profile, replay}` resolved to a
+        // READ-ONLY replay with the profile silently ignored.
+        assert_eq!(
+            resolve_run_mode(&json!({ "profile": "acme", "urls": ["https://a/"] })).unwrap(),
+            RunMode::Urls
+        );
+        assert_eq!(
+            resolve_run_mode(&json!({
+                "profile": "acme",
+                "source": { "app": "crawl", "dataset": "pages" }
+            }))
+            .unwrap(),
+            RunMode::Source
+        );
+        let err = resolve_run_mode(&json!({ "profile": "acme", "replay": { "rules": rules() } }))
+            .expect_err("a profile beside a read-only root is the same confusion as rules");
+        assert!(err.contains("profile") && err.contains("replay"), "{err}");
+    }
+
+    #[test]
+    fn a_profile_run_is_repairable_and_an_inline_run_says_why_not() {
+        let stamp = |params: &Value, version: Option<i64>| {
+            let origin = profiles::rules_source(params).expect("no conflict");
+            let mut out = json!({});
+            RulesRegistration::from_outcome(Ok("sha".into()))
+                .with_origin(&origin, version)
+                .merge_into(&mut out);
+            out
+        };
+        let profiled = stamp(&json!({ "profile": "acme-products" }), Some(7));
+        assert_eq!(profiled["repairable"], true);
+        assert_eq!(profiled["profile"], "acme-products");
+        assert_eq!(
+            profiled["profile_version"], 7,
+            "the version that RAN is reported, not whatever is active by the time anyone looks"
+        );
+        assert!(profiled.get("repair_reason").is_none());
+
+        // The migration incentive: inline keeps working, and the run says what
+        // the system cannot do for it.
+        let inline = stamp(&json!({ "rules": rules() }), None);
+        assert_eq!(inline["repairable"], false);
+        assert_eq!(inline["repair_reason"], "inline rules");
+        assert!(
+            inline.get("profile").is_none() && inline.get("profile_version").is_none(),
+            "an inline run names no profile and stamps no version: {inline}"
+        );
+    }
+
+    #[test]
+    fn profile_and_rules_together_are_refused_not_silently_preferred() {
+        // Both doors agree, so the answer is the same whether the enqueue door
+        // validated the schema or the app resolved the mode itself.
+        assert!(profiles::rules_source(&json!({ "profile": "acme", "rules": rules() })).is_err());
+        assert!(resolve_run_mode(&json!({
+            "profile": "acme",
+            "rules": rules(),
+            "urls": ["https://a/"]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn a_blank_profile_is_absent_not_a_lookup_for_the_empty_name() {
+        // A params template with an unfilled variable must fall through to the
+        // inline answer rather than asking the registry for profile "".
+        let params = json!({ "profile": "   ", "rules": rules(), "urls": ["https://a/"] });
+        assert_eq!(
+            profiles::rules_source(&params).expect("blank profile is not a conflict"),
+            RulesSource::Inline
+        );
+        assert_eq!(resolve_run_mode(&params).unwrap(), RunMode::Urls);
+    }
+
+    #[test]
+    fn the_manifest_schema_admits_a_profile_run_and_refuses_the_pair() {
+        let schema = Extractor.manifest().params_schema.expect("declared");
+        let validator = jsonschema::validator_for(&schema).expect("schema compiles");
+        let ok = |p: Value| assert!(validator.is_valid(&p), "must validate: {p}");
+        let bad = |p: Value| assert!(!validator.is_valid(&p), "must be refused: {p}");
+        ok(json!({ "profile": "acme", "urls": ["https://a/"] }));
+        ok(json!({ "profile": "acme", "source": { "app": "crawl", "dataset": "pages" } }));
+        ok(json!({ "rules": rules(), "urls": ["https://a/"] }));
+        bad(json!({ "profile": "acme", "rules": rules(), "urls": ["https://a/"] }));
+        bad(json!({ "profile": "acme", "replay": { "rules": rules() } }));
+        bad(json!({ "urls": ["https://a/"] }));
     }
 }

@@ -127,6 +127,26 @@ It fires only on a hop that was actually **created**: a hop suppressed by the
 idempotency key, or refused by the target's params schema, never reaches it.
 That makes it "a job now exists", not "the trigger fired".
 
+### Shaping (`transform`) vs binding (`bind`/`each`)
+
+These two look like the same lever and are not, so pick by what you are trying
+to move:
+
+| | `transform` plugin (here) | `bind` / `each` ([triggers.md](triggers.md#param-binding-and-fan-out)) |
+| --- | --- | --- |
+| What it changes | the `_trigger` **payload** the hop carries | the hop's **params** (and how many hops there are) |
+| Where it runs | sandboxed WASM, fuel- and memory-bounded | in the host, declaratively, from JSON pointers |
+| Failure posture | fail-open — a broken transform leaves the payload untouched | `bind_miss`: the hop is **not** enqueued, with the pointer named |
+| Can it change the work scope? | **No.** `keys`/`keys_truncated` are re-added by the host afterwards | Yes — that is the point; a bound param is the target's input |
+| Order | runs first, on the pre-bind envelope | resolves against the **transformed** envelope, before the target-schema door |
+
+A transform is for *less payload* (drop what a downstream sink must not see, cut
+a 5 MB delta to the two fields a webhook needs). A bind is for *a different job*
+(lift a URL out of the event and hand it to `extractor` as `params.url`, or fan
+one event into a hop per record). Reaching for a transform to set a param is the
+mistake this table exists to prevent: the payload it shapes is not what the
+target runs on, and the host will re-add exactly the fields you removed.
+
 `keep` shapes the **payload**, never the target's work scope: `keys` and
 `keys_truncated` are re-added by the host afterwards. (This example used to be a
 live footgun — pairing `target_app: extractor` with a keep-list that omits `keys`

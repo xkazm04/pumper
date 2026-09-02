@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use serde_json::Value;
@@ -108,6 +108,17 @@ pub struct AppContext {
     /// (serve every fetch/research from a prior job's cassette — a MISS is a
     /// typed error, never a silent live fetch; replay spends $0).
     pub vcr: crate::vcr::Vcr,
+    /// Schedules this run has ASKED the runtime to create
+    /// ([`request_schedule`](Self::request_schedule)), drained by the worker's
+    /// post-run fan-out. An app has no schedule-writing seam of its own on
+    /// purpose: a schedule is a standing commitment, and the runtime owns the
+    /// ownership tag, the cap and the fence.
+    pub schedule_requests: Arc<Mutex<Vec<Value>>>,
+    /// Per-run ceiling on [`request_schedule`](Self::request_schedule)
+    /// (`[worker] max_app_schedules_per_run`). A run that asks for more is
+    /// told `false` at the seam rather than having the surplus dropped
+    /// silently after it finished.
+    pub max_schedule_requests: usize,
     pub artifacts_dir: PathBuf,
 }
 
@@ -125,6 +136,40 @@ impl AppContext {
     /// write means re-doing real work on resume.
     pub async fn checkpoint_now(&self, state: Value) -> bool {
         self.checkpoints.save(state, true).await
+    }
+
+    /// Asks the runtime to create a schedule after this run
+    /// (a `POST /schedules`-shaped body: `{app, cron, params?}`).
+    ///
+    /// Apps do not write schedules themselves: the runtime owns the ownership
+    /// tag (`app:<name>`), the per-run cap and the fence, and it applies the
+    /// requests only once the run has finished. Returns `false` when the run
+    /// has already used its `[worker] max_app_schedules_per_run` budget — a
+    /// caller that cares reports the cut (`*_truncated`) rather than letting
+    /// the surplus vanish.
+    pub fn request_schedule(&self, body: Value) -> bool {
+        let Ok(mut pending) = self.schedule_requests.lock() else {
+            return false;
+        };
+        if pending.len() >= self.max_schedule_requests {
+            return false;
+        }
+        pending.push(body);
+        true
+    }
+
+    /// Takes the schedules this run asked for, leaving the list empty.
+    ///
+    /// The worker does not go through here: the context has moved into `run()`
+    /// by the time its fan-out drains, so it holds a clone of
+    /// [`schedule_requests`](Self::schedule_requests) instead. This is the
+    /// equivalent for an embedder that drives an `AppContext` itself and owns
+    /// the post-run step.
+    pub fn take_schedule_requests(&self) -> Vec<Value> {
+        self.schedule_requests
+            .lock()
+            .map(|mut p| std::mem::take(&mut *p))
+            .unwrap_or_default()
     }
 
     /// The last checkpoint persisted by a prior attempt of this job, if any.
@@ -801,6 +846,152 @@ impl AppContext {
     }
 }
 
+// ── app-declared schedules (N25 / P.4) ──────────────────────────────────────
+
+/// One schedule an app asked the runtime to create, already validated.
+///
+/// `managed_by` is `app:<name>` and is set HERE, never by the app: it is the
+/// ownership fence every managed write is made under
+/// (`Storage::upsert_managed_schedule`), which is what stops an app-declared
+/// row from overwriting a hand-made schedule that happens to share an id.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScheduleRequest {
+    pub id: String,
+    pub app: String,
+    pub cron: String,
+    pub params: Value,
+    pub managed_by: String,
+}
+
+/// The `managed_by` tag for schedules an app declared.
+pub fn app_managed_by(requested_by: &str) -> String {
+    format!("app:{requested_by}")
+}
+
+/// Validates one app-declared `POST /schedules`-shaped body and derives the row
+/// the runtime will write.
+///
+/// THE ANTI-PATTERN THIS CLOSES: an app with no schedule-writing seam
+/// (N25 `research`) emitted `watch_requests[]` — ready-to-POST bodies a human
+/// was supposed to notice and replay by hand. Nothing created them, so
+/// `watch_sources: true` produced a list and no watches.
+///
+/// The id is DERIVED, content-addressed over `(requesting app, target app,
+/// cron, params)`, so re-running the same job re-syncs the same row instead of
+/// minting a duplicate schedule every night. `enabled` is not taken from the
+/// body: an app-declared schedule is created running, and an operator disables
+/// it through the ordinary `/schedules` surface.
+pub fn schedule_request(
+    requested_by: &str,
+    body: &Value,
+) -> std::result::Result<ScheduleRequest, String> {
+    let app = body
+        .get("app")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| "a schedule request needs a non-empty 'app'".to_string())?;
+    let cron = body
+        .get("cron")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|c| !c.is_empty())
+        .ok_or_else(|| format!("the schedule request for '{app}' has no 'cron'"))?;
+    // Parsed, not shape-checked: a cron the scheduler cannot read would be
+    // stored as a schedule that never fires — indistinguishable from one that
+    // fires and finds nothing.
+    <cron::Schedule as std::str::FromStr>::from_str(cron)
+        .map_err(|e| format!("the schedule request for '{app}' has an invalid cron: {e}"))?;
+    let params = match body.get("params") {
+        None | Some(Value::Null) => Value::Object(Default::default()),
+        Some(v @ Value::Object(_)) => v.clone(),
+        Some(_) => {
+            return Err(format!(
+                "the schedule request for '{app}' has non-object params"
+            ))
+        }
+    };
+    let digest = {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(requested_by.as_bytes());
+        h.update(
+            b"
+",
+        );
+        h.update(app.as_bytes());
+        h.update(
+            b"
+",
+        );
+        h.update(cron.as_bytes());
+        h.update(
+            b"
+",
+        );
+        h.update(crate::mesh::canonical_json(&params).as_bytes());
+        hex::encode(&h.finalize()[..8])
+    };
+    Ok(ScheduleRequest {
+        id: format!("app-{requested_by}-{digest}"),
+        app: app.to_string(),
+        cron: cron.to_string(),
+        params,
+        managed_by: app_managed_by(requested_by),
+    })
+}
+
+/// What the post-run fan-out did with a run's schedule requests. Every number
+/// is reported rather than logged: a request that was refused is the operator's
+/// business, not a warn line on a box nobody reads.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScheduleRequestOutcome {
+    /// Rows written or re-synced.
+    pub created: usize,
+    /// Requests refused because the body was unusable, with the reason.
+    pub rejected: Vec<String>,
+    /// Requests dropped because an existing row with that id is owned by
+    /// somebody else — the ownership fence held.
+    pub not_owned: usize,
+}
+
+/// Applies a run's schedule requests, fenced on `managed_by = "app:<name>"`.
+///
+/// Cap is applied here as well as at the seam so a caller that reaches this
+/// function another way cannot write an unbounded number of standing
+/// commitments out of one job.
+pub async fn apply_schedule_requests(
+    storage: &crate::storage::Storage,
+    requested_by: &str,
+    requests: &[Value],
+    cap: usize,
+) -> ScheduleRequestOutcome {
+    let mut out = ScheduleRequestOutcome::default();
+    for body in requests.iter().take(cap) {
+        match schedule_request(requested_by, body) {
+            Err(why) => out.rejected.push(why),
+            Ok(req) => {
+                match storage
+                    .upsert_managed_schedule(
+                        &req.id,
+                        &req.app,
+                        &req.cron,
+                        &req.params,
+                        true,
+                        &req.managed_by,
+                    )
+                    .await
+                {
+                    Ok(true) => out.created += 1,
+                    Ok(false) => out.not_owned += 1,
+                    Err(e) => out.rejected.push(format!("schedule write failed: {e}")),
+                }
+            }
+        }
+    }
+    out
+}
+
 /// This build's identity, stamped on every run row so a fleet-wide break
 /// correlates with a deploy in one query instead of looking like thirty sites
 /// changing on the same day. `PUMPER_BUILD_ID` when set (a commit sha in CI),
@@ -1098,9 +1289,10 @@ pub trait ScrapeApp: Send + Sync {
 #[cfg(test)]
 mod tests {
     use super::{
-        budget_exhausted_error, budget_is_exhausted, fetch_cost_detail, router_pin,
-        safe_path_segment, success_spend_event, FetchOutcome, RouterPin,
+        app_managed_by, budget_exhausted_error, budget_is_exhausted, fetch_cost_detail, router_pin,
+        safe_path_segment, schedule_request, success_spend_event, FetchOutcome, RouterPin,
     };
+    use serde_json::json;
 
     fn outcome(escalations: &[&str], snapshot: Option<(&str, Option<&str>)>) -> FetchOutcome {
         FetchOutcome {
@@ -1327,5 +1519,88 @@ mod tests {
         for ok in ["page-0001.html", "grants-gov", "a.b_c-d", "café", ".hidden"] {
             assert!(safe_path_segment(ok, "test").is_ok(), "must accept {ok:?}");
         }
+    }
+
+    // ── app-declared schedules (P.4) ────────────────────────────────────────
+
+    #[test]
+    fn an_app_declared_schedule_is_owned_by_the_app_that_asked_for_it() {
+        let req = schedule_request(
+            "research",
+            &json!({"app": "watch", "cron": "0 0 6 * * *", "params": {"url": "https://a/"}}),
+        )
+        .expect("a well-formed body");
+        assert_eq!(req.app, "watch", "the TARGET app, not the requester");
+        assert_eq!(req.managed_by, app_managed_by("research"));
+        assert_eq!(
+            req.managed_by, "app:research",
+            "the fence tag is set by the runtime, never taken from the body"
+        );
+        assert_eq!(req.params["url"], "https://a/");
+        // The body cannot smuggle its own ownership or id past the fence.
+        let forged = schedule_request(
+            "research",
+            &json!({
+                "app": "watch", "cron": "0 0 6 * * *",
+                "managed_by": "catalog", "id": "catalog-watch"
+            }),
+        )
+        .expect("opens");
+        assert_eq!(forged.managed_by, "app:research");
+        assert_ne!(forged.id, "catalog-watch");
+    }
+
+    #[test]
+    fn the_same_request_twice_is_one_row_not_a_schedule_per_night() {
+        // THE REFUTED BEHAVIOR a random id would have: a nightly research run
+        // asking to watch the same URL would mint a new schedule every night.
+        let body = json!({"app": "watch", "cron": "0 0 6 * * *", "params": {"url": "https://a/"}});
+        let a = schedule_request("research", &body).expect("ok");
+        let b = schedule_request("research", &body).expect("ok");
+        assert_eq!(a.id, b.id);
+        // …and a DIFFERENT target is a different row.
+        let other = schedule_request(
+            "research",
+            &json!({"app": "watch", "cron": "0 0 6 * * *", "params": {"url": "https://b/"}}),
+        )
+        .expect("ok");
+        assert_ne!(a.id, other.id);
+        // Params compare canonically: key order is not a new schedule.
+        let reordered = schedule_request(
+            "research",
+            &json!({"params": {"url": "https://a/"}, "cron": "0 0 6 * * *", "app": "watch"}),
+        )
+        .expect("ok");
+        assert_eq!(a.id, reordered.id);
+        // The requester is part of the identity: two apps asking for the same
+        // watch own their own rows rather than fighting over one.
+        assert_ne!(a.id, schedule_request("watch", &body).expect("ok").id);
+    }
+
+    #[test]
+    fn an_unreadable_cron_is_refused_not_stored_as_a_schedule_that_never_fires() {
+        let err = schedule_request(
+            "research",
+            &json!({"app": "watch", "cron": "every tuesday"}),
+        )
+        .expect_err("must refuse");
+        assert!(err.contains("invalid cron"), "{err}");
+        assert!(schedule_request("research", &json!({"app": "watch"})).is_err());
+        assert!(schedule_request("research", &json!({"cron": "0 0 6 * * *"})).is_err());
+        assert!(
+            schedule_request("research", &json!({"app": "  ", "cron": "0 0 6 * * *"})).is_err()
+        );
+        assert!(schedule_request(
+            "research",
+            &json!({"app": "watch", "cron": "0 0 6 * * *", "params": "not an object"})
+        )
+        .is_err());
+        // Absent params is not an error — it is the empty object.
+        assert_eq!(
+            schedule_request("research", &json!({"app": "watch", "cron": "0 0 6 * * *"}))
+                .expect("ok")
+                .params,
+            json!({})
+        );
     }
 }

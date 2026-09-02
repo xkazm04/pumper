@@ -45,27 +45,17 @@
 //! watch AND every matching native subscription. One event, one code path, and
 //! a watch that has been disabled for a day resumes from its own cursor.
 
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
-
 use pumper_core::{EventRecord, Subscription, Watch};
 use serde_json::{json, Value};
 use tracing::warn;
 
 use crate::state::AppState;
 
-/// Log rows are pruned at most this often. The drain runs on every scheduler
-/// tick; a `DELETE` scan per tick would be retention as a hot loop.
-const PRUNE_INTERVAL: Duration = Duration::from_secs(3600);
-
 /// Pages one drain call will walk per subscription before leaving the rest to
 /// the next tick. Bounds a catch-up: a subscription re-enabled after a week
 /// works through its backlog over several ticks instead of queueing the whole
 /// log onto the delivery pool at once.
 const MAX_PAGES_PER_TICK: usize = 20;
-
-/// When the log was last pruned, process-wide.
-static LAST_PRUNE: Mutex<Option<Instant>> = Mutex::new(None);
 
 /// Serializes drain passes process-wide.
 ///
@@ -353,7 +343,6 @@ pub async fn drain(state: &AppState) {
     for target in targets {
         drain_target(state, target).await;
     }
-    prune_log(state).await;
 }
 
 /// Every enabled push target: native subscriptions plus watch adapters.
@@ -490,33 +479,6 @@ fn delivery_payload(target: &Target, event: &EventRecord) -> Value {
         "created_at": event.created_at,
         "payload": event.payload,
     })
-}
-
-/// Prunes the log past `[events] log_retention_days`, at most hourly.
-///
-/// Lives here rather than in `main.rs`'s retention janitor because the drain is
-/// the loop that owns this table, and because the janitor returns immediately
-/// unless one of ITS knobs is enabled — a default deployment would never prune.
-async fn prune_log(state: &AppState) {
-    let days = state.config.events.log_retention_days;
-    if days <= 0 {
-        return;
-    }
-    {
-        let mut last = match LAST_PRUNE.lock() {
-            Ok(last) => last,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if last.is_some_and(|t| t.elapsed() < PRUNE_INTERVAL) {
-            return;
-        }
-        *last = Some(Instant::now());
-    }
-    match state.storage.prune_events(days).await {
-        Ok(0) => {}
-        Ok(n) => tracing::info!(pruned = n, retention_days = days, "event log pruned"),
-        Err(e) => warn!("event log prune failed: {e}"),
-    }
 }
 
 #[cfg(test)]

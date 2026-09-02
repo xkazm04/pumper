@@ -610,10 +610,18 @@ otherwise would be the dishonest part of the design.
 > and is it therefore repairable — is `resilience::profiles::rules_source` +
 > `repairability`.
 >
-> **Not yet wired into the `extractor` app's params door**: `POST
-> /apps/extractor/jobs {"profile": …}` is not accepted yet, so today the
-> registry is written by the `repair` app (§6) and by direct store calls.
-> Everything an existing job does is byte-for-byte unchanged.
+> **Wired into the `extractor` app (P.2, wave 4).** `POST /apps/extractor/jobs
+> {"profile": "<name>", "urls": [...]}` — and the same with `source` — is
+> accepted wherever `rules` is: the run resolves the profile's ACTIVE version
+> through `profiles::rules_source`, executes it, stamps that number onto its
+> `source_runs` row (`HealthStore::stamp_profile_version`) and reports
+> `repairable: true` with `profile` + `profile_version` in the job result. An
+> inline-`rules` run is unchanged byte for byte and reports `repairable: false,
+> repair_reason: "inline rules"`. `profile` and `rules` together are refused at
+> both doors (the manifest schema, and `resolve_run_mode` for the doors that do
+> not validate) rather than resolved by precedence, and a blank `profile`
+> string reads as absent at both — the same reading `rules_source` gives it.
+> A `profile` with no active version is an `Error::App` naming the profile.
 
 Today a `RuleSet` is a **job parameter**. It has no identity, no version, and no
 home — it arrives in `POST /apps/extractor/jobs` or sits inside a `schedules`

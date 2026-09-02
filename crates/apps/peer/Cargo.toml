@@ -9,7 +9,5 @@ async-trait.workspace = true
 chrono.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-# Mesh envelopes (N16): the signature check and the dataset live-set digest.
-ring.workspace = true
-sha2.workspace = true
-hex.workspace = true
+# The mesh wire format (N16) moved to `pumper_core::mesh`; the crypto and hex
+# dependencies moved with it.

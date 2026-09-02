@@ -8,10 +8,18 @@ use serde_json::{json, Value};
 ///   1. create a crate under `crates/apps/<name>` implementing `ScrapeApp`
 ///   2. add it to `[workspace.dependencies]` and the server's Cargo.toml
 ///   3. add one line here
-pub fn apps() -> Vec<Arc<dyn ScrapeApp>> {
+///
+/// `config` is the operator's loaded config, so an app that owns a `[section]`
+/// is CONSTRUCTED with it. Before this, `apps()` took nothing, and an app could
+/// only reach an operator key through a per-run job param — which is how
+/// `[research] max_watched_sources` sat in `config.toml` binding nothing while
+/// the run capped at the shipped default. Most apps take no section and are
+/// registered exactly as before; the ones that do read theirs off `self` in
+/// `run()`, never from a global.
+pub fn apps(config: &pumper_core::Config) -> Vec<Arc<dyn ScrapeApp>> {
     vec![
         Arc::new(app_hackernews::HackerNews),
-        Arc::new(app_research::Research),
+        Arc::new(app_research::Research::with_config(&config.research)),
         Arc::new(app_connector_api_watch::ConnectorApiWatch),
         Arc::new(app_readable::Readable),
         Arc::new(app_watch::Watch),
@@ -809,7 +817,10 @@ mod virtual_namespace_tests {
     use std::collections::BTreeSet;
 
     fn registered() -> BTreeSet<&'static str> {
-        apps().iter().map(|a| a.name()).collect()
+        apps(&pumper_core::Config::default())
+            .iter()
+            .map(|a| a.name())
+            .collect()
     }
 
     /// The drift this pins: a seed entry survives a rename or a removal of the
@@ -852,7 +863,7 @@ mod virtual_namespace_tests {
     /// every namespace that actually holds a record.)
     #[test]
     fn a_namespace_never_names_a_publisher_that_writes_nothing_into_it() {
-        let apps = apps();
+        let apps = apps(&pumper_core::Config::default());
         for ns in VIRTUAL_NAMESPACES {
             for publisher in ns.publishers {
                 let app = apps
@@ -923,7 +934,7 @@ mod manifest_tests {
     #[test]
     fn every_manifest_example_passes_its_own_schema() {
         let mut rich = 0;
-        for app in apps() {
+        for app in apps(&pumper_core::Config::default()) {
             let manifest = app.manifest();
             let Some(schema) = &manifest.params_schema else {
                 assert!(
@@ -966,7 +977,7 @@ mod manifest_tests {
     /// must satisfy it, or the schedule breaks itself.
     #[test]
     fn scheduled_apps_default_params_pass_their_schema() {
-        for app in apps() {
+        for app in apps(&pumper_core::Config::default()) {
             if app.schedule().is_none() {
                 continue;
             }

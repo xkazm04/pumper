@@ -797,6 +797,8 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
         // the budget governor then serves free tiers only (reversible pause).
         budget_usd: crate::datahub::effective_budget(&state, &job.app, job.budget_usd),
         spent_usd: std::sync::Arc::new(pumper_core::SpentTotal::new(spent_seed)),
+        schedule_requests: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+        max_schedule_requests: state.config.worker.max_app_schedules_per_run,
         research_cache: state.research_cache.clone(),
         tiers: state.tiers.clone(),
         health: state.health.clone(),
@@ -832,6 +834,10 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     // heartbeat branch above is ever reached and no unwind happens at all. The
     // heartbeat goes stale and the reaper (`reap_once`) remains the backstop for
     // that class — as it does for a hard abort (`process::exit`, OOM, SIGKILL).
+    // P.4: the handle to whatever schedules the run asks for
+    // (`AppContext::request_schedule`), cloned before the context moves into
+    // the app.
+    let schedule_requests = ctx.schedule_requests.clone();
     let run = futures::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(app.run(ctx)));
     install_panic_location_hook();
     tokio::pin!(run);
@@ -873,6 +879,40 @@ async fn execute(state: AppState, job: Job, cancel: tokio_util::sync::Cancellati
     // a cancellation; every other outcome leaves the registry untouched.
     let cancelled_by = matches!(outcome, Outcome::Cancelled)
         .then(|| resolve_cancel(job.id, state.shutdown.is_cancelled()));
+
+    // P.4 post-run fan-out: turn the run's schedule REQUESTS into real
+    // `managed_by = "app:<name>"` rows. Only for a run that finished OK — a
+    // panicked, timed-out or cancelled attempt will be retried, and minting
+    // standing commitments out of an attempt that did not conclude is how one
+    // flapping job creates a schedule per retry.
+    if matches!(outcome, Outcome::Finished(Ok(_))) {
+        let requests = schedule_requests
+            .lock()
+            .map(|mut p| std::mem::take(&mut *p))
+            .unwrap_or_default();
+        if !requests.is_empty() {
+            let applied = pumper_core::app::apply_schedule_requests(
+                &state.storage,
+                &job.app,
+                &requests,
+                state.config.worker.max_app_schedules_per_run,
+            )
+            .await;
+            for why in &applied.rejected {
+                warn!(job = %job.id, app = %job.app, "app-declared schedule refused: {why}");
+            }
+            if applied.created > 0 || applied.not_owned > 0 {
+                info!(
+                    job = %job.id,
+                    app = %job.app,
+                    created = applied.created,
+                    not_owned = applied.not_owned,
+                    requested = requests.len(),
+                    "applied app-declared schedules"
+                );
+            }
+        }
+    }
 
     match outcome {
         // A shutdown does NOT by itself mean suspend: an operator's `DELETE
