@@ -4894,4 +4894,21 @@ impl Storage {
         .await?;
         Ok(rows.into_iter().map(|(id,)| id).collect())
     }
+
+    /// `(workflow_run_id, root_id)` for one job — where it sits in a chain.
+    ///
+    /// Both columns are written at enqueue (N03) but neither is loaded into
+    /// [`Job`], because nothing on the hot path needs them. Lineage does: it is
+    /// what turns a workflow's twenty step jobs into one story in a downstream
+    /// catalog instead of twenty unrelated runs. A missing job answers
+    /// `(None, None)` rather than erroring — an emitter must never be able to
+    /// fail because a job row was reaped underneath it.
+    pub async fn job_chain_ids(&self, id: Uuid) -> Result<(Option<String>, Option<String>)> {
+        let row: Option<(Option<String>, Option<String>)> =
+            sqlx::query_as("SELECT workflow_run_id, root_id FROM jobs WHERE id = ?1")
+                .bind(id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.unwrap_or((None, None)))
+    }
 }

@@ -46,6 +46,10 @@ pub struct Config {
     pub peer: Vec<PeerConfig>,
     /// N01 Transact v2: the live-submission gate. Default OFF.
     pub transact: TransactConfig,
+    /// N24 vendor-neutral lineage: the OpenLineage writer plus the quality and
+    /// external-source aspects both writers can carry. Every key defaults to
+    /// off, so a build without this section emits exactly what it emits today.
+    pub lineage: LineageConfig,
 }
 
 /// Quiet-window maintenance: when the store's housekeeping is allowed to run.
@@ -3280,5 +3284,154 @@ impl TransactConfig {
     /// `None` for "no cap".
     pub fn daily_cap(&self) -> Option<i64> {
         (self.max_submits_per_profile_per_day > 0).then_some(self.max_submits_per_profile_per_day)
+    }
+}
+
+/// N24 — vendor-neutral lineage.
+///
+/// Pumper's metadata push has been DataHub-shaped from the start: entities are
+/// built straight into DataHub's v1 ingestion envelope, so a second catalog
+/// meant a second emitter. This section turns on the other half — a writer that
+/// speaks [OpenLineage](https://openlineage.io) `RunEvent`s, which Marquez,
+/// Dagster, Airflow, Atlan and OpenMetadata all consume — and the two classes of
+/// fact Pumper already knows but never pushed: its own quality verdicts, and the
+/// external `[[source]]` rows its data actually comes from.
+///
+/// **Everything here is off by default and the defaults are load-bearing.** With
+/// no `[lineage]` section the DataHub emitter produces byte-for-byte the entity
+/// set it produced before N24: `openlineage_url` unset means no second writer,
+/// `emit_quality` off means no assertion/tag aspects, `emit_sources` off means
+/// column lineage keeps its honest `upstreamType: NONE`. Turning a key on is an
+/// operator saying "yes, push more".
+///
+/// The writers share the emitter's **no-retry** posture (see
+/// `docs/features/datahub.md`): a failed post is recorded per writer on
+/// `GET /datahub/status` (`lineage.writers[]`) and healed by the next run, never
+/// queued. Two writers double the failure surface, so they are reported apart —
+/// a green DataHub must not hide a dead Marquez.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct LineageConfig {
+    /// Base URL of an OpenLineage HTTP receiver (Marquez: `http://localhost:5000`).
+    /// Empty/unset = the OpenLineage writer is off and posts nothing.
+    ///
+    /// The standard OpenLineage HTTP transport path `/api/v1/lineage` is
+    /// appended unless the URL already ends in `/lineage`, so both a bare host
+    /// and a fully-qualified endpoint work.
+    pub openlineage_url: Option<String>,
+    /// OpenLineage job/dataset namespace for this node. One namespace per
+    /// Pumper deployment is the intended granularity.
+    pub namespace: String,
+    /// Bearer token for the receiver. Falls back to the `OPENLINEAGE_API_KEY`
+    /// env var so the secret can live in `.env`.
+    pub api_key: Option<String>,
+    /// Model each catalog `[[source]]` as an external upstream entity: an
+    /// OpenLineage input dataset in the `web` namespace, a DataHub dataset URN
+    /// on platform `web`, and — the point — the fine-grained column lineage
+    /// stops claiming `upstreamType: NONE` and names the source it came from.
+    ///
+    /// Off by default because it adds entities to whatever catalog is
+    /// connected; nothing about it is irreversible.
+    pub emit_sources: bool,
+    /// Push what Pumper already judged: the latest data-contract verdict for a
+    /// dataset becomes an OpenLineage `dataQualityAssertions` entry and a
+    /// DataHub `assertionRunEvent`, and extraction-health state + trust tier
+    /// become `globalTags` / an OpenLineage `tags` facet.
+    ///
+    /// Off by default for the same reason as `emit_sources`: it is additional
+    /// writes to someone else's catalog.
+    pub emit_quality: bool,
+}
+
+impl Default for LineageConfig {
+    fn default() -> Self {
+        Self {
+            openlineage_url: None,
+            namespace: "pumper".into(),
+            api_key: None,
+            emit_sources: false,
+            emit_quality: false,
+        }
+    }
+}
+
+impl LineageConfig {
+    /// The OpenLineage receiver endpoint, or `None` when the writer is off.
+    ///
+    /// Extracted (rather than inlined at the post site) because "is the writer
+    /// on?" and "where does it post?" are the same question, and a status route
+    /// that answers it differently from the writer is how a bridge reports
+    /// healthy while posting nowhere.
+    pub fn endpoint(&self) -> Option<String> {
+        let base = self
+            .openlineage_url
+            .as_deref()?
+            .trim()
+            .trim_end_matches('/');
+        if base.is_empty() {
+            return None;
+        }
+        if base.ends_with("/lineage") {
+            Some(base.to_string())
+        } else {
+            Some(format!("{base}/api/v1/lineage"))
+        }
+    }
+
+    /// Config key, else `OPENLINEAGE_API_KEY` from the environment.
+    pub fn resolve_api_key(&self) -> Option<String> {
+        self.api_key.clone().filter(|t| !t.is_empty()).or_else(|| {
+            std::env::var("OPENLINEAGE_API_KEY")
+                .ok()
+                .filter(|t| !t.is_empty())
+        })
+    }
+}
+
+#[cfg(test)]
+mod lineage_config_tests {
+    use super::LineageConfig;
+
+    #[test]
+    fn an_unset_url_is_a_writer_that_is_off_not_a_post_to_nowhere() {
+        let mut cfg = LineageConfig::default();
+        assert_eq!(cfg.endpoint(), None);
+        cfg.openlineage_url = Some(String::new());
+        assert_eq!(cfg.endpoint(), None);
+        cfg.openlineage_url = Some("   ".into());
+        assert_eq!(cfg.endpoint(), None);
+    }
+
+    #[test]
+    fn endpoint_appends_the_transport_path_once_not_twice() {
+        let ep = |u: &str| {
+            LineageConfig {
+                openlineage_url: Some(u.into()),
+                ..Default::default()
+            }
+            .endpoint()
+        };
+        assert_eq!(
+            ep("http://localhost:5000"),
+            Some("http://localhost:5000/api/v1/lineage".into())
+        );
+        assert_eq!(
+            ep("http://localhost:5000/"),
+            Some("http://localhost:5000/api/v1/lineage".into())
+        );
+        // Already a full endpoint: appending again would 404 silently.
+        assert_eq!(
+            ep("http://localhost:5000/api/v1/lineage"),
+            Some("http://localhost:5000/api/v1/lineage".into())
+        );
+    }
+
+    #[test]
+    fn defaults_are_off_so_master_emits_what_it_emitted_before() {
+        let cfg = LineageConfig::default();
+        assert_eq!(cfg.endpoint(), None);
+        assert!(!cfg.emit_sources);
+        assert!(!cfg.emit_quality);
+        assert_eq!(cfg.namespace, "pumper");
     }
 }

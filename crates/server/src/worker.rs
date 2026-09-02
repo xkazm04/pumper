@@ -2111,6 +2111,10 @@ async fn finalize_with_stages(
     // the global `[webhooks] failure_url` subscriber, if configured. Retryable
     // requeues never reach `finalize`, so this is permanent failures only.
     if job.status == JobStatus::Failed {
+        // N24: the other terminal outcome a lineage consumer needs. DataHub is
+        // deliberately not written here — a failed run refreshed no dataset —
+        // so this is the OpenLineage writer only, and a no-op without it.
+        crate::datahub::on_job_failure(state, &job).await;
         if let Some(url) = &state.config.webhooks.failure_url {
             webhook::dispatch_failure(
                 state,

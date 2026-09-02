@@ -136,6 +136,11 @@ pub struct AppState {
     /// failure — that hid flapping), and the full-sync overlap flag. Surfaced on
     /// `GET /datahub/status`. In-memory only — emission is best-effort telemetry.
     pub datahub_last: crate::datahub::StatusCell,
+    /// N24 OpenLineage emission history, kept APART from `datahub_last`. Two
+    /// writers double the failure surface, and one merged slot is exactly how a
+    /// healthy DataHub would hide a dead OpenLineage receiver. Surfaced on
+    /// `GET /datahub/status` → `lineage.writers[]`.
+    pub lineage_last: crate::datahub::StatusCell,
     /// M26 governance state: `cost:pause`d apps + last poll summary, surfaced on
     /// `GET /datahub/status`. In-memory only — re-derived from DataHub each poll.
     pub datahub_govern: crate::datahub::GovernCell,
@@ -266,6 +271,7 @@ impl AppState {
             job_cancels: Arc::new(std::sync::Mutex::new(HashMap::new())),
             metrics_cache: Arc::new(tokio::sync::Mutex::new(None)),
             datahub_last: Arc::new(std::sync::Mutex::new(Default::default())),
+            lineage_last: Arc::new(std::sync::Mutex::new(Default::default())),
             datahub_govern: Default::default(),
             contract_verdicts: Arc::new(std::sync::Mutex::new(HashMap::new())),
             plugin_missing_reported: Arc::new(tokio::sync::Mutex::new(

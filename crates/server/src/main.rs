@@ -5,6 +5,8 @@ mod datahub;
 mod e2e;
 mod events;
 mod fanout;
+// N24: the vendor-neutral run/quality model both catalog writers render.
+mod lineage;
 mod maintenance;
 mod mcp;
 // N16: node identity (the ed25519 keypair mesh bundles are signed with).
