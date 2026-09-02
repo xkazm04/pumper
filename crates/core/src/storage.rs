@@ -90,6 +90,17 @@ pub struct EnqueueOptions {
     /// complement of `trigger_id` (which trigger) and what makes "the hops this
     /// run caused" an index seek rather than a scan of the jobs table.
     pub source_job_id: Option<String>,
+    /// N03: the workflow run this job is a step of. `None` for every ordinary
+    /// job — a workflow is a *forward* declaration, so the absence of a run id
+    /// is the honest statement that nothing declared this work in advance.
+    pub workflow_run_id: Option<String>,
+    /// N03: the step name inside that run's spec. Always set together with
+    /// `workflow_run_id`; the pair is the cell in `workflow_steps`.
+    pub workflow_step: Option<String>,
+    /// N03: the chain's correlation id — the workflow run id for a step job.
+    /// Kept distinct from `workflow_run_id` so a future non-workflow chain can
+    /// share the same key without pretending to be a declared plan.
+    pub root_id: Option<String>,
 }
 
 /// A standing subscription: deliver a `dataset.changed` event whenever a job
@@ -350,14 +361,18 @@ impl Storage {
         let sched = opts.schedule_id.as_deref();
         let trig = opts.trigger_id.as_deref();
         let src = opts.source_job_id.as_deref();
+        let wf_run = opts.workflow_run_id.as_deref();
+        let wf_step = opts.workflow_step.as_deref();
+        let root = opts.root_id.as_deref();
         let insert = self
             .metered(StoreOp::JobEnqueue, |mut conn| async move {
                 let r = sqlx::query(
                     "INSERT INTO jobs (id, app, params, status, attempts, max_attempts, priority, \
                      callback_url, callback_secret, budget_usd, idempotency_key, schedule_id, \
-                     trigger_id, source_job_id, created_at, available_at, principal_id) \
+                     trigger_id, source_job_id, created_at, available_at, principal_id, \
+                     workflow_run_id, workflow_step, root_id) \
                      VALUES (?1, ?2, ?3, 'queued', 0, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, \
-                     ?14, ?15)",
+                     ?14, ?15, ?16, ?17, ?18)",
                 )
                 .bind(id.to_string())
                 .bind(app)
@@ -374,6 +389,9 @@ impl Storage {
                 .bind(ts(created))
                 .bind(ts(available))
                 .bind(principal_id)
+                .bind(wf_run)
+                .bind(wf_step)
+                .bind(root)
                 .execute(&mut *conn)
                 .await?;
                 let rows = r.rows_affected();
@@ -4390,5 +4408,481 @@ mod latest_job_tiebreaker_tests {
             "a created_at tie must resolve to the greatest id (house keyset), not \
              an arbitrary row"
         );
+    }
+}
+
+// ---- workflow runs (N03, migration 0046) ------------------------------------
+
+/// A declared plan: a named DAG of steps, stored verbatim as its spec document.
+///
+/// The spec is kept as opaque JSON at this layer on purpose — the queue's job is
+/// durability, and the *meaning* of a spec (barriers, templates, budgets) lives
+/// in one place, `pumper-server`'s `workflow` module, which is also the only
+/// thing that validates it. A storage layer that half-understood the spec would
+/// be a second, silently diverging validator.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowDef {
+    pub id: String,
+    pub name: String,
+    pub spec: Value,
+    /// `None` = on-demand only. `Some(cron)` = the scheduler owns this plan.
+    pub cron: Option<String>,
+    pub enabled: bool,
+    pub created_at: DateTime<Utc>,
+}
+
+/// One execution of a [`WorkflowDef`].
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowRun {
+    pub id: String,
+    pub def_id: String,
+    /// `running` | `succeeded` | `failed` | `cancelled`.
+    pub status: String,
+    pub budget_usd: Option<f64>,
+    /// Envelope spend, refreshed from `cost_events` as each step ends.
+    pub spent_usd: f64,
+    pub idempotency_key: Option<String>,
+    pub principal_id: Option<String>,
+    /// Correlation id every step job carries (equal to `id` in v1).
+    pub root_id: String,
+    pub error: Option<String>,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// One `(run, step)` cell: the barrier's state and its job's outcome.
+#[derive(Debug, Clone, Serialize)]
+pub struct WorkflowStepRow {
+    pub run_id: String,
+    pub step: String,
+    pub job_id: Option<String>,
+    pub depends_on: Vec<String>,
+    /// `pending` | `queued` | `succeeded` | `failed` | `cancelled` | `skipped`.
+    pub status: String,
+    pub result: Option<Value>,
+    pub error: Option<String>,
+    pub finished_at: Option<DateTime<Utc>>,
+}
+
+/// Create-time fields for a run (borrowed; storage assigns id/started_at).
+#[derive(Debug, Clone, Default)]
+pub struct NewWorkflowRun<'a> {
+    pub def_id: &'a str,
+    pub budget_usd: Option<f64>,
+    pub idempotency_key: Option<&'a str>,
+    pub principal_id: Option<&'a str>,
+}
+
+#[derive(sqlx::FromRow)]
+struct WorkflowDefRow {
+    id: String,
+    name: String,
+    spec_json: String,
+    cron: Option<String>,
+    enabled: bool,
+    created_at: String,
+}
+
+impl TryFrom<WorkflowDefRow> for WorkflowDef {
+    type Error = Error;
+    fn try_from(r: WorkflowDefRow) -> Result<WorkflowDef> {
+        Ok(WorkflowDef {
+            id: r.id,
+            name: r.name,
+            spec: serde_json::from_str(&r.spec_json)
+                .map_err(|e| Error::Parse(format!("workflow spec is not JSON: {e}")))?,
+            cron: r.cron,
+            enabled: r.enabled,
+            created_at: parse_ts(&r.created_at)?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct WorkflowRunRow {
+    id: String,
+    def_id: String,
+    status: String,
+    budget_usd: Option<f64>,
+    spent_usd: f64,
+    idempotency_key: Option<String>,
+    principal_id: Option<String>,
+    root_id: String,
+    error: Option<String>,
+    started_at: String,
+    finished_at: Option<String>,
+}
+
+impl TryFrom<WorkflowRunRow> for WorkflowRun {
+    type Error = Error;
+    fn try_from(r: WorkflowRunRow) -> Result<WorkflowRun> {
+        Ok(WorkflowRun {
+            id: r.id,
+            def_id: r.def_id,
+            status: r.status,
+            budget_usd: r.budget_usd,
+            spent_usd: r.spent_usd,
+            idempotency_key: r.idempotency_key,
+            principal_id: r.principal_id,
+            root_id: r.root_id,
+            error: r.error,
+            started_at: parse_ts(&r.started_at)?,
+            finished_at: r.finished_at.as_deref().map(parse_ts).transpose()?,
+        })
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct WorkflowStepDbRow {
+    run_id: String,
+    step: String,
+    job_id: Option<String>,
+    depends_on: String,
+    status: String,
+    result: Option<String>,
+    error: Option<String>,
+    finished_at: Option<String>,
+}
+
+impl TryFrom<WorkflowStepDbRow> for WorkflowStepRow {
+    type Error = Error;
+    fn try_from(r: WorkflowStepDbRow) -> Result<WorkflowStepRow> {
+        Ok(WorkflowStepRow {
+            run_id: r.run_id,
+            step: r.step,
+            job_id: r.job_id,
+            // A `depends_on` that will not parse must NOT read as "no
+            // dependencies" — that would silently turn a join into a fan-out.
+            depends_on: serde_json::from_str(&r.depends_on).map_err(|e| {
+                Error::Parse(format!("workflow depends_on is not a JSON array: {e}"))
+            })?,
+            status: r.status,
+            result: parse_json_column(r.result.as_deref()),
+            error: r.error,
+            finished_at: r.finished_at.as_deref().map(parse_ts).transpose()?,
+        })
+    }
+}
+
+const WORKFLOW_DEF_COLUMNS: &str = "id, name, spec_json, cron, enabled, created_at";
+const WORKFLOW_RUN_COLUMNS: &str = "id, def_id, status, budget_usd, spent_usd, idempotency_key, \
+                                    principal_id, root_id, error, started_at, finished_at";
+const WORKFLOW_STEP_COLUMNS: &str =
+    "run_id, step, job_id, depends_on, status, result, error, finished_at";
+
+impl Storage {
+    /// Stores a plan. `spec` is written verbatim; the caller validated it.
+    pub async fn create_workflow(
+        &self,
+        name: &str,
+        spec: &Value,
+        cron: Option<&str>,
+    ) -> Result<WorkflowDef> {
+        let id = Uuid::new_v4().to_string();
+        sqlx::query(
+            "INSERT INTO workflow_defs (id, name, spec_json, cron, enabled, created_at) \
+             VALUES (?1, ?2, ?3, ?4, 1, ?5)",
+        )
+        .bind(&id)
+        .bind(name)
+        .bind(spec.to_string())
+        .bind(cron)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        self.get_workflow(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))
+    }
+
+    pub async fn list_workflows(&self) -> Result<Vec<WorkflowDef>> {
+        let sql = format!("SELECT {WORKFLOW_DEF_COLUMNS} FROM workflow_defs ORDER BY name");
+        let rows: Vec<WorkflowDefRow> = sqlx::query_as(&sql).fetch_all(&self.pool).await?;
+        rows.into_iter().map(WorkflowDef::try_from).collect()
+    }
+
+    /// Looks a plan up by **id or name** — the two ways a caller refers to one.
+    pub async fn get_workflow(&self, id_or_name: &str) -> Result<Option<WorkflowDef>> {
+        let sql =
+            format!("SELECT {WORKFLOW_DEF_COLUMNS} FROM workflow_defs WHERE id = ?1 OR name = ?1");
+        let row: Option<WorkflowDefRow> = sqlx::query_as(&sql)
+            .bind(id_or_name)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(WorkflowDef::try_from).transpose()
+    }
+
+    /// Plans the scheduler owns: enabled, with a cron.
+    pub async fn scheduled_workflows(&self) -> Result<Vec<WorkflowDef>> {
+        let sql = format!(
+            "SELECT {WORKFLOW_DEF_COLUMNS} FROM workflow_defs \
+             WHERE enabled = 1 AND cron IS NOT NULL ORDER BY name"
+        );
+        let rows: Vec<WorkflowDefRow> = sqlx::query_as(&sql).fetch_all(&self.pool).await?;
+        rows.into_iter().map(WorkflowDef::try_from).collect()
+    }
+
+    pub async fn delete_workflow(&self, id: &str) -> Result<bool> {
+        let r = sqlx::query("DELETE FROM workflow_defs WHERE id = ?1")
+            .bind(id)
+            .execute(&self.pool)
+            .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Opens a run. The bool reports whether one was created — an idempotency
+    /// replay returns the original, exactly like [`Self::enqueue_dedup`].
+    pub async fn create_workflow_run(
+        &self,
+        new: NewWorkflowRun<'_>,
+    ) -> Result<(WorkflowRun, bool)> {
+        if let Some(key) = new.idempotency_key {
+            if let Some(existing) = self.workflow_run_by_key(key).await? {
+                return Ok((existing, false));
+            }
+        }
+        let id = Uuid::new_v4().to_string();
+        let insert = sqlx::query(
+            "INSERT INTO workflow_runs (id, def_id, status, budget_usd, spent_usd, \
+             idempotency_key, principal_id, root_id, error, started_at, finished_at) \
+             VALUES (?1, ?2, 'running', ?3, 0, ?4, ?5, ?1, NULL, ?6, NULL)",
+        )
+        .bind(&id)
+        .bind(new.def_id)
+        .bind(new.budget_usd)
+        .bind(new.idempotency_key)
+        .bind(new.principal_id)
+        .bind(now())
+        .execute(&self.pool)
+        .await;
+        if insert.is_err() {
+            // Lost a concurrent race on the unique key — return the winner.
+            if let Some(key) = new.idempotency_key {
+                if let Some(existing) = self.workflow_run_by_key(key).await? {
+                    return Ok((existing, false));
+                }
+            }
+            insert?;
+        }
+        let run = self
+            .get_workflow_run(&id)
+            .await?
+            .ok_or(Error::Storage(sqlx::Error::RowNotFound))?;
+        Ok((run, true))
+    }
+
+    async fn workflow_run_by_key(&self, key: &str) -> Result<Option<WorkflowRun>> {
+        let sql =
+            format!("SELECT {WORKFLOW_RUN_COLUMNS} FROM workflow_runs WHERE idempotency_key = ?1");
+        let row: Option<WorkflowRunRow> = sqlx::query_as(&sql)
+            .bind(key)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(WorkflowRun::try_from).transpose()
+    }
+
+    pub async fn get_workflow_run(&self, run_id: &str) -> Result<Option<WorkflowRun>> {
+        let sql = format!("SELECT {WORKFLOW_RUN_COLUMNS} FROM workflow_runs WHERE id = ?1");
+        let row: Option<WorkflowRunRow> = sqlx::query_as(&sql)
+            .bind(run_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(WorkflowRun::try_from).transpose()
+    }
+
+    pub async fn list_workflow_runs(&self, def_id: &str, limit: i64) -> Result<Vec<WorkflowRun>> {
+        let sql = format!(
+            "SELECT {WORKFLOW_RUN_COLUMNS} FROM workflow_runs WHERE def_id = ?1 \
+             ORDER BY started_at DESC, id DESC LIMIT ?2"
+        );
+        let rows: Vec<WorkflowRunRow> = sqlx::query_as(&sql)
+            .bind(def_id)
+            .bind(limit.clamp(1, 500))
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(WorkflowRun::try_from).collect()
+    }
+
+    /// The newest run of a plan, as `(id, status)` — the scheduler's overlap
+    /// guard ("is the newest run still open?").
+    pub async fn latest_workflow_run(&self, def_id: &str) -> Result<Option<(String, String)>> {
+        let row: Option<(String, String)> = sqlx::query_as(
+            "SELECT id, status FROM workflow_runs WHERE def_id = ?1 \
+             ORDER BY started_at DESC, id DESC LIMIT 1",
+        )
+        .bind(def_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    /// Seeds every cell of a run in one transaction: all steps `pending`.
+    pub async fn insert_workflow_steps(
+        &self,
+        run_id: &str,
+        steps: &[(String, Vec<String>)],
+    ) -> Result<()> {
+        let mut tx = self.pool.begin().await?;
+        for (step, deps) in steps {
+            sqlx::query(
+                "INSERT INTO workflow_steps (run_id, step, job_id, depends_on, status, result, \
+                 error, finished_at) VALUES (?1, ?2, NULL, ?3, 'pending', NULL, NULL, NULL)",
+            )
+            .bind(run_id)
+            .bind(step)
+            .bind(serde_json::to_string(deps).unwrap_or_else(|_| "[]".into()))
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn workflow_steps(&self, run_id: &str) -> Result<Vec<WorkflowStepRow>> {
+        let sql = format!(
+            "SELECT {WORKFLOW_STEP_COLUMNS} FROM workflow_steps WHERE run_id = ?1 ORDER BY step"
+        );
+        let rows: Vec<WorkflowStepDbRow> = sqlx::query_as(&sql)
+            .bind(run_id)
+            .fetch_all(&self.pool)
+            .await?;
+        rows.into_iter().map(WorkflowStepRow::try_from).collect()
+    }
+
+    /// Which `(run, step)` a job belongs to — the worker hook's only lookup,
+    /// one seek on `idx_workflow_steps_job`.
+    pub async fn workflow_step_for_job(&self, job_id: Uuid) -> Result<Option<(String, String)>> {
+        let row: Option<(String, String)> =
+            sqlx::query_as("SELECT run_id, step FROM workflow_steps WHERE job_id = ?1")
+                .bind(job_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row)
+    }
+
+    /// Claims a step for enqueue: `pending` → `queued`, atomically.
+    ///
+    /// This guarded UPDATE **is** the join barrier's exactly-once guarantee. Two
+    /// upstream jobs of a diamond can finish on different worker tasks at the
+    /// same instant and both compute the same ready step; only the one whose
+    /// UPDATE changes a row goes on to enqueue it.
+    pub async fn claim_workflow_step(&self, run_id: &str, step: &str) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE workflow_steps SET status = 'queued' \
+             WHERE run_id = ?1 AND step = ?2 AND status = 'pending'",
+        )
+        .bind(run_id)
+        .bind(step)
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Records the job a claimed step was enqueued as.
+    pub async fn set_workflow_step_job(
+        &self,
+        run_id: &str,
+        step: &str,
+        job_id: &str,
+    ) -> Result<()> {
+        sqlx::query("UPDATE workflow_steps SET job_id = ?3 WHERE run_id = ?1 AND step = ?2")
+            .bind(run_id)
+            .bind(step)
+            .bind(job_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    /// Lands a step's outcome, guarded on it still being open. `false` = another
+    /// task already finished this cell (a repeated terminal event, a boot
+    /// re-evaluation), which is what makes the worker hook idempotent per
+    /// `(run, step)`.
+    pub async fn finish_workflow_step(
+        &self,
+        run_id: &str,
+        step: &str,
+        status: &str,
+        result: Option<&Value>,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE workflow_steps SET status = ?3, result = ?4, error = ?5, finished_at = ?6 \
+             WHERE run_id = ?1 AND step = ?2 AND status IN ('pending', 'queued')",
+        )
+        .bind(run_id)
+        .bind(step)
+        .bind(status)
+        .bind(result.map(Value::to_string))
+        .bind(error)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Steps still open (`pending` or `queued`) — the cancel door's work list
+    /// and the "is this run finished?" test.
+    pub async fn open_workflow_steps(&self, run_id: &str) -> Result<Vec<(String, Option<String>)>> {
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT step, job_id FROM workflow_steps \
+             WHERE run_id = ?1 AND status IN ('pending', 'queued') ORDER BY step",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    /// Closes a run, guarded on it still being `running` so a concurrent cancel
+    /// and a concurrent completion cannot both stamp an ending.
+    pub async fn finish_workflow_run(
+        &self,
+        run_id: &str,
+        status: &str,
+        error: Option<&str>,
+    ) -> Result<bool> {
+        let r = sqlx::query(
+            "UPDATE workflow_runs SET status = ?2, error = ?3, finished_at = ?4 \
+             WHERE id = ?1 AND status = 'running'",
+        )
+        .bind(run_id)
+        .bind(status)
+        .bind(error)
+        .bind(now())
+        .execute(&self.pool)
+        .await?;
+        Ok(r.rows_affected() > 0)
+    }
+
+    /// Refreshes the envelope's running total from the ledger: the sum of
+    /// `cost_events.cost_usd` over this run's job set. Read back rather than
+    /// accumulated in memory, so a restart mid-run does not lose spend.
+    pub async fn refresh_workflow_spend(&self, run_id: &str) -> Result<f64> {
+        let spent: Option<f64> = sqlx::query_scalar(
+            "SELECT COALESCE(SUM(c.cost_usd), 0) FROM cost_events c \
+             JOIN jobs j ON j.id = c.job_id WHERE j.workflow_run_id = ?1",
+        )
+        .bind(run_id)
+        .fetch_one(&self.pool)
+        .await?;
+        let spent = spent.unwrap_or(0.0);
+        sqlx::query("UPDATE workflow_runs SET spent_usd = ?2 WHERE id = ?1")
+            .bind(run_id)
+            .bind(spent)
+            .execute(&self.pool)
+            .await?;
+        Ok(spent)
+    }
+
+    /// Every job enqueued under this run — the receipt's job set.
+    pub async fn workflow_run_job_ids(&self, run_id: &str) -> Result<Vec<String>> {
+        let rows: Vec<(String,)> = sqlx::query_as(
+            "SELECT id FROM jobs WHERE workflow_run_id = ?1 ORDER BY created_at, id",
+        )
+        .bind(run_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|(id,)| id).collect())
     }
 }

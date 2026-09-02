@@ -163,6 +163,9 @@ pub(crate) async fn enqueue_job(
         schedule_id: None,
         trigger_id: None,
         source_job_id: None,
+        workflow_run_id: None,
+        workflow_step: None,
+        root_id: None,
     };
     let (job, created) = state.storage.enqueue_dedup(&name, opts).await?;
     if created {

@@ -598,6 +598,9 @@ async fn enqueue_app(
         schedule_id: None,
         trigger_id: None,
         source_job_id: None,
+        workflow_run_id: None,
+        workflow_step: None,
+        root_id: None,
     };
     let (job, created) = state
         .storage

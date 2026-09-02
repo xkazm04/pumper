@@ -94,9 +94,9 @@ pub use retention::{
 pub use storage::{
     AuditEntry, CheckpointRound, Delivery, DeliveryHealth, EnqueueOptions, IngressSource,
     JobStages, JobTimingStats, LedgerPruned, LedgerRetention, LedgerStat, NewDerivedSpec,
-    NewSchedule, NewTrigger, PluginHook, Principal, QueueAges, RevisionCount, SavedSearch,
-    Schedule, SearchMaterialize, Storage, Trigger, TriggerPluginHooks, Watch, YieldSummary,
-    LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
+    NewSchedule, NewTrigger, NewWorkflowRun, PluginHook, Principal, QueueAges, RevisionCount,
+    SavedSearch, Schedule, SearchMaterialize, Storage, Trigger, TriggerPluginHooks, Watch,
+    WorkflowDef, WorkflowRun, WorkflowStepRow, YieldSummary, LEDGER_TABLES, MAX_CHECKPOINT_BYTES,
 };
 #[cfg(feature = "storage")]
 pub use store_instrument::{
