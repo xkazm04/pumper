@@ -24,13 +24,6 @@ pub const MARKET_BLEND_DATASET: &str = "market_blend";
 /// Per-place saturation (establishments per 10k of an ACS base).
 pub const SATURATION_DATASET: &str = "saturation";
 
-/// The cross-FAMILY product the blend also republishes (N33): one row per state
-/// x trade, joining the trades economics layer to these census products. Owned
-/// by `trades_common::market`, which does the join; named here as literals
-/// because this crate is on the census side of it and takes no dependency back.
-pub const PROFILE_APP: &str = "market";
-pub const PROFILE_DATASET: &str = "profile";
-
 /// RFC-3339 UTC micros for *now* — the `as_of` a derived write is stamped with.
 ///
 /// Deliberately a **provenance** value, never a record field: provenance lives
@@ -60,11 +53,6 @@ pub fn product_index_datasets() -> Value {
     json!([
         { "app": MARKET_APP, "dataset": MARKET_BLEND_DATASET },
         { "app": MARKET_APP, "dataset": SATURATION_DATASET },
-        // N33: the blend also republishes the cross-FAMILY `market/profile`
-        // (state x trade), so the `market` namespace has to enter this run's
-        // `indexed_apps` too — otherwise a watch, trigger or saved search on
-        // the product cannot fire on a census-driven refresh.
-        { "app": PROFILE_APP, "dataset": PROFILE_DATASET },
     ])
 }
 
@@ -762,24 +750,17 @@ mod tests {
     /// `census` can ever see (worker `run_indexed_apps`). Dropping either from
     /// the spec list silently un-hooks that dataset — pinned here.
     #[test]
-    fn product_specs_name_both_census_products_and_the_market_profile() {
+    fn product_specs_name_both_census_products_under_the_virtual_app() {
         assert_eq!(
             product_index_datasets(),
             json!([
                 { "app": "census", "dataset": "market_blend" },
                 { "app": "census", "dataset": "saturation" },
-                { "app": "market", "dataset": "profile" },
             ])
         );
         assert_eq!(
             (MARKET_APP, MARKET_BLEND_DATASET, SATURATION_DATASET),
             ("census", "market_blend", "saturation")
-        );
-        // N33: the third spec is a DIFFERENT namespace, and that is the whole
-        // point of it being here — a census run publishes into `market` too.
-        assert_eq!(
-            (super::PROFILE_APP, super::PROFILE_DATASET),
-            ("market", "profile")
         );
     }
 

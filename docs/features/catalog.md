@@ -89,8 +89,10 @@ it is in the same product group but writes only its own datasets and never rebui
 `market` (N33) is the third, and the only one fed by **two families**: `market/profile` (one row per
 state x trade) is re-derived at the end of both `unified::sync_operator_economics` and
 `app_census_density::sync_market_blend`, so its nine publishers are the five trades apps AND the
-four census apps, and whichever refreshed last publishes it. All nine declare `market/profile`
-through `index_datasets` for exactly the reason above. The seed's publisher-evidence test accepts
+four census apps, and whichever refreshed last publishes it. The five trades apps and `census-density` declare
+`market/profile` through `index_datasets` for exactly the reason above; the other three census
+apps publish it without declaring it, because the shared `census_common::product_index_datasets` output
+is pinned by their tests (noted in apps.md as a known gap). The seed's publisher-evidence test accepts
 either spelling a manifest uses for a shared write — a `unified` block (grants, trades) or the
 namespace's own name (`market_blend` / `market_profile`) — because a publisher owes evidence that
 its declared result NAMES the shared layer, not that it uses one family's word for it.

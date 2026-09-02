@@ -488,25 +488,27 @@ impl ScrapeApp for CensusDensity {
         // `with_product_index` is what puts the two `census/*` products in the
         // worker's index + hook scope — without it no watch, trigger or saved
         // search on app `census` can fire, and neither product is searchable.
-        Ok(census_common::with_product_index(json!({
-            "source": format!("census/cbp/{year}"),
-            "geo": geo,
-            "year": year,
-            "vintage": vintage,
-            "trades": trade_summaries,
-            "top_places_overall": top_overall,
-            "top_places_by_saturation": saturation,
-            "normalization": normalization,
-            // What the API declined to tell us this run, so a shrinking corpus
-            // reads as suppression rather than as a market that vanished.
-            "suppression": suppression.as_json(),
-            "empty_answers": empty_answers,
-            "market_blend": market_blend,
-            "records": record_count,
-            "new": summary.new.len(),
-            "changed": summary.changed.len(),
-            "unchanged": summary.unchanged,
-        })))
+        Ok(with_market_index(census_common::with_product_index(
+            json!({
+                "source": format!("census/cbp/{year}"),
+                "geo": geo,
+                "year": year,
+                "vintage": vintage,
+                "trades": trade_summaries,
+                "top_places_overall": top_overall,
+                "top_places_by_saturation": saturation,
+                "normalization": normalization,
+                // What the API declined to tell us this run, so a shrinking corpus
+                // reads as suppression rather than as a market that vanished.
+                "suppression": suppression.as_json(),
+                "empty_answers": empty_answers,
+                "market_blend": market_blend,
+                "records": record_count,
+                "new": summary.new.len(),
+                "changed": summary.changed.len(),
+                "unchanged": summary.unchanged,
+            }),
+        )))
     }
 }
 
@@ -947,6 +949,29 @@ pub async fn sync_saturation(
     ctx.datasets
         .upsert_many_stamped(MARKET_APP, SATURATION_DATASET, records, None, Some(&prov))
         .await
+}
+
+/// Adds the cross-FAMILY `market/profile` spec (N33) to a result that
+/// `census_common::with_product_index` has already stamped, so the `market`
+/// namespace enters this run's `indexed_apps` too — without it a watch, trigger,
+/// saved search or contract evaluation on the product cannot fire for a
+/// census-driven refresh, however often the run rewrites it.
+///
+/// **Why here and not in `census_common::product_index_datasets`,** which is
+/// where it belongs: that helper is shared by all four census apps, and three of
+/// them (`census-nonemp`, `census-nesd`, `census-bfs`) pin its exact two-element
+/// output in their own tests. Adding the spec there is a one-line change plus
+/// three test updates in crates this change may not touch — reported as a seam,
+/// not made. Until then the declaration rides the app that OWNS the blend, and
+/// the other three publish the profile without indexing it.
+fn with_market_index(mut result: Value) -> Value {
+    if let Some(specs) = result
+        .get_mut("index_datasets")
+        .and_then(Value::as_array_mut)
+    {
+        specs.push(trades_common::market::product_index_spec());
+    }
+    result
 }
 
 /// What a saturation row is derived from: this run's own CBP establishment
@@ -1641,11 +1666,34 @@ mod tests {
             json!([
                 { "app": "census", "dataset": "market_blend" },
                 { "app": "census", "dataset": "saturation" },
-                // N33: this run also republishes the cross-family product, and
-                // a namespace the result does not name is a namespace no watch,
-                // trigger or saved search can fire for.
+            ])
+        );
+        // N33: this app's run also republishes the cross-FAMILY product, and a
+        // namespace the result does not name is a namespace no watch, trigger,
+        // saved search or contract evaluation can fire for. The spec is added by
+        // `with_market_index`, which run() wraps around the shared stamp.
+        let needle = concat!("with_market_index", "(census_common::with_product_index");
+        assert_eq!(
+            include_str!("lib.rs").matches(needle).count(),
+            1,
+            "census-density's run() must add the market spec exactly once"
+        );
+        // Bound in two steps on purpose: written as one nested call this line
+        // would match the needle above and the count would check itself.
+        let stamped = census_common::with_product_index(json!({}));
+        assert_eq!(
+            with_market_index(stamped)["index_datasets"],
+            json!([
+                { "app": "census", "dataset": "market_blend" },
+                { "app": "census", "dataset": "saturation" },
                 { "app": "market", "dataset": "profile" },
             ])
+        );
+        // A result with no index_datasets at all is passed through untouched —
+        // there is nowhere honest to append to.
+        assert_eq!(
+            with_market_index(json!({ "records": 1 })),
+            json!({ "records": 1 })
         );
     }
 
