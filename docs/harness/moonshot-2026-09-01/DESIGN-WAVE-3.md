@@ -112,7 +112,24 @@ move with tests; else leave a note), an `explain` read-only mode, auto-follow-up
 second run with `session_id` updates rather than duplicates; `snapshot_sources` spend lands on the
 job ledger and `artifact_sha` verifies.
 
+## Carry-forward from wave 2 (assigned; see FIXES-WAVE-2.md §Carry-forward)
+
+- **K (N05)** also dispatches `transaction.pending|submitted` (N01) and
+  `source.repair_promoted|rolled_back` (N12) as first-class event kinds through the new log —
+  the apps name them in their results; the worker's post-run fan-out is where they become events.
+- **K (N05)** adds `Storage::upsert_managed_schedule(id, app, cron, params, enabled, tag)` to
+  `crates/core/src/storage.rs` and ports `scheduler.rs`'s raw `sqlx` peer upsert onto it (K owns
+  the outbox drain on the scheduler tick anyway). Keep `sqlx` as a real server dependency only if
+  something else still needs it; say which.
+- **Not this wave:** moving the mesh wire format from `apps/peer` to `core/src/mesh.rs` (wave 4,
+  when nobody touches `apps/peer`), the N10 benchmark, real-Chrome transact runs.
+- **Migrations:** master is at **0048**; take 0049+ and expect renumbering on collision.
+- **Config sections:** append at the very end of `Config` and of `config.rs`, after
+  `TransactConfig`.
+- **MCP tools:** append at the end of the tool table and dispatch; `fetch` must stay last (the
+  inventory test pins it). L adds five tools — put them before `fetch`.
+
 ## Merge order (coordinator)
 
-N (N24) → M (N11) → O (N25) → L (N04) → K (N05). Migrations from **0050** upward (wave 2 is expected
-to take 0046–0049; renumber on collision). `cargo check --workspace` after each; full gates after all.
+N (N24) → M (N11) → O (N25) → L (N04) → K (N05). `cargo check --workspace` after each; full gates
+after all.
