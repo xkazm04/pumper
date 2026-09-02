@@ -4,6 +4,10 @@ mod datahub;
 #[cfg(test)]
 mod e2e;
 mod events;
+// N18: the elastic executor plane — coordinator-side policy, and the outbound
+// executor process `--executor` starts instead of the server.
+mod executor_main;
+mod executors;
 mod fanout;
 // N24: the vendor-neutral run/quality model both catalog writers render.
 mod lineage;
@@ -186,10 +190,71 @@ fn main() -> anyhow::Result<()> {
         .with(sentry_tracing::layer())
         .init();
 
-    tokio::runtime::Builder::new_multi_thread()
+    let mode = parse_mode(std::env::args().skip(1))?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .build()?
-        .block_on(run())
+        .build()?;
+    match mode {
+        Mode::Server => runtime.block_on(run()),
+        // N18: the same binary as an OUTBOUND worker. It binds no port, serves
+        // no API and runs no scheduler — it dials the coordinator and drains its
+        // queue. See `executor_main`.
+        Mode::Executor { coordinator } => {
+            let config = Config::load()?;
+            runtime.block_on(executor_main::run(config, coordinator))
+        }
+    }
+}
+
+/// Which process this invocation is.
+#[derive(Debug, PartialEq, Eq)]
+enum Mode {
+    /// The coordinator: HTTP API, queue, scheduler, local worker. The default,
+    /// and byte-for-byte what `pumper` has always been.
+    Server,
+    /// An outbound executor (N18): `--executor [--coordinator <url>]`.
+    Executor { coordinator: Option<String> },
+}
+
+/// Parses the two flags this binary understands.
+///
+/// Deliberately hand-rolled rather than a new `clap` dependency: the entire CLI
+/// surface is two flags, and the failure this function exists to prevent is
+/// *silence* — `--coordinator` with no value, or a stray argument, used to be
+/// ignored, so a mistyped flag started a perfectly healthy server on a box the
+/// operator believed was an executor.
+fn parse_mode(args: impl IntoIterator<Item = String>) -> anyhow::Result<Mode> {
+    let mut executor = false;
+    let mut coordinator = None;
+    let mut args = args.into_iter().peekable();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--executor" => executor = true,
+            "--coordinator" => {
+                let value = args.next().unwrap_or_default();
+                if value.trim().is_empty() || value.starts_with("--") {
+                    anyhow::bail!(
+                        "--coordinator needs a URL (e.g. --coordinator http://host:8088)"
+                    );
+                }
+                coordinator = Some(value);
+            }
+            other => anyhow::bail!(
+                "unknown argument '{other}'. Usage: pumper [--executor [--coordinator <url>]]"
+            ),
+        }
+    }
+    if !executor && coordinator.is_some() {
+        anyhow::bail!(
+            "--coordinator only means something with --executor: a coordinator does not dial \
+             another coordinator"
+        );
+    }
+    Ok(if executor {
+        Mode::Executor { coordinator }
+    } else {
+        Mode::Server
+    })
 }
 
 /// One boot line saying what declared-contract enforcement can be **observed**

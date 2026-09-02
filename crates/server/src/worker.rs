@@ -479,7 +479,7 @@ fn forget_cancel_intent(id: Uuid) {
 /// failed to complete, the checkpoint is discarded (fresh start) instead of
 /// being retried forever. Fail-open — an unreadable checkpoint store never
 /// blocks the run, it just means no restore.
-async fn load_restore(state: &AppState, job: &Job) -> Option<Value> {
+pub(crate) async fn load_restore(state: &AppState, job: &Job) -> Option<Value> {
     let max = state.config.worker.max_resume_failures;
     if max <= 0 {
         return None;
@@ -529,7 +529,7 @@ async fn blocked_apps(
         .collect()
 }
 
-fn app_limit(state: &AppState, app: &str) -> usize {
+pub(crate) fn app_limit(state: &AppState, app: &str) -> usize {
     state
         .config
         .worker
@@ -1364,6 +1364,117 @@ async fn finalize_fanout(state: AppState, job: Job, mut stages: StageWatch) {
     // operator can feel. The scheduler tick's drain is the safety net for
     // whatever this pass could not hand off.
     crate::subscriptions::drain(&state).await;
+}
+
+/// Announces that a job has started, for a run this process is not executing.
+///
+/// The local claim publishes this event inline in `run`'s spawn arm; an
+/// executor's claim comes in over HTTP and must publish the identical event, or
+/// `GET /jobs/{id}/stream` would go quiet for the whole remote run and an
+/// operator would see a job sitting in `queued` while it is in fact running on
+/// another host.
+pub(crate) fn publish_running(state: &AppState, job: &Job) {
+    publish(state, JobEvent::new(job.id, job.app.clone(), "running"));
+}
+
+/// The remote-report finish path (N18): an executor has run a job to an outcome
+/// and reported it; this is everything the local `execute` does **after** the
+/// app future resolves.
+///
+/// It is deliberately the same code path, not a parallel one:
+/// - success writes through the attempt-fenced [`Storage::complete`], records
+///   the run's yield, clears the spent checkpoint, and hands the whole post-run
+///   fan-out to [`finalize_fanout`] on the bounded pool — search indexing, the
+///   health and contract gates, watches, dataset triggers, saved searches, the
+///   terminal event and the result webhook, in the same load-bearing order;
+/// - failure goes through [`Storage::fail`], so the retry ladder, the jittered
+///   backoff and the attempts-exhausted permanent failure are byte-identical to
+///   a local failure — and a re-queued job wakes the local worker, which is
+///   correct: the next attempt may legitimately run *here*.
+///
+/// The returned word is what the door reports back: `succeeded`, `queued` (a
+/// retry is pending), `failed`, or `stale` when the fence discarded the write
+/// between the door's ownership check and this write.
+///
+/// `run_ms` is the only span the coordinator cannot measure, so the executor
+/// reports it and the stage clock is started that far in the past — making
+/// `total_ms` mean the same thing it means locally (the app's own run plus the
+/// fan-out) rather than silently shrinking to "how long the fan-out took".
+/// Absent, the stage row says `run_ms: null` = unmeasured, never `0`.
+pub(crate) async fn finish_from_executor(
+    state: &AppState,
+    job: Job,
+    outcome: std::result::Result<Value, String>,
+    run_ms: Option<i64>,
+) -> &'static str {
+    let executor = job.executor_id.clone().unwrap_or_default();
+    match outcome {
+        Ok(result) => {
+            let yields = pumper_core::extract_yields(&result);
+            match state.storage.complete(job.id, job.attempts, result).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    warn!(
+                        job = %job.id, executor = %executor,
+                        "executor completion discarded: the job was reset or reaped mid-run"
+                    );
+                    return "stale";
+                }
+                Err(e) => {
+                    error!(job = %job.id, "failed to persist executor result: {e}; skipping fan-out");
+                    return "stale";
+                }
+            }
+            info!(job = %job.id, executor = %executor, "job succeeded on executor");
+            if let Err(e) = state.storage.clear_checkpoint(job.id).await {
+                warn!(job = %job.id, "checkpoint clear failed: {e}");
+            }
+            if !yields.is_empty() {
+                if let Err(e) = state
+                    .storage
+                    .record_job_yield(job.id, &job.app, &yields)
+                    .await
+                {
+                    warn!(job = %job.id, "job-yield record failed: {e}");
+                }
+            }
+            let reported = run_ms.unwrap_or(0).max(0) as u64;
+            let started = std::time::Instant::now()
+                .checked_sub(Duration::from_millis(reported))
+                .unwrap_or_else(std::time::Instant::now);
+            let mut stages = StageWatch::new(job.attempts, 0, started);
+            // Honest absence: a run the executor did not time reports `null`,
+            // not a zero that would read as "it was instantaneous".
+            stages.stages.run_ms = run_ms;
+            let (st, jb) = (state.clone(), job.clone());
+            state
+                .fanout
+                .run("finalize", job.id, async move {
+                    finalize_fanout(st, jb, stages).await;
+                })
+                .await;
+            "succeeded"
+        }
+        Err(error) => {
+            warn!(job = %job.id, executor = %executor, %error, "job failed on executor");
+            match state.storage.fail(job.id, job.attempts, &error).await {
+                Ok(Some(JobStatus::Queued)) => {
+                    // The next attempt may run anywhere — including here.
+                    state.notify.notify_one();
+                    "queued"
+                }
+                Ok(None) => "stale",
+                Ok(Some(_)) => {
+                    finalize(state, job.id).await;
+                    "failed"
+                }
+                Err(e) => {
+                    error!(job = %job.id, "failed to persist executor failure: {e}");
+                    "stale"
+                }
+            }
+        }
+    }
 }
 
 /// Parses the VCR enqueue params out of a job's params object:
@@ -2954,6 +3065,7 @@ mod fanout_fence_tests {
             waiting_since: None,
             waiting_expires_at: None,
             resumed_input: None,
+            executor_id: None,
             created_at: chrono::Utc::now(),
             available_at: chrono::Utc::now(),
             started_at: None,

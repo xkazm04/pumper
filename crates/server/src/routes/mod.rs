@@ -85,6 +85,7 @@ mod doctor;
 mod economics;
 mod error;
 mod events;
+mod executors;
 mod health;
 mod host_weather;
 mod ingress;
@@ -116,6 +117,7 @@ use derived::*;
 use doctor::*;
 use economics::*;
 use events::*;
+use executors::*;
 use health::*;
 use host_weather::*;
 use ingress::*;
@@ -177,6 +179,7 @@ use workflows::*;
         (name = "provenance", description = "Record-level derivation chains (M12): who wrote each revision from what, plus read-only re-derivation"),
         (name = "principals", description = "Identity and tenancy: scoped API keys, their spend, and the audit ledger"),
         (name = "mesh", description = "Pumper mesh: signed node identity and scheduled peer sync of datasets, host weather and recipes"),
+        (name = "executors", description = "Elastic executor plane: outbound worker processes that long-poll for whole jobs, run them with their own engines, and report results back to the coordinator"),
         (name = "meta", description = "The OpenAPI document itself"),
         (name = "sources", description = "Extraction health: per-source degradation detection"),
         (name = "provisioner", description = "Proposal lifecycle: list/validate/promote what the provisioner app compiled — never writes the catalog itself"),
@@ -339,6 +342,15 @@ fn openapi_router() -> OpenApiRouter<AppState> {
         .routes(routes!(get_transaction))
         .routes(routes!(approve_transaction))
         .routes(routes!(reject_transaction))
+        // N18: the executor plane's doors. All six answer 404 unless
+        // `[executors] enabled` + a secret, so registering them changes nothing
+        // for a node that never configures the plane.
+        .routes(routes!(claim_job))
+        .routes(routes!(list_executors))
+        .routes(routes!(executor_heartbeat))
+        .routes(routes!(executor_checkpoint))
+        .routes(routes!(executor_progress))
+        .routes(routes!(executor_finish))
         .routes(routes!(openapi_json))
         // Document-bodied routes, with their own scoped body ceiling.
         .merge(large_body_router())
@@ -745,6 +757,13 @@ mod api_spec_tests {
         "GET /transactions/{id}",
         "POST /transactions/{id}/approve",
         "POST /transactions/{id}/reject",
+        // N18 elastic executor plane.
+        "POST /executors/claim",
+        "GET /executors",
+        "POST /jobs/{id}/heartbeat",
+        "POST /jobs/{id}/checkpoint",
+        "POST /jobs/{id}/progress",
+        "POST /jobs/{id}/finish",
         "GET /openapi.json",
     ];
 
