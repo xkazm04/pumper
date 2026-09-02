@@ -57,7 +57,7 @@ fn default_limit() -> i64 {
     responses(
         (status = 200, description = "`{recipes: [{id, host, url_template, params, json_paths, \
             score, validated, validation_reason, validated_at, consecutive_failures, \
-            discovered_at, last_seen_at}]}`"),
+            discovered_at, last_seen_at}]}`", body = crate::routes::dto::RecipeListResponse),
     )
 )]
 pub(crate) async fn list_recipes(
@@ -99,7 +99,7 @@ fn default_validated_only() -> bool {
     params(RecipeExportQuery),
     responses((status = 200, description = "Signed envelope `{schema: \"pumper.recipes/1\", \
         node_id, legacy_id, generated_at, sig, payload: {entries: [{host, url_template, params, \
-        json_paths, score, validated_at_origin}]}}`."))
+        json_paths, score, validated_at_origin}]}}`.", body = crate::routes::dto::SignedBundle))
 )]
 pub(crate) async fn export_recipes(
     State(state): State<AppState>,
@@ -150,9 +150,9 @@ pub(crate) struct RecipeImportQuery {
     responses(
         (status = 200, description = "`{applied, source_node_id, verified, considered, \
             imported, skipped, notes: [..]}` — every imported recipe lands \
-            `validated: false` regardless of what the origin claimed."),
+            `validated: false` regardless of what the origin claimed.", body = crate::routes::dto::RecipeImportResponse),
         (status = 400, description = "Unknown schema, refused signature, or an oversized bundle",
-            body = Object),
+            body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn import_recipes(

@@ -41,7 +41,7 @@ async fn host_json(state: &AppState, mut profile: HostProfile) -> Value {
     params(HostsQuery),
     responses((status = 200, description = "Dual-mode: `{hosts: [...]}` without `cursor=`, \
         `{items, next_cursor}` with it. Each host: `{host, preferred_tier, http_strikes, \
-        penalty_ms (live), updated_at, penalty_updated_at}`"))
+        penalty_ms (live), updated_at, penalty_updated_at}`", body = crate::routes::dto::HostsResponse))
 )]
 pub(crate) async fn list_hosts(
     State(state): State<AppState>,
@@ -73,8 +73,8 @@ pub(crate) async fn list_hosts(
     params(("host" = String, Path, description = "Hostname (case-insensitive)")),
     responses(
         (status = 200, description = "`{host, preferred_tier, http_strikes, penalty_ms (live), \
-            updated_at, penalty_updated_at}`"),
-        (status = 404, description = "No learned state for this host", body = Object),
+            updated_at, penalty_updated_at}`", body = crate::routes::dto::HostProfileDto),
+        (status = 404, description = "No learned state for this host", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn get_host(
@@ -108,8 +108,8 @@ pub(crate) async fn get_host(
     tag = "hosts",
     params(("host" = String, Path, description = "Hostname (case-insensitive)")),
     responses(
-        (status = 200, description = "`{host, reset: true}`"),
-        (status = 404, description = "No learned state for this host", body = Object),
+        (status = 200, description = "`{host, reset: true}`", body = crate::routes::dto::HostMemoryReset),
+        (status = 404, description = "No learned state for this host", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn delete_host_memory(
@@ -172,7 +172,7 @@ pub(crate) struct FreshnessQuery {
     params(FreshnessQuery),
     responses((status = 200, description = "`{refresher_enabled, keys: [{key, url, checks, \
         changes, last_checked_at, last_change_at, interval_secs, predicted_next_change, \
-        due_in_secs}], hosts: [{host, keys, due_now}]}` — keys sorted most-urgent first"))
+        due_in_secs}], hosts: [{host, keys, due_now}]}` — keys sorted most-urgent first", body = crate::routes::dto::CacheFreshnessResponse))
 )]
 pub(crate) async fn cache_freshness(
     State(state): State<AppState>,
@@ -230,7 +230,7 @@ struct ProfileInfo {
         status = 200,
         description = "`{profiles: [{name, has_cookies, has_browser_dir, last_used}]}`, \
                        alphabetical. Empty (not an error) when the vault dir does not exist yet.",
-        body = Object,
+        body = crate::routes::dto::ProfileListResponse,
     ))
 )]
 pub(crate) async fn list_profiles(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -316,7 +316,7 @@ pub(crate) struct PluginsQuery {
     path = "/plugins",
     tag = "plugins",
     params(PluginsQuery),
-    responses((status = 200, description = "`{plugins: [{name, ...}]}` — each entry is a plugin's self-describing manifest (name/version/description/kind/params_schema/output_schema) when it exports `describe`, else just `{name}`. `?kind=` filters by the manifest's declared kind."))
+    responses((status = 200, description = "`{plugins: [{name, ...}]}` — each entry is a plugin's self-describing manifest (name/version/description/kind/params_schema/output_schema) when it exports `describe`, else just `{name}`. `?kind=` filters by the manifest's declared kind.", body = crate::routes::dto::PluginListResponse))
 )]
 pub(crate) async fn list_plugins(
     State(state): State<AppState>,
@@ -340,7 +340,7 @@ pub(crate) async fn list_plugins(
     post,
     path = "/plugins/reload",
     tag = "plugins",
-    responses((status = 200, description = "`{loaded: <count>}` — also re-arms the once-per-deployment `plugin_missing`/`hook_not_executable` trigger-ledger reports"))
+    responses((status = 200, description = "`{loaded: <count>}` — also re-arms the once-per-deployment `plugin_missing`/`hook_not_executable` trigger-ledger reports", body = crate::routes::dto::PluginReloadResponse))
 )]
 pub(crate) async fn reload_plugins(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let loaded = state.plugins.reload().await?;
@@ -395,9 +395,9 @@ pub(crate) struct PreviewBody {
     tag = "extract",
     request_body = PreviewBody,
     responses(
-        (status = 200, description = "`{values, report, fields_matched, fields_total}` — extracted values plus the report: `report.fields` is the per-field match status (`matched`|`empty`|`container_empty`|`error`), `report.coercion` the post-transform outcome (`coerced`|`coercion_failed`|`no_transforms`) for fields with a transform chain, and `report.base_url_missing` is present only when a `url_absolute` transform had no document URL to resolve against (pass `base_url`, or `url`, to supply one)."),
+        (status = 200, description = "`{values, report, fields_matched, fields_total}` — extracted values plus the report: `report.fields` is the per-field match status (`matched`|`empty`|`container_empty`|`error`), `report.coercion` the post-transform outcome (`coerced`|`coercion_failed`|`no_transforms`) for fields with a transform chain, and `report.base_url_missing` is present only when a `url_absolute` transform had no document URL to resolve against (pass `base_url`, or `url`, to supply one).", body = crate::routes::dto::ExtractPreviewResponse),
         (status = 400, description = "Bad request: not exactly one of html|url, non-object `rules`, non-http(s) url, fetch failure/timeout, or rule compile errors — the body then carries a `fields: [{field, error}]` list covering every bad field.", body = Object),
-        (status = 413, description = "Fetched body over the preview size budget", body = Object),
+        (status = 413, description = "Fetched body over the preview size budget", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn extract_preview(

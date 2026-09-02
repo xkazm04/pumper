@@ -50,8 +50,8 @@ const MAX_ARTIFACTS: usize = 200;
             what it changed. `cost.egress` is `[{node, calls}]`: which remote-fabric peer nodes \
             this run's fetches actually left from (empty when nothing went through a peer, i.e. \
             always on a deployment with `[remote]` off). Any figure this server cannot know is \
-            `null` and the reason is listed in `unknown`; nothing is inferred."),
-        (status = 404, description = "Job not found", body = Object),
+            `null` and the reason is listed in `unknown`; nothing is inferred.", body = crate::routes::dto::JobReceipt),
+        (status = 404, description = "Job not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn job_receipt(

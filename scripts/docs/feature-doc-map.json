@@ -192,9 +192,12 @@
       ]
     },
     {
-      "doc": "docs/features/sdk-typescript.md",
+      "doc": "docs/features/sdks.md",
       "sourceGlobs": [
-        "clients/typescript/src/**"
+        "clients/typescript/src/**",
+        "clients/python/pumper_sync/**",
+        "clients/cli/src/**",
+        "scripts/gen/**"
       ]
     },
     {

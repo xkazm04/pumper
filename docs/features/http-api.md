@@ -2,7 +2,47 @@
 
 Axum server (default port 8088, `[server]` config). **Local power mode: no auth by default** — any process that can reach the loopback listener may call it. That is now a *setting*, not a fact: `[auth] mode = "keys"` puts scoped API keys, per-principal spend ceilings, throttles and an audit ledger in front of every route except `/health`, `/metrics` and `/openapi.json`. The default stays `open`, which behaves byte for byte as before — see [auth.md](auth.md). CORS is **off by default**; a browser UI opts in by listing its exact origin in `[server] cors_allowed_origins` (see [../deployment.md](../deployment.md#cors)). Every route carries a request-body ceiling — see [Request body limits](#request-body-limits).
 
-**Canonical machine-readable surface: `GET /openapi.json`** — a generated OpenAPI 3.1 document covering every route below, with typed request bodies and query params (response bodies are described inline; the ad-hoc JSON envelopes are documented in prose per endpoint). The spec and the router are generated from the same source (`utoipa` `#[utoipa::path]` annotations + `OpenApiRouter`), so a route cannot be added without appearing in the spec; a path-coverage test fails CI if the two ever diverge. Use it for client codegen and CLI agents; the table below is the human summary.
+**Canonical machine-readable surface: `GET /openapi.json`** — a generated OpenAPI 3.1 document covering every route below, with typed request bodies, query params **and response bodies**. The spec and the router are generated from the same source (`utoipa` `#[utoipa::path]` annotations + `OpenApiRouter`), so a route cannot be added without appearing in the spec; a path-coverage test fails CI if the two ever diverge. Use it for client codegen and CLI agents; the table below is the human summary.
+
+### Typed response envelopes
+
+Every 2xx response references a `components.schemas` entry, and so does every
+refusal (`ErrorEnvelope`, the `{error, code}` shape above). Until N23 the
+opposite was true — 135 of 136 success responses declared `body = Object` and
+described their payload in a sentence, so the document said what the routes were
+and nothing about what they returned.
+
+The schemas live in `crates/server/src/routes/dto.rs`. They are **declarations,
+not the code path**: no handler constructs one, and adding them changed no byte
+of any response. Three properties are worth relying on:
+
+- **Legacy shapes are typed, not replaced.** The dozen list endpoints that answer
+  a bare array (or a pre-cursor envelope) without `?cursor=` and a keyset page
+  with it are declared as a `oneOf` of both arms — `JobsResponse`,
+  `RecordsResponse`, `WatchesResponse`, `AppsResponse` (which switches on
+  `?format=` instead), and so on. A generated client narrows on the field it
+  finds; nothing was tightened, so nothing that worked stopped working.
+- **`null` is not the same as absent.** A `json!` literal never omits a key, so a
+  field typed `Option<T>` in a DTO is present-and-null on the wire and its doc
+  comment says so; the handful that are genuinely absent (a `?keys=true` opt-in,
+  a `cursor` only present mid-backfill) say *that* instead. `null` is Pumper's
+  honest-unknown and the distinction is load-bearing.
+- **Free-form means free-form.** A record's `data`, an app's `params`, a plugin's
+  self-declared manifest and the store-instrument report are typed as bare
+  objects, because the server does not enforce a shape on them and inventing one
+  in the document would be a contract nothing keeps.
+
+Six responses reference no schema, each listed with its reason in
+`SCHEMALESS_RESPONSES` (`crates/server/src/routes/mod.rs`): `/metrics`
+(Prometheus text), the two SSE streams, the streamed dataset export (whose media
+type varies with `?format=`), `/openapi.json` itself, and the executor plane's
+empty `204`. That list is diffed against the document **in both directions**, so
+a new route with an untyped 2xx fails the test naming itself, and a response that
+gains a schema must be struck from the list.
+
+The document is committed at `clients/openapi.json` and pinned to the router by
+`cargo test`; every SDK and the CLI are generated from it and pinned by CI. See
+[sdks.md](sdks.md).
 
 **Errors:** `{"error": "<message>", "code": "<code>"}` with the matching HTTP status. `code` is a stable machine-readable string — branch on it instead of the human message. The complete map, which an inventory test diffs against the statuses the handlers actually emit (so a new status cannot ship without a code):
 

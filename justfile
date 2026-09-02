@@ -87,14 +87,48 @@ fmt-check:
 audit:
     cargo deny check advisories bans sources
 
-# The published consumer SDK in clients/typescript — its own npm project, which
-# `cargo test --workspace` cannot reach and nothing here compiled until the
-# `@pumper/sync` CI job existed. Needs `npm --prefix clients/typescript ci` once.
+# The published consumer clients under clients/ — their own npm/python projects,
+# which `cargo test --workspace` cannot reach and nothing here compiled until the
+# `@pumper/sync` CI job existed. Needs `npm --prefix clients/typescript ci` and
+# `npm --prefix clients/cli ci` once.
 #
-# Typecheck + test the TypeScript SDK, as its CI job does.
-sdk:
+# Typecheck + test every client, as their CI job does.
+sdk: clients-check
     npm --prefix clients/typescript run typecheck
     npm --prefix clients/typescript test
+    npm --prefix clients/cli run typecheck
+    npm --prefix clients/cli test
+    python -m unittest discover -s clients/python -t clients/python
+
+# --- the consumer plane: one document, every client generated from it ---------
+
+# The document exists only inside the router, so this is the one step in the
+# chain that needs the Rust toolchain — which is exactly why it is separate from
+# `clients` below, whose generators are Node-only and run in a job with no cargo.
+#
+# The same test that writes the file asserts it matches on every `cargo test`, so
+# a route or DTO change that skips this step fails the Rust suite rather than
+# silently shipping clients built from last week's contract.
+#
+# Regenerate clients/openapi.json from the router. Needs cargo.
+openapi:
+    UPDATE_OPENAPI=1 cargo test -p pumper-server --bin pumper spec_snapshot
+
+# TypeScript through openapi-typescript (a devDependency of clients/typescript,
+# so the SDK's existing `npm ci` installs it), the CLI's own copy of the same
+# output, and the Python TypedDicts from a ~120-line emitter in the script.
+#
+# Regenerate every client's wire types from clients/openapi.json. Node only.
+clients:
+    node scripts/gen/generate-clients.mjs
+
+# Regenerates into memory and diffs against the committed output, so a spec
+# change that was not regenerated fails the build instead of shipping clients
+# built from the previous contract. Part of `sdk`, so `just ci` blocks on it.
+#
+# The generated-client drift gate: exit 1 when the clients are stale.
+clients-check:
+    node scripts/gen/generate-clients.mjs --check
 
 # Walks the tree for package manifests and fails on any that no CI job claims
 # (the out-of-graph check), then replays the doc-sync hook against its fixtures.

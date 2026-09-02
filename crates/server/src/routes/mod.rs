@@ -82,6 +82,9 @@ pub(crate) use watches::{create_watch, CreateWatchBody};
 mod datasets;
 mod derived;
 mod doctor;
+// N23: the typed response envelopes every route's `responses(...)` block
+// points at. Schema-only — nothing here runs at request time.
+mod dto;
 mod economics;
 mod error;
 mod events;
@@ -931,5 +934,244 @@ mod filter_tests {
     #[test]
     fn empty_specs_yield_no_filters() {
         assert!(parse_filters(&[]).expect("ok").is_empty());
+    }
+}
+
+#[cfg(test)]
+mod spec_snapshot_tests {
+    use std::path::PathBuf;
+
+    /// The committed OpenAPI document, the artifact every generated client is
+    /// built from.
+    ///
+    /// The spec is generated from the router, so it exists only inside a running
+    /// `pumper` process — and the client generators are Node scripts that must
+    /// run in a job with no Rust toolchain. Committing the document is what lets
+    /// those two live in different CI jobs: this test is the ONLY thing keeping
+    /// the committed copy honest, so a route or DTO change that is not
+    /// regenerated fails `cargo test` here rather than silently shipping clients
+    /// generated from last week's contract.
+    ///
+    /// Regenerate with `just openapi` (or `UPDATE_OPENAPI=1 cargo test -p
+    /// pumper-server spec_snapshot`).
+    pub(crate) fn snapshot_path() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../clients/openapi.json")
+    }
+
+    /// The document as the router generates it, pretty-printed with a trailing
+    /// newline so the committed file is a normal text file and its diffs are
+    /// readable.
+    pub(crate) fn generated_spec() -> String {
+        let api = super::openapi_router().split_for_parts().1;
+        let value = serde_json::to_value(&api).expect("spec serializes");
+        let mut out = serde_json::to_string_pretty(&value).expect("spec pretty-prints");
+        out.push('\n');
+        out
+    }
+
+    #[test]
+    fn committed_spec_matches_the_router() {
+        let path = snapshot_path();
+        let generated = generated_spec();
+        if std::env::var("UPDATE_OPENAPI").is_ok() {
+            std::fs::create_dir_all(path.parent().expect("clients dir")).expect("mkdir");
+            std::fs::write(&path, &generated).expect("write spec");
+            return;
+        }
+        let committed = std::fs::read_to_string(&path).unwrap_or_else(|e| {
+            panic!(
+                "clients/openapi.json is missing or unreadable ({e}) — every generated client is \
+                 built from it. Regenerate with `just openapi`."
+            )
+        });
+        // Deliberately NOT `assert_eq!` on the two documents: the spec is a
+        // quarter-megabyte of JSON, and dumping both copies into the test output
+        // buries the one line that actually differs under 700 kB of identical
+        // context. Report the first divergence and its line number instead.
+        let committed = committed.replace("\r\n", "\n");
+        if committed != generated {
+            let at = committed
+                .lines()
+                .zip(generated.lines())
+                .position(|(a, b)| a != b);
+            let detail = match at {
+                Some(i) => format!(
+                    "first difference at line {}:\n  committed: {}\n  generated: {}",
+                    i + 1,
+                    committed.lines().nth(i).unwrap_or(""),
+                    generated.lines().nth(i).unwrap_or("")
+                ),
+                None => format!(
+                    "same prefix, different length ({} committed vs {} generated lines)",
+                    committed.lines().count(),
+                    generated.lines().count()
+                ),
+            };
+            panic!(
+                "clients/openapi.json is stale — the router's spec changed and the committed \
+                 document (and every client generated from it) did not. Run `just clients`.\n\
+                 {detail}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod spec_schema_tests {
+    use std::collections::BTreeSet;
+
+    /// Every 2xx response in the document that does NOT reference a
+    /// `#/components/schemas/…` entry — the EXPECTED-diff idiom this repo uses
+    /// for route and body-limit inventories, pointed at response *bodies*.
+    ///
+    /// # Why an allowlist rather than a bare "all responses are typed"
+    ///
+    /// N23 found 135 of 136 success responses describing their payload in a
+    /// backtick sentence and declaring `body = Object` (or no body at all). A
+    /// test that simply demanded zero would have been red for the whole item
+    /// and would have had to be committed red; an allowlist that starts at 135
+    /// and shrinks makes each route file's typing a green, revertible step, and
+    /// — the part that matters after N23 is done — makes the fence work in the
+    /// direction that will actually be exercised:
+    ///
+    /// - a NEW route with an untyped 2xx appears here and fails, naming itself.
+    ///   It cannot join the surface untyped and silent, which is the whole
+    ///   point of typing the surface in the first place;
+    /// - a route that GAINS a schema must be struck from this list, so nobody
+    ///   can quietly re-untype a response and hide behind a stale entry.
+    ///
+    /// Both directions are asserted. Entries left below are responses that are
+    /// not a JSON document at all, and each says why.
+    const SCHEMALESS_RESPONSES: &[&str] = &[
+        // Prometheus text exposition, not JSON.
+        "GET /metrics 200",
+        // Server-sent events. The FRAMES carry JSON, but the response body is a
+        // stream, and OpenAPI has no way to say "one `JobEvent` per `data:`
+        // line" — pretending otherwise would generate a client that tries to
+        // parse the whole stream as one document.
+        "GET /events 200",
+        "GET /jobs/{id}/stream 200",
+        // A streamed export whose media type is chosen by `?format=`
+        // (`application/json`, `application/x-ndjson`, `text/csv`) and whose
+        // JSON arm deliberately omits its closing bracket on a mid-stream abort
+        // — the truncation signal. That is not a document a schema describes.
+        "GET /datasets/{app}/{dataset}/export 200",
+        // The OpenAPI document itself. Its schema is the OpenAPI meta-schema,
+        // which this document does not (and should not) embed.
+        "GET /openapi.json 200",
+        // 204: no body at all. The executor plane's long poll came back empty.
+        "POST /executors/claim 204",
+    ];
+
+    /// `(METHOD, path, status)` for every 2xx response whose media type carries
+    /// no reference to a component schema.
+    ///
+    /// The `$ref` is looked for ANYWHERE inside the media type's schema, not
+    /// just at its root, because the interesting shapes are wrappers: an array
+    /// of records is `{type: array, items: {$ref}}` and a dual-mode response is
+    /// a `oneOf` of two refs. A response is typed when a generator can reach a
+    /// named component from it — that is exactly what "anywhere" tests.
+    fn success_responses_without_a_schema() -> BTreeSet<String> {
+        fn has_ref(v: &serde_json::Value) -> bool {
+            match v {
+                serde_json::Value::Object(map) => map.iter().any(|(k, val)| {
+                    (k == "$ref"
+                        && val
+                            .as_str()
+                            .is_some_and(|s| s.starts_with("#/components/schemas/")))
+                        || has_ref(val)
+                }),
+                serde_json::Value::Array(items) => items.iter().any(has_ref),
+                _ => false,
+            }
+        }
+
+        let api = super::openapi_router().split_for_parts().1;
+        let json = serde_json::to_value(&api).expect("spec serializes");
+        let methods = [
+            "get", "post", "put", "delete", "patch", "head", "options", "trace",
+        ];
+        let mut out = BTreeSet::new();
+        for (path, item) in json["paths"].as_object().expect("paths object") {
+            for (method, op) in item.as_object().expect("path item object") {
+                if !methods.contains(&method.as_str()) {
+                    continue;
+                }
+                let Some(responses) = op["responses"].as_object() else {
+                    continue;
+                };
+                for (status, response) in responses {
+                    if !status.starts_with('2') {
+                        continue;
+                    }
+                    if !has_ref(&response["content"]) {
+                        out.insert(format!("{} {} {}", method.to_uppercase(), path, status));
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_success_response_references_a_component_schema() {
+        let untyped = success_responses_without_a_schema();
+        let allowed: BTreeSet<String> =
+            SCHEMALESS_RESPONSES.iter().map(|s| s.to_string()).collect();
+        let unexpected: Vec<_> = untyped.difference(&allowed).collect();
+        let stale: Vec<_> = allowed.difference(&untyped).collect();
+        assert!(
+            unexpected.is_empty(),
+            "these 2xx responses describe their body in prose instead of referencing a component \
+             schema, so no client can be generated for them. Add a DTO in `routes::dto` and point \
+             the handler's `responses(...)` at it with `body = <Dto>`: {unexpected:?}"
+        );
+        assert!(
+            stale.is_empty(),
+            "these responses now DO reference a schema — strike them from \
+             SCHEMALESS_RESPONSES so the fence keeps binding: {stale:?}"
+        );
+    }
+
+    #[test]
+    fn every_schema_reference_resolves_to_a_component() {
+        let api = super::openapi_router().split_for_parts().1;
+        let json = serde_json::to_value(&api).expect("spec serializes");
+        let components: BTreeSet<String> = json["components"]["schemas"]
+            .as_object()
+            .expect("components.schemas")
+            .keys()
+            .cloned()
+            .collect();
+
+        fn collect(v: &serde_json::Value, out: &mut BTreeSet<String>) {
+            match v {
+                serde_json::Value::Object(map) => {
+                    for (k, val) in map {
+                        if k == "$ref" {
+                            if let Some(name) = val
+                                .as_str()
+                                .and_then(|s| s.strip_prefix("#/components/schemas/"))
+                            {
+                                out.insert(name.to_string());
+                            }
+                        }
+                        collect(val, out);
+                    }
+                }
+                serde_json::Value::Array(items) => items.iter().for_each(|i| collect(i, out)),
+                _ => {}
+            }
+        }
+
+        let mut referenced = BTreeSet::new();
+        collect(&json["paths"], &mut referenced);
+        collect(&json["components"], &mut referenced);
+        let dangling: Vec<_> = referenced.difference(&components).collect();
+        assert!(
+            dangling.is_empty(),
+            "the document references component schemas it does not define — a generated client \
+             would emit `any` (or fail to compile) for each: {dangling:?}"
+        );
     }
 }

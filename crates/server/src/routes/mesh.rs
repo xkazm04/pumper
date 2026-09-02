@@ -107,7 +107,7 @@ pub(crate) fn trust_for(
     tag = "mesh",
     responses((status = 200, description = "`{node_id, legacy_id, algo: \"ed25519\", public_key, \
         key_path, key_created}` — `node_id` is the key fingerprint a peer pins as `public_key`'s \
-        owner; `legacy_id` is the pre-N16 database-path hash, kept for one release."))
+        owner; `legacy_id` is the pre-N16 database-path hash, kept for one release.", body = crate::routes::dto::NodeResponse))
 )]
 pub(crate) async fn get_node(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let id = crate::node::identity(&state).map_err(|e| {
@@ -135,7 +135,7 @@ pub(crate) async fn get_node(State(state): State<AppState>) -> Result<Json<Value
         allow_unsigned, every, every_secs, enabled, streams: [{stream, schedule_id, \
         scheduled, last_attempt_at, last_success_at, lag_secs, ok, verified, pulls, \
         signature_failures, ghosts_removed, detail}]}], totals: {...}}` — a peer with no \
-        recorded pull reports nulls, never a fabricated zero timestamp."))
+        recorded pull reports nulls, never a fabricated zero timestamp.", body = crate::routes::dto::MeshResponse))
 )]
 pub(crate) async fn get_mesh(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let node_id = crate::node::identity(&state)

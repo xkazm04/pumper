@@ -27,7 +27,7 @@ pub(crate) struct DerivedQuery {
     path = "/derived",
     tag = "derived",
     params(DerivedQuery),
-    responses((status = 200, description = "`{specs: [DerivedSpec]}`"))
+    responses((status = 200, description = "`{specs: [DerivedSpec]}`", body = crate::routes::dto::DerivedListResponse))
 )]
 pub(crate) async fn list_derived(
     State(state): State<AppState>,
@@ -87,8 +87,8 @@ impl From<&LookupBody> for DerivedLookup {
     tag = "derived",
     request_body = CreateDerivedBody,
     responses(
-        (status = 201, description = "Created spec", body = Object),
-        (status = 400, description = "Invalid filters/project/lookup, or the spec would create a cycle", body = Object),
+        (status = 201, description = "Created spec", body = crate::routes::dto::DerivedSpecDto),
+        (status = 400, description = "Invalid filters/project/lookup, or the spec would create a cycle", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn create_derived(
@@ -169,8 +169,8 @@ pub(crate) async fn create_derived(
     tag = "derived",
     params(("id" = String, Path, description = "Spec id")),
     responses(
-        (status = 200, description = "The spec", body = Object),
-        (status = 404, description = "Unknown spec", body = Object),
+        (status = 200, description = "The spec", body = crate::routes::dto::DerivedSpecDto),
+        (status = 404, description = "Unknown spec", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn get_derived(
@@ -192,8 +192,8 @@ pub(crate) async fn get_derived(
     tag = "derived",
     params(("id" = String, Path, description = "Spec id")),
     responses(
-        (status = 200, description = "Deleted"),
-        (status = 404, description = "Unknown spec", body = Object),
+        (status = 200, description = "Deleted", body = crate::routes::dto::DerivedDeleted),
+        (status = 404, description = "Unknown spec", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn delete_derived(
@@ -217,8 +217,8 @@ pub(crate) async fn delete_derived(
     params(("id" = String, Path, description = "Spec id")),
     request_body = EnabledBody,
     responses(
-        (status = 200, description = "Kill-switch flipped"),
-        (status = 404, description = "Unknown spec", body = Object),
+        (status = 200, description = "Kill-switch flipped", body = crate::routes::dto::EnabledResponse),
+        (status = 404, description = "Unknown spec", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn set_derived_enabled(
@@ -256,10 +256,10 @@ pub(crate) struct BackfillBody {
     request_body(content = BackfillBody, description = "Optional `{batch, max_rows, cursor}`"),
     params(("id" = String, Path, description = "Spec id")),
     responses(
-        (status = 200, description = "Backfill slice: `{scanned, matched, new, changed, unchanged, done, cursor?}`. `done: false` means the row budget stopped this request — call again with `cursor` to continue."),
-        (status = 400, description = "An aggregate spec's source exceeds `max_rows` (a partial aggregate pass is refused, not written)", body = Object),
-        (status = 404, description = "Unknown spec", body = Object),
-        (status = 409, description = "Spec is disabled", body = Object),
+        (status = 200, description = "Backfill slice: `{scanned, matched, new, changed, unchanged, done, cursor?}`. `done: false` means the row budget stopped this request — call again with `cursor` to continue.", body = crate::routes::dto::DerivedBackfillResponse),
+        (status = 400, description = "An aggregate spec's source exceeds `max_rows` (a partial aggregate pass is refused, not written)", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "Unknown spec", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "Spec is disabled", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn backfill_derived(

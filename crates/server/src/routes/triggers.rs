@@ -60,8 +60,8 @@ async fn trigger_filter_values(
     tag = "triggers",
     params(TriggersQuery),
     responses(
-        (status = 200, description = "Dual-mode: `{triggers: [Trigger]}`, or `{items, next_cursor}` when `cursor` is present. `app` filters on `source_app`."),
-        (status = 400, description = "Unknown `app`: no trigger source can carry that value (the message lists the accepted ones — registered apps, virtual namespaces, ingress source ids, and `*`)", body = Object),
+        (status = 200, description = "Dual-mode: `{triggers: [Trigger]}`, or `{items, next_cursor}` when `cursor` is present. `app` filters on `source_app`.", body = crate::routes::dto::TriggersResponse),
+        (status = 400, description = "Unknown `app`: no trigger source can carry that value (the message lists the accepted ones — registered apps, virtual namespaces, ingress source ids, and `*`)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_triggers(
@@ -211,9 +211,9 @@ fn validate_hook(
     tag = "triggers",
     request_body = CreateTriggerBody,
     responses(
-        (status = 201, description = "Created trigger", body = Object),
-        (status = 400, description = "Invalid source_kind/on_change/on_status", body = Object),
-        (status = 404, description = "Unknown target app", body = Object),
+        (status = 201, description = "Created trigger", body = crate::routes::dto::TriggerDto),
+        (status = 400, description = "Invalid source_kind/on_change/on_status", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "Unknown target app", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn create_trigger(
@@ -353,8 +353,8 @@ pub(crate) async fn create_trigger(
     tag = "triggers",
     params(("id" = String, Path, description = "Trigger id")),
     responses(
-        (status = 200, description = "Deleted (`{deleted: true}`)"),
-        (status = 404, description = "Trigger not found", body = Object),
+        (status = 200, description = "Deleted (`{deleted: true}`)", body = crate::routes::dto::DeletedResponse),
+        (status = 404, description = "Trigger not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn delete_trigger(
@@ -375,8 +375,8 @@ pub(crate) async fn delete_trigger(
     params(("id" = String, Path, description = "Trigger id")),
     request_body = EnabledBody,
     responses(
-        (status = 200, description = "`{id, enabled}`"),
-        (status = 404, description = "Trigger not found", body = Object),
+        (status = 200, description = "`{id, enabled}`", body = crate::routes::dto::EnabledResponse),
+        (status = 404, description = "Trigger not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn set_trigger_enabled(
@@ -408,9 +408,9 @@ pub(crate) struct TestTriggerQuery {
     tag = "triggers",
     params(("id" = String, Path, description = "Trigger id"), TestTriggerQuery),
     responses(
-        (status = 200, description = "Dry-run decision `{would_fire, ..., hooks: {unusable_plugins, incidents}}` or, with `?fire=true`, `{fired, job, jobs}` (every planned hop; `job` is the first). With `bind`/`each` the SAME plan the live path would build is resolved, so `resolved_params` are the bound params of the first hop and `bound_params` / `fan_out: {each, hops, total, truncated, cap}` describe the rest; a plan that cannot be built answers `would_fire: false` with `outcome: \"bind_miss\"` or `\"fan_out_empty\"`. `hooks.unusable_plugins` names configured hook plugins this host cannot execute (the hop is then UNGATED even when `would_fire` is true); `hooks.incidents` carries each hook's ledger outcome + detail."),
-        (status = 404, description = "Trigger not found", body = Object),
-        (status = 422, description = "`?fire=true` only: the resolved params fail the target app's declared JSON Schema (the live fire path records this as a `bad_params` decision instead)", body = Object),
+        (status = 200, description = "Dry-run decision `{would_fire, ..., hooks: {unusable_plugins, incidents}}` or, with `?fire=true`, `{fired, job, jobs}` (every planned hop; `job` is the first). With `bind`/`each` the SAME plan the live path would build is resolved, so `resolved_params` are the bound params of the first hop and `bound_params` / `fan_out: {each, hops, total, truncated, cap}` describe the rest; a plan that cannot be built answers `would_fire: false` with `outcome: \"bind_miss\"` or `\"fan_out_empty\"`. `hooks.unusable_plugins` names configured hook plugins this host cannot execute (the hop is then UNGATED even when `would_fire` is true); `hooks.incidents` carries each hook's ledger outcome + detail.", body = crate::routes::dto::TriggerTestResponse),
+        (status = 404, description = "Trigger not found", body = crate::routes::dto::ErrorEnvelope),
+        (status = 422, description = "`?fire=true` only: the resolved params fail the target app's declared JSON Schema (the live fire path records this as a `bad_params` decision instead)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn test_trigger(
@@ -647,8 +647,8 @@ pub(crate) struct RunsQuery {
     tag = "triggers",
     params(("id" = String, Path, description = "Trigger id"), RunsQuery),
     responses(
-        (status = 200, description = "`{trigger_id, count, runs: [Job], decisions: [TriggerRun], next_cursor}`"),
-        (status = 404, description = "Trigger not found", body = Object),
+        (status = 200, description = "`{trigger_id, count, runs: [Job], decisions: [TriggerRun], next_cursor}`", body = crate::routes::dto::TriggerRunsResponse),
+        (status = 404, description = "Trigger not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn trigger_runs(
@@ -726,8 +726,8 @@ pub(crate) struct DeliveriesQuery {
     tag = "webhooks",
     params(DeliveriesQuery),
     responses(
-        (status = 200, description = "Dual-mode: `{count, deliveries}`, or `{items, next_cursor}` when `cursor` is present. `?status=dead` is the dead-letter view (the retry ladder gave up); `?status=failed` is still-retrying, NOT the DLQ."),
-        (status = 400, description = "Unknown `status` (allowed: pending, delivered, failed, dead)", body = Object),
+        (status = 200, description = "Dual-mode: `{count, deliveries}`, or `{items, next_cursor}` when `cursor` is present. `?status=dead` is the dead-letter view (the retry ladder gave up); `?status=failed` is still-retrying, NOT the DLQ.", body = crate::routes::dto::WebhookDeliveriesResponse),
+        (status = 400, description = "Unknown `status` (allowed: pending, delivered, failed, dead)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_deliveries(
@@ -760,8 +760,8 @@ pub(crate) async fn list_deliveries(
     tag = "webhooks",
     params(("id" = String, Path, description = "Delivery id")),
     responses(
-        (status = 200, description = "The delivery, including body", body = Object),
-        (status = 404, description = "Delivery not found", body = Object),
+        (status = 200, description = "The delivery, including body", body = crate::routes::dto::DeliveryDto),
+        (status = 404, description = "Delivery not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn get_delivery(
@@ -798,9 +798,9 @@ pub(crate) struct ReplayQuery {
     tag = "webhooks",
     params(("id" = String, Path, description = "Delivery id"), ReplayQuery),
     responses(
-        (status = 202, description = "Replay claimed and scheduled (`{id, replaying: true}`)"),
-        (status = 404, description = "Delivery not found", body = Object),
-        (status = 409, description = "Not replayable: the row is in flight (`pending`), already claimed by the auto-drain, or `delivered` without `?force=true`", body = Object),
+        (status = 202, description = "Replay claimed and scheduled (`{id, replaying: true}`)", body = crate::routes::dto::DeliveryReplayResponse),
+        (status = 404, description = "Delivery not found", body = crate::routes::dto::ErrorEnvelope),
+        (status = 409, description = "Not replayable: the row is in flight (`pending`), already claimed by the auto-drain, or `delivered` without `?force=true`", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn replay_delivery(

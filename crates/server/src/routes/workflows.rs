@@ -43,9 +43,9 @@ pub(crate) struct CreateWorkflowBody {
     tag = "workflows",
     request_body = CreateWorkflowBody,
     responses(
-        (status = 201, description = "Created. `steps[]` reports, per step, whether its params could be schema-validated now (`params_validated: false` = the step is templated and is validated when it is rendered)", body = Object),
-        (status = 409, description = "The name is taken", body = Object),
-        (status = 422, description = "The spec does not validate: an unknown step in an `after` barrier, a cycle, an unregistered app, params failing the app's schema (pointer paths), a non-positive budget, or step budgets summing past the run envelope", body = Object),
+        (status = 201, description = "Created. `steps[]` reports, per step, whether its params could be schema-validated now (`params_validated: false` = the step is templated and is validated when it is rendered)", body = crate::routes::dto::WorkflowCreated),
+        (status = 409, description = "The name is taken", body = crate::routes::dto::ErrorEnvelope),
+        (status = 422, description = "The spec does not validate: an unknown step in an `after` barrier, a cycle, an unregistered app, params failing the app's schema (pointer paths), a non-positive budget, or step budgets summing past the run envelope", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn create_workflow(
@@ -121,7 +121,7 @@ pub(crate) async fn create_workflow(
     get,
     path = "/workflows",
     tag = "workflows",
-    responses((status = 200, description = "Every declared plan", body = Object))
+    responses((status = 200, description = "Every declared plan", body = crate::routes::dto::WorkflowListResponse))
 )]
 pub(crate) async fn list_workflows(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let defs = state.storage.list_workflows().await?;
@@ -134,8 +134,8 @@ pub(crate) async fn list_workflows(State(state): State<AppState>) -> Result<Json
     tag = "workflows",
     params(("id" = String, Path, description = "Workflow id or name")),
     responses(
-        (status = 200, description = "The plan", body = Object),
-        (status = 404, description = "Unknown workflow", body = Object),
+        (status = 200, description = "The plan", body = crate::routes::dto::WorkflowResponse),
+        (status = 404, description = "Unknown workflow", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn get_workflow(
@@ -152,8 +152,8 @@ pub(crate) async fn get_workflow(
     tag = "workflows",
     params(("id" = String, Path, description = "Workflow id or name")),
     responses(
-        (status = 200, description = "`{deleted}`. Runs already open are NOT cancelled — they finish against the spec they started with, then report the plan as gone", body = Object),
-        (status = 404, description = "Unknown workflow", body = Object),
+        (status = 200, description = "`{deleted}`. Runs already open are NOT cancelled — they finish against the spec they started with, then report the plan as gone", body = crate::routes::dto::DeletedResponse),
+        (status = 404, description = "Unknown workflow", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn delete_workflow(
@@ -183,10 +183,10 @@ pub(crate) struct StartRunBody {
     params(("id" = String, Path, description = "Workflow id or name")),
     request_body = StartRunBody,
     responses(
-        (status = 202, description = "Run opened; its root steps are enqueued", body = Object),
-        (status = 200, description = "Idempotency-Key replay: the original run", body = Object),
-        (status = 404, description = "Unknown workflow", body = Object),
-        (status = 422, description = "`budget_usd` is not a positive number, or the stored spec no longer validates", body = Object),
+        (status = 202, description = "Run opened; its root steps are enqueued", body = crate::routes::dto::WorkflowRunStarted),
+        (status = 200, description = "Idempotency-Key replay: the original run", body = crate::routes::dto::WorkflowRunStarted),
+        (status = 404, description = "Unknown workflow", body = crate::routes::dto::ErrorEnvelope),
+        (status = 422, description = "`budget_usd` is not a positive number, or the stored spec no longer validates", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn start_workflow_run(
@@ -240,8 +240,8 @@ pub(crate) struct RunsQuery {
     tag = "workflows",
     params(("id" = String, Path, description = "Workflow id or name"), RunsQuery),
     responses(
-        (status = 200, description = "This plan's runs, newest first", body = Object),
-        (status = 404, description = "Unknown workflow", body = Object),
+        (status = 200, description = "This plan's runs, newest first", body = crate::routes::dto::WorkflowRunListResponse),
+        (status = 404, description = "Unknown workflow", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_workflow_runs(
@@ -263,8 +263,8 @@ pub(crate) async fn list_workflow_runs(
     tag = "workflows",
     params(("run_id" = String, Path, description = "Workflow run id")),
     responses(
-        (status = 200, description = "`{run, workflow, steps, receipt, unknown}` — the step matrix plus one rolled-up receipt: cost summed from `cost_events` over the run's job set, yield from `job_yield`. A step that never became a job has `cost_usd: null`, not `$0`", body = Object),
-        (status = 404, description = "Unknown run", body = Object),
+        (status = 200, description = "`{run, workflow, steps, receipt, unknown}` — the step matrix plus one rolled-up receipt: cost summed from `cost_events` over the run's job set, yield from `job_yield`. A step that never became a job has `cost_usd: null`, not `$0`", body = crate::routes::dto::WorkflowRunReport),
+        (status = 404, description = "Unknown run", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn get_workflow_run(
@@ -284,8 +284,8 @@ pub(crate) async fn get_workflow_run(
     tag = "workflows",
     params(("run_id" = String, Path, description = "Workflow run id")),
     responses(
-        (status = 200, description = "`{cancelled, jobs_cancelled}` — every open step is closed and each one that already had a job goes through the ordinary `DELETE /jobs/{id}` door", body = Object),
-        (status = 404, description = "Unknown run", body = Object),
+        (status = 200, description = "`{cancelled, jobs_cancelled}` — every open step is closed and each one that already had a job goes through the ordinary `DELETE /jobs/{id}` door", body = crate::routes::dto::WorkflowRunCancelled),
+        (status = 404, description = "Unknown run", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn cancel_workflow_run(

@@ -342,8 +342,8 @@ pub(crate) struct EventLogQuery {
     tag = "events",
     params(EventLogQuery),
     responses(
-        (status = 200, description = "`{events, count, next_after, latest_seq, retained, retention_days}`. Ascending by `seq`."),
-        (status = 409, description = "The durable event log is off (`[events] log_enabled = false`)", body = Object),
+        (status = 200, description = "`{events, count, next_after, latest_seq, retained, retention_days}`. Ascending by `seq`.", body = crate::routes::dto::EventLogPage),
+        (status = 409, description = "The durable event log is off (`[events] log_enabled = false`)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn event_log(

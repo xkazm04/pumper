@@ -214,8 +214,8 @@ pub(crate) async fn run_search(
     tag = "search",
     params(SearchQuery),
     responses(
-        (status = 200, description = "`{query, total, count, hits, facets, index}` — BM25 ranked (or `sort=newest`), highlighted snippets. `total` is the full match count; `count` is the returned page size. `offset` pages (offset=limit → page 2, clamped to 10000); `sort=newest` orders by index time; `since=<unix-secs>` filters to recent docs. Entity filters (index-time regex extraction; docs without an extracted value never match): `amount_gte`/`amount_lte` in whole US dollars, `date_before`/`date_after` on the extracted deadline (unix seconds). The MCP `search` tool takes these same params through the same parser, and returns everything but `facets`. `index` is the state the answer was computed against — `{enabled, doc_count, degraded, reason}`; `degraded: true` (disabled index, or an enabled one holding 0 documents) means an empty page is NOT evidence the records are missing, and `reason` names the recovery."),
-        (status = 400, description = "Empty query, or a `sort` other than `score`/`newest`", body = Object),
+        (status = 200, description = "`{query, total, count, hits, facets, index}` — BM25 ranked (or `sort=newest`), highlighted snippets. `total` is the full match count; `count` is the returned page size. `offset` pages (offset=limit → page 2, clamped to 10000); `sort=newest` orders by index time; `since=<unix-secs>` filters to recent docs. Entity filters (index-time regex extraction; docs without an extracted value never match): `amount_gte`/`amount_lte` in whole US dollars, `date_before`/`date_after` on the extracted deadline (unix seconds). The MCP `search` tool takes these same params through the same parser, and returns everything but `facets`. `index` is the state the answer was computed against — `{enabled, doc_count, degraded, reason}`; `degraded: true` (disabled index, or an enabled one holding 0 documents) means an empty page is NOT evidence the records are missing, and `reason` names the recovery.", body = crate::routes::dto::SearchResponse),
+        (status = 400, description = "Empty query, or a `sort` other than `score`/`newest`", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn search(
@@ -249,7 +249,7 @@ pub(crate) async fn search(
     get,
     path = "/search/status",
     tag = "search",
-    responses((status = 200, description = "`{enabled, doc_count, disk_bytes, segment_count, enrichers}` — index telemetry. `enrichers` is one row per configured `[search] enrichers` entry (`{name, docs, entities, failures}`, N11): `failures > 0` is a pass that could NOT run (a trapping plugin, a module nobody installed) — those documents were indexed without its entities, so an enricher that fails on everything is otherwise indistinguishable from one that honestly finds nothing. Empty when nothing enriches. `doc_count: 0` on an enabled index means it was wiped (schema drift) or never populated; rebuild with the `search-backfill` bin. `disk_bytes` is the index directory's on-disk size and `segment_count` the searchable segments the reader sees — `doc_count` flat while those climb is the growth signal upserts hide. Both are 0 when search is disabled (`NoSearch` measures nothing rather than guessing)."))
+    responses((status = 200, description = "`{enabled, doc_count, disk_bytes, segment_count, enrichers}` — index telemetry. `enrichers` is one row per configured `[search] enrichers` entry (`{name, docs, entities, failures}`, N11): `failures > 0` is a pass that could NOT run (a trapping plugin, a module nobody installed) — those documents were indexed without its entities, so an enricher that fails on everything is otherwise indistinguishable from one that honestly finds nothing. Empty when nothing enriches. `doc_count: 0` on an enabled index means it was wiped (schema drift) or never populated; rebuild with the `search-backfill` bin. `disk_bytes` is the index directory's on-disk size and `segment_count` the searchable segments the reader sees — `doc_count` flat while those climb is the growth signal upserts hide. Both are 0 when search is disabled (`NoSearch` measures nothing rather than guessing).", body = crate::routes::dto::SearchStatusResponse))
 )]
 pub(crate) async fn search_status(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let doc_count = state.search.doc_count().await?;
@@ -283,7 +283,7 @@ pub(crate) struct SavedSearchesQuery {
     path = "/searches",
     tag = "search",
     params(SavedSearchesQuery),
-    responses((status = 200, description = "Dual-mode: `{searches: [SavedSearch]}`, or `{items, next_cursor}` when `cursor` is present."))
+    responses((status = 200, description = "Dual-mode: `{searches: [SavedSearch]}`, or `{items, next_cursor}` when `cursor` is present.", body = crate::routes::dto::SavedSearchesResponse))
 )]
 pub(crate) async fn list_saved_searches(
     State(state): State<AppState>,
@@ -343,8 +343,8 @@ pub(crate) struct MaterializeBody {
     tag = "search",
     request_body = CreateSavedSearchBody,
     responses(
-        (status = 201, description = "Created saved search", body = Object),
-        (status = 400, description = "Empty query or url not http(s)", body = Object),
+        (status = 201, description = "Created saved search", body = crate::routes::dto::SavedSearchDto),
+        (status = 400, description = "Empty query or url not http(s)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn create_saved_search(
@@ -408,8 +408,8 @@ pub(crate) async fn create_saved_search(
     tag = "search",
     params(("id" = String, Path, description = "Saved search id")),
     responses(
-        (status = 200, description = "Deleted (`{deleted: true}`)"),
-        (status = 404, description = "Saved search not found", body = Object),
+        (status = 200, description = "Deleted (`{deleted: true}`)", body = crate::routes::dto::DeletedResponse),
+        (status = 404, description = "Saved search not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn delete_saved_search(
@@ -433,8 +433,8 @@ pub(crate) async fn delete_saved_search(
     params(("id" = String, Path, description = "Saved search id")),
     request_body = EnabledBody,
     responses(
-        (status = 200, description = "`{id, enabled}`"),
-        (status = 404, description = "Saved search not found", body = Object),
+        (status = 200, description = "`{id, enabled}`", body = crate::routes::dto::EnabledResponse),
+        (status = 404, description = "Saved search not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn set_saved_search_enabled(
@@ -468,8 +468,8 @@ pub(crate) struct DeleteDocsBody {
     tag = "search",
     request_body = DeleteDocsBody,
     responses(
-        (status = 200, description = "`{deleted: <count>}`"),
-        (status = 400, description = "`ids` must be non-empty", body = Object),
+        (status = 200, description = "`{deleted: <count>}`", body = crate::routes::dto::SearchDocsDeleted),
+        (status = 400, description = "`ids` must be non-empty", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn delete_search_docs(
@@ -496,7 +496,7 @@ pub(crate) async fn delete_search_docs(
         ("app" = String, Path, description = "App name"),
         ("dataset" = String, Path, description = "Dataset name"),
     ),
-    responses((status = 200, description = "`{app, dataset, deleted: true}`"))
+    responses((status = 200, description = "`{app, dataset, deleted: true}`", body = crate::routes::dto::SearchDatasetDeleted))
 )]
 pub(crate) async fn delete_search_dataset(
     State(state): State<AppState>,

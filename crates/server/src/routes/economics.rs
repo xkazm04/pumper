@@ -275,7 +275,7 @@ fn app_json(app: &str, w: &AppWindow, weight: f64) -> Value {
     get,
     path = "/economics",
     tag = "costs",
-    responses((status = 200, description = "`{enforce, windows: {7d: {days, apps: [App]}, 30d: …}, advice: [{app, weight, recommended_budget_usd, cadence, reason}]}` — App = `{app, weight, jobs_with_yield, engine_calls, cost_usd, new, changed, unchanged, cost_per_new_usd, cost_per_changed_usd, weighted_fresh_per_dollar, claude: {cost_usd, calls, records_per_dollar, worth_it}, datasets}`. Advisory only; unknown/zero denominators are null."))
+    responses((status = 200, description = "`{enforce, windows: {7d: {days, apps: [App]}, 30d: …}, advice: [{app, weight, recommended_budget_usd, cadence, reason}]}` — App = `{app, weight, jobs_with_yield, engine_calls, cost_usd, new, changed, unchanged, cost_per_new_usd, cost_per_changed_usd, weighted_fresh_per_dollar, claude: {cost_usd, calls, records_per_dollar, worth_it}, datasets}`. Advisory only; unknown/zero denominators are null.", body = crate::routes::dto::EconomicsReport))
 )]
 pub(crate) async fn economics_report(
     State(state): State<AppState>,

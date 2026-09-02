@@ -128,16 +128,16 @@ fn absent_profile(profiles_dir: &Path, profile: Option<&str>) -> Option<String> 
     ),
     responses(
         (status = 200, description = "The `HttpResponse` envelope: \
-            `{status, headers, body, final_url, cache_hit}`"),
-        (status = 401, description = "Missing or wrong `x-pumper-remote-secret`"),
+            `{status, headers, body, final_url, cache_hit}`", body = crate::routes::dto::FetchProxyResponse),
+        (status = 401, description = "Missing or wrong `x-pumper-remote-secret`", body = crate::routes::dto::ErrorEnvelope),
         (status = 403, description = "Target out of policy: a loopback / link-local / private / \
-            CGNAT address, or a non-http(s) scheme. Relax with `[remote] allow_private_targets`"),
-        (status = 404, description = "`[remote]` disabled on this node"),
+            CGNAT address, or a non-http(s) scheme. Relax with `[remote] allow_private_targets`", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "`[remote]` disabled on this node", body = crate::routes::dto::ErrorEnvelope),
         (status = 422, description = "This node will not produce a result for this request — \
             either the local fetch itself failed, or the request names a session profile this \
             node does not hold (serving that would return the logged-out page with a 200). \
             Deliberately NOT 502: a coordinator's transport retries 502 by default, which \
-            multiplied every deterministic peer-side failure by `[http] retries`"),
+            multiplied every deterministic peer-side failure by `[http] retries`", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn fetch_proxy(

@@ -31,7 +31,7 @@ pub(crate) struct SchedulesQuery {
     path = "/schedules",
     tag = "schedules",
     params(SchedulesQuery),
-    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `overlapping`) — so a silently-wedged schedule is visible over the API. `last_run` means *a job was enqueued* and is null until one was; firings eaten by `misfire_policy = \"skip\"` are reported separately as `last_skipped_at` + `skipped_count` (cumulative), so the two can no longer contradict each other. `budget_usd` is the spend ceiling replayed into every run this schedule enqueues (`null` = no ceiling)."))
+    responses((status = 200, description = "Dual-mode: bare `[Schedule]` array, or `{items, next_cursor}` when `cursor` is present. Each schedule is enriched with `next_run` (computed next firing), `last_job_id` / `last_status` (its most recent run), and `health` (`ok` | `disabled` | `invalid_cron` | `unregistered_app` | `invalid_params` | `overlapping`) — so a silently-wedged schedule is visible over the API. `last_run` means *a job was enqueued* and is null until one was; firings eaten by `misfire_policy = \"skip\"` are reported separately as `last_skipped_at` + `skipped_count` (cumulative), so the two can no longer contradict each other. `budget_usd` is the spend ceiling replayed into every run this schedule enqueues (`null` = no ceiling).", body = crate::routes::dto::SchedulesResponse))
 )]
 pub(crate) async fn list_schedules(
     State(state): State<AppState>,
@@ -157,10 +157,10 @@ pub(crate) struct CreateScheduleBody {
     tag = "schedules",
     request_body = CreateScheduleBody,
     responses(
-        (status = 201, description = "Created schedule", body = Object),
-        (status = 400, description = "Invalid cron, timezone, or misfire_policy", body = Object),
-        (status = 404, description = "Unknown app", body = Object),
-        (status = 422, description = "The effective params (app defaults + this body's `params`) fail the app's declared JSON Schema — same shape as the enqueue door — or `budget_usd` is not a positive number of dollars", body = Object),
+        (status = 201, description = "Created schedule", body = crate::routes::dto::ScheduleDto),
+        (status = 400, description = "Invalid cron, timezone, or misfire_policy", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "Unknown app", body = crate::routes::dto::ErrorEnvelope),
+        (status = 422, description = "The effective params (app defaults + this body's `params`) fail the app's declared JSON Schema — same shape as the enqueue door — or `budget_usd` is not a positive number of dollars", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn create_schedule(
@@ -245,9 +245,9 @@ pub(crate) struct ScheduleBudgetBody {
     params(("id" = String, Path, description = "Schedule id")),
     request_body = ScheduleBudgetBody,
     responses(
-        (status = 200, description = "`{id, budget_usd}`"),
-        (status = 404, description = "Schedule not found", body = Object),
-        (status = 422, description = "`budget_usd` is not a positive number of dollars", body = Object),
+        (status = 200, description = "`{id, budget_usd}`", body = crate::routes::dto::ScheduleBudgetResponse),
+        (status = 404, description = "Schedule not found", body = crate::routes::dto::ErrorEnvelope),
+        (status = 422, description = "`budget_usd` is not a positive number of dollars", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn set_schedule_budget(
@@ -274,8 +274,8 @@ pub(crate) async fn set_schedule_budget(
     tag = "schedules",
     params(("id" = String, Path, description = "Schedule id")),
     responses(
-        (status = 200, description = "Deleted (`{deleted: true}`)"),
-        (status = 404, description = "Schedule not found", body = Object),
+        (status = 200, description = "Deleted (`{deleted: true}`)", body = crate::routes::dto::DeletedResponse),
+        (status = 404, description = "Schedule not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn delete_schedule(
@@ -296,8 +296,8 @@ pub(crate) async fn delete_schedule(
     params(("id" = String, Path, description = "Schedule id")),
     request_body = EnabledBody,
     responses(
-        (status = 200, description = "`{id, enabled}`"),
-        (status = 404, description = "Schedule not found", body = Object),
+        (status = 200, description = "`{id, enabled}`", body = crate::routes::dto::EnabledResponse),
+        (status = 404, description = "Schedule not found", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn set_schedule_enabled(

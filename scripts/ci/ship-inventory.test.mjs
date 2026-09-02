@@ -29,13 +29,20 @@ import { fileURLToPath } from 'node:url';
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(HERE, '../..');
 
-/** Tracked package manifests, repo-relative and forward-slashed. */
+/** Tracked package manifests, repo-relative and forward-slashed.
+ *
+ * `pyproject.toml` joined the list when N23 shipped `clients/python`
+ * (`pumper-sync`). This walk is an inventory of SHIPPED ARTIFACTS, not of Rust
+ * and Node specifically, so a package ecosystem it does not recognize is
+ * precisely the blind spot it exists to close — a Python package could
+ * otherwise sit in the tree reachable from no gated root and pass this check
+ * by being invisible to it. */
 function manifests() {
   const out = execFileSync('git', ['ls-files'], { cwd: REPO_ROOT, encoding: 'utf8' });
   return out
     .split('\n')
     .map((l) => l.trim())
-    .filter((l) => /(^|\/)(Cargo\.toml|package\.json)$/.test(l))
+    .filter((l) => /(^|\/)(Cargo\.toml|package\.json|pyproject\.toml)$/.test(l))
     .filter((l) => !l.includes('node_modules/'));
 }
 
@@ -95,5 +102,7 @@ test('the_inventory_walk_actually_found_the_tree', () => {
     `the manifest walk found only ${found.length} manifests — it is looking in the wrong place`
   );
   assert.ok(found.includes('clients/typescript/package.json'));
+  assert.ok(found.includes('clients/cli/package.json'));
+  assert.ok(found.includes('clients/python/pyproject.toml'));
   assert.ok(found.includes('plugins-src/busyloop/Cargo.toml'));
 });

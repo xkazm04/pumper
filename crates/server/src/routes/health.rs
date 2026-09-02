@@ -64,8 +64,8 @@ pub(crate) struct SourcesQuery {
             `[source.contract]` catalog block that have run since boot; verdicts are held in \
             memory and never expire on their own, so `stale: true` (age past the source's \
             freshness window, or the source is no longer live) marks a verdict that describes \
-            a run that is no longer current, and `stale: null` one that cannot be judged."),
-        (status = 503, description = "Detection is disabled ([resilience] enabled = false)", body = Object),
+            a run that is no longer current, and `stale: null` one that cannot be judged.", body = crate::routes::dto::SourceListResponse),
+        (status = 503, description = "Detection is disabled ([resilience] enabled = false)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn list_sources(
@@ -135,9 +135,9 @@ pub(crate) async fn list_sources(
             `statistical_coverage: false` means the *latest run* was below the cohort \
             floor (recorded with verdict `below_cohort`: it moved neither the state nor \
             the baseline), and `source.monitored: false` means no run ever cleared it, so \
-            the source is watched only by the assumption-free rules."),
-        (status = 404, description = "Unknown source", body = Object),
-        (status = 503, description = "Detection is disabled", body = Object),
+            the source is watched only by the assumption-free rules.", body = crate::routes::dto::SourceDetailResponse),
+        (status = 404, description = "Unknown source", body = crate::routes::dto::ErrorEnvelope),
+        (status = 503, description = "Detection is disabled", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn get_source(
@@ -216,8 +216,8 @@ pub(crate) struct SourceRunsQuery {
     params(("id" = String, Path, description = "Source id, `<app>/<dataset>`"), SourceRunsQuery),
     responses(
         (status = 200, description = "`{id, count, runs: [{job_id, docs, fetch_ok_rate, d_text, \
-            d_dom, d_val, verdict, diagnosis, score, reasons, state_after, build_id, created_at}]}`"),
-        (status = 503, description = "Detection is disabled", body = Object),
+            d_dom, d_val, verdict, diagnosis, score, reasons, state_after, build_id, created_at}]}`", body = crate::routes::dto::SourceRunsResponse),
+        (status = 503, description = "Detection is disabled", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn source_runs(
@@ -274,8 +274,8 @@ pub(crate) struct EnforcementPreviewQuery {
             `[resilience] enforce` would change nothing about the next run; `not_ready` names \
             the sources that make it false. Counts are **runs and the documents in them**, \
             never deliveries — how many webhooks a suppressed run would have sent is not \
-            stored. Deletes and writes nothing."),
-        (status = 503, description = "Detection is disabled ([resilience] enabled = false)", body = Object),
+            stored. Deletes and writes nothing.", body = crate::routes::dto::EnforcementPreview),
+        (status = 503, description = "Detection is disabled ([resilience] enabled = false)", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn enforcement_preview(
@@ -336,10 +336,10 @@ pub(crate) struct SourceStateBody {
     params(("id" = String, Path, description = "Source id, `<app>/<dataset>`")),
     request_body = SourceStateBody,
     responses(
-        (status = 200, description = "`{id, state, reason}`"),
-        (status = 400, description = "Unrecognized state", body = Object),
-        (status = 404, description = "Unknown source", body = Object),
-        (status = 503, description = "Detection is disabled", body = Object),
+        (status = 200, description = "`{id, state, reason}`", body = crate::routes::dto::SourceStateResponse),
+        (status = 400, description = "Unrecognized state", body = crate::routes::dto::ErrorEnvelope),
+        (status = 404, description = "Unknown source", body = crate::routes::dto::ErrorEnvelope),
+        (status = 503, description = "Detection is disabled", body = crate::routes::dto::ErrorEnvelope),
     )
 )]
 pub(crate) async fn set_source_state(
