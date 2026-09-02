@@ -23,6 +23,32 @@
 //! dwellings: landscaping/pool). A NAICS whose data is fully suppressed is recorded
 //! with a note rather than failing the whole run. NES lags ~2 years (override
 //! `params.year`; default 2021).
+//!
+//! # COUNTY GRAIN — contract verdict: **ASSUMED**, not verified (N35, 2026-09-02)
+//!
+//! The census-density blend has always asserted "NES is state-only". That
+//! assertion was never tested against the live API: this app only ever issued
+//! `for=state:*`. N35 needed the answer, so the probe is now BUILT — `geo:
+//! "county"` issues `for=county:*&in=state:{states}` for each requested NAICS
+//! and reports a per-NAICS verdict under `county_probe` (`served` /
+//! `empty` / `unsupported_geography` / `http_error`) — but it could **not be
+//! RUN**: the build box that shipped it has no network and no Census key, the
+//! same posture in which the BFS contract header (`census-bfs/src/lib.rs`) was
+//! pinned, except that one was later LIVE-verified and this one has not been.
+//!
+//! **Recorded verdict: ASSUMED UNAVAILABLE.** Every downstream consumer is
+//! built for that answer and degrades honestly if it is wrong in either
+//! direction:
+//!  - the blend's county cells carry `solo_grain: "state_carried"` and a Null
+//!    `solo_operators` — never a per-county number nobody published;
+//!  - the moment a real keyed run returns `served`, the county rows land in
+//!    `nonemployers` with `geo: "county"` and the blend joins them at county
+//!    grain with `solo_grain: "county"` — **no code change**, only this header
+//!    and `docs/features/apps.md` need updating with the LIVE-verified verdict.
+//!
+//! Run it with a key to settle it:
+//! `POST /jobs {"app":"census-nonemp","params":{"geo":"county","states":"06",
+//! "naics":["2382"]}}` → read `county_probe`.
 
 use async_trait::async_trait;
 use pumper_core::{
@@ -87,7 +113,12 @@ impl ScrapeApp for CensusNonemp {
                     },
                     "states": {
                         "type": "string",
-                        "description": "Comma-separated state FIPS list (e.g. \"06,12,48\"). Empty or \"*\" = all states."
+                        "description": "Comma-separated state FIPS list (e.g. \"06,12,48\"). Empty or \"*\" = all states; REQUIRED when geo=county."
+                    },
+                    "geo": {
+                        "type": "string",
+                        "enum": ["state", "county"],
+                        "description": "Geographic grain. `county` is the N35 PROBE of whether NES serves county rows at 4-digit NAICS — the answer is reported per NAICS under `county_probe` and is recorded as ASSUMED-unavailable in this app's doc header until a keyed run settles it. `county` REQUIRES a `states` FIPS filter."
                     },
                     "naics": {
                         "type": "array",
@@ -119,13 +150,24 @@ impl ScrapeApp for CensusNonemp {
                         "naics": ["2382"]
                     }),
                 },
+                ManifestExample {
+                    description: "N35 county probe: does NES serve county rows at 4-digit NAICS? \
+                         Read the per-NAICS verdict under `county_probe`",
+                    params: json!({
+                        "year": DEFAULT_YEAR,
+                        "geo": "county",
+                        "states": "06",
+                        "naics": ["2382"]
+                    }),
+                },
             ],
             output_shape: Some(
-                "{source, year, trades: [{naics, label, states_reported, total_nonemployers, \
+                "{source, geo, county_probe: {geo, verdicts: [{naics, verdict, detail}], \
+                 served}, year, trades: [{naics, label, states_reported, total_nonemployers, \
                  total_receipts_thousands, national_avg_receipts_per_operator, \
                  states_with_receipts, suppressed: {places_dropped, receipts_cells}, \
                  top_states_by_density, top_states_by_avg_receipts} | {naics, label, note}], \
-                 market_blend, suppression, empty_answers, index_datasets, records, new, \
+                 market_blend (the census/market_blend + census/atlas products this run \n                 re-derives), suppression, empty_answers, index_datasets, records, new, \
                  changed, unchanged} — a fully suppressed NAICS yields a `note` entry, not a \
                  failure; a suppressed NRCPTOT cell yields Null receipts (never $0), so the \
                  receipts totals cover `states_with_receipts` only",
@@ -148,6 +190,22 @@ impl ScrapeApp for CensusNonemp {
             .unwrap_or("")
             .trim()
             .to_string();
+        // N35: `county` is the probe grain. Default `state` — the shipped
+        // behaviour, byte for byte.
+        let geo = ctx
+            .params
+            .get("geo")
+            .and_then(Value::as_str)
+            .unwrap_or("state")
+            .to_string();
+        if geo == "county" && (states.is_empty() || states == "*") {
+            return Err(Error::App(
+                "geo=county requires a `states` FIPS filter (e.g. \"06\") — the NES county \
+                 probe fans out `for=county:*&in=state:{states}`, and county:* nationwide \
+                 is not a request this app will make blind"
+                    .into(),
+            ));
+        }
 
         // params.naics overrides everything; otherwise the governed
         // `trades/taxonomy` registry drives the code list at this app's
@@ -189,11 +247,7 @@ impl ScrapeApp for CensusNonemp {
         // data and publishes the regression as a forward change.
         let vintage = census_common::guard_vintage(&ctx, "nonemployers", &year).await?;
 
-        let for_clause = if states.is_empty() || states == "*" {
-            "for=state:*".to_string()
-        } else {
-            format!("for=state:{states}")
-        };
+        let for_clause = nes_for_clause(&geo, &states);
 
         // The NAICS classification vintage is year-dependent: NES 2017–2021 expose the
         // trade codes under the NAICS2017 predicate, but the 2022 vintage switched to
@@ -214,6 +268,8 @@ impl ScrapeApp for CensusNonemp {
         let mut run_suppressed_places = 0usize;
         let mut run_suppressed_receipts = 0usize;
         let mut empty_answers = 0usize;
+        // N35 probe: one verdict per NAICS, only in county mode.
+        let mut probe_verdicts: Vec<Value> = Vec::new();
 
         for (naics, label) in &trades {
             let url = format!(
@@ -224,6 +280,30 @@ impl ScrapeApp for CensusNonemp {
                 .http
                 .fetch(HttpRequest::get(url.clone()))
                 .await?;
+            // THE PROBE. In county mode an answer that is not rows is the
+            // ANSWER — "NES does not serve this grain" — so it is recorded as a
+            // verdict and the run continues. In state mode nothing changes: a
+            // non-success or non-JSON body is still a failed run, because the
+            // shipped grain returning junk is a fault, not a finding.
+            if geo == "county" {
+                let verdict = county_probe_verdict(resp.status, &resp.body);
+                probe_verdicts.push(json!({
+                    "naics": naics,
+                    "verdict": verdict,
+                    "status": resp.status,
+                    "detail": resp.body.chars().take(160).collect::<String>(),
+                }));
+                if verdict != PROBE_SERVED {
+                    trade_summaries.push(json!({
+                        "naics": naics, "label": label,
+                        "note": format!("county probe: {verdict}"),
+                    }));
+                    if verdict == PROBE_EMPTY {
+                        empty_answers += 1;
+                    }
+                    continue;
+                }
+            }
             // An empty answer (204, or a 200 with no body) is Census saying
             // "nothing published at this grain" for THIS trade → note it, don't
             // fail the whole run. Shared with the three sibling apps so the
@@ -283,6 +363,20 @@ impl ScrapeApp for CensusNonemp {
                     "Census NES NAICS {naics}: no state column in {header:?}"
                 ))
             })?;
+            // County mode only: the geography column trails the requested vars,
+            // and is matched by NAME like every other column in this family.
+            let cols = NesCols {
+                estab: i_estab,
+                rcpt: i_rcpt,
+                state: i_state,
+                county: idx("county"),
+            };
+            if geo == "county" && cols.county.is_none() {
+                return Err(Error::App(format!(
+                    "Census NES {year} NAICS {naics}: county probe returned rows with no \
+                     'county' column in {header:?} — the answer is not county grain"
+                )));
+            }
 
             let TradeRollup {
                 records,
@@ -291,7 +385,7 @@ impl ScrapeApp for CensusNonemp {
                 total_rcpt,
                 suppressed_places,
                 suppressed_receipts,
-            } = map_trade_rows(&rows, i_estab, i_rcpt, i_state, naics, label, &year);
+            } = map_trade_rows(&rows, &cols, &geo, naics, label, &year);
             run_suppressed_places += suppressed_places;
             run_suppressed_receipts += suppressed_receipts;
             record_count += records.len();
@@ -369,8 +463,26 @@ impl ScrapeApp for CensusNonemp {
         // `with_product_index` puts `census/market_blend` + `census/saturation`
         // in the worker's index + hook scope for this run — see
         // `census_common::product_index_datasets`.
+        // The probe's answer, in the run result rather than only in the logs:
+        // `served` on ANY requested NAICS is the finding that retires the
+        // blend's `state_carried` fallback, and it must be readable by a human
+        // and by a trigger alike.
+        let county_probe = if geo == "county" {
+            json!({
+                "geo": "county",
+                "served": probe_verdicts
+                    .iter()
+                    .any(|v| v["verdict"] == PROBE_SERVED),
+                "verdicts": probe_verdicts,
+                "doc_header_verdict": "ASSUMED unavailable — see the crate doc header",
+            })
+        } else {
+            Value::Null
+        };
         Ok(census_common::with_product_index(json!({
             "source": format!("census/nonemp/{year}"),
+            "geo": geo,
+            "county_probe": county_probe,
             "year": year,
             "vintage": vintage,
             "trades": trade_summaries,
@@ -411,13 +523,80 @@ struct TradeRollup {
     suppressed_receipts: usize,
 }
 
+/// Pre-resolved NES column indices, matched by NAME (the geography columns
+/// trail the requested `get=` vars, so position is never assumed).
+pub struct NesCols {
+    pub estab: usize,
+    pub rcpt: usize,
+    pub state: usize,
+    /// Present only on a county-grain answer.
+    pub county: Option<usize>,
+}
+
+/// The four county-probe verdicts. Strings, not an enum, because they are
+/// published in the run result and read by a human deciding whether the blend's
+/// `state_carried` fallback can be retired.
+pub const PROBE_SERVED: &str = "served";
+/// Census answered 204 / an empty body: the grain is *accepted* but nothing is
+/// published for this NAICS — suppression, not a refusal of the geography.
+pub const PROBE_EMPTY: &str = "empty";
+/// The API refused the geography hierarchy itself (the shape BFS returns for
+/// `for=state:*`): the strongest evidence that NES has no county grain.
+pub const PROBE_UNSUPPORTED: &str = "unsupported_geography";
+/// Any other non-success, or a success whose body is not a JSON array (the
+/// missing-key HTML page).
+pub const PROBE_HTTP_ERROR: &str = "http_error";
+
+/// What one county-probe response says about NES county availability.
+///
+/// Extracted and tested rather than branched inline, because this predicate is
+/// the entire deliverable of the probe: the difference between
+/// `unsupported_geography` (NES has no county grain — the blend's
+/// `state_carried` fallback is permanent) and `empty` (it does, but this NAICS
+/// is suppressed — the fallback is per-cell) is the whole question, and reading
+/// it off an HTTP status alone would answer it wrong.
+pub fn county_probe_verdict(status: u16, body: &str) -> &'static str {
+    if census_common::is_empty_answer(status, body) {
+        return PROBE_EMPTY;
+    }
+    if (200..300).contains(&status) {
+        return if body.trim_start().starts_with('[') {
+            PROBE_SERVED
+        } else {
+            PROBE_HTTP_ERROR
+        };
+    }
+    let lower = body.to_lowercase();
+    if lower.contains("geography") || lower.contains("geo hierarchy") {
+        PROBE_UNSUPPORTED
+    } else {
+        PROBE_HTTP_ERROR
+    }
+}
+
+/// The `for=`/`in=` geography clause: all states, a state FIPS subset, or
+/// `county:*` within the given states (the N35 probe).
+pub fn nes_for_clause(geo: &str, states: &str) -> String {
+    if geo == "county" {
+        format!("for=county:*&in=state:{states}")
+    } else if states.is_empty() || states == "*" {
+        "for=state:*".to_string()
+    } else {
+        format!("for=state:{states}")
+    }
+}
+
 /// Map the Census array-of-arrays payload (row 0 = header, addressed by the
-/// pre-resolved column indices) into per-state records for one trade NAICS.
+/// pre-resolved column indices) into per-place records for one trade NAICS.
+///
+/// State rows keep their historical key (`{naics}:{state_fips}`) and shape; a
+/// county row is keyed `{naics}:{state_fips}{county_fips}` and stamped
+/// `geo: "county"` so the blend can tell the grains apart in SQL rather than
+/// by key length.
 fn map_trade_rows(
     rows: &[Vec<String>],
-    i_estab: usize,
-    i_rcpt: usize,
-    i_state: usize,
+    cols: &NesCols,
+    geo: &str,
     naics: &str,
     label: &str,
     year: &str,
@@ -430,7 +609,7 @@ fn map_trade_rows(
     let mut suppressed_receipts = 0usize;
 
     for row in rows.iter().skip(1) {
-        let Some(estab) = census_common::census_num(row.get(i_estab)) else {
+        let Some(estab) = census_common::census_num(row.get(cols.estab)) else {
             // Suppressed/jammed primary cell → not a reported operator place.
             suppressed_places += 1;
             continue;
@@ -441,12 +620,23 @@ fn map_trade_rows(
         // into the national average, into the blend's `solo_receipts_thousands`
         // and out the far end as a $0 succession-wave receipt for a state that
         // simply wasn't allowed to report.
-        let rcpt = census_common::census_num(row.get(i_rcpt));
+        let rcpt = census_common::census_num(row.get(cols.rcpt));
         if rcpt.is_none() {
             suppressed_receipts += 1;
         }
-        let st_fips = row.get(i_state).cloned().unwrap_or_default();
+        let st_fips = row.get(cols.state).cloned().unwrap_or_default();
         let state = census_common::state_abbr(&st_fips).to_string();
+        let county_fips = cols.county.and_then(|i| row.get(i)).cloned();
+        // The place label matches the employer side's `place_of` exactly
+        // (`CA` / `CA·037`), because the blend joins the two by it.
+        let place = match &county_fips {
+            Some(c) => format!("{state}·{c}"),
+            None => state.clone(),
+        };
+        let key = match &county_fips {
+            Some(c) => format!("{naics}:{}", census_common::county_fips5(&st_fips, c)),
+            None => format!("{naics}:{st_fips}"),
+        };
         let avg = match rcpt {
             Some(r) if estab > 0 => Some((r * 1000) / estab),
             _ => None,
@@ -454,15 +644,21 @@ fn map_trade_rows(
 
         total_estab += estab;
         total_rcpt += rcpt.unwrap_or(0);
-        ranked.push((state.clone(), estab, avg));
+        ranked.push((place.clone(), estab, avg));
 
         records.push((
-            format!("{naics}:{st_fips}"),
+            key,
             json!({
                 "naics": naics,
                 "trade": label,
                 "state": state,
                 "state_fips": st_fips,
+                // The grain this row IS. Legacy rows predate the field and are
+                // read as `state` (the only grain that existed then) — see the
+                // blend's solo split.
+                "geo": geo,
+                "county_fips": county_fips,
+                "place": place,
                 "nonemployers": estab,
                 // Null, not absent: the column stays in every CSV export and
                 // every consumer sees an explicit "suppressed" rather than a
@@ -555,15 +751,107 @@ mod tests {
     }
 
     fn rollup(data: &[[&str; 4]]) -> TradeRollup {
+        let cols = NesCols {
+            estab: 1,
+            rcpt: 2,
+            state: 3,
+            county: None,
+        };
         map_trade_rows(
             &nes_rows(data),
-            1,
-            2,
-            3,
+            &cols,
+            "state",
             "2382",
             "Building equipment",
             "2021",
         )
+    }
+
+    /// The N35 probe's whole deliverable: telling "NES refuses this geography"
+    /// apart from "NES serves it and withheld this cell". Answering the first
+    /// with the second's verdict would retire the blend's `state_carried`
+    /// fallback on evidence that never existed.
+    #[test]
+    fn a_refused_geography_is_not_read_as_a_suppressed_cell() {
+        // The BFS-shaped refusal: HTTP 400 naming the geography hierarchy.
+        assert_eq!(
+            county_probe_verdict(400, "error: unknown/unsupported geography hierarchy"),
+            PROBE_UNSUPPORTED
+        );
+        // Suppression: the grain is accepted, this NAICS is not published.
+        assert_eq!(county_probe_verdict(204, ""), PROBE_EMPTY);
+        assert_eq!(county_probe_verdict(200, "   "), PROBE_EMPTY);
+        // The answer we are looking for.
+        assert_eq!(
+            county_probe_verdict(200, "[[\"NAME\",\"NESTAB\"]]"),
+            PROBE_SERVED
+        );
+        // A 200 that is the missing-key HTML page is NOT a served verdict.
+        assert_eq!(
+            county_probe_verdict(200, "<html>missing key</html>"),
+            PROBE_HTTP_ERROR
+        );
+        // A non-success that says nothing about geography stays undiagnosed
+        // rather than being promoted to "NES has no counties".
+        assert_eq!(county_probe_verdict(500, "server error"), PROBE_HTTP_ERROR);
+    }
+
+    /// A county answer must key and label itself as county grain — otherwise it
+    /// lands on top of the state row for the same NAICS and the state's solo
+    /// count silently becomes one county's.
+    #[test]
+    fn county_rows_key_on_five_digit_fips_and_never_overwrite_the_state_row() {
+        let mut rows = vec![vec![
+            "NAME".to_string(),
+            "NESTAB".to_string(),
+            "NRCPTOT".to_string(),
+            "state".to_string(),
+            "county".to_string(),
+        ]];
+        rows.push(
+            ["Los Angeles County", "900", "4000", "06", "037"]
+                .iter()
+                .map(|c| c.to_string())
+                .collect(),
+        );
+        let cols = NesCols {
+            estab: 1,
+            rcpt: 2,
+            state: 3,
+            county: Some(4),
+        };
+        let r = map_trade_rows(&rows, &cols, "county", "2382", "Building equipment", "2021");
+        assert_eq!(r.records.len(), 1);
+        assert_eq!(r.records[0].0, "2382:06037", "not the state key 2382:06");
+        let v = &r.records[0].1;
+        assert_eq!(v["geo"], "county");
+        assert_eq!(v["county_fips"], "037");
+        assert_eq!(v["state_fips"], "06");
+        // The place label is the one the employer side writes, so the blend can
+        // join the two halves without a second convention.
+        assert_eq!(v["place"], "CA·037");
+        assert_eq!(r.ranked[0].0, "CA·037");
+
+        // The shipped state path is untouched: same key, and `geo` says state.
+        let s = rollup(&[["California", "100", "5000", "06"]]);
+        assert_eq!(s.records[0].0, "2382:06");
+        assert_eq!(s.records[0].1["geo"], "state");
+        assert_eq!(s.records[0].1["county_fips"], Value::Null);
+        assert_eq!(s.records[0].1["place"], "CA");
+    }
+
+    /// `county` fans out inside the requested states; the state clause is
+    /// unchanged in both of its shipped forms.
+    #[test]
+    fn the_county_clause_stays_inside_the_requested_states() {
+        assert_eq!(nes_for_clause("state", ""), "for=state:*");
+        assert_eq!(nes_for_clause("state", "*"), "for=state:*");
+        assert_eq!(nes_for_clause("state", "06,48"), "for=state:06,48");
+        assert_eq!(
+            nes_for_clause("county", "06"),
+            "for=county:*&in=state:06",
+            "county:* nationwide is never requested"
+        );
     }
 
     #[test]

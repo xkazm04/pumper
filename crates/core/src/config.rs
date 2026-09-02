@@ -60,6 +60,9 @@ pub struct Config {
     /// sides — `/executors/*` answers 404 until `enabled`, and no process runs
     /// in executor mode unless it is started with `--executor`.
     pub executors: ExecutorsConfig,
+    /// N35 sub-state launch atlas: the county fan-out rail and the metro
+    /// pricing driver. The driver is OFF by default. See [`CensusConfig`].
+    pub census: CensusConfig,
 }
 
 /// Quiet-window maintenance: when the store's housekeeping is allowed to run.
@@ -3666,3 +3669,58 @@ impl ExecutorsConfig {
 /// (the plane secret and, in keys mode, an `admin` key). One header per
 /// credential keeps "wrong secret" and "wrong key" two distinguishable 401s.
 pub const EXECUTOR_SECRET_HEADER: &str = "x-pumper-executor-secret";
+
+/// N35 — the sub-state launch atlas.
+///
+/// The census family publishes state-grain products; the atlas is the county
+/// and metro grain on top of them. Two things here need to be an OPERATOR
+/// setting rather than a job param: how many states a county run is allowed to
+/// fan out over (the cost rail — a nationwide county run is ~3,000 counties x
+/// N trades of CBP requests), and whether the atlas may create metered pricing
+/// schedules for the metros it ranks.
+///
+/// **The pricing driver is OFF by default.** Everything else here shapes a
+/// derived dataset and is safe to compute on every run; `metro_pricing` asks
+/// the runtime to create schedules that spend real money through the Claude
+/// engine, so it ships disabled and the plan is reported instead. With no
+/// `[census]` section the atlas behaves as a pure read-model: ranked, written,
+/// and buying nothing.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct CensusConfig {
+    /// How many states the county atlas is scoped to — the top K by the state
+    /// ranking the atlas publishes. The atlas never contains a county outside
+    /// them, so this is the one number that bounds both the dataset and the
+    /// CBP request fan-out a county run implies.
+    pub atlas_states_k: usize,
+    /// How many counties per trade each of the atlas's two rankings keeps.
+    pub atlas_top_n: usize,
+    /// How many distinct metros the pricing plan may name. Each one is a
+    /// metered ~20-turn research run when the driver is enabled.
+    pub atlas_metros: usize,
+    /// Ask the runtime to create the `homewyse-pricing` schedules the atlas
+    /// plans. **Default false**: the plan is always computed and reported, and
+    /// only an operator turning this on turns it into standing spend.
+    pub metro_pricing: bool,
+    /// Cron for each metro pricing schedule. Quarterly by default — the
+    /// pricing app's own freshness gate is 90 days, so a tighter cron buys
+    /// nothing but skipped runs.
+    pub metro_pricing_cron: String,
+    /// Per-run spend ceiling replayed into every job the metro schedules
+    /// enqueue, through the same `budget_usd` rail `POST /schedules` validates.
+    /// `0` = no ceiling requested (the runtime's own defaults apply).
+    pub metro_pricing_budget_usd: f64,
+}
+
+impl Default for CensusConfig {
+    fn default() -> Self {
+        Self {
+            atlas_states_k: 10,
+            atlas_top_n: 25,
+            atlas_metros: 5,
+            metro_pricing: false,
+            metro_pricing_cron: "0 0 7 1 1,4,7,10 *".to_string(),
+            metro_pricing_budget_usd: 2.0,
+        }
+    }
+}
