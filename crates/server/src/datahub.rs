@@ -1216,7 +1216,29 @@ pub async fn on_job_failure(state: &AppState, job: &Job) {
     let state = state.clone();
     let job = job.clone();
     pool.run("openlineage", job_id, async move {
-        let ev = gather_run_event(&state, &job, &[], RunOutcome::Fail).await;
+        // Run + flow only, and no dataset gathering at all. A failed run has no
+        // outputs to describe, and walking them anyway would spend a row count,
+        // a sample read and — worse — one GMS round-trip per dataset on the
+        // failure path, which is exactly when the box is least likely to have
+        // capacity to spare.
+        let mut ev = LineageEvent::for_run(
+            state.config.datahub.env.clone(),
+            gather_run(&state, &job, RunOutcome::Fail).await,
+        );
+        if state.config.datahub.emit_flows {
+            let (flow_id, flow_name, kind) = flow_identity(
+                &job.app,
+                job.schedule_id.as_deref(),
+                job.trigger_id.as_deref(),
+            );
+            ev.flow = Some(FlowRef {
+                flow_id,
+                name: flow_name,
+                kind,
+                schedule_id: job.schedule_id.clone(),
+                trigger_id: job.trigger_id.clone(),
+            });
+        }
         crate::lineage::emit(&state, &ev).await;
     })
     .await;
@@ -3194,7 +3216,10 @@ mod tests {
                 ),
                 envelope(&urn, operation(GOLDEN_MS)),
                 envelope(&urn, dataset_profile(GOLDEN_MS, 3)),
-                envelope(&urn, schema_metadata("hn", "stories", &json!({ "title": "a" }))),
+                envelope(
+                    &urn,
+                    schema_metadata("hn", "stories", &json!({ "title": "a" }))
+                ),
                 entity(
                     "dataFlow",
                     &flow,
@@ -3278,7 +3303,10 @@ mod tests {
             .map(|e| e["aspect"]["fineGrainedLineages"][0].clone())
             .expect("a fine-grained lineage aspect");
         assert_eq!(fine["upstreamType"], "FIELD_SET");
-        assert_eq!(fine["upstreams"][0], format!("urn:li:schemaField:({surn},title)"));
+        assert_eq!(
+            fine["upstreams"][0],
+            format!("urn:li:schemaField:({surn},title)")
+        );
         assert_eq!(fine["transformOperation"], "css:.titleline");
 
         // …and the source itself is an entity, on the `web` platform.
