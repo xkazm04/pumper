@@ -267,6 +267,23 @@ A failure that never started a process (a bad `binary`) writes no row at all —
 
 **Structured answers are cacheable.** Under `--json-schema` the CLI may return `result` as an object rather than a string. That used to become empty `text`, which the research cache refuses to store — so the call re-paid the model on every repeat, silently. A non-string `result` now falls back to the validated `structured_output` (then the raw value), serialized.
 
+#### The subprocess can fetch through pumper instead of around it (N15)
+
+`[claude] self_hosted_tools` (default **OFF**) replaces the CLI's own
+`WebFetch`/`WebSearch` with pumper's `fetch` MCP tool: a per-run `.mcp.json`
+carrying a single-job token, `--mcp-config … --strict-mcp-config`, and
+`self_hosted_allowed_tools` in place of `allowed_tools`. Every byte the model
+then pulls goes down **this** ladder — recipe tier, archive tier, http, browser
+— under the governor, the response cache, the session profile and the job's own
+`budget_usd`, and lands in `cost_events` like every other fetch. The tier-3
+default prompt names the tool. Full contract, the two auth modes, the refusals
+and what is out of the v1 slice: [mcp.md § The self-hosted agent
+loop](mcp.md#the-self-hosted-agent-loop-claude-self_hosted_tools).
+
+Two things this does **not** do: the model's fetches are not recorded into a VCR
+cassette (so a replayed research run's sub-fetches still go live), and the tool
+refuses `auto_with_research` — the research tier may not re-enter itself.
+
 #### What may cross the cmd.exe shim
 
 Only the Windows shim path re-parses (`[claude] binary` pointing at a real `.exe`, and every POSIX spawn, deliver argv byte-exact and are not restricted). On that path cmd.exe parses the command line a second time, and the following were **measured** through a real round-trip rather than assumed:

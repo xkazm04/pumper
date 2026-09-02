@@ -111,6 +111,13 @@
       ]
     },
     {
+      "doc": "docs/features/mcp.md",
+      "sourceGlobs": [
+        "crates/server/src/mcp/**",
+        "crates/core/src/agent_tools.rs"
+      ]
+    },
+    {
       "doc": "docs/features/auth.md",
       "sourceGlobs": [
         "crates/server/src/auth.rs",
