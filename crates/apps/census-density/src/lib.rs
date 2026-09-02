@@ -33,7 +33,27 @@ use pumper_core::{
 };
 use serde_json::{json, Value};
 
-pub struct CensusDensity;
+/// The CBP ingester — and, through the blend it owns, the publisher of the
+/// three `census/*` products.
+///
+/// Carries the operator's `[census]` section (N35) because the atlas's scope
+/// rail and its metered pricing driver are policy, not per-job params: a
+/// scheduled run cannot carry them inline, and a key that binds nothing is the
+/// bug `[research] max_watched_sources` documented. `Default` is the shipped
+/// section, so an embedder constructing the app by hand behaves as before.
+#[derive(Debug, Clone, Default)]
+pub struct CensusDensity {
+    census: pumper_core::config::CensusConfig,
+}
+
+impl CensusDensity {
+    /// Construct with the operator's `[census]` section.
+    pub fn with_config(census: &pumper_core::config::CensusConfig) -> Self {
+        Self {
+            census: census.clone(),
+        }
+    }
+}
 
 const DEFAULT_YEAR: &str = "2022";
 const DEFAULT_NAICS_VAR: &str = "NAICS2017";
@@ -123,7 +143,31 @@ impl ScrapeApp for CensusDensity {
                         "type": "boolean",
                         "description": "Permit a run whose `year` is OLDER than the vintage this app already holds. Default false: these records are keyed without the year, so an older run overwrites current data and publishes the regression as a forward change (a `changed` revision, every watch/trigger on the dataset, a search re-index). Set true only when re-pointing the store at an older vintage is the intent."
                     },
-                    "api_key": { "type": "string", "description": "Free Census API key; falls back to env CENSUS_API_KEY." }
+                    "api_key": { "type": "string", "description": "Free Census API key; falls back to env CENSUS_API_KEY." },
+                    "atlas_states_k": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "How many states the county atlas is scoped to (default [census] atlas_states_k = 10). The atlas never contains a county outside them."
+                    },
+                    "atlas_top_n": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Counties per trade kept by EACH of the atlas's two rankings (saturation, total_market_per_10k). Default [census] atlas_top_n = 25."
+                    },
+                    "atlas_metros": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "How many metros the pricing plan may name. Default [census] atlas_metros = 5."
+                    },
+                    "metro_pricing": {
+                        "type": "boolean",
+                        "description": "Ask the runtime to create the planned homewyse-pricing schedules. Default [census] metro_pricing = false — the plan is ALWAYS computed and reported; this turns it into metered spend."
+                    },
+                    "blend_read_limit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "description": "Diagnostic: lower the blend's per-input row cap so the truncation report fires."
+                    }
                 },
                 "additionalProperties": true
             })),
@@ -151,7 +195,10 @@ impl ScrapeApp for CensusDensity {
                  employees_cells, payroll_cells}, top} | {naics, label, note}], \
                  top_places_overall, top_places_by_saturation, normalization: \
                  {places_matched, places_excluded_no_denominator_row, \
-                 places_excluded_base_not_positive, ...}, market_blend (carrying \n                 market_profile: the state x trade product this run republishes), \
+                 places_excluded_base_not_positive, ...}, market_blend (carrying \n                 market_profile: the state x trade product this run republishes, and 
+                 atlas: {states, state_rank_basis, counties_ranked, metro_pricing: 
+                 {enabled, plan, requested, unmapped_counties}} - the county/metro 
+                 launch atlas), \
                  suppression, empty_answers, index_datasets, records, new, changed, \
                  unchanged} — suppressed cells are absent (Null), never zeroed, and \
                  are counted; a trade the API publishes nothing for (HTTP 204) yields \
@@ -480,7 +527,8 @@ impl ScrapeApp for CensusDensity {
         // counts into the shared `census/market_blend` dataset. Degrades
         // gracefully — a blend failure (or the other app never having run)
         // must not fail an otherwise-good CBP scrape.
-        let market_blend = match sync_market_blend(&ctx).await {
+        let atlas_settings = AtlasSettings::from_config(&self.census).with_params(&ctx);
+        let market_blend = match sync_market_blend_with(&ctx, &atlas_settings).await {
             Ok(v) => v,
             Err(e) => json!({ "skipped": format!("{e}") }),
         };
@@ -970,6 +1018,11 @@ fn with_market_index(mut result: Value) -> Value {
         .and_then(Value::as_array_mut)
     {
         specs.push(trades_common::market::product_index_spec());
+        // N35: the county atlas, for the same reason and by the same route —
+        // `census_common::product_index_datasets` is pinned by three sibling
+        // crates' tests, so the third `census/*` product is declared here, on
+        // the app that owns it.
+        specs.push(json!({ "app": MARKET_APP, "dataset": ATLAS_DATASET }));
     }
     result
 }
@@ -983,6 +1036,16 @@ const SATURATION_INPUTS: [&str; 2] = ["census-density/establishments", "census-a
 /// either side has no data yet (the other app may never have run), reports
 /// `blended: 0` with a note instead of writing half-truths.
 pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
+    // The three sibling census apps re-derive the blend through this signature
+    // and hold no `[census]` section of their own, so they get the shipped
+    // defaults plus whatever their job params say. `census-density` — the app
+    // that OWNS the atlas and the county runs — calls the `_with` form with the
+    // operator's section.
+    sync_market_blend_with(ctx, &AtlasSettings::default().with_params(ctx)).await
+}
+
+/// [`sync_market_blend`] with the atlas rails supplied by the caller.
+pub async fn sync_market_blend_with(ctx: &AppContext, atlas: &AtlasSettings) -> Result<Value> {
     let limit = blend_read_limit(ctx);
     // Truncation is measured on the RAW read (the cap is a SQL `LIMIT`), before
     // tombstones are filtered out in Rust — filtering first would hide a
@@ -1017,7 +1080,30 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
     if read_hit_cap(employers_raw.len(), limit) {
         truncated.push("census-density/establishments");
     }
-    let employers = live(employers_raw);
+    let mut employers = live(employers_raw);
+    // N35: county rows are read SEPARATELY rather than by dropping the geo
+    // filter, so each grain gets the whole cap instead of competing for one
+    // recency window — a nationwide county run is ~3,000 counties x N trades and
+    // would otherwise push every state row out of a shared 50k read. The
+    // truncation report names the grain, because a capped county read and a
+    // capped state read make different cells wrong.
+    let counties_raw = ctx
+        .datasets
+        .list_filtered(
+            "census-density",
+            "establishments",
+            &[pumper_core::datasets::JsonFilter::Eq {
+                path: "$.geo".into(),
+                value: "county".into(),
+            }],
+            None,
+            limit,
+        )
+        .await?;
+    if read_hit_cap(counties_raw.len(), limit) {
+        truncated.push("census-density/establishments@county");
+    }
+    employers.extend(live(counties_raw));
     let solos_raw = ctx
         .datasets
         .list("census-nonemp", "nonemployers", limit)
@@ -1140,6 +1226,17 @@ pub async fn sync_market_blend(ctx: &AppContext) -> Result<Value> {
     if let Value::Object(map) = &mut out {
         map.insert("market_profile".into(), profile);
     }
+    // N35: the county/metro atlas over the cells just written. Built from the
+    // in-memory `items`, never a re-read, so the atlas can never describe a
+    // different blend than the one this run published. Reported, never fatal —
+    // same rule as the profile above.
+    let atlas_block = match sync_atlas(ctx, &items, &bases, atlas).await {
+        Ok(v) => v,
+        Err(e) => json!({ "counties_ranked": 0, "error": e.to_string() }),
+    };
+    if let Value::Object(map) = &mut out {
+        map.insert("atlas".into(), atlas_block);
+    }
     Ok(out)
 }
 
@@ -1165,52 +1262,86 @@ pub struct PlaceBase {
 
 /// place → base for the blend's per-capita join.
 ///
-/// `saturation` now holds one row per (geo, denominator, place), so a place can
-/// appear several times — with DIFFERENT bases. Two rules make the pick
+/// `saturation` holds one row per (geo, denominator, place), so a place can
+/// appear several times — with DIFFERENT bases. Three rules make the pick
 /// deterministic instead of "whichever the map iterator wrote last":
-///  - **state rows only**: the blend's cells are state-grain, and a county
-///    row's base would be a fraction of the state's;
-///  - **first wins**, and `Datasets::list` returns `updated_at DESC`, so the
-///    most recently written denominator is the one in force. That is also what
-///    keeps a legacy `{place}`-keyed row from shadowing a current one.
+///  - **both grains are indexed** (N35): the blend now emits county cells as
+///    well as state ones, and a county cell's per-10k needs the county's ACS
+///    base. Place labels are grain-distinct by construction (`place_of` writes
+///    `CA` and `CA·037`), so one map holds both without collision;
+///  - **state rows are indexed first**, so a county row can never supply a
+///    STATE cell's base even if some future row mislabels its place — the
+///    guarantee the state-only filter used to provide;
+///  - **first wins** within a pass, and `Datasets::list` returns
+///    `updated_at DESC`, so the most recently written denominator is the one in
+///    force. That is also what keeps a legacy `{place}`-keyed row from
+///    shadowing a current one.
 pub fn base_index(bases: &[Value]) -> BTreeMap<String, PlaceBase> {
     let mut out: BTreeMap<String, PlaceBase> = BTreeMap::new();
-    for r in bases {
-        // Legacy rows predate `geo`; treat a missing one as state (the only
-        // grain that existed then) rather than dropping it.
-        if r.get("geo").and_then(Value::as_str).unwrap_or("state") != "state" {
-            continue;
+    // Legacy rows predate `geo`; treat a missing one as state (the only grain
+    // that existed then) rather than dropping it.
+    let grain = |r: &Value| {
+        r.get("geo")
+            .and_then(Value::as_str)
+            .unwrap_or("state")
+            .to_string()
+    };
+    for pass in ["state", "county"] {
+        for r in bases {
+            if grain(r) != pass {
+                continue;
+            }
+            let (Some(place), Some(base)) = (
+                r.get("place").and_then(Value::as_str),
+                r.get("base").and_then(Value::as_i64),
+            ) else {
+                continue;
+            };
+            out.entry(place.to_string()).or_insert(PlaceBase {
+                base,
+                denominator_kind: r
+                    .get("denominator_kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                acs_year: r
+                    .get("acs_year")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+            });
         }
-        let (Some(place), Some(base)) = (
-            r.get("place").and_then(Value::as_str),
-            r.get("base").and_then(Value::as_i64),
-        ) else {
-            continue;
-        };
-        out.entry(place.to_string()).or_insert(PlaceBase {
-            base,
-            denominator_kind: r
-                .get("denominator_kind")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_string(),
-            acs_year: r
-                .get("acs_year")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-        });
     }
     out
 }
 
-/// Pure blend: employer state rows (6-digit NAICS, from `establishments`) +
-/// solo state rows (4-digit NAICS, from `nonemployers`) → one record per
-/// (4-digit NAICS group × state FIPS), keyed `{naics4}:{state_fips}`.
+/// Pure blend: employer rows (6-digit NAICS, from `establishments`) + solo rows
+/// (4-digit NAICS, from `nonemployers`) → one record per (4-digit NAICS group ×
+/// GEOGRAPHY), keyed `{naics4}:{geo_fips}` — a 2-digit state FIPS or a 5-digit
+/// county FIPS.
 ///
-/// Employer county rows are skipped (NES has no county grain); a group present
-/// on only one side is still emitted — with 0 on the missing side and a
-/// `coverage` marker — so the dataset shows WHERE the blend is partial rather
-/// than hiding it.
+/// **The geo dimension (N35).** County employer rows used to be dropped here
+/// ("the solo side has no county grain"), which made a county launch ranking
+/// impossible to build from the product. They now form their own cells, and
+/// each cell says what its solo half actually is:
+///  - `solo_grain: "state"` — a state cell, both halves at the cell's grain;
+///  - `solo_grain: "county"` — NES served county rows for this cell (the probe
+///    in `census-nonemp` answered `served`) and they are joined at county;
+///  - `solo_grain: "state_carried"` — NES published nothing at county grain, so
+///    `solo_operators` is **Null** and `total_market` counts employers only.
+///    The state's solo total rides along as `solo_state_operators`, labelled,
+///    as CONTEXT — apportioning it across counties would fabricate exactly the
+///    per-county number this whole product refuses to invent.
+///
+/// A county cell carries `state_fips: null` and names its state in
+/// `parent_state_fips` on purpose: `trades_common::market::build_profiles`
+/// indexes blend cells by `{naics4}:{state_fips}` off the record's own fields,
+/// so a county cell that filled `state_fips` in would collide with — and
+/// silently replace — the state cell backing every `market/profile` row.
+/// `market/profile` is state × trade and stays that way.
+///
+/// A group present on only one side is still emitted — with 0 on the missing
+/// side and a `coverage` marker — so the dataset shows WHERE the blend is
+/// partial rather than hiding it.
 ///
 /// `owner_age` are census-nesd `owner_age` band records (2-digit SECTOR grain,
 /// joined via the naics4's sector prefix; may be empty) and
@@ -1224,10 +1355,18 @@ pub fn blend_market(
     owner_age: &[Value],
     formation_velocity: &[Value],
 ) -> Vec<(String, Value)> {
-    // (naics4, state_fips) → accumulating blend halves.
+    // (naics4, geo_fips) → accumulating blend halves.
     #[derive(Default)]
     struct Cell {
+        /// The place LABEL (`CA` / `CA·037`) — the key the per-capita base and
+        /// the saturation ranking are both indexed by.
         state: Option<String>,
+        /// `state` | `county`.
+        geo: String,
+        /// The state this cell is in, whatever its grain.
+        parent_state_fips: String,
+        /// `Some` only on a county cell.
+        county_fips: Option<String>,
         trade: Option<String>,
         /// Per-CONTRIBUTING-CODE establishment counts, resolved to a single sum
         /// only at emit time — see `census_common::covering_naics`. Summing as
@@ -1278,17 +1417,57 @@ pub fn blend_market(
 
     let mut cells: BTreeMap<(String, String), Cell> = BTreeMap::new();
 
-    for e in employers {
-        // Only state rows: the solo side has no county grain to join against.
-        if e.get("geo").and_then(Value::as_str) != Some("state") {
+    // The GEOGRAPHY a source row belongs to: `(geo, parent state FIPS, county
+    // FIPS, geo FIPS)`. `None` for a row whose grain says county but which
+    // carries no county code — placing it would be a guess.
+    let geo_of = |v: &Value| -> Option<(String, String, Option<String>, String)> {
+        // Rows written before the geo dimension existed are state rows: that is
+        // the only grain either app ever wrote.
+        let geo = v
+            .get("geo")
+            .and_then(Value::as_str)
+            .unwrap_or("state")
+            .to_string();
+        let st = str_field(v, "state_fips")?;
+        if geo == "county" {
+            let county = str_field(v, "county_fips")?;
+            let fips5 = census_common::county_fips5(&st, &county);
+            Some((geo, st, Some(county), fips5))
+        } else {
+            let fips = st.clone();
+            Some((geo, st, None, fips))
+        }
+    };
+    let stamp_geo = |cell: &mut Cell, geo: &str, st: &str, county: &Option<String>| {
+        if cell.geo.is_empty() {
+            cell.geo = geo.to_string();
+            cell.parent_state_fips = st.to_string();
+            cell.county_fips = county.clone();
+        }
+    };
+
+    // The state's solo total per (naics4, state FIPS) — the figure a
+    // `state_carried` county cell reports as CONTEXT beside its Null solo count.
+    let mut solo_by_state: BTreeMap<(String, String), i64> = BTreeMap::new();
+    for s in solos {
+        if s.get("geo").and_then(Value::as_str).unwrap_or("state") != "state" {
             continue;
         }
-        let (Some(naics), Some(st)) = (str_field(e, "naics"), str_field(e, "state_fips")) else {
+        let (Some(naics4), Some(st)) = (str_field(s, "naics"), str_field(s, "state_fips")) else {
+            continue;
+        };
+        *solo_by_state.entry((naics4, st)).or_insert(0) += num_field(s, "nonemployers");
+    }
+
+    for e in employers {
+        let (Some(naics), Some((geo, st, county, geo_fips))) = (str_field(e, "naics"), geo_of(e))
+        else {
             continue;
         };
         // 6-digit → 4-digit trade group (codes shorter than 4 pass through).
         let naics4: String = naics.chars().take(4).collect();
-        let cell = cells.entry((naics4, st)).or_default();
+        let cell = cells.entry((naics4, geo_fips)).or_default();
+        stamp_geo(cell, &geo, &st, &county);
         *cell.employer_by_naics.entry(naics).or_insert(0) += num_field(e, "establishments");
         cell.employer_year = cell.employer_year.take().or_else(|| str_field(e, "year"));
         cell.state
@@ -1296,17 +1475,21 @@ pub fn blend_market(
     }
 
     for s in solos {
-        let (Some(naics4), Some(st)) = (str_field(s, "naics"), str_field(s, "state_fips")) else {
+        let (Some(naics4), Some((geo, st, county, geo_fips))) = (str_field(s, "naics"), geo_of(s))
+        else {
             continue;
         };
-        let cell = cells.entry((naics4, st)).or_default();
+        let cell = cells.entry((naics4, geo_fips)).or_default();
+        stamp_geo(cell, &geo, &st, &county);
         *cell.solo_estab.get_or_insert(0) += num_field(s, "nonemployers");
         if let Some(rcpt) = s.get("receipts_thousands").and_then(Value::as_i64) {
             *cell.solo_receipts_thousands.get_or_insert(0) += rcpt;
         }
         cell.solo_year = cell.solo_year.take().or_else(|| str_field(s, "year"));
-        if let Some(state) = str_field(s, "state") {
-            cell.state.get_or_insert(state);
+        // The place label: `place` on a county row, the state abbreviation on a
+        // state row (which is what `state` has always held).
+        if let Some(place) = str_field(s, "place").or_else(|| str_field(s, "state")) {
+            cell.state.get_or_insert(place);
         }
         // The 4-digit group label lives on the solo side; keep it.
         if let Some(trade) = str_field(s, "trade") {
@@ -1316,7 +1499,18 @@ pub fn blend_market(
 
     cells
         .into_iter()
-        .map(|((naics4, st_fips), c)| {
+        .map(|((naics4, geo_fips), c)| {
+            let is_county = c.geo == "county";
+            // The state this cell sits in — the join key for every input that
+            // is published per state (NES-D bands, the state's solo total).
+            let st_fips = c.parent_state_fips.clone();
+            // WHAT THE SOLO HALF OF THIS CELL IS. The one label a sub-state
+            // consumer has to read before comparing two cells.
+            let solo_grain = match (is_county, c.solo_estab.is_some()) {
+                (false, _) => "state",
+                (true, true) => "county",
+                (true, false) => "state_carried",
+            };
             // Mixed-grain resolution BEFORE the sum: keep the covering
             // aggregate, drop the components it already contains.
             let contributing: BTreeSet<String> = c.employer_by_naics.keys().cloned().collect();
@@ -1334,9 +1528,24 @@ pub fn blend_market(
             };
             let employer = employer_estab.unwrap_or(0);
             let solo = c.solo_estab.unwrap_or(0);
-            let total = employer + solo;
-            let solo_share = if total > 0 {
+            // A `state_carried` cell has an UNKNOWN solo half, not an empty
+            // one: `0` here would read as "no solo operators in this county",
+            // which is a claim nobody published. State cells keep their shipped
+            // behaviour exactly (a missing side is 0 with a coverage marker).
+            let solo_known = solo_grain != "state_carried";
+            let total = employer + if solo_known { solo } else { 0 };
+            let solo_share = if solo_known && total > 0 {
                 Value::from(((solo as f64 / total as f64) * 10_000.0).round() / 10_000.0)
+            } else {
+                Value::Null
+            };
+            // The state's solo total, as CONTEXT on a state-carried county cell
+            // — never apportioned, never added into `total_market`.
+            let solo_state_operators = if solo_grain == "state_carried" {
+                solo_by_state
+                    .get(&(naics4.clone(), st_fips.clone()))
+                    .map(|n| Value::from(*n))
+                    .unwrap_or(Value::Null)
             } else {
                 Value::Null
             };
@@ -1360,7 +1569,7 @@ pub fn blend_market(
                     Value::from(
                         ((total as f64 / b.base as f64) * 10_000.0 * 100.0).round() / 100.0,
                     ),
-                    Value::from(per_10k_basis(coverage)),
+                    Value::from(per_10k_basis(coverage, solo_grain)),
                 ),
                 _ => (Value::Null, Value::Null, Value::Null, Value::Null),
             };
@@ -1434,7 +1643,22 @@ pub fn blend_market(
                 "naics4": naics4,
                 "trade": c.trade,
                 "state": c.state,
-                "state_fips": st_fips,
+                // NULL ON A COUNTY CELL, on purpose: `market/profile`'s join
+                // indexes blend cells by `{naics4}:{state_fips}` off these very
+                // fields, and a county cell that filled this in would replace
+                // the state cell behind every state x trade profile row. The
+                // county cell names its state in `parent_state_fips` instead.
+                "state_fips": if is_county { Value::Null } else { Value::from(st_fips.clone()) },
+                "geo": c.geo,
+                "geo_fips": geo_fips,
+                "parent_state_fips": st_fips,
+                "county_fips": c.county_fips,
+                // The grain of each half, said out loud. `employer_grain` is
+                // always the cell's own grain (CBP publishes both); the solo
+                // side is the one that can be coarser than the cell.
+                "employer_grain": c.geo,
+                "solo_grain": solo_grain,
+                "solo_state_operators": solo_state_operators,
                 "employer_establishments": employer,
                 "employer_naics": counted_naics,
                 // Codes present in the store but NOT counted, because a coarser
@@ -1443,7 +1667,9 @@ pub fn blend_market(
                 // mixed-grain and the correction is on the record, not silent.
                 "employer_naics_covered": dropped_naics,
                 "employer_year": c.employer_year,
-                "solo_operators": solo,
+                // Null (never 0) when the solo half is state-carried: nobody
+                // published a solo count for this county.
+                "solo_operators": if solo_known { Value::from(solo) } else { Value::Null },
                 "solo_year": c.solo_year,
                 "total_market": total,
                 "solo_share": solo_share,
@@ -1476,7 +1702,10 @@ pub fn blend_market(
                     "base_acs_year": base_acs_year,
                 },
             });
-            (format!("{naics4}:{st_fips}"), value)
+            // `{naics4}:{geo_fips}` — a 2-digit state FIPS or a 5-digit county
+            // FIPS. State keys are byte-identical to the ones shipped before
+            // the geo dimension, so no state row is rewritten by this change.
+            (format!("{naics4}:{geo_fips}"), value)
         })
         .collect()
 }
@@ -1489,10 +1718,17 @@ pub fn blend_market(
 /// of the data hasn't been ingested for this trade". Naming the basis on the
 /// record is what stops the two from being compared as if they were the same
 /// measure.
-fn per_10k_basis(coverage: &str) -> &'static str {
-    match coverage {
-        "both" => "employer+solo",
-        "employer_only" => "employer_only — solo operators NOT counted",
+fn per_10k_basis(coverage: &str, solo_grain: &str) -> &'static str {
+    match (coverage, solo_grain) {
+        // The sub-state case, and the one most likely to be misread: employers
+        // at county grain over a county population, with the solo half missing
+        // because NES does not publish it there.
+        (_, "state_carried") => {
+            "employer_only at county grain — the solo half is published only per STATE \
+             (solo_grain: state_carried) and is NOT counted"
+        }
+        ("both", _) => "employer+solo",
+        ("employer_only", _) => "employer_only — solo operators NOT counted",
         _ => "solo_only — employer establishments NOT counted",
     }
 }
@@ -1617,6 +1853,514 @@ async fn fetch_denominator(
     Ok(map)
 }
 
+// ---------------------------------------------------------------------------
+// N35 — the sub-state launch atlas.
+//
+// `census/market_blend` answers "which STATE" at naics4 grain. The atlas is the
+// grain people actually open a business in: the top counties per trade, ranked
+// two ways, scoped to the top-K states, with the metro each one sits in — and
+// with every block saying what grain it is, because a county row assembled from
+// county employers, state-carried solos, sector-grain succession and national
+// formation is four grains in one record and reads as one unless it says so.
+// ---------------------------------------------------------------------------
+
+/// The county atlas, in the same virtual `census` namespace as the other two
+/// products.
+pub const ATLAS_DATASET: &str = "atlas";
+
+/// What the atlas is derived from, in read order.
+const ATLAS_INPUTS: [&str; 2] = ["census/market_blend", "census/saturation"];
+
+/// **How the top-K states are chosen, and why it is not what the card asked
+/// for.** The design says "the top-K states by formation velocity". BFS — the
+/// only formation source in the fleet — publishes at NATIONAL geography only
+/// (`census-bfs`: `for=state:*` is HTTP 400, and every velocity record carries
+/// `grain: naics_sector_national`). There is no per-state formation velocity to
+/// rank by, and inventing one by apportioning the national series across states
+/// is exactly the fabrication this family refuses.
+///
+/// So the scope rail ranks states by the largest honest signal that IS
+/// state-grain: the blend's own `total_market` summed across trades. The basis
+/// is published on the run result and on every atlas record, so nobody reads
+/// this ranking as a formation ranking.
+pub const ATLAS_STATE_RANK_BASIS: &str =
+    "state_total_market — BFS formation velocity is NATIONAL-grain only and cannot rank states";
+
+/// The rails the atlas runs under: `[census]` for an operator, `params.*` for
+/// one run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AtlasSettings {
+    pub states_k: usize,
+    pub top_n: usize,
+    pub metros: usize,
+    /// Whether the metro plan is actually REQUESTED as schedules. Default
+    /// false: the plan is computed and reported either way.
+    pub metro_pricing: bool,
+    pub metro_pricing_cron: String,
+    /// `None` = ask for no ceiling.
+    pub metro_pricing_budget_usd: Option<f64>,
+}
+
+impl Default for AtlasSettings {
+    fn default() -> Self {
+        Self::from_config(&pumper_core::config::CensusConfig::default())
+    }
+}
+
+impl AtlasSettings {
+    /// The operator's `[census]` section.
+    pub fn from_config(c: &pumper_core::config::CensusConfig) -> Self {
+        Self {
+            states_k: c.atlas_states_k.max(1),
+            top_n: c.atlas_top_n.max(1),
+            metros: c.atlas_metros,
+            metro_pricing: c.metro_pricing,
+            metro_pricing_cron: c.metro_pricing_cron.clone(),
+            metro_pricing_budget_usd: (c.metro_pricing_budget_usd > 0.0)
+                .then_some(c.metro_pricing_budget_usd),
+        }
+    }
+
+    /// Per-run overrides. Params only ever narrow or widen numbers a run may
+    /// legitimately choose; `metro_pricing` can be turned ON here as well,
+    /// because a one-off "plan and buy it" is a job, not a policy — and the
+    /// runtime's own `max_app_schedules_per_run` cap still bounds it.
+    pub fn with_params(mut self, ctx: &AppContext) -> Self {
+        let usize_param = |name: &str| {
+            ctx.params
+                .get(name)
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+        };
+        if let Some(k) = usize_param("atlas_states_k") {
+            self.states_k = k.max(1);
+        }
+        if let Some(n) = usize_param("atlas_top_n") {
+            self.top_n = n.max(1);
+        }
+        if let Some(m) = usize_param("atlas_metros") {
+            self.metros = m;
+        }
+        if let Some(b) = ctx.params.get("metro_pricing").and_then(Value::as_bool) {
+            self.metro_pricing = b;
+        }
+        self
+    }
+}
+
+/// The top-K states the county atlas is scoped to, ranked by the blend's own
+/// state-grain `total_market` — see [`ATLAS_STATE_RANK_BASIS`] for why this is
+/// not formation velocity.
+///
+/// Ties break on state FIPS so the scope is stable run to run: a ranking that
+/// reshuffles under a tie would silently move counties in and out of the atlas.
+pub fn top_states_for_atlas(blend: &[(String, Value)], k: usize) -> Vec<Value> {
+    let mut totals: BTreeMap<String, (i64, String)> = BTreeMap::new();
+    for (_, v) in blend {
+        if v.get("geo").and_then(Value::as_str).unwrap_or("state") != "state" {
+            continue;
+        }
+        let Some(fips) = v.get("parent_state_fips").and_then(Value::as_str) else {
+            continue;
+        };
+        let entry = totals
+            .entry(fips.to_string())
+            .or_insert_with(|| (0, String::new()));
+        entry.0 += v.get("total_market").and_then(Value::as_i64).unwrap_or(0);
+        if entry.1.is_empty() {
+            entry.1 = v
+                .get("state")
+                .and_then(Value::as_str)
+                .unwrap_or(fips)
+                .to_string();
+        }
+    }
+    let mut ranked: Vec<(String, i64, String)> = totals
+        .into_iter()
+        .map(|(fips, (total, label))| (fips, total, label))
+        .collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    ranked
+        .into_iter()
+        .take(k)
+        .enumerate()
+        .map(|(i, (fips, total, label))| {
+            json!({
+                "rank": i + 1,
+                "state_fips": fips,
+                "state": label,
+                "state_total_market": total,
+                "ranked_by": ATLAS_STATE_RANK_BASIS,
+            })
+        })
+        .collect()
+}
+
+/// place → per-10k saturation, off the persisted `census/saturation` rows the
+/// blend already read. County rows only: the atlas ranks counties, and a
+/// state's saturation is not a county's.
+pub fn county_saturation_index(bases: &[Value]) -> BTreeMap<String, f64> {
+    let mut out = BTreeMap::new();
+    for r in bases {
+        if r.get("geo").and_then(Value::as_str) != Some("county") {
+            continue;
+        }
+        let (Some(place), Some(per_10k)) = (
+            r.get("place").and_then(Value::as_str),
+            r.get("per_10k").and_then(Value::as_f64),
+        ) else {
+            continue;
+        };
+        out.entry(place.to_string()).or_insert(per_10k);
+    }
+    out
+}
+
+/// Rank the county cells of the scoped states two ways and emit the union.
+///
+/// **Two rankings, not one blended score.** `saturation_per_10k` is the
+/// employer-side ranking `census/saturation` already publishes (establishments
+/// per 10k, county grain); `total_market_per_10k` is the blend cell's own
+/// density, which on a `state_carried` county counts employers ONLY. They
+/// answer different questions and a county can top one and miss the other, so
+/// each record carries both ranks and a Null for the ranking it did not enter —
+/// never a fabricated position.
+///
+/// A county outside `allowed_states` is not in the atlas at all: the scope rail
+/// is what bounds both this dataset and the CBP fan-out behind it.
+pub fn atlas_records(
+    blend: &[(String, Value)],
+    saturation: &BTreeMap<String, f64>,
+    state_ranks: &BTreeMap<String, usize>,
+    top_n: usize,
+) -> Vec<(String, Value)> {
+    // naics4 → the county cells of the scoped states.
+    let mut by_trade: BTreeMap<String, Vec<(&String, &Value)>> = BTreeMap::new();
+    for (key, v) in blend {
+        if v.get("geo").and_then(Value::as_str) != Some("county") {
+            continue;
+        }
+        let Some(state_fips) = v.get("parent_state_fips").and_then(Value::as_str) else {
+            continue;
+        };
+        if !state_ranks.contains_key(state_fips) {
+            continue;
+        }
+        let Some(naics4) = v.get("naics4").and_then(Value::as_str) else {
+            continue;
+        };
+        by_trade
+            .entry(naics4.to_string())
+            .or_default()
+            .push((key, v));
+    }
+
+    let place_of_cell = |v: &Value| {
+        v.get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string()
+    };
+    let mut out: Vec<(String, Value)> = Vec::new();
+    for (naics4, cells) in by_trade {
+        // Ranking 1: county saturation (establishments per 10k).
+        let mut by_sat: Vec<(&String, f64)> = cells
+            .iter()
+            .filter_map(|(k, v)| saturation.get(&place_of_cell(v)).map(|s| (*k, *s)))
+            .collect();
+        by_sat.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let sat_rank: BTreeMap<&String, usize> = by_sat
+            .iter()
+            .take(top_n)
+            .enumerate()
+            .map(|(i, (k, _))| (*k, i + 1))
+            .collect();
+
+        // Ranking 2: the blend cell's own total-market density.
+        let mut by_market: Vec<(&String, f64)> = cells
+            .iter()
+            .filter_map(|(k, v)| {
+                v.get("total_market_per_10k")
+                    .and_then(Value::as_f64)
+                    .map(|m| (*k, m))
+            })
+            .collect();
+        by_market.sort_by(|a, b| b.1.total_cmp(&a.1).then_with(|| a.0.cmp(b.0)));
+        let market_rank: BTreeMap<&String, usize> = by_market
+            .iter()
+            .take(top_n)
+            .enumerate()
+            .map(|(i, (k, _))| (*k, i + 1))
+            .collect();
+
+        for (key, v) in cells {
+            let (sat, market) = (sat_rank.get(key), market_rank.get(key));
+            if sat.is_none() && market.is_none() {
+                continue;
+            }
+            let place = place_of_cell(v);
+            let county_fips5 = v
+                .get("geo_fips")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            let metro = census_common::cbsa_for_county(&county_fips5)
+                .map(|m| {
+                    json!({
+                        "cbsa_code": m.code,
+                        "cbsa_title": m.title,
+                        "crosswalk_vintage": census_common::CBSA_VINTAGE,
+                    })
+                })
+                .unwrap_or(Value::Null);
+            let state_fips = v
+                .get("parent_state_fips")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let rank = |r: Option<&usize>| r.map(|n| Value::from(*n)).unwrap_or(Value::Null);
+            let field = |name: &str| v.get(name).cloned().unwrap_or(Value::Null);
+            out.push((
+                key.clone(),
+                json!({
+                    "naics4": naics4,
+                    "trade": field("trade"),
+                    "place": place,
+                    "geo": "county",
+                    "geo_fips": county_fips5,
+                    "state": census_common::state_abbr(state_fips),
+                    "state_fips": state_fips,
+                    "county_fips": field("county_fips"),
+                    "atlas_state_rank": state_ranks.get(state_fips).map(|r| Value::from(*r)).unwrap_or(Value::Null),
+                    "atlas_state_rank_basis": ATLAS_STATE_RANK_BASIS,
+                    "rank_by_saturation": rank(sat),
+                    "rank_by_total_market_per_10k": rank(market),
+                    "saturation_per_10k": saturation
+                        .get(&place_of_cell(v))
+                        .map(|s| Value::from(*s))
+                        .unwrap_or(Value::Null),
+                    "employer_establishments": field("employer_establishments"),
+                    "solo_operators": field("solo_operators"),
+                    "solo_state_operators": field("solo_state_operators"),
+                    "total_market": field("total_market"),
+                    "total_market_per_10k": field("total_market_per_10k"),
+                    "total_market_per_10k_basis": field("total_market_per_10k_basis"),
+                    "base": field("base"),
+                    "denominator_kind": field("denominator_kind"),
+                    "coverage": field("coverage"),
+                    "metro": metro,
+                    // EVERY BLOCK, GRAIN-LABELLED. A county atlas row is four
+                    // grains stacked: employers at county, solos at county or
+                    // state-carried, succession at 2-digit sector x state,
+                    // formation at national sector. Without these five labels
+                    // the row reads as one measurement of one county.
+                    "grains": {
+                        "cell": "naics4|county",
+                        "employer": field("employer_grain"),
+                        "solo": field("solo_grain"),
+                        "saturation": "county",
+                        "succession": field("succession_grain"),
+                        "formation": v.get("formation")
+                            .and_then(|f| f.get("grain"))
+                            .cloned()
+                            .unwrap_or(Value::Null),
+                        "state_scope": ATLAS_STATE_RANK_BASIS,
+                    },
+                    "pct_owners_55plus": field("pct_owners_55plus"),
+                    "formation": field("formation"),
+                    "vintages": field("vintages"),
+                }),
+            ));
+        }
+    }
+    out
+}
+
+/// The metro pricing plan: which markets the atlas would pay to price.
+///
+/// Counties are walked in atlas order (best rank first) and folded into their
+/// CBSA, so the metros picked are the ones the atlas actually ranked highest —
+/// and a metro is named once however many of its counties made the list. A
+/// county the crosswalk does not know is COUNTED, never substituted: an
+/// unmapped county silently priced as its state is how a national research run
+/// gets billed as a metro one.
+pub struct MetroPlan {
+    pub entries: Vec<Value>,
+    /// Counties in the atlas whose metro the crosswalk does not know.
+    pub unmapped_counties: usize,
+    /// Metros the atlas found beyond the `metros` cap — reported, not dropped
+    /// silently.
+    pub truncated: usize,
+}
+
+pub fn metro_pricing_plan(
+    atlas: &[(String, Value)],
+    max_metros: usize,
+    cron: &str,
+    budget_usd: Option<f64>,
+) -> MetroPlan {
+    // Best rank a county reached in either ranking — the order metros are
+    // chosen in.
+    let best_rank = |v: &Value| -> usize {
+        let r = |n: &str| {
+            v.get(n)
+                .and_then(Value::as_u64)
+                .map(|n| n as usize)
+                .unwrap_or(usize::MAX)
+        };
+        r("rank_by_saturation").min(r("rank_by_total_market_per_10k"))
+    };
+    let mut ordered: Vec<&(String, Value)> = atlas.iter().collect();
+    ordered.sort_by(|a, b| {
+        best_rank(&a.1)
+            .cmp(&best_rank(&b.1))
+            .then_with(|| a.0.cmp(&b.0))
+    });
+
+    let mut order: Vec<String> = Vec::new();
+    let mut by_cbsa: BTreeMap<String, (String, BTreeSet<String>, BTreeSet<String>)> =
+        BTreeMap::new();
+    let mut unmapped: BTreeSet<String> = BTreeSet::new();
+    for (_, v) in ordered {
+        let fips5 = v.get("geo_fips").and_then(Value::as_str).unwrap_or("");
+        let Some(metro) = v.get("metro").and_then(|m| m.get("cbsa_code")) else {
+            unmapped.insert(fips5.to_string());
+            continue;
+        };
+        let Some(code) = metro.as_str() else {
+            unmapped.insert(fips5.to_string());
+            continue;
+        };
+        let title = v
+            .get("metro")
+            .and_then(|m| m.get("cbsa_title"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let slot = by_cbsa.entry(code.to_string()).or_insert_with(|| {
+            order.push(code.to_string());
+            (title, BTreeSet::new(), BTreeSet::new())
+        });
+        slot.1.insert(fips5.to_string());
+        if let Some(n) = v.get("naics4").and_then(Value::as_str) {
+            slot.2.insert(n.to_string());
+        }
+    }
+
+    let truncated = order.len().saturating_sub(max_metros);
+    let entries = order
+        .into_iter()
+        .take(max_metros)
+        .map(|code| {
+            let (title, counties, trades) = by_cbsa.remove(&code).expect("ordered code");
+            let mut schedule = json!({
+                "app": "homewyse-pricing",
+                "cron": cron,
+                "params": { "locality": title },
+            });
+            // The budget rail `POST /schedules` validates. Omitted, never 0:
+            // `validate_budget_usd` refuses a non-positive ceiling.
+            if let (Some(b), Value::Object(map)) = (budget_usd, &mut schedule) {
+                map.insert("budget_usd".into(), Value::from(b));
+            }
+            json!({
+                "cbsa_code": code,
+                "cbsa_title": title,
+                "locality": title,
+                "counties": counties.into_iter().collect::<Vec<_>>(),
+                "naics4": trades.into_iter().collect::<Vec<_>>(),
+                "schedule": schedule,
+            })
+        })
+        .collect();
+    MetroPlan {
+        entries,
+        unmapped_counties: unmapped.len(),
+        truncated,
+    }
+}
+
+/// Builds the atlas from a blend that has just been computed (never a re-read:
+/// the atlas must describe THIS blend), upserts it, and returns the run block —
+/// including the metro pricing plan, which is always reported and only
+/// REQUESTED when the driver is on.
+pub async fn sync_atlas(
+    ctx: &AppContext,
+    blend: &[(String, Value)],
+    bases: &[Value],
+    settings: &AtlasSettings,
+) -> Result<Value> {
+    let states = top_states_for_atlas(blend, settings.states_k);
+    let state_ranks: BTreeMap<String, usize> = states
+        .iter()
+        .filter_map(|s| {
+            Some((
+                s.get("state_fips")?.as_str()?.to_string(),
+                s.get("rank")?.as_u64()? as usize,
+            ))
+        })
+        .collect();
+    let saturation = county_saturation_index(bases);
+    let records = atlas_records(blend, &saturation, &state_ranks, settings.top_n);
+    let plan = metro_pricing_plan(
+        &records,
+        settings.metros,
+        &settings.metro_pricing_cron,
+        settings.metro_pricing_budget_usd,
+    );
+
+    // The runtime owns schedule creation; the app only asks, and only when the
+    // driver is on. A refusal (the per-run ceiling) is reported, not swallowed.
+    let mut requested = 0usize;
+    let mut refused = 0usize;
+    if settings.metro_pricing {
+        for entry in &plan.entries {
+            let Some(body) = entry.get("schedule") else {
+                continue;
+            };
+            if ctx.request_schedule(body.clone()) {
+                requested += 1;
+            } else {
+                refused += 1;
+            }
+        }
+    }
+
+    let prov = census_common::derived_provenance(ctx, ATLAS_DATASET, &ATLAS_INPUTS);
+    let summary = ctx
+        .datasets
+        .upsert_many_stamped(MARKET_APP, ATLAS_DATASET, &records, None, Some(&prov))
+        .await?;
+    let county_cells = blend
+        .iter()
+        .filter(|(_, v)| v.get("geo").and_then(Value::as_str) == Some("county"))
+        .count();
+    Ok(json!({
+        "dataset": format!("{MARKET_APP}/{ATLAS_DATASET}"),
+        "states_k": settings.states_k,
+        "top_n": settings.top_n,
+        "states": states,
+        "state_rank_basis": ATLAS_STATE_RANK_BASIS,
+        "county_cells_available": county_cells,
+        "counties_ranked": records.len(),
+        "counties_with_saturation": saturation.len(),
+        "new": summary.new.len(),
+        "changed": summary.changed.len(),
+        "unchanged": summary.unchanged,
+        "metro_pricing": {
+            // The plan is ALWAYS computed and reported; `enabled` says whether
+            // any of it was actually asked for.
+            "enabled": settings.metro_pricing,
+            "cap": settings.metros,
+            "plan": plan.entries,
+            "metros_truncated": plan.truncated,
+            "unmapped_counties": plan.unmapped_counties,
+            "crosswalk_counties": census_common::cbsa_crosswalk_len(),
+            "requested": requested,
+            "refused_by_run_cap": refused,
+        },
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1628,7 +2372,7 @@ mod tests {
     /// 422 on the app's own documented call.
     #[test]
     fn manifest_declares_every_param_it_ships() {
-        let app = CensusDensity;
+        let app = CensusDensity::default();
         let m = app.manifest();
         let schema = m.params_schema.expect("rich manifest declares a schema");
         let props = schema["properties"]
@@ -1687,6 +2431,10 @@ mod tests {
                 { "app": "census", "dataset": "market_blend" },
                 { "app": "census", "dataset": "saturation" },
                 { "app": "market", "dataset": "profile" },
+                // N35: the county atlas is a product like the other two — a
+                // namespace/dataset pair the result does not name is one no
+                // watch, trigger or saved search can ever fire for.
+                { "app": "census", "dataset": "atlas" },
             ])
         );
         // A result with no index_datasets at all is passed through untouched —
@@ -1956,6 +2704,28 @@ mod tests {
         })
     }
 
+    /// A county-grain employer row, exactly as the CBP loop writes one.
+    fn county_emp(naics: &str, st: &str, county: &str, estab: i64) -> Value {
+        json!({
+            "naics": naics, "geo": "county",
+            "place": format!("{}·{county}", census_common::state_abbr(st)),
+            "state_fips": st, "county_fips": county,
+            "establishments": estab, "year": "2022",
+        })
+    }
+
+    /// A county-grain SOLO row — what `census-nonemp` writes if the probe ever
+    /// answers `served`.
+    fn county_solo(naics4: &str, st: &str, county: &str, nonemp: i64) -> Value {
+        json!({
+            "naics": naics4, "trade": "Building equipment contractors",
+            "geo": "county", "state": census_common::state_abbr(st),
+            "state_fips": st, "county_fips": county,
+            "place": format!("{}·{county}", census_common::state_abbr(st)),
+            "nonemployers": nonemp, "year": "2021",
+        })
+    }
+
     fn solo(naics4: &str, state: &str, st: &str, nonemp: i64) -> Value {
         json!({
             "naics": naics4, "trade": "Building equipment contractors",
@@ -1987,16 +2757,108 @@ mod tests {
         assert_eq!(v["trade"], "Building equipment contractors");
     }
 
+    /// County employer rows used to be DROPPED here ("the solo side has no
+    /// county grain"). They now form their own cell — and the anti-pattern this
+    /// test pins is the one that replaced it: a county cell folding into, or
+    /// overwriting, the state cell for the same trade. The state cell must be
+    /// byte-identical to what it was before the geo dimension existed.
     #[test]
-    fn county_employer_rows_are_excluded_from_the_state_grain_blend() {
+    fn county_employer_rows_get_their_own_cell_and_never_the_states() {
         let employers = vec![
-            emp("238220", "county", "CA·037", "06", 40),
+            county_emp("238220", "06", "037", 40),
             emp("238220", "state", "CA", "06", 100),
         ];
         let solos = vec![solo("2382", "CA", "06", 10)];
         let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &[]);
-        assert_eq!(items.len(), 1);
-        assert_eq!(items[0].1["employer_establishments"], 100);
+        let by_key: BTreeMap<_, _> = items.into_iter().collect();
+        assert_eq!(by_key.len(), 2, "one state cell and one county cell");
+
+        let state = &by_key["2382:06"];
+        assert_eq!(state["employer_establishments"], 100, "not 140");
+        assert_eq!(state["geo"], "state");
+        assert_eq!(state["state_fips"], "06");
+        assert_eq!(state["solo_grain"], "state");
+        assert_eq!(state["solo_operators"], 10);
+
+        let county = &by_key["2382:06037"];
+        assert_eq!(county["employer_establishments"], 40);
+        assert_eq!(county["geo"], "county");
+        assert_eq!(county["geo_fips"], "06037");
+        assert_eq!(county["county_fips"], "037");
+        assert_eq!(county["parent_state_fips"], "06");
+    }
+
+    /// **The N35 gate.** A county cell with no NES row of its own carries
+    /// `solo_grain: state_carried`, a NULL solo count, and a `total_market`
+    /// that counts employers only — never the state's solo operators
+    /// apportioned onto a county, and never a `0` that reads as "no solo
+    /// operators here".
+    #[test]
+    fn a_county_with_no_nes_row_is_state_carried_not_a_fabricated_county_number() {
+        let employers = vec![county_emp("238220", "06", "037", 40)];
+        // Only a STATE solo row exists — the ASSUMED-unavailable county grain.
+        let solos = vec![solo("2382", "CA", "06", 300)];
+        let mut bases = BTreeMap::new();
+        bases.insert("CA·037".to_string(), test_base(10_000));
+        let items = blend_market(&employers, &solos, &bases, &[], &[]);
+        let by_key: BTreeMap<_, _> = items.into_iter().collect();
+        let c = &by_key["2382:06037"];
+        assert_eq!(c["solo_grain"], "state_carried");
+        assert!(
+            c["solo_operators"].is_null(),
+            "a county solo count nobody published must be Null, not 0 and not 300"
+        );
+        assert!(c["solo_share"].is_null());
+        assert_eq!(c["total_market"], 40, "employers only");
+        // The state's total rides along as labelled CONTEXT.
+        assert_eq!(c["solo_state_operators"], 300);
+        // 40 employers / 10,000 households * 10k = 40.0, and the basis says
+        // out loud that it is half a market.
+        assert_eq!(c["total_market_per_10k"], json!(40.0));
+        let basis = c["total_market_per_10k_basis"].as_str().expect("a basis");
+        assert!(basis.contains("state_carried"), "{basis}");
+
+        // And when NES DOES serve the county, the same cell joins at county
+        // grain with no code change — the probe's `served` verdict landing.
+        let solos = vec![
+            solo("2382", "CA", "06", 300),
+            county_solo("2382", "06", "037", 25),
+        ];
+        let items = blend_market(&employers, &solos, &bases, &[], &[]);
+        let by_key: BTreeMap<_, _> = items.into_iter().collect();
+        let c = &by_key["2382:06037"];
+        assert_eq!(c["solo_grain"], "county");
+        assert_eq!(c["solo_operators"], 25);
+        assert_eq!(c["total_market"], 65);
+        assert!(c["solo_state_operators"].is_null());
+    }
+
+    /// The collision this row shape exists to prevent: `market/profile` indexes
+    /// blend cells by `{naics4}:{state_fips}` off the record's own fields, so a
+    /// county cell carrying `state_fips` would replace the state cell behind
+    /// every state × trade profile row — a county's employer count published as
+    /// the state's market.
+    #[test]
+    fn county_cells_cannot_displace_the_state_cell_in_the_profile_join() {
+        let employers = vec![
+            emp("238220", "state", "CA", "06", 100),
+            county_emp("238220", "06", "037", 40),
+        ];
+        let solos = vec![solo("2382", "CA", "06", 300)];
+        let blend: Vec<Value> = blend_market(&employers, &solos, &BTreeMap::new(), &[], &[])
+            .into_iter()
+            .map(|(_, v)| v)
+            .collect();
+        let economics = vec![json!({ "trade": "Plumbing", "state": "CA" })];
+        let naics4 = BTreeMap::from([("Plumbing".to_string(), "2382".to_string())]);
+        let profiles = trades_common::market::build_profiles(&economics, &blend, &naics4);
+        assert_eq!(profiles.len(), 1);
+        let (key, p) = &profiles[0];
+        assert_eq!(key, "CA:Plumbing");
+        assert_eq!(
+            p["density"]["total_market"], 400,
+            "the STATE cell (100 + 300), never the county's 40"
+        );
     }
 
     #[test]
@@ -2460,9 +3322,22 @@ mod tests {
                 acs_year: Some("2022".into()),
             }
         );
-        // A county row never supplies a state cell's base.
-        let county_only = base_index(&[sat("county", "households", 500, "2022")]);
-        assert!(county_only.is_empty());
+        // A county row never supplies a STATE cell's base — the guarantee the
+        // old state-only filter gave, kept now that county rows ARE indexed:
+        // state rows are indexed first, so a county row labelled with a state
+        // place cannot shadow one.
+        let both = base_index(&[
+            sat("county", "households", 500, "2022"),
+            sat("state", "households", 10_000, "2022"),
+        ]);
+        assert_eq!(both["CA"].base, 10_000);
+        // A county row under its own place label IS indexed (N35): a county
+        // cell's per-10k needs the county's base, not the state's.
+        let county = base_index(&[json!({
+            "place": "CA·037", "geo": "county", "base": 3_000,
+            "denominator_kind": "households", "acs_year": "2022"
+        })]);
+        assert_eq!(county["CA·037"].base, 3_000);
         // A legacy row with no `geo` is read as state (the only grain that
         // existed when it was written) rather than dropped.
         let legacy = base_index(&[json!({ "place": "CA", "base": 9_000 })]);
@@ -2612,5 +3487,272 @@ mod tests {
         let velocity_other = vec![json!({ "sector": "NAICS72", "geo": "US" })];
         let items = blend_market(&employers, &solos, &BTreeMap::new(), &[], &velocity_other);
         assert!(items[0].1["formation"].is_null());
+    }
+
+    // ── N35: the atlas ───────────────────────────────────────────────────────
+
+    /// A blend over three states and one county each, with a base for every
+    /// place so every cell gets a per-10k.
+    fn atlas_fixture() -> (Vec<(String, Value)>, Vec<Value>) {
+        // (state fips, county fips, state employers, county employers).
+        let places = [
+            ("06", "037", 1_000, 400), // CA — biggest state market
+            ("48", "201", 800, 300),   // TX
+            ("12", "086", 600, 200),   // FL
+            ("56", "021", 5, 2),       // WY — outside any sane top-K
+        ];
+        let mut employers = Vec::new();
+        let mut solos = Vec::new();
+        let mut bases: BTreeMap<String, PlaceBase> = BTreeMap::new();
+        for (st, county, state_estab, county_estab) in places {
+            employers.push(emp(
+                "238220",
+                "state",
+                census_common::state_abbr(st),
+                st,
+                state_estab,
+            ));
+            employers.push(county_emp("238220", st, county, county_estab));
+            solos.push(solo("2382", census_common::state_abbr(st), st, state_estab));
+            bases.insert(
+                census_common::state_abbr(st).to_string(),
+                test_base(100_000),
+            );
+            bases.insert(
+                format!("{}·{county}", census_common::state_abbr(st)),
+                test_base(10_000),
+            );
+        }
+        let blend = blend_market(&employers, &solos, &bases, &[], &[]);
+        // Saturation rows as `census/saturation` stores them.
+        let sat = |place: &str, per_10k: f64| json!({ "place": place, "geo": "county", "per_10k": per_10k, "base": 10_000 });
+        let saturation = vec![
+            sat("CA·037", 40.0),
+            sat("TX·201", 30.0),
+            sat("FL·086", 20.0),
+            sat("WY·021", 2.0),
+        ];
+        (blend, saturation)
+    }
+
+    /// **The N35 gate.** The atlas never contains a county outside the top-K
+    /// states — the rail that bounds both the dataset and the CBP fan-out
+    /// behind it. K=2 keeps CA and TX; FL's and WY's counties are absent, not
+    /// ranked last.
+    #[test]
+    fn the_atlas_never_contains_a_county_outside_the_top_k_states() {
+        let (blend, saturation) = atlas_fixture();
+        let states = top_states_for_atlas(&blend, 2);
+        assert_eq!(states.len(), 2);
+        assert_eq!(states[0]["state_fips"], "06");
+        assert_eq!(states[1]["state_fips"], "48");
+        // The basis is published: this is not a formation ranking and says so.
+        assert!(states[0]["ranked_by"]
+            .as_str()
+            .expect("a basis")
+            .contains("NATIONAL-grain only"));
+
+        let ranks: BTreeMap<String, usize> =
+            BTreeMap::from([("06".to_string(), 1), ("48".to_string(), 2)]);
+        let records = atlas_records(&blend, &county_saturation_index(&saturation), &ranks, 25);
+        let keys: Vec<&str> = records.iter().map(|(k, _)| k.as_str()).collect();
+        assert_eq!(keys, vec!["2382:06037", "2382:48201"]);
+        assert!(
+            !keys
+                .iter()
+                .any(|k| k.starts_with("2382:12") || k.starts_with("2382:56")),
+            "a county outside the scoped states is not in the atlas at all"
+        );
+
+        // Every block is grain-labelled, and the solo half is the ASSUMED one.
+        let (_, ca) = &records[0];
+        assert_eq!(ca["grains"]["cell"], "naics4|county");
+        assert_eq!(ca["grains"]["employer"], "county");
+        assert_eq!(ca["grains"]["solo"], "state_carried");
+        assert_eq!(ca["grains"]["saturation"], "county");
+        assert_eq!(ca["rank_by_saturation"], 1);
+        assert_eq!(ca["rank_by_total_market_per_10k"], 1);
+        assert_eq!(ca["saturation_per_10k"], json!(40.0));
+        assert_eq!(
+            ca["metro"]["cbsa_title"],
+            "Los Angeles-Long Beach-Anaheim, CA"
+        );
+        assert_eq!(ca["state"], "CA");
+        assert!(
+            ca["solo_operators"].is_null(),
+            "no fabricated county solo count"
+        );
+    }
+
+    /// `top_n` cuts each ranking independently: a county that made only ONE of
+    /// the two rankings carries a Null for the other rather than a position it
+    /// never reached.
+    #[test]
+    fn a_county_that_made_one_ranking_gets_a_null_for_the_other() {
+        let (blend, saturation) = atlas_fixture();
+        let ranks: BTreeMap<String, usize> = BTreeMap::from([
+            ("06".to_string(), 1),
+            ("48".to_string(), 2),
+            ("12".to_string(), 3),
+        ]);
+        // Only the single best county per ranking survives; both rankings agree
+        // here, so exactly one record is emitted.
+        let top1 = atlas_records(&blend, &county_saturation_index(&saturation), &ranks, 1);
+        assert_eq!(top1.len(), 1);
+        assert_eq!(top1[0].0, "2382:06037");
+
+        // With no saturation rows at all, the saturation ranking is empty and
+        // every surviving record says so — Null, not rank 0.
+        let no_sat = atlas_records(&blend, &BTreeMap::new(), &ranks, 25);
+        assert_eq!(no_sat.len(), 3);
+        for (_, v) in &no_sat {
+            assert!(v["rank_by_saturation"].is_null());
+            assert!(v["saturation_per_10k"].is_null());
+            assert!(!v["rank_by_total_market_per_10k"].is_null());
+        }
+    }
+
+    /// **The N35 gate.** A fixture run's `metro_pricing` plan lists the expected
+    /// CBSA names — one entry per METRO however many of its counties ranked,
+    /// capped, with the counties it was built from on the record.
+    #[test]
+    fn the_metro_plan_lists_the_expected_cbsa_names_and_never_invents_one() {
+        let (blend, saturation) = atlas_fixture();
+        let ranks: BTreeMap<String, usize> = BTreeMap::from([
+            ("06".to_string(), 1),
+            ("48".to_string(), 2),
+            ("12".to_string(), 3),
+        ]);
+        let records = atlas_records(&blend, &county_saturation_index(&saturation), &ranks, 25);
+        let plan = metro_pricing_plan(&records, 5, "0 0 7 1 1,4,7,10 *", Some(2.0));
+        let names: Vec<&str> = plan
+            .entries
+            .iter()
+            .map(|e| e["cbsa_title"].as_str().expect("a title"))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "Los Angeles-Long Beach-Anaheim, CA",
+                "Houston-The Woodlands-Sugar Land, TX",
+                "Miami-Fort Lauderdale-Pompano Beach, FL",
+            ],
+            "in atlas rank order"
+        );
+        assert_eq!(plan.unmapped_counties, 0);
+        let la = &plan.entries[0];
+        assert_eq!(la["cbsa_code"], "31080");
+        assert_eq!(la["counties"], json!(["06037"]));
+        assert_eq!(la["locality"], "Los Angeles-Long Beach-Anaheim, CA");
+        // The schedule body is a `POST /schedules` body, budget rail included.
+        assert_eq!(la["schedule"]["app"], "homewyse-pricing");
+        assert_eq!(la["schedule"]["params"]["locality"], la["locality"]);
+        assert_eq!(la["schedule"]["budget_usd"], json!(2.0));
+        assert_eq!(la["schedule"]["cron"], "0 0 7 1 1,4,7,10 *");
+
+        // The cap TRUNCATES and says so, rather than dropping metros silently.
+        let capped = metro_pricing_plan(&records, 1, "0 0 7 1 1,4,7,10 *", None);
+        assert_eq!(capped.entries.len(), 1);
+        assert_eq!(capped.truncated, 2);
+        assert!(
+            capped.entries[0]["schedule"].get("budget_usd").is_none(),
+            "no ceiling asked for means the key is absent, not 0"
+        );
+
+        // A county the crosswalk does not know is COUNTED, never substituted.
+        let unknown = vec![(
+            "2382:06003".to_string(),
+            json!({ "geo_fips": "06003", "naics4": "2382", "metro": Value::Null,
+                    "rank_by_saturation": 1 }),
+        )];
+        let plan = metro_pricing_plan(&unknown, 5, "* * * * * *", None);
+        assert!(plan.entries.is_empty());
+        assert_eq!(plan.unmapped_counties, 1);
+    }
+
+    /// `[census]` must actually BIND: the operator's section reaches the atlas,
+    /// and a per-run param can still narrow it.
+    #[test]
+    fn the_census_section_binds_and_params_narrow_it() {
+        let shipped = AtlasSettings::default();
+        assert_eq!(shipped.states_k, 10, "[census] atlas_states_k default");
+        assert!(
+            !shipped.metro_pricing,
+            "the metered driver ships OFF — the plan is reported, not bought"
+        );
+        let operator = AtlasSettings::from_config(&pumper_core::config::CensusConfig {
+            atlas_states_k: 3,
+            metro_pricing: true,
+            ..pumper_core::config::CensusConfig::default()
+        });
+        assert_eq!(operator.states_k, 3);
+        assert!(operator.metro_pricing);
+        // A zero would scope the atlas to nothing and call it a ranking.
+        let floored = AtlasSettings::from_config(&pumper_core::config::CensusConfig {
+            atlas_states_k: 0,
+            atlas_top_n: 0,
+            ..pumper_core::config::CensusConfig::default()
+        });
+        assert_eq!((floored.states_k, floored.top_n), (1, 1));
+    }
+
+    /// End to end through a real store: the atlas is written into the `census`
+    /// namespace with a derived stamp, and the pricing driver asks for nothing
+    /// while it is off.
+    #[tokio::test]
+    async fn the_atlas_lands_in_the_census_namespace_and_buys_nothing_by_default() {
+        let store = pumper_core::testing::TempStore::new("census-atlas").await;
+        let ctx = pumper_core::testing::TestContext::new(&store.storage, "census-density").build();
+        let (blend, saturation) = atlas_fixture();
+        let out = sync_atlas(&ctx, &blend, &saturation, &AtlasSettings::default())
+            .await
+            .expect("atlas");
+        assert_eq!(out["dataset"], "census/atlas");
+        assert_eq!(out["states_k"], 10);
+        assert_eq!(out["counties_ranked"], 4);
+        assert_eq!(out["metro_pricing"]["enabled"], false);
+        assert_eq!(
+            out["metro_pricing"]["requested"], 0,
+            "the plan is computed; nothing is scheduled until an operator says so"
+        );
+        assert_eq!(
+            out["metro_pricing"]["plan"].as_array().expect("plan").len(),
+            4
+        );
+        assert!(ctx.take_schedule_requests().is_empty());
+
+        let rec = ctx
+            .datasets
+            .get(MARKET_APP, ATLAS_DATASET, "2382:06037")
+            .await
+            .expect("read")
+            .expect("record");
+        assert_eq!(rec.data["grains"]["solo"], "state_carried");
+        let revs = ctx
+            .datasets
+            .history(MARKET_APP, ATLAS_DATASET, "2382:06037", 10)
+            .await
+            .expect("history");
+        let p = &revs.first().expect("one revision").provenance;
+        assert_eq!(p.job_id.as_deref(), Some(&*ctx.job_id.to_string()));
+        let url = p.source_url.as_deref().expect("derived source_url");
+        assert!(url.starts_with("derived://census/atlas?"), "{url}");
+        assert!(!p.replayable());
+
+        // Driver ON: the run ASKS the runtime for one schedule per planned
+        // metro, and says how many it asked for.
+        let settings = AtlasSettings {
+            metro_pricing: true,
+            metros: 2,
+            ..AtlasSettings::default()
+        };
+        let out = sync_atlas(&ctx, &blend, &saturation, &settings)
+            .await
+            .expect("atlas");
+        assert_eq!(out["metro_pricing"]["requested"], 2);
+        assert_eq!(out["metro_pricing"]["metros_truncated"], 2);
+        let asked = ctx.take_schedule_requests();
+        assert_eq!(asked.len(), 2);
+        assert_eq!(asked[0]["app"], "homewyse-pricing");
     }
 }

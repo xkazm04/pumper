@@ -25,7 +25,9 @@ pub fn apps(config: &pumper_core::Config) -> Vec<Arc<dyn ScrapeApp>> {
         Arc::new(app_watch::Watch),
         Arc::new(app_grants_gov::GrantsGov),
         Arc::new(app_cms_fee_schedule::CmsFeeSchedule),
-        Arc::new(app_census_density::CensusDensity),
+        Arc::new(app_census_density::CensusDensity::with_config(
+            &config.census,
+        )),
         Arc::new(app_census_nonemp::CensusNonemp),
         Arc::new(app_census_nesd::CensusNesd),
         Arc::new(app_census_bfs::CensusBfs),
@@ -142,6 +144,29 @@ pub(crate) const VIRTUAL_NAMESPACES: &[VirtualNamespace] = &[
         ],
         note: "the cross-FAMILY market namespace holding profile (one row per state x trade), \
            which the five trades apps and the four census apps all publish into",
+    },
+    VirtualNamespace {
+        // `census_common::MARKET_APP` (N35). The census family's own product
+        // namespace — market_blend, saturation and the county atlas — which all
+        // four census apps re-derive after their own upserts.
+        //
+        // APPENDED, deliberately: `publishes_into` returns the FIRST match, and
+        // the four census apps already resolve to `market` above. Putting this
+        // entry earlier would change where an operator watching `census-density`
+        // is redirected, which is a behaviour change this row does not need to
+        // make — the entry exists so a catalog `[[source]]` may NAME the
+        // namespace its data actually lands under (the guard in
+        // `routes::mod`'s `live_catalog_entries_map_to_registered_apps_with_
+        // matching_cron`).
+        name: "census",
+        publishers: &[
+            "census-density",
+            "census-nonemp",
+            "census-nesd",
+            "census-bfs",
+        ],
+        note: "the census product namespace holding market_blend, saturation and the county \
+           atlas, which all four census apps publish into",
     },
 ];
 
