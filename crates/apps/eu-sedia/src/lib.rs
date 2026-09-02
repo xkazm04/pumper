@@ -123,6 +123,8 @@ impl ScrapeApp for EuSedia {
                  swept, crossSourceDups, recurrenceLinks, \
                  corpusPass: {ran, cycle, batchSwept, corpusSwept, \
                  programs: {rows, withProjection, withEvents, stamped, complete}}, \
+                 fits: {profiles, evaluated, eligible, likely, blocked, unknown, fresh}, \
+                 \
                  warnings[], index_datasets[]} — `sweep` names how the walk ended \
                  (complete|capped|short_page|unknown_total: swept the corpus, hit maxPages, \
                  the source served a short page, or it published no usable `totalResults` to \
