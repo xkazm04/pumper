@@ -48,6 +48,7 @@
 
 pub mod detect;
 pub mod invariants;
+pub mod mutate;
 #[cfg(feature = "storage")]
 pub mod preview;
 pub mod profiles;
@@ -65,6 +66,7 @@ pub use detect::{
     Baseline, CohortAdequacy, FetchHealth, InvariantCheck, Reason, Recovery, RunEvaluation,
 };
 pub use invariants::{Invariant, InvariantKind};
+pub use mutate::{evaluate_corpus, ClassResult, EvalReport, EvalTargets, Mutation, MutationClass};
 pub use profiles::{
     known_origin, repairability, rules_source, Repairability, RulesSource, RulesSourceConflict,
 };

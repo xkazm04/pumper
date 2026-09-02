@@ -1376,13 +1376,35 @@ least prevents a coin-flip promotion.
 
 ## 12. Evaluation plan — proving a design that detects the invisible
 
-> **Not built.** The `resilience-eval` mutation harness, the historical
-> backtest and the canary source do not exist, so the recall and
-> false-positive-rate numbers below are **targets, not measurements**. Nothing
-> in this document reports an observed FPR. That is precisely why `enforce`
-> ships `false`: §12.6's soak is the only evidence currently available, and it
-> accrues in `source_runs` as the fleet runs. Treat every threshold in §9 as a
-> starting guess.
+> **§12.1 built (N12 step 2); §12.2–12.7 not.** `cargo run -p pumper-server
+> --bin resilience-eval` applies the mutation taxonomy below to a deterministic
+> synthetic corpus and runs the real detector over it. Exit codes follow the
+> repo's gate convention: 0 targets met / 2 findings / 3 could not check.
+> `--json` emits the whole score sheet; `--cohorts 5,30,200` picks the sizes.
+> The taxonomy and the harness are `pumper_core::resilience::mutate`, and the
+> same numbers are asserted as unit tests, so a change to `dom_simhash`, the
+> sketch or a threshold shows up as a recall/FPR delta in `cargo test` rather
+> than as silence in production.
+>
+> **First measured numbers** (default config, baseline 4 runs, cohorts 5/30/200,
+> recall measured at cohorts ≥ `min_cohort_docs`):
+>
+> | metric | measured | target |
+> |---|---|---|
+> | hard-break recall (rename, tag, wrapper, attr-move, deletion) | **1.000** | ≥ 0.90 |
+> | silent-corruption recall (duplicate-node, sibling-swap) | **0.500** | ≥ 0.50 |
+> | false-positive rate (build-hash churn, text-only change, no mutation) | **0.000** | ≤ 0.003 |
+>
+> Read honestly: the silent number is exactly at its floor, and it is carried
+> entirely by **duplicate-node** (distinctness collapse, caught at 1.000).
+> **Sibling-swap is not detected** — it scores 0.300 against a 0.6 threshold on
+> invariant and shape signals alone. Two same-shaped fields exchanging values is
+> the case §3 says is not detectable, and the harness now says so with a number
+> instead of a prediction. At cohort 5 nothing is judged at all (`below_cohort`),
+> which is the *unmonitored* answer, not a miss.
+>
+> The backtest (§12.2), the canary (§10.9) and the production soak (§12.6) still
+> do not exist, so `enforce` stays `false`.
 
 The thing this detects is by definition unobserved, so ground truth has to be
 *manufactured*. Six measurements, each with a number that would falsify part of
