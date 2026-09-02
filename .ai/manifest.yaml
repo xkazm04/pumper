@@ -120,3 +120,28 @@ skills:
   - ship-loop
   - test-before-commit
   - tiger
+
+# Scope - what this project does and deliberately does not do. Read by the registry's
+# scripts/build-fleet-map.mjs to classify subjects this project has NO context for: an
+# absence inside an out-of-scope category or subject is never proposed as a new direction;
+# every other in-domain absence is a `candidate` for the intake direction pass. Keys are
+# `<bundle>/<category>[/<subcategory>]` and `<bundle>/<subject>`. Decisions on proposed
+# directions live in .ai/directions/ledger.jsonl. DRAFT written by the registry on
+# 2026-09-02 from the purpose line and the project note - the owner edits this block, the
+# registry only reads it.
+scope:
+  does:
+    - durable SQLite job queue behind an HTTP API; pluggable scrape and fetch engines
+    - research cache, remote fetch fabric, cost ledger, tier memory
+  does_not:
+    - a user-facing UI
+    - agent orchestration beyond calling a CLI for research
+    - localization, recruiting, media
+  out_of_scope_categories:
+    - software-engineering/ui-surfaces
+    - software-engineering/client-architecture
+    - software-engineering/llm-agent/companion
+    - software-engineering/llm-agent/orchestration
+    - software-engineering/engineering-assessment
+  out_of_scope_subjects:
+  directions_ledger: .ai/directions/ledger.jsonl
