@@ -3064,6 +3064,28 @@ mod saved_search_scope_tests {
 }
 
 #[cfg(test)]
+mod waiting_deadline_tests {
+    use super::waiting_deadline;
+    use chrono::{Duration, Utc};
+
+    /// The anti-pattern: `expiry_secs = 0` read as "expires now". Zero is the
+    /// DEFAULT, and a park that expired the instant it was made would fail
+    /// every approval the feature exists to enable, on a fresh install, with
+    /// nobody having configured anything.
+    #[test]
+    fn zero_expiry_waits_forever_it_does_not_expire_immediately() {
+        let now = Utc::now();
+        assert_eq!(waiting_deadline(now, 0), None);
+        // Any positive window is a real deadline, in the future.
+        let deadline = waiting_deadline(now, 3600).expect("a configured window stamps a deadline");
+        assert_eq!(deadline, now + Duration::seconds(3600));
+        assert!(deadline > now, "a deadline must be ahead of the park");
+        // And the smallest configurable window is still a future instant.
+        assert!(waiting_deadline(now, 1).expect("1s window") > now);
+    }
+}
+
+#[cfg(test)]
 mod vcr_param_tests {
     use super::vcr_params;
     use serde_json::json;
