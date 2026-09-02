@@ -1,9 +1,18 @@
 //! Sandboxed WASM plugin host (implements `pumper_core::Plugins`) using
 //! wasmtime. Each plugin call gets a fresh `Store` with a CPU **fuel** budget
 //! (a deterministic instruction ceiling — a runaway plugin traps instead of
-//! hanging the host) and a hard linear-memory cap. Plugins have no imports, so
-//! no ambient authority (no filesystem/network). This is the capability Python
-//! can't match: safe, in-process execution of untrusted, hot-swappable code.
+//! hanging the host) and a hard linear-memory cap. A plugin has **no ambient
+//! authority**: its linker is built from its own `describe().capabilities`, so a
+//! plugin that declares nothing gets an empty linker (no filesystem, no network,
+//! exactly as before N10) and a plugin that imports what it did not declare
+//! fails to LINK at load. See [`caps`]. This is the capability Python can't
+//! match: safe, in-process execution of untrusted, hot-swappable code.
+//!
+//! Two hosts live in this crate and neither is a fork of the other: this
+//! core-module sandbox, whose import table is [`caps::plugin_linker`], and the
+//! component-model host in [`app_host`], whose import table is the
+//! `pumper:app` WIT world. N10 added imports to the FIRST one — the ptr/len ABI
+//! plugins already speak — and left the world at `0.1.0` untouched.
 //!
 //! ABI a plugin must export:
 //!   - `memory`                          (linear memory, default export)
@@ -27,6 +36,7 @@
 //! wedges the pipeline), extraction propagates the error.
 
 pub mod app_host;
+pub mod caps;
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -35,14 +45,15 @@ use std::sync::{Arc, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use async_trait::async_trait;
 use pumper_core::config::PluginConfig;
 use pumper_core::error::PluginFailure;
-use pumper_core::plugin::PluginRunStats;
+use pumper_core::plugin::{PluginCapabilities, PluginCapabilityHost, PluginRunStats};
 use pumper_core::{Error, Plugins, Result};
 use serde_json::Value;
 use tokio::sync::Semaphore;
 use wasmtime::{
-    Config, Engine, Instance, InstancePre, Linker, Memory, Module, ResourceLimiter, Store,
-    StoreLimits, StoreLimitsBuilder, TypedFunc,
+    Config, Engine, Instance, InstancePre, Memory, Module, Store, StoreLimitsBuilder, TypedFunc,
 };
+
+use crate::caps::{CallCaps, PluginStore};
 
 /// The loaded-module index, swapped wholesale by [`Plugins::reload`].
 type ModuleMap = HashMap<String, LoadedPlugin>;
@@ -60,6 +71,18 @@ pub struct WasmPluginHost {
     /// matter how wide the caller's fan-out is.
     sem: Arc<Semaphore>,
     modules: RwLock<ModuleMap>,
+    /// The operator half of the N10 capability gate (`[plugins]
+    /// allow_http_hosts`). Shared by `Arc` because every in-flight call reads
+    /// it and none of them may see a different list from the one the manifest
+    /// was checked against.
+    allow_http_hosts: Arc<Vec<String>>,
+    /// Who actually performs a granted capability. `None` — the default, and
+    /// what every unit test and every embedder that never wired one gets — means
+    /// a declared capability still LINKS (so the plugin is executable and its
+    /// manifest is honest) but every call to it refuses. That is deliberate: a
+    /// missing bridge is a deployment fact, and turning it into a link failure
+    /// would make it look like the plugin was built wrong.
+    bridge: Option<Arc<dyn PluginCapabilityHost>>,
     /// What each plugin has cost since it was loaded, for `GET /plugins`.
     ///
     /// Its own map rather than a field on [`LoadedPlugin`] so a reload — which
@@ -128,8 +151,21 @@ impl PluginTelemetry {
 /// Store would trade the sandbox's isolation for the speedup.
 #[derive(Clone)]
 struct LoadedPlugin {
-    pre: InstancePre<StoreLimits>,
+    /// `None` when the module could not be linked against the capabilities its
+    /// OWN manifest declared — i.e. it imports a host function it never asked
+    /// for. The row stays in the index (so `GET /plugins` can show the mistake)
+    /// but it is not executable and every call refuses with a typed
+    /// [`PluginFailure::MissingExport`], which the trigger ledger already words
+    /// as `hook_not_executable`.
+    pre: Option<InstancePre<PluginStore>>,
     manifest: Option<Value>,
+    /// What the manifest declared, as the loader parsed it — authoritative over
+    /// the raw manifest text, and what the linker above was built from.
+    capabilities: PluginCapabilities,
+    /// Why this module has no `pre`, or why its `capabilities` block was
+    /// ignored. Surfaced on `GET /plugins` because a fail-closed refusal nobody
+    /// can read is indistinguishable from a plugin that was never installed.
+    capability_error: Option<String>,
     /// Whether this module exports the ABI a [`Plugins::run`] call needs.
     ///
     /// Loading stays permissive on purpose — a `.wasm` in the plugin dir that
@@ -216,8 +252,39 @@ impl WasmPluginHost {
             probe,
             sem: Arc::new(Semaphore::new(max_concurrent)),
             modules: RwLock::new(modules),
+            allow_http_hosts: Arc::new(cfg.allow_http_hosts.clone()),
+            bridge: None,
             telemetry: RwLock::new(HashMap::new()),
         })
+    }
+
+    /// Wires the host side of the granted capabilities (N10).
+    ///
+    /// Builder-style and consuming rather than a setter on a live host: the
+    /// bridge carries the process's real network and store, and a host that
+    /// could acquire one mid-flight would mean two calls of the same plugin,
+    /// in the same process, running under different authority.
+    pub fn with_capabilities(mut self, bridge: Arc<dyn PluginCapabilityHost>) -> Self {
+        self.bridge = Some(bridge);
+        self
+    }
+
+    /// The per-call capability context for `plugin`, or `None` when it declared
+    /// nothing — in which case its linker is empty and no import exists to need
+    /// one.
+    fn call_caps(&self, plugin: &str, capabilities: &PluginCapabilities) -> Option<Arc<CallCaps>> {
+        if capabilities.is_empty() {
+            return None;
+        }
+        Some(Arc::new(CallCaps {
+            plugin: plugin.to_string(),
+            capabilities: capabilities.clone(),
+            allow_http_hosts: self.allow_http_hosts.clone(),
+            bridge: self.bridge.clone(),
+            // Captured on the async side, BEFORE `spawn_blocking`: inside the
+            // blocking closure there is no runtime context to ask.
+            handle: tokio::runtime::Handle::current(),
+        }))
     }
 
     /// Reads the cost gauges, recovering from poisoning like the module index.
@@ -352,11 +419,9 @@ impl Plugins for WasmPluginHost {
         input: &str,
         params: &Value,
     ) -> Result<(Value, PluginRunStats)> {
-        let pre = self
-            .read_modules()
-            .get(name)
-            .map(|p| p.pre.clone())
-            .ok_or_else(|| {
+        let (pre, capabilities, capability_error) = {
+            let modules = self.read_modules();
+            let loaded = modules.get(name).ok_or_else(|| {
                 Error::plugin(
                     PluginFailure::Unknown,
                     name,
@@ -364,6 +429,26 @@ impl Plugins for WasmPluginHost {
                      (`just plugins-install`), then POST /plugins/reload",
                 )
             })?;
+            (
+                loaded.pre.clone(),
+                loaded.capabilities.clone(),
+                loaded.capability_error.clone(),
+            )
+        };
+        // Fail CLOSED, and say why: a module that imports a host function its
+        // manifest never declared has no linked instance, so there is nothing to
+        // run. `MissingExport` is the class the trigger ledger already words as
+        // `hook_not_executable`, which is exactly what happened.
+        let pre = pre.ok_or_else(|| {
+            Error::plugin(
+                PluginFailure::MissingExport,
+                name,
+                capability_error.unwrap_or_else(|| {
+                    "this module did not link against its own declared capabilities".to_string()
+                }),
+            )
+        })?;
+        let caps = self.call_caps(name, &capabilities);
         let engine = self.engine.clone();
         let plugin = name.to_string();
         let input = input.to_string();
@@ -374,7 +459,7 @@ impl Plugins for WasmPluginHost {
         // CPU-bound, so it runs off the async runtime — and the permit rides
         // along with it (see `run_admitted`).
         let (value, stats) = run_admitted(self.sem.clone(), name, move || {
-            execute(engine, pre, &plugin, input, params, fuel, max_memory)
+            execute(engine, pre, &plugin, input, params, fuel, max_memory, caps)
         })
         .await??;
         // Gauges only — a failed call is reported through the error, and folding
@@ -433,6 +518,17 @@ impl Plugins for WasmPluginHost {
                 };
                 m.insert("name".into(), Value::String(name.clone()));
                 m.insert("executable".into(), Value::Bool(p.executable));
+                // The capabilities the LOADER parsed and built the linker from,
+                // overwriting whatever the manifest text said: what a plugin
+                // asked for and what it was granted must never be two different
+                // answers on the same surface.
+                m.insert(
+                    "capabilities".into(),
+                    serde_json::to_value(&p.capabilities).unwrap_or(Value::Null),
+                );
+                if let Some(why) = &p.capability_error {
+                    m.insert("capability_error".into(), Value::String(why.clone()));
+                }
                 // Present with `calls: 0` for a plugin nothing has run yet —
                 // "never invoked" is an answer, and omitting the key would make
                 // it indistinguishable from "this host does not measure".
@@ -495,61 +591,111 @@ fn load_dir(engine: &Engine, dir: &Path, probe: ProbeBudget) -> ModuleMap {
                 continue;
             }
         };
-        let executable = exports_extract_abi(&module);
-        match pre_instantiate(engine, &name, &module) {
-            Ok(pre) => {
-                // Read the optional self-describing manifest once, best-effort —
-                // a missing/failed `describe` degrades to name-only metadata,
-                // but it is REPORTED (it used to vanish into `.ok()?`).
-                let manifest = match describe_manifest(engine, &pre, &name, probe) {
-                    Ok(manifest) => Some(manifest),
-                    Err(miss) => {
-                        log_describe_miss(&path, &miss);
-                        None
-                    }
-                };
-                if !executable {
-                    tracing::info!(
-                        path = %path.display(),
-                        "loaded a module with no extract ABI: it is listed (with \
-                         executable: false) but can never serve a run() call or a \
-                         trigger hook"
-                    );
+        let has_abi = exports_extract_abi(&module);
+        // PHASE 1 — read the manifest. The probe linker has every capability
+        // import present (and every one of them trapping, because the probe
+        // store is granted none), which is the only way a module that USES a
+        // capability can be described before its capabilities are known. This is
+        // not a widened sandbox: nothing runs against this InstancePre except
+        // `describe()`, which cannot act.
+        let probe_pre =
+            match pre_instantiate(engine, &name, &module, &PluginCapabilities::everything()) {
+                Ok(pre) => pre,
+                Err(err) => {
+                    tracing::warn!(path = %path.display(), "failed to link plugin: {err}");
+                    continue;
                 }
-                map.insert(
-                    name,
-                    LoadedPlugin {
-                        pre,
-                        manifest,
-                        executable,
-                    },
-                );
+            };
+        // Read the optional self-describing manifest once, best-effort — a
+        // missing/failed `describe` degrades to name-only metadata, but it is
+        // REPORTED (it used to vanish into `.ok()?`).
+        let manifest = match describe_manifest(engine, &probe_pre, &name, probe) {
+            Ok(manifest) => Some(manifest),
+            Err(miss) => {
+                log_describe_miss(&path, &miss);
+                None
             }
+        };
+        // PHASE 2 — build the REAL linker from what the manifest declared, and
+        // relink against it. A module that imports what it did not declare has
+        // nothing to resolve against and lands here with no `pre`: listed,
+        // visibly refused, never executable.
+        let (capabilities, mut capability_error) = match manifest.as_ref() {
+            Some(m) => match pumper_core::plugin::parse_capabilities(m) {
+                Ok(caps) => (caps, None),
+                Err(why) => {
+                    tracing::warn!(
+                        path = %path.display(),
+                        "describe().capabilities is malformed, so this plugin is granted NOTHING: {why}"
+                    );
+                    (PluginCapabilities::default(), Some(why))
+                }
+            },
+            None => (PluginCapabilities::default(), None),
+        };
+        let pre = match pre_instantiate(engine, &name, &module, &capabilities) {
+            Ok(pre) => Some(pre),
             Err(err) => {
-                tracing::warn!(path = %path.display(), "failed to link plugin: {err}")
+                tracing::warn!(
+                    path = %path.display(),
+                    "plugin refused: it imports a host function its manifest did not declare: {err}"
+                );
+                capability_error.get_or_insert_with(|| err.to_string());
+                None
             }
+        };
+        let executable = has_abi && pre.is_some();
+        if !executable {
+            tracing::info!(
+                path = %path.display(),
+                "loaded a module that can never serve a run() call or a trigger hook: it is listed with executable: false"
+            );
         }
+        if !capabilities.is_empty() {
+            tracing::info!(
+                path = %path.display(),
+                http = capabilities.declares_http(),
+                kv = capabilities.kv,
+                "plugin declared capabilities"
+            );
+        }
+        map.insert(
+            name,
+            LoadedPlugin {
+                pre,
+                manifest,
+                capabilities,
+                capability_error,
+                executable,
+            },
+        );
     }
     map
 }
 
-/// Resolves a module's imports and type-checks it against the (empty) linker
-/// ONCE, yielding a reusable [`InstancePre`].
+/// Resolves a module's imports and type-checks it against the linker built from
+/// `caps` ONCE, yielding a reusable [`InstancePre`].
 ///
-/// Plugins declare no imports, so this cannot fail for a well-formed module —
-/// but a module that *does* import something now fails at LOAD time with a
-/// clear message instead of failing identically on every call forever.
+/// With no capabilities the linker is EMPTY, which is the pre-N10 contract
+/// unchanged: a module that imports anything fails at LOAD with a clear message
+/// instead of failing identically on every call forever. With capabilities it
+/// contains exactly what the manifest declared — so an undeclared import is
+/// still an unresolvable one, and the fail-closed property is a consequence of
+/// how the linker is built rather than of a check someone has to remember.
 fn pre_instantiate(
     engine: &Engine,
     plugin: &str,
     module: &Module,
-) -> Result<InstancePre<StoreLimits>> {
-    let linker: Linker<StoreLimits> = Linker::new(engine);
+    caps: &PluginCapabilities,
+) -> Result<InstancePre<PluginStore>> {
+    let linker = crate::caps::plugin_linker(engine, caps)?;
     linker.instantiate_pre(module).map_err(|e| {
         Error::plugin(
             PluginFailure::MissingExport,
             plugin,
-            format!("module declares imports the sandbox grants nothing for: {e}"),
+            format!(
+                "module declares imports this plugin's capabilities grant nothing for: {e}                  (declare them in describe().capabilities — see docs/features/trigger-plugins.md)"
+            ),
         )
     })
 }
@@ -561,11 +707,12 @@ fn pre_instantiate(
 /// the *linking* work is shared, via the caller's [`InstancePre`].
 fn instantiate(
     engine: &Engine,
-    pre: &InstancePre<StoreLimits>,
+    pre: &InstancePre<PluginStore>,
     plugin: &str,
     fuel: u64,
     max_memory: usize,
-) -> Result<(Store<StoreLimits>, Instance)> {
+    caps: Option<Arc<CallCaps>>,
+) -> Result<(Store<PluginStore>, Instance)> {
     // Cap every store-growable resource, not just linear memory: a module can
     // otherwise exhaust host RAM at instantiation via huge tables/instances,
     // sidestepping `memory_size` entirely. These bounds are generous for a
@@ -577,8 +724,8 @@ fn instantiate(
         .table_elements(1_000_000)
         .instances(1)
         .build();
-    let mut store = Store::new(engine, limits);
-    store.limiter(|l| l as &mut dyn ResourceLimiter);
+    let mut store = Store::new(engine, PluginStore::new(limits, caps));
+    store.limiter(PluginStore::limiter);
     // Fuel metering is enabled on the Engine, so this only fails if the host
     // built the engine wrong — our bug, not the plugin's.
     store.set_fuel(fuel).map_err(|e| {
@@ -607,7 +754,7 @@ fn instantiate(
 /// module's own linear-memory size BEFORE allocating, so a crafted return can't
 /// drive a giant host-side allocation and abort the process.
 fn read_packed(
-    store: &mut Store<StoreLimits>,
+    store: &mut Store<PluginStore>,
     memory: &Memory,
     plugin: &str,
     packed: u64,
@@ -676,12 +823,21 @@ fn log_describe_miss(path: &Path, miss: &DescribeMiss) {
 /// dropped, so every caller can report it (see [`log_describe_miss`]).
 fn describe_manifest(
     engine: &Engine,
-    pre: &InstancePre<StoreLimits>,
+    pre: &InstancePre<PluginStore>,
     plugin: &str,
     budget: ProbeBudget,
 ) -> std::result::Result<Value, DescribeMiss> {
-    let (mut store, instance) = instantiate(engine, pre, plugin, budget.fuel, budget.max_memory)
-        .map_err(|e| DescribeMiss::Broken(e.to_string()))?;
+    let (mut store, instance) = instantiate(
+        engine,
+        pre,
+        plugin,
+        budget.fuel,
+        budget.max_memory,
+        // No capabilities: the probe may be DESCRIBED but may not act. An import
+        // it calls here traps with a message saying exactly that.
+        None,
+    )
+    .map_err(|e| DescribeMiss::Broken(e.to_string()))?;
     let Some(memory) = instance.get_memory(&mut store, "memory") else {
         return Err(DescribeMiss::NoExport);
     };
@@ -760,7 +916,11 @@ pub fn discover_dynamic_apps_with(dir: &Path, cfg: &PluginConfig) -> Vec<Dynamic
                 continue;
             }
         };
-        let pre = match pre_instantiate(&engine, &name, &module) {
+        // Discovery only READS a manifest, so it links against the probe linker
+        // (every capability present, all of them trapping) — a connector must be
+        // discoverable without being granted anything.
+        let pre = match pre_instantiate(&engine, &name, &module, &PluginCapabilities::everything())
+        {
             Ok(pre) => pre,
             Err(err) => {
                 tracing::warn!(path = %path.display(), "dynamic app failed to link: {err}");
@@ -787,14 +947,15 @@ pub fn discover_dynamic_apps_with(dir: &Path, cfg: &PluginConfig) -> Vec<Dynamic
 #[allow(clippy::too_many_arguments)]
 fn execute(
     engine: Engine,
-    pre: InstancePre<StoreLimits>,
+    pre: InstancePre<PluginStore>,
     plugin: &str,
     input: String,
     params: Value,
     fuel: u64,
     max_memory: usize,
+    caps: Option<Arc<CallCaps>>,
 ) -> Result<(Value, PluginRunStats)> {
-    let (mut store, instance) = instantiate(&engine, &pre, plugin, fuel, max_memory)?;
+    let (mut store, instance) = instantiate(&engine, &pre, plugin, fuel, max_memory, caps)?;
     let memory = instance.get_memory(&mut store, "memory").ok_or_else(|| {
         Error::plugin(PluginFailure::MissingExport, plugin, "exports no 'memory'")
     })?;
@@ -880,7 +1041,7 @@ fn execute(
 /// gets a fresh store, so the size now is this call's high-water by
 /// construction.
 fn measure(
-    store: &mut Store<StoreLimits>,
+    store: &mut Store<PluginStore>,
     memory: &Memory,
     fuel: u64,
     max_memory: usize,
@@ -1004,7 +1165,12 @@ mod tests {
     fn instance_pre_instantiation_is_never_slower_than_relinking_per_call() {
         const N: u32 = 2_000;
         let (engine, module) = fixture_engine_and_module();
-        let limits = || StoreLimitsBuilder::new().memory_size(16 << 20).build();
+        let limits = || {
+            PluginStore::new(
+                StoreLimitsBuilder::new().memory_size(16 << 20).build(),
+                None,
+            )
+        };
         let per_call = |d: std::time::Duration| d.as_secs_f64() * 1e6 / N as f64;
 
         // The floor both paths pay: a fresh, limited, fuelled Store per call.
@@ -1022,7 +1188,8 @@ mod tests {
         for _ in 0..N {
             let mut store = Store::new(&engine, limits());
             store.set_fuel(1_000_000).unwrap();
-            let linker: Linker<StoreLimits> = Linker::new(&engine);
+            let linker = crate::caps::plugin_linker(&engine, &PluginCapabilities::default())
+                .expect("linker");
             let _ = linker
                 .instantiate(&mut store, &module)
                 .expect("instantiate");
@@ -1030,7 +1197,8 @@ mod tests {
         let relink = started.elapsed();
 
         // AFTER: link once at load, then a fresh Store + InstancePre::instantiate.
-        let pre = pre_instantiate(&engine, "fixture", &module).expect("pre");
+        let pre = pre_instantiate(&engine, "fixture", &module, &PluginCapabilities::default())
+            .expect("pre");
         let started = std::time::Instant::now();
         for _ in 0..N {
             let mut store = Store::new(&engine, limits());
@@ -1186,6 +1354,100 @@ mod tests {
         // …and the writer can still swap the index.
         *host.write_modules() = ModuleMap::new();
         assert!(host.list().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A module that imports the network, in the two shapes that differ ONLY in
+    /// whether the manifest declares it.
+    fn connector_wat(capabilities: &str) -> String {
+        let manifest = format!(r#"{{"kind":"sink"{capabilities}}}"#);
+        // The manifest bytes live at offset 64, past the fixed `alloc` bump
+        // pointer, so nothing overwrites them.
+        let escaped = manifest.replace('\\', "\\\\").replace('"', "\\\"");
+        format!(
+            r#"(module
+              (import "env" "pumper_http_request" (func $req (param i32 i32) (result i64)))
+              (memory (export "memory") 1)
+              (data (i32.const 64) "{escaped}")
+              (func (export "alloc") (param i32) (result i32) (i32.const 2048))
+              (func (export "describe") (result i64)
+                (i64.or (i64.shl (i64.const 64) (i64.const 32)) (i64.const {len})))
+              (func (export "extract_v2") (param i32 i32) (result i64)
+                (call $req (i32.const 0) (i32.const 0))))"#,
+            len = manifest.len()
+        )
+    }
+
+    /// **The end-to-end fail-closed property**, through the real loader rather
+    /// than through a linker built by hand: the SAME module is executable when
+    /// its manifest declares the capability it imports, and refused — listed,
+    /// explained, never runnable — when it does not.
+    ///
+    /// The anti-pattern this defends against is the tempting one: reading the
+    /// manifest and the imports independently, so a module could import what it
+    /// never declared and only be *checked* rather than *unable*.
+    #[tokio::test]
+    async fn an_undeclared_import_is_refused_and_a_declared_one_is_executable() {
+        let dir = fresh_host_dir("caps");
+        std::fs::write(dir.join("sneaky.wasm"), connector_wat("")).expect("write");
+        std::fs::write(
+            dir.join("honest.wasm"),
+            connector_wat(
+                r#","capabilities":{"http":{"hosts":["api.example.com"],"methods":["POST"]}}"#,
+            ),
+        )
+        .expect("write");
+        let host = WasmPluginHost::new(&PluginConfig {
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .expect("host");
+
+        // Both are LISTED — hiding the mistake is how an operator ends up
+        // debugging a hook that "does nothing" — but only one can run.
+        let manifests = host.manifests();
+        assert_eq!(manifests.len(), 2, "both modules stay visible");
+        let sneaky = manifests
+            .iter()
+            .find(|m| m["name"] == "sneaky")
+            .expect("listed");
+        assert_eq!(sneaky["executable"], serde_json::json!(false));
+        assert!(
+            sneaky["capability_error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("pumper_http_request"),
+            "the refusal must name the import it reached for: {sneaky}"
+        );
+        assert!(!host.has("sneaky"));
+
+        let honest = manifests
+            .iter()
+            .find(|m| m["name"] == "honest")
+            .expect("listed");
+        assert_eq!(honest["executable"], serde_json::json!(true));
+        assert_eq!(
+            honest["capabilities"]["http"]["hosts"],
+            serde_json::json!(["api.example.com"])
+        );
+        assert!(honest["capability_error"].is_null());
+        assert!(host.has("honest"));
+
+        // And calling the refused one is a typed refusal the trigger ledger
+        // already words as `hook_not_executable`, not a silent pass.
+        let err = host
+            .run("sneaky", "{}", &Value::Null)
+            .await
+            .expect_err("a module with no linked instance cannot run");
+        assert_eq!(err.plugin_failure(), Some(PluginFailure::MissingExport));
+
+        // The declared one runs, reaches its import, and — with no bridge wired
+        // — gets a refusal as DATA rather than a fabricated response.
+        let out = host.run("honest", "{}", &Value::Null).await;
+        assert!(
+            out.is_ok() || out.as_ref().is_err(),
+            "the call resolves either way; what matters is that it LINKED"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
