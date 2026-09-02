@@ -31,6 +31,10 @@ use serde_json::{json, Map, Value};
 use tracing::{info, warn};
 
 use crate::events::JobEvent;
+use crate::lineage::{
+    Assertion, DatasetOrigin, FlowRef, LineageDataset, LineageEvent, OutputStats, PumperFacet,
+    RunOutcome, RunRef, SourceRef,
+};
 use crate::state::AppState;
 
 /// Entities per ingestion POST — small batches so one oversized payload can't
@@ -282,19 +286,36 @@ pub(crate) fn rule_ops(rules: &RuleSet) -> Vec<(String, String)> {
 /// claiming a dataset-level source here would be a lie) and the rule descriptor
 /// as `transformOperation`. Existing table-level upstreams are preserved so
 /// this write cannot clobber edges other writers registered.
-fn upstream_lineage_with_fields(
+/// `upstreamLineage` carrying column-level provenance, and — when the catalog
+/// names one — the external source the columns were extracted FROM, when the catalog names one (N24, `[lineage] emit_sources`).
+///
+/// `source_urn: None` reproduces the pre-N24 aspect exactly — `upstreamType:
+/// NONE`, empty `upstreams` — which is the honest shape when the upstream is a
+/// fetched page nothing has modelled. With a source entity in the catalog the
+/// upstream is no longer unnameable, and the field-level edge finally points at
+/// it: the same column, sourced from the same `schemaField` on the `web`
+/// platform dataset.
+fn upstream_lineage_with_fields_from(
     dataset_urn: &str,
     upstreams: &[String],
     ops: &[(String, String)],
+    source_urn: Option<&str>,
     ms: i64,
 ) -> Value {
     let mut aspect = upstream_lineage(upstreams, ms);
     let fine: Vec<Value> = ops
         .iter()
         .map(|(field, op)| {
+            let (kind, ups) = match source_urn {
+                Some(src) => (
+                    "FIELD_SET",
+                    vec![Value::String(schema_field_urn(src, field))],
+                ),
+                None => ("NONE", Vec::new()),
+            };
             json!({
-                "upstreamType": "NONE",
-                "upstreams": [],
+                "upstreamType": kind,
+                "upstreams": ups,
                 "downstreamType": "FIELD",
                 "downstreams": [schema_field_urn(dataset_urn, field)],
                 "confidenceScore": 1.0,
@@ -304,6 +325,255 @@ fn upstream_lineage_with_fields(
         .collect();
     aspect["fineGrainedLineages"] = Value::Array(fine);
     aspect
+}
+
+// ── N24: external sources, quality aspects, and the vendor-neutral render ────
+
+/// External sources sit on DataHub's `web` platform. Putting them on the
+/// `pumper` platform would claim Pumper *produces* what it merely reads.
+pub const WEB_PLATFORM_URN: &str = "urn:li:dataPlatform:web";
+
+/// `urn:li:dataset:(urn:li:dataPlatform:web,<source id>,<env>)` — one catalog
+/// `[[source]]` as an entity, so lineage no longer starts at Pumper.
+pub fn source_urn(env: &str, id: &str) -> String {
+    format!("urn:li:dataset:({WEB_PLATFORM_URN},{id},{env})")
+}
+
+/// `datasetProperties` for a catalog `[[source]]`. Only fields the row actually
+/// declares are stamped: an empty `cadence` is "not declared", and writing it
+/// as `""` would put a fact-shaped blank into someone else's catalog.
+fn source_properties(src: &SourceRef) -> Value {
+    let mut props = Map::new();
+    props.insert("pumper_source_id".into(), json!(src.id));
+    for (k, v) in [
+        ("url", &src.url),
+        ("cadence", &src.cadence),
+        ("access", &src.access),
+        ("category", &src.category),
+    ] {
+        if !v.is_empty() {
+            props.insert(k.into(), json!(v));
+        }
+    }
+    json!({
+        "__type": "DatasetProperties",
+        "name": src.name,
+        "description": format!(
+            "External source `{}` declared in Pumper's catalog \
+             (catalog/data-sources.toml). Pumper reads it; nothing writes it.",
+            src.id
+        ),
+        "customProperties": Value::Object(props),
+    })
+}
+
+/// `globalTags` from `key:value` labels. The `key:value` tag-name convention is
+/// the one the governance poll already reads (`cost:pause`), so Pumper writes
+/// tags in the vocabulary it reads.
+fn global_tags(tags: &[String]) -> Value {
+    json!({
+        "__type": "GlobalTags",
+        "tags": tags
+            .iter()
+            .map(|t| json!({ "tag": format!("urn:li:tag:{t}") }))
+            .collect::<Vec<_>>(),
+    })
+}
+
+/// `urn:li:assertion:<...>` — stable per `(dataset, check)`, so re-running the
+/// same check updates one assertion's history instead of minting a new entity
+/// every run.
+fn assertion_urn(app: &str, dataset: &str, name: &str) -> String {
+    format!("urn:li:assertion:pumper.{app}.{dataset}.{name}")
+}
+
+/// `assertionInfo`: what this assertion checks, and on which dataset.
+fn assertion_info(dataset_urn: &str, name: &str) -> Value {
+    json!({
+        "__type": "AssertionInfo",
+        "type": "DATASET",
+        "datasetAssertion": {
+            "dataset": dataset_urn,
+            "scope": "DATASET_ROWS",
+            "operator": "_NATIVE_",
+            "aggregation": "_NATIVE_",
+            "nativeType": name,
+        },
+        "customProperties": { "source": "pumper" },
+    })
+}
+
+/// `assertionRunEvent` (timeseries): the result Pumper's own gate produced for
+/// this run. This is the half that closes the governance loop — the poll used
+/// to read assertion health somebody else wrote.
+fn assertion_run_event(dataset_urn: &str, run_id: &str, a: &Assertion, ms: i64) -> Value {
+    let mut result = Map::new();
+    result.insert(
+        "type".into(),
+        json!(if a.passed { "SUCCESS" } else { "FAILURE" }),
+    );
+    if let Some(m) = &a.message {
+        result.insert("nativeResults".into(), json!({ "message": m }));
+    }
+    json!({
+        "__type": "AssertionRunEvent",
+        "timestampMillis": ms,
+        "runId": run_id,
+        "asserteeUrn": dataset_urn,
+        "status": "COMPLETE",
+        "result": Value::Object(result),
+    })
+}
+
+/// The DataHub URN of one lineage dataset — a Pumper dataset, or an external
+/// source on the `web` platform.
+fn urn_of(env: &str, d: &LineageDataset) -> String {
+    match (d.origin, &d.source) {
+        (DatasetOrigin::Source, Some(s)) => source_urn(env, &s.id),
+        _ => dataset_urn(env, &d.app, &d.dataset),
+    }
+}
+
+/// The run metadata DataHub carries as custom properties on a dataset.
+fn dataset_customs(d: &LineageDataset, run: Option<&RunRef>) -> Vec<(&'static str, String)> {
+    let mut custom: Vec<(&'static str, String)> = vec![("pumper_app", d.app.clone())];
+    if let Some(rows) = d.rows {
+        custom.push(("record_count", rows.to_string()));
+    }
+    if let (Some(run), Some(stats)) = (run, d.stats) {
+        custom.push(("last_job_id", run.job_id.to_string()));
+        custom.push(("last_run_new", stats.new.to_string()));
+        custom.push(("last_run_changed", stats.changed.to_string()));
+        custom.push(("last_run_removed", stats.removed.to_string()));
+    }
+    custom
+}
+
+/// The dataFlow + dataJob entities for one run, as a pure function of the model.
+fn flow_entities_of(
+    env: &str,
+    flow: &FlowRef,
+    run: &RunRef,
+    inputs: &[LineageDataset],
+    outputs: &[LineageDataset],
+) -> Vec<Value> {
+    let flow_urn = dataflow_urn(env, &flow.flow_id);
+    let mut custom: Vec<(&str, String)> = vec![
+        ("pumper_app", run.app.clone()),
+        ("kind", flow.kind.to_string()),
+    ];
+    if let Some(s) = &flow.schedule_id {
+        custom.push(("schedule_id", s.clone()));
+    }
+    if let Some(t) = &flow.trigger_id {
+        custom.push(("trigger_id", t.clone()));
+    }
+    let job_id = run.job_id.to_string();
+    let jurn = datajob_urn(&flow_urn, &job_id);
+    let job_custom: Vec<(&str, String)> = vec![
+        ("pumper_app", run.app.clone()),
+        ("job_id", job_id.clone()),
+        ("attempts", run.attempts.to_string()),
+    ];
+    let input_urns: Vec<String> = inputs.iter().map(|d| urn_of(env, d)).collect();
+    let output_urns: Vec<String> = outputs.iter().map(|d| urn_of(env, d)).collect();
+    vec![
+        entity("dataFlow", &flow_urn, dataflow_info(&flow.name, &custom)),
+        entity(
+            "dataJob",
+            &jurn,
+            datajob_info(&format!("{} run {}", run.app, job_id), &job_custom),
+        ),
+        entity("dataJob", &jurn, datajob_io(&input_urns, &output_urns)),
+    ]
+}
+
+/// The DataHub writer: one [`LineageEvent`] rendered into the v1 ingestion
+/// envelope. Pure — no clock, no config read, no I/O.
+///
+/// The entity SEQUENCE is load-bearing and is the pre-N24 one, aspect for
+/// aspect: own datasets, then derived datasets with their merged table lineage,
+/// then the flow/job topology, then column lineage. The N24 additions (external
+/// source entities, tags, assertion results) are **appended** rather than
+/// interleaved, so the prefix a DataHub GMS receives is byte-identical to what
+/// it received before — and with `[lineage]` at its defaults none of them are
+/// produced at all.
+pub struct DatahubEntities(pub Vec<Value>);
+
+impl From<&LineageEvent> for DatahubEntities {
+    fn from(ev: &LineageEvent) -> Self {
+        let env = &ev.env;
+        let ms = ev.ms;
+        let run = ev.run.as_ref();
+        let mut out = Vec::new();
+
+        for d in &ev.outputs {
+            let urn = dataset_urn(env, &d.app, &d.dataset);
+            out.push(envelope(
+                &urn,
+                dataset_properties(&d.app, &d.dataset, &dataset_customs(d, run)),
+            ));
+            out.push(envelope(&urn, operation(ms)));
+            if let Some(rows) = d.profile_rows {
+                out.push(envelope(&urn, dataset_profile(ms, rows)));
+            }
+            if let Some(sample) = &d.sample {
+                out.push(envelope(&urn, schema_metadata(&d.app, &d.dataset, sample)));
+            }
+            if d.origin == DatasetOrigin::Derived {
+                if let Some(ups) = &d.upstreams {
+                    out.push(envelope(&urn, upstream_lineage(ups, ms)));
+                }
+            }
+        }
+
+        if let (Some(flow), Some(run)) = (&ev.flow, run) {
+            out.extend(flow_entities_of(env, flow, run, &ev.inputs, &ev.outputs));
+        }
+
+        for d in ev.outputs.iter().filter(|d| !d.column_ops.is_empty()) {
+            let urn = dataset_urn(env, &d.app, &d.dataset);
+            let src = d.source_upstream.as_ref().map(|s| source_urn(env, &s.id));
+            out.push(envelope(
+                &urn,
+                upstream_lineage_with_fields_from(
+                    &urn,
+                    d.upstreams.as_deref().unwrap_or(&[]),
+                    &d.column_ops,
+                    src.as_deref(),
+                    ms,
+                ),
+            ));
+        }
+
+        // ── appended: everything N24 adds, off unless an operator opted in ──
+        for d in ev
+            .inputs
+            .iter()
+            .filter(|d| d.origin == DatasetOrigin::Source)
+        {
+            if let Some(src) = &d.source {
+                out.push(envelope(&source_urn(env, &src.id), source_properties(src)));
+            }
+        }
+        let run_id = run.map(|r| r.job_id.to_string()).unwrap_or_default();
+        for d in &ev.outputs {
+            let urn = dataset_urn(env, &d.app, &d.dataset);
+            if !d.tags.is_empty() {
+                out.push(envelope(&urn, global_tags(&d.tags)));
+            }
+            for a in &d.assertions {
+                let aurn = assertion_urn(&d.app, &d.dataset, &a.name);
+                out.push(entity("assertion", &aurn, assertion_info(&urn, &a.name)));
+                out.push(entity(
+                    "assertion",
+                    &aurn,
+                    assertion_run_event(&urn, &run_id, a, ms),
+                ));
+            }
+        }
+        Self(out)
+    }
 }
 
 /// Own client, not the 15s webhook one: GMS ingestion can take >15s on a
@@ -445,51 +715,94 @@ fn record_status(state: &AppState, kind: &str, outcome: Result<usize, String>) -
     entry
 }
 
-/// Aspects for one dataset: properties (+run counts), operation, and — when
-/// enabled — profile and inferred schema. Reads are fail-open (a failed count
-/// or sample read just omits that aspect).
-async fn dataset_entities(
+/// Everything one dataset contributes to a [`LineageEvent`]: row count, a
+/// sample record for schema inference, this run's revision counts, and — under
+/// `[lineage] emit_quality` — Pumper's own verdict and health tags.
+///
+/// Every read is fail-open, and a failed read leaves the field ABSENT rather
+/// than zero. That distinction is the whole reason the model has `Option`s: a
+/// `rowCount: 0` published because a count query errored is a fact-shaped lie in
+/// someone's catalog, and the renderers turn `None` into an omitted aspect.
+///
+/// The two `[datahub]` emit flags are applied HERE, at gather, not in the
+/// renderers: `profile_rows`/`sample` are simply not read when they are off, so
+/// the vendor-neutral model never learns about a DataHub config key.
+async fn gather_dataset(
     state: &AppState,
     app: &str,
     dataset: &str,
-    run: Option<(&Job, usize, usize, usize)>,
-) -> Vec<Value> {
+    origin: DatasetOrigin,
+    stats: Option<OutputStats>,
+    run: Option<&Job>,
+) -> LineageDataset {
     let cfg = &state.config.datahub;
-    let urn = dataset_urn(&cfg.env, app, dataset);
-    let ms = now_ms();
-    let rows = state.datasets.record_count(app, dataset).await.ok();
-
-    let mut custom: Vec<(&str, String)> = vec![("pumper_app", app.to_string())];
-    if let Some(rows) = rows {
-        custom.push(("record_count", rows.to_string()));
-    }
-    if let Some((job, new, changed, removed)) = run {
-        custom.push(("last_job_id", job.id.to_string()));
-        custom.push(("last_run_new", new.to_string()));
-        custom.push(("last_run_changed", changed.to_string()));
-        custom.push(("last_run_removed", removed.to_string()));
-    }
-
-    let mut out = vec![
-        envelope(&urn, dataset_properties(app, dataset, &custom)),
-        envelope(&urn, operation(ms)),
-    ];
+    let mut d = LineageDataset::new(app, dataset, origin);
+    d.rows = state.datasets.record_count(app, dataset).await.ok();
     if cfg.emit_profile {
-        if let Some(rows) = rows {
-            out.push(envelope(&urn, dataset_profile(ms, rows)));
-        }
+        d.profile_rows = d.rows;
     }
     if cfg.emit_schema {
         match state.datasets.list(app, dataset, 1).await {
-            Ok(recs) => {
-                if let Some(rec) = recs.first() {
-                    out.push(envelope(&urn, schema_metadata(app, dataset, &rec.data)));
-                }
-            }
+            Ok(recs) => d.sample = recs.first().map(|rec| rec.data.clone()),
             Err(e) => warn!("datahub: sample read {app}/{dataset} failed: {e}"),
         }
     }
-    out
+    d.stats = stats;
+    if state.config.lineage.emit_quality {
+        // A verdict belongs to whichever run judged the pair LAST, so it is
+        // published only when it belongs to THIS run — see `verdict_assertion`.
+        if let Some(job) = run {
+            // Poison-tolerant, like every other reader of this advisory cache:
+            // a panic elsewhere must not turn the metadata push into a second
+            // failure. The map is structurally sound either way.
+            let verdict = state
+                .contract_verdicts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&format!("{app}/{dataset}"))
+                .cloned();
+            if let Some(v) = verdict {
+                d.assertions
+                    .extend(crate::lineage::verdict_assertion(&v, job.id));
+            }
+        }
+        // `state`, not `enforced_state`: the tag reports what the ladder knows,
+        // and soak mode (enforce = false) does not make a degraded source
+        // healthy — it only means nothing is gated on it.
+        let health = state.health.state(app, dataset).await;
+        d.tags = crate::lineage::health_tags(health.as_str(), health.trust());
+    }
+    d
+}
+
+/// The catalog `[[source]]` an `<app>/<dataset>` pair is extracted from, if any.
+///
+/// A row matches on its app; a row that also names a dataset must match that
+/// too. Exact `(app, dataset)` rows win over an app-wide row, so an app serving
+/// several sources attributes each dataset to the right one instead of to
+/// whichever row the file happens to list first.
+pub(crate) fn catalog_source_for(
+    catalog: &pumper_core::Catalog,
+    app: &str,
+    dataset: &str,
+) -> Option<SourceRef> {
+    let of = |s: &pumper_core::catalog::Source| SourceRef {
+        id: s.id.clone(),
+        name: if s.name.is_empty() {
+            s.id.clone()
+        } else {
+            s.name.clone()
+        },
+        url: s.url.clone(),
+        cadence: s.cadence.clone(),
+        access: s.access.clone(),
+        category: s.category.clone(),
+    };
+    let mine = || catalog.sources.iter().filter(|s| s.app == app);
+    mine()
+        .find(|s| s.dataset == dataset)
+        .or_else(|| mine().find(|s| s.dataset.is_empty()))
+        .map(of)
 }
 
 /// Datasets a result names in `index_datasets` (`[{app, dataset}]`) — the
@@ -588,80 +901,260 @@ async fn existing_upstreams(state: &AppState, urn: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// The dataFlow + dataJob entities for one succeeded run. Inputs are the
-/// firing trigger's source datasets (the one upstream edge Pumper knows
-/// mechanically); outputs are everything the run wrote. Reads are fail-open:
-/// an unreadable trigger just means no input edges.
-async fn flow_entities(state: &AppState, job: &Job, output_urns: &[String]) -> Vec<Value> {
-    let env = &state.config.datahub.env;
-    let (flow_id, flow_name, kind) = flow_identity(
+/// The datasets a run's firing trigger listens on, as lineage inputs — the one
+/// upstream edge Pumper knows mechanically. Fail-open: an unreadable trigger
+/// just means no input edges.
+async fn gather_trigger_inputs(state: &AppState, job: &Job) -> Vec<LineageDataset> {
+    let mut inputs = Vec::new();
+    let Some(tid) = &job.trigger_id else {
+        return inputs;
+    };
+    match state.storage.get_trigger(tid).await {
+        Ok(Some(t)) => {
+            let source_datasets = match (t.source_kind.as_str(), t.source_dataset.as_deref()) {
+                ("dataset", Some(ds)) if ds != "*" => vec![ds.to_string()],
+                _ => state
+                    .datasets
+                    .datasets(&t.source_app)
+                    .await
+                    .unwrap_or_default(),
+            };
+            for ds in source_datasets {
+                inputs.push(LineageDataset::new(
+                    t.source_app.clone(),
+                    ds,
+                    DatasetOrigin::Upstream,
+                ));
+            }
+        }
+        Ok(None) => {}
+        Err(e) => warn!(trigger = %tid, "datahub: trigger read failed: {e}"),
+    }
+    inputs
+}
+
+/// The run half of a [`LineageEvent`]: identity, chain position and cost.
+///
+/// `root_id`/`workflow_run_id` come from the jobs row (N03), not from the
+/// in-memory `Job`, which does not carry them. They are what makes a workflow's
+/// twenty steps render as one lineage story instead of twenty unrelated runs.
+/// Both reads are fail-open — an absent chain id is `None`, i.e. "not part of a
+/// chain", which is also what a read failure honestly leaves it as.
+async fn gather_run(state: &AppState, job: &Job, outcome: RunOutcome) -> RunRef {
+    let (_, _, kind) = flow_identity(
         &job.app,
         job.schedule_id.as_deref(),
         job.trigger_id.as_deref(),
     );
-    let flow_urn = dataflow_urn(env, &flow_id);
-    let mut custom: Vec<(&str, String)> =
-        vec![("pumper_app", job.app.clone()), ("kind", kind.into())];
-    if let Some(s) = &job.schedule_id {
-        custom.push(("schedule_id", s.clone()));
+    let cost_usd = state.costs.job_total(job.id).await.ok();
+    let (workflow_run_id, root_id) =
+        state
+            .storage
+            .job_chain_ids(job.id)
+            .await
+            .unwrap_or_else(|e| {
+                warn!(job = %job.id, "lineage: chain-id read failed: {e}");
+                (None, None)
+            });
+    RunRef {
+        job_id: job.id,
+        app: job.app.clone(),
+        attempts: job.attempts,
+        outcome,
+        error: (outcome == RunOutcome::Fail)
+            .then(|| job.error.clone())
+            .flatten(),
+        pumper: PumperFacet {
+            job_id: job.id.to_string(),
+            app: job.app.clone(),
+            attempts: job.attempts,
+            flow_kind: kind.to_string(),
+            schedule_id: job.schedule_id.clone(),
+            trigger_id: job.trigger_id.clone(),
+            workflow_run_id,
+            root_id,
+            cost_usd,
+        },
     }
-    if let Some(t) = &job.trigger_id {
-        custom.push(("trigger_id", t.clone()));
-    }
+}
 
-    // Input edges: the datasets the firing trigger listens on.
-    let mut inputs: Vec<String> = Vec::new();
-    if let Some(tid) = &job.trigger_id {
-        match state.storage.get_trigger(tid).await {
-            Ok(Some(t)) => {
-                let source_datasets = match (t.source_kind.as_str(), t.source_dataset.as_deref()) {
-                    ("dataset", Some(ds)) if ds != "*" => vec![ds.to_string()],
-                    _ => state
-                        .datasets
-                        .datasets(&t.source_app)
-                        .await
-                        .unwrap_or_default(),
-                };
-                for ds in source_datasets {
-                    inputs.push(dataset_urn(env, &t.source_app, &ds));
+/// Builds the one [`LineageEvent`] a terminal run produces — every dataset in
+/// the job's namespace (a successful run refreshes them whether or not rows
+/// changed: the freshness signal must not go stale on quiet runs), the
+/// cross-namespace `index_datasets` outputs with their merged upstream edges,
+/// the flow topology, column provenance where declarative rules make it
+/// mechanical, and — under `[lineage]` — external sources and quality verdicts.
+///
+/// Everything here is a READ. The writers are pure functions of what it
+/// gathered, which is what lets one run feed two catalogs without either of
+/// them re-deriving the facts from the store.
+async fn gather_run_event(
+    state: &AppState,
+    job: &Job,
+    index_specs: &[(String, String)],
+    outcome: RunOutcome,
+) -> LineageEvent {
+    let env = state.config.datahub.env.clone();
+    let mut ev = LineageEvent::for_run(&env, gather_run(state, job, outcome).await);
+    // Loaded once per emission, and only when asked for: this is a file read on
+    // the fan-out pool, not on the scrape permit.
+    let catalog = if state.config.lineage.emit_sources {
+        match pumper_core::Catalog::load() {
+            Ok(c) => Some(c),
+            Err(e) => {
+                warn!("lineage: catalog unreadable, no source entities: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    // All datasets under the job's namespace, with this run's revision counts
+    // where the run changed anything (zeroes on a quiet run).
+    let own = match state.datasets.datasets(&job.app).await {
+        Ok(own) => own,
+        Err(e) => {
+            warn!("datahub: datasets for {} failed: {e}", job.app);
+            Vec::new()
+        }
+    };
+    let counts = run_counts(state, &job.app, None, job).await;
+    for ds in &own {
+        let stats = counts
+            .iter()
+            .find(|(d, ..)| d == ds)
+            .map(|(_, n, c, r)| OutputStats {
+                new: *n,
+                changed: *c,
+                removed: *r,
+            })
+            .unwrap_or_default();
+        let mut d = gather_dataset(
+            state,
+            &job.app,
+            ds,
+            DatasetOrigin::Own,
+            Some(stats),
+            Some(job),
+        )
+        .await;
+        if let Some(cat) = &catalog {
+            d.source_upstream = catalog_source_for(cat, &job.app, ds);
+        }
+        ev.outputs.push(d);
+    }
+    let own_urns: Vec<String> = own
+        .iter()
+        .map(|ds| dataset_urn(&env, &job.app, ds))
+        .collect();
+
+    // Cross-namespace outputs (e.g. grants-gov → grants/unified).
+    for (app, ds) in index_specs {
+        if *app == job.app {
+            continue; // already covered above
+        }
+        let c = run_counts(state, app, Some(ds), job).await;
+        let stats = c
+            .first()
+            .map(|(_, n, ch, r)| OutputStats {
+                new: *n,
+                changed: *ch,
+                removed: *r,
+            })
+            .unwrap_or_default();
+        let mut d = gather_dataset(
+            state,
+            app,
+            ds,
+            DatasetOrigin::Derived,
+            Some(stats),
+            Some(job),
+        )
+        .await;
+        if !own_urns.is_empty() {
+            let urn = dataset_urn(&env, app, ds);
+            let mut merged = existing_upstreams(state, &urn).await;
+            for u in &own_urns {
+                if !merged.contains(u) {
+                    merged.push(u.clone());
                 }
             }
-            Ok(None) => {}
-            Err(e) => warn!(trigger = %tid, "datahub: trigger read failed: {e}"),
+            d.upstreams = Some(merged);
+        }
+        if let Some(cat) = &catalog {
+            d.source_upstream = catalog_source_for(cat, app, ds);
+        }
+        ev.outputs.push(d);
+    }
+
+    // M25: this run as a dataJob under its flow (schedule / trigger / ad-hoc),
+    // with input/output dataset edges — the run renders as a node in the
+    // lineage graph of whichever catalog is listening.
+    if state.config.datahub.emit_flows {
+        let (flow_id, flow_name, kind) = flow_identity(
+            &job.app,
+            job.schedule_id.as_deref(),
+            job.trigger_id.as_deref(),
+        );
+        ev.flow = Some(FlowRef {
+            flow_id,
+            name: flow_name,
+            kind,
+            schedule_id: job.schedule_id.clone(),
+            trigger_id: job.trigger_id.clone(),
+        });
+        ev.inputs = gather_trigger_inputs(state, job).await;
+
+        // Column lineage — ONLY where a declarative RuleSet makes field
+        // provenance mechanical. Apps whose extraction logic is code (not
+        // rules) are honestly skipped: guessing would poison the graph.
+        if let Some(rules) = job_rule_set(&job.params) {
+            let ops = rule_ops(&rules);
+            if !ops.is_empty() {
+                for d in ev.outputs.iter_mut().filter(|d| {
+                    d.origin == DatasetOrigin::Own && d.stats.map(|s| s.touched()).unwrap_or(false)
+                }) {
+                    let urn = dataset_urn(&env, &d.app, &d.dataset);
+                    d.upstreams = Some(existing_upstreams(state, &urn).await);
+                    d.column_ops = ops.clone();
+                }
+            }
         }
     }
 
-    let job_id = job.id.to_string();
-    let jurn = datajob_urn(&flow_urn, &job_id);
-    let job_custom: Vec<(&str, String)> = vec![
-        ("pumper_app", job.app.clone()),
-        ("job_id", job_id.clone()),
-        ("attempts", job.attempts.to_string()),
-    ];
-    vec![
-        entity("dataFlow", &flow_urn, dataflow_info(&flow_name, &custom)),
-        entity(
-            "dataJob",
-            &jurn,
-            datajob_info(&format!("{} run {}", job.app, job_id), &job_custom),
-        ),
-        entity("dataJob", &jurn, datajob_io(&inputs, output_urns)),
-    ]
+    // External upstreams: one input entity per distinct catalog source behind
+    // this run's outputs, so lineage no longer starts at Pumper.
+    let mut seen: HashSet<String> = HashSet::new();
+    let sources: Vec<SourceRef> = ev
+        .outputs
+        .iter()
+        .filter_map(|d| d.source_upstream.clone())
+        .filter(|s| seen.insert(s.id.clone()))
+        .collect();
+    for src in sources {
+        let mut d = LineageDataset::new(job.app.clone(), String::new(), DatasetOrigin::Source);
+        d.source = Some(src);
+        ev.inputs.push(d);
+    }
+    ev
 }
 
-/// Emission for a succeeded job: every dataset in the job's namespace (a
-/// successful run refreshes them whether or not rows changed — the freshness
-/// signal must not go stale on quiet runs), plus the cross-namespace
-/// `index_datasets` outputs with lineage edges (own datasets → derived dataset)
-/// merged into the edges other writers already registered. One-line hook in the
-/// worker; everything (including the revision reads) happens off the hot path.
+/// Emission for a succeeded job: one [`LineageEvent`], rendered by every
+/// configured writer. One-line hook in the worker; everything (including the
+/// revision reads) happens off the hot path.
 ///
 /// Runs on the worker's fan-out pool rather than a bare `tokio::spawn`: off the
 /// scrape permit, but **tracked** — the shutdown drain waits for it, and says
 /// out loud how many emissions it abandoned instead of dropping them silently.
 /// Panics are contained by the pool for the same reason.
+///
+/// The two writers are independent and **separately reported**: an OpenLineage
+/// failure does not stop the DataHub post and neither is retried. A single
+/// shared "last emission" slot is exactly how a dead second bridge would hide
+/// behind a healthy first one.
 pub async fn on_job_success(state: &AppState, job: &Job, index_specs: Vec<(String, String)>) {
-    if !state.config.datahub.enabled {
+    if !emitting(state) {
         return;
     }
     let job_id = job.id;
@@ -669,100 +1162,84 @@ pub async fn on_job_success(state: &AppState, job: &Job, index_specs: Vec<(Strin
     let state = state.clone();
     let job = job.clone();
     pool.run("datahub", job_id, async move {
-        let env = state.config.datahub.env.clone();
-        let mut entities = Vec::new();
+        let ev = gather_run_event(&state, &job, &index_specs, RunOutcome::Complete).await;
+        crate::lineage::emit(&state, &ev).await;
+        post_event(&state, &job, &ev).await;
+    })
+    .await;
+}
 
-        // All datasets under the job's namespace, with this run's revision
-        // counts where the run changed anything (zeroes on a quiet run).
-        let own = match state.datasets.datasets(&job.app).await {
-            Ok(own) => own,
-            Err(e) => {
-                warn!("datahub: datasets for {} failed: {e}", job.app);
-                Vec::new()
-            }
-        };
-        let counts = run_counts(&state, &job.app, None, &job).await;
-        for ds in &own {
-            let (n, c, r) = counts
-                .iter()
-                .find(|(d, ..)| d == ds)
-                .map(|(_, n, c, r)| (*n, *c, *r))
-                .unwrap_or_default();
-            entities.extend(dataset_entities(&state, &job.app, ds, Some((&job, n, c, r))).await);
+/// Whether ANY lineage writer is configured. The DataHub master switch alone is
+/// no longer the gate: with `[datahub] enabled = false` and an OpenLineage URL
+/// set, the OpenLineage writer must still run.
+pub(crate) fn emitting(state: &AppState) -> bool {
+    state.config.datahub.enabled || state.config.lineage.endpoint().is_some()
+}
+
+/// Renders and posts one event's DataHub entities. No-op when DataHub is off.
+async fn post_event(state: &AppState, job: &Job, ev: &LineageEvent) {
+    if !state.config.datahub.enabled {
+        return;
+    }
+    let DatahubEntities(entities) = ev.into();
+    if entities.is_empty() {
+        return;
+    }
+    let count = entities.len();
+    match post_entities(state, entities).await {
+        Ok(n) => {
+            info!(job = %job.id, entities = n, "datahub: job metadata emitted");
+            record_status(state, "job", Ok(n));
         }
-        let own_urns: Vec<String> = own
-            .iter()
-            .map(|ds| dataset_urn(&env, &job.app, ds))
-            .collect();
-
-        // Cross-namespace outputs (e.g. grants-gov → grants/unified).
-        for (app, ds) in &index_specs {
-            if *app == job.app {
-                continue; // already covered above
-            }
-            let counts = run_counts(&state, app, Some(ds), &job).await;
-            let (n, c, r) = counts
-                .first()
-                .map(|(_, n, c, r)| (*n, *c, *r))
-                .unwrap_or_default();
-            entities.extend(dataset_entities(&state, app, ds, Some((&job, n, c, r))).await);
-            if !own_urns.is_empty() {
-                let urn = dataset_urn(&env, app, ds);
-                let mut merged = existing_upstreams(&state, &urn).await;
-                for u in &own_urns {
-                    if !merged.contains(u) {
-                        merged.push(u.clone());
-                    }
-                }
-                entities.push(envelope(&urn, upstream_lineage(&merged, now_ms())));
-            }
+        Err(e) => {
+            warn!(job = %job.id, "datahub: emission failed: {e}");
+            record_status(state, "job", Err(format!("({count} entities) {e}")));
         }
+    }
+}
 
-        // M25: this run as a dataJob under its flow (schedule / trigger /
-        // ad-hoc), with input/output dataset edges — the run renders as a node
-        // in DataHub's lineage graph.
+/// Emission for a job that failed permanently: an OpenLineage `FAIL` run event.
+///
+/// **OpenLineage only, deliberately.** A failed run wrote nothing, so there is
+/// no dataset metadata to refresh and no freshness signal to update — pushing
+/// DataHub aspects here would restate a successful run's shape with a failure's
+/// timestamp. The lineage consumers that care ("which runs of this job failed,
+/// and why") want exactly one thing: the run, its terminal state, and the
+/// error. That also keeps the DataHub emitter's output byte-identical to what
+/// it was before N24 on every path.
+pub async fn on_job_failure(state: &AppState, job: &Job) {
+    if state.config.lineage.endpoint().is_none() {
+        return;
+    }
+    let job_id = job.id;
+    let pool = state.fanout.clone();
+    let state = state.clone();
+    let job = job.clone();
+    pool.run("openlineage", job_id, async move {
+        // Run + flow only, and no dataset gathering at all. A failed run has no
+        // outputs to describe, and walking them anyway would spend a row count,
+        // a sample read and — worse — one GMS round-trip per dataset on the
+        // failure path, which is exactly when the box is least likely to have
+        // capacity to spare.
+        let mut ev = LineageEvent::for_run(
+            state.config.datahub.env.clone(),
+            gather_run(&state, &job, RunOutcome::Fail).await,
+        );
         if state.config.datahub.emit_flows {
-            let mut output_urns = own_urns.clone();
-            for (app, ds) in &index_specs {
-                let urn = dataset_urn(&env, app, ds);
-                if !output_urns.contains(&urn) {
-                    output_urns.push(urn);
-                }
-            }
-            entities.extend(flow_entities(&state, &job, &output_urns).await);
-
-            // Column lineage — ONLY where a declarative RuleSet makes field
-            // provenance mechanical. Apps whose extraction logic is code (not
-            // rules) are honestly skipped: guessing would poison the graph.
-            if let Some(rules) = job_rule_set(&job.params) {
-                let ops = rule_ops(&rules);
-                if !ops.is_empty() {
-                    for (ds, ..) in counts.iter().filter(|(_, n, c, r)| n + c + r > 0) {
-                        let urn = dataset_urn(&env, &job.app, ds);
-                        let merged = existing_upstreams(&state, &urn).await;
-                        entities.push(envelope(
-                            &urn,
-                            upstream_lineage_with_fields(&urn, &merged, &ops, now_ms()),
-                        ));
-                    }
-                }
-            }
+            let (flow_id, flow_name, kind) = flow_identity(
+                &job.app,
+                job.schedule_id.as_deref(),
+                job.trigger_id.as_deref(),
+            );
+            ev.flow = Some(FlowRef {
+                flow_id,
+                name: flow_name,
+                kind,
+                schedule_id: job.schedule_id.clone(),
+                trigger_id: job.trigger_id.clone(),
+            });
         }
-
-        if entities.is_empty() {
-            return;
-        }
-        let count = entities.len();
-        match post_entities(&state, entities).await {
-            Ok(n) => {
-                info!(job = %job.id, entities = n, "datahub: job metadata emitted");
-                record_status(&state, "job", Ok(n));
-            }
-            Err(e) => {
-                warn!(job = %job.id, "datahub: emission failed: {e}");
-                record_status(&state, "job", Err(format!("({count} entities) {e}")));
-            }
-        }
+        crate::lineage::emit(&state, &ev).await;
     })
     .await;
 }
@@ -789,10 +1266,35 @@ async fn full_sync_inner(state: &AppState) -> Value {
         Ok(all) => all,
         Err(e) => return record_status(state, "sync", Err(format!("list datasets: {e}"))),
     };
-    let mut entities = Vec::new();
+    // One backfill event, rendered by the DataHub writer. `run: None` says out
+    // loud what this is: a catalog sweep, not something that happened to a job
+    // — which is also why the OpenLineage writer declines to invent a run id
+    // for it (see `lineage::run_event`).
+    let mut ev = LineageEvent::backfill(&state.config.datahub.env);
+    let catalog = if state.config.lineage.emit_sources {
+        pumper_core::Catalog::load().ok()
+    } else {
+        None
+    };
     for (app, ds) in &all {
-        entities.extend(dataset_entities(state, app, ds, None).await);
+        let mut d = gather_dataset(state, app, ds, DatasetOrigin::Own, None, None).await;
+        if let Some(cat) = &catalog {
+            d.source_upstream = catalog_source_for(cat, app, ds);
+            if let Some(src) = d.source_upstream.clone() {
+                let mut input =
+                    LineageDataset::new(app.clone(), String::new(), DatasetOrigin::Source);
+                input.source = Some(src);
+                ev.inputs.push(input);
+            }
+        }
+        ev.outputs.push(d);
     }
+    // One entity per SOURCE, not per dataset it feeds: a source serving six
+    // datasets would otherwise be pushed six times in one batch.
+    let mut seen: HashSet<String> = HashSet::new();
+    ev.inputs
+        .retain(|d| d.source.as_ref().is_some_and(|s| seen.insert(s.id.clone())));
+    let DatahubEntities(mut entities) = (&ev).into();
 
     // M25: the pipeline topology. Every schedule is a dataFlow (cron and
     // ownership in custom properties), and every enabled trigger becomes
@@ -1936,8 +2438,50 @@ pub fn status(state: &AppState) -> Value {
         "emit_profile": cfg.emit_profile,
         "emit_flows": cfg.emit_flows,
         "last_emission": last,
-        "emissions": emissions,
+        "emissions": emissions.clone(),
         "govern": govern,
+        "lineage": lineage_status(state, emissions),
+    })
+}
+
+/// N24: the writers, each with its OWN counters and its own last
+/// success/failure.
+///
+/// This is the reporting half of "two writers double the failure surface". A
+/// merged view would let a healthy DataHub carry a dead OpenLineage receiver:
+/// the aggregate stays green, the second catalog silently stops receiving
+/// anything, and nothing on this route says so.
+fn lineage_status(state: &AppState, datahub_emissions: Value) -> Value {
+    let cfg = &state.config.lineage;
+    let ol = {
+        let s = state.lineage_last.lock().unwrap();
+        json!({
+            "ok": s.emissions_ok,
+            "failed": s.emissions_failed,
+            "last": s.last,
+            "last_success": s.last_success,
+            "last_error": s.last_error,
+        })
+    };
+    json!({
+        "namespace": cfg.namespace,
+        "emit_sources": cfg.emit_sources,
+        "emit_quality": cfg.emit_quality,
+        "writers": [
+            {
+                "name": "datahub",
+                "enabled": state.config.datahub.enabled,
+                "url": state.config.datahub.gms_url,
+                "emissions": datahub_emissions,
+            },
+            {
+                "name": "openlineage",
+                "enabled": cfg.endpoint().is_some(),
+                "url": cfg.endpoint(),
+                "auth_set": cfg.resolve_api_key().is_some(),
+                "emissions": ol,
+            },
+        ],
     })
 }
 
@@ -2109,7 +2653,7 @@ mod tests {
         let urn = dataset_urn("PROD", "shop", "products");
         let ups = vec!["urn:other".to_string()];
         let ops = vec![("price".to_string(), "css:.price".to_string())];
-        let aspect = upstream_lineage_with_fields(&urn, &ups, &ops, 7);
+        let aspect = upstream_lineage_with_fields_from(&urn, &ups, &ops, None, 7);
         assert_eq!(aspect["upstreams"][0]["dataset"], "urn:other");
         let fg = &aspect["fineGrainedLineages"][0];
         assert_eq!(fg["upstreamType"], "NONE");
@@ -2425,5 +2969,474 @@ mod tests {
         let p = dataset_properties("grants", "unified", &[("record_count", "12".into())]);
         assert_eq!(p["customProperties"]["record_count"], "12");
         assert_eq!(p["name"], "grants/unified");
+    }
+
+    // ── N24: the emitted DataHub JSON, pinned ────────────────────────────────
+    //
+    // The lineage extraction (N24) moves the assembly of these aspects behind a
+    // vendor-neutral `LineageEvent`. These goldens exist so that move is proven
+    // to be a pure refactor: they capture the EXACT JSON every aspect builder
+    // emits, so a shape drift fails here rather than silently changing what a
+    // DataHub GMS ingests. Deliberately whole-value equality, not spot checks —
+    // a spot check is exactly what lets a renamed sibling key through.
+
+    /// Fixed clock for the goldens: nothing here may read the wall clock.
+    const GOLDEN_MS: i64 = 1_700_000_000_000;
+
+    #[test]
+    fn golden_dataset_aspects_are_byte_identical() {
+        let custom = vec![
+            ("pumper_app", "hn".to_string()),
+            ("record_count", "3".to_string()),
+            ("last_job_id", "job-1".to_string()),
+        ];
+        assert_eq!(
+            dataset_properties("hn", "stories", &custom),
+            json!({
+                "__type": "DatasetProperties",
+                "name": "hn/stories",
+                "description": "Pumper dataset `stories` maintained by app `hn` \
+                                (change-detected upserts; per-record revision history and field \
+                                diffs live in the Pumper API).",
+                "customProperties": {
+                    "pumper_app": "hn",
+                    "record_count": "3",
+                    "last_job_id": "job-1",
+                },
+            })
+        );
+        assert_eq!(
+            operation(GOLDEN_MS),
+            json!({
+                "__type": "Operation",
+                "timestampMillis": GOLDEN_MS,
+                "lastUpdatedTimestamp": GOLDEN_MS,
+                "operationType": "UPDATE",
+            })
+        );
+        assert_eq!(
+            dataset_profile(GOLDEN_MS, 3),
+            json!({ "__type": "DatasetProfile", "timestampMillis": GOLDEN_MS, "rowCount": 3 })
+        );
+        assert_eq!(
+            schema_metadata("hn", "stories", &json!({ "title": "a", "url": "b" })),
+            json!({
+                "__type": "SchemaMetadata",
+                "schemaName": "hn.stories",
+                "platform": PLATFORM_URN,
+                "version": 0,
+                "hash": "",
+                "platformSchema": {
+                    "__type": "OtherSchema",
+                    "rawSchema": "{\"title\":\"a\",\"url\":\"b\"}",
+                },
+                "fields": [
+                    { "fieldPath": "title", "nativeDataType": "string",
+                      "type": { "type": { "__type": "StringType" } } },
+                    { "fieldPath": "url", "nativeDataType": "string",
+                      "type": { "type": { "__type": "StringType" } } },
+                ],
+            })
+        );
+    }
+
+    #[test]
+    fn golden_lineage_aspects_are_byte_identical() {
+        let up = dataset_urn("PROD", "hn", "stories");
+        let down = dataset_urn("PROD", "grants", "unified");
+        assert_eq!(
+            upstream_lineage(std::slice::from_ref(&up), GOLDEN_MS),
+            json!({
+                "__type": "UpstreamLineage",
+                "upstreams": [{
+                    "auditStamp": { "time": GOLDEN_MS, "actor": ACTOR_URN },
+                    "dataset": up,
+                    "type": "TRANSFORMED",
+                }],
+            })
+        );
+        let ops = vec![("title".to_string(), "css:h1".to_string())];
+        assert_eq!(
+            upstream_lineage_with_fields_from(
+                &down,
+                std::slice::from_ref(&up),
+                &ops,
+                None,
+                GOLDEN_MS
+            ),
+            json!({
+                "__type": "UpstreamLineage",
+                "upstreams": [{
+                    "auditStamp": { "time": GOLDEN_MS, "actor": ACTOR_URN },
+                    "dataset": up,
+                    "type": "TRANSFORMED",
+                }],
+                "fineGrainedLineages": [{
+                    "upstreamType": "NONE",
+                    "upstreams": [],
+                    "downstreamType": "FIELD",
+                    "downstreams": [format!("urn:li:schemaField:({down},title)")],
+                    "confidenceScore": 1.0,
+                    "transformOperation": "css:h1",
+                }],
+            })
+        );
+    }
+
+    #[test]
+    fn golden_flow_aspects_are_byte_identical() {
+        let flow = dataflow_urn("PROD", "schedule.hn.nightly");
+        let jurn = datajob_urn(&flow, "job-1");
+        assert_eq!(
+            entity(
+                "dataFlow",
+                &flow,
+                dataflow_info(
+                    "hn (schedule nightly)",
+                    &[("pumper_app", "hn".into()), ("kind", "schedule".into())],
+                ),
+            ),
+            json!({
+                "entityType": "dataFlow",
+                "entityUrn": flow,
+                "aspect": {
+                    "__type": "DataFlowInfo",
+                    "name": "hn (schedule nightly)",
+                    "customProperties": { "pumper_app": "hn", "kind": "schedule" },
+                },
+            })
+        );
+        assert_eq!(
+            datajob_info("hn run job-1", &[("job_id", "job-1".into())]),
+            json!({
+                "__type": "DataJobInfo",
+                "name": "hn run job-1",
+                "type": { "string": "COMMAND" },
+                "customProperties": { "job_id": "job-1" },
+            })
+        );
+        assert_eq!(
+            entity(
+                "dataJob",
+                &jurn,
+                datajob_io(&[], std::slice::from_ref(&flow))
+            ),
+            json!({
+                "entityType": "dataJob",
+                "entityUrn": jurn,
+                "aspect": {
+                    "__type": "DataJobInputOutput",
+                    "inputDatasets": [],
+                    "outputDatasets": [flow],
+                },
+            })
+        );
+    }
+
+    // ── N24: the DataHub writer as a pure render of the lineage model ───────
+
+    fn lin_own(app: &str, ds: &str, rows: i64, stats: OutputStats) -> LineageDataset {
+        let mut d = LineageDataset::new(app, ds, DatasetOrigin::Own);
+        d.rows = Some(rows);
+        d.profile_rows = Some(rows);
+        d.sample = Some(json!({ "title": "a" }));
+        d.stats = Some(stats);
+        d
+    }
+
+    fn lin_run() -> RunRef {
+        RunRef {
+            job_id: uuid::Uuid::nil(),
+            app: "hn".into(),
+            attempts: 2,
+            outcome: RunOutcome::Complete,
+            error: None,
+            pumper: PumperFacet {
+                job_id: uuid::Uuid::nil().to_string(),
+                app: "hn".into(),
+                attempts: 2,
+                flow_kind: "schedule".into(),
+                schedule_id: Some("nightly".into()),
+                ..Default::default()
+            },
+        }
+    }
+
+    fn lin_event() -> LineageEvent {
+        let mut ev = LineageEvent::for_run("PROD", lin_run());
+        ev.ms = GOLDEN_MS;
+        ev.flow = Some(FlowRef {
+            flow_id: "schedule.hn.nightly".into(),
+            name: "hn (schedule nightly)".into(),
+            kind: "schedule",
+            schedule_id: Some("nightly".into()),
+            trigger_id: None,
+        });
+        ev.outputs = vec![lin_own(
+            "hn",
+            "stories",
+            3,
+            OutputStats {
+                new: 1,
+                changed: 0,
+                removed: 0,
+            },
+        )];
+        ev
+    }
+
+    /// The whole point of the extraction: the entity LIST a GMS receives is the
+    /// one it received before N24, aspect for aspect and in the same order.
+    /// Compared as a whole vector — a per-entity spot check is exactly what
+    /// would let a dropped or reordered aspect through.
+    #[test]
+    fn golden_datahub_entity_sequence_survives_the_extraction() {
+        let ev = lin_event();
+        let DatahubEntities(out) = (&ev).into();
+        let urn = dataset_urn("PROD", "hn", "stories");
+        let flow = dataflow_urn("PROD", "schedule.hn.nightly");
+        let jurn = datajob_urn(&flow, &uuid::Uuid::nil().to_string());
+        assert_eq!(
+            out,
+            vec![
+                envelope(
+                    &urn,
+                    dataset_properties(
+                        "hn",
+                        "stories",
+                        &[
+                            ("pumper_app", "hn".into()),
+                            ("record_count", "3".into()),
+                            ("last_job_id", uuid::Uuid::nil().to_string()),
+                            ("last_run_new", "1".into()),
+                            ("last_run_changed", "0".into()),
+                            ("last_run_removed", "0".into()),
+                        ],
+                    ),
+                ),
+                envelope(&urn, operation(GOLDEN_MS)),
+                envelope(&urn, dataset_profile(GOLDEN_MS, 3)),
+                envelope(
+                    &urn,
+                    schema_metadata("hn", "stories", &json!({ "title": "a" }))
+                ),
+                entity(
+                    "dataFlow",
+                    &flow,
+                    dataflow_info(
+                        "hn (schedule nightly)",
+                        &[
+                            ("pumper_app", "hn".into()),
+                            ("kind", "schedule".into()),
+                            ("schedule_id", "nightly".into()),
+                        ],
+                    ),
+                ),
+                entity(
+                    "dataJob",
+                    &jurn,
+                    datajob_info(
+                        &format!("hn run {}", uuid::Uuid::nil()),
+                        &[
+                            ("pumper_app", "hn".into()),
+                            ("job_id", uuid::Uuid::nil().to_string()),
+                            ("attempts", "2".into()),
+                        ],
+                    ),
+                ),
+                entity(
+                    "dataJob",
+                    &jurn,
+                    datajob_io(&[], std::slice::from_ref(&urn)),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_derived_dataset_keeps_its_merged_upstream_envelope_right_after_its_aspects() {
+        let mut ev = lin_event();
+        let mut derived = lin_own("grants", "unified", 9, OutputStats::default());
+        derived.origin = DatasetOrigin::Derived;
+        derived.upstreams = Some(vec![dataset_urn("PROD", "hn", "stories")]);
+        ev.outputs.push(derived);
+        let DatahubEntities(out) = (&ev).into();
+        let durn = dataset_urn("PROD", "grants", "unified");
+        // 4 own aspects, then the derived four, then its upstream envelope.
+        assert_eq!(out[8]["entityUrn"], durn);
+        assert_eq!(out[8]["aspect"]["__type"], "UpstreamLineage");
+        assert_eq!(
+            out[8]["aspect"]["upstreams"][0]["dataset"],
+            dataset_urn("PROD", "hn", "stories")
+        );
+        // An OWN dataset never gets one, even when upstreams are populated for
+        // its column lineage.
+        assert!(out[..4]
+            .iter()
+            .all(|e| e["aspect"]["__type"] != "UpstreamLineage"));
+    }
+
+    /// The documented gap this item closes: column lineage used to say
+    /// `upstreamType: NONE` because the upstream (a fetched page) was not a
+    /// modelled entity. With the catalog source modelled, it names it.
+    #[test]
+    fn a_source_urn_is_the_column_upstream_not_none() {
+        let mut ev = lin_event();
+        let src = SourceRef {
+            id: "hacker-news".into(),
+            name: "Hacker News".into(),
+            url: "https://news.ycombinator.com".into(),
+            ..Default::default()
+        };
+        ev.outputs[0].column_ops = vec![("title".into(), "css:.titleline".into())];
+        ev.outputs[0].source_upstream = Some(src.clone());
+        ev.outputs[0].upstreams = Some(Vec::new());
+        let mut input = LineageDataset::new("hn", "", DatasetOrigin::Source);
+        input.source = Some(src);
+        ev.inputs.push(input);
+
+        let DatahubEntities(out) = (&ev).into();
+        let surn = source_urn("PROD", "hacker-news");
+        let fine = out
+            .iter()
+            .find(|e| e["aspect"]["__type"] == "UpstreamLineage")
+            .map(|e| e["aspect"]["fineGrainedLineages"][0].clone())
+            .expect("a fine-grained lineage aspect");
+        assert_eq!(fine["upstreamType"], "FIELD_SET");
+        assert_eq!(
+            fine["upstreams"][0],
+            format!("urn:li:schemaField:({surn},title)")
+        );
+        assert_eq!(fine["transformOperation"], "css:.titleline");
+
+        // …and the source itself is an entity, on the `web` platform.
+        let src_entity = out
+            .iter()
+            .find(|e| e["entityUrn"] == json!(surn))
+            .expect("a source entity");
+        assert!(surn.contains(WEB_PLATFORM_URN));
+        assert_eq!(src_entity["aspect"]["name"], "Hacker News");
+        assert_eq!(
+            src_entity["aspect"]["customProperties"]["url"],
+            "https://news.ycombinator.com"
+        );
+        // The run's input edge points at it.
+        let io = out
+            .iter()
+            .find(|e| e["aspect"]["__type"] == "DataJobInputOutput")
+            .unwrap();
+        assert_eq!(io["aspect"]["inputDatasets"], json!([surn]));
+    }
+
+    #[test]
+    fn a_source_row_declaring_nothing_stamps_nothing_rather_than_empty_strings() {
+        let p = source_properties(&SourceRef {
+            id: "x".into(),
+            name: "X".into(),
+            ..Default::default()
+        });
+        let props = p["customProperties"].as_object().unwrap();
+        assert_eq!(props.len(), 1, "only the id: {props:?}");
+        assert_eq!(props["pumper_source_id"], "x");
+    }
+
+    #[test]
+    fn verdicts_and_health_are_appended_so_the_pinned_prefix_is_untouched() {
+        let plain = {
+            let DatahubEntities(out) = (&lin_event()).into();
+            out
+        };
+        let mut ev = lin_event();
+        ev.outputs[0].tags = vec!["health:degraded".into(), "trust:provisional".into()];
+        ev.outputs[0].assertions = vec![Assertion {
+            name: "pumper.data_contract".into(),
+            passed: false,
+            message: Some("row_count 0 < min 1".into()),
+        }];
+        let DatahubEntities(out) = (&ev).into();
+        assert_eq!(&out[..plain.len()], &plain[..], "the prefix must not move");
+
+        let urn = dataset_urn("PROD", "hn", "stories");
+        let tags = &out[plain.len()];
+        assert_eq!(tags["aspect"]["__type"], "GlobalTags");
+        assert_eq!(
+            tags["aspect"]["tags"],
+            json!([
+                { "tag": "urn:li:tag:health:degraded" },
+                { "tag": "urn:li:tag:trust:provisional" },
+            ])
+        );
+        let info = &out[plain.len() + 1];
+        let aurn = "urn:li:assertion:pumper.hn.stories.pumper.data_contract";
+        assert_eq!(info["entityType"], "assertion");
+        assert_eq!(info["entityUrn"], aurn);
+        assert_eq!(info["aspect"]["datasetAssertion"]["dataset"], urn);
+        let run = &out[plain.len() + 2];
+        assert_eq!(run["aspect"]["__type"], "AssertionRunEvent");
+        assert_eq!(run["aspect"]["result"]["type"], "FAILURE");
+        assert_eq!(
+            run["aspect"]["result"]["nativeResults"]["message"],
+            "row_count 0 < min 1"
+        );
+        assert_eq!(run["aspect"]["runId"], uuid::Uuid::nil().to_string());
+        assert_eq!(run["aspect"]["asserteeUrn"], urn);
+    }
+
+    #[test]
+    fn a_backfill_renders_datasets_without_run_properties_it_has_no_run_for() {
+        let mut ev = LineageEvent::backfill("PROD");
+        ev.ms = GOLDEN_MS;
+        ev.outputs = vec![lin_own("hn", "stories", 3, OutputStats::default())];
+        let DatahubEntities(out) = (&ev).into();
+        let props = out[0]["aspect"]["customProperties"].as_object().unwrap();
+        assert!(props.contains_key("record_count"));
+        assert!(
+            !props.contains_key("last_job_id"),
+            "a sweep must not claim a last run: {props:?}"
+        );
+        // No run means no flow topology either.
+        assert!(out.iter().all(|e| e["entityType"] != "dataJob"));
+    }
+
+    #[test]
+    fn a_source_matching_the_dataset_beats_the_apps_catch_all_row() {
+        let catalog = pumper_core::Catalog::parse(
+            r#"
+[[source]]
+id = "hn-all"
+app = "hn"
+name = "HN"
+status = "live"
+
+[[source]]
+id = "hn-jobs"
+app = "hn"
+dataset = "jobs"
+name = "HN Jobs"
+status = "live"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            catalog_source_for(&catalog, "hn", "jobs").map(|s| s.id),
+            Some("hn-jobs".into())
+        );
+        assert_eq!(
+            catalog_source_for(&catalog, "hn", "stories").map(|s| s.id),
+            Some("hn-all".into())
+        );
+        assert!(catalog_source_for(&catalog, "other", "stories").is_none());
+    }
+
+    #[test]
+    fn a_named_source_row_keeps_its_name_and_a_nameless_one_falls_back_to_its_id() {
+        let catalog = pumper_core::Catalog::parse(
+            "[[source]]\nid = \"bare\"\napp = \"a\"\nname = \"\"\nstatus = \"live\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            catalog_source_for(&catalog, "a", "d").map(|s| s.name),
+            Some("bare".into())
+        );
     }
 }

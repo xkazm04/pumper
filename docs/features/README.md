@@ -21,7 +21,7 @@ These documents describe the **implemented** product surface of pumper — a loc
 | Identity & tenancy (scoped API keys) | [auth.md](auth.md) | `crates/server/src/auth.rs`, `crates/server/src/routes/principals.rs`, migration 0041 |
 | Observability (logging, error reporting, metrics) | [observability.md](observability.md) | `crates/server/src/main.rs`, `crates/server/src/routes/health.rs` |
 | Data-source catalog | [catalog.md](catalog.md) | `catalog/`, `crates/core/src/catalog.rs` |
-| DataHub metadata emitter | [datahub.md](datahub.md) | `crates/server/src/datahub.rs` |
+| Lineage bridge (DataHub + OpenLineage) | [datahub.md](datahub.md) | `crates/server/src/datahub.rs`, `crates/server/src/lineage.rs` |
 | TypeScript consumer SDK (`@pumper/sync`) | [sdk-typescript.md](sdk-typescript.md) | `clients/typescript/` |
 | Pumper mesh (signed peer sync of datasets, host weather and recipes) | [mesh.md](mesh.md) | `crates/apps/peer/`, `crates/server/src/node.rs`, `crates/server/src/routes/mesh.rs`, consuming `crates/server/src/routes/datasets.rs` § changes feed + manifest |
 | App fleet & domain datasets | [apps.md](apps.md) | `crates/apps/*` |

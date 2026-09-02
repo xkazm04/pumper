@@ -86,6 +86,18 @@ and `enforce_contracts` see their revisions at all — the worker's fan-out is s
 mechanisms no matter how often it is rewritten. `cms-fee-schedule` is deliberately not a publisher:
 it is in the same product group but writes only its own datasets and never rebuilds the join.
 
+## Sources as lineage entities
+
+With `[lineage] emit_sources = true` every `[[source]]` row also becomes an
+**external upstream entity** in whatever metadata catalog is connected:
+`urn:li:dataset:(urn:li:dataPlatform:web,<id>,<env>)` in DataHub, an input
+dataset in the `web` namespace in OpenLineage. The row's `url`, `cadence`,
+`access` and `category` ride along as properties (blank fields are not stamped),
+and column-level lineage stops claiming `upstreamType: NONE` and names the
+source instead. A dataset is attributed to the row that names its exact
+`(app, dataset)` pair, falling back to the app's catch-all row. Off by default;
+see [`datahub.md`](datahub.md#source-entities-emit_sources).
+
 ## API
 
 - `GET /catalog/sources?market=&status=&category=` → `{count, sources: [Source]}`. Filters are exact-match on the trimmed field; an absent or empty filter matches everything.

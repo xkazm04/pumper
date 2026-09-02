@@ -183,7 +183,11 @@ their own ordinary job events, unchanged.
 `root_id` (the chain correlation id; equal to the run id for a step job).
 `EnqueueOptions` carries all three, so a step job is self-describing. Every step
 job inherits the run's `principal_id`, so `GET /costs?principal=` prices a whole
-plan to whoever asked for it.
+plan to whoever asked for it. `Storage::job_chain_ids(id)` reads the pair back
+(the in-memory `Job` does not carry it); the lineage bridge uses it to put
+`workflowRunId`/`rootId` and an OpenLineage `parent` facet on every step's run
+event, so a plan renders as one story downstream instead of N unrelated runs —
+see [`datahub.md`](datahub.md#the-runevent).
 
 Step-job dedup keys are `wf:{run_id}:{step}`, so a re-enqueue after a crash
 returns the original job instead of doubling the work.
