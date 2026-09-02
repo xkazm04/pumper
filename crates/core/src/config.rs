@@ -1880,6 +1880,17 @@ pub struct SearchConfig {
     /// detection over the view — a broad query stays a bounded view, not an
     /// unbounded dataset copy.
     pub max_materialize_results: usize,
+    /// Index-time entity enrichment passes, IN ORDER (N11). `"builtin"` is the
+    /// shipped regex pass (`amount` + `event_date`); `"plugin:<name>"` runs a
+    /// core-module WASM plugin's `enrich` export under the same fuel/memory
+    /// caps as every other plugin call, fail-open per document.
+    ///
+    /// The default is `["builtin"]` -- byte-for-byte today's behaviour. An
+    /// earlier entry wins a colliding entity kind, so appending a plugin can
+    /// only ADD kinds; putting it first is how an operator deliberately lets it
+    /// override `amount`. An unparseable or unknown entry is refused by name at
+    /// startup rather than silently skipped.
+    pub enrichers: Vec<String>,
 }
 
 impl Default for SearchConfig {
@@ -1888,6 +1899,7 @@ impl Default for SearchConfig {
             enabled: true,
             dir: "data/search-index".into(),
             max_materialize_results: 500,
+            enrichers: vec![crate::search::ENRICHER_BUILTIN.to_string()],
         }
     }
 }
