@@ -1530,7 +1530,7 @@ impl Storage {
         // NULL when neither hook is set — an all-empty hooks object is no hooks.
         let hooks_json = t
             .plugin_hooks
-            .filter(|h| h.predicate.is_some() || h.transform.is_some())
+            .filter(|h| h.predicate.is_some() || h.transform.is_some() || h.post_enqueue.is_some())
             .map(|h| serde_json::to_string(h).unwrap_or_else(|_| "{}".into()));
         sqlx::query(
             "INSERT INTO triggers (id, name, source_kind, source_app, source_dataset, on_change, \
