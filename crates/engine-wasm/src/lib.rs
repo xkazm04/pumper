@@ -30,8 +30,11 @@
 //! `{"pass": bool}`), and trigger TRANSFORM plugins (doc = the `_trigger`
 //! object, output = the shaped object; provenance re-stamped by the caller).
 //! Convention: a plugin declares its hook class in its `describe()` manifest
-//! via `"kind": "extractor" | "predicate" | "transform"` so `GET
-//! /plugins?kind=` can offer the right plugins per hook. Callers own their
+//! via `"kind": "extractor" | "predicate" | "transform" | "sink" | "enricher"`
+//! so `GET /plugins?kind=` can offer the right plugins per hook. An ENRICHER
+//! (N11) enters through an `enrich` export instead of `extract_v2` -- the same
+//! `{doc, params}` envelope, under the same fuel and memory caps, with `doc` the
+//! document's title+body text and the output `{"entities": {kind: value}}`. Callers own their
 //! failure semantics — trigger hooks fail OPEN (a trap/malformed output never
 //! wedges the pipeline), extraction propagates the error.
 
@@ -178,8 +181,22 @@ struct LoadedPlugin {
     executable: bool,
 }
 
+/// The export names a call may enter through that take the `{doc, params}`
+/// envelope, most preferred first.
+///
+/// `enrich` (N11) is a second NAME for the same shape, not a second ABI: an
+/// index-time enricher is not an extractor, and a module whose only entry point
+/// is `extract_v2` would have to lie about what it is to be callable. Adding a
+/// name here is additive by construction — resolution is first-match, so every
+/// module that worked before still enters through exactly the export it did.
+const ENVELOPE_EXPORTS: &[&str] = &["extract_v2", "enrich"];
+
+/// The legacy entry point: the raw document, no params envelope.
+const LEGACY_EXPORT: &str = "extract";
+
 /// Whether `module` exports the ABI [`Plugins::run`] needs: a `memory`, an
-/// `alloc`, and at least one of `extract_v2` / `extract`.
+/// `alloc`, and at least one entry point ([`ENVELOPE_EXPORTS`] or
+/// [`LEGACY_EXPORT`]).
 ///
 /// Names only — the exact signatures are re-checked per call, where a
 /// wrong-typed export surfaces as a `missing_export` failure. This is the cheap
@@ -189,7 +206,7 @@ fn exports_extract_abi(module: &Module) -> bool {
     let names: std::collections::HashSet<&str> = module.exports().map(|e| e.name()).collect();
     names.contains("memory")
         && names.contains("alloc")
-        && (names.contains("extract_v2") || names.contains("extract"))
+        && (names.contains(LEGACY_EXPORT) || ENVELOPE_EXPORTS.iter().any(|e| names.contains(e)))
 }
 
 /// Resolve the concurrency cap: `0` means "one per core" via
@@ -969,28 +986,35 @@ fn execute(
             )
         })?;
 
-    // Prefer the params-aware `extract_v2` ABI (input is a `{doc, params}`
-    // envelope); fall back to the legacy `extract` (raw document, params ignored)
-    // so plugins built before the envelope keep working unchanged.
-    let (func, input_bytes): (TypedFunc<(u32, u32), u64>, Vec<u8>) =
-        match instance.get_typed_func::<(u32, u32), u64>(&mut store, "extract_v2") {
-            Ok(f) => {
-                let envelope = serde_json::json!({ "doc": input, "params": params }).to_string();
-                (f, envelope.into_bytes())
-            }
-            Err(_) => {
-                let f = instance
-                    .get_typed_func::<(u32, u32), u64>(&mut store, "extract")
-                    .map_err(|e| {
-                        Error::plugin(
-                            PluginFailure::MissingExport,
-                            plugin,
-                            format!("exports neither extract_v2 nor extract(u32,u32)->u64: {e}"),
-                        )
-                    })?;
-                (f, input.into_bytes())
-            }
-        };
+    // Prefer a params-aware envelope entry point (`extract_v2`, then N11's
+    // `enrich`: input is a `{doc, params}` envelope); fall back to the legacy
+    // `extract` (raw document, params ignored) so plugins built before the
+    // envelope keep working unchanged.
+    let envelope_entry = ENVELOPE_EXPORTS.iter().find_map(|name| {
+        instance
+            .get_typed_func::<(u32, u32), u64>(&mut store, name)
+            .ok()
+    });
+    let (func, input_bytes): (TypedFunc<(u32, u32), u64>, Vec<u8>) = match envelope_entry {
+        Some(f) => {
+            let envelope = serde_json::json!({ "doc": input, "params": params }).to_string();
+            (f, envelope.into_bytes())
+        }
+        None => {
+            let f = instance
+                .get_typed_func::<(u32, u32), u64>(&mut store, LEGACY_EXPORT)
+                .map_err(|e| {
+                    Error::plugin(
+                        PluginFailure::MissingExport,
+                        plugin,
+                        format!(
+                            "exports none of {ENVELOPE_EXPORTS:?} nor                              {LEGACY_EXPORT}(u32,u32)->u64: {e}"
+                        ),
+                    )
+                })?;
+            (f, input.into_bytes())
+        }
+    };
 
     let len = input_bytes.len() as u32;
     let in_ptr = alloc
@@ -1471,6 +1495,65 @@ mod tests {
         let budget = ProbeBudget::from_config(&cfg);
         assert_eq!(budget.fuel, cfg.fuel);
         assert_eq!(budget.max_memory, cfg.max_memory_mb * 1024 * 1024);
+    }
+
+    /// N11: an index-time ENRICHER enters through an `enrich` export, not
+    /// `extract_v2`.
+    ///
+    /// The anti-pattern this closes: the host resolved exactly one envelope
+    /// export name, so a module whose only entry point says what it actually is
+    /// loaded, reported `has() == false`, and every document it was supposed to
+    /// enrich came out with no entities — a silent, permanent no-op that looks
+    /// exactly like a corpus with nothing to extract. The legacy `extract`-only
+    /// module must keep working through the same resolution.
+    #[tokio::test]
+    async fn an_enrich_only_module_is_executable_and_enters_through_its_own_export() {
+        let dir = fresh_host_dir("enrich-entry");
+        // `{"entities":{"currency":"czk"}}` — 31 bytes at offset 16.
+        std::fs::write(
+            dir.join("enricher.wasm"),
+            r#"(module
+              (memory (export "memory") 1)
+              (data (i32.const 16) "{\"entities\":{\"currency\":\"czk\"}}")
+              (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+              (func (export "enrich") (param i32 i32) (result i64)
+                (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 31))))"#,
+        )
+        .expect("write fixture");
+        // The legacy shape, alongside it: still resolved, still executable.
+        std::fs::write(
+            dir.join("legacy.wasm"),
+            r#"(module
+              (memory (export "memory") 1)
+              (data (i32.const 16) "{\"ok\":true}")
+              (func (export "alloc") (param i32) (result i32) (i32.const 4096))
+              (func (export "extract") (param i32 i32) (result i64)
+                (i64.or (i64.shl (i64.const 16) (i64.const 32)) (i64.const 11))))"#,
+        )
+        .expect("write fixture");
+        let host = WasmPluginHost::new(&PluginConfig {
+            dir: dir.clone(),
+            ..Default::default()
+        })
+        .expect("host");
+
+        assert!(
+            host.has("enricher"),
+            "a module exporting `enrich` is a runnable plugin, not a describe-only one"
+        );
+        let out = host
+            .run("enricher", "award of $5 due 2026-01-01", &Value::Null)
+            .await
+            .expect("the enricher runs");
+        assert_eq!(out["entities"]["currency"], Value::from("czk"));
+
+        assert!(host.has("legacy"), "the legacy `extract` shape still loads");
+        let out = host
+            .run("legacy", "<doc/>", &Value::Null)
+            .await
+            .expect("the legacy plugin runs");
+        assert_eq!(out["ok"], Value::from(true));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// Every failure the CALL path can produce is classified, so consumers
