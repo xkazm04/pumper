@@ -80,6 +80,8 @@ async fn a_receipt_joins_cost_stages_yield_changes_and_artifacts_for_one_run() {
             max_attempts: 1,
             filters: None,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .unwrap();

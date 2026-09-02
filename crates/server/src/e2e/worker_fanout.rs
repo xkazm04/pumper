@@ -41,6 +41,8 @@ async fn a_job_run_fans_out_to_events_watches_and_trigger_hops() {
             max_attempts: 1,
             filters: None,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .expect("create trigger");

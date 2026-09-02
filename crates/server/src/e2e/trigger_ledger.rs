@@ -60,6 +60,8 @@ async fn external_trigger(
             max_attempts: 1,
             filters,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         })
         .await
         .expect("create trigger")

@@ -90,6 +90,196 @@ pub fn merged_params(template: &Value, trigger_obj: Value) -> Value {
     Value::Object(obj)
 }
 
+// -- N04: param binding and per-record fan-out --------------------------------
+
+/// A `bind` (or `each`) JSON pointer that did not resolve against the
+/// `{template, _trigger}` view.
+///
+/// The anti-pattern this names: a binding that silently produced *nothing*
+/// enqueued a hop whose target param was absent - or, worse, still carrying the
+/// static template's stale value - so "the event steers this job" became
+/// unfalsifiable from the outside. The hop is refused instead, and the ledger
+/// says which param and which pointer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BindMiss {
+    /// The target param the pointer was supposed to fill, or `each` for the
+    /// fan-out pointer itself.
+    pub param: String,
+    pub pointer: String,
+    /// Why it missed: absent, or (for `each`) present but not an array.
+    pub reason: &'static str,
+}
+
+impl BindMiss {
+    /// The `trigger_runs.detail` for this miss.
+    pub fn detail(&self) -> String {
+        format!(
+            "bind '{}' -> '{}': {} (pointers resolve against the {{template, _trigger}} \
+             view; POST /triggers/{{id}}/test shows it)",
+            self.param, self.pointer, self.reason
+        )
+    }
+}
+
+/// The param name a trigger may never bind over.
+///
+/// `_trigger` IS the envelope every pointer resolves against and every target
+/// reads its provenance from; letting a bind overwrite it would let a trigger
+/// author forge `chain`/`depth` (the cycle guards) from the outside - the same
+/// authority [`HOST_OWNED_KEYS`] denies a sandboxed transform.
+pub const BIND_RESERVED_PARAM: &str = "_trigger";
+
+/// True when `p` is syntactically a JSON pointer (RFC 6901): empty, or starting
+/// with `/`.
+///
+/// Validated at CREATE time rather than at fire time, because a pointer like
+/// `"payload.url"` (the dotted `$.path` grammar the *filters* use) is a
+/// plausible mistake that would otherwise present as a `bind_miss` on every
+/// event forever, with nothing saying the syntax was wrong rather than the
+/// data absent.
+pub fn valid_pointer(p: &str) -> bool {
+    p.is_empty() || p.starts_with('/')
+}
+
+/// Resolves a trigger's `bind` map over the merged `{template, _trigger}` view,
+/// lifting values OUT of the envelope and INTO the target's own top-level
+/// params.
+///
+/// Every pointer is resolved against the same pre-bind view, so the result does
+/// not depend on the order the map is walked in - a bind cannot read another
+/// bind's output and quietly change meaning when a key is renamed.
+///
+/// `None`/empty `bind` is exactly [`merged_params`], byte for byte: this is the
+/// path every pre-N04 trigger takes.
+pub fn bind_params(
+    template: &Value,
+    trigger_obj: Value,
+    bind: Option<&serde_json::Map<String, Value>>,
+) -> Result<Value, BindMiss> {
+    let merged = merged_params(template, trigger_obj);
+    let Some(bind) = bind.filter(|b| !b.is_empty()) else {
+        return Ok(merged);
+    };
+    let mut resolved: Vec<(String, Value)> = Vec::with_capacity(bind.len());
+    for (param, pointer) in bind {
+        let pointer = pointer.as_str().unwrap_or_default();
+        let value = merged.pointer(pointer).ok_or_else(|| BindMiss {
+            param: param.clone(),
+            pointer: pointer.to_string(),
+            reason: "resolved to nothing",
+        })?;
+        resolved.push((param.clone(), value.clone()));
+    }
+    let mut out = merged;
+    if let Value::Object(map) = &mut out {
+        for (param, value) in resolved {
+            map.insert(param, value);
+        }
+    }
+    Ok(out)
+}
+
+/// One planned hop: the fully resolved target params, and which element of a
+/// fan-out it came from (`None` = not a fan-out).
+#[derive(Debug, Clone, PartialEq)]
+pub struct Hop {
+    pub params: Value,
+    pub index: Option<usize>,
+}
+
+impl Hop {
+    /// The `_trigger` envelope inside the resolved params - what a
+    /// `post_enqueue` hook sees, and what the fan-out fields were stamped onto.
+    pub fn trigger_obj(&self) -> &Value {
+        self.params.get("_trigger").unwrap_or(&Value::Null)
+    }
+}
+
+/// Per-element `_trigger` object for one fan-out hop.
+///
+/// `fan_out_total` stays EXACT while the hop list is capped - the
+/// `keys_truncated` contract one level up: a target must be able to read
+/// "did I get the whole array?" as a field rather than infer it from a hop
+/// count it cannot see.
+fn fan_out_obj(obj: &Value, item: &Value, index: usize, total: usize, truncated: bool) -> Value {
+    let mut map = match obj {
+        Value::Object(m) => m.clone(),
+        _ => serde_json::Map::new(),
+    };
+    map.insert("item".into(), item.clone());
+    map.insert("item_index".into(), Value::from(index));
+    map.insert("fan_out_total".into(), Value::from(total));
+    map.insert("fan_out_truncated".into(), Value::Bool(truncated));
+    Value::Object(map)
+}
+
+/// Every hop one source event produces: one, or one per element of the array
+/// `trigger.each` points at (capped by `cfg.fan_out_cap`).
+///
+/// Pure and total: it either returns the full plan or names the pointer that
+/// failed. Nothing here touches storage, so the cap, the per-element envelope
+/// and the bind resolution are all unit-testable without a database.
+pub fn plan_hops(
+    trigger: &Trigger,
+    obj: Value,
+    cfg: &TriggersConfig,
+) -> Result<Vec<Hop>, BindMiss> {
+    let Some(each) = trigger.each.as_deref().filter(|p| !p.is_empty()) else {
+        return Ok(vec![Hop {
+            params: bind_params(&trigger.params, obj, trigger.bind.as_ref())?,
+            index: None,
+        }]);
+    };
+    // The `each` pointer resolves against the SAME view a bind does, so
+    // `/_trigger/payload/commits` reads the ingress payload while `/records`
+    // reads the trigger's own static template.
+    let view = merged_params(&trigger.params, obj.clone());
+    let items = view
+        .pointer(each)
+        .ok_or_else(|| BindMiss {
+            param: "each".into(),
+            pointer: each.to_string(),
+            reason: "resolved to nothing",
+        })?
+        .as_array()
+        .ok_or_else(|| BindMiss {
+            param: "each".into(),
+            pointer: each.to_string(),
+            reason: "resolved to a value that is not an array",
+        })?
+        .clone();
+    let total = items.len();
+    let truncated = total > cfg.fan_out_cap;
+    let mut hops = Vec::with_capacity(total.min(cfg.fan_out_cap));
+    for (index, item) in items.into_iter().take(cfg.fan_out_cap).enumerate() {
+        let per_item = fan_out_obj(&obj, &item, index, total, truncated);
+        hops.push(Hop {
+            params: bind_params(&trigger.params, per_item, trigger.bind.as_ref())?,
+            index: Some(index),
+        });
+    }
+    Ok(hops)
+}
+
+/// The dedup key for one hop of a fan-out: the batch's key plus the element
+/// index.
+///
+/// The anti-pattern: every element of a fan-out sharing the batch key, so
+/// exactly one of N hops was created and the other N-1 were recorded as
+/// redeliveries of it. The element index is part of a fan-out hop's identity.
+pub fn fan_out_idempotency_key(base: &str, index: usize) -> String {
+    format!("{base}:i:{index}")
+}
+
+/// The key one planned hop enqueues under: the batch key for a plain hop, that
+/// key plus the element index for a fan-out hop.
+pub fn hop_idempotency_key(base: &str, index: Option<usize>) -> String {
+    match index {
+        None => base.to_string(),
+        Some(i) => fan_out_idempotency_key(base, i),
+    }
+}
+
 /// The key list a dataset hop carries, and whether `cap` cut it short.
 ///
 /// The anti-pattern this exists to name: `revs.iter().take(cap)` dropped record
@@ -1329,71 +1519,80 @@ pub async fn fire_external_triggers(
         // The pre-merge `_trigger` object is what a `post_enqueue` hook sees;
         // cloned only when that slot is configured, so a hop without one pays
         // nothing for it.
-        let params_obj = post_enqueue_input(trigger, &obj);
-        let params = merged_params(&trigger.params, obj);
-        if !hop_params_pass_target_schema(state, trigger, &params, &ctx).await {
+        // N04: an ingress payload is the case param binding exists for - the
+        // event steers the target's own params, and `each` turns one webhook
+        // into one hop per record it carries.
+        let Some(hops) = planned_hops(state, trigger, obj, &ctx).await else {
             continue;
-        }
-        let key = idempotency_key(&trigger.id, event_id);
-        let opts = EnqueueOptions {
-            params,
-            max_attempts: trigger.max_attempts,
-            priority: trigger.priority,
-            budget_usd: trigger.budget_usd,
-            idempotency_key: Some(key.clone()),
-            trigger_id: Some(trigger.id.clone()),
-            ..Default::default()
         };
-        match state.storage.enqueue_dedup(&trigger.target_app, opts).await {
-            Ok((hop, true)) => {
-                info!(trigger = %trigger.id, event = %event_id, target = %hop.id,
+        let base_key = idempotency_key(&trigger.id, event_id);
+        for hop in hops {
+            let key = hop_idempotency_key(&base_key, hop.index);
+            let params_obj = post_enqueue_input(trigger, hop.trigger_obj());
+            let params = hop.params;
+            if !hop_params_pass_target_schema(state, trigger, &params, &ctx).await {
+                continue;
+            }
+            let opts = EnqueueOptions {
+                params,
+                max_attempts: trigger.max_attempts,
+                priority: trigger.priority,
+                budget_usd: trigger.budget_usd,
+                idempotency_key: Some(key.clone()),
+                trigger_id: Some(trigger.id.clone()),
+                ..Default::default()
+            };
+            match state.storage.enqueue_dedup(&trigger.target_app, opts).await {
+                Ok((hop, true)) => {
+                    info!(trigger = %trigger.id, event = %event_id, target = %hop.id,
                       app = %trigger.target_app, "external trigger fired");
-                let hop_id = hop.id.to_string();
-                // N10 `post_enqueue`: side effects that must not gate the hop,
-                // run once the hop HAS a job id. Ledgered, never acted on.
-                let incidents = run_post_enqueue_hook(
-                    state.plugins.as_ref(),
-                    trigger,
-                    params_obj.as_ref(),
-                    &hop_id,
-                )
-                .await;
-                record_hook_incidents(state, trigger, &ctx, &incidents).await;
-                record(
-                    state,
-                    NewTriggerRun {
-                        job_id: Some(&hop_id),
-                        ..ctx.row(&trigger.id, "fired")
-                    },
-                )
-                .await;
-                fired += 1;
-            }
-            Ok((_, false)) => {
-                // Already fired for this event id — the redelivery case, which
-                // is the point of the key, but it must still be observable.
-                debug!(trigger = %trigger.id, event = %event_id, key = %key,
+                    let hop_id = hop.id.to_string();
+                    // N10 `post_enqueue`: side effects that must not gate the hop,
+                    // run once the hop HAS a job id. Ledgered, never acted on.
+                    let incidents = run_post_enqueue_hook(
+                        state.plugins.as_ref(),
+                        trigger,
+                        params_obj.as_ref(),
+                        &hop_id,
+                    )
+                    .await;
+                    record_hook_incidents(state, trigger, &ctx, &incidents).await;
+                    record(
+                        state,
+                        NewTriggerRun {
+                            job_id: Some(&hop_id),
+                            ..ctx.row(&trigger.id, "fired")
+                        },
+                    )
+                    .await;
+                    fired += 1;
+                }
+                Ok((_, false)) => {
+                    // Already fired for this event id — the redelivery case, which
+                    // is the point of the key, but it must still be observable.
+                    debug!(trigger = %trigger.id, event = %event_id, key = %key,
                        "external trigger hop suppressed: a job already exists for this event");
-                record(
-                    state,
-                    NewTriggerRun {
-                        detail: Some(&key),
-                        ..ctx.row(&trigger.id, "dedup")
-                    },
-                )
-                .await;
-            }
-            Err(e) => {
-                warn!(trigger = %trigger.id, event = %event_id, "external trigger enqueue failed: {e}");
-                let detail = e.to_string();
-                record(
-                    state,
-                    NewTriggerRun {
-                        detail: Some(&detail),
-                        ..ctx.row(&trigger.id, "enqueue_failed")
-                    },
-                )
-                .await;
+                    record(
+                        state,
+                        NewTriggerRun {
+                            detail: Some(&key),
+                            ..ctx.row(&trigger.id, "dedup")
+                        },
+                    )
+                    .await;
+                }
+                Err(e) => {
+                    warn!(trigger = %trigger.id, event = %event_id, "external trigger enqueue failed: {e}");
+                    let detail = e.to_string();
+                    record(
+                        state,
+                        NewTriggerRun {
+                            detail: Some(&detail),
+                            ..ctx.row(&trigger.id, "enqueue_failed")
+                        },
+                    )
+                    .await;
+                }
             }
         }
     }
@@ -1439,6 +1638,67 @@ async fn hop_params_pass_target_schema(
     }
 }
 
+/// Resolves one source event into its hop plan, recording the ledger row when
+/// the plan cannot be built (a `bind`/`each` pointer that missed) or is empty
+/// (an `each` array with no elements).
+///
+/// `None` means "enqueue nothing"; the decision is already in the ledger.
+async fn planned_hops(
+    state: &AppState,
+    trigger: &Trigger,
+    obj: Value,
+    ctx: &Ctx<'_>,
+) -> Option<Vec<Hop>> {
+    match plan_hops(trigger, obj, &state.config.triggers) {
+        Ok(hops) if hops.is_empty() => {
+            let detail = format!(
+                "each '{}' resolved to an empty array - zero hops",
+                trigger.each.as_deref().unwrap_or("")
+            );
+            debug!(trigger = %trigger.id, "trigger fan-out produced no hops: {detail}");
+            record(
+                state,
+                NewTriggerRun {
+                    detail: Some(&detail),
+                    ..ctx.row(&trigger.id, "fan_out_empty")
+                },
+            )
+            .await;
+            None
+        }
+        Ok(hops) => {
+            // A truncated fan-out is a partial run over a partial array, said
+            // out loud as well as declared in every hop's envelope.
+            if hops
+                .first()
+                .map(|h| h.trigger_obj()["fan_out_truncated"] == Value::Bool(true))
+                .unwrap_or(false)
+            {
+                warn!(trigger = %trigger.id, hops = hops.len(),
+                      fan_out_cap = state.config.triggers.fan_out_cap,
+                      "trigger fan-out TRUNCATED: elements past [triggers] fan_out_cap \
+                       produced no hop; every hop carries `_trigger.fan_out_truncated: true` \
+                       and the exact `fan_out_total`");
+            }
+            Some(hops)
+        }
+        Err(miss) => {
+            let detail = miss.detail();
+            warn!(trigger = %trigger.id, param = %miss.param, pointer = %miss.pointer,
+                  "trigger hop not enqueued: {detail}");
+            record(
+                state,
+                NewTriggerRun {
+                    detail: Some(&detail),
+                    ..ctx.row(&trigger.id, "bind_miss")
+                },
+            )
+            .await;
+            None
+        }
+    }
+}
+
 /// Enqueues one triggered hop under `key` (dedup-guarded). Returns 1 when a job
 /// was actually created, 0 when skipped/deduped/failed.
 async fn enqueue_hop(
@@ -1473,9 +1733,34 @@ async fn enqueue_hop(
         .await;
         return 0;
     }
+    // N04: one hop, or one per element of the array `each` points at. Binding
+    // and the cap happen HERE, before the schema door, so a bound param is
+    // validated exactly like a templated one.
+    let Some(hops) = planned_hops(state, trigger, obj, ctx).await else {
+        return 0;
+    };
+    let mut fired = 0;
+    for hop in hops {
+        fired += enqueue_one_hop(state, trigger, source, hop, &key, ctx).await;
+    }
+    fired
+}
+
+/// Enqueues ONE resolved hop. Split out of [`enqueue_hop`] so a fan-out's
+/// elements go through the identical door - schema check, post_enqueue slot,
+/// ledger row - rather than through a second, drifting copy of it.
+async fn enqueue_one_hop(
+    state: &AppState,
+    trigger: &Trigger,
+    source: &Job,
+    hop: Hop,
+    base_key: &str,
+    ctx: &Ctx<'_>,
+) -> usize {
+    let key = hop_idempotency_key(base_key, hop.index);
     // See the sibling call site: cloned only when the slot is configured.
-    let params_obj = post_enqueue_input(trigger, &obj);
-    let params = merged_params(&trigger.params, obj);
+    let params_obj = post_enqueue_input(trigger, hop.trigger_obj());
+    let params = hop.params;
     if !hop_params_pass_target_schema(state, trigger, &params, ctx).await {
         return 0;
     }
@@ -1558,6 +1843,7 @@ mod tests {
         TriggersConfig {
             max_depth: 3,
             key_cap: 2,
+            fan_out_cap: 3,
         }
     }
 
@@ -1596,6 +1882,168 @@ mod tests {
                                                     // Non-object template is replaced, not merged into.
         let merged = merged_params(&Value::Null, json!({ "count": 1 }));
         assert_eq!(merged["_trigger"]["count"], 1);
+    }
+
+    // -- N04 param binding and fan-out ---------------------------------------
+
+    fn bind_trigger(bind: Value, each: Option<&str>, template: Value) -> pumper_core::Trigger {
+        pumper_core::Trigger {
+            id: "T1".into(),
+            name: None,
+            source_kind: "external".into(),
+            source_app: "src".into(),
+            source_dataset: None,
+            on_change: None,
+            on_status: None,
+            target_app: "crawl".into(),
+            params: template,
+            budget_usd: None,
+            priority: 0,
+            max_attempts: 1,
+            enabled: true,
+            created_at: chrono::Utc::now(),
+            filters: None,
+            plugin_hooks: None,
+            bind: bind.as_object().cloned(),
+            each: each.map(String::from),
+        }
+    }
+
+    /// The anti-pattern: a pointer that resolved to nothing enqueued the hop
+    /// anyway, so the target ran with the STATIC template's stale value (or
+    /// with the param simply absent) and "the event steers this job" was
+    /// unfalsifiable. A miss is a refusal that names the param and the pointer.
+    #[test]
+    fn bind_miss_is_reported_not_silently_dropped() {
+        let template = json!({ "max_pages": 10 });
+        let obj = json!({ "payload": { "repository": { "html_url": "https://acme.dev" } } });
+        let bind = json!({ "url": "/_trigger/payload/repository/html_url" });
+
+        let ok = bind_params(&template, obj.clone(), bind.as_object()).expect("pointer resolves");
+        assert_eq!(ok["url"], "https://acme.dev");
+        assert_eq!(ok["max_pages"], 10, "the static template still applies");
+        assert_eq!(
+            ok["_trigger"]["payload"]["repository"]["html_url"],
+            "https://acme.dev"
+        );
+
+        let missing = json!({ "url": "/_trigger/payload/nope" });
+        let miss = bind_params(&template, obj, missing.as_object()).expect_err("must refuse");
+        assert_eq!(miss.param, "url");
+        assert_eq!(miss.pointer, "/_trigger/payload/nope");
+        assert!(
+            miss.detail().contains("/_trigger/payload/nope"),
+            "{}",
+            miss.detail()
+        );
+
+        // No bind at all is `merged_params`, byte for byte: the pre-N04 path.
+        let plain = bind_params(&json!({ "a": 1 }), json!({ "b": 2 }), None).unwrap();
+        assert_eq!(plain, merged_params(&json!({ "a": 1 }), json!({ "b": 2 })));
+    }
+
+    /// Binds resolve against the SAME pre-bind view, so renaming a key cannot
+    /// silently change what another bind reads.
+    #[test]
+    fn binds_do_not_read_each_others_output() {
+        let template = json!({ "url": "static" });
+        let bind = json!({ "url": "/_trigger/a", "also": "/url" });
+        let out = bind_params(&template, json!({ "a": "dynamic" }), bind.as_object()).unwrap();
+        assert_eq!(out["url"], "dynamic");
+        // `/url` read the TEMPLATE's value, not the one `url` was just bound to.
+        assert_eq!(out["also"], "static");
+    }
+
+    /// The anti-pattern: a fan-out truncated at the cap looked exactly like a
+    /// complete one from the target's side. `fan_out_total` stays exact and
+    /// every hop declares `fan_out_truncated`.
+    #[test]
+    fn each_fans_out_capped_and_says_so() {
+        let cfg = cfg(); // fan_out_cap = 3
+        let obj = json!({ "payload": { "commits": [
+            { "url": "u0" }, { "url": "u1" }, { "url": "u2" }, { "url": "u3" }, { "url": "u4" }
+        ] } });
+        let trigger = bind_trigger(
+            json!({ "url": "/_trigger/item/url" }),
+            Some("/_trigger/payload/commits"),
+            json!({}),
+        );
+        let hops = plan_hops(&trigger, obj.clone(), &cfg).expect("plan");
+        assert_eq!(hops.len(), 3, "capped at fan_out_cap");
+        assert_eq!(hops[0].index, Some(0));
+        assert_eq!(hops[2].index, Some(2));
+        assert_eq!(
+            hops[1].params["url"], "u1",
+            "each hop binds from its OWN item"
+        );
+        for hop in &hops {
+            assert_eq!(
+                hop.trigger_obj()["fan_out_total"],
+                5,
+                "the total stays exact"
+            );
+            assert_eq!(hop.trigger_obj()["fan_out_truncated"], true);
+        }
+        assert_eq!(hops[2].trigger_obj()["item_index"], 2);
+        assert_eq!(hops[2].trigger_obj()["item"]["url"], "u2");
+
+        // Under the cap: nothing is truncated, and the flag says so rather than
+        // being absent (absence is not "no opinion" to a reader).
+        let small = json!({ "payload": { "commits": [{ "url": "u0" }] } });
+        let hops = plan_hops(&trigger, small, &cfg).unwrap();
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].trigger_obj()["fan_out_truncated"], false);
+        assert_eq!(hops[0].trigger_obj()["fan_out_total"], 1);
+
+        // No `each`: exactly one hop, and no fan-out keys invented on it.
+        let plain = bind_trigger(Value::Null, None, json!({ "url": "static" }));
+        let hops = plan_hops(&plain, obj, &cfg).unwrap();
+        assert_eq!(hops.len(), 1);
+        assert_eq!(hops[0].index, None);
+        assert!(hops[0].trigger_obj().get("item_index").is_none());
+    }
+
+    /// An `each` pointer that misses, or that lands on something that is not an
+    /// array, is the same refusal class as a bind miss - never "zero hops,
+    /// quietly".
+    #[test]
+    fn each_that_is_not_an_array_is_a_miss_not_an_empty_fan_out() {
+        let cfg = cfg();
+        let t = bind_trigger(Value::Null, Some("/_trigger/payload/commits"), json!({}));
+        let miss = plan_hops(&t, json!({ "payload": {} }), &cfg).expect_err("absent");
+        assert_eq!(miss.param, "each");
+        assert_eq!(miss.reason, "resolved to nothing");
+        let miss =
+            plan_hops(&t, json!({ "payload": { "commits": 7 } }), &cfg).expect_err("not an array");
+        assert!(miss.reason.contains("not an array"), "{}", miss.reason);
+        // An EMPTY array is not a miss: it is zero hops, which the caller
+        // ledgers as `fan_out_empty`.
+        let hops = plan_hops(&t, json!({ "payload": { "commits": [] } }), &cfg).unwrap();
+        assert!(hops.is_empty());
+    }
+
+    /// The anti-pattern: every element of a fan-out sharing the batch key, so
+    /// one hop was created and the rest were recorded as redeliveries of it.
+    #[test]
+    fn fan_out_keys_are_per_element_not_per_batch() {
+        let base = idempotency_key("T1", "ev-9");
+        assert_eq!(hop_idempotency_key(&base, None), "trig:T1:ev-9");
+        assert_eq!(hop_idempotency_key(&base, Some(0)), "trig:T1:ev-9:i:0");
+        assert_ne!(
+            hop_idempotency_key(&base, Some(0)),
+            hop_idempotency_key(&base, Some(1))
+        );
+    }
+
+    /// Pointer syntax is decidable at create time; the dotted `$.path` filter
+    /// grammar is the mistake this rejects before it becomes a `bind_miss` on
+    /// every event forever.
+    #[test]
+    fn pointer_syntax_is_checked_not_discovered_at_fire_time() {
+        assert!(valid_pointer("/_trigger/payload/url"));
+        assert!(valid_pointer(""));
+        assert!(!valid_pointer("payload.url"));
+        assert!(!valid_pointer("$.payload.url"));
     }
 
     #[test]
@@ -1869,6 +2317,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             filters: None,
             plugin_hooks: None,
+            bind: None,
+            each: None,
         };
         let obj = external_trigger_obj(
             &trigger,
@@ -1966,6 +2416,8 @@ mod tests {
             created_at: chrono::Utc::now(),
             filters: None,
             plugin_hooks: Some(hooks),
+            bind: None,
+            each: None,
         }
     }
 

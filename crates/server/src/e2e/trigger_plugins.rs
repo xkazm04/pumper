@@ -130,6 +130,8 @@ fn trigger(hooks: Option<TriggerPluginHooks>) -> Trigger {
         created_at: chrono::Utc::now(),
         filters: None,
         plugin_hooks: hooks,
+        bind: None,
+        each: None,
     }
 }
 
@@ -277,6 +279,8 @@ async fn a_transform_cannot_rescope_the_work_of_the_job_it_fires() {
                     max_attempts: 1,
                     filters: None,
                     plugin_hooks: Some(&transform_only(plugin, json!({}))),
+                    bind: None,
+                    each: None,
                 })
                 .await
                 .expect("create trigger"),
@@ -440,6 +444,8 @@ async fn a_configured_hook_with_no_loaded_plugin_is_recorded_not_only_silently_p
                 transform: None,
                 post_enqueue: None,
             }),
+            bind: None,
+            each: None,
         })
         .await
         .unwrap();
@@ -500,6 +506,8 @@ async fn hooked_trigger(state: &AppState, hooks: TriggerPluginHooks) -> Trigger 
             max_attempts: 1,
             filters: None,
             plugin_hooks: Some(&hooks),
+            bind: None,
+            each: None,
         })
         .await
         .expect("create trigger")
@@ -742,6 +750,8 @@ async fn a_loaded_hook_plugin_records_no_plugin_missing_row() {
                 transform: None,
                 post_enqueue: None,
             }),
+            bind: None,
+            each: None,
         })
         .await
         .unwrap();
