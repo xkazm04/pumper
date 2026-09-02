@@ -28,7 +28,7 @@ Other durable references live outside `.perfect/`:
 
 ## Invariants and gotchas
 
-Six things this repo does that are **not** derivable from a skim, and that prose
+Seven things this repo does that are **not** derivable from a skim, and that prose
 elsewhere gets wrong.
 
 1. **CORS is OFF by default — README.md and ONBOARDING.md §2 say the opposite.**
@@ -91,6 +91,20 @@ elsewhere gets wrong.
    is a self-healing rung of `just ci`. Do not simplify `line-tables-only` to
    `debug = 0`: backtrace frames stop resolving to source, which is verified by a
    planted-panic probe, not assumed.
+
+7. **The mesh wire format lives in an APP crate, on purpose-under-protest.**
+   `app_peer::envelope` (signing bytes, ed25519 verification, the live-set digest)
+   and `app_peer::mesh` (the bundle shapes) are consumed by
+   `crates/server/src/{node.rs, routes/mesh.rs, routes/host_weather.rs,
+   routes/recipes.rs}`. Server → app-crate is allowed (so is `grants-common`);
+   the natural home is `crates/core/src/mesh.rs` and it was out of the N16 file
+   scope. Do **not** re-implement any of it server-side: two implementations of
+   "what bytes a bundle is" is an interoperability bug that shows up only between
+   two nodes on different builds. Related traps: node identity is memoised per
+   **key-file path**, never a `OnceLock` (the two-node e2e runs both nodes in one
+   process and a shared keypair makes the forgery test pass for the wrong
+   reason); a corrupt `node.key` is a hard error, never a silent re-key; and
+   `[[peer]]` is reconciled into schedules at **boot only**, unlike the catalog.
 
 ## How to extend this file
 
