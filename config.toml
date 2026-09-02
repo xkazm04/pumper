@@ -407,3 +407,31 @@ enforce = false          # DEFERRED seam — inert today, ships OFF so landing e
 #                               # rounds with NO connection held, so an abandoned pass is
 #                               # incomplete, never corrupt. Rung 2 runs a single round.
 # analyze_every_passes = 24     # one ANALYZE per this many optimize passes
+
+# ── Pumper mesh (N16): [[peer]] — federation, entirely by pulling ────────────
+#
+# ABSENT BY DEFAULT. With no [[peer]] rows this node is not in a mesh: nothing
+# is scheduled, nothing is pulled, and bundle imports behave exactly as they did
+# before the mesh existed. Full reference: docs/features/mesh.md
+#
+# Each row becomes ONE SCHEDULE PER STREAM at boot (id `peer-<name>-<stream>`,
+# fenced on managed_by = 'peer'), running the `peer` app — so budgets, receipts,
+# retries, cancel and the /jobs surface all apply unchanged.
+#
+# `public_key` is the only thing that makes a bundle believable: get it from the
+# peer's `GET /node`. Without it a bundle can only be accepted UNVERIFIED, and
+# only when allow_unsigned is explicitly true.
+#
+# [[peer]]
+# name = "vps"
+# url = "https://vps.example:8088"
+# public_key = "9f3c..."             # 64 hex, from the peer's GET /node
+# pull = ["datasets:grants-gov/opportunities", "weather", "recipes"]
+# every = "15m"                      # must divide an hour, or (>= 1h) divide a day
+# allow_unsigned = false             # accept pre-mesh / unverifiable bundles
+# max_penalty_secs = 60              # ceiling on an imported politeness penalty
+# api_key = "env:PUMPER_VPS_KEY"     # sent as x-pumper-key when the PEER runs [auth] keys.
+#                                    # USE THE env: FORM — the schedule row and every job it
+#                                    # enqueues are readable on GET /schedules and GET /jobs/{id}.
+# namespace = "edge_grants"          # default peer_{remote app}
+# enabled = true                     # false disables the schedules, keeping their history

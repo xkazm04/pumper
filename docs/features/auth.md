@@ -139,6 +139,27 @@ warning and the response is unchanged.
 
 All six require `admin`.
 
+### Keys for mesh peers
+
+A pumper node that pulls from this one ([mesh.md](mesh.md)) authenticates with
+an ordinary principal key, presented as `x-pumper-key`. Mint it with **`read`
+only**:
+
+```
+POST /principals {"name": "mesh-laptop", "scopes": ["read"]}
+```
+
+A pull only ever GETs `/host-weather/export`, `/recipes/export`,
+`/datasets/{app}/{ds}/manifest` and `/datasets/{app}/{ds}/changes` — all reads.
+Nothing a pull does needs `enqueue` or `admin`, and a mesh key carrying either
+would let a peer create work, or spend money, on this node. Give each peer its
+own key so `GET /audit?principal=` and `GET /principals/costs` can tell them
+apart, and so revoking one does not lock out the fleet.
+
+On the pulling side the key goes in `[[peer]] api_key`, and it should be
+`env:VAR_NAME` rather than a literal: the schedule row and every job it enqueues
+are readable on `GET /schedules` and `GET /jobs/{id}`.
+
 ## Bootstrapping
 
 Creating a principal requires `admin`, and in `keys` mode there is no admin key
