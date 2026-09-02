@@ -28,11 +28,14 @@
 //! no row and is refused, rather than minting a second live lineage for one
 //! irreversible action.
 
-use crate::engine::{FilledField, SubmitTarget};
+// The digest and the commit guard live beside the evidence types they are
+// computed over (`crate::engine`), so an engine can compute and check them
+// without the `storage` feature this ledger needs. Re-exported here because
+// this module is where the approval lifecycle is documented.
+pub use crate::engine::{commit_guard, evidence_digest, CommitRefusal};
 use crate::{Error, Result, Storage};
 use chrono::{DateTime, SecondsFormat, Utc};
 use serde::Serialize;
-use sha2::{Digest, Sha256};
 
 // ── state ────────────────────────────────────────────────────────────────────
 
@@ -115,61 +118,6 @@ pub struct Transaction {
 }
 
 // ── the reviewed surface ─────────────────────────────────────────────────────
-
-/// SHA-256 over exactly what a reviewer looked at when they said yes: the
-/// submit target's identity and clickability, and every filled field's
-/// selector, found-ness and **length** (never its value — a redacted password
-/// contributes its length, so a changed password still changes the digest
-/// without the plaintext ever entering it).
-///
-/// The digest is canonical by construction: fields are sorted by selector, so
-/// two probes of the same page in a different DOM order agree. It is the
-/// approval's binding — `approve` quotes it, `commit` re-probes it, and a
-/// mismatch is a refusal instead of a click.
-pub fn evidence_digest(submit_target: Option<&SubmitTarget>, filled: &[FilledField]) -> String {
-    let mut rows: Vec<String> = filled
-        .iter()
-        .map(|f| {
-            format!(
-                "f\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
-                f.selector,
-                f.found,
-                f.redacted,
-                f.value_len.map(|n| n.to_string()).unwrap_or_default(),
-            )
-        })
-        .collect();
-    rows.sort();
-    if let Some(t) = submit_target {
-        rows.insert(
-            0,
-            format!(
-                "t\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}\u{1}{}",
-                t.selector,
-                opt_bool(t.found),
-                opt_bool(t.visible),
-                opt_bool(t.enabled),
-                t.tag.as_deref().unwrap_or(""),
-                t.label.as_deref().unwrap_or(""),
-            ),
-        );
-    } else {
-        rows.insert(0, "t\u{1}none".to_string());
-    }
-    let mut hasher = Sha256::new();
-    hasher.update(rows.join("\u{2}").as_bytes());
-    format!("{:x}", hasher.finalize())
-}
-
-/// `Some(true)` / `Some(false)` / `None` as three distinguishable tokens —
-/// "we could not look" must never hash the same as "it is not there".
-fn opt_bool(v: Option<bool>) -> &'static str {
-    match v {
-        Some(true) => "yes",
-        Some(false) => "no",
-        None => "unknown",
-    }
-}
 
 // ── the state machine, as pure functions ─────────────────────────────────────
 
@@ -276,45 +224,6 @@ pub fn reject_decision(state: TransactionState) -> std::result::Result<(), Appro
         return Err(ApprovalRefusal::NotPending(state));
     }
     Ok(())
-}
-
-/// The commit-time guard: the live page, re-probed immediately before the
-/// irreversible action, must hash to the digest that was approved.
-///
-/// This is the whole risk surface of the feature. A page that changed between
-/// review and submit ends the run as a **refusal**, never as a click on a
-/// button a human never saw.
-pub fn commit_guard(
-    approved_sha: &str,
-    observed_sha: &str,
-) -> std::result::Result<(), CommitRefusal> {
-    if approved_sha == observed_sha {
-        return Ok(());
-    }
-    Err(CommitRefusal::ProbeMismatch {
-        approved: approved_sha.to_string(),
-        observed: observed_sha.to_string(),
-    })
-}
-
-/// Why a commit refused to click.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum CommitRefusal {
-    ProbeMismatch { approved: String, observed: String },
-}
-
-impl CommitRefusal {
-    pub fn message(&self) -> String {
-        match self {
-            CommitRefusal::ProbeMismatch { approved, observed } => format!(
-                "submit blocked: probe_mismatch. The page approved for submission hashed to \
-                 {approved}; re-probed immediately before the click it hashes to {observed}. The \
-                 submit target or a filled field changed after review, so the approved action is \
-                 no longer the action that would run. Nothing was submitted. Re-run the dry run \
-                 to capture fresh evidence and approve that."
-            ),
-        }
-    }
 }
 
 // ── store ────────────────────────────────────────────────────────────────────
@@ -585,6 +494,7 @@ pub async fn submitted_since(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::engine::CommitRefusal;
 
     fn t(offset_secs: i64) -> DateTime<Utc> {
         DateTime::from_timestamp(1_800_000_000 + offset_secs, 0).unwrap()
@@ -652,19 +562,6 @@ mod tests {
     /// reviewed; a page that drifted afterwards must end as a refusal, never as
     /// a click on a button nobody saw.
     #[test]
-    fn approved_with_stale_evidence_not_submitted() {
-        assert!(commit_guard("sha-a", "sha-a").is_ok());
-        let err = commit_guard("sha-a", "sha-b").unwrap_err();
-        assert_eq!(
-            err,
-            CommitRefusal::ProbeMismatch {
-                approved: "sha-a".into(),
-                observed: "sha-b".into()
-            }
-        );
-        assert!(err.message().contains("probe_mismatch"));
-        assert!(err.message().contains("Nothing was submitted"));
-    }
 
     /// An approval that quotes a digest the row does not hold is approving
     /// something else's evidence.
@@ -749,85 +646,14 @@ mod tests {
         );
     }
 
-    fn field(selector: &str, len: Option<usize>, redacted: bool) -> FilledField {
-        FilledField {
-            selector: selector.into(),
-            value: None,
-            found: true,
-            redacted,
-            value_len: len,
-            truncated: false,
-        }
-    }
-
-    fn target(enabled: Option<bool>) -> SubmitTarget {
-        SubmitTarget {
-            selector: "#go".into(),
-            found: Some(true),
-            visible: Some(true),
-            enabled,
-            tag: Some("button".into()),
-            label: Some("Confirm".into()),
-        }
-    }
-
     /// The digest must be stable across probe ORDER (two renders of the same
     /// page can enumerate fields differently) and must change on every fact a
     /// reviewer actually looked at.
     #[test]
-    fn digest_is_order_stable_and_moves_on_every_reviewed_fact() {
-        let a = field("#email", Some(16), false);
-        let b = field("#name", Some(4), false);
-        let base = evidence_digest(Some(&target(Some(true))), &[a.clone(), b.clone()]);
-        assert_eq!(
-            base,
-            evidence_digest(Some(&target(Some(true))), &[b.clone(), a.clone()]),
-            "field order must not change the digest"
-        );
-        // A disabled button is a different page to approve.
-        assert_ne!(
-            base,
-            evidence_digest(Some(&target(Some(false))), &[a.clone(), b.clone()])
-        );
-        // "we could not look" is not "it is not there".
-        assert_ne!(
-            evidence_digest(Some(&target(None)), &[]),
-            evidence_digest(Some(&target(Some(false))), &[])
-        );
-        // A changed value length moves the digest even when the value is redacted.
-        assert_ne!(
-            base,
-            evidence_digest(
-                Some(&target(Some(true))),
-                &[field("#email", Some(17), false), b.clone()]
-            )
-        );
-        // A vanished field moves it too.
-        assert_ne!(
-            base,
-            evidence_digest(Some(&target(Some(true))), &[a.clone()])
-        );
-        // No submit target at all is its own token, not an empty string.
-        assert_ne!(
-            evidence_digest(None, &[]),
-            evidence_digest(Some(&target(None)), &[])
-        );
-    }
 
     /// A redacted password's PLAINTEXT must never be an input to the digest —
     /// the digest travels in URLs, logs and approval payloads.
     #[test]
-    fn digest_never_hashes_a_field_value() {
-        let mut with_value = field("#password", Some(8), true);
-        with_value.value = Some("hunter2!".into());
-        let without = field("#password", Some(8), true);
-        assert_eq!(
-            evidence_digest(None, &[with_value]),
-            evidence_digest(None, &[without]),
-            "the digest is over shape and length, never over the value"
-        );
-    }
-
     #[test]
     fn state_round_trips_and_refuses_junk() {
         for s in [
