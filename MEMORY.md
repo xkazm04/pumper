@@ -141,6 +141,27 @@ elsewhere gets wrong.
 11. **The nine invariants above were numbered 1–9 before wave 3.** Renumbering on merge is
    normal here; cite invariants by their text, not their number.
 
+12. **A new route or a changed response shape has THREE coupled artifacts, not one.**
+   Since N23 the OpenAPI document is the client contract, and it is committed:
+   (a) the route's `responses(...)` must name a DTO from `crates/server/src/routes/dto.rs`
+   — `spec_schema_tests::every_success_response_references_a_component_schema` diffs the
+   untyped set against `SCHEMALESS_RESPONSES` **in both directions**, so a new untyped 2xx
+   fails naming itself AND a stale allowlist entry fails too; (b) `clients/openapi.json`
+   must be regenerated (`just openapi`), or
+   `spec_snapshot_tests::committed_spec_matches_the_router` fails `cargo test`; (c) the
+   generated clients must be regenerated (`just clients`), or the CI `sdk` job's
+   `generate-clients.mjs --check` fails. The DTOs are **declarations only** — nothing
+   constructs one, and editing one changes no response; if you find yourself wanting a DTO
+   to change a payload, you are editing the wrong thing. The dual-mode list endpoints
+   (bare array or legacy envelope without `?cursor=`, keyset page with it) are declared as
+   untagged unions and both arms are load-bearing: tightening one breaks the consumers the
+   whole surface exists for. Two smaller traps: utoipa renders `Option<T>` as
+   **non-required**, while a `json!` literal always writes the key as `null`, so the
+   document is looser than the server and `@pumper/sync` corrects for it with `Required<>`;
+   and a schema-only struct is `never constructed` as far as rustc is concerned, which is
+   why `dto.rs` carries a module-level `#![allow(dead_code)]` with a comment saying so.
+   Learned 2026-09-02 (N23 build).
+
 ## How to extend this file
 
 Add an entry only when the fact is (a) durable across sessions, (b) not obvious from
