@@ -158,8 +158,13 @@ impl AppContext {
         true
     }
 
-    /// Takes the schedules this run asked for, leaving the list empty. Called
-    /// once by the runtime's post-run fan-out.
+    /// Takes the schedules this run asked for, leaving the list empty.
+    ///
+    /// The worker does not go through here: the context has moved into `run()`
+    /// by the time its fan-out drains, so it holds a clone of
+    /// [`schedule_requests`](Self::schedule_requests) instead. This is the
+    /// equivalent for an embedder that drives an `AppContext` itself and owns
+    /// the post-run step.
     pub fn take_schedule_requests(&self) -> Vec<Value> {
         self.schedule_requests
             .lock()
