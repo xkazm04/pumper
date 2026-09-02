@@ -30,11 +30,15 @@
 //!   `data/sinks/<watch_id>.ndjson`. The delivery row's `url` is the
 //!   `file://<watch_id>.ndjson` pseudo-URL, which the transport re-validates
 //!   (filename chars only) so nothing in the log can escape the sinks dir.
-//!
-//! WASM sinks are deliberately OUT of v1. The seam for them is the transport
-//! branch in [`deliver`]: a future `plugin:<name>` sink value would resolve
-//! through the plugin host with the same `(delivery_id, event, body)` contract
-//! and report `(delivered, attempts, last_error, permanent)` like the built-ins.
+//! - `plugin:<name>` (N10): resolve through the WASM plugin host. The module
+//!   receives `{delivery_id, event, body}` as its envelope and answers
+//!   `{delivered, permanent?, error?}`, which [`plugin_delivery_outcome`] maps
+//!   onto the same `(delivered, attempts, last_error, permanent)` tuple every
+//!   other sink returns — so the delivery log, the in-process ladder, the DLQ
+//!   and manual replay are byte-for-byte unchanged. The delivery row's `url` is
+//!   the `plugin://<name>` pseudo-URL, re-validated by the transport (name
+//!   chars only), which is what makes a replayed row resolve to the same
+//!   module and nothing else.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -166,6 +170,22 @@ pub async fn dispatch_change(state: &AppState, watch: Watch, payload: serde_json
             )
             .await;
         }
+        // N10: `plugin:<name>`. The body is the payload UNSHAPED — the same
+        // bytes a webhook sink would receive — so one connector module works
+        // against every event kind rather than against a sink-specific shape.
+        sink if sink.starts_with(PLUGIN_SINK_PREFIX) => {
+            let url = plugin_sink_url(&sink[PLUGIN_SINK_PREFIX.len()..]);
+            dispatch_event(
+                state,
+                "change",
+                &watch.id,
+                &url,
+                "dataset.changed",
+                &payload,
+                None,
+            )
+            .await;
+        }
         "slack" => {
             let body = slack_summary(&payload);
             dispatch_event(
@@ -199,6 +219,35 @@ pub async fn dispatch_change(state: &AppState, watch: Watch, payload: serde_json
 // ---- Sink helpers ---------------------------------------------------------
 
 const FILE_SINK_SCHEME: &str = "file://";
+
+/// The `watch.sink` prefix that selects a WASM plugin connector (N10).
+pub(crate) const PLUGIN_SINK_PREFIX: &str = "plugin:";
+
+/// The pseudo-URL logged for a plugin-sink delivery: `plugin://<name>`.
+///
+/// Same move as [`file_sink_url`], for the same reason: the delivery row must
+/// carry everything the DLQ drain and a manual replay need to re-resolve the
+/// transport, and it must carry nothing a tampered row could turn into a
+/// different destination.
+fn plugin_sink_url(name: &str) -> String {
+    format!("{PLUGIN_SINK_SCHEME}{name}")
+}
+
+const PLUGIN_SINK_SCHEME: &str = "plugin://";
+
+/// Resolves a logged plugin-sink URL back to a module name. The name must look
+/// like a plugin file stem (`[A-Za-z0-9._-]`, no `..`) — anything else is
+/// rejected, so nothing in the delivery log can name something that is not a
+/// module in the plugin dir.
+fn plugin_sink_name(url: &str) -> Option<&str> {
+    let name = url.strip_prefix(PLUGIN_SINK_SCHEME)?;
+    let valid = !name.is_empty()
+        && !name.contains("..")
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'));
+    valid.then_some(name)
+}
 
 /// `data/sinks/` — a sibling of the artifacts dir so all on-disk output lives
 /// under the same data root (`data/artifacts` → `data/sinks`).
@@ -324,6 +373,7 @@ pub async fn replay(
 ) {
     let storage = state.storage.clone();
     let client = state.webhook_client.clone();
+    let plugins = state.plugins.clone();
     let tag = delivery_id.clone();
     state
         .deliveries
@@ -331,6 +381,7 @@ pub async fn replay(
             let outcome = deliver(
                 &storage,
                 &client,
+                plugins.as_ref(),
                 &url,
                 &event,
                 &delivery_id,
@@ -377,6 +428,7 @@ async fn queue_logged(
 ) {
     let storage = state.storage.clone();
     let client = state.webhook_client.clone();
+    let plugins = state.plugins.clone();
     let tag = format!("{kind}:{ref_id}");
     state
         .deliveries
@@ -400,6 +452,7 @@ async fn queue_logged(
                     let outcome = deliver(
                         &storage,
                         &client,
+                        plugins.as_ref(),
                         &url,
                         &event,
                         &fallback_id,
@@ -418,6 +471,7 @@ async fn queue_logged(
             let outcome = deliver(
                 &storage,
                 &client,
+                plugins.as_ref(),
                 &url,
                 &event,
                 &delivery_id,
@@ -643,6 +697,7 @@ pub async fn drain_due(state: &AppState) {
 async fn deliver(
     storage: &Storage,
     client: &reqwest::Client,
+    plugins: &dyn pumper_core::Plugins,
     url: &str,
     event: &str,
     delivery_id: &str,
@@ -651,6 +706,9 @@ async fn deliver(
 ) -> (bool, i64, Option<String>, bool) {
     if url.starts_with(FILE_SINK_SCHEME) {
         return deliver_file(&sinks_dir(storage), url, event, delivery_id, body).await;
+    }
+    if url.starts_with(PLUGIN_SINK_SCHEME) {
+        return deliver_plugin(plugins, url, event, delivery_id, body).await;
     }
     let mut last_error = None;
     // Sleep before the NEXT attempt: linear backoff by default, overridden by a
@@ -715,6 +773,99 @@ async fn deliver(
         }
     }
     (false, MAX_ATTEMPTS as i64, last_error, false)
+}
+
+/// Plugin-sink transport (N10): hand the envelope to a WASM connector.
+///
+/// Single attempt on purpose, exactly like [`deliver_file`]: the in-process
+/// ladder's value is riding out a receiver's momentary 5xx, and a sandboxed
+/// module called three times in a row with the same bytes and a fresh store
+/// produces the same answer three times. Recovery belongs to the backed-off DLQ
+/// drain, which is also where a *reloaded* module gets its second chance.
+async fn deliver_plugin(
+    plugins: &dyn pumper_core::Plugins,
+    url: &str,
+    event: &str,
+    delivery_id: &str,
+    body: &[u8],
+) -> (bool, i64, Option<String>, bool) {
+    let Some(name) = plugin_sink_name(url) else {
+        // A malformed pseudo-URL will never parse on a retry — permanent.
+        return (
+            false,
+            1,
+            Some(format!("invalid plugin-sink url '{url}'")),
+            true,
+        );
+    };
+    // The envelope every connector sees. `body` is the payload as it was
+    // logged, so a replayed delivery hands the module the same bytes the first
+    // attempt did — the stable `delivery_id` is the idempotency key a connector
+    // dedups on, the same contract the `x-pumper-delivery-id` header gives an
+    // HTTP receiver.
+    let envelope = serde_json::json!({
+        "delivery_id": delivery_id,
+        "event": event,
+        "body": serde_json::from_slice::<serde_json::Value>(body)
+            .unwrap_or_else(|_| serde_json::Value::String(String::from_utf8_lossy(body).into_owned())),
+    });
+    let outcome = plugins
+        .run(name, &envelope.to_string(), &serde_json::json!({}))
+        .await;
+    plugin_delivery_outcome(outcome)
+}
+
+/// Maps a connector's answer onto the delivery ladder's tuple.
+///
+/// Extracted and tested rather than inlined in the transport, because this is
+/// the whole "retries/DLQ/replay are unchanged" claim: every arm here has to
+/// land a plugin sink in the same state a webhook sink would reach for the
+/// equivalent outcome, and an arm that got `permanent` backwards would either
+/// dead-letter a recoverable delivery or retry an impossible one five times.
+///
+/// The classification, and why each is what it is:
+///
+/// * `{delivered: true}` — done, like a 2xx.
+/// * `{delivered: false, permanent: true}` — the connector says the receiver
+///   will keep refusing these bytes (a rejected schema, a deleted target). Like
+///   a non-429 4xx: mark `dead` now instead of burning the whole ladder.
+/// * `{delivered: false}` — transient; the ladder applies.
+/// * anything else, including a trap, a missing module and malformed output —
+///   NOT delivered and NOT permanent. A plugin that is broken or absent today
+///   can be fixed and `POST /plugins/reload`ed, and the backed-off drain is
+///   exactly the thing that would then succeed. Fail-open is a *trigger hook*
+///   contract; a sink that quietly reported success for a module that never ran
+///   would lose the event.
+fn plugin_delivery_outcome(
+    outcome: pumper_core::Result<serde_json::Value>,
+) -> (bool, i64, Option<String>, bool) {
+    let value = match outcome {
+        Ok(value) => value,
+        Err(e) => return (false, 1, Some(format!("plugin sink failed: {e}")), false),
+    };
+    match value.get("delivered").and_then(serde_json::Value::as_bool) {
+        Some(true) => (true, 1, None, false),
+        Some(false) => {
+            let permanent = value
+                .get("permanent")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let error = value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| "the connector reported delivered=false".into());
+            (false, 1, Some(error), permanent)
+        }
+        None => (
+            false,
+            1,
+            Some(format!(
+                "plugin sink returned a malformed result (want {{\"delivered\": bool}}): {value}"
+            )),
+            false,
+        ),
+    }
 }
 
 /// File-sink transport: append one NDJSON envelope line. The envelope carries
@@ -1211,5 +1362,83 @@ mod tests {
         assert!(!verify_signature(secret, Some((0, "x")), body, &github_hex));
         // Garbage hex never verifies (and never panics).
         assert!(!verify_signature(secret, None, body, "not-hex"));
+    }
+
+    /// The sink's whole promise is "retries/DLQ/replay are unchanged", which is
+    /// this mapping. A `permanent` read backwards either dead-letters a
+    /// recoverable delivery or retries an impossible one through the whole
+    /// ladder.
+    #[test]
+    fn a_permanent_refusal_goes_to_the_dlq_not_the_ladder() {
+        let (delivered, attempts, error, permanent) = plugin_delivery_outcome(Ok(
+            serde_json::json!({"delivered": false, "permanent": true, "error": "422 schema"}),
+        ));
+        assert!(!delivered);
+        assert_eq!(attempts, 1);
+        assert_eq!(error.as_deref(), Some("422 schema"));
+        assert!(
+            permanent,
+            "the connector said the receiver will keep refusing"
+        );
+
+        // …and the transient sibling, which must climb the ladder instead.
+        let (_, _, _, permanent) =
+            plugin_delivery_outcome(Ok(serde_json::json!({"delivered": false})));
+        assert!(!permanent);
+    }
+
+    #[test]
+    fn a_delivered_connector_answer_is_a_delivery() {
+        let (delivered, attempts, error, permanent) =
+            plugin_delivery_outcome(Ok(serde_json::json!({"delivered": true})));
+        assert!(delivered);
+        assert_eq!((attempts, error, permanent), (1, None, false));
+    }
+
+    /// The failure mode a sink must never have: a module that traps, is missing,
+    /// or answers nonsense must NOT report success. Trigger hooks fail open
+    /// because a broken gate must not wedge a pipeline; a sink that failed open
+    /// would silently drop the event it exists to deliver.
+    #[test]
+    fn a_broken_or_missing_connector_is_not_a_delivery_and_is_retryable() {
+        let missing = pumper_core::Error::plugin(
+            pumper_core::error::PluginFailure::Unknown,
+            "sink-nowhere",
+            "not loaded",
+        );
+        let (delivered, _, error, permanent) = plugin_delivery_outcome(Err(missing));
+        assert!(!delivered, "a plugin that never ran did not deliver");
+        assert!(
+            !permanent,
+            "install the module and POST /plugins/reload — the drain is what then succeeds"
+        );
+        assert!(error.unwrap_or_default().contains("plugin sink failed"));
+
+        let (delivered, _, error, permanent) =
+            plugin_delivery_outcome(Ok(serde_json::json!({"ok": "sure"})));
+        assert!(!delivered);
+        assert!(!permanent);
+        assert!(error.unwrap_or_default().contains("malformed"));
+    }
+
+    /// The delivery row is the only thing a DLQ drain re-reads, so its url must
+    /// re-resolve to the same module and to nothing else. Same guard, and same
+    /// reason, as the file sink's path validation.
+    #[test]
+    fn a_tampered_plugin_url_resolves_to_no_module() {
+        assert_eq!(
+            plugin_sink_name("plugin://sink-postgrest"),
+            Some("sink-postgrest")
+        );
+        assert_eq!(plugin_sink_url("sink-postgrest"), "plugin://sink-postgrest");
+        for bad in [
+            "plugin://../../etc/passwd",
+            "plugin://a/b",
+            "plugin://",
+            "https://evil.example",
+            "file://x.ndjson",
+        ] {
+            assert_eq!(plugin_sink_name(bad), None, "{bad} must not resolve");
+        }
     }
 }

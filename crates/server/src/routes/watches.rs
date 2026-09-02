@@ -338,10 +338,28 @@ pub(crate) async fn create_watch(
             }
             url
         }
+        // N10: `plugin:<name>` delivers through the WASM plugin host. The
+        // module must already be loaded — a watch pointed at a plugin that was
+        // never installed would look configured and dead-letter every event.
+        // Any supplied url is ignored: a plugin sink's destination is the
+        // module's own (see docs/features/events-webhooks.md §plugin sinks).
+        other if other.starts_with(crate::webhook::PLUGIN_SINK_PREFIX) => {
+            let name = &other[crate::webhook::PLUGIN_SINK_PREFIX.len()..];
+            if !state.plugins.has(name) {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    format!(
+                        "no executable plugin named '{name}' is loaded — build and install it \
+                         (`just plugins-install`), then POST /plugins/reload"
+                    ),
+                ));
+            }
+            ""
+        }
         other => {
             return Err(ApiError(
                 StatusCode::BAD_REQUEST,
-                format!("unknown sink '{other}' (expected webhook, file, or slack)"),
+                format!("unknown sink '{other}' (expected webhook, file, slack, or plugin:<name>)"),
             ));
         }
     };
